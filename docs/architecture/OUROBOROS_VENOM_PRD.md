@@ -445,7 +445,7 @@ v2 fix (`df4b70a4a8`):
 
 | # | Arc | Evidence | Why structural-not-workaround |
 |---|---|---|---|
-| **A** | Worktree-aware OperationAdvisor (composes `evidence.worktree_path` into blast computation) | 14 `advisor_blocked` events; `_compute_worker_id: worktree_path is None` | A worktree-isolated edit's blast radius on the main tree IS zero; the advisor must consume first-class isolation signals already on the envelope. **Not** a category special-case (rejected per gap-closure direction §3) — must be general policy. |
+| **A** | Worktree-aware OperationAdvisor (composes `evidence.repo_root` into blast computation) — ✅ **CLOSED 2026-05-12 as v3.7 Phase 2 Phase B.2.0** (see §40.7.10-b20 below) | 14 `advisor_blocked` events; `_compute_worker_id: worktree_path is None` | A worktree-isolated edit's blast radius on the main tree IS zero; the advisor must consume first-class isolation signals already on the envelope. **Not** a category special-case (rejected per gap-closure direction §3) — must be general policy. |
 | **B** | Parallel worktree creation in `maybe_inject_exercise_at_boot` (`asyncio.gather` over the 4 problems) | Sequential `git worktree add` took 7–11 min each; 4-problem injection consumed 28 min of the 40-min wall budget | Boot hook is fire-once at session start; serial loop multiplies latency unnecessarily. Parallel via `asyncio.gather` cuts injection from sum-of-creates to max-of-creates. |
 | **C** | Router→Dispatcher accounting trace (why `attempted=0` despite 4 successful ingests + at least 1 confirmed dispatch) | `summary.json.stats.attempted=0` while debug.log shows `iter=0 dispatching CLASSIFY` for L2-exercise op_id | Suspected: terminal `advisor_blocked` short-circuits before the orchestrator's outer counter. Worth a small AST-pin on the orchestrator's `attempted` increment site. |
 
@@ -466,6 +466,44 @@ v2 fix (`df4b70a4a8`):
 - `backend/core/ouroboros/battle_test/harness.py` — boot hook (lazy import + 4-attribute walker + fail-open try/except)
 
 **Tests: 170/170 cumulative Treefinement-arc spine green; `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine during the 1.5.D.2 arc).**
+
+##### §40.7.10-b20 — Worktree-aware OperationAdvisor (CLOSED 2026-05-12; follow-up arc A)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/b-2-0-worktree-aware-advisor` as PR 1 of the §40.7.9 Phase 2 Phase B.2 split (operator-bound: B.2.0 ships separately from B.2.1–3 so the worktree-aware advisor can graduate independently for L3 + in-repo corpus + SWE-Bench-Pro all at once).
+
+**Structural fix at source**: `OperationAdvisor.advise()` gains optional `repo_root: Optional[Path]` kwarg threaded through all four scan-tree signal-compute methods (`_compute_blast_radius` / `_compute_test_coverage` / `_check_staleness` / `_check_large_files`). When supplied, each method scans THAT tree's import graph + test layout + file mtimes instead of `self._project_root`. When `None` (default), behavior is byte-identical to pre-B.2.0.
+
+**Canonical evidence key** (operator binding B.2.0 hardening note 2 — pick ONE name, document it): `repo_root`. Exported as `EVIDENCE_REPO_ROOT_KEY` constant from `operation_advisor.py`. Future SWE-Bench-Pro Phase B.2.1 envelope builder + any other worktree-isolating sensor consume the same constant — no parallel spellings (`worktree_path` remains a sensor-side telemetry field, but the advisor's input is unambiguously `repo_root`).
+
+**Untrusted-input safety** (operator binding B.2.0 hardening note 1): `resolve_envelope_repo_root(intake_evidence_json, *, project_root, extra_allowlist=None) -> Optional[Path]` validates the envelope-provided path through a first-failure-wins pipeline: (1) master flag ON; (2) evidence is valid JSON dict with `repo_root` string; (3) `Path.resolve(strict=False)` succeeds; (4) resolved path exists + is a directory; (5) resolved path is contained under an allowed prefix (default = the orchestrator's `project_root`; env-extendable via `JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST` colon-separated absolute paths). Symlink escapes are defeated by canonicalizing BEFORE the prefix check. Any failure → return `None` → advisor falls back to legacy project_root path.
+
+**Source-agnostic by design** (operator binding B.2.0 hardening note 4): the advisor and resolver never branch on `envelope.source`. AST pins in the spine enforce this: no `swe_bench_pro` string literal under 80 chars in `operation_advisor.py`, no `Compare` node against any `.source` attribute, no `swe_bench_pro` comparison literal in `orchestrator.py`. Blast is computed from the actual mutation root — not from a sensor-category hint.
+
+**Wiring**: `orchestrator.py` advisor call site (`backend/core/ouroboros/governance/orchestrator.py:~1852`) invokes `resolve_envelope_repo_root(ctx.intake_evidence_json, project_root=self._config.project_root)` BEFORE `advisor.advise(..., repo_root=resolved)`. AST pin asserts the two calls co-occur in the orchestrator source — drift that silently dropped the resolver would silently revert behavior to pre-B.2.0 even with the master flag ON.
+
+**Master flags (§33.1 default-FALSE; FlagRegistry auto-seeded via `register_flags`)**:
+- `JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED` (BOOL/SAFETY) — master switch; OFF → resolver returns `None` for every envelope, byte-identical legacy behavior
+- `JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST` (STR/SAFETY) — colon-separated extra allowed prefixes, applied after `Path.resolve()` to defeat symlink escape
+
+**29 spine tests** (`tests/governance/test_operation_advisor_worktree_aware.py`) covering master-flag-off byte-identical / override-scans-the-right-tree / 7 untrusted-input rejection classes (root path, outside allowlist, missing dir, file-not-dir, malformed JSON, missing key, non-string value) / symlink escape rejection / legitimate symlink under allowlist accepted / env-allowlist extension (single + colon-separated) / 4 AST pins (advise() signature / 4 signal-compute methods all parameterize / orchestrator calls resolver / no source-branch in advisor or orchestrator) / FlagRegistry seed assertions (2 specs, master default-FALSE, fail-open under missing FlagRegistry module) / canonical evidence-key invariant.
+
+**Surrounding-substrate regression**: 184 advisor + classify + recovery + visual-verify-advisory tests green; 240 cross-arc tests (Treefinement v3.3+v3.4 + L2 exercise corpus v3.6 Phase 1.5 + SWE-Bench-Pro Phase A+B.1) green; 108 FlagRegistry walker tests green. `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/operation_advisor.py` — substrate (parameterized `advise()` + 4 signal-compute methods + `resolve_envelope_repo_root` + `register_flags`)
+- `backend/core/ouroboros/governance/orchestrator.py:~1852` — wiring (resolver call + `repo_root=` kwarg passthrough)
+- `tests/governance/test_operation_advisor_worktree_aware.py` — 29-test spine + 6 AST pins
+- `tests/governance/test_read_only_advisor_bypass.py` — minor fixture update (`**_` absorbs new kwarg)
+
+**What B.2.0 deliberately did NOT do** (composition discipline):
+- No special case for `envelope.source == "swe_bench_pro"` — root-correct, not category-correct
+- No new advisor variant / subclass / parallel module — extend the canonical advisor in place
+- No new envelope schema field — the evidence dict already carries arbitrary keys
+- No worktree-creation logic — that's Phase B.1's per_problem_harness (already shipped)
+- No reachability into RepairEngine / Iron Gate / SemanticGuardian — pure advisory layer
+- No graduation flip — master flag stays default-FALSE until soak evidence is collected
+
+**Next**: B.2.1 (`PreparedProblem → IntentEnvelope` builder setting `evidence["repo_root"] = str(prepared.worktree_path)`) + B.2.2 (`evaluate_problem` façade composing `IntakeLayerService.ingest_envelope` + canonical SSE terminal-event rendezvous + bounded `asyncio.wait_for` per operator binding) + B.2.3 (spine + memory artifact + soak-readiness checklist). Operator-bound as PR 2 — a separate commit chain from this B.2.0 PR.
 
 ---
 

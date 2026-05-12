@@ -19,6 +19,7 @@ Boundary Principle:
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
@@ -35,6 +36,33 @@ _ENABLED = os.environ.get(
 ).lower() in ("true", "1", "yes")
 _BLAST_RADIUS_WARN = int(os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_WARN", "10"))
 _FAILURE_STREAK_WARN = int(os.environ.get("JARVIS_ADVISOR_FAILURE_STREAK_WARN", "3"))
+
+# ---------------------------------------------------------------------------
+# B.2.0 — Worktree-aware advisory (SWE-Bench-Pro Phase 2 enabling layer +
+# permanent improvement for L3 worktree-isolated work and the in-repo L2
+# exercise corpus). §33.1 default-FALSE master switch; when ON, the advisor
+# scans the per-envelope ``repo_root`` for blast/coverage/staleness/large-file
+# signals instead of its constructor-bound ``self._project_root``.
+#
+# Source-agnostic by design: no envelope.source branch is consulted. The
+# override applies whenever the envelope carries a trusted ``repo_root``
+# string in its evidence, regardless of which sensor produced it. Per
+# operator binding (B.2.0 hardening note 4): blast is computed from the
+# actual mutation root — not from a category special-case.
+# ---------------------------------------------------------------------------
+ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR: str = (
+    "JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED"
+)
+ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR: str = (
+    "JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST"
+)
+
+# Canonical evidence key (operator binding: pick ONE name, document it,
+# don't fork parallel spellings in B.2.1 envelope builder). Mirrored by
+# OperationContext.intake_evidence_json schema. Sensors that historically
+# stamped ``worktree_path`` continue to do so for telemetry; the advisor
+# input is unambiguously ``repo_root``.
+EVIDENCE_REPO_ROOT_KEY: str = "repo_root"
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +180,158 @@ def infer_read_only_intent(description: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Trusted-path resolver — bridges envelope.evidence to advisor.repo_root.
+#
+# Untrusted-input contract (B.2.0 hardening note 1): the evidence dict is
+# operator-influenced data (it flows from sensors, ingest endpoints, and the
+# `/attach` REPL path). The advisor must NOT trust an arbitrary path string —
+# a hostile or buggy envelope could point ``repo_root`` at ``/etc`` (silently
+# making blast=0 globally) or at a symlink that escapes the worktree base.
+#
+# Validation pipeline (first-failure-wins, NEVER raises):
+#   1. master flag ON
+#   2. evidence carries ``repo_root`` string + non-empty
+#   3. Path resolves (no permission error, no missing-parent ENOENT)
+#   4. Resolved path exists + is a directory
+#   5. Resolved path is contained under an allowed prefix:
+#         a. ``self._project_root`` (covers in-repo worktrees + L3 .worktrees/)
+#         b. additional prefixes from
+#            ``JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST`` (colon-separated
+#            absolute paths; each is itself ``resolve()``-d)
+#
+# On any failure → returns None → orchestrator falls back to
+# ``self._project_root`` (legacy byte-identical behavior).
+# ---------------------------------------------------------------------------
+
+
+def _worktree_aware_enabled() -> bool:
+    """Master switch (§33.1 default-FALSE)."""
+    raw = os.environ.get(ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR, "")
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def _parse_allowlist_env() -> Tuple[Path, ...]:
+    """Parse the colon-separated allowlist env into resolved Paths.
+    NEVER raises; invalid entries are skipped with a debug log."""
+    raw = os.environ.get(ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR, "").strip()
+    if not raw:
+        return ()
+    out: List[Path] = []
+    for entry in raw.split(os.pathsep):
+        s = entry.strip()
+        if not s:
+            continue
+        try:
+            out.append(Path(s).resolve())
+        except (OSError, RuntimeError):
+            logger.debug(
+                "[Advisor] worktree_root_allowlist: skipping invalid entry %r",
+                s,
+            )
+    return tuple(out)
+
+
+def _is_under(candidate: Path, parent: Path) -> bool:
+    """True iff ``candidate`` is ``parent`` or a descendant of it.
+
+    Uses POSIX-style path comparison on already-resolved Paths (caller
+    must ``resolve()`` first to defeat symlink escapes). NEVER raises.
+    """
+    try:
+        candidate.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_envelope_repo_root(
+    intake_evidence_json: str,
+    *,
+    project_root: Path,
+    extra_allowlist: Optional[Tuple[Path, ...]] = None,
+) -> Optional[Path]:
+    """Resolve a per-envelope ``repo_root`` to a trusted absolute Path.
+
+    Parameters
+    ----------
+    intake_evidence_json:
+        The JSON-encoded evidence snapshot from ``OperationContext
+        .intake_evidence_json`` (or any source-equivalent string). Empty
+        string + malformed JSON + missing key are all silently treated
+        as "no override".
+    project_root:
+        The orchestrator's bound project root. Used both as the legacy
+        fallback context AND as the canonical allowed-prefix anchor.
+    extra_allowlist:
+        Optional caller-supplied extra prefixes (already resolved). When
+        ``None`` (default), the env-derived allowlist is consulted.
+
+    Returns
+    -------
+    Optional[Path]
+        Resolved trusted path on success, ``None`` on:
+          * master flag OFF
+          * evidence missing / not a dict / no ``repo_root`` key
+          * path doesn't resolve / doesn't exist / isn't a directory
+          * resolved path escapes every allowed prefix
+
+    NEVER raises (mirrors advisor fail-open contract).
+    """
+    if not _worktree_aware_enabled():
+        return None
+    if not intake_evidence_json:
+        return None
+    try:
+        evidence = json.loads(intake_evidence_json)
+    except (ValueError, TypeError):
+        logger.debug(
+            "[Advisor] resolve_envelope_repo_root: evidence not valid JSON",
+        )
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    raw = evidence.get(EVIDENCE_REPO_ROOT_KEY)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        # ``resolve(strict=False)`` defeats symlink escapes by canonicalizing
+        # the path against the live filesystem. ``strict=True`` would raise
+        # on missing components — we want a graceful None, not an exception.
+        resolved = Path(raw).resolve(strict=False)
+    except (OSError, RuntimeError):
+        logger.debug(
+            "[Advisor] resolve_envelope_repo_root: Path.resolve raised "
+            "for %r",
+            raw,
+        )
+        return None
+    try:
+        if not resolved.exists() or not resolved.is_dir():
+            return None
+    except (OSError, PermissionError):
+        return None
+    try:
+        anchor = Path(project_root).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    allowlist: List[Path] = [anchor]
+    extras = (
+        extra_allowlist if extra_allowlist is not None
+        else _parse_allowlist_env()
+    )
+    allowlist.extend(extras)
+    for parent in allowlist:
+        if _is_under(resolved, parent):
+            return resolved
+    logger.info(
+        "[Advisor] resolve_envelope_repo_root: %r rejected — "
+        "outside %d allowed prefix(es)",
+        str(resolved), len(allowlist),
+    )
+    return None
+
+
 class AdvisoryDecision(str, Enum):
     RECOMMEND = "recommend"            # Proceed normally
     CAUTION = "caution"                # Proceed but inject warnings into prompt
@@ -192,6 +372,7 @@ class OperationAdvisor:
         description: str,
         op_id: str = "",
         is_read_only: bool = False,
+        repo_root: Optional[Path] = None,
     ) -> Advisory:
         """Evaluate an operation and return advisory judgment.
 
@@ -202,6 +383,16 @@ class OperationAdvisor:
         unreachable. Stale-file, large-file, time-of-day, and chronic-entropy
         signals still apply because they speak to generation quality, not
         blast radius.
+
+        ``repo_root`` (B.2.0) — when supplied, all filesystem-scanning signals
+        (blast radius, test coverage, staleness, large-file) compute against
+        this root instead of ``self._project_root``. Callers MUST validate
+        the path through :func:`resolve_envelope_repo_root` before passing
+        it in. When ``None`` (default) the advisor falls back to its
+        constructor-bound project root — byte-identical to pre-B.2.0
+        behavior. Source-agnostic: the advisor never branches on which
+        sensor produced the envelope (operator binding: blast is root-
+        correct, not category-special).
         """
         if not _ENABLED:
             return Advisory(
@@ -216,7 +407,7 @@ class OperationAdvisor:
         # Signal 1: Blast radius (how many files import the targets)
         # Always computed for observability — surfaced as a reason only
         # for mutating ops.
-        blast_radius = self._compute_blast_radius(target_files)
+        blast_radius = self._compute_blast_radius(target_files, root=repo_root)
         if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
             reasons.append(
                 f"High blast radius: {blast_radius} files import these targets"
@@ -226,7 +417,7 @@ class OperationAdvisor:
         # Signal 2: Test coverage
         # Same bypass logic — read-only ops don't execute mutations, so
         # coverage of the targets is structurally irrelevant.
-        test_coverage = self._compute_test_coverage(target_files)
+        test_coverage = self._compute_test_coverage(target_files, root=repo_root)
         if not is_read_only and test_coverage < 0.5:
             reasons.append(
                 f"Low test coverage: {test_coverage:.0%} of targets have tests"
@@ -248,7 +439,7 @@ class OperationAdvisor:
             risk_factors.append(0.3)
 
         # Signal 5: File staleness (untouched for long time = riskier)
-        stale_files = self._check_staleness(target_files)
+        stale_files = self._check_staleness(target_files, root=repo_root)
         if stale_files:
             reasons.append(
                 f"Stale files (>90 days untouched): {', '.join(stale_files[:3])}"
@@ -256,7 +447,7 @@ class OperationAdvisor:
             risk_factors.append(0.2)
 
         # Signal 6: Large file risk
-        large_files = self._check_large_files(target_files)
+        large_files = self._check_large_files(target_files, root=repo_root)
         if large_files:
             reasons.append(
                 f"Large files (>500 lines): {', '.join(f'{f}({l}L)' for f, l in large_files[:3])}"
@@ -343,8 +534,19 @@ class OperationAdvisor:
     # Signal computation (all deterministic)
     # ------------------------------------------------------------------
 
-    def _compute_blast_radius(self, target_files: Tuple[str, ...]) -> int:
-        """Count files that import the targets. AST-based, deterministic."""
+    def _compute_blast_radius(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+    ) -> int:
+        """Count files that import the targets. AST-based, deterministic.
+
+        ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
+        ``None`` (pre-B.2.0 behavior). Callers MUST validate the override
+        path through :func:`resolve_envelope_repo_root` first.
+        """
+        scan_root = root if root is not None else self._project_root
         target_modules = set()
         for f in target_files:
             if f.endswith(".py"):
@@ -356,7 +558,7 @@ class OperationAdvisor:
             return 0
 
         importers = 0
-        for py_file in self._project_root.rglob("*.py"):
+        for py_file in scan_root.rglob("*.py"):
             if "venv" in str(py_file) or "__pycache__" in str(py_file):
                 continue
             try:
@@ -369,8 +571,18 @@ class OperationAdvisor:
                 break  # Cap the search
         return importers
 
-    def _compute_test_coverage(self, target_files: Tuple[str, ...]) -> float:
-        """Fraction of target files that have corresponding test files."""
+    def _compute_test_coverage(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+    ) -> float:
+        """Fraction of target files that have corresponding test files.
+
+        ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
+        ``None`` (pre-B.2.0 behavior).
+        """
+        scan_root = root if root is not None else self._project_root
         if not target_files:
             return 1.0
         py_files = [f for f in target_files if f.endswith(".py") and "test_" not in f]
@@ -380,7 +592,7 @@ class OperationAdvisor:
         covered = 0
         for f in py_files:
             stem = Path(f).stem
-            if any((self._project_root / "tests" / f"test_{stem}.py").exists()
+            if any((scan_root / "tests" / f"test_{stem}.py").exists()
                    for _ in [1]):
                 covered += 1
         return covered / len(py_files)
@@ -402,12 +614,22 @@ class OperationAdvisor:
             pass
         return 0.0
 
-    def _check_staleness(self, target_files: Tuple[str, ...]) -> List[str]:
-        """Find files not modified in 90+ days. Git-free check via mtime."""
+    def _check_staleness(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+    ) -> List[str]:
+        """Find files not modified in 90+ days. Git-free check via mtime.
+
+        ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
+        ``None`` (pre-B.2.0 behavior).
+        """
+        scan_root = root if root is not None else self._project_root
         stale = []
         cutoff = time.time() - (90 * 86400)
         for f in target_files:
-            full = self._project_root / f
+            full = scan_root / f
             if full.exists():
                 try:
                     if full.stat().st_mtime < cutoff:
@@ -417,12 +639,20 @@ class OperationAdvisor:
         return stale
 
     def _check_large_files(
-        self, target_files: Tuple[str, ...],
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
     ) -> List[Tuple[str, int]]:
-        """Find files with >500 lines."""
+        """Find files with >500 lines.
+
+        ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
+        ``None`` (pre-B.2.0 behavior).
+        """
+        scan_root = root if root is not None else self._project_root
         large = []
         for f in target_files:
-            full = self._project_root / f
+            full = scan_root / f
             if full.exists() and f.endswith(".py"):
                 try:
                     lines = len(full.read_text().split("\n"))
@@ -456,3 +686,95 @@ class OperationAdvisor:
                 f"{reasons[0] if reasons else 'Safety threshold exceeded.'}"
             )
         return ""
+
+
+# ---------------------------------------------------------------------------
+# FlagRegistry self-registration (auto-discovered by §33.3 walker)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration. Returns count successfully
+    registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        FlagSpec(
+            name=ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "B.2.0 master switch (§33.1 default-FALSE): when ON, the "
+                "OperationAdvisor consumes a per-envelope ``repo_root`` "
+                "string from intake_evidence_json and scans THAT tree for "
+                "blast radius / coverage / staleness / large-file signals "
+                "instead of the orchestrator's constructor-bound "
+                "project_root. Source-agnostic — no branch on "
+                "envelope.source. Enabling layer for SWE-Bench-Pro Phase 2 "
+                "+ permanent improvement for L3 worktree-isolated work + "
+                "the in-repo L2 exercise corpus. Untrusted-input contract "
+                "enforced by resolve_envelope_repo_root."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/operation_advisor.py"
+            ),
+            example="false",
+            since="v3.7 Phase 2 Phase B.2.0 (2026-05-12)",
+        ),
+        FlagSpec(
+            name=ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR,
+            type=FlagType.STR,
+            default="",
+            description=(
+                "Colon-separated absolute-path prefixes that supplement "
+                "the orchestrator's project_root as allowed locations for "
+                "envelope-provided ``repo_root`` overrides. Default empty "
+                "= project_root only (covers in-repo worktrees + L3 "
+                ".worktrees/ + .jarvis/swe_bench_pro/worktrees/). Each "
+                "entry is Path.resolve()'d at parse time so symlinks "
+                "cannot escape the allowlist after the fact. Entries "
+                "outside this allowlist are rejected and the advisor "
+                "falls back to the constructor-bound project_root."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/operation_advisor.py"
+            ),
+            example="/private/tmp/eval-clones:/var/jarvis/scratch",
+            since="v3.7 Phase 2 Phase B.2.0 (2026-05-12)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[Advisor] flag registration failed for %s",
+                getattr(spec, "name", "?"),
+                exc_info=True,
+            )
+    return count
+
+
+__all__ = [
+    "ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR",
+    "ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR",
+    "EVIDENCE_REPO_ROOT_KEY",
+    "Advisory",
+    "AdvisoryDecision",
+    "OperationAdvisor",
+    "infer_read_only_intent",
+    "register_flags",
+    "resolve_envelope_repo_root",
+]

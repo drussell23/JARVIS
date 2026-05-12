@@ -1832,7 +1832,10 @@ class GovernedOrchestrator:
             _advisory = None
             try:
                 from backend.core.ouroboros.governance.operation_advisor import (
-                    OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
+                    OperationAdvisor,
+                    AdvisoryDecision,
+                    infer_read_only_intent,
+                    resolve_envelope_repo_root,
                 )
                 # Stamp read-only intent onto the hash-chained context BEFORE
                 # advising. The Advisor's bypass of blast_radius + test_coverage
@@ -1850,9 +1853,29 @@ class GovernedOrchestrator:
                             ctx.op_id,
                         )
                 _advisor = OperationAdvisor(self._config.project_root)
+                # B.2.0 — worktree-aware advisory: when the envelope carries a
+                # trusted ``repo_root`` string in evidence AND the master flag
+                # is ON, the advisor scans THAT tree's import graph instead of
+                # the orchestrator's bound project_root. Source-agnostic by
+                # design — the resolver validates a path, not an envelope
+                # category. Returns None when the flag is off / evidence is
+                # missing / the path fails the untrusted-input safety
+                # validation; advise() then falls back byte-identically.
+                _adv_repo_root = resolve_envelope_repo_root(
+                    ctx.intake_evidence_json,
+                    project_root=self._config.project_root,
+                )
+                if _adv_repo_root is not None:
+                    logger.info(
+                        "[Orchestrator] Advisor scanning per-envelope "
+                        "repo_root=%s for op=%s "
+                        "(legacy project_root retained as fallback)",
+                        _adv_repo_root, ctx.op_id,
+                    )
                 _advisory = _advisor.advise(
                     ctx.target_files, ctx.description, ctx.op_id,
                     is_read_only=ctx.is_read_only,
+                    repo_root=_adv_repo_root,
                 )
 
                 if _advisory.decision == AdvisoryDecision.BLOCK:

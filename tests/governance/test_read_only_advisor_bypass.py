@@ -123,19 +123,23 @@ class _HighBlastAdvisor(OperationAdvisor):
         self._fake_blast = blast_radius
         self._fake_coverage = test_coverage
 
-    def _compute_blast_radius(self, target_files: Tuple[str, ...]) -> int:
+    # B.2.0: signal-compute methods now accept an optional ``root`` kwarg
+    # for worktree-aware scanning. The override ignores it — the fixture
+    # short-circuits to fake values regardless of which root the parent
+    # would have scanned.
+    def _compute_blast_radius(self, target_files: Tuple[str, ...], **_) -> int:
         return self._fake_blast
 
-    def _compute_test_coverage(self, target_files: Tuple[str, ...]) -> float:
+    def _compute_test_coverage(self, target_files: Tuple[str, ...], **_) -> float:
         return self._fake_coverage
 
     def _get_chronic_entropy(self, target_files: Tuple[str, ...], description: str) -> float:
         return 0.0
 
-    def _check_staleness(self, target_files: Tuple[str, ...]):
+    def _check_staleness(self, target_files: Tuple[str, ...], **_):
         return []
 
-    def _check_large_files(self, target_files: Tuple[str, ...]):
+    def _check_large_files(self, target_files: Tuple[str, ...], **_):
         return []
 
 
