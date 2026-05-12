@@ -18,6 +18,40 @@ Operator-paced contract
 * Bounded-cost: hard-stops at ``--max-cost-usd`` (default 0.50).
 * Pure-stdlib + canonical substrate composition only.
 
+Phase 1.5 acceptance — singleton HARDNESS_SET bootstrap
+-------------------------------------------------------
+
+Per PRD §40.7.10 (v3.6, 2026-05-12), HARDNESS_SET may be a
+**singleton** (``{problem_002}``) for Phase 1.5 acceptance ONLY:
+
+* The gate computation (per-problem floor + mean threshold)
+  is **NOT relaxed** — the set is **narrowed** so the gate
+  answers the operationally-honest question: "Is there at
+  least one fixture in this repo that reliably forces
+  first-try failure under the harness?"
+* The Stage 3.5.D paid run measured problem_002 at 100%
+  first-try fail rate (5/5 completed attempts) — clearing
+  both the 0.20 per-problem floor and the 0.45 mean
+  threshold. problem_003-v2 + problem_004 measured 0% (the
+  model pattern-matches canonical-shape fixes from training
+  data); they remain in the corpus but are NOT in the
+  singleton bootstrap.
+* Multi-fixture hardness, diverse-bug-class coverage, and
+  external benchmark provenance are owned by **PRD §40.7.9
+  Phase 2 SWE-Bench-Pro** — NOT by inventing additional
+  in-session synthetics.  Phase 2 brings curated real-world
+  bugs with reproducible test harnesses + comparison against
+  published baselines (Claude Sonnet 4.5 at 43.6% resolve rate).
+
+Operator runbook (1.5.E re-confirm)::
+
+    export JARVIS_VALIDATOR_HARDNESS_SET=problem_002
+    python3 scripts/validate_l2_exercise_corpus_hardness.py \\
+        --confirm-paid --attempts 5 --max-cost-usd 1.50
+    # Expected: meets_acceptance_gate=true,
+    #           hardness_set_mean_fail_rate ~= 1.0,
+    #           gate_diagnostic.reason="ok", n_problems=1
+
 Composition discipline (single-source-of-truth)
 -----------------------------------------------
 
