@@ -192,24 +192,29 @@ class TestReadTail:
 class TestBoundsEnforcement:
 
     def test_max_file_bytes_rejects_write(self, monkeypatch, tmp_path):
+        # Cap is 1100 (above the 1024-byte floor in _env_int).
         monkeypatch.setenv(
-            "JARVIS_CONVERSATION_LEDGER_MAX_FILE_BYTES", "200",
+            "JARVIS_CONVERSATION_LEDGER_MAX_FILE_BYTES", "1100",
         )
         from backend.core.ouroboros.governance.conversation_ledger import (
-            append_turn, ledger_dir,
+            append_turn, ledger_dir, max_file_bytes,
         )
+        assert max_file_bytes() == 1100
         sid = "test-size-cap"
-        # First write should succeed.
+        # First write: ~1100 bytes of text + JSON envelope ≈ >1100.
         ok1 = append_turn(
             sid, role="user",
-            text="x" * 100,
+            text="x" * 1000,
             source="tui_user",
         )
         assert ok1 is True
-        # Second write should be rejected (file now > 200 bytes).
+        # Verify file now exceeds the cap.
+        path = ledger_dir() / f"{sid}.jsonl"
+        assert path.stat().st_size >= 1100
+        # Second write should be rejected.
         ok2 = append_turn(
             sid, role="user",
-            text="y" * 100,
+            text="y" * 50,
             source="tui_user",
         )
         assert ok2 is False
@@ -274,8 +279,13 @@ class TestSessionIdSanitization:
         d = ledger_dir()
         files = list(d.glob("*.jsonl"))
         assert len(files) == 1
-        assert "etc" not in files[0].name
+        # The sanitized filename must not contain path separators
+        # or .. sequences — the word 'etc' appearing in the flat
+        # filename is fine (no directory traversal occurred).
+        assert "/" not in files[0].name
         assert ".." not in files[0].name
+        # Verify the file is inside the ledger dir, not elsewhere.
+        assert files[0].parent == d
 
     def test_empty_session_id_rejected(self):
         from backend.core.ouroboros.governance.conversation_ledger import (
@@ -483,7 +493,9 @@ class TestResumeFlow:
         from backend.core.ouroboros.governance.conversation_repl import (
             dispatch_conversation_command,
         )
-        result = dispatch_conversation_command(f"resume {sid}")
+        result = dispatch_conversation_command(
+            f"/conversation resume {sid}",
+        )
         assert result.ok is True
         assert "rehydrated 3 turn(s)" in result.text
 
@@ -495,7 +507,7 @@ class TestResumeFlow:
             dispatch_conversation_command,
         )
         result = dispatch_conversation_command(
-            "resume nonexistent-session",
+            "/conversation resume nonexistent-session",
         )
         assert result.ok is False
         assert "not found" in result.text
@@ -510,7 +522,9 @@ class TestResumeFlow:
         from backend.core.ouroboros.governance.conversation_repl import (
             dispatch_conversation_command,
         )
-        result = dispatch_conversation_command("resume some-id")
+        result = dispatch_conversation_command(
+            "/conversation resume some-id",
+        )
         assert result.ok is False
         assert "ledger disabled" in result.text
 
@@ -543,7 +557,9 @@ class TestResumeFlow:
         from backend.core.ouroboros.governance.conversation_repl import (
             dispatch_conversation_command,
         )
-        result = dispatch_conversation_command(f"resume {sid}")
+        result = dispatch_conversation_command(
+            f"/conversation resume {sid}",
+        )
         assert result.ok is True
         assert "rehydrated 1 turn(s)" in result.text
 
@@ -584,7 +600,9 @@ class TestSessionsSubcommand:
         from backend.core.ouroboros.governance.conversation_repl import (
             dispatch_conversation_command,
         )
-        result = dispatch_conversation_command("sessions")
+        result = dispatch_conversation_command(
+            "/conversation sessions",
+        )
         assert result.ok is True
         assert "sess-" in result.text
 
@@ -598,7 +616,9 @@ class TestSessionsSubcommand:
         from backend.core.ouroboros.governance.conversation_repl import (
             dispatch_conversation_command,
         )
-        result = dispatch_conversation_command("sessions")
+        result = dispatch_conversation_command(
+            "/conversation sessions",
+        )
         assert result.ok is False
         assert "ledger disabled" in result.text
 

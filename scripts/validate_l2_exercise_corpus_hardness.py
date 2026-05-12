@@ -273,9 +273,47 @@ async def call_doubleword_one_shot(
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-    text = data["choices"][0]["message"]["content"]
+    text = _extract_dw_message_content(data)
     usage = data.get("usage", {}) or {}
     return text, usage
+
+
+def _extract_dw_message_content(data: Dict[str, Any]) -> str:
+    """Extract the assistant message content from a DW chat-completions
+    response.
+
+    Mirrors the canonical parsing path in
+    :meth:`DoublewordProvider._call_realtime_chat_completions`
+    (``doubleword_provider.py`` lines 2058-2074): for reasoning models
+    like Qwen3.5-397B, the actual answer may appear in ``content`` OR
+    in ``reasoning_content`` (when the model emits a long reasoning
+    trace and folds the final answer into the reasoning section).
+    Composes the SAME fallback ladder — no parallel parsing logic.
+
+    Raises
+    ------
+    KeyError
+        If neither ``content`` nor ``reasoning_content`` is present.
+        Includes the available keys in the error message so empirical
+        diagnosis is one-step.
+    """
+    choices = data.get("choices", []) or []
+    if not choices:
+        raise KeyError(
+            f"DW response missing 'choices' (or empty). Top-level "
+            f"keys: {sorted(data.keys())}"
+        )
+    message = choices[0].get("message", {}) or {}
+    content = message.get("content", "") or ""
+    if not content:
+        content = message.get("reasoning_content", "") or ""
+    if not content:
+        raise KeyError(
+            f"DW response 'message' has neither 'content' nor "
+            f"'reasoning_content' (or both were empty). Message "
+            f"keys: {sorted(message.keys())}"
+        )
+    return content
 
 
 # ===========================================================================

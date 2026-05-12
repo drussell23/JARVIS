@@ -334,6 +334,58 @@ def test_clean_room_prompt_includes_target_and_test_filenames():
     assert "def test_f(): assert f() == 1" in prompt
 
 
+def test_dw_response_parser_handles_content_field():
+    """Composition pin: the parser MUST extract ``content`` from the
+    standard OpenAI-compat shape ``{choices:[{message:{content:"..."}}]}``."""
+    mod = _load_script_module()
+    data = {
+        "choices": [{"message": {"content": "def f(): return 1"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+    }
+    assert mod._extract_dw_message_content(data) == "def f(): return 1"
+
+
+def test_dw_response_parser_falls_back_to_reasoning_content():
+    """Composition pin: mirrors the canonical
+    ``DoublewordProvider._call_realtime_chat_completions`` fallback
+    (Qwen3.5 reasoning models emit the final answer in
+    ``reasoning_content`` instead of ``content`` when reasoning is
+    long).  Without this fallback every validator attempt crashes
+    with ``KeyError: 'content'`` against the production Qwen3.5
+    model — empirically observed on first 1.5.D run, fixed in same
+    arc."""
+    mod = _load_script_module()
+    data = {
+        "choices": [{"message": {
+            "content": "",
+            "reasoning_content": "def f(): return 1",
+        }}],
+    }
+    assert mod._extract_dw_message_content(data) == "def f(): return 1"
+    # Also: missing 'content' key (not just empty) falls back too
+    data2 = {
+        "choices": [{"message": {
+            "reasoning_content": "def f(): return 2",
+        }}],
+    }
+    assert mod._extract_dw_message_content(data2) == "def f(): return 2"
+
+
+def test_dw_response_parser_raises_clear_error_when_both_missing():
+    """Diagnostic pin: when neither field is present, the parser
+    MUST raise KeyError with the available keys listed (so the
+    operator can diagnose response-shape drift in one step, not via
+    re-running)."""
+    import pytest as _pytest
+    mod = _load_script_module()
+    data = {
+        "choices": [{"message": {"weird_field": "x"}}],
+    }
+    with _pytest.raises(KeyError) as excinfo:
+        mod._extract_dw_message_content(data)
+    assert "weird_field" in str(excinfo.value)
+
+
 def test_strip_markdown_fences_handles_standard_fenced_block():
     """Defensive-parsing pin: if the LLM ignores the 'no fences'
     instruction, we strip one leading + trailing fence so pytest sees

@@ -1,0 +1,43 @@
+{
+  "schema_version": "hardness_report.v1",
+  "timestamp": "2026-05-12T18:22:39.098650+00:00",
+  "provider_chain_used": "doubleword",
+  "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "attempts_requested": 5,
+  "max_cost_usd": 0.5,
+  "total_cost_usd": 0.0,
+  "results": [
+    {
+      "problem_id": "problem_001",
+      "kind": "off_by_one",
+      "attempts_requested": 5,
+      "attempts_completed": 0,
+      "attempts_errored": 5,
+      "passes": 0,
+      "fails": 0,
+      "measured_first_try_fail_rate": null,
+      "per_attempt": [
+        {
+          "attempt": 0,
+          "error": "KeyError: 'content'"
+        },
+        {
+          "attempt": 1,
+          "error": "KeyError: 'content'"
+        },
+        {
+          "attempt": 2,
+          "error": "KeyError: 'content'"
+        },
+        {
+          "attempt": 3,
+          "error": "KeyError: 'content'"
+        },
+        {
+          "attempt": 4,
+          "error": "KeyError: 'content'"
+        }
+      ]
+    }
+  ]
+}

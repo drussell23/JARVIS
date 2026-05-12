@@ -142,7 +142,7 @@ class TestSessionIdResolution:
 
         with mock.patch(
             "backend.core.ouroboros.governance."
-            "conversation_ledger_observer.get_session_manager",
+            "session_manager.get_session_manager",
             side_effect=ImportError("no manager"),
         ):
             sid = ConversationLedgerObserver._resolve_session_id()
@@ -163,7 +163,7 @@ class TestSessionIdResolution:
 
         with mock.patch(
             "backend.core.ouroboros.governance."
-            "conversation_ledger_observer.get_session_manager",
+            "session_manager.get_session_manager",
             return_value=fake_mgr,
         ):
             sid = ConversationLedgerObserver._resolve_session_id()
