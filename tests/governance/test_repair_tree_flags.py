@@ -56,13 +56,14 @@ def _isolate_registry() -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
-def test_register_flags_installs_seven_specs():
+def test_register_flags_installs_all_specs():
     """The substrate's ``register_flags`` MUST install exactly
-    the seven Treefinement flags. Drift here (e.g. silently
-    dropping one) is operator-visible via this count assertion."""
+    12 Treefinement flags (7 Phase 0 + 5 Phase 2 scoring knobs).
+    Drift here (e.g. silently dropping one) is operator-visible
+    via this count assertion."""
     registry = FlagRegistry()
     count = register_flags(registry)
-    assert count == 7, f"expected 7 specs, got {count}"
+    assert count == 12, f"expected 12 specs (7 P0 + 5 P2), got {count}"
 
 
 def test_master_flag_spec_shape():

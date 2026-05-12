@@ -109,13 +109,17 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Composition imports — load-bearing single-source-of-truth pins
 # ---------------------------------------------------------------------------
-# These three imports are the substrate's structural commitment to "no
+# These six imports are the substrate's structural commitment to "no
 # parallel state": branch_id derives from the canonical patch hash,
 # K sizing flows through the canonical posture-weight table, branch
-# isolation flows through the canonical worktree manager. Phase 5
-# AST-pins each import so refactors that try to inline a parallel
-# primitive (e.g., a tree-local hash function) fail the spine before
-# they reach review.
+# isolation flows through the canonical worktree manager, and the
+# Phase 2 validator stack composes the canonical ascii_strict_gate +
+# SemanticGuardian + TestRunner. Phase 5 AST-pins each import so
+# refactors that try to inline a parallel primitive (e.g., a tree-
+# local pattern detector) fail the spine before they reach review.
+from backend.core.ouroboros.governance.ascii_strict_gate import (
+    scan_content as ascii_scan_content,
+)
 from backend.core.ouroboros.governance.failure_classifier import (
     patch_signature_hash,
 )
@@ -123,6 +127,13 @@ from backend.core.ouroboros.governance.parallel_dispatch import (
     posture_weight_for,
 )
 from backend.core.ouroboros.governance.posture import Posture
+from backend.core.ouroboros.governance.semantic_guardian import (
+    SemanticGuardian,
+)
+from backend.core.ouroboros.governance.test_runner import (
+    TestResult,
+    TestRunner,
+)
 from backend.core.ouroboros.governance.worktree_manager import (
     WorktreeManager,
 )
@@ -163,6 +174,24 @@ EMERGENCY_DEMOTE_THRESHOLD_ENV_VAR: str = (
     "JARVIS_L2_TREE_EMERGENCY_DEMOTE_THRESHOLD"
 )
 
+# Phase 2 validator scoring coefficients — env-tunable so operators
+# can re-weight the pruning oracle without code changes.
+TEST_PASS_WEIGHT_ENV_VAR: str = "JARVIS_L2_TREE_TEST_PASS_WEIGHT"
+SOFT_FINDING_PENALTY_ENV_VAR: str = (
+    "JARVIS_L2_TREE_SOFT_FINDING_PENALTY"
+)
+WON_SCORE_FLOOR_ENV_VAR: str = "JARVIS_L2_TREE_WON_FLOOR"
+PROMOTED_SCORE_FLOOR_ENV_VAR: str = "JARVIS_L2_TREE_PROMOTED_FLOOR"
+TEST_TIMEOUT_S_ENV_VAR: str = "JARVIS_L2_TREE_VALIDATOR_TEST_TIMEOUT_S"
+
+# Phase 3 cross-branch learning knobs — env-tunable so operators can
+# resize the sibling-outcomes prompt block without code changes.
+SIBLING_MAX_COUNT_ENV_VAR: str = "JARVIS_L2_TREE_SIBLING_MAX_COUNT"
+SIBLING_MAX_CHARS_ENV_VAR: str = "JARVIS_L2_TREE_SIBLING_MAX_CHARS"
+SIBLING_SKIP_POSTURES_ENV_VAR: str = (
+    "JARVIS_L2_TREE_SIBLING_SKIP_POSTURES"
+)
+
 
 # Defaults — referenced by both code paths and AST pin tests so drift
 # is structurally detectable. K=3 + M=2 + threshold=0.85 are operator-
@@ -170,6 +199,43 @@ EMERGENCY_DEMOTE_THRESHOLD_ENV_VAR: str = (
 _DEFAULT_MAX_BRANCHES_PER_LAYER: int = 3
 _DEFAULT_BEAM_WIDTH: int = 2
 _DEFAULT_EMERGENCY_DEMOTE_THRESHOLD: float = 0.85
+
+# Phase 2 scoring defaults — chosen to mirror Manifesto §6 stance:
+# tests carry full weight (1.0); soft Guardian findings reduce score
+# by 0.2 each (so 5 soft findings = -1.0 = falls below WON floor);
+# WON requires ≥0.95 (effectively a clean test pass with ≤0 soft
+# findings); PROMOTED floor 0.4 lets BEAM_K survive partial test
+# passes when no clean alternative is found.
+_DEFAULT_TEST_PASS_WEIGHT: float = 1.0
+_DEFAULT_SOFT_FINDING_PENALTY: float = 0.2
+_DEFAULT_WON_SCORE_FLOOR: float = 0.95
+_DEFAULT_PROMOTED_SCORE_FLOOR: float = 0.4
+_DEFAULT_TEST_TIMEOUT_S: float = 60.0
+
+# Phase 3 — cross-branch learning defaults
+_DEFAULT_SIBLING_MAX_COUNT: int = 2     # M=2 per operator approval
+# 800 chars ≈ 200 tokens (4 chars/token rule of thumb). The cap is on
+# CHARACTERS (deterministic, tokenizer-independent) not tokens.
+_DEFAULT_SIBLING_MAX_CHARS: int = 800
+# Postures that suppress sibling-outcomes injection. MAINTAIN is the
+# minimal-context posture; injecting cross-branch context there bloats
+# prompts without commensurate benefit. Comma-separated env override
+# accepts case-insensitive Posture names ("MAINTAIN", "explore", etc.).
+_DEFAULT_SIBLING_SKIP_POSTURES: Tuple[str, ...] = ("MAINTAIN",)
+_SIBLING_MAX_COUNT_CEILING: int = 8
+_SIBLING_MAX_CHARS_CEILING: int = 8000
+
+# Closed set of PruningReasons that contribute NO cross-branch learning
+# signal — including them in the sibling-outcomes block would bloat the
+# prompt without informing future strategy choices. Strategy-relevant
+# reasons (WORSE_THAN_SIBLING, SEMANTIC_GUARDIAN_HARD_FINDING) are
+# implicitly INCLUDED by being absent from this set.
+_NON_INFORMATIVE_PRUNE_REASONS: frozenset = frozenset({
+    "duplicate_patch_sig",          # no signal — same diff as sibling
+    "iron_gate_reject",             # ASCII issue, not strategy
+    "validation_budget_exhausted",  # ran out of budget, not strategy
+    "wall_clock_cap",               # ran out of time, not strategy
+})
 
 # Bound clamps — defensive ceilings to prevent env misconfiguration
 # from producing pathological tree sizes.
@@ -1617,6 +1683,98 @@ def register_flags(registry: Any) -> int:
             example="0.85",
             since="Treefinement Phase 0 (2026-05-11)",
         ),
+        # Phase 2 — ValidatorScoringConfig env knobs
+        FlagSpec(
+            name=TEST_PASS_WEIGHT_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_TEST_PASS_WEIGHT,
+            description=(
+                "Coefficient on (tests_passed/tests_total) in the "
+                "validator_score formula. Default 1.0 — full weight "
+                "to test signal. Increase to >1.0 to amplify test "
+                "signal vs Guardian findings. Clamped [0.0, 10.0]."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="1.0",
+            since="Treefinement Phase 2 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=SOFT_FINDING_PENALTY_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_SOFT_FINDING_PENALTY,
+            description=(
+                "Per-soft-finding penalty subtracted from "
+                "validator_score. Default 0.2 — five soft findings "
+                "= -1.0 score (drops a perfect-test branch below "
+                "WON floor, demoting to PROMOTED in BEAM_K). Hard "
+                "findings always short-circuit to PRUNED so this "
+                "coefficient applies only to soft. Clamped [0, 10]."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="0.2",
+            since="Treefinement Phase 2 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=WON_SCORE_FLOOR_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_WON_SCORE_FLOOR,
+            description=(
+                "Minimum validator_score AND zero-soft-finding "
+                "requirement for terminal WON. Default 0.95 — "
+                "effectively requires a clean test pass + no soft "
+                "Guardian findings. Lower to relax WON criteria; "
+                "raise to require near-perfect signal. Clamped "
+                "[0.0, 10.0]."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="0.95",
+            since="Treefinement Phase 2 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=PROMOTED_SCORE_FLOOR_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_PROMOTED_SCORE_FLOOR,
+            description=(
+                "Minimum validator_score for PROMOTED (advances to "
+                "next layer). Default 0.4 — branch must demonstrate "
+                "≥40% relevant test pass rate (assuming default "
+                "test_pass_weight=1.0). Lower to be more permissive "
+                "(more branches survive layers); raise to be more "
+                "selective. Below this floor → PRUNED_VALIDATOR with "
+                "WORSE_THAN_SIBLING reason. Clamped [0.0, 10.0]."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="0.4",
+            since="Treefinement Phase 2 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=TEST_TIMEOUT_S_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_TEST_TIMEOUT_S,
+            description=(
+                "Per-branch TestRunner.run timeout in seconds. "
+                "Default 60s mirrors RepairBudget."
+                "per_iteration_test_timeout_s. Clamped [1, 600]."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="60.0",
+            since="Treefinement Phase 2 (2026-05-11)",
+        ),
     ]
 
     count = 0
@@ -1633,6 +1791,492 @@ def register_flags(registry: Any) -> int:
     return count
 
 
+# ===========================================================================
+# Phase 2 — ValidatorScoringConfig (env-tunable pruning oracle weights)
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class ValidatorScoringConfig:
+    """Coefficients for the per-branch validator_score formula.
+
+    Score formula::
+
+        validator_score = max(0.0,
+            (tests_passed / max(1, tests_total)) * test_pass_weight
+            - soft_findings_count * soft_finding_penalty
+        )
+
+    Hard SemanticGuardian findings short-circuit to ``PRUNED_VALIDATOR``
+    with ``PruningReason.SEMANTIC_GUARDIAN_HARD_FINDING`` (no score
+    contribution — they're disqualifying). Non-ASCII codepoints
+    short-circuit to ``PRUNED_VALIDATOR`` with
+    ``PruningReason.IRON_GATE_REJECT``. The score formula handles only
+    the graded outcomes (test pass ratio + soft findings).
+
+    Outcome mapping::
+
+        score >= won_score_floor    → WON (terminal)
+        score >= promoted_score_floor → PROMOTED (advances to next layer)
+        score < promoted_score_floor  → PRUNED_VALIDATOR (WORSE_THAN_SIBLING)
+
+    All thresholds env-tunable. Operator may re-weight via
+    ``JARVIS_L2_TREE_*`` env vars without code changes.
+    """
+
+    test_pass_weight: float
+    soft_finding_penalty: float
+    won_score_floor: float
+    promoted_score_floor: float
+    test_timeout_s: float
+
+    @classmethod
+    def from_env(cls) -> "ValidatorScoringConfig":
+        return cls(
+            test_pass_weight=_env_float(
+                TEST_PASS_WEIGHT_ENV_VAR,
+                _DEFAULT_TEST_PASS_WEIGHT,
+                minimum=0.0,
+                maximum=10.0,
+            ),
+            soft_finding_penalty=_env_float(
+                SOFT_FINDING_PENALTY_ENV_VAR,
+                _DEFAULT_SOFT_FINDING_PENALTY,
+                minimum=0.0,
+                maximum=10.0,
+            ),
+            won_score_floor=_env_float(
+                WON_SCORE_FLOOR_ENV_VAR,
+                _DEFAULT_WON_SCORE_FLOOR,
+                minimum=0.0,
+                maximum=10.0,
+            ),
+            promoted_score_floor=_env_float(
+                PROMOTED_SCORE_FLOOR_ENV_VAR,
+                _DEFAULT_PROMOTED_SCORE_FLOOR,
+                minimum=0.0,
+                maximum=10.0,
+            ),
+            test_timeout_s=_env_float(
+                TEST_TIMEOUT_S_ENV_VAR,
+                _DEFAULT_TEST_TIMEOUT_S,
+                minimum=1.0,
+                maximum=600.0,
+            ),
+        )
+
+
+# ===========================================================================
+# Phase 2 — DiffApplier Protocol + TestTargetResolver Protocol
+# ===========================================================================
+
+
+@runtime_checkable
+class DiffApplier(Protocol):
+    """Apply a diff inside a worktree and return per-file (path, old,
+    new) tuples for downstream SemanticGuardian inspection.
+
+    The applier is the SOLE owner of "what changed" semantics — it
+    saw the old content (read before apply) and the new content
+    (read after apply), so callers don't have to re-parse the diff.
+    This is the load-bearing 'no parallel parsing' invariant: the
+    validator NEVER attempts to extract per-file content from the
+    diff string itself.
+
+    NEVER raises — apply failures (malformed diff, file not found,
+    git apply non-zero exit) MUST surface as an empty result tuple
+    paired with a non-empty ``error`` field. The validator maps
+    empty-result-with-error to ``PRUNED_VALIDATOR``.
+
+    Production wires either ``RepairSandbox.apply_patch`` semantics
+    or a direct ``git apply`` shell-out. Phase 2 ships no concrete
+    applier — Phase 5 wires the real one when integrating with
+    ``RepairEngine.run()``.
+    """
+
+    async def __call__(
+        self,
+        *,
+        worktree_dir: Path,
+        diff: str,
+    ) -> "DiffApplyResult":
+        """Apply diff in worktree, return result with per-file tuples
+        + error string (empty on success)."""
+        ...
+
+
+@dataclass(frozen=True)
+class DiffApplyResult:
+    """Output of a ``DiffApplier`` call.
+
+    ``files`` carries (path, old_content, new_content) tuples for
+    every touched file; consumed by SemanticGuardian.inspect_batch.
+    ``error`` is empty string on success; non-empty error string on
+    failure (e.g., "patch_failed: malformed hunk", "git apply timeout").
+    """
+
+    files: Tuple[Tuple[str, str, str], ...]
+    error: str = ""
+
+
+@runtime_checkable
+class TestTargetResolver(Protocol):
+    """Pick the test files to run for a given (op_id, candidate_files)
+    pair. Composes the existing ``TestRunner.resolve_test_targets``
+    semantics in production; Phase 2 tests inject deterministic stubs.
+
+    NEVER raises — resolution failures yield an empty tuple, which
+    TestRunner treats as a vacuous-pass (the validator then PROMOTES
+    with score = test_pass_weight × 1.0, which is the safe semantic:
+    no relevant tests = no validation evidence either way).
+    """
+
+    async def __call__(
+        self,
+        *,
+        op_id: str,
+        candidate_files: Tuple[Tuple[str, str, str], ...],
+        worktree_dir: Path,
+    ) -> Tuple[Path, ...]:
+        ...
+
+
+# ===========================================================================
+# Phase 2 — CanonicalBranchValidator (composes 3 canonical surfaces)
+# ===========================================================================
+
+
+class CanonicalBranchValidator:
+    """The Phase 2 production BranchValidator implementation.
+
+    Composes three canonical Ouroboros surfaces — ``ascii_strict_gate``,
+    ``SemanticGuardian``, ``TestRunner`` — into a single per-branch
+    pruning oracle.  Implements the
+    :class:`~backend.core.ouroboros.governance.repair_tree.BranchValidator`
+    Protocol so the Phase 1 runner consumes it without modification.
+
+    Stage discipline (cheapest first, most expensive last):
+
+      1. **ASCII gate** (microseconds) — ``ascii_scan_content(diff)``
+         on the raw diff text. Non-ASCII offenders → IRON_GATE_REJECT.
+         No score contribution; binary outcome.
+
+      2. **Diff apply** (milliseconds) — INJECTED ``DiffApplier``
+         writes the diff inside ``worktree_dir`` and returns per-file
+         (path, old, new) tuples. Apply failure → PRUNED_VALIDATOR
+         with ``WORSE_THAN_SIBLING`` (no test evidence either way).
+
+      3. **SemanticGuardian** (milliseconds) — ``inspect_batch`` over
+         the applied tuples. Hard findings → SEMANTIC_GUARDIAN_HARD_FINDING.
+         Soft findings reduce ``validator_score`` per
+         ``ValidatorScoringConfig.soft_finding_penalty``.
+
+      4. **TestRunner** (seconds) — ``run`` with ``sandbox_dir=worktree_dir``
+         and timeout from ``ValidatorScoringConfig.test_timeout_s``.
+         Pass/fail/total feeds the test-pass-ratio score component.
+
+    Outcome mapping (after stages 3 + 4):
+
+      * ``score >= won_score_floor`` AND no soft findings → WON
+      * ``score >= promoted_score_floor`` → PROMOTED
+      * ``score <  promoted_score_floor`` → PRUNED_VALIDATOR
+        (``WORSE_THAN_SIBLING``)
+
+    Authority asymmetry (§1 Boundary): the validator orchestrates
+    composed authorities; it makes no independent decisions about
+    code correctness — every verdict is a deterministic function of
+    the upstream signals. Drift toward inline pattern detection or
+    parallel test infrastructure is structurally forbidden.
+    """
+
+    def __init__(
+        self,
+        *,
+        diff_applier: DiffApplier,
+        test_runner: TestRunner,
+        test_target_resolver: TestTargetResolver,
+        semantic_guardian: Optional[SemanticGuardian] = None,
+        ascii_check: Optional[
+            Callable[[str], "List[Any]"]
+        ] = None,
+        scoring: Optional[ValidatorScoringConfig] = None,
+    ) -> None:
+        """Construct a validator.
+
+        Parameters
+        ----------
+        diff_applier : DiffApplier
+            How to apply the diff inside the worktree + extract
+            (path, old, new) tuples. REQUIRED — Phase 2 ships no
+            concrete impl; production wires it Phase 5.
+        test_runner : TestRunner
+            Canonical TestRunner instance. REQUIRED.
+        test_target_resolver : TestTargetResolver
+            How to pick test files for a given branch. REQUIRED —
+            production wires ``test_runner.resolve_test_targets``;
+            tests inject deterministic stubs.
+        semantic_guardian : SemanticGuardian, optional
+            Defaults to a fresh ``SemanticGuardian()`` instance using
+            the canonical pattern set. Tests may inject a stub.
+        ascii_check : Callable[[str], List[BadCodepoint]], optional
+            Defaults to ``ascii_strict_gate.scan_content``. Tests may
+            inject a stub returning canned offenders.
+        scoring : ValidatorScoringConfig, optional
+            Defaults to ``ValidatorScoringConfig.from_env()``.
+        """
+        self._apply = diff_applier
+        self._tests = test_runner
+        self._resolve = test_target_resolver
+        self._guardian = semantic_guardian or SemanticGuardian()
+        self._ascii = ascii_check or ascii_scan_content
+        self._scoring = scoring or ValidatorScoringConfig.from_env()
+
+    # ---------------------------------------------------------------------
+    # BranchValidator Protocol implementation
+    # ---------------------------------------------------------------------
+
+    async def __call__(
+        self,
+        *,
+        op_id: str,
+        branch_id: str,
+        diff: str,
+        worktree_dir: Path,
+    ) -> Tuple[BranchOutcome, float, Optional[PruningReason], int]:
+        """Stage discipline: ASCII → apply → Guardian → tests.
+
+        NEVER raises. Cancellation propagates via the awaited stages
+        (TestRunner.run + DiffApplier are the cancel boundaries);
+        every other exception path quarantines to PRUNED_VALIDATOR
+        with a structured PruningReason.
+        """
+        # Stage 1 — ASCII gate (binary, no score)
+        try:
+            offenders = self._ascii(diff or "")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[RepairTree] op=%s branch=%s ascii_check raised; "
+                "treating as IRON_GATE_REJECT",
+                op_id, branch_id[:12], exc_info=True,
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.IRON_GATE_REJECT,
+                0,
+            )
+        if offenders:
+            logger.info(
+                "[RepairTree] op=%s branch=%s IRON_GATE_REJECT "
+                "(%d ASCII offenders)",
+                op_id, branch_id[:12], len(offenders),
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.IRON_GATE_REJECT,
+                0,
+            )
+
+        # Stage 2 — diff apply (NEVER raises per Protocol)
+        try:
+            apply_result = await self._apply(
+                worktree_dir=worktree_dir, diff=diff or "",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — Protocol contract violated
+            logger.warning(
+                "[RepairTree] op=%s branch=%s diff_applier raised "
+                "(Protocol violation): %s",
+                op_id, branch_id[:12], exc, exc_info=True,
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.WORSE_THAN_SIBLING,
+                0,
+            )
+        if apply_result.error:
+            logger.info(
+                "[RepairTree] op=%s branch=%s apply_failed: %s",
+                op_id, branch_id[:12], apply_result.error,
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.WORSE_THAN_SIBLING,
+                0,
+            )
+
+        # Stage 3 — SemanticGuardian (compose canonical inspect_batch)
+        try:
+            findings = self._guardian.inspect_batch(apply_result.files)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive (Guardian.inspect already swallows)
+            logger.warning(
+                "[RepairTree] op=%s branch=%s guardian raised; "
+                "treating as no-findings",
+                op_id, branch_id[:12], exc_info=True,
+            )
+            findings = []
+        hard_findings = [f for f in findings if _finding_is_hard(f)]
+        soft_findings = [f for f in findings if _finding_is_soft(f)]
+
+        if hard_findings:
+            logger.info(
+                "[RepairTree] op=%s branch=%s SEMANTIC_GUARDIAN_HARD_FINDING "
+                "(%d hard, %d soft)",
+                op_id, branch_id[:12],
+                len(hard_findings), len(soft_findings),
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.SEMANTIC_GUARDIAN_HARD_FINDING,
+                0,
+            )
+
+        # Stage 4 — TestRunner (compose canonical run + resolve)
+        try:
+            test_targets = await self._resolve(
+                op_id=op_id,
+                candidate_files=apply_result.files,
+                worktree_dir=worktree_dir,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[RepairTree] op=%s branch=%s test_target_resolver "
+                "raised; treating as no targets (vacuous pass)",
+                op_id, branch_id[:12], exc_info=True,
+            )
+            test_targets = ()
+
+        try:
+            test_result = await self._tests.run(
+                test_files=test_targets,
+                sandbox_dir=worktree_dir,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — TestRunner.run shouldn't raise but defense in depth
+            logger.warning(
+                "[RepairTree] op=%s branch=%s test_runner raised: %s",
+                op_id, branch_id[:12], exc, exc_info=True,
+            )
+            return (
+                BranchOutcome.PRUNED_VALIDATOR,
+                0.0,
+                PruningReason.WORSE_THAN_SIBLING,
+                0,
+            )
+
+        # Score computation + outcome mapping
+        validator_score = self._compute_score(
+            test_result=test_result,
+            soft_findings_count=len(soft_findings),
+        )
+        runs_consumed = self._test_runs_consumed(test_result)
+        outcome, prune_reason = self._map_outcome(
+            validator_score=validator_score,
+            soft_findings_count=len(soft_findings),
+        )
+        return (outcome, validator_score, prune_reason, runs_consumed)
+
+    # ---------------------------------------------------------------------
+    # Internal — score + outcome mapping (pure functions, no I/O)
+    # ---------------------------------------------------------------------
+
+    def _compute_score(
+        self,
+        *,
+        test_result: TestResult,
+        soft_findings_count: int,
+    ) -> float:
+        """Apply the env-tunable score formula. Clamped to [0, ∞).
+
+        Vacuous-pass semantic: when ``test_result.total == 0`` (no
+        tests matched the branch's changed files), ratio is 0.0 —
+        not 1.0. For repair-branch evaluation, "no test evidence"
+        is a weaker signal than "tests passed"; the conservative
+        choice prevents tree-search from converging on branches
+        that touch only test-irrelevant code. Operators wanting the
+        permissive semantic can set ``PROMOTED_SCORE_FLOOR=0`` to
+        let zero-evidence branches survive layers (still won't WON
+        because won_floor>0 by default).
+        """
+        total = int(getattr(test_result, "total", 0) or 0)
+        if total <= 0:
+            ratio = 0.0
+        else:
+            failed = int(getattr(test_result, "failed", 0) or 0)
+            passed = max(0, total - failed)
+            ratio = passed / total
+        score = (
+            ratio * self._scoring.test_pass_weight
+            - soft_findings_count * self._scoring.soft_finding_penalty
+        )
+        return max(0.0, score)
+
+    def _map_outcome(
+        self,
+        *,
+        validator_score: float,
+        soft_findings_count: int,
+    ) -> Tuple[BranchOutcome, Optional[PruningReason]]:
+        """Map score to BranchOutcome.
+
+        WON requires both: (a) score ≥ won_score_floor AND
+        (b) zero soft findings (clean signal). This makes WON
+        terminal-strict — a single soft Guardian finding demotes
+        an otherwise-perfect branch to PROMOTED, which is
+        operator-visible in BEAM_K survivor selection but doesn't
+        early-return the tree.
+        """
+        if (
+            validator_score >= self._scoring.won_score_floor
+            and soft_findings_count == 0
+        ):
+            return (BranchOutcome.WON, None)
+        if validator_score >= self._scoring.promoted_score_floor:
+            return (BranchOutcome.PROMOTED, None)
+        return (
+            BranchOutcome.PRUNED_VALIDATOR,
+            PruningReason.WORSE_THAN_SIBLING,
+        )
+
+    @staticmethod
+    def _test_runs_consumed(_test_result: TestResult) -> int:
+        """A TestRunner.run() call counts as ONE validation run
+        regardless of how many test files it covered. This keeps the
+        shared ``RepairBudget.max_total_validation_runs`` envelope
+        proportional to validator INVOCATIONS, not test counts. The
+        test_result parameter is reserved for future graduation to a
+        weighted accounting (e.g., counting flake re-runs)."""
+        return 1
+
+
+def _finding_is_hard(finding: Any) -> bool:
+    """Defensive accessor — Detection.severity may be missing on
+    duck-typed stubs."""
+    try:
+        return getattr(finding, "severity", "") == "hard"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _finding_is_soft(finding: Any) -> bool:
+    try:
+        return getattr(finding, "severity", "") == "soft"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 __all__ = [
     "REPAIR_TREE_SCHEMA_VERSION",
     "MASTER_FLAG_ENV_VAR",
@@ -1642,6 +2286,11 @@ __all__ = [
     "BRANCH_DEDUP_ENV_VAR",
     "CROSS_BRANCH_LEARNING_ENV_VAR",
     "EMERGENCY_DEMOTE_THRESHOLD_ENV_VAR",
+    "TEST_PASS_WEIGHT_ENV_VAR",
+    "SOFT_FINDING_PENALTY_ENV_VAR",
+    "WON_SCORE_FLOOR_ENV_VAR",
+    "PROMOTED_SCORE_FLOOR_ENV_VAR",
+    "TEST_TIMEOUT_S_ENV_VAR",
     "BranchingStrategy",
     "BranchOutcome",
     "LayerVerdict",
@@ -1650,9 +2299,14 @@ __all__ = [
     "RepairTreeLayer",
     "RepairTreeResult",
     "TreefinementBudget",
+    "ValidatorScoringConfig",
     "RepairTreeRunner",
+    "CanonicalBranchValidator",
     "BranchGenerator",
     "BranchValidator",
+    "DiffApplier",
+    "DiffApplyResult",
+    "TestTargetResolver",
     "EmergencyBrakeCheck",
     "DeadlineCheck",
     "treefinement_enabled",
