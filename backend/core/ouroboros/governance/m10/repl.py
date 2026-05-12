@@ -61,6 +61,8 @@ _HELP = (
     "(default 20, max 200)\n"
     "  /m10 stats                 phase histogram across all "
     "proposals\n"
+    "  /m10 fire                  operator-initiated mining "
+    "cycle (Slice 1; persists DETECTING records)\n"
     "  /m10 help                  this text\n"
     "\n"
     "Phases: detecting, synthesizing, validating, committing, "
@@ -208,6 +210,8 @@ def dispatch_m10_command(line: str) -> M10ReplDispatchResult:
         )
     if head == "stats":
         return _render_stats()
+    if head == "fire":
+        return _render_fire()
     return M10ReplDispatchResult(
         ok=False,
         text=(
@@ -344,6 +348,57 @@ def _render_history(limit: int) -> M10ReplDispatchResult:
         lines.append(_format_proposal_one_line(r))
     return M10ReplDispatchResult(
         ok=True, text="\n".join(lines),
+    )
+
+
+def _render_fire() -> M10ReplDispatchResult:
+    """Slice 1 — operator-initiated mining cycle.
+
+    Composes :func:`m10_producer_bridge.fire_mining_cycle_sync`
+    which runs one canonical miner → ledger persistence cycle.
+    NEVER raises — the bridge wraps everything in a structured
+    :class:`MineCycleResult`."""
+    try:
+        from backend.core.ouroboros.governance.m10.m10_producer_bridge import (  # noqa: E501
+            fire_mining_cycle_sync,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        return M10ReplDispatchResult(
+            ok=False,
+            text=(
+                f"  /m10 fire: bridge import failed: "
+                f"{type(exc).__name__}"
+            ),
+        )
+    result = fire_mining_cycle_sync()
+    # Render the structured result for the operator.
+    lines = [
+        f"/m10 fire — outcome={result.outcome}",
+        f"  ok:                      {result.ok}",
+        f"  proposals_emitted_count: {result.proposals_emitted_count}",
+        f"  rows_stored:             {result.rows_stored}",
+        f"  elapsed_s:               {result.elapsed_s:.3f}",
+    ]
+    if result.proposal_ids:
+        lines.append("  proposal_ids:")
+        for pid in result.proposal_ids[:10]:
+            lines.append(f"    {pid}")
+        if len(result.proposal_ids) > 10:
+            lines.append(
+                f"    ... ({len(result.proposal_ids) - 10} more)"
+            )
+    if result.diagnostic:
+        lines.append(f"  diagnostic: {result.diagnostic[:256]}")
+    if not result.ok or result.outcome == "error":
+        lines.append("")
+        lines.append(
+            "  hint: master flag is "
+            "JARVIS_M10_ARCH_PROPOSER_ENABLED "
+            "(default-FALSE per §30.5.2)"
+        )
+    return M10ReplDispatchResult(
+        ok=result.ok or result.outcome == "disabled",
+        text="\n".join(lines),
     )
 
 
