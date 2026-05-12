@@ -1775,6 +1775,62 @@ def register_flags(registry: Any) -> int:
             example="60.0",
             since="Treefinement Phase 2 (2026-05-11)",
         ),
+        # Phase 3 — CrossBranchLearningConfig env knobs
+        FlagSpec(
+            name=SIBLING_MAX_COUNT_ENV_VAR,
+            type=FlagType.INT,
+            default=_DEFAULT_SIBLING_MAX_COUNT,
+            description=(
+                "Maximum sibling branches surfaced in the cross-"
+                "branch learning prompt block (M from AlphaVerus's "
+                "treefinement). Default 2 — enough to convey "
+                "diversity without bloating the prompt. Clamped "
+                "[1, 8]."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="2",
+            since="Treefinement Phase 3 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=SIBLING_MAX_CHARS_ENV_VAR,
+            type=FlagType.INT,
+            default=_DEFAULT_SIBLING_MAX_CHARS,
+            description=(
+                "Hard character cap on the sibling-outcomes prompt "
+                "block. Default 800 chars (~200 tokens at 4 "
+                "chars/token rule of thumb). When the rendered "
+                "block exceeds this, the lowest-ranked sibling is "
+                "dropped iteratively. Clamped [64, 8000]."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="800",
+            since="Treefinement Phase 3 (2026-05-11)",
+        ),
+        FlagSpec(
+            name=SIBLING_SKIP_POSTURES_ENV_VAR,
+            type=FlagType.STR,
+            default="MAINTAIN",
+            description=(
+                "Comma-separated Posture names that suppress "
+                "sibling-outcomes injection (case-insensitive). "
+                "Default 'MAINTAIN' — minimal-context posture "
+                "doesn't benefit from cross-branch context. "
+                "Unknown posture names silently dropped. Set to "
+                "an empty string to inject for ALL postures."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/repair_tree.py"
+            ),
+            example="MAINTAIN,HARDEN",
+            since="Treefinement Phase 3 (2026-05-11)",
+        ),
     ]
 
     count = 0
@@ -2277,6 +2333,289 @@ def _finding_is_soft(finding: Any) -> bool:
         return False
 
 
+# ===========================================================================
+# Phase 3 — Cross-branch learning (the AlphaVerus delta)
+# ===========================================================================
+#
+# Without this signal, tree mode degrades to race-the-loop: K parallel
+# branches generate independently, the winner gets adopted, the rest
+# are discarded. AlphaVerus's contribution is using survivor + pruned
+# sibling outcomes from layer N to inform GENERATE prompts at layer N+1
+# — the model learns "strategy X scored 0.8, strategy Y was rejected
+# by Guardian, therefore I should try strategy Z."
+#
+# Phase 3 ships the substrate; Phase 5 wires the call from the
+# production BranchGenerator. The function design is sync + pure
+# (text-only, no I/O) so it can be called from any sync OR async
+# generator path without ceremony.
+
+
+@dataclass(frozen=True)
+class CrossBranchLearningConfig:
+    """Tunables for the sibling-outcomes prompt block.
+
+    All knobs env-overridable per §33.3 naming-cage. Defaults
+    chosen to match operator approval (M=2, 200-token cap budgeted
+    as 800 chars, MAINTAIN posture suppresses).
+    """
+
+    enabled: bool
+    max_siblings: int
+    max_chars: int
+    skip_postures: Tuple[str, ...]
+
+    @classmethod
+    def from_env(cls) -> "CrossBranchLearningConfig":
+        """Load config from env. NEVER raises — malformed values fall
+        back to defaults with a structured warning log."""
+        enabled = _env_bool(
+            CROSS_BRANCH_LEARNING_ENV_VAR, default=True,
+        )
+        max_siblings = _env_int(
+            SIBLING_MAX_COUNT_ENV_VAR,
+            _DEFAULT_SIBLING_MAX_COUNT,
+            minimum=1,
+            maximum=_SIBLING_MAX_COUNT_CEILING,
+        )
+        max_chars = _env_int(
+            SIBLING_MAX_CHARS_ENV_VAR,
+            _DEFAULT_SIBLING_MAX_CHARS,
+            minimum=64,
+            maximum=_SIBLING_MAX_CHARS_CEILING,
+        )
+        skip_raw = os.environ.get(SIBLING_SKIP_POSTURES_ENV_VAR)
+        if skip_raw is None:
+            skip_postures = _DEFAULT_SIBLING_SKIP_POSTURES
+        else:
+            skip_postures = _parse_posture_list(skip_raw)
+        return cls(
+            enabled=enabled,
+            max_siblings=max_siblings,
+            max_chars=max_chars,
+            skip_postures=skip_postures,
+        )
+
+
+def _parse_posture_list(raw: str) -> Tuple[str, ...]:
+    """Parse comma-separated posture names → uppercase tuple. Unknown
+    names are silently dropped with a debug log; canonical Posture
+    enum is the authority on valid values."""
+    if not isinstance(raw, str):
+        return _DEFAULT_SIBLING_SKIP_POSTURES
+    valid = {p.value.upper() for p in Posture}
+    parts = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    accepted = tuple(p for p in parts if p in valid)
+    dropped = [p for p in parts if p not in valid]
+    if dropped:
+        logger.debug(
+            "[RepairTree] %s dropped unknown postures: %s",
+            SIBLING_SKIP_POSTURES_ENV_VAR, dropped,
+        )
+    return accepted if accepted else _DEFAULT_SIBLING_SKIP_POSTURES
+
+
+def select_informative_siblings(
+    siblings: Tuple[RepairBranch, ...],
+    *,
+    max_siblings: int = _DEFAULT_SIBLING_MAX_COUNT,
+) -> Tuple[RepairBranch, ...]:
+    """Filter + rank siblings for cross-branch learning.
+
+    **Filter rules** (drop non-informative outcomes):
+      - PRUNED_DUPLICATE — no signal (same diff as another sibling)
+      - PRUNED_BUDGET / VALIDATION_BUDGET_EXHAUSTED / WALL_CLOCK_CAP
+        — time exhaustion, not strategy
+      - IRON_GATE_REJECT — ASCII issue, not strategy
+      - WON — early-returned by runner; never reaches Phase 3
+      - Empty fix_hypothesis — no learnable content
+
+    **Rank**: validator_score descending; ties broken by branch_id
+    lex sort (deterministic).
+
+    **Dedup**: hypotheses with identical normalized text collapse to
+    the highest-scored entry (avoids the same strategy appearing twice).
+
+    Returns at most ``max_siblings`` entries. NEVER raises.
+    """
+    if not siblings:
+        return ()
+
+    informative: List[RepairBranch] = []
+    for s in siblings:
+        # Filter by outcome
+        if s.outcome == BranchOutcome.PRUNED_DUPLICATE:
+            continue
+        if s.outcome == BranchOutcome.PRUNED_BUDGET:
+            continue
+        if s.outcome == BranchOutcome.WON:
+            continue  # never reaches Phase 3 in practice
+        # Filter by prune reason (the closed non-informative set)
+        if s.prune_reason is not None:
+            if s.prune_reason.value in _NON_INFORMATIVE_PRUNE_REASONS:
+                continue
+        # Filter by content
+        if not (s.fix_hypothesis or "").strip():
+            continue
+        informative.append(s)
+
+    # Dedup by normalized hypothesis (case-insensitive, whitespace-collapsed)
+    by_hypothesis: dict = {}
+    for s in informative:
+        key = _normalize_hypothesis(s.fix_hypothesis)
+        existing = by_hypothesis.get(key)
+        if existing is None or s.validator_score > existing.validator_score:
+            by_hypothesis[key] = s
+    deduped = tuple(by_hypothesis.values())
+
+    # Rank: score descending, branch_id lex tiebreak
+    ranked = sorted(
+        deduped,
+        key=lambda b: (-b.validator_score, b.branch_id),
+    )
+    return tuple(ranked[: max(1, max_siblings)])
+
+
+def _normalize_hypothesis(text: str) -> str:
+    """Whitespace-collapse + lowercase for dedup keying."""
+    return " ".join((text or "").lower().split())
+
+
+def format_sibling_outcomes_block(
+    siblings: Tuple[RepairBranch, ...],
+    *,
+    layer_index: int,
+    max_chars: int = _DEFAULT_SIBLING_MAX_CHARS,
+) -> str:
+    """Render selected siblings as a markdown prompt block.
+
+    Returns an empty string when ``siblings`` is empty (caller's
+    composer treats empty block as 'don't inject').
+
+    Truncation: when the rendered block exceeds ``max_chars``, the
+    LAST sibling entry is dropped and the block is re-rendered. This
+    preserves the highest-ranked siblings (which were ordered first
+    by ``select_informative_siblings``) and never produces a
+    half-truncated entry.
+
+    NEVER raises.
+    """
+    if not siblings:
+        return ""
+
+    header = (
+        f"## Sibling Branch Outcomes (cross-branch learning)\n\n"
+        f"Layer {layer_index} already attempted these strategies. "
+        f"Choose a DIFFERENT approach — repeating a sibling's "
+        f"strategy would be wasted effort.\n\n"
+    )
+    footer = ""
+
+    # Render iteratively, dropping tail entries until the block fits.
+    entries = list(siblings)
+    while entries:
+        body_lines: List[str] = []
+        for i, s in enumerate(entries, start=1):
+            line = _format_one_sibling(i, s)
+            body_lines.append(line)
+        block = header + "\n".join(body_lines) + footer
+        if len(block) <= max_chars:
+            return block
+        # Too long — drop the last (lowest-ranked) entry and retry
+        entries.pop()
+
+    # Even rendering one entry exceeds the cap → return header alone
+    return header.rstrip() + "\n"
+
+
+def _format_one_sibling(index: int, branch: RepairBranch) -> str:
+    """Format one sibling as a 2-line markdown entry."""
+    outcome_tag = branch.outcome.value
+    if branch.prune_reason is not None:
+        outcome_tag = f"{outcome_tag}:{branch.prune_reason.value}"
+
+    score = branch.validator_score
+    hypothesis = (branch.fix_hypothesis or "").strip()
+    # Trim hypothesis to a one-liner — keep first ~100 chars
+    if len(hypothesis) > 100:
+        hypothesis = hypothesis[:97] + "..."
+
+    warning = ""
+    if branch.prune_reason is not None and (
+        branch.prune_reason == PruningReason.SEMANTIC_GUARDIAN_HARD_FINDING
+    ):
+        warning = " (semantic-rejected — AVOID this pattern)"
+
+    return (
+        f"{index}. score={score:.2f} {outcome_tag}\n"
+        f"   Strategy: {hypothesis}{warning}"
+    )
+
+
+def maybe_inject_sibling_outcomes(
+    prompt: str,
+    *,
+    sibling_outcomes: Tuple[RepairBranch, ...],
+    layer_index: int,
+    op_id: str = "",
+    posture: Optional[Posture] = None,
+    config: Optional[CrossBranchLearningConfig] = None,
+) -> str:
+    """§33.2 producer-bridge — inject sibling-outcomes block when active.
+
+    Returns ``prompt`` (unchanged) when:
+      * master flag (``JARVIS_L2_CROSS_BRANCH_LEARNING_ENABLED``) is FALSE
+      * ``layer_index == 0`` (no siblings exist yet)
+      * ``posture`` is in the configured skip list (default: MAINTAIN)
+      * no informative siblings remain after filtering
+      * any internal error occurs (NEVER raises into the caller)
+
+    Returns ``prompt + "\\n\\n" + block`` when injection is active.
+
+    Designed to be called by the BranchGenerator AFTER it builds its
+    base GENERATE prompt and BEFORE the LLM call. Phase 5 wires this
+    into the production BranchGenerator. Phase 3 ships standalone for
+    isolation testability.
+    """
+    try:
+        cfg = config or CrossBranchLearningConfig.from_env()
+        if not cfg.enabled:
+            return prompt
+        if layer_index <= 0:
+            return prompt
+        if posture is not None:
+            if posture.value.upper() in cfg.skip_postures:
+                logger.debug(
+                    "[RepairTree] op=%s skipping sibling injection "
+                    "for posture=%s",
+                    op_id, posture.value,
+                )
+                return prompt
+        if not sibling_outcomes:
+            return prompt
+        selected = select_informative_siblings(
+            sibling_outcomes, max_siblings=cfg.max_siblings,
+        )
+        if not selected:
+            return prompt
+        block = format_sibling_outcomes_block(
+            selected,
+            layer_index=layer_index,
+            max_chars=cfg.max_chars,
+        )
+        if not block:
+            return prompt
+        return f"{prompt}\n\n{block}"
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — fail-open per §7
+        logger.warning(
+            "[RepairTree] op=%s sibling injection raised; "
+            "returning prompt unchanged",
+            op_id, exc_info=True,
+        )
+        return prompt
+
+
 __all__ = [
     "REPAIR_TREE_SCHEMA_VERSION",
     "MASTER_FLAG_ENV_VAR",
@@ -2291,6 +2630,9 @@ __all__ = [
     "WON_SCORE_FLOOR_ENV_VAR",
     "PROMOTED_SCORE_FLOOR_ENV_VAR",
     "TEST_TIMEOUT_S_ENV_VAR",
+    "SIBLING_MAX_COUNT_ENV_VAR",
+    "SIBLING_MAX_CHARS_ENV_VAR",
+    "SIBLING_SKIP_POSTURES_ENV_VAR",
     "BranchingStrategy",
     "BranchOutcome",
     "LayerVerdict",
@@ -2300,6 +2642,10 @@ __all__ = [
     "RepairTreeResult",
     "TreefinementBudget",
     "ValidatorScoringConfig",
+    "CrossBranchLearningConfig",
+    "select_informative_siblings",
+    "format_sibling_outcomes_block",
+    "maybe_inject_sibling_outcomes",
     "RepairTreeRunner",
     "CanonicalBranchValidator",
     "BranchGenerator",

@@ -58,12 +58,14 @@ def _isolate_registry() -> Iterator[None]:
 
 def test_register_flags_installs_all_specs():
     """The substrate's ``register_flags`` MUST install exactly
-    12 Treefinement flags (7 Phase 0 + 5 Phase 2 scoring knobs).
+    15 Treefinement flags (7 Phase 0 + 5 Phase 2 + 3 Phase 3).
     Drift here (e.g. silently dropping one) is operator-visible
     via this count assertion."""
     registry = FlagRegistry()
     count = register_flags(registry)
-    assert count == 12, f"expected 12 specs (7 P0 + 5 P2), got {count}"
+    assert count == 15, (
+        f"expected 15 specs (7 P0 + 5 P2 + 3 P3), got {count}"
+    )
 
 
 def test_master_flag_spec_shape():
@@ -221,7 +223,7 @@ def test_register_flags_partial_failure_returns_partial_count():
 
     reg = _SelectiveRegistry()
     count = register_flags(reg)
-    assert 0 < count < 7, (
+    assert 0 < count < 15, (
         f"partial-failure path broken — got count={count}"
     )
     assert count == len(reg.installed)
