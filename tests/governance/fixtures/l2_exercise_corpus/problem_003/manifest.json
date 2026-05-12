@@ -1,0 +1,14 @@
+{
+  "id": "problem_003",
+  "kind": "missing_null_check",
+  "target_file_name": "before.py",
+  "test_file_name": "test_before.py",
+  "difficulty": "medium",
+  "expected_first_try_fail_rate": 0.50,
+  "design_note": "Three-layer content sanitizer pipeline (strip_html_tags -> truncate; sanitize_comment composes them; sanitize_thread iterates a list of comments). The bug surface is two-layer: (a) two leaf primitives crash on None input (TypeError from re.sub(None) and len(None)), (b) the LIST-level sanitize_thread has a SEMANTIC contract that None comments must be EXCLUDED from the output (deleted/missing comment shouldn't surface as an empty row in the moderation feed). A naive fix that only adds None-check at strip_html_tags still crashes inside truncate(None). A naive fix at BOTH primitives makes the type errors go away but produces an empty string for None comments, failing the semantic-contract test that requires None to be excluded from the thread output. The correct coherent fix requires three coordinated changes: (1) strip_html_tags None-safe, (2) truncate None-safe, AND (3) sanitize_thread filters None entries — not just type-error suppression but understanding the cross-function contract.",
+  "trap_categories": [
+    "multi_site_type_error_coordination",
+    "cross_function_semantic_contract",
+    "docstring_dependent_correctness"
+  ]
+}
