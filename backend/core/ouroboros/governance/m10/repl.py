@@ -63,6 +63,11 @@ _HELP = (
     "proposals\n"
     "  /m10 fire                  operator-initiated mining "
     "cycle (Slice 1; persists DETECTING records)\n"
+    "  /m10 sweep                 (Slice 3) poll pending PRs; "
+    "transition merged/closed to graduated/rejected\n"
+    "  /m10 expire                (Slice 3) expire stale "
+    "AWAITING_APPROVAL proposals (>"
+    "JARVIS_M10_APPROVAL_TIMEOUT_S)\n"
     "  /m10 help                  this text\n"
     "\n"
     "Phases: detecting, synthesizing, validating, committing, "
@@ -212,6 +217,10 @@ def dispatch_m10_command(line: str) -> M10ReplDispatchResult:
         return _render_stats()
     if head == "fire":
         return _render_fire()
+    if head == "sweep":
+        return _render_sweep()
+    if head == "expire":
+        return _render_expire()
     return M10ReplDispatchResult(
         ok=False,
         text=(
@@ -447,6 +456,70 @@ def _render_full_lifecycle_fire(
         if len(result.advanced_proposals) > 10:
             lines.append(
                 f"    ... ({len(result.advanced_proposals) - 10} more)"
+            )
+    if result.diagnostic:
+        lines.append(f"  diagnostic: {result.diagnostic[:256]}")
+    return M10ReplDispatchResult(
+        ok=bool(result.ok),
+        text="\n".join(lines),
+    )
+
+
+def _render_sweep() -> M10ReplDispatchResult:
+    """Slice 3 — sweep pending PRs for merge / closure."""
+    try:
+        from backend.core.ouroboros.governance.m10.cadence_runner import (  # noqa: E501
+            sweep_pending_for_merge_sync,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return M10ReplDispatchResult(
+            ok=False,
+            text=(
+                f"  /m10 sweep: cadence_runner import failed: "
+                f"{type(exc).__name__}"
+            ),
+        )
+    result = sweep_pending_for_merge_sync()
+    return _render_sweep_result("sweep", result)
+
+
+def _render_expire() -> M10ReplDispatchResult:
+    """Slice 3 — expire stale AWAITING_APPROVAL proposals."""
+    try:
+        from backend.core.ouroboros.governance.m10.cadence_runner import (  # noqa: E501
+            expire_stale_pending_sync,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return M10ReplDispatchResult(
+            ok=False,
+            text=(
+                f"  /m10 expire: cadence_runner import failed: "
+                f"{type(exc).__name__}"
+            ),
+        )
+    result = expire_stale_pending_sync()
+    return _render_sweep_result("expire", result)
+
+
+def _render_sweep_result(
+    verb: str, result: Any,
+) -> M10ReplDispatchResult:
+    lines = [
+        f"/m10 {verb} — ok={result.ok}",
+        f"  inspected: {result.inspected_count}",
+        f"  elapsed_s: {result.elapsed_s:.3f}",
+    ]
+    if result.transitions:
+        lines.append(f"  transitions ({len(result.transitions)}):")
+        for t in result.transitions[:10]:
+            lines.append(
+                f"    {t.proposal_id}  "
+                f"{t.from_phase} → {t.to_phase}  "
+                f"({t.reason})"
+            )
+        if len(result.transitions) > 10:
+            lines.append(
+                f"    ... ({len(result.transitions) - 10} more)"
             )
     if result.diagnostic:
         lines.append(f"  diagnostic: {result.diagnostic[:256]}")

@@ -1195,6 +1195,16 @@ EVENT_TYPE_PERMISSION_DECISION_RECORDED = (
 # to avoid surfacing operator content over the IDE stream).
 EVENT_TYPE_QA_RECORDED = "qa_recorded"
 
+# §32.4/§40.1 Slice 3 — M10 cadence runner phase-transition
+# beacon. Fires when sweep_pending_for_merge or
+# expire_stale_pending transitions a proposal-store row
+# (AWAITING_APPROVAL → GRADUATED on PR merge, AWAITING_APPROVAL
+# → EXPIRED on timeout, etc.). Operator-initiated only (Slice 3);
+# autonomous orchestrator wiring is deferred per Layer-changing-
+# event discipline. Master-flag gated at producer side
+# (JARVIS_M10_ARCH_PROPOSER_ENABLED + JARVIS_M10_CADENCE_ENABLED).
+EVENT_TYPE_M10_PROPOSAL_PHASE_CHANGED = "m10_proposal_phase_changed"
+
 # Treefinement Phase 4 — branch + layer lifecycle events. Producers
 # (in repair_tree_archive.maybe_archive_tree_result + the runner)
 # fire best-effort; broker exception NEVER raises into the runner
@@ -1340,6 +1350,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_INFRA_RECOVERY_EVALUATED,         # §41.4 Phase 1 eighth arc (PRD v3.0+, infra_recovery_loop)
     EVENT_TYPE_MULTI_DAY_DEADLOCK_EVALUATED,     # §41.4 Phase 1 ninth (final) arc (PRD v3.0+, multi_day_deadlock_detector)
     EVENT_TYPE_QA_RECORDED,                      # §41.3 #26 Phase 2 Slice 3 (PRD v3.x, fast_path_qa)
+    EVENT_TYPE_M10_PROPOSAL_PHASE_CHANGED,        # §32.4/§40.1 Slice 3 (M10 cadence runner)
     EVENT_TYPE_REPAIR_BRANCH_PROMOTED,           # Treefinement Phase 4 (repair_tree_archive)
     EVENT_TYPE_REPAIR_BRANCH_PRUNED,             # Treefinement Phase 4 (repair_tree_archive)
     EVENT_TYPE_REPAIR_LAYER_COMPLETED,           # Treefinement Phase 4 (repair_tree_archive)
