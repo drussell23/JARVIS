@@ -425,18 +425,19 @@ def test_treefinement_enabled_respects_env(monkeypatch):
 
 def test_runner_construction_accepts_dependencies():
     """Constructor MUST accept the three injection points (repair
-    budget, worktree manager, clock) for test composability. Phase 1
-    runner needs all three to be substitutable."""
+    budget, worktree manager, clock) for test composability. The
+    runner needs all three to be substitutable so Phase 1+ tests
+    can exercise the loop in isolation."""
     budget = TreefinementBudget.from_env()
     runner = RepairTreeRunner(
         budget,
         repair_budget=object(),
-        worktree_manager=object(),
+        worktree_manager=None,  # type-pinned to WorktreeManager | None
         clock=lambda: 42.0,
     )
     assert runner.budget is budget
     assert runner._repair_budget is not None
-    assert runner._worktree_manager is not None
+    assert runner._worktree_manager is None
     assert runner._clock() == 42.0
 
 
@@ -449,21 +450,59 @@ def test_runner_default_clock_is_monotonic():
     assert runner._clock is _time.monotonic
 
 
-def test_run_tree_raises_not_implemented_phase0():
-    """Phase 0 ships substrate skeleton only. Accidental wiring of
-    run_tree() in production MUST be loud. Phase 1 replaces this."""
+def test_run_tree_linear_strategy_returns_empty(monkeypatch):
+    """Phase 1 contract: LINEAR strategy short-circuits run_tree to
+    return an empty-layers RepairTreeResult so the caller falls through
+    to the legacy _run_inner path with byte-identical behavior. This
+    is the load-bearing rollback invariant."""
+    monkeypatch.delenv(MASTER_FLAG_ENV_VAR, raising=False)
+    budget = TreefinementBudget.from_env()  # strategy=LINEAR by default
+    runner = RepairTreeRunner(budget)
+
+    async def _stub_generator(**_kwargs):
+        return ("", "should-not-be-called", 0.0)
+
+    async def _stub_validator(**_kwargs):
+        from backend.core.ouroboros.governance.repair_tree import (
+            BranchOutcome as _BO,
+        )
+        return (_BO.PROMOTED, 1.0, None, 0)
+
+    result = asyncio.run(
+        runner.run_tree(
+            op_id="op-linear-test",
+            generator=_stub_generator,
+            validator=_stub_validator,
+        )
+    )
+    assert result.layers == ()
+    assert result.winning_branch_path == ()
+    assert result.final_status is None
+
+
+def test_run_tree_master_flag_false_returns_empty(monkeypatch):
+    """Defense in depth: even with strategy=BFS, if the master flag
+    is FALSE, run_tree MUST short-circuit. Phase 5 strategy gate at
+    RepairEngine.run() is the primary check; this is the second."""
+    monkeypatch.delenv(MASTER_FLAG_ENV_VAR, raising=False)
+    monkeypatch.setenv("JARVIS_L2_BRANCHING_STRATEGY", "bfs")
     budget = TreefinementBudget.from_env()
     runner = RepairTreeRunner(budget)
 
-    async def _invoke():
-        await runner.run_tree()
+    async def _stub_generator(**_kwargs):
+        raise AssertionError("generator must not be called master-off")
 
-    with pytest.raises(NotImplementedError) as exc_info:
-        asyncio.run(_invoke())
-    assert MASTER_FLAG_ENV_VAR in str(exc_info.value), (
-        "Phase 0 NotImplementedError MUST mention the master flag — "
-        "operators reading the traceback need the override path"
+    async def _stub_validator(**_kwargs):
+        raise AssertionError("validator must not be called master-off")
+
+    result = asyncio.run(
+        runner.run_tree(
+            op_id="op-master-off",
+            generator=_stub_generator,
+            validator=_stub_validator,
+        )
     )
+    assert result.layers == ()
 
 
 # ===========================================================================

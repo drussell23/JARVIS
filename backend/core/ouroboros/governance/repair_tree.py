@@ -568,74 +568,893 @@ def treefinement_enabled() -> bool:
 
 
 # ===========================================================================
-# RepairTreeRunner — Phase 0 skeleton (execution lives in Phase 1)
+# Injection Protocols — Phase 1 testability seam
+# ===========================================================================
+#
+# The runner is fully testable in isolation by injecting these three
+# Protocols. Phase 2 ships a concrete BranchValidator composing
+# TestRunner + SemanticGuardian + IronGate. Phase 3 ships a concrete
+# BranchGenerator composing the existing repair_engine generation path
+# with the cross-branch StrategicDirection injection. The runner itself
+# never imports orchestrator / iron_gate / change_engine (§1 Boundary).
+
+
+@runtime_checkable
+class BranchGenerator(Protocol):
+    """Produces a candidate diff + fix hypothesis + cost for one branch.
+
+    NEVER raises — generation failures (provider exhausted, prompt
+    rejected, parse error) MUST surface as an empty diff with a
+    descriptive ``fix_hypothesis``. The runner converts empty-diff
+    branches to PRUNED_VALIDATOR with a structured prune reason.
+
+    The ``parent_branch`` and ``sibling_outcomes`` arguments carry the
+    cross-layer information signal — Phase 1 plumbs them; Phase 3 wires
+    them into the actual GENERATE prompt via StrategicDirection.
+    """
+
+    async def __call__(
+        self,
+        *,
+        op_id: str,
+        layer_index: int,
+        parent_branch: Optional["RepairBranch"],
+        sibling_outcomes: Tuple["RepairBranch", ...],
+    ) -> Tuple[str, str, float]:
+        """Returns (diff, fix_hypothesis, cost_usd)."""
+        ...
+
+
+@runtime_checkable
+class BranchValidator(Protocol):
+    """Validates a candidate diff in an isolated worktree.
+
+    NEVER raises — every infrastructure error path MUST yield a
+    PRUNED_VALIDATOR outcome with the appropriate ``PruningReason``
+    (e.g., ``IRON_GATE_REJECT``, ``SEMANTIC_GUARDIAN_HARD_FINDING``).
+    The runner does NOT distinguish "validator crashed" from
+    "validator returned PRUNED" — both feed the same pruning oracle.
+
+    Phase 2 wires the real composition (TestRunner + SemanticGuardian
+    + IronGate). Phase 1 tests inject deterministic stubs.
+    """
+
+    async def __call__(
+        self,
+        *,
+        op_id: str,
+        branch_id: str,
+        diff: str,
+        worktree_dir: Path,
+    ) -> Tuple[BranchOutcome, float, Optional[PruningReason], int]:
+        """Returns (outcome, validator_score, prune_reason, runs_consumed)."""
+        ...
+
+
+# Plain callable type alias — emergency brake is a synchronous predicate
+# (composes the SensorGovernor.SensorState.emergency_brake field, no
+# parallel emergency state per §1 Boundary).
+EmergencyBrakeCheck = Callable[[], bool]
+
+# Per-iteration deadline check — composes the orchestrator's existing
+# pipeline_deadline. Returns remaining seconds or None if no deadline set.
+DeadlineCheck = Callable[[], Optional[float]]
+
+
+# ===========================================================================
+# Helper functions — composition primitives (no parallel state)
+# ===========================================================================
+
+
+def _branch_id_for(diff: str) -> str:
+    """Derive a branch identifier from the canonical patch hash.
+
+    Composes ``failure_classifier.patch_signature_hash`` — the SAME
+    primitive that ``repair_engine._patch_sig`` wraps for in-iteration
+    dedup. This is the load-bearing 'single signature source' invariant
+    (§1 Boundary): two branches with identical diffs MUST produce
+    identical branch_ids regardless of which subsystem computes the
+    hash.
+    """
+    return patch_signature_hash(diff or "")
+
+
+def _compute_layer_k(
+    *,
+    posture: Optional[Posture],
+    base_k: int,
+    remaining_runs: int,
+    runs_per_branch: int = 1,
+) -> int:
+    """Compute the K branches to attempt at one layer.
+
+    Composes ``parallel_dispatch.posture_weight_for`` for posture
+    weighting (the canonical 4-value table — no parallel posture
+    weights here). Then clamps to the remaining shared validation
+    envelope (``RepairBudget.max_total_validation_runs``) so the tree
+    can never overshoot the canonical budget.
+
+    Returns at minimum 1 — a layer always gets at least one attempt
+    even under tight budget (the alternative would silently skip
+    layers, which is observability-hostile).
+    """
+    weight = posture_weight_for(posture)  # 1.0 default for None
+    k_weighted = max(1, int(round(base_k * weight)))
+    rpb = max(1, int(runs_per_branch))
+    if remaining_runs <= 0:
+        return 1  # last-chance attempt; budget aggregation will mark BUDGET_TERMINAL
+    k_budget_capped = max(1, remaining_runs // rpb)
+    return min(k_weighted, k_budget_capped)
+
+
+def _select_survivors(
+    branches: Tuple[RepairBranch, ...],
+    *,
+    strategy: BranchingStrategy,
+    beam_width: int,
+) -> Tuple[RepairBranch, ...]:
+    """Pick survivors that advance to the next layer.
+
+    BFS — every PROMOTED branch survives.
+    BEAM_K — top-M by validator_score (deterministic tie-break by
+        branch_id lex sort to keep results reproducible across runs).
+    LINEAR — never invoked here (caller short-circuits before runner).
+    """
+    promoted = tuple(b for b in branches if b.outcome == BranchOutcome.PROMOTED)
+    if strategy == BranchingStrategy.BFS:
+        return promoted
+    if strategy == BranchingStrategy.BEAM_K:
+        # Sort by (-score, branch_id) for deterministic ordering
+        ranked = sorted(
+            promoted,
+            key=lambda b: (-b.validator_score, b.branch_id),
+        )
+        return tuple(ranked[: max(1, beam_width)])
+    # LINEAR fallback — caller should have short-circuited
+    return promoted
+
+
+def _aggregate_layer_verdict(
+    branches: Tuple[RepairBranch, ...],
+    *,
+    survivors: Tuple[RepairBranch, ...],
+    budget_remaining: int,
+) -> LayerVerdict:
+    """Map per-branch outcomes to one of four closed layer verdicts."""
+    if any(b.outcome == BranchOutcome.WON for b in branches):
+        return LayerVerdict.WON_TERMINAL
+    if budget_remaining <= 0:
+        return LayerVerdict.BUDGET_TERMINAL
+    if not survivors:
+        return LayerVerdict.EXHAUSTED
+    return LayerVerdict.EXPANDED
+
+
+# ===========================================================================
+# RepairTreeRunner — Phase 1 implementation
 # ===========================================================================
 
 
 class RepairTreeRunner:
     """BFS / BEAM_K tree-search repair orchestrator.
 
-    Phase 0 ships the constructor signature + public method stubs.
-    Phase 1 wires the actual layer-dispatch loop composing
-    ``parallel_dispatch.build_execution_graph`` +
-    ``worktree_manager.WorktreeManager`` + the existing
-    ``repair_engine`` generation path.
+    Phase 1 wires the layer-dispatch loop composing the canonical
+    ``posture_weight_for`` (K sizing), ``WorktreeManager`` (per-branch
+    isolation), ``patch_signature_hash`` (branch dedup), and the
+    shared ``RepairBudget.max_total_validation_runs`` envelope (no
+    parallel budget bookkeeping).
 
     The runner is intentionally separate from ``RepairEngine`` —
     ``RepairEngine`` keeps its byte-identical LINEAR FSM. The strategy
-    gate added in Phase 1 routes ``BFS``/``BEAM_K`` to this class
-    while ``LINEAR`` continues through ``RepairEngine._run_inner``
-    unchanged (master-flag-FALSE rollback path).
+    gate added in Phase 5 routes BFS/BEAM_K to this class while
+    LINEAR continues through ``RepairEngine._run_inner`` unchanged
+    (master-flag-FALSE rollback path).
+
+    Authority asymmetry (§1 Boundary): the runner orchestrates;
+    GENERATE authority lives with ``BranchGenerator``, VALIDATE
+    authority lives with ``BranchValidator``, isolation authority
+    lives with ``WorktreeManager``. This module makes no decisions
+    about correctness — it only schedules.
+
+    Fail-closed contract (§7): ``run_tree`` NEVER raises into the
+    orchestrator except for ``asyncio.CancelledError`` (which
+    propagates per existing repair_engine convention so the
+    orchestrator handles POSTMORTEM itself). All other infrastructure
+    errors quarantine to a per-branch ``PRUNED_VALIDATOR`` outcome.
     """
+
+    # Estimated validation runs per branch when projecting K against
+    # the shared budget envelope. Tuned conservative — actual
+    # consumption may be higher (e.g., flake re-runs); the runner
+    # tracks actual ``validation_runs_consumed`` post-hoc.
+    _RUNS_PER_BRANCH_ESTIMATE: int = 1
 
     def __init__(
         self,
         budget: TreefinementBudget,
         *,
         repair_budget: Any = None,
-        worktree_manager: Any = None,
-        clock: Any = None,
+        worktree_manager: Optional[WorktreeManager] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         """Construct a runner.
 
         Parameters
         ----------
         budget : TreefinementBudget
-            Tree-only knobs (strategy, K, beam width, etc.).
+            Tree-only knobs (strategy, K, beam width, dedup, etc.).
         repair_budget : RepairBudget, optional
-            Shared validation envelope (max_total_validation_runs,
-            timebox_s). Phase 1 runner consults this; Phase 0 stores
-            it for symmetry. Injection-friendly for tests.
+            Shared validation envelope. Provides
+            ``max_total_validation_runs`` (default 8) and
+            ``timebox_s``. Phase 1 reads only the validation cap;
+            Phase 5 also consults timebox at the strategy gate.
+            When None, the runner falls back to a permissive default
+            (validation cap = 8) so tests don't have to construct
+            a full RepairBudget.
         worktree_manager : WorktreeManager, optional
-            COW git-worktree provider per branch. Phase 1 wires the
-            real ``worktree_manager.WorktreeManager``; Phase 0 accepts
-            the dependency for testability.
+            COW git-worktree provider. When None, the runner runs in
+            "no-isolation" mode — branches receive a synthetic
+            worktree path tied to ``op_id`` + ``branch_id`` and the
+            caller is responsible for sandboxing. Production wiring
+            (Phase 5) always supplies a real WorktreeManager.
         clock : Callable[[], float], optional
-            Monotonic time source. Defaults to ``time.monotonic``.
-            Tests inject deterministic clocks.
+            Monotonic time source. Defaults to ``time.monotonic`` per
+            Vector #11 sleep/suspend-immune discipline. Tests inject
+            deterministic clocks for wall_ms reproducibility.
         """
         self.budget = budget
         self._repair_budget = repair_budget
         self._worktree_manager = worktree_manager
         self._clock = clock or time.monotonic
 
-    async def run_tree(
-        self, *_args: Any, **_kwargs: Any,
-    ) -> RepairTreeResult:
-        """BFS layer dispatch — Phase 1.
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
 
-        Phase 0 raises ``NotImplementedError`` to make accidental
-        wiring loud. The master flag stays default-FALSE through
-        Phases 0-4 specifically so this method is unreachable in
-        production until Phase 5 hardening + Phase 6 PRD update land.
+    async def run_tree(
+        self,
+        *,
+        op_id: str,
+        generator: BranchGenerator,
+        validator: BranchValidator,
+        posture: Optional[Posture] = None,
+        max_layers: int = 5,
+        emergency_brake_check: Optional[EmergencyBrakeCheck] = None,
+        deadline_check: Optional[DeadlineCheck] = None,
+    ) -> RepairTreeResult:
+        """BFS / BEAM_K layer dispatch loop.
+
+        Returns a ``RepairTreeResult`` with at minimum one layer
+        (even degraded paths produce telemetry). LINEAR strategy or
+        master-flag-FALSE returns an empty-layers result so the caller
+        falls through to the legacy ``_run_inner`` unchanged.
+
+        ``asyncio.CancelledError`` propagates immediately (orchestrator
+        handles POSTMORTEM); all other infra errors quarantine
+        per-branch.
         """
-        del _args, _kwargs  # Phase 1 will define the real signature
-        raise NotImplementedError(
-            "RepairTreeRunner.run_tree is Phase 1; Phase 0 ships the "
-            "substrate skeleton only. Master flag "
-            f"({MASTER_FLAG_ENV_VAR}) must remain default-FALSE until "
-            "Phases 1+2+3 land and Phase 5 hardening passes."
+        # Strategy gate — LINEAR short-circuits so the caller can route
+        # back to the legacy FSM with byte-identical behavior.
+        if self.budget.branching_strategy == BranchingStrategy.LINEAR:
+            return RepairTreeResult(
+                root_op_id=op_id,
+                layers=(),
+                winning_branch_path=(),
+                final_status=None,
+            )
+
+        # Master-flag check — descriptive, not authoritative. The Phase 5
+        # strategy gate at RepairEngine.run() should have already
+        # short-circuited if the flag is FALSE; this is defense-in-depth.
+        if not treefinement_enabled():
+            return RepairTreeResult(
+                root_op_id=op_id,
+                layers=(),
+                winning_branch_path=(),
+                final_status=None,
+            )
+
+        # Initial emergency-brake check — if globally braked, don't
+        # even spin up layer 0.
+        if emergency_brake_check and self._safe_brake_check(
+            emergency_brake_check
+        ):
+            logger.info(
+                "[RepairTree] op=%s emergency_brake active at startup; "
+                "returning empty result for LINEAR fallback",
+                op_id,
+            )
+            return RepairTreeResult(
+                root_op_id=op_id,
+                layers=(),
+                winning_branch_path=(),
+                final_status=None,
+            )
+
+        max_total_runs = self._max_validation_runs()
+        runs_consumed_total = 0
+        seen_branch_ids: Set[str] = set()
+        layers: List[RepairTreeLayer] = []
+        sibling_context: Tuple[RepairBranch, ...] = ()
+        parent_for_next: Optional[RepairBranch] = None
+
+        for layer_index in range(max(1, max_layers)):
+            # Per-layer brake re-check — operator may flip mid-tree.
+            if emergency_brake_check and self._safe_brake_check(
+                emergency_brake_check
+            ):
+                # Record a synthetic budget-terminal layer so the audit
+                # trail shows WHERE the tree stopped, not just that it did.
+                layers.append(
+                    self._budget_terminal_layer(
+                        layer_index=layer_index,
+                        wall_ms=0.0,
+                    )
+                )
+                break
+
+            # Per-layer deadline check.
+            if deadline_check is not None:
+                remaining = self._safe_deadline_check(deadline_check)
+                if remaining is not None and remaining <= 0:
+                    layers.append(
+                        self._budget_terminal_layer(
+                            layer_index=layer_index,
+                            wall_ms=0.0,
+                        )
+                    )
+                    break
+
+            remaining_runs = max(0, max_total_runs - runs_consumed_total)
+            k = _compute_layer_k(
+                posture=posture,
+                base_k=self.budget.max_branches_per_layer,
+                remaining_runs=remaining_runs,
+                runs_per_branch=self._RUNS_PER_BRANCH_ESTIMATE,
+            )
+
+            layer_start = self._clock()
+            try:
+                layer = await self._dispatch_layer(
+                    op_id=op_id,
+                    layer_index=layer_index,
+                    k=k,
+                    parent_branch=parent_for_next,
+                    sibling_context=sibling_context,
+                    seen_branch_ids=seen_branch_ids,
+                    generator=generator,
+                    validator=validator,
+                    layer_start=layer_start,
+                    remaining_runs=remaining_runs,
+                )
+            except asyncio.CancelledError:
+                # Cancellation MUST propagate so the orchestrator can
+                # handle POSTMORTEM. Worktree cleanup happens inside
+                # _materialize_and_validate_branch via finally blocks.
+                raise
+
+            layers.append(layer)
+            runs_consumed_total += sum(
+                b.validation_runs_consumed for b in layer.branches
+            )
+
+            # WON terminal — early-return with the winning path.
+            if layer.verdict == LayerVerdict.WON_TERMINAL:
+                won = next(
+                    b for b in layer.branches
+                    if b.outcome == BranchOutcome.WON
+                )
+                winning_path = self._build_winning_path(
+                    won_branch=won,
+                    layers=tuple(layers),
+                )
+                return RepairTreeResult(
+                    root_op_id=op_id,
+                    layers=tuple(layers),
+                    winning_branch_path=winning_path,
+                    final_status=None,
+                )
+
+            # Hard breaks for terminal verdicts.
+            if layer.verdict in (
+                LayerVerdict.EXHAUSTED,
+                LayerVerdict.BUDGET_TERMINAL,
+            ):
+                break
+
+            # Setup for next layer — sibling context = ALL branches
+            # (winners + losers; both are signal for cross-branch
+            # learning per AlphaVerus). Parent = best survivor.
+            sibling_context = layer.branches
+            survivors = _select_survivors(
+                layer.branches,
+                strategy=self.budget.branching_strategy,
+                beam_width=self.budget.beam_width,
+            )
+            if survivors:
+                parent_for_next = max(
+                    survivors, key=lambda b: b.validator_score
+                )
+
+        return RepairTreeResult(
+            root_op_id=op_id,
+            layers=tuple(layers),
+            winning_branch_path=(),
+            final_status=None,
         )
+
+    # ---------------------------------------------------------------------
+    # Internal — layer dispatch + per-branch lifecycle
+    # ---------------------------------------------------------------------
+
+    async def _dispatch_layer(
+        self,
+        *,
+        op_id: str,
+        layer_index: int,
+        k: int,
+        parent_branch: Optional[RepairBranch],
+        sibling_context: Tuple[RepairBranch, ...],
+        seen_branch_ids: Set[str],
+        generator: BranchGenerator,
+        validator: BranchValidator,
+        layer_start: float,
+        remaining_runs: int,
+    ) -> RepairTreeLayer:
+        """Generate K branches in parallel; materialize + validate
+        each in its own worktree; aggregate to a layer verdict.
+
+        ``asyncio.gather(return_exceptions=True)`` guarantees that one
+        branch's failure cannot poison the other K-1. Per-branch
+        exceptions quarantine to PRUNED_VALIDATOR with structured
+        diagnostic.
+        """
+        # Stage 1 — parallel generation (K candidate diffs)
+        gen_coros = [
+            self._safe_generate(
+                generator=generator,
+                op_id=op_id,
+                layer_index=layer_index,
+                parent_branch=parent_branch,
+                sibling_outcomes=sibling_context,
+            )
+            for _ in range(k)
+        ]
+        gen_results = await asyncio.gather(
+            *gen_coros, return_exceptions=True
+        )
+        # CancelledError MUST propagate — orchestrator handles
+        # POSTMORTEM. asyncio.gather(return_exceptions=True) captures
+        # cancellation as a result (3.8+ behavior); we re-raise
+        # explicitly so the §1 Boundary contract holds.
+        for entry in gen_results:
+            if isinstance(entry, asyncio.CancelledError):
+                raise entry
+
+        # Stage 2 — per-branch materialize + validate (also parallel)
+        branch_coros: List[Awaitable[RepairBranch]] = []
+        local_seen: Set[str] = set()  # within-layer dedup snapshot
+        for gen_result in gen_results:
+            if isinstance(gen_result, BaseException):
+                branch_coros.append(
+                    self._wrap_in_coro(
+                        self._infra_failed_branch(
+                            layer_index=layer_index,
+                            parent_branch=parent_branch,
+                            failure_class="generator_exception",
+                            fix_hypothesis=(
+                                f"generator raised: "
+                                f"{type(gen_result).__name__}"
+                            ),
+                        )
+                    )
+                )
+                continue
+
+            diff, hypothesis, cost_usd = gen_result
+            branch_id = _branch_id_for(diff)
+
+            # Cross-branch dedup (within layer + across layers)
+            if self.budget.branch_dedup_enabled and (
+                branch_id in seen_branch_ids
+                or branch_id in local_seen
+            ):
+                branch_coros.append(
+                    self._wrap_in_coro(
+                        self._pruned_duplicate_branch(
+                            branch_id=branch_id,
+                            layer_index=layer_index,
+                            parent_branch=parent_branch,
+                            diff=diff,
+                            fix_hypothesis=hypothesis,
+                            cost_usd=cost_usd,
+                        )
+                    )
+                )
+                continue
+
+            local_seen.add(branch_id)
+            branch_coros.append(
+                self._materialize_and_validate_branch(
+                    op_id=op_id,
+                    branch_id=branch_id,
+                    layer_index=layer_index,
+                    parent_branch=parent_branch,
+                    diff=diff,
+                    fix_hypothesis=hypothesis,
+                    cost_usd=cost_usd,
+                    validator=validator,
+                )
+            )
+
+        gathered = await asyncio.gather(
+            *branch_coros, return_exceptions=True
+        )
+        # CancelledError propagates (same contract as Stage 1).
+        for entry in gathered:
+            if isinstance(entry, asyncio.CancelledError):
+                raise entry
+        branches: List[RepairBranch] = []
+        for entry in gathered:
+            if isinstance(entry, RepairBranch):
+                branches.append(entry)
+            else:
+                # Defense in depth — gather exceptions should be
+                # impossible because every branch coro catches its own,
+                # but if one slips through we quarantine it.
+                branches.append(
+                    self._infra_failed_branch(
+                        layer_index=layer_index,
+                        parent_branch=parent_branch,
+                        failure_class="branch_coroutine_exception",
+                        fix_hypothesis=(
+                            f"branch coro raised: "
+                            f"{type(entry).__name__}"
+                        ),
+                    )
+                )
+
+        # Commit successful branch_ids to the cross-layer dedup set
+        for b in branches:
+            if b.outcome != BranchOutcome.PRUNED_DUPLICATE:
+                seen_branch_ids.add(b.branch_id)
+
+        # Compute survivors + verdict
+        survivors = _select_survivors(
+            tuple(branches),
+            strategy=self.budget.branching_strategy,
+            beam_width=self.budget.beam_width,
+        )
+        runs_this_layer = sum(
+            b.validation_runs_consumed for b in branches
+        )
+        budget_remaining_after = remaining_runs - runs_this_layer
+        verdict = _aggregate_layer_verdict(
+            tuple(branches),
+            survivors=survivors,
+            budget_remaining=budget_remaining_after,
+        )
+
+        wall_ms = max(0.0, (self._clock() - layer_start) * 1000.0)
+        return RepairTreeLayer(
+            layer_index=layer_index,
+            branches=tuple(branches),
+            verdict=verdict,
+            wall_ms=wall_ms,
+            parallel_units_actual=k,
+        )
+
+    async def _materialize_and_validate_branch(
+        self,
+        *,
+        op_id: str,
+        branch_id: str,
+        layer_index: int,
+        parent_branch: Optional[RepairBranch],
+        diff: str,
+        fix_hypothesis: str,
+        cost_usd: float,
+        validator: BranchValidator,
+    ) -> RepairBranch:
+        """Create worktree → run validator → return frozen branch.
+
+        Worktree cleanup runs in ``finally`` so even cancellation
+        leaves no orphan worktrees beyond what the canonical
+        ``WorktreeManager.reap_orphans`` boot sweep covers.
+
+        Worktree creation failure surfaces as ``PRUNED_VALIDATOR``
+        with ``failure_class=infra`` and structured ``fix_hypothesis``
+        — never falls back to a shared tree (§1 Boundary mirror of
+        the L3 ``subagent_scheduler`` discipline).
+        """
+        worktree_path: Optional[Path] = None
+        worktree_id: Optional[str] = None
+        if self._worktree_manager is not None:
+            branch_name = f"ouroboros/repair-tree/{op_id}/{branch_id[:12]}"
+            try:
+                worktree_path = await self._worktree_manager.create(
+                    branch_name
+                )
+                worktree_id = branch_name
+            except (Exception, asyncio.CancelledError) as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                logger.warning(
+                    "[RepairTree] op=%s branch=%s "
+                    "worktree_create_failed: %s",
+                    op_id, branch_id[:12], exc,
+                )
+                return RepairBranch(
+                    branch_id=branch_id,
+                    parent_branch_id=(
+                        parent_branch.branch_id if parent_branch else None
+                    ),
+                    layer_index=layer_index,
+                    failure_class="infra",
+                    fix_hypothesis=(
+                        f"worktree_create_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    ),
+                    diff=diff,
+                    validator_score=0.0,
+                    outcome=BranchOutcome.PRUNED_VALIDATOR,
+                    prune_reason=(
+                        PruningReason.VALIDATION_BUDGET_EXHAUSTED
+                    ),
+                    worktree_id=None,
+                    cost_usd=cost_usd,
+                    validation_runs_consumed=0,
+                )
+
+        validation_dir = worktree_path or Path(
+            f"/tmp/no-isolation/{op_id}/{branch_id[:12]}"
+        )
+        try:
+            try:
+                outcome, score, prune_reason, runs = await validator(
+                    op_id=op_id,
+                    branch_id=branch_id,
+                    diff=diff,
+                    worktree_dir=validation_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — fail-closed contract
+                logger.warning(
+                    "[RepairTree] op=%s branch=%s validator_exception: %s",
+                    op_id, branch_id[:12], exc,
+                )
+                outcome = BranchOutcome.PRUNED_VALIDATOR
+                score = 0.0
+                prune_reason = (
+                    PruningReason.VALIDATION_BUDGET_EXHAUSTED
+                )
+                runs = 0
+
+            return RepairBranch(
+                branch_id=branch_id,
+                parent_branch_id=(
+                    parent_branch.branch_id if parent_branch else None
+                ),
+                layer_index=layer_index,
+                failure_class=(
+                    parent_branch.failure_class if parent_branch
+                    else ""
+                ),
+                fix_hypothesis=fix_hypothesis,
+                diff=diff,
+                validator_score=float(score),
+                outcome=outcome,
+                prune_reason=prune_reason,
+                worktree_id=worktree_id,
+                cost_usd=cost_usd,
+                validation_runs_consumed=int(runs),
+            )
+        finally:
+            # Worktree cleanup — best-effort, swallow errors. The
+            # canonical reap_orphans sweep on next boot covers anything
+            # we miss (e.g., cancellation arriving during cleanup).
+            if (
+                self._worktree_manager is not None
+                and worktree_path is not None
+            ):
+                try:
+                    await self._worktree_manager.cleanup(worktree_path)
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[RepairTree] worktree cleanup failed for %s",
+                        worktree_path,
+                        exc_info=True,
+                    )
+
+    async def _safe_generate(
+        self,
+        *,
+        generator: BranchGenerator,
+        op_id: str,
+        layer_index: int,
+        parent_branch: Optional[RepairBranch],
+        sibling_outcomes: Tuple[RepairBranch, ...],
+    ) -> Tuple[str, str, float]:
+        """Wrap generator call so exceptions surface as gather entries
+        (rather than poisoning the gather)."""
+        return await generator(
+            op_id=op_id,
+            layer_index=layer_index,
+            parent_branch=parent_branch,
+            sibling_outcomes=sibling_outcomes,
+        )
+
+    @staticmethod
+    async def _wrap_in_coro(value: RepairBranch) -> RepairBranch:
+        """Lift a synchronously-built RepairBranch into a coroutine so
+        it can join the async gather alongside live materialize calls."""
+        return value
+
+    # ---------------------------------------------------------------------
+    # Internal — synchronous branch builders (no I/O)
+    # ---------------------------------------------------------------------
+
+    def _infra_failed_branch(
+        self,
+        *,
+        layer_index: int,
+        parent_branch: Optional[RepairBranch],
+        failure_class: str,
+        fix_hypothesis: str,
+    ) -> RepairBranch:
+        """Synthetic branch for infrastructure failures (generator
+        exception, branch coroutine exception). Surfaced in the layer
+        so operators can see WHY a branch slot was wasted."""
+        # branch_id derived from a synthetic seed so cross-layer dedup
+        # doesn't collapse all infra failures into one entry.
+        synthetic_seed = (
+            f"infra:{layer_index}:{failure_class}:{fix_hypothesis}"
+        )
+        return RepairBranch(
+            branch_id=patch_signature_hash(synthetic_seed),
+            parent_branch_id=(
+                parent_branch.branch_id if parent_branch else None
+            ),
+            layer_index=layer_index,
+            failure_class=failure_class,
+            fix_hypothesis=fix_hypothesis,
+            diff="",
+            validator_score=0.0,
+            outcome=BranchOutcome.PRUNED_VALIDATOR,
+            prune_reason=PruningReason.VALIDATION_BUDGET_EXHAUSTED,
+            worktree_id=None,
+            cost_usd=0.0,
+            validation_runs_consumed=0,
+        )
+
+    def _pruned_duplicate_branch(
+        self,
+        *,
+        branch_id: str,
+        layer_index: int,
+        parent_branch: Optional[RepairBranch],
+        diff: str,
+        fix_hypothesis: str,
+        cost_usd: float,
+    ) -> RepairBranch:
+        return RepairBranch(
+            branch_id=branch_id,
+            parent_branch_id=(
+                parent_branch.branch_id if parent_branch else None
+            ),
+            layer_index=layer_index,
+            failure_class=(
+                parent_branch.failure_class if parent_branch else ""
+            ),
+            fix_hypothesis=fix_hypothesis,
+            diff=diff,
+            validator_score=0.0,
+            outcome=BranchOutcome.PRUNED_DUPLICATE,
+            prune_reason=PruningReason.DUPLICATE_PATCH_SIG,
+            worktree_id=None,
+            cost_usd=cost_usd,
+            validation_runs_consumed=0,
+        )
+
+    def _budget_terminal_layer(
+        self,
+        *,
+        layer_index: int,
+        wall_ms: float,
+    ) -> RepairTreeLayer:
+        """Synthetic empty layer recording the BUDGET_TERMINAL boundary
+        so audit trails show WHERE the tree stopped."""
+        return RepairTreeLayer(
+            layer_index=layer_index,
+            branches=(),
+            verdict=LayerVerdict.BUDGET_TERMINAL,
+            wall_ms=wall_ms,
+            parallel_units_actual=0,
+        )
+
+    # ---------------------------------------------------------------------
+    # Internal — defensive accessors
+    # ---------------------------------------------------------------------
+
+    def _max_validation_runs(self) -> int:
+        """Read shared validation envelope from the injected
+        RepairBudget. Fallback to 8 (the canonical default) when None
+        is injected so tests don't have to construct a full
+        RepairBudget. Defensive against malformed budgets — any
+        exception raised by the attribute accessor (e.g., a property
+        getter that explodes) falls back to the default."""
+        rb = self._repair_budget
+        if rb is None:
+            return 8
+        try:
+            value = getattr(rb, "max_total_validation_runs", None)
+            if value is None:
+                return 8
+            return int(value)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive fallback
+            logger.debug(
+                "[RepairTree] repair_budget.max_total_validation_runs "
+                "raised; falling back to default 8",
+                exc_info=True,
+            )
+            return 8
+
+    @staticmethod
+    def _safe_brake_check(check: EmergencyBrakeCheck) -> bool:
+        """Defensive wrapper — emergency brake check failure MUST NOT
+        crash the runner. Returns False (no-brake) on exception."""
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[RepairTree] emergency_brake_check raised; "
+                "treating as inactive",
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _safe_deadline_check(check: DeadlineCheck) -> Optional[float]:
+        """Defensive wrapper — deadline check failure MUST NOT crash
+        the runner. Returns None (no-deadline-info) on exception."""
+        try:
+            return check()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[RepairTree] deadline_check raised; "
+                "treating as no-deadline",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _build_winning_path(
+        *,
+        won_branch: RepairBranch,
+        layers: Tuple[RepairTreeLayer, ...],
+    ) -> Tuple[str, ...]:
+        """Walk parent_branch_id pointers root→leaf for the audit
+        trail. Returns the chain ending in won_branch.branch_id."""
+        # Build a quick branch_id → branch lookup across all layers.
+        index: Dict[str, RepairBranch] = {}
+        for layer in layers:
+            for b in layer.branches:
+                index[b.branch_id] = b
+
+        # Walk parent pointers from won_branch backward.
+        chain: List[str] = []
+        cursor: Optional[RepairBranch] = won_branch
+        seen: Set[str] = set()  # cycle guard (defense in depth)
+        while cursor is not None and cursor.branch_id not in seen:
+            seen.add(cursor.branch_id)
+            chain.append(cursor.branch_id)
+            parent_id = cursor.parent_branch_id
+            cursor = index.get(parent_id) if parent_id else None
+        chain.reverse()
+        return tuple(chain)
 
 
 # ===========================================================================
@@ -832,6 +1651,10 @@ __all__ = [
     "RepairTreeResult",
     "TreefinementBudget",
     "RepairTreeRunner",
+    "BranchGenerator",
+    "BranchValidator",
+    "EmergencyBrakeCheck",
+    "DeadlineCheck",
     "treefinement_enabled",
     "register_flags",
 ]

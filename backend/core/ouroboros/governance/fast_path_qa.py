@@ -389,6 +389,36 @@ class QAVerdict(str, enum.Enum):
 
 
 @dataclass(frozen=True)
+class QAStoreSnapshot:
+    """Read-only projection of the BoundedQAStore's state for
+    observability. §41.3 #26 Phase 2 Slice 4 — mirrors the
+    canonical :class:`ArchiveSnapshot` shape from
+    :mod:`permission_decision_archive` so IDE consumers see
+    parallel structure across all artifact-ring substrates."""
+
+    capacity: int
+    size: int
+    next_seq: int
+    schema_version: str = FAST_PATH_QA_SCHEMA_VERSION
+
+    @property
+    def utilization(self) -> float:
+        """Fraction in [0.0, 1.0] of capacity currently used."""
+        if self.capacity <= 0:
+            return 0.0
+        return min(1.0, self.size / self.capacity)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "capacity": self.capacity,
+            "size": self.size,
+            "next_seq": self.next_seq,
+            "utilization": self.utilization,
+            "schema_version": self.schema_version,
+        }
+
+
+@dataclass(frozen=True)
 class QAArtifact:
     """One parked Q&A interaction. Mirrors
     :class:`tool_render_store.StoredBody` shape for `/expand`
@@ -597,6 +627,79 @@ class BoundedQAStore:
         """Snapshot of refs in insertion order. NEVER raises."""
         with self._lock:
             return tuple(self._items.keys())
+
+    # ----------------------------------------------------------------
+    # §41.3 #26 Phase 2 Slice 4 — canonical ring API for IDE GET
+    # surface. Mirrors permission_decision_archive's contract
+    # (recent / snapshot / by_op / by_path) so IDE consumers see
+    # parallel structure across all artifact-ring substrates.
+    # All methods are read-only + NEVER raise.
+    # ----------------------------------------------------------------
+
+    def snapshot(self) -> QAStoreSnapshot:
+        """Read-only state projection. NEVER raises."""
+        with self._lock:
+            return QAStoreSnapshot(
+                capacity=self._capacity,
+                size=len(self._items),
+                next_seq=self._next_seq,
+            )
+
+    def recent(self, limit: int = 20) -> Tuple[QAArtifact, ...]:
+        """Newest-first list of up to ``limit`` artifacts.
+        Bounds: limit clamped to [1, capacity]. NEVER raises."""
+        try:
+            n = max(1, min(int(limit), self._capacity))
+        except (TypeError, ValueError):
+            n = 20
+        with self._lock:
+            # OrderedDict preserves insertion order; reverse for
+            # newest-first then slice. Tuple is immutable +
+            # cheap for callers to project.
+            return tuple(reversed(list(self._items.values())))[:n]
+
+    def by_op(
+        self, op_id: object, *, limit: int = 100,
+    ) -> Tuple[QAArtifact, ...]:
+        """Newest-first filter on artifact.op_id (exact match).
+        NEVER raises. Empty tuple when op_id is empty / non-str /
+        no matches. Q&A typically issues one artifact per op_id
+        but this contract supports repeat ops cleanly."""
+        if not isinstance(op_id, str) or not op_id:
+            return ()
+        try:
+            n = max(1, min(int(limit), self._capacity))
+        except (TypeError, ValueError):
+            n = 100
+        with self._lock:
+            matches = [
+                a for a in reversed(list(self._items.values()))
+                if a.op_id == op_id
+            ]
+        return tuple(matches[:n])
+
+    def by_path(
+        self, retrieval_path: object, *, limit: int = 50,
+    ) -> Tuple[QAArtifact, ...]:
+        """Newest-first filter on artifact.retrieval_path (exact
+        match). Composes the open-vocabulary RETRIEVAL_PATH_*
+        provenance tags (retrieval_only / hybrid_grounded /
+        claude_direct / retrieval_disabled). NEVER raises."""
+        if (
+            not isinstance(retrieval_path, str)
+            or not retrieval_path
+        ):
+            return ()
+        try:
+            n = max(1, min(int(limit), self._capacity))
+        except (TypeError, ValueError):
+            n = 50
+        with self._lock:
+            matches = [
+                a for a in reversed(list(self._items.values()))
+                if a.retrieval_path == retrieval_path
+            ]
+        return tuple(matches[:n])
 
 
 # Singleton accessor — pattern matches existing artifact-ref rings.
@@ -2014,6 +2117,7 @@ __all__ = [
     "BoundedQAStore",
     "QAArtifact",
     "QAReport",
+    "QAStoreSnapshot",
     "QAVerdict",
     "ask_question",
     "cost_today_usd",
