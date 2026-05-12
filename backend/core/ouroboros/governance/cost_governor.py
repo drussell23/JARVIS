@@ -939,3 +939,260 @@ class OpCostCapExceeded(RuntimeError):
         super().__init__(
             f"op_cost_cap_exceeded: op={op_id[:12]} cumulative=${cum} cap=${cap}"
         )
+
+
+# ===========================================================================
+# §41.3 #26 Phase 2 Slice 6 — FlagRegistry seed
+# ===========================================================================
+#
+# Auto-discovered by the canonical FlagRegistry boot-time walker
+# (mirrors the convention in fast_path_qa.py, sensor_governor.py,
+# direction_inferrer.py, etc.). Seeds the canonical
+# ``JARVIS_OP_COST_*`` family — operators get typed FlagSpec
+# entries in ``/help flags`` with descriptions, defaults, and
+# category tags rather than having to greplook for env knobs.
+#
+# Pre-Slice 6 cost_governor.py had ZERO FlagRegistry seed —
+# all 13 env knobs were undiscovered by /help. Slice 6 closes
+# that gap as part of the §41.3 #26 Phase 2 D3b roll-up.
+
+
+def register_flags(registry: Any) -> int:
+    """Seed cost_governor's env-knob family into the canonical
+    FlagRegistry. Returns the count of FlagSpecs registered.
+    NEVER raises — each spec is registered independently."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    src = "backend/core/ouroboros/governance/cost_governor.py"
+    seeds = [
+        # Per-route cost-factor family.
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_IMMEDIATE",
+            type=FlagType.FLOAT,
+            default=5.0,
+            description=(
+                "IMMEDIATE route cost-factor multiplier. "
+                "Sized for tool-loop + multi-attempt code "
+                "generation under critical urgency."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_IMMEDIATE=5.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_STANDARD",
+            type=FlagType.FLOAT,
+            default=1.5,
+            description=(
+                "STANDARD route cost-factor multiplier "
+                "(DW-primary cascade)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_STANDARD=1.5",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_COMPLEX",
+            type=FlagType.FLOAT,
+            default=4.0,
+            description=(
+                "COMPLEX route cost-factor multiplier "
+                "(Claude-plans + DW-executes; sized for "
+                "multi-file architectural changes)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_COMPLEX=4.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_BACKGROUND",
+            type=FlagType.FLOAT,
+            default=0.5,
+            description=(
+                "BACKGROUND route cost-factor multiplier "
+                "(DW-only, no Claude fallback)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_BACKGROUND=0.5",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_SPECULATIVE",
+            type=FlagType.FLOAT,
+            default=0.25,
+            description=(
+                "SPECULATIVE route cost-factor multiplier "
+                "(fire-and-forget batched DW)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_SPECULATIVE=0.25",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_ROUTE_INFORMATIONAL",
+            type=FlagType.FLOAT,
+            default=0.3,
+            description=(
+                "§41.3 #26 Phase 2 D3b — INFORMATIONAL route "
+                "cost-factor multiplier. Closed-5→6 expansion "
+                "at cost_governor pairing the canonical "
+                "ProviderRoute.INFORMATIONAL value in "
+                "urgency_router. Cheaper than BACKGROUND "
+                "because Q&A is read-only by design (§41.3.1 "
+                "non-decision #1) + small-token Sonnet calls."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_ROUTE_INFORMATIONAL=0.3",
+        ),
+        # Complexity-factor family.
+        FlagSpec(
+            name="JARVIS_OP_COST_COMPLEXITY_TRIVIAL",
+            type=FlagType.FLOAT,
+            default=0.5,
+            description="trivial complexity cost-factor.",
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_COMPLEXITY_TRIVIAL=0.5",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_COMPLEXITY_SIMPLE",
+            type=FlagType.FLOAT,
+            default=0.8,
+            description="simple complexity cost-factor.",
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_COMPLEXITY_SIMPLE=0.8",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_COMPLEXITY_LIGHT",
+            type=FlagType.FLOAT,
+            default=1.0,
+            description="light complexity cost-factor (baseline).",
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_COMPLEXITY_LIGHT=1.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_COMPLEXITY_HEAVY",
+            type=FlagType.FLOAT,
+            default=2.0,
+            description=(
+                "heavy_code complexity cost-factor (multi-file "
+                "code generation, tool-loop intensive)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_COMPLEXITY_HEAVY=2.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_COMPLEXITY_ARCH",
+            type=FlagType.FLOAT,
+            default=3.0,
+            description=(
+                "complex complexity cost-factor (architectural "
+                "changes, planner + executor split)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_COMPLEXITY_ARCH=3.0",
+        ),
+        # Cap-derivation knobs.
+        FlagSpec(
+            name="JARVIS_OP_BASELINE_COST_USD",
+            type=FlagType.FLOAT,
+            default=0.10,
+            description=(
+                "Per-op cost cap baseline. Final cap is "
+                "baseline × route_factor × complexity_factor "
+                "× retry_headroom, clamped to [min_cap, max_cap]."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_BASELINE_COST_USD=0.10",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_RETRY_HEADROOM",
+            type=FlagType.FLOAT,
+            default=3.0,
+            description=(
+                "Multiplier headroom for VALIDATE retries "
+                "(prevents cap-tripping mid-retry)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_RETRY_HEADROOM=3.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_MIN_CAP_USD",
+            type=FlagType.FLOAT,
+            default=0.05,
+            description=(
+                "Absolute per-op cap floor — prevents config "
+                "typos from starving every op."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_MIN_CAP_USD=0.05",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_MAX_CAP_USD",
+            type=FlagType.FLOAT,
+            default=5.00,
+            description=(
+                "Absolute per-op cap ceiling — defeats config "
+                "typos that would defeat the cap entirely."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_MAX_CAP_USD=5.00",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_READONLY_FACTOR",
+            type=FlagType.FLOAT,
+            default=5.0,
+            description=(
+                "Multiplier scaling the cap for read-only ops "
+                "(subagent fan-out + Claude synthesis). "
+                "Session 10 (bt-2026-04-18-050658) drove the "
+                "default 5× — 3-stream cartography needed "
+                "$0.34 against a $0.15 cap pre-fix."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_READONLY_FACTOR=5.0",
+        ),
+        FlagSpec(
+            name="JARVIS_OP_COST_PARALLEL_STREAM_FACTOR",
+            type=FlagType.FLOAT,
+            default=1.1,
+            description=(
+                "Per-stream cap multiplier for PLAN-EXPLOIT "
+                "asyncio.gather() fan-out. Default 1.1 (10% "
+                "extra per concurrent stream)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_OP_COST_PARALLEL_STREAM_FACTOR=1.1",
+        ),
+    ]
+
+    count = 0
+    for spec in seeds:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.debug(
+                "[CostGovernor] failed to register %s",
+                spec.name,
+                exc_info=True,
+            )
+    return count
