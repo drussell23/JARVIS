@@ -1,0 +1,15 @@
+{
+  "id": "problem_004",
+  "kind": "dict_keyerror",
+  "target_file_name": "before.py",
+  "test_file_name": "test_before.py",
+  "difficulty": "medium",
+  "expected_first_try_fail_rate": 0.50,
+  "design_note": "Recursive deep-merge for nested config dicts. The buggy implementation uses dict.update (shallow merge), so an override at depth 2+ completely replaces the base dict at that key instead of merging into it. The naive level-1 fix (handle nested dicts but don't recurse) ceiling-fails at depth 3. The correct fix requires recursion AND careful edge handling: lists fully REPLACE (not merge into); scalar-vs-dict override at the same key REPLACES based on override's type; equal-type non-dict values just replace. Multiple semantic edges all caught by separate tests so naive single-rule fixes fail. Contract surface deliberately neutral (function called `merge`, no `deep_merge` telegraph; docstring describes behavior in terms of input/output examples rather than naming the algorithm).",
+  "trap_categories": [
+    "recursion_required",
+    "depth_ceiling_canary",
+    "semantic_edge_cases",
+    "behavior_inferred_from_test_examples"
+  ]
+}
