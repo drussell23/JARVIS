@@ -2393,6 +2393,92 @@ class SemanticIndex:
             "boost_applied": boost_applied,
         }
 
+    def top_k_for_text(
+        self,
+        text: str,
+        *,
+        k: int = 5,
+        min_score: float = 0.0,
+    ) -> Tuple[Tuple["CorpusItem", float], ...]:
+        """§41.3 #26 Phase 1 D2c — corpus-level top-K retrieval.
+
+        Returns a tuple of ``(CorpusItem, cosine_score)`` pairs
+        sorted by descending cosine similarity, filtered to those
+        ≥ ``min_score``. NEVER raises.
+
+        Read-only over ``self._corpus`` + ``self._embedder``. NO
+        state mutation — no boost recording, no histogram update.
+        Operators querying for retrieval are NOT contributing
+        signals to the centroid (asymmetric: retrieval reads;
+        ``score()`` reads-and-records).
+
+        Routing:
+          * Disabled / empty corpus / embed failure → ``()``
+          * ``k <= 0`` → ``()``
+          * Otherwise: cosine vs every corpus item; sort desc;
+            filter by ``min_score``; take top-K.
+
+        Composes the same private ``_embedder`` + ``_corpus`` +
+        ``_cosine`` helpers ``score()`` uses — NO parallel
+        embedding pipeline, NO duplicate corpus.
+        """
+        if not _is_enabled():
+            return ()
+        try:
+            k_int = max(0, int(k))
+        except (TypeError, ValueError):
+            return ()
+        if k_int <= 0:
+            return ()
+        try:
+            cleaned = _sanitize_corpus_text(text)
+        except Exception:  # noqa: BLE001
+            return ()
+        if not cleaned:
+            return ()
+        # Snapshot corpus + embed query under the lock so we
+        # don't race a rebuild.
+        with self._lock:
+            corpus_snapshot = tuple(self._corpus)
+        if not corpus_snapshot:
+            return ()
+        try:
+            query_vecs = self._embedder.embed([cleaned])
+        except Exception:  # noqa: BLE001
+            return ()
+        if not query_vecs:
+            return ()
+        query_vec = query_vecs[0]
+        if not query_vec:
+            return ()
+        # Embed each corpus item (cached at first build —
+        # repeated embed of the same text returns the same
+        # vector from the embedder). For now embed batch-wise
+        # to amortize fastembed overhead.
+        try:
+            corpus_texts = [it.text for it in corpus_snapshot]
+            corpus_vecs = self._embedder.embed(corpus_texts)
+        except Exception:  # noqa: BLE001
+            return ()
+        if not corpus_vecs or len(corpus_vecs) != len(corpus_snapshot):
+            return ()
+        try:
+            min_score_f = float(min_score)
+        except (TypeError, ValueError):
+            min_score_f = 0.0
+        scored: List[Tuple["CorpusItem", float]] = []
+        for item, vec in zip(corpus_snapshot, corpus_vecs):
+            try:
+                sim = _cosine(query_vec, vec)
+            except Exception:  # noqa: BLE001
+                continue
+            if sim < min_score_f:
+                continue
+            scored.append((item, sim))
+        # Descending sort; stable for ties (preserves corpus order).
+        scored.sort(key=lambda pair: -pair[1])
+        return tuple(scored[:k_int])
+
     @property
     def clusters(self) -> Tuple[ClusterInfo, ...]:
         """Immutable snapshot of the current cluster set. Empty under

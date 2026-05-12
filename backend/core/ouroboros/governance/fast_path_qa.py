@@ -91,6 +91,23 @@ _ENV_SYSTEM_PROMPT = "JARVIS_FAST_PATH_QA_SYSTEM_PROMPT"
 _ENV_TIMEOUT_S = "JARVIS_FAST_PATH_QA_TIMEOUT_S"
 _ENV_MODEL = "JARVIS_FAST_PATH_QA_MODEL"
 
+# §41.3 #26 Phase 1 D2c — hybrid retrieval sub-flags. Compose
+# the canonical :class:`semantic_index.SemanticIndex` for
+# project-context grounding before invoking Claude. The 3-tier
+# confidence ladder is fully operator-tunable.
+_ENV_RETRIEVAL_ENABLED = (
+    "JARVIS_FAST_PATH_QA_RETRIEVAL_ENABLED"
+)
+_ENV_RETRIEVAL_HIGH_CONFIDENCE = (
+    "JARVIS_FAST_PATH_QA_RETRIEVAL_HIGH_CONFIDENCE"
+)
+_ENV_RETRIEVAL_LOW_CONFIDENCE = (
+    "JARVIS_FAST_PATH_QA_RETRIEVAL_LOW_CONFIDENCE"
+)
+_ENV_RETRIEVAL_TOP_K = (
+    "JARVIS_FAST_PATH_QA_RETRIEVAL_TOP_K"
+)
+
 # Canonical model knob name — operators have ANTHROPIC_API_KEY
 # set globally; we don't re-shadow that.
 _ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
@@ -103,6 +120,26 @@ _DEFAULT_TEMPERATURE: float = 0.3
 _DEFAULT_STORE_CAPACITY: int = 100
 _DEFAULT_TIMEOUT_S: int = 30
 _DEFAULT_MODEL: str = "claude-sonnet-4-5"  # latest Sonnet
+
+# D2c thresholds. Tuned for fastembed/bge-small embeddings —
+# operators can adjust per their corpus. The semantic_index
+# cosine range is [-1, 1] but real-world signals cluster
+# 0.0–0.95; 0.55 high / 0.30 low maps to: "near-exact paraphrase
+# matches CLAUDE.md fact" / "topic overlap, worth injecting".
+_DEFAULT_RETRIEVAL_HIGH_CONFIDENCE: float = 0.55
+_DEFAULT_RETRIEVAL_LOW_CONFIDENCE: float = 0.30
+_DEFAULT_RETRIEVAL_TOP_K: int = 5
+
+# Provenance tags for QAArtifact.retrieval_path — closed
+# 4-value enum-like vocabulary documenting which path produced
+# the answer. Stored as a plain str on the artifact (vs adding
+# a closed enum) so the provenance vocabulary can extend
+# additively per Phase 2/3 without churning the QAVerdict
+# bytes-pin.
+RETRIEVAL_PATH_RETRIEVAL_ONLY = "retrieval_only"   # high conf — $0 Claude
+RETRIEVAL_PATH_HYBRID = "hybrid_grounded"          # mid conf — Claude w/ context
+RETRIEVAL_PATH_CLAUDE_DIRECT = "claude_direct"     # low conf — Phase 0 path
+RETRIEVAL_PATH_RETRIEVAL_DISABLED = "retrieval_disabled"  # sub-flag off
 _DEFAULT_SYSTEM_PROMPT: str = (
     "You are JARVIS, a developer assistant embedded in the "
     "Ouroboros + Venom (O+V) self-developing governance "
@@ -204,6 +241,63 @@ def model_name() -> str:
     return raw if raw else _DEFAULT_MODEL
 
 
+# §41.3 #26 Phase 1 — D2c hybrid retrieval accessors.
+
+
+def retrieval_enabled() -> bool:
+    """§41.3 #26 Phase 1 — D2c hybrid sub-flag. Default-TRUE
+    (conditional on master). When the substrate is master-on
+    AND retrieval is enabled, ``ask_question`` composes
+    :class:`semantic_index.SemanticIndex.top_k_for_text` BEFORE
+    invoking Claude. Operator opt-out: set
+    ``JARVIS_FAST_PATH_QA_RETRIEVAL_ENABLED=false`` to fall
+    back to Phase 0 Claude-direct path."""
+    if not master_enabled():
+        return False
+    raw = os.environ.get(_ENV_RETRIEVAL_ENABLED, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def retrieval_high_confidence_threshold() -> float:
+    """Cosine threshold above which retrieval ALONE answers
+    (no Claude call; cost = $0). Clamped [0.0, 1.0]."""
+    raw = os.environ.get(
+        _ENV_RETRIEVAL_HIGH_CONFIDENCE, "",
+    ).strip()
+    if not raw:
+        return _DEFAULT_RETRIEVAL_HIGH_CONFIDENCE
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return _DEFAULT_RETRIEVAL_HIGH_CONFIDENCE
+
+
+def retrieval_low_confidence_threshold() -> float:
+    """Cosine threshold above which retrieval grounds Claude
+    (context injected into system prompt). Below this falls to
+    pure Claude-direct (Phase 0 path)."""
+    raw = os.environ.get(
+        _ENV_RETRIEVAL_LOW_CONFIDENCE, "",
+    ).strip()
+    if not raw:
+        return _DEFAULT_RETRIEVAL_LOW_CONFIDENCE
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return _DEFAULT_RETRIEVAL_LOW_CONFIDENCE
+
+
+def retrieval_top_k() -> int:
+    """Number of corpus items to retrieve."""
+    raw = os.environ.get(_ENV_RETRIEVAL_TOP_K, "").strip()
+    if not raw:
+        return _DEFAULT_RETRIEVAL_TOP_K
+    try:
+        return max(1, min(50, int(raw)))
+    except (TypeError, ValueError):
+        return _DEFAULT_RETRIEVAL_TOP_K
+
+
 # ---------------------------------------------------------------------------
 # Closed taxonomy — bytes-pinned via AST
 # ---------------------------------------------------------------------------
@@ -240,6 +334,16 @@ class QAArtifact:
     model: str             # model name used
     elapsed_s: float
     inserted_at: float     # time.monotonic() — for telemetry
+    # §41.3 #26 Phase 1 — D2c provenance. One of the
+    # ``RETRIEVAL_PATH_*`` module constants. Defaults to
+    # ``RETRIEVAL_PATH_CLAUDE_DIRECT`` for backward compat with
+    # Phase 0 artifacts that predate the field. Open-vocabulary
+    # by design — Phase 2+ may introduce new path tags
+    # additively without churning the QAVerdict bytes-pin.
+    retrieval_path: str = RETRIEVAL_PATH_CLAUDE_DIRECT
+    # Top retrieval cosine score (when retrieval ran). 0.0 for
+    # retrieval_disabled / claude_direct paths.
+    top_score: float = 0.0
     schema_version: str = FAST_PATH_QA_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -253,6 +357,8 @@ class QAArtifact:
             "model": self.model[:128],
             "elapsed_s": float(self.elapsed_s),
             "inserted_at": float(self.inserted_at),
+            "retrieval_path": self.retrieval_path[:64],
+            "top_score": float(self.top_score),
             "schema_version": self.schema_version,
         }
 
@@ -326,6 +432,8 @@ class BoundedQAStore:
         cost_usd: object = 0.0,
         model: object = "",
         elapsed_s: object = 0.0,
+        retrieval_path: object = RETRIEVAL_PATH_CLAUDE_DIRECT,
+        top_score: object = 0.0,
     ) -> QAArtifact:
         """Park a Q&A pair. NEVER raises — coerces garbage to
         safe types. Issues a monotonic ``q-N`` ref."""
@@ -357,6 +465,16 @@ class BoundedQAStore:
             elapsed = max(0.0, float(elapsed_s))
         except (TypeError, ValueError):
             elapsed = 0.0
+        try:
+            path_str = str(
+                retrieval_path or RETRIEVAL_PATH_CLAUDE_DIRECT,
+            )[:64]
+        except Exception:  # noqa: BLE001
+            path_str = RETRIEVAL_PATH_CLAUDE_DIRECT
+        try:
+            top_score_f = max(-1.0, min(1.0, float(top_score)))
+        except (TypeError, ValueError):
+            top_score_f = 0.0
         with self._lock:
             ref = f"{QA_REF_PREFIX}{self._next_seq}"
             self._next_seq += 1
@@ -370,6 +488,8 @@ class BoundedQAStore:
                 model=model_str,
                 elapsed_s=elapsed,
                 inserted_at=time.monotonic(),
+                retrieval_path=path_str,
+                top_score=top_score_f,
             )
             self._items[ref] = artifact
             while len(self._items) > self._capacity:
@@ -582,6 +702,167 @@ async def _default_claude_callable(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 D2c retrieval composer
+# ---------------------------------------------------------------------------
+#
+# Composes semantic_index.get_default_index + top_k_for_text.
+# NO parallel embedder, NO parallel corpus, NO duplicate cosine
+# math. Read-only over the canonical index — retrieval does NOT
+# contribute signals to the centroid (asymmetric: score() reads-
+# and-records, this helper reads-only).
+
+
+@dataclass(frozen=True)
+class _RetrievalResult:
+    """Outcome of one retrieve_context call."""
+
+    top_score: float
+    snippets: Tuple[Tuple[str, str, float], ...]
+    item_count: int
+    elapsed_s: float
+    diagnostic: str = ""
+
+
+RetrievalCallable = Callable[
+    [str, int, float],
+    Awaitable[Tuple[Tuple[Any, float], ...]],
+]
+
+
+async def _default_semantic_retrieval(
+    query: str, k: int, min_score: float,
+) -> Tuple[Tuple[Any, float], ...]:
+    """Default Phase 1 retriever. Composes semantic_index
+    singleton. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.semantic_index import (  # noqa: E501  # type: ignore[import-not-found]
+            get_default_index,
+        )
+    except Exception:  # noqa: BLE001
+        return ()
+    try:
+        index = get_default_index()
+    except Exception:  # noqa: BLE001
+        return ()
+    if index is None:
+        return ()
+    try:
+        return index.top_k_for_text(
+            query, k=k, min_score=min_score,
+        )
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+async def _retrieve_context(
+    question: str,
+    *,
+    retrieval_callable: Optional[RetrievalCallable] = None,
+    now_unix: Optional[float] = None,
+) -> _RetrievalResult:
+    """Top-K retrieval over the canonical semantic_index.
+    NEVER raises."""
+    started = time.time() if now_unix is None else float(now_unix)
+    fn = (
+        retrieval_callable if retrieval_callable is not None
+        else _default_semantic_retrieval
+    )
+    try:
+        raw = await fn(question, retrieval_top_k(), 0.0)
+    except Exception as exc:  # noqa: BLE001
+        return _RetrievalResult(
+            top_score=0.0,
+            snippets=(),
+            item_count=0,
+            elapsed_s=max(0.0, time.time() - started),
+            diagnostic=f"retrieval raised: {exc!r}"[:200],
+        )
+    if not raw:
+        return _RetrievalResult(
+            top_score=0.0,
+            snippets=(),
+            item_count=0,
+            elapsed_s=max(0.0, time.time() - started),
+            diagnostic="empty corpus or embedder offline",
+        )
+    snippets: List[Tuple[str, str, float]] = []
+    top = -1.0
+    for pair in raw:
+        try:
+            item, score = pair[0], float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        try:
+            txt = str(getattr(item, "text", "") or "")[:512]
+            src = str(getattr(item, "source", "") or "")[:64]
+        except Exception:  # noqa: BLE001
+            continue
+        if not txt:
+            continue
+        snippets.append((src, txt, score))
+        if score > top:
+            top = score
+    top_clamped = max(0.0, top) if top >= 0 else 0.0
+    return _RetrievalResult(
+        top_score=top_clamped,
+        snippets=tuple(snippets),
+        item_count=len(snippets),
+        elapsed_s=max(0.0, time.time() - started),
+        diagnostic=f"retrieved {len(snippets)} item(s)",
+    )
+
+
+def _format_snippets_for_claude_prompt(
+    snippets: Tuple[Tuple[str, str, float], ...],
+) -> str:
+    """Render retrieved snippets as a system-prompt block to
+    ground Claude. NEVER raises."""
+    if not snippets:
+        return ""
+    lines: List[str] = [
+        "",
+        "Relevant project context (retrieved from the "
+        "semantic index — excerpts from CLAUDE.md, the PRD, "
+        "prior commits, and conversation history; ground "
+        "your answer but do NOT quote verbatim unless "
+        "directly relevant):",
+        "",
+    ]
+    for i, (src, text, score) in enumerate(snippets, start=1):
+        lines.append(
+            f"[{i}] (source={src}, relevance={score:.2f}):"
+        )
+        lines.append(f"    {text}")
+    return "\n".join(lines)
+
+
+def _format_snippets_for_operator_answer(
+    snippets: Tuple[Tuple[str, str, float], ...],
+) -> str:
+    """High-confidence retrieval-only path. Renders top snippets
+    as the operator-facing answer. NEVER raises."""
+    if not snippets:
+        return ""
+    lines: List[str] = [
+        "Based on the project's semantic index, the most "
+        "relevant context for your question is:",
+        "",
+    ]
+    for i, (src, text, score) in enumerate(snippets, start=1):
+        lines.append(
+            f"  [{i}] ({src}, relevance {score:.2f}):"
+        )
+        lines.append(f"      {text}")
+    lines.append("")
+    lines.append(
+        "(retrieved without invoking Claude — $0 cost; set "
+        f"{_ENV_RETRIEVAL_ENABLED}=false to force Claude "
+        "synthesis.)"
+    )
+    return "\n".join(lines)
+
+
 def _record_turn_safely(
     role: str, text: str, *, source: str, op_id: str = "",
 ) -> None:
@@ -617,6 +898,7 @@ async def ask_question(
     bridge_callable: Optional[
         Callable[[str, str, str, str], None]
     ] = None,
+    retrieval_callable: Optional[RetrievalCallable] = None,
     now_unix: Optional[float] = None,
 ) -> QAReport:
     """Top-level Q&A entry. NEVER raises.
@@ -713,7 +995,97 @@ async def ask_question(
             "[FastPathQA] user-turn record failed: %r", exc,
         )
 
-    # Step 5: invoke provider callable.
+    # Step 5: §41.3 #26 Phase 1 — D2c hybrid retrieval.
+    # 3-tier confidence ladder; operator-tunable thresholds:
+    #
+    #   * HIGH (top_score >= high_threshold): retrieved
+    #     snippets ARE the answer — no Claude call, $0 cost.
+    #   * MEDIUM (top_score >= low_threshold): inject snippets
+    #     into Claude's system prompt for grounding.
+    #   * LOW (no snippets or below low threshold): Phase 0
+    #     Claude-direct path unchanged.
+    #
+    # Retrieval-disabled / failed → falls through cleanly to
+    # the LOW-confidence Phase 0 path (byte-identical to Phase
+    # 0 behavior under that flag).
+    retrieval_path = RETRIEVAL_PATH_RETRIEVAL_DISABLED
+    top_score = 0.0
+    retrieved_snippets: Tuple[Tuple[str, str, float], ...] = ()
+    if retrieval_enabled():
+        retrieval = await _retrieve_context(
+            q_text,
+            retrieval_callable=retrieval_callable,
+            now_unix=started,
+        )
+        top_score = retrieval.top_score
+        retrieved_snippets = retrieval.snippets
+        high_t = retrieval_high_confidence_threshold()
+        low_t = retrieval_low_confidence_threshold()
+        # Tier 1: HIGH confidence → retrieval-only path.
+        if (
+            retrieved_snippets
+            and top_score >= high_t
+        ):
+            answer_text = _format_snippets_for_operator_answer(
+                retrieved_snippets,
+            )
+            try:
+                recorder(
+                    "assistant", answer_text,
+                    "ask_human_a", op_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[FastPathQA] retrieval-only "
+                    "assistant-turn record failed: %r", exc,
+                )
+            qa_store = (
+                store if store is not None
+                else get_default_qa_store()
+            )
+            elapsed = max(0.0, time.time() - started)
+            artifact = qa_store.store(
+                question=q_text,
+                answer=answer_text,
+                asked_at_unix=started,
+                op_id=op_id,
+                cost_usd=0.0,  # no Claude call
+                model="semantic_index",  # provenance
+                elapsed_s=elapsed,
+                retrieval_path=RETRIEVAL_PATH_RETRIEVAL_ONLY,
+                top_score=top_score,
+            )
+            return QAReport(
+                verdict=QAVerdict.ANSWERED,
+                artifact=artifact,
+                diagnostic=(
+                    f"ok retrieval-only (top_score="
+                    f"{top_score:.3f} >= {high_t:.2f}, "
+                    f"ref={artifact.ref}, $0)"
+                ),
+                evaluated_at_unix=started,
+            )
+        # Tier 2: MEDIUM confidence → snippets ground Claude.
+        if (
+            retrieved_snippets
+            and top_score >= low_t
+        ):
+            retrieval_path = RETRIEVAL_PATH_HYBRID
+        else:
+            retrieval_path = RETRIEVAL_PATH_CLAUDE_DIRECT
+
+    # Step 6: build Claude system prompt (with or without
+    # retrieved context injection).
+    base_prompt = system_prompt()
+    if retrieval_path == RETRIEVAL_PATH_HYBRID:
+        ctx_block = _format_snippets_for_claude_prompt(
+            retrieved_snippets,
+        )
+        effective_prompt = base_prompt + "\n\n" + ctx_block
+    else:
+        effective_prompt = base_prompt
+
+    # Step 7: invoke provider callable.
     provider = (
         provider_callable
         if provider_callable is not None
@@ -721,7 +1093,7 @@ async def ask_question(
     )
     try:
         answer, cost = await asyncio.wait_for(
-            provider(system_prompt(), q_text),
+            provider(effective_prompt, q_text),
             timeout=float(timeout_s()),
         )
     except asyncio.TimeoutError:
@@ -739,7 +1111,7 @@ async def ask_question(
             evaluated_at_unix=started,
         )
 
-    # Step 6: empty answer guard.
+    # Step 8: empty answer guard.
     try:
         answer_text = str(answer or "").strip()
         cost_usd = max(0.0, float(cost))
@@ -754,7 +1126,7 @@ async def ask_question(
             evaluated_at_unix=started,
         )
 
-    # Step 7: record cost; record assistant turn via
+    # Step 9: record cost; record assistant turn via
     # ConversationBridge (D4 default).
     _record_cost(cost_usd, now_unix=started)
     try:
@@ -764,7 +1136,7 @@ async def ask_question(
             "[FastPathQA] assistant-turn record failed: %r", exc,
         )
 
-    # Step 8: park artifact — gets q-N ref.
+    # Step 10: park artifact — gets q-N ref.
     qa_store = (
         store if store is not None else get_default_qa_store()
     )
@@ -777,15 +1149,18 @@ async def ask_question(
         cost_usd=cost_usd,
         model=model_name(),
         elapsed_s=elapsed,
+        retrieval_path=retrieval_path,
+        top_score=top_score,
     )
 
-    # Step 9: return ANSWERED.
+    # Step 11: return ANSWERED with path provenance.
     return QAReport(
         verdict=QAVerdict.ANSWERED,
         artifact=artifact,
         diagnostic=(
             f"ok (cost=${cost_usd:.5f}, {elapsed:.2f}s, "
-            f"ref={artifact.ref})"
+            f"ref={artifact.ref}, path={retrieval_path}, "
+            f"top_score={top_score:.3f})"
         ),
         evaluated_at_unix=started,
     )
@@ -934,6 +1309,22 @@ def register_shipped_invariants() -> list:
                 "must mirror BoundedBodyStore pattern "
                 "(OrderedDict + threading.RLock + monotonic "
                 "seq + drop-oldest)"
+            )
+        # D2c Phase 1 — must compose canonical semantic_index
+        # (no parallel embedder, no parallel corpus). The
+        # retrieval composer references get_default_index +
+        # top_k_for_text.
+        if "semantic_index" not in source:
+            violations.append(
+                "must compose semantic_index "
+                "(D2c Phase 1 hybrid retrieval — no parallel "
+                "embedding pipeline, no duplicate corpus)"
+            )
+        if "top_k_for_text" not in source:
+            violations.append(
+                "must invoke SemanticIndex.top_k_for_text "
+                "(D2c Phase 1 — the canonical retrieval method "
+                "we added to semantic_index for this use)"
             )
         return tuple(violations)
 
@@ -1158,6 +1549,62 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example=f"{_ENV_MODEL}=claude-haiku-4-5",
         ),
+        FlagSpec(
+            name=_ENV_RETRIEVAL_ENABLED,
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "§41.3 #26 Phase 1 D2c hybrid retrieval. "
+                "Default-TRUE (conditional on master). When "
+                "on, ask_question composes semantic_index "
+                "top_k_for_text BEFORE invoking Claude. "
+                "Operator opt-out: set to false to fall back "
+                "to Phase 0 Claude-direct path."
+            ),
+            category=Category.ROUTING,
+            source_file=src,
+            example=f"{_ENV_RETRIEVAL_ENABLED}=false",
+        ),
+        FlagSpec(
+            name=_ENV_RETRIEVAL_HIGH_CONFIDENCE,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_RETRIEVAL_HIGH_CONFIDENCE,
+            description=(
+                "Cosine threshold above which retrieval ALONE "
+                "answers (no Claude call, $0 cost). Clamped "
+                "[0.0, 1.0]. Tune per corpus characteristics."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example=f"{_ENV_RETRIEVAL_HIGH_CONFIDENCE}=0.65",
+        ),
+        FlagSpec(
+            name=_ENV_RETRIEVAL_LOW_CONFIDENCE,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_RETRIEVAL_LOW_CONFIDENCE,
+            description=(
+                "Cosine threshold above which retrieval "
+                "grounds Claude (context injected into system "
+                "prompt). Below → pure Claude-direct (Phase 0 "
+                "path). Clamped [0.0, 1.0]."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example=f"{_ENV_RETRIEVAL_LOW_CONFIDENCE}=0.40",
+        ),
+        FlagSpec(
+            name=_ENV_RETRIEVAL_TOP_K,
+            type=FlagType.INT,
+            default=_DEFAULT_RETRIEVAL_TOP_K,
+            description=(
+                "Number of corpus items to retrieve. Clamped "
+                "[1, 50]. More items → more context but more "
+                "tokens consumed under the hybrid path."
+            ),
+            category=Category.CAPACITY,
+            source_file=src,
+            example=f"{_ENV_RETRIEVAL_TOP_K}=8",
+        ),
     ]
     count = 0
     for spec in seeds:
@@ -1172,6 +1619,10 @@ def register_flags(registry: Any) -> int:
 __all__ = [
     "FAST_PATH_QA_SCHEMA_VERSION",
     "QA_REF_PREFIX",
+    "RETRIEVAL_PATH_CLAUDE_DIRECT",
+    "RETRIEVAL_PATH_HYBRID",
+    "RETRIEVAL_PATH_RETRIEVAL_DISABLED",
+    "RETRIEVAL_PATH_RETRIEVAL_ONLY",
     "BoundedQAStore",
     "QAArtifact",
     "QAReport",
@@ -1187,6 +1638,10 @@ __all__ = [
     "register_shipped_invariants",
     "reset_cost_today",
     "reset_default_qa_store",
+    "retrieval_enabled",
+    "retrieval_high_confidence_threshold",
+    "retrieval_low_confidence_threshold",
+    "retrieval_top_k",
     "store_capacity",
     "system_prompt",
     "temperature",
