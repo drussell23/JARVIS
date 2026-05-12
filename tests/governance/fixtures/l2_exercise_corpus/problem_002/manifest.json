@@ -1,0 +1,14 @@
+{
+  "id": "problem_002",
+  "kind": "logic_inversion",
+  "target_file_name": "before.py",
+  "test_file_name": "test_before.py",
+  "difficulty": "medium",
+  "expected_first_try_fail_rate": 0.50,
+  "design_note": "MaxPriorityQueue wraps heapq (Python's min-heap). Bug is multi-site: push() must negate priority for max-heap behavior AND peek() must re-negate the stored priority before returning it to the caller. A naive fix that only negates at push leaks the internal -priority through peek's return value (catches caller). A naive fix that only changes pop semantics (e.g. nlargest) breaks tie-break ordering (FIFO required). The correct fix coordinates push() + peek() and preserves a counter-based stable ordering for ties.",
+  "trap_categories": [
+    "multi_site_coordination",
+    "internal_state_leak_through_peek",
+    "tie_break_ordering_invariant"
+  ]
+}
