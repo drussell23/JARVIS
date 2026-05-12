@@ -1,41 +1,58 @@
 {
   "schema_version": "hardness_report.v1",
-  "timestamp": "2026-05-12T18:22:39.098650+00:00",
+  "timestamp": "2026-05-12T18:25:44.179632+00:00",
   "provider_chain_used": "doubleword",
   "model": "Qwen/Qwen3.5-397B-A17B-FP8",
   "attempts_requested": 5,
   "max_cost_usd": 0.5,
-  "total_cost_usd": 0.0,
+  "total_cost_usd": 0.001021,
   "results": [
     {
       "problem_id": "problem_001",
       "kind": "off_by_one",
       "attempts_requested": 5,
-      "attempts_completed": 0,
-      "attempts_errored": 5,
-      "passes": 0,
+      "attempts_completed": 1,
+      "attempts_errored": 4,
+      "passes": 1,
       "fails": 0,
-      "measured_first_try_fail_rate": null,
+      "measured_first_try_fail_rate": 0.0,
       "per_attempt": [
         {
           "attempt": 0,
-          "error": "KeyError: 'content'"
+          "error": "KeyError: \"DW response 'message' has neither 'content' nor 'reasoning_content' (or both were empty). Message keys: ['reasoning', 'reasoning_details', 'refusal', 'role']\""
         },
         {
           "attempt": 1,
-          "error": "KeyError: 'content'"
+          "error": "KeyError: \"DW response 'message' has neither 'content' nor 'reasoning_content' (or both were empty). Message keys: ['reasoning', 'reasoning_details', 'refusal', 'role']\""
         },
         {
           "attempt": 2,
-          "error": "KeyError: 'content'"
+          "error": "KeyError: \"DW response 'message' has neither 'content' nor 'reasoning_content' (or both were empty). Message keys: ['reasoning', 'reasoning_details', 'refusal', 'role']\""
         },
         {
           "attempt": 3,
-          "error": "KeyError: 'content'"
+          "error": "KeyError: \"DW response 'message' has neither 'content' nor 'reasoning_content' (or both were empty). Message keys: ['reasoning', 'reasoning_details', 'refusal', 'role']\""
         },
         {
           "attempt": 4,
-          "error": "KeyError: 'content'"
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 1097,
+            "completion_tokens": 2279,
+            "total_tokens": 3376,
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cache_write_tokens": 0,
+              "cached_tokens": 1088,
+              "video_tokens": 0
+            },
+            "completion_tokens_details": {
+              "audio_tokens": 0,
+              "image_tokens": 0,
+              "reasoning_tokens": 1881
+            }
+          },
+          "cost_usd": 0.001021
         }
       ]
     }

@@ -529,7 +529,7 @@ def test_parse_error_returns_structured_result(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_register_shipped_invariants_returns_four_pins():
+def test_register_shipped_invariants_returns_five_pins():
     pins = register_shipped_invariants()
     names = {p.invariant_name for p in pins}
     assert names == {
@@ -537,6 +537,7 @@ def test_register_shipped_invariants_returns_four_pins():
         "conversation_repl_authority_asymmetry",
         "conversation_repl_composes_canonical",
         "conversation_repl_ref_prefix_pinned",
+        "conversation_resume_resanitizes",
     }
 
 
