@@ -441,6 +441,28 @@ class IDEObservabilityRouter:
             self._handle_tool_permissions_by_op,
         )
 
+        # §41.3 #26 Phase 2 Slice 4 — fast-path Q&A surfaces.
+        # Closes the IDE GET parity gap for the q-N ring. Three
+        # sub-routes mirror the tool-permissions pattern verbatim:
+        # recent / by-path / by-ref. Route-order discipline: the
+        # literal-prefix routes (``/by-path/{name}`` + ``/by-ref/
+        # {ref}``) MUST register BEFORE any generic catch-all —
+        # aiohttp matches in order. by-op intentionally NOT
+        # registered: Q&A issues at most one artifact per op_id,
+        # so /by-ref/{ref} is the canonical lookup axis.
+        app.router.add_get(
+            "/observability/qa-recent",
+            self._handle_qa_recent,
+        )
+        app.router.add_get(
+            "/observability/qa-recent/by-path/{retrieval_path}",
+            self._handle_qa_by_path,
+        )
+        app.router.add_get(
+            "/observability/qa-recent/by-ref/{ref}",
+            self._handle_qa_by_ref,
+        )
+
     # --- request-path helpers ---------------------------------------------
 
     def _client_key(self, request: "web.Request") -> str:
@@ -3374,6 +3396,229 @@ class IDEObservabilityRouter:
                 "op_id": op_id,
                 "count": len(records),
                 "records": [r.to_dict() for r in records],
+            },
+        )
+
+    # ----------------------------------------------------------------------
+    # §41.3 #26 Phase 2 Slice 4 — fast-path Q&A IDE GET surface
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _fast_path_qa_master_enabled() -> bool:
+        """Authority-free gate — the Q&A surface inherits the
+        fast_path_qa master switch. When off we 403 so port
+        scanners see no signal about what's behind the route.
+        Mirrors :meth:`_permission_archive_master_enabled`.
+        NEVER raises — falls through to False on import or
+        runtime failure."""
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (  # noqa: E501
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        try:
+            return bool(master_enabled())
+        except Exception:  # noqa: BLE001 — defensive
+            return False
+
+    async def _handle_qa_recent(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/qa-recent[?limit=N]`` — bounded
+        read-only projection of the most-recent N parked Q&A
+        artifacts across all retrieval paths.
+
+        Composes the canonical :class:`BoundedQAStore` ring
+        (Phase 0 substrate, q-N artifact-ref family member) +
+        the canonical :meth:`QAArtifact.to_dict` projection.
+        Read-only — never mutates the ring.
+
+        Query params:
+
+        * ``limit`` — integer in [1, 200], default 20.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "count": 14,
+              "snapshot": {
+                "capacity": 100,
+                "size": 14,
+                "next_seq": 15,
+                "utilization": 0.14,
+                "schema_version": "fast_path_qa.1"
+              },
+              "records": [
+                {
+                  "ref": "q-14",
+                  "op_id": "op-019e1148-3081",
+                  "question": "...",
+                  "answer_chars": 482,
+                  "cost_usd": 0.0042,
+                  "model": "claude-sonnet-4-5",
+                  "elapsed_s": 1.83,
+                  "retrieval_path": "hybrid_grounded",
+                  "top_score": 0.71,
+                  "route": "informational",
+                  "schema_version": "fast_path_qa.1"
+                },
+                ...
+              ]
+            }
+
+        Returns 403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false``
+        OR ``JARVIS_FAST_PATH_QA_ENABLED=false``. 429 on rate-
+        limit. 503 on unexpected substrate failure.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._fast_path_qa_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.fast_path_qa_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = self._parse_limit(request, default=20, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (  # noqa: E501
+                get_default_qa_store,
+            )
+            store = get_default_qa_store()
+            records = store.recent(limit=limit)
+            snap = store.snapshot()
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.fast_path_qa_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "count": len(records),
+                "snapshot": snap.to_dict(),
+                "records": [a.to_dict() for a in records],
+            },
+        )
+
+    async def _handle_qa_by_path(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/qa-recent/by-path/{retrieval_path}
+        [?limit=N]`` — filter the ring to one retrieval path
+        (exact match), newest-first.
+
+        Composes :meth:`BoundedQAStore.by_path`. Read-only.
+        Valid retrieval_path values: ``retrieval_only`` |
+        ``hybrid_grounded`` | ``claude_direct`` |
+        ``retrieval_disabled`` (open-vocabulary by design —
+        future paths additive).
+
+        Returns 400 when ``retrieval_path`` is missing or empty.
+        403/429 same as the parent route."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._fast_path_qa_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.fast_path_qa_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        retrieval_path = (
+            request.match_info.get("retrieval_path", "") or ""
+        ).strip()
+        if not retrieval_path:
+            return self._error_response(
+                request, 400,
+                "ide_observability.fast_path_qa_missing_path",
+            )
+        limit = self._parse_limit(request, default=20, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (  # noqa: E501
+                get_default_qa_store,
+            )
+            records = get_default_qa_store().by_path(
+                retrieval_path, limit=limit,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.fast_path_qa_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "retrieval_path": retrieval_path,
+                "count": len(records),
+                "records": [a.to_dict() for a in records],
+            },
+        )
+
+    async def _handle_qa_by_ref(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/qa-recent/by-ref/{ref}`` —
+        canonical single-artifact lookup by q-N ref (exact match).
+        Returns the projection of the matching artifact, or 404
+        when the ref doesn't exist (or was evicted by drop-oldest).
+
+        Composes :meth:`BoundedQAStore.lookup`. Read-only.
+
+        Returns 400 when ``ref`` is missing or empty.
+        404 when ref doesn't resolve. 403/429 same as the parent
+        route."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._fast_path_qa_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.fast_path_qa_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        ref = (
+            request.match_info.get("ref", "") or ""
+        ).strip()
+        if not ref:
+            return self._error_response(
+                request, 400,
+                "ide_observability.fast_path_qa_missing_ref",
+            )
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (  # noqa: E501
+                get_default_qa_store,
+            )
+            artifact = get_default_qa_store().lookup(ref)
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.fast_path_qa_unavailable",
+            )
+        if artifact is None:
+            return self._error_response(
+                request, 404,
+                "ide_observability.fast_path_qa_ref_not_found",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "ref": ref,
+                "record": artifact.to_dict(),
             },
         )
 
