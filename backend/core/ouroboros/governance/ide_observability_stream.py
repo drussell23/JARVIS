@@ -1180,6 +1180,21 @@ EVENT_TYPE_PERMISSION_DECISION_RECORDED = (
     "permission_decision_recorded"
 )
 
+# §41.3 #26 Phase 2 Slice 3 — fast-path Q&A artifact-record beacon.
+# Fires once per parked QAArtifact (every q-N ring insertion).
+# Closes the observability-triad parity gap: every other artifact-
+# ring substrate (tool_render, diff_archive, op_block_buffer,
+# narrative_channel, permission_decision_archive) already publishes
+# an SSE event on record; Q&A was the last ring without one.
+# Best-effort: master-flag-gated at the substrate producer
+# (JARVIS_FAST_PATH_QA_ENABLED) — when off, ask_question short-
+# circuits at the master gate so the producer hook never fires.
+# Stream-side gate (JARVIS_IDE_STREAM_ENABLED) still applies via
+# publish_task_event. Payload is QAArtifact.to_dict() (already
+# bounded — question[:1024], answer projected as char-count only
+# to avoid surfacing operator content over the IDE stream).
+EVENT_TYPE_QA_RECORDED = "qa_recorded"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -1312,6 +1327,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_LONG_HORIZON_MEMORY_RECALLED,     # §41.4 Phase 1 seventh arc (PRD v3.0+, long_horizon_memory)
     EVENT_TYPE_INFRA_RECOVERY_EVALUATED,         # §41.4 Phase 1 eighth arc (PRD v3.0+, infra_recovery_loop)
     EVENT_TYPE_MULTI_DAY_DEADLOCK_EVALUATED,     # §41.4 Phase 1 ninth (final) arc (PRD v3.0+, multi_day_deadlock_detector)
+    EVENT_TYPE_QA_RECORDED,                      # §41.3 #26 Phase 2 Slice 3 (PRD v3.x, fast_path_qa)
 })
 
 

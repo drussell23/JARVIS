@@ -1037,6 +1037,45 @@ def _cost_governor_finish_safely(
         )
 
 
+def _publish_qa_recorded_safely(artifact: QAArtifact) -> None:
+    """§41.3 #26 Phase 2 Slice 3 — producer-bridge for the
+    canonical ``qa_recorded`` SSE event.
+
+    Composes :func:`ide_observability_stream.publish_task_event`
+    via lazy import (mirrors the v2.91 permission_decision_archive
+    pattern). Fires AFTER ``qa_store.store()`` returns — the
+    artifact has already been parked + given its monotonic q-N
+    ref by the time we publish.
+
+    Best-effort contract: broker exceptions are swallowed at
+    BOTH levels (publish_task_event itself never raises; the
+    outer try/except here is defense-in-depth in case the lazy
+    import or the symbol lookup fails). SSE broker failure MUST
+    NOT propagate into the Q&A pipeline.
+
+    Stream-side gate (``JARVIS_IDE_STREAM_ENABLED``) is checked
+    inside ``publish_task_event``; substrate-side gate
+    (``JARVIS_FAST_PATH_QA_ENABLED``) is checked at the master
+    flag — when off, ``ask_question`` short-circuits before
+    reaching this helper.
+    """
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501  # type: ignore[import-not-found]
+            EVENT_TYPE_QA_RECORDED,
+            publish_task_event,
+        )
+        publish_task_event(
+            EVENT_TYPE_QA_RECORDED,
+            artifact.op_id,
+            artifact.to_dict(),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[FastPathQA] qa_recorded SSE publish failed: %r",
+            exc,
+        )
+
+
 def _record_turn_safely(
     role: str, text: str, *, source: str, op_id: str = "",
 ) -> None:
@@ -1270,6 +1309,10 @@ async def ask_question(
                 retrieval_path=RETRIEVAL_PATH_RETRIEVAL_ONLY,
                 top_score=top_score,
             )
+            # §41.3 #26 Phase 2 Slice 3 — publish qa_recorded SSE
+            # AFTER the artifact is parked (q-N ref allocated).
+            # Best-effort; broker exceptions never raise.
+            _publish_qa_recorded_safely(artifact)
             # Finalize cost_governor op (fires finalize_observer
             # chain). Retrieval-only paths charge $0 — the
             # governor still gets the op's lifecycle for cross-
@@ -1378,6 +1421,11 @@ async def ask_question(
         retrieval_path=retrieval_path,
         top_score=top_score,
     )
+
+    # §41.3 #26 Phase 2 Slice 3 — publish qa_recorded SSE AFTER
+    # the artifact is parked (q-N ref allocated). Best-effort;
+    # broker exceptions never raise.
+    _publish_qa_recorded_safely(artifact)
 
     # Step 11: finalize cost_governor op (fires finalize_observer
     # chain for cross-substrate observability — e.g.,
@@ -1572,6 +1620,22 @@ def register_shipped_invariants() -> list:
                 "must call get_default_cost_governor "
                 "(canonical singleton accessor — no parallel "
                 "governor instance)"
+            )
+        # §41.3 #26 Phase 2 Slice 3 — must compose canonical
+        # SSE event-publish for qa_recorded. Closes the
+        # observability-triad parity gap with every other
+        # artifact-ring substrate.
+        if "EVENT_TYPE_QA_RECORDED" not in source:
+            violations.append(
+                "must reference EVENT_TYPE_QA_RECORDED "
+                "(Phase 2 Slice 3 — canonical SSE event for "
+                "Q&A artifact-record beacon)"
+            )
+        if "publish_task_event" not in source:
+            violations.append(
+                "must compose publish_task_event "
+                "(canonical SSE broker producer-bridge — "
+                "no parallel publisher)"
             )
         return tuple(violations)
 

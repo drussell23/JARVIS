@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from typing import Any, Tuple
 
 import pytest
@@ -680,6 +681,267 @@ def test_composes_canonical_ast_pin_requires_cost_governor():
     """The composes_canonical pin requires cost_governor +
     get_default_cost_governor references in the substrate source
     — guarantees the composition isn't accidentally ripped out."""
+    invariants = register_shipped_invariants()
+    target = next(
+        inv for inv in invariants
+        if inv.invariant_name == "fast_path_qa_composes_canonical"
+    )
+    import ast as _ast
+    src_path = (
+        "backend/core/ouroboros/governance/fast_path_qa.py"
+    )
+    with open(src_path, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = _ast.parse(source)
+    violations = target.validate(tree, source)
+    assert violations == (), f"AST pin drift: {violations}"
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — Canonical SSE event (qa_recorded)
+#
+# Closes the observability-triad parity gap. Every other artifact-
+# ring substrate (tool_render, diff_archive, op_block_buffer,
+# narrative_channel, permission_decision_archive) publishes an SSE
+# event when a new artifact is parked; Q&A was the last ring
+# without one. Slice 3 mirrors the v2.91 permission_decision_archive
+# pattern: lazy import at producer-bridge call site, best-effort
+# try/except, publish AFTER the ring assigns the monotonic ref.
+# ---------------------------------------------------------------------------
+
+
+def test_qa_recorded_event_constant_registered():
+    """The canonical event-type constant exists at the
+    ide_observability_stream module level."""
+    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+        EVENT_TYPE_QA_RECORDED,
+    )
+    assert EVENT_TYPE_QA_RECORDED == "qa_recorded"
+
+
+def test_qa_recorded_event_in_valid_frozenset():
+    """The constant is registered in the canonical
+    _VALID_EVENT_TYPES frozenset — broker drops events not in
+    the allowlist, so missing this entry silently kills the
+    feature."""
+    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+        EVENT_TYPE_QA_RECORDED,
+        _VALID_EVENT_TYPES,
+    )
+    assert EVENT_TYPE_QA_RECORDED in _VALID_EVENT_TYPES
+
+
+def test_qa_recorded_event_distinct_from_other_qa_or_artifact_events():
+    """The event-type string doesn't collide with existing
+    artifact-ring events (defensive)."""
+    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+        EVENT_TYPE_PERMISSION_DECISION_RECORDED,
+        EVENT_TYPE_QA_RECORDED,
+    )
+    # Sanity: distinct values + namespace-clean.
+    assert EVENT_TYPE_QA_RECORDED != EVENT_TYPE_PERMISSION_DECISION_RECORDED
+    assert "qa_" in EVENT_TYPE_QA_RECORDED  # substrate prefix
+
+
+def test_ask_question_publishes_qa_recorded_on_success(monkeypatch):
+    """End-to-end: a successful Q&A op fires the qa_recorded SSE
+    event. Verified by patching publish_task_event to capture
+    invocations."""
+    captured: list = []
+
+    def _fake_publish(event_type: str, op_id: str, payload: Any = None):
+        captured.append((event_type, op_id, payload))
+        return f"evt-{len(captured)}"
+
+    from backend.core.ouroboros.governance import (
+        ide_observability_stream as ios,
+    )
+    monkeypatch.setattr(ios, "publish_task_event", _fake_publish)
+
+    async def _fake_provider(
+        system: str, q: str,
+    ) -> Tuple[str, float]:
+        return ("ok", 0.0001)
+
+    async def _run() -> None:
+        report = await ask_question(
+            "anything?",
+            op_id="op-sse-1",
+            provider_callable=_fake_provider,
+            bridge_callable=lambda *_: None,
+        )
+        assert report.verdict is QAVerdict.ANSWERED
+
+    asyncio.run(_run())
+
+    ours = [c for c in captured if c[0] == "qa_recorded"]
+    assert len(ours) == 1
+    event_type, captured_op_id, payload = ours[0]
+    assert event_type == "qa_recorded"
+    assert captured_op_id == "op-sse-1"
+    # Payload is the QAArtifact projection — must carry route +
+    # ref + retrieval_path provenance.
+    assert payload is not None
+    assert payload["route"] == "informational"
+    assert payload["ref"].startswith("q-")
+    assert "retrieval_path" in payload
+
+
+def test_ask_question_publishes_qa_recorded_on_retrieval_only(monkeypatch):
+    """Retrieval-only path ($0 cost; no Claude call) STILL
+    fires the qa_recorded event — cross-substrate observability
+    must see EVERY artifact-record, regardless of which sub-path
+    produced it."""
+    monkeypatch.setenv(_ENV_RETRIEVAL_ENABLED, "true")
+    captured: list = []
+
+    def _fake_publish(event_type: str, op_id: str, payload: Any = None):
+        captured.append((event_type, op_id, payload))
+        return f"evt-{len(captured)}"
+
+    from backend.core.ouroboros.governance import (
+        ide_observability_stream as ios,
+    )
+    monkeypatch.setattr(ios, "publish_task_event", _fake_publish)
+
+    @dataclass(frozen=True)
+    class _Item:
+        text: str
+        source: str = "doc"
+
+    async def _retrieve(query: str, k: int, min_score: float):
+        return ((_Item(text="canonical answer"), 0.99),)
+
+    async def _provider(system: str, q: str):
+        raise AssertionError("provider must NOT be called on retrieval-only")
+
+    async def _run() -> None:
+        report = await ask_question(
+            "what?",
+            op_id="op-sse-retr",
+            provider_callable=_provider,
+            retrieval_callable=_retrieve,
+            bridge_callable=lambda *_: None,
+        )
+        assert report.verdict is QAVerdict.ANSWERED
+        assert report.artifact is not None
+        assert (
+            report.artifact.retrieval_path
+            == "retrieval_only"
+        )
+
+    asyncio.run(_run())
+
+    ours = [c for c in captured if c[0] == "qa_recorded"]
+    assert len(ours) == 1
+    _, _, payload = ours[0]
+    assert payload["retrieval_path"] == "retrieval_only"
+    # Retrieval-only is $0 by construction.
+    assert payload["cost_usd"] == 0.0
+
+
+def test_qa_recorded_NOT_published_when_provider_fails(monkeypatch):
+    """Provider failure → no artifact parked → no qa_recorded
+    event. The SSE beacon is a record-of-success, not a record-
+    of-attempt."""
+    captured: list = []
+
+    def _fake_publish(event_type: str, op_id: str, payload: Any = None):
+        captured.append((event_type, op_id, payload))
+        return None
+
+    from backend.core.ouroboros.governance import (
+        ide_observability_stream as ios,
+    )
+    monkeypatch.setattr(ios, "publish_task_event", _fake_publish)
+
+    async def _failing_provider(system: str, q: str):
+        raise RuntimeError("simulated crash")
+
+    async def _run() -> None:
+        report = await ask_question(
+            "fails?",
+            op_id="op-sse-fail",
+            provider_callable=_failing_provider,
+            bridge_callable=lambda *_: None,
+        )
+        assert report.verdict is QAVerdict.PROVIDER_FAILED
+
+    asyncio.run(_run())
+
+    ours = [c for c in captured if c[0] == "qa_recorded"]
+    assert ours == []
+
+
+def test_qa_recorded_publish_broker_exception_does_not_raise(monkeypatch):
+    """Best-effort contract: if the broker raises, the Q&A path
+    must NOT propagate. Substrate is responsible for its own
+    correctness regardless of observability health."""
+    def _exploding_publish(event_type: str, op_id: str, payload: Any = None):
+        raise RuntimeError("simulated broker explosion")
+
+    from backend.core.ouroboros.governance import (
+        ide_observability_stream as ios,
+    )
+    monkeypatch.setattr(ios, "publish_task_event", _exploding_publish)
+
+    async def _fake_provider(system: str, q: str):
+        return ("ok", 0.0001)
+
+    async def _run() -> None:
+        # Must not raise — substrate degrades the broker
+        # exception silently.
+        report = await ask_question(
+            "any?",
+            op_id="op-sse-explode",
+            provider_callable=_fake_provider,
+            bridge_callable=lambda *_: None,
+        )
+        assert report.verdict is QAVerdict.ANSWERED
+
+    asyncio.run(_run())
+
+
+def test_qa_recorded_publish_lazy_imports_observability_stream():
+    """The producer-bridge must use LAZY import (call-site, not
+    module-level) — module-level import would be a load-bearing
+    cycle risk + violates the lazy-import contract documented
+    in shipped_code_invariants."""
+    import ast as _ast
+    src_path = (
+        "backend/core/ouroboros/governance/fast_path_qa.py"
+    )
+    with open(src_path, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = _ast.parse(source)
+    # No module-level ImportFrom for ide_observability_stream.
+    for node in tree.body:
+        if isinstance(node, _ast.ImportFrom):
+            assert (
+                "ide_observability_stream" not in (node.module or "")
+            ), (
+                "module-level import of ide_observability_stream "
+                "in fast_path_qa.py — must be lazy (call-site)"
+            )
+    # Confirm at least ONE lazy ImportFrom exists (inside a
+    # function body). Walk the entire tree.
+    found_lazy = False
+    for node in _ast.walk(tree):
+        if (
+            isinstance(node, _ast.ImportFrom)
+            and "ide_observability_stream" in (node.module or "")
+        ):
+            found_lazy = True
+            break
+    assert found_lazy, (
+        "no lazy import of ide_observability_stream "
+        "(producer-bridge must be wired)"
+    )
+
+
+def test_composes_canonical_ast_pin_requires_qa_event():
+    """Phase 2 Slice 3 strengthens composes_canonical to require
+    EVENT_TYPE_QA_RECORDED + publish_task_event references."""
     invariants = register_shipped_invariants()
     target = next(
         inv for inv in invariants
