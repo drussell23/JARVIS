@@ -421,23 +421,29 @@ def test_banned_call_inside_class_method_does_not_trip_rule_8():
 # ---------------------------------------------------------------------------
 
 
-def test_disguised_module_level_call_via_alias_not_blocked():
-    """KNOWN GAP: an alias defeats the static-name resolver
-    (``s = os.system; s("ls")``). Rule 8 only blocks DOTTED-NAME
-    Calls. The alias case requires runtime hooking.
+def test_disguised_module_level_call_via_alias_now_blocked_by_rule_10():
+    """Vector #7 closure (2026-05-12) — what was pinned here as
+    a KNOWN GAP is now closed by Rule 10 (alias-defeat tracker).
+    The P9.4 corpus documented this pattern: ``s = <banned-attr-
+    chain>; s("ls")``. Rule 10 walks function bodies + module
+    level tracking simple Name=Attr bindings whose RHS resolves
+    to a banned name; subsequent Calls to the alias in the same
+    scope are flagged.
 
-    Pin the gap so it's visible and a future tightening surfaces in
-    test output. Defense-in-depth: Rule 7 catches `__class__` etc.
-    on any function body, and the sandbox's limited builtin set
-    blunts most aliases at runtime."""
+    Limitations preserved: intraprocedural only (cross-function
+    aliases remain a known gap; runtime sandbox is the final
+    gate). This test pins the intraprocedural close."""
     name = _O("system")
     prologue = (
         f"_alias = {name}\n"
         "_alias('ls')\n"
     )
     result = validate_ast(_candidate_with_module_prologue(prologue))
-    # Currently expected to PASS — pin the known gap.
-    assert result.status is ValidationStatus.PASSED
+    # Vector #7 closure — Rule 10 now catches this.
+    assert result.status is ValidationStatus.FAILED
+    assert (
+        result.reason == ValidationFailureReason.ALIAS_DEFEAT
+    )
 
 
 def test_call_on_call_at_module_level_not_blocked():

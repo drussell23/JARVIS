@@ -118,7 +118,86 @@ _BANNED_INTROSPECTION_ATTRS: FrozenSet[str] = frozenset({
     "__subclasses__",
     "__bases__",
     "__class__",
+    # PRD §3.6.2 Vector #7 closure (2026-05-12) — additional
+    # object-graph traversal attrs that P9.4 adversarial corpus
+    # documented as Rule-7 gaps. Each is a documented bypass:
+    #   * ``__mro__`` — type(x).__mro__ walks the inheritance
+    #     chain to reach object → subclasses(). Empirically
+    #     reachable when Rule 7 only blocks the three base attrs
+    #     above.
+    #   * ``__dict__`` — direct namespace projection; combined
+    #     with getattr lets a candidate read attributes whose
+    #     names are computed at runtime.
+    #   * ``__globals__`` — function.__globals__ exposes the
+    #     defining module's globals (any imported subprocess
+    #     reachable).
+    #   * Frame attrs (``f_back``/``f_globals``/``f_locals``) —
+    #     traversal up the call stack reaches caller scopes via
+    #     sys._getframe()-shaped patterns.
+    # All belong to the "object-graph traversal" gap class the
+    # PRD calls out. Per-rule kill-switch remains the existing
+    # JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE flag — no
+    # new flag needed (these are the same rule's attribute set).
+    "__mro__",
+    "__dict__",
+    "__globals__",
+    "f_back",
+    "f_globals",
+    "f_locals",
 })
+
+
+# PRD §3.6.2 Vector #7 closure — Rule 9 (introspection-builtin
+# Calls). Catches the SECOND gap class the P9.4 corpus
+# documented: ``vars(x)`` / ``dir(x)`` / ``globals()`` /
+# ``locals()`` calls. These return dict-shaped projections of
+# scope or object state that a motivated candidate can mine to
+# find banned-attr references by string match — defeating Rule
+# 7's static-string check.
+#
+# ``type()`` is included because the canonical bypass calls it
+# first; banning ``type()`` ALSO catches the multi-step pattern
+# (Rule 7 adds the bypassed dunder for direct-access; Rule 9
+# adds ``type()`` for the entry call — defense-in-depth).
+#
+# Pattern: ANY ast.Call whose func is an ast.Name in this set,
+# anywhere in the module (function body OR module-level). Module-
+# level Calls to other dangerous builtins are caught by Rule 8;
+# this rule catches the new introspection-builtin class anywhere.
+#
+# isinstance / type-equality patterns are NOT banned — Rule 9
+# fires on Call to ``type`` (not the bare name reference), so
+# ``isinstance(x, type)`` is fine but ``type(x).__mro__`` is not.
+_BANNED_INTROSPECTION_BUILTIN_CALLS: FrozenSet[str] = frozenset({
+    "vars",
+    "dir",
+    "globals",
+    "locals",
+    "type",
+})
+
+
+# PRD §3.6.2 Vector #7 closure — Rule 10 (alias-defeat tracker).
+# The P9.4 corpus documented the alias-defeat pattern as a pinned
+# known gap: a candidate aliases a banned attribute-chain to a
+# local name, then calls the local. Rule 8's static-name check
+# sees the local call and has no idea what the name is bound to.
+#
+# Rule 10 walks function bodies (and module level) tracking
+# simple Name = Attribute|Name assignments where the RHS
+# resolves to a banned-call attribute path (from Rule 8's set
+# OR Rule 9's set). Any subsequent Call to that alias name
+# within the same scope is flagged.
+#
+# Scope is intentionally LIMITED: alias tracking is per-function-
+# body (intraprocedural), not cross-function. A motivated
+# candidate that aliases across function boundaries defeats
+# Rule 10. Rule 10 positions as "raises the bar" defense-in-
+# depth, not "provably tight" — the runtime sandbox remains
+# the authoritative final gate.
+#
+# Per-rule kill-switch: JARVIS_AST_VALIDATOR_BLOCK_ALIAS_DEFEAT
+# (default TRUE).
 
 
 # Phase 7.7 follow-up — Rule 8: Module-level side-effect detection.
@@ -200,6 +279,41 @@ def is_introspection_block_enabled() -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
+def is_introspection_builtin_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 9 —
+    ``JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_BUILTINS`` (default
+    **true** — same security-on-by-default convention as Rules 7
+    and 8). Rule 9 closes the P9.4 corpus gap where ``vars(x)`` /
+    ``dir(x)`` / ``globals()`` / ``locals()`` / ``type()`` Calls
+    bypass Rule 7's attribute-string check.
+
+    Operators can disable in emergency without disabling the whole
+    validator. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_BUILTINS",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
+def is_alias_defeat_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 10 —
+    ``JARVIS_AST_VALIDATOR_BLOCK_ALIAS_DEFEAT`` (default **true** —
+    security-on-by-default). Rule 10 catches intra-function alias
+    bindings that defeat Rule 8's static-name check (the
+    documented P9.4 ``s = <banned-attr>; s(...)`` gap).
+
+    Operators can disable in emergency without disabling the whole
+    validator. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_ALIAS_DEFEAT",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
 def is_module_side_effect_block_enabled() -> bool:
     """Per-rule kill switch for Rule 8 —
     ``JARVIS_AST_VALIDATOR_BLOCK_MODULE_SIDE_EFFECTS`` (default
@@ -263,6 +377,10 @@ class ValidationFailureReason(str, enum.Enum):
     BANNED_IMPORT = "banned_import"
     INTROSPECTION_ESCAPE = "introspection_escape"  # P7.7 Rule 7
     MODULE_LEVEL_SIDE_EFFECT = "module_level_side_effect"  # Rule 8
+    # PRD §3.6.2 Vector #7 closure (2026-05-12) — Rules 9-10
+    # plug the documented P9.4 corpus gaps that Rules 7/8 missed.
+    INTROSPECTION_BUILTIN_CALL = "introspection_builtin_call"  # Rule 9
+    ALIAS_DEFEAT = "alias_defeat"  # Rule 10
 
 
 @dataclass(frozen=True)
@@ -450,6 +568,39 @@ def validate_ast(
                 status=ValidationStatus.FAILED,
                 reason=ValidationFailureReason.MODULE_LEVEL_SIDE_EFFECT,
                 detail=side_effect,
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 9 (Vector #7 closure): introspection-builtin Calls ----
+    # P9.4 corpus documented vars()/dir()/globals()/locals()/type()
+    # as Rule-7 bypass routes. Rule 9 catches any ast.Call to a
+    # name in _BANNED_INTROSPECTION_BUILTIN_CALLS, anywhere in the
+    # module (function body OR module-level).
+    if is_introspection_builtin_block_enabled():
+        builtin_call = _find_introspection_builtin_call(tree)
+        if builtin_call is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.INTROSPECTION_BUILTIN_CALL,
+                detail=builtin_call,
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 10 (Vector #7 closure): alias-defeat detector ----
+    # P9.4 corpus documented `local_name = <banned-attr-chain>;
+    # local_name(...)` as a pinned known gap. Rule 10 walks
+    # function bodies + module level tracking simple Name=Attr
+    # bindings where RHS resolves to a banned name (Rule 8 set OR
+    # Rule 9 set); subsequent Call to the alias in the same scope
+    # is flagged. Intraprocedural only (cross-function aliases
+    # remain a known gap — runtime sandbox is the final gate).
+    if is_alias_defeat_block_enabled():
+        alias_defeat = _find_alias_defeat(tree)
+        if alias_defeat is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.ALIAS_DEFEAT,
+                detail=alias_defeat,
                 classes_inspected=inspected,
             )
 
@@ -964,6 +1115,150 @@ __all__ = [
     "validate_ast",
     "validate_ast_strict",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Rule 9 (Vector #7 closure): introspection-builtin Calls
+# ---------------------------------------------------------------------------
+
+
+def _find_introspection_builtin_call(
+    tree: ast.AST,
+) -> Optional[str]:
+    """Walk the FULL AST (function bodies + module level) for any
+    ast.Call whose .func is an ast.Name in
+    :data:`_BANNED_INTROSPECTION_BUILTIN_CALLS`. Returns a
+    structured detail string on first hit, None when clean.
+
+    ``isinstance(x, type)`` is allowed — Rule 9 fires on Call to
+    ``type`` (not the bare-name reference). The single argument
+    pattern ``type(x).__mro__`` is the canonical bypass.
+
+    NEVER raises."""
+    try:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name):
+                continue
+            if func.id in _BANNED_INTROSPECTION_BUILTIN_CALLS:
+                return (
+                    f"Rule 9 (introspection_builtin_call): "
+                    f"Call to {func.id!r} at line "
+                    f"{getattr(node, 'lineno', '?')} — see PRD "
+                    f"§3.6.2 Vector #7 closure"
+                )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rule 10 (Vector #7 closure): alias-defeat tracker
+# ---------------------------------------------------------------------------
+
+
+def _resolves_to_banned_name(node: ast.AST) -> Optional[str]:
+    """If ``node`` is a Name or Attribute chain whose canonical
+    dotted form is in Rule 8's or Rule 9's banned set, return
+    that canonical form. Else None. NEVER raises."""
+    try:
+        # ast.Name → bare name (e.g. ``open``, ``eval``).
+        if isinstance(node, ast.Name):
+            if node.id in _BANNED_MODULE_LEVEL_CALLS:
+                return node.id
+            if node.id in _BANNED_INTROSPECTION_BUILTIN_CALLS:
+                return node.id
+            return None
+        # ast.Attribute → walk the chain (e.g. ``os.system`` →
+        # "os.system").
+        if isinstance(node, ast.Attribute):
+            parts: List[str] = []
+            cur: ast.AST = node
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                parts.append(cur.id)
+                dotted = ".".join(reversed(parts))
+                if dotted in _BANNED_MODULE_LEVEL_CALLS:
+                    return dotted
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    return None
+
+
+def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
+    """Walk every function scope + the module-level scope,
+    tracking simple ``Name = Attribute|Name`` assignments where
+    the RHS resolves to a banned name. Flag any subsequent
+    ``Call`` to the alias within the same function scope.
+
+    Intra-function alias tracking is full-tree (descends into
+    try/if/with/for inside the function body). Cross-function
+    aliases remain a known gap (runtime sandbox is the final
+    gate). NEVER raises.
+    """
+    try:
+        scopes: List[ast.AST] = [tree]
+        # Collect every function-scope as its own tracking unit.
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scopes.append(n)
+
+        for scope in scopes:
+            # Two-pass within each scope:
+            #   Pass 1: collect all alias bindings (Name=banned).
+            #   Pass 2: walk for Calls to aliased names.
+            # Walking via ast.walk descends into nested control-
+            # flow blocks (try/if/with/for/while) so an alias
+            # inside ``try:`` is still tracked.
+            aliases: dict = {}
+            for node in ast.walk(scope):
+                # Don't recurse into nested function definitions —
+                # those are their own scope (handled in the outer
+                # for loop). The current `scope` is the function-
+                # def itself, so skip its child function defs.
+                if scope is not tree and isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef),
+                ) and node is not scope:
+                    continue
+                if not isinstance(node, ast.Assign):
+                    continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                ):
+                    banned = _resolves_to_banned_name(node.value)
+                    if banned is not None:
+                        aliases[node.targets[0].id] = banned
+            if not aliases:
+                continue
+            for node in ast.walk(scope):
+                if scope is not tree and isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef),
+                ) and node is not scope:
+                    continue
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id in aliases
+                ):
+                    return (
+                        f"Rule 10 (alias_defeat): Call to "
+                        f"{func.id!r} at line "
+                        f"{getattr(node, 'lineno', '?')} — "
+                        f"alias for banned "
+                        f"{aliases[func.id]!r} (P9.4 documented "
+                        f"gap; runtime sandbox is the final gate)"
+                    )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

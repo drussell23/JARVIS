@@ -69,13 +69,20 @@ def _enable_validator(monkeypatch):
 
 class TestRule7Constants:
     def test_banned_attrs_set_shape(self):
+        """Vector #7 closure (2026-05-12) — Rule 7's banned-attrs
+        set expanded from 3 to 9 entries. The original 3 stay;
+        the 6 additions close documented P9.4 gaps."""
         assert v._BANNED_INTROSPECTION_ATTRS == frozenset({
             "__subclasses__", "__bases__", "__class__",
+            "__mro__", "__dict__", "__globals__",
+            "f_back", "f_globals", "f_locals",
         })
 
     def test_banned_attrs_is_frozen(self):
         with pytest.raises(AttributeError):
-            v._BANNED_INTROSPECTION_ATTRS.add("__mro__")  # type: ignore[attr-defined]
+            # Different attr (already in the set after Vector #7
+            # closure) — still proves frozenness.
+            v._BANNED_INTROSPECTION_ATTRS.add("__new_attr__")  # type: ignore[attr-defined]
 
     def test_introspection_escape_in_failure_reason_enum(self):
         assert "INTROSPECTION_ESCAPE" in ValidationFailureReason.__members__
@@ -86,7 +93,9 @@ class TestRule7Constants:
 
     def test_full_failure_reason_set_pinned(self):
         # Pin the full set so adding/removing a reason is intentional.
-        # Phase 7.7 added INTROSPECTION_ESCAPE as the 9th reason.
+        # Phase 7.7 added INTROSPECTION_ESCAPE; Vector #7 closure
+        # (2026-05-12) added INTROSPECTION_BUILTIN_CALL + ALIAS_DEFEAT
+        # for Rules 9 and 10.
         assert {r.value for r in ValidationFailureReason} == {
             "no_phase_runner_subclass",
             "missing_phase_attr",
@@ -97,6 +106,9 @@ class TestRule7Constants:
             "no_top_level_try",
             "banned_import",
             "introspection_escape",
+            "module_level_side_effect",
+            "introspection_builtin_call",
+            "alias_defeat",
         }
 
 
@@ -423,9 +435,11 @@ class TestKillSwitchBehavior:
 
     def test_validator_master_off_skips_everything(self, monkeypatch):
         # If the entire validator is off, Rule 7 doesn't fire either —
-        # ValidationStatus.SKIPPED.
-        monkeypatch.delenv(
-            "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", raising=False,
+        # ValidationStatus.SKIPPED. Master flag graduated default-TRUE
+        # on 2026-05-03; the test must EXPLICITLY set false to
+        # exercise the SKIPPED path.
+        monkeypatch.setenv(
+            "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", "false",
         )
         source = _runner("v = object.__subclasses__()")
         result = validate_ast(source)
