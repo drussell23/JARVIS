@@ -53,13 +53,66 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.orchestrator import GovernedOrchestrator
     from backend.core.ouroboros.governance.op_context import OperationContext
+    from backend.core.ouroboros.governance.park_signal import ParkRequested
 
 logger = logging.getLogger("Ouroboros.BackgroundAgentPool")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1.6 — lazy import of ParkRequested
+# ---------------------------------------------------------------------------
+# Lazy-loaded so the BG pool stays module-import-cheap and the park
+# substrate can be unit-tested without forcing this module to load.
+# Cached on first call (typically the FIRST park event in the process
+# lifetime — there is no resolution on the legacy non-park path).
+#
+# Cannot use ``TYPE_CHECKING`` here because the worker loop must actually
+# catch the class at runtime — TYPE_CHECKING gates compile-time-only
+# imports.  A cached lazy-import is the cleanest pattern that keeps
+# import order acyclic and one-shot.
+
+_PARK_REQUESTED_CLS: Optional[Type[BaseException]] = None
+
+
+def _ParkRequested_t() -> "Type[ParkRequested]":
+    """Resolve and cache the :class:`ParkRequested` class.
+
+    Returns the bare ``BaseException`` subclass that the worker
+    ``except`` clause can use as a class-reference.  Cached for the
+    lifetime of the process — the import is idempotent and the class
+    object never changes mid-process.
+
+    On import failure (substrate not yet merged, broken install) the
+    function returns a sentinel ``_ParkRequestedUnavailable`` class
+    so the ``except`` clause is well-formed but unreachable.  This
+    keeps the worker resilient to substrate breakage — the legacy
+    paths (completed / failed / cancelled / timeout) remain valid.
+    """
+    global _PARK_REQUESTED_CLS
+    if _PARK_REQUESTED_CLS is not None:
+        return _PARK_REQUESTED_CLS  # type: ignore[return-value]
+    try:
+        from backend.core.ouroboros.governance.park_signal import (
+            ParkRequested as _PR,
+        )
+        _PARK_REQUESTED_CLS = _PR
+    except Exception:  # noqa: BLE001 — defensive substrate-load
+        logger.warning(
+            "ParkRequested import failed; park-aware worker loop is a "
+            "no-op until substrate is reachable",
+            exc_info=True,
+        )
+
+        class _ParkRequestedUnavailable(Exception):
+            """Sentinel — never raised, makes the except clause well-formed."""
+
+        _PARK_REQUESTED_CLS = _ParkRequestedUnavailable
+    return _PARK_REQUESTED_CLS  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +133,19 @@ class QueueFullError(Exception):
 # ---------------------------------------------------------------------------
 
 
-_VALID_STATUSES = frozenset({"queued", "running", "completed", "failed", "cancelled"})
+_VALID_STATUSES = frozenset({
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    # Stage 1.6 — terminal-for-this-dispatch but non-terminal for the
+    # op: the slot is freed and a resume dispatch will fire when the
+    # out-of-pool continuation completes.  ``is_terminal`` deliberately
+    # returns False for "parked" so existing watchers (e.g. waiters
+    # awaiting result) keep waiting until the resume completes.
+    "parked",
+})
 
 
 @dataclass
@@ -125,6 +190,18 @@ class BackgroundOp:
     error: Optional[str] = None
     context: Optional[Any] = None  # OperationContext (typed loosely to avoid import)
     task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+    # Stage 1.6 — resume-after-park indicator.  Set to True by the
+    # out-of-pool continuation when it re-submits ctx after the parked
+    # provider call completes.  The GENERATE wrapper (Slice 2b) reads
+    # this (via a pool side-channel) to materialize the parked result
+    # from ParkedOpStore instead of re-issuing the provider call.
+    # Default False = fresh dispatch — behavior identical to pre-1.6.
+    resumed: bool = False
+    # Stage 1.6 — monotonic park-attempt sequence for this op.  Bumped
+    # by the GENERATE wrapper each time it parks, so a GENERATE_RETRY
+    # produces a fresh ledger entry_id under the same op_id.  Default 0
+    # = never parked.
+    park_attempt_seq: int = 0
 
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:
@@ -236,6 +313,13 @@ class BackgroundAgentPool:
         self._completed_count: int = 0
         self._failed_count: int = 0
         self._cancelled_count: int = 0
+        # Stage 1.6 — count of GENERATE-parked dispatches.  Distinct
+        # from completed/failed/cancelled because "parked" is non-
+        # terminal for the op: a separate resumed dispatch will land
+        # one of the other three counters when the out-of-pool
+        # continuation completes.  Surfaced in get_status() for
+        # observability.
+        self._parked_count: int = 0
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -532,6 +616,7 @@ class BackgroundAgentPool:
             "completed_count": self._completed_count,
             "failed_count": self._failed_count,
             "cancelled_count": self._cancelled_count,
+            "parked_count": self._parked_count,
             "active_ops": [
                 {
                     "op_id": op.op_id,
@@ -839,6 +924,32 @@ class BackgroundAgentPool:
                         op.op_id,
                     )
                     raise  # Re-raise to let asyncio handle task cancellation
+                except _ParkRequested_t() as park_exc:
+                    # Stage 1.6 — the op released its slot for the duration
+                    # of provider I/O.  The PARKED_GENERATE ledger entry was
+                    # written by the GENERATE wrapper BEFORE raising
+                    # (canonical authority: orchestrator owns the ledger,
+                    # worker owns the slot).  The out-of-pool continuation
+                    # is already scheduled — on completion it re-submits
+                    # ctx with resumed=True.  Here we just observe + free.
+                    #
+                    # ``op.result`` carries the ParkSignal so observers
+                    # tracing through the BackgroundOp can find the token.
+                    # ``op.status="parked"`` is non-terminal (see
+                    # BackgroundOp.is_terminal — "parked" is deliberately
+                    # NOT in the terminal tuple).
+                    op.result = park_exc.signal
+                    op.status = "parked"
+                    self._parked_count += 1
+                    logger.info(
+                        "Worker %d: operation %s parked at GENERATE "
+                        "token=%s attempt=%d kind=%s — freeing slot "
+                        "(slot held for %.2fs)",
+                        worker_id, op.op_id, park_exc.signal.token,
+                        park_exc.signal.attempt_seq,
+                        park_exc.signal.descriptor.kind,
+                        op.elapsed_s or 0.0,
+                    )
                 except Exception as exc:
                     op.error = f"{type(exc).__name__}: {exc}"
                     op.status = "failed"
