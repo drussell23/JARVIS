@@ -1630,19 +1630,42 @@ class TheOracle:
 
         # Find all Python files
         python_files = await self._find_python_files(repo_path)
-        logger.info(f"Found {len(python_files)} Python files in {repo_name}")
+        total_files = len(python_files)
+        logger.info(f"Found {total_files} Python files in {repo_name}")
 
-        # Process files in parallel batches
+        # Process files in parallel batches.  Per-batch progress logging
+        # so operators have visibility into long-running indexing — the
+        # silent ~24-minute index in stage-1 wiring soak 2026-05-13 had
+        # zero between-boundary logs, making "still indexing" vs "hung"
+        # indistinguishable from outside the process.
         batch_size = OracleConfig.MAX_PARALLEL_FILES
-        for i in range(0, len(python_files), batch_size):
+        batch_count = (total_files + batch_size - 1) // batch_size
+        _t_batch_start = time.monotonic()
+        _last_progress_log = _t_batch_start
+        for i in range(0, total_files, batch_size):
             batch = python_files[i:i + batch_size]
             tasks = [
                 self._index_file(repo_name, repo_path, file_path)
                 for file_path in batch
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Emit progress at most every 5s OR on the last batch — bounds
+            # log volume on fast SSDs while still surfacing forward motion.
+            _now = time.monotonic()
+            files_done = min(i + batch_size, total_files)
+            is_last = files_done >= total_files
+            if is_last or (_now - _last_progress_log) >= 5.0:
+                rate = files_done / max(_now - _t_batch_start, 0.001)
+                pct = 100.0 * files_done / max(total_files, 1)
+                logger.info(
+                    "[Oracle.index] %s: %d/%d files (%.1f%%) "
+                    "rate=%.0f files/s elapsed=%.1fs",
+                    repo_name, files_done, total_files, pct,
+                    rate, _now - _t_batch_start,
+                )
+                _last_progress_log = _now
 
-        self._graph._metrics["files_indexed"] = len(python_files)
+        self._graph._metrics["files_indexed"] = total_files
 
     async def _find_python_files(self, root: Path) -> List[Path]:
         """Find all Python files in a directory, excluding patterns."""
@@ -1671,42 +1694,90 @@ class TheOracle:
         return python_files
 
     async def _index_file(self, repo_name: str, repo_path: Path, file_path: Path) -> None:
-        """Index a single Python file."""
+        """Index a single Python file.
+
+        The CPU-heavy work (file read + ``ast.parse`` + visitor walk) is
+        dispatched to a worker thread via ``asyncio.to_thread`` so 14
+        threads can chew through files concurrently instead of
+        serializing on the asyncio event loop.  Only the graph mutation
+        runs on the event loop (small + fast dict/list inserts; the
+        single-threaded mutation also avoids needing graph-level
+        thread-safety).
+
+        Stage-1 wiring soak 2026-05-13 observation: the original
+        implementation moved ONLY ``file_path.read_text`` into a thread
+        and ran ``ast.parse`` + ``visitor.visit`` synchronously on the
+        event loop, which serialized the most expensive work and
+        produced ~24-minute cold-cache index times.  Moving the parse
+        and walk into the same to_thread call lets the default
+        ThreadPoolExecutor's ~14 workers run them in parallel, dropping
+        the cold-cache index to single-digit minutes on typical macOS
+        hardware.
+        """
         try:
-            # Read file content
-            content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
-
-            # Calculate hash for change detection
-            content_hash = hashlib.md5(content.encode()).hexdigest()
-            relative_path = str(file_path.relative_to(repo_path))
-
-            # Skip if unchanged
-            cache_key = f"{repo_name}:{relative_path}"
-            if cache_key in self._file_hashes and self._file_hashes[cache_key] == content_hash:
-                return
-
-            self._file_hashes[cache_key] = content_hash
-
-            # Parse AST
-            try:
-                tree = ast.parse(content, filename=str(file_path))
-            except SyntaxError as e:
-                logger.warning(f"Syntax error in {file_path}: {e}")
-                return
-
-            # Extract structure
-            visitor = CodeStructureVisitor(repo_name, relative_path, content)
-            visitor.visit(tree)
-
-            # Add to graph
-            for node_data in visitor.nodes:
-                self._graph.add_node(node_data)
-
-            for source, target, edge_data in visitor.edges:
-                self._graph.add_edge(source, target, edge_data)
-
+            parse_result = await asyncio.to_thread(
+                self._read_parse_visit_blocking,
+                repo_name, repo_path, file_path,
+            )
         except Exception as e:
             logger.warning(f"Error indexing {file_path}: {e}")
+            return
+        if parse_result is None:
+            return
+
+        nodes, edges, cache_key, content_hash = parse_result
+        # Graph mutations happen on the event loop — fast, atomic per op,
+        # and the single-threaded write side keeps the graph internally
+        # consistent without per-instance locks.
+        self._file_hashes[cache_key] = content_hash
+        for node_data in nodes:
+            self._graph.add_node(node_data)
+        for source, target, edge_data in edges:
+            self._graph.add_edge(source, target, edge_data)
+
+    def _read_parse_visit_blocking(
+        self,
+        repo_name: str,
+        repo_path: Path,
+        file_path: Path,
+    ) -> "Optional[Tuple[list, list, str, str]]":
+        """Read + AST-parse + visitor-walk a single Python file.
+
+        Designed to run ENTIRELY in a worker thread (called via
+        ``asyncio.to_thread``).  Returns ``(nodes, edges, cache_key,
+        content_hash)`` or ``None`` to signal "skip" (unchanged file
+        in incremental mode, syntax error, or unreadable file).
+
+        Reads ``self._file_hashes`` for the unchanged-skip check.  In
+        Python with the GIL, individual dict reads are atomic; the
+        incremental-update path holds ``self._lock`` (asyncio.Lock) at
+        the caller level so concurrent writes can't tear the read.
+        """
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Error reading {file_path}: {e}")
+            return None
+
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        relative_path = str(file_path.relative_to(repo_path))
+        cache_key = f"{repo_name}:{relative_path}"
+
+        # Skip if unchanged (incremental-update fast path)
+        existing = self._file_hashes.get(cache_key)
+        if existing is not None and existing == content_hash:
+            return None
+
+        try:
+            tree = ast.parse(content, filename=str(file_path))
+        except SyntaxError as e:
+            logger.warning(f"Syntax error in {file_path}: {e}")
+            return None
+
+        visitor = CodeStructureVisitor(repo_name, relative_path, content)
+        visitor.visit(tree)
+
+        return visitor.nodes, visitor.edges, cache_key, content_hash
 
     async def _update_file(self, file_path: Path) -> None:
         """Update index for a specific file."""
