@@ -806,6 +806,80 @@ def test_compute_blast_radius_walks_only_under_scan_root(tmp_path) -> None:
     )
 
 
+def test_classify_runner_threads_repo_root_through_advise_async() -> None:
+    """The PRIMARY CLASSIFY path (phase_runners/classify_runner.py)
+    MUST call ``resolve_envelope_repo_root`` AND pass its result via
+    ``repo_root=`` to every ``advise_async`` invocation.
+
+    Gap closed 2026-05-13: stage-1 wiring soak v11 (session
+    bt-2026-05-13-181745) showed that even with the worktree-aware
+    master flag graduated to default-TRUE, the SWE-Bench-Pro op
+    still hit the BG-pool 360s ceiling because classify_runner was
+    threading nothing — it called ``advise_async`` without
+    ``repo_root=``, so advise() byte-identically fell back to
+    project_root.  Only orchestrator.py's parallel CLASSIFY path
+    (rarely reached in production) was threading the override.
+
+    AST pin: every ``advise_async`` call in classify_runner.py MUST
+    pass ``repo_root=`` as a keyword.  Drift here would silently
+    re-introduce the wrong-substrate failure mode even though the
+    flag-gate above is now permissive.
+    """
+    import ast as _ast
+    import inspect as _inspect
+    from backend.core.ouroboros.governance.phase_runners import (
+        classify_runner,
+    )
+    src = Path(_inspect.getfile(classify_runner)).read_text(encoding="utf-8")
+    tree = _ast.parse(src)
+
+    # First: confirm resolve_envelope_repo_root is imported & called
+    resolver_called = False
+    advise_async_sites: list = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        func = node.func
+        name = (
+            func.attr if isinstance(func, _ast.Attribute)
+            else func.id if isinstance(func, _ast.Name)
+            else None
+        )
+        if name == "resolve_envelope_repo_root":
+            resolver_called = True
+        if name == "advise_async":
+            advise_async_sites.append(node)
+
+    assert resolver_called, (
+        "classify_runner.py never calls resolve_envelope_repo_root — "
+        "envelope-evidence-driven worktree-aware advisory wiring is "
+        "missing.  This was the gap that made stage-1 wiring soak "
+        "v11 advise() starve even after Phase 0 graduation."
+    )
+    assert advise_async_sites, (
+        "classify_runner.py has no advise_async calls — earlier PRs "
+        "presumed at least two (primary + fallback).  Either the "
+        "advisor path was removed or this test is searching the "
+        "wrong file."
+    )
+
+    missing_repo_root: list = []
+    for call in advise_async_sites:
+        if not any(kw.arg == "repo_root" for kw in call.keywords):
+            unparsed = _ast.unparse(call)[:140]
+            missing_repo_root.append(
+                f"line {call.lineno}: {unparsed}"
+            )
+
+    assert not missing_repo_root, (
+        "classify_runner.py has advise_async call(s) without "
+        "``repo_root=``.  This re-introduces the v11 wrong-substrate "
+        "failure mode — the envelope's worktree gets discarded and "
+        "advise() rglob-scans project_root.  Offenders:\n"
+        + "\n".join(f"  - {s}" for s in missing_repo_root)
+    )
+
+
 def test_compute_blast_radius_scan_root_does_NOT_climb_to_project_root(tmp_path) -> None:
     """Sibling pin to scan-bounding: the scan MUST NOT walk UP the
     filesystem from scan_root.  An importer in a parent directory

@@ -260,6 +260,7 @@ class CLASSIFYRunner(PhaseRunner):
         try:
             from backend.core.ouroboros.governance.operation_advisor import (
                 OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
+                resolve_envelope_repo_root,
             )
             # Stamp read-only intent onto the hash-chained context BEFORE
             # advising. The Advisor's bypass of blast_radius + test_coverage
@@ -277,6 +278,33 @@ class CLASSIFYRunner(PhaseRunner):
                         ctx.op_id,
                     )
             _advisor = OperationAdvisor(orch._config.project_root)
+
+            # B.2.0 worktree-aware advisor: when the envelope carries a
+            # trusted ``repo_root`` in evidence AND the (now-graduated
+            # 2026-05-13) master flag is on, scan THAT tree instead of
+            # the orchestrator's project_root.  resolve_envelope_repo_root
+            # validates the path against project_root + the allowlist
+            # env knob, returning None if anything is off — at which
+            # point advise() byte-identically falls back to scanning
+            # project_root.  Threading the resolved root through BOTH
+            # primary and fallback advise_async sites closes the gap
+            # observed in v11 stage-1 wiring soak (session
+            # bt-2026-05-13-181745): orchestrator.py's parallel
+            # CLASSIFY path passed repo_root, but THIS — the primary
+            # classify_runner path that actually runs in production —
+            # did not, so the 6-file SWE-Bench-Pro worktree silently
+            # triggered a full project_root scan.
+            _adv_repo_root = resolve_envelope_repo_root(
+                ctx.intake_evidence_json,
+                project_root=orch._config.project_root,
+            )
+            if _adv_repo_root is not None:
+                logger.info(
+                    "[Orchestrator] Advisor scanning per-envelope "
+                    "repo_root=%s for op=%s "
+                    "(legacy project_root retained as fallback)",
+                    _adv_repo_root, ctx.op_id,
+                )
 
             # Phase 1 Slice 1.3.a — wrap the advisor verdict in
             # capture_phase_decision so RECORD/REPLAY/VERIFY work for
@@ -302,11 +330,19 @@ class CLASSIFYRunner(PhaseRunner):
                     # bounded executor guarantees advisor isolation;
                     # queue depth is logged on every submission for
                     # operator-visible observability.
+                    #
+                    # ``repo_root`` (2026-05-13) — when the envelope
+                    # carries a trusted worktree path AND the
+                    # graduated master flag accepts it, scan THAT
+                    # tree instead of project_root.  For SWE-Bench-Pro
+                    # 6-file worktrees, this turns a 29.5k-file scan
+                    # into a millisecond walk.
                     return await _advisor.advise_async(
                         ctx.target_files,
                         ctx.description,
                         ctx.op_id,
                         is_read_only=ctx.is_read_only,
+                        repo_root=_adv_repo_root,
                     )
 
                 _advisory = await capture_phase_decision(
@@ -338,11 +374,14 @@ class CLASSIFYRunner(PhaseRunner):
                 # Fallback path ALSO routes through dedicated executor —
                 # leaving asyncio.to_thread here would re-introduce
                 # default-executor contention for the fallback case.
+                # ``repo_root`` threaded for the same worktree-aware
+                # benefit as the primary path above.
                 _advisory = await _advisor.advise_async(
                     ctx.target_files,
                     ctx.description,
                     ctx.op_id,
                     is_read_only=ctx.is_read_only,
+                    repo_root=_adv_repo_root,
                 )
 
             if _advisory.decision == AdvisoryDecision.BLOCK:
