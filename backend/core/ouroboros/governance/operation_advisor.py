@@ -71,6 +71,25 @@ _BLAST_RADIUS_CACHE_MAX_ENTRIES: int = int(
     os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_CACHE_MAX_ENTRIES", "256")
 )
 
+# Module-level cache — shared across ALL OperationAdvisor instances in
+# the process so that per-CLASSIFY-call instantiation (classify_runner
+# line ~278; orchestrator line ~1855) doesn't re-pay the cold scan for
+# every op.  Stage-1 wiring soak 2026-05-13 (session
+# bt-2026-05-13-070956) caught the per-instance trap: my per-instance
+# cache was correct in isolation (114,567x speedup demonstrated) but
+# wasted in production because each CLASSIFY built a fresh
+# OperationAdvisor and lost the cached state.  Advisor verdict latency
+# observed at 8m28s for the SWE-Bench-Pro envelope; expected drop to
+# seconds with the shared cache.
+#
+# Cache key includes ``str(scan_root)`` so worktree-aware advisors
+# (each with a distinct scan tree) never read each other's results.
+# Single threading.Lock guards mutation since the cache is accessed
+# from worker threads via asyncio.to_thread.
+_BLAST_RADIUS_CACHE_SHARED: "Dict[Tuple[frozenset, str], Tuple[float, int]]" = {}
+import threading as _threading  # local alias — keep top-level import block clean
+_BLAST_RADIUS_CACHE_LOCK: "_threading.Lock" = _threading.Lock()
+
 # ---------------------------------------------------------------------------
 # B.2.0 — Worktree-aware advisory (SWE-Bench-Pro Phase 2 enabling layer +
 # permanent improvement for L3 worktree-isolated work and the in-repo L2
@@ -399,13 +418,13 @@ class OperationAdvisor:
 
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
-        # Blast-radius memoization — see _BLAST_RADIUS_CACHE_TTL_S module
-        # comment.  Stores (frozenset(target_files), str(scan_root)) →
-        # (computed_at_monotonic, result).  Bounded by
-        # _BLAST_RADIUS_CACHE_MAX_ENTRIES via FIFO eviction.  Per-instance
-        # so worktree-aware ops (different scan_root per envelope) don't
-        # cross-pollute, and so test fixtures get isolated state.
-        self._blast_radius_cache: "Dict[Tuple[frozenset, str], Tuple[float, int]]" = {}
+        # Blast-radius memoization — see _BLAST_RADIUS_CACHE_SHARED
+        # module-level state for the shared store.  This attribute is
+        # an alias to the module-level dict, kept for backward-compat
+        # with existing tests that introspect ``self._blast_radius_cache``
+        # directly.  Mutation goes through ``_BLAST_RADIUS_CACHE_LOCK``
+        # because the dict is accessed from worker threads.
+        self._blast_radius_cache = _BLAST_RADIUS_CACHE_SHARED
 
     def advise(
         self,
@@ -600,10 +619,13 @@ class OperationAdvisor:
 
         # Cache lookup — frozenset key makes the cache invariant to
         # target_files tuple ordering (coalesced envelopes can arrive
-        # in arbitrary order).
+        # in arbitrary order).  Module-level shared cache: every
+        # OperationAdvisor instance reads/writes the same store so
+        # per-CLASSIFY-call instantiation doesn't re-pay the cold scan.
         cache_key = (frozenset(target_files), str(scan_root))
         now = time.monotonic()
-        cached = self._blast_radius_cache.get(cache_key)
+        with _BLAST_RADIUS_CACHE_LOCK:
+            cached = _BLAST_RADIUS_CACHE_SHARED.get(cache_key)
         if cached is not None:
             computed_at, result = cached
             if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
@@ -618,8 +640,9 @@ class OperationAdvisor:
                 target_modules.add(Path(f).stem)
 
         if not target_modules:
-            self._blast_radius_cache[cache_key] = (now, 0)
-            self._evict_blast_radius_cache_if_oversized()
+            with _BLAST_RADIUS_CACHE_LOCK:
+                _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, 0)
+                self._evict_blast_radius_cache_if_oversized()
             return 0
 
         importers = 0
@@ -638,8 +661,9 @@ class OperationAdvisor:
         # Record + bound the cache.  FIFO eviction is acceptable because the
         # TTL already bounds entry age; max-entries is a defensive memory
         # ceiling not the primary freshness mechanism.
-        self._blast_radius_cache[cache_key] = (now, importers)
-        self._evict_blast_radius_cache_if_oversized()
+        with _BLAST_RADIUS_CACHE_LOCK:
+            _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+            self._evict_blast_radius_cache_if_oversized()
         return importers
 
     def _evict_blast_radius_cache_if_oversized(self) -> None:
@@ -650,8 +674,11 @@ class OperationAdvisor:
         entries get overwritten by the next compute pass with the same key,
         and unused expired entries are evicted only when memory pressure
         (max_entries) forces it.  Acceptable for a 60s-TTL cache.
+
+        MUST be called with ``_BLAST_RADIUS_CACHE_LOCK`` held — the
+        eviction races on the shared module-level dict.
         """
-        cache = self._blast_radius_cache
+        cache = _BLAST_RADIUS_CACHE_SHARED
         while len(cache) > _BLAST_RADIUS_CACHE_MAX_ENTRIES:
             # popitem(last=False) is dict-method on Python 3.7+ via
             # iter(cache).  Use next(iter(...)) for explicit FIFO.
