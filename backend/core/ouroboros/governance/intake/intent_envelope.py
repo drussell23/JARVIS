@@ -68,6 +68,19 @@ _VALID_SOURCES = frozenset({
     # (low-cost; never burns Claude budget). See PRD §36.5 priority #1
     # + `phase_9_synthetic_workload.py`.
     "cadence_synthetic",
+    # Added 2026-05-12 for SWE-Bench-Pro Phase 2 Phase B.2.1 evaluator
+    # envelopes (PRD §40.7.9 / §40.7.10-b21). Same honest-source-token
+    # precedent: external-benchmark workloads MUST NOT masquerade as
+    # `cadence_synthetic` / `ai_miner` / etc. Downstream observability
+    # (B.2.0.5 op_lifecycle SSE + IDE consumers + benchmark scorers in
+    # Phase C) filter on this token to distinguish benchmark eval traffic
+    # from production signal flow. The B.2.1 envelope_builder writes
+    # this value via the single-source-of-truth ``ENVELOPE_SOURCE``
+    # constant exported by
+    # ``backend.core.ouroboros.governance.swe_bench_pro.envelope_builder``
+    # — drift between that constant and this frozenset is caught by an
+    # AST pin in the B.2.1 spine.
+    "swe_bench_pro",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 

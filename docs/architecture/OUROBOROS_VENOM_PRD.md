@@ -570,6 +570,70 @@ v2 fix (`df4b70a4a8`):
 
 **Next**: B.2.1 (`PreparedProblem → IntentEnvelope` builder using `EVIDENCE_REPO_ROOT_KEY` from B.2.0 + new envelope source `"swe_bench_pro"`) + B.2.2 (`evaluate_problem` façade composing this PR's canonical broker subscription with bounded `asyncio.wait_for`) + B.2.3 (spine asserting terminal resolution goes through broker first + optional one-shot ledger fallback on timeout + no unbounded waits). Operator-bound as a separate commit chain.
 
+##### §40.7.10-b21 — SWE-Bench-Pro envelope builder (CLOSED 2026-05-12; PR 3 of the B.2 arc)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/b-2-1-envelope-builder`. PR 3 of the operator-bound split (PR 1 = B.2.0 advisor / PR 2 = B.2.0.5 lifecycle SSE / PR 3 = this builder / PR 4 = B.2.2 façade + B.2.3 spine). The builder is a pure-data composition layer with no side effects — the natural unit to ship before the side-effect-producing evaluator façade.
+
+**What it does**: `build_evaluation_envelope(problem: ProblemSpec, prepared: PreparedProblem) -> IntentEnvelope` composes Phase A's `ProblemSpec` + Phase B.1's `PreparedProblem` into an `IntentEnvelope` ready for `IntakeLayerService.ingest_envelope`. The envelope's `evidence[repo_root]` carries the worktree path so the B.2.0 worktree-aware advisor scans the cloned tree's small import graph; the envelope's `causal_id` becomes the downstream `OperationContext.op_id`, which the B.2.2 evaluator façade uses to subscribe to the B.2.0.5 `operation_terminal` SSE stream. End-to-end, the three preceding PRs compose into a clean primary-path rendezvous shape.
+
+**Canonical composition discipline**:
+- **Single source of truth for the evidence key**: imports `EVIDENCE_REPO_ROOT_KEY` from `operation_advisor.py` (the B.2.0 export). AST pin in the spine forbids any naked `"repo_root"` string literal in the builder body — drift would silently fork the producer/consumer contract.
+- **Single source of truth for the envelope-source token**: `ENVELOPE_SOURCE = "swe_bench_pro"` constant exported from the builder. AST pin asserts membership in `_VALID_SOURCES` so renames propagate. The frozenset entry in `intent_envelope.py` carries an inline comment cross-referencing this constant.
+- **Canonical factory composition**: invokes `make_envelope(...)` from `intake/intent_envelope.py`. AST pin forbids any direct `IntentEnvelope(...)` constructor call in the builder — that would bypass causal_id / idempotency_key allocation + `_dedup_key` derivation.
+- **No master-flag gate in the builder**: pure data composition. The `swe_bench_pro_enabled()` check lives in B.2.2's side-effect-producing façade. AST pin in the spine forbids any `swe_bench_pro_enabled` call inside the builder body — drift would couple data composition to env state and create the "flag drift across layers" anti-pattern.
+- **Source-agnostic policy (mirrors B.2.0 hardening note 4)**: downstream consumers MUST NOT branch on `source == "swe_bench_pro"` for correctness. The token exists for observability + WAL replay + router-side dedup only; behavioral routing flows through observable envelope/context fields (target_files, evidence.repo_root, urgency).
+
+**Honest urgency derivation**:
+- Default `"low"` → routes BACKGROUND via UrgencyRouter → DW-only (no Claude budget burn on bulk eval)
+- `JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY` env override accepts any of the four valid urgencies (`critical` / `high` / `normal` / `low`)
+- Case-insensitive + whitespace-trimmed
+- Invalid values produce a WARN log and fall back to default (keeps benchmark robust to operator typos)
+
+**Evidence schema (closed, documented for the B.2.2 evaluator + Phase C scorer)**:
+- `repo_root` → `str(prepared.worktree_path)`
+- `problem_instance_id` → `ProblemSpec.instance_id`
+- `base_commit` → `ProblemSpec.base_commit`
+- `branch_name` → `PreparedProblem.branch_name`
+- `repo_url` → `ProblemSpec.repo_url`
+- `signature` → `ProblemSpec.instance_id` (drives `_dedup_key` so back-to-back ingests of the same problem within the router's idempotency window collapse to one op)
+
+**Spine — 31 regression tests + 5 AST pins**:
+- Builder produces valid IntentEnvelope (passes `__post_init__` + round-trips through `to_dict` / `from_dict`)
+- Source / target_files / evidence / description correct
+- 4 urgency-default-low + 4-valid-urgency-env-override (parametrized) + invalid-fallback + case-insensitive
+- repo derivation (prefers `.repo` over `.repo_url`)
+- confidence=1.0 + requires_human_ack=False (benchmark contract)
+- Signature / dedup_key stable across builds for same problem; causal_id fresh per build
+- Source membership in `_VALID_SOURCES`
+- AST pin: builder imports `EVIDENCE_REPO_ROOT_KEY`
+- AST pin: no naked `"repo_root"` literal in builder body
+- AST pin: builder calls `make_envelope` and never `IntentEnvelope(...)` directly
+- AST pin: no `swe_bench_pro_enabled` call inside builder
+- AST pin: `ENVELOPE_SOURCE == "swe_bench_pro"` literal pinned
+- 2 FlagRegistry seed assertions
+- End-to-end: envelope JSON-serializable (load-bearing precondition for `unified_intake_router`'s `intake_evidence_json` stamping); target_files non-empty
+
+**Master flag (§33.1; FlagRegistry auto-seeded)**:
+- `JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY` (STR/INTEGRATION, default `"low"`) — operator override for the per-envelope urgency, applies cleanly through UrgencyRouter
+
+**Surrounding regression**: 199 cumulative tests green across B.2.1 spine + Phase A + B.1 + B.2.0 advisor + B.2.0.5 lifecycle + read-only-advisor + `_run_inner` sha256 pin. `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine). Pre-existing test-ordering pollution in `test_l2_exercise_seed.py::test_register_flags_*` is unrelated (same 5 failures occur on main without these changes — `flag_registry` class-identity drift across imports).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/envelope_builder.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports
+- `backend/core/ouroboros/governance/intake/intent_envelope.py` — `_VALID_SOURCES` += `"swe_bench_pro"` with provenance comment
+- `tests/governance/test_swe_bench_pro_envelope_builder.py` — 31-test spine + 5 AST pins
+
+**What this PR deliberately did NOT do**:
+- No side effects in the builder (no `ingest_envelope`, no SSE subscription) — those land in B.2.2
+- No master-flag gate in the builder body (responsibility separation)
+- No parallel envelope construction (composes canonical `make_envelope`)
+- No parallel evidence key spelling (imports canonical `EVIDENCE_REPO_ROOT_KEY`)
+- No source-conditional logic anywhere downstream
+- No graduation flip — envelope construction is dormant until B.2.2 ships the side-effect-producing surface
+
+**Next**: PR 4 — B.2.2 `evaluate_problem(problem: ProblemSpec)` async façade composing `prepare_problem` (B.1) → `build_evaluation_envelope` (B.2.1) → `IntakeLayerService.ingest_envelope` + `StreamEventBroker.subscribe(op_id_filter=envelope.causal_id)` rendezvous + bounded `asyncio.wait_for` with optional one-shot `OperationLedger.get_latest_state` fallback on timeout → `capture_produced_patch` (B.1) → `cleanup_prepared` (B.1) → `EvaluationResult`. Plus B.2.3 spine asserting terminal resolution goes through broker first + AST pin against unbounded waits anywhere in the façade.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)

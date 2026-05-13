@@ -2,12 +2,14 @@
 
 Package layout (one phase per module; all default-FALSE per §33.1):
 
-  * ``dataset_loader``   — Phase A: ProblemSpec + cache + load.
-  * (future) ``per_problem_harness`` — Phase B
-  * (future) ``scorer``               — Phase C
-  * (future) ``result_substrate``     — Phase D
-  * (future) ``parallel_eval``        — Phase E
-  * (future) ``report_card``          — Phase F
+  * ``dataset_loader``     — Phase A: ProblemSpec + cache + load.
+  * ``per_problem_harness`` — Phase B.1: PreparedProblem + worktree.
+  * ``envelope_builder``    — Phase B.2.1: PreparedProblem → IntentEnvelope.
+  * (future) ``evaluator``  — Phase B.2.2: evaluate_problem façade.
+  * (future) ``scorer``     — Phase C
+  * (future) ``result_substrate`` — Phase D
+  * (future) ``parallel_eval``    — Phase E
+  * (future) ``report_card``      — Phase F
 
 Composition discipline (mirrors :mod:`l2_exercise_seed` pattern):
 
@@ -49,6 +51,11 @@ from backend.core.ouroboros.governance.swe_bench_pro.per_problem_harness import 
     repo_cache_path,
     worktree_base_path,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.envelope_builder import (
+    ENVELOPE_SOURCE,
+    ENVELOPE_URGENCY_ENV_VAR,
+    build_evaluation_envelope,
+)
 
 
 __all__ = [
@@ -71,4 +78,8 @@ __all__ = [
     "prepare_problem",
     "repo_cache_path",
     "worktree_base_path",
+    # Phase B.2.1 — envelope builder
+    "ENVELOPE_SOURCE",
+    "ENVELOPE_URGENCY_ENV_VAR",
+    "build_evaluation_envelope",
 ]
