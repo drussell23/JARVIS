@@ -543,6 +543,89 @@ def test_ast_pin_wrapper_three_paths_present():
     assert "Path 3 — LEGACY" in src, "LEGACY path marker missing"
 
 
+def test_park_requested_propagates_past_except_exception():
+    """ParkRequested MUST NOT be caught by ``except Exception:`` clauses.
+
+    This is the load-bearing invariant for production wiring: the
+    orchestrator's GENERATE retry loop at generate_runner.py:1210 has
+    an ``except Exception as exc:`` catch-all that would otherwise
+    swallow park-emit and route to retry/failure.  By inheriting from
+    BaseException (mirroring asyncio.CancelledError), ParkRequested
+    propagates transparently past every ``except Exception:`` in the
+    pipeline — leaving the BG worker's structured handler as the only
+    catcher.
+
+    If a future refactor regresses ParkRequested to subclass Exception,
+    THIS test will fail and the operator will see the regression
+    BEFORE it breaks a live soak.
+    """
+    from backend.core.ouroboros.governance.park_signal import (
+        ParkRequested,
+    )
+
+    signal = ParkSignal(
+        op_id="op-propagation-test",
+        token="op-propagation-test::attempt-1",
+        attempt_seq=1,
+        descriptor=ParkDescriptor(kind="generate", payload={}),
+        park_started_at=0.0,
+    ) if False else None  # noqa: F841
+
+    from backend.core.ouroboros.governance.park_signal import (
+        ParkDescriptor as _PD,
+    )
+
+    sig = ParkSignal_make_minimal()
+    caught = None
+    try:
+        try:
+            raise ParkRequested(sig)
+        except Exception as exc:  # noqa: BLE001 — this is the test
+            caught = exc
+    except ParkRequested:
+        pass
+    assert caught is None, (
+        f"ParkRequested was caught by `except Exception:` — this WILL "
+        f"break production wiring at generate_runner.py:1210. "
+        f"Caught: {caught!r}. Ensure ParkRequested inherits from "
+        f"BaseException, NOT Exception."
+    )
+
+
+def ParkSignal_make_minimal():
+    """Local helper to mint a minimal ParkSignal for propagation test."""
+    from backend.core.ouroboros.governance.park_signal import (
+        ParkDescriptor as _PD,
+        ParkSignal as _PS,
+    )
+    return _PS(
+        op_id="op-x", token="op-x::attempt-1", attempt_seq=1,
+        descriptor=_PD(kind="generate", payload={}),
+        park_started_at=0.0,
+    )
+
+
+def test_park_requested_inherits_from_base_exception():
+    """Direct AST/runtime pin — ParkRequested.__mro__ MUST include BaseException
+    but NOT Exception in its direct parent set."""
+    from backend.core.ouroboros.governance.park_signal import (
+        ParkRequested,
+    )
+    # MRO chain
+    mro = ParkRequested.__mro__
+    assert BaseException in mro, "ParkRequested must inherit from BaseException"
+    # The direct parent of ParkRequested must be BaseException (not Exception)
+    direct_parents = ParkRequested.__bases__
+    assert BaseException in direct_parents, (
+        f"ParkRequested.__bases__ must include BaseException; got {direct_parents}"
+    )
+    assert Exception not in direct_parents, (
+        f"ParkRequested must NOT inherit directly from Exception "
+        f"(would be caught by `except Exception:` in orchestrator). "
+        f"Got bases: {direct_parents}"
+    )
+
+
 def test_ast_pin_wrapper_master_flag_first():
     """The wrapper MUST gate on park_enabled() in EVERY non-legacy
     branch — preserving the §33.1 default-FALSE invariant."""

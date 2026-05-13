@@ -192,11 +192,25 @@ def test_park_requested_resolver_caches_result():
 # ---------------------------------------------------------------------------
 
 
-def test_park_requested_subclasses_exception():
-    """Worker's ``except`` clause requires BaseException subclass."""
+def test_park_requested_subclasses_base_exception_only():
+    """ParkRequested MUST subclass BaseException but NOT Exception.
+
+    This mirrors asyncio.CancelledError exactly.  If ParkRequested
+    inherited from Exception it would be caught by the GENERATE
+    retry-loop's ``except Exception as exc:`` at generate_runner.py:1210
+    and routed to retry/failure instead of park-emit.
+    """
     signal = _make_signal()
     exc = ParkRequested(signal)
-    assert isinstance(exc, Exception)
+    assert isinstance(exc, BaseException), (
+        "ParkRequested must subclass BaseException for the worker "
+        "except clause + worker-loop except chain to bind it"
+    )
+    assert not isinstance(exc, Exception), (
+        "ParkRequested must NOT subclass Exception — would be caught by "
+        "`except Exception:` clauses throughout the orchestrator (esp. "
+        "generate_runner.py:1210). See ParkRequested docstring for why."
+    )
     assert exc.signal is signal
 
 
