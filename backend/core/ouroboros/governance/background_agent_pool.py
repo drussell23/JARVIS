@@ -53,7 +53,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.orchestrator import GovernedOrchestrator
@@ -727,29 +727,74 @@ class BackgroundAgentPool:
                     _is_read_only = bool(
                         getattr(op.context, "is_read_only", False)
                     )
+                    _signal_source = (
+                        getattr(op.context, "signal_source", "") or ""
+                    )
+
+                    # Source-aware + shape-aware timebox table — operator
+                    # binding 2026-05-13 ("per-route / per-source timeout
+                    # table; default conservative for sensors, explicitly
+                    # higher for swe_bench_pro").  Same discipline as the
+                    # CLAUDE.md route-timeout table — env-tunable, single
+                    # source of truth per category, MAX-aggregated so
+                    # multiple applicable categories compose (e.g.
+                    # read-only swe_bench_pro takes whichever is longer)
+                    # rather than letting the precedence chain accidentally
+                    # mask a longer legitimate budget.
+                    #
+                    # Stage-1 wiring soak v12 (session
+                    # bt-2026-05-13-201526) caught the gap: SWE-Bench-Pro
+                    # envelopes with 1 target file + is_read_only=False
+                    # inherited the 360s sensor base, which is too tight
+                    # for the full CLASSIFY → ROUTE → CTX → PLAN →
+                    # GENERATE-with-LLM → VALIDATE → APPLY → VERIFY
+                    # pipeline.  Source-aware budget lets benchmark eval
+                    # work get a longer lease without raising the global
+                    # default and weakening the anti-hang watchdog for
+                    # sensor traffic.
+                    _candidates: "List[Tuple[float, str]]" = [
+                        (_op_timeout_base_s, "base"),
+                    ]
                     if _is_read_only:
-                        _op_timeout_s = float(os.environ.get(
-                            "JARVIS_BG_WORKER_OP_TIMEOUT_READONLY_S", "900",
+                        _candidates.append((
+                            float(os.environ.get(
+                                "JARVIS_BG_WORKER_OP_TIMEOUT_READONLY_S",
+                                "900",
+                            )),
+                            "read_only",
                         ))
-                        logger.info(
-                            "Worker %d: %s read-only ceiling %.0fs "
-                            "(file_count=%d, base=%.0fs) — subagent "
-                            "fan-out + synthesis profile",
-                            worker_id, op.op_id, _op_timeout_s,
-                            _target_file_count, _op_timeout_base_s,
-                        )
-                    elif _target_file_count >= 4:
-                        _op_timeout_s = float(os.environ.get(
-                            "JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S", "900",
+                    if _target_file_count >= 4:
+                        _candidates.append((
+                            float(os.environ.get(
+                                "JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S",
+                                "900",
+                            )),
+                            "complex",
                         ))
+                    if _signal_source == "swe_bench_pro":
+                        _candidates.append((
+                            float(os.environ.get(
+                                "JARVIS_BG_WORKER_OP_TIMEOUT_SWE_BENCH_PRO_S",
+                                "900",
+                            )),
+                            "swe_bench_pro",
+                        ))
+                    # Max-aggregation: the longest applicable ceiling wins.
+                    # Tie-break by category-name lexicographic order so the
+                    # log line is deterministic across runs.
+                    _op_timeout_s, _ceiling_reason = max(
+                        _candidates, key=lambda p: (p[0], p[1]),
+                    )
+                    if _ceiling_reason != "base":
                         logger.info(
-                            "Worker %d: %s complex-route ceiling %.0fs "
-                            "(file_count=%d, base=%.0fs)",
+                            "Worker %d: %s ceiling=%.0fs reason=%s "
+                            "(source=%r, file_count=%d, read_only=%s, "
+                            "base=%.0fs)",
                             worker_id, op.op_id, _op_timeout_s,
-                            _target_file_count, _op_timeout_base_s,
+                            _ceiling_reason, _signal_source,
+                            _target_file_count, _is_read_only,
+                            _op_timeout_base_s,
                         )
-                    else:
-                        _op_timeout_s = _op_timeout_base_s
                     result = await asyncio.wait_for(
                         _orch.run(op.context), timeout=_op_timeout_s,
                     )
@@ -763,13 +808,27 @@ class BackgroundAgentPool:
                         op.elapsed_s or 0.0,
                     )
                 except asyncio.TimeoutError:
-                    op.error = f"pool_worker_timeout:{_op_timeout_s:.0f}s"
+                    # Structured reason_code per operator binding 2026-05-13:
+                    # "orchestrator cooperative checkpoints so kills are
+                    # observable (reason_code=bg_timebox) not silent
+                    # starvation".  The structured payload carries the
+                    # applied category + source so downstream observability
+                    # (op-lifecycle SSE, audit ledger, postmortem) can
+                    # distinguish ceiling-bound kills from upstream
+                    # cancellations.
+                    op.error = (
+                        f"bg_timebox:{_ceiling_reason}:"
+                        f"source={_signal_source or '-'}:"
+                        f"timeout={_op_timeout_s:.0f}s"
+                    )
                     op.status = "failed"
                     self._failed_count += 1
                     logger.warning(
                         "Worker %d: operation %s exceeded pool ceiling "
-                        "(%.0fs) — freeing slot",
-                        worker_id, op.op_id, _op_timeout_s,
+                        "reason=bg_timebox category=%s source=%r "
+                        "timeout=%.0fs — freeing slot",
+                        worker_id, op.op_id, _ceiling_reason,
+                        _signal_source, _op_timeout_s,
                     )
                 except asyncio.CancelledError:
                     op.status = "cancelled"

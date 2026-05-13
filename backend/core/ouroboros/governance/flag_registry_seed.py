@@ -407,6 +407,25 @@ SEED_SPECS: list = [
         since="v1.0",
     ),
     FlagSpec(
+        name="JARVIS_BG_WORKER_OP_TIMEOUT_SWE_BENCH_PRO_S",
+        type=FlagType.INT, default=900,
+        description=(
+            "Outer wall-clock cap per SWE-Bench-Pro op in the BG worker "
+            "pool.  Source-aware Stage 1.5 motor budget (operator "
+            "binding 2026-05-13) — benchmark eval traffic needs a longer "
+            "lease than sensor traffic because the full pipeline "
+            "(CLASSIFY → ROUTE → CTX → PLAN → GENERATE-with-LLM → "
+            "VALIDATE → APPLY → VERIFY) for even a trivial fixture "
+            "exceeds the 360s sensor base.  Max-aggregated with "
+            "read_only and complex categories — whichever applicable "
+            "ceiling is longest wins."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/background_agent_pool.py",
+        example="900",
+        since="2026-05-13",
+    ),
+    FlagSpec(
         name="JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S",
         type=FlagType.INT, default=360,
         description=(
