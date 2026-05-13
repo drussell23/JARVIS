@@ -320,6 +320,21 @@ class BackgroundAgentPool:
         # continuation completes.  Surfaced in get_status() for
         # observability.
         self._parked_count: int = 0
+        # Stage 1.6 — out-of-pool continuation tasks (Slice 2b).  These
+        # are the asyncio.Tasks that run the actual provider call
+        # OUTSIDE the worker slot (where the slot has been released).
+        # Tracked so shutdown can cancel them gracefully + GC them on
+        # completion via add_done_callback.  Set semantics — a task
+        # cannot be in the set twice.
+        self._park_continuation_tasks: set = set()
+        # Stage 1.6 — resume-dispatch side-channel.  Maps
+        # ctx.op_id -> park_attempt_seq for ops currently in a resume
+        # dispatch.  The GENERATE-park wrapper reads this to know
+        # whether to materialize from the store (resume) or take the
+        # park-emit / legacy path.  Cleared after the resumed
+        # dispatch reaches terminal in the worker loop's finally
+        # block (see _clear_resume_mark below).
+        self._resumed_ops: Dict[str, int] = {}
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -341,6 +356,22 @@ class BackgroundAgentPool:
             )
             for i in range(self._pool_size)
         ]
+        # Stage 1.6 — register self in the process-wide bind so the
+        # GENERATE-park wrapper can re-submit resumed dispatches
+        # without taking a hard module dependency on this class.
+        # Mirrors the orchestrator bind shape; best-effort (test
+        # contexts that import _governance_state lazily are fine).
+        try:
+            from backend.core.ouroboros.governance._governance_state import (
+                bind_bg_pool as _bind,
+            )
+            _bind(self)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "bind_bg_pool unavailable at pool.start() — park "
+                "substrate will fall back to legacy direct-await",
+                exc_info=True,
+            )
         logger.info(
             "Background agent pool started: pool_size=%d, queue_size=%d",
             self._pool_size,
@@ -357,6 +388,37 @@ class BackgroundAgentPool:
 
         self._running = False
         logger.info("Stopping background agent pool (%d workers)", len(self._workers))
+
+        # Stage 1.6 — clear the process-wide bind BEFORE cancelling
+        # workers so no new park-emit can racing the shutdown can
+        # re-submit a resumed dispatch into a stopped pool.
+        try:
+            from backend.core.ouroboros.governance._governance_state import (
+                bind_bg_pool as _bind,
+            )
+            _bind(None)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "bind_bg_pool(None) failed during pool.stop()",
+                exc_info=True,
+            )
+
+        # Stage 1.6 — cancel any in-flight out-of-pool continuations.
+        # These are the tasks that hold the slot-freed provider call;
+        # cancelling them propagates CancelledError up through the
+        # continuation handler which calls store.cancel(token).
+        if self._park_continuation_tasks:
+            n_cont = len(self._park_continuation_tasks)
+            for cont in list(self._park_continuation_tasks):
+                cont.cancel()
+            await asyncio.gather(
+                *self._park_continuation_tasks, return_exceptions=True,
+            )
+            self._park_continuation_tasks.clear()
+            logger.info(
+                "Cancelled %d park continuation tasks during shutdown",
+                n_cont,
+            )
 
         # Cancel workers
         for worker in self._workers:
@@ -524,6 +586,114 @@ class BackgroundAgentPool:
         object to determine whether the operation is still in progress.
         """
         return self._ops.get(op_id)
+
+    # ------------------------------------------------------------------
+    # Stage 1.6 — park / resume side-channel (Slice 2b)
+    # ------------------------------------------------------------------
+
+    async def submit_for_resume(
+        self, op_context: "OperationContext", *, attempt_seq: int,
+    ) -> str:
+        """Re-submit a parked op as a resume dispatch.
+
+        Called by the out-of-pool continuation task after the parked
+        provider call completes (or fails).  The next worker that picks
+        up this ctx will read ``BackgroundOp.resumed=True`` and
+        ``park_attempt_seq=attempt_seq``; the GENERATE-park wrapper
+        materializes the parked result from :class:`ParkedOpStore`
+        instead of re-issuing the provider call.
+
+        Parameters
+        ----------
+        op_context:
+            The same OperationContext the original park-emit dispatch
+            ran under.  Identity preservation invariant — ctx.op_id
+            stable across park→resume.
+        attempt_seq:
+            The park attempt sequence (1 for first GENERATE, 2+ for
+            GENERATE_RETRY).  Mirrored into the ledger entry_id.
+
+        Returns
+        -------
+        str
+            The pool-internal op_id of the resumed BackgroundOp.
+
+        Raises
+        ------
+        QueueFullError
+            If the queue is at capacity.  The out-of-pool continuation
+            should catch this and route the op to a failure ledger
+            entry — the parked op cannot resume without a slot.
+        """
+        # Submit via the canonical path so all the priority + tracking
+        # invariants compose; THEN mark the BackgroundOp as resumed.
+        # The marking happens BEFORE any worker can pick it up because
+        # we hold the loop until both ops complete in this coroutine.
+        if attempt_seq < 1:
+            raise ValueError(
+                f"attempt_seq must be >= 1, got {attempt_seq}"
+            )
+        op_id = await self.submit(op_context)
+        bg_op = self._ops[op_id]
+        bg_op.resumed = True
+        bg_op.park_attempt_seq = attempt_seq
+        # Side-channel for the GENERATE wrapper.  Keyed by ctx.op_id
+        # (the orchestrator-visible id), not the pool-internal slot id,
+        # because the wrapper sees only ctx.
+        ctx_op_id = str(getattr(op_context, "op_id", "") or "")
+        if ctx_op_id:
+            self._resumed_ops[ctx_op_id] = attempt_seq
+        logger.info(
+            "submit_for_resume: ctx_op_id=%s pool_op_id=%s attempt=%d "
+            "(resumed=True)",
+            ctx_op_id, op_id, attempt_seq,
+        )
+        return op_id
+
+    def is_resumed_dispatch(self, ctx_op_id: str) -> bool:
+        """Return True iff a resumed dispatch is pending or in-flight
+        for this ctx.op_id.
+
+        The GENERATE-park wrapper queries this to know whether to
+        take the resume path (materialize from store) or the
+        park-emit / legacy path.
+        """
+        return ctx_op_id in self._resumed_ops
+
+    def get_park_attempt_seq(self, ctx_op_id: str) -> int:
+        """Return the park attempt sequence for a resumed dispatch.
+
+        Returns 0 if the op is not currently in a resume dispatch.
+        Callers should treat 0 as "not resumed."
+        """
+        return self._resumed_ops.get(ctx_op_id, 0)
+
+    def queue_depth(self) -> int:
+        """Number of ops waiting for a worker slot (queue pressure).
+
+        The GENERATE-park wrapper uses this to decide whether parking
+        the current op would benefit throughput — if no one is waiting,
+        parking just adds bookkeeping with no slot-utilization gain.
+        """
+        return self._queue.qsize()
+
+    def _clear_resume_mark(self, ctx_op_id: str) -> None:
+        """Drop the resume mark.  Called by the worker loop's finally
+        block AFTER a resumed dispatch reaches terminal.
+
+        Idempotent — clearing a never-marked op is a no-op.
+        """
+        self._resumed_ops.pop(ctx_op_id, None)
+
+    def register_park_continuation(self, task: asyncio.Task) -> None:
+        """Track an out-of-pool continuation task.
+
+        Called by the GENERATE-park wrapper after spawning the
+        continuation.  The task is GC'd via add_done_callback when it
+        completes; pool.stop() cancels all remaining tasks.
+        """
+        self._park_continuation_tasks.add(task)
+        task.add_done_callback(self._park_continuation_tasks.discard)
 
     async def cancel(self, op_id: str) -> bool:
         """Cancel a queued or running operation.
@@ -965,6 +1135,14 @@ class BackgroundAgentPool:
                     op.completed_at = time.monotonic()
                     op.task = None
                     self._queue.task_done()
+                    # Stage 1.6 — clear the resume mark IF this was a
+                    # resumed dispatch that reached a real terminal
+                    # state (completed/failed/cancelled). If status is
+                    # "parked" we are NOT terminal — the out-of-pool
+                    # continuation will re-submit and that resumed
+                    # dispatch's finally will clear the mark.
+                    if op.resumed and op.status in ("completed", "failed", "cancelled"):
+                        self._clear_resume_mark(_ctx_op_id)
                     # Move 2 v5 — Unified Observability cleanup. Always
                     # unregister, even on cancellation / failure / rupture
                     # so no dangling state accumulates in the central
