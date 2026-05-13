@@ -232,10 +232,17 @@ def test_slice_2_pin_wedged_but_alive_ttl_branch():
 
 def test_slice_2_pin_single_flight_helper_exists():
     """Slice 2 — single-flight launcher helper exists with canonical
-    pgrep + sys.exit(75)."""
+    pgrep + sys.exit(75).
+
+    Pattern evolution 2026-05-13: the regex gained a leading ``^``
+    anchor so caffeinate (and other wrappers that compose the
+    python invocation as later argv elements) don't match.  See
+    ``test_slice_2_single_flight_pgrep_pattern_is_anchored`` for the
+    rationale.  This pin accepts the new shape so we don't fight
+    ourselves; the anchor-specific test is the load-bearing one."""
     src = _read("scripts/ouroboros_battle_test.py")
     assert "def _single_flight_preflight()" in src
-    assert r'"python3? scripts/ouroboros_battle_test\.py"' in src
+    assert r'"^python3? scripts/ouroboros_battle_test\.py"' in src
     assert "sys.exit(75)" in src
 
 
@@ -349,4 +356,41 @@ def test_wave_3_7_cancel_infrastructure_still_graduated(
     )
     assert mid_op_cancel_enabled() is True, (
         "W3(7) graduated default must remain True post-harness-epic"
+    )
+
+
+def test_slice_2_single_flight_pgrep_pattern_is_anchored() -> None:
+    """Regression pin (operator runbook v12, 2026-05-13): the
+    pgrep regex used by ``_single_flight_preflight`` MUST start
+    with ``^`` to anchor against argv[0]+argv[1] only.
+
+    Without the anchor, wrappers like ``caffeinate -dimsu python3
+    scripts/ouroboros_battle_test.py`` match because their cmdline
+    CONTAINS the python path as later argv elements — the
+    wrapper's PID then masquerades as a "concurrent battle-test"
+    and the launch is rejected.  Operators hitting this in a fresh
+    terminal (no actual concurrent run) are reduced to either
+    killing the wrapper or using the
+    ``JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false`` escape hatch —
+    both workarounds for what is a regex-anchoring bug.
+
+    Anchoring with ``^`` excludes wrappers structurally without
+    a self-PID list or ancestor-walk: the wrapper's argv[0] is
+    ``caffeinate`` (not ``python3``), so ``^python3?`` doesn't
+    match.  Same applies to ``nice``, ``taskset``, ``time``,
+    ``strace``, etc. — every standard wrapper composes the
+    target's argv as later elements, not as argv[0].
+    """
+    src = Path("scripts/ouroboros_battle_test.py").read_text()
+    assert (
+        r"r\"^python3? scripts/ouroboros_battle_test\.py\"" in src
+        or r"r'^python3? scripts/ouroboros_battle_test\.py'" in src
+        or 'r"^python3? scripts/ouroboros_battle_test\\.py"' in src
+        or "r'^python3? scripts/ouroboros_battle_test\\.py'" in src
+    ), (
+        "Single-flight pgrep pattern lost its leading '^' anchor — "
+        "wrappers like caffeinate will now match and reject "
+        "legitimate launches.  See operator runbook v12 / "
+        "scripts/ouroboros_battle_test.py:_single_flight_preflight "
+        "for the anchoring rationale."
     )

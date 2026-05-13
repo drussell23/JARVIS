@@ -334,10 +334,20 @@ def _single_flight_preflight() -> None:
 
     Rejects concurrent battle-test runs at the process level. Two checks:
 
-    1. **pgrep canonical**: ``pgrep -f "python3? scripts/ouroboros_battle_test\\.py"``
-       must return at most 1 PID (this process). The pattern is anchored
-       enough to avoid matching zsh wrapper eval text (operator runbook
-       pattern from harness epic item 4 — also addressed in Slice 3).
+    1. **pgrep canonical**: ``pgrep -f "^python3? scripts/ouroboros_battle_test\\.py"``
+       must return at most 1 PID (this process).
+
+       The leading ``^`` anchor is load-bearing 2026-05-13 (operator
+       runbook v12): when the harness is launched via a wrapper like
+       ``caffeinate -dimsu python3 scripts/ouroboros_battle_test.py``,
+       the wrapper's cmdline CONTAINS the python path as later argv
+       elements, so an unanchored ``-f`` match would treat the
+       wrapper as a "concurrent battle-test" and reject the launch.
+       ``^`` forces the match against argv[0]+argv[1] only, so the
+       wrapper (whose cmdline starts with "caffeinate") is correctly
+       excluded.  This is structural — we leverage the existing
+       wrapper-friendly pattern (``caffeinate`` is the canonical
+       macOS App-Nap escape) rather than fighting it.
 
     2. **Lock-with-live-PID-and-non-stale-TTL**: if ``.jarvis/intake_router.lock``
        exists AND its PID is alive AND its ``ts`` is newer than the
@@ -361,10 +371,13 @@ def _single_flight_preflight() -> None:
     self_pid = os.getpid()
     violators: list = []
 
-    # (1) pgrep canonical probe
+    # (1) pgrep canonical probe — anchored to avoid matching wrappers
+    # whose cmdline contains the python path as a later argv element
+    # (notably ``caffeinate -dimsu python3 scripts/ouroboros_battle_test.py``,
+    # which is the canonical macOS App-Nap escape for foreground runs).
     try:
         result = _subprocess.run(
-            ["pgrep", "-f", r"python3? scripts/ouroboros_battle_test\.py"],
+            ["pgrep", "-f", r"^python3? scripts/ouroboros_battle_test\.py"],
             capture_output=True,
             text=True,
             timeout=10.0,
