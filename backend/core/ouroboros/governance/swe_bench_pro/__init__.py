@@ -9,7 +9,14 @@ Package layout (one phase per module; all default-FALSE per §33.1):
   * ``scorer``              — Phase C: score_evaluation pass/partial/fail.
   * ``result_store``        — Phase D: EvaluationResultStore + JSONL audit.
   * ``parallel_eval``       — Phase E: parallel_evaluate async generator.
-  * (future) ``report_card``      — Phase F
+  * ``report_card``         — Phase F: aggregate ReportCard renderer.
+
+**SWE-Bench-Pro arc fully closed end-to-end** (2026-05-12): Phases
+A → F shipped sequentially as independent default-FALSE substrates.
+The system can load N problems → fan out concurrent fix attempts →
+capture each patch → score deterministically → persist into a
+queryable aggregate store → render an aggregate ReportCard for
+human triage.
 
 Composition discipline (mirrors :mod:`l2_exercise_seed` pattern):
 
@@ -88,6 +95,17 @@ from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (
     ParallelEvalProgress,
     parallel_evaluate,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.report_card import (
+    REPORT_CARD_SCHEMA_VERSION,
+    DifficultyStats,
+    FailureCluster,
+    ReportCard,
+    RepoStats,
+    build_report_card,
+    render_json,
+    render_markdown,
+    write_report_card,
+)
 
 
 __all__ = [
@@ -142,4 +160,14 @@ __all__ = [
     "PARALLEL_CONCURRENCY_ENV_VAR",
     "ParallelEvalProgress",
     "parallel_evaluate",
+    # Phase F — report card renderer
+    "REPORT_CARD_SCHEMA_VERSION",
+    "DifficultyStats",
+    "FailureCluster",
+    "ReportCard",
+    "RepoStats",
+    "build_report_card",
+    "render_json",
+    "render_markdown",
+    "write_report_card",
 ]

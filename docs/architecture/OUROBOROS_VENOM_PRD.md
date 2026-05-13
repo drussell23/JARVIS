@@ -1052,6 +1052,128 @@ The system can now: load a problem → prepare a worktree → dispatch a fix →
 
 **Next**: **Phase F** — `report_card` renderer that reads from Phase D's `EvaluationResultStore` and produces aggregate cards: per-repo pass-rates, per-difficulty-tier breakdowns, `ScoreOutcome` distributions, top-N failing problems with diagnostic clustering for human triage. Pure-data rendering with optional Markdown/JSON output artifact. Phase F has no I/O of its own beyond writing the optional artifact file.
 
+##### §40.7.10-f — SWE-Bench-Pro Phase F report card renderer (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/phase-f-report-card`. **Phase F is the final milestone of the SWE-Bench-Pro arc** — pure-data aggregation + rendering above Phase D's `EvaluationResultStore`. Operators consume aggregate cards (per-repo pass-rates, per-difficulty-tier breakdowns, `ScoreOutcome` distributions, top-N failure clusters with diagnostic prefix grouping) to triage benchmark runs.
+
+**What it does**: `build_report_card(store, *, problems=None, top_n_failures=10) -> ReportCard` composes Phase D's canonical aggregators (`store.query` / `aggregate_score_outcomes` / `aggregate_evaluation_outcomes` / `pass_rate`) into a closed-hierarchy frozen dataclass payload. `render_markdown(card)` produces human-friendly Markdown; `render_json(card)` produces lossless JSON. `await write_report_card(card, output_path, format='markdown')` writes via canonical Path I/O on the default thread executor (event loop never blocked on disk write).
+
+**Closed dataclass hierarchy (§33.5 symmetric serialization)**:
+
+```
+ReportCard
+  ├── total_records / overall_pass_rate (SKIPPED excluded)
+  ├── score_distribution / eval_distribution (closed-enum counters)
+  ├── per_repo: Tuple[RepoStats, ...]   (sorted pass-rate desc)
+  ├── per_difficulty: Tuple[DifficultyStats, ...]   (sorted pass-rate desc)
+  ├── top_failures: Tuple[FailureCluster, ...]   (sorted count desc)
+  └── rendered_at_iso / schema_version
+```
+
+Each of `ReportCard` / `RepoStats` / `DifficultyStats` / `FailureCluster` is a `@dataclass(frozen=True)` with `to_dict()` / `from_dict()` round-trip — JSON renders are lossless.
+
+**Composition discipline (AST-pinned, 4 pins)**:
+
+1. **Canonical `EvaluationResultStore` import** — composes Phase D's store. AST pin asserts the import; no parallel store / cache logic.
+2. **Canonical outcome enums** — composes `ScoreOutcome` + `EvaluationOutcome`. AST pin asserts both imports.
+3. **Canonical aggregators** — substring check asserts at least 2 of `aggregate_score_outcomes` / `aggregate_evaluation_outcomes` / `pass_rate` appear in the source so the rendering pipeline goes through Phase D rather than re-implementing counters from scratch.
+4. **No master flag** — AST pin asserts no `os.environ.get(...)` call anywhere in the module. Phase F is read-only over Phase D's store; the Phase A `JARVIS_SWE_BENCH_PRO_ENABLED` master gates the whole arc via Phase D's store contents (an empty store renders an empty card cleanly).
+
+**Repo derivation**:
+- When `problems: Mapping[str, ProblemSpec]` is provided, uses `problem.repo` directly (authoritative)
+- Falls back to instance_id prefix parsing using the SWE-Bench convention `{org}__{repo}-{N}` → `{org}/{repo}` (e.g., `octocat__hello-001` → `octocat/hello`)
+- Spine has tests for both paths
+
+**Per-difficulty aggregation**:
+- Only meaningful when `problems` mapping is supplied (authoritative `problem.difficulty`)
+- Without the mapping, every record buckets under `"unknown"` — operators see the single-row collapse as an explicit signal that the mapping was omitted
+
+**Failure clustering**:
+- Groups by `ScoringResult.diagnostic` prefix before the first colon
+- `apply_failed:bad hunk` + `apply_failed:line 5` → cluster `apply_failed` with count=2
+- Empty diagnostics bucket as `"(empty)"` (deterministic; never null)
+- Each cluster carries the first 5 instance_ids as examples for human inspection
+- Top-N cap (default 10) keeps cards compact
+
+**No master flag** (operator binding):
+- Phase F is pure-data read-only over Phase D's store
+- The Phase A `JARVIS_SWE_BENCH_PRO_ENABLED` master gates the arc via the data Phase D contains (off → empty store → empty card)
+- AST pin asserts no `os.environ.get(...)` in the substrate
+
+**Spine — 25 regression tests + 4 AST pins**:
+- Empty store renders empty card cleanly (no crashes; sections present with zero-counts)
+- ScoreOutcome distribution correct under mixed records
+- EvaluationOutcome distribution correct
+- Overall pass_rate excludes SKIPPED from denominator
+- Per-repo aggregation (with + without problems mapping)
+- Per-repo sort order (pass_rate desc → total desc → repo asc)
+- Per-difficulty aggregation present only with problems mapping; collapse to `"unknown"` otherwise
+- Top-N failure clustering by diagnostic prefix before colon
+- Sort orders (count desc / prefix asc tie-break)
+- Example instance_ids capped at 5 per cluster
+- Empty-diagnostic bucket → `"(empty)"`
+- Markdown render contains all canonical sections (Overall / Score distribution / Eval distribution / Per-repo / Top failures)
+- JSON render round-trips via `from_dict` losslessly
+- `write_report_card` writes Markdown + JSON; parent auto-created; bad-path → False
+- All four dataclasses frozen
+- 4 AST pins: canonical `EvaluationResultStore` import / canonical outcome enums / canonical aggregator usage / no `os.environ.get(...)`
+
+**Surrounding regression**: **339 cumulative tests green** across the entire SWE-Bench-Pro arc (Phases A → F) + earlier substrates (B.2.0 advisor + B.2.0.5 lifecycle SSE + read-only-advisor + `_run_inner` sha256 pin). `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/report_card.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports + arc-closure docstring update
+- `tests/governance/test_swe_bench_pro_report_card.py` — 25-test spine + 4 AST pins (NEW)
+
+**What this PR deliberately did NOT do**:
+- No parallel store / cache logic — composes canonical `EvaluationResultStore` (AST-pinned)
+- No homegrown counters — composes canonical aggregators (AST-pinned)
+- No master flag of its own — Phase A gates the arc via Phase D contents (AST-pinned: no `os.environ.get`)
+- No SSE event for card-render — purely synchronous data transformation
+- No I/O beyond optional `write_report_card`
+- No edits to `repair_engine.py` — `_run_inner` sha256 stays `9e881fdde25ec5b1`
+
+##### §40.7.10-arc — SWE-Bench-Pro arc CLOSURE BANNER (2026-05-12)
+
+**The SWE-Bench-Pro arc is now fully closed end-to-end**. Every phase shipped sequentially as an independent default-FALSE substrate. The system can: **load N problems → fan out concurrent fix attempts → capture each patch → score each deterministically against the canonical SWE-Bench rubric → persist each into a queryable aggregate store with JSONL audit → render aggregate cards for human triage**.
+
+| Phase | Commit | Substrate | Spine | AST pins |
+|---|---|---|---|---|
+| A | (prior) | `dataset_loader.py` (ProblemSpec + cache) | (Phase A) | (Phase A) |
+| B.1 | `a5529b0f1a` | `per_problem_harness.py` (PreparedProblem + worktree) | (B.1) | (B.1) |
+| B.2.0 | `4c5580cff7` | Worktree-aware `OperationAdvisor` | 29 | 6 |
+| B.2.0.5 | `3139718edf` | Orchestrator `operation_terminal` SSE | 36 | 6 |
+| B.2.1 | `3f5660112a` | `build_evaluation_envelope` | 31 | 5 |
+| B.2.2+3 | `04513d8e5f` | `evaluate_problem` async façade | 29 | 8 |
+| C | `a636a24840` | `score_evaluation` pure-data scorer | 34 | 6 |
+| D | `7109ddf5d2` | `EvaluationResultStore` aggregate substrate | 33 | 4 |
+| E | `3011a05b47` | `parallel_evaluate` async generator rig | 19 | 4 |
+| **F** | (this PR) | **`build_report_card` aggregate renderer** | **25** | **4** |
+
+**Cross-arc cumulative totals**:
+- **9 phases shipped sequentially** as independent PRs (sequence not chained — each layer graduated independently)
+- **261 spine tests + 43 AST pins** across phases B.2.0 → F (Phase A + B.1 spines pre-date this arc tally)
+- **339 cumulative regression tests green** in the SWE-Bench-Pro + closely-coupled domains
+- **0 edits to `repair_engine.py`** — `_run_inner` sha256 still `9e881fdde25ec5b1` (locked across the entire arc; the SWE-Bench-Pro rig is composed entirely from existing canonical surfaces)
+- **All master flags default-FALSE per §33.1** — the arc ships dormant; operator-paced graduation
+- **No new SSE event types** — composes B.2.0.5's `operation_terminal` for op-lifecycle visibility
+- **No parallel state anywhere** — every concurrency primitive composes the canonical hot-reload-safe `get_semaphore`; every JSONL append composes the canonical `flock_append_line`; every diff parse composes `extract_diff_targets`; every cross-process flock composes `cross_process_jsonl`
+
+**Soak-readiness checklist** (the SWE-Bench-Pro arc is ready for operator-paced graduation):
+
+1. **Flip master**: `JARVIS_SWE_BENCH_PRO_ENABLED=true`
+2. **Optional persistence**: `JARVIS_SWE_BENCH_PRO_RESULT_PERSISTENCE_ENABLED=true` (turns on Phase D JSONL audit at `.jarvis/swe_bench_pro/results.jsonl`)
+3. **Optional advisor**: `JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=true` (enables B.2.0 worktree-scoped blast radius)
+4. **Optional lifecycle SSE**: `JARVIS_OP_LIFECYCLE_SSE_ENABLED=true` (enables B.2.0.5 op-FSM terminal events)
+5. **Concurrency**: `JARVIS_SWE_BENCH_PRO_PARALLEL_CONCURRENCY=4` (default; tune to box)
+6. **Evaluation timeout**: `JARVIS_SWE_BENCH_PRO_EVAL_TIMEOUT_S=1800` (default 30 min/problem)
+7. **Scoring timeout**: `JARVIS_SWE_BENCH_PRO_SCORE_TEST_TIMEOUT_S=600` (default 10 min pytest cap)
+8. **Cheat-detection**: `JARVIS_SWE_BENCH_PRO_SCORE_REJECT_TEST_MODS=true` (default; matches upstream rubric)
+9. **Run**: `async for record in parallel_evaluate(problems, intake_service=svc, concurrency=4): ...`
+10. **Render**: `card = build_report_card(store, problems=...); print(render_markdown(card))`
+
+**Graduation criterion (preliminary)**: SWE-Bench-Pro master stays default-FALSE until a soak demonstrates ≥1 RESOLVED outcome on a known-good problem AND ≥1 UNRESOLVED outcome on a known-hard problem (rubric sanity floor: the rubric distinguishes real fixes from non-fixes). Per-repo soaks accumulate evidence for the §41.6 cadence-flags-graduated metric.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
