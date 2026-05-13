@@ -49,9 +49,11 @@ import pytest
 from backend.core.ouroboros.governance import operation_advisor
 from backend.core.ouroboros.governance.operation_advisor import (
     OperationAdvisor,
+    _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
     _BLAST_RADIUS_CACHE_MAX_ENTRIES,
     _BLAST_RADIUS_CACHE_SHARED,
     _BLAST_RADIUS_CACHE_TTL_S,
+    _get_advisor_blast_executor,
 )
 
 
@@ -355,82 +357,16 @@ def _is_to_thread_call_with_advise(call: ast.Call) -> bool:
     return first.attr == "advise"
 
 
-def test_classify_runner_advisor_calls_are_to_thread_wrapped():
-    """AST pin: every ``_advisor.advise(...)`` call in
-    classify_runner MUST be wrapped in ``asyncio.to_thread``.
-
-    A direct ``_advisor.advise(...)`` call on the event loop
-    re-introduces the 12-min wiring-soak starvation.
-    """
-    src, tree = _classify_runner_ast()
-
-    # Find every Attribute access of form `<x>.advise` that is a Call
-    direct_advise_calls = []
-    to_thread_wraps = 0
-    for call in _walk_calls(tree):
-        if _is_to_thread_call_with_advise(call):
-            to_thread_wraps += 1
-            continue
-        func = call.func
-        if isinstance(func, ast.Attribute) and func.attr == "advise":
-            # Walk up via parent? ast doesn't have parent links.
-            # Direct call site that ISN'T wrapped in to_thread is a regression.
-            unparsed = ast.unparse(call)
-            # Skip the format_for_prompt-style ones (different surface)
-            direct_advise_calls.append(
-                f"line {call.lineno}: {unparsed[:120]}"
-            )
-
-    assert to_thread_wraps >= 2, (
-        f"Expected at least 2 ``asyncio.to_thread(...advise, ...)`` "
-        f"wraps (primary path + fallback path); found "
-        f"{to_thread_wraps}.  The fix is incomplete."
-    )
-    assert not direct_advise_calls, (
-        "Some `_advisor.advise(...)` call sites are NOT wrapped in "
-        "asyncio.to_thread — these will block the asyncio event loop "
-        "for ~15s (cold) or seconds (warm cache) per call.  The fix "
-        "must wrap EVERY synchronous advise call:\n"
-        + "\n".join(f"  - {s}" for s in direct_advise_calls)
-    )
-
-
-def test_orchestrator_advisor_call_is_to_thread_wrapped():
-    """AST pin: the legacy orchestrator-direct advise call site
-    is ALSO wrapped in asyncio.to_thread.
-
-    classify_runner is the primary path, but the orchestrator
-    still has a parallel call site that must stay consistent —
-    drift there would re-introduce starvation for whatever path
-    reaches it.
-    """
-    src, tree = _orchestrator_ast()
-    to_thread_wraps = 0
-    direct_calls = []
-    for call in _walk_calls(tree):
-        if _is_to_thread_call_with_advise(call):
-            to_thread_wraps += 1
-            continue
-        func = call.func
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "advise"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "_advisor"
-        ):
-            direct_calls.append(
-                f"line {call.lineno}: {ast.unparse(call)[:120]}"
-            )
-
-    assert to_thread_wraps >= 1, (
-        f"Expected at least 1 ``asyncio.to_thread(_advisor.advise, "
-        f"...)`` wrap in orchestrator.py; found {to_thread_wraps}."
-    )
-    assert not direct_calls, (
-        "Some _advisor.advise() call sites in orchestrator.py are "
-        "NOT wrapped in asyncio.to_thread:\n"
-        + "\n".join(f"  - {s}" for s in direct_calls)
-    )
+# Note: the prior ``test_classify_runner_advisor_calls_are_to_thread_wrapped``
+# and ``test_orchestrator_advisor_call_is_to_thread_wrapped`` AST pins
+# asserted the FIRST-iteration shape (``asyncio.to_thread(_advisor.advise, …)``).
+# PR-B 2026-05-13 evolved that to ``_advisor.advise_async(…)`` so the
+# dedicated bounded executor (not the default asyncio one) handles
+# advisor blast scans.  The structural invariant is preserved — advisor
+# work must NOT block the event loop — but the call shape changed.
+# ``test_classify_runner_uses_advise_async_not_to_thread`` +
+# ``test_orchestrator_uses_advise_async_not_to_thread`` below are the
+# successor pins.
 
 
 # ---------------------------------------------------------------------------
@@ -458,4 +394,226 @@ def test_cache_max_entries_is_bounded():
         "outside sensible bounds.  Default of 256 leaves headroom "
         "for ~50 typical entries; raise if hit rate measurements "
         "say so."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-B: Dedicated bounded executor for advisor blast work
+# ---------------------------------------------------------------------------
+
+
+def test_dedicated_executor_is_bounded_and_named():
+    """The advisor's dedicated ThreadPoolExecutor MUST be a small,
+    bounded pool with a distinct thread-name prefix so it's
+    distinguishable from the default executor in stack traces /
+    py-spy output.
+
+    Operator binding 2026-05-13: advisor isolation is the point;
+    blast scans are CPU-light I/O-heavy and ~2 workers is enough.
+    Unbounded would defeat the isolation guarantee.
+    """
+    assert 1 <= _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS <= 16, (
+        f"_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS="
+        f"{_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS} outside sensible "
+        "[1, 16] range.  Default 2 keeps the pool small enough that "
+        "advisor work can't congest itself."
+    )
+    executor = _get_advisor_blast_executor()
+    assert executor is not None
+    # Same instance returned on subsequent calls (singleton)
+    assert _get_advisor_blast_executor() is executor
+    # Bounded
+    assert executor._max_workers == _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS, (
+        f"Executor max_workers ({executor._max_workers}) doesn't match "
+        f"the module constant ({_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS})"
+    )
+    # Distinct thread name (operator visibility)
+    assert executor._thread_name_prefix == "advisor-blast", (
+        f"Executor thread_name_prefix is "
+        f"{executor._thread_name_prefix!r}, expected 'advisor-blast' "
+        "(operator binding 2026-05-13 for stack-trace identification)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_advise_async_dispatches_to_dedicated_executor(tmp_path):
+    """``advise_async`` MUST run the underlying ``advise()`` call on
+    a thread from the dedicated ``advisor-blast`` pool — NOT on the
+    asyncio main thread, NOT on the default ThreadPoolExecutor.
+
+    This is the isolation contract.  Verified by inspecting
+    ``threading.current_thread().name`` from inside the call.
+    """
+    import threading
+
+    (tmp_path / "a.py").write_text("import x\n")
+    advisor = OperationAdvisor(tmp_path)
+
+    # Monkey-patch _compute_blast_radius to record the thread name
+    captured = {}
+    original = advisor._compute_blast_radius
+
+    def _spy(*args, **kwargs):
+        captured["thread_name"] = threading.current_thread().name
+        return original(*args, **kwargs)
+
+    advisor._compute_blast_radius = _spy  # type: ignore[method-assign]
+    await advisor.advise_async(("x.py",), "test", "op-test")
+
+    assert "thread_name" in captured
+    thread_name = captured["thread_name"]
+    assert thread_name.startswith("advisor-blast"), (
+        f"advise_async ran on thread {thread_name!r}, expected one "
+        "prefixed 'advisor-blast'.  This means the call is leaking "
+        "back to asyncio.to_thread (default executor) — the "
+        "isolation contract is broken and harness contention will "
+        "re-introduce the v7 starvation pattern."
+    )
+
+
+@pytest.mark.asyncio
+async def test_advise_async_isolated_from_default_executor_saturation(tmp_path):
+    """Saturate the DEFAULT asyncio executor with 20 long-running
+    tasks; advise_async MUST still complete promptly because it
+    routes through the dedicated pool.
+
+    This is the production failure mode that motivated PR-B:
+    stage-1 wiring soak 2026-05-13 (session bt-2026-05-13-072716)
+    showed advise() never completed in 360s when 16 sensors + Oracle
+    + DreamEngine were also dispatching blocking I/O to the default
+    executor.
+    """
+    (tmp_path / "a.py").write_text("import x\n")
+    advisor = OperationAdvisor(tmp_path)
+
+    async def _saturate_default_executor():
+        # Each task sleeps 2s on a default-pool worker
+        def _block():
+            time.sleep(2.0)
+        await asyncio.to_thread(_block)
+
+    # Spawn 20 sensor-like tasks to saturate the default pool
+    saturators = [
+        asyncio.create_task(_saturate_default_executor())
+        for _ in range(20)
+    ]
+    # Brief delay so the saturators actually start hogging
+    await asyncio.sleep(0.05)
+
+    # Now run 3 advisor advise_async — they should NOT queue behind
+    # the saturators (different executor)
+    t0 = time.monotonic()
+    results = await asyncio.gather(*[
+        advisor.advise_async(("x.py",), "test", f"op{i}")
+        for i in range(3)
+    ])
+    elapsed = time.monotonic() - t0
+
+    # Clean up
+    await asyncio.gather(*saturators)
+
+    assert len(results) == 3
+    # Without PR-B, advise() under 20 default-pool saturators would
+    # queue behind them — total time would be at least
+    # ceil(20 / N_default_workers) × 2s ≈ 4-10s of wait + scan time.
+    # With dedicated pool, advise should be unblocked from default-
+    # pool contention.  10s ceiling is generous for slow CI.
+    assert elapsed < 10.0, (
+        f"3 advise_async calls under 20-task default-pool saturation "
+        f"took {elapsed:.2f}s — expected < 10s.  The dedicated "
+        "executor isn't actually isolating: either advise_async is "
+        "still routing through the default pool, OR another part of "
+        "advise() is on the event loop and blocking.  This is the "
+        "v7 starvation pattern returning."
+    )
+
+
+def test_classify_runner_uses_advise_async_not_to_thread():
+    """AST pin: classify_runner.py MUST use ``advisor.advise_async``,
+    NOT ``asyncio.to_thread(advisor.advise, ...)``.
+
+    The dedicated executor only kicks in via the advise_async path.
+    A drift back to asyncio.to_thread would silently route advisor
+    work through the default (contested) pool.
+    """
+    from backend.core.ouroboros.governance.phase_runners import (
+        classify_runner,
+    )
+    src = Path(inspect.getfile(classify_runner)).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    advise_async_calls = 0
+    to_thread_with_advise = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # Count advise_async invocations
+        if isinstance(func, ast.Attribute) and func.attr == "advise_async":
+            advise_async_calls += 1
+        # Flag any asyncio.to_thread(<x>.advise, ...) pattern
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "to_thread"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "asyncio"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr == "advise"
+        ):
+            to_thread_with_advise.append(
+                f"line {node.lineno}: {ast.unparse(node)[:120]}"
+            )
+
+    assert advise_async_calls >= 2, (
+        f"classify_runner.py has {advise_async_calls} advise_async "
+        "calls, expected ≥ 2 (primary path + fallback).  PR-B "
+        "wiring incomplete."
+    )
+    assert not to_thread_with_advise, (
+        "classify_runner.py still has asyncio.to_thread(...advise, ...) "
+        "call(s) — these route through the contested default executor "
+        "and re-introduce the v7 advisor starvation:\n"
+        + "\n".join(f"  - {s}" for s in to_thread_with_advise)
+    )
+
+
+def test_orchestrator_uses_advise_async_not_to_thread():
+    """AST pin: orchestrator.py's parallel CLASSIFY path MUST also
+    use ``advise_async``.  Same rationale as classify_runner — drift
+    here would silently route to the default executor for any path
+    that reaches it."""
+    from backend.core.ouroboros.governance import orchestrator
+    src = Path(inspect.getfile(orchestrator)).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    advise_async_calls = 0
+    to_thread_with_advise = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "advise_async":
+            advise_async_calls += 1
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "to_thread"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "asyncio"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr == "advise"
+        ):
+            to_thread_with_advise.append(
+                f"line {node.lineno}: {ast.unparse(node)[:120]}"
+            )
+
+    assert advise_async_calls >= 1, (
+        f"orchestrator.py has {advise_async_calls} advise_async "
+        "calls, expected ≥ 1 (legacy parallel CLASSIFY path)."
+    )
+    assert not to_thread_with_advise, (
+        "orchestrator.py still has asyncio.to_thread(...advise, ...) "
+        "call(s):\n"
+        + "\n".join(f"  - {s}" for s in to_thread_with_advise)
     )

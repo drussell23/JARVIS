@@ -290,22 +290,19 @@ class CLASSIFYRunner(PhaseRunner):
                 )
 
                 async def _advise_op() -> Any:
-                    # Dispatch the synchronous Advisor.advise() call to a
-                    # worker thread.  The implementation scans every
-                    # Python file in the project root (cold ~15s, warm
-                    # several seconds via internal TTL cache) — that I/O
-                    # MUST NOT block the asyncio event loop.  Stage-1
-                    # wiring soak 2026-05-12 (session
-                    # bt-2026-05-13-054721) confirmed: the first CLASSIFY
-                    # in a session stalled the entire event loop for ~12
-                    # minutes (16 sensors + router dispatch + governed
-                    # loop all starved), and subsequent ones blocked for
-                    # ~60s each.  asyncio.to_thread decouples the wait
-                    # from event-loop scheduling — same pattern the
-                    # SWE-Bench-Pro per-problem harness uses for git
-                    # subprocess work.
-                    return await asyncio.to_thread(
-                        _advisor.advise,
+                    # Dispatch through the dedicated ``advisor-blast``
+                    # ThreadPoolExecutor (PR-B 2026-05-13), NOT the
+                    # default asyncio executor.  In the live harness
+                    # the default executor is contested by 16 sensors
+                    # + Oracle + DreamEngine + IntakeLayer all doing
+                    # their own blocking I/O via asyncio.to_thread —
+                    # advisor blast scans queued behind that traffic
+                    # and missed the BG-pool 360s ceiling
+                    # (session bt-2026-05-13-072716).  The dedicated
+                    # bounded executor guarantees advisor isolation;
+                    # queue depth is logged on every submission for
+                    # operator-visible observability.
+                    return await _advisor.advise_async(
                         ctx.target_files,
                         ctx.description,
                         ctx.op_id,
@@ -338,8 +335,10 @@ class CLASSIFYRunner(PhaseRunner):
                     "CLASSIFY/advisor_verdict; falling back to direct "
                     "advise call", exc_info=True,
                 )
-                _advisory = await asyncio.to_thread(
-                    _advisor.advise,
+                # Fallback path ALSO routes through dedicated executor —
+                # leaving asyncio.to_thread here would re-introduce
+                # default-executor contention for the fallback case.
+                _advisory = await _advisor.advise_async(
                     ctx.target_files,
                     ctx.description,
                     ctx.op_id,
