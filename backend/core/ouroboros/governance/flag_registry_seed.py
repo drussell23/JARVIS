@@ -438,6 +438,58 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Stage 1.6 — BG release / op park during GENERATE LLM wait — 3 flags
+    # (operator binding 2026-05-13; substrate landed Slice 1; default-FALSE
+    # until Slice 2 wiring + Slice 3 graduation soak prove the 3-claim
+    # spine — slot freed during stall / no double-dispatch / no lost terminal)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_BG_PARK_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for the Stage 1.6 BG park substrate.  "
+            "When false (default per §33.1), ParkedOpStore.park() raises "
+            "and no caller can admit a park — the substrate is byte-"
+            "identical at runtime.  Flips to default-true only after the "
+            "Slice 3 graduation soak proves slot release + single-flight "
+            "+ terminal preservation under live SWE-Bench-Pro traffic."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/op_park_store.py",
+        example="true",
+        since="2026-05-13",
+    ),
+    FlagSpec(
+        name="JARVIS_BG_PARK_TTL_S",
+        type=FlagType.INT, default=1800,
+        description=(
+            "Seconds after which a parked op whose resume continuation "
+            "never fires is reaped (status=ttl_expired).  Defaults to 30 "
+            "min — longer than the longest legitimate provider round-trip "
+            "(DW BACKGROUND ~10 min) but short enough that dead resume "
+            "continuations don't wedge the store."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/op_park_store.py",
+        example="1800",
+        since="2026-05-13",
+    ),
+    FlagSpec(
+        name="JARVIS_BG_PARK_STORE_MAX_SIZE",
+        type=FlagType.INT, default=64,
+        description=(
+            "Bounded capacity of the ParkedOpStore registry.  When at "
+            "capacity, the oldest non-terminal record is evicted "
+            "(status=evicted) so any awaiter unblocks cleanly.  Default "
+            "64 covers ~BG_POOL_SIZE × 4 concurrent parks with headroom."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/op_park_store.py",
+        example="64",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # Orange PR review — 1 flag
     # ====================================================================
     FlagSpec(
