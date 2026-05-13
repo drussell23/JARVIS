@@ -390,6 +390,175 @@ def test_clear_cache_missing_dir_returns_zero(monkeypatch, tmp_path):
 
 
 # ===========================================================================
+# list_cached_problems — union semantics over cache + LOCAL_DATASET_PATH
+# ===========================================================================
+#
+# Closes the bug found by the v3.7 stage-1 wiring-validation soak
+# (bt-2026-05-13-025330): the harness boot hook calls
+# list_cached_problems() to enumerate available instance_ids; before
+# this fix, that function only scanned the cache dir, missing fixture
+# IDs declared in JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH. Operators
+# were forced onto CSV-override workarounds. The fix:
+# list_cached_problems() is now the single source of truth — returns
+# cache_ids ∪ jsonl_instance_ids whenever LOCAL_DATASET_PATH is set
+# and readable.
+
+
+def test_list_cached_problems_fixture_only_no_cache(monkeypatch, tmp_path):
+    """Operator binding: fixture-only config (no cache dir populated)
+    yields a non-empty list. This is THE acceptance bar that closed
+    the workaround-inducing bug."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "no-cache"),
+    )
+    dataset = tmp_path / "fixture.jsonl"
+    dataset.write_text(
+        json.dumps(_sample_spec("fixture_only__test-1").to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", str(dataset),
+    )
+    assert list_cached_problems() == ["fixture_only__test-1"]
+
+
+def test_list_cached_problems_union_with_cache(monkeypatch, tmp_path):
+    """Cache + JSONL both populated → union, sorted, deduped."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "cache"),
+    )
+    # Cache: two instances
+    dataset_loader._write_cache(_sample_spec("only_in_cache__id-1"))
+    dataset_loader._write_cache(_sample_spec("shared__id-1"))
+    # JSONL: one shared + one unique
+    dataset = tmp_path / "fixture.jsonl"
+    dataset.write_text(
+        json.dumps(_sample_spec("shared__id-1").to_dict()) + "\n"
+        + json.dumps(_sample_spec("only_in_jsonl__id-1").to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", str(dataset),
+    )
+    result = list_cached_problems()
+    assert result == sorted([
+        "only_in_cache__id-1",
+        "only_in_jsonl__id-1",
+        "shared__id-1",
+    ])
+
+
+def test_list_cached_problems_unset_dataset_path_returns_cache_only(
+    monkeypatch, tmp_path,
+):
+    """When LOCAL_DATASET_PATH is unset, enumeration uses cache only —
+    byte-identical to pre-fix behavior for the no-fixture case."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "cache"),
+    )
+    dataset_loader._write_cache(_sample_spec("cache_only__test-1"))
+    monkeypatch.delenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", raising=False,
+    )
+    assert list_cached_problems() == ["cache_only__test-1"]
+
+
+def test_list_cached_problems_missing_jsonl_file_falls_back_to_cache(
+    monkeypatch, tmp_path,
+):
+    """LOCAL_DATASET_PATH points at a nonexistent file — enumeration
+    silently treats that source as empty (fail-open per-source)."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "cache"),
+    )
+    dataset_loader._write_cache(_sample_spec("only_cache__test-1"))
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH",
+        str(tmp_path / "does-not-exist.jsonl"),
+    )
+    assert list_cached_problems() == ["only_cache__test-1"]
+
+
+def test_list_cached_problems_skips_jsonl_malformed_lines(
+    monkeypatch, tmp_path,
+):
+    """Malformed JSONL lines + non-dict records + records missing
+    instance_id are silently skipped — only well-formed records
+    contribute to the enumeration."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "no-cache"),
+    )
+    dataset = tmp_path / "noisy.jsonl"
+    dataset.write_text(
+        "this is not json\n"
+        + json.dumps(_sample_spec("ok__id-1").to_dict()) + "\n"
+        + "42\n"  # non-dict
+        + json.dumps({"no_instance_id": True}) + "\n"
+        + json.dumps(_sample_spec("ok__id-2").to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", str(dataset),
+    )
+    assert list_cached_problems() == ["ok__id-1", "ok__id-2"]
+
+
+def test_list_cached_problems_jsonl_bounded_scan(monkeypatch, tmp_path):
+    """The bounded scan ceiling (_LOCAL_JSONL_MAX_ROWS) caps line
+    enumeration. We monkeypatch to a tiny value to keep the test
+    fast while validating the cap honors operator binding ("bounded
+    scan — cap lines/bytes if needed")."""
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "no-cache"),
+    )
+    monkeypatch.setattr(dataset_loader, "_LOCAL_JSONL_MAX_ROWS", 3)
+    dataset = tmp_path / "big.jsonl"
+    rows = [
+        json.dumps(_sample_spec(f"capped__id-{i}").to_dict())
+        for i in range(10)
+    ]
+    dataset.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", str(dataset),
+    )
+    result = list_cached_problems()
+    # Only first 3 lines parsed; capped__id-3..9 omitted.
+    assert result == ["capped__id-0", "capped__id-1", "capped__id-2"]
+
+
+def test_list_cached_problems_load_problem_can_resolve_enumerated_ids(
+    monkeypatch, tmp_path,
+):
+    """Operator binding: list_cached_problems() is the single source
+    of truth for "what IDs can load_problem resolve." This pin asserts
+    every id returned can in fact be loaded — there is no surface
+    where the enumeration lies to consumers."""
+    monkeypatch.setenv("JARVIS_SWE_BENCH_PRO_ENABLED", "true")
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_CACHE_PATH", str(tmp_path / "cache"),
+    )
+    monkeypatch.delenv(
+        "JARVIS_SWE_BENCH_PRO_HF_DATASET", raising=False,
+    )
+    dataset = tmp_path / "fixture.jsonl"
+    dataset.write_text(
+        json.dumps(_sample_spec("truth__id-1").to_dict()) + "\n"
+        + json.dumps(_sample_spec("truth__id-2").to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH", str(dataset),
+    )
+    for iid in list_cached_problems():
+        spec, outcome = load_problem(iid)
+        assert spec is not None, (
+            f"list_cached_problems claimed {iid!r} but load_problem "
+            f"returned None (outcome={outcome.value}) — single-source-"
+            f"of-truth contract violated"
+        )
+
+
+# ===========================================================================
 # Authority asymmetry (§1 Boundary) — AST-pinned forbidden imports
 # ===========================================================================
 

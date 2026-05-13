@@ -80,7 +80,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 
 logger = logging.getLogger("Ouroboros.SWEBenchPro.DatasetLoader")
@@ -415,20 +415,52 @@ def _write_cache(spec: ProblemSpec) -> bool:
 # ===========================================================================
 
 
-def _load_from_local_jsonl(instance_id: str) -> Optional[ProblemSpec]:
-    """Scan the local JSONL for the requested instance_id.  Returns
-    None if file missing or instance not found.  NEVER raises."""
+# Bounded scan ceiling for the local JSONL — SWE-Bench-Pro's full
+# upstream dataset is 1,865 problems; 10,000 leaves headroom for
+# derivative datasets without unbounded scans. Both
+# :func:`_iter_local_jsonl_records` (used by enumeration) and the
+# per-id scan in :func:`_load_from_local_jsonl` honor this cap.
+_LOCAL_JSONL_MAX_ROWS: int = 10000
+
+
+def _iter_local_jsonl_records(
+    *, max_rows: Optional[int] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield each parsed dict record from the LOCAL_DATASET_PATH
+    JSONL, bounded by ``max_rows`` (default
+    :data:`_LOCAL_JSONL_MAX_ROWS`, read at CALL time so tests can
+    monkey-patch the module constant).
+
+    Single source of truth for local-JSONL scanning — both
+    :func:`_load_from_local_jsonl` (per-id load) and
+    :func:`list_cached_problems` (enumeration) compose this
+    iterator so the line-parsing + dedup-key logic stays in one
+    place. Malformed rows + non-dict records are skipped with a
+    DEBUG log. Missing file → empty iterator (no raise). NEVER
+    raises (asyncio.CancelledError propagates).
+    """
+    effective_cap = (
+        max_rows if max_rows is not None else _LOCAL_JSONL_MAX_ROWS
+    )
     path = _local_dataset_path()
     try:
         if not path.is_file():
-            return None
+            return
         with path.open("r", encoding="utf-8") as fh:
             for line_num, raw in enumerate(fh, start=1):
-                raw = raw.strip()
-                if not raw:
+                if line_num > effective_cap:
+                    logger.debug(
+                        "[SWEBenchPro] local JSONL bounded scan capped "
+                        "at %d rows — additional rows ignored. "
+                        "Bump _LOCAL_JSONL_MAX_ROWS if needed.",
+                        effective_cap,
+                    )
+                    return
+                stripped = raw.strip()
+                if not stripped:
                     continue
                 try:
-                    record = json.loads(raw)
+                    record = json.loads(stripped)
                 except json.JSONDecodeError:
                     logger.debug(
                         "[SWEBenchPro] local JSONL line %d malformed — skipping",
@@ -437,16 +469,37 @@ def _load_from_local_jsonl(instance_id: str) -> Optional[ProblemSpec]:
                     continue
                 if not isinstance(record, dict):
                     continue
-                if record.get("instance_id") == instance_id:
-                    try:
-                        return ProblemSpec.from_dict(record)
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            "[SWEBenchPro] local JSONL line %d for %r "
-                            "failed schema validation", line_num, instance_id,
-                            exc_info=True,
-                        )
-                        return None
+                yield record
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — defensive (fail-open scan)
+        logger.debug(
+            "[SWEBenchPro] _iter_local_jsonl_records raised",
+            exc_info=True,
+        )
+        return
+
+
+def _load_from_local_jsonl(instance_id: str) -> Optional[ProblemSpec]:
+    """Scan the local JSONL for the requested instance_id.  Returns
+    None if file missing or instance not found.  NEVER raises.
+
+    Composes :func:`_iter_local_jsonl_records` so the line-parsing
+    + bounded-scan + dedup logic stays in one place. Schema-validation
+    failures on the matched record produce a WARNING + None.
+    """
+    try:
+        for record in _iter_local_jsonl_records():
+            if record.get("instance_id") != instance_id:
+                continue
+            try:
+                return ProblemSpec.from_dict(record)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[SWEBenchPro] local JSONL record for %r failed "
+                    "schema validation", instance_id, exc_info=True,
+                )
+                return None
         return None
     except asyncio.CancelledError:
         raise
@@ -566,37 +619,77 @@ def load_problem(
 
 
 def list_cached_problems() -> List[str]:
-    """Return sorted list of instance_ids currently in the cache.
-    NEVER raises."""
+    """Single source of truth for "which instance_ids can
+    :func:`load_problem` resolve right now."
+
+    Returns the sorted union of:
+
+      1. instance_ids materialized in the on-disk cache
+         (``cache_dir()/<sanitized-id>.json``); AND
+      2. instance_ids declared in the local-dataset JSONL pointed
+         at by :data:`LOCAL_DATASET_PATH_ENV_VAR` (when the env var
+         is set AND the file exists AND is readable).
+
+    Both sources are composed via the SAME line-parsing helper
+    :func:`_iter_local_jsonl_records` (single-source-of-truth for
+    local JSONL scanning) so consumers cannot disagree about
+    "available problems" — historically a workaround-inducing
+    bug surface for the harness boot hook.
+
+    The JSONL scan is bounded by :data:`_LOCAL_JSONL_MAX_ROWS`
+    (default 10,000 — comfortable headroom over the upstream
+    SWE-Bench-Pro 1,865-problem dataset). Malformed rows + records
+    missing an ``instance_id`` field are silently skipped with a
+    DEBUG log.
+
+    Dedup semantics: the union collapses cache + JSONL duplicates;
+    callers see each instance_id exactly once. NEVER raises;
+    failures in either source produce an empty list from that
+    source rather than tearing down the whole enumeration.
+    """
+    ids: set = set()
     try:
         d = cache_dir()
-        if not d.is_dir():
-            return []
-        out: List[str] = []
-        for entry in d.iterdir():
-            if not entry.is_file():
-                continue
-            if entry.suffix != ".json":
-                continue
-            if entry.name.startswith("_"):
-                # Convention: underscore-prefixed files are reserved
-                # (e.g., _index.json if a future arc adds one).
-                continue
-            # The cache filename basename IS the sanitized
-            # instance_id — but we want to surface the original
-            # instance_id from the cached payload (the sanitization
-            # is one-way for safety).
-            spec = _read_cache(entry.stem)
-            if spec is not None:
-                out.append(spec.instance_id)
-        return sorted(out)
+        if d.is_dir():
+            for entry in d.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.suffix != ".json":
+                    continue
+                if entry.name.startswith("_"):
+                    # Convention: underscore-prefixed files are
+                    # reserved (e.g., _index.json if a future arc
+                    # adds one).
+                    continue
+                # The cache filename basename IS the sanitized
+                # instance_id — but we want the original
+                # instance_id from the cached payload (the
+                # sanitization is one-way for safety).
+                spec = _read_cache(entry.stem)
+                if spec is not None:
+                    ids.add(spec.instance_id)
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — defensive (fail-open per-source)
         logger.debug(
-            "[SWEBenchPro] list_cached_problems raised", exc_info=True,
+            "[SWEBenchPro] list_cached_problems cache scan raised",
+            exc_info=True,
         )
-        return []
+
+    try:
+        for record in _iter_local_jsonl_records():
+            iid = record.get("instance_id")
+            if isinstance(iid, str) and iid:
+                ids.add(iid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — defensive (fail-open per-source)
+        logger.debug(
+            "[SWEBenchPro] list_cached_problems JSONL scan raised",
+            exc_info=True,
+        )
+
+    return sorted(ids)
 
 
 def clear_cache(instance_id: Optional[str] = None) -> int:

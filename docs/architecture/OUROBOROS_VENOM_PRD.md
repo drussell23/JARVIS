@@ -1269,6 +1269,57 @@ python3 scripts/ouroboros_battle_test.py --cost-cap 2.00 --idle-timeout 1800 -v
 
 **Graduation criterion**: SWE-Bench-Pro masters stay default-FALSE until a soak demonstrates ≥1 RESOLVED outcome on a known-good problem AND ≥1 UNRESOLVED outcome on a known-hard problem (rubric sanity floor — distinguishes real fixes from non-fixes). Per-repo soaks accumulate evidence for the §41.6 cadence-flags-graduated metric.
 
+##### §40.7.10-union — Phase A enumeration union fix (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on branch `ouroboros/swe-bench-pro/loader-enumeration-union`. Closes the bug found by stage-1 wiring-validation soak `bt-2026-05-13-025330`: the harness boot hook called `list_cached_problems()` to enumerate available problems, but that function only scanned the cache directory — missing fixture ids declared in `JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH`. Operators were forced onto `INJECT_INSTANCE_IDS` CSV overrides every time.
+
+**Root problem (operator framing 2026-05-12)**:
+> `list_cached_problems()` and the harness hook disagreed on what "available problems" means. If `JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH` is a supported config surface, enumeration must include it — otherwise every consumer that trusts `list_cached_problems()` is lied to.
+
+**Structural fix**: `list_cached_problems()` is now the single source of truth — returns `cache_ids ∪ jsonl_instance_ids` whenever `LOCAL_DATASET_PATH` is set and readable. Bounded scan (`_LOCAL_JSONL_MAX_ROWS=10000` — comfortable headroom over the upstream SWE-Bench-Pro 1,865-problem dataset). Cap is read at call time (not function-def time) so tests can monkey-patch the module constant.
+
+**Composition discipline**: Both `_load_from_local_jsonl` (per-id load) and `list_cached_problems` (enumeration) now compose the same `_iter_local_jsonl_records()` iterator — single source of truth for local-JSONL line-parsing. The per-source enumeration is fail-open: cache-scan failure or JSONL-scan failure produces an empty set from that source rather than tearing down the whole enumeration.
+
+**Dedup semantics**: union collapses cache + JSONL duplicates. Callers see each `instance_id` exactly once. Malformed JSONL rows + non-dict records + records missing `instance_id` field are silently skipped with a DEBUG log.
+
+**Spine — 7 new regression tests**:
+- Fixture-only config (no cache populated) yields non-empty list — **acceptance bar**
+- Cache + JSONL both populated → union, sorted, deduped
+- LOCAL_DATASET_PATH unset → cache-only (byte-identical to pre-fix)
+- Missing JSONL file → fail-open to cache only
+- Malformed JSONL lines + non-dict records + missing instance_id silently skipped
+- Bounded scan honors `_LOCAL_JSONL_MAX_ROWS` cap (test monkey-patches to 3, asserts only first 3 returned)
+- **Round-trip pin**: every id returned by `list_cached_problems()` can in fact be loaded by `load_problem(id)` — the single-source-of-truth contract cannot lie to consumers
+
+**Stage-1 wiring-validation result**:
+
+With the union fix in place, the focused validator (uncommitted, ran from `$TMPDIR`) confirmed end-to-end:
+
+```
+STEP 1: list_cached_problems() with LOCAL_DATASET_PATH set, no cache populated
+  result: ['jarvis__harness-smoke-001']         elapsed: 1.2ms   ✓
+STEP 2: load_problem('jarvis__harness-smoke-001')
+  outcome: loaded                                elapsed: 3.1ms   ✓
+STEP 3: maybe_inject_swe_bench_at_boot(stub_intake)
+  verdict: injected                              elapsed: 1.3ms   ✓
+  envelope.source: 'swe_bench_pro'                                ✓
+  envelope.target_files: ('tests/test_smoke.py',)                 ✓
+  envelope.evidence.repo_root: <worktree path>   ← B.2.0 contract ✓
+  envelope.evidence.problem_instance_id: 'jarvis__harness-smoke-001' ✓
+```
+
+**Note on sandbox environment**: the focused validator used a stubbed `prepare_problem` because the sandbox blocks `git clone --templates` (template-hook copy disallowed). The clone-blocked behavior surfaces correctly as `verdict=failed_inject` via the fail-closed contract — the hook does NOT silently misclassify the failure. In an unrestricted environment, the real clone of `octocat/Hello-World` would succeed.
+
+**Separate performance triage filed (NOT bundled)**: `IntakeLayerService.start()` observed taking 5min 30sec in the stage-1 soak (`bt-2026-05-13-025330`). Details in `memory/project_intake_layer_start_perf_triage.md`. Orthogonal to enumeration correctness; do not bundle.
+
+**Surrounding regression**: **265 cumulative tests green** across the entire SWE-Bench-Pro arc (37 dataset-loader tests including 7 new union pins + 19 harness-inject + 25 report-card + 19 parallel-eval + 33 result-store + 34 scorer + 29 evaluator + 31 envelope-builder + …). `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/dataset_loader.py` — union fix + `_iter_local_jsonl_records` extraction
+- `tests/governance/test_swe_bench_pro_dataset_loader.py` — 7 new union-semantics tests
+- `memory/project_intake_layer_start_perf_triage.md` — separate perf triage (NEW)
+- This PRD section
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
