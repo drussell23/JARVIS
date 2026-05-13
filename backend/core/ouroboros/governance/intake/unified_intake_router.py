@@ -64,6 +64,17 @@ _PRIORITY_MAP: Dict[str, int] = {
     "voice_human": 0,
     "test_failure": 1,
     "backlog": 2,
+    # SWE-Bench-Pro evaluator envelopes (PRD §40.7.10-priority-map).  Tier
+    # 2 (peer with `backlog`) is deliberate: this is queued benchmark
+    # evaluation work — neither a runtime fire (would be `test_failure` @
+    # 1) nor low-priority background fuzz (would land in the deferred
+    # tier @ unmapped default 99).  Without this entry, the envelope
+    # source falls through to `base = 99` and the `urgency="low"` default
+    # subtracts another -1 → final priority 100, putting it strictly
+    # behind every other in-flight signal.  Observed in stage-1 wiring
+    # soak 2026-05-12 (session bt-2026-05-13-040242) as a 21-minute
+    # dequeue lag while 16 other ops were dispatched ahead of ours.
+    "swe_bench_pro": 2,
     "ai_miner": 3,
     "architecture": 3,
     "exploration": 4,
@@ -72,6 +83,32 @@ _PRIORITY_MAP: Dict[str, int] = {
     "cu_execution": 5,
     "runtime_health": 6,
 }
+
+# Documented technical debt: these sources in `_VALID_SOURCES` predate
+# the `_PRIORITY_MAP`-completeness spine assertion and currently fall
+# through to `base = 99` (starvation territory under any contended
+# queue).  Each entry is a known prioritization gap — adding it to
+# `_PRIORITY_MAP` with a deliberate tier closes the gap.  New sources
+# MUST either join `_PRIORITY_MAP` directly OR opt into this set with
+# an explicit comment justifying why the default is acceptable; the
+# spine pin at
+# `tests/governance/test_unified_intake_router_priority_map.py`
+# catches drift.  Migration removes entries here as their tiers are
+# assigned.
+_PRIORITY_MAP_DEFERRED: frozenset = frozenset({
+    "auto_proposed",
+    "cadence_synthetic",
+    "cross_repo_drift",
+    "doc_staleness",
+    "github_issue",
+    "intent_discovery",
+    "meta_dormancy_alarm",
+    "performance_regression",
+    "security_advisory",
+    "todo_scanner",
+    "vision_sensor",
+    "web_intelligence",
+})
 
 # Urgency → priority boost (subtracted from base, so lower = higher priority)
 _URGENCY_BOOST: Dict[str, int] = {
