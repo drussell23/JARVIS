@@ -1387,6 +1387,64 @@ Peer with `backlog` is defensible: SWE-Bench-Pro envelopes are **queued benchmar
 - `tests/governance/intake/test_unified_intake_router_priority_map.py` — new spine file, 12 tests
 - This PRD section
 
+##### §40.7.10-heap-tiebreak — Deterministic 4-tuple heap shape eliminates IntentEnvelope comparison (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on branch `ouroboros/intake/heap-tiebreak-deterministic`. Closes the **second** root cause exposed by the priority-map fix: even though our envelope's intake priority computed to 2 (top tier), the priority queue still dispatched priority-7+ envelopes ahead of it in stage-1 wiring soak `bt-2026-05-13-051420` (14+ min lag observed before manual stop).
+
+**Root cause** (proved at unit level): `IntentEnvelope` is a frozen dataclass without `__lt__`. The router enqueued items as `(priority, submitted_at, envelope)` 3-tuples. When two enqueues collided on the `(priority, submitted_at)` prefix (rare but real under burst ingest), `heapq`'s tuple comparison fell through to the envelope and raised `TypeError: '<' not supported between instances of 'IntentEnvelope'`. The exception bubbled out of `await queue.put(...)` mid-mutation, leaving the binary heap invariant violated. Subsequent dequeues no longer honored priority ordering.
+
+**Reproduction** (10-line test that fails on the pre-fix code):
+```python
+await q.put((2, 1.0, env_a))
+await q.put((2, 1.0, env_b))   # TypeError: '<' not supported between instances of 'IntentEnvelope'
+```
+
+**Structural fix** — totally-ordered tuple prefix at the queue seam:
+
+```python
+# Module-level monotonic counter — shared across ALL enqueue sites
+_HEAP_TIE_SEQ: "itertools.count[int]" = itertools.count()
+
+# Every self._queue.put / put_nowait now uses a 4-tuple
+await self._queue.put((
+    priority,
+    envelope.submitted_at,
+    next(_HEAP_TIE_SEQ),    # ← strictly monotonic, guarantees no tie fallthrough
+    envelope,
+))
+```
+
+Heap comparison touches only `(priority, submitted_at, tie_seq)` — all numeric, never simultaneously equal (tie_seq is unique-per-enqueue across the whole process). `envelope` stays inert for ordering. FIFO among genuine `(priority, submitted_at)` ties is preserved via the monotonic counter.
+
+**Deliberate non-choice** — we did NOT add `__lt__` to `IntentEnvelope`. Per the 2026-05-12 operator binding: an `__lt__` returning `False` is not a strict weak order and falls back on object-id / implementation-defined tie behavior. Adding `__lt__` would also create two ordering surfaces (tuple-prefix AND envelope) that could drift apart under future edits. The single-seam design at the router is strictly more robust.
+
+**Sites touched** (5 total, all in `unified_intake_router.py`):
+- Line 482 — type annotation `asyncio.PriorityQueue[Tuple[int, float, int, IntentEnvelope]]`
+- Line 703 — `ingest()` enqueue
+- Line 994 — `_dispatch_loop` legacy-path dequeue (unpacks 4-tuple)
+- Line 1356 — retry enqueue after dispatch failure
+- Line 1391 — `_replay_wal` enqueue on boot
+
+**Systemic regression** (`test_unified_intake_router_heap_tiebreak.py`, 8 new tests):
+
+| Layer | Test | What it locks in |
+|---|---|---|
+| Module | `test_heap_tie_seq_is_itertools_count_at_module_scope` | Single shared monotonic counter |
+| AST | `test_every_queue_put_site_uses_4_tuple_shape` | No 3-tuple put can re-introduce the bug |
+| AST | `test_every_queue_put_site_uses_heap_tie_seq` | Third element is `next(_HEAP_TIE_SEQ)`, not a literal |
+| AST | `test_dequeue_site_unpacks_4_tuple` | Dequeue stays in sync with the new shape |
+| Runtime | `test_burst_100_colliding_ties_complete_without_typeerror` | 100 identical-prefix ties enqueue cleanly |
+| Runtime | `test_burst_100_colliding_ties_dequeue_in_fifo_order` | FIFO preserved among ties |
+| Runtime | `test_higher_priority_still_wins_under_collision` | Priority ordering survives tie-break |
+| Pin | `test_intent_envelope_is_NOT_given_lt` | Envelope stays inert for ordering |
+
+**Integration honesty**: the unit repro proves a real foot-gun; it does not, by itself, prove the 21-min WAL ack lag was solely this bug. The next live re-run will produce log anchors (ack_latency, queue_depth). If latency collapses, the link is proved. If not, the next triage item stays open without undoing this fix — both root causes (priority-map + tie-break) needed real fixes regardless.
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/intake/unified_intake_router.py` — `itertools` import + `_HEAP_TIE_SEQ` module constant + 5 enqueue/dequeue sites updated to the 4-tuple shape + type annotation updated
+- `tests/governance/intake/test_unified_intake_router_heap_tiebreak.py` — new spine file, 8 tests
+- This PRD section
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
