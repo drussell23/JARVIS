@@ -634,6 +634,123 @@ v2 fix (`df4b70a4a8`):
 
 **Next**: PR 4 — B.2.2 `evaluate_problem(problem: ProblemSpec)` async façade composing `prepare_problem` (B.1) → `build_evaluation_envelope` (B.2.1) → `IntakeLayerService.ingest_envelope` + `StreamEventBroker.subscribe(op_id_filter=envelope.causal_id)` rendezvous + bounded `asyncio.wait_for` with optional one-shot `OperationLedger.get_latest_state` fallback on timeout → `capture_produced_patch` (B.1) → `cleanup_prepared` (B.1) → `EvaluationResult`. Plus B.2.3 spine asserting terminal resolution goes through broker first + AST pin against unbounded waits anywhere in the façade.
 
+##### §40.7.10-b22 — SWE-Bench-Pro evaluator façade + B.2 arc closure (CLOSED 2026-05-12; PR 4 of the B.2 arc)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/b-2-2-evaluator`. Final PR of the operator-bound B.2 split (PR 1 = B.2.0 advisor / PR 2 = B.2.0.5 lifecycle SSE / PR 3 = B.2.1 envelope builder / PR 4 = this evaluator façade + B.2.3 spine). **The B.2 arc is now fully closed end-to-end**; SWE-Bench-Pro Phase B is operationally complete and Phase C scorer integration is the next structural milestone.
+
+**What it does**: `evaluate_problem(problem, *, intake_service, operation_ledger=None, broker=None, timeout_s=None, cleanup=True) -> EvaluationResult` is the async façade that composes every preceding B.2 layer into a single end-to-end evaluation pipeline:
+
+```
+swe_bench_pro_enabled()                            # master-flag gate
+    ↓ (False → MASTER_FLAG_OFF, zero side effects)
+prepare_problem(problem)                           # B.1
+    ↓ PreparedProblem (worktree + branch + test_patch applied)
+build_evaluation_envelope(problem, prepared)       # B.2.1
+    ↓ IntentEnvelope (causal_id = future op_id, evidence[repo_root] set)
+broker.subscribe(op_id_filter=envelope.causal_id)  # B.2.0.5 SSE — BEFORE ingest
+    ↓ subscriber (race-free primary path)
+intake_service.ingest_envelope(envelope)           # canonical intake
+    ↓ orchestrator picks up async, advances FSM
+asyncio.wait_for(terminal_event, timeout_s)        # bounded primary wait
+    ↓ on TimeoutError
+operation_ledger.get_latest_state(op_id)           # ONE-SHOT fallback (never polled)
+    ↓ ledger authority promotes outcome (if terminal)
+capture_produced_patch(prepared)                   # B.1 — captures the produced diff
+    ↓ finally
+cleanup_prepared(prepared)                         # B.1 — worktree removal
+```
+
+**Closed `EvaluationOutcome` taxonomy (AST-pinned 7-value)**:
+- `RESOLVED` — terminal state was `applied` (model produced a working fix)
+- `UNRESOLVED` — terminal state in `{failed, blocked, rolled_back}` (operator-visible failure)
+- `PREPARE_FAILED` — Phase B.1 returned non-READY (clone/checkout/test_patch failure)
+- `INGEST_FAILED` — `intake_service.ingest_envelope` returned False or raised; or broker capacity exhausted at subscribe time
+- `TERMINAL_TIMEOUT` — bounded SSE wait expired AND one-shot ledger fallback found no terminal state
+- `CANCELLED` — `asyncio.CancelledError` propagated (cleanup still ran in `finally`)
+- `MASTER_FLAG_OFF` — `swe_bench_pro_enabled()` was False (zero side effects)
+
+**Frozen `EvaluationResult` dataclass (§33.5 symmetric to_dict / from_dict)**:
+- `outcome: EvaluationOutcome`
+- `problem_instance_id: str`
+- `op_id: str` (the orchestrator's downstream op_id = envelope.causal_id)
+- `terminal_phase: str` (from SSE payload or empty)
+- `terminal_state: str` (`applied` / `failed` / `blocked` / `rolled_back` or empty)
+- `terminal_reason_code: str` (diagnostic: `sse_timeout_after_Ns` / `sse_timeout_ledger_fallback_terminal` / `ingest_returned_false` / etc.)
+- `captured_patch: Optional[str]` (from B.1 capture_produced_patch)
+- `diff_outcome: Optional[str]` (DiffCaptureOutcome value)
+- `elapsed_s: float`
+- `schema_version: str` = `swe_bench_pro_evaluation.v1`
+
+**Canonical composition discipline (AST-enforced, 8 pins)**:
+
+1. **subscribe BEFORE ingest** (race-free primary path) — AST pin via `ast.unparse` + `find()` index comparison. The envelope is built first (allocating `causal_id`), then the broker subscription is registered with `op_id_filter=causal_id` BEFORE `ingest_envelope` is called. This way even an instant terminal transition reaches the subscriber's queue.
+
+2. **Bounded primary wait** — AST pin asserts `asyncio.wait_for` is present in the substrate. Companion pin forbids any naked `asyncio.wait(...)` call (variant without `timeout=`).
+
+3. **No polling loop** — AST pin asserts no `while True:` loop anywhere in the façade body. Drift toward a busy-wait ledger poll is structurally forbidden.
+
+4. **One-shot ledger fallback** — AST pin counts `Call` nodes against `get_latest_state` attribute; asserts ≤1 call site. The fallback can never become a poll loop by construction.
+
+5. **Cleanup in try/finally** — AST pin walks `Try` nodes inside `evaluate_problem` body, asserts at least one has a `finalbody` containing `cleanup_prepared`. Cancellation, ingest failures, and SSE drops all leave the filesystem clean.
+
+6. **Master-flag-first discipline** — AST pin walks body statements top-down (skipping docstring), asserts `swe_bench_pro_enabled` is the first executable substrate reference. Forbidden tokens (`prepare_problem`, `ingest_envelope`, `subscribe`, etc.) MUST NOT appear before the gate.
+
+7. **No parallel state** — substring-level AST pin forbids `asyncio.Event(`, `defaultdict(asyncio.Event`, `Dict[str, asyncio.Event` patterns. The shortcut path (in-process `Dict[op_id, asyncio.Event]` registry) — explicitly rejected during B.2.2 scoping — is structurally impossible.
+
+8. **Closed taxonomy** — `EvaluationOutcome` enum has exactly 7 values; pinned by value-set equality.
+
+**Master flag (§33.1; FlagRegistry auto-seeded)**:
+- `JARVIS_SWE_BENCH_PRO_EVAL_TIMEOUT_S` (INT/CAPACITY, default 1800) — bounded terminal-wait ceiling in seconds. Default 30 min covers the long tail of hard SWE-Bench-Pro problems. Operators tuning fast eval cycles flip to smaller values; the env is honored end-to-end through `_resolve_timeout_s` with invalid-fallback discipline.
+
+**Spine — 29 regression tests + 8 AST pins**:
+- All 7 EvaluationOutcomes (parametrized over 3 UNRESOLVED states)
+- Master-flag OFF zero-side-effects (intake never called, broker subscriber count unchanged)
+- Timeout + ledger-fallback promotion to RESOLVED (ledger authority) + UNRESOLVED
+- Cancellation: cleanup runs + CancelledError propagates
+- Subscriber lifecycle: unsubscribed in finally (no broker capacity leak)
+- `cleanup=False` opt-out preserves worktree
+- `EvaluationResult` schema round-trip (`to_dict` / `from_dict`)
+- Timeout env override honored end-to-end
+- FlagRegistry seed assertion + never-raises-on-capturer-failure
+- 8 AST pins enumerated above
+
+**Surrounding regression**: **228 cumulative tests green** across the full B.2 arc (B.2.2 spine + B.2.1 envelope builder + B.1 per-problem harness + Phase A dataset loader + B.2.0 advisor + B.2.0.5 lifecycle SSE + read-only-advisor + `_run_inner` sha256 pin). `_run_inner` sha256 still `9e881fdde25ec5b1`. Pre-existing `test_l2_exercise_seed.py::test_register_flags_*` test-ordering pollution remains unrelated (flag_registry class-identity drift across imports on main).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/evaluator.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports + docstring update
+- `tests/governance/test_swe_bench_pro_evaluator.py` — 29-test spine + 8 AST pins
+
+**What this PR deliberately did NOT do**:
+- No parallel `Dict[op_id, asyncio.Event]` registry (AST-pinned forbidden)
+- No polling-loop ledger query (AST-pinned forbidden)
+- No naked `asyncio.wait()` without timeout (AST-pinned forbidden)
+- No master-flag gate hoisted into the envelope builder (responsibility separation)
+- No source-conditional logic anywhere (mirrors B.2.0 hardening note 4)
+- No new SSE event type (composes B.2.0.5's `operation_terminal` canonical)
+- No new broker / observer / ledger surface (composes existing canonical APIs)
+- No graduation flip — master flag stays default-FALSE until Phase C scorer + parallel-eval rig accumulate soak evidence
+
+**End-to-end B.2 arc closure summary**:
+
+| Layer | PR | Purpose | Tests |
+|---|---|---|---|
+| **B.1** | (prior) | `prepare_problem` / `PreparedProblem` / worktree + branch + test_patch | (B.1 spine) |
+| **B.2.0** | PR 1 | Worktree-aware `OperationAdvisor` (`EVIDENCE_REPO_ROOT_KEY` canonical) | 29 |
+| **B.2.0.5** | PR 2 | Orchestrator `operation_terminal` SSE (`_record_ledger` single-seam publish) | 36 |
+| **B.2.1** | PR 3 | `build_evaluation_envelope` (PreparedProblem → IntentEnvelope) | 31 |
+| **B.2.2 + B.2.3** | PR 4 (this) | `evaluate_problem` async façade + 8 AST pins | 29 |
+
+**Each layer is independently graduating-eligible** (every master flag default-FALSE per §33.1). Composition end-to-end is the operational answer to PRD §40.7.5's question "can the system produce a passing patch under an external benchmark?" — but the system stays dormant until operator-paced graduation.
+
+**Next**: **Phase C** — scorer surface that consumes `EvaluationResult.captured_patch` + applies the original `gold_patch` rubric to produce a pass/fail score. Architectural shape (preliminary, operator alignment pending):
+- `score_evaluation(result: EvaluationResult, problem: ProblemSpec) -> ScoringResult`
+- Composes the patch diff against the gold-patch's test invariants
+- Pure-data computation (no side effects beyond optional JSONL audit at `.jarvis/swe_bench_pro/scoring.jsonl`)
+- Closed `ScoreOutcome` taxonomy: PASS / PARTIAL / FAIL / SCORING_ERROR / SKIPPED (when `result.outcome != RESOLVED`)
+
+**Parallel-eval rig (Phase E)** is the operational ceiling — driving N problems concurrently through `evaluate_problem` via `subagent_scheduler` with bounded concurrency from the existing `JARVIS_PARALLEL_DISPATCH_*` knobs. Phase D (result_substrate) bridges Phase C's per-problem scores into the cross-problem aggregate report card (Phase F).
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)

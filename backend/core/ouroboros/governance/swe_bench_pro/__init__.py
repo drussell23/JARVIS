@@ -5,7 +5,7 @@ Package layout (one phase per module; all default-FALSE per §33.1):
   * ``dataset_loader``     — Phase A: ProblemSpec + cache + load.
   * ``per_problem_harness`` — Phase B.1: PreparedProblem + worktree.
   * ``envelope_builder``    — Phase B.2.1: PreparedProblem → IntentEnvelope.
-  * (future) ``evaluator``  — Phase B.2.2: evaluate_problem façade.
+  * ``evaluator``           — Phase B.2.2: evaluate_problem async façade.
   * (future) ``scorer``     — Phase C
   * (future) ``result_substrate`` — Phase D
   * (future) ``parallel_eval``    — Phase E
@@ -56,6 +56,13 @@ from backend.core.ouroboros.governance.swe_bench_pro.envelope_builder import (
     ENVELOPE_URGENCY_ENV_VAR,
     build_evaluation_envelope,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.evaluator import (
+    EVAL_TIMEOUT_ENV_VAR,
+    EVALUATION_RESULT_SCHEMA_VERSION,
+    EvaluationOutcome,
+    EvaluationResult,
+    evaluate_problem,
+)
 
 
 __all__ = [
@@ -82,4 +89,10 @@ __all__ = [
     "ENVELOPE_SOURCE",
     "ENVELOPE_URGENCY_ENV_VAR",
     "build_evaluation_envelope",
+    # Phase B.2.2 — evaluator façade
+    "EVAL_TIMEOUT_ENV_VAR",
+    "EVALUATION_RESULT_SCHEMA_VERSION",
+    "EvaluationOutcome",
+    "EvaluationResult",
+    "evaluate_problem",
 ]
