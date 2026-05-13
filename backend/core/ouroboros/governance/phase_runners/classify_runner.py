@@ -76,6 +76,7 @@ imports beyond what the verbatim transcription requires.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses as _dc
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -289,8 +290,25 @@ class CLASSIFYRunner(PhaseRunner):
                 )
 
                 async def _advise_op() -> Any:
-                    return _advisor.advise(
-                        ctx.target_files, ctx.description, ctx.op_id,
+                    # Dispatch the synchronous Advisor.advise() call to a
+                    # worker thread.  The implementation scans every
+                    # Python file in the project root (cold ~15s, warm
+                    # several seconds via internal TTL cache) — that I/O
+                    # MUST NOT block the asyncio event loop.  Stage-1
+                    # wiring soak 2026-05-12 (session
+                    # bt-2026-05-13-054721) confirmed: the first CLASSIFY
+                    # in a session stalled the entire event loop for ~12
+                    # minutes (16 sensors + router dispatch + governed
+                    # loop all starved), and subsequent ones blocked for
+                    # ~60s each.  asyncio.to_thread decouples the wait
+                    # from event-loop scheduling — same pattern the
+                    # SWE-Bench-Pro per-problem harness uses for git
+                    # subprocess work.
+                    return await asyncio.to_thread(
+                        _advisor.advise,
+                        ctx.target_files,
+                        ctx.description,
+                        ctx.op_id,
                         is_read_only=ctx.is_read_only,
                     )
 
@@ -311,14 +329,20 @@ class CLASSIFYRunner(PhaseRunner):
             except Exception:  # noqa: BLE001 — defensive
                 # Capture wrapper failed → fall back to direct call.
                 # Determinism is best-effort; advisor verdict must
-                # always materialize.
+                # always materialize.  The fallback ALSO dispatches
+                # through asyncio.to_thread — leaving a synchronous
+                # ~15s scan on the event loop here would re-introduce
+                # the very starvation the primary path closes.
                 logger.debug(
                     "[Orchestrator] capture_phase_decision failed for "
                     "CLASSIFY/advisor_verdict; falling back to direct "
                     "advise call", exc_info=True,
                 )
-                _advisory = _advisor.advise(
-                    ctx.target_files, ctx.description, ctx.op_id,
+                _advisory = await asyncio.to_thread(
+                    _advisor.advise,
+                    ctx.target_files,
+                    ctx.description,
+                    ctx.op_id,
                     is_read_only=ctx.is_read_only,
                 )
 
