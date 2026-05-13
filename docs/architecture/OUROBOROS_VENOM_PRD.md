@@ -1445,6 +1445,57 @@ Heap comparison touches only `(priority, submitted_at, tie_seq)` — all numeric
 - `tests/governance/intake/test_unified_intake_router_heap_tiebreak.py` — new spine file, 8 tests
 - This PRD section
 
+##### §40.7.10-stage1-v12v13 — Stage 1 wiring soak: empirical closure + Stage 1.6 motor arc opened (2026-05-13)
+
+**Context**: After the priority-map + heap-tiebreak commits closed the intake/dispatch path, three live SWE-Bench-Pro harness soaks (v8, v9, v10, v11, v12, v13) progressively peeled the substrate layers. Each soak surfaced a new wrong-substrate / coupling defect, repaired structurally, and validated on the next run. This memo records what those soaks proved, what they did NOT prove, and the Stage 1.6 motor arc those findings opened.
+
+**v8 → v10 — Advisor saturation + cold Oracle disk contention**: dispatch worked (40-115s consistently) but advise() didn't complete inside the 360s BG-pool ceiling because the default `asyncio.to_thread` executor was contested by 16 sensors + Oracle + DreamEngine + IntakeLayer all dispatching their own blocking I/O. PR-B (dedicated `advisor-blast` bounded ThreadPoolExecutor, default max_workers=2) was the structural fix; PR-A (Oracle-graph blast composing `TheOracle.get_blast_radius`, flag-gated default-FALSE with strict legacy fallback) sat behind it. Standalone benchmark: 3 advise calls under 8-CPU-spinner saturation = 240ms.
+
+**v11 — Wrong-substrate gap exposed**: even with PR-A/PR-B live and `JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=true` for the 2026-05-12 B.2.0 substrate, the SWE-Bench-Pro 6-file worktree STILL triggered a 29.5k-file `project_root` rglob. Phase 0 root-cause: master flag defaulted to FALSE per §33.1, so `resolve_envelope_repo_root` silently discarded the envelope's `evidence.repo_root`. AND classify_runner's primary CLASSIFY path (the one that actually runs in production) was passing `advise_async(...)` WITHOUT `repo_root=` — only the rarely-reached orchestrator.py parallel CLASSIFY path threaded the override. **Two-part Phase 0 fix**: master flag graduated to default-TRUE (with `JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=false` as explicit opt-out) + classify_runner.py threads `_adv_repo_root = resolve_envelope_repo_root(...)` to both primary and fallback advise_async sites. Standalone speedup: 27.48s → 0.9ms = **31,716×**.
+
+**v12 — Phase 0 confirmed empirically + first end-to-end SWE op INTENT**: foreground run with `caffeinate -dimsu` (monotonic=1902s wall=1902s — 1:1 ratio, no App Nap suspension). Live trace evidence:
+  - `Advisor scanning per-envelope repo_root=/private/var/folders/.../jarvis__harness-smoke-001 for op=op-019e22fe-...` — Phase 0 wiring LIVE
+  - `[Advisor] recommend (risk=0.00, blast=1, coverage=100%, entropy=0%, read_only=False) reasons=0 op=op-019e22fe-...` — worktree-bounded approval
+  - `[CommProtocol] INTENT op=019e22fe ... 'risk_tier': 'SAFE_AUTO', 'blast_radius': 1` — **the operator's wrong-substrate invariant CLOSED in production INTENT payload**
+  - But: 0 of 26 ops reached terminal COMPLETE. Each pipeline (CLASSIFY → ROUTE → CTX → PLAN → GENERATE-with-LLM → VALIDATE → APPLY → VERIFY → COMPLETE) for trivial fixture exceeded the 360s `BackgroundAgentPool` ceiling. NOT a substrate defect — a budget/coupling issue.
+
+**v13 — Stage 1.5 motor budget intermediate (source-aware ceiling + observable timebox)**: per operator binding "Raising the ceiling alone is a pressure valve, not the root fix. Pair it with policy-driven, source-aware budgets via existing routing/budget machinery + FlagRegistry." Refactored the ceiling-selection precedence chain (read_only > complex > base) into a **max-aggregated candidates list** with new `swe_bench_pro` category (`JARVIS_BG_WORKER_OP_TIMEOUT_SWE_BENCH_PRO_S`, default 900s — operator-tunable via FlagRegistry seed). Drift to first-match precedence would let one short ceiling mask a longer applicable one — max-aggregation kills that failure mode structurally. **Observable timebox**: structured kill payload `bg_timebox:<category>:source=<name>:timeout=<sec>` replaces opaque `pool_worker_timeout:Xs` so downstream observability (op-lifecycle SSE / audit ledger / postmortem) distinguishes ceiling kills from upstream cancellations.
+
+Empirical v13 evidence:
+  - `Worker 2: bgop-9a000bf6f7a6 ceiling=900s reason=swe_bench_pro (source='swe_bench_pro', file_count=1, read_only=False, base=360s)` — source-aware lease applied
+  - `Worker 1 completed operation bgop-d5375300a509 in 435.00s` — **FIRST CLEAN WORKER COMPLETION OF THE ARC** (a `runtime_health` op picked up the `complex` category at 8 target files → 900s lease, completed cleanly past the prior 360s wall)
+  - `Worker 2: operation bgop-9a000bf6f7a6 exceeded pool ceiling reason=bg_timebox category=swe_bench_pro source='swe_bench_pro' timeout=900s — freeing slot` — OUR SWE op hit the 900s lease, observable kill emitted
+  - 2+ clean worker completions vs **0 in v12** — motor budget is empirically unblocking pipeline progress
+
+**What v12+v13 jointly proved**:
+  - Nervous system: fully wired and substrate-correct (dispatch + advisor + worktree-aware + observable budget)
+  - Motor system: 360s sensor base is correct; 900s SWE lease lets the pipeline progress further but is NOT sufficient for full COMPLETE under current GENERATE LLM round-trip latency
+  - The remaining gap is **architectural coupling**, not budget: a scarce BG worker slot is held across the entire GENERATE wall-clock (LLM round-trip). Raising the ceiling further only moves the kill line — it does not change the coupling
+
+**Stage 1.6 — BG release / op park during LLM wait (operator binding 2026-05-13, MANDATORY arc)**:
+At GENERATE entry (or the narrowest await boundary that already exists), the op MUST release BG pool occupancy while waiting on provider I/O, without losing single-flight / op identity / cancellation semantics. Must compose existing park/resume infrastructure (`battle_test/resume_command.py` + `OperationLedger` + `subagent_ledger_sink` already implement op-state-persistence + scan_orphans + /resume REPL verb) — do NOT fork a second orchestrator. Parked ops must remain observable (phase heartbeats / ledger / SSE) and cooperatively cancellable. Safety: default-FALSE master flag + spine proving (a) slot is not held during a mock-stalled GENERATE, (b) no double-dispatch, (c) no lost terminal on success/cancel paths. Bar A (≥1 SWE op reaches terminal COMPLETE under unchanged or tighter 900s lease) closes the motor story; Bar B (Stage 1 = nervous system only, motor budget = Stage 1.5 documented) only if a timeboxed 1.6 feasibility spike (~4-6h) concludes "impossible without FSM rewrite" with evidence.
+
+**Commits this soak arc** (all on `main`, all spine-pinned, all default-on or §33.1-gated as appropriate):
+
+| Commit | Layer | Closure |
+|---|---|---|
+| `1960194150` | intake/router | priority-map registers `swe_bench_pro` |
+| `498225aee1` | intake/router | 4-tuple heap shape (deterministic tie-break) |
+| `037f9e763a` | advisor | `to_thread` + per-instance TTL cache |
+| `6795f88a98` | advisor | module-level shared cache (cross-instance) |
+| `0db52b6449` | advisor | PR-B dedicated `advisor-blast` ThreadPoolExecutor |
+| `48562ce21d` | advisor | PR-A Oracle-graph blast (flag-gated, strict fallback) |
+| `3a9cf4701f` | oracle | parse-in-executor + per-batch progress logs |
+| `e2197779d1` | advisor | Phase 0: worktree-aware default-TRUE graduation |
+| `80aa643adc` | classify_runner | thread `repo_root` through advise_async |
+| `1c4b27fe7c` | harness | single-flight pgrep `^`-anchored (caffeinate-friendly) |
+| `f0e2e928dc` | bg_pool | Stage 1.5 source-aware motor budget + `bg_timebox` reason_code |
+
+**File-coordinate summary** (this PRD entry):
+- All 11 commits listed above on `main`, with regression spines totaling 200+ new tests
+- `docs/operations/battle_test_runbook.md` should reference `JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST` + `caffeinate -dimsu` for SWE-eval workflows (future runbook update)
+- This PRD section documents the empirical closure trail for §41 graduation review
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
