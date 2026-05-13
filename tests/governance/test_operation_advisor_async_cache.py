@@ -50,8 +50,21 @@ from backend.core.ouroboros.governance import operation_advisor
 from backend.core.ouroboros.governance.operation_advisor import (
     OperationAdvisor,
     _BLAST_RADIUS_CACHE_MAX_ENTRIES,
+    _BLAST_RADIUS_CACHE_SHARED,
     _BLAST_RADIUS_CACHE_TTL_S,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_blast_radius_cache():
+    """Clear the module-level shared cache between tests so they
+    don't observe each other's writes.  Required because the cache
+    is process-wide (a deliberate design choice — see
+    ``_BLAST_RADIUS_CACHE_SHARED`` comment in the module — but tests
+    are easier to reason about in isolation)."""
+    _BLAST_RADIUS_CACHE_SHARED.clear()
+    yield
+    _BLAST_RADIUS_CACHE_SHARED.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +141,79 @@ def test_blast_radius_cache_respects_ttl(tmp_path, monkeypatch):
     # Second call must miss (TTL=0) — but result should still be correct
     r = advisor._compute_blast_radius(target_files)
     assert isinstance(r, int)
+
+
+def test_blast_radius_cache_is_shared_across_advisor_instances(tmp_path):
+    """Module-level cache MUST be shared across all OperationAdvisor
+    instances pointing at the same scan_root.
+
+    The production code instantiates a fresh ``OperationAdvisor``
+    per CLASSIFY phase (classify_runner line ~278, orchestrator
+    line ~1855), so a per-instance cache would be wasted across
+    ops — that's exactly what stage-1 wiring soak 2026-05-13
+    (session bt-2026-05-13-070956) caught: Advisor verdict took
+    8m28s for a SWE-Bench-Pro envelope because each fresh
+    instance re-scanned 29.5k files.  This test pins the shared
+    surface so the regression can't sneak back.
+    """
+    # Tiny scan tree so cold is also fast
+    (tmp_path / "a.py").write_text("import target_mod\n")
+    advisor_one = OperationAdvisor(tmp_path)
+    advisor_two = OperationAdvisor(tmp_path)
+    target_files = ("target_mod.py",)
+
+    # First instance populates the shared cache
+    t0 = time.monotonic()
+    r1 = advisor_one._compute_blast_radius(target_files)
+    cold = time.monotonic() - t0
+
+    # Second instance — DIFFERENT object — should hit the same cache
+    t1 = time.monotonic()
+    r2 = advisor_two._compute_blast_radius(target_files)
+    warm = time.monotonic() - t1
+
+    assert r1 == r2, (
+        f"Cross-instance cache returned different result: "
+        f"r1={r1} r2={r2}"
+    )
+    # Warm hit MUST be substantially faster — proves the cache is
+    # actually shared (otherwise the second instance would do the
+    # full scan).  Allowing 10x margin for noise on slow CI.
+    assert warm < cold / 10 or warm < 0.001, (
+        f"Second instance ({warm*1000:.3f}ms) was not at least 10x "
+        f"faster than first ({cold*1000:.3f}ms) — the cache is per-"
+        "instance, not shared.  Fresh OperationAdvisor instances in "
+        "the production CLASSIFY path will re-pay the cold scan and "
+        "the 12-min event-loop starvation will return."
+    )
+
+
+def test_blast_radius_cache_different_scan_roots_dont_collide(tmp_path):
+    """Two advisors pointing at DIFFERENT roots MUST get distinct
+    cache entries (worktree-aware ops with per-envelope scan_root
+    must not cross-pollute)."""
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    (root_a / "f.py").write_text("import x\n")
+    (root_b / "f.py").write_text("# different content\nimport x\nimport y\n")
+
+    advisor_a = OperationAdvisor(root_a)
+    advisor_b = OperationAdvisor(root_b)
+
+    # Both query same target_files — but they live in different roots,
+    # so cache_key (which includes str(scan_root)) MUST be distinct.
+    advisor_a._compute_blast_radius(("x.py",))
+    advisor_b._compute_blast_radius(("x.py",))
+
+    # 2 distinct entries in the shared cache
+    assert len(_BLAST_RADIUS_CACHE_SHARED) == 2, (
+        f"Expected 2 cache entries (one per scan_root), got "
+        f"{len(_BLAST_RADIUS_CACHE_SHARED)}.  Cache key MUST "
+        "include str(scan_root) so worktree-aware advisors don't "
+        "see each other's results."
+    )
 
 
 def test_blast_radius_cache_max_entries_evicts_fifo(tmp_path, monkeypatch):
