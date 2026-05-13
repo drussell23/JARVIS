@@ -1872,15 +1872,15 @@ class GovernedOrchestrator:
                         "(legacy project_root retained as fallback)",
                         _adv_repo_root, ctx.op_id,
                     )
-                # Dispatch the synchronous Advisor.advise() to a worker
-                # thread.  The implementation scans every Python file in
-                # the project root (cold ~15s, warm seconds via internal
-                # TTL cache) — running that on the event loop starves
-                # the entire harness for the duration.  See
-                # operation_advisor._BLAST_RADIUS_CACHE_TTL_S docstring
-                # for the wiring-soak observation that motivated this.
-                _advisory = await asyncio.to_thread(
-                    _advisor.advise,
+                # Dispatch through the dedicated advisor-blast executor
+                # (PR-B 2026-05-13) — NOT the default asyncio
+                # ThreadPoolExecutor.  In the live harness the default
+                # executor is contested by 16 sensors + Oracle + etc.;
+                # advisor work would queue behind them and miss the
+                # BG-pool 360s ceiling.  See operation_advisor
+                # ``_get_advisor_blast_executor`` for the isolation
+                # contract.
+                _advisory = await _advisor.advise_async(
                     ctx.target_files,
                     ctx.description,
                     ctx.op_id,

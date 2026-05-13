@@ -19,6 +19,7 @@ Boundary Principle:
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import os
@@ -89,6 +90,74 @@ _BLAST_RADIUS_CACHE_MAX_ENTRIES: int = int(
 _BLAST_RADIUS_CACHE_SHARED: "Dict[Tuple[frozenset, str], Tuple[float, int]]" = {}
 import threading as _threading  # local alias — keep top-level import block clean
 _BLAST_RADIUS_CACHE_LOCK: "_threading.Lock" = _threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Dedicated bounded executor for advisor blast scans (PR-B)
+# ---------------------------------------------------------------------------
+#
+# Background: stage-1 wiring soak 2026-05-13 (session
+# bt-2026-05-13-072716) showed that even after asyncio.to_thread + TTL
+# cache + module-level shared cache, advisor.advise() in the live
+# harness still didn't complete within 360s while the standalone
+# benchmark of the same workload finished in 30s (12x slowdown).
+# Standalone vs live difference: the live harness has 16 sensors +
+# Oracle + DreamEngine + IntakeLayer all dispatching their own
+# blocking I/O to asyncio.to_thread, which uses the DEFAULT
+# ThreadPoolExecutor.  Advisor's blast scan got queued behind dozens
+# of unrelated tasks.
+#
+# Fix: a dedicated, bounded ThreadPoolExecutor for advisor blast work
+# ONLY.  Small max_workers (default 2 — blast scans are CPU-light
+# I/O-heavy, and isolation is the point, not parallelism).  Observable
+# via logger queue-depth on every dispatch.  Process-wide singleton
+# (lazy-init under lock).
+#
+# This is a workload-isolation fix, not a semantic change.  Legacy
+# rglob blast computation runs unchanged inside the dedicated executor
+# (PR-A separately replaces the rglob with Oracle-graph BFS).
+import concurrent.futures as _futures
+import atexit as _atexit
+_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS: int = int(
+    os.environ.get("JARVIS_ADVISOR_BLAST_EXECUTOR_WORKERS", "2")
+)
+_ADVISOR_BLAST_EXECUTOR: "Optional[_futures.ThreadPoolExecutor]" = None
+_ADVISOR_BLAST_EXECUTOR_INIT_LOCK: "_threading.Lock" = _threading.Lock()
+
+
+def _get_advisor_blast_executor() -> "_futures.ThreadPoolExecutor":
+    """Lazy-init singleton dedicated ThreadPoolExecutor for advisor
+    blast scans.  All ``advise_async`` calls dispatch here so advisor
+    work never queues behind the default executor's other consumers.
+    """
+    global _ADVISOR_BLAST_EXECUTOR
+    if _ADVISOR_BLAST_EXECUTOR is None:
+        with _ADVISOR_BLAST_EXECUTOR_INIT_LOCK:
+            if _ADVISOR_BLAST_EXECUTOR is None:
+                _ADVISOR_BLAST_EXECUTOR = _futures.ThreadPoolExecutor(
+                    max_workers=_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
+                    thread_name_prefix="advisor-blast",
+                )
+                _atexit.register(_shutdown_advisor_blast_executor)
+                logger.info(
+                    "[Advisor] dedicated executor initialized "
+                    "(max_workers=%d, thread_prefix=advisor-blast)",
+                    _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
+                )
+    return _ADVISOR_BLAST_EXECUTOR
+
+
+def _shutdown_advisor_blast_executor() -> None:
+    """Clean shutdown at process exit — drains pending work then
+    closes the pool.  Idempotent: safe to call multiple times."""
+    global _ADVISOR_BLAST_EXECUTOR
+    with _ADVISOR_BLAST_EXECUTOR_INIT_LOCK:
+        if _ADVISOR_BLAST_EXECUTOR is not None:
+            try:
+                _ADVISOR_BLAST_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001
+                pass
+            _ADVISOR_BLAST_EXECUTOR = None
 
 # ---------------------------------------------------------------------------
 # B.2.0 — Worktree-aware advisory (SWE-Bench-Pro Phase 2 enabling layer +
@@ -425,6 +494,63 @@ class OperationAdvisor:
         # directly.  Mutation goes through ``_BLAST_RADIUS_CACHE_LOCK``
         # because the dict is accessed from worker threads.
         self._blast_radius_cache = _BLAST_RADIUS_CACHE_SHARED
+
+    async def advise_async(
+        self,
+        target_files: Tuple[str, ...],
+        description: str,
+        op_id: str = "",
+        is_read_only: bool = False,
+        repo_root: Optional[Path] = None,
+    ) -> "Advisory":
+        """Async wrapper around :meth:`advise` that dispatches through
+        the dedicated ``advisor-blast`` ThreadPoolExecutor — NOT the
+        default asyncio executor.
+
+        Why: in the live harness, the default executor is contested by
+        16 sensors + Oracle + DreamEngine all dispatching their own
+        blocking I/O via ``asyncio.to_thread``.  Advisor blast scans
+        queued behind that traffic and missed the BG-pool 360s ceiling
+        (stage-1 wiring soak 2026-05-13 session bt-2026-05-13-072716).
+        Routing advisor work to a dedicated bounded executor
+        guarantees isolation.  Queue depth is logged on every
+        submission for observability (operator binding 2026-05-13).
+
+        Identical signature + semantics to ``advise`` — callers can
+        substitute ``await advisor.advise_async(...)`` for any
+        ``advisor.advise(...)`` site they previously wrapped in
+        ``asyncio.to_thread``.  AST-pinned at every CLASSIFY call site.
+        """
+        loop = asyncio.get_running_loop()
+        executor = _get_advisor_blast_executor()
+        # Observable queue-depth.  ThreadPoolExecutor exposes
+        # _work_queue (a queue.SimpleQueue / queue.Queue) for the
+        # backlog — qsize() is approximate but good enough for
+        # operator visibility.  Falls back silently if the attr
+        # disappears across Python versions.
+        try:
+            _qdepth = executor._work_queue.qsize()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            _qdepth = -1
+        if _qdepth > 0:
+            logger.info(
+                "[Advisor] dispatching op=%s blast scan via dedicated "
+                "executor; queue_depth=%d max_workers=%d",
+                op_id[:16] if op_id else "-",
+                _qdepth, _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
+            )
+        # Use a lambda to bind kwargs because run_in_executor doesn't
+        # take **kwargs natively.
+        return await loop.run_in_executor(
+            executor,
+            lambda: self.advise(
+                target_files,
+                description,
+                op_id,
+                is_read_only=is_read_only,
+                repo_root=repo_root,
+            ),
+        )
 
     def advise(
         self,

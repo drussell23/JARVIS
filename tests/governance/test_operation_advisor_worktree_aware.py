@@ -516,15 +516,20 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
     silently dropped the resolver would silently revert behavior to
     pre-B.2.0 even with the master flag ON.
 
-    Two call shapes are accepted (both preserve the structural
+    Three call shapes are accepted (all preserve the structural
     invariant "repo_root is threaded into advise"):
 
     1. Direct: ``_advisor.advise(..., repo_root=...)``
     2. ``asyncio.to_thread``-wrapped:
        ``asyncio.to_thread(_advisor.advise, ..., repo_root=...)``
-       — the 2026-05-13 fix that moves the ~15s blast-radius scan
-       off the asyncio event loop.  See
-       ``test_operation_advisor_async_cache.py`` for the rationale.
+       — the 2026-05-13 first-iteration fix that moved the ~15s
+       blast-radius scan off the asyncio event loop.
+    3. ``advise_async`` (PR-B 2026-05-13): ``_advisor.advise_async(
+       ..., repo_root=...)`` — routes through the dedicated bounded
+       advisor-blast ThreadPoolExecutor to isolate from default-pool
+       contention (16 sensors + Oracle saturating the default
+       executor in the live harness).  See
+       ``test_operation_advisor_async_cache.py`` for rationale.
     """
     from backend.core.ouroboros.governance import orchestrator
     orchestrator_src = Path(orchestrator.__file__).read_text()
@@ -554,14 +559,18 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
                     and any(kw.arg == "repo_root" for kw in node.keywords)
                 ):
                     advise_with_repo_root = True
+            # Shape 3: _advisor.advise_async(..., repo_root=...)
+            if name == "advise_async":
+                if any(kw.arg == "repo_root" for kw in node.keywords):
+                    advise_with_repo_root = True
     assert resolver_called, (
         "orchestrator.py never calls resolve_envelope_repo_root — "
         "B.2.0 wiring missing"
     )
     assert advise_with_repo_root, (
         "orchestrator.py never passes repo_root= to advise() — "
-        "B.2.0 wiring incomplete (checked both direct and "
-        "asyncio.to_thread-wrapped call shapes)"
+        "B.2.0 wiring incomplete (checked direct, "
+        "asyncio.to_thread-wrapped, and advise_async call shapes)"
     )
 
 
