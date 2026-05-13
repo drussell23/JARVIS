@@ -1174,6 +1174,101 @@ Each of `ReportCard` / `RepoStats` / `DifficultyStats` / `FailureCluster` is a `
 
 **Graduation criterion (preliminary)**: SWE-Bench-Pro master stays default-FALSE until a soak demonstrates ≥1 RESOLVED outcome on a known-good problem AND ≥1 UNRESOLVED outcome on a known-hard problem (rubric sanity floor: the rubric distinguishes real fixes from non-fixes). Per-repo soaks accumulate evidence for the §41.6 cadence-flags-graduated metric.
 
+##### §40.7.10-soak — SWE-Bench-Pro harness boot hook (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/harness-inject`. Mirrors the L2 exercise corpus precedent at `backend/core/ouroboros/governance/l2_exercise_seed.maybe_inject_exercise_at_boot` — master-flag-gated boot-time injection that lifts cached `ProblemSpec` records into per-problem worktrees + envelopes + the canonical `IntakeLayerService.ingest_envelope` surface.
+
+**What it closes**: the only remaining gap between "Phases A → F substrate shipped" and "operator can run O+V live on SWE-Bench-Pro". Before this PR, the SWE-Bench-Pro arc had:
+- ✅ Substrate (A → F, 339 tests green)
+- ✅ Phase A loader configured for cache + local JSONL + HF fetch
+- ❌ **No harness driver** — `parallel_evaluate` shipped as an async generator but no operator-facing entry point bound it to the live `IntakeLayerService`
+- ❌ **No on-disk seed data** — `.jarvis/swe_bench_pro/` empty
+
+Post-PR:
+- ✅ `maybe_inject_swe_bench_at_boot(intake_service)` wired into `battle_test/harness.py` after the L2 exercise hook (same shape, same fail-open contract)
+- ✅ Checked-in minimal fixture at `tests/fixtures/swe_bench_pro/problems.jsonl` (1 record against stable upstream `octocat/Hello-World` for wiring validation)
+- ✅ Operator runbook with cost / wall-clock caps documented (this paragraph)
+- ✅ 19-test spine + 4 AST pins + 3 FlagRegistry seeds
+
+**Composition discipline (AST-pinned, 4 pins)**:
+1. Composes canonical Phase A `load_problem` (no parallel loader)
+2. Composes canonical Phase B.1 `prepare_problem` (no parallel worktree manager — AST pin forbids `WorktreeManager` name reference)
+3. Composes canonical Phase B.2.1 `build_evaluation_envelope` (no parallel envelope shape)
+4. Composes canonical `IntakeLayerService.ingest_envelope` (no parallel router — AST pin forbids `UnifiedIntakeRouter` name reference)
+
+**Closed 5-value `SWEBenchProInjectionVerdict`** mirroring the L2 exercise verdict shape:
+- `INJECTED` — at least one envelope reached `ingest_envelope` with `True` return
+- `SKIPPED_DISABLED` — master flag OFF (zero side effects)
+- `SKIPPED_NO_PROBLEMS` — neither CSV override nor cached problems available
+- `FAILED_LOAD` — every candidate's Phase A load returned `None`
+- `FAILED_INJECT` — every candidate's ingest returned `False` (or `intake_service` was None)
+
+**Two-tier instance-id selection**:
+1. **CSV override** (`JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS`) takes priority — explicit operator-chosen problem set, useful for reproducing a specific failure / soak
+2. **Count first-N** (`JARVIS_SWE_BENCH_PRO_INJECT_COUNT`, default 1) — takes first N from `list_cached_problems()` when CSV unset
+
+**Master flags (§33.1; FlagRegistry auto-seeded — 3 specs)**:
+- `JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED` (BOOL/SAFETY, default **FALSE**) — orthogonal to Phase A's master (operators can have loader enabled without auto-injecting at every boot)
+- `JARVIS_SWE_BENCH_PRO_INJECT_COUNT` (INT/CAPACITY, default 1) — first-N selection limit
+- `JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS` (STR/INTEGRATION, default empty) — CSV override
+
+**Spine — 19 regression tests + 4 AST pins + 3 FlagRegistry seed assertions**:
+- All 5 verdicts via stubs (master OFF / None intake / no problems / loads fail / ingests fail / mixed-partial-success / prepare fails)
+- CSV override priority over count
+- Count limits first-N selection
+- Closed 5-value taxonomy
+- AST pins: canonical `load_problem` import / canonical `prepare_problem` import / canonical `build_evaluation_envelope` import / no parallel `WorktreeManager` or `UnifiedIntakeRouter` references
+- Harness wiring pin: `battle_test/harness.py` references `maybe_inject_swe_bench_at_boot` AND wraps it in `try/except` (boot-must-never-fail contract)
+- FlagRegistry: 3 specs / master default FALSE / never-raises-on-capturer-failure
+
+**Surrounding regression**: **369 cumulative tests green** across the entire SWE-Bench-Pro arc + harness boot hook + L2 exercise wire spine (shape-parity preserved). `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+##### §40.7.10-arc — Operator runbook for first live run (post-harness-inject)
+
+The stop condition is now met:
+1. ✅ **Harness hook merged** — `maybe_inject_swe_bench_at_boot` wired into `battle_test/harness.py`
+2. ✅ **≥1 on-disk problem** — `tests/fixtures/swe_bench_pro/problems.jsonl` (1 wiring-validation record)
+3. ✅ **Cost/wall caps documented** — below
+
+**Operator-bound budget for first live run**: **$2.00 max for 5–10 problems** (per 2026-05-12 operator decision).
+
+**Recommended first live run** (wiring validation, ~$0.01–0.10):
+
+```bash
+# Phase A loader on (so the fixture is readable)
+export JARVIS_SWE_BENCH_PRO_ENABLED=true
+# Phase A local-JSONL fixture path
+export JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH=tests/fixtures/swe_bench_pro/problems.jsonl
+# Harness boot hook on
+export JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=true
+export JARVIS_SWE_BENCH_PRO_INJECT_COUNT=1
+# Optional but recommended: full observability
+export JARVIS_SWE_BENCH_PRO_RESULT_PERSISTENCE_ENABLED=true
+export JARVIS_OP_LIFECYCLE_SSE_ENABLED=true
+export JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=true
+# Run with operator-bound cost cap
+python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 1800 -v
+```
+
+**Real upstream benchmark run** (after wiring-validation green, ~$0.05–2.00 depending on per-problem complexity):
+
+```bash
+# Configure HF dataset
+export JARVIS_SWE_BENCH_PRO_HF_DATASET=princeton-nlp/SWE-bench-Pro  # or equivalent
+export HUGGINGFACE_HUB_TOKEN=<your-token>
+# Cherry-pick 1–3 problems FIRST — do not download the full 1865 on first live test
+export JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS=astropy__astropy-12345,sympy__sympy-67890
+# Then flip masters as above
+python3 scripts/ouroboros_battle_test.py --cost-cap 2.00 --idle-timeout 1800 -v
+```
+
+**Observability while soaking**:
+- **`operation_terminal` SSE events** stream live on the canonical broker (`get_default_broker`); IDE extensions auto-receive via `GET /observability/stream`
+- **JSONL audit** at `.jarvis/swe_bench_pro/results.jsonl` per Phase D (when persistence master ON)
+- **Post-soak report card**: `python3 -c "from backend.core.ouroboros.governance.swe_bench_pro import *; ...; print(render_markdown(build_report_card(get_default_store(), problems=problem_map)))"` — or write to disk via `await write_report_card(card, Path('soak-report.md'))`
+
+**Graduation criterion**: SWE-Bench-Pro masters stay default-FALSE until a soak demonstrates ≥1 RESOLVED outcome on a known-good problem AND ≥1 UNRESOLVED outcome on a known-hard problem (rubric sanity floor — distinguishes real fixes from non-fixes). Per-repo soaks accumulate evidence for the §41.6 cadence-flags-graduated metric.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)

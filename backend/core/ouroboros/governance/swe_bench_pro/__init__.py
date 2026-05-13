@@ -106,6 +106,14 @@ from backend.core.ouroboros.governance.swe_bench_pro.report_card import (
     render_markdown,
     write_report_card,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (
+    HARNESS_INJECT_ENABLED_ENV_VAR,
+    INJECT_COUNT_ENV_VAR,
+    INJECT_INSTANCE_IDS_ENV_VAR,
+    SWEBenchProInjectionVerdict,
+    harness_inject_enabled,
+    maybe_inject_swe_bench_at_boot,
+)
 
 
 __all__ = [
@@ -170,4 +178,11 @@ __all__ = [
     "render_json",
     "render_markdown",
     "write_report_card",
+    # Harness boot hook
+    "HARNESS_INJECT_ENABLED_ENV_VAR",
+    "INJECT_COUNT_ENV_VAR",
+    "INJECT_INSTANCE_IDS_ENV_VAR",
+    "SWEBenchProInjectionVerdict",
+    "harness_inject_enabled",
+    "maybe_inject_swe_bench_at_boot",
 ]

@@ -1884,6 +1884,48 @@ class BattleTestHarness:
                 exc_info=True,
             )
 
+        # ── v3.7 Phase 2 — SWE-Bench-Pro harness boot hook ─────────────
+        # Default-FALSE per §33.1 — when JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED
+        # is unset, this short-circuits at the master-flag check inside
+        # maybe_inject_swe_bench_at_boot without any fixture I/O /
+        # worktree allocation. When operator opts in (first live
+        # benchmark soak), the hook lifts cached ProblemSpec records
+        # through the full SWE-Bench-Pro vertical:
+        #
+        #     Phase A load_problem        — pulls from cache/HF
+        #     Phase B.1 prepare_problem   — clones repo, applies test_patch
+        #     Phase B.2.1 build_envelope  — composes IntentEnvelope
+        #     canonical ingest_envelope   — same surface L2 exercise +
+        #                                   Phase 9 synthetic use
+        #
+        # Orthogonal to JARVIS_SWE_BENCH_PRO_ENABLED (operators can
+        # have loader enabled without auto-injecting every boot).
+        # Positioning: AFTER the IntakeLayerService boot block above
+        # so self._intake_service is non-None — mirrors the v2 L2
+        # exercise hook positioning fix (df4b70a4a8).
+        try:
+            from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (  # noqa: E501
+                maybe_inject_swe_bench_at_boot,
+            )
+            if self._intake_service is not None:
+                _swebp_verdict = await maybe_inject_swe_bench_at_boot(
+                    self._intake_service,
+                )
+                logger.info(
+                    "[Harness] SWE-Bench-Pro boot hook: verdict=%s",
+                    _swebp_verdict.value,
+                )
+            else:
+                logger.debug(
+                    "[Harness] SWE-Bench-Pro boot hook: "
+                    "_intake_service is None — skipping",
+                )
+        except Exception:  # noqa: BLE001 — boot must NEVER fail
+            logger.debug(
+                "[Harness] SWE-Bench-Pro boot hook raised — continuing",
+                exc_info=True,
+            )
+
     async def _inject_phase_9_synthetic_workload(self) -> None:
         """Phase 9 cadence synthetic workload injection.
 
