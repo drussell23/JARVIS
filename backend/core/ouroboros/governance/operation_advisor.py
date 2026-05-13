@@ -454,9 +454,37 @@ def infer_read_only_intent(description: str) -> bool:
 
 
 def _worktree_aware_enabled() -> bool:
-    """Master switch (§33.1 default-FALSE)."""
-    raw = os.environ.get(ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR, "")
-    return raw.strip().lower() in ("true", "1", "yes", "on")
+    """Master switch — graduated to default-TRUE 2026-05-13 (§33.1).
+
+    Why graduated: the B.2.0 substrate has been shipped + tested since
+    2026-05-12, the path-validation contract (``resolve_envelope_repo_root``)
+    rejects every path that doesn't resolve under ``project_root`` or
+    a caller-supplied allowlist, and the off-default was the root
+    cause of Stage-1 wiring-soak v8–v10 advise() starvation: for a
+    6-file SWE-Bench-Pro worktree, the legacy fallback rglob-scanned
+    the entire 29.5k-file ``project_root`` because the envelope's
+    ``repo_root`` was silently discarded.  The substrate ALREADY
+    walks only ``scan_root`` when given a non-None root — the flag
+    was the gatekeeper, not the scanner.  Spine pin at
+    ``test_operation_advisor_worktree_aware`` asserts the scan-bounding
+    contract on a counterfactual fixture so the graduation can't
+    silently regress.
+
+    Operators who need the prior default-FALSE behavior can set
+    ``JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=false`` explicitly.  The
+    allowlist (``JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST``) remains
+    opt-in — only paths under ``project_root`` are accepted without
+    additional allowlist entries, so the graduation is safe for the
+    default case (envelopes lacking ``repo_root`` or with
+    ``repo_root`` under the bound project root).
+    """
+    raw = os.environ.get(ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR, "").strip().lower()
+    # Default-TRUE: unset/empty enables the worktree-aware path.
+    # Explicit "false"/"0"/"no"/"off" opts back to the legacy
+    # always-scan-project_root behavior.
+    if raw in ("false", "0", "no", "off"):
+        return False
+    return True
 
 
 def _parse_allowlist_env() -> Tuple[Path, ...]:
@@ -1101,9 +1129,10 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
-                "B.2.0 master switch (§33.1 default-FALSE): when ON, the "
+                "B.2.0 master switch — graduated to default-TRUE 2026-05-13 "
+                "(§33.1). When ON (default), the "
                 "OperationAdvisor consumes a per-envelope ``repo_root`` "
                 "string from intake_evidence_json and scans THAT tree for "
                 "blast radius / coverage / staleness / large-file signals "
