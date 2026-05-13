@@ -310,8 +310,24 @@ async def _ensure_repo_cached(repo_url: str) -> Optional[Path]:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_dir():
             shutil.rmtree(str(target), ignore_errors=True)
+        # ``--template=`` (empty string) disables template-hook copying
+        # from git's global templates directory. SWE-Bench-Pro clones
+        # don't need or want pre-commit / commit-msg / etc. hooks —
+        # they're benchmark eval substrates, not contributor checkouts.
+        # As a side effect this also unblocks restricted environments
+        # where git's global templates dir is non-writable (a real
+        # failure mode observed in stage-1 wiring soak 2026-05-12:
+        # ``fatal: cannot copy '/opt/homebrew/opt/git/share/git-core/
+        # templates/hooks/commit-msg.sample' to ...``). The flag is
+        # AST-pinned by the spine to prevent drift.
         rc, _stdout, stderr = await _run_git(
-            ["clone", "--filter=blob:none", repo_url, str(target)],
+            [
+                "clone",
+                "--filter=blob:none",
+                "--template=",  # AST-pinned: benchmark cleanliness
+                repo_url,
+                str(target),
+            ],
             timeout_s=git_clone_timeout_s(),
         )
         if rc != 0:

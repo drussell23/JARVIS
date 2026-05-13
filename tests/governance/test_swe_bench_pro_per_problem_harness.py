@@ -708,3 +708,50 @@ def test_git_clone_timeout_default_and_clamping(monkeypatch):
     assert per_problem_harness.git_clone_timeout_s() == 600
     monkeypatch.setenv("JARVIS_SWE_BENCH_PRO_GIT_CLONE_TIMEOUT_S", "-50")
     assert per_problem_harness.git_clone_timeout_s() == 1
+
+
+# ===========================================================================
+# AST pin: clone invocation disables template-hook copying
+# ===========================================================================
+#
+# Operator binding 2026-05-12: SWE-Bench-Pro clones don't need or want
+# pre-commit / commit-msg / etc. template hooks — they're benchmark
+# eval substrates, not contributor checkouts. The ``--template=`` flag
+# (empty string) disables the copy. As a side effect this also unblocks
+# restricted environments where git's global templates dir is non-
+# writable. This pin prevents drift back to template-copying clones.
+
+
+def test_ast_pin_clone_invocation_disables_template_hooks():
+    """The ``--template=`` flag MUST appear in the
+    ``_ensure_repo_cached`` clone args list. Drift here re-introduces
+    the stage-1 wiring soak failure mode
+    (``fatal: cannot copy '/opt/.../templates/hooks/...'``) AND
+    silently pollutes benchmark clones with contributor hooks."""
+    source = Path(per_problem_harness.__file__).read_text()
+    tree = ast.parse(source)
+    target_fn = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_ensure_repo_cached"
+        ):
+            target_fn = node
+            break
+    assert target_fn is not None, (
+        "_ensure_repo_cached not found — pin needs updating"
+    )
+    fn_text = ast.unparse(target_fn)
+    # ast.unparse renders string literals in single quotes (Python's
+    # default repr style); match either form for robustness.
+    assert "'clone'" in fn_text or '"clone"' in fn_text, (
+        "_ensure_repo_cached no longer issues a `clone` subcommand"
+    )
+    assert "'--template='" in fn_text or '"--template="' in fn_text, (
+        "_ensure_repo_cached clone args do NOT include `--template=` "
+        "— template-hook copying re-enabled. This will break in "
+        "restricted environments (e.g. sandboxes that disallow writes "
+        "to /opt/.../templates/hooks/) AND pollute benchmark clones "
+        "with contributor hooks. Restore the flag per the operator "
+        "binding 2026-05-12."
+    )

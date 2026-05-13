@@ -1320,6 +1320,43 @@ STEP 3: maybe_inject_swe_bench_at_boot(stub_intake)
 - `memory/project_intake_layer_start_perf_triage.md` — separate perf triage (NEW)
 - This PRD section
 
+##### §40.7.10-template — git clone --template= for benchmark cleanliness (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on branch `ouroboros/swe-bench-pro/clone-template-bypass`. Closes the follow-on issue found during the stage-1 wiring re-validation: even after the union enumeration fix landed, the focused validator's real `git clone` failed with:
+```
+fatal: cannot copy '/opt/homebrew/opt/git/share/git-core/templates/hooks/commit-msg.sample'
+       to '/Users/djrussell23/Doc[...]'
+```
+
+**Root problem**: `git clone` copies template hooks (`commit-msg.sample`, `pre-commit.sample`, etc.) from a global templates directory into every fresh clone's `.git/hooks/`. SWE-Bench-Pro clones don't need or want those hooks — they're benchmark eval substrates, not contributor checkouts. The template copy is dead weight that, as a side effect, breaks in restricted environments where the templates dir is non-writable.
+
+**Structural fix**: Add `--template=` (empty string) to the canonical clone args list in `_ensure_repo_cached`. Disables template-hook copying entirely. The flag is AST-pinned by `tests/governance/test_swe_bench_pro_per_problem_harness.py::test_ast_pin_clone_invocation_disables_template_hooks` so drift back to template-copying is structurally caught.
+
+**Composition discipline**: single-line addition to the existing `_run_git` args list — same shape as `--filter=blob:none` (which is also there for benchmark-cleanliness). No new helper functions; no new behavior surfaces. The flag's intent is documented inline ("benchmark eval substrates, not contributor checkouts") + cross-referenced to the stage-1 soak observation in a comment.
+
+**Spine pin** (1 new test): `test_ast_pin_clone_invocation_disables_template_hooks` walks the `_ensure_repo_cached` AST + asserts `--template=` appears in the unparsed args list. Drift causes the test to fail with a precise diagnostic citing the sandbox failure mode + the operator binding.
+
+**Validator confirmation**: re-running the focused validator with REAL `prepare_problem` (no stub) — **REAL `git clone` of `octocat/Hello-World` + real `git worktree add` at base_commit + real `git apply --index` of test_patch** — completed in **0.97 sec** with `verdict=INJECTED`. The applied test_patch file `tests/test_smoke.py` was verified present in the worktree.
+
+**Operator runbook update — restricted environments**:
+
+The sandbox in which this PR was developed blocks writes to `.git/config` files anywhere under the JARVIS-AI-Agent repo root (deny-within-allow pattern matches nested git configs). For operators in similarly restricted environments, the existing env knobs solve this:
+
+```bash
+# Point cache + worktrees at a writable temp area
+export JARVIS_SWE_BENCH_PRO_REPO_CACHE_PATH="$TMPDIR/swebp-cache"
+export JARVIS_SWE_BENCH_PRO_WORKTREE_BASE_PATH="$TMPDIR/swebp-worktrees"
+```
+
+No code change needed — these knobs already existed; they're now documented for the restricted-env case.
+
+**Surrounding regression**: 266 cumulative tests green across the SWE-Bench-Pro arc (39 per_problem_harness including 1 new AST pin + 37 dataset-loader + 19 harness-inject + 25 report-card + 19 parallel-eval + 33 result-store + 34 scorer + 29 evaluator + 31 envelope-builder). `_run_inner` sha256 still `9e881fdde25ec5b1`.
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/per_problem_harness.py` — `--template=` added to `_ensure_repo_cached` clone args + inline rationale comment
+- `tests/governance/test_swe_bench_pro_per_problem_harness.py` — `test_ast_pin_clone_invocation_disables_template_hooks` pin
+- This PRD section
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
