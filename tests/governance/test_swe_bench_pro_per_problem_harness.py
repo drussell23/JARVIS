@@ -19,8 +19,16 @@ Pins the load-bearing structural invariants for
 * Authority asymmetry pin — module MUST NOT import policy
   substrates (orchestrator / iron_gate / etc)
 * Canonical safe-subprocess composition pin (AST-based) —
-  asyncio create_subprocess_exec only; no blocking subprocess.run,
-  no shell=True, no os.system
+  ``asyncio.to_thread`` + ``subprocess.run`` (the loop-decoupled
+  pattern that survives event-loop starvation); FORBIDS the v2
+  ``asyncio.create_subprocess_exec`` + ``proc.communicate()``
+  pattern (which exhibited a 2500× slowdown under sensor
+  contention during 2026-05-12 stage-1 wiring soak); FORBIDS
+  ``shell=True`` and direct os-level command execution
+* Event-loop starvation contention regression — runs ``_run_git``
+  alongside 8 CPU-spinning coroutines and asserts it completes
+  in << what the v2 pattern took (the broken pattern timed out
+  at 60s on a sub-second workload)
 * FlagRegistry self-registration registers exactly 4 specs
 """
 from __future__ import annotations
@@ -582,23 +590,20 @@ def _attribute_chain(node):
     return ".".join(reversed(parts))
 
 
-def test_no_blocking_subprocess_calls():
-    """AST pin: substrate MUST NOT call ``subprocess.run`` /
-    ``subprocess.Popen`` / ``subprocess.call`` (would block the
-    event loop) or ``os.system``."""
-    forbidden = {
-        "subprocess.run", "subprocess.Popen", "subprocess.call",
-        "subprocess.check_output", "subprocess.check_call",
-        "os.system", "os.popen",
-    }
+def test_no_os_level_command_execution():
+    """AST pin: substrate MUST NOT call direct os-level command
+    execution surfaces (``os.system`` / ``os.popen``) — those
+    invoke a shell interpreter and bypass the program+args list
+    invariant."""
+    forbidden = {"os.system", "os.popen"}
     found = []
     for call in _walk_calls():
         chain = _attribute_chain(call.func)
         if chain in forbidden:
             found.append(chain)
     assert found == [], (
-        f"Phase B.1 substrate has forbidden blocking subprocess "
-        f"calls: {found}"
+        f"Phase B.1 substrate has forbidden os-level command "
+        f"execution calls: {found}"
     )
 
 
@@ -616,21 +621,54 @@ def test_no_shell_true_kwarg():
     )
 
 
-def test_uses_canonical_async_subprocess_pattern():
-    """AST pin: substrate MUST compose
-    ``asyncio.create_subprocess_exec`` (the canonical safe
-    asyncio subprocess primitive) — at least one such call
-    must appear in source."""
-    found = False
+def test_uses_loop_decoupled_subprocess_pattern():
+    """AST pin: substrate MUST compose ``asyncio.to_thread`` +
+    ``subprocess.run`` (the loop-decoupled pattern that survives
+    event-loop starvation under sensor contention).  At least
+    one ``asyncio.to_thread`` call AND at least one
+    ``subprocess.run`` call must appear.
+
+    Replaces the v2 pin which required
+    ``asyncio.create_subprocess_exec``; that v2 pattern was
+    falsified in stage-1 wiring soak 2026-05-12 — under harness
+    sensor contention, ``proc.communicate()`` await scheduling
+    was starved beyond the 60s timeout despite the subprocess
+    completing in milliseconds (2500× slowdown vs. standalone).
+    """
+    has_to_thread = False
+    has_subprocess_run = False
+    for call in _walk_calls():
+        chain = _attribute_chain(call.func)
+        if chain == "asyncio.to_thread":
+            has_to_thread = True
+        elif chain == "subprocess.run":
+            has_subprocess_run = True
+    assert has_to_thread, (
+        "Phase B.1 substrate MUST dispatch git invocations via "
+        "asyncio.to_thread — composes the loop-decoupled pattern "
+        "that survives event-loop starvation"
+    )
+    assert has_subprocess_run, (
+        "Phase B.1 substrate MUST use subprocess.run inside the "
+        "to_thread closure — OS-enforced timeout replaces "
+        "scheduler-dependent asyncio.wait_for"
+    )
+
+
+def test_forbids_v2_create_subprocess_exec_pattern():
+    """AST pin: substrate MUST NOT use
+    ``asyncio.create_subprocess_exec`` — that pattern's
+    ``proc.communicate()`` await is scheduler-dependent and was
+    starved under harness sensor contention during 2026-05-12
+    wiring soak (60s timeout firing on 0.35s real workload)."""
+    found = []
     for call in _walk_calls():
         chain = _attribute_chain(call.func)
         if chain == "asyncio.create_subprocess_exec":
-            found = True
-            break
-    assert found, (
-        "Phase B.1 substrate MUST use asyncio.create_subprocess_exec "
-        "for git invocations — composes the canonical safe pattern "
-        "v3.4 production wiring uses"
+            found.append(ast.unparse(call)[:120])
+    assert found == [], (
+        "Phase B.1 substrate MUST NOT use asyncio.create_subprocess_exec — "
+        f"the v2 anti-pattern starved under sensor contention: {found}"
     )
 
 
@@ -754,4 +792,87 @@ def test_ast_pin_clone_invocation_disables_template_hooks():
         "to /opt/.../templates/hooks/) AND pollute benchmark clones "
         "with contributor hooks. Restore the flag per the operator "
         "binding 2026-05-12."
+    )
+
+
+# ===========================================================================
+# Event-loop starvation contention regression — pins the to_thread fix
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_run_git_survives_event_loop_contention(tmp_path):
+    """Regression: ``_run_git`` MUST complete under heavy
+    event-loop contention.
+
+    The v2 wrapper (``asyncio.create_subprocess_exec`` +
+    ``asyncio.wait_for(proc.communicate(), …)``) exhibited a
+    2500× slowdown vs. standalone timing under 8 concurrent
+    CPU-spinning coroutines — the 60s git timeout fired on a
+    sub-second workload because the pipe-reader coroutines
+    couldn't be scheduled.  The to_thread + subprocess.run fix
+    decouples the subprocess wait from the event loop entirely.
+
+    Test pattern: initialize an empty git repo in tmp_path,
+    spawn 8 CPU-spinning coroutines, then invoke ``_run_git
+    ['status']`` and assert it completes in << what the v2
+    pattern took (60s timeout).  Pass-bar is 10s — under
+    asyncio.to_thread the test typically completes in <1s; the
+    10s ceiling preserves headroom for slow CI machines while
+    still catching any regression to a loop-coupled wait.
+    """
+    import time as _time
+
+    # Initialize a git repo so `git status` has something to operate on
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_rc, _stdout, init_stderr = await per_problem_harness._run_git(
+        ["init"],
+        cwd=repo,
+        timeout_s=30,
+    )
+    assert init_rc == 0, f"git init failed: {init_stderr}"
+
+    # CPU-spinning coroutines that aggressively yield + recompute —
+    # mimics ProactiveExplorationSensor + OpportunityMinerSensor
+    # cycles in the harness boot context.
+    contention_active = {"stop": False}
+
+    async def _spinner():
+        while not contention_active["stop"]:
+            x = 0
+            for _ in range(50_000):
+                x += 1
+            await asyncio.sleep(0)
+
+    spinners = [asyncio.create_task(_spinner()) for _ in range(8)]
+    try:
+        t0 = _time.monotonic()
+        rc, _stdout, stderr = await per_problem_harness._run_git(
+            ["status", "--porcelain"],
+            cwd=repo,
+            timeout_s=30,
+        )
+        elapsed = _time.monotonic() - t0
+    finally:
+        contention_active["stop"] = True
+        for s in spinners:
+            s.cancel()
+        for s in spinners:
+            try:
+                await s
+            except asyncio.CancelledError:
+                pass
+
+    assert rc == 0, (
+        f"git status returned rc={rc} under contention "
+        f"(stderr={stderr!r}) — this is the v2-regression failure mode "
+        f"(timeout firing on completed subprocess)"
+    )
+    # Generous 10s ceiling.  Standalone is ~50ms; the v2 pattern
+    # would have hit the 30s timeout and returned rc=-1.
+    assert elapsed < 10.0, (
+        f"_run_git took {elapsed:.2f}s under event-loop contention — "
+        f"the v2 pattern's scheduler-coupled wait is back. Verify "
+        f"_run_git dispatches via asyncio.to_thread + subprocess.run."
     )

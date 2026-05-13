@@ -33,8 +33,19 @@ Composition discipline (mandate compliance)
     / policy_engine / risk_tier).  RepairEngine import deferred
     to Phase B.2.  AST-pinned in spine.
   * Canonical safe-subprocess composition: every git invocation
-    uses ``asyncio.create_subprocess_exec`` with program+args
-    list (NEVER ``shell=True``).
+    uses ``subprocess.run`` with program+args list (NEVER
+    ``shell=True``) dispatched via ``asyncio.to_thread`` so the
+    blocking subprocess wait runs in a worker thread and NEVER
+    competes with the asyncio event loop for scheduling cycles.
+    This is load-bearing: the harness boot hook runs alongside
+    16 sensors + GovernedLoop + DreamEngine in the same event
+    loop, and ``proc.communicate()`` await scheduling can be
+    starved under contention even when the subprocess itself
+    finished in milliseconds — the v2 wiring used
+    ``create_subprocess_exec + wait_for(proc.communicate(), …)``
+    which exhibited a 2500× slowdown vs. standalone timing (60s
+    timeout firing on a 0.35s real workload during 2026-05-12
+    stage-1 wiring-validation soak).
   * No dependency-surface increase: pure stdlib + canonical
     ``ProblemSpec`` from Phase A.  No new pip deps.
   * Lazy + cached: one clone per repo, reused across all instances.
@@ -58,6 +69,7 @@ import enum
 import logging
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -230,54 +242,50 @@ async def _run_git(
     stdin_input: Optional[bytes] = None,
     timeout_s: Optional[int] = None,
 ) -> Tuple[int, str, str]:
-    """Run a git subprocess via canonical safe asyncio subprocess.
+    """Run a git subprocess off the asyncio event loop.
 
-    Returns ``(returncode, stdout, stderr)``.  Composes the SAME
-    safe-subprocess pattern v3.4 production wiring uses: program +
-    args list (NEVER shell-string), explicit cwd, explicit timeout.
+    Returns ``(returncode, stdout, stderr)``.  The blocking
+    ``subprocess.run`` invocation is dispatched via
+    ``asyncio.to_thread`` so the wait + pipe drain happens on a
+    worker thread, NEVER on the asyncio event loop — the harness
+    boot hook coexists with 16 sensors + GovernedLoop + DreamEngine
+    in the same loop, and pipe-reader coroutine scheduling can be
+    starved under that contention even when the subprocess itself
+    finished in milliseconds.  The OS-enforced ``subprocess.run``
+    timeout (SIGKILL on expiry) replaces the prior
+    ``asyncio.wait_for(proc.communicate(), …)`` await whose timer
+    was scheduler-dependent.
 
-    NEVER raises (``asyncio.CancelledError`` propagates).  Returns
-    ``(-1, "", "<error>")`` on subprocess construction failure or
-    timeout.
+    Composition discipline preserved: program + args list (NEVER
+    shell-string), explicit cwd, explicit timeout, NEVER raises
+    (``asyncio.CancelledError`` propagates from ``to_thread``).
+    Returns ``(-1, "", "<error>")`` on construction failure or
+    timeout (same shape + ``git_timeout_after_Xs`` diagnostic
+    format as the v2 wrapper).
     """
     timeout = timeout_s if timeout_s is not None else git_op_timeout_s()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            stdin=asyncio.subprocess.PIPE if stdin_input is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(cwd) if cwd is not None else None,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        return -1, "", f"{type(exc).__name__}: {exc}"
-    try:
-        comm_kwargs: Dict[str, Any] = {}
-        if stdin_input is not None:
-            comm_kwargs["input"] = stdin_input
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(**comm_kwargs), timeout=timeout,
-        )
-    except asyncio.TimeoutError:
+
+    def _blocking_call() -> Tuple[int, str, str]:
         try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        return -1, "", f"git_timeout_after_{timeout}s"
-    except asyncio.CancelledError:
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        raise
-    rc = proc.returncode if proc.returncode is not None else -1
-    return (
-        rc,
-        stdout_b.decode("utf-8", errors="replace") if stdout_b else "",
-        stderr_b.decode("utf-8", errors="replace") if stderr_b else "",
-    )
+            result = subprocess.run(
+                ["git", *args],
+                input=stdin_input,
+                capture_output=True,
+                cwd=str(cwd) if cwd is not None else None,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return -1, "", f"git_timeout_after_{timeout}s"
+        except Exception as exc:  # noqa: BLE001
+            return -1, "", f"{type(exc).__name__}: {exc}"
+        return (
+            result.returncode if result.returncode is not None else -1,
+            result.stdout.decode("utf-8", errors="replace") if result.stdout else "",
+            result.stderr.decode("utf-8", errors="replace") if result.stderr else "",
+        )
+
+    return await asyncio.to_thread(_blocking_call)
 
 
 # ===========================================================================
