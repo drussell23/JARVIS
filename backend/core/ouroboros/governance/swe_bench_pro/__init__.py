@@ -6,7 +6,7 @@ Package layout (one phase per module; all default-FALSE per §33.1):
   * ``per_problem_harness`` — Phase B.1: PreparedProblem + worktree.
   * ``envelope_builder``    — Phase B.2.1: PreparedProblem → IntentEnvelope.
   * ``evaluator``           — Phase B.2.2: evaluate_problem async façade.
-  * (future) ``scorer``     — Phase C
+  * ``scorer``              — Phase C: score_evaluation pass/partial/fail.
   * (future) ``result_substrate`` — Phase D
   * (future) ``parallel_eval``    — Phase E
   * (future) ``report_card``      — Phase F
@@ -63,6 +63,15 @@ from backend.core.ouroboros.governance.swe_bench_pro.evaluator import (
     EvaluationResult,
     evaluate_problem,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.scorer import (
+    SCORE_GIT_OP_TIMEOUT_ENV_VAR,
+    SCORE_REJECT_TEST_MODS_ENV_VAR,
+    SCORE_TEST_TIMEOUT_ENV_VAR,
+    SCORING_RESULT_SCHEMA_VERSION,
+    ScoreOutcome,
+    ScoringResult,
+    score_evaluation,
+)
 
 
 __all__ = [
@@ -95,4 +104,12 @@ __all__ = [
     "EvaluationOutcome",
     "EvaluationResult",
     "evaluate_problem",
+    # Phase C — scorer
+    "SCORE_GIT_OP_TIMEOUT_ENV_VAR",
+    "SCORE_REJECT_TEST_MODS_ENV_VAR",
+    "SCORE_TEST_TIMEOUT_ENV_VAR",
+    "SCORING_RESULT_SCHEMA_VERSION",
+    "ScoreOutcome",
+    "ScoringResult",
+    "score_evaluation",
 ]

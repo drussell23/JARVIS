@@ -751,6 +751,142 @@ cleanup_prepared(prepared)                         # B.1 — worktree removal
 
 **Parallel-eval rig (Phase E)** is the operational ceiling — driving N problems concurrently through `evaluate_problem` via `subagent_scheduler` with bounded concurrency from the existing `JARVIS_PARALLEL_DISPATCH_*` knobs. Phase D (result_substrate) bridges Phase C's per-problem scores into the cross-problem aggregate report card (Phase F).
 
+##### §40.7.10-c — SWE-Bench-Pro Phase C scorer (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/phase-c-scorer`. Phase C is the structural answer to the question "did the model's fix actually work?" — pure-data scoring layer that reproduces the captured patch in a fresh isolated worktree and runs the failing tests added by `problem.test_patch`.
+
+**What it does**: `score_evaluation(result: EvaluationResult, problem: ProblemSpec, *, test_timeout_s=None, reject_test_modifications=None) -> ScoringResult` composes the entire scoring pipeline:
+
+```
+swe_bench_pro_enabled()          # master-flag gate
+    ↓ False → SKIPPED (diagnostic="master_flag_off")
+if result.outcome != RESOLVED    # only score successful evaluations
+    ↓ → SKIPPED (diagnostic="evaluation_outcome=<value>")
+if not captured_patch.strip()    # need a patch to score
+    ↓ → SCORING_ERROR (diagnostic="no_patch")
+extract_diff_targets(patch)      # canonical Treefinement primitive
+    ↓ filter to test files
+if patch touches test files      # canonical SWE-Bench cheat-detection
+    ↓ → FAIL (diagnostic="patch_modified_tests:<paths>")
+prepare_problem(problem)         # B.1 — fresh worktree, fresh test_patch
+    ↓ non-READY → SCORING_ERROR (diagnostic="prepare_failed:<outcome>")
+_git_apply_patch(captured_patch) # safe asyncio.create_subprocess_exec
+    ↓ failure → SCORING_ERROR (diagnostic="apply_failed:<stderr>")
+TestRunner(worktree).run(tests)  # canonical pytest + flake retry
+    ↓ exception → SCORING_ERROR (diagnostic="test_runner_raised")
+_classify_test_outcome(passed, failed, total)
+    ↓
+PASS / PARTIAL / FAIL            # closed 5-value taxonomy
+    ↓ finally
+cleanup_prepared(prepared)       # B.1 — worktree hygiene
+```
+
+**Canonical composition (AST-pinned)**:
+- `extract_diff_targets` from Treefinement v3.4 (`repair_tree_production.py`) — the single source of truth for unified-diff path parsing. AST pin in the spine asserts the import; drift to a homegrown regex would re-introduce edge-case bugs around `/dev/null` markers, quoted paths, git c-quote format.
+- `prepare_problem` / `cleanup_prepared` / `PreparedProblem` from Phase B.1 — no parallel worktree management. AST pin asserts both imports.
+- `TestRunner` from `test_runner.py` — canonical pytest invocation with flake retry. AST pin asserts the import.
+- `swe_bench_pro_enabled` / `ProblemSpec` from Phase A.
+- `EvaluationOutcome` / `EvaluationResult` from Phase B.2.2.
+
+**Canonical safe subprocess for git apply**: `_git_apply_patch` composes the SAME `asyncio.create_subprocess_exec` shape Phase B.1's `_run_git` uses — program + args list, NEVER `shell=True`, explicit cwd, bounded timeout. Phase A authority asymmetry forbids importing the B.1 private primitive, but the shape is identical so behavior stays in lock-step.
+
+**Canonical SWE-Bench cheat-detection (default ON)**:
+
+Real SWE-Bench benchmarks disqualify patches that modify test files — a patch that changes the assertion makes any test "pass" for the wrong reason. `_patch_modifies_test_files(captured_patch)` composes `extract_diff_targets` to identify test files (heuristic: starts with `test_`, ends with `_test.py`, or path contains `/tests/`/`/test/`); on hit, the scorer returns `FAIL` with diagnostic `patch_modified_tests:<path1>,<path2>` BEFORE any worktree work. Operators evaluating rubric variants can flip via `JARVIS_SWE_BENCH_PRO_SCORE_REJECT_TEST_MODS=false`.
+
+**Test-file selection scoped to test_patch**:
+
+The scorer runs ONLY the failing tests added by `problem.test_patch` — NOT the whole repo's test suite (which could take hours and include unrelated failures). `_resolve_test_files_under_worktree(prepared)` filters `prepared.target_paths` (already parsed by B.1 from the test_patch's `+++ b/<path>` headers) to test files and resolves them under the worktree. If no test files remain after filtering, the scorer returns `SCORING_ERROR` with diagnostic `no_test_files_in_test_patch`.
+
+**Reproducible from `(captured_patch, problem)` alone**:
+
+The scorer does NOT require access to the evaluation's original worktree. Phases C / D / F can re-score historic `EvaluationResult` payloads + `ProblemSpec` data offline — e.g., when the rubric evolves, or when third-party SWE-Bench-Pro runs ingest into the JARVIS report pipeline, or when a different scoring rubric needs cross-validation against the same captured patches.
+
+**Closed 5-value `ScoreOutcome` taxonomy**:
+
+| Outcome | Trigger |
+|---|---|
+| `PASS` | all relevant tests passed (passed == total > 0) |
+| `PARTIAL` | some pass, some fail (0 < passed < total) |
+| `FAIL` | all relevant tests failed OR no tests selected OR cheat-detection fired |
+| `SCORING_ERROR` | no_patch / prepare_failed / apply_failed / test_runner_raised / no_test_files_in_test_patch |
+| `SKIPPED` | master flag OFF OR `result.outcome != RESOLVED` |
+
+**Frozen `ScoringResult` dataclass (§33.5 symmetric to_dict / from_dict)**:
+- `outcome: ScoreOutcome`
+- `problem_instance_id: str`
+- `tests_passed: int`
+- `tests_failed: int`
+- `tests_total: int`
+- `pass_rate: float` (passed/total, 0.0 if total=0; rounded to 4 dp)
+- `diagnostic: str` (e.g. `patch_modified_tests:tests/test_foo.py` / `failed_tests=t1,t2,t3` / `apply_failed:...`)
+- `elapsed_s: float`
+- `schema_version: str` = `swe_bench_pro_scoring.v1`
+
+**Master flags (§33.1; FlagRegistry auto-seeded — 3 specs)**:
+- `JARVIS_SWE_BENCH_PRO_SCORE_TEST_TIMEOUT_S` (INT/CAPACITY, default 600 = 10 min) — caps the canonical `TestRunner.run` timeout
+- `JARVIS_SWE_BENCH_PRO_SCORE_REJECT_TEST_MODS` (BOOL/SAFETY, default **TRUE**) — canonical SWE-Bench cheat-detection (the only Phase C flag that defaults TRUE because the rubric integrity depends on it; operators evaluating variant rubrics flip to false explicitly)
+- `JARVIS_SWE_BENCH_PRO_SCORE_GIT_OP_TIMEOUT_S` (INT/CAPACITY, default 60) — subprocess timeout for git apply
+
+**Spine — 34 regression tests + 6 AST pins + 3 FlagRegistry seed assertions**:
+- All 5 ScoreOutcomes exercised via stubs (PASS / PARTIAL / FAIL / SCORING_ERROR / SKIPPED)
+- Non-RESOLVED EvaluationResult parametrized over 6 upstream outcomes (UNRESOLVED / PREPARE_FAILED / INGEST_FAILED / TERMINAL_TIMEOUT / CANCELLED / MASTER_FLAG_OFF) — all → SKIPPED
+- Empty / whitespace-only captured_patch → SCORING_ERROR
+- Cheat-detection FAILS patches modifying test files (default behavior)
+- Cheat-detection can be disabled via argument OR env (rubric-variant escape hatch)
+- prepare_failed cascades to SCORING_ERROR with `prepare_failed:<outcome>` diagnostic
+- apply_failed cascades to SCORING_ERROR with stderr-tail diagnostic
+- TestRunner exception cascades to SCORING_ERROR with `test_runner_raised` diagnostic
+- All-pass → PASS with pass_rate=1.0
+- Some-pass-some-fail → PARTIAL with 0 < pass_rate < 1.0 + failed_tests diagnostic
+- All-fail → FAIL with pass_rate=0.0
+- Zero test files in target_paths → SCORING_ERROR with `no_test_files_in_test_patch` diagnostic
+- Cleanup runs in finally for every post-prepare path (success / apply_failed / test_runner_raised)
+- ScoringResult schema round-trip through json.dumps/loads
+- Closed 5-value taxonomy (value-set equality)
+- AST pins: extract_diff_targets imported / prepare_problem + cleanup_prepared imported / TestRunner imported / no while-True polling loop / cleanup_prepared in try/finally / no naked asyncio.wait
+- FlagRegistry seeds: 3 specs / reject_test_mods default TRUE / never-raises-on-capturer-failure
+- Timeout env override honored end-to-end + invalid-fallback
+
+**Surrounding regression**: **262 cumulative tests green** across Phase C spine + B.2.2 evaluator + B.2.1 envelope builder + B.1 per-problem harness + Phase A dataset loader + B.2.0 advisor + B.2.0.5 lifecycle SSE + read-only-advisor + `_run_inner` sha256 pin. `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/scorer.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports + docstring update
+- `tests/governance/test_swe_bench_pro_scorer.py` — 34-test spine + 6 AST pins (NEW)
+
+**What this PR deliberately did NOT do**:
+- No parallel diff parser — composes `extract_diff_targets` (AST-pinned)
+- No parallel worktree management — composes `prepare_problem` / `cleanup_prepared` (AST-pinned)
+- No parallel pytest invocation — composes `TestRunner` (AST-pinned)
+- No while-True polling loop (AST-pinned forbidden)
+- No naked `asyncio.wait()` without timeout (AST-pinned forbidden)
+- No JSONL audit sink in this PR — that's Phase D's responsibility (`result_substrate`)
+- No graduation flip — master flag stays default-FALSE (the Phase A `JARVIS_SWE_BENCH_PRO_ENABLED` flag covers the whole arc)
+- No edits to `repair_engine.py` — `_run_inner` sha256 stays `9e881fdde25ec5b1`
+
+**End-to-end Phases A → B → C closure summary**:
+
+| Layer | Purpose | Tests |
+|---|---|---|
+| Phase A | `ProblemSpec` + dataset loader + cache | (Phase A spine) |
+| B.1 | `prepare_problem` / `PreparedProblem` / worktree | (B.1 spine) |
+| B.2.0 | Worktree-aware `OperationAdvisor` | 29 + 6 AST pins |
+| B.2.0.5 | Orchestrator `operation_terminal` SSE | 36 + 6 AST pins |
+| B.2.1 | `build_evaluation_envelope` | 31 + 5 AST pins |
+| B.2.2 + B.2.3 | `evaluate_problem` async façade | 29 + 8 AST pins |
+| **Phase C** | `score_evaluation` pure-data scorer | **34 + 6 AST pins** |
+
+**Phases A → B → C is now operationally complete end-to-end**: the system can load a problem, prepare a worktree, dispatch a fix attempt through the full 11-phase Ouroboros pipeline, capture the produced patch, and score it deterministically against the canonical SWE-Bench rubric.
+
+**Next**: **Phase D** — `result_substrate` that bridges per-problem `(EvaluationResult, ScoringResult)` pairs into the cross-problem aggregate result store. Architectural shape (preliminary):
+- `EvaluationResultStore` (in-memory + optional JSONL persistence at `.jarvis/swe_bench_pro/results.jsonl`)
+- `record_evaluation(eval_result, scoring_result)` — append-only, dedup by `(instance_id, op_id)` pair
+- `query(...)` — bounded reads for Phase F report card aggregation
+- §33.4 audit-ledger contract (append-only JSONL with flock-protected cross-process append)
+
+**Phase E** (parallel_eval) and **Phase F** (report_card) follow. Phase E drives N problems concurrently via `subagent_scheduler` with bounded concurrency from existing `JARVIS_PARALLEL_DISPATCH_*` knobs; Phase F renders the aggregate report card from Phase D's store.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
