@@ -82,6 +82,15 @@ class OperationState(Enum):
     # to honor the (op_id, state, entry_id) dedup key.
     SUBAGENT_DISPATCH = "subagent_dispatch"
 
+    # Stage 1.6 — GENERATE park / resume (operator binding 2026-05-13).
+    # Recorded when an op releases its BG worker slot while awaiting
+    # provider I/O (LLM round-trip).  Multiple park cycles per op are
+    # possible (GENERATE_RETRY), so callers supply attempt_seq as
+    # entry_id to honor the (op_id, state, entry_id) dedup key.  See
+    # ``op_park_store.py`` + ``park_signal.py`` for the substrate, and
+    # ``project_stage_1_6_park_spike.md`` for the structural rationale.
+    PARKED_GENERATE = "parked_generate"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
