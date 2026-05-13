@@ -10121,14 +10121,28 @@ class GovernedOrchestrator:
         Awaits the ledger append inline so that entries are committed
         before the pipeline continues.  Errors are logged but never
         propagate -- ledger failures must not crash the pipeline.
+
+        B.2.0.5 — operation-FSM lifecycle SSE publish: after a
+        successful ledger.append() AND when ``state`` is one of the
+        closed TERMINAL_OPERATION_STATES, fan out an
+        ``operation_terminal`` SSE event via the canonical broker.
+        The publish is best-effort + bounded payload + NEVER raises
+        into this function — per operator binding "publish_* cannot
+        block ledger". Idempotency rides on the ledger's existing
+        (op_id, state) dedup key: ledger.append() returns False on
+        duplicate, which suppresses the publish. Master flag
+        ``JARVIS_OP_LIFECYCLE_SSE_ENABLED`` (§33.1 default-FALSE) —
+        when off, the publish is a no-op and behavior is byte-
+        identical to pre-B.2.0.5.
         """
         entry = LedgerEntry(
             op_id=ctx.op_id,
             state=state,
             data=data,
         )
+        written = False
         try:
-            await self._stack.ledger.append(entry)
+            written = await self._stack.ledger.append(entry)
         except Exception as exc:
             logger.error(
                 "Ledger append failed: op_id=%s state=%s error=%s",
@@ -10136,6 +10150,26 @@ class GovernedOrchestrator:
                 entry.state.value,
                 exc,
             )
+        # B.2.0.5 single-seam SSE publish — composed via lazy import to
+        # avoid an orchestrator → observability hard-dep at module load
+        # (mirrors the same pattern Slice 2 `task_tool.py` uses). The
+        # nested try/except is load-bearing: publish_operation_terminal
+        # already documents NEVER-raise, but this defensive wrapper
+        # honors the operator binding verbatim ("never raise into
+        # _record_ledger — swallow + DEBUG").
+        if written:
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    publish_operation_terminal,
+                )
+                publish_operation_terminal(ctx, state)
+            except Exception:  # noqa: BLE001 — observability is best-effort
+                logger.debug(
+                    "[Orchestrator] publish_operation_terminal raised "
+                    "(swallowed): op_id=%s state=%s",
+                    entry.op_id, entry.state.value,
+                    exc_info=True,
+                )
 
 
 # Alias so tests can import `Orchestrator` as well as `GovernedOrchestrator`

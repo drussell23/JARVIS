@@ -503,7 +503,72 @@ v2 fix (`df4b70a4a8`):
 - No reachability into RepairEngine / Iron Gate / SemanticGuardian — pure advisory layer
 - No graduation flip — master flag stays default-FALSE until soak evidence is collected
 
-**Next**: B.2.1 (`PreparedProblem → IntentEnvelope` builder setting `evidence["repo_root"] = str(prepared.worktree_path)`) + B.2.2 (`evaluate_problem` façade composing `IntakeLayerService.ingest_envelope` + canonical SSE terminal-event rendezvous + bounded `asyncio.wait_for` per operator binding) + B.2.3 (spine + memory artifact + soak-readiness checklist). Operator-bound as PR 2 — a separate commit chain from this B.2.0 PR.
+**Next**: B.2.1 (`PreparedProblem → IntentEnvelope` builder setting `evidence["repo_root"] = str(prepared.worktree_path)`) + B.2.2 (`evaluate_problem` façade composing `IntakeLayerService.ingest_envelope` + canonical SSE terminal-event rendezvous + bounded `asyncio.wait_for` per operator binding) + B.2.3 (spine + memory artifact + soak-readiness checklist). Operator-bound as a follow-on PR; the SSE primary-path rendezvous lands first as §40.7.10-b205 below.
+
+##### §40.7.10-b205 — Orchestrator op-FSM lifecycle SSE (CLOSED 2026-05-12; PR 2 of the B.2 arc)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/observability/op-lifecycle-stream` as the prerequisite infrastructure for the SWE-Bench-Pro Phase B.2.2 evaluator's primary-path rendezvous. Operator-approved standalone PR (same discipline as B.2.0): structural improvement on its own merits, benefiting L3 observability + in-repo L2 exercise corpus + IDE extensions + SWE-Bench-Pro evaluator simultaneously — not a SWE-Bench-Pro special case.
+
+**Why this PR exists**: substrate audit during B.2.2 scoping discovered the operator's "primary path: SSE subscribe by op_id, await documented terminal event types" rendezvous binding could not actually be composed today. `StreamEventBroker.subscribe(op_id_filter=...)` works, and the broker has `task_completed` / `task_cancelled` event types — but those are scoped to the `task_tool.py` TaskBoard concept (tool-call boards), NOT to the orchestrator's operation-FSM terminal phases. `OpsDigestObserver` is single-slot + only fires for APPLY/VERIFY/commit (misses advisor_blocked / cancel / pre-APPLY-failure paths). `OperationLedger` writes JSONL with no observer hook. Without this PR, the B.2.2 evaluator (and any other operation-watching consumer) would hang.
+
+**Structural fix at source**: orchestrator's `_record_ledger(ctx, state, data)` (single chokepoint, ~16 call sites flow through it for every state transition) gains a best-effort SSE publish AFTER a successful `ledger.append()` returns True. The publish fans out an `operation_terminal` SSE event scoped to `ctx.op_id` with a closed bounded payload. Idempotency rides on the ledger's existing `(op_id, state)` dedup key — `append()` returns False on duplicate, which suppresses the follow-up publish.
+
+**Canonical taxonomies (closed; AST-pinned)**:
+- `EVENT_TYPE_OPERATION_TERMINAL = "operation_terminal"` — distinct from `task_*` (TaskBoard) to prevent IDE clients from mis-parsing tool-call board events as op-FSM terminals
+- `TERMINAL_OPERATION_STATES = frozenset({"applied", "rolled_back", "failed", "blocked"})` — the four ledger states that signal "operation has reached a terminal outcome". Closed-taxonomy AST pin: drift (missing one, adding one) is a coverage bug — missing `blocked` would silently drop advisor_blocked terminals; adding `applying` would fan out duplicate events.
+- Closed payload schema: `op_id` / `phase` (`COMPLETE` / `CANCELLED` / `POSTMORTEM` or the phase the op died in) / `state` (terminal value) / `terminal_reason_code` (capped at 256 chars) / `phase_entered_at` (ISO8601) / `timestamp` (ISO8601 wall-clock at publish)
+
+**Wiring discipline** (operator binding "publish_* cannot block ledger"):
+- Lazy import inside `_record_ledger` body (avoids orchestrator → observability hard-dep at module load)
+- Wrapped in try/except — both the publish helper itself AND the call site at `_record_ledger` (defense-in-depth)
+- Source-order invariant: `ledger.append()` MUST appear positionally BEFORE `publish_operation_terminal` in the function body (AST-pinned via `ast.unparse` + index comparison — line numbers can lie under formatter shuffles)
+- Single-seam: `publish_operation_terminal` referenced EXACTLY ONCE in the entire `orchestrator.py` file (AST-pinned via call-name walk). Drift here would mean a parallel call site issuing duplicate events.
+- Inside `_record_ledger` body (AST-pinned via class-method walk). Hoisting the publish into `OperationContext.advance()` is forbidden by a defensive AST pin (`op_context.py` must not reference `publish_operation_terminal` — data class transitions stay side-effect-free).
+
+**Master flag (§33.1 default-FALSE; FlagRegistry auto-seeded via `register_flags`)**:
+- `JARVIS_OP_LIFECYCLE_SSE_ENABLED` (BOOL/SAFETY) — when OFF, the publish helper is a no-op and `_record_ledger` behavior is byte-identical to pre-B.2.0.5. The ledger.append still fires; only the SSE side-effect is suppressed.
+
+**Spine — 36 regression tests + 6 AST pins**:
+- Master-flag-off byte-identical (no events on broker)
+- Each of the 4 terminal states publishes correct event with full bounded payload (parametrized)
+- Bounded terminal_reason_code (1000-char input clamped to ≤256)
+- 8 non-terminal states do NOT publish (parametrized)
+- Malformed input handling (missing op_id, non-string state value, missing state attribute, None ctx.phase)
+- Subscriber filtered by op_id receives only its target's terminal event (primary-path shape SWE-Bench-Pro B.2.2 composes)
+- Closed-taxonomy AST pin (`TERMINAL_OPERATION_STATES` literal frozenset)
+- AST pin: terminal-states subset of live ledger OperationState enum
+- AST pin: event type in `_VALID_EVENT_TYPES` AND distinct from `task_*` prefix
+- AST pin: `publish_operation_terminal` called exactly once in orchestrator.py
+- AST pin: that single call is inside `_record_ledger`'s body
+- AST pin: that call is wrapped in try/except
+- AST pin: `ledger.append` positionally precedes `publish_operation_terminal` (source-order)
+- AST pin: `op_context.py` does NOT contain `publish_operation_terminal` (data class stays side-effect-free)
+- FlagRegistry seed assertions (1 spec, default-FALSE, BOOL/SAFETY)
+- 4 end-to-end orchestrator integration tests (real `_record_ledger`, stub ledger with dedup contract): publish-on-terminal / no-publish-on-non-terminal / idempotent-on-duplicate / master-off-byte-identical
+
+**Surrounding regression**: 301 cumulative governance tests green across B.2.0.5 spine + B.2.0 advisor + SWE-Bench-Pro Phase A+B.1 + Treefinement (v3.3+v3.4). 4 pre-existing flag_registry test-ordering-pollution failures unrelated to this PR (same failures occur on main without these changes). `_run_inner` sha256 still `9e881fdde25ec5b1`.
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/ide_observability_stream.py` — substrate (`EVENT_TYPE_OPERATION_TERMINAL` constant + `_VALID_EVENT_TYPES` entry + `OP_LIFECYCLE_SSE_ENABLED_ENV_VAR` + `TERMINAL_OPERATION_STATES` frozenset + `op_lifecycle_sse_enabled` + `publish_operation_terminal` + `register_flags`)
+- `backend/core/ouroboros/governance/orchestrator.py:~10113` — single-seam wiring inside `_record_ledger`
+- `tests/governance/test_op_lifecycle_stream.py` — 36-test spine + 6 AST pins
+
+**What this enables**:
+- **SWE-Bench-Pro Phase B.2.2 evaluator** (next PR): the `evaluate_problem` façade composes `IntakeLayerService.ingest_envelope` + `StreamEventBroker.subscribe(op_id_filter=envelope.causal_id)` + `asyncio.wait_for(...)` for a bounded terminal-event rendezvous. Source-agnostic. Composes only canonical surfaces.
+- **VS Code / Cursor / Sublime / JetBrains extensions** (Gap #6 IDE stream consumers): operation-FSM lifecycle becomes first-class observable. No code changes required on the extension side — the existing SSE consumer auto-receives `operation_terminal` events.
+- **In-repo L2 exercise corpus** (PRD §40.7.10 follow-up arc C — "Router→Dispatcher accounting trace why attempted=0"): the trace becomes auditable in real-time via the broker, not just via `debug.log` forensics.
+- **L3 worktree-isolated work**: parallel unit terminals become operator-observable as they happen.
+
+**What this PR deliberately did NOT do** (composition discipline):
+- No new SSE broker / parallel observability surface — composes existing `publish_task_event`
+- No new event-type prefix collision — `operation_terminal` is unambiguously distinct from `task_*` (TaskBoard)
+- No data-class side effects — `OperationContext.advance()` stays pure (defensive AST pin)
+- No fan-out to multiple call sites — single-seam at `_record_ledger` (AST-enforced)
+- No `op_started` symmetric event — minimal scope, can be added later if a consumer needs intake visibility
+- No new authority module imports in `ide_observability_stream.py` — substrate stays independent of `op_context` / `ledger` (duck-typed `ctx` + `state` parameters; the four terminal-state strings are mirrored verbatim in a frozenset rather than imported from `OperationState`)
+- No graduation flip — master flag stays default-FALSE until soak evidence is collected
+
+**Next**: B.2.1 (`PreparedProblem → IntentEnvelope` builder using `EVIDENCE_REPO_ROOT_KEY` from B.2.0 + new envelope source `"swe_bench_pro"`) + B.2.2 (`evaluate_problem` façade composing this PR's canonical broker subscription with bounded `asyncio.wait_for`) + B.2.3 (spine asserting terminal resolution goes through broker first + optional one-shot ledger fallback on timeout + no unbounded waits). Operator-bound as a separate commit chain.
 
 ---
 

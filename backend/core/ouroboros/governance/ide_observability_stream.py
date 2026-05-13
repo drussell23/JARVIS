@@ -1217,6 +1217,30 @@ EVENT_TYPE_REPAIR_BRANCH_PRUNED = "repair_branch_pruned"
 EVENT_TYPE_REPAIR_LAYER_COMPLETED = "repair_layer_completed"
 EVENT_TYPE_REPAIR_TREE_WON = "repair_tree_won"
 
+# --- Operation FSM lifecycle (B.2.0.5 — distinct from task_* TaskBoard) ---
+#
+# The orchestrator's operation-FSM terminals (COMPLETE / CANCELLED /
+# POSTMORTEM) are architecturally distinct from the TaskBoard
+# ``task_completed`` / ``task_cancelled`` events, which scope to the
+# tool-call board concept owned by ``task_tool.py``. IDE clients,
+# the SWE-Bench-Pro evaluator (PRD §40.7.9 Phase B.2.2), and any
+# future operation-watching consumer subscribe to this event to
+# learn when an op reached a terminal state.
+#
+# Payload schema (closed; documented in PRD §40.7.10-b205):
+#   * op_id:                str       — OperationContext.op_id
+#   * phase:                str       — OperationPhase value
+#                                       (one of COMPLETE / CANCELLED /
+#                                       POSTMORTEM, or the intermediate
+#                                       phase the op died in)
+#   * state:                str       — OperationState value (one of
+#                                       applied / rolled_back / failed
+#                                       / blocked)
+#   * terminal_reason_code: str       — ctx.terminal_reason_code (may be "")
+#   * phase_entered_at:     str       — ISO8601 from ctx.phase_entered_at
+#   * timestamp:            str       — ISO8601 wall-clock at publish
+EVENT_TYPE_OPERATION_TERMINAL = "operation_terminal"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -1355,6 +1379,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_REPAIR_BRANCH_PRUNED,             # Treefinement Phase 4 (repair_tree_archive)
     EVENT_TYPE_REPAIR_LAYER_COMPLETED,           # Treefinement Phase 4 (repair_tree_archive)
     EVENT_TYPE_REPAIR_TREE_WON,                  # Treefinement Phase 4 (repair_tree_archive)
+    EVENT_TYPE_OPERATION_TERMINAL,               # B.2.0.5 (v3.7 — operation FSM terminal event;
+                                                  # distinct from task_* TaskBoard events; consumed by
+                                                  # SWE-Bench-Pro Phase B.2.2 evaluator + IDE clients
+                                                  # tracking full-op lifecycle, not just tool-call boards)
 })
 
 
@@ -2031,6 +2059,124 @@ def publish_task_event(
         return get_default_broker().publish(event_type, op_id, payload)
     except Exception:  # noqa: BLE001 — best-effort hook
         logger.debug("[Stream] publish_task_event exception", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Operation-FSM lifecycle publish (B.2.0.5 — distinct from TaskBoard)
+# ---------------------------------------------------------------------------
+#
+# This is the canonical bridge from orchestrator FSM terminal transitions
+# to the SSE broker. Composed at ``orchestrator._record_ledger`` AFTER a
+# successful ``ledger.append()`` (idempotency rides on the ledger's existing
+# (op_id, state) dedup key — append returns False on duplicate, the
+# publish call is gated by that True return). Never raises into the
+# caller; never blocks the ledger append.
+#
+# Closed taxonomies (AST-pinned by spine):
+#   * TERMINAL_OPERATION_STATES — the four ledger states that
+#     correspond to a "the op is done one way or another" terminal:
+#     applied / rolled_back / failed / blocked. Intermediate state
+#     records (sandboxing, gating, applying, validating, ...) do NOT
+#     publish.
+#
+# Master switch ``JARVIS_OP_LIFECYCLE_SSE_ENABLED`` (§33.1 default-FALSE).
+# When OFF, the publish is a no-op and the broker sees zero
+# operation_terminal events — byte-identical to pre-B.2.0.5 behavior.
+
+OP_LIFECYCLE_SSE_ENABLED_ENV_VAR: str = "JARVIS_OP_LIFECYCLE_SSE_ENABLED"
+
+# The four ledger states that flag "this operation has reached a
+# terminal outcome". Closed taxonomy — AST-pinned. Mirrors
+# ``backend.core.ouroboros.governance.ledger.OperationState`` values
+# verbatim; not imported to keep this module substrate-independent
+# (intake → governance.ledger is a deeper dep than this observability
+# module should hold).
+TERMINAL_OPERATION_STATES: frozenset = frozenset({
+    "applied",
+    "rolled_back",
+    "failed",
+    "blocked",
+})
+
+
+def op_lifecycle_sse_enabled() -> bool:
+    """Master flag query (§33.1 default-FALSE)."""
+    raw = os.environ.get(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, "")
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def publish_operation_terminal(ctx: Any, state: Any) -> Optional[str]:
+    """Publish an ``operation_terminal`` event for a terminal op transition.
+
+    Called by ``orchestrator._record_ledger`` AFTER a successful
+    ``ledger.append()`` returned True. Idempotency rides on the ledger's
+    existing (op_id, state) dedup key. Best-effort + bounded payload +
+    NEVER raises — operator binding for B.2.0.5: ``never raise into
+    _record_ledger``.
+
+    Parameters
+    ----------
+    ctx:
+        :class:`OperationContext` (or duck-typed equivalent with
+        ``op_id``, ``phase``, ``phase_entered_at``,
+        ``terminal_reason_code``). The Any type keeps this module
+        independent of op_context to avoid an
+        observability → state-machine dep cycle.
+    state:
+        :class:`OperationState` (or any object exposing ``.value`` as
+        a string). When ``.value`` is not in
+        :data:`TERMINAL_OPERATION_STATES`, this is a no-op and the
+        caller's intermediate-state recording proceeds without an
+        SSE side effect.
+
+    Returns
+    -------
+    Optional[str]
+        Event id on successful publish; ``None`` when the master flag
+        is off, the state is not terminal, the stream is disabled, or
+        any internal failure occurred.
+    """
+    if not op_lifecycle_sse_enabled():
+        return None
+    try:
+        state_value = getattr(state, "value", None)
+        if not isinstance(state_value, str):
+            return None
+        if state_value not in TERMINAL_OPERATION_STATES:
+            return None
+        op_id = getattr(ctx, "op_id", None)
+        if not isinstance(op_id, str) or not op_id:
+            return None
+        phase_obj = getattr(ctx, "phase", None)
+        phase_value = getattr(phase_obj, "name", None)
+        if not isinstance(phase_value, str):
+            phase_value = ""
+        terminal_reason_code = getattr(ctx, "terminal_reason_code", "") or ""
+        phase_entered_at = getattr(ctx, "phase_entered_at", None)
+        try:
+            phase_entered_iso = (
+                phase_entered_at.isoformat()
+                if phase_entered_at is not None else ""
+            )
+        except Exception:  # noqa: BLE001
+            phase_entered_iso = ""
+        payload: Dict[str, Any] = {
+            "op_id": op_id,
+            "phase": phase_value,
+            "state": state_value,
+            "terminal_reason_code": str(terminal_reason_code)[:256],
+            "phase_entered_at": phase_entered_iso,
+            "timestamp": _iso_now(),
+        }
+        return publish_task_event(
+            EVENT_TYPE_OPERATION_TERMINAL, op_id, payload,
+        )
+    except Exception:  # noqa: BLE001 — strict fail-silent per operator binding
+        logger.debug(
+            "[Stream] publish_operation_terminal exception",
+            exc_info=True,
+        )
         return None
 
 
@@ -3668,3 +3814,63 @@ def publish_review_branch_event(
             exc_info=True,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# FlagRegistry self-registration (auto-discovered by §33.3 walker)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for B.2.0.5
+    operation-FSM lifecycle SSE master flag. Returns count successfully
+    registered. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        FlagSpec(
+            name=OP_LIFECYCLE_SSE_ENABLED_ENV_VAR,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "B.2.0.5 master switch (§33.1 default-FALSE): when ON, "
+                "the orchestrator emits an ``operation_terminal`` SSE "
+                "event after every successful terminal ledger.append() "
+                "(states: applied / rolled_back / failed / blocked). "
+                "Distinct from task_* TaskBoard events — this fans out "
+                "the orchestrator FSM's terminal state, consumed by the "
+                "SWE-Bench-Pro Phase B.2.2 evaluator, IDE extensions "
+                "tracking full-op lifecycle, and any future operation-"
+                "watching consumer. Best-effort + bounded payload + "
+                "never raises into _record_ledger."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "ide_observability_stream.py"
+            ),
+            example="false",
+            since="v3.7 Phase 2 Phase B.2.0.5 (2026-05-12)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[Stream] flag registration failed for %s",
+                getattr(spec, "name", "?"),
+                exc_info=True,
+            )
+    return count
