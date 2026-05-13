@@ -1357,6 +1357,36 @@ No code change needed — these knobs already existed; they're now documented fo
 - `tests/governance/test_swe_bench_pro_per_problem_harness.py` — `test_ast_pin_clone_invocation_disables_template_hooks` pin
 - This PRD section
 
+##### §40.7.10-priority-map — swe_bench_pro registered in router `_PRIORITY_MAP` (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on branch `ouroboros/intake/priority-map-swebenchpro`. Closes the **21-minute dequeue lag** observed in stage-1 wiring soak 2026-05-12 (session `bt-2026-05-13-040242`): our SWE-Bench-Pro envelope was successfully injected at 21:17:10 but didn't reach `BackgroundAgentPool.submit` until 21:38:12 — while 16 other ops (8 doc_staleness, 6 todo_scanner, 2 exploration) were dispatched ahead of it in the interim.
+
+**Root cause** (evidence-backed, 60-min triage): `envelope.source = "swe_bench_pro"` was not in `unified_intake_router._PRIORITY_MAP`, so `_compute_priority` defaulted to `base = 99`. With the honest-urgency default `urgency="low"` (`_URGENCY_BOOST = -1`, subtracted from base) the final intake priority was **100** — strictly worse than every other in-flight signal. `asyncio.PriorityQueue` dequeues the lowest int first, so as long as sensors kept emitting envelopes with priority ≤ 99, ours never reached the head.
+
+**Ruled out during triage**: dispatch-loop deadlock (16 OTHER ops dispatched during the gap), BG-pool capacity (`queue_depth=1/16 → 2/16` peak), file-conflict `queued_behind` (target file unique to fixture), SensorGovernor throttling (no `governor_throttled` lines), WAL lock contention (unrelated paths), and `idle_timeout=300s` (a symptom, not the cause — extending it would mask, not fix).
+
+**Structural fix** — one-line `_PRIORITY_MAP` entry at tier 2 (peer with `backlog`):
+
+| Why not `test_failure` (1) | Why not `exploration` (4) | Why not `runtime_health` (6) |
+|---|---|---|
+| Runtime fires must always preempt benchmark eval | Eval work is queued, not curiosity-driven | Eval is not infrastructure monitoring |
+
+Peer with `backlog` is defensible: SWE-Bench-Pro envelopes are **queued benchmark evaluation work** — neither a runtime fire nor low-priority background fuzz. The same semantic tier as the operator-curated backlog.
+
+**Systemic fix (belt-and-suspenders)** — new `_PRIORITY_MAP_DEFERRED` frozenset documents the 12 pre-existing `_VALID_SOURCES` that currently fall through to base=99 (existing tech debt: `auto_proposed`, `cadence_synthetic`, `cross_repo_drift`, `doc_staleness`, `github_issue`, `intent_discovery`, `meta_dormancy_alarm`, `performance_regression`, `security_advisory`, `todo_scanner`, `vision_sensor`, `web_intelligence`). The spine pin `test_every_valid_source_has_priority_or_deferred_opt_in` asserts `_VALID_SOURCES ⊆ _PRIORITY_MAP.keys() ∪ _PRIORITY_MAP_DEFERRED` — so a future new source added to `_VALID_SOURCES` (intent_envelope.py) without a corresponding `_PRIORITY_MAP` entry **fails CI** instead of silently starving in production for 21 minutes. Adding a new source now requires a deliberate decision: assign a tier or document why starvation is acceptable.
+
+**Spine** (12 new tests, all green): `tests/governance/intake/test_unified_intake_router_priority_map.py` — 4 source-specific pins (`swe_bench_pro` in map, strictly worse than `test_failure`, strictly better than 99, peer with `backlog`) + 4 systemic invariants (every valid source covered, deferred/mapped disjoint, deferred names all valid, mapped names all valid) + 4 priority-arithmetic parametrized cases. Together they form the structural lock against this class of bug.
+
+**Explicit non-goals** (operator binding 2026-05-12):
+- ❌ Widening `--idle-timeout` as the "fix" — that's schedule-pressure relief, not evidence
+- ❌ Special-casing `swe_bench_pro` in the dequeue loop — map registration only
+- ❌ Backfilling all 12 deferred sources in the same PR — out of scope (would require 12 deliberate tier assignments without operator review)
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/intake/unified_intake_router.py` — `_PRIORITY_MAP` += `"swe_bench_pro": 2` (with rationale comment cross-referencing soak observation) + new `_PRIORITY_MAP_DEFERRED` frozenset
+- `tests/governance/intake/test_unified_intake_router_priority_map.py` — new spine file, 12 tests
+- This PRD section
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
