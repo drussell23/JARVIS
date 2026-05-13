@@ -4948,6 +4948,26 @@ class GovernedLoopService:
                 self._oracle = oracle
             if self._stack is not None:
                 self._stack.oracle = self._oracle
+            # PR-A 2026-05-13 — register Oracle with the advisor module
+            # so blast-radius queries can compose Oracle's pre-built
+            # CodeGraph BFS instead of the 29.5k-file rglob scan.
+            # Master-flag-gated (JARVIS_ADVISOR_ORACLE_BLAST_ENABLED);
+            # advisor falls back to legacy when off / cold-miss.
+            try:
+                from backend.core.ouroboros.governance.operation_advisor import (
+                    set_active_oracle,
+                )
+                set_active_oracle(self._oracle)
+                logger.info(
+                    "[GovernedLoop] Oracle registered with OperationAdvisor "
+                    "(PR-A blast path now available, gated by "
+                    "JARVIS_ADVISOR_ORACLE_BLAST_ENABLED)",
+                )
+            except Exception:  # noqa: BLE001 — defensive: registration is best-effort
+                logger.debug(
+                    "[GovernedLoop] Oracle registration with advisor failed",
+                    exc_info=True,
+                )
             logger.info(
                 "[GovernedLoop] Oracle indexed %s nodes across all repos",
                 self._oracle.get_metrics().get("total_nodes", "?"),
