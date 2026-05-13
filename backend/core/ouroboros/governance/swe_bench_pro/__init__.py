@@ -7,7 +7,7 @@ Package layout (one phase per module; all default-FALSE per §33.1):
   * ``envelope_builder``    — Phase B.2.1: PreparedProblem → IntentEnvelope.
   * ``evaluator``           — Phase B.2.2: evaluate_problem async façade.
   * ``scorer``              — Phase C: score_evaluation pass/partial/fail.
-  * (future) ``result_substrate`` — Phase D
+  * ``result_store``        — Phase D: EvaluationResultStore + JSONL audit.
   * (future) ``parallel_eval``    — Phase E
   * (future) ``report_card``      — Phase F
 
@@ -72,6 +72,17 @@ from backend.core.ouroboros.governance.swe_bench_pro.scorer import (
     ScoringResult,
     score_evaluation,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.result_store import (
+    RESULT_PATH_ENV_VAR,
+    RESULT_PERSISTENCE_ENABLED_ENV_VAR,
+    RESULT_RECORD_SCHEMA_VERSION,
+    EvaluationRecord,
+    EvaluationResultStore,
+    get_default_store,
+    record_evaluation,
+    replay_default_store_from_disk,
+    reset_default_store,
+)
 
 
 __all__ = [
@@ -112,4 +123,14 @@ __all__ = [
     "ScoreOutcome",
     "ScoringResult",
     "score_evaluation",
+    # Phase D — result substrate
+    "RESULT_PATH_ENV_VAR",
+    "RESULT_PERSISTENCE_ENABLED_ENV_VAR",
+    "RESULT_RECORD_SCHEMA_VERSION",
+    "EvaluationRecord",
+    "EvaluationResultStore",
+    "get_default_store",
+    "record_evaluation",
+    "replay_default_store_from_disk",
+    "reset_default_store",
 ]

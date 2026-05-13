@@ -887,6 +887,101 @@ The scorer does NOT require access to the evaluation's original worktree. Phases
 
 **Phase E** (parallel_eval) and **Phase F** (report_card) follow. Phase E drives N problems concurrently via `subagent_scheduler` with bounded concurrency from existing `JARVIS_PARALLEL_DISPATCH_*` knobs; Phase F renders the aggregate report card from Phase D's store.
 
+##### §40.7.10-d — SWE-Bench-Pro Phase D result substrate (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/phase-d-result-substrate`. Phase D bridges per-problem `(EvaluationResult, ScoringResult)` pairs into the cross-problem aggregate store that Phases E (parallel_eval) and F (report_card) consume.
+
+**What it does**: `EvaluationResultStore` is an in-memory + optionally JSONL-persisted store with three observable surfaces:
+- **`async record(evaluation, scoring) -> bool`** — updates the in-memory dict (dedup by `(instance_id, op_id)`; latest-write wins) AND appends to JSONL when persistence is enabled. JSONL retains the full audit history; in-memory holds the hot read cache.
+- **`query(*, instance_id, score_outcome, evaluation_outcome, limit) -> Tuple[EvaluationRecord, ...]`** — bounded snapshot read. Phase F renders aggregate cards from this surface.
+- **`async replay_from_disk() -> int`** — reconstructs the in-memory cache from JSONL at boot. Idempotent under repeated invocations; malformed rows skipped with a DEBUG log.
+
+Plus aggregate helpers operators reach for directly: `aggregate_score_outcomes()` / `aggregate_evaluation_outcomes()` / `pass_rate()` (excludes SKIPPED from denominator).
+
+**Canonical composition (AST-pinned)**:
+- **`cross_process_jsonl.flock_append_line`** — the canonical cross-process flock primitive (Vector #10 / v2.82). AST pin asserts the import; another AST pin forbids any `fcntl` import or reference in `result_store.py` so the canonical primitive remains the single seam to disk locking. No homegrown fcntl loops, no parallel `threading.Lock`-only fallbacks.
+- **`EvaluationResult.to_dict / from_dict`** (B.2.2) + **`ScoringResult.to_dict / from_dict`** (Phase C) — JSONL row composes both canonical payloads verbatim. AST pin asserts both imports.
+- **`EvaluationOutcome` / `ScoreOutcome`** enums — closed-taxonomy aggregation counters cover every enum value (with zero counts where absent).
+
+**Frozen `EvaluationRecord` dataclass (§33.5)**:
+- `evaluation: EvaluationResult` + `scoring: ScoringResult` (canonical payloads verbatim)
+- `recorded_at_iso: str` (UTC ISO8601 provenance)
+- `schema_version: str` = `swe_bench_pro_result.v1`
+- `dedup_key` property → `(instance_id, op_id)` tuple
+- `to_dict / from_dict` round-trip composes the canonical Phase B.2.2 + C dataclasses
+
+**Dedup semantics**:
+- In-memory key: `(problem_instance_id, op_id)` — same problem under the same op-id is one record (latest-write wins). Same problem under a different op-id (a retry, a different evaluation session) is a distinct record.
+- JSONL: append-only audit. The same `(instance_id, op_id)` pair may appear multiple times if the operator re-scored after rubric evolution; in-memory replay collapses to the last-written record but the JSONL history is preserved for forensics.
+
+**Thread + async safety**:
+- `record()` updates the in-memory dict under a `threading.Lock` so concurrent records don't lose updates
+- JSONL append goes through `run_in_executor(None, ...)` so the event loop is never blocked on disk I/O + flock acquisition
+- `query()` snapshots under the lock then iterates unlocked so concurrent records don't block reads
+- Cross-process safety via `flock_append_line` — multiple processes (parallel_eval rig + offline scorer + report-card renderer) can append concurrently without corruption
+
+**Module-level singleton (mirrors `get_default_broker` pattern)**:
+- `get_default_store()` — lazy-construct the process-global default store
+- `reset_default_store()` — drop the singleton (primarily for tests)
+- `async record_evaluation(evaluation, scoring)` — convenience module-level call via the singleton
+- `async replay_default_store_from_disk()` — boot-time replay helper
+
+**Master flags (§33.1; FlagRegistry auto-seeded — 2 specs)**:
+- `JARVIS_SWE_BENCH_PRO_RESULT_PERSISTENCE_ENABLED` (BOOL/SAFETY, default **FALSE** per §33.1) — when ON, the store appends to JSONL via `flock_append_line`. Phase D ships dormant until soak evidence accumulates.
+- `JARVIS_SWE_BENCH_PRO_RESULT_PATH` (STR/INTEGRATION, default `.jarvis/swe_bench_pro/results.jsonl`) — canonical audit path; parent directory auto-created on first append.
+
+**Spine — 33 regression tests + 4 AST pins + 3 FlagRegistry seed assertions**:
+- Schema round-trip via `json.dumps`/`loads`
+- Dedup key correctness
+- In-memory record + dedup-by-(instance_id, op_id) with latest-write-wins
+- Query filters by instance_id / score_outcome / evaluation_outcome + bounded limit
+- Aggregate counters covering all 5 ScoreOutcomes + all 7 EvaluationOutcomes (with zero counts where absent)
+- `pass_rate()` excludes SKIPPED from denominator
+- Master-flag OFF: no JSONL write
+- Master-flag ON: JSONL line appended via canonical flock primitive; parent auto-created
+- JSONL retains audit history under in-memory dedup
+- Env-resolved persistence path + master flag
+- Replay reconstructs in-memory cache + idempotent + skips malformed rows + missing file returns 0
+- Singleton helpers preserve identity until `reset_default_store`
+- `record_evaluation` + `replay_default_store_from_disk` module helpers
+- Fail-closed contract: `record()` returns False on malformed payload + `query()` never raises
+- `clear()` drops in-memory but preserves JSONL on disk
+- 4 AST pins: imports canonical `flock_append_line` / imports canonical `EvaluationResult`+`ScoringResult`+enums / no `fcntl` import or reference anywhere / `record`+`query`+`replay_from_disk` wrapped in try/except (fail-closed contract is structural)
+- FlagRegistry seeds: 2 specs / persistence default FALSE / never-raises-on-capturer-failure
+
+**Surrounding regression**: **295 cumulative tests green** across Phase D spine + Phase C scorer + B.2.2 evaluator + B.2.1 envelope builder + B.1 per-problem harness + Phase A dataset loader + B.2.0 advisor + B.2.0.5 lifecycle SSE + read-only-advisor + `_run_inner` sha256 pin. `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/result_store.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports + docstring update
+- `tests/governance/test_swe_bench_pro_result_store.py` — 33-test spine + 4 AST pins (NEW)
+
+**What this PR deliberately did NOT do**:
+- No parallel flock implementation (composes canonical `flock_append_line`; AST-pinned forbidden)
+- No new schema fields on `EvaluationResult` / `ScoringResult` — composes both verbatim
+- No homegrown JSONL parser — `json.loads` + `EvaluationRecord.from_dict` is the single seam
+- No bounded ring-buffer retention in this PR — JSONL is intentionally unbounded audit; replay reads everything. (Phase F's report-card may add tier-bounded sampling at render time.)
+- No graduation flip — master flag stays default-FALSE per §33.1
+- No SSE event for record() landings — could be added in a follow-on if a live aggregate dashboard needs it (Phase F surface)
+- No edits to `repair_engine.py` — `_run_inner` sha256 stays `9e881fdde25ec5b1`
+
+**End-to-end Phases A → B → C → D closure summary**:
+
+| Layer | Purpose | Tests |
+|---|---|---|
+| Phase A | `ProblemSpec` + dataset loader + cache | (Phase A spine) |
+| B.1 | `prepare_problem` / `PreparedProblem` / worktree | (B.1 spine) |
+| B.2.0 | Worktree-aware `OperationAdvisor` | 29 + 6 AST pins |
+| B.2.0.5 | Orchestrator `operation_terminal` SSE | 36 + 6 AST pins |
+| B.2.1 | `build_evaluation_envelope` | 31 + 5 AST pins |
+| B.2.2 + B.2.3 | `evaluate_problem` async façade | 29 + 8 AST pins |
+| Phase C | `score_evaluation` pure-data scorer | 34 + 6 AST pins |
+| **Phase D** | `EvaluationResultStore` aggregate substrate | **33 + 4 AST pins** |
+
+The system can now: load a problem → prepare a worktree → dispatch a fix → capture the patch → score it deterministically → **persist the (evaluation, scoring) pair into a queryable aggregate store with JSONL audit**.
+
+**Next**: **Phase E** — `parallel_eval` rig that drives N problems concurrently through `evaluate_problem` → `score_evaluation` → `record_evaluation` via `subagent_scheduler` with bounded concurrency from existing `JARVIS_PARALLEL_DISPATCH_*` knobs. Phase F (report_card) renders the aggregate report from Phase D's store: per-repo pass-rates, per-difficulty-tier breakdowns, ScoreOutcome distributions, top-N failing problems for human triage.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
