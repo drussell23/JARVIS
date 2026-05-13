@@ -108,14 +108,29 @@ def _evidence(repo_root: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_resolver_returns_none_when_master_flag_unset(
+def test_resolver_resolves_valid_evidence_when_master_flag_unset(
     project_root: Path, worktree: Path, clean_env: None,
 ) -> None:
-    """Default-FALSE: even a valid evidence payload is ignored."""
+    """Graduated to default-TRUE 2026-05-13: when the master flag is
+    unset, the resolver MUST honor a valid evidence payload (assuming
+    the path passes the allowlist check, which the fixture's worktree
+    does since it's under ``project_root``).
+
+    Prior behavior (default-FALSE) silently discarded the override
+    even for safe paths under project_root — that was the root cause
+    of stage-1 wiring-soak v8–v10 advise() starvation.
+    """
     out = resolve_envelope_repo_root(
         _evidence(str(worktree)), project_root=project_root,
     )
-    assert out is None
+    # The fixture's worktree resolves under project_root → allowlist
+    # accepts it → resolver returns the resolved Path.
+    assert out is not None, (
+        "Resolver returned None even though master flag is unset "
+        "(graduated default-TRUE) and worktree is under project_root. "
+        "Either the graduation regressed OR the fixture changed shape."
+    )
+    assert out == worktree.resolve()
 
 
 def test_resolver_returns_none_when_master_flag_false(
@@ -603,8 +618,9 @@ def test_ast_pin_orchestrator_no_source_branch_for_worktree_aware() -> None:
 
 def test_register_flags_returns_two_specs() -> None:
     """B.2.0 seeds: JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED (BOOL,
-    default-FALSE) + JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST (STR,
-    default empty)."""
+    GRADUATED to default-TRUE 2026-05-13)
+    + JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST (STR, default empty,
+    opt-in for non-project_root worktrees)."""
     captured: list = []
 
     class _Capturer:
@@ -618,11 +634,26 @@ def test_register_flags_returns_two_specs() -> None:
     assert ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR in names
 
 
-def test_register_flags_master_default_false_per_section_33_1() -> None:
-    """§33.1 graduation contract: master flag MUST default to FALSE.
+def test_register_flags_master_graduated_to_default_true_2026_05_13() -> None:
+    """§33.1 graduation contract: the worktree-aware master flag
+    was GRADUATED to default-TRUE on 2026-05-13.
 
-    Drift to default-TRUE would silently activate the override behavior
-    on every op for every operator without explicit graduation soak."""
+    Rationale: the B.2.0 substrate has been shipped + tested since
+    2026-05-12; the path-validation contract
+    (``resolve_envelope_repo_root``) rejects every path that doesn't
+    resolve under ``project_root`` or a caller-supplied allowlist,
+    making the default-on safe for the unprivileged case (envelopes
+    lacking ``evidence.repo_root`` or with paths under project_root).
+
+    The default-OFF was the root cause of stage-1 wiring soak
+    v8–v10 advise() starvation: for a 6-file SWE-Bench-Pro worktree,
+    the legacy fallback rglob-scanned the entire 29.5k-file
+    ``project_root`` because the envelope's ``repo_root`` was
+    silently discarded by the master-flag gate.
+
+    Operators who genuinely need the prior default-FALSE behavior
+    can set ``JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED=false``.
+    """
     captured: list = []
 
     class _Capturer:
@@ -633,7 +664,41 @@ def test_register_flags_master_default_false_per_section_33_1() -> None:
     master = next(
         s for s in captured if s.name == ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR
     )
-    assert master.default is False
+    assert master.default is True, (
+        f"Master flag default is {master.default!r}, expected True. "
+        "If you're reverting the graduation, ALSO revert "
+        "_worktree_aware_enabled() in operation_advisor.py — the "
+        "two MUST agree on the default."
+    )
+
+
+@pytest.mark.parametrize("env_val,expected", [
+    ("", True),       # unset/empty → graduated default-TRUE
+    ("true", True),
+    ("1", True),
+    ("yes", True),
+    ("on", True),
+    ("false", False),  # explicit opt-out
+    ("0", False),
+    ("no", False),
+    ("off", False),
+    ("garbage", True),  # unrecognized → default-TRUE (graduated)
+])
+def test_worktree_aware_enabled_env_parsing(
+    env_val: str, expected: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag parser MUST treat unset/empty/unrecognized as TRUE
+    (graduated default) and explicit truthy/falsy strings as the
+    obvious mapping.  This protects against subtle behavior shift
+    after the 2026-05-13 graduation."""
+    from backend.core.ouroboros.governance.operation_advisor import (
+        _worktree_aware_enabled,
+    )
+    if env_val == "":
+        monkeypatch.delenv(ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR, env_val)
+    assert _worktree_aware_enabled() is expected
 
 
 def test_register_flags_never_raises_under_missing_registry_module(
@@ -671,3 +736,107 @@ def test_canonical_evidence_key_is_repo_root() -> None:
     by the advisor module is the single source of truth for B.2.1's
     envelope builder."""
     assert EVIDENCE_REPO_ROOT_KEY == "repo_root"
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 spine: _compute_blast_radius walks ONLY under scan_root
+# ---------------------------------------------------------------------------
+
+
+def test_compute_blast_radius_walks_only_under_scan_root(tmp_path) -> None:
+    """Phase 0 spine (operator binding 2026-05-13): when ``root`` is
+    passed to ``_compute_blast_radius``, the filesystem walk MUST stay
+    bounded under that path.  Files outside ``root`` but inside
+    ``project_root`` MUST NOT contribute to the blast count.
+
+    This is the wrong-substrate invariant the operator asked to pin —
+    the bug that made stage-1 wiring-soak v8–v10 advise() starve was
+    NOT that the scan logic ignored ``root`` (it doesn't — ``rglob``
+    is bounded), it was that ``root`` was silently discarded by the
+    flag-gate above.  This test verifies the scan-level invariant
+    holds regardless of the flag's state — drift here (e.g. a future
+    refactor accidentally walking ``self._project_root`` even when
+    ``root`` is provided) would silently re-introduce the wrong-
+    substrate cost.
+
+    Fixture: a "project root" containing one importer file, plus a
+    sub-directory "worktree" containing another importer file.  When
+    we scan with ``root=worktree``, blast == 1 (only worktree's
+    importer).  When we scan with ``root=None``, blast == 2 (both).
+    """
+    from backend.core.ouroboros.governance.operation_advisor import (
+        OperationAdvisor,
+    )
+
+    project_root = tmp_path / "project_root"
+    project_root.mkdir()
+    worktree = project_root / "worktree"
+    worktree.mkdir()
+
+    # Outer importer — inside project_root, OUTSIDE worktree
+    (project_root / "outer_importer.py").write_text(
+        "import target_mod\n", encoding="utf-8",
+    )
+    # Inner importer — inside the worktree
+    (worktree / "inner_importer.py").write_text(
+        "import target_mod\n", encoding="utf-8",
+    )
+
+    advisor = OperationAdvisor(project_root)
+
+    # Default scan (root=None) sees BOTH files
+    full_scan = advisor._compute_blast_radius(("target_mod.py",), root=None)
+    assert full_scan == 2, (
+        f"Default scan (root=None) found {full_scan} importers, "
+        "expected 2 (outer + inner).  Test fixture is misconfigured "
+        "OR the substring-match logic skipped a file."
+    )
+
+    # Worktree-bounded scan sees ONLY the inner importer.  This is
+    # the operator's wrong-substrate invariant.
+    bounded_scan = advisor._compute_blast_radius(
+        ("target_mod.py",), root=worktree,
+    )
+    assert bounded_scan == 1, (
+        f"Worktree-bounded scan (root=worktree) found {bounded_scan} "
+        "importers, expected 1 (only inner).  Drift: the scan is "
+        "leaking outside scan_root.  This re-introduces the v8–v10 "
+        "wiring-soak failure mode where a 6-file SWE-Bench-Pro "
+        "worktree triggered a 29.5k-file rglob over project_root."
+    )
+
+
+def test_compute_blast_radius_scan_root_does_NOT_climb_to_project_root(tmp_path) -> None:
+    """Sibling pin to scan-bounding: the scan MUST NOT walk UP the
+    filesystem from scan_root.  An importer in a parent directory
+    of scan_root (but inside project_root) MUST NOT contribute.
+    """
+    from backend.core.ouroboros.governance.operation_advisor import (
+        OperationAdvisor,
+    )
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    parent_dir = project_root / "parent"
+    parent_dir.mkdir()
+    worktree = parent_dir / "worktree"
+    worktree.mkdir()
+
+    # An importer SIDEWAYS from the worktree but still under project_root
+    (parent_dir / "sibling_importer.py").write_text(
+        "import target_mod\n", encoding="utf-8",
+    )
+    # And one inside the worktree
+    (worktree / "in_worktree.py").write_text(
+        "import target_mod\n", encoding="utf-8",
+    )
+
+    advisor = OperationAdvisor(project_root)
+    bounded_scan = advisor._compute_blast_radius(
+        ("target_mod.py",), root=worktree,
+    )
+    assert bounded_scan == 1, (
+        f"Sibling-parent scan leaked: got {bounded_scan} importers, "
+        "expected 1.  scan_root MUST stay descendant-bounded, never "
+        "climbing to siblings or ancestors."
+    )
