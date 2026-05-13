@@ -93,6 +93,132 @@ _BLAST_RADIUS_CACHE_LOCK: "_threading.Lock" = _threading.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Oracle-graph blast radius (PR-A 2026-05-13)
+# ---------------------------------------------------------------------------
+#
+# Replaces the ~29.5k-file rglob+read_text scan in _compute_blast_radius
+# with a query against the Oracle's pre-built CodeGraph
+# (``compute_blast_radius`` BFS over import/call edges).  When the
+# graph is loaded and the target file/symbol is found, this is O(degree)
+# instead of O(N×avg_file_size) — typically microseconds instead of
+# seconds.  Stage-1 wiring soak 2026-05-13 (session
+# bt-2026-05-13-075148, even after PR-B isolation) showed that OS-level
+# disk contention from 16 sensors + Oracle + DreamEngine reading files
+# concurrently was the residual bottleneck; eliminating the rglob
+# entirely closes it.
+#
+# Composition discipline (per operator binding "leverage existing files
+# + architecture"): we use TheOracle's PUBLIC ``get_blast_radius()``
+# API — the same one CLI ``oracle.py blast`` already exposes.  No
+# duplicate BFS; no parallel graph state.  Parity contract: when the
+# graph doesn't have the target node (cold graph / new file / Oracle
+# disabled), we fall back to the legacy rglob scan byte-identically
+# so behavior is conservative under cold-cache.
+#
+# Master flag (default-FALSE per §33.1 graduation): when off, the
+# Oracle path is short-circuited and behavior is byte-identical to
+# pre-PR-A.  Operators graduate the flag after parity validation on
+# their own data.
+ADVISOR_ORACLE_BLAST_ENABLED_ENV_VAR: str = (
+    "JARVIS_ADVISOR_ORACLE_BLAST_ENABLED"
+)
+
+
+def _advisor_oracle_blast_enabled() -> bool:
+    """Master flag for the Oracle-graph blast path."""
+    raw = os.environ.get(ADVISOR_ORACLE_BLAST_ENABLED_ENV_VAR, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+# Module-level Oracle reference — mirrors the ``_active_goal_tracker``
+# pattern in unified_intake_router.py.  GovernedLoopService sets this
+# after Oracle initialization; advisor reads it at advise() time.
+# Optional[TheOracle], typed as Any to avoid an import cycle.
+_active_oracle: "Optional[Any]" = None
+
+
+def set_active_oracle(oracle: "Optional[Any]") -> None:
+    """Register the running Oracle instance with the advisor module.
+
+    Called by GovernedLoopService once the Oracle is initialized.
+    When the advisor's blast computation runs, it will check this
+    reference; ``None`` keeps the legacy rglob path active.
+    """
+    global _active_oracle
+    _active_oracle = oracle
+
+
+def _oracle_blast_count(
+    oracle: "Any",
+    target_files: "Tuple[str, ...]",
+) -> "Optional[int]":
+    """Query Oracle for the blast radius of ``target_files``.
+
+    Returns the count of unique affected files (direct + transitive
+    importers/callers), capped at 50 to match the legacy scan's
+    behavior.  Returns ``None`` when:
+
+    - any target file isn't in the graph (cold cache / new file)
+    - the graph itself isn't populated (Oracle still initializing)
+    - any query raises
+
+    A ``None`` return signals "fall back to legacy" — the advisor
+    treats it as a cache miss.  This keeps the Oracle path
+    conservative: we only TRUST the Oracle count when EVERY target
+    is graph-resolvable.  Heterogeneous mixes (one new file + one
+    indexed file) fall through rather than silently undercount.
+
+    Uses TheOracle's PUBLIC ``get_blast_radius`` API (the same
+    surface ``oracle.py`` CLI ``blast`` command exposes), composing
+    existing architecture rather than duplicating BFS logic.
+    """
+    # Only treat as resolved when EVERY target file is in the graph.
+    # Mixed resolution would silently undercount.
+    all_affected_file_paths: set = set()
+    for target in target_files:
+        # The Oracle API resolves both file paths and symbol names.
+        # We prefer the basename without extension (matches how the
+        # graph indexes module nodes) but try both forms.
+        candidates: "List[str]" = []
+        if target.endswith(".py"):
+            from pathlib import Path as _Path
+            stem = _Path(target).stem
+            candidates.append(stem)
+            candidates.append(target)
+        else:
+            candidates.append(target)
+
+        resolved_for_target = False
+        for candidate in candidates:
+            try:
+                blast = oracle.get_blast_radius(candidate)
+            except Exception:  # noqa: BLE001
+                return None  # Defensive: any Oracle error → legacy fallback
+            if blast.risk_level == "unknown":
+                continue  # candidate not in graph; try next form
+            # Found.  Collect affected NodeIDs → unique file_paths.
+            for node_id in blast.directly_affected:
+                fp = getattr(node_id, "file_path", "") or ""
+                if fp:
+                    all_affected_file_paths.add(fp)
+            for node_id in blast.transitively_affected:
+                fp = getattr(node_id, "file_path", "") or ""
+                if fp:
+                    all_affected_file_paths.add(fp)
+            resolved_for_target = True
+            break
+
+        if not resolved_for_target:
+            # Target not in graph — abort the Oracle path; legacy
+            # rglob still catches name occurrences across the tree.
+            return None
+
+    # Cap at 50 to match legacy scan's break threshold (preserves
+    # the existing risk-score calibration in advise()).
+    return min(len(all_affected_file_paths), 50)
+
+
+# ---------------------------------------------------------------------------
 # Dedicated bounded executor for advisor blast scans (PR-B)
 # ---------------------------------------------------------------------------
 #
@@ -757,6 +883,29 @@ class OperationAdvisor:
             if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
                 return result
             # Expired — fall through to recompute.
+
+        # PR-A: Oracle-graph blast (gated, fallback to legacy on miss).
+        # When the master flag is ON and the running Oracle has graph
+        # state covering at least one target, use its pre-built BFS
+        # instead of the 29.5k-file rglob scan.  Strict semantics:
+        # cold graph / node-not-found / any exception → fall back to
+        # legacy.  Cache the result with the same key so downstream
+        # paths see a uniform value source.
+        if _advisor_oracle_blast_enabled() and _active_oracle is not None:
+            try:
+                oracle_count = _oracle_blast_count(_active_oracle, target_files)
+                if oracle_count is not None:
+                    with _BLAST_RADIUS_CACHE_LOCK:
+                        _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, oracle_count)
+                        self._evict_blast_radius_cache_if_oversized()
+                    return oracle_count
+                # else: Oracle didn't have the node → fall through to legacy
+            except Exception:  # noqa: BLE001 — defensive: Oracle errors must NEVER block advise
+                logger.debug(
+                    "[Advisor] Oracle blast query failed for "
+                    "target_files=%r — falling back to legacy scan",
+                    target_files, exc_info=True,
+                )
 
         target_modules = set()
         for f in target_files:
