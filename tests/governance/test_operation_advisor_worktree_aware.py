@@ -515,6 +515,16 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
     must co-occur within the same function body — a drift that
     silently dropped the resolver would silently revert behavior to
     pre-B.2.0 even with the master flag ON.
+
+    Two call shapes are accepted (both preserve the structural
+    invariant "repo_root is threaded into advise"):
+
+    1. Direct: ``_advisor.advise(..., repo_root=...)``
+    2. ``asyncio.to_thread``-wrapped:
+       ``asyncio.to_thread(_advisor.advise, ..., repo_root=...)``
+       — the 2026-05-13 fix that moves the ~15s blast-radius scan
+       off the asyncio event loop.  See
+       ``test_operation_advisor_async_cache.py`` for the rationale.
     """
     from backend.core.ouroboros.governance import orchestrator
     orchestrator_src = Path(orchestrator.__file__).read_text()
@@ -531,8 +541,18 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
                 name = fn.attr
             if name == "resolve_envelope_repo_root":
                 resolver_called = True
+            # Shape 1: direct advise call with repo_root kwarg
             if name == "advise":
                 if any(kw.arg == "repo_root" for kw in node.keywords):
+                    advise_with_repo_root = True
+            # Shape 2: asyncio.to_thread(_advisor.advise, ..., repo_root=...)
+            if name == "to_thread" and node.args:
+                first_arg = node.args[0]
+                if (
+                    isinstance(first_arg, ast.Attribute)
+                    and first_arg.attr == "advise"
+                    and any(kw.arg == "repo_root" for kw in node.keywords)
+                ):
                     advise_with_repo_root = True
     assert resolver_called, (
         "orchestrator.py never calls resolve_envelope_repo_root — "
@@ -540,7 +560,8 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
     )
     assert advise_with_repo_root, (
         "orchestrator.py never passes repo_root= to advise() — "
-        "B.2.0 wiring incomplete"
+        "B.2.0 wiring incomplete (checked both direct and "
+        "asyncio.to_thread-wrapped call shapes)"
     )
 
 

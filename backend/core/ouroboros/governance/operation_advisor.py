@@ -38,6 +38,40 @@ _BLAST_RADIUS_WARN = int(os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_WARN", "10"
 _FAILURE_STREAK_WARN = int(os.environ.get("JARVIS_ADVISOR_FAILURE_STREAK_WARN", "3"))
 
 # ---------------------------------------------------------------------------
+# Blast-radius cache (TTL-bounded memoization)
+# ---------------------------------------------------------------------------
+#
+# Default 60s.  Per-call ``_compute_blast_radius`` scans every Python file in
+# the project root and substring-checks the content for target modules — on
+# this repo (~29.5k Python files) a cold scan takes ~15s and a warm one
+# still takes several seconds.  Without caching, each Advisor call inside the
+# orchestrator's CLASSIFY phase paid the full scan, and the call was made on
+# the asyncio event loop, starving every other coroutine (16 sensors +
+# router dispatch + governed loop) for the duration.  Observed 2026-05-12
+# stage-1 wiring soak (session bt-2026-05-13-054721): first CLASSIFY took
+# ~12 minutes wall-clock between dispatch and Advisor verdict, subsequent
+# ones ~60s each — entirely the filesystem scan, serialized through one
+# starved event loop.
+#
+# TTL is short (60s default) so the cache stays honest under fast-moving
+# file changes; longer windows risk acting on stale blast radius.  Most
+# ops within a session target similar file sets (sensors re-emit on the
+# same hot files), so even a 60s window yields high hit rate.
+#
+# Cache key: (frozenset(target_files), str(scan_root)) — invariant to
+# tuple ordering of target_files (operator binding 2026-04-26: signal
+# coalescing must not produce duplicate blast-radius work).
+_BLAST_RADIUS_CACHE_TTL_S: float = float(
+    os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_CACHE_TTL_S", "60")
+)
+# Bounded by op count to keep memory predictable.  16 active sensors × ~3
+# unique target_file sets each = ~50 entries typical; pinning to 256
+# leaves headroom without unbounded growth.
+_BLAST_RADIUS_CACHE_MAX_ENTRIES: int = int(
+    os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_CACHE_MAX_ENTRIES", "256")
+)
+
+# ---------------------------------------------------------------------------
 # B.2.0 — Worktree-aware advisory (SWE-Bench-Pro Phase 2 enabling layer +
 # permanent improvement for L3 worktree-isolated work and the in-repo L2
 # exercise corpus). §33.1 default-FALSE master switch; when ON, the advisor
@@ -365,6 +399,13 @@ class OperationAdvisor:
 
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
+        # Blast-radius memoization — see _BLAST_RADIUS_CACHE_TTL_S module
+        # comment.  Stores (frozenset(target_files), str(scan_root)) →
+        # (computed_at_monotonic, result).  Bounded by
+        # _BLAST_RADIUS_CACHE_MAX_ENTRIES via FIFO eviction.  Per-instance
+        # so worktree-aware ops (different scan_root per envelope) don't
+        # cross-pollute, and so test fixtures get isolated state.
+        self._blast_radius_cache: "Dict[Tuple[frozenset, str], Tuple[float, int]]" = {}
 
     def advise(
         self,
@@ -545,8 +586,30 @@ class OperationAdvisor:
         ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
         ``None`` (pre-B.2.0 behavior). Callers MUST validate the override
         path through :func:`resolve_envelope_repo_root` first.
+
+        Results are TTL-memoized per
+        (frozenset(target_files), str(scan_root)) — see the
+        ``_BLAST_RADIUS_CACHE_TTL_S`` module comment for the reason.  The
+        scan reads ~29.5k Python files on the main repo (cold) and dominates
+        the wall-clock cost of the Advisor.  Without the cache, every op
+        within ``_BLAST_RADIUS_CACHE_TTL_S`` seconds paid the full scan;
+        with the cache, repeat calls (signal coalescing on the same target
+        files; WAL replay of stuck envelopes) return in microseconds.
         """
         scan_root = root if root is not None else self._project_root
+
+        # Cache lookup — frozenset key makes the cache invariant to
+        # target_files tuple ordering (coalesced envelopes can arrive
+        # in arbitrary order).
+        cache_key = (frozenset(target_files), str(scan_root))
+        now = time.monotonic()
+        cached = self._blast_radius_cache.get(cache_key)
+        if cached is not None:
+            computed_at, result = cached
+            if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
+                return result
+            # Expired — fall through to recompute.
+
         target_modules = set()
         for f in target_files:
             if f.endswith(".py"):
@@ -555,6 +618,8 @@ class OperationAdvisor:
                 target_modules.add(Path(f).stem)
 
         if not target_modules:
+            self._blast_radius_cache[cache_key] = (now, 0)
+            self._evict_blast_radius_cache_if_oversized()
             return 0
 
         importers = 0
@@ -569,7 +634,32 @@ class OperationAdvisor:
                 pass
             if importers >= 50:
                 break  # Cap the search
+
+        # Record + bound the cache.  FIFO eviction is acceptable because the
+        # TTL already bounds entry age; max-entries is a defensive memory
+        # ceiling not the primary freshness mechanism.
+        self._blast_radius_cache[cache_key] = (now, importers)
+        self._evict_blast_radius_cache_if_oversized()
         return importers
+
+    def _evict_blast_radius_cache_if_oversized(self) -> None:
+        """Drop the oldest entries until the cache fits.
+
+        FIFO eviction (relies on dict insertion order being preserved in
+        Python 3.7+).  TTL pruning is implicit at lookup time — expired
+        entries get overwritten by the next compute pass with the same key,
+        and unused expired entries are evicted only when memory pressure
+        (max_entries) forces it.  Acceptable for a 60s-TTL cache.
+        """
+        cache = self._blast_radius_cache
+        while len(cache) > _BLAST_RADIUS_CACHE_MAX_ENTRIES:
+            # popitem(last=False) is dict-method on Python 3.7+ via
+            # iter(cache).  Use next(iter(...)) for explicit FIFO.
+            try:
+                oldest = next(iter(cache))
+                del cache[oldest]
+            except (StopIteration, KeyError):
+                break
 
     def _compute_test_coverage(
         self,
