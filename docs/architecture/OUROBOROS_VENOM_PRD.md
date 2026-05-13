@@ -982,6 +982,76 @@ The system can now: load a problem → prepare a worktree → dispatch a fix →
 
 **Next**: **Phase E** — `parallel_eval` rig that drives N problems concurrently through `evaluate_problem` → `score_evaluation` → `record_evaluation` via `subagent_scheduler` with bounded concurrency from existing `JARVIS_PARALLEL_DISPATCH_*` knobs. Phase F (report_card) renders the aggregate report from Phase D's store: per-repo pass-rates, per-difficulty-tier breakdowns, ScoreOutcome distributions, top-N failing problems for human triage.
 
+##### §40.7.10-e — SWE-Bench-Pro Phase E parallel evaluation rig (CLOSED 2026-05-12)
+
+**Status**: SHIPPED on dedicated branch `ouroboros/swe-bench-pro/phase-e-parallel-eval`. Phase E is the operational ceiling — drives N problems concurrently through the full B.2.2 → C → D pipeline with bounded concurrency from the canonical hot-reload-safe semaphore primitive.
+
+**What it does**: `parallel_evaluate(problems, *, intake_service, concurrency=None, score_each=True, record_each=True, ...) -> AsyncIterator[EvaluationRecord]` is an async generator that yields records in **completion order** (not submission order) so operators see fast problems land first. Each task internally: acquire bounded semaphore → `evaluate_problem` (B.2.2) → `score_evaluation` if `score_each` (Phase C) → `store.record` if `record_each` (Phase D) → enqueue record. Iterator drains the queue.
+
+**Composition discipline (AST-pinned, 4 pins)**:
+
+1. **Canonical hot-reload-safe semaphore** — composes `_process_singletons.get_semaphore("swe_bench_pro_parallel_eval", concurrency)`. AST pin asserts the import; another AST pin forbids any `asyncio.Semaphore(` literal in the module body. The canonical primitive survives module hot-reload (its objects live in a quarantined module); a homegrown `asyncio.Semaphore` would orphan in-flight tasks across reload boundaries.
+2. **Canonical pipeline surfaces** — composes `evaluate_problem` (B.2.2) + `score_evaluation` (Phase C) + `EvaluationResultStore` + `EvaluationRecord` (Phase D). AST pin asserts all four imports. No parallel implementations anywhere.
+3. **No while-True polling** — AST pin asserts no `while True:` loop. The rig drains an `asyncio.Queue` sized to the exact submitted-task count, never speculatively.
+4. **No new master flag** — composes Phase A's `JARVIS_SWE_BENCH_PRO_ENABLED` master via the underlying `evaluate_problem` gate. The rig's only knob is concurrency (orthogonal to the arc's enablement).
+
+**Stream-not-batch semantics**: the rig yields each `EvaluationRecord` as soon as its task completes via an internal `asyncio.Queue`. Operators see live progress under any concurrency level (even concurrency=1 yields per-problem as serial work completes, not at the end). Fast problems surface first; long-tail problems don't block faster ones from being scored + recorded + visible.
+
+**Frozen `ParallelEvalProgress` dataclass**: optional `progress_callback` invoked on each completion with a snapshot covering `total_submitted` / `total_completed` / `pending` / `pass_count` / `fail_count` / `partial_count` / `error_count` / `skipped_count` / `last_instance_id` / `last_score_outcome` / `snapshot_iso`. Observer errors are swallowed at DEBUG so a buggy callback cannot tear down the rig.
+
+**Per-task fail-closed contract**: a defensive `try/except` wraps each task's full pipeline. If `evaluate_problem` or `score_evaluation` violate their fail-closed contract and raise unexpectedly, the rig produces a **synthetic record** with `EvaluationOutcome.INGEST_FAILED` (or `ScoreOutcome.SCORING_ERROR` for scorer failures) and a diagnostic carrying the exception class name. Other in-flight tasks continue; the rig does not die from a single contract violation.
+
+**Cooperative cancel**: `async for ... break` early exits and full-rig cancellation both cancel every in-flight task. Each task's `finally` block runs (so `evaluate_problem` cleans its worktree via B.2.2's discipline; `score_evaluation` cleans its scoring worktree via Phase C's discipline). Pending unyielded records are dropped — cancellation is cooperative, not eager.
+
+**Master flag (§33.1; FlagRegistry auto-seeded — 1 spec)**:
+- `JARVIS_SWE_BENCH_PRO_PARALLEL_CONCURRENCY` (INT/CAPACITY, default **4**) — bounded concurrency cap. Default 4 is tuned for a single workstation (4 worktrees + 4 orchestrator dispatches + 4 pytest invocations concurrently). Operators on larger infra flip higher; on memory-constrained envs flip to 1 or 2. The semaphore is process-wide via `get_semaphore`, so concurrent invocations of `parallel_evaluate` share the same slot pool — protecting the box from accidental nested fan-outs.
+
+**Spine — 19 regression tests + 4 AST pins + 2 FlagRegistry seed assertions**:
+- Empty iterable yields zero records
+- Single + multi-problem flows yield correct counts
+- `concurrency=1` forces serial (max_in_flight = 1 verified via instrumented stub)
+- `concurrency=N` admits up to N concurrent (max_in_flight observed within bound)
+- `score_each=True` invokes Phase C scorer; `=False` produces synthetic `SKIPPED` scoring half
+- `record_each=True` persists to injected store; `=False` does not
+- Per-task contract violation yields synthetic record; rig continues
+- `progress_callback` fires per completion; observer exceptions swallowed
+- `ParallelEvalProgress` is frozen
+- 4 AST pins: canonical `get_semaphore` import / canonical pipeline imports / no `asyncio.Semaphore(` literal / no `while True:` loop
+- FlagRegistry: 1 spec / never-raises-on-capturer-failure
+
+**Surrounding regression**: **314 cumulative tests green** across Phase E spine + Phase D result store + Phase C scorer + B.2.2 evaluator + B.2.1 envelope builder + B.1 per-problem harness + Phase A dataset loader + B.2.0 advisor + B.2.0.5 lifecycle SSE + read-only-advisor + `_run_inner` sha256 pin. `_run_inner` sha256 still `9e881fdde25ec5b1` (no edits to repair_engine).
+
+**File-coordinate summary**:
+- `backend/core/ouroboros/governance/swe_bench_pro/parallel_eval.py` — substrate (NEW)
+- `backend/core/ouroboros/governance/swe_bench_pro/__init__.py` — package re-exports + docstring update
+- `tests/governance/test_swe_bench_pro_parallel_eval.py` — 19-test spine + 4 AST pins (NEW)
+
+**What this PR deliberately did NOT do**:
+- No homegrown `asyncio.Semaphore` literal in the module body — composes canonical `get_semaphore` (AST-pinned forbidden literal)
+- No while-True polling loop — bounded queue.get sized to submitted-task count (AST-pinned)
+- No new master flag — composes Phase A's master via underlying `evaluate_problem` gate
+- No batch-style return — stream-as-completed semantics throughout
+- No event-loop-blocking sync I/O — every async surface uses canonical async primitives
+- No edits to `repair_engine.py` — `_run_inner` sha256 stays `9e881fdde25ec5b1`
+
+**End-to-end Phases A → B → C → D → E closure summary**:
+
+| Layer | Purpose | Tests |
+|---|---|---|
+| Phase A | `ProblemSpec` + dataset loader + cache | (Phase A spine) |
+| B.1 | `prepare_problem` / `PreparedProblem` / worktree | (B.1 spine) |
+| B.2.0 | Worktree-aware `OperationAdvisor` | 29 + 6 AST pins |
+| B.2.0.5 | Orchestrator `operation_terminal` SSE | 36 + 6 AST pins |
+| B.2.1 | `build_evaluation_envelope` | 31 + 5 AST pins |
+| B.2.2 + B.2.3 | `evaluate_problem` async façade | 29 + 8 AST pins |
+| Phase C | `score_evaluation` pure-data scorer | 34 + 6 AST pins |
+| Phase D | `EvaluationResultStore` aggregate substrate | 33 + 4 AST pins |
+| **Phase E** | `parallel_evaluate` async generator rig | **19 + 4 AST pins** |
+
+**Phases A → E are operationally complete end-to-end**. The system can: load N problems → fan out concurrent fix attempts → capture each patch → score each deterministically → persist each into a queryable aggregate store, all under bounded concurrency from a hot-reload-safe primitive, with live streaming-as-completed semantics.
+
+**Next**: **Phase F** — `report_card` renderer that reads from Phase D's `EvaluationResultStore` and produces aggregate cards: per-repo pass-rates, per-difficulty-tier breakdowns, `ScoreOutcome` distributions, top-N failing problems with diagnostic clustering for human triage. Pure-data rendering with optional Markdown/JSON output artifact. Phase F has no I/O of its own beyond writing the optional artifact file.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)

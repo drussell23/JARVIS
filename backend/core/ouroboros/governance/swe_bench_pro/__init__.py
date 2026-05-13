@@ -8,7 +8,7 @@ Package layout (one phase per module; all default-FALSE per §33.1):
   * ``evaluator``           — Phase B.2.2: evaluate_problem async façade.
   * ``scorer``              — Phase C: score_evaluation pass/partial/fail.
   * ``result_store``        — Phase D: EvaluationResultStore + JSONL audit.
-  * (future) ``parallel_eval``    — Phase E
+  * ``parallel_eval``       — Phase E: parallel_evaluate async generator.
   * (future) ``report_card``      — Phase F
 
 Composition discipline (mirrors :mod:`l2_exercise_seed` pattern):
@@ -83,6 +83,11 @@ from backend.core.ouroboros.governance.swe_bench_pro.result_store import (
     replay_default_store_from_disk,
     reset_default_store,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (
+    PARALLEL_CONCURRENCY_ENV_VAR,
+    ParallelEvalProgress,
+    parallel_evaluate,
+)
 
 
 __all__ = [
@@ -133,4 +138,8 @@ __all__ = [
     "record_evaluation",
     "replay_default_store_from_disk",
     "reset_default_store",
+    # Phase E — parallel evaluation rig
+    "PARALLEL_CONCURRENCY_ENV_VAR",
+    "ParallelEvalProgress",
+    "parallel_evaluate",
 ]
