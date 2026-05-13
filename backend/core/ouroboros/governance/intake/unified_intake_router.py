@@ -11,6 +11,7 @@ File advisory lock prevents two router instances on the same project root.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import threading
 import fcntl
 import logging
@@ -120,6 +121,36 @@ _URGENCY_BOOST: Dict[str, int] = {
 
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
+
+
+# ---------------------------------------------------------------------------
+# Heap tie-break counter
+# ---------------------------------------------------------------------------
+#
+# Every enqueue onto ``self._queue`` (asyncio.PriorityQueue) MUST carry a
+# strictly-monotonic ``tie_seq`` so the heap NEVER falls through to
+# IntentEnvelope comparison.  IntentEnvelope is a frozen dataclass with
+# no ``__lt__``; when two items collide on the (priority, submitted_at)
+# prefix, heapq's tuple comparison reaches the envelope and raises
+# ``TypeError: '<' not supported between instances of 'IntentEnvelope'``.
+# That exception bubbles up from inside ``await queue.put(...)``, leaves
+# the heap in a partially-mutated state, and can quietly corrupt dequeue
+# ordering — observed 2026-05-12 stage-1 wiring soak as a priority-2
+# envelope sitting in the queue while priority-7+ envelopes dispatched
+# ahead of it (session bt-2026-05-13-051420, swe_bench_pro envelope
+# pending for 14+ min while 9 other ops drained).
+#
+# The fix is a totally-ordered prefix: heap items are
+# ``(priority, submitted_at, tie_seq, envelope)``.  Heap compares only
+# the first three fields (all numeric / never tie all at once because
+# tie_seq is unique-per-enqueue).  ``envelope`` is inert for ordering.
+# FIFO among genuine priority+timestamp ties is preserved via
+# monotonic tie_seq.
+#
+# Discipline: ``next(_HEAP_TIE_SEQ)`` is the ONLY way to construct the
+# tie-break field — both ingest-path enqueues and WAL-replay enqueues
+# compose it.  AST-pinned in the spine.
+_HEAP_TIE_SEQ: "itertools.count[int]" = itertools.count()
 
 # ---------------------------------------------------------------------------
 # Slice 5 Arc A — SensorGovernor consultation maps
@@ -447,7 +478,14 @@ class UnifiedIntakeRouter:
         self._runtime_orchestrator = runtime_orchestrator
         self._config = config
         self._wal = WAL(config.resolved_wal_path)
-        self._queue: asyncio.PriorityQueue[Tuple[int, float, IntentEnvelope]] = (
+        # Heap tuple shape: (priority, submitted_at, tie_seq, envelope).
+        # The tie_seq third element is REQUIRED so heapq never falls
+        # through to envelope comparison — see _HEAP_TIE_SEQ module
+        # docstring + the dedicated regression spine at
+        # tests/governance/intake/test_unified_intake_router_heap_tiebreak.py
+        self._queue: asyncio.PriorityQueue[
+            Tuple[int, float, int, IntentEnvelope]
+        ] = (
             asyncio.PriorityQueue(maxsize=config.max_queue_size)
         )
         self._dedup: Dict[str, float] = {}
@@ -700,7 +738,9 @@ class UnifiedIntakeRouter:
                 envelope.evidence.update(alignment.as_evidence())
             except Exception as _stash_exc:  # pragma: no cover — defence in depth
                 logger.debug("[Router] evidence stash failed: %s", _stash_exc)
-        await self._queue.put((priority, envelope.submitted_at, envelope))
+        await self._queue.put(
+            (priority, envelope.submitted_at, next(_HEAP_TIE_SEQ), envelope),
+        )
 
         # F1 Slice 2 — mirror to IntakePriorityQueue when wired.
         # Primary mode (master on): this queue becomes the source of truth
@@ -991,7 +1031,7 @@ class UnifiedIntakeRouter:
             else:
                 # Legacy path (byte-identical to pre-F1).
                 try:
-                    priority, ts, envelope = await asyncio.wait_for(
+                    priority, ts, _tie_seq, envelope = await asyncio.wait_for(
                         self._queue.get(), timeout=1.0
                     )
                 except asyncio.TimeoutError:
@@ -1317,7 +1357,12 @@ class UnifiedIntakeRouter:
                 # If the queue is full, dead-letter immediately rather than stall.
                 priority, _alignment = _compute_priority(envelope)
                 try:
-                    self._queue.put_nowait((priority, envelope.submitted_at, envelope))
+                    self._queue.put_nowait((
+                        priority,
+                        envelope.submitted_at,
+                        next(_HEAP_TIE_SEQ),
+                        envelope,
+                    ))
                 except asyncio.QueueFull:
                     logger.error(
                         "Router: queue full during retry — dead-lettering lease_id=%s",
@@ -1347,7 +1392,12 @@ class UnifiedIntakeRouter:
                 # with a second round of scorer failures if the tracker
                 # happens to be broken at replay time.
                 priority, _alignment = _compute_priority(envelope)
-                await self._queue.put((priority, envelope.submitted_at, envelope))
+                await self._queue.put((
+                    priority,
+                    envelope.submitted_at,
+                    next(_HEAP_TIE_SEQ),
+                    envelope,
+                ))
                 logger.debug(
                     "Router: replayed lease_id=%s source=%s",
                     entry.lease_id,
