@@ -116,6 +116,102 @@ def park_enabled() -> bool:
     }
 
 
+# ---------------------------------------------------------------------------
+# Park-policy — deterministic route-aware decision, no LLM, ~1µs
+# ---------------------------------------------------------------------------
+
+
+_ENV_PARK_ROUTES = "JARVIS_BG_PARK_ROUTES"
+
+# Default policy: park only on routes whose generation budget is long
+# enough that holding a slot during provider I/O dominates BG-pool
+# utilization.  IMMEDIATE / STANDARD are operator-visible fast paths
+# (60–120s budgets) — parking them just adds bookkeeping overhead.
+# SPECULATIVE is fire-and-forget — no human is waiting, no slot to
+# protect.  BACKGROUND (180s+ budget) and COMPLEX (180s+ planning + tool
+# rounds) are the routes where slot release matters.  Operator
+# override via JARVIS_BG_PARK_ROUTES (CSV of route names).
+_DEFAULT_PARK_ROUTES = frozenset({"background", "complex"})
+
+
+def _resolved_park_routes() -> frozenset:
+    """Resolve the set of routes eligible for parking. Read at call time.
+
+    Empty / missing env → default.  Malformed entries (whitespace, case)
+    are normalized.  Unknown route names are silently retained (they
+    simply never match) so operators can experiment without breaking
+    the resolver.
+    """
+    raw = os.environ.get(_ENV_PARK_ROUTES, "").strip()
+    if not raw:
+        return _DEFAULT_PARK_ROUTES
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return frozenset(parts) if parts else _DEFAULT_PARK_ROUTES
+
+
+def should_park_for_route(
+    provider_route: str,
+    *,
+    queue_pressure: bool,
+    is_resumed: bool = False,
+) -> bool:
+    """Single source of truth for "should this op park before its
+    provider await?"  Pure function — no I/O, no side effects.
+
+    Decision table
+    --------------
+
+    +--------------+---------------+-----------+----------+
+    | master flag  | provider_route| queue_p.  | result   |
+    +==============+===============+===========+==========+
+    | off          | *             | *         | False    |
+    | on           | not eligible  | *         | False    |
+    | on           | eligible      | False     | False    |
+    | on           | eligible      | True      | True     |
+    | on           | *             | * (resumed) | False  |
+    +--------------+---------------+-----------+----------+
+
+    Parameters
+    ----------
+    provider_route:
+        The route stamped by UrgencyRouter at ROUTE phase (e.g.
+        ``"background"``, ``"complex"``, ``"standard"``, etc.).
+        Compared case-insensitively against the eligible-route set.
+    queue_pressure:
+        ``True`` iff the BG pool has at least one queued op waiting
+        for a slot.  Without pressure, parking the current op just
+        adds bookkeeping with no throughput benefit — the slot would
+        idle anyway.  The caller (BG pool wiring at Slice 2b)
+        computes this from ``pool._queue.qsize() > 0`` or
+        equivalent.
+    is_resumed:
+        ``True`` iff this dispatch is a resume-after-park.  Resumed
+        dispatches MUST NOT re-park (would loop indefinitely); they
+        materialize from the store and proceed.
+
+    Returns
+    -------
+    bool
+        ``True`` iff the op should park its GENERATE provider await.
+
+    Why a pure function
+    -------------------
+    The policy is a deterministic compose of (1) the master flag, (2)
+    a CSV-driven set of eligible routes, and (3) the caller's queue-
+    pressure observation.  Keeping it pure makes the spine trivial to
+    pin (parametrized table) and lets future arcs add more inputs
+    without touching the BG pool's hot path.
+    """
+    if not park_enabled():
+        return False
+    if is_resumed:
+        return False
+    if not queue_pressure:
+        return False
+    eligible = _resolved_park_routes()
+    return (provider_route or "").strip().lower() in eligible
+
+
 def _ttl_s() -> float:
     """Resolved TTL in seconds. Invalid values fall back to default."""
     raw = os.environ.get(_ENV_TTL_S, "")

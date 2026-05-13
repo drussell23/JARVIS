@@ -65,6 +65,44 @@ class ParkDescriptor:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
 
+class ParkRequested(Exception):
+    """Raised by the GENERATE wrapper to bail out of ``_orch.run(ctx)``.
+
+    Why an exception, not a return value
+    ------------------------------------
+    The orchestrator is ~10K lines with a deep nested phase FSM; threading
+    a new "park" branch through every PhaseResult union, every retry
+    loop, every shadow path, and every orchestrator-internal early-return
+    would be a brittle and invasive refactor.  Raising at the leaf and
+    letting the exception propagate up to the BG worker's outer
+    ``except`` is the canonical asyncio pattern for "unwind cleanly past
+    every nested ``finally``."  Same shape as ``asyncio.CancelledError``
+    — which the orchestrator already handles via the
+    ``re-raise → finally block fires → slot freed`` path.
+
+    Critically, ``ParkRequested`` is **not** a failure.  The BG worker
+    catches it explicitly (separate from the ``except Exception`` catch-
+    all) and routes the op to status ``"parked"``, not ``"failed"``.
+    Any orchestrator-level ``finally`` block that resets state on errors
+    will fire — which is correct, because GENERATE has decided to
+    suspend the op, not to fail it.
+
+    Attributes
+    ----------
+    signal:
+        The :class:`ParkSignal` carrying the op_id, token, attempt_seq,
+        and descriptor.  The worker reads this to write the ledger
+        entry and (in Slice 2b) plumb the out-of-pool continuation.
+    """
+
+    def __init__(self, signal: "ParkSignal") -> None:
+        super().__init__(
+            f"park_requested: op_id={signal.op_id} token={signal.token} "
+            f"attempt={signal.attempt_seq} kind={signal.descriptor.kind}"
+        )
+        self.signal = signal
+
+
 @dataclass(frozen=True)
 class ParkSignal:
     """Sentinel returned from ``orch.run(ctx)`` when the op parks.
