@@ -489,9 +489,27 @@ class GENERATERunner(PhaseRunner):
                     if _parallel_gen is not None:
                         generation = _parallel_gen
                     else:
-                        generation = await asyncio.wait_for(
-                            orch._generator.generate(ctx, deadline),
-                            timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
+                        # Stage 1.6 — park-aware GENERATE seam.  The
+                        # wrapper has three paths (RESUME / PARK-EMIT /
+                        # LEGACY) and is byte-identical to the legacy
+                        # direct-await when ``JARVIS_BG_PARK_ENABLED``
+                        # is off (default per §33.1).  On PARK-EMIT it
+                        # raises ParkRequested, which propagates up to
+                        # the BG worker's except clause via the same
+                        # unwinding path as CancelledError — every
+                        # ``finally`` block in the orchestrator FSM
+                        # fires cleanly.  See generate_park_wrapper.py
+                        # and project_stage_1_6_park_spike.md for the
+                        # full design.
+                        from backend.core.ouroboros.governance.generate_park_wrapper import (
+                            maybe_park_or_resume,
+                        )
+                        generation = await maybe_park_or_resume(
+                            orch=orch,
+                            ctx=ctx,
+                            deadline=deadline,
+                            gen_timeout=_gen_timeout,
+                            outer_grace_s=_OUTER_GATE_GRACE_S,
                         )
 
                     # Phase 1 Slice 1.3.b — capture the provider

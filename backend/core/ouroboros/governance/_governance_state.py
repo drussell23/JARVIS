@@ -710,6 +710,16 @@ _jprime_state: Optional[JPrimeState] = None
 # already-held bind context would deadlock with a plain ``Lock``.
 _bind_lock = threading.RLock()
 _bound_orchestrator: Optional[OrchestratorRole] = None
+# Stage 1.6 — process-wide BG pool bind for the park substrate.
+# Mirrors the orchestrator bind shape: BackgroundAgentPool.start()
+# calls bind_bg_pool(self); stop() clears via bind_bg_pool(None).
+# The GENERATE-park wrapper reads through get_bound_bg_pool() so it
+# can re-submit resumed dispatches without taking a hard module
+# dependency on the pool class (avoids cycles via the orchestrator).
+# Held under the SAME _bind_lock as the orchestrator bind so the two
+# binds flip atomically together — important for graceful shutdown
+# where the loop drops both refs before any new dispatch can race.
+_bound_bg_pool: Optional[Any] = None
 
 
 def get_generator_state(
@@ -838,6 +848,36 @@ def get_bound_orchestrator() -> Optional[OrchestratorRole]:
     """
     with _bind_lock:
         return _bound_orchestrator
+
+
+def bind_bg_pool(pool: Optional[Any]) -> None:
+    """Atomically swap the process-wide BG pool reference (Stage 1.6).
+
+    Called by :meth:`BackgroundAgentPool.start` to register the live
+    pool, and by :meth:`BackgroundAgentPool.stop` to clear with
+    ``None``.  The GENERATE-park wrapper resolves the pool through
+    :func:`get_bound_bg_pool` so it can re-submit resumed dispatches
+    without taking a hard module dependency on the pool class.
+
+    Held under the same :data:`_bind_lock` as the orchestrator bind
+    so the two binds flip atomically together at loop start/stop.
+    """
+    global _bound_bg_pool
+    with _bind_lock:
+        _bound_bg_pool = pool
+
+
+def get_bound_bg_pool() -> Optional[Any]:
+    """Return the currently bound BG pool, or ``None`` if unset.
+
+    None is a valid steady state — direct-construction call sites
+    (unit tests, ad-hoc harnesses) never call bind_bg_pool and the
+    GENERATE-park wrapper falls back to the legacy direct-await path
+    when no pool is bound.  This keeps the substrate park-aware
+    without forcing every caller to wire the bind.
+    """
+    with _bind_lock:
+        return _bound_bg_pool
 
 
 def get_jprime_state() -> JPrimeState:
