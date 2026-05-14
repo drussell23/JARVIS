@@ -4553,6 +4553,68 @@ _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S = float(
 )
 
 # ---------------------------------------------------------------------------
+# Autonomous Connection Lifecycle Policy (Task #99, 2026-05-14)
+# ---------------------------------------------------------------------------
+# v14-rev16 graduation soak proved Task #98 universal phase budget closed
+# the upstream burn (SWE op reached GENERATE for the first time across
+# the 14-rev arc), but Claude streams still returned 0 bytes on
+# ``thinking=on`` after ~5 min of pipeline work — even under
+# stdlib_default client mode (H1 falsified).  The remaining variable:
+# the AsyncAnthropic client + its httpx connection pool sit IDLE during
+# CLASSIFY/ROUTE/CTX/PLAN, and by the time GENERATE fires the keepalive
+# connections may have been silently torn down by upstream NAT / load-
+# balancer / firewall.  The next stream call inherits a dead pool —
+# httpx attempts reuse, hangs, ConnectTimeout fires upstream, and the
+# stream consumer sees first_token=NEVER.
+#
+# The fix is NOT a workaround (recreate the client on every call wastes
+# the pool benefit) and NOT brute force (raising timeouts hides the
+# defect).  Per operator binding 2026-05-14: "Build an Autonomous
+# Connection Lifecycle Policy" — track time-since-last-successful-call;
+# when the next ``_ensure_client`` runs after an idle gap exceeding the
+# safe threshold, autonomously recycle the pool BEFORE the new call.
+# Composes the existing ``_recycle_client`` primitive (Task #4 cascade
+# hardening) — no new bounding mechanism.
+#
+# Threshold default 120s — under any normal back-to-back call pattern
+# (DW Tier 0 + Claude Tier 1 cascading in seconds), the policy is a
+# no-op.  Above 120s of idle is the regime where keepalives have
+# accumulated enough wall time for upstream killers to fire (typical
+# NAT idle timeout is 60-300s, load-balancer keepalives often 120s).
+_CLAUDE_IDLE_RECYCLE_THRESHOLD_S_DEFAULT = 120.0
+
+
+def _resolve_idle_recycle_threshold_s() -> float:
+    """Resolve ``JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S`` to a non-
+    negative float.  Invalid / negative values fall back to default
+    (120.0s).  ``0`` is a valid operator opt-out: a 0 threshold means
+    every ``_ensure_client`` call after any successful call triggers a
+    recycle, which effectively makes the pool single-use — useful for
+    diagnosing pool-related defects but expensive in production."""
+    try:
+        _raw = float(
+            os.environ.get(
+                "JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S",
+                str(_CLAUDE_IDLE_RECYCLE_THRESHOLD_S_DEFAULT),
+            )
+        )
+    except (TypeError, ValueError):
+        return _CLAUDE_IDLE_RECYCLE_THRESHOLD_S_DEFAULT
+    if _raw < 0.0:
+        return _CLAUDE_IDLE_RECYCLE_THRESHOLD_S_DEFAULT
+    return _raw
+
+
+def _idle_recycle_policy_enabled() -> bool:
+    """Master switch — ``JARVIS_CLAUDE_IDLE_RECYCLE_ENABLED`` (default
+    true).  Operators can flip off for byte-identical legacy behavior.
+    """
+    _raw = os.environ.get(
+        "JARVIS_CLAUDE_IDLE_RECYCLE_ENABLED", "true",
+    ).strip().lower()
+    return _raw in {"1", "true", "yes", "on"}
+
+# ---------------------------------------------------------------------------
 # D2 — Per-request httpx budget coherence (Task #95, 2026-05-14)
 # ---------------------------------------------------------------------------
 # v14-rev12 graduation soak (PRD §40.7.10-stage1.6-slice3-v14rev12) surfaced
@@ -5028,6 +5090,20 @@ class ClaudeProvider:
         self._tool_loop = tool_loop
         self._mcp_client = mcp_client
 
+        # Task #99 (2026-05-14) — Autonomous Connection Lifecycle Policy.
+        # Tracks monotonic timestamp of last successful Claude API call
+        # (stream / create / plan / legacy_tool_loop).  When the next
+        # ``_ensure_client`` runs after an idle gap longer than
+        # ``JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S``, the pool is
+        # autonomously recycled BEFORE the new call — drops any silently-
+        # killed TCP keepalives that accumulated during the long compute
+        # gap (e.g. across a 5-minute PLAN phase).  Composes the existing
+        # ``_recycle_client`` primitive (Task #4 cascade hardening) — no
+        # new bounding mechanism.  ``None`` until the first successful
+        # call is recorded — the policy is opt-out by design until
+        # there's something to recycle.
+        self._last_successful_call_at: Optional[float] = None
+
         # Extended thinking: enables deep chain-of-thought reasoning before
         # code generation.  Manifesto §6: "deploy intelligence where it creates
         # true leverage" — the model thinks before it writes.
@@ -5246,6 +5322,15 @@ class ClaudeProvider:
         and zero SDK-level retries — all retry decisions are made by
         :meth:`_call_with_backoff` so they stay visible in the logs.
         """
+        # Task #99 (2026-05-14) — Autonomous Connection Lifecycle Policy.
+        # BEFORE returning the cached client, check whether the pool has
+        # sat idle long enough that upstream keepalives may have been
+        # silently killed (5+ minute compute gaps across PLAN/CTX
+        # phases are normal in O+V).  If yes, recycle the pool — the
+        # next ``_ensure_client`` call below will lazily construct a
+        # fresh AsyncAnthropic with a fresh httpx pool.
+        self._maybe_recycle_for_idle()
+
         if self._client is None:
             try:
                 import anthropic
@@ -5399,6 +5484,79 @@ class ClaudeProvider:
             reason, before, self._client_generation,
         )
         return self._client_generation
+
+    # ------------------------------------------------------------------
+    # Autonomous Connection Lifecycle Policy (Task #99, 2026-05-14)
+    # ------------------------------------------------------------------
+
+    def _maybe_recycle_for_idle(self) -> None:
+        """Drop the httpx pool if too much wall time has elapsed since
+        the last successful Claude API call.
+
+        Why this exists (v14-rev16 evidence): O+V phases routinely
+        consume 3–6 minutes (CLASSIFY/ROUTE/CTX/PLAN) before GENERATE
+        fires a stream.  Upstream NAT / load-balancer / firewall
+        keepalive timeouts (typical 60–300s) silently tear down the
+        idle TCP connections in our httpx pool; httpx then attempts
+        reuse, the underlying socket is dead, and the stream hangs
+        forever (first_token=NEVER bytes_received=0 for the entire
+        outer budget window).
+
+        Policy:
+          * If the master switch is off → no-op (legacy pass-through).
+          * If no successful call has been recorded yet → no-op
+            (there's nothing to recycle).
+          * If the current client is already None → no-op
+            (will be lazily constructed by ``_ensure_client``).
+          * Otherwise compute ``idle_s = now - last_successful_call_at``
+            and recycle when ``idle_s > threshold``.
+
+        Composes the existing ``_recycle_client`` primitive — same
+        telemetry ring-buffer (``recycle_events``), same async-close
+        best-effort, same ``_client_generation`` increment.  Threshold
+        is env-tunable via ``JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S``
+        (default 120s).
+
+        NEVER raises — defensive try/except on the env read; logs the
+        recycle event for observability.
+        """
+        try:
+            if not _idle_recycle_policy_enabled():
+                return
+            if self._last_successful_call_at is None:
+                return
+            if self._client is None:
+                # Nothing to recycle — next _ensure_client will build fresh.
+                return
+            _threshold_s = _resolve_idle_recycle_threshold_s()
+            _idle_s = time.monotonic() - self._last_successful_call_at
+            if _idle_s > _threshold_s:
+                logger.warning(
+                    "[ClaudeProvider] autonomous idle-recycle: %.1fs "
+                    "since last successful call (threshold=%.1fs) — "
+                    "recycling pool to drop potentially-stale keepalive "
+                    "connections (Task #99 operator binding 2026-05-14)",
+                    _idle_s, _threshold_s,
+                )
+                self._recycle_client(
+                    f"idle_threshold_exceeded:{_idle_s:.0f}s"
+                )
+        except Exception:  # noqa: BLE001 — never raise into _ensure_client
+            logger.debug(
+                "[ClaudeProvider] _maybe_recycle_for_idle degraded",
+                exc_info=True,
+            )
+
+    def _record_successful_call(self) -> None:
+        """Stamp the monotonic timestamp of a successful Claude API
+        call.  Called from the 4 SDK entry points (stream / create /
+        plan / legacy_tool_loop) on their happy paths.  Read by
+        ``_maybe_recycle_for_idle`` at the start of each
+        ``_ensure_client`` invocation.  Defensive — never raises."""
+        try:
+            self._last_successful_call_at = time.monotonic()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _record_cascade_attempt(
         self,
@@ -6707,6 +6865,13 @@ class ClaudeProvider:
             # Update cumulative cache telemetry — stats are surfaced via
             # get_cache_stats() so governance can report hit rate & savings.
             self._record_cache_observation(input_tokens, _cached_input)
+
+            # Task #99 (2026-05-14) — Autonomous Connection Lifecycle.
+            # Stamp last-successful-call timestamp so the next
+            # _ensure_client can decide whether to autonomously recycle
+            # the pool after an idle gap.  Stream + create paths both
+            # converge here on success.
+            self._record_successful_call()
             if _cached_input > 0:
                 logger.info(
                     "[ClaudeProvider] \U0001f4b0 Prompt cache hit: %d cached tokens "
@@ -6869,6 +7034,8 @@ class ClaudeProvider:
                 except (TypeError, ValueError):
                     _legacy_cached = 0
                 self._record_cache_observation(input_tokens, _legacy_cached)
+                # Task #99 — stamp success for autonomous idle-recycle.
+                self._record_successful_call()
                 cost = self._estimate_cost(
                     input_tokens, output_tokens, _legacy_cached,
                 )
@@ -7022,4 +7189,6 @@ class ClaudeProvider:
         input_tokens = getattr(message.usage, "input_tokens", 0)
         output_tokens = getattr(message.usage, "output_tokens", 0)
         self._record_cost(self._estimate_cost(input_tokens, output_tokens))
+        # Task #99 — stamp success for autonomous idle-recycle.
+        self._record_successful_call()
         return message.content[0].text
