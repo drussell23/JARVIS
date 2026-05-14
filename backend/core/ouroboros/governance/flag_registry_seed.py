@@ -490,6 +490,30 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Fallback outer-budget — thinking-aware cap (Task #88b, 2026-05-13)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S",
+        type=FlagType.INT, default=360,
+        description=(
+            "Outer asyncio.wait_for budget cap for Claude fallback "
+            "calls that will have thinking enabled.  Task #88's "
+            "inner rupture widening (JARVIS_STREAM_RUPTURE_TIMEOUT_"
+            "THINKING_S=360s) is insufficient alone: the outer "
+            "_call_fallback wait_for fires first if its cap is "
+            "narrower than the inner.  Single policy with #88: outer "
+            ">= inner for thinking-on calls.  Applied via max() so it "
+            "never SHRINKS route-specific caps (COMPLEX=180, read-only-"
+            "BG~480+).  Non-thinking routes (IMMEDIATE) keep the 120s "
+            "base cap."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/candidate_generator.py",
+        example="360",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # Stream rupture — thinking-aware TTFT (Task #88, 2026-05-13)
     # ====================================================================
     FlagSpec(

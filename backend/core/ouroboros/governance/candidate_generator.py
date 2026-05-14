@@ -3764,6 +3764,50 @@ class CandidateGenerator:
         else:
             _max_cap = self._FALLBACK_MAX_TIMEOUT_S
 
+        # Task #88b — thinking-aware outer-budget widening (2026-05-13).
+        #
+        # v14-rev6 graduation soak proved: Task #88's inner rupture
+        # widening (120s -> 360s for thinking-enabled calls) is correct
+        # but insufficient — the OUTER asyncio.wait_for budget computed
+        # from _max_cap fires FIRST and kills the Claude stream before
+        # the inner rupture matters.  Log evidence:
+        # ``elapsed=290.0s budget=218.7s first_token=NEVER thinking=on``.
+        # Direct-host streaming probes confirmed Claude responds in
+        # seconds with thinking events; the harness's outer budget was
+        # the load-bearing constraint.
+        #
+        # Single policy with Task #88: outer >= inner for thinking-on.
+        # When the op's task_complexity + route would produce a
+        # thinking-enabled call (see providers.py:_resolve_thinking_*
+        # rules), widen _max_cap to at least
+        # JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S (default 360s, matches
+        # Task #88's inner default).  Apply via ``max()`` so it never
+        # SHRINKS the existing route-specific cap (e.g. COMPLEX's 180s,
+        # read-only-BG's 480s+).
+        #
+        # The thinking-likelihood signal is conservative but correct
+        # for the dominant case: any non-trivial task_complexity on a
+        # non-reflex (non-IMMEDIATE) route will have thinking enabled
+        # per the existing _resolve_thinking_budget rules.  We avoid
+        # reaching back into providers._resolve_thinking_budget to keep
+        # this module orchestration-free; the inline check matches the
+        # decision rule structurally.
+        _task_complexity = (
+            getattr(context, "task_complexity", "") or ""
+        ).strip().lower()
+        # IMMEDIATE routes intentionally skip thinking (reflex path).
+        # Anything else with task_complexity != "trivial" will likely
+        # have thinking enabled — match this superset to be safe.
+        _likely_thinking = (
+            _task_complexity not in ("", "trivial")
+            and _op_route not in ("immediate",)
+        )
+        if _likely_thinking:
+            _thinking_cap = float(os.environ.get(
+                "JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S", "360.0",
+            ))
+            _max_cap = max(_max_cap, _thinking_cap)
+
         # Seed Arc Path 3 follow-up — PLAN-EXPLOIT per-stream override.
         # When ``plan_exploit_active_var`` is True (set by
         # ``try_parallel_generate`` before its gather), the per-stream
