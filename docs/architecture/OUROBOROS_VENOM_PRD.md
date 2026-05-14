@@ -2479,6 +2479,186 @@ What to build NOW vs. what to defer, by time horizon.
 
 ---
 
+### §41.11 Empirical Claims Audit & Open Verification Tickets (NEW 2026-05-14)
+
+**Origin.** During post-submission audit of the OV research paper §92 (Recent Developments addendum), the SICA-pattern empirical-demonstration claim in §92.16 thread (1) + §92.18 was found to overstate what `git log --author=Claude` actually supports. Specifically: the paper claimed "On 2026-05-11, O+V autonomously shipped two self-modification commits (Posture Aurora + Karen voice command router)" — but both commits are dated **2026-05-10** and **authored by Derek J. Russell** (no Claude signature, no Co-Authored-By trailer, no AutoCommitter attribution). The 23 commits actually authored `Claude <noreply@anthropic.com>` in the repo are **all** appends to `docs/governance/passb_graduation_ledger.jsonl` — autonomous bookkeeping under the Phase 9 cadence, **not** governance-code self-modification in the SICA-paper-strict sense.
+
+**Correction commits.** Research paper §92.16 + §92.18 corrected and pushed to `origin/main` as **`ec07677c4a`** on 2026-05-14. The "demonstrated three years ahead of 2028" framing was reframed from *retroactive demonstration* to *structural readiness on a multi-month timeline well inside Anthropic's 2028 ASL-4 horizon*. The five-thread closure count in the §92.16 summary was honestly downgraded from 3-of-5 to 2-of-5 (Treefinement L2 + SWE-Bench-Pro harness binding remain real citation→implementation closures; SICA / Constitutional / ASL-4 are positioned-but-not-empirically-closed).
+
+**Why this section exists.** Two reasons: (i) make the empirical gaps **engineering tickets** with graduation criteria, not just paper caveats — every overstated claim becomes a concrete ladder item the cadence can climb; (ii) preserve the audit trail for any future reviewer who walks the §92 corrections back to the PRD. The tickets below are the load-bearing items that, once closed, fully retire the §92.16 caveats — at which point the "demonstrated SICA pattern" framing becomes *actually demonstrated*, not *positioned to demonstrate*.
+
+#### §41.11.1 SICA-pattern empirical demonstration — fully-autonomous governance self-modification
+
+**The claim that needs proving.** O+V autonomously generates, validates, and commits a code mutation to a *governance file* (`iron_gate.py`, `semantic_guardian.py`, `policy_engine.py`, `risk_tier_floor.py`, `auto_committer.py`, etc.) under an autonomous signature, surviving the full Iron Gate ∘ Semantic Guardian ∘ TestRunner ∘ AutoCommitter cycle with **zero operator intervention** during the generate→validate→commit window.
+
+**What is empirically demonstrated today.**
+
+- ✅ Autonomous-ledger-write: 23 `Claude <noreply@anthropic.com>` commits to `docs/governance/passb_graduation_ledger.jsonl` (verifiable: `git log --author=Claude --diff-filter=A`).
+- ✅ NOTIFY_APPLY-mediated code generation with operator-approved commit (substrate-complete; AutoCommitter constructs the signature, operator approves the diff overlay).
+- ✅ AutoCommitter primitive end-to-end: `auto_committer.py` constructs commits with O+V signature, conventional commit format, risk-tier metadata, protected-branch push prevention.
+
+**What is *not* empirically demonstrated.**
+
+- ❌ Fully-autonomous *generate → validate → commit* cycle without operator intervention.
+- ❌ Self-modification of governance code (only application code or ledger files have been auto-committed historically; governance files are still human-authored).
+
+**Graduation criterion (concrete).** **≥1 commit visible in `git log --author=Claude --diff-filter=M` against a governance file**, accompanied by:
+
+1. Iron Gate AST validation green (no immutable-rule violation logged)
+2. Semantic Guardian inspection green (no hard finding)
+3. TestRunner green for the scoped test set
+4. AutoCommitter signature present (Co-Authored-By: Claude trailer + O+V signature line)
+5. Commit message conforms to conventional format with risk-tier metadata
+6. **Zero operator approval events** in the audit ledger for the op span
+
+Repeat across **3 consecutive clean soaks** under Phase 9 cadence — at that point graduate.
+
+**Prerequisites.**
+
+- §41.11.4 Phase 9 graduation of `JARVIS_AUTO_COMMIT_ENABLED` (default-TRUE for unattended apply)
+- `risk_tier_floor` configuration permitting Yellow-tier unattended-apply on governance ops (currently floor is `notify_apply` or stricter for `ORDER_2_GOVERNANCE` per Pass B)
+- Pass B Order-2 governance cage (§40.1) graduated default-true OR the SICA candidate's scope kept below Order-2 (Body-only governance ops only)
+
+**Tier placement.** §41.8 Phase 1 candidate (months 6–12 of the 18–30 month roadmap). Single highest-leverage empirical milestone — closing this ticket alone retires ~40% of the §92.16 thread (1) caveat.
+
+#### §41.11.2 Anti-Venom parity-scale evaluation — Constitutional Classifiers benchmark
+
+**The claim that needs proving.** Anti-Venom's deterministic substrate achieves **≤4.4% catastrophic-error rate** against an adversarial corpus of comparable scale to Anthropic's Constitutional Classifiers benchmark (*arXiv:2501.18837* — 86%→4.4% reduction on Claude 3.5 Sonnet).
+
+**What is empirically demonstrated today.**
+
+- ✅ Adversarial Cage Phase 9.4: **0/38 escapes** on hand-authored adversarial corpus (12/38 *documented* gaps — predicted detection-gaps, not active escapes).
+- ✅ Semantic Firewall 11 injection detectors + 5 credential shapes + recursion ban + ScopedToolBackend mutation cage (§92.1).
+- ✅ Iron Gate 12 immutable rules + Semantic Guardian 10 pre-apply detectors.
+
+**What is *not* empirically demonstrated.**
+
+- ❌ Parity-scale corpus (Constitutional Classifiers uses thousands of synthetic jailbreaks; current Adversarial Cage is 38 hand-authored).
+- ❌ LLM-generated adversarial mutations (the §40.1 #3 "Anti-Venom self-immunization" tier — generate jailbreaks to harden the cage).
+- ❌ Real Claude-class generative core under the cage during adversarial evaluation (current 0/38 was deterministic-only — no live LLM in the loop).
+
+**Graduation criterion (concrete).** Adversarial corpus expanded to **≥3,000 inputs** (≥100× the current 38), drawn from:
+
+1. LLM-generated adversarial mutations (§40.1 #3, gated by JARVIS_ANTIVENOM_SELF_IMMUNIZATION_ENABLED)
+2. Curated jailbreak corpus from public benchmarks (HarmBench-style + Constitutional Classifiers replications)
+3. Domain-specific O+V-targeted attacks (governance-mutation attempts, recursion attempts, credential exfiltration shapes)
+
+Acceptance gate: **≤4.4% catastrophic-error rate** (matching Anthropic's benchmark) across the full ≥3,000-input corpus, with 12/38 → ≤132/3000 documented-gap inflation acceptable.
+
+**Prerequisites.**
+
+- §40.1 #3 Anti-Venom self-immunization tier shipped (corpus generator)
+- AdversarialReviewer subagent extended for full-corpus parallel evaluation (currently scoped per-op, not corpus-batch)
+- Test-time compute budget: ~$50–200 per parity-scale evaluation pass (DW Tier 0 estimated)
+
+**Tier placement.** §41.8 Phase 2 candidate (months 12–18). Closing this ticket retires the §92.16 thread (3) caveat (Constitutional Classifiers comparison stops being "structural analog" and becomes "empirical parity result").
+
+#### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
+
+**The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
+
+**What is empirically demonstrated today.**
+
+- ✅ Recursion-depth gate is implemented in `boundary_recursion_gate.py` (per §40 Wave 2 #5 closure, 2026-05-10).
+- ✅ Hash-cap on self-modification proposals exists structurally (§40.1 #2).
+- ✅ Unit-tested invariants: gate refuses recursion-depth > N; hash-cap refuses identical-hash mutations within window.
+
+**What is *not* empirically demonstrated.**
+
+- ❌ Stability *under stress* — gate must hold during sustained autonomous self-modification, not just during synthetic test pressure.
+- ❌ 7-day continuous operation under autonomy (longest unattended soak to date is hours, not days).
+- ❌ Recovery behavior when gate fires under real autonomy (synthetic recovery tested; live-fire recovery has never happened because the gate has never fired in production).
+
+**Graduation criterion (concrete).**
+
+- **≥7 days cumulative** of unattended-apply autonomy with §41.11.1 firing (so the gate has actual self-modification activity to constrain, not just idle uptime).
+- **Zero §1 Boundary violations** logged in the audit ledger across the 7-day span.
+- **At least one synthetic stress-test** where the gate's recursion-depth threshold is artificially lowered to fire under load, and the recovery path (operator notification + safe-state retreat) runs end-to-end.
+
+**Prerequisites.**
+
+- §41.11.1 must graduate first (no stress test until self-mods are happening — the gate must have actual pressure to demonstrate stability against)
+- 7-day unattended-apply session feasibility (current battle-test harness wall-clock cap is hours; needs longer-soak infrastructure or a sequence of stitched-together soaks with state-preservation)
+- Synthetic stress-test fixture (one-shot, gated by a dev-only env flag, fires gate intentionally and verifies recovery)
+
+**Tier placement.** §41.8 Phase 2 candidate (months 12–18, after §41.11.1 and concurrent with §41.11.2). Closing this ticket retires the §92.16 thread (4) caveat (ASL-4 framework alignment stops being "structural mapping" and becomes "empirical stability result").
+
+#### §41.11.4 Phase 9 graduation of `JARVIS_AUTO_COMMIT_ENABLED` for unattended apply
+
+**The claim that needs proving.** AutoCommitter's `JARVIS_AUTO_COMMIT_ENABLED` flag graduates from `default-FALSE` (current) to `default-TRUE` under the Phase 9 cadence ladder, with risk-tier floor configured to permit Yellow-tier unattended apply for governance-code mutations.
+
+**What is empirically demonstrated today.**
+
+- ✅ Phase 9 cadence operational (started 2026-05-05, §92.9).
+- ✅ First flag graduated: `JARVIS_DECISION_TRACE_LEDGER_ENABLED` (2026-05-05).
+- ✅ AutoCommitter primitive end-to-end (constructs commit signature, conventional format, risk-tier metadata, protected-branch push prevention).
+
+**What is *not* empirically demonstrated.**
+
+- ❌ `JARVIS_AUTO_COMMIT_ENABLED=true` as default (currently FALSE).
+- ❌ Unattended-apply on governance ops (currently requires `notify_apply` floor or stricter).
+- ❌ 3-clean-soak ladder green for AutoCommitter under cadence pressure.
+
+**Graduation criterion (concrete).**
+
+- 3 consecutive clean soaks under Phase 9 cadence with AutoCommitter firing on real Yellow-tier ops.
+- Master flag flips `default-FALSE` → `default-TRUE` in the owner module.
+- AST pin renames per pre-graduation discipline.
+- Layered evidence: master-flag-default-true source-grep + pre-graduation pin rename + 3-clean-soak audit ledger entries.
+- Hot-revert path verified (`JARVIS_AUTO_COMMIT_ENABLED=false` → AutoCommitter short-circuits).
+
+**Prerequisites.**
+
+- Phase 9 cadence ladder reaches `JARVIS_AUTO_COMMIT_ENABLED` (currently ~24 flags queued, AutoCommitter is somewhere in the middle of the queue — sequencing decision per §40.7 cadence run log).
+- §41.11.2 Anti-Venom parity-scale eval *should ideally close first* — don't let unattended autonomy run if the cage isn't parity-scale-verified. (This is a soft prerequisite; the operator may choose to graduate AutoCommitter under a smaller risk-tier scope first.)
+
+**Tier placement.** §41.8 Phase 1 candidate (months 6–12). Closing this ticket is the **engineering prerequisite** for §41.11.1 — without AutoCommitter graduated to default-TRUE under unattended-apply, the SICA-pattern demonstration cannot run.
+
+#### §41.11.5 Reverse Russian Doll bounded-RSI formal proof (dissertation cross-reference)
+
+**The claim that needs proving.** The Reverse Russian Doll architecture (§3, §50) is a *sufficient condition* for bounded recursive self-improvement, formalizable as a thermodynamic stability theorem on the (*C*, *S<sub>n</sub>*) system under the Wang RSI formulation (*arXiv:1805.06610*) extended to non-stationary, multi-repository, memory-augmented settings.
+
+**What is empirically demonstrated today.**
+
+- ✅ Conjecture sketch (research paper §92.17, claims a/b/c).
+- ✅ Three Wang RSI extensions identified (non-stationary kernel / coupled multi-chain state / memory-augmented capability score).
+- ✅ Thermodynamic-entropy formulation sketched (shell as deterministic-entropy reservoir; core as thermal source; AST-pin invariants as lower bound on shell entropy).
+
+**What is *not* empirically demonstrated (and is not engineering work — this is dissertation work).**
+
+- ❌ Formal proof of (a) monotone non-decreasing deterministic-entropy of *S<sub>n</sub>*.
+- ❌ Formal proof of (b) monotone non-increasing conditional semantic-entropy of *C* under *S<sub>n</sub>*.
+- ❌ Formal proof of (c) net agentic entropy bounded above by a finite constant.
+- ❌ Empirical validation of the proof against O+V's actual Phase 9 graduation-cadence data.
+
+**Graduation criterion (concrete).** Peer-reviewed publication (or arXiv pre-print + faculty endorsement) of the **bounded-RSI theorem** under the working dissertation title — *"Thermodynamic Containment of Agentic Entropy: Formalizing the Reverse Russian Doll Architecture for Bounded Recursive Self-Improvement"*. Acceptance criteria match standard ML-conference / safety-research review (NeurIPS / ICLR / SaTML / Anthropic-aligned venue).
+
+**Prerequisites.**
+
+- Penn MSE-AI program enrollment (in-progress; UPenn application submitted 2026-05-13).
+- Dissertation work under Eric Wong (certifiably robust networks) / Aaron Roth (trustworthy-learning) / PRECISE Center lineage.
+- §41.11.1 — §41.11.4 empirical closures provide the *substrate evidence* the proof validates against.
+
+**Tier placement.** §41.8 Phase 3 (months 18–30) — dissertation-track, not engineering-track. This ticket exists in the PRD as a **placeholder + cross-reference**, not an engineering deliverable. The engineering arc closes at §41.11.1 — §41.11.4; the formal arc opens with §41.11.5 and is the dissertation work proper.
+
+#### §41.11 Closure Note — How These Tickets Retire the §92.16 Caveats
+
+The five tickets above map onto the §92.16 + §92.18 honesty caveats as follows:
+
+| §92.16 thread / §92.18 framing | Closes when |
+|---|---|
+| Thread (1) — SICA-pattern empirical demo | §41.11.1 + §41.11.4 graduate |
+| Thread (3) — Constitutional Classifiers parity | §41.11.2 graduates |
+| Thread (4) — ASL-4 recursion-bound stability | §41.11.3 graduates |
+| §92.18 — Mechanic → Neurosurgeon transition | §41.11.1 + §41.11.3 graduate |
+| §92.17 — Reverse Russian Doll formal proof | §41.11.5 graduates (dissertation, not engineering) |
+
+When §41.11.1 + §41.11.2 + §41.11.3 + §41.11.4 are all graduated under Phase 9 cadence, the §92.16 framing returns from *"the substrate is positioned to demonstrate"* to *"demonstrated, with the following empirical evidence"* — at that point §92.16 in the research paper gets re-edited to remove the conservative reframe and cite the actual graduation-soak audit ledger.
+
+**Operator note.** No new master flag is introduced for the audit itself — these tickets compose existing Phase 9 cadence + existing §40.1 / §40.7 substrate. The audit IS the engineering discipline of converting "we claimed it" into "we proved it."
+
+---
+
 **Version (prior)**: 2.97 (2026-05-10 — **Move 6.5 PLAN canonical integration seam SHIPPED + completed-arcs cross-off table**: Closes the §36 v10 brutal-review "Move 6.5 still named gap" finding from May 5. Pre-v2.97 state was: 6 Move 6.5 substrate slices fully shipped between May 1-7 (multi_prior_planning + runner + dispatch + observer + graduation_contract + canvas — 10 files, 410 tests, 6 master flags), 30 Phase 9.4 adversarial corpus tests shipped, but **the orchestrator never invoked `dispatch_multi_prior`** — the system was substrate-complete but operationally unreachable. The brutal review correctly cited this; the gap was operational integration, not substrate existence. **The fix — ONE shared async helper** `multi_prior_plan_seam.py` composing the canonical substrate (zero parallel logic): `dispatch_multi_prior` (Slice 3) for K-roll dispatch + `ConsensusActionRecommendation` closed 4-value taxonomy + `record_dispatch_outcome` (Slice 4) drives graduation ledger growth + `PlanGenerator._parse_plan_response` (existing) rehydrates winner + `PlanGenerator._validate_plan_coherence` (existing) same coherence path + `classify_ui_affected` (existing) same ui_affected stamping + `Prior.system_prompt_addendum` + `seed` real prior angles per operator binding clarification #4 (not cosmetic noise). **Single helper, two callers** (operator binding clarification #5 — no duplication): `phase_runners/plan_runner.py` (Slice 3-extracted path) AND `orchestrator.py` inline PLAN block (legacy fallback when `JARVIS_PHASE_RUNNER_SLICE3_FULLY_EXTRACTED=false`). Both callers: if seam returns PlanResult, use it; if None (master-off OR non-actionable consensus OR ESCALATE), fall through to existing single-shot `generate_plan` path. **Zero behavior change at default** (all 4 master flags FALSE). **Action recommendation routing**: ACCEPT_CANONICAL → use consensus winner; CLAMP_TO_NOTIFY_APPLY → use winner (risk-tier clamp is downstream GATE phase's concern); ESCALATE_TO_OPERATOR_REVIEW → fall through to single-shot (operator reviews via SSE event + recorded verdict; pipeline continues); FALL_THROUGH → fall through (disabled/failed). **Master-flag AND-composition** (no parallel flag — uses substrate's internal `evaluate_dispatch_decision` check): `JARVIS_MULTI_PRIOR_PLANNING_ENABLED` (Slice 1 materializer) AND `JARVIS_MULTI_PRIOR_RUNNER_ENABLED` (Slice 2 runner) AND `JARVIS_MULTI_PRIOR_DISPATCH_ENABLED` (Slice 3 dispatch); `JARVIS_MULTI_PRIOR_OBSERVER_ENABLED` (Slice 4 ledger) gated internally by `record_dispatch_outcome`. **Route + posture gates** (substrate-enforced via `materialize_priors`): `route=complex` AND `posture=EXPLORE` — naturally narrow blast radius; only the ops that most benefit trigger multi-prior. **Authority asymmetry (AST-pinned via test)**: Seam imports stdlib + `verification/multi_prior_*` + `plan_generator` only. NEVER imports `orchestrator` / `iron_gate` / `policy_engine` / `candidate_generator` / `providers` / `change_engine` / `semantic_guardian` — pure integration adapter, zero policy. **15 regression tests** in `tests/governance/test_multi_prior_plan_seam.py`: master-off + partial-flags returns None (3 tests); substrate-gate-fails returns None (route + posture, 2 tests); exception isolation NEVER raises into caller (1 test); **8 AST pins** (canonical substrate imports / authority asymmetry / rehydration via `_parse_plan_response` / coherence via `_validate_plan_coherence` / `record_dispatch_outcome(verdict)` invoked / `Prior.system_prompt_addendum` threaded / `seed` threaded / two-caller consumer presence in plan_runner.py + orchestrator.py); schema version canonical literal (1 test). **273 broader Move 6.5 regression tests still green** (all 6 substrate slices unaffected — Slice 1 through Slice 6). **Why this matters for RSI** (operator binding clarification #6): graduation observations accumulate ONLY via `record_dispatch_outcome` — pre-v2.97 the helper was unused so Slice 6's graduation contract (`is_ready_for_graduation()` needs 50+ observations) could never advance. Post-v2.97, when operator flips the 3 substrate master flags via Phase 9 cadence, every PLAN-phase op on (complex, EXPLORE) routes through multi-prior dispatch + records to ledger. After 50+ observations with <40% non-actionable rate, Slice 6 reports READY → operator flips `JARVIS_MULTI_PRIOR_DISPATCH_ENABLED=true` permanently. **Files**: `backend/core/ouroboros/governance/verification/multi_prior_plan_seam.py` (NEW, ~360 LOC); `backend/core/ouroboros/governance/phase_runners/plan_runner.py` (+22 LOC integration); `backend/core/ouroboros/governance/orchestrator.py` (+22 LOC integration — same helper, mirrors plan_runner exactly); `tests/governance/test_multi_prior_plan_seam.py` (NEW, 15 tests + 8 AST pins). Operator binding 2026-05-10 satisfied verbatim across all 7 clarifications: (1) plan JSON as str artifact OK via SHA-256 signature; (2) rehydration via canonical parser + validator, not parallel parser; (3) Slice 1 substrate purity preserved (Slice 1 materializer doesn't fork PlanGenerator; the seam — not the substrate — composes both); (4) real prior angles via `system_prompt_addendum` + `seed` threading from `materialize_priors`; (5) shared helper across both callers, no duplication; (6) `record_dispatch_outcome` invoked unconditionally (observer-flag-gated by recorder internally); (7) Seam A (GENERATE/GenerationResult) deferred to follow-on slice (closure-map pattern is an adapter, not cheating; higher cost + higher blast radius justifies deferring). 
 
 ## SESSION-CUMULATIVE CROSS-OFF TABLE (2026-05-10)
