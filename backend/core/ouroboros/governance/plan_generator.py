@@ -58,12 +58,13 @@ after parse — not produced by the model. It routes Visual VERIFY (see
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -93,6 +94,119 @@ _PLAN_SCHEMA_VERSION = "plan.1"
 # Complexity thresholds for skip decision
 _TRIVIAL_MAX_FILES = int(os.environ.get("JARVIS_PLAN_TRIVIAL_MAX_FILES", "1"))
 _TRIVIAL_MAX_DESCRIPTION_LEN = 200
+
+
+# ---------------------------------------------------------------------------
+# Phase-local sub-budgeting (Task #97, 2026-05-14)
+# ---------------------------------------------------------------------------
+# v14-rev14 graduation soak surfaced a structural defect: the SWE op's
+# PLAN phase consumed 194–337s before reaching GENERATE, ultimately
+# raising ``claude_plan_budget_starved:-45.4s_remaining`` because
+# ``PlanGenerator.generate_plan`` passed the OUTER op deadline straight
+# through to ``self._generator.plan(...)``.  ``_call_with_backoff`` then
+# happily retried Claude calls against that shared deadline, draining
+# the budget that GENERATE was supposed to inherit.
+#
+# Per operator binding 2026-05-14 ("strict asynchronous isolation +
+# sub-phase budgeting"): PLAN must enforce its own phase-local deadline
+# that ALWAYS preserves a minimum reserve for GENERATE.  Composes
+# existing primitives — ``_call_with_backoff`` already consults the
+# deadline, ``asyncio.wait_for`` is the canonical hard-cancel.  No new
+# bounding primitive.  No hardcoded magic numbers: every threshold is
+# env-tunable (FlagRegistry-seeded) with safe floors.
+#
+# Adaptive math (decision table, AST-pinned):
+#
+#     op_remaining        = (op_deadline - now).total_seconds(), clamped ≥0
+#     fraction_bound      = op_remaining × JARVIS_PLAN_PHASE_BUDGET_FRACTION
+#     reserve_bound       = max(0, op_remaining - JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S)
+#     plan_budget_s       = min(fraction_bound, reserve_bound)
+#
+#     if plan_budget_s < JARVIS_PLAN_PHASE_MIN_BUDGET_S:
+#         → skip PLAN entirely (graceful degrade; GENERATE keeps full
+#           op_remaining intact)
+#     else:
+#         → call self._generator.plan with a deadline at now + plan_budget_s
+#         → wrap in asyncio.wait_for(timeout=plan_budget_s + grace) for
+#           autonomous interrupt if the soft deadline check misses
+#
+# The fraction (default 0.30) reserves the majority of the op budget
+# for GENERATE — planning is preparation, not execution.  The min-
+# generate-reserve (default 60s) is the absolute floor under which
+# planning is skipped no matter what.  The plan-min-budget (default
+# 5s) is the floor under which a planning attempt would be doomed
+# regardless.
+_PLAN_PHASE_BUDGET_FRACTION_DEFAULT = 0.30
+_PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT = 60.0
+_PLAN_PHASE_MIN_BUDGET_S_DEFAULT = 5.0
+_PLAN_PHASE_WAIT_FOR_GRACE_S_DEFAULT = 1.0
+
+
+def _resolve_plan_phase_fraction() -> float:
+    """Resolve ``JARVIS_PLAN_PHASE_BUDGET_FRACTION`` to a float in
+    (0.0, 1.0].  Invalid / non-numeric / out-of-range values fall back
+    to the default — no silent behavior change from typos."""
+    try:
+        _raw = float(
+            os.environ.get(
+                "JARVIS_PLAN_PHASE_BUDGET_FRACTION",
+                str(_PLAN_PHASE_BUDGET_FRACTION_DEFAULT),
+            )
+        )
+    except (TypeError, ValueError):
+        return _PLAN_PHASE_BUDGET_FRACTION_DEFAULT
+    if not (0.0 < _raw <= 1.0):
+        return _PLAN_PHASE_BUDGET_FRACTION_DEFAULT
+    return _raw
+
+
+def _resolve_plan_phase_min_generate_reserve_s() -> float:
+    """Resolve ``JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S`` to a non-
+    negative float — the minimum runway GENERATE is guaranteed."""
+    try:
+        _raw = float(
+            os.environ.get(
+                "JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S",
+                str(_PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT),
+            )
+        )
+    except (TypeError, ValueError):
+        return _PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT
+    if _raw < 0.0:
+        return _PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT
+    return _raw
+
+
+def _resolve_plan_phase_min_budget_s() -> float:
+    """Resolve ``JARVIS_PLAN_PHASE_MIN_BUDGET_S`` to a non-negative
+    float — the floor below which PLAN is skipped entirely."""
+    try:
+        _raw = float(
+            os.environ.get(
+                "JARVIS_PLAN_PHASE_MIN_BUDGET_S",
+                str(_PLAN_PHASE_MIN_BUDGET_S_DEFAULT),
+            )
+        )
+    except (TypeError, ValueError):
+        return _PLAN_PHASE_MIN_BUDGET_S_DEFAULT
+    if _raw < 0.0:
+        return _PLAN_PHASE_MIN_BUDGET_S_DEFAULT
+    return _raw
+
+
+def _compute_plan_phase_budget_s(op_remaining_s: float) -> float:
+    """Pure-data math kernel — exposed at module scope so the spine can
+    test the decision table without needing a full PlanGenerator
+    instance.  Returns the phase-local budget seconds for PLAN.  Caller
+    decides whether to skip PLAN by comparing against the min-budget
+    floor.
+    """
+    _op = max(0.0, float(op_remaining_s))
+    _fraction = _resolve_plan_phase_fraction()
+    _reserve = _resolve_plan_phase_min_generate_reserve_s()
+    _fraction_bound = _op * _fraction
+    _reserve_bound = max(0.0, _op - _reserve)
+    return min(_fraction_bound, _reserve_bound)
 
 
 def _plan_review_required() -> bool:
@@ -511,9 +625,56 @@ class PlanGenerator:
 
         t0 = time.monotonic()
 
+        # ── Phase-local sub-budget (Task #97, 2026-05-14) ──
+        # Strict asynchronous isolation: PLAN gets a fraction of the
+        # remaining op budget and ALWAYS preserves a minimum reserve
+        # for GENERATE.  Composes ``_call_with_backoff``'s existing
+        # deadline-aware pre-attempt check (soft bound) plus
+        # ``asyncio.wait_for`` for autonomous interrupt (hard bound).
+        _now = datetime.now(tz=timezone.utc)
+        _op_remaining_s = max(0.0, (deadline - _now).total_seconds())
+        _plan_budget_s = _compute_plan_phase_budget_s(_op_remaining_s)
+        _min_plan_budget_s = _resolve_plan_phase_min_budget_s()
+
+        if _plan_budget_s < _min_plan_budget_s:
+            logger.info(
+                "[PlanGenerator] Phase-local budget %.1fs below floor "
+                "%.1fs (op_remaining=%.1fs, fraction=%.2f, reserve=%.1fs) "
+                "— skipping PLAN to preserve GENERATE budget (Task #97 "
+                "graceful degrade per operator binding 2026-05-14)",
+                _plan_budget_s, _min_plan_budget_s, _op_remaining_s,
+                _resolve_plan_phase_fraction(),
+                _resolve_plan_phase_min_generate_reserve_s(),
+            )
+            return PlanResult.skipped_result(
+                f"plan_phase_skipped:insufficient_budget:"
+                f"{_op_remaining_s:.1f}s_op_remaining"
+            )
+
+        _plan_deadline = _now + timedelta(seconds=_plan_budget_s)
+        _wait_for_grace_s = _PLAN_PHASE_WAIT_FOR_GRACE_S_DEFAULT
+        logger.info(
+            "[PlanGenerator] Phase-local deadline %.1fs / op_remaining "
+            "%.1fs (fraction=%.2f, generate_reserve=%.1fs) — protects "
+            "GENERATE budget from planning burn (Task #97)",
+            _plan_budget_s, _op_remaining_s,
+            _resolve_plan_phase_fraction(),
+            _resolve_plan_phase_min_generate_reserve_s(),
+        )
+
         try:
             prompt = self._build_plan_prompt(ctx)
-            raw_response = await self._generator.plan(prompt, deadline)
+            # Autonomous interrupt — hard bound via asyncio.wait_for.
+            # The soft bound (phase-local deadline propagated to
+            # _call_with_backoff) is the primary defense; wait_for is
+            # the hard kill if a single Claude attempt blocks past the
+            # budget without checking remaining-deadline.  +grace gives
+            # the soft path a moment to surrender cleanly before hard
+            # cancel.
+            raw_response = await asyncio.wait_for(
+                self._generator.plan(prompt, _plan_deadline),
+                timeout=_plan_budget_s + _wait_for_grace_s,
+            )
             result = self._parse_plan_response(raw_response)
             result.planning_duration_s = time.monotonic() - t0
 

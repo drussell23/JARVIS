@@ -543,6 +543,65 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # PLAN phase-local sub-budgeting (Task #97, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_PLAN_PHASE_BUDGET_FRACTION",
+        type=FlagType.FLOAT, default=0.30,
+        description=(
+            "Fraction of remaining op budget that PLAN may consume "
+            "(default 0.30 — leaves 70% for GENERATE).  Combined with "
+            "JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S (absolute floor) "
+            "via min(fraction_bound, reserve_bound).  Valid range: "
+            "(0.0, 1.0]; invalid values fall back to default.  "
+            "Closes v14-rev14 Tier 1 regression where PLAN consumed "
+            "194-337s of the op budget, leaving GENERATE with "
+            "claude_plan_budget_starved:-45.4s_remaining.  Operator "
+            "binding 2026-05-14: strict asynchronous isolation + sub-"
+            "phase budgeting — no hardcoding."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/plan_generator.py",
+        example="0.30",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S",
+        type=FlagType.FLOAT, default=60.0,
+        description=(
+            "Absolute minimum seconds reserved for GENERATE after PLAN "
+            "phase completes (default 60s).  Acts as a hard floor on "
+            "the PLAN phase budget: plan_budget = min(op_remaining × "
+            "fraction, op_remaining - this_reserve).  GENERATE's "
+            "Claude calls need real runway — a 1s reserve is "
+            "operationally unusable; this knob enforces a viable "
+            "minimum.  Task #97 operator binding 2026-05-14."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/plan_generator.py",
+        example="60.0",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PLAN_PHASE_MIN_BUDGET_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Floor below which PLAN is skipped entirely (default 5s) "
+            "— graceful degrade.  If the computed phase-local budget "
+            "falls below this floor, PlanGenerator returns "
+            "PlanResult.skipped_result(\"plan_phase_skipped:...\") "
+            "and the pipeline falls through to GENERATE with the "
+            "full op_remaining preserved.  Below 5s, a planning "
+            "attempt is doomed and would only burn the GENERATE "
+            "budget.  Task #97 operator binding 2026-05-14."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/plan_generator.py",
+        example="5.0",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # H1 falsification — http client mode (Task #96, 2026-05-14)
     # ====================================================================
     FlagSpec(
