@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -390,13 +391,59 @@ async def _spawn_park_continuation(
         get_default_store,
     )
 
+    # Task #88d (2026-05-13) — fourth-layer coherence.
+    # v14-rev8 surfaced that even with Task #88/#88b/#88c all firing
+    # (inner=outer=floor=360s for thinking-on), the Claude call was
+    # cancelled at elapsed=248s while its budget was 357.5s.  The
+    # cancel source: THIS continuation's own asyncio.wait_for, whose
+    # timeout (``gen_timeout + outer_grace_s``) inherits the LEGACY
+    # GENERATE-phase wall (~200s for STANDARD route + 30s grace =
+    # ~230s).  That wall was sized for in-pool calls where the BG
+    # worker slot is held during the entire await — for an OUT-OF-POOL
+    # continuation, the slot is already freed, so the legacy wall
+    # doesn't serve its original purpose; it just falsely cancels
+    # legitimate thinking-on streams.
+    #
+    # Same single-policy coherence rule as Task #88/#88b/#88c: when
+    # the call is likely-thinking (signal reused for consistency),
+    # widen the continuation's outer wait_for to match the inner /
+    # outer / floor 360s budget — plus a small grace so the wait_for
+    # never wins a race against a legitimate stream completion at the
+    # 360s edge.
+    #
+    # Math after Task #88d:
+    #   non-thinking IMMEDIATE: timeout = gen_timeout + outer_grace_s
+    #     (legacy preserved)
+    #   thinking-on STANDARD:   timeout = max(legacy,
+    #     JARVIS_PARK_CONTINUATION_TIMEOUT_THINKING_S=390s)
+    # The max() clamp is essential: never SHRINK below the legacy
+    # value, only widen.
+    _task_complexity = (
+        getattr(ctx, "task_complexity", "") or ""
+    ).strip().lower()
+    _op_route = (
+        getattr(ctx, "provider_route", "") or ""
+    ).strip().lower()
+    _likely_thinking = (
+        _task_complexity not in ("", "trivial")
+        and _op_route not in ("immediate",)
+    )
+    _legacy_timeout = gen_timeout + outer_grace_s
+    if _likely_thinking:
+        _thinking_cont_timeout = float(os.environ.get(
+            "JARVIS_PARK_CONTINUATION_TIMEOUT_THINKING_S", "390.0",
+        ))
+        _continuation_timeout = max(_legacy_timeout, _thinking_cont_timeout)
+    else:
+        _continuation_timeout = _legacy_timeout
+
     async def _continuation() -> None:
         store = get_default_store()
         try:
             # The actual provider call — out-of-pool, slot is free.
             generation = await asyncio.wait_for(
                 orch._generator.generate(ctx, deadline),
-                timeout=gen_timeout + outer_grace_s,
+                timeout=_continuation_timeout,
             )
             await store.complete(
                 token, payload={"generation": generation},
