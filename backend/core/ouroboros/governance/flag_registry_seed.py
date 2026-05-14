@@ -543,6 +543,39 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # H1 falsification — http client mode (Task #96, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CLAUDE_HTTP_CLIENT_MODE",
+        type=FlagType.STR, default="custom",
+        description=(
+            "Closed 2-value taxonomy {custom, stdlib_default} gating "
+            "the ClaudeProvider httpx client construction.  Default "
+            "'custom' preserves the production httpx.AsyncClient + "
+            "Timeout + Limits configuration byte-identically — no "
+            "behavior change without explicit operator measurement.  "
+            "'stdlib_default' drops the construction-time http_client "
+            "kwarg (uses SDK / httpx defaults exactly like the Step 2 "
+            "probe shape) while preserving D2 per-request timeout + "
+            "max_retries=0.  Unknown values fall back to 'custom' "
+            "per operator binding (no silent behavior change).  This "
+            "knob is the H1 falsification gate for the v14-rev13 "
+            "Tier 2 blocker: 4 stream terminations with "
+            "first_token=NEVER bytes_received=0 thinking=on at "
+            "httpcore.ConnectTimeout in connect_tcp, despite Step 2 "
+            "probe showing AsyncAnthropic() defaults complete in 1-2s. "
+            "Flip for v14-rev14 only — if H1 clears the timeouts, the "
+            "correct forward-port is recalibration of Limits / "
+            "Timeout per measurement, NOT permanent removal of the "
+            "custom client."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="custom",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Oracle ↔ Advisor cooperative yield (Task #88f, 2026-05-14)
     # ====================================================================
     FlagSpec(
