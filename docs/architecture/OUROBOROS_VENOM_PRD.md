@@ -1706,6 +1706,94 @@ The next soak (v14-rev7, post-Task #88b) is the test. If `first_token=NEVER byte
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev9 — Stage 1.6 arc PARKED: substrate proven; Tier 2 blocked at SDK transport layer (2026-05-13)
+
+**Context**: v14-rev9 graduation soak (`bt-2026-05-14-053739`) was the test of the four-layer coherence stack — `JARVIS_BG_PARK_ENABLED=true` + Task #88 inner (`JARVIS_STREAM_RUPTURE_TIMEOUT_THINKING_S=360s`) + Task #88b outer (`JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S=360s`) + Task #88c floor (`JARVIS_FALLBACK_MIN_GUARANTEED_THINKING_S=360s`) + Task #88d continuation (`JARVIS_PARK_CONTINUATION_TIMEOUT_THINKING_S=390s`). All four layers verified live in the log.
+
+**Tier 1 ✅ for the FIFTH consecutive soak**:
+
+| Signal | Count |
+|---|---|
+| PARK-EMIT | 2 |
+| Worker-parked-and-freed | 2 |
+| Task #88c floor REFRESHED (thinking=yes) | 2 |
+
+Empirical proof of the four-layer coherence from `bt-2026-05-14-053739`:
+
+```
+23:05:00 [CandidateGenerator] Fallback: budget=360.0s REFRESHED
+  (parent=219.9s, guaranteed_min=360s, cap=360s, sem_wait=0.0s, thinking=yes)
+23:05:01 [ClaudeProvider] → stream model=claude-sonnet-4-6 timeout=359.4s
+  max_tokens=16384 temp=1.0 thinking=on tool_round=no prompt_chars=17572
+```
+
+This is the **structurally complete** thinking-aware budget delivery:
+- Claude received the full **359.4s** budget (vs 90s in v14-rev6, 357.5s in v14-rev8 after #88c, 359.4s after #88d)
+- Stream ran the FULL 360s window before terminating
+- All four cancel layers respected (no early cancellation from outer scopes)
+
+**Tier 2 ❌ — STOP CONDITION DEFINITIVELY MET**:
+
+```
+23:11:09 [ClaudeProvider] stream terminated via CancelledError:
+  elapsed=368.9s budget=359.4s first_token=NEVER bytes_received=0
+  tool_round=no thinking=on
+```
+
+Claude API **did not send a single byte** in **6 minutes** when called from the harness with thinking=on + 17k-char prompt. Direct curl probes from the same host (same `ANTHROPIC_API_KEY`, same model, same payload shape with thinking=on) return `thinking_delta` events in 1.6-2.5 seconds. **The bug is not in any budget layer — it's in the harness's SDK invocation topology.**
+
+**Operator binding (verbatim)**:
+> "Stop if outer is widened and logs still show connect timeout with 0 bytes — then open a separate httpx/cancel-scope triage (bounded), don't stack blind increases."
+
+Condition met. Task #88e filed (standalone Claude SDK repro outside harness).
+
+**Cumulative arc on `main` (Stage 1.6 graduation prep)**:
+
+| Commit | Layer | Closure |
+|---|---|---|
+| `62108de37a` | substrate | Slice 1 — ParkedOpStore + ParkSignal + PARKED_GENERATE enum |
+| `1340b5c94d` | bg_pool | Slice 2a — ParkRequested + BackgroundOp.resumed |
+| `a0968774bd` | wiring | Slice 2b — generate_park_wrapper + GENERATE callsite |
+| `f1a3dba3d1` | propagation | Slice 2c — ParkRequested(BaseException) hotfix |
+| `cacd09b5aa` | classifier | Task #86 — dw_entitlement_classifier |
+| `da3d4d5999` | autonomy | Task #86b — heavy_probe → sentinel entitlement wire |
+| `993ba4a0f2` | inner-budget | Task #88 — thinking-aware TTFT rupture |
+| `13cd392424` | outer-budget | Task #88b — thinking-aware outer cascade |
+| `66f59b2716` | floor-budget | Task #88c — Claude-floor reservation |
+| `afb403ebe0` | continuation-budget | Task #88d — fourth-layer coherence |
+
+**Spine totals**: 169 + 27 + 4 + 10 + 6 + 7 + 7 = **230 regression tests**. All green. Single-policy invariant runtime-pinned across all four budget layers.
+
+**Empirical evidence across the 5-soak arc**:
+
+| Soak | Claude budget | Result |
+|---|---|---|
+| v14-rev3 | not measured | continuation_failed: background_dw_blocked_by_topology |
+| v14-rev4 | not measured | continuation_failed: background_dw_blocked_by_topology |
+| v14-rev5 | 90s (no widening) | continuation_failed: background_dw_blocked_by_topology → all_providers_exhausted |
+| v14-rev6 | 192.8s (only `_max_cap` widened) | first_token=NEVER, elapsed=290s |
+| v14-rev7 | 90s (`_max_cap=360s` but floor=90s) | first_token=NEVER, elapsed=248s |
+| v14-rev8 | 357.5s (#88c floor applied) | first_token=NEVER, elapsed=248s (continuation wait_for fired) |
+| **v14-rev9** | **359.4s (all 4 layers)** | **first_token=NEVER, elapsed=368.9s (budget exhausted naturally)** |
+
+Successive widenings demonstrate the budget code path is structurally complete. The persistence of `first_token=NEVER` at full 360s budget proves the bug is downstream of the harness's budget machinery.
+
+**Stage 1.6 graduation status — PARKED**:
+
+- Substrate empirically PROVEN across 5 consecutive soaks (Tier 1)
+- Autonomous coupling fix (PARK-EMIT → slot freed → continuation → cancel-flip → submit_for_resume) delivers in production diagnostics
+- `JARVIS_BG_PARK_ENABLED` stays **default-FALSE** (no graduation flip)
+- Tier 2 closure (continuation completed + RESUME materialized + APPLIED/COMPLETE) blocked on Task #88e (SDK transport triage outside harness)
+- No further soaks planned per operator binding
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev9 session: `.ouroboros/sessions/bt-2026-05-14-053739/debug.log`
+- All four spine files: `tests/governance/test_stream_rupture_thinking_aware.py` + `test_fallback_thinking_aware_cap.py` + `test_fallback_min_guaranteed_thinking.py` + `test_park_continuation_thinking_timeout.py`
+- Active tasks: #81 (Slice 3 — paused), #92 (Task #88e — pending operator-bound standalone repro)
+- Closed this arc: #85, #86, #86b, #88, #88b, #88c, #88d (8 tasks)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
