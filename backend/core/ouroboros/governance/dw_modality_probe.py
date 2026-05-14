@@ -278,7 +278,35 @@ async def micro_probe(
                     latency_ms=latency_ms,
                 )
             if status in (401, 403):
-                # Auth failure — don't blame the model
+                # Task #86 — disambiguate auth failure (global, transient)
+                # from entitlement block (per-model, permanent).  Both
+                # historically returned 403 from DW.  The classifier
+                # inspects the body for the operator-tunable marker
+                # set (default includes DW's "blocked by a routing
+                # rule" phrasing).  When matched → VERDICT_NON_CHAT
+                # PERMANENT, which the modality_ledger persists and the
+                # catalog classifier autonomously excludes from future
+                # route assignments.  No hardcoded model list required —
+                # entitlement boundaries are discovered live from DW's
+                # own response bodies.  See dw_entitlement_classifier.py
+                # for the design rationale.
+                from backend.core.ouroboros.governance.dw_entitlement_classifier import (
+                    classify_4xx,
+                    KIND_ENTITLEMENT_BLOCKED,
+                )
+                _ent = classify_4xx(status, body_excerpt)
+                if _ent.kind == KIND_ENTITLEMENT_BLOCKED:
+                    return ProbeResult(
+                        model_id=model_id,
+                        verdict=VERDICT_NON_CHAT,
+                        status_code=status,
+                        response_body_excerpt=body_excerpt,
+                        latency_ms=latency_ms,
+                        failure_reason=(
+                            f"entitlement_blocked:{_ent.matched_marker}"
+                        ),
+                    )
+                # Legacy auth-failure path preserved verbatim.
                 return ProbeResult(
                     model_id=model_id,
                     verdict=VERDICT_UNKNOWN,
