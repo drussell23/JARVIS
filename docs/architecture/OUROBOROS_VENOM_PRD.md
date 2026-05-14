@@ -1496,6 +1496,68 @@ At GENERATE entry (or the narrowest await boundary that already exists), the op 
 - `docs/operations/battle_test_runbook.md` should reference `JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST` + `caffeinate -dimsu` for SWE-eval workflows (future runbook update)
 - This PRD section documents the empirical closure trail for §41 graduation review
 
+##### §40.7.10-stage1.6-slice3-tier1 — Stage 1.6 graduation soak: Tier 1 (substrate proven) MET; Tier 2 (full pipeline) BLOCKED by provider config (2026-05-13)
+
+**Context**: Slice 3 graduation soak (`bt-2026-05-14-000028`, branch `main`, harness v14-rev3, master flag `JARVIS_BG_PARK_ENABLED=true`, eligible route set extended to `{background, complex, standard}` to admit SWE-Bench-Pro's empirically-observed `route=standard` stamp from UrgencyRouter). The operator's binding splits Bar A closure into two tiers when the LLM round-trip cannot complete due to upstream issues — this section records both empirical halves.
+
+**Tier 1 (Stage 1.6 substrate correctness) — ✅ EMPIRICALLY MET**:
+
+The substrate is provably correct under live SWE-Bench-Pro traffic. Three of the five Bar A signals fire end-to-end against op `op-019e23a9-f09c-73ed-8d01-692b92f91862-cau`:
+
+| Signal | Time | Evidence |
+|---|---|---|
+| **PARK-EMIT** | 17:06:33 | `[Ouroboros.GenerateParkWrapper] INFO PARK-EMIT: ctx_op_id=op-019e23a9-… attempt=1 token=op-019e23a9-…::attempt-1 — continuation spawned, raising ParkRequested` |
+| **Worker-parked-and-freed** | 17:07:17 | `[Ouroboros.BackgroundAgentPool] INFO Worker 0: operation bgop-4ddf1cf5723f parked at GENERATE token=op-019e23a9-…::attempt-1 attempt=1 kind=generate — freeing slot (slot held for 178.22s)` |
+| **Store cancel-flip on continuation failure** | 17:07:17 | `[Ouroboros.OpParkStore] INFO terminal_flip: op_id=op-019e23a9-… status=cancelled reason='continuation_failed:RuntimeError:background_dw_blocked_by_topology:…'` |
+| **submit_for_resume** | 17:07:17 | `[Ouroboros.BackgroundAgentPool] INFO submit_for_resume: ctx_op_id=op-019e23a9-… pool_op_id=bgop-62f5addba58c attempt=1 (resumed=True)` |
+
+This proves the operator-named coupling fix is correct in production:
+
+1. The wrapper's PARK-EMIT path correctly detected eligible route + queue pressure + master-on + non-resumed, registered the descriptor in `ParkedOpStore`, spawned the out-of-pool continuation Task, and raised `ParkRequested(BaseException)`.
+2. The exception propagated past the orchestrator's `except Exception:` clauses (the load-bearing Slice 2c hotfix) to the BG worker's structured handler.
+3. The worker marked `op.status='parked'`, persisted observability, and **returned from the loop iteration — freeing the slot for the next dispatch**. Slot held for 178s, then released; this is the load-bearing structural win.
+4. The continuation Task ran the actual provider call OUTSIDE the slot. When it failed, the store cancel-flip + `submit_for_resume` cleanly surfaced the failure into the resume-dispatch path — exactly per the Slice 2b design.
+
+**Critical reframe**: Stage 1.6 made an existing upstream failure *diagnosable*. Without the park substrate, the SWE op would have silently held a BG worker slot for the full 900s `swe_bench_pro` lease while the underlying provider rejection silently retried — surfacing only as a `bg_timebox` kill with no useful diagnostic. With Stage 1.6, the failure surfaces as a structured `terminal_flip status=cancelled reason='continuation_failed:RuntimeError:background_dw_blocked_by_topology:…'` — operator-actionable.
+
+**Tier 2 (full pipeline → APPLIED/COMPLETE) — ⏳ BLOCKED by upstream**:
+
+The remaining two Bar A signals (`continuation completed ≥1` + `RESUME materialize ≥1` + `APPLIED/COMPLETE ≥1`) require a successful LLM round-trip. The soak surfaced that this is currently blocked at the provider layer, NOT in Stage 1.6:
+
+- **`api.doubleword.ai` reachable** (curl `-m 10`: HTTP 401 in 466ms, TLS clean, DNS instant)
+- **`api.anthropic.com` reachable** (curl `-m 10`: HTTP 404 in 49ms, TLS clean, DNS instant)
+- **DW heavy-probe rejections**:
+  - `model=deepseek-ai/DeepSeek-OCR-2 ... error=status_403:Real-time access to 'deepseek-ai/DeepSeek-OCR-2' is blocked by a routing rule. Please contact your administrator to request access.`
+  - `model=moonshotai/Kimi-K2.6 ... error=transport:ClientOSError:[Errno 54] Connection reset by peer`
+  - `model=zai-org/GLM-5.1-FP8 ... error=transport:ConnectionTimeoutError:Connection timeout to host`
+- **`dw_catalog_classifier` consequence**: 0 affordable + accessible models under `max_out_price=$0.5/M` → marks BACKGROUND/STANDARD blocked → falls to Claude → 10 fallback attempts / 0 successes (cancellation cascade from the parked op's store-cancel).
+
+This is a **DW catalog/account access mismatch** — the harness's DW heavy-probe is testing models the configured account doesn't have routing-rule access to. Tracked as Task #85 (separate from Stage 1.6). Not a substrate defect; not a network defect.
+
+**Graduation discipline**: per operator binding, default flip of `JARVIS_BG_PARK_ENABLED` to TRUE is **NOT** justified by Tier 1 alone. Tier 2 requires a clean rerun under healthy provider state. The fix path is:
+
+1. Restore DW catalog account access (Task #85) OR pin DW catalog probe to accessible-only models
+2. Rerun `bash /tmp/claude-501/v14-park-launch.sh` — substrate is unchanged, the closure signals fall out naturally on the next op
+3. THEN open the graduation PR (Slice 3.1) flipping the default
+
+**No workaround attempted**: I declined to disable `dw_catalog_classifier`, fake a successful LLM, or raise the lease — each would simulate Bar A without proving the coupling fix delivers value under real LLM latency.
+
+**Cumulative commits on `main` since the v12/v13 entry above**:
+
+| Commit | Layer | Closure |
+|---|---|---|
+| `62108de37a` | substrate | Slice 1 — ParkedOpStore + ParkSignal + PARKED_GENERATE enum + 3 FlagRegistry seeds (default-FALSE) |
+| `1340b5c94d` | bg_pool | Slice 2a — ParkRequested exception + should_park_for_route + BackgroundOp.resumed + worker except-handler |
+| `a0968774bd` | wiring | Slice 2b — generate_park_wrapper + bind_bg_pool + GENERATE callsite + 3-claim integration spine |
+| `f1a3dba3d1` | propagation | Slice 2c — ParkRequested(BaseException) hotfix (load-bearing: caught pre-soak, would have silently failed) |
+
+**Spine cumulative**: 169 tests across 4 new spine files (`test_op_park_store.py`, `test_bg_pool_park_substrate.py`, `test_bg_park_integration.py`, BaseException-propagation pins). Zero unit-test regression across adjacent suites.
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev3 session: `.ouroboros/sessions/bt-2026-05-14-000028/debug.log`
+- v14 launch + proof-bundle: `/tmp/claude-501/v14-park-launch.sh` + `/tmp/claude-501/v14-proof-bundle.sh`
+- Tasks: #81 (Slice 3 — still in_progress until Tier 2 cleared), #85 (DW topology investigation), #83 (UrgencyRouter standard-vs-background follow-up), #84 (CrossProcessJSONL stale-lock cleanup follow-up)
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
