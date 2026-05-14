@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #58714
-- **Branch**: `fix/ci/pr-automation-validation-run58712-20260514-133613`
-- **Commit**: `26f723e3a35006fa59eaeecc84161baf71495fe2`
+- **Run Number**: #58716
+- **Branch**: `fix/ci/pr-automation-validation-run58714-20260514-133828`
+- **Commit**: `c9f7a286a276fe6e3ab1e868dcc57e7346fbea13`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-14T13:36:54Z
+- **Timestamp**: 2026-05-14T13:39:02Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25863121707)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25863226589)
 
 ## Failure Overview
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-14T13:36:58Z
-**Completed**: 2026-05-14T13:37:01Z
+**Started**: 2026-05-14T13:39:06Z
+**Completed**: 2026-05-14T13:39:09Z
 **Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25863121707/job/75997941228)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25863226589/job/75998316584)
 
 #### Failed Steps
 
@@ -42,13 +42,13 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-14T13:36:59.7544284Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-14T13:37:00.3027533Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-14T13:39:07.8188426Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-14T13:39:08.4639633Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-14T13:37:00.3427786Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-14T13:39:08.5228061Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -78,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-14T13:38:28.150776*
+📊 *Report generated on 2026-05-14T13:40:44.526425*
 🤖 *JARVIS CI/CD Auto-PR Manager*
