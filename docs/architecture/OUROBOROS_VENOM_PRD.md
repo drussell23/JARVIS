@@ -1631,6 +1631,81 @@ The remaining 3 closure signals (`continuation completed` / `RESUME materialized
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev6 — v14-rev6 surfaces two-layer thinking-aware budget (Task #88 inner + Task #88b outer); Tier 2 still pending (2026-05-13)
+
+**Context**: v14-rev6 graduation soak (`bt-2026-05-14-030150`) was launched with the FULL root-fix stack: park substrate (Slice 1+2a+2b+2c) + Task #86 entitlement classifier + Task #86b sentinel autonomy wire + Task #88 inner-rupture thinking-aware widening. Fresh DW catalog cache, env eligibility extended, no zombies, no stale locks. The soak fired Tier 1 substrate signals AND the autonomous loop completed end-to-end for the first time, but Tier 2 (continuation completed + RESUME + APPLIED/COMPLETE) still didn't close. This entry records the surfacing of the SECOND budget layer + its rooted fix (Task #88b).
+
+**Tier 1 again ✅** (now with autonomous adaptation proven live):
+
+| Signal | v14-rev6 |
+|---|---|
+| PARK-EMIT | 2 |
+| Worker-parked-and-freed | 2 |
+| Task #86 entitlement_blocked emissions | 4 |
+| **Task #86b sentinel→TERMINAL_OPEN routes** | 2 |
+| Continuation completed | 0 |
+| RESUME materialized | 0 |
+| APPLIED/COMPLETE | 0 |
+
+The autonomous coupling loop (probe → classify → route → TERMINAL_OPEN → next-cycle exclusion) fired twice live. Stage 1.6 substrate is **definitively proven for the third consecutive soak**.
+
+**Tier 2 still blocked — new sub-root identified**:
+
+Task #88 widened the INNER stream-rupture cap (120s → 360s for thinking-on calls), but v14-rev6's log surfaced a second budget layer:
+
+```
+[ClaudeProvider] → stream model=claude-sonnet-4-6 timeout=218.7s ... thinking=on prompt_chars=9141
+[ClaudeProvider] stream terminated via CancelledError:
+  elapsed=290.0s budget=218.7s first_token=NEVER bytes_received=0 thinking=on
+```
+
+The `218.7s budget` is the OUTER `asyncio.wait_for` deadline computed in `CandidateGenerator._call_fallback`. It fires FIRST and cancels the SDK call before Task #88's inner rupture widening can engage. Same shape as #88, different layer.
+
+**Task #88b (root fix for outer layer)** — merged `13cd392424` on main:
+
+Apply the same thinking-aware widening pattern to the outer cap. `_call_fallback` now computes `_likely_thinking` from `(task_complexity, provider_route)` — a conservative superset of `_resolve_thinking_budget`'s enable-rules — and applies `max(_max_cap, JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S)` (default 360s). Single policy with Task #88: **outer ≥ inner for thinking-on**. The `max()` clamp preserves existing route-specific caps (COMPLEX=180s, read-only-BG≈480s+).
+
+Exclusions (no widening):
+- IMMEDIATE route (reflex path, thinking off by design)
+- Trivial task_complexity (thinking off per `_resolve_thinking_budget`)
+- Empty/unstamped task_complexity (defensive — don't engage until ComplexityClassifier has stamped the ctx)
+
+**Two-layer single-policy invariant pinned by spine**:
+
+`test_fallback_thinking_aware_cap.py::test_thinking_caps_share_default_value` asserts at runtime that Task #88 inner cap (`stream_rupture_timeout_s(thinking_enabled=True)`) and Task #88b outer cap (`JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S`) share the same default (360s). If a future refactor splits them, the pin fails and forces an explicit rationale.
+
+**Operator binding upheld**: no blind widening (non-thinking IMMEDIATE keeps 120s); same `thinking` signal as #88 (no forked heuristics); env-tunable via FlagRegistry; outer-narrower-than-inner regression structurally impossible per the runtime pin.
+
+**Failure-mode triage discipline (operator binding 2026-05-13)**:
+> "Stop if outer is widened and logs still show connect timeout with 0 bytes — then open a separate httpx/cancel-scope triage (bounded), don't stack blind increases."
+
+The next soak (v14-rev7, post-Task #88b) is the test. If `first_token=NEVER bytes_received=0` persists after the outer cap is widened, the bug is no longer in either budget layer — it's at the httpx transport / asyncio cancel-scope level. That investigation would be a separate bounded task (filed Task #88c stub if needed).
+
+**Cumulative arc on `main` for Stage 1.6 graduation prep (post-v14-rev6)**:
+
+| Commit | Layer | Closure |
+|---|---|---|
+| `62108de37a` | substrate | Slice 1 — ParkedOpStore + ParkSignal + PARKED_GENERATE enum |
+| `1340b5c94d` | bg_pool | Slice 2a — ParkRequested + should_park_for_route + BackgroundOp.resumed |
+| `a0968774bd` | wiring | Slice 2b — generate_park_wrapper + GENERATE callsite + 3-claim spine |
+| `f1a3dba3d1` | propagation | Slice 2c — ParkRequested(BaseException) hotfix |
+| `cacd09b5aa` | classifier | Task #86 — dw_entitlement_classifier (no hardcoded models) |
+| `da3d4d5999` | autonomy | Task #86b — heavy_probe → sentinel entitlement wire |
+| `5f2972cc2a` | docs | PRD — v14-rev5 Tier 1 met / Tier 2 blocked |
+| `993ba4a0f2` | inner-budget | Task #88 — thinking-aware TTFT rupture widening |
+| `13cd392424` | **outer-budget** | **Task #88b — thinking-aware outer cascade budget** |
+
+**Spine totals**: 169 + 27 + 4 + 10 + 6 = **216 regression tests**. All green.
+
+**Graduation discipline maintained**: `JARVIS_BG_PARK_ENABLED` stays default-FALSE. Tier 2 closure (continuation completed + RESUME materialized + APPLIED/COMPLETE) must fire on a clean soak before the default flip. No graduation PR drafted yet.
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev6 session: `.ouroboros/sessions/bt-2026-05-14-030150/debug.log`
+- Task #88 + Task #88b spine: `tests/governance/test_stream_rupture_thinking_aware.py` + `test_fallback_thinking_aware_cap.py`
+- Tasks: #81 (Slice 3 — still in_progress until Tier 2), #89 (Task #88b — completed on this turn)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
