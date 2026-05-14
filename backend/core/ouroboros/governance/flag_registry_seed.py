@@ -543,6 +543,54 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Autonomous Connection Lifecycle Policy (Task #99, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CLAUDE_IDLE_RECYCLE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for ClaudeProvider's autonomous idle-recycle "
+            "policy.  When true, ``_ensure_client`` checks "
+            "time-since-last-successful-call before returning the "
+            "cached AsyncAnthropic client; if elapsed > "
+            "JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S, autonomously "
+            "recycles the httpx pool (composes existing "
+            "``_recycle_client`` primitive — Task #4 cascade hardening) "
+            "before the new call.  Closes the v14-rev16 Tier 2 blocker "
+            "where Claude streams returned 0 bytes after ~5 min of "
+            "pipeline work — stale TCP keepalives silently torn down "
+            "by upstream NAT / LB / firewall.  Default true per "
+            "operator binding 2026-05-14: 'survive the long-compute "
+            "gaps inherent to O+V.'  Set false for byte-identical "
+            "legacy behavior."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="true",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_CLAUDE_IDLE_RECYCLE_THRESHOLD_S",
+        type=FlagType.FLOAT, default=120.0,
+        description=(
+            "Seconds of idle time since last successful Claude API "
+            "call after which the next ``_ensure_client`` "
+            "autonomously recycles the pool.  Default 120s — covers "
+            "typical upstream NAT / load-balancer keepalive timeouts "
+            "(60-300s).  Set to 0 for opt-out single-use behavior "
+            "(every call after any successful call triggers recycle "
+            "— useful for diagnosing pool-related defects).  Negative "
+            "/ invalid values fall back to 120s default.  Task #99 "
+            "Autonomous Connection Lifecycle Policy, operator "
+            "binding 2026-05-14."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="120.0",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Universal phase-local sub-budgeting (Task #98, 2026-05-14)
     # ====================================================================
     FlagSpec(
