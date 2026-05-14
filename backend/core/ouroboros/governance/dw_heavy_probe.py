@@ -575,11 +575,36 @@ class HeavyProber:
                         body_text = (await resp.text())[:200]
                     except Exception:  # noqa: BLE001 — defensive
                         pass
+                    # Task #86 — entitlement-block disambiguation.
+                    # The legacy ``status_{N}:body`` error string was
+                    # opaque to downstream observability: an account-
+                    # entitlement rejection (per-model permanent) and a
+                    # bad-auth failure (global transient) produced the
+                    # same payload, so neither could route the model to
+                    # TERMINAL_OPEN.  Now the classifier discriminates
+                    # via DW's own response-body marker — on
+                    # ENTITLEMENT_BLOCKED, the structured error string
+                    # carries the marker for log forensics and lets a
+                    # downstream consumer (caller of ``probe()``) flip
+                    # the breaker to TERMINAL_OPEN without re-parsing
+                    # the body.  See dw_entitlement_classifier.py.
+                    from backend.core.ouroboros.governance.dw_entitlement_classifier import (  # noqa: E501
+                        classify_4xx,
+                        KIND_ENTITLEMENT_BLOCKED,
+                    )
+                    _ent = classify_4xx(resp.status, body_text)
+                    if _ent.kind == KIND_ENTITLEMENT_BLOCKED:
+                        _err = (
+                            f"entitlement_blocked:{_ent.matched_marker}:"
+                            f"status_{resp.status}"
+                        )
+                    else:
+                        _err = f"status_{resp.status}:{body_text}"
                     return (
                         int(timeout_s * 1000),
                         int((time.monotonic() - t_start) * 1000),
                         False,
-                        f"status_{resp.status}:{body_text}",
+                        _err,
                     )
                 # Read SSE until first non-empty content chunk
                 while True:

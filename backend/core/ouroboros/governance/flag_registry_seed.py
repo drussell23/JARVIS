@@ -490,6 +490,30 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # DW entitlement classifier — Task #86 root fix (2026-05-13)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_DW_ENTITLEMENT_BLOCK_MARKERS",
+        type=FlagType.STR, default=None,
+        description=(
+            "CSV of response-body markers that identify per-model "
+            "DoubleWord entitlement blocks (distinct from global auth "
+            "failures).  Matching is case-insensitive substring against "
+            "the response body excerpt.  Empty/missing falls back to "
+            "the defaults: 'blocked by a routing rule', 'contact your "
+            "administrator', 'request access' — phrases empirically "
+            "observed in DW 403 responses for non-entitled models.  "
+            "Operators extend (or replace) when DW changes phrasing.  "
+            "Consumed by dw_entitlement_classifier.classify_4xx() — "
+            "single source of truth, no hardcoded model list anywhere."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/dw_entitlement_classifier.py",
+        example="blocked by a routing rule,contact your administrator",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # Orange PR review — 1 flag
     # ====================================================================
     FlagSpec(
