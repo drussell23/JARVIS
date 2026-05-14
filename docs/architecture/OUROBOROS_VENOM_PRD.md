@@ -1560,6 +1560,77 @@ This is a **DW catalog/account access mismatch** — the harness's DW heavy-prob
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev5 — Stage 1.6 substrate fully proven live; Tier 2 shifts to provider-side blocker (2026-05-13)
+
+**Context**: v14-rev5 graduation soak (`bt-2026-05-14-013144`, harness commit `da3d4d5999`, Task #86 + Task #86b + park substrate composed). First soak with the full root-fix stack — fresh catalog cache, autonomous entitlement detection, sentinel routing. The Tier 1 substrate signals fired for the FIRST time including the autonomous adaptation loop.
+
+**Tier 1 (substrate correctness + autonomous adaptation) — ✅ EMPIRICALLY MET**:
+
+| Signal | v14-rev3 | v14-rev4 | **v14-rev5** | Closure |
+|---|---|---|---|---|
+| PARK-EMIT ≥ 1 | 2 | 2 | **2** | ✅ |
+| Worker-parked-and-freed-slot ≥ 1 | 2 | 2 | **2** (slot held 878s on SWE op) | ✅ |
+| Task #86 entitlement_blocked emissions | 0 (wiring incomplete) | 2 | **4** | ✅ |
+| **Task #86b sentinel→TERMINAL_OPEN routes** | N/A | N/A | **2** ⭐ FIRST LIVE FIRE | ✅ |
+
+Critical empirical evidence (single line, complete autonomous loop):
+
+```
+2026-05-13T18:38:38 [HeavyProbe] model=deepseek-ai/DeepSeek-OCR-2 success=False ...
+  error=entitlement_blocked:blocked by a routing rule:status_403
+2026-05-13T18:38:38 [HeavyProbe] entitlement_blocked routed to TERMINAL_OPEN:
+  model=deepseek-ai/DeepSeek-OCR-2 detail='entitlement_blocked:blocked by a
+  routing rule:status_403'
+2026-05-13T19:00:44 Worker 1: operation bgop-01ab632226d8 parked at GENERATE
+  token=op-019e2422-...::attempt-1 attempt=1 kind=generate — freeing slot
+  (slot held for 878.73s)
+```
+
+This is the **complete autonomous coupling fix in action**: DW probe surfaces a per-model entitlement rejection → classifier (Task #86) labels it `KIND_ENTITLEMENT_BLOCKED` with the matched marker → scheduler (Task #86b) routes the detection to `topology_sentinel.report_failure(is_terminal=True)` → breaker flips `TERMINAL_OPEN` → next discovery cycle excludes the model autonomously. **Zero hardcoded model list. Zero operator intervention.** The SWE-Bench-Pro op subsequently parked at GENERATE entry (slot held 878s through CLASSIFY → ROUTE → PLAN → enter-GENERATE), the worker freed the slot, the out-of-pool continuation engaged the provider call — exactly per Slice 2b design.
+
+**Tier 2 (full pipeline → APPLIED/COMPLETE) — ❌ BLOCKED, failure mode SHIFTED**:
+
+The remaining 3 closure signals (`continuation completed` / `RESUME materialized` / `APPLIED/COMPLETE`) did NOT fire. But the continuation failure error **changed**:
+
+| Soak | Continuation failure error |
+|---|---|
+| v14-rev3 / v14-rev4 | `RuntimeError:background_dw_blocked_by_topology:Catalog-driven (Phase 12). Static list purged; ranking authority is dw_catalog_classifier (default max_out_price=$0.5/M)` |
+| **v14-rev5** | `RuntimeError:all_providers_exhausted:fallback_failed` |
+
+**This is structural progress**. The classifier now successfully converges past the catalog-block stage (it had pruned the entitlement-blocked subset autonomously). The new failure is at the actual provider-call layer:
+
+- DW providers tried in cascade — each subsequent model also hits routing-rule rejections → exhausts STANDARD-route candidate list
+- Claude fallback also tried — `0 successes / 10 attempts` consistent across v14-rev3 through v14-rev5 (NOT a new problem — pre-existing across the arc)
+
+**Tier 2 root is no longer in the park substrate or the entitlement classifier**. The remaining blocker is upstream provider state — either (a) the configured DW account has insufficient entitled affordable models for the SWE workload, (b) `ANTHROPIC_API_KEY` is missing/invalid in the continuation context, or (c) Claude provider client construction differs on the out-of-pool continuation path vs the pre-park path. Filed as Task #88 (Claude-fallback failure-mode investigation, timeboxed) — operator-bound to local creds, no LLM keys in chat.
+
+**Cumulative commits on `main` for this arc (since v13 motor budget)**:
+
+| Commit | Layer | Closure |
+|---|---|---|
+| `62108de37a` | substrate | Slice 1 — ParkedOpStore + ParkSignal + PARKED_GENERATE enum |
+| `1340b5c94d` | bg_pool | Slice 2a — ParkRequested + should_park_for_route + BackgroundOp.resumed |
+| `a0968774bd` | wiring | Slice 2b — generate_park_wrapper + GENERATE callsite + 3-claim spine |
+| `f1a3dba3d1` | propagation | Slice 2c — ParkRequested(BaseException) hotfix |
+| `cacd09b5aa` | classifier | Task #86 — dw_entitlement_classifier (no hardcoded models) |
+| `da3d4d5999` | autonomy | Task #86b — heavy_probe → sentinel entitlement wire |
+
+**Spine totals**: 169 + 27 + 6 = **202 regression tests** across the arc. All green. AST-pinned: no hardcoded probe models, classifier single-seam per consumer, master flag default-FALSE per §33.1, ParkRequested propagation invariant, bound BG pool resolution.
+
+**Graduation discipline maintained**: `JARVIS_BG_PARK_ENABLED` stays default-FALSE until Tier 2 closes on a soak with healthy provider state. **No** workarounds attempted (no fake LLM, no topology classifier disable, no `max_out_price` crank, no synthetic completion signal).
+
+**Operator-bound next steps**:
+1. Task #88 — Claude-fallback failure-mode investigation (timeboxed ~90 min): pull HTTP status/body from logs, verify `ANTHROPIC_API_KEY` visibility in continuation process context, diff provider client construction between pre-park and out-of-pool paths. Deliverable: one of (a) reproducible code bug + PR, (b) misconfig + exact env fix, (c) upstream outage + redacted evidence.
+2. Once Tier 2 evidence is captured on a clean soak → graduation PR flipping `JARVIS_BG_PARK_ENABLED` default-TRUE.
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev5 session: `.ouroboros/sessions/bt-2026-05-14-013144/debug.log`
+- v14 launch: `/tmp/claude-501/v14-park-launch.sh`
+- Proof bundle script: `/tmp/claude-501/v14-proof-bundle.sh` (NOTE: caller MUST point at correct session — `ls -1dt` picks most-recently-modified, which can be a finalizing prior session)
+- Tasks: #81 (Slice 3 — still in_progress until Tier 2), #88 (Claude-fallback investigation — new, timeboxed)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
