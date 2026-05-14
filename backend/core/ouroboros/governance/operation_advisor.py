@@ -251,6 +251,65 @@ _ADVISOR_BLAST_EXECUTOR: "Optional[_futures.ThreadPoolExecutor]" = None
 _ADVISOR_BLAST_EXECUTOR_INIT_LOCK: "_threading.Lock" = _threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Task #88f (2026-05-14) — Advisor-busy signal (public, stable)
+# ---------------------------------------------------------------------------
+#
+# Closes the v14-rev10 graduation-soak blocker: Oracle's
+# ``_oracle_index_loop.incremental_update([])`` polls the full 29k-file
+# main tree every ~3min and contends with Advisor's blast-radius file
+# walks on disk I/O.  The Advisor's dedicated executor IS isolated for
+# thread scheduling, but its rglob+read_text scans share the kernel's
+# block-device I/O bandwidth with Oracle's main-tree indexing.
+#
+# This counter is the OFFICIAL "advisor busy" signal that
+# ``_oracle_index_loop`` reads to decide whether to yield this poll
+# cycle.  Operator binding 2026-05-14: prefer a stable counter over
+# ``executor._work_queue.qsize()`` (private, fragile across Python
+# versions).  Incremented at the start of every ``advise_async``
+# blast scan (inside the executor thread); decremented at the end
+# (always, even on exception).  Read by ``get_advisor_busy_count()``
+# (public).  Thread-safe via threading.Lock.
+#
+# The counter measures CONCURRENT BLAST WORK — not pending queue.
+# When it's >0, Oracle should yield to avoid disk contention.  When
+# it's 0, Oracle is free to poll its bulk indexing.
+
+_ADVISOR_BUSY_COUNT: int = 0
+_ADVISOR_BUSY_LOCK: "_threading.Lock" = _threading.Lock()
+
+
+def get_advisor_busy_count() -> int:
+    """Return the count of advise_async() blast scans currently in
+    flight on the dedicated executor.
+
+    Stable public surface for cooperative scheduling — callers like
+    ``governed_loop_service._oracle_index_loop`` use it to decide
+    whether to yield a polling cycle.  Always returns a non-negative
+    integer; never raises.
+    """
+    with _ADVISOR_BUSY_LOCK:
+        return _ADVISOR_BUSY_COUNT
+
+
+def _advisor_busy_incr() -> None:
+    """Internal — bump the counter when an advise_async scan starts."""
+    global _ADVISOR_BUSY_COUNT
+    with _ADVISOR_BUSY_LOCK:
+        _ADVISOR_BUSY_COUNT += 1
+
+
+def _advisor_busy_decr() -> None:
+    """Internal — drop the counter when an advise_async scan ends.
+
+    Defensive: never let the counter go negative even on double-decrement
+    (would indicate a bug; clamp to 0 to keep the public surface honest).
+    """
+    global _ADVISOR_BUSY_COUNT
+    with _ADVISOR_BUSY_LOCK:
+        _ADVISOR_BUSY_COUNT = max(0, _ADVISOR_BUSY_COUNT - 1)
+
+
 def _get_advisor_blast_executor() -> "_futures.ThreadPoolExecutor":
     """Lazy-init singleton dedicated ThreadPoolExecutor for advisor
     blast scans.  All ``advise_async`` calls dispatch here so advisor
@@ -693,17 +752,30 @@ class OperationAdvisor:
                 op_id[:16] if op_id else "-",
                 _qdepth, _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
             )
+        # Task #88f — wrap the blast scan in busy-count tracking.
+        # The counter is incremented inside the executor thread (just
+        # before advise() runs) and decremented inside ``finally`` to
+        # cover all exit paths.  Oracle's ``_oracle_index_loop`` reads
+        # ``get_advisor_busy_count()`` to decide whether to yield this
+        # poll cycle, avoiding disk-I/O contention with our blast scan.
+        def _advise_with_busy_tracking() -> "Advisory":
+            _advisor_busy_incr()
+            try:
+                return self.advise(
+                    target_files,
+                    description,
+                    op_id,
+                    is_read_only=is_read_only,
+                    repo_root=repo_root,
+                )
+            finally:
+                _advisor_busy_decr()
+
         # Use a lambda to bind kwargs because run_in_executor doesn't
         # take **kwargs natively.
         return await loop.run_in_executor(
             executor,
-            lambda: self.advise(
-                target_files,
-                description,
-                op_id,
-                is_read_only=is_read_only,
-                repo_root=repo_root,
-            ),
+            _advise_with_busy_tracking,
         )
 
     def advise(
