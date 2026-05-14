@@ -356,6 +356,46 @@ def test_ast_pin_classifier_referenced_once_per_consumer():
 # ---------------------------------------------------------------------------
 
 
+def test_ast_pin_heavy_probe_scheduler_routes_entitlement_to_sentinel():
+    """Task #86b — the missing wire that closes the autonomous loop.
+
+    When ``_do_probe`` emits ``entitlement_blocked:`` (Task #86), the
+    scheduler MUST call ``sentinel.report_failure(is_terminal=True)``
+    so the model's breaker flips TERMINAL_OPEN and the catalog
+    classifier excludes it from future route assignments.  Without
+    this wire, entitlement detection is a leaf log line with no
+    autonomous adaptation effect — exactly the gap v14-rev4 surfaced.
+
+    This pin asserts both:
+      * The scheduler imports FailureSource + get_default_sentinel
+      * The scheduler matches ``result.error.startswith("entitlement_blocked:")``
+      * The scheduler calls ``report_failure(... is_terminal=True ...)``
+    """
+    src = _HEAVY_PROBE_SRC.read_text(encoding="utf-8")
+    assert "entitlement_blocked:" in src, (
+        "Task #86 must keep the entitlement_blocked: error-string emission"
+    )
+    # The new Task #86b wire — these three patterns must coexist in
+    # the source.  They live inside run_cycle, lazy-imported to keep
+    # the module-import cost low.
+    assert "from backend.core.ouroboros.governance.topology_sentinel import" in src, (
+        "Heavy probe must import topology_sentinel (lazy) to route "
+        "entitlement detection to TERMINAL_OPEN"
+    )
+    assert "FailureSource.HEAVY_PROBE_FAIL" in src, (
+        "Heavy probe must use FailureSource.HEAVY_PROBE_FAIL when "
+        "routing entitlement detection — canonical failure-source taxonomy"
+    )
+    assert "is_terminal=True" in src, (
+        "Heavy probe must pass is_terminal=True to flip TERMINAL_OPEN "
+        "(weighted-streak bypass per Slice H)"
+    )
+    assert 'result.error.startswith("entitlement_blocked:")' in src, (
+        "Heavy probe must gate the sentinel call on the structured "
+        "error-string prefix from Task #86's classifier dispatch"
+    )
+
+
 def test_seed_has_entitlement_block_markers_flag():
     """JARVIS_DW_ENTITLEMENT_BLOCK_MARKERS MUST be seeded so operators
     can /help flag and toggle without grepping the codebase."""
