@@ -6990,6 +6990,18 @@ class ClaudeProvider:
         async def _plan_create() -> Any:
             # Re-acquire per attempt — see _do_stream comment.
             _current_client = self._ensure_client()
+            # D2 (Task #95) — per-request httpx.Timeout derived from
+            # the remaining deadline so this messages.create call
+            # cannot exceed the (phase-local) outer budget.  Task #97
+            # surfaced that this call site was the 4th Claude SDK
+            # entry point and was MISSED by D2's original wiring —
+            # leaving _plan_create using the construction-time httpx
+            # config which let attempts run 60-120s each, draining
+            # PlanGenerator's deadline via _call_with_backoff retries.
+            _attempt_budget_s = max(
+                1.0,
+                (deadline - datetime.now(tz=timezone.utc)).total_seconds(),
+            )
             return await _current_client.messages.create(
                 model=self._model,
                 max_tokens=512,
@@ -7001,6 +7013,7 @@ class ClaudeProvider:
                 ),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
+                timeout=_derive_per_request_httpx_timeout(_attempt_budget_s),
             )
 
         message = await self._call_with_backoff(
