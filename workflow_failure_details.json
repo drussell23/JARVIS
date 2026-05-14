@@ -1,0 +1,125 @@
+{
+  "workflow_name": "terraform in /infrastructure - Update #1367421911",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25852011490",
+  "branch": "main",
+  "commit_sha": "96ed18b",
+  "run_number": 143,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/terraform-in-infrastructure-update-1367421911-run143-20260514-091605",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: terraform in /infrastructure - Update #1367421911 (Run #143)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 46,
+              "content": "2026-05-14T09:14:39.4378096Z updater | 2026/05/14 09:14:39 INFO <job_1367421911> Job definition: {\"job\":{\"command\":\"version\",\"allowed-updates\":[{\"dependency-type\":\"direct\",\"update-type\":\"all\"}],\"commit-message-options\":{\"prefix\":\"infra\",\"prefix-development\":null,\"include-scope\":null},\"credentials-metadata\":[{\"type\":\"git_source\",\"host\":\"github.com\"}],\"debug\":null,\"dependencies\":null,\"dependency-groups\":[],\"dependency-group-to-refresh\":null,\"existing-pull-requests\":[],\"existing-group-pull-requests\":[],\"experiments\":{\"record-ecosystem-versions\":true,\"record-update-job-unknown-error\":true,\"proxy-cached\":true,\"enable-corepack-for-npm-and-yarn\":true,\"enable-private-registry-for-corepack\":true,\"allow-refresh-for-existing-pr-dependencies\":true,\"allow-refresh-group-with-all-dependencies\":true,\"azure-registry-backup\":true,\"enable-enhanced-error-details-for-updater\":true,\"gradle-lockfile-updater\":true,\"enable-exclude-paths-subdirectory-manifest-files\":true,\"group-membership-enforcement\":true},\"ignore-conditions\":[],\"lockfile-only\":false,\"max-updater-run-time\":2700,\"package-manager\":\"terraform\",\"requirements-update-strategy\":null,\"reject-external-code\":false,\"security-advisories\":[],\"security-updates-only\":false,\"source\":{\"provider\":\"github\",\"repo\":\"drussell23/JARVIS\",\"branch\":null,\"directory\":\"/infrastructure\",\"api-endpoint\":\"https://api.github.com/\",\"hostname\":\"github.com\"},\"updating-a-pull-request\":false,\"update-subdependencies\":false,\"vendor-dependencies\":false,\"enable-beta-ecosystems\":false,\"repo-private\":false,\"multi-ecosystem-update\":false,\"exclude-paths\":null}}",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 68,
+              "content": "2026-05-14T09:14:48.1182143Z updater | 2026/05/14 09:14:48 ERROR <job_1367421911> Error during file fetching; aborting: No files found in /infrastructure",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 69,
+              "content": "2026-05-14T09:14:48.2767439Z   proxy | 2026/05/14 09:14:48 [010] POST /update_jobs/1367421911/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 70,
+              "content": "2026-05-14T09:14:48.3560101Z   proxy | 2026/05/14 09:14:48 [010] 204 /update_jobs/1367421911/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 75,
+              "content": "2026-05-14T09:14:48.5501222Z Dependabot encountered '1' error(s) during execution, please check the logs for more details.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 77,
+              "content": "2026-05-14T09:14:48.5502659Z |                                    Errors                                     |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-05-14T09:14:48.7017120Z Failure running container 25097a9c6949509f38fc04f774d3a3ad4bc2b4b111858e84ea31610b32d0dcea: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 90,
+              "content": "2026-05-14T09:14:49.8493968Z ##[error]Dependabot encountered an error performing the update",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 92,
+              "content": "Error: The updater encountered one or more errors.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 95,
+              "content": "2026-05-14T09:14:49.8503181Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 10
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 24,
+              "content": "2026-05-14T09:14:20.4014836Z \ud83e\udd16 ~ Failed to parse GITHUB_REGISTRIES_PROXY environment variable ~",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-05-14T09:14:48.7017120Z Failure running container 25097a9c6949509f38fc04f774d3a3ad4bc2b4b111858e84ea31610b32d0dcea: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 40,
+              "content": "2026-05-14T09:14:37.3437846Z updater | rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 98,
+              "content": "2026-05-14T09:14:50.0788591Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: github/dependabot-action@main. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-14T09:16:05.326187"
+}
