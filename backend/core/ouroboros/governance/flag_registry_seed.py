@@ -517,6 +517,32 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # D2 — Per-request httpx budget coherence (Task #95, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Absolute cap on the per-request httpx connect/write/pool "
+            "timeout for Claude messages.stream/create calls.  The "
+            "actual connect ceiling at call time is min(this_cap, "
+            "outer_attempt_budget_s) — connect can never exceed the "
+            "outer asyncio.wait_for budget.  Closes v14-rev12 D2: "
+            "before this knob, ClaudeProvider constructed a static "
+            "httpx.Timeout(connect=10, read=600 thinking / 120 default) "
+            "at _ensure_client() time, so a 10.4s outer-attempt budget "
+            "produced a 131s actual call (10s connect + 120s read), "
+            "12× over the outer wait_for.  Per operator binding "
+            "2026-05-14: derive httpx timeouts from per-request budget; "
+            "no magic numbers; cap composes outer budget invariant."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="5.0",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Oracle ↔ Advisor cooperative yield (Task #88f, 2026-05-14)
     # ====================================================================
     FlagSpec(

@@ -4552,6 +4552,81 @@ _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S = float(
     os.environ.get("JARVIS_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S", "30.0")
 )
 
+# ---------------------------------------------------------------------------
+# D2 — Per-request httpx budget coherence (Task #95, 2026-05-14)
+# ---------------------------------------------------------------------------
+# v14-rev12 graduation soak (PRD §40.7.10-stage1.6-slice3-v14rev12) surfaced
+# a single concentrated defect: the AsyncAnthropic client's httpx.Timeout is
+# constructed once at ``_ensure_client()`` time with static values (connect=
+# 10s, read=120s default / 600s thinking, write=600s, pool=600s).  When the
+# outer asyncio.wait_for fires with a small per-attempt budget (e.g. the
+# outer-retry-loop's second attempt at 10.4s after attempt-1 consumed 80s
+# of a 90s post-sem floor), httpx still uses the construction-time values
+# — so the actual call runs 130s+ (10s connect + 120s read) before the
+# cancel scope can surrender, violating the outer budget by 12×.
+#
+# Per operator binding 2026-05-14 (D2 design questions resolved):
+#   1. httpx.Timeout MUST derive from the per-request outer budget.
+#   2. Connect+pool ceilings are bounded by an env-tunable absolute cap
+#      ``JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S`` (default 5.0s) AND by the
+#      outer attempt budget (``min(cap, outer)``) — connect can never
+#      exceed the outer asyncio.wait_for budget.
+#   3. Read may match the full per-request budget (thinking streams emit
+#      no bytes until reasoning completes, so read needs the full window).
+#   4. ``max_retries=0`` is already set at ``_ensure_client()`` (line ~5162)
+#      so the SDK does no internal retry stack on top of our outer budget.
+#      All retry policy lives in ``_call_with_backoff``.
+#
+# This is HONEST ENFORCEMENT — no fabrication.  Companion fast-fail
+# (``sem_exhausted_zero_budget``) at ``candidate_generator._call_fallback``
+# refuses to open a stream when post-sem ``_parent_remaining <= 0``.
+_CLAUDE_HTTPX_PER_REQUEST_CONNECT_CAP_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S", "5.0")
+)
+
+
+def _derive_per_request_httpx_timeout(
+    outer_budget_s: float,
+    *,
+    connect_cap_s: Optional[float] = None,
+) -> Any:
+    """Derive a per-request ``httpx.Timeout`` honoring the outer asyncio
+    budget.
+
+    Invariant (D2, operator binding 2026-05-14):
+
+        ``connect, write, pool <= min(connect_cap_s, outer_budget_s)``
+        ``read <= outer_budget_s``
+
+    The connect cap defaults to ``JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S``
+    (5.0s).  Both ``outer_budget_s`` and the resolved cap are floored at
+    0.1s so a zero/negative budget cannot produce an httpx error at
+    construction — the caller is responsible for fast-failing before
+    reaching this helper when budget is exhausted.
+
+    Returned as ``Any`` (``httpx.Timeout`` at runtime) so this module's
+    forward-declared annotations remain importable without httpx loaded
+    at top level.
+    """
+    import httpx  # noqa: PLC0415 — lazy: matches _ensure_client pattern
+
+    _budget = max(0.1, float(outer_budget_s))
+    _cap = max(
+        0.1,
+        float(
+            _CLAUDE_HTTPX_PER_REQUEST_CONNECT_CAP_S
+            if connect_cap_s is None else connect_cap_s
+        ),
+    )
+    _connect = min(_cap, _budget)
+    return httpx.Timeout(
+        connect=_connect,
+        read=_budget,
+        write=_connect,
+        pool=_connect,
+    )
+
+
 # Exponential backoff retry — 2s, 4s, 8s between attempts.
 _CLAUDE_RETRY_MAX_ATTEMPTS = int(
     os.environ.get("JARVIS_CLAUDE_RETRY_MAX_ATTEMPTS", "3")
@@ -6163,6 +6238,17 @@ class ClaudeProvider:
                     }
                     if _thinking_param is not None:
                         _stream_kwargs["thinking"] = _thinking_param
+                    # D2 (Task #95, 2026-05-14) — per-request httpx.Timeout
+                    # derived from the outer attempt budget.  Without this,
+                    # the SDK's construction-time httpx.Timeout (connect=10s,
+                    # read=600s thinking / 120s default) runs the network
+                    # call far past the outer asyncio.wait_for budget on
+                    # small per-attempt windows (e.g. 131s observed with
+                    # budget=10.4s on v14-rev12).  Helper is module-level
+                    # and AST-pinned to enforce wiring.
+                    _stream_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+                        timeout_s,
+                    )
                     async with _current_client.messages.stream(**_stream_kwargs) as stream:
                         # Two-Phase Stream Rupture Breaker.
                         # Phase 1 (TTFT): generous default 120s for first
@@ -6457,6 +6543,14 @@ class ClaudeProvider:
                 }
                 if _thinking_param is not None:
                     _create_kwargs["thinking"] = _thinking_param
+                # D2 (Task #95, 2026-05-14) — per-request httpx.Timeout
+                # derived from the outer attempt budget.  Same rationale
+                # as the stream path: connect/pool ≤ outer budget, no
+                # 130s overruns on small attempts.
+                _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+                    timeout_s,
+                )
+
                 async def _create_with_prefill_fallback() -> Any:
                     """Same prefill-rejection fallback as the stream path."""
                     # Re-acquire the client on every attempt — see the
@@ -6658,6 +6752,7 @@ class ClaudeProvider:
                 async def _legacy_create() -> Any:
                     # Re-acquire per attempt — see _do_stream comment.
                     _current_client = self._ensure_client()
+                    # D2 (Task #95) — per-request httpx.Timeout.
                     return await _current_client.messages.create(
                         model=self._model,
                         max_tokens=self._compute_output_budget(
@@ -6666,6 +6761,7 @@ class ClaudeProvider:
                         temperature=0.2,
                         system=_legacy_system,
                         messages=messages,
+                        timeout=_derive_per_request_httpx_timeout(timeout_s),
                     )
 
                 msg = await asyncio.wait_for(
