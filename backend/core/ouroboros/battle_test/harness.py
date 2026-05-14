@@ -279,6 +279,16 @@ class BattleTestHarness:
         # complete (exception in shutdown components, parent kills hard
         # before async cleanup, interpreter teardown during async work).
         self._summary_written: bool = False
+        # Task #94 (2026-05-14) — suspension diagnostic state.  Set by
+        # the WallClockWatchdog when monotonic/wall ratio falls below
+        # JARVIS_HARNESS_SUSPENSION_WARN_RATIO (default 0.5).  Read by
+        # ``_generate_report`` + ``_atexit_fallback_write`` so the
+        # additive ``suspension_likely`` + ``suspension_ratio`` fields
+        # land in summary.json without changing stop_reason (per
+        # operator binding 2026-05-14: avoid breaking summary.json
+        # consumers — additive over modifying).
+        self._suspension_likely: bool = False
+        self._suspension_ratio: Optional[float] = None
         self._install_atexit_fallback()
 
         # Harness Epic Slice 1 — bounded shutdown watchdog.
@@ -501,6 +511,13 @@ class BattleTestHarness:
                 convergence_r2=0.0,
                 session_outcome=session_outcome,
                 last_activity_ts=_last_activity_ts,
+                # Task #94 (2026-05-14) — carry the suspension
+                # diagnostic into partial summaries too.  If the
+                # WallClockWatchdog already detected suspension and
+                # set these fields before atexit fires, the partial
+                # summary still surfaces them to PRD/audit trails.
+                suspension_likely=getattr(self, "_suspension_likely", False),
+                suspension_ratio=getattr(self, "_suspension_ratio", None),
             )
             self._summary_written = True
             # Can't trust logger during interpreter teardown — fallback
@@ -4805,18 +4822,56 @@ class BattleTestHarness:
         # If another waiter already fired and the shutdown path is in progress,
         # this is a no-op — set() on an already-set event is idempotent, and
         # the FIRST_COMPLETED race has already picked its winner.
+        _fired_monotonic = time.monotonic() - anchor_monotonic
+        _fired_wall = max(0.0, time.time() - anchor_wall)
+        _fired_effective = max(_fired_monotonic, _fired_wall)
         logger.warning(
             "[WallClockWatchdog] fired: monotonic=%.0fs wall=%.0fs "
             "effective=%.0fs >= max_wall_seconds=%.0fs — triggering "
             "graceful shutdown with stop_reason=wall_clock_cap.",
-            time.monotonic() - anchor_monotonic,
-            max(0.0, time.time() - anchor_wall),
-            max(
-                time.monotonic() - anchor_monotonic,
-                max(0.0, time.time() - anchor_wall),
-            ),
-            cap_s,
+            _fired_monotonic, _fired_wall, _fired_effective, cap_s,
         )
+        # Task #94 (2026-05-14) — suspension-likely diagnostic.
+        # When wall_clock advances substantially faster than monotonic
+        # (process was suspended by the OS), the firing is technically
+        # correct (per Ticket A1 Guard 2: effective = max(monotonic,
+        # wall) — opaque to activity), but the soak evidence is
+        # invalidated.  A graduation/Bar A claim from such a session
+        # is unreliable.  Compute the monotonic/wall ratio and warn
+        # if it falls below JARVIS_HARNESS_SUSPENSION_WARN_RATIO
+        # (default 0.5).  Pure diagnostic — no behavior change to
+        # WHEN the watchdog fires.  Surfaced via summary.json's
+        # suspension_likely + suspension_ratio fields (additive,
+        # schema_version unchanged) so PRD/audit trails can cite
+        # structured evidence instead of grepping the log.
+        try:
+            _susp_thresh = float(os.environ.get(
+                "JARVIS_HARNESS_SUSPENSION_WARN_RATIO", "0.5",
+            ))
+            if not (0.0 < _susp_thresh <= 1.0):
+                _susp_thresh = 0.5
+        except (TypeError, ValueError):
+            _susp_thresh = 0.5
+        _susp_ratio: Optional[float] = None
+        _susp_likely = False
+        if _fired_wall > 0.0:
+            _susp_ratio = max(0.0, min(1.0, _fired_monotonic / _fired_wall))
+            if _susp_ratio < _susp_thresh:
+                _susp_likely = True
+                logger.warning(
+                    "[WallClockWatchdog] SUSPENSION LIKELY: monotonic/"
+                    "wall ratio=%.2f < threshold=%.2f (process was "
+                    "suspended ~%.0fs of %.0fs wall window).  "
+                    "Graduation / Bar A claims from this session are "
+                    "INVALID unless re-run under caffeinate.  "
+                    "Surfaced as summary.json suspension_likely=true.",
+                    _susp_ratio, _susp_thresh,
+                    _fired_wall - _fired_monotonic, _fired_wall,
+                )
+        # Stash on self for save_summary to read.  Additive field —
+        # legacy callers / pre-v1.1c consumers ignore it.
+        self._suspension_likely = _susp_likely
+        self._suspension_ratio = _susp_ratio
         # Stamp stop_reason FIRST so the termination-hook adapter
         # below sees "wall_clock_cap" instead of falling back to
         # the cause-derived value. Mirrors the signal handler's
@@ -5181,6 +5236,12 @@ class BattleTestHarness:
                 # two values form the enum audit tooling consumes.
                 session_outcome="complete",
                 last_activity_ts=time.time(),
+                # Task #94 (2026-05-14, v1.1c additive) — suspension diagnostic.
+                # Set by WallClockWatchdog when monotonic/wall ratio < threshold
+                # (default 0.5). Default False on clean runs.  Audit tooling
+                # treats suspension_likely=True as graduation-evidence-invalid.
+                suspension_likely=self._suspension_likely,
+                suspension_ratio=self._suspension_ratio,
             )
             # Flag prevents the atexit fallback from double-writing a
             # partial summary on top of the clean one.

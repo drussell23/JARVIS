@@ -490,6 +490,33 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # WallClockWatchdog suspension diagnostic (Task #94, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_HARNESS_SUSPENSION_WARN_RATIO",
+        type=FlagType.FLOAT, default=0.5,
+        description=(
+            "Monotonic/wall ratio threshold below which the "
+            "WallClockWatchdog emits a SUSPENSION LIKELY warning + "
+            "stamps summary.json with suspension_likely=true + "
+            "suspension_ratio=<value>.  Closes the v14-rev10 session-"
+            "075335 observability gap: a session suspended by macOS "
+            "App Nap (process paused while laptop slept) currently "
+            "fires stop_reason=wall_clock_cap identical to a clean "
+            "full-runtime cap-hit.  Threshold value: monotonic/wall < "
+            "0.5 means the process was suspended >50% of its session "
+            "wall window — graduation/Bar A claims from such a "
+            "session are evidence-invalid unless re-run under "
+            "caffeinate.  Pure additive diagnostic — no behavior "
+            "change to WHEN the watchdog fires."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/battle_test/harness.py",
+        example="0.5",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Oracle ↔ Advisor cooperative yield (Task #88f, 2026-05-14)
     # ====================================================================
     FlagSpec(
