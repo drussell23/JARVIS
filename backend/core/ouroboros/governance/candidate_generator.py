@@ -3975,6 +3975,46 @@ class CandidateGenerator:
                 _sem_wait_s = time.monotonic() - _sem_t0
                 _parent_remaining = self._remaining_seconds(deadline)
 
+                # D2 (Task #95, 2026-05-14) — sem-exhausted fast-fail.
+                # Per operator binding: "after the semaphore wait is
+                # charged, remaining_budget_for_network = max(0,
+                # outer_remaining - sem_wait_total); if ≤ 0, fail fast
+                # with a structured reason (sem_exhausted_zero_budget)
+                # instead of still opening a stream that will always
+                # violate outer wait_for."
+                #
+                # This sits BEFORE the post-acquire floor refresh (#88c
+                # territory) by design: #88c's refresh is the explicit
+                # op-envelope extension when budget is tight but
+                # *nonzero* — honest enforcement.  D2 is the new
+                # invariant for the *zero* case: do not pretend time
+                # exists that does not.  When the entire pre-sem budget
+                # was consumed waiting for the semaphore, the outer
+                # asyncio.wait_for is already arithmetically violated;
+                # opening a stream now guarantees a TimeoutError /
+                # CancelledError 130s later (httpx connect+read
+                # surrender latency).  Fast-fail here is observability +
+                # cost win.
+                if _parent_remaining <= 0.0:
+                    logger.info(
+                        "[CandidateGenerator] Post-sem fast-fail: "
+                        "sem_wait=%.1fs drained pre_sem_remaining=%.1fs → "
+                        "parent_remaining=0s.  Honest enforcement per D2 "
+                        "operator binding 2026-05-14 — refusing to open "
+                        "a stream that would violate outer wait_for.",
+                        _sem_wait_s, _pre_sem_remaining,
+                    )
+                    self._raise_exhausted(
+                        "sem_exhausted_zero_budget",
+                        context=context,
+                        deadline=deadline,
+                        sem_wait_s=round(_sem_wait_s, 2),
+                        pre_sem_remaining_s=round(_pre_sem_remaining, 2),
+                        parent_remaining_s=0.0,
+                        phase=_phase_hint,
+                        route=_op_route,
+                    )
+
                 # AdmissionGate Slice 2 — feed observed wait
                 # back to the EWMA estimator so the next op's
                 # projection reflects actual queue pressure.
