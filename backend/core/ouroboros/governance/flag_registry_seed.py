@@ -490,6 +490,33 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Park continuation timeout — thinking-aware (Task #88d, 2026-05-13)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_PARK_CONTINUATION_TIMEOUT_THINKING_S",
+        type=FlagType.INT, default=390,
+        description=(
+            "Timeout (in seconds) for the asyncio.wait_for that wraps "
+            "the out-of-pool park continuation's provider call when "
+            "thinking is enabled.  The fourth coherence layer (after "
+            "Task #88 inner 360s, #88b outer 360s, #88c floor 360s): "
+            "the continuation's own wait_for inherits the legacy "
+            "GENERATE-phase wall (~200s for STANDARD), which falsely "
+            "cancels legitimate thinking-on streams.  Default 390s "
+            "= 360s single-policy budget + 30s grace for asyncio "
+            "wait_for overhead.  Operator binding 2026-05-13: 'every "
+            "outer waiter that can kill the stream must be >= the "
+            "innermost legitimate LLM budget when thinking=yes'.  "
+            "Non-thinking IMMEDIATE/trivial paths keep the legacy "
+            "gen_timeout + outer_grace_s (no widening)."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/generate_park_wrapper.py",
+        example="390",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # Fallback min-guaranteed floor — thinking-aware (Task #88c, 2026-05-13)
     # ====================================================================
     FlagSpec(
