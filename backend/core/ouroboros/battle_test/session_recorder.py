@@ -439,6 +439,8 @@ class SessionRecorder:
         strategic_drift: Optional[Dict[str, Any]] = None,
         session_outcome: Optional[str] = None,
         last_activity_ts: Optional[float] = None,
+        suspension_likely: Optional[bool] = None,
+        suspension_ratio: Optional[float] = None,
     ) -> Path:
         """Write ``summary.json`` and (if any) ``review_queue.jsonl`` to *output_dir*.
 
@@ -511,6 +513,21 @@ class SessionRecorder:
             summary["session_outcome"] = session_outcome
         if last_activity_ts is not None:
             summary["last_activity_ts"] = last_activity_ts
+        # Task #94 (v1.1c additive, 2026-05-14) — suspension diagnostic.
+        # Emitted only when non-None / explicitly truthful so v1.1a +
+        # v1.1b consumers parse pre-1.1c summaries cleanly.
+        # schema_version stays at SCHEMA_VERSION (additive extension).
+        # ``suspension_likely=True`` means the WallClockWatchdog fired
+        # under a monotonic/wall ratio below
+        # JARVIS_HARNESS_SUSPENSION_WARN_RATIO (default 0.5) — the
+        # session's elapsed wall-clock includes substantial OS
+        # suspension, so any graduation / Bar A claims from this
+        # session are evidence-invalid unless re-run under
+        # caffeinate.  Audit / PRD trails should treat as non-cert.
+        if suspension_likely is not None:
+            summary["suspension_likely"] = bool(suspension_likely)
+        if suspension_ratio is not None:
+            summary["suspension_ratio"] = float(suspension_ratio)
 
         # v1.1a: emit ``ops_digest`` only when at least one real APPLY
         # was observed. Empty sessions produce no digest key at all so
