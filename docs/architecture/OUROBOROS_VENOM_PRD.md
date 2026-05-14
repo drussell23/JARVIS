@@ -1941,6 +1941,57 @@ Versions: `anthropic 0.75.0`, `httpx 0.28.1`, `python 3.11.10`, model `claude-so
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev14-plan — H1 falsification soak plan (Task #96, 2026-05-14)
+
+**Picker decision (operator binding 2026-05-14)**: H1 first, as a measured experiment, NOT a permanent "drop custom client" story.
+
+**Why H1 before H3** (operator rationale): Step 2 proved `AsyncAnthropic()` defaults + thinking stream works in isolation; the harness differs on `http_client + Limits + per-request Timeout(pool=5)`. `ConnectTimeout in connect_tcp` under ~360s of "no bytes" is more consistent with client/pool/timeout misconfiguration than with "Anthropic never sends thinking_delta." A one-flag short-lived branch that uses library defaults for one soak is the cheapest falsification of H1.
+
+**Task #96 substrate** (committed `5c5f19253d`, merged `1016558af2`):
+
+| Surface | Detail |
+|---|---|
+| Closed taxonomy | `_CLAUDE_HTTP_CLIENT_MODES = frozenset({"custom", "stdlib_default"})` |
+| Resolver | `_resolve_http_client_mode()` — module-level, importable; case-insensitive; whitespace-stripped; unknown → `custom` fallback |
+| Dispatch seam | `_ensure_client()` reads resolver → branches on stdlib_default vs custom |
+| `stdlib_default` branch | `AsyncAnthropic(api_key=, max_retries=0)` — bare, no `http_client=`, no Limits |
+| `custom` branch | Preserves existing httpx.AsyncClient + Timeout + Limits byte-identically |
+| Master switch | `JARVIS_CLAUDE_HTTP_CLIENT_MODE` (STR, Category.**SAFETY**, default `custom`) |
+| Load-bearing invariant | Both branches pass `max_retries=0` to AsyncAnthropic (AST-pinned via ast.walk + Keyword node count == 2) — D2 invariant: single retry authority is `_call_with_backoff` |
+| Spine | 20 tests (closed-taxonomy frozenset pin + 10 resolver decision-table cases + 5 AST pins on dispatch/branch correctness + FlagRegistry seed pin + production byte-identity pin) |
+| Regression | 38 cumulative tests green across H1 + D2 spines |
+
+**v14-rev14 soak plan**:
+- Launch script: `/tmp/claude-501/v14-rev14-launch.sh` (caffeinate -dimsu protected, same shape as v14-rev13 + `JARVIS_CLAUDE_HTTP_CLIENT_MODE=stdlib_default`)
+- Caps: cost-cap 0.50, max-wall-seconds 2400, idle-timeout 300, headless
+- Compare to rev13:
+  - ConnectTimeout rate (was 4/4 streams in rev13)
+  - first_token latency (was NEVER in 4/4 rev13 thinking-on streams)
+  - bytes_received (was 0 in 4/4 rev13)
+  - SWE Tier 2 closure signals (was 0 SWE COMPLETE in rev13)
+
+**Decision tree post-rev14**:
+
+| rev14 outcome | Verdict | Next work |
+|---|---|---|
+| ConnectTimeouts gone + SWE Tier 2 closes | H1 confirmed | **Forward-port what we need** — keep D2; recalibrate (or remove) `_CLAUDE_HTTP_MAX_CONNECTIONS / _CLAUDE_HTTP_MAX_KEEPALIVE / _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S` based on measured concurrent-stream count; reintroduce Limits ONLY where measured FD/connection caps justify them. **NOT** a permanent "drop custom client" — that was a measurement, not a fix. Targeted PR with the calibrated values + spine. |
+| ConnectTimeouts gone but SWE Tier 2 still blocked | H1 partial — different blocker | Classify new top line. Do NOT widen budgets again to mask. |
+| ConnectTimeouts still firing under stdlib_default | H1 falsified → H3 second | Add lightweight observability counters (active_streams, waiters) at `_do_stream` entry/exit, debug-level only — one soak — diagnose H3. No permanent log spam; master-flag or debug. |
+
+**Explicit non-paths** (operator binding):
+- No `max_connections=999`-style "beef up" without evidence.
+- No graduation flip (`JARVIS_BG_PARK_ENABLED` default-FALSE) until Tier 2 Bar A green.
+- No revert of D2 — agreed.
+- No budget-widening to mask zero-event streams — that was the old failure mode in a different costume.
+
+**File-coordinate summary**:
+- Task #96 PR: commit `5c5f19253d`, merge `1016558af2` (providers.py + flag_registry_seed.py + spine)
+- Launch script: `/tmp/claude-501/v14-rev14-launch.sh`
+- Spine: `tests/governance/test_h1_http_client_mode.py` (20 tests, 5 AST pins, frozenset taxonomy)
+- Active tasks: #96 (H1 — in progress, awaiting v14-rev14 soak result)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
