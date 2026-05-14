@@ -1794,6 +1794,65 @@ Successive widenings demonstrate the budget code path is structurally complete. 
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev12 — Stage 1.6 substrate confirmed for the 6th consecutive soak; Tier 2 blocker reclassified as D2 (harness budget propagation), not stream-path regression (2026-05-14)
+
+**Context**: v14-rev12 graduation soak (`bt-2026-05-14-182948`, harness commit `7601b23178` w/ Task #94 suspension diagnostic merged, `JARVIS_BG_PARK_ENABLED=true`, `JARVIS_BG_PARK_ROUTES="background,complex,standard"`, `--cost-cap 0.50`, `--max-wall-seconds 2400`, `--headless`, `caffeinate -dimsu`). First Stage 1.6 soak run under the Task #94 suspension-diagnostic substrate — this run is the first to carry a positive "real run" certification in `summary.json` (`suspension_likely=false`, `suspension_ratio=1.0` — monotonic and wall clocks tracked identically across the 2417s session window, confirming no macOS suspension under caffeinate).
+
+**Tier 1 — ✅ EMPIRICAL substrate proof for the SIXTH consecutive soak**:
+
+| Signal | Count | Source |
+|---|---|---|
+| SWE-Bench-Pro op injected + worktree prepared | 1 | `[SWEBenchPro.HarnessInject] injected instance='jarvis__harness-smoke-001' worktree='/tmp/claude-501/swebp-worktrees/jarvis__harness-smoke-001' causal_id='op-019e27c3-d96d-…'` (29.4s prep) |
+| Route stamped | 1 | `🛤️  Route: standard (standard:low:swe_bench_pro:simple)` |
+| PARK admitted to OpParkStore | 1 | `park admitted: op_id=op-019e27c3-d96d-… seq=1 store_size=1 (state=parked_generate)` |
+| PARK-EMIT continuation spawned + ParkRequested raised | 1 | `PARK-EMIT: ctx_op_id=op-019e27c3-d96d-… continuation spawned, raising ParkRequested` |
+| BG slot freed empirically | 1 | 22 BG ops picked up while SWE op was parked; 2 BG ops completed in the interim (`bgop-5195b0e090ee` 400s, `bgop-c2f5eb9accff` 276s) |
+| Task #94 — clean caffeinated run certification | ✅ | `suspension_likely=false, suspension_ratio=1.0` in `summary.json` |
+
+**Tier 2 — ❌ NOT MET, but blocker reclassified**:
+
+Mid-soak partial counts initially suggested Task #88e (raw-event consumer) regression. Post-wall full-trace classification ruled this out. The failures are:
+
+1. **First-line evidence** — `EXHAUSTION event_n=2 cause=fallback_failed ... fallback_err_msg=claude_stream_timed_out_after_131.2s_(budget=10.4s, first_token=NEVER, bytes_received=0, tool_round=no, thinking=off)`. The Claude call ran **12× over its 10.4s budget** before cancellation surfaced.
+2. **Root error chain** — `claude_stream transient failure (APITimeoutError(chain=APITimeoutError→ConnectTimeout→ConnectTimeout→TimeoutError→CancelledError: Cancelled via cancel scope ...; reason: deadline exceeded))`. The outer cancel scope *did* fire (`reason: deadline exceeded`) — but the SDK swallowed the cancellation for 131s, consistent with httpx connect-pool blocking attempts that don't surrender to the outer scope.
+3. **Budget arithmetic mismatch** — `sem_wait_total_s=480.85, pre_sem_remaining_s=216.03`. Semaphore wait drained 480s out of a 216s pre-sem budget, leaving operationally `0s` remaining — but Claude was called with `budget=10.4s`. Some floor/clamp fabricates a non-zero budget after exhaustion.
+
+**Isolation probe** (free diagnostic from the same shell env, operator-approved 2026-05-14):
+
+| Step | Result |
+|---|---|
+| `host api.anthropic.com` | 58ms (A + AAAA both resolve) |
+| `curl -X POST .../v1/messages` (10s timeout, empty body) | `status=400 dns=0.016s connect=0.024s tls=0.043s total=0.215s` |
+| `AsyncAnthropic.messages.create` (`claude-sonnet-4-6`, 8 tokens) | **1.51s OK**, `stop=max_tokens`, `"Hi there! 👋 How"` |
+
+**Outcome**: Anthropic API is reachable from the harness's exact shell env at sub-2s round-trip. **D1 (environmental/network/DNS/IPv6/firewall/VPN) ruled out.** The ConnectTimeout chain observed in the harness is **harness-induced**, not environmental.
+
+**Bar A signal source verification** (no inadvertent non-SWE counting):
+
+The mid-soak `APPLIED/COMPLETE=2` count derives entirely from `bgop-*` prefixed background ops (`bgop-5195b0e090ee` 400s, `bgop-c2f5eb9accff` 276s) — these are sensor-triggered (web-intel / opportunity miner) ops, NOT `swe_bench_pro` envelopes. The SWE op `op-019e27c3-d96d-…` terminated at `Generation attempt 1/2 failed for op-019e27c3-d96d: all_providers_exhausted:fallback_failed` (11:46:45). **Bar A SWE-Bench-Pro completions = 0** on this soak.
+
+**D2 — single defect now isolated** (next-PR scope, operator-bound):
+
+| Facet | Evidence | Hypothesized seam |
+|---|---|---|
+| **D2a — budget propagation through SDK retry loop** | Outer `asyncio.wait_for(budget=10.4s)` did not cancel the Claude SDK's internal retry stack for 131s. SDK default `max_retries=2` × ~30s per `ConnectTimeout` × IPv4+IPv6 attempts = >120s of internal retry budget regardless of outer scope. | `ClaudeProvider.__init__` — `AsyncAnthropic(...)` is constructed without explicit `timeout=httpx.Timeout(...)` or `max_retries=0`. Inherits SDK defaults (~600s timeout, 2 retries) which are larger than every reasonable outer budget. |
+| **D2b — budget floor after sem-wait exhaustion** | `sem_wait_total_s=480.85, pre_sem_remaining_s=216.03` → effective remaining should be `max(0, -264.82) = 0`, but Claude was called with `budget=10.4s`. | `candidate_generator._call_fallback` — a min-floor clamps the remaining-budget upward when it should propagate exhaustion. The `tier1_reserve_s=25.0` from `UrgencyRouter` should be a *floor for not-calling* (skip if effective < reserve), not a target. |
+
+**Stage 1.6 graduation status — STILL PARKED**:
+
+- Substrate empirically PROVEN across **6** consecutive soaks (v14-rev3 through v14-rev12)
+- `JARVIS_BG_PARK_ENABLED` stays **default-FALSE** (no graduation flip per operator binding)
+- Tier 2 closure (continuation completed + RESUME materialized + APPLIED/COMPLETE on SWE op) blocked on **D2 — single targeted PR pending operator approval** (httpx.Timeout + max_retries=0 + sem-exhaustion floor enforcement at `ClaudeProvider.__init__` + `_call_fallback` chokepoints)
+- Separate hygiene gap surfaced (non-blocking, follow-up PR after D2): `PARK-EMIT: orch has no ._ledger attribute; skipping PARKED_GENERATE ledger entry` — park behaves correctly, but ledger emission code path needs fix or removal for park milestones to be auditable
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev12 session: `.ouroboros/sessions/bt-2026-05-14-182948/debug.log` + `summary.json`
+- Task #94 substrate: `tests/governance/test_harness_suspension_diagnostic.py` (20 spine tests, 6 AST pins) — first soak with positive "real run" certification
+- D2 design surfaces (no edits yet): `backend/core/ouroboros/governance/providers.py` (`ClaudeProvider.__init__`), `backend/core/ouroboros/governance/candidate_generator.py` (`_call_fallback` budget arithmetic), `backend/core/ouroboros/governance/urgency_router.py` (`tier1_reserve_s` semantic)
+- Active tasks: #81 (Slice 3 — still paused on Tier 2), #76 (live harness run — in progress); #94 (suspension diagnostic — closed); #92 (Task #88e — confirmed not regressed by this soak's trace)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
