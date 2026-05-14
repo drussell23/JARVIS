@@ -4584,6 +4584,57 @@ _CLAUDE_HTTPX_PER_REQUEST_CONNECT_CAP_S = float(
     os.environ.get("JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S", "5.0")
 )
 
+# ---------------------------------------------------------------------------
+# H1 falsification — http client mode (Task #96, 2026-05-14)
+# ---------------------------------------------------------------------------
+# v14-rev13 graduation soak proved D2 budget invariant holds (no more 12×
+# overshoot) but surfaced a new top line: 4 stream terminations with
+# ``first_token=NEVER bytes_received=0 thinking=on``, all root-caused (via
+# asyncio.leak stack-trace) to ``httpcore.ConnectTimeout`` in TCP connect.
+# Step 2 isolation probe (operator-approved 2026-05-14) proved this is NOT
+# product behavior — ``AsyncAnthropic()`` defaults from the same shell env
+# with thinking-on stream the first event in 1.08–1.34s consistently.
+#
+# The harness differs from the probe in three places:
+#   1. Custom ``httpx.AsyncClient`` with ``Timeout(connect=10, read=600,
+#      write=600, pool=600) + Limits(max_connections=10, max_keepalive=5,
+#      keepalive_expiry=30s)``.
+#   2. D2 per-request override ``Timeout(connect=5, read=outer, write=5,
+#      pool=5)``.
+#   3. Multiple parallel streams (BG pool + sensors + park continuations).
+#
+# H1 falsification (operator binding 2026-05-14): one-soak experiment to
+# distinguish "custom httpx.AsyncClient config is wrong" (H1) from
+# "concurrency-induced pool starvation" (H3).  This knob lets v14-rev14
+# flip to the SDK-default httpx client — same shape as the Step 2 probe —
+# while keeping ``max_retries=0`` (D2 invariant: single retry authority is
+# ``_call_with_backoff``) and the D2 per-request timeout override.
+#
+# Closed 2-value taxonomy.  Default ``custom`` preserves production byte-
+# identically; flipping to ``stdlib_default`` is opt-in measurement only.
+# Unknown values fall back to ``custom`` (operator binding: no behavior
+# change without explicit measurement).
+_CLAUDE_HTTP_CLIENT_MODE_CUSTOM = "custom"
+_CLAUDE_HTTP_CLIENT_MODE_STDLIB_DEFAULT = "stdlib_default"
+_CLAUDE_HTTP_CLIENT_MODES = frozenset({
+    _CLAUDE_HTTP_CLIENT_MODE_CUSTOM,
+    _CLAUDE_HTTP_CLIENT_MODE_STDLIB_DEFAULT,
+})
+
+
+def _resolve_http_client_mode() -> str:
+    """Resolve ``JARVIS_CLAUDE_HTTP_CLIENT_MODE`` to a member of the closed
+    taxonomy.  Unknown values fall back to ``custom`` per operator binding
+    (no behavior change for production without explicit measurement).
+    """
+    _raw = os.environ.get(
+        "JARVIS_CLAUDE_HTTP_CLIENT_MODE",
+        _CLAUDE_HTTP_CLIENT_MODE_CUSTOM,
+    ).strip().lower()
+    if _raw not in _CLAUDE_HTTP_CLIENT_MODES:
+        return _CLAUDE_HTTP_CLIENT_MODE_CUSTOM
+    return _raw
+
 
 def _derive_per_request_httpx_timeout(
     outer_budget_s: float,
@@ -5203,54 +5254,89 @@ class ClaudeProvider:
                 raise RuntimeError(
                     "claude_api_unavailable:anthropic_not_installed"
                 ) from _exc
-            _read_timeout = (
-                _CLAUDE_HTTP_READ_TIMEOUT_THINKING_S
-                if self._extended_thinking
-                else _CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S
-            )
-            _http_timeout = httpx.Timeout(
-                connect=_CLAUDE_HTTP_CONNECT_TIMEOUT_S,
-                read=_read_timeout,
-                write=_CLAUDE_HTTP_WRITE_TIMEOUT_S,
-                pool=_CLAUDE_HTTP_POOL_TIMEOUT_S,
-            )
-            # Transport Resilience Layer — explicit Limits + segmented
-            # Timeout. Constructing our own ``httpx.AsyncClient`` and passing
-            # it to the SDK as ``http_client=`` ensures the pool caps land
-            # on the actual transport, not just on a wrapper. Stale
-            # keepalives die fast (30s); pool stays bounded (10/5) so dead
-            # connections can't masquerade as connect timeouts under load.
-            _http_limits = httpx.Limits(
-                max_connections=_CLAUDE_HTTP_MAX_CONNECTIONS,
-                max_keepalive_connections=_CLAUDE_HTTP_MAX_KEEPALIVE,
-                keepalive_expiry=_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
-            )
-            _http_client = httpx.AsyncClient(
-                timeout=_http_timeout,
-                limits=_http_limits,
-            )
-            self._client = anthropic.AsyncAnthropic(
-                api_key=self._api_key,
-                http_client=_http_client,
-                # SDK-level retries hide signal and consume our timebox
-                # silently. We do our own visible retry in _call_with_backoff.
-                max_retries=0,
-            )
-            logger.info(
-                "[ClaudeProvider] anthropic client initialized "
-                "(connect=%.0fs read=%.0fs write=%.0fs pool=%.0fs thinking=%s "
-                "max_conn=%d max_keepalive=%d keepalive_exp=%.0fs "
-                "generation=%d)",
-                _CLAUDE_HTTP_CONNECT_TIMEOUT_S,
-                _read_timeout,
-                _CLAUDE_HTTP_WRITE_TIMEOUT_S,
-                _CLAUDE_HTTP_POOL_TIMEOUT_S,
-                "on" if self._extended_thinking else "off",
-                _CLAUDE_HTTP_MAX_CONNECTIONS,
-                _CLAUDE_HTTP_MAX_KEEPALIVE,
-                _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
-                self._client_generation,
-            )
+
+            # H1 falsification (Task #96, 2026-05-14) — gated client-mode
+            # selector.  Default ``custom`` preserves the construction-time
+            # httpx.AsyncClient + Limits per operator binding (no behavior
+            # change without explicit measurement).  ``stdlib_default``
+            # drops the custom http_client kwarg — uses SDK / httpx
+            # defaults exactly like the Step 2 isolation probe.  D2's per-
+            # request timeout override + ``max_retries=0`` are preserved
+            # in BOTH modes (D2 invariant: single retry authority is
+            # ``_call_with_backoff``).
+            _client_mode = _resolve_http_client_mode()
+
+            if _client_mode == _CLAUDE_HTTP_CLIENT_MODE_STDLIB_DEFAULT:
+                # H1 measurement mode — no construction-time httpx.Timeout,
+                # no Limits.  Reproduces the Step 2 probe's client shape
+                # exactly.  D2 per-request timeout (in _stream_kwargs /
+                # _create_kwargs) still binds connect/read/write/pool to
+                # the outer asyncio.wait_for budget; max_retries=0
+                # preserves the single-retry-authority invariant.
+                self._client = anthropic.AsyncAnthropic(
+                    api_key=self._api_key,
+                    max_retries=0,
+                )
+                logger.info(
+                    "[ClaudeProvider] anthropic client initialized "
+                    "(mode=stdlib_default — H1 falsification per Task #96; "
+                    "no custom http_client / Limits; D2 per-request "
+                    "timeout + max_retries=0 preserved; generation=%d)",
+                    self._client_generation,
+                )
+            else:
+                # Default ``custom`` mode — production byte-identical with
+                # pre-Task-#96.  Custom httpx.AsyncClient with explicit
+                # Timeout + Limits as previously documented above.
+                _read_timeout = (
+                    _CLAUDE_HTTP_READ_TIMEOUT_THINKING_S
+                    if self._extended_thinking
+                    else _CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S
+                )
+                _http_timeout = httpx.Timeout(
+                    connect=_CLAUDE_HTTP_CONNECT_TIMEOUT_S,
+                    read=_read_timeout,
+                    write=_CLAUDE_HTTP_WRITE_TIMEOUT_S,
+                    pool=_CLAUDE_HTTP_POOL_TIMEOUT_S,
+                )
+                # Transport Resilience Layer — explicit Limits + segmented
+                # Timeout. Constructing our own ``httpx.AsyncClient`` and
+                # passing it to the SDK as ``http_client=`` ensures the
+                # pool caps land on the actual transport, not just on a
+                # wrapper.  Stale keepalives die fast (30s); pool stays
+                # bounded (10/5) so dead connections can't masquerade as
+                # connect timeouts under load.
+                _http_limits = httpx.Limits(
+                    max_connections=_CLAUDE_HTTP_MAX_CONNECTIONS,
+                    max_keepalive_connections=_CLAUDE_HTTP_MAX_KEEPALIVE,
+                    keepalive_expiry=_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
+                )
+                _http_client = httpx.AsyncClient(
+                    timeout=_http_timeout,
+                    limits=_http_limits,
+                )
+                self._client = anthropic.AsyncAnthropic(
+                    api_key=self._api_key,
+                    http_client=_http_client,
+                    # SDK-level retries hide signal and consume our timebox
+                    # silently. We do our own visible retry in _call_with_backoff.
+                    max_retries=0,
+                )
+                logger.info(
+                    "[ClaudeProvider] anthropic client initialized "
+                    "(mode=custom; connect=%.0fs read=%.0fs write=%.0fs "
+                    "pool=%.0fs thinking=%s max_conn=%d max_keepalive=%d "
+                    "keepalive_exp=%.0fs generation=%d)",
+                    _CLAUDE_HTTP_CONNECT_TIMEOUT_S,
+                    _read_timeout,
+                    _CLAUDE_HTTP_WRITE_TIMEOUT_S,
+                    _CLAUDE_HTTP_POOL_TIMEOUT_S,
+                    "on" if self._extended_thinking else "off",
+                    _CLAUDE_HTTP_MAX_CONNECTIONS,
+                    _CLAUDE_HTTP_MAX_KEEPALIVE,
+                    _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
+                    self._client_generation,
+                )
         return self._client
 
     # ------------------------------------------------------------------
