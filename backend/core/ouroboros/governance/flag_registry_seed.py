@@ -490,6 +490,44 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Oracle ↔ Advisor cooperative yield (Task #88f, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_ORACLE_YIELD_TO_ADVISOR",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "When true, Oracle's _oracle_index_loop skips an "
+            "incremental_update poll cycle if Advisor blast scans are "
+            "in flight (get_advisor_busy_count() > 0).  Closes the "
+            "v14-rev10 graduation soak blocker where Oracle's 29k-file "
+            "main-tree polling contended with SWE op's Advisor blast "
+            "(4m 46s vs <2s when Oracle was quiet).  Bounded skip via "
+            "JARVIS_ORACLE_YIELD_MAX_CONSECUTIVE_SKIPS prevents "
+            "indefinite Oracle starvation."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/governed_loop_service.py",
+        example="true",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_ORACLE_YIELD_MAX_CONSECUTIVE_SKIPS",
+        type=FlagType.INT, default=10,
+        description=(
+            "Maximum consecutive yields before Oracle's "
+            "_oracle_index_loop forces an incremental_update regardless "
+            "of advisor busy state.  Prevents indefinite Oracle "
+            "starvation while still cooperating with hot-path SWE ops.  "
+            "At default 3min poll * 10 skips = 30min maximum yield "
+            "window before Oracle force-polls."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/governed_loop_service.py",
+        example="10",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Park continuation timeout — thinking-aware (Task #88d, 2026-05-13)
     # ====================================================================
     FlagSpec(

@@ -4982,10 +4982,69 @@ class GovernedLoopService:
             self._oracle = None
             return
 
-        # Incremental update loop — polls every oracle_incremental_poll_interval_s
+        # Incremental update loop — polls every oracle_incremental_poll_interval_s.
+        #
+        # Task #88f (2026-05-14) — cooperative yield to Advisor.
+        # v14-rev10 graduation soak proved: Oracle's full-tree
+        # incremental_update([]) contends with Advisor's blast-radius
+        # rglob+read_text scans on disk I/O.  Advisor scans for a SWE
+        # op's tiny worktree took 4m 46s when Oracle's main-tree poll
+        # was concurrent (vs <2s when Oracle was quiet).
+        #
+        # When the Advisor is actively running blast scans
+        # (``get_advisor_busy_count() > 0``), this loop SKIPS the
+        # heavy ``incremental_update([])`` call for this cycle only —
+        # it'll re-evaluate next poll interval.  Bounded by
+        # ``JARVIS_ORACLE_YIELD_MAX_CONSECUTIVE_SKIPS`` (default 10):
+        # after N consecutive skips, force a poll regardless to
+        # prevent indefinite starvation.  Master-flag-gated by
+        # ``JARVIS_ORACLE_YIELD_TO_ADVISOR`` (default ``true``) so
+        # operators can revert to legacy behavior with one env flip
+        # if any starvation regression appears.
+        _yield_enabled = (
+            os.environ.get("JARVIS_ORACLE_YIELD_TO_ADVISOR", "true")
+            .strip().lower() in ("true", "1", "yes", "on")
+        )
+        try:
+            _max_consec_skips = int(os.environ.get(
+                "JARVIS_ORACLE_YIELD_MAX_CONSECUTIVE_SKIPS", "10",
+            ))
+        except (TypeError, ValueError):
+            _max_consec_skips = 10
+        _consec_skips = 0
         while True:
             try:
                 await asyncio.sleep(self._config.oracle_incremental_poll_interval_s)
+                # Cooperative yield decision — Task #88f.  Read the
+                # advisor busy count via the official public surface
+                # (NOT executor._work_queue.qsize() which is private +
+                # fragile across Python versions, per operator binding).
+                if _yield_enabled and _consec_skips < _max_consec_skips:
+                    try:
+                        from backend.core.ouroboros.governance.operation_advisor import (
+                            get_advisor_busy_count,
+                        )
+                        _busy = get_advisor_busy_count()
+                    except Exception:  # noqa: BLE001 — defensive
+                        _busy = 0
+                    if _busy > 0:
+                        _consec_skips += 1
+                        logger.info(
+                            "[GovernedLoop] Oracle yielding to advisor "
+                            "(busy=%d, consec_skip=%d/%d) — Task #88f",
+                            _busy, _consec_skips, _max_consec_skips,
+                        )
+                        continue
+                # Either advisor idle, master flag off, or bounded-skip
+                # ceiling reached — run the poll.
+                if _consec_skips >= _max_consec_skips and _yield_enabled:
+                    logger.info(
+                        "[GovernedLoop] Oracle bounded-skip ceiling reached "
+                        "(%d/%d) — forcing incremental_update to prevent "
+                        "starvation",
+                        _consec_skips, _max_consec_skips,
+                    )
+                _consec_skips = 0
                 await self._oracle.incremental_update([])
             except asyncio.CancelledError:
                 await self._oracle.shutdown()
