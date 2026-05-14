@@ -6168,18 +6168,34 @@ class ClaudeProvider:
                         # Phase 1 (TTFT): generous default 120s for first
                         #   token.  Task #88 (2026-05-13) — widened to
                         #   360s when ``thinking=on`` is in the SDK
-                        #   kwargs.  Extended thinking emits
-                        #   thinking_delta events for the full reasoning
-                        #   phase, which ``stream.text_stream`` filters
-                        #   out — to a text-only consumer the stream
-                        #   appears silent for 3-5 minutes on complex
-                        #   prompts.  Empirically proven via v14-rev3/4/5
-                        #   soaks (0/30 Claude completions, all
-                        #   first_token=NEVER) + direct-host streaming
-                        #   probes showing API healthy.  The thinking-
-                        #   aware default keeps non-thinking callers at
-                        #   the legacy 120s.
+                        #   kwargs.
                         # Phase 2 (Inter-Chunk): tight 30s once tokens flow.
+                        #
+                        # Task #88e (2026-05-13) — raw-event consumption.
+                        # v14-rev9 proved the harness STOP condition:
+                        # 'first_token=NEVER bytes_received=0 elapsed=368.9s
+                        # thinking=on' even after all four budget layers
+                        # widened to 360s.  Standalone repro (task_88e_repro.py)
+                        # showed identical config + payload streams text in
+                        # 12s and thinking_delta in 0.001s — bug was the
+                        # SDK's ``stream.text_stream`` filter, which yields
+                        # ONLY content_block_delta(type='text_delta') events
+                        # to its consumer.  During the entire reasoning
+                        # phase Claude emits thinking_delta events instead;
+                        # text_stream consumer sees silence and the TTFT
+                        # wait_for fires falsely.
+                        #
+                        # Fix per operator binding 2026-05-13: 'no cancel
+                        # before first byte unless outer budget truly
+                        # expired'.  Consume raw events from the stream
+                        # iterator (which yields ALL events: message_start,
+                        # content_block_start, thinking_delta, ping,
+                        # text_delta, …).  Any event arrival resets the
+                        # TTFT wait_for — the model is producing.  Text is
+                        # extracted manually from content_block_delta
+                        # events whose delta.type == "text_delta".  Rupture
+                        # fires only on TRUE silence (no events of any
+                        # type for the rupture window).
                         _thinking_active = (
                             "thinking" in _stream_kwargs
                             and _stream_kwargs["thinking"] is not None
@@ -6189,15 +6205,18 @@ class ClaudeProvider:
                         )
                         _rupture_ic = _stream_inter_chunk_timeout_s()
                         _chunk_timeout = _rupture_ttft  # Phase 1
-                        _chunk_iter = stream.text_stream.__aiter__()
+                        # Task #88e: raw-event iterator instead of text_stream.
+                        # The wait_for now measures stream-level silence,
+                        # not text-only silence.
+                        _event_iter = stream.__aiter__()
                         # Phase-Aware Heartbeat counter — every Nth chunk
                         # pulses the harness ActivityMonitor so long
                         # GENERATEs stay observably fresh.
                         _stream_chunk_count = 0
                         while True:
                             try:
-                                text = await asyncio.wait_for(
-                                    _chunk_iter.__anext__(),
+                                _event = await asyncio.wait_for(
+                                    _event_iter.__anext__(),
                                     timeout=_chunk_timeout,
                                 )
                             except StopAsyncIteration:
@@ -6210,7 +6229,7 @@ class ClaudeProvider:
                                 )
                                 logger.error(
                                     "[ClaudeProvider] STREAM RUPTURE "
-                                    "(phase=%s): no chunk for %.0fs "
+                                    "(phase=%s): no event for %.0fs "
                                     "(elapsed=%.1fs, bytes=%d, "
                                     "tool_round=%s, thinking=%s)",
                                     _rupt_phase,
@@ -6227,7 +6246,26 @@ class ClaudeProvider:
                                     rupture_timeout_s=_chunk_timeout,
                                     phase=_rupt_phase,
                                 )
-                            # Token received — process it.
+                            # Task #88e — Extract text only from text_delta
+                            # events.  Non-text events (thinking_delta,
+                            # ping, message_start, content_block_start,
+                            # content_block_stop, …) count as activity:
+                            # they keep the wait_for fresh on the next
+                            # iteration and don't fire the rupture.
+                            text = ""
+                            _ev_type = getattr(_event, "type", "")
+                            if _ev_type == "content_block_delta":
+                                _delta = getattr(_event, "delta", None)
+                                if _delta is not None and getattr(
+                                    _delta, "type", "",
+                                ) == "text_delta":
+                                    text = getattr(_delta, "text", "") or ""
+                            if not text:
+                                # Activity-only event (thinking, ping, etc).
+                                # Loop to next __anext__() — wait_for resets
+                                # naturally because we re-enter the await.
+                                continue
+                            # Text token received — process it.
                             if _stream_first_token_at[0] is None:
                                 _stream_first_token_at[0] = time.monotonic()
                                 _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
