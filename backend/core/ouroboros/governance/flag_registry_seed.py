@@ -490,6 +490,35 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Fallback min-guaranteed floor — thinking-aware (Task #88c, 2026-05-13)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_FALLBACK_MIN_GUARANTEED_THINKING_S",
+        type=FlagType.INT, default=360,
+        description=(
+            "Floor (in seconds) for the Claude fallback budget when "
+            "thinking is enabled.  The non-thinking floor remains "
+            "_FALLBACK_MIN_GUARANTEED_S=90 (env "
+            "OUROBOROS_FALLBACK_MIN_GUARANTEED_S).  v14-rev7 surfaced "
+            "the third budget layer: even with Task #88 (inner 360s) "
+            "and #88b (outer _max_cap 360s) widened, the actual Claude "
+            "timeout was 90s because the DW cascade had already consumed "
+            "~140s of the ~200s op deadline; the post-acquire refresh "
+            "floor of 90s was the binding constraint.  Promoting the "
+            "floor to 360s for thinking-on closes the single-policy "
+            "invariant: thinking floor >= max(inner, outer) = 360s.  "
+            "Operator binding 2026-05-13: 'Claude-floor reservation "
+            "against op global deadline — DW cannot force Claude below "
+            "the floor.'  Non-thinking IMMEDIATE routes keep the 90s "
+            "default floor unchanged."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/candidate_generator.py",
+        example="360",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # Fallback outer-budget — thinking-aware cap (Task #88b, 2026-05-13)
     # ====================================================================
     FlagSpec(

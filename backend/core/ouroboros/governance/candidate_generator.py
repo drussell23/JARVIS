@@ -4006,7 +4006,40 @@ class CandidateGenerator:
                 # outer wait_for is the absolute Iron Gate. ``_max_cap`` is
                 # the route-aware ceiling computed at acquire time (180s
                 # for complex, 120s otherwise).
-                _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
+                #
+                # Task #88c (2026-05-13) — thinking-aware floor reservation.
+                # v14-rev7 proved the third budget layer: even with Task #88
+                # (inner 360s) and #88b (outer _max_cap 360s) widened, the
+                # actual Claude timeout was 90s because the DW cascade had
+                # already consumed ~140s of the ~200s op deadline. The post-
+                # acquire refresh's floor (_FALLBACK_MIN_GUARANTEED_S=90s)
+                # was the binding constraint — and 90s is nowhere near the
+                # 360s thinking-on inner/outer single-policy floor.
+                #
+                # Fix: when the call is likely-thinking (signal reused from
+                # Task #88b, computed earlier in this method), promote the
+                # floor to JARVIS_FALLBACK_MIN_GUARANTEED_THINKING_S (default
+                # 360s, matching the #88/#88b inner+outer caps).  Same env-
+                # tunable pattern.  Single-policy invariant the spine pins:
+                # thinking floor >= max(inner, outer) for thinking-on calls.
+                #
+                # NOTE: the floor is OVERRIDDEN by ``_max_cap`` via the
+                # subsequent ``min(..., _max_cap)``, so as long as #88b's
+                # _max_cap=360 lands first, the math is:
+                #   _budget_target = max(60.1s remaining, 360s floor) = 360s
+                #   remaining = min(360s budget_target, 360s _max_cap) = 360s
+                # Claude gets a guaranteed 360s, even when parent_remaining
+                # was nearly exhausted by the DW cascade.  This is the
+                # "Claude-floor reservation against op deadline" the operator
+                # binding mandates — DW cannot force Claude below the floor.
+                _min_guaranteed_s = (
+                    float(os.environ.get(
+                        "JARVIS_FALLBACK_MIN_GUARANTEED_THINKING_S", "360.0",
+                    ))
+                    if _likely_thinking
+                    else _FALLBACK_MIN_GUARANTEED_S
+                )
+                _budget_target = max(_parent_remaining, _min_guaranteed_s)
                 remaining = min(_budget_target, _max_cap)
                 _refreshed = remaining > _parent_remaining + 1.0
 
@@ -4026,10 +4059,11 @@ class CandidateGenerator:
                     logger.info(
                         "[CandidateGenerator] Fallback: budget=%.1fs REFRESHED "
                         "(parent=%.1fs, guaranteed_min=%.0fs, cap=%.0fs, "
-                        "sem_wait=%.1fs)",
+                        "sem_wait=%.1fs, thinking=%s)",
                         remaining, _parent_remaining,
-                        _FALLBACK_MIN_GUARANTEED_S, _max_cap,
+                        _min_guaranteed_s, _max_cap,
                         _sem_wait_s,
+                        "yes" if _likely_thinking else "no",
                     )
                     deadline = datetime.now(tz=timezone.utc) + timedelta(
                         seconds=remaining,
