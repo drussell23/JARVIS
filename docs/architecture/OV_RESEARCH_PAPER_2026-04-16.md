@@ -9,6 +9,7 @@ date: "2026-04-16"
 
 > **Prepared by:** Derek J. Russell
 > **Report date:** 2026-04-16
+> **Last updated:** 2026-05-13 — see **§92. Recent Developments (April 17 – May 13, 2026)** for arcs landed since the 2026-04-16 stamp. The original §1–§91 substrate is unchanged; §92 is appended per the addendum policy in Appendix F.
 > **Repository:** `github.com/drussell23/JARVIS-AI-Agent`
 > **Canonical technical reference:** `docs/architecture/OUROBOROS.md` (2,774 lines)
 > **This paper:** research-paper treatment of the above — plain-English explanation, analogies, architectural narrative, visual diagrams, honest evidence-backed claims.
@@ -4437,7 +4438,154 @@ not merely structurally plausible.
 
 ---
 
-# Appendices
+## §92. Recent Developments (April 17 – May 13, 2026)
+
+> **Big Picture.** The original 2026-04-16 stamp captured O+V as a system that had just proven end-to-end autonomous APPLY (Session W, 2026-04-15). The four weeks since have been a transition from *proving capability exists* to *graduating capability into the default-on substrate, and adding the operator-visible surface layer that makes a proactive system legible.* No claim in §1–§91 has been retracted; the additions below extend rather than amend the substrate. The same audit-trail discipline applies — every arc cited here has a regression test count, a graduation date, and a memory-file under `memory/project_*.md`.
+
+This addendum is intentionally dense: the four-week window covers ~40 distinct shipping events, including the **closure of the last structural-engineering arc** on the §35 / §3.6.3 / §37 PRD tables (2026-05-09) and the **start of the Phase 9 flag-graduation cadence** (2026-05-05). It is grouped thematically rather than chronologically; per-arc detail lives in the indexed memory files.
+
+---
+
+### §92.1 Phase B Subagent Family — Graduated Default-True (2026-04-20)
+
+All four Phase B subagents shipped to default-on in a single day, with 138 regression tests green at arc close:
+
+- **EXPLORE** — read-only context-expansion subagent.
+- **REVIEW** — pre-APPLY semantic critique under `JARVIS_REVIEW_SUBAGENT_SHADOW=true` (shadow-mode by default).
+- **PLAN** — parallel-edge planning shadow + default-on. Multi-file ops measured at ~4× wall-clock speedup.
+- **GENERAL** — infrastructure-only subagent gated by the **Semantic Firewall** (`semantic_firewall.py`): 11 injection detectors, 5 credential shapes, recursion ban, output quarantine fence, hard-kill wrapper. Paired with the **mutation cage** (`scoped_tool_backend.py`) — per-instance mutation counter + budget as a structural COUNT gate (second-rejection after the type gate, `POLICY_DENIED reason=mutation_budget_exhausted`). The `state_mirror` dict preserves `exec_trace` across hard-kill so the audit survives the cage. LLM driver master flag `JARVIS_GENERAL_LLM_DRIVER_ENABLED` graduated default-TRUE.
+
+Phase C Slices 1a+1b + Epochs 1+2 landed the same day. Detail: `memory/project_phase_b_subagent_roadmap.md`, `project_phase_c_general_llm_driver.md`.
+
+### §92.2 Sensor Event-Primary Campaign + IDE Observability Surface (2026-04-20)
+
+**Gap #4** closed: 9 of 13 sensors are now event-primary, 4 retained on polling by design (RuntimeHealth, WebIntelligence, ProactiveExploration, Scheduled — architectural, not deferred). Webhook transport for GitHub/CI; `TrinityEventBus` `fs.changed.*` for filesystem sensors (TestFailure, TodoScanner, Backlog, OpportunityMiner) with a layered storm-guard; conversation-bus for IntentDiscovery. The `EventChannelServer` exposes multi-surface (`/webhook/github`, `/webhook/ci`) and per-sensor telemetry on `/channel/health`. ~120 tests.
+
+The **IDE Observability** surface (Gap #6) graduated the same day across two slices:
+
+- **Slice 1** (`ide_observability.py`): read-only `GET /observability/{health,tasks,tasks/{op_id}}`. Loopback-only + 120/min/IP rate limit + CORS allowlist + `schema_version: "1.0"`. Authority invariant grep-enforced — the route module has no orchestrator/policy/iron_gate imports. 41 tests.
+- **Slice 2** (`ide_observability_stream.py`): SSE at `GET /observability/stream`, 10 event types, bounded (8 subscribers × 64 queue × 512 history × 15s heartbeat). Drop-oldest → single `stream_lag` per window. `Last-Event-ID` replay. 49 tests.
+
+VS Code, Cursor, Sublime, and JetBrains extensions consume the same SSE stream (CSP-hardened webview, exp-backoff+jitter reconnect, bounded LRU, poll fallback). 35 TS + 27 Sublime + 28 Kotlin tests.
+
+### §92.3 Wave 1 — Three Default-True Substrates Same Day (2026-04-21)
+
+Three substrates that had been shadow-mode since the 2026-04-16 stamp graduated default-TRUE in a single coordinated wave:
+
+1. **DirectionInferrer + StrategicPosture** (`direction_inferrer.py`, `posture*.py`). Deterministic signal→posture metacognition: 4-value vocabulary (`EXPLORE`/`CONSOLIDATE`/`HARDEN`/`MAINTAIN`) from 12 ambient signals, zero LLM cost. `PostureObserver` runs on a 300s cadence with 900s hysteresis + 0.75 confidence bypass + overrides clamped to 24h. Durable triplet at `.jarvis/posture_{current,history,audit}.jsonl` — the audit file is append-only per Manifesto §8. Four surfaces: CONTEXT_EXPANSION prompt injection, `/posture` REPL verb, `GET /observability/posture{,/history}`, SSE `posture_changed`.
+2. **SensorGovernor + MemoryPressureGate** (`sensor_governor.py`, `memory_pressure_gate.py`). Global op-emission cap across the 16 sensors weighted by posture + advisory memory-pressure gate for L3 fan-out. Rolling window, 200 global ops/hour, weighted cap = `base × posture_weight × urgency_multiplier`. Emergency brake at `cost_burn>0.9` OR `postmortem_rate>0.6` → 20% caps. Stdlib probe cascade (psutil → meminfo → vm_stat) with a 4-level enum.
+3. **FlagRegistry + /help dispatcher** (`flag_registry.py`, `help_dispatcher.py`). Typed registry for 481+ `JARVIS_*` env flags (52 curated seed), each carrying type + category (8 slots) + source_file + example + posture-relevance (CRITICAL/RELEVANT/IGNORED). Bounded Levenshtein typo detection (`JARVIS_POSTUR_ENABLED` → suggests `JARVIS_POSTURE_ENABLED`).
+
+The three are wired in series: FlagRegistry seeds 13 governor flags automatically; the governor consumes posture-weights from DirectionInferrer; both feed the IDE observability surface from §92.2. Detail: `memory/project_direction_inferrer_graduation.md`, `project_sensor_governor_graduation.md`, `project_flag_registry_graduation.md`.
+
+### §92.4 Battle-Test Harness Hardening + Adversarial Cage (2026-04-23 / 2026-04-27)
+
+The harness (`battle_test/harness.py`) gained three structural guards on 2026-04-23 (Wave 2 / Tickets A1+B+C):
+
+- **`--max-wall-seconds`** (env `OUROBOROS_BATTLE_MAX_WALL_SECONDS`): hard wall-clock ceiling, fires `stop_reason=wall_clock_cap` when exceeded. Opaque to any activity signal so it cannot be defeated by provider retry storms that reset the per-op liveness counter — the exact failure mode that hung session #7 GENERATE S2 for 67+ min. Graduation soaks now set this (typical 2400s for ~2× safety margin over the 850–1300s happy-path).
+- **`--headless`** (env `OUROBOROS_BATTLE_HEADLESS`): skips the `SerpentREPL` input task. Agent-conducted soaks, CI, and daemons set this (or rely on auto-detect via `not sys.stdin.isatty()`). Replaces the deprecated `tail -f /dev/null | python3 ...` stdin-guard idiom.
+- **Signal handling**: SIGHUP / SIGINT / SIGTERM install handlers + SIGPIPE is ignored. On any of those signals the harness writes a partial `summary.json` with `session_outcome=incomplete_kill` + signal-specific `stop_reason` before the shutdown event fires. Schema is v1.1b (additive — `schema_version` stays 2). Closes the failure class where externally-killed sessions left only `debug.log` and no auditable artifact.
+
+The **Adversarial Cage** (Phase 9.4) landed 2026-04-27: **0/38 escapes, 12/38 documented gaps**. The cage exercises the Iron Gate + Semantic Guardian + Anti-Venom recursion-bound against 38 hand-authored adversarial inputs (prompt injection, recursion attempts, credential exfiltration shapes, AST evasion via Unicode confusables, etc.). Zero escapes — the documented gaps are predicted detection-gaps, not active vulnerabilities. The §35 #2 / §3.6.3 #2 stale-row sync shipped alongside (`memory/project_section_37_tier1_3_ledger_flock.md`).
+
+### §92.5 CLI / UX Identity Layer — Five Major Surfaces Same Day (2026-05-04)
+
+The single highest-throughput shipping day of the four-week window. Five operator-visible surfaces graduated default-TRUE same day, each with its own master kill switch and verbatim legacy-path preservation for byte-identical rollback:
+
+1. **ToolRenderRegistry** (`battle_test/tool_render_{registry,policy,store,view}.py`). Descriptor-driven adaptive tool-result rendering replacing two hardcoded `if/elif` paths. Closed taxonomies: `BodyShape` (6), `ToolStatus` (4), `DensityLevel` (3), `LayoutKind` (3). Declarative `(Posture × LayoutKind) → DensityLevel` table covering all 12 cells. `BoundedBodyStore` ring with monotonic `t-N` refs (no reuse) + drop-oldest eviction. 3 AST pins + 275 regression tests.
+2. **Presentation Restraint** (`battle_test/{presentation_restraint,repl_completion,repl_input_polish}.py`). CC-style aesthetic restraint applied to O+V's CLI while preserving identity. Boot redesign (~10-line `Rich.Panel` vs legacy ~30-line dashboard). Color discipline (`chrome_color()` returns `dim` under restraint so green stays reserved for outcomes). **Load-bearing TTY-gate fix**: `should_render()` now checks `sys.__stdout__` (the unpatched original) instead of `sys.stdout.isatty()` which fails under `patch_stdout(raw=True)` — the silent reason the Gap #1 status line never surfaced before. Auto-discovered slash palette (27 verbs via `inspect.getmembers`). `@filepath` mention extraction. OSC 0 terminal title. 198 regression tests.
+3. **NarrativeChannel** (`battle_test/narrative_channel.py` + `narrative_renderer.py`). Makes O+V's proactive intelligence legible via the model's voice surface. Closes the operator-flagged "silent black box" gap. Closed `NarrativeKind` (6) taxonomy: `INTENT` / `PLAN_PROSE` / `TOOL_PREAMBLE` / `THINKING` / `L2_REPAIR_PROSE` / `POSTMORTEM_PROSE` (later extended to 7 with `DREAM`, see §92.7). Three operator-facing surfaces: `op_started` fires a fire-and-forget bounded LLM call (Tier 0 DW, 50-token cap, 5s timeout, hard-fail-silent) for "I'm going to do X" intent prose; `op_tool_start` synthesizes a deterministic 1-sentence WHY (per-tool descriptor table, no LLM cost) when the model omits a preamble; closed-table visual hierarchy distinguishes model voice from system actions. 175 regression tests.
+4. **Live Status Line + Collapsible Op Blocks** (`battle_test/{live_status_line,op_block_buffer}.py`). Closes the original UX audit's Gap #1 (no persistent status line during generation) + Gap #3 (no collapsible op blocks). Gap #5 was re-diagnosed as a phantom — `patch_stdout(raw=True)` already handled async output interleaving during typing; what was missing was the status line itself. `OpBlockBuffer` adds a per-op FIFO ring with monotonic `o-N` refs (env: `JARVIS_OP_BLOCK_BUFFER_SIZE`, default 50) + active-index pruning on eviction. Unified `/expand <ref>` REPL verb dispatches across all three artifact substrates by ref prefix (`t-N` → tool bodies, `d-N` → diffs, `o-N` → op blocks). 108 regression tests.
+5. **IDE-native ReviewBranch** (`battle_test/diff_archive.py` + `governance/review_branch_manager.py`, `review_coordinator.py`). Replaces the 5s Rich overlay → auto-apply path for Yellow-tier (`NOTIFY_APPLY`) ops with non-destructive git preview branches (`hash-object` + `commit-tree` + `branch` plumbing — **never** touches working tree, HEAD, or operator's index) that VS Code's source-control panel surfaces natively. Closed taxonomies: `DiffOutcome` (5), `VerifyOutcome` (4), `ReviewState` (5), `ReviewDecision` (5). `DiffArchive` ring with monotonic `d-N` refs (env: `JARVIS_DIFF_ARCHIVE_SIZE`, default 30) carries full lifecycle audit. Default 300s timeout → auto-REJECT (env: `JARVIS_REVIEW_TIMEOUT_S`; `=0` opts back to legacy auto-apply). 4 SSE event types. 167 regression tests.
+
+Detail: `memory/project_gap_2_tool_render_registry.md`, `project_gap_7_presentation_restraint.md`, `project_gap_6_narrative_channel.md`, `project_gap_135_live_status_collapse.md`, `project_gap_4_review_branch.md`.
+
+### §92.6 §37 Operator UX/UI Tier 1 Arc — Fully Closed (2026-05-05)
+
+All 9 Tier 1 UX slices shipped end-to-end same day with 278/279 tests green. 5 new operator-facing REPL verbs (`/health`, `/listen`, `/why_changed`, `/show_plan`, `@mention` completion); 3 new SSE event types (`cost_band_crossed`, `plan_generated`, `circuit_breaker_approaching`); 22 AST pins; 9 singleton/read-API extensions; **0 edits to `repl_dispatch_registry.py`** (naming-cage automatic). Two **pattern crystallization candidates** emerged for the §33 pattern catalog: (1) the *Singleton + Read-API Extension Pattern* (applied 8×); (2) the *Chatter-Suppressed Band Observer Pattern* (applied 2× — cost band + circuit breaker, both reusing the same `CostBand` 5-value enum). All six §37.9 identity-preservation invariants honored. ~14h elapsed total under the §37.7 estimate of ~20h. Detail: `memory/project_section_37_tier_1_complete.md`.
+
+§37 Tier 2 #10 (**Temporal Observability** — `--rerun-from <session>:<phase>` + `/replay` REPL) shipped on the same day as a thin-wrapper single-slice (~2h actual vs ~3d audit-estimated, 90%+ savings via composition). The `CausalityDAG` gained three read-API helpers (`nodes_for_phase` / `first_record_in_phase` / `distinct_phases` — 138/138 DAG core still green). 28 tests, 306/307 §37 sweep green. Closes §36.4 Priority #2.
+
+### §92.7 §38.11 Proactive Intelligence + §39 Embodied Surfaces (2026-05-07 → 2026-05-09)
+
+Thirteen slices across two adjacent arcs, all default-FALSE per Phase 9 cadence discipline (the substrate is in place; flag-graduation follows on the cron schedule, see §92.9).
+
+**§38.11 — Proactive Intelligence (six slices):**
+
+- **B** — `session_continuity.py`: graduation ticker + cross-session memory diff.
+- **C** — `anticipation_surface.py`: proactive intervention banners + anticipatory pre-fetch. `BannerKind` (4) + `PrefetchKind` (5) closed enums.
+- **D** — `introspective_voice.py`: extends the canonical `NarrativeKind` 6 → 7 (DREAM 🌙 added). Composes 4-axis aggregator over the canonical channel via `frames_by_op_kind` / `find_by_kind`.
+- **E** — `proactive_proposal_surface.py`: unifies four canonical autonomy producers (curiosity / capability_gap / opportunity / architecture) via a `signal_source` field. Deterministic `sha256[:12]` proposal_id. Closed `ProposalKind` (4) + `ProposalDecision` (4) lifecycle. Optional flock'd JSONL persistence at `.jarvis/proactive_proposals.jsonl`.
+- **F** — `capability_constellation.py`: final §38.11 slice; composes canonical `flag_registry` + `graduation_dashboard` + manifesto map. Five-value `ConstellationBrightness` pinned 1:1 to `UnifiedGraduationVerdict`. Eight-value `Category` reused as axis (no parallel taxonomy).
+
+**§39 — Embodied & Predictive Surfaces (seven tiers):**
+
+- **Tier 1** — `risk_tier_tint.py` + `phase_flow_ribbon.py`: composes canonical `organism_status` + `pipeline_progress` 11-phase forward-flow. Five-value `DensityLevel`.
+- **Tier 2** — `organism_dashboard.py` + `cognitive_heatmap.py`: Mission Control mode. `organism_dashboard` is a pure composer reusing all 8 canonical pane render-surfaces via bytes-pinned `_PANE_COMPOSERS` dispatch.
+- **Tier 3** — `op_trajectory_predictor.py` + `risk_command_preview.py`: predictive surfaces. Four-value `TrajectoryConfidence` + bytes-pinned thresholds 0.70 / 0.40 + variance-tightness scoring. Synthetic `_PreviewContext` duck-typed for `classify()` (no `OperationContext` clone).
+- **Tier 4** — `session_story.py` + `memory_crystallization.py`: introspective surfaces. Reads `.jarvis/ouroboros/consciousness/insights.jsonl` directly with 4-value `CrystalAge` + bytes-pinned canonical categories (no `MemoryEngine` import — async-cage purity).
+- **Tier 5** — four embodied surfaces: `architecture_viz` (8-zone bytes-pinned to CLAUDE.md), `confidence_aura` (composes `ConfidenceTrace.margin` with bytes-pinned thresholds — **zero parallel logprob math**), `attention_mirror` (composes broker `recent_history` + `narrative_channel`), `procedural_portrait` (deterministic ASCII face from canonical mood + posture + heartbeat).
+- **Tier 7** — `phase_orchestra.py`: composes canonical `pipeline_progress` 11-phase tuple via modular arithmetic on `phase_index` → 8-value `OrchestraNote` (canonical solfège octave) + 4-value `CueIntensity`. **No hardcoded per-phase mapping.**
+
+Cumulative tests at arc close: 977 / 977 green.
+
+### §92.8 Structural Engineering Vector Closures (2026-05-09)
+
+The **last structural-engineering arc** on the §35 / §3.6.3 / §37 PRD tables closed on 2026-05-09. The closure of §35 row #4 — **Cross-runner artifact contract** (`governance/artifact_contract.py`, ~530 LOC pure-stdlib) — was the terminal item; the autonomy arc then transitioned to operator-paced Phase 9 cadence with no further structural-engineering items in the relevant tables. New substrate ships a closed 10-value `ArtifactKind` taxonomy mirroring `PhaseContext` slots 1:1 + closed 6-value `ValidationOutcome` + frozen `ArtifactSpec` registry (10 entries with per-artifact `schema_version` + duck-typed `validate_value` callable + producer/consumer phase sets). Wired at a single choke point (`phase_dispatcher.py:828`, AST-pinned) before `pctx.merge_artifacts`. Catches four violation classes: `UNKNOWN_KEY` rename / `TYPE_MISMATCH` shape drift / `WRONG_PRODUCER` phase ownership / `SCHEMA_VERSION_SKEW`. 32 regression tests + **1147 / 1147 cumulative** at arc close.
+
+Five Vector closures landed alongside:
+
+- **Vector #5 Part A** — `cross_session_harness.py`: composes four canonical cross-session memory surfaces (UserPreferenceStore + AdaptationLedger + SemanticIndex + LastSessionSummary) with 4-value `CoherenceAxis` + 4-value `DriftLevel`. Deterministic per-axis `sha256[:16]` digests. 40 tests.
+- **Vector #5 Part B** — Phase 8 producer wiring at 3 minimal-touch sites (route_runner / semantic_triage / phase_dispatcher). `Vector #11` monotonic-clock discipline preserved.
+- **Vector #9** — mask-discipline consumer-chain pin. AST allowlist-pin walks `backend/` for `.prev_value` / `.next_value` access; bytes-pinned 2-entry allowlist.
+- **Vector #10** — AutoCommitter `async_flock_critical_section` TOCTOU wrap verified + strengthened. True cross-process race coverage via `multiprocessing.Process`.
+- **Vector #11** — CuriosityScheduler `_fire_history_mono` + `_last_fire_mono` via `time.monotonic()` drives all gating; wall-clock preserved as `ts_epoch` audit. Closes NTP-skew vulnerability.
+
+### §92.9 Phase 9 Graduation Cadence — Begins (2026-05-05)
+
+The post-arc graduation cadence began 2026-05-05 with the first flag graduated default-TRUE: **`JARVIS_DECISION_TRACE_LEDGER_ENABLED`**. Cron installed on a 12h cadence (00:00 / 12:00 PDT, 2 fires/day, ~$1/day max cost). All five Slice substrates were empirically validated under real provider conditions before cron install — every diagnostic event triggered halt-discipline: two pre-Slice-4 runner soaks halted cron install → diagnosed → shipped Slice 4 + Slice 5 → re-proved green → **then** installed cron.
+
+Calendar: 24 flags × 3 clean soaks ÷ 2 fires per day = ~36 days minimum, realistic 6–9 weeks with noise. The cadence is operational and self-pacing. Detail: `memory/project_phase_9_cadence_run_log_2026_05_05.md`.
+
+### §92.10 Live-Fire Cadence Debug Arc (2026-05-10)
+
+A 5+ hour debug arc on 2026-05-10 closed four distinct structural layers in the live-fire soak harness:
+
+- **Layer 1** — `.env` not loading. Wrapper now sources via a bash 3.2-portable `case`/glob loader.
+- **Layer 2** — `--once` bypassed wrapper. Now delegates to `WRAPPER_SCRIPT`, eliminating the duplicate env-block (one source of truth for cron + launchd + `--once` + manual).
+- **Layer 3** — `JARVIS_TOPOLOGY_SENTINEL_ENABLED` defaults FALSE → v1 yaml `dw_allowed:false` blanket-blocks DW. The YAML was purposely purged in Phase 12 Slice E but the sentinel-flag gate was never set in cadence path.
+- **Layer 4** — `httpx 0.28+` requires `socksio` when parent has a `socks5h://` tunnel. First attempt stripped the proxy and broke DNS — the correct structural fix is to **install** `socksio`, not strip the proxy. Pinned `socksio==1.0.0` in `requirements.txt`.
+
+All four fixes preserve operator-override discipline, use portable bash, and compose existing canonical primitives. Layer 5 (topology blanket-block under load — 75% block rate even with all four Layer 1–4 fixes) and Layer 6 (0-cost session-id linkage failure → outcome=infra session=unknown when battle-test wall-clock cap hits before atexit writes summary.json) were deferred to fresh-eyes investigation (v2.87 + v2.88 — both subsequently closed). Detail: `memory/project_v2_86_cadence_connectivity.md`.
+
+### §92.11 Updated Topline & §89 Limitations Revisited
+
+As of 2026-05-13:
+
+- **3.2M LOC** Trinity ecosystem (JARVIS / J-Prime / Reactor-Core).
+- **2.9M LOC** JARVIS repository, **620K LOC** Ouroboros + Venom governance core.
+- **7,687+** commits on the autonomous path since 2025-02-20.
+- **23,000+** governance tests at master-green.
+- **521+** AST-pin structural invariants.
+- **481+** typed `JARVIS_*` env flags in `FlagRegistry` (52 curated seed).
+- **1,147** cumulative tests at the §35 arc-close gate (2026-05-09); subsequent waves track against this baseline.
+
+§89 limitations revisited (verbatim numbering from §89.1–§89.6):
+
+- **§89.4 — Visual VERIFY graduation:** auto-demotion at ≥50% post-graduation FP shipped. Visual VERIFY is now a first-class post-APPLY pre-COMPLETE check with a 3-tier trigger (target_files glob / plan ui_affected / risk-based fallback). Deterministic battery (first-miss-wins: app_crashed / blank_screen / hash_unchanged / hash_scrambled). TestRunner-red clamps a pass to fail (asymmetric). Model-assisted advisory via injectable VLM + AdvisoryLedger.
+- **§89.1 — §89.3, §89.5 — §89.6:** still open. The Ferrari TTY-lifetime gap (§89.1) and the multi-page PDF page-level reasoning gap (§89.6) remain operator-visible. PDF support on non-Claude providers (§89.5) is now partially addressed by the multi-modal ingest convergence (`unified_intake_router` hoist), though full DW PDF-block parity remains future work.
+
+### §92.12 Open Questions — The MSE-AI Direction
+
+The four-week window covered here closes the *engineering* arc: the substrate is now both behaviorally proven (Sessions A–W in §42–§47) and structurally graduated (Phase 9 cadence in §92.9). What remains open is the *formal* arc — converting the empirical claims of §1–§91 into mathematically proven theorems. Specifically:
+
+1. **Iron Gate determinism** (§22) is empirically zero-escape across 38 adversarial inputs (§92.4) — the open question is whether this can be proven as a formal property of the AST-validation operator over the space of generated patches, in the framework of certifiably robust networks (Wong et al., PRECISE).
+2. **Anti-Venom recursion-bound** (§30) is empirically stable across the L2 / L3 / GENERAL composition — the open question is whether the bounded-RSI claim can be formalized against Wang's Markov-chain RSI formulation (`arXiv:1805.06610`), extended into the non-stationary, multi-repository, memory-augmented setting that O+V actually inhabits.
+3. **Reverse Russian Doll containment** (§3, §50) is empirically intact across the four-week window — the open question is whether the thermodynamic-entropy formulation in the working dissertation thesis can be formalized as a sufficient condition for bounded RSI, against the SICA pattern (ICLR 2025, `arXiv:2504.15228`) and the Anthropic ASL-4 safeguard framework.
+
+These three are the substantive open questions the engineering substrate now demands. They are the gap that the MSE-AI program is positioned to close — and the gap that this paper, with §92, brings up to current state.
+
+---
 
 ## Appendix A — Glossary for Non-Technical Readers
 
