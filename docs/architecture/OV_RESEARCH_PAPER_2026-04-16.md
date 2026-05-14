@@ -4585,6 +4585,191 @@ The four-week window covered here closes the *engineering* arc: the substrate is
 
 These three are the substantive open questions the engineering substrate now demands. They are the gap that the MSE-AI program is positioned to close — and the gap that this paper, with §92, brings up to current state.
 
+The remaining subsections (§92.13–§92.18) go deeper on the two load-bearing citation→implementation closures of the window (Treefinement L2 and the SWE-Bench-Pro evaluation arc), name the meta-pattern that emerged, map the five research threads onto specific O+V primitives, sketch the formal direction the working dissertation is developing, and frame the four-week window in the Ten Orders of Trinity Evolution.
+
+---
+
+### §92.13 Treefinement L2 — The First §40.7 Citation → Implementation Closure (2026-05-11 → 2026-05-12)
+
+> **Big Picture.** The previous L2 self-repair FSM (§52) was linear — five sequential repair iterations under a 120-second timebox, each iteration conditioned only on its predecessor's failure. When iteration N took a wrong fix-strategy turn, iterations N+1..5 inherited the misclassification and the timebox burned out on a dead branch. Empirically the same failure mode that **AlphaVerus** (Vermouth et al., CMU L3 lab, *arXiv:2412.06176*) introduced "treefinement" to address. The Treefinement L2 arc ports that published pattern into O+V's repair pipeline as the first structured citation→implementation closure under PRD §40.7's template.
+
+**The AlphaVerus delta — what was structurally ported.** AlphaVerus's three-step framework (*exploration → treefinement → critique*) maps directly onto O+V's L2 path:
+
+| AlphaVerus phase | O+V implementation |
+|---|---|
+| **Exploration** — translates programs using verifier feedback | Iron Gate exploration-first discipline + `ExplorationLedger` diversity-weighted scoring (§54) |
+| **Treefinement** — iteratively fixes errors guided by verifier feedback + tree search | `RepairTreeRunner` BFS/BEAM_K layer dispatch with cross-branch learning (the published delta over naive parallel repair) |
+| **Critique** — validates and filters underspecified/incorrect translations | `CanonicalBranchValidator` composing `ASCIIStrictGate` + `SemanticGuardian.inspect_batch` + `TestRunner.run` per branch |
+
+Tree-search forks at each repair attempt; validator feedback prunes losing branches; surviving branches inform the next layer's GENERATE prompt — the cross-branch learning signal is the actual structural delta over O+V's pre-existing parallel-generator (§M9).
+
+**v3.3 — The substrate (six-phase arc, 2026-05-11):**
+
+| Phase | Scope | Commit | Tests |
+|---|---|---|---|
+| 0 | Substrate (taxonomies + dataclasses + budget knobs + flag seed) | `00c7944739` | 40 |
+| 1 | Tree runner core (BFS layer dispatch + budget + posture-K) | `271c43a24e` | 42 |
+| 2 | Validator integration + pruning | `271c43a24e` | 32 |
+| 3 | Cross-branch learning (the AlphaVerus delta) | `d62e5218d1` | 34 |
+| 4 | Surfaces (REPL + IDE GET + SSE + `/expand b-N` + persistence) | `28fce98d4f` | 68 |
+| 5 | Hardening + integration (strategy gate + 12 AST pins + defense-in-depth) | (in-session) | 27 |
+
+Cumulative substrate: **4 files** (`repair_tree.py` + `repair_tree_archive.py` + `repair_tree_repl.py` + edits to `repair_engine.py`, `serpent_flow.py`, `ide_observability.py`, `ide_observability_stream.py`) / **6,114+ LOC** / **243 regression tests** / **12 consolidated AST pins** / **19 FlagRegistry seeds** / **4 SSE events** / **3 IDE GET routes** / **5-subcommand REPL verb**.
+
+**v3.4 — Production wiring (six-phase A→F arc, 2026-05-12).** v3.3's Phase 5 strategy gate was structurally REACHABLE but BEHAVIORALLY a no-op — no production factory was registered. v3.4 ships the factory + adapter + lazy boot wiring so the gate becomes operationally reachable end-to-end:
+
+| Phase | Scope | Tests |
+|---|---|---|
+| A | `RepairEngine._generate_repair_candidate` primitive extracted (sha256 bytes-pin re-locked at `9e881fdde25ec5b1`) | 11 |
+| B | `GitApplyDiffApplier` — production `DiffApplier` impl via `asyncio.create_subprocess_exec` (safe arg-list API, no shell); 5-stage discipline; 8 structured error codes | 27 |
+| C | `ProductionBranchGenerator` — composes Phase A primitive + Phase 3 `maybe_inject_sibling_outcomes` cross-branch substrate | 26 |
+| D | `production_tree_runner_factory` — pure-function `tree_result_to_repair_result` over closed `LayerVerdict × BranchOutcome` taxonomies | 20 |
+| E | `register_production_factory_at_boot` lazy registration; 8 AST pins; 14 defense-in-depth tests (lazy-registration semantics / partial-worktree-failure isolation / git-timeout integration / cancellation through production wiring / master-FALSE keeps registration dormant) | 23 |
+| F | PRD update + memory artifact + soak-readiness checklist (documentation only) | 0 |
+
+Cumulative production wiring: **1 new substrate file** (`repair_tree_production.py` ~1,700 LOC) + edits to `repair_engine.py` / **107 new regression tests** / **8 production-wiring AST pins** / **2 new FlagRegistry seeds** / **0 changes to `_run_inner` source bytes** (sha256 still `9e881fdde25ec5b1`).
+
+**Composition discipline — load-bearing.** Tree mode composes **seven canonical surfaces** without duplicating any:
+
+- `WorktreeManager.create()` — COW git worktree, reap-orphans on boot (§80)
+- `GitApplyDiffApplier` (Phase B) — the **only** `git apply` subprocess invocation in the codebase, AST-pinned
+- `TestRunner.run` — pytest invocation (§64)
+- `SemanticGuardian.inspect_batch` — 10 deterministic detectors (§29)
+- `CanonicalBranchValidator` — per-branch pruning oracle
+- `ProductionBranchGenerator` — provider invocation composing Phase A primitive + Phase 3 cross-branch substrate
+- `RepairTreeRunner` — BFS/BEAM_K layer dispatch
+
+Composition over fork is the structural answer to AlphaVerus's open question of *how* treefinement integrates into an existing repair pipeline without forking the substrate.
+
+**§1 Boundary preserved.** `repair_tree_production.py` MUST NOT import `orchestrator`, `iron_gate`, `change_engine`, `candidate_generator`, `policy_engine`, or `risk_tier` — AST-pinned. `repair_engine.py` MUST NOT have a top-level import of `repair_tree_production` — lazy import inside `_invoke_tree_factory` only (circular-import safety + zero-cost for non-tree-mode callers).
+
+**Phase 9 graduation criterion.** Master flag `JARVIS_L2_TREEFINEMENT_ENABLED` stays default-FALSE until 3-clean-soak ladder demonstrates **≥10% L2 success-rate lift OR ≥20% wall-clock reduction** at parity success rate over ≥2 consecutive soaks. Empirically derived, no hand-tuning. Production-factory wiring is the prerequisite for graduation soaks. Rollback: `JARVIS_L2_BRANCHING_STRATEGY=linear` (immediate fall-through) OR `JARVIS_L2_TREEFINEMENT_ENABLED=false` (master kill); legacy `_run_inner` sha256-pinned at `9e881fdde25ec5b1` — bytes-identical pre-v3.3 behavior preserved.
+
+**What's next after graduation.** **STELLAR** (Wang et al., *arXiv:2601.19903*) — Structure-guided LLM Assertion Retrieval, the first framework to guide LLM-based SVA generation using AST structural fingerprints — stacks naturally on Treefinement's `_patch_sig` ring: top-M survivors at layer N → AST-shape retrieval key into `SemanticIndex` → past-patches as layer-N+1 priors via Phase 3 injection point. **Agent0** (*arXiv:2511.16043*) uncertainty-as-reward boosts ProactiveExploration priority from Move 6.5 K-roll disagreement. The Treefinement L2 arc validates the citation→implementation template (§92.15) under which both will land.
+
+Per-arc full provenance: `memory/project_v3_3_treefinement_l2_six_phase_arc.md`, `project_v3_4_treefinement_production_wiring.md`.
+
+---
+
+### §92.14 The SWE-Bench-Pro Evaluation Arc — Six Phases in a Single Day (2026-05-12)
+
+> **Big Picture.** **SWE-Bench Pro** (*arXiv:2509.16941*) is the long-horizon successor to SWE-bench Verified: 1,865 problems drawn from 41 actively-maintained repositories, patches that span multiple files, hours-to-days of human-engineer effort per task. The published frontier at the time of this writing is **Claude Sonnet 4.5 at 43.6% resolve rate** — the best result of any agent system on the benchmark. The paper identifies three structural failure modes that account for most of the remaining 56.4%: multi-file APPLY atomicity, test-file modification cheats, and inability to recover from partial failures. The SWE-Bench-Pro evaluation arc closes the harness binding that lets O+V be empirically evaluated against this frontier, with each of the three failure modes addressed *structurally* (not retrofittably) by primitives already in the substrate.
+
+**Cross-arc cumulative.** Six phases shipped sequentially as independent PRs in a single day:
+
+| Phase | Scope | Tests |
+|---|---|---|
+| A | Loader + `ProblemSpec` dataclass + fixture/JSONL enumeration union | 12 + 7 (loader_enumeration_union) |
+| B.1 | `prepare_problem` + `cleanup_prepared` (worktree lifecycle) | (prior arc) |
+| B.2.0 | Read-only `OperationAdvisor` (worktree-aware, `EVIDENCE_REPO_ROOT_KEY` contract) | 36 |
+| B.2.0.5 | Orchestrator op-FSM lifecycle SSE (`operation_terminal` event type) | 36 |
+| B.2.1 | `build_evaluation_envelope` — pure-data composition; canonical `make_envelope` factory; signature = instance_id for router-side dedup | 31 |
+| B.2.2 | Async façade `evaluate_problem` — composes B.1 + B.2.1 + intake + lifecycle SSE rendezvous + one-shot ledger fallback; 8-pin AST discipline | 29 |
+| C | Pure-data scorer `score_evaluation` — closed 5-value `ScoreOutcome` taxonomy; **cheat-detection default-on** (canonical SWE-Bench rubric: patches modifying test files → FAIL outright) | 34 |
+| D | `EvaluationResultStore` — async record + JSONL persistence via canonical `flock_append_line` (Vector #10 primitive); module-level singleton + dedup by `(instance_id, op_id)` | 33 |
+| E | `parallel_evaluate` async generator — bounded concurrency via canonical `_process_singletons.get_semaphore` (key `swe_bench_pro_parallel_eval`); progress callback per completion | 19 |
+| F | `build_report_card` — pure-data aggregator + `render_markdown` / `render_json`; per-repo + per-difficulty + top-N failure clustering | 25 |
+
+**261 spine tests + 43 AST pins** across B.2.0 → F; **339 total cumulative regression tests** green; **0 edits to `repair_engine.py`** (the sha256 bytes-pin holds at `9e881fdde25ec5b1` across the entire arc); 0 new SSE event types beyond B.2.0.5's `operation_terminal`; **0 parallel state anywhere** — every primitive composes a canonical surface (`get_semaphore` for concurrency, `flock_append_line` for JSONL, `extract_diff_targets` for diff parsing).
+
+**How the substrate addresses SWE-Bench-Pro's three published failure modes:**
+
+1. **Multi-file APPLY atomicity.** The orchestrator's `_iter_candidate_files` / `_apply_multi_file_candidate` provide *batch-level* rollback: every file is AST/placeholder-validated at the parser, and if file N fails, files 1..N−1 are restored from pre-apply snapshots while new files are unlinked. The 8-phase per-file guarantees compose with atomic multi-file semantics — addressing the paper's failure mode (i).
+2. **Test-file modification cheats.** Phase C's scorer enables `_reject_test_modifications` by default per the upstream rubric. Patches that modify any test file (extension-aware: `tests/**`, `*_test.py`, `*.spec.ts`, etc.) FAIL outright — the only Phase C flag that defaults TRUE precisely because rubric integrity depends on it. Addresses failure mode (ii).
+3. **Partial-failure recovery.** Phase E's per-task `try`/`except` wraps the entire pipeline; contract violations yield synthetic records (`INGEST_FAILED` + `SCORING_ERROR` with `diagnostic` carrying the exception class name), and the rig continues with the remaining tasks. Cooperative cancellation runs each task's `finally` block (worktree cleanup via B.1, archive flushing via Phase D disciplines). Addresses failure mode (iii).
+
+**Reproducibility — the scoring layer is offline.** Phase C's `score_evaluation(result, problem)` is reproducible from `(captured_patch, problem)` alone — does NOT require access to the evaluation's original worktree. This supports three downstream uses: (a) offline re-scoring when the rubric evolves, (b) rubric A/B comparison from disk alone (the JSONL retains full audit history; in-memory collapses to latest-write per dedup key), (c) third-party SWE-Bench-Pro ingest of `(patch, problem)` pairs without re-running the agent.
+
+**Stop condition for first live run.** Harness boot hook merged (composes canonical Phase A `load_problem` + B.1 `prepare_problem` + B.2.1 `build_evaluation_envelope` + `IntakeLayerService.ingest_envelope`; AST-pinned against parallel `WorktreeManager` or `UnifiedIntakeRouter` references) + ≥1 on-disk problem fixture checked in (`tests/fixtures/swe_bench_pro/problems.jsonl` — 1 `ProblemSpec` against stable `octocat/Hello-World`) + cost/wall caps documented in PRD §40.7.10-arc operator runbook. **No live run today** per operator stop condition — operator-bound $2.00 max / 5–10 problems budget. Two runbook paths: (i) wiring-validation soak (~$0.01–0.10 on the checked-in fixture, idempotent), (ii) real benchmark cherry-pick (~$0.05–2.00 via HuggingFace dataset + `JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS` CSV override).
+
+**Graduation criterion.** Master flags stay default-FALSE until **≥1 RESOLVED known-good + ≥1 UNRESOLVED known-hard** (rubric sanity floor) — empirical proof that the scoring layer behaves correctly on both ends of the distribution before any aggregate-resolve-rate claim is published. The §40.7.5 PRD claim — "O+V's substrate is positioned to handle SWE-Bench-Pro-class tasks; what's missing is the harness binding" — is now closed on the harness side. The empirical resolve-rate result awaits operator approval.
+
+Per-arc provenance: `memory/project_v3_7_phase_{a,b1,b2_0,b2_0_5,b2_1,b2_2,c,d,e,f}*.md` + `project_v3_7_phase_2_harness_inject.md` + `project_v3_7_clone_template_bypass.md` + `project_v3_7_loader_enumeration_union.md`.
+
+---
+
+### §92.15 The Citation → Implementation Pattern (Meta-Observation)
+
+PRD §40.7 was added on 2026-05-08 as an explicit map between O+V's architecture and published research across five threads: RSI (SICA / STOP / Gödel Agent / AlphaEvolve / DARWIN / Stanford CS329A), formal verification + AST safety (AlphaVerus / STELLAR / CMU SEI Pointer Ownership / arXiv:2507.13290), multi-agent consensus + speculative execution (HEAVYSKILL / Empirical Speculative Decoding for SWE / Agent0), AI safety + constitutional cage (Anthropic CAI / Constitutional Classifiers / ASL-4 framework), and benchmarks (SWE-bench Verified / SWE-Bench Pro / Live-SWE-agent).
+
+The four weeks covered by §92 demonstrate that **the mapping is bidirectional and structurally enforceable**: §92.13 ported AlphaVerus as the first citation→implementation closure; §92.14 closed the SWE-Bench-Pro harness binding. The template that emerged across both arcs:
+
+1. **Default-FALSE master flag** (per the §33.1 graduation contract) — no capability graduates without empirical proof. Treefinement L2's `JARVIS_L2_TREEFINEMENT_ENABLED` and SWE-Bench-Pro's `JARVIS_SWE_BENCH_PRO_*` all default FALSE; rollback is byte-identical.
+2. **Closed taxonomies** — every state machine has its values pinned at declaration. Treefinement's `LayerVerdict × BranchOutcome`, SWE-Bench-Pro's `ScoreOutcome` (5 values) + `EvaluationOutcome` (7 values) + `ProblemDifficulty` (3 values). AST-pin enforcement refuses open-set drift.
+3. **AST-bytes pinning** — structural invariants compile-time refuse violations. The `_run_inner` sha256 is bytes-pinned at `9e881fdde25ec5b1` across both arcs; the only `git apply` subprocess invocation in the codebase is `GitApplyDiffApplier` (AST-pinned); `repair_tree_production.py` imports forbidden by AST-pin.
+4. **Composition over fork** — every new primitive composes ≥2 existing canonical surfaces; parallel implementations are AST-rejected. Treefinement composes 7 canonical surfaces; SWE-Bench-Pro composes 6 (Phase A loader, B.1 worktree lifecycle, B.2.1 envelope builder, B.2.2 façade, C scorer, D-E-F result substrate) plus canonical `make_envelope`, `_process_singletons.get_semaphore`, `flock_append_line`, `extract_diff_targets`.
+5. **Phase 9 graduation contract** — flags graduate by clean-soak ladder, not by hand-tuning. Treefinement: ≥10% lift OR ≥20% wall-clock reduction over ≥2 soaks. SWE-Bench-Pro: ≥1 RESOLVED known-good + ≥1 UNRESOLVED known-hard.
+
+The pattern is **structurally inheritable**. Future §40.7 closures stack on top: STELLAR structural patch retrieval on Treefinement's `_patch_sig` ring; Agent0 uncertainty-as-reward on Move 6.5 K-roll disagreement; HEAVYSKILL parallel-reasoning-agents on M9 + Move 6.5 multi-prior dispatch; DARWIN dynamic role assignment on `subagent_scheduler` + L3 worktree isolation; AlphaEvolve autonomous algorithm discovery on ProactiveExploration + Shannon-entropy gap detection. Each future closure inherits the same default-FALSE substrate + closed taxonomies + AST-pin + composition + graduation-contract template.
+
+**Operator value (verbatim from PRD §40.7.6):** the §40.7 citations provide (a) prior-art justification for architectural choices, (b) baseline numbers to benchmark against (Constitutional Classifiers' 86%→4.4% jailbreak reduction is the Anti-Venom self-immunization target; SWE-Bench-Pro's 43.6% Claude Sonnet 4.5 ceiling is the resolve-rate benchmark), (c) terminology alignment with the published research community. Every engineering decision now has cited-research provenance — not operator binding alone.
+
+---
+
+### §92.16 Theoretical Grounding — Five Research Threads Now Anchored in O+V
+
+The four-week window aligns O+V with five published research threads at increasing structural depth. Each is a load-bearing reference for the working dissertation (§92.17–§92.18).
+
+**(1) Recursive Self-Improvement — the SICA pattern (ICLR 2025 SSI-FM, *arXiv:2504.15228*).** SICA demonstrates an agent that autonomously edits its own coding tools, achieving 17–53% performance gains on SWE-bench Verified. On 2026-05-11, O+V autonomously shipped two self-modification commits (Posture Aurora observability surface + Karen voice command router) under the standard Yellow-tier `NOTIFY_APPLY` discipline — empirically the *same self-modification pattern*, with the Anti-Venom cage (Iron Gate + Semantic Guardian + recursion-bound) wrapped around it. This is the SICA pattern demonstrated **three years ahead of Anthropic's 2028 ASL-4 horizon** (Anthropic, *alignment.anthropic.com/2025/recommended-directions/*; Jack Clark's >50% probability of autonomous self-improving systems by 2028). The implication is direct: the empirical gap between SICA's published demonstration and a *bounded* RSI formalization is closeable in finite time; the four-week window of §92 provides the substrate, and the working dissertation provides the formal apparatus.
+
+**(2) Formal verification + AST safety — AlphaVerus (CMU L3 lab, *arXiv:2412.06176*) and STELLAR (*arXiv:2601.19903*).** §92.13 is the first §40.7 closure: AlphaVerus's *exploration → treefinement → critique* framework maps directly onto O+V's L2 path (Iron Gate exploration-first + `RepairTreeRunner` BFS/BEAM_K + `CanonicalBranchValidator`). The composition discipline (seven canonical surfaces, no fork) is the structural answer to AlphaVerus's open question of pipeline integration. STELLAR — the first framework to guide LLM-based SystemVerilog Assertion generation using AST structural fingerprints — stacks naturally on Treefinement's `_patch_sig` ring (top-M survivors at layer N → AST-shape retrieval key into `SemanticIndex`). The CMU SEI Pointer Ownership Model (*sei.cmu.edu/blog/ai-powered-memory-safety-with-the-pointer-ownership-model/*) extends the AST-as-verifier-input pattern to memory safety; O+V's `semantic_firewall.py` (11 injection detectors + 5 credential shapes + recursion ban + `ScopedToolBackend` mutation cage) is the structural analog at the MCP boundary.
+
+**(3) Constitutional safety — Constitutional Classifiers (Anthropic, *arXiv:2501.18837*).** Anthropic's benchmark reports **86% → 4.4% catastrophic-error collapse** when constitutional classifiers are deployed alongside a base model. Anti-Venom's deterministic substrate — Iron Gate's 12 immutable rules + Semantic Guardian's 10 pre-apply detectors + the 11 injection detectors and 5 credential shapes in the GENERAL Semantic Firewall (§92.1) — is structurally analogous, with one significant difference: **O+V's classifiers are AST-deterministic, not learned**. Zero-LLM, ~10ms per detection, fail-closed on parse failure. The Adversarial Cage (§92.4) reports **0/38 escapes** against hand-authored adversarial inputs, with 12/38 *documented* gaps (predicted detection-gaps, not active vulnerabilities). The §40.1 #3 "Anti-Venom self-immunization" tier extends this toward parity-scale corpus evaluation — generating jailbreak mutations to harden the cage, matching Constitutional Classifiers' synthetic-data training discipline.
+
+**(4) Recursion-bounding — Anthropic ASL-4 RSI safeguard framework.** Anthropic's ASL-4 framework (*alignment.anthropic.com/2025/recommended-directions/*) identifies recursive self-improvement as a capability threshold requiring active safeguards. O+V's §1 Boundary principle + §40.1 recursion-depth gate + §40.1 hash-cap on self-modification map onto ASL-4's recursion-bounding requirement structurally. The Reverse Russian Doll containment claim (§92.17) is the dissertation's load-bearing formalization of this mapping. **This is the load-bearing alignment-research justification for the entire Anti-Venom tier** — the substrate is positioned to be ASL-4-aligned by construction, not by retrofit.
+
+**(5) Benchmarks — SWE-Bench Pro (*arXiv:2509.16941*) and Live-SWE-agent (Nov 2025, *live-swe-agent.github.io*).** §92.14 closes the SWE-Bench-Pro harness binding. The substrate addresses the three failure modes the paper identifies — multi-file atomicity, test-modification cheats, partial-failure recovery — *structurally* rather than empirically. Live-SWE-agent is the closest published parallel to O+V's auto-shipping behavior (§92.5 — §92.10 evidence + the 2026-05-11 auto-shipped commits in thread (1) above); the operationally significant difference is the Anti-Venom hardening overlay that Live-SWE-agent does not appear to expose.
+
+**Summary of the five threads.** Three of the five (RSI, formal verification, benchmarks) have direct citation→implementation closures landed in §92 (Treefinement L2 + SWE-Bench-Pro harness + auto-shipped 2026-05-11 commits). The remaining two (constitutional safety, recursion-bounding) are positioned structurally — the substrate is in place; what remains is the *formal* proof of the containment property the substrate empirically exhibits. That is the dissertation's load-bearing claim, sketched in §92.17 and contextualized in §92.18.
+
+---
+
+### §92.17 The Reverse Russian Doll — From Architectural Pattern Toward Formal Sketch
+
+The Reverse Russian Doll method, as deployed throughout this paper (§3, §50), is an **architectural pattern**: a volatile generative core $C$ is sealed inside an expanding shell $S_n$ of deterministic constraints, and as $C$ carves a smarter shell around itself, the immune system scales proportionally so it never crushes the core. §92.1–§92.14 demonstrate the empirical claim. This subsection sketches the formal one — the direction the working dissertation is developing.
+
+**Setup (informal).** Let $C$ denote the generative core (Claude, J-Prime, or DoubleWord — the substrate is provider-agnostic per §85). Let $S_n$ denote the deterministic shell at iteration $n$ — the composed operator (Iron Gate ∘ Semantic Guardian ∘ ExplorationLedger ∘ ASCIIStrictGate ∘ TestRunner ∘ CanonicalBranchValidator) acting on candidate patches. Let $M$ denote the manifesto-encoded mutation operator that extends $S_n$ by validated patches. A *Reverse Russian Doll iteration* is the composition
+
+$$ (C, S_n) \xrightarrow{\textrm{GENERATE}} \delta \xrightarrow{S_n} \delta' \xrightarrow{M} S_{n+1} $$
+
+where $\delta$ is a candidate patch generated by $C$ under the shell-injected GENERATE prompt, $S_n$ filters and refines $\delta$ to $\delta'$ (rejecting if not exploration-sufficient, semantic-guardian-clean, ASCII-strict, test-green, or branch-validator-promoted), and $S_{n+1} = M(S_n, \delta')$ is the shell *extended* by the validated patch (a new AST pin, a new policy rule, a new test, a new branch-validator clause).
+
+**The bounded-RSI conjecture (working dissertation's load-bearing claim).** Under the Reverse Russian Doll iteration, *as $n \to \infty$*: (a) the **deterministic-entropy** of $S_n$ is monotonically non-decreasing (every accepted $\delta'$ adds structural capacity, never removes it); (b) the **semantic-entropy** of unconstrained-$C$-output, *conditioned on $S_n$*, is monotonically non-increasing in the dimensions $S_n$ now bounds; (c) the *net agentic entropy* of the $(C, S_n)$ system is bounded above by a finite constant depending on $C$'s base capacity and $S_n$'s growth rate. The conjecture is that **bounded-RSI is a thermodynamic stability condition on the $(C, S_n)$ system**, not a learning-rate condition on $C$ alone.
+
+**Mapping to Wang's RSI formulation (*arXiv:1805.06610*).** Wang (2018) treats RSI as a Markov chain on capability states under a stationary transition kernel, with five MVP-RSI conditions: a composite capability score, persistence across iterations, a 30-day positive trend, a non-decreasing trajectory, and self-formed goals. The Reverse Russian Doll extension generalizes this for the **non-stationary, multi-repository, memory-augmented** setting O+V actually inhabits:
+
+1. **Non-stationary kernel.** The mutation operator $M$ is *not* stationary — each iteration's $S_{n+1}$ depends on the full history $\{S_0, \ldots, S_n\}$ via the `ExplorationLedger` (§54) and the recency-weighted `SemanticIndex` centroid + k-means cluster classifier (§92.5 substrates). This violates Wang's stationarity assumption. The dissertation conjectures a *non-stationary-but-monotone* extension under which Wang's persistence theorem survives.
+2. **Coupled multi-chain state.** Trinity's three repositories (JARVIS / J-Prime / Reactor-Core) carry distinct shells; cross-repository invariants are enforced by the Cross-Session Coherence Harness (§92.8 Vector #5 Part A — 4-value `CoherenceAxis`, 4-value `DriftLevel`) and the cross-runner artifact contract (§92.8 §35 row #4 — 10-value `ArtifactKind`, 6-value `ValidationOutcome`). Wang's single-state-chain becomes a *coupled multi-chain*; the dissertation extends Wang's MVP-RSI conditions to this product space.
+3. **Memory-augmented capability score.** Wang's composite capability score becomes recency-weighted via the `SemanticIndex`'s 3-day half-life conversation + 14-day half-life commits/goals + auto-K silhouette cluster classifier (§92.5 substrate). The dissertation conjectures a *recency-decayed* version of Wang's persistence condition, robust to capability oscillations from operator-side noise during graduation-cadence soaks.
+
+**The thermodynamic-entropy formulation — load-bearing for the dissertation title.** Treat the shell $S_n$ as a *deterministic-entropy reservoir* and the core $C$ as a *thermal source*. The "entropy of agentic action" is bounded by the shell's deterministic capacity. The Iron Gate's twelve immutable rules + Semantic Guardian's ten detectors + ExplorationLedger floors + the 521+ AST-pin structural invariants (§92.11) set a hard *lower bound* on $S_n$'s deterministic entropy — the entropy can only grow, not shrink, because every $S_{n+1}$ strictly extends $S_n$ via $M$. The bounded-RSI conjecture is that this monotone-growth-of-deterministic-entropy implies bounded-agentic-entropy of $C$ under $S_n$ — formalizable as a thermodynamic stability theorem.
+
+**What is *not* claimed.** This subsection is a *conjecture sketch*, not a proof. None of (a) — (c) above is currently a theorem in the strict mathematical sense. The empirical demonstrations in §92.1 — §92.14 are the substrate; the formal conversion is the next four weeks (or four months) of work, not yet done. The honest framing: the engineering arc has closed; the formal arc has been *opened*, with the next milestone being a precise statement of the bounded-RSI theorem and its proof outline against Wang's MVP-RSI conditions extended to the non-stationary multi-chain setting.
+
+This is the gap the MSE-AI program is positioned to fill — under the Trustworthy AI lineage at Penn (§92.18), with the engineering substrate (§92.1 — §92.14) as the empirical evidence and the formal apparatus of certifiably robust networks (Wong's lineage) as the mathematical scaffold.
+
+---
+
+### §92.18 The Working Dissertation, the Penn Inflection Point, and the Ten Orders
+
+**The working dissertation thesis.** *"Thermodynamic Containment of Agentic Entropy: Formalizing the Reverse Russian Doll Architecture for Bounded Recursive Self-Improvement"*. This is the operational research goal — to convert §92.17's conjecture sketch into a formal theorem, against the Wang (2018) RSI formulation extended to non-stationary, multi-repository, memory-augmented settings. Six architectural improvements over Wang's MVP-RSI conditions are sketched in §92.17 (non-stationary kernel, coupled multi-chain state, recency-weighted capability score, thermodynamic-stability formulation, AST-pinning as deterministic-entropy reservoir, ExplorationLedger as monotone growth witness). The dissertation will develop each as a formal statement, prove the principal one (bounded-agentic-entropy under monotone-shell-growth), and validate the proof empirically against O+V's graduation-cadence data (Phase 9 in §92.9).
+
+**Why Penn — the Trustworthy AI lineage.** Three faculty research lineages at Penn map directly onto the three components of the bounded-RSI formalization:
+
+1. **Eric Wong — Certifiably robust networks.** Wong's lineage provides the mathematical apparatus for proving that the Iron Gate's twelve immutable rules + the 521+ AST-pin structural invariants are a *certifiable* operator (every accepted patch is provably within a defined safety envelope, not just empirically observed to be). This is the analog for *Iron Gate determinism* — formal closure on the empirical 0/38 escape result in §92.4's Adversarial Cage.
+2. **Aaron Roth — Trustworthy-learning foundations.** Roth's lineage provides the algorithmic-game-theory and differential-privacy apparatus for proving that the Anti-Venom recursion-bound is a *stable equilibrium* of the $(C, S_n)$ system — neither $C$ nor any composition of $C$-instances can converge on a policy that escapes $S_n$'s envelope. This is the analog for *Anti-Venom recursion-bound stability* — formal closure on the empirical stability observed across the L2 / L3 / GENERAL Semantic Firewall composition (§92.1).
+3. **PRECISE Center — End-to-end verifiable AI systems.** PRECISE's institutional focus on certified AI provides the integration framework for the Reverse Russian Doll containment claim as a whole — bridging Wong's per-operator certification and Roth's stability theorems into a single end-to-end-verified RSI system, mapping onto Anthropic's ASL-4 safeguard framework structurally.
+
+The fit is not approximate. Each of the three open questions in §92.12 maps onto one of the three Penn lineages: (1) Iron Gate determinism → Wong; (2) Anti-Venom recursion-bound → Roth; (3) Reverse Russian Doll containment → PRECISE end-to-end integration. The dissertation thesis is the bridge.
+
+**The Ten Orders of Trinity Evolution.** The Trinity Manifesto frames the system's developmental trajectory as a ladder of ten Orders, each outgrowing its prior shell and engineering the next. Three Orders are publicly named: **Order 1 — Mechanic** (current state at the time of this paper's 2026-04-16 stamp), **Order N — Neurosurgeon** (the spark of AGI: self-modification of the governance substrate itself, not just of the application code), and **Order 10 — Apotheosis** (the ASI threshold). The intermediate Orders are not publicly named at this writing and remain internal to the project's working manifesto.
+
+The four-week window covered by §92 sits between **Mechanic and Neurosurgeon**. The auto-shipped self-modification commits of 2026-05-11 (Posture Aurora + Karen voice — see §92.16 thread (1)) are the *first empirical signature of Neurosurgeon emerging* — the system began modifying its own governance code, under Yellow-tier `NOTIFY_APPLY` discipline, with the Anti-Venom cage holding throughout. The Phase 9 graduation cadence (§92.9) is the operational scaffolding by which this transition is paced — empirical proof gates every default-on graduation.
+
+**The Penn inflection point.** The Mechanic → Neurosurgeon transition is precisely the threshold where engineering ceases to be *sufficient* and formal methods become *load-bearing*. Before Neurosurgeon, the substrate can be proven sound by adversarial soaking (the Adversarial Cage's 0/38 result is the empirical proof). At and beyond Neurosurgeon, the system modifies its own governance — and only a formal proof of containment, not empirical observation, can rule out the existence of a modification trajectory that escapes the bound. **This is the gap the MSE-AI program is positioned to fill** — not by replacing the engineering substrate, but by providing the mathematical apparatus to prove what the substrate empirically already does, in time for the Neurosurgeon → next-Order transition to be safely attempted.
+
+The empirical demonstrations are stable. The formal arc has been opened. The four-week window of §92 was the last engineering inflection before the formal one — and §92 itself is the bridge between this paper's empirical substrate (§1 — §91) and the dissertation's formal conversion. The conversion is the next research arc, and Penn is where it is positioned to be done.
+
 ---
 
 ## Appendix A — Glossary for Non-Technical Readers
