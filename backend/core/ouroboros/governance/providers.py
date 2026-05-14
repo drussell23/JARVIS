@@ -6165,10 +6165,28 @@ class ClaudeProvider:
                         _stream_kwargs["thinking"] = _thinking_param
                     async with _current_client.messages.stream(**_stream_kwargs) as stream:
                         # Two-Phase Stream Rupture Breaker.
-                        # Phase 1 (TTFT): generous 120s for first token
-                        #   (deep-thinking models pause 30-60s).
+                        # Phase 1 (TTFT): generous default 120s for first
+                        #   token.  Task #88 (2026-05-13) — widened to
+                        #   360s when ``thinking=on`` is in the SDK
+                        #   kwargs.  Extended thinking emits
+                        #   thinking_delta events for the full reasoning
+                        #   phase, which ``stream.text_stream`` filters
+                        #   out — to a text-only consumer the stream
+                        #   appears silent for 3-5 minutes on complex
+                        #   prompts.  Empirically proven via v14-rev3/4/5
+                        #   soaks (0/30 Claude completions, all
+                        #   first_token=NEVER) + direct-host streaming
+                        #   probes showing API healthy.  The thinking-
+                        #   aware default keeps non-thinking callers at
+                        #   the legacy 120s.
                         # Phase 2 (Inter-Chunk): tight 30s once tokens flow.
-                        _rupture_ttft = _stream_rupture_timeout_s()
+                        _thinking_active = (
+                            "thinking" in _stream_kwargs
+                            and _stream_kwargs["thinking"] is not None
+                        )
+                        _rupture_ttft = _stream_rupture_timeout_s(
+                            thinking_enabled=_thinking_active,
+                        )
                         _rupture_ic = _stream_inter_chunk_timeout_s()
                         _chunk_timeout = _rupture_ttft  # Phase 1
                         _chunk_iter = stream.text_stream.__aiter__()

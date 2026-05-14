@@ -490,6 +490,29 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Stream rupture — thinking-aware TTFT (Task #88, 2026-05-13)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_STREAM_RUPTURE_TIMEOUT_THINKING_S",
+        type=FlagType.INT, default=360,
+        description=(
+            "Seconds waiting for first TEXT token from a streaming "
+            "Claude/DW call when extended thinking is enabled.  The "
+            "SDK's text_stream filters out thinking_delta events, so "
+            "to a text-only consumer the stream appears silent during "
+            "the entire reasoning phase.  For 17k-char SWE-Bench-Pro "
+            "prompts with thinking_budget=16k tokens, thinking can "
+            "legitimately run 3-5 minutes.  Default 360s = 6 min "
+            "covers empirically-observed durations.  Non-thinking "
+            "calls fall back to JARVIS_STREAM_RUPTURE_TIMEOUT_S (120s)."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/stream_rupture.py",
+        example="360",
+        since="2026-05-13",
+    ),
+
+    # ====================================================================
     # DW entitlement classifier — Task #86 root fix (2026-05-13)
     # ====================================================================
     FlagSpec(
