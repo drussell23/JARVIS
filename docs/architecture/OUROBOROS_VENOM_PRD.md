@@ -1853,6 +1853,94 @@ The mid-soak `APPLIED/COMPLETE=2` count derives entirely from `bgop-*` prefixed 
 
 ---
 
+##### §40.7.10-stage1.6-slice3-v14rev13 — D2 budget invariant verified empirically; new top line = harness-side ConnectTimeout at custom httpx.AsyncClient (NOT product behavior) (2026-05-14)
+
+**Context**: v14-rev13 graduation soak (`bt-2026-05-14-195550`, harness commit `46d1a63e6e` w/ Task #95 D2 merged, `JARVIS_BG_PARK_ENABLED=true`, `JARVIS_BG_PARK_ROUTES="background,complex,standard"`, `JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S=5.0` (default), `--cost-cap 0.50`, `--max-wall-seconds 2400`, `--headless`, `caffeinate -dimsu`). First soak under D2; Task #94 certifies it as a real caffeinated run (`suspension_likely=false` in `summary.json`).
+
+**Tier 1 — ✅ 7th consecutive substrate proof**:
+
+| Signal | Count |
+|---|---|
+| SWE-Bench-Pro op injected + worktree prepared | 2 |
+| PARK admitted to OpParkStore | 2 |
+| PARK-EMIT continuation spawned | 2 |
+| Worker slot freed empirically | ✅ (BG pool dispatched non-SWE ops while SWE was parked) |
+| Task #94 suspension certification | `suspension_likely=false` (clean caffeinated run) |
+
+**D2 — ✅ BUDGET INVARIANT EMPIRICALLY VERIFIED**:
+
+| Metric | v14-rev12 | **v14-rev13 (D2)** |
+|---|---|---|
+| Stream elapsed vs budget | `131.2s on 10.4s budget` (1260% overshoot, **12× violation**) | `317.8s on 359.6s budget` (88% utilization, **honest**) and `384.9s on 359.9s budget` (107% — ~25s over due to existing `hard_kill_budget_s = timeout_s + 30s` grace, NOT D2 budget violation) |
+| Fallback err class | `TimeoutError` (httpx static-config surrender latency) | `CancelledError` (outer cancel scope authoritative — D2's "outer wait_for binds" semantic) |
+| `sem_exhausted_zero_budget` fast-fail | N/A (didn't exist) | 0 occurrences (sem wait didn't fully drain budget on this run — predicate guard `_parent_remaining <= 0.0` correctly held back; the branch waits for genuine zero-budget scenarios) |
+
+The D2 PR (Task #95, single chokepoint at `ClaudeProvider._do_stream` + `_create_with_prefill_fallback` + `_legacy_create` SDK entry points, helper `_derive_per_request_httpx_timeout`) closes the v14-rev12 budget-violation defect cleanly and additively. Stream now respects outer asyncio budget — no more 12× overshoots, no fabricated post-sem budgets. `JARVIS_CLAUDE_HTTPX_CONNECT_CAP_S=5.0` graduated as a TUNING knob.
+
+**Tier 2 — STILL NOT MET. NEW TOP LINE.**
+
+The 4 stream terminations in this soak ALL had `thinking=on first_token=NEVER bytes_received=0` after 317–385s. D2 made these cancels honest (budget = elapsed, not 12× overshoot), but the underlying defect is now visible at the right granularity. asyncio.leak stack trace pinpoints the failure:
+
+```
+File "providers.py", line 6252, in _do_stream
+    async with _current_client.messages.stream(**_stream_kwargs) as stream:
+File "anthropic/lib/streaming/_messages.py", in __aenter__
+    raw_stream = await self.__api_request
+File "anthropic/_base_client.py", line 1655, in request
+    raise APITimeoutError(request=request) from err
+↓
+httpx.ConnectTimeout → httpcore.ConnectTimeout
+    File "httpcore/_async/connection.py", line 124, in _connect
+        stream = await self._network_backend.connect_tcp(**kwargs)
+```
+
+**TCP connect itself failed.** Never reached the stream consumer — so `bytes_received=0` is the correct downstream symptom of a connect-tier failure inside the harness's custom httpx client.
+
+**Step 2 isolation probe** (`/tmp/claude-501/step2_stream_probe.py`, operator-approved 2026-05-14, no PR, no keys in chat):
+
+| Probe | thinking | Configuration | First event | Stream completion |
+|---|---|---|---|---|
+| A | on (budget=1024, max=2048) | `AsyncAnthropic()` defaults, single stream | **1.34s** | 2.71s clean |
+| B (control) | off (max=60) | `AsyncAnthropic()` defaults | 1.25s | 2.21s clean |
+| C (repeat A) | on (same as A) | `AsyncAnthropic()` defaults | **1.08s** | 2.35s clean |
+
+Versions: `anthropic 0.75.0`, `httpx 0.28.1`, `python 3.11.10`, model `claude-sonnet-4-6` — identical to harness. **H2 ruled out** (not SDK / API / "thinking stream stall" product behavior). The harness's 317s `bytes_received=0` is NOT product behavior — Anthropic's stream API works perfectly from the same shell env, same SDK version, identical request shape, including thinking-on (`ThinkingEvent` fires at <2s).
+
+**Diff between probe and harness**:
+
+| | Probe | Harness |
+|---|---|---|
+| Client construction | `AsyncAnthropic()` defaults | `AsyncAnthropic(http_client=httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=600, write=600, pool=600), limits=httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=30)), max_retries=0)` |
+| Per-request timeout | none | D2: `httpx.Timeout(connect=5, read=outer_budget, write=5, pool=5)` |
+| Concurrent streams | 1 (sequential probes) | Multiple (BG pool 3-4 workers + sensors + park continuations) |
+
+**Hypotheses for next investigation (no PR yet)**:
+
+- **H1 — custom httpx.AsyncClient configuration**: The harness's explicit `Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=30s)` may produce stale-connection reuse under sustained load. Defaults work for the probe; harness-specific Limits config diverges.
+- **H3 — concurrency**: D2's `pool=5s` per-request + harness's `max_connections=10` + parallel BG/sensor calls may cause pool starvation when ≥10 concurrent streams contend. v14-rev13 soak saw multiple parallel BG-pool workers — single-stream probe doesn't reproduce.
+- **D2's per-request override interaction with custom client**: Less likely but: the per-request `pool=5s` is much tighter than the client's construction-time `pool=600s`. If httpx interprets these idiosyncratically when both are set, that's a path.
+
+**Discipline (operator binding 2026-05-14)**:
+
+- **D2 PR stands** (Task #95 closes v14-rev12 12×-overshoot defect on its own merit) — no revert.
+- **No graduation flip** until SWE op reaches COMPLETE on a clean post-fix soak (or operator publishes Bar B).
+- **No widening of budgets** to mask zero-event streams — that was the old failure mode in a different costume.
+- **Next work**: one targeted PR after picking H1 vs H3 by measurement. Candidates:
+  1. Test by reverting harness to default `AsyncAnthropic()` (no custom http_client) and observing whether ConnectTimeouts disappear — distinguishes "harness Limits/Timeout config is wrong" vs "concurrency-induced pool starvation".
+  2. Add temporary observability: log active stream count + httpx pool utilization at each `_do_stream` entry/exit; rerun soak; diagnose H3.
+  3. If H1: revisit `_CLAUDE_HTTP_MAX_CONNECTIONS / _CLAUDE_HTTP_MAX_KEEPALIVE / _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S` defaults (currently calibrated at `10 / 5 / 30s` per Move-2 v2 soak commentary).
+
+**Hygiene queue (non-blocking, after the H1/H3 diagnosis)**:
+- `orch._ledger missing attribute` on PARK-EMIT path (still present in v14-rev13 trace).
+
+**File-coordinate summary** (this PRD entry):
+- v14-rev13 session: `.ouroboros/sessions/bt-2026-05-14-195550/debug.log` + `summary.json` (Tier 1 substrate signals + D2 budget invariant evidence)
+- D2 PR: commit `26a13202c8`, merge `46d1a63e6e` (Task #95, providers.py + candidate_generator.py + flag_registry_seed.py + 18-test spine)
+- Step 2 probe artifact: `/tmp/claude-501/step2_stream_probe.py` (3-probe set: thinking-on, thinking-off control, thinking-on repeat — all green from same shell env)
+- Active tasks: #81 (Slice 3 — still paused on Tier 2), #76 (live harness run); #95 (D2 — closed). New investigation pending: H1 vs H3 picker (no task # yet, awaiting operator binding).
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
