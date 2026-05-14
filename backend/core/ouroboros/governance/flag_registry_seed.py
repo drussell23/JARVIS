@@ -543,6 +543,92 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Universal phase-local sub-budgeting (Task #98, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_UNIVERSAL_PHASE_BUDGET_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for universal phase-local sub-budgeting "
+            "across pre-GENERATE phases (CLASSIFY, ROUTE, "
+            "CONTEXT_EXPANSION, PLAN).  When true, each runner "
+            "dispatch is wrapped in asyncio.wait_for with a phase "
+            "budget computed from min(op_remaining × fraction, "
+            "op_remaining - MIN_GENERATE_RESERVE_S).  Graceful degrade "
+            "via PhaseResult(status='skip', "
+            "reason='phase_budget_exhausted:...') preserves operation "
+            "integrity.  Default true per operator binding 2026-05-14: "
+            "'every phase must autonomously calculate its phase-local "
+            "deadline and gracefully degrade or interrupt its sub-"
+            "components if it threatens the MIN_GENERATE_RESERVE_S "
+            "floor.'  Setting false reverts to byte-identical pre-"
+            "Task-#98 pass-through dispatch."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/phase_budget.py",
+        example="true",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE_BUDGET_FRACTION_CLASSIFY",
+        type=FlagType.FLOAT, default=0.05,
+        description=(
+            "Fraction of op_remaining that CLASSIFY phase may consume "
+            "(default 0.05 — CLASSIFY is fast deterministic; small "
+            "slice is defense-in-depth).  Composes with universal "
+            "kernel: min(fraction × op_remaining, op_remaining - "
+            "MIN_GENERATE_RESERVE_S).  Invalid values fall back to "
+            "default.  Task #98 universal phase-budget."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/phase_budget.py",
+        example="0.05",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE_BUDGET_FRACTION_ROUTE",
+        type=FlagType.FLOAT, default=0.05,
+        description=(
+            "Fraction of op_remaining that ROUTE phase may consume "
+            "(default 0.05).  Same composition shape as CLASSIFY. "
+            "Task #98 universal phase-budget."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/phase_budget.py",
+        example="0.05",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE_BUDGET_FRACTION_CONTEXT_EXPANSION",
+        type=FlagType.FLOAT, default=0.20,
+        description=(
+            "Fraction of op_remaining that CONTEXT_EXPANSION phase "
+            "may consume (default 0.20 — medium slice since CTX runs "
+            "Claude expansion).  Task #98 universal phase-budget."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/phase_budget.py",
+        example="0.20",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE_BUDGET_FRACTION_PLAN",
+        type=FlagType.FLOAT, default=0.30,
+        description=(
+            "Fraction of op_remaining that PLAN phase may consume "
+            "(default 0.30 — largest pre-GENERATE slice).  Canonical "
+            "name for the Task #97 PLAN-phase fraction; the legacy "
+            "JARVIS_PLAN_PHASE_BUDGET_FRACTION knob still works for "
+            "back-compat (resolver reads legacy first).  Task #98 "
+            "universal phase-budget."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/phase_budget.py",
+        example="0.30",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # PLAN phase-local sub-budgeting (Task #97, 2026-05-14)
     # ====================================================================
     FlagSpec(
