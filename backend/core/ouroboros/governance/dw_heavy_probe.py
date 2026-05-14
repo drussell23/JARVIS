@@ -747,6 +747,50 @@ class HeavyProbeScheduler:
                     result.total_latency_ms, result.cost_usd,
                     result.error or "-",
                 )
+                # Task #86b — autonomous entitlement adaptation.
+                # When the structured error string from _do_probe starts
+                # with "entitlement_blocked:" (set by Task #86's
+                # classifier dispatch), route the detection to
+                # topology_sentinel.report_failure(is_terminal=True).
+                # This flips the model's breaker to TERMINAL_OPEN, which
+                # _is_eligible() already honors (line 791-795), and
+                # which dw_catalog_classifier excludes from future route
+                # assignments.  No hardcoded model lookup, no operator
+                # config — the system DISCOVERS entitlement boundaries
+                # from DW's own response bodies and prunes them at the
+                # next discovery cycle.  Best-effort: sentinel unwired
+                # in unit tests is fine, the probe still returns
+                # normally so the result is observable.
+                if (
+                    not result.success
+                    and result.error
+                    and result.error.startswith("entitlement_blocked:")
+                ):
+                    try:
+                        from backend.core.ouroboros.governance.topology_sentinel import (  # noqa: E501
+                            get_default_sentinel,
+                            FailureSource,
+                        )
+                        sent = get_default_sentinel()
+                        if sent is not None and hasattr(sent, "report_failure"):
+                            sent.report_failure(
+                                model_id=mid,
+                                source=FailureSource.HEAVY_PROBE_FAIL,
+                                detail=result.error,
+                                status_code=403,
+                                response_body=result.error,
+                                is_terminal=True,
+                            )
+                            logger.info(
+                                "[HeavyProbe] entitlement_blocked routed "
+                                "to TERMINAL_OPEN: model=%s detail=%r",
+                                mid, result.error[:120],
+                            )
+                    except Exception:  # noqa: BLE001 — defensive
+                        logger.debug(
+                            "[HeavyProbe] entitlement→sentinel route "
+                            "failed for model=%s", mid, exc_info=True,
+                        )
                 return result
             except asyncio.CancelledError:
                 raise
