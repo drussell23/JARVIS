@@ -1784,7 +1784,27 @@ class GovernedOrchestrator:
             )
             logger.info("[PhaseRunnerDelegate] CLASSIFY → runner op=%s", ctx.op_id[:16])
             _classify_runner = CLASSIFYRunner(self, _serpent)
-            _classify_result = await _classify_runner.run(ctx)
+            # Task #98 (2026-05-14) — universal phase-local sub-budget
+            # via shared kernel.  Wraps runner.run() in asyncio.wait_for
+            # with phase budget = min(op_remaining × fraction,
+            # op_remaining - reserve).  Graceful degrade on timeout or
+            # insufficient-budget returns PhaseResult(status="skip",
+            # reason="phase_budget_exhausted:classify:...").  Master
+            # switch JARVIS_UNIVERSAL_PHASE_BUDGET_ENABLED (default true)
+            # gates this wrap; legacy pass-through when off.
+            from backend.core.ouroboros.governance.phase_budget import (
+                dispatch_phase_with_budget,
+            )
+            from backend.core.ouroboros.governance.op_context import (
+                OperationPhase as _OpPhase,
+            )
+            _classify_result = await dispatch_phase_with_budget(
+                _classify_runner,
+                ctx,
+                phase_name="CLASSIFY",
+                op_deadline=getattr(ctx, "pipeline_deadline", None),
+                fallback_next_phase=_OpPhase.ROUTE,
+            )
             # Rebind CLASSIFY locals that downstream phases read:
             #  - _advisory at ~line 2819 (Tier 6 personality voice)
             #  - _consciousness_bridge at ~line 3030 and ~line 4513
@@ -2630,16 +2650,44 @@ class GovernedOrchestrator:
                 ROUTERunner,
             )
             logger.info("[PhaseRunnerDelegate] ROUTE+CTX+PLAN → runners op=%s", ctx.op_id[:16])
+            # Task #98 (2026-05-14) — universal phase-local sub-budget.
+            # Same shared kernel as CLASSIFY hook above.  Each phase
+            # gets its own fraction of op_remaining, asyncio.wait_for
+            # bounds, graceful degrade on timeout / insufficient budget.
+            from backend.core.ouroboros.governance.phase_budget import (
+                dispatch_phase_with_budget,
+            )
             # ROUTE: runs the routing body + either advance(CTX) or advance(PLAN)
-            _route_result = await ROUTERunner(self, _serpent).run(ctx)
+            _route_result = await dispatch_phase_with_budget(
+                ROUTERunner(self, _serpent),
+                ctx,
+                phase_name="ROUTE",
+                op_deadline=getattr(ctx, "pipeline_deadline", None),
+                fallback_next_phase=OperationPhase.CONTEXT_EXPANSION,
+            )
             ctx = _route_result.next_ctx
             # CTX: runs only if ROUTERunner advanced to CONTEXT_EXPANSION
             if _route_result.next_phase is OperationPhase.CONTEXT_EXPANSION:
-                _ctx_result = await ContextExpansionRunner(self, _serpent).run(ctx)
+                _ctx_result = await dispatch_phase_with_budget(
+                    ContextExpansionRunner(self, _serpent),
+                    ctx,
+                    phase_name="CONTEXT_EXPANSION",
+                    op_deadline=getattr(ctx, "pipeline_deadline", None),
+                    fallback_next_phase=OperationPhase.PLAN,
+                )
                 ctx = _ctx_result.next_ctx
             # PLAN: advisory artifact comes from CLASSIFY's result — carried
             # via the _advisory local established by the CLASSIFY hook.
-            _plan_result = await PLANRunner(self, _serpent, advisory=_advisory).run(ctx)
+            # Note: PlanRunner.run also has Task #97's *internal* phase
+            # budget (via PlanGenerator.generate_plan) — this outer wrap
+            # is defense-in-depth at the runner-dispatch boundary.
+            _plan_result = await dispatch_phase_with_budget(
+                PLANRunner(self, _serpent, advisory=_advisory),
+                ctx,
+                phase_name="PLAN",
+                op_deadline=getattr(ctx, "pipeline_deadline", None),
+                fallback_next_phase=OperationPhase.GENERATE,
+            )
             if _plan_result.next_phase is None:
                 # Terminal exit from PLAN (plan_rejected, plan_expired, etc.)
                 return _plan_result.next_ctx

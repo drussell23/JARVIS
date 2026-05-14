@@ -136,71 +136,69 @@ _TRIVIAL_MAX_DESCRIPTION_LEN = 200
 # planning is skipped no matter what.  The plan-min-budget (default
 # 5s) is the floor under which a planning attempt would be doomed
 # regardless.
-_PLAN_PHASE_BUDGET_FRACTION_DEFAULT = 0.30
-_PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT = 60.0
-_PLAN_PHASE_MIN_BUDGET_S_DEFAULT = 5.0
+# Task #97 helpers — Task #98 universalized these.  Wrappers below
+# preserve the Task #97 API surface (resolver names, math kernel)
+# while delegating to the shared ``phase_budget`` module so there is
+# ONE source of truth for the math.  Operator binding 2026-05-14
+# "avoid duplication" — Task #97's helpers are thin re-exports.
+_PLAN_PHASE_BUDGET_FRACTION_DEFAULT = 0.30  # legacy constant — kept for spine
+_PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT = 60.0  # legacy — kept for spine
+_PLAN_PHASE_MIN_BUDGET_S_DEFAULT = 5.0  # legacy — kept for spine
 _PLAN_PHASE_WAIT_FOR_GRACE_S_DEFAULT = 1.0
 
 
 def _resolve_plan_phase_fraction() -> float:
-    """Resolve ``JARVIS_PLAN_PHASE_BUDGET_FRACTION`` to a float in
-    (0.0, 1.0].  Invalid / non-numeric / out-of-range values fall back
-    to the default — no silent behavior change from typos."""
-    try:
-        _raw = float(
-            os.environ.get(
-                "JARVIS_PLAN_PHASE_BUDGET_FRACTION",
-                str(_PLAN_PHASE_BUDGET_FRACTION_DEFAULT),
-            )
-        )
-    except (TypeError, ValueError):
-        return _PLAN_PHASE_BUDGET_FRACTION_DEFAULT
-    if not (0.0 < _raw <= 1.0):
-        return _PLAN_PHASE_BUDGET_FRACTION_DEFAULT
-    return _raw
+    """Task #97 legacy resolver — delegates to shared kernel.
+
+    Reads ``JARVIS_PLAN_PHASE_BUDGET_FRACTION`` (legacy) FIRST so
+    operators with the old knob set retain their override.  Falls back
+    to the shared ``resolve_phase_fraction("PLAN")`` which reads
+    ``JARVIS_PHASE_BUDGET_FRACTION_PLAN`` (Task #98 canonical).  Both
+    env knobs default to 0.30 so behavior is identical whether the
+    operator uses the legacy or canonical name.
+    """
+    _legacy_raw = os.environ.get("JARVIS_PLAN_PHASE_BUDGET_FRACTION", "")
+    if _legacy_raw.strip():
+        try:
+            _v = float(_legacy_raw)
+            if 0.0 < _v <= 1.0:
+                return _v
+        except (TypeError, ValueError):
+            pass
+    from backend.core.ouroboros.governance.phase_budget import (
+        resolve_phase_fraction as _shared,
+    )
+    return _shared("PLAN")
 
 
 def _resolve_plan_phase_min_generate_reserve_s() -> float:
-    """Resolve ``JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S`` to a non-
-    negative float — the minimum runway GENERATE is guaranteed."""
-    try:
-        _raw = float(
-            os.environ.get(
-                "JARVIS_PLAN_PHASE_MIN_GENERATE_RESERVE_S",
-                str(_PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT),
-            )
-        )
-    except (TypeError, ValueError):
-        return _PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT
-    if _raw < 0.0:
-        return _PLAN_PHASE_MIN_GENERATE_RESERVE_S_DEFAULT
-    return _raw
+    """Task #97 legacy resolver — delegates to shared kernel."""
+    from backend.core.ouroboros.governance.phase_budget import (
+        resolve_min_generate_reserve_s as _shared,
+    )
+    return _shared()
 
 
 def _resolve_plan_phase_min_budget_s() -> float:
-    """Resolve ``JARVIS_PLAN_PHASE_MIN_BUDGET_S`` to a non-negative
-    float — the floor below which PLAN is skipped entirely."""
-    try:
-        _raw = float(
-            os.environ.get(
-                "JARVIS_PLAN_PHASE_MIN_BUDGET_S",
-                str(_PLAN_PHASE_MIN_BUDGET_S_DEFAULT),
-            )
-        )
-    except (TypeError, ValueError):
-        return _PLAN_PHASE_MIN_BUDGET_S_DEFAULT
-    if _raw < 0.0:
-        return _PLAN_PHASE_MIN_BUDGET_S_DEFAULT
-    return _raw
+    """Task #97 legacy resolver — delegates to shared kernel."""
+    from backend.core.ouroboros.governance.phase_budget import (
+        resolve_phase_min_budget_s as _shared,
+    )
+    return _shared()
 
 
 def _compute_plan_phase_budget_s(op_remaining_s: float) -> float:
-    """Pure-data math kernel — exposed at module scope so the spine can
-    test the decision table without needing a full PlanGenerator
-    instance.  Returns the phase-local budget seconds for PLAN.  Caller
-    decides whether to skip PLAN by comparing against the min-budget
-    floor.
+    """Task #97 legacy math kernel — delegates to shared phase_budget
+    kernel parameterized for the PLAN phase.
+
+    Preserved at module scope so Task #97's spine
+    (``test_task_97_plan_phase_isolation.py``) continues to import +
+    test the same shape.  Single source of truth for the math now
+    lives in ``phase_budget.compute_phase_budget_s``.
     """
+    # Respect legacy env knob if explicitly set (already handled by
+    # _resolve_plan_phase_fraction).  Use the same math the shared
+    # kernel runs, but with PLAN's specific fraction resolution.
     _op = max(0.0, float(op_remaining_s))
     _fraction = _resolve_plan_phase_fraction()
     _reserve = _resolve_plan_phase_min_generate_reserve_s()
