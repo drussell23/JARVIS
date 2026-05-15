@@ -1498,10 +1498,37 @@ class TheOracle:
                 logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
                            f"{self._graph._metrics['total_edges']} edges")
             else:
-                # Phase 2 — no cache, do full index (only on cache miss)
-                logger.info("No cache found, performing full index...")
-                with _OraclePhase("oracle_full_index"):
-                    await self.full_index()
+                # Phase 2 — no cache, do full index (only on cache miss).
+                #
+                # Falsification B1 gate (operator-bound 2026-05-14):
+                # ``JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED=false`` ALSO
+                # skips this boot-time 29k-file cold index — the SAME
+                # single knob that suppresses GovernedLoopService's
+                # periodic ``_oracle_index_loop``.  Run A proved the
+                # GLS-loop gate alone was insufficient: the harness
+                # constructs its OWN ``TheOracle()`` whose
+                # ``initialize()`` → ``full_index()`` is the dominant
+                # event-loop offender and was NOT covered.  With this,
+                # B1 maps to the exact + complete code path (operator
+                # binding: "B1 must map to the exact code path").  The
+                # graph stays empty; readiness still resolves below so
+                # consumers degrade gracefully instead of hanging.
+                _b1_indexer_enabled = os.environ.get(
+                    "JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED", "true",
+                ).strip().lower() != "false"
+                if not _b1_indexer_enabled:
+                    logger.warning(
+                        "[Oracle.boot] full_index SKIPPED "
+                        "(JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED=false) "
+                        "— falsification B1: graph stays empty, "
+                        "readiness still resolves; consumers degrade "
+                        "gracefully.  This is a diagnostic gate, NOT a "
+                        "production default."
+                    )
+                else:
+                    logger.info("No cache found, performing full index...")
+                    with _OraclePhase("oracle_full_index"):
+                        await self.full_index()
 
             # Graph is ready — emit the granular signal so any consumer
             # gated on GRAPH-scope readiness (blast-radius, dependency
