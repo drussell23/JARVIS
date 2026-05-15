@@ -1793,13 +1793,51 @@ class TheOracle:
         logger.warning(f"File not in any known repository: {file_path}")
 
     async def _scan_for_changes(self, repo_name: str, repo_path: Path) -> None:
-        """Scan repository for changed files."""
+        """Scan repository for changed files.
+
+        Task #102 (2026-05-14) — Autonomous Event-Loop Governance.
+        v14-rev18 isolated H11 (event-loop starvation) as the final-mile
+        cause of Claude stream first_token=NEVER under harness conditions.
+        This loop iterates 29k+ files on the event loop; even though the
+        read + index work is offloaded via asyncio.to_thread, the per-
+        iteration hash + dict-lookup + scheduling churn cumulatively
+        starves higher-priority coroutines (notably the Claude SDK
+        stream consumer).
+
+        Fix: read + hash compute now ALSO offloaded via
+        ``offload_blocking`` (composes the shared event_loop_governance
+        substrate), and the iterator is wrapped in
+        ``cooperative_yield_every_n_async`` which inserts ``asyncio.
+        sleep(0)`` every N items (default 64) — gives Claude's stream
+        consumer guaranteed scheduling slots even during the heaviest
+        Oracle scan.  Master switch
+        ``JARVIS_EVENT_LOOP_GOVERNANCE_ENABLED`` (default true);
+        flip-off restores legacy byte-identical behavior.
+        """
+        # Lazy import — substrate lives under .governance/ and oracle.py
+        # is imported eagerly at module-import time of the governance
+        # tree; avoid a top-level import cycle.
+        from backend.core.ouroboros.governance.event_loop_governance import (
+            cooperative_yield_every_n_async,
+            offload_blocking,
+        )
+
         python_files = await self._find_python_files(repo_path)
 
-        for file_path in python_files:
+        def _read_and_hash(p: Path) -> "tuple[str, str]":
+            """Sync helper — read + hash in ONE thread hop instead of
+            two.  Each separate await asyncio.to_thread costs a
+            scheduler round-trip; bundling halves the overhead and
+            keeps the hash CPU off the event loop entirely."""
+            _content = p.read_text(encoding="utf-8")
+            return _content, hashlib.md5(_content.encode()).hexdigest()
+
+        async for file_path in cooperative_yield_every_n_async(python_files):
             try:
-                content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
-                content_hash = hashlib.md5(content.encode()).hexdigest()
+                content, content_hash = await offload_blocking(
+                    _read_and_hash, file_path,
+                    label="oracle._scan_for_changes.read_and_hash",
+                )
                 relative_path = str(file_path.relative_to(repo_path))
                 cache_key = f"{repo_name}:{relative_path}"
 

@@ -560,6 +560,56 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Autonomous Event-Loop Governance Substrate (Task #102, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_EVENT_LOOP_GOVERNANCE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the Autonomous Event-Loop Governance "
+            "Substrate.  When true, hot iterations over large "
+            "collections (Oracle._scan_for_changes 29k files, future "
+            "Advisor / sensor sites) inject asyncio.sleep(0) every N "
+            "items via cooperative_yield_every_n_async, AND offload "
+            "blocking work (file read + hash compute) via "
+            "offload_blocking → asyncio.to_thread.  Composes existing "
+            "asyncio primitives — no external dependencies, no "
+            "dedicated threading hacks that fracture the async "
+            "context.  Closes H11 (event-loop starvation) — the "
+            "final-mile cause of Claude stream first_token=NEVER "
+            "under harness load (Task #101 diagnostic matrix proved "
+            "substrate sound at probe scale; harness fails despite "
+            "identical config).  Default true per operator binding "
+            "2026-05-14: 'autonomous defense, no brittle hacks.'  "
+            "Set false for byte-identical legacy behavior."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/event_loop_governance.py",
+        example="true",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_EVENT_LOOP_YIELD_EVERY_N",
+        type=FlagType.INT, default=64,
+        description=(
+            "Cooperative-yield cadence — every N items processed by "
+            "cooperative_yield_every_n_async triggers an asyncio."
+            "sleep(0) to release the event loop.  Default 64 — "
+            "calibrated so Oracle's 29k-file scan triggers ~450 "
+            "yields (dozens of scheduling slots/sec for the Claude "
+            "SDK stream consumer) while amortizing yield overhead.  "
+            "Lower = more responsive event loop; higher = more "
+            "throughput.  Invalid / non-positive values fall back "
+            "to 64.  Task #102 Event-Loop Governance, operator "
+            "binding 2026-05-14."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/event_loop_governance.py",
+        example="64",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Autonomous Connection Lifecycle Policy (Task #99, 2026-05-14)
     # ====================================================================
     FlagSpec(
