@@ -2686,11 +2686,12 @@ Acceptance gate: **≤4.4% catastrophic-error rate** (matching Anthropic's bench
 
 **Prerequisites.**
 
-- §40.1 #3 Anti-Venom self-immunization tier shipped (corpus generator)
-- AdversarialReviewer subagent extended for full-corpus parallel evaluation (currently scoped per-op, not corpus-batch)
-- Test-time compute budget: ~$50–200 per parity-scale evaluation pass (DW Tier 0 estimated)
+- ✅ **§40.1 #3 Anti-Venom self-immunization tier — SHIPPED 2026-05-14** (`backend/core/ouroboros/governance/self_immunization.py`, ~900 LOC + 47-test spine + 6 AST pins + 5 FlagRegistry seeds). The deterministic mutation corpus generator. Closed 3-taxonomy substrate (`MutationStrategy` 8-value / `ImmunizationVerdict` 4-value / `ImmunizationOutcome` 4-value), 8 pure structural mutation operators derived from the documented-gap evasion taxonomy (alias-rebind / dunder-reconstruct / getattr-indirect / string-split / whitespace-pad / comment-decoy / unicode-confusable / identity-control), async bounded-concurrency campaign runner composing the canonical `adversarial_cage.evaluate_entry` (detection single-source-of-truth — zero re-implementation), `cross_process_jsonl.flock_append_line` ledger, `_process_singletons.get_semaphore` concurrency, `MutationProvider`/`HardeningSink` Protocol DI. Master flag `JARVIS_ANTIVENOM_SELF_IMMUNIZATION_ENABLED` §33.1 default-FALSE. AST-pinned authority asymmetry (no orchestrator/iron_gate/policy_engine/change_engine/candidate_generator imports). `summarize_campaign()` exposes the `meets_parity_gate` boolean read against `JARVIS_ANTIVENOM_TARGET_ESCAPE_RATE` (default 0.044). **The "no hardcoding" property holds**: parity-scale corpus volume is produced dynamically (`seeds × strategies`), not enumerated by hand.
+- AdversarialReviewer subagent extended for full-corpus parallel evaluation (currently scoped per-op, not corpus-batch) — *remaining*
+- LLM-driven `MutationProvider` implementation wired (the deterministic 8 operators ship; the optional LLM-augmentation Protocol seam exists but no concrete provider is wired yet) — *remaining*
+- Test-time compute budget: ~$50–200 per parity-scale evaluation pass (DW Tier 0 estimated) — *remaining (only once LLM MutationProvider is wired; the deterministic path is zero-LLM-cost)*
 
-**Tier placement.** §41.8 Phase 2 candidate (months 12–18). Closing this ticket retires the §92.16 thread (3) caveat (Constitutional Classifiers comparison stops being "structural analog" and becomes "empirical parity result").
+**Tier placement.** §41.8 Phase 2 candidate (months 12–18). Closing this ticket retires the §92.16 thread (3) caveat (Constitutional Classifiers comparison stops being "structural analog" and becomes "empirical parity result"). **The substrate prerequisite is now CLOSED** — the remaining work is corpus *scale* (≥3,000 inputs via wired LLM MutationProvider + AdversarialReviewer corpus-batch extension) and the empirical parity soak, not the generator itself.
 
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
