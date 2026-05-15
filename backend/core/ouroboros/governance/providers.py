@@ -6488,6 +6488,13 @@ class ClaudeProvider:
                 output_tokens = 0
                 _cached_input = 0
                 _stream_first_token_at: List[Optional[float]] = [None]
+                # Falsification-mode first-raw-event log state (operator-
+                # bound 2026-05-14): one-shot flag for the very first
+                # SDK event arrival regardless of type, so we can split
+                # "SDK never sends" from "SDK sends thinking_delta only"
+                # from "consumer never scheduled".  Set inside the
+                # iterator the first time _event returns successfully.
+                _first_raw_event_logged: List[bool] = [False]
                 # Closure-captured op_id for stream-tick activity hook.
                 # Move 2 v4 Phase-Aware Heartbeats: read once here so the
                 # nested _do_stream can pulse the harness ActivityMonitor.
@@ -6522,6 +6529,36 @@ class ClaudeProvider:
                     _stream_kwargs["timeout"] = _derive_per_request_httpx_timeout(
                         _live_http_budget,
                     )
+                    # Falsification-mode boundary log (operator-bound 2026-05-14):
+                    # one-shot, additive, honest asyncio metrics — fires when
+                    # JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED=true (default
+                    # false; reusable env knob, no new substrate seed).
+                    # Surfaces loop crowdedness at the exact moment the stream
+                    # consumer is about to be installed — helps separate
+                    # "SDK never sends" from "consumer never scheduled".
+                    if os.environ.get(
+                        "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
+                    ).strip().lower() in ("1", "true", "yes", "on"):
+                        try:
+                            _loop = asyncio.get_running_loop()
+                            _all_tasks = asyncio.all_tasks(_loop)
+                            _not_done = [t for t in _all_tasks if not t.done()]
+                            _names_sample = [
+                                t.get_name() for t in _not_done[:12]
+                            ]
+                            logger.info(
+                                "[ClaudeProvider.stream.boundary] "
+                                "loop_id=%s tasks_total=%d tasks_not_done=%d "
+                                "thinking=%s prompt_chars=%d op_id=%s "
+                                "tasks_sample=%s",
+                                id(_loop), len(_all_tasks), len(_not_done),
+                                "on" if _thinking_param is not None else "off",
+                                _prompt_chars,
+                                str(getattr(context, "op_id", "?"))[:24],
+                                _names_sample,
+                            )
+                        except Exception:  # noqa: BLE001 — log-only, never raise
+                            pass
                     async with _current_client.messages.stream(**_stream_kwargs) as stream:
                         # Two-Phase Stream Rupture Breaker.
                         # Phase 1 (TTFT): generous default 120s for first
@@ -6613,6 +6650,33 @@ class ClaudeProvider:
                                     rupture_timeout_s=_chunk_timeout,
                                     phase=_rupt_phase,
                                 )
+                            # Falsification first-raw-event marker
+                            # (one-shot, flag-gated).  Logs the very first
+                            # SDK event arrival WITH its type so we can
+                            # distinguish "SDK silent" vs "SDK sends only
+                            # thinking_delta" vs "consumer never scheduled."
+                            if (
+                                not _first_raw_event_logged[0]
+                                and os.environ.get(
+                                    "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
+                                ).strip().lower() in ("1", "true", "yes", "on")
+                            ):
+                                _first_raw_event_logged[0] = True
+                                try:
+                                    _raw_ms = int(
+                                        (time.monotonic() - _call_start) * 1000
+                                    )
+                                    logger.info(
+                                        "[ClaudeProvider.stream.first_raw_event] "
+                                        "type=%s elapsed_ms=%d thinking=%s "
+                                        "op_id=%s",
+                                        getattr(_event, "type", "?"),
+                                        _raw_ms,
+                                        "on" if _thinking_param is not None else "off",
+                                        str(getattr(context, "op_id", "?"))[:24],
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                             # Task #88e — Extract text only from text_delta
                             # events.  Non-text events (thinking_delta,
                             # ping, message_start, content_block_start,

@@ -716,6 +716,15 @@ class GovernedLoopConfig:
             ),
             repair_budget=_lazy_repair_budget_from_env(),
             l3_enabled=os.environ.get("JARVIS_GOVERNED_L3_ENABLED", "true").lower() == "true",
+            # Bisection knob (B1, operator-bound 2026-05-14) — when "false",
+            # the Oracle indexer background task is NOT spawned in start()
+            # (see ``if self._config.oracle_enabled:`` ~1228).  Single-knob
+            # falsification gate for "is the 29k-file scan the event-loop
+            # offender behind Claude stream first_token=NEVER?"  Default
+            # "true" preserves production byte-identically.  No new
+            # substrate — composes the existing ``oracle_enabled`` dataclass
+            # field that previously had no env path.
+            oracle_enabled=os.environ.get("JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED", "true").lower() == "true",
             max_concurrent_execution_graphs=int(
                 os.environ.get("JARVIS_GOVERNED_L3_MAX_CONCURRENT_GRAPHS", "2")
             ),
