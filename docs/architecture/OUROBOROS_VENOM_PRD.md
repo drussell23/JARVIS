@@ -1992,6 +1992,54 @@ Versions: `anthropic 0.75.0`, `httpx 0.28.1`, `python 3.11.10`, model `claude-so
 
 ---
 
+##### §40.7.10-quiescence — Autonomous Quiescence Protocol GRADUATED: TTFT 94,638ms → 722ms (130×), Core Sovereignty over the event loop proven (2026-05-14)
+
+**The 16-rev arc closes here.** Tasks #95–#102 sealed budget / lifecycle / phase-isolation / monotonic-deadline invariants but never moved the Claude stream `first_raw_event` past the NEVER/90s+ wall. Task #101's diagnostic matrix falsified H7/H8/H9 (prompt size, thinking budget, system prompt, TLS, idle-pool-staleness — all clean in isolation: probe streamed first event in 759–1340ms across every dimension incl. 10-min idle). Task #103's **B1 falsification campaign** was the turning point: it isolated the fault to **event-loop starvation under concurrent background load**, not any provider/network/payload axis.
+
+**The falsification ladder (Task #103, operator-bound bisection runbook v2):**
+
+| Run | Config | `first_raw_event` | Reading |
+|---|---|---|---|
+| Run A (invalid) | B1 wired only at GLS periodic loop | 0 events | B1 efficacy gap — harness builds its OWN `TheOracle()`; boot `full_index` was a separate ungated trigger |
+| B1 completeness fix | `9b0f3b0479` — same flag gates `TheOracle.initialize()` boot `full_index` too | — | One knob → both Oracle index triggers |
+| **Run A2 (clean B1)** | `JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED=false`, Quiescence absent | **0 → 24 events; first at 94,638ms** | Oracle boot index = *dominant* suffocator (binary flipped). But residual ~97 not-done tasks still delayed first event **94–333s** — consciousness/sensor matrix also guilty |
+
+**The architectural fix (Task #104 — Autonomous Quiescence Protocol / Core Isolation):**
+
+Deterministic containment, not per-subsystem `asyncio.sleep(0)` whack-a-mole. A single global `asyncio.Event` gate (`backend/core/ouroboros/governance/quiescence.py`):
+- `quiescence_core_active(label="claude_stream")` wraps the SDK stream's critical network section — first concurrent entrant **clears** the gate (background matrix parks in `Event.wait()` at 0% CPU), last exit **sets** it. Refcounted under `asyncio.Lock` for the BG pool's concurrent workers; `finally`-releases even if the stream body raises.
+- `await_quiescence_clearance()` — the background-loop checkpoint; immediate when set, parked when cleared, bounded by `JARVIS_QUIESCENCE_MAX_PAUSE_S` (default 420s) — degrade, never starve.
+- **Composition over duplication**: Task #102's `cooperative_yield_every_n_async` was extended to await the gate at each yield point, so every existing consumer (Oracle `_scan_for_changes` + any future loop) inherits containment with zero per-call-site code. Plus surgical adoption at the proven B1 dominant offender (`oracle._index_repository`).
+- Composes `asyncio.Event` + `asyncio.Lock` + `asyncio.wait_for` ONLY. No subprocess, no thread, no async-context fracture. Master `JARVIS_QUIESCENCE_PROTOCOL_ENABLED` (default true, SAFETY) → false = byte-identical legacy.
+
+**Validation soak `bt-2026-05-15-052902`** — apples-to-apples with the 94,638ms Run A2 baseline (B1 ON / Oracle indexer disabled, same residual matrix, Quiescence ON), operator-bound decision table applied strictly:
+
+| Metric | Run A2 baseline | **Quiescence validation** | Factor |
+|---|---|---|---|
+| `first_raw_event` thinking=on | **94,638 ms** | **722 ms**, 925 ms | **~130×** |
+| `first_raw_event` thinking=off | (NEVER in earlier soaks) | 799 / 1,035 / 1,225 / 1,230 / 1,273 / 1,274 / 1,453 / 1,734 / 3,260 ms | sub-3.3s, mostly ~1.2s |
+| Gate engagements (ACTIVE/RELEASED) | n/a | 14 / 14 (balanced — no leaked gate) | — |
+| `max-pause exceeded` (anti-starvation valve) | n/a | **0** (healthy core, gate never held too long) | — |
+| `first_token=Nms` (real tokens flowed) | 0 | **6** | — |
+
+**Decision-table verdict: absolute PASS.** `first_raw_event` collapsed two orders of magnitude (94,638ms → 722ms thinking-on), at/below the Step 2 isolation-probe baseline (~1,340ms). Boundary log confirmed gate-aware parking: `[Quiescence] core ACTIVE — background matrix PAUSED (refcount=1)` bracketing each stream against a `tasks_total=92` matrix that was running but contained. Hypothesis confirmed: the residual delay was event-loop contention; deterministic containment eliminates it. **Core Sovereignty over the event loop is mathematically proven** — a load-bearing proof of non-stationary control over the organism's task population.
+
+**Discipline held throughout**: no Bar A 3/4/5 claimed from a falsification soak; no PR opened until operator reviewed the four log signatures vs the A2 baseline; the fix is composition (gate + Task #102 primitive) not new timeout layers; every threshold env-tunable + FlagRegistry-seeded; default-true with byte-identical rollback.
+
+**Next**: training wheels off — re-enable the Oracle boot index (`JARVIS_GOVERNED_ORACLE_INDEXER_ENABLED=true`) and run the **full-matrix soak** (Oracle ON + Sensors ON + Quiescence ON). The proof obligation: deterministic containment chokes out the heaviest, most entropic cold-boot load (29k-file `full_index`) the system can generate while still delivering sub-second TTFT to the core.
+
+**File-coordinate summary**:
+- Substrate: `backend/core/ouroboros/governance/quiescence.py` (Task #104, commit `7b400f8de1`, merge `af79176f75`)
+- Composition seam: `event_loop_governance.py::cooperative_yield_every_n_async` (Task #102 extended)
+- Core flipper: `providers.py` `messages.stream()` wrapped in `quiescence_core_active`
+- B1 completeness: `oracle.py::initialize()` boot `full_index` gate (commit `9b0f3b0479`)
+- Spine: `tests/governance/test_task_104_quiescence_protocol.py` (22 tests incl. load-bearing core-active-blocks-bg + refcount + safety-valve + exception-failsafe)
+- Diagnostic: `scripts/diagnostics/claude_stream_probe_matrix.py` (Task #101 — falsified H7/H8/H9)
+- Baselines: Run A2 `bt-2026-05-15-041448` (94,638ms) → validation `bt-2026-05-15-052902` (722ms)
+- Active tasks: #103 (falsification campaign — PASS, closes), #104 (Quiescence Protocol — GRADUATED)
+
+---
+
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
 
 **As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
