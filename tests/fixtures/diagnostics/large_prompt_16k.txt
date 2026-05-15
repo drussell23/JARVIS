@@ -1,0 +1,322 @@
+def process_envelope_0(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_1(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_2(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_3(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_4(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_5(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_6(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_7(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_8(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_9(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_10(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_11(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_12(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_13(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_14(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_15(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_16(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_17(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_18(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_19(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_20(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < MIN_VIABLE_S:
+        return ProcessResult(status='starved', remaining_s=remaining)
+    candidates = enumerate_candidates(envelope['target_files'])
+    for cand in candidates[:MAX_CANDIDATES]:
+        verdict = advisor.recommend(cand, ctx)
+        if verdict.outcome == 'block':
+            continue
+        return ProcessResult(status='ok', candidate=cand)
+
+def process_envelope_21(envelope: dict, ctx: OperationContext) -> ProcessResult:
+    """Process the operation envelope through the budget gate."""
+    if not envelope.get('target_files'):
+        return ProcessResult(status='skip', reason='no_targets')
+    deadline = envelope.get('deadline') or default_deadline()
+    remaining = (deadline - now()).total_seconds()
+    if remaining < M
