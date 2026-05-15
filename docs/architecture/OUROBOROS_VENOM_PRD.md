@@ -2654,7 +2654,7 @@ Repeat across **3 consecutive clean soaks** under Phase 9 cadence — at that po
 
 **Prerequisites.**
 
-- §41.11.4 Phase 9 graduation of `JARVIS_AUTO_COMMIT_ENABLED` (default-TRUE for unattended apply)
+- §41.11.4 AutoCommitter graduation-**evidence gate** returns `READY` (NOT "flag flips default-TRUE" — the flag is already default-TRUE; the real prerequisite is the gate's per-soak-window Yellow-tier O+V evidence verdict, see §41.11.4 premise-correction)
 - `risk_tier_floor` configuration permitting Yellow-tier unattended-apply on governance ops (currently floor is `notify_apply` or stricter for `ORDER_2_GOVERNANCE` per Pass B)
 - Pass B Order-2 governance cage (§40.1) graduated default-true OR the SICA candidate's scope kept below Order-2 (Body-only governance ops only)
 
@@ -2723,36 +2723,33 @@ Acceptance gate: **≤4.4% catastrophic-error rate** (matching Anthropic's bench
 
 **Tier placement.** §41.8 Phase 2 candidate (months 12–18, after §41.11.1 and concurrent with §41.11.2). Closing this ticket retires the §92.16 thread (4) caveat (ASL-4 framework alignment stops being "structural mapping" and becomes "empirical stability result").
 
-#### §41.11.4 Phase 9 graduation of `JARVIS_AUTO_COMMIT_ENABLED` for unattended apply
+#### §41.11.4 AutoCommitter graduation-evidence gate for unattended apply
 
-**The claim that needs proving.** AutoCommitter's `JARVIS_AUTO_COMMIT_ENABLED` flag graduates from `default-FALSE` (current) to `default-TRUE` under the Phase 9 cadence ladder, with risk-tier floor configured to permit Yellow-tier unattended apply for governance-code mutations.
+**PREMISE CORRECTION (2026-05-14 — a §92.16-class self-audit catch).** The original framing of this ticket said *"AutoCommitter's `JARVIS_AUTO_COMMIT_ENABLED` flag graduates from `default-FALSE` (current) to `default-TRUE`."* **That premise was false** and was an unverified claim authored into this PRD by the same hand that authored §92.16. `auto_committer.py` line 83 reads `os.environ.get("JARVIS_AUTO_COMMIT_ENABLED", "true")` — **the flag is and was already `default-TRUE`.** "Flip the flag" was never the work. This is exactly the class of overclaim §41.11 exists to retire, caught here in the PRD itself by the same forensic discipline (`git`/source verification, not assertion).
+
+**The claim that actually needs proving (reframed).** The generic `GraduationLedger.is_eligible()` proves *"soaks were clean"* — it does **not** prove *"AutoCommitter actually fired on a real Yellow-tier (`NOTIFY_APPLY`) op during those clean soaks."* A soak is clean even if every op was `SAFE_AUTO`, or no op fired, or all commits were human-authored. Graduating AutoCommitter (or asserting §41.11.1's SICA prerequisite is met) on clean-soak-count alone is a §92.16-class overclaim. What needs proving is **per-soak-window evidence** that AutoCommitter exercised the unattended-apply path.
+
+**SHIPPED 2026-05-14 — the AutoCommitter graduation-evidence gate** (`backend/core/ouroboros/governance/auto_commit_graduation_gate.py`, ~700 LOC + 33-test spine + 6 AST pins + 4 FlagRegistry seeds). Closed taxonomies `CommitEvidenceKind` (3) + `AutoCommitEvidenceVerdict` (5: READY / LEDGER_NOT_ELIGIBLE / EVIDENCE_INSUFFICIENT / NO_GIT_HISTORY / MASTER_OFF). **Composes** the canonical `GraduationLedger` clean-soak counter + `_read_all` row reader (never re-implements it) and **adds** the missing evidence layer: genuine per-soak-window `git log` attribution (consecutive clean-`SessionRecord.recorded_at_epoch` define each window; oldest soak bounded by `JARVIS_AUTOCOMMIT_GRAD_LOOKBACK_DAYS`, caveat stated in the diagnostic — *claim exactly what the evidence supports*). A soak has evidence iff ≥1 commit in its window carries **both** the canonical O+V signature (derived from `auto_committer.ov_signature_substring()` — not hardcoded) **and** the Yellow marker (derived as `f"Risk: {RiskTier.NOTIFY_APPLY.name}"` — not hardcoded). `READY` only when the generic ledger is eligible **and** every counted clean soak has window evidence; otherwise `EVIDENCE_INSUFFICIENT` with the bare soaks named. git access via `asyncio.create_subprocess_exec` argv-list (no shell, repo standard, AST-pinned). Master `JARVIS_AUTOCOMMIT_GRADUATION_GATE_ENABLED` §33.1 default-FALSE. Authority-asymmetry AST-pinned (no orchestrator/iron_gate/policy_engine/change_engine/candidate_generator). The gate **NEVER flips the flag** — it makes the operator's evidence-driven decision auditable; `evidence_summary().meets_evidence_gate` is the single boolean a REPL/SSE surface reads.
 
 **What is empirically demonstrated today.**
 
-- ✅ Phase 9 cadence operational (started 2026-05-05, §92.9).
-- ✅ First flag graduated: `JARVIS_DECISION_TRACE_LEDGER_ENABLED` (2026-05-05).
-- ✅ AutoCommitter primitive end-to-end (constructs commit signature, conventional format, risk-tier metadata, protected-branch push prevention).
+- ✅ `JARVIS_AUTO_COMMIT_ENABLED` is already `default-TRUE` (verified `auto_committer.py:83`).
+- ✅ AutoCommitter primitive end-to-end (commit signature, conventional format, risk-tier metadata, protected-branch push prevention).
+- ✅ The graduation-evidence gate substrate (this ship) — deterministic, fail-closed, 33 tests + 6 AST pins green.
 
 **What is *not* empirically demonstrated.**
 
-- ❌ `JARVIS_AUTO_COMMIT_ENABLED=true` as default (currently FALSE).
-- ❌ Unattended-apply on governance ops (currently requires `notify_apply` floor or stricter).
-- ❌ 3-clean-soak ladder green for AutoCommitter under cadence pressure.
+- ❌ The empirical *evidence* itself — i.e. the gate returning `READY` against a real ledger + real git history (requires actual Phase 9 clean soaks where AutoCommitter fired on Yellow-tier ops). The gate is the *instrument*; the soak is the *measurement*. Fabricating the measurement would be the §92.16 mistake — not done.
+- ❌ Unattended-apply on governance ops (still requires `notify_apply` floor or stricter; that floor relaxation is a separate operator decision the gate informs but does not make).
 
-**Graduation criterion (concrete).**
-
-- 3 consecutive clean soaks under Phase 9 cadence with AutoCommitter firing on real Yellow-tier ops.
-- Master flag flips `default-FALSE` → `default-TRUE` in the owner module.
-- AST pin renames per pre-graduation discipline.
-- Layered evidence: master-flag-default-true source-grep + pre-graduation pin rename + 3-clean-soak audit ledger entries.
-- Hot-revert path verified (`JARVIS_AUTO_COMMIT_ENABLED=false` → AutoCommitter short-circuits).
+**Graduation criterion (concrete).** `evaluate_graduation_evidence()` returns `AutoCommitEvidenceVerdict.READY` against the live ledger + live git history — meaning generic clean-soak eligibility **and** ≥1 Yellow-tier O+V commit in every counted clean-soak window. That verdict (not clean-soak-count, not operator judgment) is the evidence-driven gate for any unattended-apply scope decision.
 
 **Prerequisites.**
 
-- Phase 9 cadence ladder reaches `JARVIS_AUTO_COMMIT_ENABLED` (currently ~24 flags queued, AutoCommitter is somewhere in the middle of the queue — sequencing decision per §40.7 cadence run log).
-- §41.11.2 Anti-Venom parity-scale eval *should ideally close first* — don't let unattended autonomy run if the cage isn't parity-scale-verified. (This is a soft prerequisite; the operator may choose to graduate AutoCommitter under a smaller risk-tier scope first.)
+- Phase 9 cadence runs producing clean soaks where AutoCommitter fires on real Yellow-tier ops (the measurement the instrument reads — operator-paced, cannot be fabricated).
+- §41.11.2 Anti-Venom parity-scale eval *should ideally close first* (soft prerequisite — don't widen unattended autonomy before the cage is parity-verified).
 
-**Tier placement.** §41.8 Phase 1 candidate (months 6–12). Closing this ticket is the **engineering prerequisite** for §41.11.1 — without AutoCommitter graduated to default-TRUE under unattended-apply, the SICA-pattern demonstration cannot run.
+**Tier placement.** §41.8 Phase 1 candidate (months 6–12). The **substrate prerequisite is now CLOSED** — §41.11.1's SICA demonstration can no longer be claimed on clean-soak-count alone; it must pass this gate's `READY` verdict, which structurally prevents the §92.16-class overclaim at the graduation boundary.
 
 #### §41.11.5 Reverse Russian Doll bounded-RSI formal proof (dissertation cross-reference)
 
@@ -2787,7 +2784,7 @@ The five tickets above map onto the §92.16 + §92.18 honesty caveats as follows
 
 | §92.16 thread / §92.18 framing | Closes when |
 |---|---|
-| Thread (1) — SICA-pattern empirical demo | §41.11.1 + §41.11.4 graduate |
+| Thread (1) — SICA-pattern empirical demo | §41.11.1 graduates AND §41.11.4 evidence-gate returns READY |
 | Thread (3) — Constitutional Classifiers parity | §41.11.2 graduates |
 | Thread (4) — ASL-4 recursion-bound stability | §41.11.3 graduates |
 | §92.18 — Mechanic → Neurosurgeon transition | §41.11.1 + §41.11.3 graduate |
