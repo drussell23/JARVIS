@@ -1669,7 +1669,26 @@ class TheOracle:
         batch_count = (total_files + batch_size - 1) // batch_size
         _t_batch_start = time.monotonic()
         _last_progress_log = _t_batch_start
+        # Task #104 — Quiescence Protocol checkpoint.  The B1
+        # falsification campaign proved this boot index is the
+        # dominant event-loop suffocator (disabling it flipped Claude
+        # stream first_raw_event 0→24).  Even gated, when it DOES run
+        # it must yield the loop the instant a core stream engages.
+        # Lazy import (same governance package; avoid load cycle).
+        try:
+            from backend.core.ouroboros.governance.quiescence import (
+                await_quiescence_clearance as _await_quiescence,
+            )
+        except Exception:  # noqa: BLE001
+            _await_quiescence = None  # type: ignore[assignment]
         for i in range(0, total_files, batch_size):
+            # Park at 0% CPU here if a Claude SDK stream is in flight —
+            # deterministic containment, not best-effort sleep(0).
+            if _await_quiescence is not None:
+                try:
+                    await _await_quiescence(label="oracle_index_repository")
+                except Exception:  # noqa: BLE001 — never break the index
+                    pass
             batch = python_files[i:i + batch_size]
             tasks = [
                 self._index_file(repo_name, repo_path, file_path)

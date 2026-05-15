@@ -147,7 +147,26 @@ async def cooperative_yield_every_n_async(
         yield item
         counter += 1
         if enabled and counter % every_n == 0:
-            await asyncio.sleep(0)
+            # Task #104 — Quiescence Protocol composition.  At each
+            # cooperative-yield point, ALSO honor the global quiescence
+            # gate: if the core (a Claude SDK stream) is active, park
+            # here at 0% CPU until it releases.  This gives every
+            # existing consumer of this primitive (Oracle
+            # _scan_for_changes, future loops) deterministic core
+            # isolation for free — no per-call-site duplication.
+            # Lazy import — quiescence lives in the same governance
+            # package; avoid an import cycle at module load.
+            try:
+                from backend.core.ouroboros.governance.quiescence import (
+                    await_quiescence_clearance,
+                )
+                await await_quiescence_clearance(
+                    label="cooperative_yield_every_n_async",
+                )
+            except Exception:  # noqa: BLE001 — never break the iterator
+                await asyncio.sleep(0)
+            else:
+                await asyncio.sleep(0)
 
 
 async def offload_blocking(
