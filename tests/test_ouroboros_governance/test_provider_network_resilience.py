@@ -149,10 +149,20 @@ def test_ensure_client_uses_extended_read_timeout_when_thinking_on() -> None:
             captured["pool"] = pool
 
     class _FakeAsyncAnthropic:
-        def __init__(self, *, api_key: str, timeout: Any, max_retries: int) -> None:
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            max_retries: int,
+            timeout: Any = None,
+            http_client: Any = None,
+            **_kw: Any,
+        ) -> None:
             captured["api_key"] = api_key
-            captured["timeout"] = timeout
             captured["max_retries"] = max_retries
+            captured["http_client"] = http_client
+            if timeout is not None:
+                captured["timeout"] = timeout
 
     fake_anthropic = MagicMock()
     fake_anthropic.AsyncAnthropic = _FakeAsyncAnthropic
@@ -184,8 +194,18 @@ def test_ensure_client_uses_default_read_timeout_when_thinking_off() -> None:
             captured["read"] = read
 
     class _FakeAsyncAnthropic:
-        def __init__(self, *, api_key: str, timeout: Any, max_retries: int) -> None:
-            captured["timeout"] = timeout
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            max_retries: int,
+            timeout: Any = None,
+            http_client: Any = None,
+            **_kw: Any,
+        ) -> None:
+            captured["http_client"] = http_client
+            if timeout is not None:
+                captured["timeout"] = timeout
 
     fake_anthropic = MagicMock()
     fake_anthropic.AsyncAnthropic = _FakeAsyncAnthropic
@@ -218,6 +238,11 @@ async def test_backoff_returns_immediately_on_success() -> None:
 
 
 @pytest.mark.asyncio
+@patch.dict(
+    "os.environ",
+    {"JARVIS_TOPOLOGY_FULL_JITTER_ENABLED": "false"},
+    clear=False,
+)
 async def test_backoff_retries_on_timeout_then_succeeds() -> None:
     provider = _new_provider()
     calls: List[int] = []

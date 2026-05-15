@@ -170,6 +170,10 @@ def test_ast_pin_helper_wired_at_stream_path():
         "messages.stream kwargs MUST set timeout via the helper "
         "(_stream_kwargs['timeout'] = _derive_per_request_httpx_timeout(...))"
     )
+    assert "_live_http_budget" in src, (
+        "Stream httpx budget MUST be derived from live UTC remaining "
+        "(Task #100) — not only the stale _generate_raw snapshot"
+    )
 
 
 def test_ast_pin_helper_wired_at_create_path():
@@ -178,6 +182,10 @@ def test_ast_pin_helper_wired_at_create_path():
     src = _PROVIDERS_SRC.read_text(encoding="utf-8")
     assert '_create_kwargs["timeout"] = _derive_per_request_httpx_timeout(' in src, (
         "messages.create kwargs MUST set timeout via the helper"
+    )
+    assert "_live_create" in src, (
+        "Create httpx budget MUST refresh from UTC deadline on each "
+        "attempt (Task #100)"
     )
 
 
@@ -271,6 +279,15 @@ def test_seed_has_httpx_connect_cap_flag():
     )
 
 
+def test_seed_has_stream_hard_kill_grace_flag():
+    src = _SEED_SRC.read_text(encoding="utf-8")
+    assert "JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S" in src
+    idx = src.find("JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S")
+    window = src[idx:idx + 1200]
+    assert "default=30.0" in window
+    assert "providers.py" in window
+
+
 # ---------------------------------------------------------------------------
 # Behavioral guarantee — wall ≤ budget + grace under slow connect
 # ---------------------------------------------------------------------------
@@ -307,3 +324,17 @@ def test_helper_invariant_connect_le_outer_budget():
                 f"pool MUST also honor outer budget: budget={budget} "
                 f"cap={cap} → pool={t.pool}"
             )
+
+
+def test_remaining_utc_budget_s_floors_and_none():
+    from datetime import datetime, timedelta, timezone
+
+    from backend.core.ouroboros.governance.providers import (
+        _remaining_utc_budget_s,
+    )
+
+    assert _remaining_utc_budget_s(None) is None
+    _past = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
+    assert _remaining_utc_budget_s(_past, floor_s=1.0) == pytest.approx(1.0)
+    _soon = datetime.now(tz=timezone.utc) + timedelta(seconds=0.001)
+    assert _remaining_utc_budget_s(_soon, floor_s=0.01) >= 0.01

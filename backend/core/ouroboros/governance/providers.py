@@ -4740,6 +4740,24 @@ def _derive_per_request_httpx_timeout(
     )
 
 
+def _remaining_utc_budget_s(
+    deadline: Optional[datetime],
+    *,
+    floor_s: float = 1.0,
+) -> Optional[float]:
+    """Wall seconds until *deadline* (UTC). ``None`` if *deadline* is absent.
+
+    Floors at *floor_s* so callers never feed 0/negative budgets into
+    ``asyncio.wait_for`` / httpx while the deadline is imminent or
+    elapsed. Task #100 — monotonic D2 spine: re-query before every
+    attempt instead of reusing a stale snapshot from an outer closure.
+    """
+    if deadline is None:
+        return None
+    rem = (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+    return max(float(floor_s), rem)
+
+
 # Exponential backoff retry — 2s, 4s, 8s between attempts.
 _CLAUDE_RETRY_MAX_ATTEMPTS = int(
     os.environ.get("JARVIS_CLAUDE_RETRY_MAX_ATTEMPTS", "3")
@@ -4758,6 +4776,12 @@ _CLAUDE_MIN_RETRY_CYCLE_S = float(
 )
 _CLAUDE_BACKOFF_BUDGET_FRACTION = float(
     os.environ.get("JARVIS_CLAUDE_BACKOFF_BUDGET_FRACTION", "0.25")
+)
+# Hard-kill grace past remaining UTC wall budget (Task #100, 2026-05-14):
+# ``asyncio.wait`` budget = live_remaining + this grace — never
+# ``stale_snapshot + 30`` which re-inflates after backoff retries.
+_CLAUDE_STREAM_HARD_KILL_GRACE_S = float(
+    os.environ.get("JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S", "30.0"),
 )
 # Client recycling (Task #4 — cascade hardening):
 # The shared ``anthropic.AsyncAnthropic`` client owns a lazily-created
@@ -5630,6 +5654,11 @@ class ClaudeProvider:
         * **Budget-capped backoff.** Sleep duration is capped at
           ``budget_remaining * _CLAUDE_BACKOFF_BUDGET_FRACTION`` (default
           25%) so exponential growth never devours the deadline.
+        * **Task #100 — D2 monotonic httpx envelope.** Each SDK entry
+          (stream/create) re-derives its per-request ``httpx.Timeout`` from
+          :func:`_remaining_utc_budget_s` at invocation time so a backoff
+          retry never inherits a stale full-route ``timeout_s`` from the
+          outer closure while the UTC deadline has shrunk.
         * **Client recycling.** On retry exhaustion (or on a "hard pool"
           exception class — ``PoolTimeout``, ``ConnectError``, etc.)
           the anthropic client is dropped so the next op starts with a
@@ -6168,7 +6197,8 @@ class ClaudeProvider:
 
         async def _generate_raw(p: str) -> str:
             nonlocal total_cost
-            timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+            _r0 = _remaining_utc_budget_s(deadline, floor_s=1.0)
+            timeout_s = float(_r0 if _r0 is not None else 1.0)
 
             # Multi-modal path. Two sources of image content merge here:
             #
@@ -6482,16 +6512,15 @@ class ClaudeProvider:
                     }
                     if _thinking_param is not None:
                         _stream_kwargs["thinking"] = _thinking_param
-                    # D2 (Task #95, 2026-05-14) — per-request httpx.Timeout
-                    # derived from the outer attempt budget.  Without this,
-                    # the SDK's construction-time httpx.Timeout (connect=10s,
-                    # read=600s thinking / 120s default) runs the network
-                    # call far past the outer asyncio.wait_for budget on
-                    # small per-attempt windows (e.g. 131s observed with
-                    # budget=10.4s on v14-rev12).  Helper is module-level
-                    # and AST-pinned to enforce wiring.
+                    # D2 (Task #95) + Task #100 — per-request httpx.Timeout
+                    # from *live* UTC remaining budget (not the stale
+                    # ``timeout_s`` snapshot at _generate_raw entry), so
+                    # backoff retries cannot re-inflate the read window.
+                    _live_http_budget = _remaining_utc_budget_s(
+                        deadline, floor_s=1.0,
+                    ) or timeout_s
                     _stream_kwargs["timeout"] = _derive_per_request_httpx_timeout(
-                        timeout_s,
+                        _live_http_budget,
                     )
                     async with _current_client.messages.stream(**_stream_kwargs) as stream:
                         # Two-Phase Stream Rupture Breaker.
@@ -6534,7 +6563,6 @@ class ClaudeProvider:
                             thinking_enabled=_thinking_active,
                         )
                         _rupture_ic = _stream_inter_chunk_timeout_s()
-                        _chunk_timeout = _rupture_ttft  # Phase 1
                         # Task #88e: raw-event iterator instead of text_stream.
                         # The wait_for now measures stream-level silence,
                         # not text-only silence.
@@ -6544,6 +6572,15 @@ class ClaudeProvider:
                         # GENERATEs stay observably fresh.
                         _stream_chunk_count = 0
                         while True:
+                            _wall_rem = _remaining_utc_budget_s(
+                                deadline, floor_s=0.01,
+                            ) or timeout_s
+                            _wall_rem = max(0.01, float(_wall_rem))
+                            _rupt_base = (
+                                _rupture_ttft if _stream_first_token_at[0] is None
+                                else _rupture_ic
+                            )
+                            _chunk_timeout = min(_rupt_base, _wall_rem)
                             try:
                                 _event = await asyncio.wait_for(
                                     _event_iter.__anext__(),
@@ -6599,8 +6636,8 @@ class ClaudeProvider:
                             if _stream_first_token_at[0] is None:
                                 _stream_first_token_at[0] = time.monotonic()
                                 _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
-                                # Phase 2: step down to tight inter-chunk timeout.
-                                _chunk_timeout = _rupture_ic
+                                # Phase 2: inter-chunk rupture base (combined
+                                # with live wall each loop iteration below).
                                 # First token also pulses activity so the
                                 # transition from "waiting for TTFT" to
                                 # "actively producing" is observable.
@@ -6691,11 +6728,18 @@ class ClaudeProvider:
                 # Python 3.9+ returns (done, pending) without awaiting
                 # cancel completion, so we can abandon a wedged task
                 # and keep the microkernel in control of its own
-                # threads. Grace = 30s past the soft timeout: if the
-                # soft wait_for didn't succeed in shutting down the
-                # task within 30s of its own deadline, we hard-kill.
+                # threads. Grace = ``JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S``
+                # (default 30s) past *live* UTC remaining wall budget — not
+                # past the stale ``timeout_s`` snapshot (Task #100 / D2).
+                _soft_wall_rem = _remaining_utc_budget_s(deadline, floor_s=0.01)
+                _soft_wall_rem = float(
+                    _soft_wall_rem if _soft_wall_rem is not None else timeout_s,
+                )
+                _soft_wall_rem = max(0.01, _soft_wall_rem)
+                _hard_kill_budget_s = (
+                    _soft_wall_rem + _CLAUDE_STREAM_HARD_KILL_GRACE_S
+                )
                 _stream_task = asyncio.create_task(_stream_with_resilience())
-                _hard_kill_budget_s = timeout_s + 30.0
                 try:
                     done, pending = await asyncio.wait(
                         {_stream_task},
@@ -6715,11 +6759,12 @@ class ClaudeProvider:
                             _t.cancel()
                         logger.error(
                             "[ClaudeProvider] HARD-KILL claude stream after "
-                            "%.1fs (soft_timeout=%.1fs did not propagate "
+                            "%.1fs (live_wall=%.1fs grace=%.1fs did not propagate "
                             "cancel — SDK wedged, microkernel severing) "
                             "tool_round=%s thinking=%s prompt_chars=%d",
                             _hard_kill_budget_s,
-                            timeout_s,
+                            _soft_wall_rem,
+                            _CLAUDE_STREAM_HARD_KILL_GRACE_S,
                             "yes" if _is_tool_round else "no",
                             "on" if _thinking_param is not None else "off",
                             len(str(_messages)),
@@ -6787,13 +6832,6 @@ class ClaudeProvider:
                 }
                 if _thinking_param is not None:
                     _create_kwargs["thinking"] = _thinking_param
-                # D2 (Task #95, 2026-05-14) — per-request httpx.Timeout
-                # derived from the outer attempt budget.  Same rationale
-                # as the stream path: connect/pool ≤ outer budget, no
-                # 130s overruns on small attempts.
-                _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
-                    timeout_s,
-                )
 
                 async def _create_with_prefill_fallback() -> Any:
                     """Same prefill-rejection fallback as the stream path."""
@@ -6801,6 +6839,11 @@ class ClaudeProvider:
                     # matching comment in _do_stream. Closure-captured
                     # clients go stale after _recycle_client() fires.
                     _current_client = self._ensure_client()
+                    _live_create = _remaining_utc_budget_s(deadline, floor_s=1.0)
+                    _live_create = float(_live_create if _live_create is not None else timeout_s)
+                    _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+                        _live_create,
+                    )
                     try:
                         return await _current_client.messages.create(**_create_kwargs)
                     except Exception as _exc:
@@ -6817,6 +6860,13 @@ class ClaudeProvider:
                                 type(_exc).__name__,
                             )
                             _messages.pop()
+                            _live_create = _remaining_utc_budget_s(deadline, floor_s=1.0)
+                            _live_create = float(
+                                _live_create if _live_create is not None else timeout_s,
+                            )
+                            _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+                                _live_create,
+                            )
                             return await _current_client.messages.create(**_create_kwargs)
                         raise
 
@@ -6832,9 +6882,11 @@ class ClaudeProvider:
                     )
 
                 try:
+                    _live_outer = _remaining_utc_budget_s(deadline, floor_s=1.0)
+                    _live_outer = float(_live_outer if _live_outer is not None else timeout_s)
                     msg = await asyncio.wait_for(
                         _create_with_resilience(),
-                        timeout=timeout_s,
+                        timeout=_live_outer,
                     )
                 except asyncio.TimeoutError as _te:
                     _elapsed = time.monotonic() - _call_start
@@ -6989,7 +7041,8 @@ class ClaudeProvider:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             raw = None
             while True:
-                timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+                _r_loop = _remaining_utc_budget_s(deadline, floor_s=1.0)
+                timeout_s = float(_r_loop if _r_loop is not None else 1.0)
                 if timeout_s <= 5.0:
                     logger.warning(
                         "[ClaudeProvider] Tool loop exiting — only %.1fs remaining "

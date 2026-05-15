@@ -541,6 +541,23 @@ SEED_SPECS: list = [
         example="5.0",
         since="2026-05-14",
     ),
+    FlagSpec(
+        name="JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S",
+        type=FlagType.FLOAT, default=30.0,
+        description=(
+            "Grace seconds added to the *live* UTC wall remaining "
+            "budget when computing the Claude stream hard-kill "
+            "``asyncio.wait`` timeout (Task #100, 2026-05-14).  The "
+            "wait budget is ``_remaining_utc_budget_s(deadline) + "
+            "this_grace`` — never ``stale_timeout_snapshot + 30``, "
+            "so backoff retries cannot re-inflate the hard-kill window "
+            "after the orchestrator deadline has shrunk (D2 envelope)."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="30.0",
+        since="2026-05-14",
+    ),
 
     # ====================================================================
     # Autonomous Connection Lifecycle Policy (Task #99, 2026-05-14)

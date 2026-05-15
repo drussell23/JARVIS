@@ -88,12 +88,17 @@ def test_hard_kill_uses_asyncio_wait_not_wait_for() -> None:
     )
 
 
-def test_hard_kill_budget_is_soft_timeout_plus_30_grace() -> None:
-    """Derek's directive: grace window is gen_timeout + 30s. The
-    wrapper computes ``_hard_kill_budget_s = timeout_s + 30.0``.
+def test_hard_kill_budget_is_live_wall_plus_grace() -> None:
+    """Hard-kill ``asyncio.wait`` budget = live UTC remaining + env grace.
+
+    Task #100 (2026-05-14): stale ``timeout_s + 30`` re-inflated the
+    wait window across backoff retries — the budget must track the
+    orchestrator deadline monotonically.
     """
     src = _read_providers_src()
-    assert "_hard_kill_budget_s = timeout_s + 30.0" in src
+    assert "_hard_kill_budget_s" in src
+    assert "_soft_wall_rem + _CLAUDE_STREAM_HARD_KILL_GRACE_S" in src
+    assert "JARVIS_CLAUDE_STREAM_HARD_KILL_GRACE_S" in src
 
 
 def test_hard_kill_does_not_await_pending_cancel() -> None:
