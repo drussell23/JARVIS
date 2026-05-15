@@ -560,6 +560,54 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Autonomous Quiescence Protocol — Core Isolation (Task #104, 2026-05-14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_QUIESCENCE_PROTOCOL_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the Autonomous Quiescence Protocol.  "
+            "When true, a global asyncio.Event gate is CLEARED for the "
+            "lifetime of every Claude SDK stream (quiescence_core_"
+            "active); heavy background loops that await the gate at "
+            "their critical-iteration top park at 0% CPU until the "
+            "core releases, handing 100% of the event loop to the "
+            "network stream consumer.  Refcounted for the BG pool's "
+            "concurrent workers.  Closes the residual 94-333s "
+            "first_raw_event delay the B1 falsification campaign "
+            "(Task #103) proved remained after Oracle was disabled — "
+            "deterministic containment, not per-subsystem sleep(0) "
+            "whack-a-mole.  Default true per operator binding "
+            "2026-05-14 ('lock down the entire matrix, let the core "
+            "breathe').  False → both surfaces no-op (byte-identical "
+            "legacy)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/quiescence.py",
+        example="true",
+        since="2026-05-14",
+    ),
+    FlagSpec(
+        name="JARVIS_QUIESCENCE_MAX_PAUSE_S",
+        type=FlagType.FLOAT, default=420.0,
+        description=(
+            "Anti-starvation ceiling — maximum seconds a background "
+            "loop will park in the quiescence gate before proceeding "
+            "(degraded, with a WARN) even if the core still holds it.  "
+            "Default 420s — longer than any single GENERATE budget "
+            "(~360s thinking + grace) so a healthy core never trips "
+            "it, but a wedged GENERATE cannot freeze the organism "
+            "forever.  Degrade, never starve.  Invalid / non-positive "
+            "values fall back to 420.  Task #104 Quiescence Protocol, "
+            "operator binding 2026-05-14."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/quiescence.py",
+        example="420.0",
+        since="2026-05-14",
+    ),
+
+    # ====================================================================
     # Autonomous Event-Loop Governance Substrate (Task #102, 2026-05-14)
     # ====================================================================
     FlagSpec(

@@ -6559,7 +6559,23 @@ class ClaudeProvider:
                             )
                         except Exception:  # noqa: BLE001 — log-only, never raise
                             pass
-                    async with _current_client.messages.stream(**_stream_kwargs) as stream:
+                    # Task #104 — Autonomous Quiescence Protocol (Core
+                    # Isolation).  Wrapping the stream's critical network
+                    # section in quiescence_core_active CLEARS the global
+                    # quiescence gate for the stream's lifetime: every
+                    # heavy background loop that awaits the gate parks at
+                    # 0% CPU, handing 100% of the event loop to the SDK
+                    # consumer.  Last concurrent stream to exit RESETS
+                    # the gate (refcounted for the BG pool's workers).
+                    # Combined async-with keeps the stream body un-
+                    # reindented; CM enter precedes stream open, CM exit
+                    # follows stream close — correct nesting.  Lazy
+                    # import avoids a governance-package cycle at load.
+                    from backend.core.ouroboros.governance.quiescence import (
+                        quiescence_core_active as _quiescence_core_active,
+                    )
+                    async with _quiescence_core_active(label="claude_stream"), \
+                            _current_client.messages.stream(**_stream_kwargs) as stream:
                         # Two-Phase Stream Rupture Breaker.
                         # Phase 1 (TTFT): generous default 120s for first
                         #   token.  Task #88 (2026-05-13) — widened to
