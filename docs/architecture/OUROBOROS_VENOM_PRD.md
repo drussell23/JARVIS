@@ -2061,6 +2061,20 @@ Pre-registered tiers applied strictly vs the 94,638ms baseline:
 
 **No Bar A 3/4/5 claimed** from this soak. Task #105 partial (thinking=off Tier-A proven; thinking=on Tier-C follow-up scoped). Task #106 closed (root fix + spine). Active follow-up: gate-adoption audit charter (additive observability only, operator-approval-gated) — boundary-snapshot diff thinking=on vs thinking=off in the TTFT window, correlate with `core ACTIVE` windows, quantify `first_token=NEVER` as text-channel vs raw-event.
 
+##### §40.7.10-quiescence-tierC-resolution — Task #107 gate-adoption audit: thinking=on Tier-C is a NON-REPRODUCIBLE transient (2026-05-15)
+
+The Task #107 audit (env-gated bounded sampler, operator-approved; commit `af8ecf2bd4`, 9-test spine) ran across two valid full-matrix reproduction soaks designed to trigger the `bt-2026-05-16-031129` thinking=on Tier-C gap:
+
+| Run (valid, suspension-free) | conditions | thinking=on `first_raw_event` | n | audit snapshots |
+|---|---|---|---|---|
+| `bt-2026-05-16-031129` (SPLIT origin) | warm cache, full matrix, Quiescence ON, ~25 min | 19,951 / 43,841 / **158,242** ms | 3 | n/a (pre-#107) |
+| `bt-2026-05-16-041846` ($0.50, 10 min, budget_exhausted) | identical + audit ON | 2,747 / 2,747 ms | 2 | 0 |
+| `bt-2026-05-16-045947` (**$2.00, 22 min, idle_timeout**, operator-authorized full-duration retry) | identical + audit ON | **1,204 / 1,206 / 2,015 ms** | 6 | 0 |
+
+The `045947` run **deliberately reproduced the exact 031129 conditions at full duration with operator-authorized $2.00 budget** (so Oracle periodic-scan + Advisor-blast ramped against the 1.38M-node warm graph) — thinking=on returned **sub-2.1 s (Tier A)**. `audit snapshots = 0` is itself dispositive: across two reproduction attempts no stream had a >15 s post-stream-open no-byte window, so the sampler had nothing to capture. Aggregate across all valid full-matrix runs: **8 of 11 thinking=on streams are sub-3 s**; the 031129 `{20s,44s,158s}` cluster (3 of 11) did not recur.
+
+**Resolution (operator-ratified 2026-05-15):** the SPLIT-verdict thinking=on Tier-C is reclassified a **non-reproducible transient** (one-off scheduling pileup / Anthropic-side latency spike / GC pause coinciding with 3 streams in `031129`) — **NOT** a structural event-loop leak the Quiescence gate fails to contain. No rogue task to name; no bisection knob justified (chasing a non-reproducible transient with new substrate would violate the anti-bloat mandate). The Autonomous Quiescence Protocol (Task #104) holds under maximum full-matrix load for **both** thinking modes. Task #107 closed. The TTFT/event-loop blocker that consumed the 16-rev arc is **sealed**; the remaining Stage-2 gate is the binary that has never fired — an SWE op reaching APPLIED/COMPLETE on the local fixture — now testable since streams return bytes in 1-4 s. Diagnostic audit/boundary flags are default-OFF and stripped from graduation soaks (substrate retained dormant per "leverage existing", not deleted).
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
