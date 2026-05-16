@@ -114,6 +114,13 @@ _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+# Contiguous, grep-discoverable terminal reason marker (single
+# source — referenced by the breaker's ctx.advance + ledger payload;
+# never split across string-concat lines so log/forensic greps and
+# the spine can match it verbatim).
+_FAILFAST_CIRCUIT_OPEN_REASON = "all_providers_exhausted_circuit_open"
+
+
 def _failfast_cb_enabled() -> bool:
     """Fail-Fast Exhaustion Circuit Breaker master switch.
 
@@ -4841,8 +4848,7 @@ class GovernedOrchestrator:
                             ctx = ctx.advance(
                                 OperationPhase.POSTMORTEM,
                                 terminal_reason_code=(
-                                    "all_providers_exhausted_"
-                                    "circuit_open"
+                                    _FAILFAST_CIRCUIT_OPEN_REASON
                                 ),
                             )
                             await self._record_ledger(
@@ -4850,8 +4856,7 @@ class GovernedOrchestrator:
                                 OperationState.FAILED,
                                 {
                                     "reason": (
-                                        "all_providers_exhausted_"
-                                        "circuit_open"
+                                        _FAILFAST_CIRCUIT_OPEN_REASON
                                     ),
                                     "failure_class": "infra",
                                     "consecutive_exhaustions": _ff_n,
@@ -10351,9 +10356,23 @@ class GovernedOrchestrator:
         if written:
             try:
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    TERMINAL_OPERATION_STATES,
                     publish_operation_terminal,
                 )
                 publish_operation_terminal(ctx, state)
+                # Fail-Fast counter prune — single terminal chokepoint.
+                # Composes the SAME canonical terminal set the SSE
+                # publisher uses (no duplicated state list). Pruning
+                # ONLY on a genuine terminal state keeps the breaker's
+                # consecutive count intact across mid-op ledger
+                # records while preventing unbounded dict growth and
+                # honoring reset-on-op-completion.
+                if getattr(state, "value", state) in (
+                    TERMINAL_OPERATION_STATES
+                ):
+                    self._failfast_exhaust_consec.pop(
+                        str(getattr(ctx, "op_id", "") or ""), None,
+                    )
             except Exception:  # noqa: BLE001 — observability is best-effort
                 logger.debug(
                     "[Orchestrator] publish_operation_terminal raised "
