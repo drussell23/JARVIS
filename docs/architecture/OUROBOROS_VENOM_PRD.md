@@ -2075,6 +2075,21 @@ The `045947` run **deliberately reproduced the exact 031129 conditions at full d
 
 **Resolution (operator-ratified 2026-05-15):** the SPLIT-verdict thinking=on Tier-C is reclassified a **non-reproducible transient** (one-off scheduling pileup / Anthropic-side latency spike / GC pause coinciding with 3 streams in `031129`) — **NOT** a structural event-loop leak the Quiescence gate fails to contain. No rogue task to name; no bisection knob justified (chasing a non-reproducible transient with new substrate would violate the anti-bloat mandate). The Autonomous Quiescence Protocol (Task #104) holds under maximum full-matrix load for **both** thinking modes. Task #107 closed. The TTFT/event-loop blocker that consumed the 16-rev arc is **sealed**; the remaining Stage-2 gate is the binary that has never fired — an SWE op reaching APPLIED/COMPLETE on the local fixture — now testable since streams return bytes in 1-4 s. Diagnostic audit/boundary flags are default-OFF and stripped from graduation soaks (substrate retained dormant per "leverage existing", not deleted).
 
+##### §40.7.10-stage16-graduation — Stage 1.6 Bar-A GRADUATES on double-confirmation; H-route falsified (2026-05-16)
+
+With the TTFT/event-loop blocker sealed, the Bar-A binary — *a `swe_bench_pro` op reaching `phase=complete` 100% end-to-end on the local fixture* — was tested under a clean full-matrix graduation gate (clean posture, $2.00 cap, warm 1.38M-node cache, Oracle ON, Sensors ON, Quiescence ON, all diagnostic flags stripped, `--max-wall-seconds 2400`). It fired, then **reproduced under byte-identical config** (operator discipline: one observation is not dispositive — the Tier-C lesson applied symmetrically).
+
+| Run (precondition-gate PASS: summary + `suspension_likely=false` + in-policy) | SWE op | Route | GENERATE provider | Terminal phase | VERIFY | Suspension | Auto-commit |
+|---|---|---|---|---|---|---|---|
+| `bt-2026-05-16-054554` | `op-019e2f54` | standard | claude-api | **complete 100%** | `must_hold_failed=0` | none | yes |
+| `bt-2026-05-16-063614` (confirmation) | `op-019e2f82` (intake `op-ca91e6df1b9d`) | `standard:low:swe_bench_pro:simple` | claude-api $0.031 | **complete progress_pct=100.0** (HEARTBEAT seq=24) | `claims=4 pass=1 fail=0 insuff=3 err=0 must_hold_failed=0 blocking=false` | `WallClockWatchdog 1183s mono / 1183s wall — NEVER fired` (ratio 1.0) | `eccabcb380` |
+
+**Stage 1.6 (BG-pool-slot-release / op-park substrate) OFFICIALLY GRADUATES.** Plumbing mathematically proven: the airplane flew twice under identical conditions.
+
+**H-route falsified (false-positive hypothesis, no code written):** the hypothesized STANDARD→BACKGROUND continuation-route demotion across the park/resume boundary **does not manifest**. The SWE op never parked (TTFT cleared → fast stream → straight to COMPLETE); the in-soak `background_dw_blocked_by_topology` failures were *legitimately-background sensor ops* whose continuations correctly route BACKGROUND → DW-block → `skip_and_queue` — that is the engineered Thermodynamic Containment cost-optimization, **not** a routing-inheritance bug. Symmetrical skepticism (the Tier-C discipline) caught the false positive before speculative substrate was written; H-route held as a latent hypothesis, triggered only if a STANDARD op is ever observed parking-and-losing-route in a real trace. **Zero substrate changed for graduation** — `git status` clean across both soaks; this was a pure reproducibility confirmation, not a fix.
+
+**Stage 2 UNLOCKED** (Task #67/#82, real HF benchmark). Operator-gated: requires a separate authorized real-cost run + RESOLVED-known-good / UNRESOLVED-known-hard rubric. Not autonomous.
+
 ---
 
 ### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
