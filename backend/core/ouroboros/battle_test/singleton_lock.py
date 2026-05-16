@@ -208,7 +208,7 @@ def acquire_singleton(
 
     try:
         with flock_critical_section(
-            target, timeout_s=0.0,
+            target, timeout_s=_FAIL_FAST_TIMEOUT_S,
         ) as acquired:
             if acquired:
                 logger.info(
@@ -317,25 +317,66 @@ def register_shipped_invariants() -> list:
         return tuple(violations)
 
     def _validate_path_not_hardcoded(
-        tree: _ast.AST, source: str,
+        tree: _ast.AST, source: str,  # noqa: ARG001
     ) -> tuple:
-        """Operator binding 'no hardcoding' — the lock path must
-        derive from ``Path(repo_root, *_LOCK_RELATIVE_PATH)``.
-        Any bare string literal ``"ouroboros_battle_test.lock"``
-        outside ``_LOCK_RELATIVE_PATH`` definition is a drift."""
-        literal = "ouroboros_battle_test.lock"
-        # Count occurrences of the literal in source — should be
-        # exactly one (in the _LOCK_RELATIVE_PATH tuple body).
-        # More than one means someone hardcoded it at a use-site.
-        occurrences = source.count(literal)
-        if occurrences > 1:
-            return (
-                f"path literal {literal!r} appears "
-                f"{occurrences} times in source — hardcoding "
-                "drift; must derive from _LOCK_RELATIVE_PATH "
-                "tuple",
+        """Operator binding 'no hardcoding' — the lock filename
+        literal must appear ONLY inside the ``_LOCK_RELATIVE_PATH``
+        tuple assignment. Use-site composition goes through
+        :func:`default_lock_path` which reads the tuple.
+
+        AST-walks every ``Constant`` node whose value is the
+        canonical filename. Each occurrence's nearest enclosing
+        assignment must target ``_LOCK_RELATIVE_PATH`` — anything
+        else (a hardcoded literal at a use site, a duplicated
+        constant in a helper) is drift.
+        """
+        canonical = (
+            "ouroboros_battle_test"  # split so this validator
+            "_lock.py"[:-3]          # body doesn't contain the
+        )                            # full literal itself.
+        canonical = canonical + ".lock"
+        # Build parent map so we can resolve "what assignment is
+        # this Constant inside?"
+        parents = {}
+        for parent in _ast.walk(tree):
+            for child in _ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+        violations = []
+        for node in _ast.walk(tree):
+            if (
+                not isinstance(node, _ast.Constant)
+                or node.value != canonical
+            ):
+                continue
+            # Walk up to find an enclosing Assign / AnnAssign.
+            cursor = parents.get(id(node))
+            while cursor is not None and not isinstance(
+                cursor, (_ast.Assign, _ast.AnnAssign),
+            ):
+                cursor = parents.get(id(cursor))
+            if cursor is None:
+                violations.append(
+                    f"literal {canonical!r} appears outside "
+                    "any assignment context"
+                )
+                continue
+            # Inspect the assignment target(s).
+            targets = (
+                cursor.targets if isinstance(
+                    cursor, _ast.Assign
+                ) else [cursor.target]
             )
-        return ()
+            target_names = {
+                t.id for t in targets
+                if isinstance(t, _ast.Name)
+            }
+            if "_LOCK_RELATIVE_PATH" not in target_names:
+                violations.append(
+                    f"literal {canonical!r} hardcoded outside "
+                    f"_LOCK_RELATIVE_PATH (in assignment to "
+                    f"{sorted(target_names)})"
+                )
+        return tuple(violations)
 
     def _validate_compose_canonical_primitive(
         tree: _ast.AST, source: str,  # noqa: ARG001

@@ -372,19 +372,32 @@ class TestScriptWiring:
         """In scripts/ouroboros_battle_test.py main(), the
         singleton lock acquisition MUST fire BEFORE the existing
         _single_flight_preflight() call — the structural defense
-        first, the diagnostic second."""
+        first, the diagnostic second.
+
+        Searches anchored from ``def main():`` so we measure the
+        positions of the *call sites* in main's body, not the
+        position of the function *definition* (which lives well
+        above main() in the script's module-level region).
+        """
         src = Path(
             "scripts/ouroboros_battle_test.py"
         ).read_text(encoding="utf-8")
-        lock_idx = src.find("from backend.core.ouroboros."
-                            "battle_test.singleton_lock import")
-        pgrep_idx = src.find("_single_flight_preflight()")
-        assert lock_idx > 0, "singleton_lock import not wired"
+        main_start = src.find("def main()")
+        assert main_start > 0, "main() entry point missing"
+        body = src[main_start:]
+        lock_idx = body.find(
+            "from backend.core.ouroboros."
+            "battle_test.singleton_lock import"
+        )
+        pgrep_idx = body.find("_single_flight_preflight()")
+        assert lock_idx > 0, (
+            "singleton_lock import not wired in main()"
+        )
         assert pgrep_idx > 0, (
-            "_single_flight_preflight call missing"
+            "_single_flight_preflight call missing in main()"
         )
         assert lock_idx < pgrep_idx, (
-            f"ordering drift: lock={lock_idx} "
+            f"ordering drift inside main(): lock={lock_idx} "
             f"pgrep={pgrep_idx}"
         )
 
