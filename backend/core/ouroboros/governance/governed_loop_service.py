@@ -4222,6 +4222,15 @@ class GovernedLoopService:
                 if not op_id:
                     return
                 self._active_ops.add(op_id)
+                # P2 Slice 3 — paired registry parity. BG ops
+                # are the Fix-A class (fire-and-forget); without
+                # a ctx_ref here the reaper's ``_MinimalCtxShim``
+                # still gets the SSE flowing. Master-gated
+                # NEVER-raise.
+                _register_op_in_flight_safely(
+                    op_id,
+                    metadata={"source": "bg_pool"},
+                )
                 # Create a minimal FSM context if one doesn't already
                 # exist — gives the staleness check something to read,
                 # and the stream-tick activity hook a target for
@@ -4230,15 +4239,6 @@ class GovernedLoopService:
                     self._fsm_contexts[op_id] = LoopRuntimeContext(
                         op_id=op_id,
                     )
-                # P2 Slice 3 — register into the typed convergence
-                # registry. BG ops are the Fix-A class (fire-and-
-                # forget) — without a ctx_ref here, the reaper's
-                # ``_MinimalCtxShim`` keeps SSE emission flowing.
-                # Master-gated NEVER-raise.
-                _register_op_in_flight_safely(
-                    op_id,
-                    metadata={"source": "bg_pool"},
-                )
                 logger.debug(
                     "[GovernedLoop] BG op registered into _active_ops: %s",
                     op_id,
