@@ -127,6 +127,83 @@ def _probe_timeout_s() -> float:
         return 30.0
 
 
+def _ttft_ref_params_b() -> float:
+    """``JARVIS_HEAVY_PROBE_TTFT_REF_PARAMS_B`` (default 14.0).
+
+    Reference parameter count (billions) that maps to the **base**
+    probe timeout. Deliberately defaults to the ``standard``-route
+    ``min_params_b`` (dw_catalog_classifier) so a model exactly at
+    the eligibility floor gets the unscaled base, and larger models
+    scale up from there — leveraging the EXISTING min_params_b datum,
+    not a new magic number. Read at call time."""
+    try:
+        return max(0.1, float(os.environ.get(
+            "JARVIS_HEAVY_PROBE_TTFT_REF_PARAMS_B", "14.0",
+        ).strip()))
+    except (ValueError, TypeError):
+        return 14.0
+
+
+def _ttft_max_s() -> float:
+    """``JARVIS_HEAVY_PROBE_TTFT_MAX_S`` (default 300.0).
+
+    Absolute ceiling on the adaptive probe timeout — a probe can be
+    generous for a 397B cold-start but must never be unbounded.
+    Read at call time."""
+    try:
+        return max(1.0, float(os.environ.get(
+            "JARVIS_HEAVY_PROBE_TTFT_MAX_S", "300.0",
+        ).strip()))
+    except (ValueError, TypeError):
+        return 300.0
+
+
+def _adaptive_probe_timeout_s(
+    parameter_count_b: "Optional[float]" = None,
+) -> float:
+    """Probe TTFT allowance scaled by model geometry.
+
+    A massive local model's first token is gated by cold-start VRAM
+    weight-load, which scales with parameter count — the static 30s
+    ceiling false-negative-excluded the 35B–397B general models in
+    v18 ``bt-2026-05-16-175621`` (`done_before_content @ ttft_ms=
+    30000`), collapsing the ``standard``-route DW catalog and making
+    Claude a single point of failure.
+
+    Scaling (all env-tunable — no hardcoded seconds):
+
+      base       = :func:`_probe_timeout_s`  (small-model floor)
+      multiplier = max(1.0, params_b / ref_params_b)
+      adaptive   = min(:func:`_ttft_max_s`, base * multiplier)
+
+    Invariants (spine-pinned):
+      * **Floor** — never below ``base`` (a 4B model → multiplier
+        1.0 → unchanged strict timeout; unknown/None/≤0 params →
+        ``base``, byte-identical to legacy behavior).
+      * **Ceiling** — never above :func:`_ttft_max_s`.
+      * **Monotonic** — non-decreasing in ``parameter_count_b``.
+
+    NEVER raises."""
+    base = _probe_timeout_s()
+    try:
+        if parameter_count_b is None:
+            return base
+        p = float(parameter_count_b)
+        if p <= 0.0:
+            return base
+        ref = _ttft_ref_params_b()
+        multiplier = p / ref
+        if multiplier < 1.0:
+            multiplier = 1.0
+        scaled = base * multiplier
+        ceiling = _ttft_max_s()
+        if scaled > ceiling:
+            scaled = ceiling
+        return scaled if scaled >= base else base
+    except (ValueError, TypeError):
+        return base
+
+
 def _budget_daily_usd() -> float:
     """``JARVIS_TOPOLOGY_HEAVY_PROBE_BUDGET_USD_DAILY`` (default 0.05).
 
@@ -408,9 +485,15 @@ class HeavyProber:
         base_url: str,
         api_key: str,
         observer: Optional[Any] = None,
+        parameter_count_b: Optional[float] = None,
     ) -> HeavyProbeResult:
         """Fire one heavy probe. Returns a result regardless of
-        success — caller can branch on ``result.success``."""
+        success — caller can branch on ``result.success``.
+
+        ``parameter_count_b`` (from the model's catalog card) scales
+        the probe TTFT allowance via :func:`_adaptive_probe_timeout_s`
+        so massive cold-starting models aren't false-negative-graded.
+        ``None`` → legacy static base (byte-identical)."""
         if not heavy_probe_enabled():
             return HeavyProbeResult(
                 model_id=model_id,
@@ -454,6 +537,7 @@ class HeavyProber:
                 session=session, model_id=model_id,
                 base_url=base_url, api_key=api_key,
                 max_tokens=max_tokens,
+                parameter_count_b=parameter_count_b,
             )
         except asyncio.CancelledError:
             raise
@@ -461,7 +545,9 @@ class HeavyProber:
             return HeavyProbeResult(
                 model_id=model_id,
                 success=False,
-                ttft_ms=int(_probe_timeout_s() * 1000),
+                ttft_ms=int(
+                    _adaptive_probe_timeout_s(parameter_count_b) * 1000
+                ),
                 total_latency_ms=int((time.monotonic() - t_start) * 1000),
                 cost_usd=est_cost,
                 error=f"unhandled:{type(exc).__name__}:{str(exc)[:80]}",
@@ -491,7 +577,9 @@ class HeavyProber:
         # still reports the timeout-ceiling ttft_ms for caller
         # introspection (logs, telemetry, debugging), but no sample
         # enters the warmth dataset.
-        recorded_ttft = ttft_ms if ok else int(_probe_timeout_s() * 1000)
+        recorded_ttft = ttft_ms if ok else int(
+            _adaptive_probe_timeout_s(parameter_count_b) * 1000
+        )
         return HeavyProbeResult(
             model_id=model_id,
             success=ok,
@@ -544,9 +632,15 @@ class HeavyProber:
         base_url: str,
         api_key: str,
         max_tokens: int,
+        parameter_count_b: Optional[float] = None,
     ) -> Tuple[int, int, bool, str]:
         """Issue the SSE request + read until first content chunk OR
-        timeout OR done. Returns (ttft_ms, total_ms, ok, error_str)."""
+        timeout OR done. Returns (ttft_ms, total_ms, ok, error_str).
+
+        The first-content wait is bounded by
+        :func:`_adaptive_probe_timeout_s` (scaled by
+        ``parameter_count_b`` — a 397B cold-start gets a far larger
+        allowance than a 4B model; ``None`` → static base)."""
         body = {
             "model": model_id,
             "messages": [
@@ -561,7 +655,7 @@ class HeavyProber:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        timeout_s = _probe_timeout_s()
+        timeout_s = _adaptive_probe_timeout_s(parameter_count_b)
         t_start = time.monotonic()
         ttft_ms = 0
         first_chunk_seen = False
@@ -721,13 +815,20 @@ class HeavyProbeScheduler:
         base_url: str,
         api_key: str,
         candidate_ids: Tuple[str, ...],
+        param_by_id: "Optional[Mapping[str, float]]" = None,
     ) -> Optional[HeavyProbeResult]:
         """One scheduler tick. Picks the first eligible candidate
         from ``candidate_ids`` (preserving caller's ranking) + fires
         a probe. Returns the probe result or None if nothing eligible.
-        NEVER raises."""
+        NEVER raises.
+
+        ``param_by_id`` maps model_id → parameter_count_b (built by
+        the caller from the catalog it already holds). The matched
+        value scales the probe TTFT (adaptive cold-start allowance).
+        ``None`` / missing key → static base (byte-identical)."""
         if not heavy_probe_enabled():
             return None
+        _pmap = param_by_id or {}
         for mid in candidate_ids:
             if not self._is_eligible(mid):
                 continue
@@ -739,6 +840,7 @@ class HeavyProbeScheduler:
                     model_id=mid,
                     base_url=base_url,
                     api_key=api_key,
+                    parameter_count_b=_pmap.get(mid),
                 )
                 logger.info(
                     "[HeavyProbe] model=%s success=%s ttft_ms=%d "

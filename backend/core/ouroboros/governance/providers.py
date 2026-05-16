@@ -6912,6 +6912,29 @@ class ClaudeProvider:
                     _soft_wall_rem + _CLAUDE_STREAM_HARD_KILL_GRACE_S
                 )
                 _stream_task = asyncio.create_task(_stream_with_resilience())
+
+                # Hygiene: retrieve the task's exception even on the
+                # paths that abandon it without `await _stream_task`
+                # (the hard-kill `pending` severance below, or an
+                # outer cancel between `asyncio.wait` and the await).
+                # Calling `.exception()` in a done-callback *retrieves*
+                # the result (suppressing the asyncio
+                # "Task exception was never retrieved" GC warning seen
+                # in v18 bt-2026-05-16-175621 with the Anthropic
+                # APIStatusError) WITHOUT awaiting a possibly-wedged
+                # task — so the Session-13 deadlock protection is
+                # preserved AND the explicit HARD-KILL logger.error
+                # below still provides the §8 visibility. Visibility
+                # via the explicit log; hygiene via retrieval.
+                def _retrieve_stream_exc(_t: "asyncio.Task") -> None:
+                    if _t.cancelled():
+                        return
+                    try:
+                        _t.exception()
+                    except Exception:  # noqa: BLE001 — retrieval only
+                        pass
+
+                _stream_task.add_done_callback(_retrieve_stream_exc)
                 try:
                     done, pending = await asyncio.wait(
                         {_stream_task},

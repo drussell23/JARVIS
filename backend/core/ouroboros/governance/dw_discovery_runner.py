@@ -966,11 +966,28 @@ async def _heavy_probe_loop(
                 )
             else:
                 candidates = ()
+            # Adaptive probe TTFT: derive parameter_count_b per
+            # candidate from the EXISTING canonical model-id parser
+            # (dw_catalog_client.parse_parameter_count — same heuristic
+            # the classifier/discovery already trust). No new data
+            # path, no catalog re-fetch. The scheduler scales each
+            # probe's cold-start allowance by this so a 397B model
+            # isn't false-negative-graded at the static 30s ceiling
+            # (v18 bt-2026-05-16-175621 root cause).
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                parse_parameter_count,
+            )
+            _param_by_id = {}
+            for _mid in candidates:
+                _p = parse_parameter_count(_mid)
+                if _p is not None:
+                    _param_by_id[_mid] = _p
             await scheduler.run_cycle(
                 session=session,
                 base_url=base_url,
                 api_key=api_key,
                 candidate_ids=tuple(candidates),
+                param_by_id=_param_by_id,
             )
         except asyncio.CancelledError:
             return
