@@ -114,6 +114,38 @@ _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+def _failfast_cb_enabled() -> bool:
+    """Fail-Fast Exhaustion Circuit Breaker master switch.
+
+    ``JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED`` — §33.1 **default
+    FALSE**. When OFF the legacy retry/park behaviour is
+    byte-identical (an op that exhausts all providers keeps cycling
+    until the 1800s eval window / op deadline). When ON, an op that
+    raises ``all_providers_exhausted`` for N consecutive attempts is
+    flipped to a terminal ``failed`` state immediately — so the
+    ``operation_terminal`` SSE fires and any awaiting subscriber
+    (B.2.2 evaluate_problem) wakes in seconds, not 1800s. Read at
+    call time."""
+    return os.environ.get(
+        "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _failfast_cb_threshold() -> int:
+    """``JARVIS_FAILFAST_EXHAUSTION_MAX_CONSECUTIVE`` (default ``2``
+    — both generation attempts genuinely exhausted; prevents a
+    twitchy false-trip on a single micro-blip while enforcing
+    thermodynamic containment). Clamped ``>= 1``. Read at call
+    time; never raises."""
+    try:
+        v = int(os.environ.get(
+            "JARVIS_FAILFAST_EXHAUSTION_MAX_CONSECUTIVE", "2",
+        ).strip())
+        return v if v >= 1 else 1
+    except (ValueError, TypeError):
+        return 2
+
+
 def _phase_runner_complete_extracted() -> bool:
     """Slice 1 of Wave 2 (5) — COMPLETE phase extraction gate.
 
@@ -820,6 +852,12 @@ class GovernedOrchestrator:
         self._approval_provider = approval_provider
         self._config = config
         self._validation_runner = validation_runner
+        # Fail-Fast Exhaustion Circuit Breaker: per-op consecutive
+        # all_providers_exhausted count, keyed by stable op_id so it
+        # survives Stage-1.6 park/resume re-dispatch. Pruned on
+        # success and on terminal. Only consulted when
+        # _failfast_cb_enabled() (§33.1 default-FALSE).
+        self._failfast_exhaust_consec: "Dict[str, int]" = {}
 
         # Phase B REVIEW subagent — harness-attached post-construction via
         # set_subagent_orchestrator() so the constructor signature stays
@@ -4759,6 +4797,68 @@ class GovernedOrchestrator:
                 except Exception as exc:
                     _err_msg = str(exc)
                     _route = getattr(ctx, "provider_route", "")
+
+                    # ── Fail-Fast Exhaustion Circuit Breaker ──
+                    # §33.1 default-FALSE. When ON: an op that raises
+                    # all_providers_exhausted for N consecutive
+                    # attempts (counter keyed by stable op_id so it
+                    # survives Stage-1.6 park/resume re-dispatch) is
+                    # flipped to a terminal `failed` state HERE —
+                    # preempting the GENERATE_RETRY/park cycle below.
+                    # _record_ledger(FAILED) is a TERMINAL_OPERATION_
+                    # STATE → publish_operation_terminal fires → an
+                    # awaiting B.2.2 subscriber wakes in seconds
+                    # instead of burning the full 1800s eval window.
+                    # `failed` (not `blocked`) keeps it natively
+                    # retryable in a future run (the exhaustion is an
+                    # environmental transient, not a policy block).
+                    # Mirrors the existing background-failure
+                    # fast-terminal precedent (advance → _record_ledger
+                    # → return ctx). When OFF: zero counter mutation,
+                    # byte-identical legacy behaviour.
+                    if (
+                        _failfast_cb_enabled()
+                        and "all_providers_exhausted" in _err_msg
+                    ):
+                        _ff_key = str(getattr(ctx, "op_id", "") or "")
+                        _ff_n = self._failfast_exhaust_consec.get(
+                            _ff_key, 0,
+                        ) + 1
+                        self._failfast_exhaust_consec[_ff_key] = _ff_n
+                        if _ff_n >= _failfast_cb_threshold():
+                            logger.error(
+                                "[Orchestrator] Fail-Fast circuit OPEN "
+                                "for %s: %d consecutive "
+                                "all_providers_exhausted ≥ threshold "
+                                "%d — terminal failed (instant, no "
+                                "30-min thrash) [%s]",
+                                _ff_key, _ff_n,
+                                _failfast_cb_threshold(), _ff_key,
+                            )
+                            self._failfast_exhaust_consec.pop(
+                                _ff_key, None,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.POSTMORTEM,
+                                terminal_reason_code=(
+                                    "all_providers_exhausted_"
+                                    "circuit_open"
+                                ),
+                            )
+                            await self._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {
+                                    "reason": (
+                                        "all_providers_exhausted_"
+                                        "circuit_open"
+                                    ),
+                                    "failure_class": "infra",
+                                    "consecutive_exhaustions": _ff_n,
+                                    "error": _err_msg[:200],
+                                },
+                            )
+                            return ctx
 
                     # ── Partial shadow log (widened) ──
                     # Fire the ExplorationLedger shadow pass for EVERY
