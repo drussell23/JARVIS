@@ -75,6 +75,9 @@ INJECT_COUNT_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_INJECT_COUNT"
 INJECT_INSTANCE_IDS_ENV_VAR: str = (
     "JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS"
 )
+AUTOSCORE_ENABLED_ENV_VAR: str = (
+    "JARVIS_SWE_BENCH_PRO_AUTOSCORE_ENABLED"
+)
 
 
 _DEFAULT_INJECT_COUNT: int = 1
@@ -86,9 +89,19 @@ _DEFAULT_INJECT_COUNT: int = 1
 
 
 class SWEBenchProInjectionVerdict(str, enum.Enum):
-    """Five canonical outcomes for maybe_inject_swe_bench_at_boot."""
+    """Six canonical outcomes for maybe_inject_swe_bench_at_boot.
+
+    ``INJECTED_AUTOSCORE`` is the closed-loop outcome: when the
+    autoscore flag is ON the boot hook hands the loaded ProblemSpec
+    set to the existing ``parallel_evaluate`` rig (Phase E → B.2.2 →
+    Phase C → Phase D) as a background task, so each solve op is
+    auto-scored against its gold patch on its terminal event. The
+    legacy ``INJECTED`` outcome is the open-loop path (ingest only,
+    no scoring) — preserved byte-identical when the flag is OFF.
+    """
 
     INJECTED = "injected"
+    INJECTED_AUTOSCORE = "injected_autoscore"
     SKIPPED_DISABLED = "skipped_disabled"
     SKIPPED_NO_PROBLEMS = "skipped_no_problems"
     FAILED_LOAD = "failed_load"
@@ -129,6 +142,19 @@ def inject_instance_ids() -> List[str]:
     if not raw:
         return []
     return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def autoscore_enabled() -> bool:
+    """Closed-loop autoscore master switch (§33.1 default-FALSE).
+
+    When ON, the boot hook composes the existing ``parallel_evaluate``
+    rig (Phase E) so injected solve ops are scored against their gold
+    patch on terminal — closing the open-loop. When OFF (default) the
+    legacy open-loop ingest path is byte-identical. NEVER raises."""
+    raw = os.environ.get(
+        AUTOSCORE_ENABLED_ENV_VAR, "",
+    ).strip().lower()
+    return raw in ("true", "1", "yes", "on")
 
 
 # ===========================================================================
@@ -193,6 +219,97 @@ def _resolve_instance_ids() -> List[str]:
     return list(cached)[: inject_count()]
 
 
+# Strong refs to fire-and-forget autoscore driver tasks — without
+# this the event loop may GC a pending task ("Task was destroyed but
+# it is pending"). Discarded in the task's own done-callback.
+_AUTOSCORE_DRIVER_TASKS: "set" = set()
+
+
+async def _drive_parallel_evaluate(
+    specs: "List[ProblemSpec]", intake_service: Any,
+) -> None:
+    """Consume the EXISTING ``parallel_evaluate`` async generator
+    (Phase E → B.2.2 evaluate_problem → Phase C score → Phase D
+    record). Pure composition — ZERO net-new evaluation logic here;
+    this only drains the iterator and logs each verdict as it lands.
+
+    Runs as a fire-and-forget background task so the soak loop keeps
+    running (solve ops must reach their terminal event for the
+    broker to wake the scorer). NEVER raises into the loop;
+    asyncio.CancelledError propagates."""
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (  # noqa: E501
+            parallel_evaluate,
+        )
+
+        async for record in parallel_evaluate(
+            specs, intake_service=intake_service,
+        ):
+            ev = getattr(record, "evaluation", None)
+            sc = getattr(record, "scoring", None)
+            logger.info(
+                "[SWEBenchPro.HarnessInject] autoscore verdict: "
+                "instance=%r eval_outcome=%s score_outcome=%s "
+                "diagnostic=%r",
+                getattr(ev, "instance_id", None)
+                or getattr(sc, "problem_instance_id", "?"),
+                getattr(getattr(ev, "outcome", None), "value", "?"),
+                getattr(getattr(sc, "outcome", None), "value", "?"),
+                getattr(sc, "diagnostic", "")[:160]
+                if getattr(sc, "diagnostic", "") else "",
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — fail-open (soak must not die)
+        logger.warning(
+            "[SWEBenchPro.HarnessInject] autoscore driver raised — "
+            "closed loop aborted, soak continues", exc_info=True,
+        )
+
+
+async def _inject_autoscore(
+    instance_ids: "List[str]", intake_service: Any,
+) -> SWEBenchProInjectionVerdict:
+    """Closed-loop injection: load each ProblemSpec (its ``gold_patch``
+    rides in-memory — the operator's "contextual state passing",
+    satisfied by the spec itself, no re-fetch) and hand the set to
+    the existing ``parallel_evaluate`` rig as a background task.
+
+    ``parallel_evaluate`` internally does subscribe-before-ingest
+    (race-free), prepare, build_envelope, ingest, await the
+    ``operation_terminal`` event, capture the produced patch, score
+    (Phase C) and record (Phase D) — so this function adds NO
+    evaluation/scoring/ingest logic of its own. NEVER raises."""
+    specs: "List[ProblemSpec]" = []
+    for instance_id in instance_ids:
+        problem, load_outcome = load_problem(instance_id)
+        if problem is None:
+            logger.info(
+                "[SWEBenchPro.HarnessInject] autoscore: could not "
+                "load problem=%r (outcome=%s) — skipping",
+                instance_id, getattr(load_outcome, "value", "?"),
+            )
+            continue
+        specs.append(problem)
+
+    if not specs:
+        return SWEBenchProInjectionVerdict.FAILED_LOAD
+
+    task = asyncio.create_task(
+        _drive_parallel_evaluate(specs, intake_service)
+    )
+    _AUTOSCORE_DRIVER_TASKS.add(task)
+    task.add_done_callback(_AUTOSCORE_DRIVER_TASKS.discard)
+
+    logger.info(
+        "[SWEBenchPro.HarnessInject] autoscore: %d ProblemSpec(s) "
+        "handed to parallel_evaluate (background) — closed loop "
+        "armed, verdicts land on each solve op's terminal event",
+        len(specs),
+    )
+    return SWEBenchProInjectionVerdict.INJECTED_AUTOSCORE
+
+
 # ===========================================================================
 # Public API - maybe_inject_swe_bench_at_boot
 # ===========================================================================
@@ -208,11 +325,16 @@ async def maybe_inject_swe_bench_at_boot(
       1. Master-flag check  -> SKIPPED_DISABLED if False
       2. Instance-id resolution (CSV > geometric sampler > count)
          -> SKIPPED_NO_PROBLEMS if no tier yielded any
-      3. Per-problem: Phase A load_problem + Phase B.1 prepare_problem
-         + Phase B.2.1 build_evaluation_envelope
-      4. Canonical IntakeLayerService.ingest_envelope submission
+      3. Closed-loop branch (autoscore flag ON): hand the loaded
+         ProblemSpec set to the existing parallel_evaluate rig as a
+         background task → INJECTED_AUTOSCORE. Each solve op is
+         scored (Phase C) + recorded (Phase D) on its terminal event.
+      3'. Legacy open-loop (flag OFF, default — byte-identical):
+         per-problem Phase B.1 prepare_problem + Phase B.2.1
+         build_evaluation_envelope + canonical
+         IntakeLayerService.ingest_envelope submission.
 
-    Returns one of five SWEBenchProInjectionVerdict outcomes.
+    Returns one of six SWEBenchProInjectionVerdict outcomes.
     NEVER raises into the caller; asyncio.CancelledError propagates
     (orchestrator POSTMORTEM contract).
 
@@ -239,6 +361,15 @@ async def maybe_inject_swe_bench_at_boot(
             )
             return SWEBenchProInjectionVerdict.SKIPPED_NO_PROBLEMS
 
+        # ── Closed-loop autoscore (§33.1 opt-in) ──────────────────
+        # When ON, compose the EXISTING parallel_evaluate rig so each
+        # solve op is scored against its gold patch on terminal.
+        # Flag-gated; the legacy open-loop path below is byte-
+        # identical when the flag is OFF (default).
+        if autoscore_enabled():
+            return await _inject_autoscore(instance_ids, intake_service)
+
+        # ── Legacy open-loop path (autoscore OFF — byte-identical) ─
         loaded_count = 0
         injected_count = 0
         for instance_id in instance_ids:
@@ -389,6 +520,29 @@ def register_flags(registry: Any) -> int:
             example="octocat__hello-001,foo__bar-003",
             since="v3.7 Phase 2 harness-inject (2026-05-12)",
         ),
+        FlagSpec(
+            name=AUTOSCORE_ENABLED_ENV_VAR,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Closed-loop autoscore (section 33.1 default-FALSE). "
+                "When ON, the boot hook hands the loaded ProblemSpec "
+                "set to the existing parallel_evaluate rig (Phase E "
+                "→ B.2.2 evaluate_problem → Phase C score → Phase D "
+                "record) as a background task — each injected solve "
+                "op is scored against its gold patch on its terminal "
+                "event, closing the open loop. When OFF the legacy "
+                "open-loop ingest path is byte-identical. Required "
+                "for any Stage-2 discriminator rubric run."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/swe_bench_pro/"
+                "harness_inject.py"
+            ),
+            example="false",
+            since="v3.7 Stage 2 autoscore wiring (2026-05-16)",
+        ),
     ]
 
     count = 0
@@ -409,10 +563,12 @@ __all__ = [
     "HARNESS_INJECT_ENABLED_ENV_VAR",
     "INJECT_COUNT_ENV_VAR",
     "INJECT_INSTANCE_IDS_ENV_VAR",
+    "AUTOSCORE_ENABLED_ENV_VAR",
     "SWEBenchProInjectionVerdict",
     "harness_inject_enabled",
     "inject_count",
     "inject_instance_ids",
+    "autoscore_enabled",
     "maybe_inject_swe_bench_at_boot",
     "register_flags",
 ]

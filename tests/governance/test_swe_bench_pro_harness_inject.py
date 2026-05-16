@@ -358,10 +358,13 @@ def test_prepare_problem_failure_skips_record(
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_closed_five_value_taxonomy() -> None:
+def test_verdict_closed_six_value_taxonomy() -> None:
+    # Stage 2 added INJECTED_AUTOSCORE (closed-loop outcome); the
+    # legacy INJECTED (open-loop) is retained byte-identical.
     values = {v.value for v in SWEBenchProInjectionVerdict}
     assert values == {
         "injected",
+        "injected_autoscore",
         "skipped_disabled",
         "skipped_no_problems",
         "failed_load",
@@ -454,7 +457,8 @@ def test_ast_pin_no_parallel_worktree_or_router() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_register_flags_seeds_three_specs() -> None:
+def test_register_flags_seeds_four_specs() -> None:
+    # Stage 2 added the closed-loop autoscore master switch.
     captured: list = []
 
     class _Capturer:
@@ -462,12 +466,13 @@ def test_register_flags_seeds_three_specs() -> None:
             captured.append(spec)
 
     count = register_flags(_Capturer())
-    assert count == 3
+    assert count == 4
     names = {s.name for s in captured}
     assert names == {
         HARNESS_INJECT_ENABLED_ENV_VAR,
         INJECT_COUNT_ENV_VAR,
         INJECT_INSTANCE_IDS_ENV_VAR,
+        "JARVIS_SWE_BENCH_PRO_AUTOSCORE_ENABLED",
     }
 
 
