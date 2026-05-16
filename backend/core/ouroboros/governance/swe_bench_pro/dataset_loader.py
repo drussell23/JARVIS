@@ -289,6 +289,24 @@ def _env_bool(name: str, *, default: bool) -> bool:
     return raw.strip().lower() not in ("", "false", "0", "no", "off")
 
 
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    """Read an int env var, clamped to ``>= minimum``.  Invalid /
+    unset → ``default``.  NEVER raises (mirrors :func:`_env_bool`
+    fail-soft contract — config errors must not crash the loader)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "[SWEBenchPro] invalid %s=%r — using default %d",
+            name, raw, default,
+        )
+        return default
+    return value if value >= minimum else minimum
+
+
 def swe_bench_pro_enabled() -> bool:
     """Master-flag accessor.  Default FALSE per §33.1.  NEVER raises."""
     return _env_bool(MASTER_FLAG_ENV_VAR, default=False)
@@ -422,6 +440,25 @@ def _write_cache(spec: ProblemSpec) -> bool:
 # per-id scan in :func:`_load_from_local_jsonl` honor this cap.
 _LOCAL_JSONL_MAX_ROWS: int = 10000
 
+# Bounded scan ceiling for the FULL-dataset enumeration consumed by
+# the geometric instance sampler (local JSONL ∪ HF). Same headroom
+# rationale as _LOCAL_JSONL_MAX_ROWS over the 1,865-problem upstream
+# dataset.
+_DATASET_SCAN_MAX_RECORDS_DEFAULT: int = 10000
+SAMPLER_MAX_SCAN_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_SAMPLER_MAX_SCAN"
+
+
+def _dataset_scan_max_records() -> int:
+    """Resolve the full-dataset scan cap at CALL time (env-overridable
+    via :data:`SAMPLER_MAX_SCAN_ENV_VAR`) so the sampler cannot run
+    unbounded on a pathological / derivative dataset and tests can
+    monkey-patch the env.  NEVER raises."""
+    return _env_int(
+        SAMPLER_MAX_SCAN_ENV_VAR,
+        default=_DATASET_SCAN_MAX_RECORDS_DEFAULT,
+        minimum=1,
+    )
+
 
 def _iter_local_jsonl_records(
     *, max_rows: Optional[int] = None,
@@ -511,15 +548,22 @@ def _load_from_local_jsonl(instance_id: str) -> Optional[ProblemSpec]:
         return None
 
 
-def _load_from_huggingface(instance_id: str) -> Optional[ProblemSpec]:
-    """Lazy-import ``datasets`` and fetch the instance from HF.
+def _iter_hf_records() -> Iterator[Dict[str, Any]]:
+    """Yield every dict record from the opt-in HuggingFace dataset.
 
-    Returns None if HF env not set, ``datasets`` not installed,
-    fetch errors, or instance not found in the dataset.
-    NEVER raises (asyncio.CancelledError propagates)."""
+    Single source of truth for the ``datasets.load_dataset`` call
+    shape — both :func:`_load_from_huggingface` (per-id load) and
+    :func:`iter_all_dataset_records` (full enumeration for the
+    geometric sampler) compose this iterator so the lazy-import +
+    load + dict-filter logic stays in ONE place (mirrors the
+    :func:`_iter_local_jsonl_records` discipline).
+
+    Empty iterator (no yield) if HF env not set, ``datasets`` not
+    installed, or fetch errors. NEVER raises (asyncio.CancelledError
+    propagates)."""
     hf_name = _hf_dataset_name()
     if not hf_name:
-        return None
+        return
     try:
         try:
             import datasets  # type: ignore  # noqa: I001 — lazy import
@@ -529,11 +573,32 @@ def _load_from_huggingface(instance_id: str) -> Optional[ProblemSpec]:
                 "is not installed — pip install datasets to enable",
                 HF_DATASET_ENV_VAR, hf_name,
             )
-            return None
+            return
         ds = datasets.load_dataset(hf_name, split=_hf_split())
         for record in ds:
-            if not isinstance(record, dict):
-                continue
+            if isinstance(record, dict):
+                yield record
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — defensive (fail-open scan)
+        logger.warning(
+            "[SWEBenchPro] _iter_hf_records raised (dataset=%r)",
+            hf_name, exc_info=True,
+        )
+        return
+
+
+def _load_from_huggingface(instance_id: str) -> Optional[ProblemSpec]:
+    """Lazy-import ``datasets`` and fetch the instance from HF.
+
+    Returns None if HF env not set, ``datasets`` not installed,
+    fetch errors, or instance not found in the dataset.
+    NEVER raises (asyncio.CancelledError propagates).
+
+    Composes :func:`_iter_hf_records` (single source of truth for
+    the HF load call)."""
+    try:
+        for record in _iter_hf_records():
             if record.get("instance_id") == instance_id:
                 try:
                     return ProblemSpec.from_dict(record)
@@ -552,6 +617,60 @@ def _load_from_huggingface(instance_id: str) -> Optional[ProblemSpec]:
             instance_id, exc_info=True,
         )
         return None
+
+
+def iter_all_dataset_records(
+    *, max_scan: Optional[int] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield raw dict records across the full dataset — the union
+    of the local JSONL (PRIMARY) and the opt-in HuggingFace dataset.
+
+    Composes the two canonical single-source iterators
+    (:func:`_iter_local_jsonl_records` + :func:`_iter_hf_records`)
+    so there is NO parallel dataset-scan logic — the geometric
+    sampler reads exactly what :func:`load_problem` would resolve.
+
+    Master-flag gated: yields nothing when
+    :func:`swe_bench_pro_enabled` is False (no dataset I/O when the
+    feature is off — mirrors :func:`load_problem`'s short-circuit).
+
+    Dedup by ``instance_id``: a record present in BOTH local JSONL
+    and HF is yielded once (local wins — it is the PRIMARY path).
+    Bounded by ``max_scan`` (default
+    :func:`_dataset_scan_max_records`, env-overridable, read at
+    CALL time so tests can monkey-patch). NEVER raises
+    (asyncio.CancelledError propagates)."""
+    if not swe_bench_pro_enabled():
+        return
+    cap = (
+        max_scan if max_scan is not None else _dataset_scan_max_records()
+    )
+    seen: set = set()
+    emitted = 0
+    try:
+        for record in _iter_local_jsonl_records(max_rows=cap):
+            iid = record.get("instance_id")
+            if isinstance(iid, str) and iid:
+                seen.add(iid)
+            yield record
+            emitted += 1
+            if emitted >= cap:
+                return
+        for record in _iter_hf_records():
+            iid = record.get("instance_id")
+            if isinstance(iid, str) and iid and iid in seen:
+                continue  # local PRIMARY already covered this id
+            yield record
+            emitted += 1
+            if emitted >= cap:
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — defensive (fail-open scan)
+        logger.warning(
+            "[SWEBenchPro] iter_all_dataset_records raised", exc_info=True,
+        )
+        return
 
 
 # ===========================================================================
@@ -874,12 +993,14 @@ __all__ = [
     "LOCAL_DATASET_PATH_ENV_VAR",
     "HF_DATASET_ENV_VAR",
     "HF_SPLIT_ENV_VAR",
+    "SAMPLER_MAX_SCAN_ENV_VAR",
     "LoadOutcome",
     "ProblemSpec",
     "swe_bench_pro_enabled",
     "cache_dir",
     "load_problem",
     "list_cached_problems",
+    "iter_all_dataset_records",
     "clear_cache",
     "register_flags",
 ]

@@ -137,11 +137,56 @@ def inject_instance_ids() -> List[str]:
 
 
 def _resolve_instance_ids() -> List[str]:
-    """Two-tier resolution: CSV override > first-N from cache.
-    Pure function over env state; NEVER raises."""
+    """Three-tier resolution (strict precedence; NEVER raises):
+
+      1. ``INJECT_INSTANCE_IDS`` CSV override — explicit operator
+         control always wins.
+      2. **GeometricInstanceSampler** (when
+         ``JARVIS_SWE_BENCH_PRO_GEOMETRIC_SAMPLER_ENABLED`` is ON):
+         a deterministic (known-good single-file, known-hard
+         multi-file) discriminator pair curated from the dataset's
+         own gold-patch geometry — zero hardcoded IDs.  This is the
+         Stage-2 rubric path.  If the sampler cannot form a valid
+         pair it returns ``None`` and resolution falls through.
+      3. First-N from ``list_cached_problems()`` (legacy default).
+
+    Pure function over env + dataset state."""
     explicit = inject_instance_ids()
     if explicit:
         return explicit
+
+    # Tier 2 — geometric self-curation (opt-in). Compose the
+    # sampler; never let an import/scan failure break the legacy
+    # fallthrough (fail-open per §7).
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.geometric_sampler import (  # noqa: E501
+            geometric_sampler_enabled,
+            sample_discriminator_pair,
+        )
+
+        if geometric_sampler_enabled():
+            sample = sample_discriminator_pair()
+            if sample is not None:
+                logger.info(
+                    "[SWEBenchPro.HarnessInject] geometric sampler "
+                    "curated discriminator pair: known_good=%r "
+                    "known_hard=%r (scanned %d records)",
+                    sample.known_good_id, sample.known_hard_id,
+                    sample.scanned_count,
+                )
+                return sample.instance_ids
+            logger.warning(
+                "[SWEBenchPro.HarnessInject] geometric sampler ON "
+                "but yielded no valid pair — falling through to "
+                "cache first-N"
+            )
+    except Exception:  # noqa: BLE001 — fail-open (legacy path intact)
+        logger.warning(
+            "[SWEBenchPro.HarnessInject] geometric sampler tier "
+            "raised — falling through to cache first-N",
+            exc_info=True,
+        )
+
     cached = list_cached_problems()
     if not cached:
         return []
@@ -161,8 +206,8 @@ async def maybe_inject_swe_bench_at_boot(
     Orchestrates the four-stage injection pipeline:
 
       1. Master-flag check  -> SKIPPED_DISABLED if False
-      2. Instance-id resolution (CSV > count) -> SKIPPED_NO_PROBLEMS
-         if neither tier yielded any
+      2. Instance-id resolution (CSV > geometric sampler > count)
+         -> SKIPPED_NO_PROBLEMS if no tier yielded any
       3. Per-problem: Phase A load_problem + Phase B.1 prepare_problem
          + Phase B.2.1 build_evaluation_envelope
       4. Canonical IntakeLayerService.ingest_envelope submission
