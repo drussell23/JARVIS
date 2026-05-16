@@ -86,6 +86,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from backend.core.ouroboros.governance.op_context import (
+    PHASE_TRANSITIONS,
+    TERMINAL_PHASES,
     OperationContext,
     OperationPhase,
 )
@@ -108,6 +110,55 @@ _TERMINAL_PHASES = frozenset({
     OperationPhase.EXPIRED,
     OperationPhase.POSTMORTEM,
 })
+
+# Phases that are reachable in PHASE_TRANSITIONS but deliberately
+# NOT served by the PhaseRunnerRegistry: the orchestrator runs
+# APPLY / VERIFY / VISUAL_VERIFY post-GATE through its own internal
+# machinery (ChangeEngine apply, scoped post-apply verification,
+# Visual VERIFY), not via a dispatched PhaseRunner. They are listed
+# here explicitly so the completeness invariant treats them as
+# intentional, not as a missing factory. ANY other non-terminal
+# transition target MUST have a registered factory — that is the
+# structural guarantee that closed the GENERATE_RETRY class of bug
+# (a phase the FSM can advance/resume into with no runner →
+# PhaseRunnerRegistryError → unhandled pipeline exception).
+DISPATCHER_INTERNAL_ONLY_PHASES = frozenset({
+    OperationPhase.APPLY,
+    OperationPhase.VERIFY,
+    OperationPhase.VISUAL_VERIFY,
+})
+
+
+def assert_registry_complete(reg: "PhaseRunnerRegistry") -> None:
+    """Structural invariant: every non-terminal phase the FSM can
+    transition (or resume) into MUST have a registered runner
+    factory, unless it is explicitly in
+    :data:`DISPATCHER_INTERNAL_ONLY_PHASES`.
+
+    Raises :class:`PhaseRunnerRegistryError` at registry-construction
+    time if violated — fail-fast so a dispatchable-phase-without-a-
+    factory can NEVER reach a live op again (the v16
+    ``bt-2026-05-16-085224`` failure mode: park/resume re-dispatched
+    a ``GENERATE_RETRY``-phase ctx into an unregistered phase)."""
+    registered = set(reg.phases())
+    reachable_non_terminal = {
+        p for p in PHASE_TRANSITIONS if p not in TERMINAL_PHASES
+    }
+    missing = (
+        reachable_non_terminal
+        - registered
+        - DISPATCHER_INTERNAL_ONLY_PHASES
+    )
+    if missing:
+        raise PhaseRunnerRegistryError(
+            "registry incomplete: non-terminal phase(s) "
+            f"{sorted(p.name for p in missing)} are reachable via "
+            "PHASE_TRANSITIONS but have no registered runner factory "
+            "and are not in DISPATCHER_INTERNAL_ONLY_PHASES. Register "
+            "a factory (compose the semantically-equivalent base "
+            "phase's factory) or add to the internal-only allowlist "
+            "with justification."
+        )
 
 
 def dispatcher_enabled() -> bool:
@@ -446,10 +497,23 @@ def build_default_registry() -> PhaseRunnerRegistry:
     reg.register(OperationPhase.CONTEXT_EXPANSION, _factory_context_expansion)
     reg.register(OperationPhase.PLAN, _factory_plan)
     reg.register(OperationPhase.GENERATE, _factory_generate)
+    # GENERATE_RETRY is GENERATE re-entered with episodic-retry
+    # context (the GENERATERunner internal loop already advances
+    # ctx → GENERATE_RETRY and is phase-aware at entry). The FSM can
+    # *resume* directly into this phase (Stage 1.6 park/resume), so
+    # it MUST have a factory — compose GENERATE's, no new retry
+    # logic. (Root fix for bt-2026-05-16-085224 PhaseRunnerRegistryError.)
+    reg.register(OperationPhase.GENERATE_RETRY, _factory_generate)
     reg.register(OperationPhase.VALIDATE, _factory_validate)
+    # VALIDATE_RETRY is VALIDATE re-entered (L2-repair / Visual-
+    # VERIFY-fail routing). Same composition discipline.
+    reg.register(OperationPhase.VALIDATE_RETRY, _factory_validate)
     reg.register(OperationPhase.GATE, _factory_gate)
     reg.register(OperationPhase.APPROVE, _factory_approve)
     reg.register(OperationPhase.COMPLETE, _factory_complete)
+    # Fail-fast structural guarantee: no dispatchable phase may lack
+    # a factory. Raises at construction if the invariant is violated.
+    assert_registry_complete(reg)
     return reg
 
 
