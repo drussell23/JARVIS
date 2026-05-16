@@ -6576,6 +6576,90 @@ class ClaudeProvider:
                     )
                     async with _quiescence_core_active(label="claude_stream"), \
                             _current_client.messages.stream(**_stream_kwargs) as stream:
+                        # Task #107 — Gate-adoption audit (additive,
+                        # env-gated, operator-approved 2026-05-15).  The
+                        # one-shot [stream.boundary] above samples only at
+                        # stream ENTRY; it cannot see WHAT stays runnable
+                        # DURING the minutes-long thinking=on no-byte
+                        # window (the Tier-C 20–158s gap).  This bounded
+                        # concurrent sampler periodically snapshots the
+                        # not-done task population until the first raw
+                        # event arrives, so a thinking=on-vs-off diff can
+                        # NAME the ungated task family.  Gated by its OWN
+                        # default-false flag (distinct from the one-shot
+                        # boundary flag); self-terminating + hard-capped
+                        # so it can never leak; log-only, never raises.
+                        _audit_task: "Optional[asyncio.Task]" = None
+                        if os.environ.get(
+                            "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED", ""
+                        ).strip().lower() in ("1", "true", "yes", "on"):
+                            try:
+                                _audit_interval_s = float(os.environ.get(
+                                    "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_INTERVAL_S",
+                                    "15.0",
+                                ))
+                            except (TypeError, ValueError):
+                                _audit_interval_s = 15.0
+                            if _audit_interval_s <= 0.0:
+                                _audit_interval_s = 15.0
+                            _audit_thinking = (
+                                "on" if _thinking_param is not None else "off"
+                            )
+                            _audit_op_id = str(
+                                getattr(context, "op_id", "?")
+                            )[:24]
+                            _audit_t0 = time.monotonic()
+                            _audit_deadline = _audit_t0 + min(
+                                float(timeout_s) + 30.0, 900.0,
+                            )
+
+                            async def _boundary_audit_sampler() -> None:
+                                _seq = 0
+                                while True:
+                                    try:
+                                        await asyncio.sleep(_audit_interval_s)
+                                    except asyncio.CancelledError:
+                                        return
+                                    # Stop conditions (any) — never leak.
+                                    if _first_raw_event_logged[0]:
+                                        return
+                                    if time.monotonic() >= _audit_deadline:
+                                        return
+                                    _seq += 1
+                                    if _seq > 60:  # absolute hard cap
+                                        return
+                                    try:
+                                        _loop = asyncio.get_running_loop()
+                                        _all = asyncio.all_tasks(_loop)
+                                        _nd = [t for t in _all if not t.done()]
+                                        _names = [
+                                            t.get_name() for t in _nd[:16]
+                                        ]
+                                        logger.info(
+                                            "[ClaudeProvider.stream.boundary.audit]"
+                                            " seq=%d elapsed_ms=%d "
+                                            "thinking=%s tasks_total=%d "
+                                            "tasks_not_done=%d op_id=%s "
+                                            "tasks_sample=%s",
+                                            _seq,
+                                            int(
+                                                (time.monotonic()
+                                                 - _audit_t0) * 1000
+                                            ),
+                                            _audit_thinking,
+                                            len(_all), len(_nd),
+                                            _audit_op_id, _names,
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        pass
+
+                            try:
+                                _audit_task = asyncio.create_task(
+                                    _boundary_audit_sampler(),
+                                    name="claude_stream_boundary_audit",
+                                )
+                            except Exception:  # noqa: BLE001
+                                _audit_task = None
                         # Two-Phase Stream Rupture Breaker.
                         # Phase 1 (TTFT): generous default 120s for first
                         #   token.  Task #88 (2026-05-13) — widened to
@@ -6678,6 +6762,14 @@ class ClaudeProvider:
                                 ).strip().lower() in ("1", "true", "yes", "on")
                             ):
                                 _first_raw_event_logged[0] = True
+                                # Task #107 — first raw event arrived;
+                                # stop the boundary-audit sampler
+                                # immediately (it would self-terminate
+                                # within one interval anyway via the
+                                # _first_raw_event_logged stop-check —
+                                # this just makes it tidy + instant).
+                                if _audit_task is not None and not _audit_task.done():
+                                    _audit_task.cancel()
                                 try:
                                     _raw_ms = int(
                                         (time.monotonic() - _call_start) * 1000

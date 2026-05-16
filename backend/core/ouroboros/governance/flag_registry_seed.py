@@ -560,6 +560,50 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Gate-adoption audit — thinking=on residual-gap localization (Task #107, 2026-05-15)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Default-FALSE diagnostic gate (distinct from the one-shot "
+            "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED).  When true, a "
+            "bounded concurrent sampler emits periodic "
+            "[ClaudeProvider.stream.boundary.audit] snapshots (not-done "
+            "task population + names) DURING the pre-first-raw-event "
+            "window of each Claude stream, until the first raw SDK "
+            "event arrives.  Purpose: localize the Task #105 SPLIT "
+            "thinking=on residual gap (Tier-C 20-158s) by naming the "
+            "task family that stays runnable while the quiescence gate "
+            "is cleared during the minutes-long thinking-phase no-byte "
+            "window.  Self-terminating + hard-capped (≤60 samples, "
+            "deadline = min(timeout_s+30, 900s)) so it can never leak; "
+            "log-only, never raises.  Measurement only — no behavior "
+            "change.  Operator-approved 2026-05-15 (Task #107 charter)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="false",
+        since="2026-05-15",
+    ),
+    FlagSpec(
+        name="JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_INTERVAL_S",
+        type=FlagType.FLOAT, default=15.0,
+        description=(
+            "Seconds between [stream.boundary.audit] samples while "
+            "awaiting the first raw SDK event (Task #107).  Default "
+            "15s — fine enough to resolve the 20-158s thinking=on gap "
+            "into multiple snapshots, coarse enough to add negligible "
+            "load.  Invalid / non-positive → 15.0.  Only consulted "
+            "when JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED=true."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="15.0",
+        since="2026-05-15",
+    ),
+
+    # ====================================================================
     # Autonomous Quiescence Protocol — Core Isolation (Task #104, 2026-05-14)
     # ====================================================================
     FlagSpec(
