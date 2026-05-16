@@ -133,35 +133,15 @@ async def _active_health_probe(
         return None
 
 
-def _is_hibernating() -> bool:
-    """Best-effort duck-typed read of organism hibernation state.
-    Conservative: only returns True on an unambiguous positive
-    signal; any uncertainty → False (not a refusal). NEVER raises."""
-    try:
-        from backend.core.ouroboros.governance.provider_exhaustion_watcher import (  # noqa: E501
-            get_provider_exhaustion_watcher,
-        )
-        w = get_provider_exhaustion_watcher()
-        for attr in ("is_hibernating", "hibernating", "is_open"):
-            v = getattr(w, attr, None)
-            if callable(v):
-                v = v()
-            if v is True:
-                return True
-        return False
-    except Exception:  # noqa: BLE001 — absence ≠ hibernating
-        return False
-
-
 async def assess_provider_readiness(
     *,
     probe_handle: Any = None,
 ) -> PreflightVerdict:
     """Single pre-spend admission gate. NEVER raises.
 
-    Order: master-flag → Claude CB state (primary; the v18
-    condition) → hibernation → optional bounded active probe →
-    indeterminate policy (A default / B strict)."""
+    Order: master-flag → Claude CB state (primary, authoritative;
+    the v18 5xx/529 condition) → optional bounded active probe →
+    indeterminate policy (A default PROCEED+WARN / B strict refuse)."""
     try:
         if not preflight_enabled():
             return PreflightVerdict.PROCEED_DISABLED
@@ -171,17 +151,10 @@ async def assess_provider_readiness(
             logger.error(
                 "[ProviderPreflight] REFUSE: Claude circuit breaker "
                 "is OPEN (recent 5xx/529 streak — the v18 outage "
-                "condition). Skipping SWE inject before any spend."
+                "condition; also covers the hibernation case "
+                "transitively). Skipping SWE inject before any spend."
             )
             return PreflightVerdict.REFUSE_CLAUDE_CB_OPEN
-
-        if _is_hibernating():
-            logger.error(
-                "[ProviderPreflight] REFUSE: organism is hibernating "
-                "(prior provider-exhaustion streak). Skipping SWE "
-                "inject before any spend."
-            )
-            return PreflightVerdict.REFUSE_HIBERNATING
 
         probe = await _active_health_probe(
             probe_handle, _probe_timeout_s(),

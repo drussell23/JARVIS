@@ -1933,9 +1933,51 @@ class BattleTestHarness:
                 maybe_inject_swe_bench_at_boot,
             )
             if self._intake_service is not None:
-                _swebp_verdict = await maybe_inject_swe_bench_at_boot(
-                    self._intake_service,
-                )
+                # ── P1 provider-readiness pre-flight (pre-spend) ──
+                # Composes the canonical Claude circuit-breaker state
+                # (+ optional bounded health_probe). §33.1
+                # default-FALSE → byte-identical (no probe, no gate)
+                # when off. On REFUSE_* we SKIP the SWE inject
+                # entirely so $0 is spent into a known 5xx/529
+                # outage window (the v18 wasted-spend hole). Runs
+                # STRICTLY before maybe_inject_swe_bench_at_boot.
+                # NEVER raises (assess is total; this wrapper is
+                # belt-and-suspenders for boot-must-never-fail).
+                _preflight_refused = False
+                try:
+                    from backend.core.ouroboros.battle_test.provider_preflight import (  # noqa: E501
+                        PreflightVerdict,
+                        assess_provider_readiness,
+                    )
+                    _pf = await assess_provider_readiness()
+                    logger.info(
+                        "[Harness] provider pre-flight: verdict=%s",
+                        _pf.value,
+                    )
+                    if _pf.is_refusal:
+                        logger.error(
+                            "[Harness] provider pre-flight REFUSED "
+                            "(%s) — skipping SWE-Bench-Pro inject; "
+                            "$0 spent into a known-bad provider "
+                            "window.",
+                            _pf.value,
+                        )
+                        _preflight_refused = True
+                except Exception:  # noqa: BLE001 — gate never fails boot
+                    logger.debug(
+                        "[Harness] provider pre-flight raised — "
+                        "proceeding (Option A; CB is the safety net)",
+                        exc_info=True,
+                    )
+
+                if _preflight_refused:
+                    _swebp_verdict = (
+                        SWEBenchProInjectionVerdict.SKIPPED_DISABLED
+                    )
+                else:
+                    _swebp_verdict = await maybe_inject_swe_bench_at_boot(
+                        self._intake_service,
+                    )
                 logger.info(
                     "[Harness] SWE-Bench-Pro boot hook: verdict=%s",
                     _swebp_verdict.value,
