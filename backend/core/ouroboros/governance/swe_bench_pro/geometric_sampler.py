@@ -48,6 +48,7 @@ from backend.core.ouroboros.governance.repair_tree_production import (
     extract_diff_targets,
 )
 from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
+    ProblemSpec,
     iter_all_dataset_records,
 )
 
@@ -191,13 +192,19 @@ def sample_discriminator_pair(
         scanned = 0
         for record in iter_all_dataset_records(max_scan=max_scan):
             scanned += 1
-            iid = record.get("instance_id")
-            if not isinstance(iid, str) or not iid:
+            # Compose the canonical normalizer so the sampler sees
+            # EXACTLY the gold_patch the downstream pipeline will use
+            # (single source of truth for the patch/gold_patch alias
+            # + Scale AI schema — no duplicate field-name logic here).
+            try:
+                spec = ProblemSpec.from_dict(record)
+            except (ValueError, TypeError):
+                continue  # missing/invalid instance_id — not a candidate
+            if not spec.gold_patch:
                 continue
-            gold = record.get("gold_patch")
-            if not isinstance(gold, str) or not gold:
-                continue
-            geom = compute_patch_geometry(iid, gold)
+            geom = compute_patch_geometry(
+                spec.instance_id, spec.gold_patch,
+            )
             if geom.changed_lines <= 0 or geom.changed_files <= 0:
                 continue  # non-measurable — not a discriminator candidate
             if geom.is_single_file:

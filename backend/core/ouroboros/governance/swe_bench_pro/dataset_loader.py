@@ -93,6 +93,26 @@ logger = logging.getLogger("Ouroboros.SWEBenchPro.DatasetLoader")
 
 SWE_BENCH_PRO_PROBLEM_SCHEMA_VERSION: str = "swe_bench_pro_problem.v1"
 
+# Reference-fix field aliases.  The upstream ``ScaleAI/SWE-bench_Pro``
+# dataset names the gold fix ``patch`` (classic SWE-Bench
+# convention); our ProblemSpec calls it ``gold_patch``.  Explicit
+# ``gold_patch`` wins over ``patch`` when both are present (defensive
+# — a derivative dataset may carry both).  Ordered: first non-empty
+# match wins.
+_GOLD_PATCH_FIELD_ALIASES: tuple = ("gold_patch", "patch")
+
+# The canonical ProblemSpec field names.  Any payload key NOT in
+# this set is folded into ``metadata`` verbatim by
+# :meth:`ProblemSpec.from_dict` (forward-compat — preserves Scale AI
+# extensions without a hardcoded extension list).  ``patch`` is
+# listed so the gold-patch alias source is not ALSO duplicated into
+# metadata.
+_CANONICAL_PROBLEM_FIELDS: frozenset = frozenset({
+    "schema_version", "instance_id", "repo", "repo_url",
+    "base_commit", "problem_statement", "test_patch", "gold_patch",
+    "patch", "difficulty", "metadata",
+})
+
 
 # Master flag (§33.1 default-FALSE).  Production behavior is
 # byte-identical when unset; load_problem short-circuits at
@@ -252,28 +272,75 @@ class ProblemSpec:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProblemSpec":
-        """Construct from a dict.  Tolerates missing optional fields
-        with sensible defaults; raises ``ValueError`` only on
-        unrecoverable schema violations (missing ``instance_id``)."""
+        """Construct from a dict, normalizing the canonical
+        SWE-Bench-Pro / Scale AI dataset schema.
+
+        Tolerates missing optional fields with sensible defaults;
+        raises ``ValueError`` only on unrecoverable schema
+        violations (missing ``instance_id``).
+
+        Schema normalization (single seam — every acquisition path
+        composes this so the loader, Phase B/C, and the geometric
+        sampler all see ONE canonical shape):
+
+          * **gold_patch** — the upstream ``ScaleAI/SWE-bench_Pro``
+            dataset names the reference fix ``patch`` (classic
+            SWE-Bench convention); our schema calls it
+            ``gold_patch``.  Explicit ``gold_patch`` wins if
+            present, else ``patch`` (:data:`_GOLD_PATCH_FIELD_ALIASES`).
+          * **repo_url** — derived ``https://github.com/<repo>.git``
+            when absent (the Scale AI dataset omits it; Phase B
+            needs a clone URL).
+          * **metadata** — every payload key that is NOT a canonical
+            ``ProblemSpec`` field is folded into ``metadata``
+            verbatim (forward-compat: preserves Scale AI extensions
+            like ``fail_to_pass`` / ``pass_to_pass`` / ``interface``
+            for downstream without a hardcoded field list).
+        """
         instance_id = payload.get("instance_id")
         if not isinstance(instance_id, str) or not instance_id:
             raise ValueError(
                 "ProblemSpec.from_dict: 'instance_id' is required + "
                 "must be a non-empty string"
             )
+
+        gold_patch = ""
+        for _alias in _GOLD_PATCH_FIELD_ALIASES:
+            _val = payload.get(_alias)
+            if isinstance(_val, str) and _val:
+                gold_patch = _val
+                break
+
+        repo = str(payload.get("repo", ""))
+        repo_url = str(payload.get("repo_url", "") or "")
+        if not repo_url and repo:
+            repo_url = f"https://github.com/{repo}.git"
+
+        # Fold unknown payload keys into metadata (structural —
+        # "everything not a canonical field", no hardcoded Scale AI
+        # key list).  Explicit ``metadata`` mapping takes precedence.
+        extra: Dict[str, Any] = {}
+        for _k, _v in payload.items():
+            if _k in _CANONICAL_PROBLEM_FIELDS:
+                continue
+            extra[_k] = _v
+        explicit_meta = payload.get("metadata", {})
+        if isinstance(explicit_meta, Mapping):
+            extra.update(explicit_meta)
+
         return cls(
             schema_version=str(payload.get(
                 "schema_version", SWE_BENCH_PRO_PROBLEM_SCHEMA_VERSION,
             )),
             instance_id=instance_id,
-            repo=str(payload.get("repo", "")),
-            repo_url=str(payload.get("repo_url", "")),
+            repo=repo,
+            repo_url=repo_url,
             base_commit=str(payload.get("base_commit", "")),
             problem_statement=str(payload.get("problem_statement", "")),
             test_patch=str(payload.get("test_patch", "")),
-            gold_patch=str(payload.get("gold_patch", "")),
+            gold_patch=gold_patch,
             difficulty=str(payload.get("difficulty", "unknown")),
-            metadata=dict(payload.get("metadata", {})),
+            metadata=extra,
         )
 
 
@@ -969,6 +1036,27 @@ def register_flags(registry: Any) -> int:
             ),
             example=_DEFAULT_HF_SPLIT,
             since="v3.7 Phase 2 Phase A (2026-05-12)",
+        ),
+        FlagSpec(
+            name=SAMPLER_MAX_SCAN_ENV_VAR,
+            type=FlagType.INT,
+            default=_DATASET_SCAN_MAX_RECORDS_DEFAULT,
+            description=(
+                "Bounded ceiling on the FULL-dataset enumeration "
+                "(local JSONL union HF) consumed by "
+                "iter_all_dataset_records / the GeometricInstanceSampler. "
+                "Clamped to >= 1; invalid/unset -> default "
+                f"{_DATASET_SCAN_MAX_RECORDS_DEFAULT} (headroom over the "
+                "1,865-problem upstream dataset). Prevents an unbounded "
+                "scan on a pathological / derivative dataset."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/swe_bench_pro/"
+                "dataset_loader.py"
+            ),
+            example=str(_DATASET_SCAN_MAX_RECORDS_DEFAULT),
+            since="v3.7 Stage 2 geometric-sampler (2026-05-16)",
         ),
     ]
 
