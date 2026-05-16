@@ -237,14 +237,20 @@ async def _drive_parallel_evaluate(
     running (solve ops must reach their terminal event for the
     broker to wake the scorer). NEVER raises into the loop;
     asyncio.CancelledError propagates."""
-    try:
-        from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (  # noqa: E501
-            parallel_evaluate,
-        )
+    from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (  # noqa: E501
+        parallel_evaluate,
+    )
 
-        async for record in parallel_evaluate(
-            specs, intake_service=intake_service,
-        ):
+    # Hold an explicit reference to the async generator so we can
+    # close it in our OWN coroutine context on cancellation. The v16
+    # `aclose(): asynchronous generator is already running` crash came
+    # from the harness force-cancelling this task while the bare
+    # `async for` was suspended at the generator's yield and a
+    # concurrent aclose ran. Owning the agen + closing it in `finally`
+    # (suppressing the benign races) keeps cancellation clean.
+    agen = parallel_evaluate(specs, intake_service=intake_service)
+    try:
+        async for record in agen:
             ev = getattr(record, "evaluation", None)
             sc = getattr(record, "scoring", None)
             logger.info(
@@ -264,6 +270,71 @@ async def _drive_parallel_evaluate(
         logger.warning(
             "[SWEBenchPro.HarnessInject] autoscore driver raised — "
             "closed loop aborted, soak continues", exc_info=True,
+        )
+    finally:
+        # Close the generator in THIS coroutine's context. Suppress
+        # the two benign races: (1) RuntimeError 'aclose(): ... already
+        # running' if cancellation is already unwinding it; (2)
+        # CancelledError re-raised by aclose during shutdown. Either
+        # way the generator's own finally (broker unsubscribe, worktree
+        # cleanup) has run or will run within parallel_evaluate.
+        try:
+            await agen.aclose()
+        except (RuntimeError, asyncio.CancelledError):
+            pass
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[SWEBenchPro.HarnessInject] autoscore agen.aclose() "
+                "raised (benign at shutdown)", exc_info=True,
+            )
+
+
+def autoscore_work_in_flight() -> bool:
+    """Session-liveness probe: True while any fire-and-forget
+    autoscore driver task is still running.
+
+    Registered with the harness ActivityMonitor at boot so a
+    backgrounded ``parallel_evaluate`` counts as "the organism is
+    busy" — closing the v16 ``bt-2026-05-16-085224`` failure where
+    the session idle-reaped a still-running discriminator because
+    the fire-and-forget task was invisible to the idle counter.
+    NEVER raises (a probe must never break the ActivityMonitor)."""
+    try:
+        return any(not t.done() for t in _AUTOSCORE_DRIVER_TASKS)
+    except Exception:  # noqa: BLE001 — probe must be total
+        return False
+
+
+async def await_autoscore_drain(grace_s: float = 30.0) -> None:
+    """Shutdown helper: give in-flight autoscore tasks a bounded
+    grace to finish (so a near-complete Phase C/D verdict can land
+    and the ``parallel_evaluate`` generator closes in its OWN
+    coroutine context), then cancel + await any stragglers.
+
+    Mirrors the harness's existing cancel→await component-shutdown
+    shape. Bounded — never blocks shutdown unboundedly. NEVER raises
+    except to propagate an outer ``CancelledError`` after still
+    cancelling children (clean teardown contract)."""
+    tasks = [t for t in _AUTOSCORE_DRIVER_TASKS if not t.done()]
+    if not tasks:
+        return
+    try:
+        _done, pending = await asyncio.wait(
+            tasks, timeout=max(0.0, grace_s),
+        )
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
+    except Exception:  # noqa: BLE001 — fail-open (shutdown must finish)
+        logger.debug(
+            "[SWEBenchPro.HarnessInject] await_autoscore_drain raised",
+            exc_info=True,
         )
 
 
@@ -569,6 +640,8 @@ __all__ = [
     "inject_count",
     "inject_instance_ids",
     "autoscore_enabled",
+    "autoscore_work_in_flight",
+    "await_autoscore_drain",
     "maybe_inject_swe_bench_at_boot",
     "register_flags",
 ]

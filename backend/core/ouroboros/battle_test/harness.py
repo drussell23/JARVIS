@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
 from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog
@@ -265,6 +265,12 @@ class BattleTestHarness:
         )
         self._idle_watchdog = IdleWatchdog(timeout_s=config.idle_timeout_s)
         self._session_recorder = SessionRecorder(session_id=self._session_id)
+        # Session-liveness probes — zero-arg callables returning True
+        # while background closed-loop work (e.g. autoscore
+        # parallel_evaluate) is in flight. The ActivityMonitor pokes
+        # the idle watchdog while any probe is hot, so fire-and-forget
+        # work cannot be idle-reaped (v16 bt-2026-05-16-085224 fix).
+        self._session_liveness_probes: List[Callable[[], bool]] = []
 
         # Stop signals — created lazily in run() to avoid event-loop mismatch on Python 3.9
         self._shutdown_event: Optional[asyncio.Event] = None
@@ -1922,6 +1928,8 @@ class BattleTestHarness:
         # exercise hook positioning fix (df4b70a4a8).
         try:
             from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (  # noqa: E501
+                SWEBenchProInjectionVerdict,
+                autoscore_work_in_flight,
                 maybe_inject_swe_bench_at_boot,
             )
             if self._intake_service is not None:
@@ -1932,6 +1940,23 @@ class BattleTestHarness:
                     "[Harness] SWE-Bench-Pro boot hook: verdict=%s",
                     _swebp_verdict.value,
                 )
+                # Closed-loop autoscore runs as a fire-and-forget
+                # background task invisible to the GLS-op staleness
+                # check. Register it as a session-liveness probe so
+                # the ActivityMonitor keeps the session alive while a
+                # discriminator eval is still solving/scoring
+                # (v16 bt-2026-05-16-085224 idle-reap fix).
+                if _swebp_verdict == (
+                    SWEBenchProInjectionVerdict.INJECTED_AUTOSCORE
+                ):
+                    self.register_session_liveness_probe(
+                        autoscore_work_in_flight
+                    )
+                    logger.info(
+                        "[Harness] registered autoscore session-"
+                        "liveness probe (idle watchdog will not reap "
+                        "while closed-loop eval is in flight)"
+                    )
             else:
                 logger.debug(
                     "[Harness] SWE-Bench-Pro boot hook: "
@@ -4293,6 +4318,21 @@ class BattleTestHarness:
                                 "[ActivityMonitor] %d ops progressing, poked watchdog",
                                 progressing_count,
                             )
+                    elif self._any_session_liveness_probe_hot():
+                        # No GLS op looks "progressing", but a registered
+                        # session-liveness probe is hot — e.g. a
+                        # fire-and-forget autoscore parallel_evaluate is
+                        # still solving/scoring. That IS the organism
+                        # being busy; starving the watchdog here is the
+                        # v16 bt-2026-05-16-085224 bug (idle-reaped a
+                        # still-running discriminator). Poke + continue.
+                        self._idle_watchdog.poke()
+                        logger.info(
+                            "[ActivityMonitor] %d GLS ops stale but a "
+                            "session-liveness probe is hot (background "
+                            "closed-loop work in flight) — poked watchdog",
+                            stale_count,
+                        )
                     else:
                         # ALL ops are stale — do NOT poke. If this persists,
                         # the idle watchdog fires and stops the session.
@@ -4986,6 +5026,30 @@ class BattleTestHarness:
     # Shutdown
     # ------------------------------------------------------------------
 
+    def register_session_liveness_probe(
+        self, probe: Callable[[], bool],
+    ) -> None:
+        """Register a zero-arg probe that returns True while
+        background closed-loop work is in flight. The ActivityMonitor
+        pokes the idle watchdog while any probe is hot, so
+        fire-and-forget work (autoscore parallel_evaluate) cannot be
+        idle-reaped. Mirrors the GENERATE stream-activity idea —
+        "don't starve the session while real work runs"."""
+        if callable(probe):
+            self._session_liveness_probes.append(probe)
+
+    def _any_session_liveness_probe_hot(self) -> bool:
+        """True if ANY registered probe reports work in flight.
+        Per-probe fail-open: a raising probe is treated as not-hot
+        and never breaks the ActivityMonitor decision loop."""
+        for probe in getattr(self, "_session_liveness_probes", ()):
+            try:
+                if probe():
+                    return True
+            except Exception:  # noqa: BLE001 — probe must not break monitor
+                continue
+        return False
+
     async def _shutdown_components(self) -> None:
         """Stop all components in reverse boot order.
 
@@ -5002,6 +5066,27 @@ class BattleTestHarness:
                     await self._activity_monitor_task
                 except asyncio.CancelledError:
                     pass
+        except Exception:
+            pass
+
+        # 0a. Bounded autoscore drain — give any in-flight closed-loop
+        # parallel_evaluate a short grace to land its Phase C/D verdict
+        # and close its generator in its OWN coroutine context BEFORE
+        # the broker/intake below are torn down. This is the clean
+        # counterpart to the liveness probe: probe keeps the session
+        # alive while work runs; this drains it deterministically at
+        # the end instead of force-cancelling mid-aclose (the v16
+        # `aclose(): asynchronous generator is already running`).
+        try:
+            from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (  # noqa: E501
+                await_autoscore_drain,
+            )
+            _grace = float(os.environ.get(
+                "JARVIS_SWE_BENCH_PRO_AUTOSCORE_SHUTDOWN_GRACE_S", "30",
+            ))
+            await await_autoscore_drain(grace_s=_grace)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
