@@ -759,6 +759,15 @@ class CodebaseKnowledgeGraph:
         node_id = node_data.node_id
         node_key = str(node_id)
 
+        # Task #106 — O(1) incremental node count.  NetworkX
+        # add_node on an EXISTING key updates attributes without
+        # changing the node count, so only genuinely-new keys are
+        # counted.  ``node_key not in self._graph`` is O(1)
+        # (``__contains__`` → ``n in self._node`` dict membership).
+        # Symmetric with the edge counter below; robust against
+        # future NetworkX ``NodeView.__len__`` semantics.
+        _is_new_node = node_key not in self._graph
+
         self._graph.add_node(
             node_key,
             **node_data.to_dict(),
@@ -770,7 +779,8 @@ class CodebaseKnowledgeGraph:
         self._repo_index[node_id.repo].add(node_key)
         self._type_index[node_id.node_type].add(node_key)
 
-        self._metrics["total_nodes"] = len(self._graph.nodes)
+        if _is_new_node:
+            self._metrics["total_nodes"] += 1
 
     def add_edge(
         self,
@@ -788,13 +798,29 @@ class CodebaseKnowledgeGraph:
         if target_key not in self._graph:
             self.add_node(NodeData(node_id=target))
 
+        # Task #106 — ROOT FIX for the 22→1 files/s cold-index decay.
+        # ``len(self._graph.edges)`` (and ``number_of_edges()``) are
+        # O(N_nodes) for a DiGraph: NetworkX ``OutEdgeView.__len__`` /
+        # ``DiGraph.size()`` sum out-degree across EVERY node.
+        # Recomputing it on every add_edge made the 29,424-file cold
+        # index O(N²).  Empirically (this repo, networkx 3.6.1):
+        # len(G.edges) = 9.7µs @200 nodes → 87µs @1850 → 1341µs @29k
+        # (perfectly linear) — exactly the observed standalone
+        # 22 files/s → 1 file/s degradation.  Fix: maintain
+        # total_edges as an O(1) incremental counter.  NetworkX
+        # add_edge on an existing (u, v) updates attributes WITHOUT
+        # changing the edge count, so only genuinely-new edges are
+        # counted.  ``has_edge`` is O(1) (dict-of-dicts lookup).
+        _is_new_edge = not self._graph.has_edge(source_key, target_key)
+
         self._graph.add_edge(
             source_key,
             target_key,
             **edge_data.to_dict(),
         )
 
-        self._metrics["total_edges"] = len(self._graph.edges)
+        if _is_new_edge:
+            self._metrics["total_edges"] += 1
 
     def get_node(self, node_id: Union[NodeID, str]) -> Optional[Dict[str, Any]]:
         """Get node data by ID."""
