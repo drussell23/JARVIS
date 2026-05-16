@@ -57,10 +57,27 @@ _SESSION_FLAG = "JARVIS_OUROBOROS_SESSION_ID"
 
 
 @pytest.fixture(autouse=True)
-def _isolate(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    for flag in (_MASTER_FLAG, _WORKSPACE_FLAG, _SESSION_FLAG):
-        monkeypatch.delenv(flag, raising=False)
-    yield
+def _isolate() -> Iterator[None]:
+    """Save + restore env vars touched by the wiring path.
+
+    Cannot use ``monkeypatch.delenv(K, raising=False)`` here:
+    when K is absent at fixture entry, monkeypatch doesn't track
+    it, so a subsequent direct ``os.environ[K] = ...`` write by
+    the harness method survives teardown and pollutes neighboring
+    test files (e.g. the AutoCommitter ignore-guard suite). The
+    explicit save/restore captures both "absent" and "present"
+    initial states unconditionally.
+    """
+    flags = (_MASTER_FLAG, _WORKSPACE_FLAG, _SESSION_FLAG)
+    saved = {flag: os.environ.pop(flag, None) for flag in flags}
+    try:
+        yield
+    finally:
+        for flag, prev in saved.items():
+            if prev is None:
+                os.environ.pop(flag, None)
+            else:
+                os.environ[flag] = prev
 
 
 def _enable(monkeypatch: pytest.MonkeyPatch) -> None:

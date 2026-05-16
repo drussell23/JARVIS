@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import contextlib
 import importlib.metadata as _metadata
 import logging
 import os
@@ -1141,6 +1143,61 @@ def main() -> None:
     if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
         _reaped = _reap_zombies()
         _cleanup_stale_router_lock(reaped_pids=_reaped)
+
+    # ------------------------------------------------------------------
+    # P1 Slice 3 — Ledger Sovereignty B1.2 singleton lock.
+    # Structural single-instance defense: composes the canonical
+    # cross_process_jsonl.flock_critical_section primitive to take
+    # a kernel-arbitrated LOCK_EX | LOCK_NB on a well-known path
+    # under the repo root. Default-FALSE per §33.1 — when off, the
+    # existing _single_flight_preflight pgrep diagnostic path is
+    # unchanged. When on, runs BEFORE _single_flight_preflight so
+    # the structural defense fires first; the pgrep layer remains
+    # as a human-readable diagnostic.
+    #
+    # The flock fd is held by the ExitStack for the rest of main(),
+    # released by the kernel on any process exit (clean, SIGKILL,
+    # os._exit) — no leaked-lock failure mode.
+    # ------------------------------------------------------------------
+    _lock_stack = contextlib.ExitStack()
+    try:
+        from backend.core.ouroboros.battle_test.singleton_lock import (
+            acquire_singleton,
+            singleton_lock_enabled,
+        )
+    except Exception as _sl_imp_err:  # noqa: BLE001 — defensive
+        # Substrate unavailable → fall through to pgrep preflight.
+        logging.getLogger(__name__).debug(
+            "[singleton_lock] substrate import failed: %r — "
+            "falling through to pgrep preflight",
+            _sl_imp_err,
+        )
+    else:
+        if singleton_lock_enabled():
+            _sl_result = _lock_stack.enter_context(
+                acquire_singleton(
+                    repo_root=Path(args.repo_path),
+                ),
+            )
+            if not _sl_result.acquired:
+                print(
+                    f"{_RED}{_BOLD}✘ Another Ouroboros soak holds "
+                    f"the singleton lock at "
+                    f"{_sl_result.lock_path}{_RESET}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"{_DIM}  Wait for the running soak to "
+                    f"finish, or kill it.{_RESET}",
+                    file=sys.stderr,
+                )
+                _lock_stack.close()
+                sys.exit(75)  # EX_TEMPFAIL
+    # Register stack close at process exit as belt-and-suspenders;
+    # the with-block in main() drops it anyway, but atexit ensures
+    # the lock is dropped even if a sys.exit path bypasses normal
+    # unwind. NOTE: ExitStack.close() is idempotent.
+    atexit.register(_lock_stack.close)
 
     # ------------------------------------------------------------------
     # Harness Epic Slice 2 — single-flight preflight.
