@@ -169,18 +169,85 @@ def test_driver_has_finally_aclose():
 # ---------------------------------------------------------------------------
 
 
-def test_harness_probe_branch_pokes_before_starve():
-    poke_if = _HSRC.index("if progressing_count > 0:")
-    probe_elif = _HSRC.index("_any_session_liveness_probe_hot()")
-    starve = _HSRC.index("ALL %d ops are stale — NOT poking watchdog")
-    assert poke_if < probe_elif < starve, (
-        "probe-hot branch must sit between the progressing-poke and "
-        "the all-stale starve (source order)"
+def test_harness_probe_is_unconditional_single_seam():
+    """A-fix-v2: the probe must be consulted BEFORE the
+    `if not active_ops` early-out (so empty-active_ops cannot bypass
+    it — the v16/v17 idle path) and EXACTLY ONCE in the activity
+    monitor (single consult site; the redundant A-v1 elif is gone)."""
+    # Anchor to the ActivityMonitor TICK gate specifically — the
+    # `if not active_ops:` that immediately follows the tick's
+    # `active_ops = getattr(gls, "_active_ops", set())`. (The
+    # function has other unrelated `if not active_ops:` lines; a
+    # bare .index() would match the wrong one — that imprecision is
+    # itself what the v17 triage taught us to guard against.)
+    tick_anchor = _HSRC.index(
+        'active_ops: set = getattr(gls, "_active_ops", set())'
     )
-    window = _HSRC[probe_elif:starve]
-    assert "self._idle_watchdog.poke()" in window, (
-        "probe-hot branch must poke the watchdog"
+    gate = _HSRC.index("if not active_ops:", tick_anchor)
+    probe = _HSRC.index("_any_session_liveness_probe_hot()")
+    assert probe < gate, (
+        "probe must be evaluated BEFORE the tick's `if not "
+        "active_ops: continue` gate — else empty active_ops "
+        "bypasses it (the exact v16/v17 idle-reap path)"
     )
+    # Exactly one consult site inside _run_activity_monitor — no
+    # duplicate (the A-v1 elif must have been reverted to a plain
+    # else).
+    assert _HSRC.count("_any_session_liveness_probe_hot()") == 1, (
+        "single probe-consult site only (no duplicate in-tree elif)"
+    )
+    # The unconditional check pokes when hot.
+    seg = _HSRC[probe:probe + 220]
+    assert "_probe_hot = self._any_session_liveness_probe_hot()" in (
+        _HSRC[probe - 40:probe + 60]
+    ) or "_probe_hot" in seg
+    assert "self._idle_watchdog.poke()" in seg, (
+        "a hot probe must poke the watchdog at the unconditional seam"
+    )
+    # The reverted branch is a plain `else:` (no probe elif remains).
+    assert "elif self._any_session_liveness_probe_hot()" not in _HSRC
+
+
+def test_harness_probe_falls_through_when_ops_present():
+    """Refinement: poke when hot, but `continue` ONLY when not
+    active_ops — when ops exist the normal progressing/stale
+    classification (incl. stale-op force-cancel) must still run."""
+    probe = _HSRC.index("_probe_hot = self._any_session_liveness")
+    gate = _HSRC.index("if not active_ops:", probe)
+    # Between the probe poke and the gate there is NO unconditional
+    # `continue` (continue lives inside the `if not active_ops` block).
+    between = _HSRC[_HSRC.index("self._idle_watchdog.poke()", probe):gate]
+    assert "continue" not in between, (
+        "must NOT continue right after the unconditional poke — only "
+        "the `if not active_ops` branch continues"
+    )
+
+
+def test_any_session_liveness_probe_hot_behavioral_kernel():
+    """Behavioral tick-kernel: when active_ops is empty the new
+    code's ONLY action is `_probe_hot = _any_session_liveness_probe_
+    hot(); if _probe_hot: poke`. Prove that decision kernel on a real
+    method (via __new__ to avoid booting the full harness)."""
+    from backend.core.ouroboros.battle_test.harness import (
+        BattleTestHarness,
+    )
+    h = BattleTestHarness.__new__(BattleTestHarness)
+    h._session_liveness_probes = []
+    assert h._any_session_liveness_probe_hot() is False  # cold → no poke
+    h._session_liveness_probes = [lambda: False, lambda: True]
+    assert h._any_session_liveness_probe_hot() is True    # hot → poke
+    # raising probe is fail-open (never breaks the monitor tick)
+    h._session_liveness_probes = [
+        lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    ]
+    assert h._any_session_liveness_probe_hot() is False
+    # register_session_liveness_probe wires a real probe in
+    h._session_liveness_probes = []
+    h.register_session_liveness_probe(harness_inject.autoscore_work_in_flight)
+    harness_inject._AUTOSCORE_DRIVER_TASKS.clear()
+    assert h._any_session_liveness_probe_hot() is False   # no tasks
+    # (the pending-task → True path is covered by
+    # test_autoscore_work_in_flight_reflects_pending)
 
 
 def test_harness_registers_autoscore_probe_on_autoscore_verdict():

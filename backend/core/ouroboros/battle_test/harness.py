@@ -4211,10 +4211,37 @@ class BattleTestHarness:
                 if gls is None:
                     continue
 
+                # A-fix-v2: UNCONDITIONAL grader-liveness heartbeat,
+                # evaluated every tick BEFORE the active_ops gate and
+                # as the SINGLE probe-consult site. Background autoscore
+                # / parallel_evaluate holds NO op in _active_ops while
+                # it awaits operation_terminal, so the v16/v17 idle
+                # path is "active_ops empty + grader still running":
+                # the old in-tree probe (A-v1) was bypassed by the
+                # `if not active_ops: continue` early-out below. If the
+                # grader is running we poke here regardless of GLS op
+                # population. We do NOT `continue` when ops exist — the
+                # normal progressing/stale classification (incl.
+                # stale-op force-cancel) must still run; we only skip
+                # it when there are no ops to classify.
+                _probe_hot = self._any_session_liveness_probe_hot()
+                if _probe_hot:
+                    self._idle_watchdog.poke()
+
                 try:
                     active_ops: set = getattr(gls, "_active_ops", set())
                     if not active_ops:
-                        continue  # No ops — let the normal idle timer handle it
+                        # No GLS ops to classify. If the grader probe
+                        # is hot we already poked → session stays
+                        # alive while closed-loop work runs (the fix).
+                        # Otherwise the normal idle timer handles it.
+                        if _probe_hot:
+                            logger.debug(
+                                "[ActivityMonitor] no active GLS ops "
+                                "but session-liveness probe hot — "
+                                "poked watchdog, session kept alive"
+                            )
+                        continue  # No ops — normal idle timer otherwise
 
                     fsm_contexts: dict = getattr(gls, "_fsm_contexts", {})
                     now = datetime.now(tz=timezone.utc)
@@ -4318,21 +4345,6 @@ class BattleTestHarness:
                                 "[ActivityMonitor] %d ops progressing, poked watchdog",
                                 progressing_count,
                             )
-                    elif self._any_session_liveness_probe_hot():
-                        # No GLS op looks "progressing", but a registered
-                        # session-liveness probe is hot — e.g. a
-                        # fire-and-forget autoscore parallel_evaluate is
-                        # still solving/scoring. That IS the organism
-                        # being busy; starving the watchdog here is the
-                        # v16 bt-2026-05-16-085224 bug (idle-reaped a
-                        # still-running discriminator). Poke + continue.
-                        self._idle_watchdog.poke()
-                        logger.info(
-                            "[ActivityMonitor] %d GLS ops stale but a "
-                            "session-liveness probe is hot (background "
-                            "closed-loop work in flight) — poked watchdog",
-                            stale_count,
-                        )
                     else:
                         # ALL ops are stale — do NOT poke. If this persists,
                         # the idle watchdog fires and stops the session.
