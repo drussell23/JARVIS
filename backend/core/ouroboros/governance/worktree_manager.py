@@ -182,8 +182,55 @@ class WorktreeManager:
                 f"for branch '{branch_name}': {stderr.decode().strip()}"
             )
 
+        # P1 Slice 2 — Ledger Sovereignty marker. Stamps a typed
+        # ownership record at <wt_path>/.jarvis/ledger_ownership.json
+        # so downstream AutoCommitter can structurally verify the
+        # commit target is a worktree this loop owns. §33.1 master-
+        # FALSE default; off-master path is byte-identical. NEVER
+        # raises — mark_owned itself returns None on I/O failure
+        # and the downstream assertion surfaces the missing marker.
+        self._stamp_ownership_marker(wt_path, branch_name)
+
         logger.info("WorktreeManager: created worktree at %s", wt_path)
         return wt_path
+
+    def _stamp_ownership_marker(
+        self, wt_path: Path, branch_name: str,
+    ) -> None:
+        """Stamp a Ledger Sovereignty marker at ``wt_path`` under
+        the master flag. NEVER raises.
+
+        The session_id comes from ``JARVIS_OUROBOROS_SESSION_ID``
+        (set by ``BattleTestHarness`` at boot, mirroring the
+        existing ``JARVIS_OUROBOROS_SESSION_DIR`` pattern). Absent
+        env → empty session_id; the marker still stamps, the
+        cross-session mismatch check just won't fire for this
+        worktree.
+        """
+        try:
+            from backend.core.ouroboros.governance.ledger_sovereignty import (  # noqa: E501
+                master_enabled,
+                mark_owned,
+            )
+        except Exception:  # noqa: BLE001 — defensive import
+            return
+        if not master_enabled():
+            return
+        session_id = os.environ.get(
+            "JARVIS_OUROBOROS_SESSION_ID", ""
+        )
+        try:
+            mark_owned(
+                wt_path,
+                session_id=session_id,
+                branch_name=branch_name,
+            )
+        except Exception as err:  # noqa: BLE001 — defensive
+            # mark_owned is itself NEVER-raise; this is paranoia.
+            logger.debug(
+                "WorktreeManager: mark_owned defensive catch: %r",
+                err,
+            )
 
     async def list_worktree_paths(self) -> List[str]:
         """Gap #3 Slice 2 — return git's current worktree path list.

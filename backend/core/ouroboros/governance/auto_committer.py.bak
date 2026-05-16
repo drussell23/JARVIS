@@ -253,31 +253,6 @@ class AutoCommitter:
                 skipped_reason="no_target_files",
             )
 
-        # P1 Slice 2 — Ledger Sovereignty structural boundary.
-        # Refuses (typed) to commit when master flag is on AND
-        # the effective commit root is not a registered owned
-        # work-area. The check happens BEFORE the manifest hash
-        # cap so the most-load-bearing defense fires first.
-        # Master-FALSE path is byte-identical (no-op assertion).
-        try:
-            self._assert_commit_target_sovereign()
-        except Exception as _sov_exc:  # LedgerSovereigntyError
-            # Convert raise to typed CommitResult — the public
-            # `commit` contract is "Never raises" (line 199).
-            # Telemetry surfaces the violation via skipped_reason
-            # and the warning log; the operator's main checkout
-            # is structurally protected from this commit.
-            logger.warning(
-                "[AutoCommitter] ledger sovereignty refused "
-                "commit op=%s — %s",
-                op_id, _sov_exc,
-            )
-            return CommitResult(
-                committed=False,
-                skipped_reason="ledger_sovereignty_refused",
-                error=str(_sov_exc)[:512],
-            )
-
         # §40 Wave 2 #6 — RRD §1 hash-cap on self-modification.
         # When the staged commit touches the canonical governance
         # directory AND the operator-signed manifest exists AND
@@ -726,7 +701,7 @@ class AutoCommitter:
         # Check if there are any changes to stage
         proc = await asyncio.create_subprocess_exec(
             "git", "status", "--porcelain",
-            cwd=str(self._effective_repo_root()),
+            cwd=str(self._repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -796,7 +771,7 @@ class AutoCommitter:
                 continue
             proc = await asyncio.create_subprocess_exec(
                 "git", "add", "--", str(f),
-                cwd=str(self._effective_repo_root()),
+                cwd=str(self._repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -826,7 +801,7 @@ class AutoCommitter:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git", "diff", "--cached", "--name-only",
-                cwd=str(self._effective_repo_root()),
+                cwd=str(self._repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -863,7 +838,7 @@ class AutoCommitter:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git", "reset", "HEAD", "--",
-                cwd=str(self._effective_repo_root()),
+                cwd=str(self._repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -879,7 +854,7 @@ class AutoCommitter:
         """Create a git commit. Returns short commit hash."""
         proc = await asyncio.create_subprocess_exec(
             "git", "commit", "-m", message,
-            cwd=str(self._effective_repo_root()),
+            cwd=str(self._repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -897,7 +872,7 @@ class AutoCommitter:
         """Get the current HEAD commit hash (short)."""
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-parse", "--short", "HEAD",
-            cwd=str(self._effective_repo_root()),
+            cwd=str(self._repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -915,7 +890,7 @@ class AutoCommitter:
 
         proc = await asyncio.create_subprocess_exec(
             "git", "push", "-u", "origin", branch,
-            cwd=str(self._effective_repo_root()),
+            cwd=str(self._repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1004,7 +979,7 @@ class AutoCommitter:
             proc = await asyncio.create_subprocess_exec(
                 "git", "notes", "--ref", self._INTENT_NOTES_REF,
                 "list",
-                cwd=str(self._effective_repo_root()),
+                cwd=str(self._repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1032,7 +1007,7 @@ class AutoCommitter:
                 "git", "notes", "--ref", self._INTENT_NOTES_REF,
                 "add", "-m", f"intent:{token}",
                 commit_hash,
-                cwd=str(self._effective_repo_root()),
+                cwd=str(self._repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

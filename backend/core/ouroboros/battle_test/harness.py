@@ -727,6 +727,16 @@ class BattleTestHarness:
                     # Gate refused — finally-block runs shutdown +
                     # report; stop_reason already stamped.
                     return
+            # P1 Slice 2 — Ledger Sovereignty workspace. Under
+            # master flag, creates an isolated worktree at
+            # ouroboros/auto/<session> via the canonical
+            # WorktreeManager. The AutoCommitter resolves its
+            # cwd from JARVIS_AUTO_COMMIT_WORKSPACE at commit
+            # time and refuses (typed) if the path isn't an
+            # owned work-area. Master-FALSE path is byte-
+            # identical; this phase no-ops cleanly.
+            with _BootPhase("boot_ledger_sovereignty_workspace"):
+                await self._boot_ledger_sovereignty_workspace()
             with _BootPhase("boot_jarvis_tiers"):
                 await self.boot_jarvis_tiers()
             with _BootPhase("create_branch"):
@@ -1917,6 +1927,83 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    async def _boot_ledger_sovereignty_workspace(self) -> None:
+        """Create the auto-commit worktree under the Ledger
+        Sovereignty master flag (P1 Slice 2).
+
+        When master is **off** (default per §33.1): pure no-op.
+        ``JARVIS_AUTO_COMMIT_WORKSPACE`` is left unset, so
+        ``AutoCommitter._effective_repo_root`` falls through to
+        ``self._repo_root`` and the loop's commit behavior is
+        byte-identical to pre-substrate.
+
+        When master is **on**: derives a session-scoped branch
+        name ``ouroboros/auto/<session>`` (collision-free per
+        session — the harness session_id is a timestamp prefix),
+        invokes the canonical ``WorktreeManager.create``, sets
+        ``JARVIS_OUROBOROS_SESSION_ID`` + ``JARVIS_AUTO_COMMIT_
+        WORKSPACE`` env vars, and lets ``WorktreeManager._stamp_
+        ownership_marker`` write the sovereignty marker. Every
+        subsequent ``AutoCommitter.commit`` resolves to that
+        worktree and refuses (typed) if the marker is missing.
+
+        NEVER raises — fail-open at this layer. If the worktree
+        can't be created (disk full, branch collision, etc.) the
+        downstream sovereignty assertion fires at commit time
+        with the same typed result. The boot does NOT short-
+        circuit on workspace failure; that decision belongs to
+        the operator (they may want the loop to run in dry-mode
+        without committing).
+        """
+        try:
+            from backend.core.ouroboros.governance.ledger_sovereignty import (  # noqa: E501
+                master_enabled,
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+        if not master_enabled():
+            return  # §33.1 master-FALSE byte-identical path
+
+        # Session id MUST be exported BEFORE WorktreeManager.create
+        # so the marker payload carries the correct value.
+        os.environ.setdefault(
+            "JARVIS_OUROBOROS_SESSION_ID",
+            str(self._session_id),
+        )
+
+        # Compose canonical WorktreeManager. Worktree base lives
+        # under the repo root's ``.worktrees/`` by default — same
+        # as L3 subagent units, sweep-able by the same orphan
+        # reaper (``WorktreeManager.reap_orphans``).
+        try:
+            from backend.core.ouroboros.governance.worktree_manager import (  # noqa: E501
+                WorktreeManager,
+            )
+            mgr = WorktreeManager(
+                repo_root=self._config.repo_path,
+            )
+            branch_name = f"ouroboros/auto/{self._session_id}"
+            wt_path = await mgr.create(branch_name)
+        except Exception as wt_err:  # noqa: BLE001 — fail-open
+            logger.warning(
+                "[ledger_sovereignty] auto-commit worktree "
+                "create failed: %r — soak will proceed but "
+                "AutoCommitter will refuse commits "
+                "(sovereignty assertion fires at commit time)",
+                wt_err,
+            )
+            return
+
+        os.environ["JARVIS_AUTO_COMMIT_WORKSPACE"] = str(wt_path)
+        # Stash on self for telemetry / cleanup decisions.
+        self._auto_commit_workspace = wt_path
+        logger.info(
+            "[ledger_sovereignty] auto-commit worktree ready: "
+            "%s (branch=%s, session=%s)",
+            wt_path, branch_name, self._session_id,
+        )
 
     async def boot_jarvis_tiers(self) -> None:
         """Import and start PredictiveRegressionEngine (Tier 3).
