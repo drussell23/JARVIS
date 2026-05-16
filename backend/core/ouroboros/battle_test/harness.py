@@ -716,6 +716,17 @@ class BattleTestHarness:
                 await self.boot_governance_stack()
             with _BootPhase("boot_governed_loop_service"):
                 await self.boot_governed_loop_service()
+            # Provider-readiness gate (§33.1, default-FALSE). Fail-fast
+            # *before* any op-emitting subsystem boots when Claude/DW
+            # are unhealthy — closes the v18 27-min thrash failure mode
+            # (8 EXHAUSTIONs before idle-timeout). Composes canonical
+            # ClaudeProvider.health_probe + claude_circuit_breaker +
+            # optional DW probe. NEVER raises.
+            with _BootPhase("boot_provider_readiness_gate"):
+                if await self._gate_provider_readiness_or_refuse():
+                    # Gate refused — finally-block runs shutdown +
+                    # report; stop_reason already stamped.
+                    return
             with _BootPhase("boot_jarvis_tiers"):
                 await self.boot_jarvis_tiers()
             with _BootPhase("create_branch"):
@@ -1799,6 +1810,113 @@ class BattleTestHarness:
 
         except Exception as exc:
             logger.warning("GovernedLoopService failed to boot: %s", exc)
+
+    async def _gate_provider_readiness_or_refuse(self) -> bool:
+        """Check provider readiness; refuse soak start when unhealthy.
+
+        Composes the canonical provider_readiness_gate substrate. The
+        gate is master-FALSE by default (§33.1) — when disabled returns
+        ``False`` (proceed) without probing. When enabled, runs the
+        configured probe cascade and:
+
+          * READY / DISABLED → returns ``False`` (proceed)
+          * any other verdict → writes a structured report to the
+            session dir, stamps ``_stop_reason``, returns ``True``
+            (refuse soak start)
+
+        NEVER raises. A failure of the gate itself logs + returns
+        ``False`` (fail-open: don't block the soak on gate breakage).
+        """
+        try:
+            from backend.core.ouroboros.battle_test.provider_readiness_gate import (
+                ReadinessVerdict,
+                check_provider_readiness,
+                master_enabled,
+                write_readiness_report,
+            )
+        except Exception as imp_err:  # noqa: BLE001
+            logger.debug(
+                "provider_readiness_gate import failed: %s",
+                imp_err,
+            )
+            return False
+
+        if not master_enabled():
+            return False
+
+        try:
+            report = await check_provider_readiness()
+        except Exception as gate_err:  # noqa: BLE001 — gate is NEVER-raise
+            logger.warning(
+                "provider_readiness_gate crashed (fail-open): %s",
+                gate_err,
+            )
+            return False
+
+        # Persist report to session dir regardless of verdict — operator
+        # audit always benefits from the readiness ledger.
+        try:
+            write_readiness_report(
+                report, session_dir=self._session_dir,
+            )
+        except Exception as write_err:  # noqa: BLE001
+            logger.debug(
+                "provider_readiness_gate write failed: %s",
+                write_err,
+            )
+
+        if report.soak_should_proceed:
+            logger.info(
+                "Provider readiness: %s (proceeding)",
+                report.verdict.value,
+            )
+            return False
+
+        # Refusal path — stamp stop_reason, log loud, return True so
+        # caller short-circuits the boot sequence.
+        self._stop_reason = (
+            f"provider_readiness_refused:{report.verdict.value}"
+        )
+        logger.error(
+            "Provider readiness REFUSED soak start: verdict=%s "
+            "diagnostic=%s — report at %s/provider_readiness.json",
+            report.verdict.value,
+            report.diagnostic,
+            self._session_dir,
+        )
+        # Best-effort visible surface (operator monitoring TUI).
+        try:
+            if (
+                hasattr(self, "_serpent_flow")
+                and self._serpent_flow is not None
+            ):
+                from rich.console import Console as _RC
+                _RC().print(
+                    f"[bold red]✘ Provider readiness refused soak: "
+                    f"{report.verdict.value}[/bold red]",
+                    highlight=False,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        # Mark verdict on session recorder if available — surfaces in
+        # summary.json so audits show why the soak ended at boot.
+        try:
+            if (
+                getattr(self, "_session_recorder", None) is not None
+                and hasattr(
+                    self._session_recorder, "record_event"
+                )
+            ):
+                self._session_recorder.record_event(
+                    "provider_readiness_refused",
+                    {
+                        "verdict": report.verdict.value,
+                        "diagnostic": report.diagnostic,
+                    },
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     async def boot_jarvis_tiers(self) -> None:
         """Import and start PredictiveRegressionEngine (Tier 3).
