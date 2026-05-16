@@ -94,6 +94,69 @@ logger = logging.getLogger("Ouroboros.GovernedLoop")
 # ---------------------------------------------------------------------------
 # Sandbox-safe state directory — redirect ~/.jarvis when not writable
 # ---------------------------------------------------------------------------
+# P2 Slice 3 — Universal Convergence registry wire-helpers
+# ---------------------------------------------------------------------------
+#
+# Thin module-level adapters around the in_flight_registry's
+# safe-wire helpers. Lazy-imported so the registry stays optional
+# at module-load time and so any future changes to the substrate
+# don't ripple into the live loop's hot path through fragile
+# import edges. Each helper is master-gated + NEVER-raise by
+# construction (the substrate's helpers already are).
+
+
+def _register_op_in_flight_safely(
+    op_id: str,
+    *,
+    ctx_ref: Any = None,
+    last_phase_name: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    try:
+        from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: E501
+            register_op_safely,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return register_op_safely(
+        op_id,
+        ctx_ref=ctx_ref,
+        last_phase_name=last_phase_name,
+        metadata=metadata,
+    )
+
+
+def _unregister_op_in_flight_safely(op_id: str) -> bool:
+    try:
+        from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: E501
+            unregister_op_safely,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return unregister_op_safely(op_id)
+
+
+def _op_registry_metadata(ctx: Any) -> Dict[str, Any]:
+    """Project the in-flight registry metadata dict from an
+    ``OperationContext``. Pulls only safe, JSON-friendly fields
+    — provider name, route, urgency, source. NEVER raises;
+    returns ``{}`` on any failure."""
+    try:
+        return {
+            "provider": str(getattr(ctx, "provider", "") or ""),
+            "route": str(getattr(ctx, "route", "") or ""),
+            "urgency": str(
+                getattr(ctx, "urgency_level", "") or ""
+            ),
+            "source": str(
+                getattr(ctx, "outcome_source", "") or ""
+            ),
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Many subsystems write to ~/.jarvis/ouroboros/*.  In sandboxed environments
 # (e.g. Claude Code, macOS sandbox, CI containers) that path may not be
 # writable.  Detect once at import time and redirect to a repo-local
@@ -1373,6 +1436,30 @@ class GovernedLoopService:
                 self._config.initial_canary_slices,
             )
 
+            # P2 Slice 3 — boot the universal Convergence Reaper.
+            # Master-gated NEVER-raise; when off, this is a no-op
+            # and the loop's start path stays byte-identical.
+            # When on, the reaper's background task begins
+            # sweeping the typed registry, force-converging any
+            # op past its deadline / ceiling and emitting
+            # ``operation_terminal`` SSE events so observers
+            # never lose visibility on a hung op.
+            try:
+                from backend.core.ouroboros.governance.convergence_reaper import (  # noqa: E501
+                    safe_start_default_reaper,
+                )
+                if safe_start_default_reaper():
+                    logger.info(
+                        "[GovernedLoop] Convergence Reaper "
+                        "started (universal terminal "
+                        "invariant active)",
+                    )
+            except Exception as _cr_exc:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] Convergence Reaper boot "
+                    "swallowed: %r", _cr_exc,
+                )
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
@@ -1388,6 +1475,20 @@ class GovernedLoopService:
             return
 
         self._state = ServiceState.STOPPING
+
+        # P2 Slice 3 — stop the Convergence Reaper first so its
+        # background task doesn't race the drain. Master-gated
+        # NEVER-raise; idempotent on an already-stopped reaper.
+        try:
+            from backend.core.ouroboros.governance.convergence_reaper import (  # noqa: E501
+                safe_stop_default_reaper,
+            )
+            await safe_stop_default_reaper()
+        except Exception as _cr_exc:  # noqa: BLE001
+            logger.debug(
+                "[GovernedLoop] Convergence Reaper stop "
+                "swallowed: %r", _cr_exc,
+            )
 
         # Cancel health probe loop
         if self._health_probe_task and not self._health_probe_task.done():
@@ -1878,6 +1979,20 @@ class GovernedLoopService:
 
         # Execute pipeline
         self._active_ops.add(dedupe_key)
+        # P2 Slice 3 — Universal Convergence registry. Master-
+        # gated, NEVER-raise. When ``JARVIS_IN_FLIGHT_REGISTRY_
+        # ENABLED=true``, the typed registry mirrors the
+        # ``_active_ops`` lifecycle so the
+        # :class:`ConvergenceReaper` (Slice 2) has an enriched
+        # view of in-flight ops. Off-master path is byte-
+        # identical to legacy behavior.
+        _register_op_in_flight_safely(
+            ctx.op_id, ctx_ref=ctx,
+            last_phase_name=getattr(
+                getattr(ctx, "phase", None), "name", "",
+            ),
+            metadata=_op_registry_metadata(ctx),
+        )
         # --- Proactive Drive telemetry hook (entry) ---
         _pds = getattr(self, "_proactive_drive_service", None)
         if _pds is not None:
@@ -2518,6 +2633,11 @@ class GovernedLoopService:
 
         finally:
             self._active_ops.discard(dedupe_key)
+            # P2 Slice 3 — Universal Convergence registry parity.
+            # Mirrors the ``_active_ops`` removal so the reaper
+            # never re-converges an op whose natural terminal
+            # has fired. Master-gated NEVER-raise.
+            _unregister_op_in_flight_safely(ctx.op_id)
             # --- Proactive Drive telemetry hook (completion) ---
             _pds = getattr(self, "_proactive_drive_service", None)
             if _pds is not None:
@@ -4110,6 +4230,15 @@ class GovernedLoopService:
                     self._fsm_contexts[op_id] = LoopRuntimeContext(
                         op_id=op_id,
                     )
+                # P2 Slice 3 — register into the typed convergence
+                # registry. BG ops are the Fix-A class (fire-and-
+                # forget) — without a ctx_ref here, the reaper's
+                # ``_MinimalCtxShim`` keeps SSE emission flowing.
+                # Master-gated NEVER-raise.
+                _register_op_in_flight_safely(
+                    op_id,
+                    metadata={"source": "bg_pool"},
+                )
                 logger.debug(
                     "[GovernedLoop] BG op registered into _active_ops: %s",
                     op_id,
@@ -4120,6 +4249,8 @@ class GovernedLoopService:
                     return
                 self._active_ops.discard(op_id)
                 self._fsm_contexts.pop(op_id, None)
+                # P2 Slice 3 — registry parity (master-gated).
+                _unregister_op_in_flight_safely(op_id)
                 logger.debug(
                     "[GovernedLoop] BG op unregistered from "
                     "_active_ops: %s",

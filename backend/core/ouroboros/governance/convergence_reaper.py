@@ -857,6 +857,67 @@ def register_shipped_invariants() -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# P2 Slice 3 — safe-wire helpers for GovernedLoopService lifecycle
+# ---------------------------------------------------------------------------
+
+
+def safe_start_default_reaper() -> bool:
+    """Boot the default :class:`ConvergenceReaper` background
+    task. Master-FALSE → silent no-op returning ``False``.
+    Master-ON → composes :func:`get_default_reaper` + calls
+    ``.start()``. NEVER raises. Returns ``True`` on successful
+    start (or already-running).
+
+    Drop-in for ``GovernedLoopService.start()`` boot path —
+    keeps the loop's lifecycle one-liner-readable.
+    """
+    if not reaper_enabled():
+        return False
+    try:
+        reaper = get_default_reaper()
+        reaper.start()
+        return reaper.is_running()
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[convergence_reaper] safe_start swallowed: %r",
+            err,
+        )
+        return False
+
+
+async def safe_stop_default_reaper() -> bool:
+    """Cancel the default reaper's background task and await
+    finalization. Master-FALSE → no-op. Master-ON → composes
+    :meth:`ConvergenceReaper.stop`. NEVER raises. Returns
+    ``True`` if a stop was attempted on a running reaper.
+
+    Drop-in for ``GovernedLoopService.stop()`` shutdown path."""
+    if not reaper_enabled():
+        # Even when master off, attempt to stop any reaper
+        # singleton that was started earlier — defensive
+        # cleanup so a master-flag toggle mid-soak doesn't
+        # leak a task.
+        pass
+    try:
+        # Resolve from global singleton; do NOT instantiate a
+        # new one — if no reaper was ever booted, this is a
+        # no-op against an idle singleton.
+        global _DEFAULT_REAPER
+        if _DEFAULT_REAPER is None:
+            return False
+        if not _DEFAULT_REAPER.is_running():
+            return False
+        await _DEFAULT_REAPER.stop()
+        return True
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[convergence_reaper] safe_stop swallowed: %r",
+            err,
+        )
+        return False
+
+
 __all__ = [
     "CONVERGENCE_REAPER_SCHEMA_VERSION",
     "ConvergenceReaper",
@@ -867,5 +928,7 @@ __all__ = [
     "reaper_enabled",
     "register_shipped_invariants",
     "reset_default_reaper",
+    "safe_start_default_reaper",
+    "safe_stop_default_reaper",
     "tick_interval_s",
 ]

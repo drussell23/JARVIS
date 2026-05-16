@@ -660,6 +660,99 @@ def register_shipped_invariants() -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# P2 Slice 3 — safe-wire helpers for GovernedLoopService lifecycle
+# ---------------------------------------------------------------------------
+#
+# These wrappers are the *only* surface the live loop's hot path
+# touches. They compose ``master_enabled`` + ``get_default_registry``
+# behind a NEVER-raise envelope so the four ``_active_ops.add`` /
+# ``_active_ops.discard`` sites can drop in single-line calls
+# without branching on the master flag at each site.
+
+
+def register_op_safely(
+    op_id: str,
+    *,
+    ctx_ref: Any = None,
+    deadline_monotonic: Optional[float] = None,
+    last_phase_name: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Lifecycle-site wrapper for :meth:`InFlightRegistry.register`.
+
+    Master-FALSE → silent no-op returning ``False``. Master-ON →
+    composes :func:`get_default_registry` and registers. NEVER
+    raises. Returns ``True`` on successful registration.
+
+    Designed for drop-in placement next to existing
+    ``self._active_ops.add(...)`` sites in
+    ``GovernedLoopService`` — the loop's hot path stays
+    one-liner-readable.
+    """
+    if not master_enabled():
+        return False
+    try:
+        result = get_default_registry().register(
+            op_id,
+            ctx_ref=ctx_ref,
+            deadline_monotonic=deadline_monotonic,
+            last_phase_name=last_phase_name,
+            metadata=metadata,
+        )
+        return result is not None
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[in_flight_registry] register_op_safely "
+            "swallowed for %s: %r", op_id, err,
+        )
+        return False
+
+
+def unregister_op_safely(op_id: str) -> bool:
+    """Lifecycle-site wrapper for
+    :meth:`InFlightRegistry.unregister`.
+
+    Master-FALSE → silent no-op returning ``False``. Master-ON →
+    composes :func:`get_default_registry` and unregisters.
+    NEVER raises. Returns ``True`` if an entry existed.
+
+    Drop-in for the four ``_active_ops.discard`` sites in
+    ``GovernedLoopService``.
+    """
+    if not master_enabled():
+        return False
+    try:
+        return get_default_registry().unregister(op_id)
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[in_flight_registry] unregister_op_safely "
+            "swallowed for %s: %r", op_id, err,
+        )
+        return False
+
+
+def update_phase_safely(op_id: str, *, phase_name: str) -> bool:
+    """Lifecycle-site wrapper for
+    :meth:`InFlightRegistry.update_phase`.
+
+    Master-FALSE → silent no-op. Master-ON → composes default
+    registry. NEVER raises. Returns ``True`` if the op was
+    registered (and the phase swapped)."""
+    if not master_enabled():
+        return False
+    try:
+        return get_default_registry().update_phase(
+            op_id, phase_name=phase_name,
+        ) is not None
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[in_flight_registry] update_phase_safely "
+            "swallowed for %s: %r", op_id, err,
+        )
+        return False
+
+
 __all__ = [
     "IN_FLIGHT_REGISTRY_SCHEMA_VERSION",
     "InFlightPhase",
@@ -667,6 +760,9 @@ __all__ = [
     "OpInFlight",
     "get_default_registry",
     "master_enabled",
+    "register_op_safely",
     "register_shipped_invariants",
     "reset_default_registry",
+    "unregister_op_safely",
+    "update_phase_safely",
 ]
