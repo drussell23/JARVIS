@@ -1,9 +1,12 @@
 """Arc #1 — Conversation Ledger tests.
 
+resume / sessions / save integration lives here.
+
 Covers:
   * Ledger CRUD (append_turn, read_tail, session_exists)
   * Bounds enforcement (max_file_bytes, max_turns, tail windowing)
   * Resume flow (rehydrate → bridge injection with re-sanitization)
+  * Save flow (force-persist bridge → ledger on disk)
   * Session identity sanitization (path traversal prevention)
   * Operator knobs (env var overrides)
   * Error isolation (corrupt rows, permission errors)
@@ -621,6 +624,183 @@ class TestSessionsSubcommand:
         )
         assert result.ok is False
         assert "ledger disabled" in result.text
+
+
+# ---------------------------------------------------------------------------
+# Save subcommand — behavioral spine
+# ---------------------------------------------------------------------------
+
+
+class TestSaveSubcommand:
+    """``/conversation save`` force-persists the live bridge snapshot
+    to the ledger. Spine pins structural outcomes (disk state via
+    canonical read_tail / session_exists), not just response text."""
+
+    def test_save_happy_path_persists_to_disk(
+        self, monkeypatch, tmp_path,
+    ):
+        """Bridge seeded → save → ok=True AND turns visible on disk
+        via canonical read_tail / session_exists."""
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_BRIDGE_ENABLED", "true",
+        )
+        from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+            get_default_bridge, reset_default_bridge,
+        )
+        reset_default_bridge()
+        bridge = get_default_bridge()
+        bridge.record_turn(
+            "user", "first save turn",
+            source="tui_user", op_id="op-save-1",
+        )
+        # ``ask_human_a`` is in the canonical _VALID_SOURCES
+        # allowlist; non-allowlisted sources (e.g. raw "claude")
+        # are silently dropped fail-closed at admission.
+        bridge.record_turn(
+            "assistant", "saved response",
+            source="ask_human_a", op_id="op-save-1",
+        )
+
+        from backend.core.ouroboros.governance.conversation_repl import (  # noqa: E501
+            dispatch_conversation_command,
+        )
+        result = dispatch_conversation_command(
+            "/conversation save",
+        )
+        assert result.ok is True
+        # Extract the session id the renderer reported.
+        # Format: "...persisted N turn(s) to session 'sid'."
+        import re
+        m = re.search(r"session '([^']+)'", result.text)
+        assert m is not None, (
+            f"renderer did not surface session id: {result.text!r}"
+        )
+        sid = m.group(1)
+
+        # Structural proof: canonical read_tail + session_exists
+        # see the persisted turns on disk.
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            read_tail, session_exists,
+        )
+        assert session_exists(sid) is True
+        tail = read_tail(sid, max_turns=100)
+        assert len(tail) == 2
+        texts = [pt.text for pt in tail]
+        assert "first save turn" in texts
+        assert "saved response" in texts
+
+    def test_save_empty_bridge_returns_nothing_to_persist(
+        self, monkeypatch,
+    ):
+        """Bridge empty → ok=True + 'nothing to persist'."""
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_BRIDGE_ENABLED", "true",
+        )
+        from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+            reset_default_bridge,
+        )
+        reset_default_bridge()
+        from backend.core.ouroboros.governance.conversation_repl import (  # noqa: E501
+            dispatch_conversation_command,
+        )
+        result = dispatch_conversation_command(
+            "/conversation save",
+        )
+        assert result.ok is True
+        assert "nothing to persist" in result.text
+
+    def test_save_ledger_disabled_fails(self, monkeypatch):
+        """ledger disabled → ok=False + 'ledger disabled' notice."""
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_LEDGER_ENABLED", "false",
+        )
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_BRIDGE_ENABLED", "true",
+        )
+        from backend.core.ouroboros.governance.conversation_repl import (  # noqa: E501
+            dispatch_conversation_command,
+        )
+        result = dispatch_conversation_command(
+            "/conversation save",
+        )
+        assert result.ok is False
+        assert "ledger disabled" in result.text
+
+
+# ---------------------------------------------------------------------------
+# Resume — additional behavioral spine (gaps in TestResumeFlow)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeSpine:
+    """Two coverage gaps not pinned by TestResumeFlow: empty
+    session_id (REPL surface) and structural bridge-state proof
+    (TestResumeFlow only asserts response text)."""
+
+    def test_resume_empty_session_id_rejected(self, monkeypatch):
+        """``/conversation resume`` with no arg or empty string →
+        ok=False before any ledger I/O. The dispatcher rejects
+        a missing positional arg with the canonical 'missing
+        session_id' error; an explicitly-empty quoted arg hits
+        the empty-string guard in _render_resume."""
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_BRIDGE_ENABLED", "true",
+        )
+        from backend.core.ouroboros.governance.conversation_repl import (  # noqa: E501
+            dispatch_conversation_command,
+        )
+        # Quoted empty string reaches _render_resume's
+        # ``not sid`` guard at the top of the function.
+        result = dispatch_conversation_command(
+            '/conversation resume ""',
+        )
+        assert result.ok is False
+        assert "session_id" in result.text.lower()
+
+    def test_resume_proves_bridge_injection_structurally(
+        self, monkeypatch,
+    ):
+        """Extends test_resume_rehydrates_turns with a structural
+        bridge-state assertion: after dispatch, the canonical
+        bridge.snapshot() actually reflects the injected turns —
+        not just the response text claim."""
+        monkeypatch.setenv(
+            "JARVIS_CONVERSATION_BRIDGE_ENABLED", "true",
+        )
+        from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+            get_default_bridge, reset_default_bridge,
+        )
+        reset_default_bridge()
+        bridge_before = get_default_bridge().snapshot()
+        assert len(bridge_before) == 0  # invariant: starts clean
+
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            append_turn,
+        )
+        sid = "test-resume-spine-bridge-proof"
+        for i in range(3):
+            append_turn(
+                sid, role="user", text=f"spine msg {i}",
+                source="tui_user", op_id=f"op-spine-{i}",
+            )
+
+        from backend.core.ouroboros.governance.conversation_repl import (  # noqa: E501
+            dispatch_conversation_command,
+        )
+        result = dispatch_conversation_command(
+            f"/conversation resume {sid}",
+        )
+        assert result.ok is True
+
+        # Structural proof: bridge ring buffer now holds the
+        # injected turns. This is the assertion test_resume_
+        # rehydrates_turns is missing — it only checks the
+        # response text.
+        bridge_after = get_default_bridge().snapshot()
+        assert len(bridge_after) == 3
+        texts = [t.text for t in bridge_after]
+        for i in range(3):
+            assert f"spine msg {i}" in texts
 
 
 # ---------------------------------------------------------------------------
