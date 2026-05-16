@@ -89,12 +89,17 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019df081-) at 2026-05-04 01:03 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019df6e4-9d96-77f6-bb36-0da7193c44f6-cau) at 2026-05-04 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019df6e4-) at 2026-05-05 06:49 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019e3031-b982-796b-a3d5-af630f62b933-cau) at 2026-05-17 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019e3031-) at 2026-05-16 09:52 UTC
+# Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0)
+
 # Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0)
 
 # Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0) -- bumped floor to >=5.7.0
 
 # Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0) -- bumped upper bound to <6 and floor to >=4.57.6
 # Reason: torch is 6 minor versions behind (installed: 2.5.1, latest: 2.11.0)
+# Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0) -- bumped to 2.12.0
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
 
@@ -155,7 +160,7 @@ hf-xet==1.2.0
 httpcore==1.0.9
 httptools==0.7.1
 httpx==0.28.1
-# httpx SOCKS support (`pip install httpx[socks]` extras) — required
+# httpx SOCKS support (`pip install httpx[socks]` extras) -- required
 # when the harness runs under a parent process whose network tunnel
 # is socks5h:// (e.g., Claude Code agent sandboxing). Without this,
 # httpx 0.28+ raises `Using SOCKS proxy, but the 'socksio' package
@@ -256,8 +261,8 @@ threadpoolctl==3.6.0
 tiktoken==0.12.0
 tokenizers>=0.15.2,<1
 tomli==2.3.0
-torch==2.11.0
-torchaudio==2.11.0
+torch==2.12.0
+torchaudio==2.12.0
 tqdm==4.67.1
 transformers>=5.7.0,<6
 typer==0.20.0
