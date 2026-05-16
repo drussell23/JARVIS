@@ -635,13 +635,14 @@ class _FakeRegistry:
         self.registered.append(spec)
 
 
-def test_register_flags_registers_five_specs():
-    """Phase A ships exactly 5 env knobs:
-      master + cache_path + local_dataset_path + hf_dataset + hf_split.
+def test_register_flags_registers_six_specs():
+    """Phase A ships 5 env knobs (master + cache_path +
+    local_dataset_path + hf_dataset + hf_split); Stage 2 adds the
+    bounded full-dataset scan ceiling (sampler_max_scan) → 6.
     Drift here = a knob was added/removed without a Phase tag."""
     reg = _FakeRegistry()
     count = dataset_loader.register_flags(reg)
-    assert count == 5
+    assert count == 6
     names = sorted(s.name for s in reg.registered)
     assert names == sorted([
         "JARVIS_SWE_BENCH_PRO_ENABLED",
@@ -649,6 +650,7 @@ def test_register_flags_registers_five_specs():
         "JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH",
         "JARVIS_SWE_BENCH_PRO_HF_DATASET",
         "JARVIS_SWE_BENCH_PRO_HF_SPLIT",
+        "JARVIS_SWE_BENCH_PRO_SAMPLER_MAX_SCAN",
     ])
 
 
@@ -678,4 +680,4 @@ def test_register_flags_fail_open_on_registry_failure():
     reg = _BrokenRegistry()
     count = dataset_loader.register_flags(reg)
     assert count == 0  # nothing succeeded
-    assert reg.calls == 5  # but all 5 were attempted (no early-exit)
+    assert reg.calls == 6  # but all 6 were attempted (no early-exit)
