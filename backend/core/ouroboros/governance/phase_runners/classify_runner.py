@@ -260,7 +260,7 @@ class CLASSIFYRunner(PhaseRunner):
         try:
             from backend.core.ouroboros.governance.operation_advisor import (
                 OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
-                resolve_envelope_repo_root,
+                guard_envelope_repo_root, EnvelopeRepoRootRejected,
             )
             # Stamp read-only intent onto the hash-chained context BEFORE
             # advising. The Advisor's bypass of blast_radius + test_coverage
@@ -294,7 +294,10 @@ class CLASSIFYRunner(PhaseRunner):
             # classify_runner path that actually runs in production —
             # did not, so the 6-file SWE-Bench-Pro worktree silently
             # triggered a full project_root scan.
-            _adv_repo_root = resolve_envelope_repo_root(
+            # B2 fail-closed: promised-but-anchor-rejected repo_root raises
+            # EnvelopeRepoRootRejected (handled below) — no silent
+            # fallback to the shared project_root tree.
+            _adv_repo_root = guard_envelope_repo_root(
                 ctx.intake_evidence_json,
                 project_root=orch._config.project_root,
             )
@@ -433,6 +436,28 @@ class CLASSIFYRunner(PhaseRunner):
                     _advisory.decision.value, _advisory.risk_score,
                     _advisory.reasons[0] if _advisory.reasons else "no specific reason",
                 )
+        except EnvelopeRepoRootRejected as _rr_exc:
+            # §1 Boundary / §6 Iron Gate: isolation promised + broken —
+            # terminate infra-FAILED, NEVER fall back to the shared tree
+            # (the bt-2026-05-17-002318 contamination root cause).
+            logger.warning(
+                "[Orchestrator] FAIL-CLOSED op=%s: %s — POSTMORTEM "
+                "(no shared-tree fallback)",
+                ctx.op_id, _rr_exc,
+            )
+            if _serpent:
+                await _serpent.stop(success=False)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="swebp_repo_root_rejected",
+            )
+            return PhaseResult(
+                next_ctx=ctx,
+                next_phase=None,
+                status="fail",
+                reason="swebp_repo_root_rejected",
+                artifacts={"advisory": None, "consciousness_bridge": None},
+            )
         except ImportError:
             pass
         except Exception:

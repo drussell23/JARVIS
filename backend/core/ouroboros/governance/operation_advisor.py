@@ -667,6 +667,127 @@ def resolve_envelope_repo_root(
     return None
 
 
+# ===========================================================================
+# Phase B — envelope repo_root PROMISE status (single canonical seam)
+# ===========================================================================
+#
+# ``resolve_envelope_repo_root`` returns ``None`` for THREE distinct
+# situations callers previously could not tell apart — and the silent
+# collapse of the third into a byte-identical project_root fallback is
+# the contamination root cause (session bt-2026-05-17-002318: a $TMPDIR
+# worktree escaped the anchor, the resolver returned None, advisor +
+# generator fell back to the JARVIS tree, the model edited the wrong
+# repo).  This is the ONE place that classifies the three:
+#
+#   NO_PROMISE  — feature off OR no ``repo_root`` in evidence.  A
+#                 byte-identical project_root fallback is CORRECT here.
+#   RESOLVED    — a ``repo_root`` was promised AND resolves under the
+#                 anchor.  Use the returned path.
+#   REJECTED    — a ``repo_root`` was promised, the worktree-aware
+#                 feature is ON, but the path escaped every allowed
+#                 prefix.  Isolation promised and broken: callers MUST
+#                 fail closed (§1 Boundary / §6 Iron Gate mirror of the
+#                 L3 subagent_scheduler / RepairTree discipline — NEVER
+#                 fall back to the shared tree).
+#
+# Both advisor sites (orchestrator.py parallel path + classify_runner.py
+# primary production path) compose this, so the "threaded one site but
+# not the other" bug class the classify_runner comment documents cannot
+# recur — one prefix-math owner (``resolve_envelope_repo_root``), one
+# status owner (this).
+
+
+class RepoRootPromiseStatus(str, Enum):
+    """Closed taxonomy for the envelope repo_root promise."""
+
+    NO_PROMISE = "no_promise"   # byte-identical legacy fallback OK
+    RESOLVED = "resolved"       # promised + trusted
+    REJECTED = "rejected"       # promised + escaped anchor → fail closed
+
+
+class EnvelopeRepoRootRejected(Exception):
+    """A promised isolated ``repo_root`` escaped the advisor anchor.
+
+    Callers convert this into the canonical infra-terminal (advance to
+    POSTMORTEM, ``failure_class='infra'``) — they MUST NOT fall back to
+    the shared project_root tree.
+    """
+
+    def __init__(self, raw_repo_root: str) -> None:
+        self.raw_repo_root = raw_repo_root
+        super().__init__(
+            f"swebp_repo_root_rejected: promised isolated repo_root "
+            f"{raw_repo_root!r} escaped the advisor allowed-prefix "
+            f"anchor — refusing silent fallback to the shared tree"
+        )
+
+
+def envelope_repo_root_status(
+    intake_evidence_json: str,
+    *,
+    project_root: Path,
+    extra_allowlist: Optional[Tuple[Path, ...]] = None,
+) -> Tuple["RepoRootPromiseStatus", Optional[Path], str]:
+    """Classify the envelope repo_root promise. NEVER raises.
+
+    Returns ``(status, resolved_path_or_None, raw_repo_root_str)``.
+    Composes :func:`resolve_envelope_repo_root` verbatim — no parallel
+    prefix math.  Feature-off / no-promise collapse to ``NO_PROMISE`` so
+    byte-identity holds when the worktree-aware advisor flag is OFF
+    (only a promised-AND-rejected path under an enabled feature is
+    ``REJECTED``).
+    """
+    raw = ""
+    try:
+        if intake_evidence_json:
+            _ev = json.loads(intake_evidence_json)
+            if isinstance(_ev, dict):
+                _r = _ev.get(EVIDENCE_REPO_ROOT_KEY)
+                if isinstance(_r, str):
+                    raw = _r.strip()
+    except (ValueError, TypeError):
+        raw = ""
+
+    if not raw:
+        return RepoRootPromiseStatus.NO_PROMISE, None, ""
+
+    resolved = resolve_envelope_repo_root(
+        intake_evidence_json,
+        project_root=project_root,
+        extra_allowlist=extra_allowlist,
+    )
+    if resolved is not None:
+        return RepoRootPromiseStatus.RESOLVED, resolved, raw
+
+    if not _worktree_aware_enabled():
+        return RepoRootPromiseStatus.NO_PROMISE, None, raw
+    return RepoRootPromiseStatus.REJECTED, None, raw
+
+
+def guard_envelope_repo_root(
+    intake_evidence_json: str,
+    *,
+    project_root: Path,
+    extra_allowlist: Optional[Tuple[Path, ...]] = None,
+) -> Optional[Path]:
+    """Composable fail-closed guard for the two advisor call sites.
+
+    Returns the trusted path (RESOLVED) or ``None`` (NO_PROMISE — caller
+    falls back byte-identically, unchanged).  Raises
+    :class:`EnvelopeRepoRootRejected` on REJECTED so the caller drives
+    the canonical infra-terminal instead of silently editing the shared
+    tree.
+    """
+    status, resolved, raw = envelope_repo_root_status(
+        intake_evidence_json,
+        project_root=project_root,
+        extra_allowlist=extra_allowlist,
+    )
+    if status is RepoRootPromiseStatus.REJECTED:
+        raise EnvelopeRepoRootRejected(raw)
+    return resolved
+
+
 class AdvisoryDecision(str, Enum):
     RECOMMEND = "recommend"            # Proceed normally
     CAUTION = "caution"                # Proceed but inject warnings into prompt
@@ -1270,4 +1391,8 @@ __all__ = [
     "infer_read_only_intent",
     "register_flags",
     "resolve_envelope_repo_root",
+    "RepoRootPromiseStatus",
+    "EnvelopeRepoRootRejected",
+    "envelope_repo_root_status",
+    "guard_envelope_repo_root",
 ]

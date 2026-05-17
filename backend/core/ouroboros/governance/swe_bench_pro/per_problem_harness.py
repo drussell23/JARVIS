@@ -624,7 +624,14 @@ def register_flags(registry: Any) -> int:
                 "Per-repo clone cache directory for SWE-Bench-Pro "
                 "Phase B harness.  One clone per upstream URL, "
                 "shared across all instances of that repo.  "
-                f"Defaults to {_DEFAULT_REPO_CACHE_PATH}."
+                f"Defaults to {_DEFAULT_REPO_CACHE_PATH}.  "
+                "RUNBOOK: a $TMPDIR override is SANDBOX-ON-ONLY (for "
+                "envs that block repo-root .git writes).  Under "
+                "sandbox-OFF it escapes the operation_advisor "
+                "allowed-prefix anchor (project_root) and the "
+                "swe-path preflight (B1) REFUSES the spend; the "
+                "runtime guard (B2) fails the op infra-closed.  Keep "
+                "the default (under repo root) for sandbox-OFF runs."
             ),
             category=Category.INTEGRATION,
             source_file=(
@@ -642,7 +649,12 @@ def register_flags(registry: Any) -> int:
                 "Per-problem worktree base directory.  One worktree "
                 "per problem instance, branch-named "
                 f"'{_BRANCH_PREFIX}<sanitized-id>'.  Distinct from "
-                "L3 'unit-*' branches + L2 exercise branches."
+                "L3 'unit-*' branches + L2 exercise branches.  "
+                "RUNBOOK: a $TMPDIR override is SANDBOX-ON-ONLY.  "
+                "Under sandbox-OFF it escapes the operation_advisor "
+                "anchor → B1 swe-path preflight REFUSES the spend, B2 "
+                "runtime guard fails the op infra-closed (no shared- "
+                "tree fallback).  Keep the default for sandbox-OFF."
             ),
             category=Category.INTEGRATION,
             source_file=(
