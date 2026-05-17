@@ -752,6 +752,27 @@ class PlanGenerator:
 
     def _should_skip(self, ctx: OperationContext) -> str:
         """Return a skip reason string, or empty string if planning should proceed."""
+        # SWE-bench op-isolation + routing fix (#3): localize-from-issue
+        # sources (swe_bench_pro / vision_sensor — see intent_envelope
+        # _EMPTY_TARGET_FILES_EXEMPT_SOURCES) carry NO target_files BY
+        # DESIGN. The agent MUST run PLAN to reason about its
+        # localization strategy from the issue text. Letting the
+        # n_files==0 gate below skip PLAN for them is exactly the
+        # starvation behind soak bt-2026-05-17-213727's no-rubric.
+        # Reuse the existing closed set — no new flag. Lazy import keeps
+        # plan_generator free of an intake import cycle.
+        try:
+            from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
+                _EMPTY_TARGET_FILES_EXEMPT_SOURCES,
+            )
+            if (
+                getattr(ctx, "signal_source", "")
+                in _EMPTY_TARGET_FILES_EXEMPT_SOURCES
+            ):
+                return ""
+        except Exception:  # noqa: BLE001 — exemption is best-effort
+            pass
+
         n_files = len(ctx.target_files)
 
         # Single-file trivial ops with short descriptions
