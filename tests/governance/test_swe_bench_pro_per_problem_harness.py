@@ -74,7 +74,7 @@ def test_harness_outcome_taxonomy_is_closed_five_values():
     values = {m.value for m in HarnessOutcome}
     assert values == {
         "ready", "master_flag_off", "clone_failed",
-        "checkout_failed", "test_patch_failed",
+        "worktree_create_failed", "test_patch_failed",
     }, f"HarnessOutcome taxonomy drift; got {sorted(values)}"
 
 
@@ -93,7 +93,7 @@ def test_harness_outcome_class_body_ast_bytes_pinned():
     ]
     assert names == [
         "READY", "MASTER_FLAG_OFF", "CLONE_FAILED",
-        "CHECKOUT_FAILED", "TEST_PATCH_FAILED",
+        "WORKTREE_CREATE_FAILED", "TEST_PATCH_FAILED",
     ]
 
 
@@ -495,9 +495,13 @@ def test_prepare_problem_clone_failed_on_invalid_url(monkeypatch, tmp_path):
     assert outcome == HarnessOutcome.CLONE_FAILED
 
 
-def test_prepare_problem_checkout_failed_on_invalid_commit(
+def test_prepare_problem_worktree_create_failed_on_invalid_commit(
     monkeypatch, tmp_path,
 ):
+    # Phase C: an invalid base_commit fails at `git worktree add -b
+    # <branch> <path> <commit>` — that IS a worktree-creation failure
+    # (there is no `git checkout` step). Renamed from the legacy
+    # CHECKOUT_FAILED misnomer.
     _isolated_env(monkeypatch, tmp_path)
     upstream, _sha = _make_tiny_repo(tmp_path)
     spec = ProblemSpec(
@@ -509,7 +513,7 @@ def test_prepare_problem_checkout_failed_on_invalid_commit(
     )
     result, outcome = asyncio.run(prepare_problem(spec))
     assert result is None
-    assert outcome == HarnessOutcome.CHECKOUT_FAILED
+    assert outcome == HarnessOutcome.WORKTREE_CREATE_FAILED
 
 
 def test_prepare_problem_test_patch_failed_on_malformed_diff(

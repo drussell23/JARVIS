@@ -2175,6 +2175,56 @@ class BattleTestHarness:
                         exc_info=True,
                     )
 
+                # ── SWE-Bench Path↔Advisor pre-flight (cb2825326a) ──
+                # Strict advisor-envelope fail-closed: asserts the
+                # SWE-Bench worktree base + repo cache resolve UNDER
+                # the operation_advisor anchor (project_root). A
+                # TMPDIR base that escaped the anchor is exactly what
+                # contaminated the shared tree in bt-2026-05-17-002318.
+                # Folded into the SAME canonical _preflight_refused
+                # gate (no parallel guard). §33.1 default-FALSE →
+                # byte-identical no-op when off. NEVER raises.
+                try:
+                    from backend.core.ouroboros.battle_test.swe_path_preflight import (  # noqa: E501
+                        SwePathVerdict,
+                        assess_swe_path_readiness,
+                    )
+
+                    _gls = self._governed_loop_service
+                    _cfg = (
+                        getattr(_gls, "_config", None)
+                        if _gls is not None
+                        else None
+                    )
+                    _proj_root = (
+                        getattr(_cfg, "project_root", None) or Path.cwd()
+                    )
+                    _swe_path_verdict = await assess_swe_path_readiness(
+                        str(self._session_dir),
+                        project_root=Path(_proj_root),
+                    )
+                    logger.info(
+                        "[Harness] swe-path preflight: verdict=%s",
+                        _swe_path_verdict.value,
+                    )
+                    if _swe_path_verdict == (
+                        SwePathVerdict.REFUSE_OUTSIDE_ANCHOR
+                    ):
+                        logger.error(
+                            "[Harness] swe-path preflight REFUSED — "
+                            "worktree base outside advisor anchor; "
+                            "skipping SWE-Bench-Pro inject (drop "
+                            "TMPDIR overrides).",
+                        )
+                        _preflight_refused = True
+                except Exception:  # noqa: BLE001 — gate never fails boot
+                    logger.debug(
+                        "[Harness] swe-path preflight raised — "
+                        "proceeding (runtime fail-closed guard is "
+                        "authoritative)",
+                        exc_info=True,
+                    )
+
                 if _preflight_refused:
                     _swebp_verdict = (
                         SWEBenchProInjectionVerdict.SKIPPED_DISABLED
