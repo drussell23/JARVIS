@@ -6259,6 +6259,9 @@ class SerpentREPL:
             elif ref_or_op.startswith("b-"):
                 # Treefinement Phase 4 — L2 tree-search branch archive
                 self._expand_repair_branch(ref_or_op)
+            elif ref_or_op.startswith("r-"):
+                # PRD §42 Slice 2 — causal Operation Timeline row
+                self._expand_timeline(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
@@ -6344,6 +6347,16 @@ class SerpentREPL:
             perm_recent = _pa().all_refs()[-5:]
         except Exception:
             perm_recent = ()
+        # PRD §42 Slice 2 — causal Operation Timeline (6th
+        # cross-substrate ref family). Lazy + guarded like perm_recent.
+        timeline_recent: tuple = ()
+        try:
+            from backend.core.ouroboros.governance.operation_timeline import (  # noqa: E501
+                get_default_timeline as _tl,
+            )
+            timeline_recent = tuple(_tl().list_recent(limit=5))
+        except Exception:
+            timeline_recent = ()
 
         self._flow.console.print(
             f"  [{_C['neural']}]Recent retrievable refs:[/{_C['neural']}]",
@@ -6386,9 +6399,24 @@ class SerpentREPL:
                 f"[/{_C['evolved']}]",
                 highlight=False,
             )
+        if timeline_recent:
+            self._flow.console.print(
+                f"    [{_C['dim']}]timeline:[/{_C['dim']}]",
+                highlight=False,
+            )
+            for tr in timeline_recent:
+                self._flow.console.print(
+                    f"      [{_C['evolved']}]{tr.ref}[/{_C['evolved']}] "
+                    f"[{_C['dim']}]{tr.op_id} · "
+                    f"{tr.signal_source or '?'} · "
+                    f"commit={(tr.commit_hash or '-')[:10]}"
+                    f"[/{_C['dim']}]",
+                    highlight=False,
+                )
         if (
             not op_recent and not diff_recent
             and not tool_refs and not perm_recent
+            and not timeline_recent
         ):
             self._flow.console.print(
                 f"  [{_C['dim']}]No retrievable refs yet[/{_C['dim']}]",
@@ -6445,6 +6473,129 @@ class SerpentREPL:
         for ln in archived.diff_text.splitlines()[:200]:
             self._flow.console.print(
                 f"    [{_C['dim']}]{ln}[/{_C['dim']}]", highlight=False,
+            )
+
+    def _expand_timeline(self, ref: str) -> None:
+        """PRD §42 Slice 2 — expand one causal Operation Timeline row:
+        the full signal→op→diff→commit→outcome join for an ``r-N``
+        ref. Composes the authority-free read-model singleton."""
+        from backend.core.ouroboros.governance.operation_timeline import (
+            get_default_timeline,
+        )
+        row = get_default_timeline().lookup(ref)
+        if row is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No timeline row for {ref}"
+                f"[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Timeline[/{_C['neural']}] "
+            f"[{_C['dim']}]{row.ref} · {row.op_id}[/{_C['dim']}]",
+            highlight=False,
+        )
+
+        def _line(label: str, value: object) -> None:
+            if value in (None, "", ()):
+                return
+            self._flow.console.print(
+                f"    [{_C['dim']}]{label}:[/{_C['dim']}] "
+                f"[{_C['file']}]{value}[/{_C['file']}]",
+                highlight=False,
+            )
+
+        _line("signal", row.signal_source)
+        _line("urgency", row.urgency)
+        _line("risk", row.risk_tier)
+        _line("apply", row.apply_mode)
+        if row.verify_total is not None:
+            _line(
+                "verify",
+                f"{row.verify_passed}/{row.verify_total}",
+            )
+        _line("commit", row.commit_hash)
+        _line("diff", row.diff_ref)
+        if row.file_paths:
+            _line("files", f"{len(row.file_paths)} file(s)")
+            for p in row.file_paths[:20]:
+                self._flow.console.print(
+                    f"      [{_C['dim']}]{p}[/{_C['dim']}]",
+                    highlight=False,
+                )
+        _line("terminal", row.terminal_state)
+        _line("reverted_by", row.reverted_by)
+        _line("updated", row.updated_iso)
+
+    def _handle_timeline(self, line: str) -> None:
+        """Show the causal operation timeline — what O+V did, newest
+        first. ``/timeline`` lists recent ops; ``/timeline <r-N>`` or
+        ``/timeline <op-id>`` expands one. @ALIAS_TAG /tl
+        @EXAMPLE_TAG /timeline @EXAMPLE_TAG /timeline r-7"""
+        try:
+            from backend.core.ouroboros.governance.operation_timeline import (
+                get_default_timeline,
+            )
+        except Exception:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['dim']}]/timeline: substrate not available"
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        parts = line.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        tl = get_default_timeline()
+        if arg:
+            # Expand a specific r-N ref, or reverse-lookup by op_id.
+            if arg.startswith("r-"):
+                self._expand_timeline(arg)
+                return
+            matches = tl.query(op_id=arg, limit=1)
+            if matches:
+                self._expand_timeline(matches[0].ref)
+            else:
+                self._flow.console.print(
+                    f"  [{_C['heal']}]No timeline row for {arg}"
+                    f"[/{_C['heal']}]",
+                    highlight=False,
+                )
+            return
+        if not tl.is_enabled():
+            self._flow.console.print(
+                f"  [{_C['dim']}]/timeline: disabled "
+                f"(JARVIS_OPERATION_TIMELINE_ENABLED=false)[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        recent = tl.list_recent(limit=12)
+        if not recent:
+            self._flow.console.print(
+                f"  [{_C['dim']}]/timeline: no operations recorded yet"
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Operation Timeline[/{_C['neural']}] "
+            f"[{_C['dim']}]({len(recent)} most recent · "
+            f"/expand r-N for detail)[/{_C['dim']}]",
+            highlight=False,
+        )
+        for r in recent:
+            verify = (
+                f"{r.verify_passed}/{r.verify_total}"
+                if r.verify_total is not None else "-"
+            )
+            commit = (r.commit_hash or "")[:10] or "-"
+            self._flow.console.print(
+                f"    [{_C['evolved']}]{r.ref}[/{_C['evolved']}] "
+                f"[{_C['dim']}]{r.op_id} · "
+                f"{r.signal_source or '?'} · "
+                f"{r.risk_tier or '?'} · "
+                f"apply={r.apply_mode or '-'} · "
+                f"verify={verify} · commit={commit}[/{_C['dim']}]",
+                highlight=False,
             )
 
     def _expand_op_block(self, ref: str) -> None:
