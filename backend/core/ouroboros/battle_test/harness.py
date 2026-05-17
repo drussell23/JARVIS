@@ -4822,66 +4822,125 @@ class BattleTestHarness:
         stop_event = threading.Event()
         self._wall_clock_hard_deadline_stop = stop_event
 
-        # Layer 3 escalation grace — if the event-set in Layer 2 doesn't
-        # cause the asyncio race to fire within this window (loop wedged,
-        # call_soon_threadsafe queue not draining), the thread sends
-        # SIGTERM to itself which the harness signal handler catches and
-        # writes a partial summary. Env-tunable; floor 10s.
+        # ── Phase D: resource-zero panic channel ───────────────────────
+        # Captured NOW (arm time, pre-wedge): a raw dup of fd 2. The
+        # kill path writes to THIS fd via os.write and never the logging
+        # module — a poisoned logging lock cannot wedge it. Falls back
+        # to fd 2 directly if dup is unavailable.
         try:
-            raw_l3 = os.environ.get(
-                "JARVIS_WALL_CLOCK_ESCALATION_SIGTERM_S", "",
+            self._wd_panic_fd = os.dup(2)
+        except OSError:
+            self._wd_panic_fd = 2
+        # Resource-zero hard-kill deadline = Layer-2 deadline + margin,
+        # so the graceful asyncio path still gets its full window first;
+        # only a WEDGE past this extra margin trips the unblockable
+        # SIGKILL. Env-tunable (no hardcoding); floor 5s, ceiling 300s.
+        try:
+            _raw_hk = os.environ.get(
+                "JARVIS_WALL_CLOCK_HARD_KILL_MARGIN_S", "",
             ).strip()
-            escalation_sigterm_s = max(
-                10.0, min(300.0, float(raw_l3) if raw_l3 else 60.0),
+            hard_kill_margin_s = max(
+                5.0, min(300.0, float(_raw_hk) if _raw_hk else 30.0),
             )
         except (TypeError, ValueError):
-            escalation_sigterm_s = 60.0
-        # Layer 4 escalation — if even SIGTERM doesn't terminate the
-        # process within this further window (signal handler wedged,
-        # asyncio cleanup path stuck), the thread does os._exit() to
-        # forcibly kill the process. Last line of defense.
-        try:
-            raw_l4 = os.environ.get(
-                "JARVIS_WALL_CLOCK_ESCALATION_EXIT_S", "",
-            ).strip()
-            escalation_exit_s = max(
-                10.0, min(300.0, float(raw_l4) if raw_l4 else 60.0),
-            )
-        except (TypeError, ValueError):
-            escalation_exit_s = 60.0
+            hard_kill_margin_s = 30.0
+        hard_kill_monotonic = deadline_monotonic + hard_kill_margin_s
+        hard_kill_wall = deadline_wall + hard_kill_margin_s
+
+        # ── Phase D: Layers 3 & 4 collapsed ─────────────────────────────
+        # The old Layer 3 (SIGTERM-to-self → harness signal handler →
+        # partial summary) and Layer 4 (logging-gated diagnostic +
+        # _atexit_fallback_write → os._exit(75)) are DELETED, not
+        # tuned. The postmortem proved both poisonable: bt-2026-05-17-
+        # 024509 ignored the external SIGTERM (signal delivery wedged
+        # behind the same starved interpreter), and the Layer-4
+        # diagnostic acquired the poisoned logging lock before it
+        # could reach os._exit. A watchdog that shares the signal
+        # path AND the logging lock with the system it guards is not
+        # a watchdog. Resource-zero collapse replaces both. The
+        # JARVIS_WALL_CLOCK_ESCALATION_SIGTERM_S / _EXIT_S env knobs
+        # are intentionally retired — they tuned a path that no
+        # longer exists; keeping them would imply a tunable that does
+        # nothing (operator-misleading dead config).
 
         def _watch() -> None:
-            import logging as _logging
-            _wd_log = _logging.getLogger(
-                "backend.core.ouroboros.battle_test.harness"
-            )
+            # ── Phase D: resource-zero thread startup ───────────────
+            # The startup announce is itself on the critical path: if
+            # the logging lock is ALREADY poisoned at arm time, a
+            # _wd_log.info() here would block on lock acquisition
+            # BEFORE the resource-zero tripwire is ever established —
+            # a try/except cannot rescue a deadlocked lock acquire
+            # (it blocks, it does not raise). So the announce uses the
+            # SAME raw os.write to the pre-dup'd panic fd as the kill
+            # path. The entire thread — not merely the kill closure —
+            # is now severed from the logging module.
             try:
-                _wd_log.info(
-                    "[WallClockWatchdog] hard-deadline thread alive: "
-                    "cap=%.0fs grace=%.0fs sigterm=%.0fs exit=%.0fs",
-                    cap_s, grace_s, escalation_sigterm_s,
-                    escalation_exit_s,
+                os.write(
+                    self._wd_panic_fd,
+                    (
+                        "\n[WallClockWatchdog] resource-zero hard-"
+                        "deadline thread alive: cap=%.0fs grace=%.0fs "
+                        "hard_kill_margin=%.0fs (logging/loop/SIGTERM "
+                        "severed).\n" % (
+                            cap_s, grace_s, hard_kill_margin_s,
+                        )
+                    ).encode("ascii", "replace"),
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 -- announce is best-effort
                 pass
             try:
-                # ── Layer 2: fire the asyncio event at cap + grace ──
-                # Layer 7 (v2.92) — dual-clock authority. remaining is
-                # the MIN of monotonic-remaining and wall-remaining, so
-                # whichever clock advances faster wins. Sleep/suspend
-                # on macOS pauses monotonic; wall keeps ticking →
-                # deadline_wall hits first, thread fires correctly.
+                # ── Phase D: resource-zero kill (ZERO shared resources)
+                # No logging module, no asyncio loop, no SIGTERM — only
+                # raw os syscalls. A poisoned logging lock / wedged loop
+                # / wedged signal handler CANNOT block this. The fd was
+                # dup'd at arm time, pre-wedge. NEVER returns.
+                def _resource_zero_kill() -> None:
+                    try:
+                        os.write(
+                            self._wd_panic_fd,
+                            b"\n[WallClockWatchdog] RESOURCE-ZERO HARD "
+                            b"KILL: wall-clock deadline exceeded; "
+                            b"logging/loop/SIGTERM bypassed; SIGKILL "
+                            b"now (stop_reason=wall_clock_cap).\n",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        # `signal` is a module-level import, already
+                        # resident in sys.modules before this thread
+                        # ever ran — reference it directly. An inner
+                        # `import signal` here would touch the import
+                        # lock on the LAST line of defense; resource-
+                        # zero means not even that.
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    os._exit(137)  # 128+SIGKILL — absolute backstop
+
+                # ── Layer 2: graceful asyncio fire at cap + grace ──
+                # Dual-clock authority (Layer 7): remaining = MIN of
+                # monotonic/wall remaining; whichever expires first
+                # wins (macOS sleep pauses monotonic; wall keeps
+                # ticking → deadline_wall fires correctly).
                 while not stop_event.is_set():
+                    # Resource-zero tripwire FIRST, on raw clocks —
+                    # before any poisonable call below. If a wedge ever
+                    # lets the thread keep looping past the hard-kill
+                    # deadline, it dies here, unblockably.
+                    if (
+                        time.monotonic() >= hard_kill_monotonic
+                        or time.time() >= hard_kill_wall
+                    ):
+                        _resource_zero_kill()  # never returns
                     now_monotonic = time.monotonic()
                     now_wall = time.time()
                     remaining_monotonic = deadline_monotonic - now_monotonic
                     remaining_wall = deadline_wall - now_wall
-                    # Effective remaining = whichever is closer to zero
-                    # (the "first to expire" clock). NEVER negative for
-                    # the wait timeout below; the deadline check sees
-                    # the raw value to decide firing.
                     remaining = min(remaining_monotonic, remaining_wall)
                     if remaining <= 0:
+                        # Best-effort graceful nudge: enqueue-only, NOT
+                        # waited — gives the clean summary.json path its
+                        # chance without ever blocking this thread.
                         try:
                             loop.call_soon_threadsafe(
                                 self._wall_clock_event.set,
@@ -4890,120 +4949,44 @@ class BattleTestHarness:
                             pass
                         if self._stop_reason in ("unknown", "", None):
                             self._stop_reason = "wall_clock_cap"
+                        # Diagnostic via RAW os.write — NEVER the
+                        # logging module (the exact poison that wedged
+                        # bt-2026-05-17-024509).
                         try:
-                            # Diagnostic: log which clock won the race
-                            # (operator-visible signal for sleep/NTP
-                            # forensics).
-                            _which = (
-                                "wall" if remaining_wall <= remaining_monotonic
-                                else "monotonic"
-                            )
-                            _wd_log.warning(
-                                "[WallClockWatchdog] HARD DEADLINE "
-                                "thread fired (Layer 2): "
-                                "monotonic_elapsed=%.0fs "
-                                "wall_elapsed=%.0fs cap=%.0fs grace=%.0fs "
-                                "won_clock=%s (asyncio path was wedged "
-                                "or already fired).",
-                                now_monotonic - anchor_monotonic,
-                                max(0.0, now_wall - anchor_wall),
-                                cap_s, grace_s, _which,
+                            os.write(
+                                self._wd_panic_fd,
+                                b"\n[WallClockWatchdog] Layer 2 fired "
+                                b"(cap+grace): graceful asyncio nudge "
+                                b"sent; resource-zero SIGKILL armed if "
+                                b"clean shutdown does not win the "
+                                b"bounded grace.\n",
                             )
                         except Exception:  # noqa: BLE001
                             pass
                         break
                     stop_event.wait(timeout=min(5.0, max(0.1, remaining)))
-                # ── Layer 3: SIGTERM self if event-set didn't work ──
-                # Reach here either via Layer 2 fire OR
-                # stop_event.set() from clean shutdown path. If clean
-                # shutdown path wins, stop_event is set → loop won't
-                # iterate, exit gracefully.
+                # ── Phase D collapse: bounded grace → resource-zero
+                # kill. Replaces the old logging-gated Layer 3 (SIGTERM
+                # self — PROVEN wedgeable: bt-2026-05-17-024509 ignored
+                # external SIGTERM) and Layer 4 (_wd_log +
+                # _atexit_fallback_write before os._exit — both
+                # poisonable by the wedged logging lock). Reached via
+                # Layer 2 fire OR clean stop_event.set().
                 if stop_event.is_set():
                     return
-                escalation_anchor = time.monotonic()
-                while not stop_event.is_set():
-                    elapsed = time.monotonic() - escalation_anchor
-                    remaining = escalation_sigterm_s - elapsed
-                    if remaining <= 0:
-                        try:
-                            _wd_log.error(
-                                "[WallClockWatchdog] LAYER 3 "
-                                "ESCALATION: SIGTERM self "
-                                "(elapsed=%.0fs since Layer 2 fired; "
-                                "asyncio race didn't honor the event "
-                                "— loop wedged). PID=%d",
-                                elapsed, os.getpid(),
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            import signal as _signal
-                            os.kill(os.getpid(), _signal.SIGTERM)
-                        except Exception:
-                            pass
-                        break
-                    stop_event.wait(timeout=min(5.0, remaining))
-                # ── Layer 4: os._exit if even SIGTERM didn't kill ──
-                if stop_event.is_set():
+                # Bounded window for the clean asyncio summary.json path
+                # to win. Event.wait() returns True iff stop_event got
+                # set (clean shutdown won) — only then skip the kill.
+                if stop_event.wait(timeout=hard_kill_margin_s):
                     return
-                exit_anchor = time.monotonic()
-                while not stop_event.is_set():
-                    elapsed = time.monotonic() - exit_anchor
-                    remaining = escalation_exit_s - elapsed
-                    if remaining <= 0:
-                        try:
-                            _wd_log.error(
-                                "[WallClockWatchdog] LAYER 4 "
-                                "ESCALATION: os._exit(75) "
-                                "(elapsed=%.0fs since Layer 3 SIGTERM; "
-                                "process didn't terminate — signal "
-                                "handler wedged or shutdown path "
-                                "stuck). LAST LINE OF DEFENSE.",
-                                elapsed,
-                            )
-                        except Exception:
-                            pass
-                        # Layer 6 closure (2026-05-10 v2.88) — write a
-                        # synchronous partial summary.json BEFORE
-                        # os._exit(75) so the soak harness's
-                        # `_read_most_recent_session` can link the
-                        # session even after this escape-hatch fires.
-                        # Without this, all wall-clock-cap exits whose
-                        # asyncio cleanup wedges leave the session dir
-                        # without a `summary.json`, causing the parent
-                        # harness to write `outcome=infra
-                        # session=unknown` (operator-visible: cadence
-                        # produces unparseable evidence). Composes the
-                        # existing canonical
-                        # `_atexit_fallback_write` (Wave 3 v2.79
-                        # partial-shutdown insurance) — sync I/O is
-                        # safe from this thread because the watchdog
-                        # runs in its own thread, NOT the asyncio loop
-                        # that's wedged. NEVER raises out of this
-                        # block: any exception is swallowed so the
-                        # os._exit(75) escape hatch always fires.
-                        try:
-                            self._atexit_fallback_write(
-                                session_outcome=(
-                                    "incomplete_kill_layer4"
-                                ),
-                            )
-                        except Exception as _wd_summary_exc:  # noqa: BLE001
-                            try:
-                                _wd_log.error(
-                                    "[WallClockWatchdog] partial "
-                                    "summary write failed before "
-                                    "os._exit(75): %r",
-                                    _wd_summary_exc,
-                                )
-                            except Exception:
-                                pass
-                        try:
-                            os._exit(75)  # EX_TEMPFAIL — try again
-                        except Exception:
-                            pass
-                        break
-                    stop_event.wait(timeout=min(5.0, remaining))
+                # Clean shutdown did NOT win within the margin → loop is
+                # wedged. Resource-zero SIGKILL: no logging, no loop, no
+                # SIGTERM, no _atexit_fallback_write — the one thing a
+                # poisoned process cannot defeat. (debug.log is the
+                # canonical session record per CLAUDE.md; a partial
+                # summary.json is not worth a poisonable blocker on the
+                # last line of defense.)
+                _resource_zero_kill()  # never returns
             except Exception:  # noqa: BLE001 -- contract: never crash
                 pass
 
