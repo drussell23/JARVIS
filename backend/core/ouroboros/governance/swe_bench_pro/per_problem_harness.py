@@ -118,7 +118,14 @@ class HarnessOutcome(str, enum.Enum):
     READY = "ready"
     MASTER_FLAG_OFF = "master_flag_off"
     CLONE_FAILED = "clone_failed"
-    CHECKOUT_FAILED = "checkout_failed"
+    # Renamed from the legacy CHECKOUT_FAILED misnomer (Phase C): there
+    # is no `git checkout` step — the worktree is created via
+    # `git worktree add -b <branch> <path> <commit>`. Every failure this
+    # covers (invalid base_commit, orphan branch-exists, path nesting,
+    # generic) IS a worktree-creation failure. Mirrors the L3
+    # `worktree_create_failed:` precedent. Pure diagnostic label — no
+    # consumer switches on it (all check `!= READY`).
+    WORKTREE_CREATE_FAILED = "worktree_create_failed"
     TEST_PATCH_FAILED = "test_patch_failed"
 
 
@@ -362,7 +369,18 @@ async def _ensure_repo_cached(repo_url: str) -> Optional[Path]:
 
 
 def _worktree_path_for(instance_id: str) -> Path:
-    return worktree_base_path() / _sanitize_for_filename(instance_id)
+    # ABSOLUTE (Phase C root-cause fix): `git worktree add` runs with
+    # cwd=cached_repo, so a RELATIVE base resolves against the cache dir
+    # and nests the worktree INSIDE the cache (the bt-2026-05-17-013346
+    # root cause: nested worktree → _apply_test_patch ran in an empty
+    # cwd → spurious test_patch_failed + orphan-branch cache poisoning).
+    # .resolve() anchors it at the process root — the SAME resolution
+    # B1 swe_path_preflight + operation_advisor already apply, so all
+    # three agree on one absolute location. Idempotent for an absolute
+    # operator override (sandbox-ON TMPDIR case). No hardcoding.
+    return (
+        worktree_base_path() / _sanitize_for_filename(instance_id)
+    ).resolve()
 
 
 def _branch_name_for(instance_id: str) -> str:
@@ -377,16 +395,44 @@ async def _create_problem_worktree(
     wt_path = _worktree_path_for(instance_id)
     branch_name = _branch_name_for(instance_id)
     try:
+        # Hardened cleanup (Phase C): rc-check both removals and SURFACE
+        # failures — silent orphaning is what poisoned the cache and
+        # cost a diagnostic cycle.
         if wt_path.is_dir():
-            await _run_git(
+            _rm_rc, _rm_out, _rm_err = await _run_git(
                 ["worktree", "remove", "--force", str(wt_path)],
                 cwd=cached_repo,
             )
+            if _rm_rc != 0:
+                logger.warning(
+                    "[SWEBenchPro] worktree remove rc=%d for %r: %s",
+                    _rm_rc, str(wt_path), _rm_err.strip()[:200],
+                )
             shutil.rmtree(str(wt_path), ignore_errors=True)
-        await _run_git(
+        _br_rc, _br_out, _br_err = await _run_git(
             ["branch", "-D", branch_name],
             cwd=cached_repo,
         )
+        # Canonical orphan reap — mirrors L3
+        # WorktreeManager.reap_orphans `git worktree prune`. Clears
+        # dangling admin entries that would otherwise make the next
+        # `worktree add -b` fail on a phantom path.
+        await _run_git(["worktree", "prune"], cwd=cached_repo)
+        # A non-zero `branch -D` is benign ONLY if the branch is truly
+        # gone (normal first run: branch never existed). If it still
+        # exists, the upcoming `worktree add -b` WILL fail — make that
+        # loud now instead of silently orphaning.
+        _ls_rc, _ls_out, _ls_err = await _run_git(
+            ["branch", "--list", branch_name],
+            cwd=cached_repo,
+        )
+        if _ls_out.strip():
+            logger.warning(
+                "[SWEBenchPro] orphan branch %r persists after cleanup "
+                "(branch -D rc=%d) — surfacing; `worktree add` will fail "
+                "loudly as WORKTREE_CREATE_FAILED, NOT silently orphan",
+                branch_name, _br_rc,
+            )
         wt_path.parent.mkdir(parents=True, exist_ok=True)
         rc, _stdout, stderr = await _run_git(
             [
@@ -493,7 +539,7 @@ async def prepare_problem(
             cached, problem.base_commit, problem.instance_id,
         )
         if wt_pair is None:
-            return None, HarnessOutcome.CHECKOUT_FAILED
+            return None, HarnessOutcome.WORKTREE_CREATE_FAILED
         worktree_path, branch_name = wt_pair
         if not await _apply_test_patch(worktree_path, problem.test_patch):
             return None, HarnessOutcome.TEST_PATCH_FAILED
@@ -522,7 +568,7 @@ async def prepare_problem(
             "[SWEBenchPro] prepare_problem raised for %r",
             problem.instance_id, exc_info=True,
         )
-        return None, HarnessOutcome.CHECKOUT_FAILED
+        return None, HarnessOutcome.WORKTREE_CREATE_FAILED
 
 
 # ===========================================================================
