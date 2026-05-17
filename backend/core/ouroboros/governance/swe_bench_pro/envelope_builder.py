@@ -234,7 +234,23 @@ def build_evaluation_envelope(
       drives router-side dedup so two near-simultaneous builds for
       the same problem don't both fire — only the first lands.
     """
-    target_files: Tuple[str, ...] = tuple(prepared.target_paths)
+    # Cognition-feed fix (soak bt-2026-05-17-194855: psf__requests-3362
+    # terminated as a CLASSIFY no-op because this builder handed the
+    # agent the test file as its target).
+    # Authentic SWE-bench protocol: the agent must LOCALIZE the bug
+    # from the issue text alone (exploration-first Iron Gate), NOT be
+    # handed a target. ``prepared.target_paths`` are the *test_patch*
+    # paths — surfacing them inverts the task (the agent is forbidden
+    # to edit tests; Phase C scorer rejects test edits as cheating),
+    # and surfacing gold_patch paths would leak the solution. So a
+    # SWE-bench envelope carries NO target_files. This is honoured by
+    # intent_envelope's ``_EMPTY_TARGET_FILES_EXEMPT_SOURCES`` (same
+    # epistemic class as vision_sensor). Dedup still works: _dedup_key
+    # composes evidence["signature"] (== problem.instance_id), so two
+    # near-simultaneous builds for the same problem still collapse.
+    # The test_patch remains worktree state for scoring only — never
+    # the agent's stated target.
+    target_files: Tuple[str, ...] = ()
     evidence = _build_evidence(problem, prepared)
     description = _safe_str(problem.problem_statement)
     repo = _safe_str(problem.repo) or _safe_str(problem.repo_url)

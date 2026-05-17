@@ -83,6 +83,24 @@ _ARCHITECTURAL_KEYWORDS = frozenset({
 _PERSISTENCE_FREQUENCY_THRESHOLD = 3
 
 
+# Signal sources whose ops are inherently COMPLEX regardless of
+# surface file-count. The file-count heuristic below is calibrated
+# for organic self-development ops (where target_files is a real
+# pre-known edit set). It is structurally wrong for benchmark
+# sources: a SWE-bench problem carries NO target_files (the agent
+# must localize from the issue — see intent_envelope
+# ``_EMPTY_TARGET_FILES_EXEMPT_SOURCES``), so file_count==0 would
+# misclassify it SIMPLE and starve it of the PLAN phase + COMPLEX
+# route budget. Flooring these sources to COMPLEX is honest
+# semantics — localize-then-multi-file-source-fix from an issue IS
+# Claude's planning-strength class. Closed set (mirrors the
+# _VALID_SOURCES / _EMPTY_TARGET_FILES_EXEMPT_SOURCES discipline) —
+# additive, AST-pinnable, no per-call hardcoding.
+_COMPLEX_FLOOR_SOURCES = frozenset({
+    "swe_bench_pro",
+})
+
+
 class OperationComplexityClassifier:
     """Classifies operations by complexity and persistence at CLASSIFY phase.
 
@@ -103,6 +121,8 @@ class OperationComplexityClassifier:
         description: str,
         target_files: List[str],
         op_history: Optional[List[Any]] = None,
+        *,
+        source: str = "",
     ) -> ClassificationResult:
         """Classify an operation's complexity, persistence, and auto-approve eligibility.
 
@@ -110,8 +130,16 @@ class OperationComplexityClassifier:
             description: Human-readable operation description
             target_files: List of file paths being modified
             op_history: Optional list of recent LedgerEntries for frequency analysis
+            source: Signal source (e.g. ``ctx.signal_source``). Sources
+                in :data:`_COMPLEX_FLOOR_SOURCES` are floored to COMPLEX
+                regardless of file-count — the file heuristic is
+                miscalibrated for benchmark envelopes that carry no
+                target_files. Default "" preserves pre-fix behaviour for
+                every organic source (byte-identical).
         """
-        complexity = self._classify_complexity(description, target_files)
+        complexity = self._classify_complexity(
+            description, target_files, source=source,
+        )
         persistence, matched_cap, freq = self._classify_persistence(
             description, target_files, op_history,
         )
@@ -139,14 +167,29 @@ class OperationComplexityClassifier:
 
     def _classify_complexity(
         self, description: str, target_files: List[str],
+        *, source: str = "",
     ) -> ComplexityClass:
-        """Determine operation complexity from file count + description signals."""
+        """Determine operation complexity from file count + description signals.
+
+        ``source`` floor: a source in :data:`_COMPLEX_FLOOR_SOURCES` is
+        clamped to at-least-COMPLEX. Architectural keywords still win
+        (ARCHITECTURAL > COMPLEX) — the floor only prevents the
+        file-count heuristic from *under*-classifying a benchmark op
+        that carries no target_files.
+        """
         desc_lower = description.lower()
         file_count = len(target_files)
 
         # Check for architectural indicators first (highest priority)
         if any(kw in desc_lower for kw in _ARCHITECTURAL_KEYWORDS):
             return ComplexityClass.ARCHITECTURAL
+
+        # Source floor — benchmark sources are inherently COMPLEX; the
+        # file-count heuristic below is calibrated for organic ops with
+        # a real pre-known edit set and would misclassify a no-target
+        # localize-from-issue task as SIMPLE (starving PLAN + budget).
+        if source in _COMPLEX_FLOOR_SOURCES:
+            return ComplexityClass.COMPLEX
 
         # Check for trivial indicators
         if file_count <= 1:

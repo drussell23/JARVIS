@@ -100,6 +100,23 @@ _VALID_ROUTING_OVERRIDES = frozenset({
 })
 
 
+# Sources whose ops genuinely do NOT know their target files at
+# envelope-build time and must localize downstream. ``vision_sensor``:
+# "there's a traceback on screen", not "fix file X". ``swe_bench_pro``:
+# the authentic SWE-bench task is *localize the bug from the issue
+# text* — surfacing the test_patch paths as target_files inverts the
+# task (the agent is forbidden to edit tests; the scorer rejects test
+# edits as cheating) AND surfacing gold_patch paths would leak the
+# solution. So a SWE-bench envelope carries NO target_files; the
+# exploration-first Iron Gate forces honest localization. Closed set
+# (mirrors _VALID_SOURCES discipline) — additive, AST-pinnable,
+# orthogonal to the evidence.user_attachments exemption below.
+_EMPTY_TARGET_FILES_EXEMPT_SOURCES = frozenset({
+    "vision_sensor",
+    "swe_bench_pro",
+})
+
+
 class EnvelopeValidationError(ValueError):
     """Raised when an IntentEnvelope fails schema validation."""
 
@@ -157,10 +174,14 @@ class IntentEnvelope:
             _has_user_att = bool(
                 (self.evidence or {}).get("user_attachments")
             )
-            if self.source != "vision_sensor" and not _has_user_att:
+            if (
+                self.source not in _EMPTY_TARGET_FILES_EXEMPT_SOURCES
+                and not _has_user_att
+            ):
                 raise EnvelopeValidationError(
-                    "target_files must be non-empty "
-                    "(exempt: vision_sensor source, or evidence.user_attachments present)"
+                    "target_files must be non-empty (exempt: sources "
+                    f"{sorted(_EMPTY_TARGET_FILES_EXEMPT_SOURCES)}, "
+                    "or evidence.user_attachments present)"
                 )
         # F2 Slice 2: validate routing_override. Empty = no override;
         # non-empty must be a known ProviderRoute value. Invalid values
