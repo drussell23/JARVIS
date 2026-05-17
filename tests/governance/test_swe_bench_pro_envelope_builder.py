@@ -153,11 +153,20 @@ def test_source_is_swe_bench_pro(
     assert env.source == "swe_bench_pro"
 
 
-def test_target_files_match_prepared_target_paths(
+def test_target_files_is_empty_not_test_patch_paths(
     problem: ProblemSpec, prepared: PreparedProblem, clean_env: None,
 ) -> None:
+    """Cognition-feed fix (soak bt-2026-05-17-194855).
+
+    The OLD contract asserted ``target_files == prepared.target_paths``
+    — but those are the *test_patch* paths; surfacing them inverted the
+    agent's task (forbidden to edit tests; scorer rejects test edits as
+    cheating) → CLASSIFY no-op. A SWE-bench envelope now carries NO
+    target_files; the agent localizes from the issue via the
+    exploration-first Iron Gate. This test now guards the FIX."""
     env = build_evaluation_envelope(problem, prepared)
-    assert env.target_files == tuple(prepared.target_paths)
+    assert env.target_files == ()
+    assert env.target_files != tuple(prepared.target_paths)
 
 
 def test_evidence_carries_canonical_repo_root_key(
@@ -504,12 +513,18 @@ def test_envelope_roundtrips_through_unified_intake_router_create_context(
     assert parsed["problem_instance_id"] == problem.instance_id
 
 
-def test_envelope_target_files_non_empty(
+def test_envelope_target_files_empty_localize_from_issue(
     problem: ProblemSpec, prepared: PreparedProblem, clean_env: None,
 ) -> None:
-    """Vision-sensor and user-attachment envelopes are exempt from
-    the non-empty target_files invariant, but SWE-Bench-Pro envelopes
-    always carry at least one target path (parsed from the
-    test_patch's ``+++ b/<path>`` headers)."""
+    """Cognition-feed fix (soak bt-2026-05-17-194855).
+
+    The OLD docstring claimed "SWE-Bench-Pro envelopes always carry at
+    least one target path (parsed from the test_patch)". That WAS the
+    defect — the test_patch paths are not the agent's target. SWE-bench
+    is now in the same epistemic class as vision_sensor: NO target
+    files; the agent localizes from the issue. The envelope still
+    constructs (intent_envelope's _EMPTY_TARGET_FILES_EXEMPT_SOURCES
+    honours source='swe_bench_pro')."""
     env = build_evaluation_envelope(problem, prepared)
-    assert len(env.target_files) >= 1
+    assert env.target_files == ()
+    assert env.source == "swe_bench_pro"

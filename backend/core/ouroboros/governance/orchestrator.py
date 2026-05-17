@@ -2036,6 +2036,7 @@ class GovernedOrchestrator:
                 _complexity_result = _classifier.classify(
                     description=ctx.description,
                     target_files=list(ctx.target_files),
+                    source=getattr(ctx, "signal_source", "") or "",
                 )
                 # Stamp complexity on context for downstream routing decisions.
                 # task_complexity is a declared field on OperationContext, so
