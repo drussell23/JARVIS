@@ -1,33 +1,44 @@
-"""§Layer 6 closure (v2.88) — wall-clock watchdog Layer 4 escape hatch
-must write a partial ``summary.json`` BEFORE invoking ``os._exit(75)``.
+"""§Layer 6 (v2.88) — SUPERSEDED by Phase D (2026-05-17).
 
-Closes the cadence-arc Layer 6 root cause diagnosed 2026-05-10:
-when the asyncio cleanup path wedges (provider streams stuck after
-wall-clock cap fires, etc.), the wall-clock watchdog escalates
-through 4 layers ending with ``os._exit(75)``. ``os._exit`` bypasses
-``atexit``, so the partial-shutdown insurance from Wave 3 v2.79
-never fires → session dir contains only ``debug.log`` → the
-soak harness's ``_read_most_recent_session`` finds the dir but
-``summary.json`` is missing → ``session_id`` falls back to literal
-``"unknown"`` → soak record gets ``outcome=infra session=unknown``
-→ cadence produces unparseable evidence indefinitely.
+ORIGINAL CONTRACT (v2.88): the wall-clock watchdog's Layer 4
+escape hatch invoked ``_atexit_fallback_write`` synchronously
+BEFORE ``os._exit(75)`` so a wedged-loop kill still left a
+parseable partial ``summary.json``.
 
-The structural fix invokes the existing canonical
-``_atexit_fallback_write`` synchronously from the watchdog thread
-BEFORE ``os._exit(75)``. Sync I/O is safe from the watchdog thread
-because that thread is NOT the asyncio loop that's wedged.
-Composes the existing canonical fallback writer (zero parallel
-logic, zero new state machinery).
+WHY IT WAS REVERSED: the bt-2026-05-17-024509 postmortem proved
+``_atexit_fallback_write`` acquires the logging lock, and that
+lock was the *poison* — a wedged producer held it, so the
+watchdog's own Layer-4 path blocked on lock acquisition and never
+reached ``os._exit``. A summary-before-exit guarantee is worth
+nothing if the guarantee itself can deadlock the last line of
+defense. Phase D (Decision A) deletes the Layer 3/4 escalation
+entirely and replaces it with a **resource-zero** SIGKILL that
+touches no shared resource. Per CLAUDE.md, ``debug.log`` — not
+``summary.json`` — is the canonical session record, so dropping
+the poisonable summary-on-the-watchdog-path is the correct
+trade.
+
+The four AST/provenance pins that enforced the (now-deleted)
+``_atexit_fallback_write``-before-``os._exit(75)`` contract have
+been retired. Their *inverse* — the watchdog path MUST NOT touch
+logging / SIGTERM / ``_atexit_fallback_write`` — is the
+load-bearing contract now, pinned in
+``test_phase_d_resource_zero_watchdog.py``.
+
+WHAT REMAINS HERE: ``_atexit_fallback_write`` itself is still a
+live, canonical method — the *signal-handler* path (Ticket B,
+Wave 3 v2.79) still composes it for externally-killed sessions.
+The two functional tests below pin that still-valid behaviour;
+they are intentionally NOT superseded.
 """
 from __future__ import annotations
 
+import ast
 import atexit
 import inspect
 import json
-import re
 from pathlib import Path
 from typing import Iterator
-from unittest.mock import patch
 
 import pytest
 
@@ -37,110 +48,71 @@ from backend.core.ouroboros.battle_test.harness import (
 )
 
 
-_HARNESS_SRC = Path(inspect.getfile(BattleTestHarness)).read_text(
-    encoding="utf-8",
-)
-
-
 # -----------------------------------------------------------------
-# AST pin: Layer 4 escape hatch invokes _atexit_fallback_write BEFORE
-# os._exit(75). Bytes-pin — drift here silently regresses Layer 6.
+# Phase D supersession marker (2026-05-17)
 # -----------------------------------------------------------------
+#
+# The four v2.88 pins that enforced the
+# `_atexit_fallback_write`-before-`os._exit(75)` watchdog contract
+# are DELETED, not skipped — the contract they guarded is gone. A
+# skipped test rots into noise; a deleted one with this marker is
+# an auditable record. The inverse contract (the watchdog path is
+# resource-zero) lives in test_phase_d_resource_zero_watchdog.py.
 
 
-def test_layer4_invokes_atexit_fallback_before_os_exit():
-    """Verify the fallback call site appears AFTER 'LAYER 4
-    ESCALATION' marker AND BEFORE the os._exit(75) call. The
-    positional invariant is load-bearing: writing AFTER os._exit
-    is unreachable; writing too early would block earlier
-    escalation layers."""
-    # Grep for the LAYER 4 ESCALATION block.
-    # Anchor on the section-comment marker `# ── Layer 4: os._exit`
-    # which is a code marker, not a log-message string. Then capture
-    # through the actual `os._exit(75)` STATEMENT (not the
-    # substring inside the log message above it). The minimum match
-    # is large enough to span the fallback invocation.
-    layer4_match = re.search(
-        r"# ── Layer 4: os\._exit.*?try:\s*os\._exit\(75\)",
-        _HARNESS_SRC, re.DOTALL,
+def test_layer6_watchdog_contract_superseded_by_phase_d():
+    """Guard against accidental resurrection of the poison path:
+    the deleted Layer-4 ``os._exit(75)`` + ``_atexit_fallback_write``
+    escalation MUST NOT reappear on the watchdog path, and the
+    Phase D spine that owns the replacement contract MUST exist."""
+    spine = (
+        Path(__file__).with_name(
+            "test_phase_d_resource_zero_watchdog.py",
+        )
     )
-    assert layer4_match, (
-        "LAYER 4 ESCALATION → os._exit(75) block not found"
+    assert spine.exists(), (
+        "Phase D spine must own the resource-zero watchdog contract"
     )
-    block = layer4_match.group(0)
-    # The fallback must be invoked WITHIN this block.
-    assert "_atexit_fallback_write" in block, (
-        "LAYER 4 escape hatch must invoke _atexit_fallback_write "
-        "BEFORE os._exit(75) — without it, summary.json never "
-        "gets written and soak harness records "
-        "session=unknown outcome=infra"
+    harness_src = Path(
+        inspect.getfile(BattleTestHarness),
+    ).read_text(encoding="utf-8")
+    # Scope to the watchdog method's AST — the separate
+    # _BoundedShutdownWatchdog subsystem legitimately uses
+    # os._exit(75), and comments may cite the retired path for
+    # provenance. Only a LIVE os._exit(75) call OR a live
+    # 'incomplete_kill_layer4' string Constant *inside the
+    # watchdog method* re-opens the poison vector.
+    fn = next(
+        (
+            n for n in ast.walk(ast.parse(harness_src))
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "_start_wall_clock_hard_deadline_thread"
+        ),
+        None,
     )
-    # AND must be BEFORE the EXECUTABLE os._exit(75) call.
-    # The block contains an os._exit(75) substring inside a log
-    # message ABOVE the fallback (the comment "ESCALATION:
-    # os._exit(75)" is a string literal). The TRAILING os._exit(75)
-    # — the one that actually executes — is captured at the very
-    # end of the regex match. Use the last occurrence to anchor.
-    fallback_pos = block.index("_atexit_fallback_write")
-    exit_pos = block.rindex("os._exit(75)")
-    assert fallback_pos < exit_pos, (
-        "_atexit_fallback_write must be called BEFORE the "
-        "executable os._exit(75) statement — writing after the "
-        "kill is unreachable"
-    )
-
-
-def test_layer4_fallback_uses_incomplete_kill_layer4_outcome():
-    """The session_outcome stamped on the partial summary must be
-    distinct enough that operators can grep it in
-    `live_fire_graduation_history.jsonl` to identify Layer-4-killed
-    soaks."""
-    # Anchor on the section-comment marker `# ── Layer 4: os._exit`
-    # which is a code marker, not a log-message string. Then capture
-    # through the actual `os._exit(75)` STATEMENT (not the
-    # substring inside the log message above it). The minimum match
-    # is large enough to span the fallback invocation.
-    layer4_match = re.search(
-        r"# ── Layer 4: os\._exit.*?try:\s*os\._exit\(75\)",
-        _HARNESS_SRC, re.DOTALL,
-    )
-    assert layer4_match
-    assert "incomplete_kill_layer4" in layer4_match.group(0), (
-        "Layer 4 fallback must stamp session_outcome="
-        "'incomplete_kill_layer4' for operator-greppable audit "
-        "(distinct from signal-driven 'incomplete_kill' from "
-        "Wave 3 v2.79's Ticket B path)"
-    )
-
-
-def test_layer4_fallback_swallows_exception():
-    """The fallback call must be wrapped in a defensive try/except
-    so a fallback-write failure NEVER blocks the escape hatch from
-    firing os._exit(75). Without this, a bug in the fallback path
-    could turn the load-bearing escape hatch into a deadlock."""
-    # Anchor on the section-comment marker `# ── Layer 4: os._exit`
-    # which is a code marker, not a log-message string. Then capture
-    # through the actual `os._exit(75)` STATEMENT (not the
-    # substring inside the log message above it). The minimum match
-    # is large enough to span the fallback invocation.
-    layer4_match = re.search(
-        r"# ── Layer 4: os\._exit.*?try:\s*os\._exit\(75\)",
-        _HARNESS_SRC, re.DOTALL,
-    )
-    assert layer4_match
-    block = layer4_match.group(0)
-    # The fallback call must be inside a try block.
-    fallback_idx = block.index("_atexit_fallback_write")
-    # Search backward for `try:` and forward for `except`.
-    pre_block = block[:fallback_idx]
-    post_block = block[fallback_idx:]
-    assert "try:" in pre_block.split("\n")[-3:][0] or "try:" in pre_block, (
-        "_atexit_fallback_write call must be inside a try/except"
-    )
-    assert "except" in post_block, (
-        "_atexit_fallback_write call must be wrapped — a fallback "
-        "exception must not block the os._exit(75) escape hatch"
-    )
+    assert fn is not None
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            assert node.args[0].value != 75, (
+                "a live os._exit(75) inside the watchdog method "
+                f"(line {node.lineno}) re-opens the Layer-4 "
+                "bt-2026-05-17-024509 poison vector"
+            )
+        if isinstance(node, ast.Constant) and node.value == (
+            "incomplete_kill_layer4"
+        ):
+            raise AssertionError(
+                "the Layer-4 'incomplete_kill_layer4' outcome stamp "
+                f"is retired with its path (line {node.lineno})"
+            )
 
 
 # -----------------------------------------------------------------
@@ -218,31 +190,3 @@ def test_atexit_fallback_idempotent_when_summary_already_written(
     # Pre-existing summary preserved.
     re_read = json.loads(summary_path.read_text(encoding="utf-8"))
     assert re_read == canonical
-
-
-# -----------------------------------------------------------------
-# Provenance pin
-# -----------------------------------------------------------------
-
-
-def test_layer4_block_documents_layer6_closure():
-    """The Layer 4 block must cite v2.88 / Layer 6 in its
-    explanatory comment so future readers can find the design doc."""
-    # Anchor on the section-comment marker `# ── Layer 4: os._exit`
-    # which is a code marker, not a log-message string. Then capture
-    # through the actual `os._exit(75)` STATEMENT (not the
-    # substring inside the log message above it). The minimum match
-    # is large enough to span the fallback invocation.
-    layer4_match = re.search(
-        r"# ── Layer 4: os\._exit.*?try:\s*os\._exit\(75\)",
-        _HARNESS_SRC, re.DOTALL,
-    )
-    assert layer4_match
-    block = layer4_match.group(0)
-    assert "Layer 6" in block, (
-        "Layer 4 block must cite 'Layer 6' so the design doc is "
-        "discoverable"
-    )
-    assert "v2.88" in block, (
-        "Layer 4 block must cite the version that shipped the fix"
-    )
