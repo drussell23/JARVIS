@@ -2042,7 +2042,30 @@ class GovernedOrchestrator:
                 # task_complexity is a declared field on OperationContext, so
                 # object.__setattr__ values survive dataclasses.replace() in
                 # advance() and all with_*() methods.
-                object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
+                #
+                # NO-DOWNGRADE (SWE-bench op-isolation fix #2b): intake
+                # stamps task_complexity="complex" for
+                # _COMPLEX_FLOOR_SOURCES BEFORE route/budget. The
+                # coalesce/BG-pool ctx path can leave signal_source
+                # unreadable at THIS site (exactly how the floor was
+                # silently lost in soak bt-2026-05-17-213727), so the
+                # classifier here could otherwise clobber the pre-stamp
+                # back to "simple". Take the STRONGER of (pre-stamped,
+                # freshly-classified) — a general robustness property
+                # (classification must never downgrade an already-higher
+                # complexity), not a swe_bench special case.
+                _CX_RANK = {
+                    "trivial": 0, "simple": 1, "light": 1, "moderate": 2,
+                    "heavy_code": 3, "complex": 4, "architectural": 5,
+                }
+                _prev_cx = (getattr(ctx, "task_complexity", "") or "").lower()
+                _new_cx = _complexity_result.complexity.value
+                _eff_cx = (
+                    _prev_cx
+                    if _CX_RANK.get(_prev_cx, -1) > _CX_RANK.get(_new_cx, -1)
+                    else _new_cx
+                )
+                object.__setattr__(ctx, "task_complexity", _eff_cx)
 
                 logger.info(
                     "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",

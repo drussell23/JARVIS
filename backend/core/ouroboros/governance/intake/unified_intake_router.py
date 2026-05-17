@@ -928,8 +928,33 @@ class UnifiedIntakeRouter:
     # ------------------------------------------------------------------
 
     def _coalesce_key(self, envelope: IntentEnvelope) -> str:
-        """Key for grouping envelopes that target overlapping files."""
-        return "|".join(sorted(envelope.target_files)) if envelope.target_files else ""
+        """Key for grouping envelopes that target overlapping files.
+
+        Empty ``target_files`` (localize-from-issue sources —
+        ``swe_bench_pro`` / ``vision_sensor``; see intent_envelope
+        ``_EMPTY_TARGET_FILES_EXEMPT_SOURCES``) must NOT collapse to the
+        shared ``""`` key. Soak bt-2026-05-17-213727 proved that fused
+        DISTINCT problems (psf__requests-3362 + django__django-16255)
+        into one Frankenstein op (``" | ".join(descs)``). Fall back to
+        the envelope's EXISTING provenance signature — B.2.1 sets
+        ``evidence["signature"] = problem.instance_id`` expressly for
+        router-side identity — so distinct problems stay strictly
+        distinct ops. Absent a signature, key on the unique
+        ``idempotency_key`` (each envelope its own op; never coalesces).
+        No new key invented; reuses existing provenance.
+        """
+        if envelope.target_files:
+            return "|".join(sorted(envelope.target_files))
+        _sig = ""
+        try:
+            _sig = str(
+                (envelope.evidence or {}).get("signature", "")
+            ).strip()
+        except Exception:  # noqa: BLE001 — never raise in dispatch hot path
+            _sig = ""
+        if _sig:
+            return f"sig:{envelope.source}:{_sig}"
+        return f"uniq:{envelope.idempotency_key}"
 
     def _flush_coalesced(self, key: str) -> Optional[IntentEnvelope]:
         """Merge buffered envelopes for *key* into a single multi-goal envelope.
@@ -1241,6 +1266,28 @@ class UnifiedIntakeRouter:
             provider_route=_pre_route,
             provider_route_reason=_pre_route_reason,
         )
+
+        # SWE-bench op-isolation + routing fix (#2): stamp the
+        # complexity floor at the EARLIEST point — here, before the op
+        # is submitted and the provider route + budget are computed.
+        # Sources in _COMPLEX_FLOOR_SOURCES are inherently COMPLEX
+        # (localize + multi-file source fix from an issue, no
+        # target_files); the downstream file-count heuristic would
+        # mislabel a no-target envelope "simple" and starve PLAN +
+        # budget (soaks bt-2026-05-17-194855 / -213727). create()
+        # hardcodes task_complexity="" so we set it post-construction.
+        # envelope.source is definitionally present here — robust to
+        # the coalesce/BG-pool ctx path that left signal_source
+        # unreadable at the orchestrator classify site. Composes the
+        # existing closed set; no new key, no flag. NEVER fails intake.
+        try:
+            from backend.core.ouroboros.governance.complexity_classifier import (  # noqa: E501
+                _COMPLEX_FLOOR_SOURCES,
+            )
+            if envelope.source in _COMPLEX_FLOOR_SOURCES:
+                object.__setattr__(ctx, "task_complexity", "complex")
+        except Exception:  # noqa: BLE001 — floor is best-effort; never block intake
+            pass
 
         # Manifesto §1 — the Tri-Partite Microkernel must bridge Senses→Mind.
         # When a vision-originated envelope carries a frame_path, hoist it
