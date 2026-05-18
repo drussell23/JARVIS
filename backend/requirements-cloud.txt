@@ -62,7 +62,7 @@ huggingface-hub==0.19.4  # For Claude API integration
 geocoder>=1.38.0  # For IP-based location detection
 
 # ML Enhancement dependencies
-joblib>=1.3.0  # For model persistence
+joblib>=1.5.3  # For model persistence
 # Note: scikit-learn is already included above as version 1.3.2
 
 # Computer Vision dependencies
