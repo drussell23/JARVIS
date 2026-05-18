@@ -1695,6 +1695,24 @@ class TheOracle:
         batch_count = (total_files + batch_size - 1) // batch_size
         _t_batch_start = time.monotonic()
         _last_progress_log = _t_batch_start
+        # Monotonic checkpoint cadence.  A cold build of ~24k files used
+        # to be a single all-or-nothing write at the very end — if the
+        # process died (OOM / memory watchdog / SIGKILL) mid-build, the
+        # entire unbounded partial graph was lost and the NEXT boot
+        # restarted the full reindex from zero (the 52GB OOM loop).
+        # Periodic _save_cache() makes partial progress durable; composed
+        # with the load/save path-symmetry fix the next boot loads this
+        # checkpoint as a cache HIT and GLS's incremental loop tops it
+        # up via the _file_hashes skip.  Quiescence parking is untouched
+        # (still awaited first each batch) — this adds durability only,
+        # it does not alter the index schedule.  Default 1 (every batch)
+        # per operator mandate; raise via env on huge graphs where the
+        # per-checkpoint pickle cost dominates.
+        _ck_raw = os.getenv("JARVIS_ORACLE_CHECKPOINT_EVERY_N_BATCHES")
+        try:
+            _ck_every_n = max(0, int(_ck_raw)) if _ck_raw is not None else 1
+        except (TypeError, ValueError):
+            _ck_every_n = 1
         # Task #104 — Quiescence Protocol checkpoint.  The B1
         # falsification campaign proved this boot index is the
         # dominant event-loop suffocator (disabling it flipped Claude
@@ -1721,6 +1739,18 @@ class TheOracle:
                 for file_path in batch
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Durable partial checkpoint (see cadence note above).  Never
+            # let a checkpoint failure break the index — durability is a
+            # best-effort enhancement, not a correctness dependency.
+            _batch_idx = i // batch_size
+            _is_last_batch = (i + batch_size) >= total_files
+            if _ck_every_n > 0 and (
+                _is_last_batch or (_batch_idx > 0 and _batch_idx % _ck_every_n == 0)
+            ):
+                try:
+                    await self._save_cache()
+                except Exception:  # noqa: BLE001 — never break the index
+                    pass
             # Emit progress at most every 5s OR on the last batch — bounds
             # log volume on fast SSDs while still surfacing forward motion.
             _now = time.monotonic()
@@ -1918,6 +1948,31 @@ class TheOracle:
             except Exception as e:
                 logger.warning(f"Error scanning {file_path}: {e}")
 
+    @staticmethod
+    def _resolved_graph_cache_path() -> Path:
+        """Single source of truth for the graph cache location.
+
+        Load AND save MUST resolve through this method so they never
+        disagree.  Historically ``_load_cache`` read the *primary* path
+        (``~/.jarvis/oracle/codebase_graph.pkl``) directly while
+        ``_save_cache`` wrote through ``sandbox_fallback`` — under the
+        Iron Gate the primary is non-writable, so every save landed in
+        ``.ouroboros/state/sandbox_fallback/oracle/`` while every load
+        looked at the (stale/absent) primary.  The result was a cold
+        full reindex of the entire codebase on *every* sandboxed boot,
+        whose unbounded partial graph never converged and accreted to
+        an OOM over a multi-hour soak.
+
+        ``sandbox_fallback`` is idempotent and cached: when the primary
+        is writable (normal dev) it returns the primary unchanged, so
+        both load and save use the primary with zero behavior change.
+        Under the Iron Gate both deterministically use the same
+        fallback path — symmetry restored without lowering shields.
+        """
+        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
+
+        return sandbox_fallback(OracleConfig.GRAPH_CACHE_FILE)
+
     async def _load_cache(self) -> bool:
         """Load cached graph from disk.
 
@@ -1930,8 +1985,9 @@ class TheOracle:
         data) — the cache file is written by this same process.
         """
         try:
-            if OracleConfig.GRAPH_CACHE_FILE.exists():
-                _raw = OracleConfig.GRAPH_CACHE_FILE.read_bytes()
+            cache_path = self._resolved_graph_cache_path()
+            if cache_path.exists():
+                _raw = cache_path.read_bytes()
                 data = pickle.loads(_raw)  # noqa: S301 — trusted internal cache
                 del _raw  # free the raw bytes immediately
 
@@ -1963,9 +2019,7 @@ class TheOracle:
         by the sandbox; ``sandbox_fallback`` routes to
         ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering shields.
         """
-        # Lazy import avoids any risk of circular deps at module init.
-        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
-
+        _tmp_name: Optional[str] = None
         try:
             data = {
                 "graph": self._graph._graph,
@@ -1977,14 +2031,36 @@ class TheOracle:
                 "file_hashes": self._file_hashes,
             }
 
-            cache_path = sandbox_fallback(OracleConfig.GRAPH_CACHE_FILE)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            _final_cache_path = self._resolved_graph_cache_path()
+            _final_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Arc B.1 — atomic durability. Serialize into a temp file in
+            # the SAME directory, then os.replace (POSIX-atomic rename)
+            # so a crash / SIGKILL / ProcessMemoryWatchdog os._exit
+            # mid-write can NEVER leave a torn cache (the
+            # bt-2026-05-18-062703 'invalid load key \\x00' that
+            # defeated checkpoint durability + blocked graduation #6).
+            # Mirrors dw_heavy_probe._atomic_write / dataset_loader.
+            import tempfile as _tempfile
+            _tmp_fd, _tmp_name = _tempfile.mkstemp(
+                prefix=_final_cache_path.name + ".",
+                suffix=".tmp",
+                dir=str(_final_cache_path.parent),
+            )
+            os.close(_tmp_fd)
+            cache_path = Path(_tmp_name)
             cache_path.write_bytes(
                 pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),  # noqa: S301
             )
 
-            logger.info(f"Saved cache to {cache_path}")
+            os.replace(_tmp_name, str(_final_cache_path))
+            _tmp_name = None  # promoted — nothing left to clean up
+            logger.info(f"Saved cache to {_final_cache_path}")
         except Exception as e:
+            if _tmp_name is not None:
+                try:
+                    os.unlink(_tmp_name)
+                except OSError:
+                    pass
             logger.error(f"Error saving cache: {e}")
 
     # =========================================================================
@@ -2144,8 +2220,8 @@ class TheOracle:
         return {
             "running": self._running,
             "metrics": self.get_metrics(),
-            "cache_file": str(OracleConfig.GRAPH_CACHE_FILE),
-            "cache_exists": OracleConfig.GRAPH_CACHE_FILE.exists(),
+            "cache_file": str(self._resolved_graph_cache_path()),
+            "cache_exists": self._resolved_graph_cache_path().exists(),
         }
 
     # =========================================================================

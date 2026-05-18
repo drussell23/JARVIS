@@ -194,6 +194,149 @@ def crawl_memory(repo_root: Path) -> List[SnapshotFragment]:
     return fragments
 
 
+def _parse_cargo_package(cargo_text: str) -> tuple[str, str]:
+    """Return ``(package_name, package_description)`` from a Cargo.toml.
+
+    Prefers stdlib ``tomllib`` (3.11+, no new dependency); falls back
+    to a bounded regex over the ``[package]`` table if TOML parsing is
+    unavailable or the manifest is malformed. Returns ``("", "")`` if
+    no package name can be derived (workspace-only manifests).
+    """
+    try:
+        import tomllib  # stdlib 3.11+ — no new dependency
+        data = tomllib.loads(cargo_text)
+        pkg = data.get("package", {}) if isinstance(data, dict) else {}
+        if isinstance(pkg, dict):
+            return (
+                str(pkg.get("name", "") or ""),
+                str(pkg.get("description", "") or ""),
+            )
+    except Exception:  # noqa: BLE001 — fall through to regex
+        pass
+    import re
+
+    name = ""
+    desc = ""
+    # Scope the scan to the [package] table only (a Cargo.toml may
+    # also carry [dependencies] etc. with their own name= keys).
+    in_pkg = False
+    for line in cargo_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_pkg = stripped == "[package]"
+            continue
+        if not in_pkg:
+            continue
+        m = re.match(r'name\s*=\s*"([^"]+)"', stripped)
+        if m and not name:
+            name = m.group(1)
+        m = re.match(r'description\s*=\s*"([^"]+)"', stripped)
+        if m and not desc:
+            desc = m.group(1)
+    return name, desc
+
+
+def crawl_rust_subsystems(repo_root: Path) -> List[SnapshotFragment]:
+    """Crawl Rust crate manifests into tier-0 ``rust_crate`` fragments.
+
+    Makes O+V *aware* the Rust subsystems exist so it proactively
+    reaches for them via the language-agnostic Venom tools
+    (``read_file`` / ``glob_files`` / ``search_code`` / ``bash``).
+    The Oracle structural graph remains Python-only — this crawler
+    does NOT change that; it only surfaces a crate map.
+
+    Discovery is fully dynamic (no hardcoded crate list):
+
+      * Walk ``repo_root / <search_root>`` for ``**/Cargo.toml``
+        (env ``JARVIS_STRATEGIC_RUST_SEARCH_ROOT``, default
+        ``"backend"``).
+      * Skip build artifacts / vendored / worktree copies
+        (``target/``, ``.git/``, ``worktrees/``, ``node_modules``)
+        so we surface real first-party crates, not compiled output.
+      * Parse ``[package].name`` / ``.description`` (stdlib
+        ``tomllib``, regex fallback). Workspace-only manifests
+        (no ``[package]``) are skipped.
+      * De-duplicate by crate name (stable, sorted-path order).
+      * Cap at ``JARVIS_STRATEGIC_RUST_MAX_CRATES`` (default 12).
+
+    Returns one fragment per crate; empty list if the search root
+    does not exist or no crates are found.
+    """
+    search_root_name = os.environ.get(
+        "JARVIS_STRATEGIC_RUST_SEARCH_ROOT", "backend",
+    ).strip() or "backend"
+    try:
+        max_crates = int(
+            os.environ.get("JARVIS_STRATEGIC_RUST_MAX_CRATES", "12")
+        )
+    except (TypeError, ValueError):
+        max_crates = 12
+    max_crates = max(1, max_crates)
+
+    search_root = repo_root / search_root_name
+    if not search_root.is_dir():
+        return []
+
+    _SKIP = ("/target/", "/.git/", "/worktrees/", "/node_modules/")
+    fragments: List[SnapshotFragment] = []
+    seen_names: set[str] = set()
+    for cargo in sorted(search_root.rglob("Cargo.toml")):
+        cargo_str = str(cargo)
+        if any(s in cargo_str for s in _SKIP):
+            continue
+        try:
+            cargo_text = cargo.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        name, description = _parse_cargo_package(cargo_text)
+        if not name or name in seen_names:
+            continue  # workspace-only manifest, or a duplicate name
+        seen_names.add(name)
+
+        crate_dir = cargo.parent
+        # Summary precedence: sibling README first line -> Cargo
+        # description -> crate path (always something non-empty).
+        summary = ""
+        readme = crate_dir / "README.md"
+        if readme.is_file():
+            try:
+                for line in readme.read_text(
+                    encoding="utf-8", errors="replace",
+                ).splitlines():
+                    if line.strip():
+                        summary = line.strip().lstrip("# ").strip()
+                        break
+            except OSError:
+                pass
+        if not summary:
+            summary = description.strip()
+        try:
+            rel = str(crate_dir.relative_to(repo_root))
+        except ValueError:
+            rel = str(crate_dir)
+        if not summary:
+            summary = rel
+
+        try:
+            mtime = cargo.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        fragments.append(SnapshotFragment(
+            source_id=f"rust:{name}",
+            uri=rel,
+            tier=0,
+            content_hash=_hash_content(cargo_text),
+            fetched_at=time.time(),
+            mtime=mtime,
+            title=name,
+            summary=summary[:500],
+            fragment_type="rust_crate",
+        ))
+        if len(fragments) >= max_crates:
+            break
+    return fragments
+
+
 def crawl_claude_md(repo_root: Path) -> List[SnapshotFragment]:
     """Read ``CLAUDE.md`` and ``AGENTS.md`` from *repo_root* if they exist.
 

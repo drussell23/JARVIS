@@ -81,7 +81,8 @@ class SnapshotFragment:
     """
 
     VALID_FRAGMENT_TYPES: ClassVar[frozenset] = frozenset(
-        {"spec", "plan", "backlog", "memory", "commit_log", "issue"}
+        {"spec", "plan", "backlog", "memory", "commit_log", "issue",
+         "rust_crate"}
     )
 
     source_id: str

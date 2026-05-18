@@ -1257,6 +1257,97 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
+    # Developer-Memory injection (priority 3) — 3 flags. Surfaces
+    # curated repo memory/*.md into every GENERATE prompt via the
+    # existing crawl_memory crawler. Default-False until graduation.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_STRATEGIC_DEV_MEMORY_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Injects curated repo memory/*.md (recency-ranked, "
+            "budget-capped) into the strategic digest as an advisory, "
+            "authority-free '## Recent Developer Memory' section. "
+            "Composes roadmap.source_crawlers.crawl_memory."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file="backend/core/ouroboros/governance/strategic_direction.py",
+        example="false",
+        since="v1.1",
+    ),
+    FlagSpec(
+        name="JARVIS_STRATEGIC_DEV_MEMORY_MAX_CHARS",
+        type=FlagType.INT, default=6000,
+        description=(
+            "Char budget cap for the '## Recent Developer Memory' "
+            "section so it never blows the generation prompt envelope."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/strategic_direction.py",
+        example="6000",
+        since="v1.1",
+    ),
+    FlagSpec(
+        name="JARVIS_STRATEGIC_DEV_MEMORY_MAX_FILES",
+        type=FlagType.INT, default=8,
+        description=(
+            "Max number of recency-ranked memory/*.md files folded "
+            "into the '## Recent Developer Memory' section."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/strategic_direction.py",
+        example="8",
+        since="v1.1",
+    ),
+
+    # ====================================================================
+    # Rust subsystem awareness map (priority 4, Option-1) — 3 flags.
+    # Surfaces native Rust crates into the strategic digest via the
+    # existing crawl_rust_subsystems crawler. Default-False until
+    # graduation. Awareness-only — Oracle stays Python-only.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_STRATEGIC_RUST_MAP_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Injects a dynamically-discovered Rust crate map "
+            "(name + path + summary) into the strategic digest as an "
+            "advisory, authority-free '## Rust Subsystems' section so "
+            "O+V uses Venom tools on .rs. Oracle stays Python-only. "
+            "Composes roadmap.source_crawlers.crawl_rust_subsystems."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file="backend/core/ouroboros/governance/strategic_direction.py",
+        example="false",
+        since="v1.1",
+    ),
+    FlagSpec(
+        name="JARVIS_STRATEGIC_RUST_MAX_CHARS",
+        type=FlagType.INT, default=4000,
+        description=(
+            "Char budget cap for the '## Rust Subsystems' section so "
+            "it never blows the generation prompt envelope."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/strategic_direction.py",
+        example="4000",
+        since="v1.1",
+    ),
+    FlagSpec(
+        name="JARVIS_STRATEGIC_RUST_MAX_CRATES",
+        type=FlagType.INT, default=12,
+        description=(
+            "Max number of Rust crates folded into the "
+            "'## Rust Subsystems' section (also bounds the "
+            "crawl_rust_subsystems Cargo.toml scan)."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/roadmap/source_crawlers.py",
+        example="12",
+        since="v1.1",
+    ),
+
+    # ====================================================================
     # Max validate retries (Session U workaround) — 1 flag
     # ====================================================================
     FlagSpec(
