@@ -1077,6 +1077,23 @@ EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE = (
 )
 
 # ----------------------------------------------------------------------
+# Slice 0 (P3/P4 graduation observability) — fires from
+# strategic_direction's render methods when the advisory dev-memory /
+# rust-map section is non-empty AND injected into the GENERATE prompt.
+# Counts-only payload (no titles / summaries / URIs — operator
+# memory/ may be sensitive). Authority-free: the model already saw
+# the section; SSE is operator visibility, not control flow. Makes
+# graduation grep-provable from session debug.log + the existing
+# /observability stream without dumping the prompt body.
+# ----------------------------------------------------------------------
+EVENT_TYPE_STRATEGIC_DEV_MEMORY_INJECTED = (
+    "strategic_dev_memory_injected"
+)
+EVENT_TYPE_STRATEGIC_RUST_MAP_INJECTED = (
+    "strategic_rust_map_injected"
+)
+
+# ----------------------------------------------------------------------
 # Deep Observability Gap #2 Slice 4 — Confidence-policy write surface.
 # ----------------------------------------------------------------------
 #
@@ -1318,6 +1335,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED,      # auto_action_router emit phase
     EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE,  # Upgrade 3 Slice 5 (PRD §31.4)
     EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE,  # M11 Slice 4 (PRD §30.5.3)
+    EVENT_TYPE_STRATEGIC_DEV_MEMORY_INJECTED,      # Slice 0 (P3 graduation obs)
+    EVENT_TYPE_STRATEGIC_RUST_MAP_INJECTED,        # Slice 0 (P4 graduation obs)
     EVENT_TYPE_COST_BAND_CROSSED,                # §37 Slice 5 (PRD §37.7 Tier 1 #1)
     EVENT_TYPE_PLAN_GENERATED,                   # §37 Slice 6 (PRD §37.7 Tier 1 #3)
     EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING,      # §37 Slice 8 (PRD §37.7 Tier 1 #6)

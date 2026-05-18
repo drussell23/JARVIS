@@ -2134,7 +2134,9 @@ class GovernedOrchestrator:
                 _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
             if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
                 try:
-                    _strat_prompt = _strategic_svc.format_for_prompt()
+                    _strat_prompt = _strategic_svc.format_for_prompt(
+                        op_id=getattr(ctx, "op_id", None),
+                    )
                     if _strat_prompt:
                         _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                         ctx = ctx.with_strategic_memory_context(
@@ -2146,9 +2148,17 @@ class GovernedOrchestrator:
                                 or _strategic_svc.digest[:500]
                             ),
                         )
-                        logger.debug(
-                            "[Orchestrator] Strategic direction injected (%d principles)",
+                        # INFO (not DEBUG): graduation greps + §7
+                        # observability must not depend on DEBUG
+                        # capture. One line per op that actually
+                        # injects — low volume, structural proof the
+                        # StrategicDirection path executed.
+                        logger.info(
+                            "[Orchestrator] Strategic direction injected "
+                            "op=%s principles=%d chars=%d",
+                            getattr(ctx, "op_id", None) or "",
                             len(_strategic_svc.principles),
+                            len(_strat_prompt),
                         )
                 except Exception:
                     logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)

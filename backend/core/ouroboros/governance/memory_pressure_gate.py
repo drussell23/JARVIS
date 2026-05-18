@@ -56,7 +56,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,45 @@ def critical_fanout_cap() -> int:
     return _env_int("JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP", 1, minimum=1)
 
 
+# -- P5 Arc C: advisory process-tree dimension --------------------------
+# Amendment A: the gate SELF-probes (production correctness must not
+# depend on the harness pushing RSS). Amendment B: "usage vs cap"
+# semantics — cap = total_ram * PROCESS_FRACTION (no hardcoded MB);
+# WARN/HIGH/CRITICAL are fractions OF THAT CAP. Master flag default-
+# FALSE until graduation; flag-off → byte-identical legacy
+# free-%-only path (AST-pinned).
+def process_dim_enabled() -> bool:
+    return _env_bool("JARVIS_MEMORY_PRESSURE_PROCESS_DIM_ENABLED", False)
+
+
+def process_cap_fraction() -> float:
+    """Process-tree cap = total_ram * this. Default 0.75."""
+    return _env_float(
+        "JARVIS_MEMORY_PRESSURE_PROCESS_FRACTION", 0.75, minimum=0.05,
+    )
+
+
+def process_warn_frac() -> float:
+    """WARN when rss/cap >= this (fraction OF the cap). Default 0.85."""
+    return _env_float(
+        "JARVIS_MEMORY_PRESSURE_PROCESS_WARN_FRAC", 0.85, minimum=0.01,
+    )
+
+
+def process_high_frac() -> float:
+    """HIGH when rss/cap >= this. Default 0.92."""
+    return _env_float(
+        "JARVIS_MEMORY_PRESSURE_PROCESS_HIGH_FRAC", 0.92, minimum=0.01,
+    )
+
+
+def process_critical_frac() -> float:
+    """CRITICAL when rss/cap >= this. Default 0.98."""
+    return _env_float(
+        "JARVIS_MEMORY_PRESSURE_PROCESS_CRITICAL_FRAC", 0.98, minimum=0.01,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -156,6 +195,20 @@ class PressureLevel(str, enum.Enum):
     WARN = "warn"
     HIGH = "high"
     CRITICAL = "critical"
+
+
+_LEVEL_RANK = {
+    PressureLevel.OK: 0,
+    PressureLevel.WARN: 1,
+    PressureLevel.HIGH: 2,
+    PressureLevel.CRITICAL: 3,
+}
+
+
+def _strictest(a: PressureLevel, b: PressureLevel) -> PressureLevel:
+    """Strictest-wins composition of two pressure dimensions
+    (Amendment B): the more severe level prevails."""
+    return a if _LEVEL_RANK[a] >= _LEVEL_RANK[b] else b
 
 
 @dataclass(frozen=True)
@@ -181,6 +234,13 @@ class FanoutDecision:
     reason_code: str
     source: str
     schema_version: str = MEMORY_PRESSURE_SCHEMA_VERSION
+    # P5 Arc C — additive process-tree dimension fields (None when
+    # the process dim is disabled/unavailable; legacy consumers
+    # ignore them). NOT a new schema/event — additive only.
+    process_level: Optional[str] = None
+    process_rss_mb: Optional[float] = None
+    process_cap_mb: Optional[float] = None
+    dominant_dimension: str = "free_pct"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -192,6 +252,10 @@ class FanoutDecision:
             "free_pct": self.free_pct,
             "reason_code": self.reason_code,
             "source": self.source,
+            "process_level": self.process_level,
+            "process_rss_mb": self.process_rss_mb,
+            "process_cap_mb": self.process_cap_mb,
+            "dominant_dimension": self.dominant_dimension,
         }
 
 
@@ -402,7 +466,12 @@ class MemoryPressureGate:
             return PressureLevel.OK
         if not probe.ok:
             return PressureLevel.OK
-        return self.level_for_free_pct(probe.free_pct)
+        free_level = self.level_for_free_pct(probe.free_pct)
+        # Strictest-wins compose with the advisory process-tree dim.
+        # Disabled → _process_tree_dim returns OK → result == free
+        # level (byte-identical legacy free-%-only path).
+        proc_level, _rss, _cap = self._process_tree_dim()
+        return _strictest(free_level, proc_level)
 
     # -- fanout decision ----------------------------------------------------
 
@@ -417,6 +486,56 @@ class MemoryPressureGate:
         if level is PressureLevel.CRITICAL:
             return critical_fanout_cap()
         return None
+
+    def _process_tree_dim(
+        self,
+    ) -> Tuple[PressureLevel, Optional[float], Optional[float]]:
+        """Advisory process-tree pressure dimension.
+
+        Amendment A: the gate SELF-probes (via the shared
+        ``process_tree_probe`` — production correctness must not
+        depend on the harness pushing RSS). Amendment B: "usage vs
+        cap" — cap = total_ram * PROCESS_FRACTION (no hardcoded MB),
+        WARN/HIGH/CRITICAL are fractions OF that cap.
+
+        Returns ``(level, rss_mb, cap_mb)``. DISABLED or unavailable
+        → ``(OK, None, None)`` so the strictest-wins composition is a
+        no-op and the legacy free-%-only path stays byte-identical.
+        Fail-open on ANY error (never clamp on a probe glitch — the
+        ProcessMemoryWatchdog remains the hard-stop authority; this
+        dimension only ever advises a fan-out clamp).
+        """
+        if not process_dim_enabled():
+            return PressureLevel.OK, None, None
+        try:
+            from backend.core.ouroboros.governance.process_tree_probe import (  # noqa: E501
+                probe_process_tree_rss_mb,
+            )
+
+            rss_mb = probe_process_tree_rss_mb()
+            if rss_mb is None or rss_mb <= 0.0:
+                return PressureLevel.OK, None, None
+            import psutil
+            total_mb = psutil.virtual_memory().total / (1024.0 * 1024.0)
+            cap_mb = total_mb * process_cap_fraction()
+            if cap_mb <= 0.0:
+                return PressureLevel.OK, rss_mb, None
+            ratio = rss_mb / cap_mb
+            if ratio >= process_critical_frac():
+                lvl = PressureLevel.CRITICAL
+            elif ratio >= process_high_frac():
+                lvl = PressureLevel.HIGH
+            elif ratio >= process_warn_frac():
+                lvl = PressureLevel.WARN
+            else:
+                lvl = PressureLevel.OK
+            return lvl, rss_mb, cap_mb
+        except Exception:  # noqa: BLE001 — fail-open, never clamp on glitch
+            logger.debug(
+                "[MemoryPressureGate] process-dim probe raised",
+                exc_info=True,
+            )
+            return PressureLevel.OK, None, None
 
     def can_fanout(self, n_requested: int) -> FanoutDecision:
         """Advisory: may ``n_requested`` parallel units proceed?
@@ -455,7 +574,13 @@ class MemoryPressureGate:
                 source=probe.source,
             )
 
-        level = self.level_for_free_pct(probe.free_pct)
+        free_level = self.level_for_free_pct(probe.free_pct)
+        # Strictest-wins compose with the advisory process-tree dim.
+        # Disabled → (OK, None, None): level == free_level, no reason
+        # suffix, additive fields None → byte-identical legacy path.
+        proc_level, proc_rss_mb, proc_cap_mb = self._process_tree_dim()
+        level = _strictest(free_level, proc_level)
+        proc_dominant = _LEVEL_RANK[proc_level] > _LEVEL_RANK[free_level]
         cap = self._cap_for_level(level)
         if cap is None:
             n_allowed = n_requested
@@ -463,11 +588,25 @@ class MemoryPressureGate:
         else:
             n_allowed = min(n_requested, cap)
             reason = f"memory_pressure_gate.capped_to_{cap}_at_{level.value}"
+            # Suffix ONLY when the process dim escalated — keeps the
+            # legacy free-%-only reason_code string byte-identical
+            # for existing subagent_scheduler consumers/tests.
+            if proc_dominant:
+                reason += "_via_process_tree"
         return FanoutDecision(
             allowed=n_allowed >= 1 if n_requested >= 1 else True,
             n_requested=n_requested, n_allowed=n_allowed,
             level=level, free_pct=probe.free_pct,
             reason_code=reason, source=probe.source,
+            process_level=(
+                proc_level.value
+                if proc_level is not PressureLevel.OK else None
+            ),
+            process_rss_mb=proc_rss_mb,
+            process_cap_mb=proc_cap_mb,
+            dominant_dimension=(
+                "process_tree" if proc_dominant else "free_pct"
+            ),
         )
 
     # -- diagnostics --------------------------------------------------------
@@ -508,6 +647,30 @@ class MemoryPressureGate:
                 "warn": warn_fanout_cap(),
                 "high": high_fanout_cap(),
                 "critical": critical_fanout_cap(),
+            },
+            # P5 Arc C — additive process-tree dimension (always
+            # present; level=None / enabled=false when the dim is
+            # off). Reuses this surface + GET /observability/
+            # memory-pressure; no new event type.
+            "process_tree": self._process_tree_snapshot(),
+        }
+
+    def _process_tree_snapshot(self) -> Dict[str, Any]:
+        """Additive diagnostics for the process-tree dimension."""
+        proc_level, rss_mb, cap_mb = self._process_tree_dim()
+        return {
+            "enabled": process_dim_enabled(),
+            "level": (
+                proc_level.value
+                if proc_level is not PressureLevel.OK else None
+            ),
+            "rss_mb": rss_mb,
+            "cap_mb": cap_mb,
+            "cap_fraction": process_cap_fraction(),
+            "thresholds": {
+                "warn_frac": process_warn_frac(),
+                "high_frac": process_high_frac(),
+                "critical_frac": process_critical_frac(),
             },
         }
 
@@ -628,6 +791,58 @@ def _own_flag_specs() -> List[Any]:
             source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
             example="1", since="v1.0",
             posture_relevance={"HARDEN": Relevance.CRITICAL},
+        ),
+        # P5 Arc C — advisory process-tree dimension (master default
+        # FALSE until graduation; strictest-wins composed with the
+        # free-% levels). Usage-vs-cap semantics: cap = total_ram *
+        # PROCESS_FRACTION; WARN/HIGH/CRITICAL are fractions OF cap.
+        FlagSpec(
+            name="JARVIS_MEMORY_PRESSURE_PROCESS_DIM_ENABLED",
+            type=FlagType.BOOL, default=False,
+            description=(
+                "Enable the advisory process-tree RSS dimension "
+                "(self-probed; strictest-wins with free-%). "
+                "Default-false until P5 Arc C graduation soak."
+            ),
+            category=Category.SAFETY,
+            source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
+            example="false", since="v1.1",
+            posture_relevance={"HARDEN": Relevance.CRITICAL},
+        ),
+        FlagSpec(
+            name="JARVIS_MEMORY_PRESSURE_PROCESS_FRACTION",
+            type=FlagType.FLOAT, default=0.75,
+            description=(
+                "Process-tree cap = total_ram * this (no hardcoded "
+                "MB; travels across hosts)."
+            ),
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
+            example="0.75", since="v1.1",
+        ),
+        FlagSpec(
+            name="JARVIS_MEMORY_PRESSURE_PROCESS_WARN_FRAC",
+            type=FlagType.FLOAT, default=0.85,
+            description="rss/cap >= this → process-dim WARN",
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
+            example="0.85", since="v1.1",
+        ),
+        FlagSpec(
+            name="JARVIS_MEMORY_PRESSURE_PROCESS_HIGH_FRAC",
+            type=FlagType.FLOAT, default=0.92,
+            description="rss/cap >= this → process-dim HIGH",
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
+            example="0.92", since="v1.1",
+        ),
+        FlagSpec(
+            name="JARVIS_MEMORY_PRESSURE_PROCESS_CRITICAL_FRAC",
+            type=FlagType.FLOAT, default=0.98,
+            description="rss/cap >= this → process-dim CRITICAL",
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/memory_pressure_gate.py",
+            example="0.98", since="v1.1",
         ),
     ]
 

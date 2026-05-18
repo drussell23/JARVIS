@@ -671,6 +671,22 @@ class BattleTestHarness:
         # max_wall_seconds_s is None or <= 0.
         self._wall_clock_event: asyncio.Event = asyncio.Event()
 
+        # ProcessMemoryWatchdog (2026-05-18) — sibling of the wall-clock
+        # watchdog, fired when this process TREE's RSS crosses an
+        # (adaptive, env-overridable) cap. The MemoryPressureGate is
+        # blind here by construction: it probes *system-wide free %*
+        # (host stayed 71% free while one process tree hit 52GB) and
+        # can only clamp NEW L3 fan-out, never a running in-process
+        # leaker (Oracle cold-reindex accretion). This event joins the
+        # same FIRST_COMPLETED race and routes stop_reason=
+        # "process_memory_cap" — a graceful, summary-producing stop
+        # BEFORE the OS OOM-kills the tree (which leaves no artifacts).
+        self._process_memory_event: asyncio.Event = asyncio.Event()
+        self._process_memory_hard_deadline_stop: Optional[
+            threading.Event
+        ] = None
+        self._process_memory_monitor_task: Optional[asyncio.Future] = None
+
         # Publish the session id to the strategic_direction module global so
         # that the Orchestrator's CLASSIFY-phase GoalActivityLedger append can
         # stamp rows with the correct session. Cleared in _generate_report.
@@ -982,6 +998,37 @@ class BattleTestHarness:
                     _wall_cap,
                 )
 
+            # ProcessMemoryWatchdog — adaptive RSS ceiling on the soak
+            # process TREE. Protective by default (the 52GB OOM had NO
+            # guard); disable with JARVIS_PROCESS_MEMORY_WATCHDOG_ENABLED
+            # =false. Cap is env-absolute (JARVIS_PROCESS_MEMORY_CAP_MB)
+            # or adaptively derived as a fraction of total system RAM —
+            # never a hardcoded byte count, so it travels across hosts.
+            _pm_warn_mb, _pm_cap_mb, _pm_interval_s = (
+                self._resolve_process_memory_thresholds()
+            )
+            if _pm_cap_mb is not None and _pm_cap_mb > 0:
+                self._process_memory_monitor_task = asyncio.ensure_future(
+                    self._monitor_process_memory(
+                        _pm_warn_mb, _pm_cap_mb, _pm_interval_s,
+                    )
+                )
+                # Thread backstop: Oracle cold-indexing is the documented
+                # dominant event-loop suffocator, so asyncio starvation
+                # is a KNOWN risk here — the dual-path discipline from
+                # WallClockWatchdog applies. The daemon thread re-probes
+                # RSS independently and fires the same event even if the
+                # loop is fully wedged by a leaking in-process op.
+                self._start_process_memory_hard_deadline_thread(
+                    _pm_warn_mb, _pm_cap_mb, _pm_interval_s,
+                )
+                logger.info(
+                    "[ProcessMemoryWatchdog] armed: warn=%.0fMB cap=%.0fMB "
+                    "interval=%.0fs — graceful stop_reason="
+                    "process_memory_cap before OS OOM-kill.",
+                    _pm_warn_mb, _pm_cap_mb, _pm_interval_s,
+                )
+
             # Start hot-reload restart-pending monitor — graceful respawn on
             # quarantined self-modifications. See _monitor_restart_pending.
             self._restart_monitor_task = asyncio.ensure_future(
@@ -1074,9 +1121,19 @@ class BattleTestHarness:
             # the waiter blocks forever and has no effect on the legacy
             # 3-way race — backwards-compatible.
             wall_clock_waiter = asyncio.ensure_future(self._wall_clock_event.wait())
+            # ProcessMemoryWatchdog joins the race. When the watchdog is
+            # disabled the event is never set, so the waiter blocks
+            # forever and has zero effect — backwards-compatible, same
+            # contract as wall_clock_waiter.
+            process_memory_waiter = asyncio.ensure_future(
+                self._process_memory_event.wait()
+            )
 
             done, pending = await asyncio.wait(
-                [shutdown_waiter, budget_waiter, idle_waiter, wall_clock_waiter],
+                [
+                    shutdown_waiter, budget_waiter, idle_waiter,
+                    wall_clock_waiter, process_memory_waiter,
+                ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -1100,6 +1157,15 @@ class BattleTestHarness:
                     "exceeded. This is a harness-class clean stop (Ticket A Guard 2).",
                     self._session_id,
                     self._config.max_wall_seconds_s or 0.0,
+                )
+            elif process_memory_waiter in done:
+                self._stop_reason = "process_memory_cap"
+                logger.warning(
+                    "Session %s stopping: process_memory_cap — process "
+                    "tree RSS exceeded the configured cap. Graceful "
+                    "summary-producing stop ahead of an OS OOM-kill "
+                    "(ProcessMemoryWatchdog).",
+                    self._session_id,
                 )
             elif shutdown_waiter in done:
                 self._stop_reason = "shutdown_signal"
@@ -1346,23 +1412,47 @@ class BattleTestHarness:
                 # output isn't drowned by DEBUG noise.  The log file lives
                 # next to the session artifacts for post-mortem analysis.
                 try:
-                    _log_dir = self._config.repo_path / ".ouroboros" / "sessions" / self._session_id
-                    _log_dir.mkdir(parents=True, exist_ok=True)
-                    _log_file = _log_dir / "debug.log"
-                    _file_handler = logging.FileHandler(str(_log_file), encoding="utf-8")
-                    _file_handler.setLevel(logging.DEBUG)
-                    _file_handler.setFormatter(logging.Formatter(
-                        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-                        datefmt="%Y-%m-%dT%H:%M:%S",
-                    ))
                     _root = logging.getLogger()
-                    _root.addHandler(_file_handler)
-                    # Remove all StreamHandlers (stdout/stderr) from root logger
-                    for _h in list(_root.handlers):
-                        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
-                            _root.removeHandler(_h)
-                    logger.info("Logging redirected to %s", _log_file)
-                    self._log_file_path = str(_log_file)
+                    # Idempotency gate: configure_silent_boot() runs first
+                    # in run() and installs a *marked* session FileHandler
+                    # on the root logger.  Adding a second FileHandler to
+                    # the SAME debug.log here makes every record emit
+                    # twice (the observed 2x duplication).  This legacy
+                    # redirect is now a genuine fallback: it runs ONLY
+                    # when silent_boot did not install its handler (e.g.
+                    # it raised), detected via silent_boot's own marker —
+                    # the single source of truth, not a hardcoded string.
+                    from backend.core.ouroboros.governance.silent_boot import (
+                        _HANDLER_MARKER as _SB_MARKER,
+                    )
+                    _sb_installed = any(
+                        getattr(_h, _SB_MARKER, False)
+                        and isinstance(_h, logging.FileHandler)
+                        for _h in _root.handlers
+                    )
+                    if _sb_installed:
+                        logger.debug(
+                            "[harness] silent_boot session log already "
+                            "active; skipping legacy FileHandler to "
+                            "prevent 2x log emission",
+                        )
+                    else:
+                        _log_dir = self._config.repo_path / ".ouroboros" / "sessions" / self._session_id
+                        _log_dir.mkdir(parents=True, exist_ok=True)
+                        _log_file = _log_dir / "debug.log"
+                        _file_handler = logging.FileHandler(str(_log_file), encoding="utf-8")
+                        _file_handler.setLevel(logging.DEBUG)
+                        _file_handler.setFormatter(logging.Formatter(
+                            "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+                            datefmt="%Y-%m-%dT%H:%M:%S",
+                        ))
+                        _root.addHandler(_file_handler)
+                        # Remove all StreamHandlers (stdout/stderr) from root logger
+                        for _h in list(_root.handlers):
+                            if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+                                _root.removeHandler(_h)
+                        logger.info("Logging redirected to %s", _log_file)
+                        self._log_file_path = str(_log_file)
                 except Exception as _log_exc:
                     logger.debug("Log redirect failed: %s", _log_exc)
                 self._keyboard_handler = None
@@ -5269,6 +5359,279 @@ class BattleTestHarness:
                 stop_evt.set()
         except Exception:  # noqa: BLE001
             pass
+
+    # =====================================================================
+    # ProcessMemoryWatchdog (2026-05-18) — process-tree RSS ceiling.
+    # Sibling of WallClockWatchdog. Closes the structural blind spot
+    # that let a 52GB process tree OOM-kill the host while
+    # MemoryPressureGate (system-free-% scoped, new-fanout-only) and
+    # SensorGovernor (cost/postmortem only) both reported "healthy".
+    # =====================================================================
+    def _resolve_process_memory_thresholds(
+        self,
+    ) -> tuple[float, Optional[float], float]:
+        """Resolve (warn_mb, cap_mb, interval_s) from env, adaptively.
+
+        Never hardcodes a byte count. ``JARVIS_PROCESS_MEMORY_CAP_MB``
+        is an absolute override; absent it the cap is a fraction of
+        total system RAM (``JARVIS_PROCESS_MEMORY_CAP_FRACTION``,
+        default 0.75) so the same code protects a 16GB laptop and a
+        256GB box without edits. ``cap_mb=None`` means DISABLED (master
+        switch off, or total RAM unknowable with no explicit cap) — the
+        caller then never arms the watchdog (inert, exactly the
+        wall-clock discipline when ``max_wall_seconds`` is None).
+        """
+        if os.environ.get(
+            "JARVIS_PROCESS_MEMORY_WATCHDOG_ENABLED", "true",
+        ).strip().lower() == "false":
+            return (0.0, None, 0.0)
+
+        def _envf(name: str) -> Optional[float]:
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return None
+            try:
+                v = float(raw)
+                return v if v > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        # Interval — floor 2s (no busy-probe), ceiling 120s (bound the
+        # detection lag on a fast leak).
+        interval_s = _envf("JARVIS_PROCESS_MEMORY_WATCHDOG_INTERVAL_S") or 15.0
+        interval_s = max(2.0, min(120.0, interval_s))
+
+        cap_mb = _envf("JARVIS_PROCESS_MEMORY_CAP_MB")
+        if cap_mb is None:
+            try:
+                frac_raw = _envf("JARVIS_PROCESS_MEMORY_CAP_FRACTION")
+                frac = frac_raw if frac_raw is not None else 0.75
+                frac = max(0.10, min(0.95, frac))
+                import psutil  # lazy — already a project dependency
+                total_mb = psutil.virtual_memory().total / (1024.0 * 1024.0)
+                cap_mb = total_mb * frac
+            except Exception:  # noqa: BLE001 — psutil missing / probe failed
+                # No host-relative cap derivable and no override → stay
+                # DISABLED rather than invent a number (no hardcoding).
+                return (0.0, None, interval_s)
+
+        warn_mb = _envf("JARVIS_PROCESS_MEMORY_WARN_MB")
+        if warn_mb is None:
+            warn_mb = cap_mb * 0.85
+        # Keep warn strictly below cap so the WARN checkpoint always
+        # precedes the CAP stop.
+        warn_mb = min(warn_mb, cap_mb * 0.98)
+        return (warn_mb, cap_mb, interval_s)
+
+    @staticmethod
+    def _probe_process_tree_rss_mb() -> Optional[float]:
+        """Sum RSS of THIS process + all descendants, in MB.
+
+        P5 Arc C Slice 5a: the implementation moved verbatim to
+        ``governance.process_tree_probe.probe_process_tree_rss_mb``
+        (single source of truth shared with MemoryPressureGate — zero
+        duplication). This thin staticmethod is preserved so the two
+        internal callers + the watchdog test monkeypatch surface stay
+        byte-stable; behavior is unchanged.
+        """
+        from backend.core.ouroboros.governance.process_tree_probe import (
+            probe_process_tree_rss_mb,
+        )
+
+        return probe_process_tree_rss_mb()
+
+    async def _checkpoint_oracle_best_effort(self) -> None:
+        """Persist the Oracle graph now (composes Arc A symmetry +
+        Arc B in-build checkpoint). Never raises — durability is an
+        enhancement, not a correctness dependency."""
+        oracle = getattr(self, "_oracle", None)
+        save = getattr(oracle, "_save_cache", None)
+        if save is None:
+            return
+        try:
+            await save()
+            logger.info("[ProcessMemoryWatchdog] Oracle graph checkpointed.")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[ProcessMemoryWatchdog] Oracle checkpoint degraded: %s",
+                exc,
+            )
+
+    async def _fire_process_memory_cap(
+        self, rss_mb: float, cap_mb: float,
+    ) -> None:
+        """Graceful CAP fire path — idempotent (``set()`` on an
+        already-set event is a no-op and the FIRST_COMPLETED race has
+        already chosen a winner if another waiter fired first)."""
+        if self._stop_reason in ("unknown", "", None):
+            self._stop_reason = "process_memory_cap"
+        # Partial summary BEFORE the bounded watchdog can os._exit
+        # (mirrors the WallClockWatchdog termination-hook discipline).
+        try:
+            from backend.core.ouroboros.battle_test.termination_hook import (  # noqa: E501
+                TerminationCause as _TermCause,
+                TerminationPhase as _TermPhase,
+            )
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                get_default_registry as _term_registry,
+            )
+            _term_registry().dispatch(
+                phase=_TermPhase.PRE_SHUTDOWN_EVENT_SET,
+                cause=_TermCause.PROCESS_MEMORY_CAP,
+                session_dir=str(self._session_dir),
+                started_at=self._started_at,
+                stop_reason=self._stop_reason or "process_memory_cap",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[ProcessMemoryWatchdog] termination-hook dispatch "
+                "degraded: %s", exc,
+            )
+        # Arm the bounded shutdown watchdog so a wedged loop still
+        # exits (mirrors WallClockWatchdog Slice 1 parallel arm).
+        try:
+            from backend.core.ouroboros.battle_test.shutdown_watchdog import (
+                default_deadline_s as _bsw_deadline_s,
+            )
+            _wdg = getattr(self, "_shutdown_watchdog", None)
+            if _wdg is not None:
+                _wdg.arm(
+                    reason="process_memory_cap",
+                    deadline_s=_bsw_deadline_s(),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        # One last lossless checkpoint, then join the race.
+        await self._checkpoint_oracle_best_effort()
+        self._process_memory_event.set()
+        stop_evt = getattr(
+            self, "_process_memory_hard_deadline_stop", None,
+        )
+        if stop_evt is not None:
+            try:
+                stop_evt.set()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _monitor_process_memory(
+        self, warn_mb: float, cap_mb: float, interval_s: float,
+    ) -> None:
+        """Async periodic RSS ceiling — sibling of _monitor_wall_clock.
+
+        WARN (debounced, with recovery hysteresis): proactively
+        checkpoint the Oracle graph so a subsequent CAP stop loses at
+        most one interval of index work. CAP: graceful artifact-
+        producing stop via :meth:`_fire_process_memory_cap` BEFORE the
+        kernel OOM-kills the tree (an OS kill leaves no summary.json).
+        """
+        logger.info(
+            "[ProcessMemoryWatchdog] async monitor alive: "
+            "warn=%.0fMB cap=%.0fMB interval=%.0fs",
+            warn_mb, cap_mb, interval_s,
+        )
+        _warned = False
+        _tick = 0
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                logger.info(
+                    "[ProcessMemoryWatchdog] async monitor cancelled "
+                    "(NEVER fired)",
+                )
+                return
+            _tick += 1
+            rss_mb = self._probe_process_tree_rss_mb()
+            if rss_mb is None:
+                continue  # transient probe failure — retry next tick
+            if _tick % 12 == 0:
+                logger.debug(
+                    "[ProcessMemoryWatchdog] heartbeat: tick=%d "
+                    "rss=%.0fMB warn=%.0fMB cap=%.0fMB",
+                    _tick, rss_mb, warn_mb, cap_mb,
+                )
+            if rss_mb >= cap_mb:
+                logger.warning(
+                    "[ProcessMemoryWatchdog] CAP exceeded: rss=%.0fMB "
+                    ">= cap=%.0fMB — graceful stop_reason="
+                    "process_memory_cap (async path).",
+                    rss_mb, cap_mb,
+                )
+                await self._fire_process_memory_cap(rss_mb, cap_mb)
+                return
+            if rss_mb >= warn_mb and not _warned:
+                _warned = True
+                logger.warning(
+                    "[ProcessMemoryWatchdog] WARN: rss=%.0fMB >= "
+                    "warn=%.0fMB — proactively checkpointing Oracle so "
+                    "an imminent cap stop is lossless.",
+                    rss_mb, warn_mb,
+                )
+                await self._checkpoint_oracle_best_effort()
+            elif rss_mb < warn_mb * 0.95:
+                _warned = False  # re-arm WARN after recovery (hysteresis)
+
+    def _start_process_memory_hard_deadline_thread(
+        self, warn_mb: float, cap_mb: float, interval_s: float,
+    ) -> None:
+        """Thread backstop immune to asyncio starvation.
+
+        Oracle cold-indexing is the documented dominant event-loop
+        suffocator — if it wedges the loop the async monitor cannot
+        tick. This daemon thread re-probes RSS on its own (slower)
+        cadence and on CAP (1) arms the bounded shutdown watchdog
+        DIRECTLY (guarantees ``os._exit`` even with a dead loop) and
+        (2) best-effort schedules the event set via
+        ``call_soon_threadsafe``. It deliberately does NOT touch the
+        Oracle from the thread (loop-affinity) — the Arc B in-build
+        checkpoint already bounds data loss. The stop event ends it
+        cleanly when the async path fired first. NEVER raises.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:  # noqa: BLE001
+            return
+        stop_event = threading.Event()
+        self._process_memory_hard_deadline_stop = stop_event
+        # Slower than the async path so the graceful async fire wins
+        # under normal conditions (no double-stop).
+        thread_interval = max(interval_s * 2.0, 10.0)
+
+        def _run() -> None:
+            while not stop_event.wait(thread_interval):
+                rss_mb = self._probe_process_tree_rss_mb()
+                if rss_mb is None or rss_mb < cap_mb:
+                    continue
+                try:
+                    from backend.core.ouroboros.battle_test.shutdown_watchdog import (  # noqa: E501
+                        default_deadline_s as _bsw_deadline_s,
+                    )
+                    _wdg = getattr(self, "_shutdown_watchdog", None)
+                    if _wdg is not None:
+                        _wdg.arm(
+                            reason="process_memory_cap",
+                            deadline_s=_bsw_deadline_s(),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    loop.call_soon_threadsafe(
+                        self._process_memory_event.set,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(
+                    "[ProcessMemoryWatchdog] thread backstop fired: "
+                    "rss=%.0fMB >= cap=%.0fMB (asyncio path wedged).",
+                    rss_mb, cap_mb,
+                )
+                return
+
+        threading.Thread(
+            target=_run,
+            name="process-memory-watchdog",
+            daemon=True,
+        ).start()
 
     async def _monitor_restart_pending(self) -> None:
         """Background task: poll the orchestrator's hot-reloader for a

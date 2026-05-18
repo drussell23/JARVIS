@@ -4756,6 +4756,19 @@ class GovernedLoopService:
             self._stack.orchestrator = self._orchestrator
         self._stack.generator = self._generator
         self._stack.approval_provider = self._approval_provider
+        # Self-register on the stack so the production read path
+        # (orchestrator._run_pipeline → getattr(stack,
+        # "governed_loop_service")._strategic_direction →
+        # format_for_prompt) resolves in ALL boot paths — not only
+        # hud_governance_boot (the sole prior writer). Without this
+        # the battle-test harness set gls._strategic_direction but
+        # stack.governed_loop_service stayed None, so the ENTIRE
+        # StrategicDirection injection (manifesto + dev-memory) was
+        # dark (soak bt-2026-05-18-092457: injected=0, failed=0 —
+        # block skipped, not raised). The GLS owns its own stack
+        # registration: single source of truth, no second
+        # StrategicDirection holder on the orchestrator.
+        self._stack.governed_loop_service = self
 
     def _detach_from_stack(self) -> None:
         """Detach governed loop components from GovernanceStack."""
@@ -4767,6 +4780,7 @@ class GovernedLoopService:
             self._stack.orchestrator = None
         self._stack.generator = None
         self._stack.approval_provider = None
+        self._stack.governed_loop_service = None
 
     async def _reconcile_on_boot(self) -> None:
         """Scan ledger for orphaned APPLIED ops and reconcile.

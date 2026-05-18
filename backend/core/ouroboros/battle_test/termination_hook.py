@@ -127,6 +127,7 @@ class TerminationCause(str, enum.Enum):
     """
 
     WALL_CLOCK_CAP = "wall_clock_cap"
+    PROCESS_MEMORY_CAP = "process_memory_cap"
     SIGTERM = "sigterm"
     SIGINT = "sigint"
     SIGHUP = "sighup"
