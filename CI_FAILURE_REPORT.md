@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Deploy JARVIS to GCP
-- **Run Number**: #3636
-- **Branch**: `main`
-- **Commit**: `d08a48718a469473a270c2d3bad3c554081fed4c`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #67730
+- **Branch**: `fix/ci/deploy-jarvis-to-gcp-run3636-20260518-210549`
+- **Commit**: `45f5fa222666f195d0ee01faa523451477a55ca3`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-18T21:00:13Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26060186619)
+- **Timestamp**: 2026-05-18T21:06:22Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26060485925)
 
 ## Failure Overview
 
@@ -17,56 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Deploy to GCP (Spot VM Architecture) | permission_error | high | 40s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. Deploy to GCP (Spot VM Architecture)
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-18T21:02:43Z
-**Completed**: 2026-05-18T21:03:23Z
-**Duration**: 40 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26060186619/job/76618309788)
+**Started**: 2026-05-18T21:06:54Z
+**Completed**: 2026-05-18T21:06:57Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26060485925/job/76619128940)
 
 #### Failed Steps
 
-- **Step 6**: Deploy Code to Cloud Storage
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 35: `2026-05-18T21:03:16.8290251Z ERROR: (gcloud.storage.buckets.create) HTTPError 403: The billing accou`
-    - Line 43: `2026-05-18T21:03:20.9275795Z ERROR: Task 'gs://***-deployments/jarvis-d08a48718a469473a270c2d3bad3c5`
-    - Line 46: `2026-05-18T21:03:21.2100047Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 5
-  - Sample matches:
-    - Line 36: `2026-05-18T21:03:16.9832497Z ⚠️  Bucket creation failed, but continuing (it may already exist)`
-    - Line 43: `2026-05-18T21:03:20.9275795Z ERROR: Task 'gs://***-deployments/jarvis-d08a48718a469473a270c2d3bad3c5`
-    - Line 45: `2026-05-18T21:03:21.2087183Z ❌ Failed to upload deployment package`
-
-- Pattern: `WARN|Warning|warning`
   - Occurrences: 2
   - Sample matches:
-    - Line 96: `2026-05-18T21:03:21.4678925Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-    - Line 98: `2026-05-18T21:03:21.5083567Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 30: `2026-05-18T21:06:55.8093772Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-18T21:06:56.5042303Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Depl`
 
-- Pattern: `AssertionError|Exception`
+- Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 38: `2026-05-18T21:03:19.2588439Z AccessDeniedException: 403 github-actions-jarvis@***.iam.gserviceaccoun`
+    - Line 58: `2026-05-18T21:06:56.5572276Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -86,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-18T21:05:49.185154*
+📊 *Report generated on 2026-05-18T21:09:26.178511*
 🤖 *JARVIS CI/CD Auto-PR Manager*
