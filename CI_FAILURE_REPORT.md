@@ -1,0 +1,82 @@
+# CI/CD Failure Analysis Report
+
+## Executive Summary
+
+- **Workflow**: Validate Configuration
+- **Run Number**: #3596
+- **Branch**: `ouroboros/swe-bench-starvation-trace-probe`
+- **Commit**: `bbf8b0e3bc48db6d8883afeb9e0ccfe97bd634bf`
+- **Status**: ❌ FAILED
+- **Timestamp**: 2026-05-18T00:40:21Z
+- **Triggered By**: @drussell23
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26007483404)
+
+## Failure Overview
+
+Total Failed Jobs: **1**
+
+| # | Job Name | Category | Severity | Duration |
+|---|----------|----------|----------|----------|
+| 1 | Validate Environment Variables | permission_error | high | 13s |
+
+## Detailed Analysis
+
+### 1. Validate Environment Variables
+
+**Status**: ❌ failure
+**Category**: Permission Error
+**Severity**: HIGH
+**Started**: 2026-05-18T00:40:42Z
+**Completed**: 2026-05-18T00:40:55Z
+**Duration**: 13 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26007483404/job/76441538646)
+
+#### Failed Steps
+
+- **Step 5**: Run Environment Variable Validation
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 87: `2026-05-18T00:40:52.4393086Z ##[error]Process completed with exit code 1.`
+
+- Pattern: `FAIL|Failed|failed`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 58: `2026-05-18T00:40:52.4330066Z ❌ VALIDATION FAILED`
+    - Line 97: `2026-05-18T00:40:52.5780054Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+
+- Pattern: `WARN|Warning|warning`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 63: `2026-05-18T00:40:52.4332502Z ⚠️  WARNINGS`
+    - Line 97: `2026-05-18T00:40:52.5780054Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+
+#### Suggested Fixes
+
+1. Review the logs above for specific error messages
+
+---
+
+## Action Items
+
+- [ ] Review detailed logs for each failed job
+- [ ] Implement suggested fixes
+- [ ] Add or update tests to prevent regression
+- [ ] Verify fixes locally before pushing
+- [ ] Update CI/CD configuration if needed
+
+## Additional Resources
+
+- [Workflow File](.github/workflows/)
+- [CI/CD Documentation](../../docs/ci-cd/)
+- [Troubleshooting Guide](../../docs/troubleshooting/)
+
+---
+
+📊 *Report generated on 2026-05-18T00:47:33.725825*
+🤖 *JARVIS CI/CD Auto-PR Manager*
