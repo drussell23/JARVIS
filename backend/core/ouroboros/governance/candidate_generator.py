@@ -375,6 +375,41 @@ def _fallback_disabled_for_route(route: str) -> bool:
     disabled = {r.strip().lower() for r in raw.split(",") if r.strip()}
     return (route or "").strip().lower() in disabled
 
+
+def gen_call_likely_thinking(route: str, task_complexity: str) -> bool:
+    """SINGLE SOURCE OF TRUTH: will this generation call have extended
+    thinking enabled (per ``providers._resolve_thinking_budget``)?
+
+    Conservative superset (matches the historical inline rule in
+    ``_call_fallback``): any non-trivial ``task_complexity`` on a
+    non-reflex (non-IMMEDIATE) route. IMMEDIATE intentionally skips
+    thinking (reflex path).
+
+    Phase R1 (soak bt-2026-05-18-015317): the INNER fallback widens
+    its cap to ``fallback_thinking_cap_s()`` for thinking-likely
+    calls; the OUTER Iron-Gate ``_gen_timeout`` (generate_runner /
+    orchestrator) MUST floor to the SAME cap or it kills GENERATE at
+    240+15s before the inner 360s window completes (CancelledError@
+    255s, psf never generated). Both inner and outer consume THIS
+    function so the invariant `outer >= inner` holds by construction
+    — no duplicated predicate, no per-path drift.
+    """
+    _tc = (task_complexity or "").strip().lower()
+    _r = (route or "").strip().lower()
+    return _tc not in ("", "trivial") and _r not in ("immediate",)
+
+
+def fallback_thinking_cap_s() -> float:
+    """The thinking-enabled timeout cap (env-tunable, default 360s).
+    Single resolver shared by the inner fallback cap and the outer
+    Iron-Gate ``_gen_timeout`` floor (Phase R1 coherence invariant)."""
+    try:
+        return float(os.environ.get(
+            "JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S", "360.0",
+        ))
+    except (TypeError, ValueError):
+        return 360.0
+
 # ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
@@ -3792,21 +3827,14 @@ class CandidateGenerator:
         # reaching back into providers._resolve_thinking_budget to keep
         # this module orchestration-free; the inline check matches the
         # decision rule structurally.
-        _task_complexity = (
-            getattr(context, "task_complexity", "") or ""
-        ).strip().lower()
-        # IMMEDIATE routes intentionally skip thinking (reflex path).
-        # Anything else with task_complexity != "trivial" will likely
-        # have thinking enabled — match this superset to be safe.
-        _likely_thinking = (
-            _task_complexity not in ("", "trivial")
-            and _op_route not in ("immediate",)
+        # Single source of truth (Phase R1): the SAME predicate + cap
+        # the OUTER Iron-Gate _gen_timeout uses, so outer >= inner by
+        # construction (no duplicated rule, no 255-vs-360 drift).
+        _likely_thinking = gen_call_likely_thinking(
+            _op_route, getattr(context, "task_complexity", "") or "",
         )
         if _likely_thinking:
-            _thinking_cap = float(os.environ.get(
-                "JARVIS_FALLBACK_MAX_TIMEOUT_THINKING_S", "360.0",
-            ))
-            _max_cap = max(_max_cap, _thinking_cap)
+            _max_cap = max(_max_cap, fallback_thinking_cap_s())
 
         # Seed Arc Path 3 follow-up — PLAN-EXPLOIT per-stream override.
         # When ``plan_exploit_active_var`` is True (set by

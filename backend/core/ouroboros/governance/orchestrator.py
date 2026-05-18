@@ -4116,6 +4116,38 @@ class GovernedOrchestrator:
                             _fanout_budget_s, _synthesis_reserve_s, ctx.op_id,
                         )
                         _gen_timeout = _gen_timeout_readonly
+                    # ── Phase R1: outer/inner timeout coherence ──────
+                    # Parity with generate_runner (the LIVE phase-
+                    # dispatcher path). Soak bt-2026-05-18-015317:
+                    # COMPLEX outer 240s + 15s grace = 255s killed
+                    # GENERATE before the inner 360s thinking window.
+                    # Consume the SAME shared predicate + cap the inner
+                    # fallback uses so outer >= inner by construction.
+                    try:
+                        from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501
+                            gen_call_likely_thinking,
+                            fallback_thinking_cap_s,
+                        )
+                        if gen_call_likely_thinking(
+                            _route,
+                            getattr(ctx, "task_complexity", "") or "",
+                        ):
+                            _r1_cap = fallback_thinking_cap_s()
+                            if _r1_cap > _gen_timeout:
+                                logger.info(
+                                    "[Orchestrator] R1 thinking-cap "
+                                    "floor: gen_timeout %.0fs → %.0fs "
+                                    "route=%s op=%s", _gen_timeout,
+                                    _r1_cap, _route,
+                                    getattr(ctx, "op_id", "?"),
+                                )
+                            _gen_timeout = max(_gen_timeout, _r1_cap)
+                    except Exception:  # noqa: BLE001 — fail-open
+                        logger.debug(
+                            "[Orchestrator] R1 thinking-cap floor "
+                            "skipped (fail-open to route base)",
+                            exc_info=True,
+                        )
                     # Slice 2 — payload-adaptive GENERATE budget.
                     # Scales the FINAL route-base _gen_timeout by
                     # deterministic op-context geometry so a heavy
