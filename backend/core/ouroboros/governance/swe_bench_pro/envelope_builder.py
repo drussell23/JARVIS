@@ -39,12 +39,15 @@ Composition discipline
 
   * **Honest urgency derivation**: ``_derive_urgency()`` is a
     deterministic helper backed by an env override
-    (``JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY``, default "low" → routes
-    BACKGROUND via UrgencyRouter). External benchmark workloads ARE
-    background by their nature — they are batch evaluations, never
-    interrupts to in-flight work. Operators tuning for interactive
-    scoring can flip to "normal" (→ STANDARD) or "high" (→ IMMEDIATE)
-    without touching the builder body.
+    (``JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY``, default "normal" →
+    routes STANDARD via UrgencyRouter). Trace-2 (soak
+    bt-2026-05-17-225244): the prior "low" default gave the injected
+    op the lowest priority-queue rank with deadline=inf, so it was
+    structurally starved by the background-sensor flood and never
+    dequeued. "normal" earns a finite deadline + starvation-guard
+    protection. Operators wanting the old DW-only bulk economics can
+    set the env to "low" explicitly (accepting the starvation risk for
+    non-interactive bulk runs); "high"/"critical" → IMMEDIATE.
 
 §7 fail-closed contract
 -----------------------
@@ -100,10 +103,20 @@ ENVELOPE_URGENCY_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY"
 #   * critical / high → IMMEDIATE (Claude direct, $0.03/op)
 #   * normal          → STANDARD (DW primary → Claude fallback)
 #   * low             → BACKGROUND (DW-only, $0.002/op)
-# External benchmark workloads ARE background work. The default
-# routes to DW only — never burning Claude budget on bulk
-# benchmark runs. Operators can flip for interactive scoring.
-_DEFAULT_URGENCY: str = "low"
+#
+# Trace-2 fix (soak bt-2026-05-17-225244): "low" gives the injected
+# benchmark op the LOWEST intake_priority_queue rank (urgency_rank=3)
+# with deadline=inf — it NEVER force-dequeues and is structurally
+# starved by higher-urgency background-sensor ops (django saw 0 BG
+# submissions while 46 sensor ops flooded the dispatch loop). The
+# queue's own starvation guard protects urgency>=normal *from* low
+# floods — the opposite of what a benchmark op needs. So the default
+# is "normal": a finite per-urgency deadline + starvation-guard
+# protection guarantee the op actually dequeues. Operators who want
+# the old DW-only bulk-cost economics can still set
+# JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY=low explicitly (accepting the
+# starvation risk for non-interactive bulk runs).
+_DEFAULT_URGENCY: str = "normal"
 
 
 # ===========================================================================
@@ -115,7 +128,8 @@ def _derive_urgency() -> str:
     """Return a deterministic envelope urgency value.
 
     Reads the ``JARVIS_SWE_BENCH_PRO_ENVELOPE_URGENCY`` env override.
-    When unset or invalid, returns ``_DEFAULT_URGENCY`` ("low").
+    When unset or invalid, returns ``_DEFAULT_URGENCY`` ("normal" —
+    Trace-2 anti-starvation default; see the constant's rationale).
     NEVER raises.
 
     The env value is normalized to lowercase + stripped. Invalid
@@ -292,13 +306,15 @@ def register_flags(registry: Any) -> int:
             description=(
                 "Override the urgency stamped on SWE-Bench-Pro Phase "
                 "B.2.1 evaluator envelopes. Allowed values: critical "
-                "/ high / normal / low. Defaults to 'low' so external "
-                "benchmark workloads route BACKGROUND via UrgencyRouter "
-                "(DW-only; never burns Claude budget). Flip to 'normal' "
-                "for interactive scoring; 'high'/'critical' would route "
-                "IMMEDIATE (Claude direct) — appropriate only when "
-                "evaluating latency-sensitive scenarios. Invalid values "
-                "log a WARN and fall back to default."
+                "/ high / normal / low. Defaults to 'normal' (→ "
+                "STANDARD) — Trace-2 anti-starvation: 'low' gave the "
+                "injected op the lowest priority-queue rank with no "
+                "deadline so it was starved by background-sensor ops "
+                "and never dequeued (soak bt-2026-05-17-225244). Set "
+                "'low' for old DW-only bulk economics (accepts "
+                "starvation risk on non-interactive bulk runs); "
+                "'high'/'critical' route IMMEDIATE (Claude direct). "
+                "Invalid values log a WARN and fall back to default."
             ),
             category=Category.INTEGRATION,
             source_file=(

@@ -208,13 +208,18 @@ def test_description_is_problem_statement(
 # ---------------------------------------------------------------------------
 
 
-def test_urgency_default_is_low(
+def test_urgency_default_is_normal(
     problem: ProblemSpec, prepared: PreparedProblem, clean_env: None,
 ) -> None:
-    """External benchmark workloads route BACKGROUND by default —
-    operator binding: no Claude budget burn on bulk eval."""
+    """Trace-2 fix (soak bt-2026-05-17-225244): the OLD default "low"
+    gave the injected op the lowest priority-queue rank with
+    deadline=inf — structurally starved by the background-sensor
+    flood (django: 0 dispatches). Default is now "normal" (finite
+    deadline + starvation-guard protection). Operators keep the env
+    escape hatch for bulk DW-only economics. This test now guards the
+    FIX, not the defect."""
     env = build_evaluation_envelope(problem, prepared)
-    assert env.urgency == "low"
+    assert env.urgency == "normal"
 
 
 @pytest.mark.parametrize("urgency", sorted(_VALID_URGENCIES))
@@ -233,10 +238,11 @@ def test_urgency_env_override_invalid_falls_back_to_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Invalid urgency value MUST NOT crash the build — falls back to
-    "low" with a WARN log. Keeps benchmark robust to operator typos."""
+    the default with a WARN log. Keeps benchmark robust to operator
+    typos. Trace-2: the default is now "normal" (anti-starvation)."""
     monkeypatch.setenv(ENVELOPE_URGENCY_ENV_VAR, "URGENT_NOW")
     env = build_evaluation_envelope(problem, prepared)
-    assert env.urgency == "low"
+    assert env.urgency == "normal"
 
 
 def test_urgency_env_override_case_insensitive(
@@ -478,7 +484,8 @@ def test_register_flags_returns_one_spec() -> None:
     count = register_flags(_Capturer())
     assert count == 1
     assert captured[0].name == ENVELOPE_URGENCY_ENV_VAR
-    assert captured[0].default == "low"
+    # Trace-2 fix (bt-2026-05-17-225244): anti-starvation default.
+    assert captured[0].default == "normal"
 
 
 def test_register_flags_never_raises_when_registry_register_throws() -> None:
