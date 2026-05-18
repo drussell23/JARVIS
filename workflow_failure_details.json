@@ -1,0 +1,95 @@
+{
+  "workflow_name": "pip in /backend - Update #1372149537",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26045908395",
+  "branch": "main",
+  "commit_sha": "625fbd1",
+  "run_number": 144,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pip-in-backend-update-1372149537-run144-20260518-174232",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: pip in /backend - Update #1372149537 (Run #144)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 77,
+              "content": "2026-05-18T16:23:59.6697335Z Dependabot encountered '2' error(s) during execution, please check the logs for more details.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 81,
+              "content": "2026-05-18T16:23:59.6698598Z | Dependency   | Error Type    | Error Details |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 83,
+              "content": "2026-05-18T16:23:59.6699126Z | transformers | unknown_error | null          |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 84,
+              "content": "2026-05-18T16:23:59.6699412Z | torch        | unknown_error | null          |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-05-18T16:23:59.8533767Z Failure running container 6bacb1d8aaf4471db5df7f71e1c0ebb96c7f6d3d41f8ce40d724a59fb0f66891: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 91,
+              "content": "2026-05-18T16:24:00.9449728Z ##[error]Dependabot encountered an error performing the update",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 93,
+              "content": "Error: The updater encountered one or more errors.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-05-18T16:24:00.9459232Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 79,
+              "content": "2026-05-18T16:23:59.6698057Z |        Dependencies failed to update         |",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-05-18T16:23:59.8533767Z Failure running container 6bacb1d8aaf4471db5df7f71e1c0ebb96c7f6d3d41f8ce40d724a59fb0f66891: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-18T17:42:32.647070"
+}
