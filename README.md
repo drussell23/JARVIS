@@ -243,7 +243,7 @@ Focus-preserving UI automation. Ghost Hands executes actions on background windo
 
 **`backend/core/ouroboros/`**
 
-The self-developing code pipeline — the organism's immune system and neuroplasticity layer. Ouroboros runs a 10-phase governance pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE) that detects improvement opportunities, generates multi-repo patches, validates them in sandboxed worktrees, applies them through branch-isolated sagas, and narrates every decision via voice and TUI.
+The self-developing code pipeline — the organism's immune system and neuroplasticity layer. Ouroboros runs an 11-phase governance pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE) that detects improvement opportunities, generates multi-repo patches, validates them in sandboxed worktrees, applies them through branch-isolated sagas, and narrates every decision via voice and TUI.
 
 **Status (2026-04-15):** The governed complex-route arc has closed end-to-end. Session `bt-2026-04-15-175547` (Session O of the April 14-15 Sessions A–O battle-test arc) produced the first autonomously-generated Python file to land on disk through the full enforcement pipeline: `tests/governance/intake/sensors/test_test_failure_sensor_dedup.py` (4,986 bytes), written by the ChangeEngine after the `ExplorationLedger` scored the retry at `would_pass=True (score=11.00, 4 categories)`, `GATE can_write=True`, approval auto-approved via headless bypass, `ChangeEngine.RollbackArtifact.capture()` handled the new-file creation path, VERIFY found test critiques, L2 Repair converged on iteration 1/5, and `DECISION outcome=applied reason_code=safe_auto_passed` with a clean `POSTMORTEM root_cause=none`. Full 15-session arc postmortem with quoted terminal logs is in [`docs/architecture/OUROBOROS.md`](docs/architecture/OUROBOROS.md#battle-test-breakthrough-log). The eight distinct failure modes surfaced during the arc (TTY-less approval crash, risk-engine `too_many_files` escalation, L3 `READ_ONLY_PLANNING` mode switch from ambient probe failures, new-file `RollbackArtifact.capture()` ENOENT, 900s pool ceiling, 180s fallback cap on 5-tool-round retries, intake WAL cross-session coalescing, and the one-file-of-four multi-file fan-out gap) are each documented in the breakthrough log with their fix commits and env overrides. The end-to-end enforcement loop is now empirically validated; multi-file coordinated APPLY fan-out is the next product item.
 
@@ -713,7 +713,7 @@ JARVIS-AI-Agent/
 |   |   `-- ouroboros/              # Self-developing governance engine
 |   |       |-- governance/
 |   |       |   |-- governed_loop_service.py  # Main autonomous loop (Zone 6.8)
-|   |       |   |-- orchestrator.py           # 10-phase FSM pipeline (180s generation timeout)
+|   |       |   |-- orchestrator.py           # 11-phase FSM pipeline (180s generation timeout)
 |   |       |   |-- brain_selector.py         # Model selection + boot handshake
 |   |       |   |-- brain_selection_policy.yaml  # Single source of truth for all model routing
 |   |       |   |-- providers.py              # PrimeProvider + ClaudeProvider (asyncio.wait_for streaming)
