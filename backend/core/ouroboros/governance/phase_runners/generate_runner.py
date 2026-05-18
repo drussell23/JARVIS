@@ -409,6 +409,64 @@ class GENERATERunner(PhaseRunner):
                         _fanout_budget_s, _synthesis_reserve_s, ctx.op_id,
                     )
                     _gen_timeout = _gen_timeout_readonly
+                # ── Phase R1: outer/inner timeout coherence ──────────
+                # Soak bt-2026-05-18-015317: COMPLEX outer _gen_timeout
+                # (240s) + _OUTER_GATE_GRACE_S (15s) = 255s killed
+                # GENERATE with CancelledError BEFORE the inner fallback
+                # widened its cap to the 360s thinking window — psf
+                # never generated. The outer Iron-Gate window MUST be
+                # >= the inner thinking cap for thinking-likely calls.
+                # Consume the SAME shared predicate + cap the inner
+                # fallback uses (candidate_generator) so the invariant
+                # holds by construction — no duplicated rule, no
+                # per-path drift. Lazy import mirrors the adaptive
+                # block below (no module-load-order coupling).
+                try:
+                    from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501
+                        gen_call_likely_thinking,
+                        fallback_thinking_cap_s,
+                    )
+                    if gen_call_likely_thinking(
+                        _route, getattr(ctx, "task_complexity", "") or "",
+                    ):
+                        _cap = fallback_thinking_cap_s()
+                        if _cap > _gen_timeout:
+                            logger.info(
+                                "[Orchestrator] R1 thinking-cap floor: "
+                                "gen_timeout %.0fs → %.0fs route=%s "
+                                "op=%s (outer >= inner 360s window)",
+                                _gen_timeout, _cap, _route,
+                                getattr(ctx, "op_id", "?"),
+                            )
+                        _gen_timeout = max(_gen_timeout, _cap)
+                except Exception:  # noqa: BLE001 — fail-open to route base
+                    logger.debug(
+                        "[Orchestrator] R1 thinking-cap floor skipped "
+                        "(fail-open to route base)", exc_info=True,
+                    )
+                # Slice 2 parity — payload-adaptive GENERATE budget runs
+                # AFTER the thinking-cap floor so one scaled value
+                # propagates to deadline + outer wait_for + tool-loop
+                # budget. Mirrors orchestrator.py verbatim. Master flag
+                # default-FALSE; fail-open to (floored) route base.
+                try:
+                    from backend.core.ouroboros.governance.adaptive_gen_budget import (  # noqa: E501
+                        scale_gen_timeout,
+                    )
+                    _adaptive_gt = scale_gen_timeout(_gen_timeout, ctx)
+                    if _adaptive_gt > _gen_timeout:
+                        logger.info(
+                            "[Orchestrator] adaptive gen budget: "
+                            "%.0fs → %.0fs route=%s op=%s",
+                            _gen_timeout, _adaptive_gt, _route,
+                            getattr(ctx, "op_id", "?"),
+                        )
+                    _gen_timeout = _adaptive_gt
+                except Exception:  # noqa: BLE001 — fail-open
+                    logger.debug(
+                        "[Orchestrator] adaptive gen budget skipped "
+                        "(fail-open to route base)", exc_info=True,
+                    )
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=_gen_timeout
                 )
