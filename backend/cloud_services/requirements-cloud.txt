@@ -19,7 +19,7 @@ numpy>=1.24.0,<2.0.0
 
 # HTTP client (for health checks and speechbrain model fetching)
 aiohttp>=3.9.0
-requests>=2.31.0
+requests>=2.34.2
 
 # Monitoring (optional)
 prometheus-client>=0.19.0
