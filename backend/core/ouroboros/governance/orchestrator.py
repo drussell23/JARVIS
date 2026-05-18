@@ -2038,32 +2038,11 @@ class GovernedOrchestrator:
                     target_files=list(ctx.target_files),
                     source=getattr(ctx, "signal_source", "") or "",
                 )
-                # Trace-1 surgical probe (soak bt-2026-05-17-225244):
-                # static analysis says this path MUST yield COMPLEX for
-                # swe_bench_pro yet production yields simple. Capture the
-                # exact runtime state at the contradiction site. Gated
-                # behind JARVIS_DEBUG_CLASSIFY_PROBE (default off →
-                # byte-identical). NEVER raises into the pipeline.
-                try:
-                    if os.environ.get(
-                        "JARVIS_DEBUG_CLASSIFY_PROBE", "",
-                    ).strip().lower() in {"1", "true", "yes", "on"}:
-                        import backend.core.ouroboros.governance.complexity_classifier as _cc_probe  # noqa: E501
-                        logger.info(
-                            "[Trace1Probe] op=%s signal_source=%r "
-                            "task_complexity=%r id(ctx)=%s in_floor=%r "
-                            "classified=%r cc_module=%s",
-                            getattr(ctx, "op_id", "")[:24],
-                            getattr(ctx, "signal_source", None),
-                            getattr(ctx, "task_complexity", None),
-                            id(ctx),
-                            (getattr(ctx, "signal_source", "") or "")
-                            in _cc_probe._COMPLEX_FLOOR_SOURCES,
-                            _complexity_result.complexity.value,
-                            getattr(_cc_probe, "__file__", "?"),
-                        )
-                except Exception:  # noqa: BLE001 — probe is best-effort
-                    pass
+                # (Trace-1 probe removed: it sat on this orchestrator
+                # inline CLASSIFY block, which is DEAD under the phase
+                # dispatcher — production runs CLASSIFYRunner. The root
+                # fix is CLASSIFY parity in classify_runner.py, not a
+                # diagnostic here. soak bt-2026-05-18-010430.)
                 # Stamp complexity on context for downstream routing decisions.
                 # task_complexity is a declared field on OperationContext, so
                 # object.__setattr__ values survive dataclasses.replace() in

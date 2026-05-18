@@ -621,4 +621,66 @@ async def test_none_serpent_emergency_path(ctx, tmp_path):
     assert result.next_ctx.phase is OperationPhase.CANCELLED
 
 
+# ---------------------------------------------------------------------------
+# Trace-1 root fix — CLASSIFY parity for _COMPLEX_FLOOR_SOURCES
+# (soak bt-2026-05-18-010430). This runner is the LIVE phase-dispatcher
+# path; it MUST thread source= + apply the _CX_RANK NO-DOWNGRADE stamp
+# so intake's task_complexity="complex" for swe_bench_pro is not
+# clobbered back to "simple" (the exact cause of swe_bench ops routing
+# STANDARD instead of COMPLEX).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_swe_bench_complexity_floor_survives_classify_runner(
+    tmp_path,
+):
+    """signal_source='swe_bench_pro' + empty target_files + intake
+    pre-stamp task_complexity='complex' → after the LIVE CLASSIFYRunner
+    runs, task_complexity is STILL 'complex' (source-floor fires AND
+    the no-downgrade stamp preserves the pre-stamp). Pre-fix this
+    runner clobbered it to 'simple'."""
+    ctx = OperationContext.create(
+        target_files=(),  # localize-from-issue: no targets by design
+        description="Uncertain about iter_content vs text decode_unicode",
+        signal_source="swe_bench_pro",
+    )
+    # Intake stamps the floor before route/budget (#2a).
+    object.__setattr__(ctx, "task_complexity", "complex")
+
+    orch = _orch(tmp_path)
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+
+    assert result.status == "ok"
+    assert result.next_ctx.task_complexity == "complex", (
+        "CLASSIFYRunner clobbered the swe_bench_pro complexity floor "
+        "back to "
+        f"{result.next_ctx.task_complexity!r} — Trace-1 regression: "
+        "the live dispatcher path lost source=/no-downgrade parity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_classify_runner_no_downgrade_preserves_higher_prestamp(
+    tmp_path,
+):
+    """General no-downgrade property (not swe_bench-specific): a
+    pre-stamped 'complex' is never downgraded even for a non-floor
+    source whose file-count heuristic would say 'simple'."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    ctx = OperationContext.create(
+        target_files=(str(tmp_path / "a.py"),),  # 1 file → heuristic 'simple'
+        description="fix a bug",
+        signal_source="test_failure",  # NOT a floor source
+    )
+    object.__setattr__(ctx, "task_complexity", "complex")
+    orch = _orch(tmp_path)
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+    assert result.status == "ok"
+    assert result.next_ctx.task_complexity == "complex", (
+        "no-downgrade MUST preserve a higher pre-stamp regardless of "
+        "source"
+    )
+
+
 __all__ = []

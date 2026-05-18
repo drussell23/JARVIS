@@ -91,15 +91,18 @@ def test_built_envelope_carries_normal_urgency(tmp_path, _clean):
     assert env.urgency in _VALID_URGENCIES
 
 
-def test_probe_is_gated_default_off_and_crash_safe():
-    """The Trace-1 probe MUST be flag-gated (byte-identical when unset)
-    and wrapped so it can never raise into the pipeline."""
+def test_trace1_probe_removed_from_dead_inline_path():
+    """The Trace-1 env-gated probe was a diagnostic that sat on the
+    orchestrator's inline CLASSIFY block — proven DEAD under the phase
+    dispatcher (production runs CLASSIFYRunner). Soak
+    bt-2026-05-18-010430 confirmed it never fired. It was ratified-
+    deleted; the root fix is CLASSIFY parity in classify_runner.py.
+    This pin guards against a dead env-gated diagnostic being
+    re-introduced on the inline path."""
     from backend.core.ouroboros.governance import orchestrator as orch
     src = inspect.getsource(orch)
-    assert "JARVIS_DEBUG_CLASSIFY_PROBE" in src
-    assert "[Trace1Probe]" in src
-    i = src.index("[Trace1Probe]")
-    assert "except Exception:" in src[i:i + 1400], (
-        "probe MUST be wrapped in try/except — never raise into the "
-        "classify path"
+    assert "JARVIS_DEBUG_CLASSIFY_PROBE" not in src, (
+        "dead env-gated Trace-1 probe re-introduced on the orchestrator "
+        "inline path (which is dead under the phase dispatcher)"
     )
+    assert "[Trace1Probe]" not in src

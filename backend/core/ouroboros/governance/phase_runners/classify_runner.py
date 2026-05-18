@@ -481,12 +481,38 @@ class CLASSIFYRunner(PhaseRunner):
             _complexity_result = _classifier.classify(
                 description=ctx.description,
                 target_files=list(ctx.target_files),
+                source=getattr(ctx, "signal_source", "") or "",
             )
             # Stamp complexity on context for downstream routing decisions.
             # task_complexity is a declared field on OperationContext, so
             # object.__setattr__ values survive dataclasses.replace() in
             # advance() and all with_*() methods.
-            object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
+            #
+            # CLASSIFY PARITY (Trace-1 root fix, soak bt-2026-05-18-
+            # 010430): this CLASSIFYRunner is the LIVE path under the
+            # phase dispatcher (JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED
+            # =true). The orchestrator's inline CLASSIFY block carried
+            # source= + the NO-DOWNGRADE stamp; this runner did NOT —
+            # so intake's task_complexity="complex" for
+            # _COMPLEX_FLOOR_SOURCES was clobbered back to "simple"
+            # here, exactly why swe_bench ops kept routing STANDARD.
+            # Mirror the orchestrator verbatim: pass source= (above)
+            # and take the STRONGER of (pre-stamped, freshly-
+            # classified) — classification must never downgrade an
+            # already-higher complexity (general property, not a
+            # swe_bench special case).
+            _CX_RANK = {
+                "trivial": 0, "simple": 1, "light": 1, "moderate": 2,
+                "heavy_code": 3, "complex": 4, "architectural": 5,
+            }
+            _prev_cx = (getattr(ctx, "task_complexity", "") or "").lower()
+            _new_cx = _complexity_result.complexity.value
+            _eff_cx = (
+                _prev_cx
+                if _CX_RANK.get(_prev_cx, -1) > _CX_RANK.get(_new_cx, -1)
+                else _new_cx
+            )
+            object.__setattr__(ctx, "task_complexity", _eff_cx)
 
             logger.info(
                 "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",

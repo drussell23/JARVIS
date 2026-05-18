@@ -46,6 +46,9 @@ from backend.core.ouroboros.governance.intake.unified_intake_router import (
     UnifiedIntakeRouter,
 )
 from backend.core.ouroboros.governance import orchestrator as _orch_mod
+from backend.core.ouroboros.governance.phase_runners import (
+    classify_runner as _classify_runner_mod,
+)
 from backend.core.ouroboros.governance.plan_generator import PlanGenerator
 
 
@@ -142,6 +145,56 @@ def test_ast_orchestrator_has_no_downgrade_guard():
         'object.__setattr__(ctx, "task_complexity", _eff_cx)'
     )
     assert i_rank < i_set, "rank logic MUST precede the stamp"
+
+
+def test_ast_classify_runner_threads_source_into_classify():
+    """Trace-1 root fix: CLASSIFYRunner is the LIVE phase-dispatcher
+    path. It MUST pass source= into the complexity classifier or the
+    _COMPLEX_FLOOR_SOURCES floor can never fire (the orchestrator
+    inline block is dead under the dispatcher)."""
+    src = inspect.getsource(_classify_runner_mod)
+    classify_calls = [
+        n for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "classify"
+        and {kw.arg for kw in n.keywords} >= {"description", "target_files"}
+    ]
+    assert classify_calls, (
+        "could not locate the OperationComplexityClassifier.classify "
+        "call in classify_runner"
+    )
+    assert any(
+        "source" in {kw.arg for kw in c.keywords} for c in classify_calls
+    ), (
+        "REGRESSION: classify_runner stopped threading source= into "
+        "the complexity classifier — _COMPLEX_FLOOR_SOURCES is dead on "
+        "the live path (Trace-1)"
+    )
+
+
+def test_ast_classify_runner_has_no_downgrade_guard_parity():
+    """classify_runner MUST carry the SAME _CX_RANK no-downgrade stamp
+    as the orchestrator inline block (parity) so a pre-stamped floor
+    cannot be clobbered on the live path."""
+    src = inspect.getsource(_classify_runner_mod)
+    assert "_CX_RANK" in src, (
+        "classify_runner missing _CX_RANK no-downgrade parity (Trace-1)"
+    )
+    i_rank = src.index("_CX_RANK = {")
+    i_set = src.index(
+        'object.__setattr__(ctx, "task_complexity", _eff_cx)'
+    )
+    assert i_rank < i_set, "rank logic MUST precede the stamp"
+    # Identical rank table to the orchestrator (no drift between paths).
+    import ast as _ast
+    def _rank(mod_src):
+        s = mod_src.index("_CX_RANK = {") + len("_CX_RANK = ")
+        return _ast.literal_eval(mod_src[s:mod_src.index("}", s) + 1])
+    assert _rank(src) == _rank(inspect.getsource(_orch_mod)), (
+        "classify_runner _CX_RANK MUST match orchestrator _CX_RANK "
+        "(parity — no per-path divergence)"
+    )
 
 
 def test_no_downgrade_rank_semantics_preserve_floor():
