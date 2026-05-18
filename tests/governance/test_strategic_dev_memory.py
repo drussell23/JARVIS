@@ -20,6 +20,7 @@ Pins:
 from __future__ import annotations
 
 import ast
+import logging
 import os
 from pathlib import Path
 
@@ -66,9 +67,51 @@ def _svc(root: Path) -> StrategicDirectionService:
 
 # --------------------------------------------------------------------------
 
-def test_disabled_by_default_is_empty(tmp_path):
+def test_graduated_default_true_injects_without_flag(tmp_path):
+    # P3 GRADUATED (soak bt-2026-05-18-185740 PASS): with NO env set
+    # the section now renders by default (was empty pre-graduation).
+    root = _repo_with_memory(tmp_path, {"a.md": ("# A\nbody", 1000.0)})
+    assert "## Recent Developer Memory" in (
+        _svc(root)._render_dev_memory_section()
+    )
+
+
+def test_explicit_disable_hot_reverts_to_empty(monkeypatch, tmp_path):
+    # Hot-revert is env=false ONLY (no code path deleted).
+    monkeypatch.setenv(_FLAG, "false")
     root = _repo_with_memory(tmp_path, {"a.md": ("# A\nbody", 1000.0)})
     assert _svc(root)._render_dev_memory_section() == ""
+
+
+def test_ast_pin_graduated_default_true_persists():
+    """Graduation must not silently revert: the in-code env default
+    for JARVIS_STRATEGIC_DEV_MEMORY_ENABLED must be 'true'."""
+    src = _SRC.read_text()
+    tree = ast.parse(src)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "_render_dev_memory_section"
+    )
+    for call in ast.walk(fn):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "get"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "JARVIS_STRATEGIC_DEV_MEMORY_ENABLED"
+        ):
+            assert (
+                len(call.args) >= 2
+                and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == "true"
+            ), (
+                "graduated default must persist as 'true' (env=false "
+                "hot-reverts; no code-path deletion)"
+            )
+            return
+    pytest.fail("env-default read for the dev-memory flag not found")
 
 
 def test_enabled_injects_memory(monkeypatch, tmp_path):
@@ -180,3 +223,83 @@ def test_ast_pin_composes_crawler_no_duplicate_glob():
     assert "_render_dev_memory_section" in ast.unparse(fmt), (
         "dev-memory section must be wired into format_for_prompt"
     )
+
+
+# ---------------------------------------------------------------------------
+# Slice 0 — injection telemetry (graduation observability, counts-only)
+# ---------------------------------------------------------------------------
+
+_STRAT_LOGGER = "backend.core.ouroboros.governance.strategic_direction"
+
+
+def test_telemetry_info_fires_when_injected(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv(_FLAG, "true")
+    root = _repo_with_memory(
+        tmp_path, {"p.md": ("# Plan\nSECRET_BODY_TOKEN summary", 1000.0)}
+    )
+    with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
+        _svc(root)._render_dev_memory_section(op_id="op-T1")
+    line = next(
+        (r.getMessage() for r in caplog.records
+         if "dev-memory injected" in r.getMessage()), None,
+    )
+    assert line is not None, "INFO telemetry must fire on injection"
+    assert "op=op-T1" in line
+    assert "files=1" in line and "chars=" in line
+
+
+def test_telemetry_counts_only_no_body_text(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv(_FLAG, "true")
+    root = _repo_with_memory(
+        tmp_path, {"p.md": ("# TitleTok\nSECRET_BODY_TOKEN", 1000.0)}
+    )
+    with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
+        _svc(root)._render_dev_memory_section(op_id="op-T2")
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SECRET_BODY_TOKEN" not in blob, "must not log summary body"
+    assert "TitleTok" not in blob, "must not log fragment title"
+    assert "p.md" not in blob, "must not log fragment uri/path"
+
+
+def test_telemetry_silent_when_flag_off(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv(_FLAG, "false")  # graduated default-true now
+    root = _repo_with_memory(tmp_path, {"a.md": ("# A\nb", 1.0)})
+    with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
+        _svc(root)._render_dev_memory_section(op_id="op-T3")
+    assert not any(
+        "dev-memory injected" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_telemetry_silent_when_no_memory(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv(_FLAG, "true")
+    with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
+        _svc(tmp_path)._render_dev_memory_section(op_id="op-T4")
+    assert not any(
+        "dev-memory injected" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_ast_pin_telemetry_is_counts_only():
+    """The logger.info call inside _render_dev_memory_section must
+    carry only op_id + counts — never the block / joined / per-frag
+    title / summary / uri (operator memory/ may be sensitive)."""
+    tree = ast.parse(_SRC.read_text())
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "_render_dev_memory_section"
+    )
+    info_calls = [
+        c for c in ast.walk(fn)
+        if isinstance(c, ast.Call)
+        and isinstance(c.func, ast.Attribute)
+        and c.func.attr == "info"
+    ]
+    assert info_calls, "expected a logger.info telemetry call"
+    args_src = " ".join(ast.unparse(a) for c in info_calls for a in c.args)
+    for forbidden in ("block", "joined", "summary", "title", "entry"):
+        assert forbidden not in args_src, (
+            "telemetry must not log fragment body: " + repr(forbidden)
+        )
+    assert "op_id" in args_src and "len(entries)" in args_src

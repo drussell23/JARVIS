@@ -277,7 +277,10 @@ def crawl_rust_subsystems(repo_root: Path) -> List[SnapshotFragment]:
     if not search_root.is_dir():
         return []
 
-    _SKIP = ("/target/", "/.git/", "/worktrees/", "/node_modules/")
+    _SKIP = (
+        "/target/", "/.git/", "/worktrees/", "/.worktrees/",
+        "/node_modules/",
+    )
     fragments: List[SnapshotFragment] = []
     seen_names: set[str] = set()
     for cargo in sorted(search_root.rglob("Cargo.toml")):
@@ -300,12 +303,23 @@ def crawl_rust_subsystems(repo_root: Path) -> List[SnapshotFragment]:
         readme = crate_dir / "README.md"
         if readme.is_file():
             try:
+                first_heading = ""
                 for line in readme.read_text(
                     encoding="utf-8", errors="replace",
                 ).splitlines():
-                    if line.strip():
-                        summary = line.strip().lstrip("# ").strip()
-                        break
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith("#"):
+                        # Remember the heading text but keep looking
+                        # for a more descriptive non-heading line.
+                        if not first_heading:
+                            first_heading = s.lstrip("#").strip()
+                        continue
+                    summary = s
+                    break
+                if not summary:
+                    summary = first_heading
             except OSError:
                 pass
         if not summary:

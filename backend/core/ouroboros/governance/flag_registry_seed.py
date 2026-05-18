@@ -1263,16 +1263,17 @@ SEED_SPECS: list = [
     # ====================================================================
     FlagSpec(
         name="JARVIS_STRATEGIC_DEV_MEMORY_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
             "Injects curated repo memory/*.md (recency-ranked, "
             "budget-capped) into the strategic digest as an advisory, "
             "authority-free '## Recent Developer Memory' section. "
-            "Composes roadmap.source_crawlers.crawl_memory."
+            "Composes roadmap.source_crawlers.crawl_memory. GRADUATED "
+            "default-true (P3, soak bt-2026-05-18-185740 PASS)."
         ),
         category=Category.OBSERVABILITY,
         source_file="backend/core/ouroboros/governance/strategic_direction.py",
-        example="false",
+        example="true",
         since="v1.1",
     ),
     FlagSpec(
@@ -1308,17 +1309,19 @@ SEED_SPECS: list = [
     # ====================================================================
     FlagSpec(
         name="JARVIS_STRATEGIC_RUST_MAP_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
             "Injects a dynamically-discovered Rust crate map "
             "(name + path + summary) into the strategic digest as an "
             "advisory, authority-free '## Rust Subsystems' section so "
             "O+V uses Venom tools on .rs. Oracle stays Python-only. "
-            "Composes roadmap.source_crawlers.crawl_rust_subsystems."
+            "Composes roadmap.source_crawlers.crawl_rust_subsystems. "
+            "GRADUATED default-true (P4, soak bt-2026-05-18-194040 "
+            "PASS)."
         ),
         category=Category.OBSERVABILITY,
         source_file="backend/core/ouroboros/governance/strategic_direction.py",
-        example="false",
+        example="true",
         since="v1.1",
     ),
     FlagSpec(

@@ -576,7 +576,15 @@ class CLASSIFYRunner(PhaseRunner):
             _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
         if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
             try:
-                _strat_prompt = _strategic_svc.format_for_prompt()
+                # Parity with orchestrator._run_pipeline's strategic
+                # block: thread op_id so per-op telemetry (incl.
+                # Slice-0 dev-memory / rust-map) is attributable. This
+                # is the CLASSIFY-phase injection site the battle-test
+                # ops actually traverse (soak bt-2026-05-18-181131
+                # fired here, not the orchestrator inline path).
+                _strat_prompt = _strategic_svc.format_for_prompt(
+                    op_id=getattr(ctx, "op_id", None),
+                )
                 if _strat_prompt:
                     _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                     ctx = ctx.with_strategic_memory_context(
@@ -588,9 +596,15 @@ class CLASSIFYRunner(PhaseRunner):
                             or _strategic_svc.digest[:500]
                         ),
                     )
-                    logger.debug(
-                        "[Orchestrator] Strategic direction injected (%d principles)",
+                    # INFO (not DEBUG): §7 — graduation greps must not
+                    # depend on DEBUG capture. Mirrors the orchestrator
+                    # promotion. One line per injecting op (low volume).
+                    logger.info(
+                        "[Orchestrator] Strategic direction injected "
+                        "op=%s principles=%d chars=%d",
+                        getattr(ctx, "op_id", None) or "",
                         len(_strategic_svc.principles),
+                        len(_strat_prompt),
                     )
             except Exception:
                 logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)

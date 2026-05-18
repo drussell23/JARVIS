@@ -70,6 +70,12 @@ class TestSnapshotFragment:
                 fragment_type="unknown_type",
             )
 
+    def test_rust_crate_fragment_type_is_valid(self):
+        # Priority-4: the Rust subsystem crawler emits this type.
+        assert "rust_crate" in SnapshotFragment.VALID_FRAGMENT_TYPES
+        sf = _frag(source_id="rust:jarvis_core", fragment_type="rust_crate")
+        assert sf.fragment_type == "rust_crate"
+
     def test_empty_source_id_raises(self):
         with pytest.raises(ValueError, match="source_id"):
             SnapshotFragment(

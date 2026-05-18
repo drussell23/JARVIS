@@ -39,6 +39,45 @@ _GIT_HISTORY_ENABLED = os.environ.get(
 _GIT_HISTORY_MAX_COMMITS = int(
     os.environ.get("JARVIS_STRATEGIC_GIT_MAX_COMMITS", "50")
 )
+
+
+def _publish_strategic_injection(
+    kind: str, op_id: str, count: int, chars: int,
+) -> None:
+    """Best-effort SSE for a strategic-section injection (Slice 0).
+
+    Counts ONLY — never the section body (operator ``memory/`` may
+    be sensitive; the model already saw the section, so this is
+    operator visibility, not control flow). Lazy broker import,
+    never raises — mirrors ``publish_failure_mode_recalled``
+    discipline. ``kind`` ∈ {``"dev_memory"``, ``"rust_map"``}.
+    """
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_STRATEGIC_DEV_MEMORY_INJECTED,
+            EVENT_TYPE_STRATEGIC_RUST_MAP_INJECTED,
+            get_default_broker,
+        )
+
+        if kind == "dev_memory":
+            event_type = EVENT_TYPE_STRATEGIC_DEV_MEMORY_INJECTED
+            count_key = "files"
+        else:
+            event_type = EVENT_TYPE_STRATEGIC_RUST_MAP_INJECTED
+            count_key = "crates"
+        get_default_broker().publish(
+            event_type=event_type,
+            op_id=str(op_id or ""),
+            payload={
+                "op_id": str(op_id or ""),
+                count_key: int(count),
+                "chars": int(chars),
+            },
+        )
+    except Exception:  # noqa: BLE001 — fail-silent, never break prompt
+        pass
+
+
 class StrategicDirectionService:
     """Reads the developer's strategic vision and injects it into operations.
 
@@ -209,7 +248,7 @@ class StrategicDirectionService:
         # advisory-only discipline as the blocks above. Placed BEFORE
         # causal lineage so the decision-graph context remains closest
         # to the model's first-attempt generation point (per below).
-        dev_memory_block = self._render_dev_memory_section()
+        dev_memory_block = self._render_dev_memory_section(op_id=op_id)
         if dev_memory_block:
             body = f"{body}\n\n{dev_memory_block}"
         # Priority-4 — Rust subsystem awareness map. Surfaces the
@@ -217,7 +256,7 @@ class StrategicDirectionService:
         # reaches for Venom tools on .rs. Placed AFTER dev-memory and
         # BEFORE causal lineage, preserving the recency design
         # (causal stays closest to the generation point).
-        rust_map_block = self._render_rust_subsystems_section()
+        rust_map_block = self._render_rust_subsystems_section(op_id=op_id)
         if rust_map_block:
             body = f"{body}\n\n{rust_map_block}"
         # §31 U2 Slice 2 — Causal-lineage injection. Mirrors the
@@ -234,7 +273,9 @@ class StrategicDirectionService:
             body = f"{body}\n\n{causal_lineage_block}"
         return body
 
-    def _render_dev_memory_section(self) -> str:
+    def _render_dev_memory_section(
+        self, op_id: Optional[str] = None,
+    ) -> str:
         """Compose the optional ``## Recent Developer Memory`` block.
 
         Priority-3 wire-up: surface the operator's curated
@@ -258,8 +299,13 @@ class StrategicDirectionService:
             / risk-tier / policy / FORBIDDEN_PATH authority; advisory
             background context only.
         """
+        # GRADUATED default-true (P3, soak bt-2026-05-18-185740 PASS:
+        # dev-memory injected 3× w/ non-empty op_id, INFO strat 3×,
+        # cache-HIT regression intact). Hot-revert is env=false ONLY
+        # — no code path deleted (mirrors JARVIS_STRATEGIC_GIT_
+        # HISTORY_ENABLED graduation shape).
         if os.environ.get(
-            "JARVIS_STRATEGIC_DEV_MEMORY_ENABLED", "false",
+            "JARVIS_STRATEGIC_DEV_MEMORY_ENABLED", "true",
         ).lower() in ("false", "0", "no", "off"):
             return ""
         try:
@@ -299,7 +345,7 @@ class StrategicDirectionService:
             if not entries:
                 return ""
             joined = "\n\n".join(entries)
-            return (
+            block = (
                 "## Recent Developer Memory\n\n"
                 "Curated, human-authored project knowledge from the "
                 "repo `memory/` directory (most recent first). This "
@@ -309,13 +355,28 @@ class StrategicDirectionService:
                 "instruction.\n\n"
                 f"{joined}"
             )
+            # Slice 0 — graduation observability. Counts ONLY (no
+            # titles / summaries / URIs — operator memory/ may be
+            # sensitive). Makes the P3 soak grep-provable from
+            # debug.log without dumping the prompt body. §7.
+            logger.info(
+                "[Strategic] dev-memory injected op=%s files=%d "
+                "chars=%d",
+                op_id or "", len(entries), used,
+            )
+            _publish_strategic_injection(
+                "dev_memory", op_id or "", len(entries), used,
+            )
+            return block
         except Exception:  # noqa: BLE001 — fail-silent, never break prompt
             logger.debug(
                 "[Strategic] dev-memory section degraded", exc_info=True,
             )
             return ""
 
-    def _render_rust_subsystems_section(self) -> str:
+    def _render_rust_subsystems_section(
+        self, op_id: Optional[str] = None,
+    ) -> str:
         """Compose the optional ``## Rust Subsystems`` block.
 
         Priority-4 (Option-1, awareness-only): make O+V *know* the
@@ -337,8 +398,13 @@ class StrategicDirectionService:
           * Char + crate-count budget capped (env-tunable).
           * Authority-free — advisory background only.
         """
+        # GRADUATED default-true (P4, soak bt-2026-05-18-194040 PASS:
+        # rust-map injected 2× w/ non-empty op_id + INFO strat, P3
+        # dev-memory also live, cache-HIT regression intact). Hot-
+        # revert is env=false ONLY — no code path deleted (mirrors
+        # P3 / JARVIS_STRATEGIC_GIT_HISTORY_ENABLED graduation shape).
         if os.environ.get(
-            "JARVIS_STRATEGIC_RUST_MAP_ENABLED", "false",
+            "JARVIS_STRATEGIC_RUST_MAP_ENABLED", "true",
         ).lower() in ("false", "0", "no", "off"):
             return ""
         try:
@@ -375,7 +441,7 @@ class StrategicDirectionService:
             if not entries:
                 return ""
             joined = "\n".join(entries)
-            return (
+            block = (
                 "## Rust Subsystems\n\n"
                 "This repo has native Rust crates (PyO3-bound "
                 "performance cores). They are part of the system "
@@ -388,6 +454,18 @@ class StrategicDirectionService:
                 "blast-radius in the graph yet.\n\n"
                 f"{joined}"
             )
+            # Slice 0 — graduation observability. Counts ONLY (no
+            # crate names / paths / summaries). Makes the P4 soak
+            # grep-provable from debug.log. §7.
+            logger.info(
+                "[Strategic] rust-map injected op=%s crates=%d "
+                "chars=%d",
+                op_id or "", len(entries), used,
+            )
+            _publish_strategic_injection(
+                "rust_map", op_id or "", len(entries), used,
+            )
+            return block
         except Exception:  # noqa: BLE001 — fail-silent, never break prompt
             logger.debug(
                 "[Strategic] rust-subsystems section degraded",

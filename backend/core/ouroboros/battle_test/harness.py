@@ -5427,36 +5427,18 @@ class BattleTestHarness:
     def _probe_process_tree_rss_mb() -> Optional[float]:
         """Sum RSS of THIS process + all descendants, in MB.
 
-        The soak forks worktrees / subprocess test runs, so a leak
-        lives in the *tree*, not just self. Probe cascade (the spirit
-        of memory_pressure_gate's psutil→stdlib fallback, but
-        PROCESS-scoped rather than system-scoped — that scope flip is
-        the whole point):
-          1. psutil: self.rss + Σ children(recursive).rss
-          2. resource.getrusage(SELF).ru_maxrss self-only high-water
-             (Darwin reports bytes, Linux KiB)
-        Returns None only if every probe fails (treated as transient).
+        P5 Arc C Slice 5a: the implementation moved verbatim to
+        ``governance.process_tree_probe.probe_process_tree_rss_mb``
+        (single source of truth shared with MemoryPressureGate — zero
+        duplication). This thin staticmethod is preserved so the two
+        internal callers + the watchdog test monkeypatch surface stay
+        byte-stable; behavior is unchanged.
         """
-        try:
-            import psutil
-            me = psutil.Process()
-            total = me.memory_info().rss
-            for child in me.children(recursive=True):
-                try:
-                    total += child.memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            return total / (1024.0 * 1024.0)
-        except Exception:  # noqa: BLE001 — fall through to stdlib
-            pass
-        try:
-            import resource
-            ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            if sys.platform == "darwin":
-                return ru / (1024.0 * 1024.0)
-            return ru / 1024.0
-        except Exception:  # noqa: BLE001
-            return None
+        from backend.core.ouroboros.governance.process_tree_probe import (
+            probe_process_tree_rss_mb,
+        )
+
+        return probe_process_tree_rss_mb()
 
     async def _checkpoint_oracle_best_effort(self) -> None:
         """Persist the Oracle graph now (composes Arc A symmetry +
