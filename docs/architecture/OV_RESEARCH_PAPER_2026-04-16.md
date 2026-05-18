@@ -1,11 +1,11 @@
 ---
-title: "Ouroboros + Venom: A Governed Architecture for Autonomous Self-Development"
+title: "Ouroboros + Venom (O+V): A Governed Architecture for Autonomous Self-Development"
 subtitle: "The JARVIS Trinity's self-evolving engine — design, implementation, and battle-tested evidence"
 author: "Derek J. Russell — JARVIS Trinity Architect, RSI/AGI Researcher"
 date: "2026-04-16"
 ---
 
-# Ouroboros + Venom: A Governed Architecture for Autonomous Self-Development
+# Ouroboros + Venom (O+V): A Governed Architecture for Autonomous Self-Development
 
 > **Prepared by:** Derek J. Russell
 > **Report date:** 2026-04-16
@@ -5042,7 +5042,7 @@ pandoc docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md \
   -o docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html \
   --from=gfm --to=html5 --standalone \
   --toc --toc-depth=3 \
-  --metadata title="Ouroboros + Venom: A Governed Architecture for Autonomous Self-Development" \
+  --metadata title="Ouroboros + Venom (O+V): A Governed Architecture for Autonomous Self-Development" \
   --css=docs/benchmarks/_report_style.css \
   --embed-resources
 ```
