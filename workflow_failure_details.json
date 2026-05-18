@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26053225214",
-  "branch": "fix/ci/pr-automation-validation-run66626-20260518-181705",
-  "commit_sha": "5f9c0d0",
-  "run_number": 66689,
-  "failed_count": 2,
-  "fix_branch": "fix/ci/pr-automation-validation-run66689-20260518-184408",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #66689)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26053358716",
+  "branch": "fix/ci/pr-automation-validation-run66689-20260518-184408",
+  "commit_sha": "6ed95cf",
+  "run_number": 66718,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run66718-20260518-184701",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #66718)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,54 +14,14 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 48,
-              "content": "2026-05-18T18:42:31.8756682Z RequestError [HttpError]: Requires authentication",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 49,
-              "content": "2026-05-18T18:42:31.8793125Z ##[error]Unhandled error: HttpError: Requires authentication",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 2
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 4,
-              "content": "${warning}",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            }
-          ],
-          "count": 1
-        }
-      ],
-      "suggested_fixes": [
-        "Review the logs above for specific error messages"
-      ],
-      "severity": "high",
-      "category": "permission_error",
-      "similar_failures": []
-    },
-    {
-      "error_patterns": [
-        {
-          "pattern": "ERROR|Error|error",
-          "matches": [
-            {
               "line_number": 30,
-              "content": "2026-05-18T18:42:52.8796834Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-05-18T18:45:36.3775277Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-05-18T18:42:53.4513257Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #66626)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-05-18T18:45:36.8804029Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #66689)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -73,7 +33,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-05-18T18:42:53.5040091Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-05-18T18:45:36.9287201Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -102,5 +62,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-18T18:44:08.751429"
+  "timestamp": "2026-05-18T18:47:01.837898"
 }
