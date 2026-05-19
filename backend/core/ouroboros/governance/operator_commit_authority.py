@@ -136,6 +136,17 @@ _DEFAULT_PRESENCE_TTL_S = 900  # 15 min
 _MIN_PRESENCE_TTL_S = 60
 _MAX_PRESENCE_TTL_S = 86_400  # 24h ceiling
 
+# Multi-entry presence store bound. Presence is keyed by
+# (repo_fingerprint, branch) so concurrent legitimate actors
+# (operator on branch X, an autonomous-ish writer on branch Y,
+# a whole-repo "" arming) COEXIST instead of clobbering a single
+# global record — the production-lockout root fix. Bounded so the
+# store can't grow unboundedly; drop-oldest by issued_at.
+_ENV_PRESENCE_MAX_ENTRIES = "JARVIS_COMMIT_PRESENCE_MAX_ENTRIES"
+_DEFAULT_PRESENCE_MAX_ENTRIES = 64
+_MIN_PRESENCE_MAX_ENTRIES = 1
+_MAX_PRESENCE_MAX_ENTRIES = 1000
+
 _GIT_OP_TIMEOUT_S = 5.0
 
 _TRUTHY: FrozenSet[str] = frozenset({"1", "true", "yes", "on"})
@@ -552,6 +563,97 @@ def _presence_signed_payload(
     }
 
 
+def _presence_max_entries() -> int:
+    raw = os.environ.get(_ENV_PRESENCE_MAX_ENTRIES, "").strip()
+    try:
+        v = int(raw) if raw else _DEFAULT_PRESENCE_MAX_ENTRIES
+    except (TypeError, ValueError):
+        v = _DEFAULT_PRESENCE_MAX_ENTRIES
+    return max(
+        _MIN_PRESENCE_MAX_ENTRIES,
+        min(_MAX_PRESENCE_MAX_ENTRIES, v),
+    )
+
+
+def _presence_entry_key(repo_fp: str, branch: str) -> str:
+    """Composite key — (repo fingerprint, branch). ``\\x1f`` (unit
+    separator) cannot occur in a fingerprint hex or a git ref, so
+    the join is unambiguous."""
+    return f"{repo_fp}\x1f{str(branch or '').strip()}"
+
+
+def _load_presence_store(target: Path) -> Dict[str, Any]:
+    """Return ``{"entries": {key: {"record":..,"signature":..}}}``.
+
+    Tolerant: a legacy single-record file
+    (``{"record":..,"signature":..}``) is migrated *in memory*
+    into one entry so an in-flight operator presence survives the
+    multi-entry upgrade (read-side back-compat). NEVER raises."""
+    try:
+        if not target.exists():
+            return {"entries": {}}
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"entries": {}}
+    if not isinstance(raw, dict):
+        return {"entries": {}}
+    entries = raw.get("entries")
+    if isinstance(entries, dict):
+        return {"entries": entries}
+    # Legacy single-record shape → synthesize one entry.
+    rec = raw.get("record")
+    sig = raw.get("signature")
+    if isinstance(rec, dict) and isinstance(sig, str):
+        key = _presence_entry_key(
+            str(rec.get("repo_root_sha256", "")),
+            str(rec.get("branch", "")),
+        )
+        return {"entries": {key: {"record": rec, "signature": sig}}}
+    return {"entries": {}}
+
+
+def _presence_entry_valid(
+    entry: Any,
+    *,
+    repo_fp: str,
+    branch: str,
+    now: float,
+    secret: str,
+) -> bool:
+    """Verify one store entry against (repo_fp, branch). A blank
+    record-branch == whole-repo arming (matches any branch). NEVER
+    raises."""
+    if not isinstance(entry, dict):
+        return False
+    record = entry.get("record")
+    signature = entry.get("signature")
+    if not isinstance(record, dict) or not isinstance(signature, str):
+        return False
+    if record.get("kind") != "operator_presence":
+        return False
+    try:
+        issued = float(record.get("issued_at_unix", 0.0))
+        ttl = int(record.get("ttl_s", 0))
+    except (TypeError, ValueError):
+        return False
+    rec_repo = str(record.get("repo_root_sha256", ""))
+    rec_branch = str(record.get("branch", ""))
+    payload = _presence_signed_payload(
+        issued, ttl, rec_repo, rec_branch,
+        str(record.get("operator_label", "")),
+    )
+    if not _verify(payload, signature, secret):
+        return False
+    if ttl <= 0 or now >= issued + float(ttl):
+        return False
+    if rec_repo and rec_repo != repo_fp:
+        return False
+    cur_branch = str(branch or "").strip()
+    if rec_branch and cur_branch and rec_branch != cur_branch:
+        return False
+    return True
+
+
 def mint_operator_presence(
     repo_root: Path,
     branch: str,
@@ -560,10 +662,17 @@ def mint_operator_presence(
     ttl_s: Optional[int] = None,
     now_unix: Optional[float] = None,
 ) -> bool:
-    """Operator-only: write the signed presence marker bound to
-    ``(repo_root, branch)``. Atomic write, 0600 (mirrors
-    :func:`enable_authority`). Bootstraps the per-machine secret on
-    first use. Returns ``True`` on success. NEVER raises."""
+    """Operator-only: ADD/refresh the signed presence entry for
+    ``(repo_root, branch)`` WITHOUT clobbering other entries.
+
+    Production-lockout root fix: presence is a multi-entry store
+    keyed by (repo fingerprint, branch). A branch-bound grant on
+    one branch no longer wipes the operator's whole-repo or
+    other-branch presence (the single-global-last-write-wins
+    defect that produced ``denied_sovereignty`` on the operator's
+    own commit). Expired entries are pruned and the store is
+    drop-oldest bounded on every write. Atomic, 0600. Bootstraps
+    the per-machine secret. NEVER raises."""
     label = str(operator_label or "").strip()
     if not label:
         return False
@@ -581,19 +690,67 @@ def mint_operator_presence(
         else presence_ttl_s()
     )
     eff_ttl = max(_MIN_PRESENCE_TTL_S, min(_MAX_PRESENCE_TTL_S, eff_ttl))
+    norm_branch = str(branch or "").strip()
     payload = _presence_signed_payload(
-        now, eff_ttl, fp, str(branch or "").strip(), label,
+        now, eff_ttl, fp, norm_branch, label,
     )
     signature = _sign(payload, secret)
     if not signature:
         return False
     target = presence_file_path()
     try:
+        store = _load_presence_store(target)
+        entries: Dict[str, Any] = dict(store.get("entries", {}))
+        # Prune expired entries (keeps the store self-cleaning).
+        kept: Dict[str, Any] = {}
+        for k, v in entries.items():
+            try:
+                rec = v.get("record", {}) if isinstance(v, dict) else {}
+                iss = float(rec.get("issued_at_unix", 0.0))
+                t = int(rec.get("ttl_s", 0))
+                if t > 0 and now < iss + float(t):
+                    kept[k] = v
+            except Exception:  # noqa: BLE001
+                continue
+        kept[_presence_entry_key(fp, norm_branch)] = {
+            "record": payload, "signature": signature,
+        }
+        # Drop-oldest hard cap by issued_at.
+        cap = _presence_max_entries()
+        if len(kept) > cap:
+            ordered = sorted(
+                kept.items(),
+                key=lambda kv: float(
+                    kv[1].get("record", {}).get(
+                        "issued_at_unix", 0.0,
+                    )
+                ),
+            )
+            kept = dict(ordered[-cap:])
+        # Transitional dual-format bridge: pre-multi-entry code
+        # reads ``raw["record"]`` (single-record shape). Until all
+        # checkouts realign, ALSO emit a signed top-level
+        # whole-repo (blank-branch) record so old readers on ANY
+        # branch stay satisfied — it is HMAC-signed (unforgeable),
+        # and new readers ignore it (entries-first in
+        # _load_presence_store). Remove once realignment completes.
+        legacy_payload = _presence_signed_payload(
+            now, eff_ttl, fp, "", label,
+        )
+        legacy_sig = _sign(legacy_payload, secret)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(
             json.dumps(
-                {"record": payload, "signature": signature},
+                {
+                    "schema_version": (
+                        OPERATOR_COMMIT_AUTHORITY_SCHEMA_VERSION
+                    ),
+                    "entries": kept,
+                    # Old-reader compatibility bridge (signed).
+                    "record": legacy_payload,
+                    "signature": legacy_sig,
+                },
                 sort_keys=True,
             ),
             encoding="utf-8",
@@ -620,59 +777,46 @@ def valid_operator_presence(
     *,
     now_unix: Optional[float] = None,
 ) -> bool:
-    """Return ``True`` iff a valid, HMAC-signed, unexpired
-    presence marker exists for ``(repo_root, branch)``. NEVER
-    raises. Missing file / missing secret / malformed JSON / bad
-    signature / expired TTL / repo mismatch / branch mismatch all
-    → ``False`` (fail closed — the commit then resolves to
-    AUTONOMOUS and the sovereignty gate decides)."""
+    """Return ``True`` iff a valid, HMAC-signed, unexpired presence
+    entry exists for the committing ``(repo_root, branch)`` — the
+    exact-branch entry OR a whole-repo (blank-branch) entry.
+    Multi-entry: other branches'/repos' entries are independent
+    and never cause a false negative here. Fail-closed on missing
+    file / secret / malformed JSON / bad signature / expiry / repo
+    mismatch. NEVER raises."""
     target = presence_file_path()
-    try:
-        if not target.exists():
-            return False
-        raw = json.loads(target.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return False
-    if not isinstance(raw, dict):
-        return False
-    record = raw.get("record")
-    signature = raw.get("signature")
-    if not isinstance(record, dict) or not isinstance(signature, str):
-        return False
-    if record.get("kind") != "operator_presence":
-        return False
     secret = _read_secret()
     if not secret:
-        return False
-    try:
-        issued = float(record.get("issued_at_unix", 0.0))
-        ttl = int(record.get("ttl_s", 0))
-    except (TypeError, ValueError):
-        return False
-    rec_repo = str(record.get("repo_root_sha256", ""))
-    rec_branch = str(record.get("branch", ""))
-    payload = _presence_signed_payload(
-        issued, ttl, rec_repo, rec_branch,
-        str(record.get("operator_label", "")),
-    )
-    if not _verify(payload, signature, secret):
-        return False
-    now = float(now_unix) if now_unix is not None else time.time()
-    if ttl <= 0 or now >= issued + float(ttl):
         return False
     try:
         fp = repo_root_fingerprint(Path(repo_root))
     except Exception:  # noqa: BLE001
         return False
-    if rec_repo and rec_repo != fp:
+    now = float(now_unix) if now_unix is not None else time.time()
+    store = _load_presence_store(target)
+    entries = store.get("entries", {})
+    if not isinstance(entries, dict):
         return False
-    cur_branch = str(branch or "").strip()
-    # An empty marker branch == operator armed the whole repo this
-    # session (branch-agnostic presence). A non-empty marker branch
-    # must match the committing branch.
-    if rec_branch and cur_branch and rec_branch != cur_branch:
-        return False
-    return True
+    norm_branch = str(branch or "").strip()
+    # Candidate keys: exact (repo, branch) + whole-repo (repo, "").
+    for key in (
+        _presence_entry_key(fp, norm_branch),
+        _presence_entry_key(fp, ""),
+    ):
+        if key in entries and _presence_entry_valid(
+            entries[key],
+            repo_fp=fp, branch=norm_branch, now=now, secret=secret,
+        ):
+            return True
+    # Defensive: also scan any entry (covers legacy-migrated single
+    # record whose synthesized key used a possibly-empty repo fp).
+    for entry in entries.values():
+        if _presence_entry_valid(
+            entry,
+            repo_fp=fp, branch=norm_branch, now=now, secret=secret,
+        ):
+            return True
+    return False
 
 
 # ===========================================================================

@@ -112,7 +112,11 @@ def test_presence_tamper_invalidates():
     pf = oca.presence_file_path()
     import json
     blob = json.loads(pf.read_text())
-    blob["record"]["operator_label"] = "attacker"  # forge a field
+    # Multi-entry store: forge a field inside an entry's record —
+    # the recomputed-from-trusted-fields HMAC must reject it.
+    entries = blob["entries"]
+    k = next(iter(entries))
+    entries[k]["record"]["operator_label"] = "attacker"
     pf.write_text(json.dumps(blob))
     assert oca.valid_operator_presence(REPO, "br", now_unix=1100.0) is False
 
