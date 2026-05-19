@@ -1,3 +1,4 @@
+# Testing for the IRON GATE - Commit blocked refusal mode revealed a major pain point: the human operator's commit path was completely separate from the autonomous commit path, with its own untracked bash hook and shell env var. The IDE GUI (Cursor Source Control) inherits no shell env, so it was always blocked by the token gate. OCA unifies the human and autonomous paths under one substrate, one verifier, and one verdict taxonomy — closing the seam and making the IDE GUI work without a hack.
 """
 Operator Commit Authority (OCA) — unified human + autonomous commit gate
 =========================================================================
