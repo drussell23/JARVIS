@@ -133,6 +133,131 @@ EVAL_TIMEOUT_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_EVAL_TIMEOUT_S"
 _DEFAULT_TIMEOUT_S: float = 1800.0
 
 
+# Task #21 — Dynamic Timeout Coherence. The harness publishes its
+# absolute monotonic WallClockWatchdog deadline here at arm time.
+# Reading it (NOT importing battle_test) lets the inner eval timeout
+# structurally end + emit TERMINAL_TIMEOUT BEFORE the outer bounded-
+# shutdown — so a verdict ALWAYS lands (A″ proved the 1800==1800
+# inversion otherwise yields zero verdicts). Absent ⇒ no clamp
+# (byte-identical legacy; non-battle-test callers unaffected).
+WALL_DEADLINE_ENV_VAR: str = "OUROBOROS_BATTLE_WALL_DEADLINE_MONOTONIC"
+_AUTOSCORE_GRACE_ENV_VAR: str = (
+    "JARVIS_SWE_BENCH_PRO_AUTOSCORE_SHUTDOWN_GRACE_S"
+)
+_DRAIN_BUFFER_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_BUFFER_S"
+# Task #22 — drain must cover the REAL post-eval teardown chain, not
+# a 2× heuristic. Env-string PARITY with
+# ``shutdown_watchdog.default_deadline_s`` (deliberately NOT imported
+# — preserves the "evaluator never imports battle_test" AST pin; the
+# parity is documented + pinned by a regression test instead).
+_SHUTDOWN_DEADLINE_ENV_VAR: str = "JARVIS_BATTLE_SHUTDOWN_DEADLINE_S"
+_DRAIN_MARGIN_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_MARGIN_S"
+_DEFAULT_SHUTDOWN_DEADLINE_S: float = 30.0   # parity w/ watchdog default
+_DEFAULT_AUTOSCORE_GRACE_S: float = 30.0
+_DEFAULT_DRAIN_MARGIN_S: float = 15.0
+# Never return <=0: a near-expired session still does the smallest
+# bounded wait so wait_for raises TERMINAL_TIMEOUT (a verdict) fast,
+# rather than a 0/negative timeout that would crash asyncio.wait_for.
+_MIN_EVAL_FLOOR_S: float = 10.0
+
+
+def _env_pos_float(name: str, default: float) -> float:
+    """Read a positive float env; fall back to ``default`` on
+    unset / invalid / non-positive. NEVER raises."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        return v if v > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _eval_drain_buffer_s() -> float:
+    """Wall time the session needs AFTER the inner eval wait so the
+    verdict ALWAYS flushes before the process exits.
+
+    Task #22 root fix — composes the REAL post-eval teardown chain
+    (deep-run bt-2026-05-19-011003 proved the prior 2×autoscore-grace
+    =60s was undersized: bounded-shutdown arms its 30s deadline IN
+    PARALLEL with the autoscore drain, so under a heavy 950k-node
+    session ``os._exit(75)`` fired before ``harness_inject`` logged
+    the verdict)::
+
+        drain = shutdown_deadline + autoscore_grace + margin
+
+    - ``shutdown_deadline`` = ``JARVIS_BATTLE_SHUTDOWN_DEADLINE_S``
+      (env-string parity with ``shutdown_watchdog.default_deadline_s``
+      — documented + test-pinned, NOT imported).
+    - ``autoscore_grace`` = ``JARVIS_SWE_BENCH_PRO_AUTOSCORE_SHUTDOWN_
+      GRACE_S`` (the existing drain knob — single source of truth).
+    - ``margin`` = ``JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_MARGIN_S`` (slack
+      for GC / asyncio teardown / log flush).
+
+    Explicit ``JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_BUFFER_S`` still wins
+    (operator override). No hardcoded magic — every term is an
+    env-composed, individually-tunable structural component. NEVER
+    raises.
+    """
+    explicit = os.environ.get(_DRAIN_BUFFER_ENV_VAR, "").strip()
+    if explicit:
+        try:
+            v = float(explicit)
+            if v > 0:
+                return v
+        except (ValueError, TypeError):
+            pass
+    shutdown_deadline = _env_pos_float(
+        _SHUTDOWN_DEADLINE_ENV_VAR, _DEFAULT_SHUTDOWN_DEADLINE_S,
+    )
+    autoscore_grace = _env_pos_float(
+        _AUTOSCORE_GRACE_ENV_VAR, _DEFAULT_AUTOSCORE_GRACE_S,
+    )
+    margin = _env_pos_float(
+        _DRAIN_MARGIN_ENV_VAR, _DEFAULT_DRAIN_MARGIN_S,
+    )
+    return shutdown_deadline + autoscore_grace + margin
+
+
+def _apply_wall_coherence(configured: float) -> float:
+    """Clamp ``configured`` below the published session wall deadline.
+
+    ``eval = min(configured, wall_remaining - drain_buffer)``. No
+    deadline env ⇒ return ``configured`` unchanged (byte-identical
+    legacy). Coherent budget <=0 ⇒ ``_MIN_EVAL_FLOOR_S`` (still a
+    fast bounded wait → TERMINAL_TIMEOUT, never 0/negative). NEVER
+    raises; NEVER imports battle_test (env-var seam only).
+    """
+    raw = os.environ.get(WALL_DEADLINE_ENV_VAR, "").strip()
+    if not raw:
+        return configured
+    try:
+        deadline = float(raw)
+    except (ValueError, TypeError):
+        return configured
+    remaining = deadline - time.monotonic()
+    drain = _eval_drain_buffer_s()
+    coherent = remaining - drain
+    if coherent <= 0:
+        logger.info(
+            "[SWEBenchPro] wall budget exhausted (remaining=%.1fs "
+            "drain=%.1fs) — eval floored to %.1fs so wait_for still "
+            "emits TERMINAL_TIMEOUT (Task #21)",
+            remaining, drain, _MIN_EVAL_FLOOR_S,
+        )
+        return _MIN_EVAL_FLOOR_S
+    clamped = min(configured, coherent)
+    if clamped < configured:
+        logger.info(
+            "[SWEBenchPro] eval timeout clamped %.1fs -> %.1fs "
+            "(wall_remaining=%.1fs drain_buffer=%.1fs) — Dynamic "
+            "Timeout Coherence (Task #21)",
+            configured, clamped, remaining, drain,
+        )
+    return clamped
+
+
 # Terminal OperationState values that translate to "the model
 # produced a working fix" (RESOLVED) vs "the model failed" (UNRESOLVED).
 # Mirrors B.2.0.5's TERMINAL_OPERATION_STATES split. Closed taxonomy
@@ -231,25 +356,33 @@ def _resolve_timeout_s(explicit: Optional[float]) -> float:
     """Resolve the bounded-wait timeout.
 
     Precedence: explicit argument > env var > default. Invalid
-    env values fall back to the default with a WARN log.
-    NEVER raises.
+    env values fall back to the default with a WARN log. The
+    resolved value is then passed through Task #21 Dynamic Timeout
+    Coherence (:func:`_apply_wall_coherence`) so the inner wait
+    ALWAYS ends + emits TERMINAL_TIMEOUT before the outer bounded-
+    shutdown when a session wall deadline is published (no-op
+    otherwise — byte-identical legacy). NEVER raises.
     """
     if explicit is not None and explicit > 0:
-        return float(explicit)
-    raw = os.environ.get(EVAL_TIMEOUT_ENV_VAR, "").strip()
-    if not raw:
-        return _DEFAULT_TIMEOUT_S
-    try:
-        value = float(raw)
-        if value <= 0:
-            raise ValueError("must be > 0")
-        return value
-    except (ValueError, TypeError):
-        logger.warning(
-            "[SWEBenchPro] invalid %s=%r — using default %.1fs",
-            EVAL_TIMEOUT_ENV_VAR, raw, _DEFAULT_TIMEOUT_S,
-        )
-        return _DEFAULT_TIMEOUT_S
+        configured = float(explicit)
+    else:
+        raw = os.environ.get(EVAL_TIMEOUT_ENV_VAR, "").strip()
+        if not raw:
+            configured = _DEFAULT_TIMEOUT_S
+        else:
+            try:
+                value = float(raw)
+                if value <= 0:
+                    raise ValueError("must be > 0")
+                configured = value
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[SWEBenchPro] invalid %s=%r — using default "
+                    "%.1fs",
+                    EVAL_TIMEOUT_ENV_VAR, raw, _DEFAULT_TIMEOUT_S,
+                )
+                configured = _DEFAULT_TIMEOUT_S
+    return _apply_wall_coherence(configured)
 
 
 # ===========================================================================
@@ -616,6 +749,47 @@ def register_flags(registry: Any) -> int:
             ),
             example=str(int(_DEFAULT_TIMEOUT_S)),
             since="v3.7 Phase 2 Phase B.2.2 (2026-05-12)",
+        ),
+        FlagSpec(
+            name=_DRAIN_BUFFER_ENV_VAR,
+            type=FlagType.INT,
+            default=0,
+            description=(
+                "Explicit override (seconds) for the post-eval drain "
+                "buffer Task #21/#22 Dynamic Timeout Coherence "
+                "subtracts from wall-remaining. 0/unset ⇒ COMPOSED = "
+                "JARVIS_BATTLE_SHUTDOWN_DEADLINE_S + "
+                "JARVIS_SWE_BENCH_PRO_AUTOSCORE_SHUTDOWN_GRACE_S + "
+                "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_MARGIN_S. >0 wins "
+                "verbatim. Seeded by Task #22 (was env-only since #21)."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/swe_bench_pro/"
+                "evaluator.py"
+            ),
+            example="0",
+            since="v3.7 Task #21/#22 (2026-05-18)",
+        ),
+        FlagSpec(
+            name=_DRAIN_MARGIN_ENV_VAR,
+            type=FlagType.INT,
+            default=int(_DEFAULT_DRAIN_MARGIN_S),
+            description=(
+                "Slack (seconds) added to the composed drain buffer "
+                "for GC / asyncio teardown / log flush so the "
+                "autoscore verdict ALWAYS flushes before os._exit. "
+                "Task #22 root fix — deep-run bt-2026-05-19-011003 "
+                "proved the prior 2×autoscore-grace heuristic "
+                "undersized vs real bounded-shutdown latency."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/swe_bench_pro/"
+                "evaluator.py"
+            ),
+            example=str(int(_DEFAULT_DRAIN_MARGIN_S)),
+            since="v3.7 Task #22 (2026-05-18)",
         ),
     ]
 

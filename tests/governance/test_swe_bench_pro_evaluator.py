@@ -735,9 +735,15 @@ def test_register_flags_seeds_timeout() -> None:
             captured.append(spec)
 
     count = register_flags(_Capturer())
-    assert count == 1
+    # Task #22: register_flags now also seeds the drain-buffer +
+    # drain-margin knobs (were env-only since #21). EVAL_TIMEOUT
+    # remains the first spec with its 1800 default.
+    assert count == 3
+    names = {s.name for s in captured}
     assert captured[0].name == EVAL_TIMEOUT_ENV_VAR
     assert captured[0].default == 1800
+    assert "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_BUFFER_S" in names
+    assert "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_MARGIN_S" in names
 
 
 def test_register_flags_never_raises_on_capturer_failure() -> None:
