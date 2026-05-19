@@ -118,6 +118,19 @@ def ov_coauthor_line() -> str:
     return _OV_COAUTHOR
 
 
+def _archive_authority_event(kind: str, detail: dict) -> None:
+    """Best-effort append to the OCA observability ring (Slice 3
+    #2). Archive absence/disable is silent (telemetry, never
+    authority). NEVER raises into the commit path."""
+    try:
+        from backend.core.ouroboros.governance import (
+            commit_authority_archive as _arch,
+        )
+        _arch.record(kind=kind, detail=detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
@@ -251,6 +264,73 @@ class AutoCommitter:
             return CommitResult(
                 committed=False,
                 skipped_reason="no_target_files",
+            )
+
+        # OCA Slice 3 #4 — Unified commit-authority gate. The
+        # AutoCommitter IS the autonomous path by definition, so
+        # the channel is the LITERAL "autonomous" — NEVER env,
+        # NEVER resolve_commit_channel (that seam exists only for
+        # the IDE/operator surface; an autonomous committer that
+        # sniffed env could be tricked into an operator channel).
+        # verify_pre_commit(autonomous) internally composes
+        # ledger_sovereignty + the governance hash-cap under ONE
+        # verdict taxonomy (the "unify human + autonomous paths"
+        # principle). The legacy per-concern blocks below remain
+        # as redundant defense — they compose the same substrates
+        # so they agree. Substrate-unavailable → fall through to
+        # the legacy gates (rollback discipline). NEVER raises.
+        try:
+            from backend.core.ouroboros.governance import (
+                operator_commit_authority as _oca,
+            )
+            _root, _branch = _oca.resolve_repo_root_and_branch(
+                self._effective_repo_root()
+            )
+            _verdict = _oca.verify_pre_commit(
+                _oca.CommitAuthorityContext(
+                    channel="autonomous",
+                    repo_root=str(
+                        _root or self._effective_repo_root()
+                    ),
+                    branch=_branch,
+                    staged_files=tuple(target_files),
+                )
+            )
+            _archive_authority_event(
+                "verify_verdict",
+                {
+                    "op_id": op_id, "channel": "autonomous",
+                    "verdict": _verdict.verdict.value,
+                },
+            )
+            if not _verdict.authorized() and (
+                _verdict.verdict
+                is not _oca.CommitAuthorityVerdict.DISABLED
+            ):
+                _reason = {
+                    _oca.CommitAuthorityVerdict.DENIED_SOVEREIGNTY:
+                        "ledger_sovereignty_refused",
+                    _oca.CommitAuthorityVerdict.DENIED_GOVERNANCE_DRIFT:
+                        "governance_manifest_drift",
+                }.get(
+                    _verdict.verdict,
+                    f"oca_denied:{_verdict.verdict.value}",
+                )
+                logger.warning(
+                    "[AutoCommitter] OCA autonomous gate refused "
+                    "commit op=%s verdict=%s — %s",
+                    op_id, _verdict.verdict.value,
+                    _verdict.detail[:200],
+                )
+                return CommitResult(
+                    committed=False,
+                    skipped_reason=_reason,
+                    error=_verdict.detail[:512],
+                )
+        except Exception as _oca_exc:  # noqa: BLE001 — fall through
+            logger.debug(
+                "[AutoCommitter] OCA autonomous gate degraded "
+                "(legacy gates still apply): %s", _oca_exc,
             )
 
         # P1 Slice 2 — Ledger Sovereignty structural boundary.

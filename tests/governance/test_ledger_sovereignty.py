@@ -52,8 +52,18 @@ _MASTER_FLAG = "JARVIS_LEDGER_SOVEREIGNTY_ENABLED"
 
 
 @pytest.fixture(autouse=True)
-def _isolate(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _isolate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> Iterator[None]:
     monkeypatch.delenv(_MASTER_FLAG, raising=False)
+    # master_enabled() is now `env OR persistent_master signed
+    # record`. These tests assert the ENV-only contract, so the
+    # persistent input must be isolated (point its dir at an empty
+    # tmp path → no record → env-only behavior). The persistent
+    # path has its own suite: test_persistent_master.py.
+    monkeypatch.setenv(
+        "JARVIS_PERSISTENT_MASTER_DIR", str(tmp_path / "pm_iso"),
+    )
     yield
 
 
