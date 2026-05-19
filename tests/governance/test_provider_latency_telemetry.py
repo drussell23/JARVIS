@@ -191,13 +191,15 @@ def test_emit_never_raises_even_if_sinks_explode(monkeypatch, tmp_path):
 # FlagRegistry seeds
 # --------------------------------------------------------------------------
 
-def test_register_flags_seeds_three(monkeypatch):
+def test_register_flags_seeds_predictive_resilience_specs(monkeypatch):
     from backend.core.ouroboros.governance import providers as P
     from backend.core.ouroboros.governance.flag_registry import FlagRegistry
 
     reg = FlagRegistry()
     n = P.register_flags(reg)
-    assert n == 3
+    # 3 Slice-0 (telemetry enable / jsonl path / window) + 2 Slice-1
+    # (forecast enable / forecast alpha).
+    assert n == 5
     # Master flag must default FALSE (Slice 0 ships dark).
     spec = reg.get(_ENABLE) if hasattr(reg, "get") else None
     if spec is not None:

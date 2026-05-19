@@ -264,6 +264,38 @@ def _provider_latency_window_n() -> int:
         return 200
 
 
+def provider_latency_forecast_enabled() -> bool:
+    """``JARVIS_PROVIDER_LATENCY_FORECAST_ENABLED`` (Slice 1 master,
+    default ``false``). Re-read at call time. SHADOW-ONLY even when
+    true — the forecaster logs predicted-vs-actual + MAE and NEVER
+    enforces a timeout or triggers shedding (that is Slice 2/3)."""
+    raw = os.environ.get(
+        "JARVIS_PROVIDER_LATENCY_FORECAST_ENABLED", "false",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _forecast_alpha() -> float:
+    """``JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA`` (default 0.2).
+
+    EMA smoothing factor for the streaming-moment regression.
+    Bounded to ``(0, 1]`` — closer to 1 = more reactive to recent
+    latency, closer to 0 = smoother. NOT a hardcoded model
+    parameter: it is the single recency knob; the slope/intercept
+    are DERIVED from the data, never set."""
+    try:
+        a = float(
+            os.environ.get(
+                "JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA", "0.2",
+            ).strip()
+        )
+    except (ValueError, TypeError):
+        return 0.2
+    if not (0.0 < a <= 1.0):
+        return 0.2
+    return a
+
+
 @dataclass(frozen=True)
 class TtftSample:
     """One TTFT measurement. Frozen + hashable for safe inter-thread
@@ -768,6 +800,237 @@ class TtftObserver:
             return len(buf) if buf else 0
 
 
+# ---------------------------------------------------------------------------
+# Slice 1 — TTFT Forecaster (SHADOW MODE)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ForecastResult:
+    """One shadow forecast outcome (predicted vs actual). Frozen.
+
+    ``predicted_ms`` is ``None`` when the per-key model has fewer
+    than the non-degenerate-variance floor of samples (the math
+    refuses to extrapolate a slope it cannot yet estimate — NOT a
+    hardcoded gate, the definition of regression validity)."""
+    provider: str
+    route: str
+    input_tokens: int
+    predicted_ms: Optional[float]
+    actual_ms: int
+    abs_err_ms: Optional[float]
+    mae_ms: Optional[float]
+    n: int
+
+
+class _RegState:
+    """EMA-weighted streaming-moment accumulator for ONE
+    ``(provider, route)`` key. Holds recency-weighted moments of
+    ``x = input_tokens`` and ``y = ttft_ms`` so an ordinary
+    least-squares line can be read off WITHOUT storing samples:
+
+        slope     = (E[xy] − E[x]E[y]) / (E[x²] − E[x]²)
+        intercept =  E[y] − slope · E[x]
+
+    All four moments decay by ``alpha`` each observation, so the
+    fit tracks reality and forgets stale regimes. No coefficient is
+    ever hardcoded — slope/intercept are pure functions of observed
+    data."""
+
+    __slots__ = ("ex", "ey", "exx", "exy", "n", "_mae_ema", "_mae_n")
+
+    def __init__(self) -> None:
+        self.ex = 0.0
+        self.ey = 0.0
+        self.exx = 0.0
+        self.exy = 0.0
+        self.n = 0
+        self._mae_ema: Optional[float] = None
+        self._mae_n = 0
+
+    def predict(self, x: float) -> Optional[float]:
+        """OLS prediction from current EMA moments, or ``None`` if
+        the slope is not yet estimable (need ≥ the variance floor
+        AND non-degenerate x-variance)."""
+        if self.n < _MIN_N_FOR_NONDEGENERATE_VARIANCE:
+            return None
+        var_x = self.exx - self.ex * self.ex
+        if var_x <= 1e-9:
+            # All observed payloads identical so far — slope
+            # undefined; fall back to the mean response (still a
+            # data-derived prediction, not a constant).
+            return self.ey
+        slope = (self.exy - self.ex * self.ey) / var_x
+        intercept = self.ey - slope * self.ex
+        pred = intercept + slope * x
+        return pred if pred >= 0.0 else 0.0
+
+    def update(self, x: float, y: float, alpha: float) -> None:
+        """Fold one observation into the EMA moments AFTER it has
+        been scored (prequential / predict-then-update)."""
+        if self.n == 0:
+            self.ex, self.ey = x, y
+            self.exx, self.exy = x * x, x * y
+        else:
+            self.ex += alpha * (x - self.ex)
+            self.ey += alpha * (y - self.ey)
+            self.exx += alpha * (x * x - self.exx)
+            self.exy += alpha * (x * y - self.exy)
+        self.n += 1
+
+    def record_error(self, abs_err: float, alpha: float) -> None:
+        if self._mae_ema is None:
+            self._mae_ema = abs_err
+        else:
+            self._mae_ema += alpha * (abs_err - self._mae_ema)
+        self._mae_n += 1
+
+    @property
+    def mae(self) -> Optional[float]:
+        return self._mae_ema
+
+
+class TtftForecaster:
+    """Predictive TTFT model — SHADOW ONLY.
+
+    Composes the existing latency stream: it does NOT store its own
+    samples, it folds each observed ``ProviderLatencySample`` into a
+    tiny per-key :class:`_RegState`. Public surface:
+
+      * ``forecast(provider, route, input_tokens)`` → predicted ms
+        (or ``None`` before the model is estimable);
+      * ``observe(sample)`` → prequential step: score the standing
+        prediction against the just-arrived actual, accumulate MAE,
+        THEN update the model (honest out-of-sample evaluation —
+        the model never sees a sample before predicting it);
+      * ``warm_start_from_jsonl(path)`` → replay the durable
+        Slice-0 dataset so the forecaster is not cold on boot.
+
+    STRICT SHADOW CONTRACT: this class only computes + the caller
+    only logs. It NEVER returns a timeout, never mutates a client,
+    never triggers shedding. Enforcement is Slice 2/3. NEVER raises
+    out of any public method."""
+
+    def __init__(self) -> None:
+        self._states: Dict[str, _RegState] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(provider: str, route: str) -> str:
+        return f"{(provider or '').strip()}|{(route or '').strip()}"
+
+    def forecast(
+        self, provider: str, route: str, input_tokens: int,
+    ) -> Optional[float]:
+        """Current-model TTFT prediction in ms. ``None`` until the
+        per-key regression is estimable. NEVER raises."""
+        try:
+            with self._lock:
+                st = self._states.get(self._key(provider, route))
+                if st is None:
+                    return None
+                return st.predict(float(max(0, int(input_tokens))))
+        except Exception:  # noqa: BLE001 — forecaster never raises
+            return None
+
+    def observe(self, sample: "ProviderLatencySample") -> ForecastResult:
+        """Prequential step. Predict with the STANDING model, score
+        vs ``sample.ttft_ms``, accumulate MAE, then fold the sample
+        in. Only meaningful for streaming successes (ttft_ms ≥ 0 and
+        input_tokens > 0) — degenerate timeout rows (ttft=-1) are
+        recorded as observations of nothing and skipped from the
+        regression so they cannot poison the slope. NEVER raises."""
+        try:
+            if not isinstance(sample, ProviderLatencySample):
+                return ForecastResult("", "", 0, None, 0, None, None, 0)
+            prov = str(sample.provider or "")
+            route = str(sample.route or "")
+            x = float(max(0, int(sample.input_tokens)))
+            y = int(sample.ttft_ms)
+            key = self._key(prov, route)
+            alpha = _forecast_alpha()
+            with self._lock:
+                st = self._states.get(key)
+                if st is None:
+                    st = _RegState()
+                    self._states[key] = st
+                # Skip non-fittable rows (timeout/cancel: ttft=-1, or
+                # zero-token) — predicting/fitting on them would
+                # corrupt the EMA. Still returns a result row so the
+                # caller can log the skip transparently.
+                if y < 0 or x <= 0.0 or sample.outcome != "success":
+                    return ForecastResult(
+                        prov, route, int(x), None, max(0, y),
+                        None, st.mae, st.n,
+                    )
+                pred = st.predict(x)
+                abs_err = abs(pred - y) if pred is not None else None
+                if abs_err is not None:
+                    st.record_error(abs_err, alpha)
+                st.update(x, float(y), alpha)
+                return ForecastResult(
+                    prov, route, int(x), pred, y, abs_err,
+                    st.mae, st.n,
+                )
+        except Exception:  # noqa: BLE001 — forecaster never raises
+            return ForecastResult("", "", 0, None, 0, None, None, 0)
+
+    def warm_start_from_jsonl(self, path: Path) -> int:
+        """Replay the durable Slice-0 JSONL into the model so it is
+        not cold on boot. Idempotent-safe to call once. Returns the
+        number of rows folded. NEVER raises (bad lines skipped)."""
+        n = 0
+        try:
+            p = Path(path)
+            if not p.exists():
+                return 0
+            for line in p.read_text(
+                encoding="utf-8", errors="replace",
+            ).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(r, Mapping):
+                    continue
+                try:
+                    self.observe(ProviderLatencySample(
+                        provider=str(r.get("provider", "")),
+                        route=str(r.get("route", "")),
+                        op_id=str(r.get("op_id", "")),
+                        input_tokens=int(r.get("input_tokens", 0) or 0),
+                        ttft_ms=int(r.get("ttft_ms", -1)),
+                        total_ms=int(r.get("total_ms", 0) or 0),
+                        outcome=str(r.get("outcome", "")),
+                        sample_unix=float(r.get("sample_unix", 0.0) or 0.0),
+                    ))
+                    n += 1
+                except (ValueError, TypeError):
+                    continue
+        except Exception:  # noqa: BLE001
+            return n
+        return n
+
+    def mae(self, provider: str, route: str) -> Optional[float]:
+        try:
+            with self._lock:
+                st = self._states.get(self._key(provider, route))
+                return st.mae if st is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def sample_n(self, provider: str, route: str) -> int:
+        try:
+            with self._lock:
+                st = self._states.get(self._key(provider, route))
+                return st.n if st is not None else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "PROVIDER_LATENCY_SCHEMA_VERSION",
@@ -775,6 +1038,9 @@ __all__ = [
     "TtftSample",
     "TtftStats",
     "ProviderLatencySample",
+    "TtftForecaster",
+    "ForecastResult",
+    "provider_latency_forecast_enabled",
     "tracking_enabled",
     "ttft_demotion_enabled",
 ]

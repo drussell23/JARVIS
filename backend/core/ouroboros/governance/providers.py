@@ -331,6 +331,45 @@ def _emit_provider_latency(
             )
         except Exception:  # noqa: BLE001 — telemetry never perturbs
             pass
+
+        # Sink 3 — Slice 1 SHADOW forecast. STRICT SHADOW: predict
+        # with the standing model, score vs the actual just observed,
+        # log predicted/actual/MAE. It returns a timeout to NOBODY,
+        # mutates NO client, triggers NO shedding (that is Slice
+        # 2/3). Gated by the Slice-1 master flag — get_ttft_forecaster
+        # returns None when off, so this is a strict no-op until
+        # explicitly enabled. NEVER perturbs generation.
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                get_ttft_forecaster,
+            )
+
+            _fc = get_ttft_forecaster()
+            if _fc is not None:
+                _r = _fc.observe(sample)
+                _pred = (
+                    f"{_r.predicted_ms:.1f}"
+                    if _r.predicted_ms is not None else "n/a"
+                )
+                _err = (
+                    f"{_r.abs_err_ms:.1f}"
+                    if _r.abs_err_ms is not None else "n/a"
+                )
+                _mae = (
+                    f"{_r.mae_ms:.1f}"
+                    if _r.mae_ms is not None else "n/a"
+                )
+                logger.info(
+                    "[TtftForecast] provider=%s route=%s "
+                    "input_tokens=%d predicted_ms=%s actual_ms=%d "
+                    "abs_err_ms=%s mae_ms=%s n=%d outcome=%s "
+                    "(SHADOW — no enforcement)",
+                    _r.provider, _r.route, _r.input_tokens,
+                    _pred, _r.actual_ms, _err, _mae, _r.n,
+                    sample.outcome,
+                )
+        except Exception:  # noqa: BLE001 — shadow never perturbs
+            pass
     except Exception:  # noqa: BLE001 — absolute never-raises boundary
         return
 
@@ -395,6 +434,36 @@ def register_flags(registry: Any) -> int:
             category=Category.OBSERVABILITY,
             source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
             example="export JARVIS_PROVIDER_LATENCY_WINDOW_N=200",
+        ),
+        FlagSpec(
+            name="JARVIS_PROVIDER_LATENCY_FORECAST_ENABLED",
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Predictive Provider Resilience Slice 1 master "
+                "switch. When true, the EMA-weighted OLS TTFT "
+                "forecaster runs in STRICT SHADOW: logs "
+                "predicted/actual/MAE per provider call. It enforces "
+                "NO timeout and triggers NO shedding (Slice 2/3). "
+                "Default false."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
+            example="export JARVIS_PROVIDER_LATENCY_FORECAST_ENABLED=true",
+        ),
+        FlagSpec(
+            name="JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA",
+            type=FlagType.FLOAT,
+            default=0.2,
+            description=(
+                "EMA smoothing factor for the streaming-moment "
+                "regression, bounded (0,1]. The single recency knob "
+                "— slope/intercept are DERIVED from data, never "
+                "hardcoded. Closer to 1 = more reactive."
+            ),
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
+            example="export JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA=0.2",
         ),
     ]
     n = 0
