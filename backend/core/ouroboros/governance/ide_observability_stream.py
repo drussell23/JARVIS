@@ -135,6 +135,14 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# GitIndexGuard (Phase C Slice 2) — a missing .git/index was
+# detected at boot and advisorily rebuilt (or the rebuild failed /
+# the probe failed). Single event; payload carries the full
+# GitIndexAnomaly.to_dict() (outcome / index_path / detail). Keyed
+# by the constant "git_index" (organism property, no op_id —
+# matches the posture_changed keying convention).
+EVENT_TYPE_GIT_INDEX_ANOMALY = "git_index_anomaly"
+
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 vocabulary.
 # Single event covering all 7 BudgetOutcome branches — payload
 # carries outcome string + reason + per-op snapshot. Operators
@@ -1297,6 +1305,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,
     EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
+    EVENT_TYPE_GIT_INDEX_ANOMALY,
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
     EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
     EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
@@ -2495,6 +2504,40 @@ def publish_posture_event(
         )
     except Exception:  # noqa: BLE001 — best-effort
         logger.debug("[Stream] publish_posture_event exception", exc_info=True)
+        return None
+
+
+def publish_git_index_anomaly(
+    anomaly: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``git_index_anomaly`` SSE frames.
+
+    ``anomaly`` is :meth:`GitIndexAnomaly.to_dict` output (outcome /
+    repo_root / index_path / detail / schema_version). Returns the
+    event_id on success, None when the stream is disabled / broker
+    missing / publish raised / payload is not a mapping. Never
+    raises into the GitIndexGuard boot hot path — it is the
+    fail-silent ``on_anomaly`` callback the guard invokes (the
+    guard imports NO governance module; this is the wiring seam).
+
+    Keyed by the constant ``"git_index"`` (organism property, no
+    op_id) so ``?op_id=git_index`` filters cleanly — identical
+    convention to :func:`publish_posture_event`.
+    """
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(anomaly, Mapping):
+            return None
+        payload: Dict[str, Any] = dict(anomaly)
+        return get_default_broker().publish(
+            EVENT_TYPE_GIT_INDEX_ANOMALY, "git_index", payload,
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[Stream] publish_git_index_anomaly exception",
+            exc_info=True,
+        )
         return None
 
 
