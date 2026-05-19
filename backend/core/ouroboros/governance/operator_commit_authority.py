@@ -112,15 +112,29 @@ _ENV_PLAN_TTL_S = "JARVIS_COMMIT_GRANT_PLAN_TTL_S"
 _ENV_GRANTS_PATH = "JARVIS_COMMIT_AUTHORITY_GRANTS_PATH"
 _ENV_SECRET_PATH = "JARVIS_COMMIT_AUTHORITY_SECRET_PATH"
 _ENV_ENABLE_FILE = "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE"
+_ENV_PRESENCE_FILE = "JARVIS_COMMIT_AUTHORITY_PRESENCE_FILE"
+_ENV_PRESENCE_TTL_S = "JARVIS_COMMIT_PRESENCE_TTL_S"
 
 _DEFAULT_GRANTS_RELATIVE = ".jarvis/commit_authority/grants.jsonl"
 _DEFAULT_SECRET_RELATIVE = ("commit_authority", "secret")  # under ~/.jarvis
 _DEFAULT_ENABLE_RELATIVE = ("commit_authority", "enabled")  # under ~/.jarvis
+_DEFAULT_PRESENCE_RELATIVE = (
+    "commit_authority", "presence.json",
+)  # under ~/.jarvis
 
 _DEFAULT_TTL_S = 3600
 _MIN_TTL_S = 60
 _MAX_TTL_S = 86_400  # 24h ceiling
 _DEFAULT_PLAN_TTL_S = 900  # PLAN/ANALYZE modes: shorter grants
+
+# Operator-presence marker lifetime. Short by design: it is a
+# "the operator is actively here this session" proof, re-minted
+# every time the operator issues a grant / re-enables. An Agent
+# cannot forge it (needs the per-machine secret + a deliberate
+# operator entry point).
+_DEFAULT_PRESENCE_TTL_S = 900  # 15 min
+_MIN_PRESENCE_TTL_S = 60
+_MAX_PRESENCE_TTL_S = 86_400  # 24h ceiling
 
 _GIT_OP_TIMEOUT_S = 5.0
 
@@ -419,6 +433,23 @@ def enable_authority(
         except Exception:  # noqa: BLE001 — best effort
             pass
         os.replace(str(tmp), str(target))
+        # Operator-only entry point: also mint a presence marker so
+        # an operator channel can be earned without a separate
+        # arming step (branch-agnostic — `enable` is a "the
+        # operator is here on this machine" act). Best-effort;
+        # never blocks enablement.
+        try:
+            _root, _branch = resolve_repo_root_and_branch(
+                _resolve_repo_root() or Path(".")
+            )
+            mint_operator_presence(
+                _root or (_resolve_repo_root() or Path(".")),
+                _branch,
+                label,
+                now_unix=now,
+            )
+        except Exception:  # noqa: BLE001 — never block enable
+            pass
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -442,6 +473,206 @@ def disable_authority() -> bool:
         return not target.exists()
     except Exception:  # noqa: BLE001
         return False
+
+
+# ===========================================================================
+# Operator-presence marker — the structural channel discriminator
+# ===========================================================================
+#
+# Root cause this closes: ``commit_authority_cli`` inferred the
+# commit channel from an env var that *hardcoded-defaulted to
+# "ide"*. A human clicking Cursor's Commit button and a Cursor
+# *Agent* running ``git commit`` are the SAME process tree with
+# identical env → both resolved to ``ide`` → both matched the
+# operator's interactive ``ide`` grant. The ``autonomous`` channel
+# (bounded by :mod:`ledger_sovereignty`) existed but was never
+# reached for IDE-spawned commits.
+#
+# You cannot reliably tell "human SCM commit" from "Agent git
+# commit" by ambient environment (they look identical). So the
+# authorization must NOT depend on that distinction. Instead, an
+# operator channel must be *earned* by a positive, unforgeable
+# proof of operator presence: a short-TTL JSON record signed with
+# the SAME per-machine secret as grants/enable (composes
+# :func:`_sign` / :func:`_verify` / :func:`_read_secret` — ZERO new
+# crypto). It is minted ONLY at operator-only entry points
+# (:func:`issue_grant`, :func:`enable_authority`). Absent a valid
+# marker, :func:`resolve_commit_channel` returns ``AUTONOMOUS`` →
+# the existing sovereignty path refuses the commit on a non-owned
+# tree (the operator main checkout). Fail-closed, no ambient
+# sniffing, no hardcoded default.
+
+
+def presence_file_path() -> Path:
+    """Operator-presence marker location. Lives OUTSIDE the repo
+    (``~/.jarvis/commit_authority/presence.json``) for the same
+    reason the secret/enable record do — GUI git inherits no shell
+    env. Operator override via
+    ``JARVIS_COMMIT_AUTHORITY_PRESENCE_FILE``. NEVER raises."""
+    raw = os.environ.get(_ENV_PRESENCE_FILE, "").strip()
+    if raw:
+        try:
+            return Path(raw).expanduser().resolve()
+        except Exception:  # noqa: BLE001
+            pass
+    return Path.home() / ".jarvis" / Path(*_DEFAULT_PRESENCE_RELATIVE)
+
+
+def presence_ttl_s() -> int:
+    """``JARVIS_COMMIT_PRESENCE_TTL_S`` (default 900s = 15 min,
+    floor 60s, ceiling 86400s). Garbage/empty → default. NEVER
+    raises."""
+    raw = os.environ.get(_ENV_PRESENCE_TTL_S, "").strip()
+    try:
+        v = int(float(raw)) if raw else _DEFAULT_PRESENCE_TTL_S
+    except (TypeError, ValueError):
+        v = _DEFAULT_PRESENCE_TTL_S
+    return max(_MIN_PRESENCE_TTL_S, min(_MAX_PRESENCE_TTL_S, v))
+
+
+def _presence_signed_payload(
+    issued_at_unix: float,
+    ttl_s: int,
+    repo_root_sha256: str,
+    branch: str,
+    operator_label: str,
+) -> Dict[str, Any]:
+    """Canonical dict the presence HMAC covers. Deterministic —
+    recomputed from trusted fields on verify so a tampered/extra
+    field cannot ride an old signature (same discipline as the
+    enable record)."""
+    return {
+        "kind": "operator_presence",
+        "issued_at_unix": float(issued_at_unix),
+        "ttl_s": int(ttl_s),
+        "repo_root_sha256": str(repo_root_sha256),
+        "branch": str(branch),
+        "operator_label": str(operator_label),
+        "schema_version": OPERATOR_COMMIT_AUTHORITY_SCHEMA_VERSION,
+    }
+
+
+def mint_operator_presence(
+    repo_root: Path,
+    branch: str,
+    operator_label: str,
+    *,
+    ttl_s: Optional[int] = None,
+    now_unix: Optional[float] = None,
+) -> bool:
+    """Operator-only: write the signed presence marker bound to
+    ``(repo_root, branch)``. Atomic write, 0600 (mirrors
+    :func:`enable_authority`). Bootstraps the per-machine secret on
+    first use. Returns ``True`` on success. NEVER raises."""
+    label = str(operator_label or "").strip()
+    if not label:
+        return False
+    secret = _ensure_secret()
+    if not secret:
+        return False
+    try:
+        fp = repo_root_fingerprint(Path(repo_root))
+    except Exception:  # noqa: BLE001
+        return False
+    now = float(now_unix) if now_unix is not None else time.time()
+    eff_ttl = (
+        int(ttl_s)
+        if (ttl_s is not None and int(ttl_s) > 0)
+        else presence_ttl_s()
+    )
+    eff_ttl = max(_MIN_PRESENCE_TTL_S, min(_MAX_PRESENCE_TTL_S, eff_ttl))
+    payload = _presence_signed_payload(
+        now, eff_ttl, fp, str(branch or "").strip(), label,
+    )
+    signature = _sign(payload, secret)
+    if not signature:
+        return False
+    target = presence_file_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"record": payload, "signature": signature},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:  # noqa: BLE001 — best effort
+            pass
+        os.replace(str(tmp), str(target))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[operator_commit_authority] presence write failed at "
+            "%s: %s",
+            target,
+            type(exc).__name__,
+        )
+        return False
+
+
+def valid_operator_presence(
+    repo_root: Path,
+    branch: str,
+    *,
+    now_unix: Optional[float] = None,
+) -> bool:
+    """Return ``True`` iff a valid, HMAC-signed, unexpired
+    presence marker exists for ``(repo_root, branch)``. NEVER
+    raises. Missing file / missing secret / malformed JSON / bad
+    signature / expired TTL / repo mismatch / branch mismatch all
+    → ``False`` (fail closed — the commit then resolves to
+    AUTONOMOUS and the sovereignty gate decides)."""
+    target = presence_file_path()
+    try:
+        if not target.exists():
+            return False
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(raw, dict):
+        return False
+    record = raw.get("record")
+    signature = raw.get("signature")
+    if not isinstance(record, dict) or not isinstance(signature, str):
+        return False
+    if record.get("kind") != "operator_presence":
+        return False
+    secret = _read_secret()
+    if not secret:
+        return False
+    try:
+        issued = float(record.get("issued_at_unix", 0.0))
+        ttl = int(record.get("ttl_s", 0))
+    except (TypeError, ValueError):
+        return False
+    rec_repo = str(record.get("repo_root_sha256", ""))
+    rec_branch = str(record.get("branch", ""))
+    payload = _presence_signed_payload(
+        issued, ttl, rec_repo, rec_branch,
+        str(record.get("operator_label", "")),
+    )
+    if not _verify(payload, signature, secret):
+        return False
+    now = float(now_unix) if now_unix is not None else time.time()
+    if ttl <= 0 or now >= issued + float(ttl):
+        return False
+    try:
+        fp = repo_root_fingerprint(Path(repo_root))
+    except Exception:  # noqa: BLE001
+        return False
+    if rec_repo and rec_repo != fp:
+        return False
+    cur_branch = str(branch or "").strip()
+    # An empty marker branch == operator armed the whole repo this
+    # session (branch-agnostic presence). A non-empty marker branch
+    # must match the committing branch.
+    if rec_branch and cur_branch and rec_branch != cur_branch:
+        return False
+    return True
 
 
 # ===========================================================================
@@ -475,6 +706,63 @@ class CommitChannel(str, enum.Enum):
             return cls(str(value).strip().lower())
         except Exception:  # noqa: BLE001
             return None
+
+
+def resolve_commit_channel(
+    repo_root: Path,
+    branch: str,
+    *,
+    env_channel: str = "",
+    now_unix: Optional[float] = None,
+) -> CommitChannel:
+    """Structural, evidence-based commit-channel resolution.
+
+    Replaces the blind ``or "ide"`` default in
+    ``commit_authority_cli`` that let a Cursor *Agent*'s headless
+    git commit borrow the operator's interactive ``ide`` grant.
+
+    Rule (fail-closed, no ambient sniffing, no hardcoded default):
+
+      1. Explicit ``autonomous`` → :attr:`CommitChannel.AUTONOMOUS`.
+         The safe sink — :func:`verify_pre_commit` delegates it to
+         :mod:`ledger_sovereignty` (composed, never reimplemented).
+      2. No valid operator-presence marker for ``(repo_root,
+         branch)`` → :attr:`CommitChannel.AUTONOMOUS`. A human
+         Cursor SCM commit *earns* an operator channel because the
+         operator minted a short-TTL signed presence marker
+         (:func:`issue_grant` / :func:`enable_authority` do so). An
+         Agent cannot forge it. So an Agent's commit on the
+         operator main checkout falls here → AUTONOMOUS → the
+         sovereignty gate refuses it on the non-owned tree. Exactly
+         the design behavior, finally reached.
+      3. Valid presence + explicit operator channel
+         (``repl``/``cli``/``ide``/``daemon``) → that channel.
+      4. Valid presence + unset/unparseable env → ``IDE`` — the
+         *earned* interactive default (presence proves the operator
+         is here), never a hardcoded blanket default.
+
+    ``env_channel`` is the raw ``JARVIS_COMMIT_CHANNEL`` value. It
+    is honored ONLY when operator presence is valid (case 3) or it
+    is ``autonomous`` (case 1) — a forged ``JARVIS_COMMIT_CHANNEL=
+    ide`` without presence does NOT yield an operator channel.
+    NEVER raises.
+    """
+    raw = str(env_channel or "").strip()
+    parsed = CommitChannel.parse(raw) if raw else None
+    if parsed is CommitChannel.AUTONOMOUS:
+        return CommitChannel.AUTONOMOUS
+    if not valid_operator_presence(
+        repo_root, branch, now_unix=now_unix,
+    ):
+        return CommitChannel.AUTONOMOUS
+    if parsed in (
+        CommitChannel.REPL,
+        CommitChannel.CLI,
+        CommitChannel.IDE,
+        CommitChannel.DAEMON,
+    ):
+        return parsed  # type: ignore[return-value]
+    return CommitChannel.IDE
 
 
 class CommitAuthorityVerdict(str, enum.Enum):
@@ -1178,6 +1466,21 @@ def issue_grant(
             grants_path_str=str(grants_path()),
             error="grant ledger append failed",
         )
+    # Operator-only entry point: mint a presence marker bound to
+    # this grant's repo+branch so resolve_commit_channel can earn
+    # an operator channel for the interactive operator. An Agent
+    # commit, lacking presence, falls to AUTONOMOUS →
+    # ledger_sovereignty. Best-effort: a presence-write failure
+    # must not fail an otherwise-successful grant.
+    try:
+        mint_operator_presence(
+            root,
+            str(branch).strip(),
+            str(operator_label).strip(),
+            now_unix=now,
+        )
+    except Exception:  # noqa: BLE001 — never block a valid grant
+        pass
     return GrantIssueOutcome(
         ok=True,
         grant_id=grant.grant_id,
@@ -1644,6 +1947,11 @@ __all__ = [
     "persistent_enabled",
     "enable_authority",
     "disable_authority",
+    "presence_file_path",
+    "presence_ttl_s",
+    "mint_operator_presence",
+    "valid_operator_presence",
+    "resolve_commit_channel",
     "resolve_repo_root_and_branch",
     "repo_root_fingerprint",
     "verify_pre_commit",
