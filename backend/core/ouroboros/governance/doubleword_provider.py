@@ -748,6 +748,31 @@ class DoublewordProvider:
                     total_output_tokens=output_tokens,
                     cost_usd=_batch_cost,
                 )
+
+            # Slice 0 — provider-latency observability (pure side
+            # channel; master-flag-gated; NEVER raises). Emitted ONLY
+            # when ``usage`` carried a real DW server-side token count
+            # — a fabricated token=0 sample would poison the Slice-1
+            # regression, so we skip rather than guess. Batch API has
+            # no streaming first-token, so ttft_ms=-1 (not measured);
+            # total_ms is the authoritative latency dimension.
+            if usage:
+                try:
+                    from backend.core.ouroboros.governance.providers import (
+                        _emit_provider_latency,
+                    )
+
+                    _emit_provider_latency(
+                        provider="doubleword-397b",
+                        route=getattr(ctx, "provider_route", "") or "",
+                        op_id=str(getattr(pending, "op_id", "") or ""),
+                        input_tokens=int(input_tokens),
+                        ttft_ms=-1,  # batch API: no first-token stream
+                        total_ms=int(elapsed * 1000.0),
+                        outcome="success",
+                    )
+                except Exception:  # noqa: BLE001 — never perturbs
+                    pass
             return result
 
         except asyncio.CancelledError:

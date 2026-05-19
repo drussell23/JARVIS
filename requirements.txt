@@ -91,6 +91,10 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019df6e4-) at 2026-05-05 06:49 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019e3031-b982-796b-a3d5-af630f62b933-cau) at 2026-05-17 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019e3031-) at 2026-05-16 09:52 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019e3d14-80c9-7c72-9f07-c0433d515386-cau) at 2026-05-17 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019e3d14-) at 2026-05-18 21:55 UTC
+# Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0)
+
 # Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0)
 
 # Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0)
@@ -229,7 +233,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 python-multipart==0.0.20
 PyYAML==6.0.3
-rapidfuzz>=3.0.0  # v32.3: Intelligent fuzzy text matching for OCR detection
+rapidFuzz>=3.0.0  # v32.3: Intelligent fuzzy text matching for OCR detection
 redis>=4.2.0  # cost_tracker real-time streaming; redis.asyncio for async
 referencing==0.36.2
 regex==2025.11.3

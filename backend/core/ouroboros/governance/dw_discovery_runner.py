@@ -465,6 +465,7 @@ _LEDGER_SINGLETON: Optional[PromotionLedger] = None
 _MODALITY_LEDGER_SINGLETON: Optional[Any] = None  # Slice G
 _TTFT_OBSERVER_SINGLETON: Optional[Any] = None  # Slice 12.2.C
 _HEAVY_PROBE_BUDGET_SINGLETON: Optional[Any] = None  # Slice 12.2.D
+_TTFT_FORECASTER_SINGLETON: Optional[Any] = None  # Predictive Resilience S1
 # Sync lock around the singleton hydration + boot flag — protects the
 # very first-call window before the asyncio.Lock has been touched.
 _BOOT_SYNC_LOCK = threading.Lock()
@@ -673,6 +674,47 @@ def get_ttft_observer() -> Optional[Any]:
     return _get_or_create_ttft_observer()
 
 
+def _get_or_create_ttft_forecaster() -> Optional[Any]:
+    """Predictive Provider Resilience Slice 1 — lazy TtftForecaster
+    singleton. Returns None when the Slice-1 master flag is off OR
+    import fails. Warm-starts ONCE from the durable Slice-0 JSONL so
+    the forecaster is not cold on boot (composes the existing
+    dataset rather than starting blind)."""
+    global _TTFT_FORECASTER_SINGLETON
+    try:
+        from backend.core.ouroboros.governance.dw_ttft_observer import (
+            TtftForecaster,
+            provider_latency_forecast_enabled,
+        )
+    except ImportError:
+        return None
+    if not provider_latency_forecast_enabled():
+        return None
+    with _BOOT_SYNC_LOCK:
+        if _TTFT_FORECASTER_SINGLETON is None:
+            fc = TtftForecaster()
+            try:
+                import os as _os
+                from pathlib import Path as _Path
+
+                _jsonl = _os.environ.get(
+                    "JARVIS_PROVIDER_LATENCY_JSONL_PATH",
+                    ".jarvis/provider_latency.jsonl",
+                ).strip() or ".jarvis/provider_latency.jsonl"
+                fc.warm_start_from_jsonl(_Path(_jsonl))
+            except Exception:  # noqa: BLE001 — cold start is acceptable
+                pass
+            _TTFT_FORECASTER_SINGLETON = fc
+        return _TTFT_FORECASTER_SINGLETON
+
+
+def get_ttft_forecaster() -> Optional[Any]:
+    """Public accessor for the Slice-1 TtftForecaster singleton.
+    Returns None when the Slice-1 master flag is off — so the
+    shadow callsite is a strict no-op until explicitly enabled."""
+    return _get_or_create_ttft_forecaster()
+
+
 def _get_or_create_heavy_probe_budget() -> Optional[Any]:
     """Slice 12.2.D — lazy HeavyProbeBudget singleton.
 
@@ -709,7 +751,7 @@ def reset_boot_state_for_tests() -> None:
     global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
     global _MODALITY_LEDGER_SINGLETON, _TTFT_OBSERVER_SINGLETON
     global _HEAVY_PROBE_TASK, _HEAVY_PROBE_BUDGET_SINGLETON
-    global _LAST_SNAPSHOT_ID
+    global _LAST_SNAPSHOT_ID, _TTFT_FORECASTER_SINGLETON
     with _BOOT_SYNC_LOCK:
         _BOOT_DISCOVERY_DONE = False
         if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
@@ -722,6 +764,7 @@ def reset_boot_state_for_tests() -> None:
         _MODALITY_LEDGER_SINGLETON = None
         _TTFT_OBSERVER_SINGLETON = None
         _HEAVY_PROBE_BUDGET_SINGLETON = None
+        _TTFT_FORECASTER_SINGLETON = None
         _LAST_SNAPSHOT_ID = ""
 
 
