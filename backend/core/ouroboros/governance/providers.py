@@ -332,13 +332,14 @@ def _emit_provider_latency(
         except Exception:  # noqa: BLE001 — telemetry never perturbs
             pass
 
-        # Sink 3 — Slice 1 SHADOW forecast. STRICT SHADOW: predict
-        # with the standing model, score vs the actual just observed,
-        # log predicted/actual/MAE. It returns a timeout to NOBODY,
-        # mutates NO client, triggers NO shedding (that is Slice
-        # 2/3). Gated by the Slice-1 master flag — get_ttft_forecaster
-        # returns None when off, so this is a strict no-op until
-        # explicitly enabled. NEVER perturbs generation.
+        # Sink 3 — SHADOW latency ENVELOPE (E1). NOT a forecast:
+        # r(tokens,TTFT)≈0.11 falsified the regression. We maintain a
+        # token-independent, robust EWMA-median baseline + a k·log-MAD
+        # ceiling that the system WOULD adopt as a dynamic timeout.
+        # STRICT SHADOW: returns a timeout to NOBODY, mutates NO
+        # client, triggers NO shedding (Slice 2/3). Gated by the
+        # master flag — get_ttft_forecaster returns None when off
+        # (strict no-op). NEVER perturbs generation.
         try:
             from backend.core.ouroboros.governance.dw_discovery_runner import (
                 get_ttft_forecaster,
@@ -347,25 +348,30 @@ def _emit_provider_latency(
             _fc = get_ttft_forecaster()
             if _fc is not None:
                 _r = _fc.observe(sample)
-                _pred = (
-                    f"{_r.predicted_ms:.1f}"
-                    if _r.predicted_ms is not None else "n/a"
+                _base = (
+                    f"{_r.baseline_ms:.1f}"
+                    if _r.baseline_ms is not None else "n/a"
                 )
-                _err = (
-                    f"{_r.abs_err_ms:.1f}"
-                    if _r.abs_err_ms is not None else "n/a"
+                _ceil = (
+                    f"{_r.ceiling_ms:.1f}"
+                    if _r.ceiling_ms is not None else "n/a"
                 )
-                _mae = (
-                    f"{_r.mae_ms:.1f}"
-                    if _r.mae_ms is not None else "n/a"
+                _band = (
+                    f"{_r.band_ms:.1f}"
+                    if _r.band_ms is not None else "n/a"
+                )
+                _env = (
+                    "yes" if _r.enveloped is True
+                    else ("no" if _r.enveloped is False else "n/a")
                 )
                 logger.info(
-                    "[TtftForecast] provider=%s route=%s "
-                    "input_tokens=%d predicted_ms=%s actual_ms=%d "
-                    "abs_err_ms=%s mae_ms=%s n=%d outcome=%s "
-                    "(SHADOW — no enforcement)",
+                    "[TtftEnvelope] provider=%s route=%s "
+                    "input_tokens=%d actual_ms=%d baseline_ms=%s "
+                    "band_ms=%s ceiling_ms=%s enveloped=%s n=%d "
+                    "outcome=%s (SHADOW — no enforcement; ceiling is "
+                    "the timeout Slice-2 WOULD adopt)",
                     _r.provider, _r.route, _r.input_tokens,
-                    _pred, _r.actual_ms, _err, _mae, _r.n,
+                    _r.actual_ms, _base, _band, _ceil, _env, _r.n,
                     sample.outcome,
                 )
         except Exception:  # noqa: BLE001 — shadow never perturbs
@@ -456,14 +462,44 @@ def register_flags(registry: Any) -> int:
             type=FlagType.FLOAT,
             default=0.2,
             description=(
-                "EMA smoothing factor for the streaming-moment "
-                "regression, bounded (0,1]. The single recency knob "
-                "— slope/intercept are DERIVED from data, never "
-                "hardcoded. Closer to 1 = more reactive."
+                "EWMA recency factor for the robust EWMA-median + "
+                "log-MAD envelope tracker, bounded (0,1]. The single "
+                "smoothing knob — baseline/scale are DERIVED from "
+                "data, never set. Closer to 1 = reacts faster to a "
+                "congesting queue."
             ),
             category=Category.TUNING,
             source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
             example="export JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA=0.2",
+        ),
+        FlagSpec(
+            name="JARVIS_PROVIDER_LATENCY_FORECAST_K",
+            type=FlagType.FLOAT,
+            default=3.0,
+            description=(
+                "Envelope width in robust-σ units: ceiling = "
+                "exp(log-median + k·MAD_const·log-MAD). σ is "
+                "MEASURED dispersion; k only sets how many robust-σ "
+                "of head-room the dynamic ceiling reserves against a "
+                "congested queue. Bounded [0.5,10.0]."
+            ),
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
+            example="export JARVIS_PROVIDER_LATENCY_FORECAST_K=3.0",
+        ),
+        FlagSpec(
+            name="JARVIS_PROVIDER_LATENCY_MAD_CONSISTENCY",
+            type=FlagType.FLOAT,
+            default=1.4826,
+            description=(
+                "MAD→σ consistency constant (1/Φ⁻¹(0.75)=1.4826). "
+                "Principled statistical constant rescaling the "
+                "log-MAD to a σ-equivalent — like the Huber 1.345, "
+                "NOT a tuned magic number. Bounded [0.5,5.0]."
+            ),
+            category=Category.TUNING,
+            source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
+            example="export JARVIS_PROVIDER_LATENCY_MAD_CONSISTENCY=1.4826",
         ),
     ]
     n = 0

@@ -278,11 +278,12 @@ def provider_latency_forecast_enabled() -> bool:
 def _forecast_alpha() -> float:
     """``JARVIS_PROVIDER_LATENCY_FORECAST_ALPHA`` (default 0.2).
 
-    EMA smoothing factor for the streaming-moment regression.
-    Bounded to ``(0, 1]`` — closer to 1 = more reactive to recent
-    latency, closer to 0 = smoother. NOT a hardcoded model
-    parameter: it is the single recency knob; the slope/intercept
-    are DERIVED from the data, never set."""
+    EWMA recency factor for the robust location-scale tracker (the
+    single smoothing knob). Bounded ``(0, 1]`` — closer to 1 reacts
+    faster to a congesting queue, closer to 0 is steadier. It is NOT
+    a model coefficient: the baseline (median) and scale (log-MAD)
+    are tracked from data, never set. (Name kept for the committed
+    env-var seam; the math is no longer a "forecast" — see E1.)"""
     try:
         a = float(
             os.environ.get(
@@ -294,6 +295,55 @@ def _forecast_alpha() -> float:
     if not (0.0 < a <= 1.0):
         return 0.2
     return a
+
+
+def _mad_consistency_const() -> float:
+    """``JARVIS_PROVIDER_LATENCY_MAD_CONSISTENCY`` (default 1.4826).
+
+    The textbook constant that rescales a Median-Absolute-Deviation
+    to a standard-deviation-equivalent under normality (1/Φ⁻¹(0.75)
+    = 1.4826). It is a *principled statistical constant*, NOT a
+    hand-tuned magic number — exactly like the Huber 1.345 we used
+    earlier. Env-overridable; bounded ``[0.5, 5.0]``."""
+    try:
+        c = float(
+            os.environ.get(
+                "JARVIS_PROVIDER_LATENCY_MAD_CONSISTENCY", "1.4826",
+            ).strip()
+        )
+    except (ValueError, TypeError):
+        return 1.4826
+    if not (0.5 <= c <= 5.0):
+        return 1.4826
+    return c
+
+
+def _forecast_k() -> float:
+    """``JARVIS_PROVIDER_LATENCY_FORECAST_K`` (default 3.0).
+
+    Envelope width in robust-σ units: ``ceiling = exp(log-median +
+    k · MAD_const · log-MAD)``. σ is MEASURED dispersion — k only
+    chooses how many robust-σ of head-room the dynamic ceiling
+    reserves against a congested queue. Bounded ``[0.5, 10.0]``."""
+    try:
+        k = float(
+            os.environ.get(
+                "JARVIS_PROVIDER_LATENCY_FORECAST_K", "3.0",
+            ).strip()
+        )
+    except (ValueError, TypeError):
+        return 3.0
+    if not (0.5 <= k <= 10.0):
+        return 3.0
+    return k
+
+
+# PHYSICAL ceiling on any exponentiated log value. A provider's
+# time-to-FIRST-token cannot exceed ~1 hour in any real regime
+# (worst observed: 73 s). exp(15.0) ≈ 3.27e6 ms ≈ 54 min — bounds
+# a transient instability to "saturated but sane", never 1e13.
+_MAX_LOG_EXPONENT = 15.0
+_LOG_FLOOR_MS = 1.0
 
 
 @dataclass(frozen=True)
@@ -806,174 +856,258 @@ class TtftObserver:
 
 
 @dataclass(frozen=True)
-class ForecastResult:
-    """One shadow forecast outcome (predicted vs actual). Frozen.
+class EnvelopeResult:
+    """One shadow ENVELOPE observation. Frozen.
 
-    ``predicted_ms`` is ``None`` when the per-key model has fewer
-    than the non-degenerate-variance floor of samples (the math
-    refuses to extrapolate a slope it cannot yet estimate — NOT a
-    hardcoded gate, the definition of regression validity)."""
+    NOT a forecast — there is nothing to forecast: r(tokens,TTFT)
+    ≈0.11, TTFT is bimodal & queue-driven, not token-driven (the
+    falsification that retired the regression). We maintain a
+    data-driven CEILING:
+
+      * ``baseline_ms``  — EWMA-median TTFT (token-independent,
+        hyper-stable: a 73 s spike barely moves it);
+      * ``ceiling_ms``   — exp(log-median + k·MAD_const·log-MAD):
+        the dynamic timeout the system WOULD adopt; inflates when
+        the queue congests, deflates when healthy;
+      * ``enveloped``    — did that ceiling cover this actual TTFT;
+      * ``abs_dev_ms``   — |baseline − actual| (informational only;
+        we are NOT scoring a prediction).
+
+    ``baseline_ms``/``ceiling_ms`` are ``None`` below the
+    minimum-samples floor (a robust dispersion is undefined for
+    n<3 — the statistical definition, not a tuned gate).
+    ``input_tokens`` is retained for observability ONLY; the model
+    does not consume it."""
     provider: str
     route: str
     input_tokens: int
-    predicted_ms: Optional[float]
+    baseline_ms: Optional[float]
     actual_ms: int
-    abs_err_ms: Optional[float]
-    mae_ms: Optional[float]
+    abs_dev_ms: Optional[float]
+    ceiling_ms: Optional[float]
+    band_ms: Optional[float]
+    enveloped: Optional[bool]
     n: int
 
 
-class _RegState:
-    """EMA-weighted streaming-moment accumulator for ONE
-    ``(provider, route)`` key. Holds recency-weighted moments of
-    ``x = input_tokens`` and ``y = ttft_ms`` so an ordinary
-    least-squares line can be read off WITHOUT storing samples:
+# Back-compat alias: external composition seams may still import the
+# old name. The illusion is gone from the SEMANTICS + fields; the
+# symbol alias only avoids gratuitous import churn.
+ForecastResult = EnvelopeResult
 
-        slope     = (E[xy] − E[x]E[y]) / (E[x²] − E[x]²)
-        intercept =  E[y] − slope · E[x]
 
-    All four moments decay by ``alpha`` each observation, so the
-    fit tracks reality and forgets stale regimes. No coefficient is
-    ever hardcoded — slope/intercept are pure functions of observed
-    data."""
+class _RobustState:
+    """Streaming **robust location-scale** tracker for ONE provider
+    key — NO slope, NO token term, NO OLS. (E1: the token-slope was
+    falsified, r≈0.11.)
 
-    __slots__ = ("ex", "ey", "exx", "exy", "n", "_mae_ema", "_mae_n")
+    Location = EWMA-**median** of ``ln(ttft_ms)`` via the
+    Robbins-Monro 0.5-quantile recursion::
+
+        lm ← lm + α · step · sign(ly − lm)
+
+    A single 73 s spike moves ``lm`` by at most ``α·step`` —
+    structurally bounded, NEVER proportional (this is why it cannot
+    diverge the way the OLS slope did).
+
+    Scale = EWMA of ``|ly − lm|`` — a robust **log-MAD** dispersion;
+    rescaled by the textbook 1.4826 MAD→σ consistency constant only
+    when read out.
+
+    ``step`` self-adapts to ``max(scale, ε)`` so the median tracks
+    at the data's own log-scale with no hardcoded step. Everything
+    is derived from observed data; α is the only knob."""
+
+    __slots__ = ("lm", "scale", "n")
+
+    _EPS = 1e-6
 
     def __init__(self) -> None:
-        self.ex = 0.0
-        self.ey = 0.0
-        self.exx = 0.0
-        self.exy = 0.0
+        self.lm = 0.0       # EWMA log-median (location)
+        self.scale = 0.0    # EWMA |ly - lm|  (robust log dispersion)
         self.n = 0
-        self._mae_ema: Optional[float] = None
-        self._mae_n = 0
 
-    def predict(self, x: float) -> Optional[float]:
-        """OLS prediction from current EMA moments, or ``None`` if
-        the slope is not yet estimable (need ≥ the variance floor
-        AND non-degenerate x-variance)."""
-        if self.n < _MIN_N_FOR_NONDEGENERATE_VARIANCE:
-            return None
-        var_x = self.exx - self.ex * self.ex
-        if var_x <= 1e-9:
-            # All observed payloads identical so far — slope
-            # undefined; fall back to the mean response (still a
-            # data-derived prediction, not a constant).
-            return self.ey
-        slope = (self.exy - self.ex * self.ey) / var_x
-        intercept = self.ey - slope * self.ex
-        pred = intercept + slope * x
-        return pred if pred >= 0.0 else 0.0
-
-    def update(self, x: float, y: float, alpha: float) -> None:
-        """Fold one observation into the EMA moments AFTER it has
-        been scored (prequential / predict-then-update)."""
+    def update(self, y: float, alpha: float) -> None:
+        """Fold ONE ttft observation (prequential — AFTER it has
+        been scored against the standing ceiling)."""
+        import math
+        ly = math.log(max(_LOG_FLOOR_MS, float(y)))
         if self.n == 0:
-            self.ex, self.ey = x, y
-            self.exx, self.exy = x * x, x * y
-        else:
-            self.ex += alpha * (x - self.ex)
-            self.ey += alpha * (y - self.ey)
-            self.exx += alpha * (x * x - self.exx)
-            self.exy += alpha * (x * y - self.exy)
+            self.lm = ly
+            self.scale = 0.0
+            self.n = 1
+            return
+        dev = abs(ly - self.lm)
+        # Scale first (so the step reflects current dispersion).
+        self.scale += alpha * (dev - self.scale)
+        step = self.scale if self.scale > self._EPS else self._EPS
+        # Robbins-Monro median: bounded-influence location update.
+        if ly > self.lm:
+            self.lm += alpha * step
+        elif ly < self.lm:
+            self.lm -= alpha * step
         self.n += 1
 
-    def record_error(self, abs_err: float, alpha: float) -> None:
-        if self._mae_ema is None:
-            self._mae_ema = abs_err
-        else:
-            self._mae_ema += alpha * (abs_err - self._mae_ema)
-        self._mae_n += 1
+    def _estimable(self) -> bool:
+        # n>=3 is the statistical floor for a non-degenerate robust
+        # dispersion (definition, not a tuned gate).
+        return self.n >= _MIN_N_FOR_NONDEGENERATE_VARIANCE
 
-    @property
-    def mae(self) -> Optional[float]:
-        return self._mae_ema
+    @staticmethod
+    def _exp(v: float) -> float:
+        import math
+        return math.exp(min(v, _MAX_LOG_EXPONENT))
+
+    def baseline(self) -> Optional[float]:
+        """Token-independent baseline TTFT (ms) = exp(log-median).
+        ``None`` until estimable. Structurally bounded."""
+        if not self._estimable():
+            return None
+        return self._exp(self.lm)
+
+    def envelope(
+        self, k: float, mad_c: float,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """``(baseline_ms, band_ms, ceiling_ms)``. The ceiling is
+        the MULTIPLICATIVE robust band ``exp(log-median + k·c·
+        log-MAD)`` — correct for a heavy-tailed/log-normal queue
+        process: it inflates upward to swallow congestion spikes
+        and deflates as they clear. Enforces nothing."""
+        if not self._estimable():
+            return (None, None, None)
+        base = self._exp(self.lm)
+        ceil = self._exp(self.lm + k * mad_c * self.scale)
+        return (base, ceil - base, ceil)
 
 
-class TtftForecaster:
-    """Predictive TTFT model — SHADOW ONLY.
+class ProviderLatencyEnvelope:
+    """Robust, token-INDEPENDENT latency-envelope tracker — SHADOW
+    ONLY. Maintains a data-driven CEILING, it does NOT forecast
+    (r(tokens,TTFT)≈0.11 falsified the regression).
 
-    Composes the existing latency stream: it does NOT store its own
-    samples, it folds each observed ``ProviderLatencySample`` into a
-    tiny per-key :class:`_RegState`. Public surface:
+    Composes the existing latency stream: folds each observed
+    ``ProviderLatencySample`` into a tiny per-PROVIDER
+    :class:`_RobustState` (route + input_tokens excluded from the
+    key — Fix A unified pool). Public surface:
 
-      * ``forecast(provider, route, input_tokens)`` → predicted ms
-        (or ``None`` before the model is estimable);
-      * ``observe(sample)`` → prequential step: score the standing
-        prediction against the just-arrived actual, accumulate MAE,
-        THEN update the model (honest out-of-sample evaluation —
-        the model never sees a sample before predicting it);
+      * ``baseline(provider, route)`` → EWMA-median TTFT ms (or
+        ``None`` before estimable). Token-independent.
+      * ``envelope(provider, route, k)`` → ``(baseline, band,
+        ceiling)``; ceiling is the dynamic timeout the system WOULD
+        adopt — it INFLATES under queue congestion, DEFLATES when
+        healthy.
+      * ``observe(sample)`` → prequential: score the standing
+        ceiling against the just-arrived actual, THEN fold it in.
       * ``warm_start_from_jsonl(path)`` → replay the durable
-        Slice-0 dataset so the forecaster is not cold on boot.
+        Slice-0 dataset so the envelope is not cold on boot.
 
-    STRICT SHADOW CONTRACT: this class only computes + the caller
-    only logs. It NEVER returns a timeout, never mutates a client,
-    never triggers shedding. Enforcement is Slice 2/3. NEVER raises
-    out of any public method."""
+    STRICT SHADOW: only computes + the caller only logs. Returns no
+    timeout, mutates no client, triggers no shedding (Slice 2/3).
+    NEVER raises out of any public method."""
 
     def __init__(self) -> None:
-        self._states: Dict[str, _RegState] = {}
+        self._states: Dict[str, _RobustState] = {}
         self._lock = threading.RLock()
 
     @staticmethod
     def _key(provider: str, route: str) -> str:
-        return f"{(provider or '').strip()}|{(route or '').strip()}"
+        # Fix A — Unified Statistical Keying. Queue/load latency
+        # depends on the PROVIDER endpoint, NOT JARVIS's internal
+        # route and (falsified) NOT on input_tokens. ``route`` kept
+        # in the signature for callers/observability but DELIBERATELY
+        # excluded from the key — all of one provider's traffic
+        # pools into one robust estimator.
+        return (provider or "").strip()
 
-    def forecast(
-        self, provider: str, route: str, input_tokens: int,
+    def baseline(
+        self, provider: str, route: str,
     ) -> Optional[float]:
-        """Current-model TTFT prediction in ms. ``None`` until the
-        per-key regression is estimable. NEVER raises."""
+        """Token-independent EWMA-median baseline TTFT (ms), or
+        ``None`` until estimable. NEVER raises."""
         try:
             with self._lock:
                 st = self._states.get(self._key(provider, route))
-                if st is None:
-                    return None
-                return st.predict(float(max(0, int(input_tokens))))
-        except Exception:  # noqa: BLE001 — forecaster never raises
+                return st.baseline() if st is not None else None
+        except Exception:  # noqa: BLE001 — never raises
             return None
 
-    def observe(self, sample: "ProviderLatencySample") -> ForecastResult:
-        """Prequential step. Predict with the STANDING model, score
-        vs ``sample.ttft_ms``, accumulate MAE, then fold the sample
-        in. Only meaningful for streaming successes (ttft_ms ≥ 0 and
-        input_tokens > 0) — degenerate timeout rows (ttft=-1) are
-        recorded as observations of nothing and skipped from the
-        regression so they cannot poison the slope. NEVER raises."""
+    # Back-compat shim: external seams may still call .forecast(...).
+    # It is NOT a forecast — it returns the token-independent
+    # baseline; the input_tokens arg is accepted and IGNORED.
+    def forecast(
+        self, provider: str, route: str, input_tokens: int = 0,
+    ) -> Optional[float]:
+        return self.baseline(provider, route)
+
+    def envelope(
+        self, provider: str, route: str,
+        k: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """``(baseline_ms, band_ms, ceiling_ms)`` for the provider's
+        unified pool. The value a future Slice-2 dynamic HTTP
+        timeout WOULD adopt. Enforces nothing. NEVER raises."""
+        try:
+            kk = _forecast_k() if k is None else float(k)
+            mad_c = _mad_consistency_const()
+            with self._lock:
+                st = self._states.get(self._key(provider, route))
+                if st is None:
+                    return (None, None, None)
+                return st.envelope(kk, mad_c)
+        except Exception:  # noqa: BLE001 — never raises
+            return (None, None, None)
+
+    def observe(self, sample: "ProviderLatencySample") -> EnvelopeResult:
+        """Prequential step. Read the STANDING ceiling, score the
+        just-arrived actual against it, THEN fold the sample. Only
+        meaningful for streaming successes — degenerate rows
+        (timeout ttft=-1, non-success) are passed through as a
+        transparent skip and NOT folded (they would bias the
+        robust scale). ``input_tokens`` is ignored by the model
+        (token-independent) — retained only in the result for
+        observability. NEVER raises."""
         try:
             if not isinstance(sample, ProviderLatencySample):
-                return ForecastResult("", "", 0, None, 0, None, None, 0)
+                return EnvelopeResult(
+                    "", "", 0, None, 0, None, None, None, None, 0,
+                )
             prov = str(sample.provider or "")
             route = str(sample.route or "")
-            x = float(max(0, int(sample.input_tokens)))
+            xtok = int(max(0, int(sample.input_tokens)))
             y = int(sample.ttft_ms)
             key = self._key(prov, route)
             alpha = _forecast_alpha()
+            k = _forecast_k()
+            mad_c = _mad_consistency_const()
             with self._lock:
                 st = self._states.get(key)
                 if st is None:
-                    st = _RegState()
+                    st = _RobustState()
                     self._states[key] = st
-                # Skip non-fittable rows (timeout/cancel: ttft=-1, or
-                # zero-token) — predicting/fitting on them would
-                # corrupt the EMA. Still returns a result row so the
-                # caller can log the skip transparently.
-                if y < 0 or x <= 0.0 or sample.outcome != "success":
-                    return ForecastResult(
-                        prov, route, int(x), None, max(0, y),
-                        None, st.mae, st.n,
+                if y < 0 or sample.outcome != "success":
+                    base0, band0, ceil0 = st.envelope(k, mad_c)
+                    return EnvelopeResult(
+                        prov, route, xtok, base0, max(0, y),
+                        None, ceil0, band0, None, st.n,
                     )
-                pred = st.predict(x)
-                abs_err = abs(pred - y) if pred is not None else None
-                if abs_err is not None:
-                    st.record_error(abs_err, alpha)
-                st.update(x, float(y), alpha)
-                return ForecastResult(
-                    prov, route, int(x), pred, y, abs_err,
-                    st.mae, st.n,
+                # Prequential: ceiling/baseline from the STANDING
+                # state, score, THEN fold (no peeking).
+                base, band, ceil = st.envelope(k, mad_c)
+                enveloped = (
+                    bool(ceil >= y) if ceil is not None else None
                 )
-        except Exception:  # noqa: BLE001 — forecaster never raises
-            return ForecastResult("", "", 0, None, 0, None, None, 0)
+                abs_dev = (
+                    abs(base - y) if base is not None else None
+                )
+                st.update(float(y), alpha)
+                return EnvelopeResult(
+                    prov, route, xtok, base, y, abs_dev,
+                    ceil, band, enveloped, st.n,
+                )
+        except Exception:  # noqa: BLE001 — never raises
+            return EnvelopeResult(
+                "", "", 0, None, 0, None, None, None, None, 0,
+            )
 
     def warm_start_from_jsonl(self, path: Path) -> int:
         """Replay the durable Slice-0 JSONL into the model so it is
@@ -1014,14 +1148,6 @@ class TtftForecaster:
             return n
         return n
 
-    def mae(self, provider: str, route: str) -> Optional[float]:
-        try:
-            with self._lock:
-                st = self._states.get(self._key(provider, route))
-                return st.mae if st is not None else None
-        except Exception:  # noqa: BLE001
-            return None
-
     def sample_n(self, provider: str, route: str) -> int:
         try:
             with self._lock:
@@ -1031,6 +1157,13 @@ class TtftForecaster:
             return 0
 
 
+# Back-compat alias for external composition seams (the singleton
+# accessor + tests imported the old name). The "forecast" illusion
+# is gone from the SEMANTICS, fields and math; the symbol alias
+# only avoids gratuitous import churn across the codebase.
+TtftForecaster = ProviderLatencyEnvelope
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "PROVIDER_LATENCY_SCHEMA_VERSION",
@@ -1038,7 +1171,9 @@ __all__ = [
     "TtftSample",
     "TtftStats",
     "ProviderLatencySample",
+    "ProviderLatencyEnvelope",
     "TtftForecaster",
+    "EnvelopeResult",
     "ForecastResult",
     "provider_latency_forecast_enabled",
     "tracking_enabled",

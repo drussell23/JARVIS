@@ -197,9 +197,9 @@ def test_register_flags_seeds_predictive_resilience_specs(monkeypatch):
 
     reg = FlagRegistry()
     n = P.register_flags(reg)
-    # 3 Slice-0 (telemetry enable / jsonl path / window) + 2 Slice-1
-    # (forecast enable / forecast alpha).
-    assert n == 5
+    # 3 Slice-0 (telemetry enable / jsonl path / window) + 4 E1
+    # (envelope enable / alpha / k / MAD-consistency).
+    assert n == 7
     # Master flag must default FALSE (Slice 0 ships dark).
     spec = reg.get(_ENABLE) if hasattr(reg, "get") else None
     if spec is not None:
