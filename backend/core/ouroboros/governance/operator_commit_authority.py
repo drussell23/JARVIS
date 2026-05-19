@@ -110,9 +110,11 @@ _ENV_DEFAULT_TTL_S = "JARVIS_COMMIT_GRANT_DEFAULT_TTL_S"
 _ENV_PLAN_TTL_S = "JARVIS_COMMIT_GRANT_PLAN_TTL_S"
 _ENV_GRANTS_PATH = "JARVIS_COMMIT_AUTHORITY_GRANTS_PATH"
 _ENV_SECRET_PATH = "JARVIS_COMMIT_AUTHORITY_SECRET_PATH"
+_ENV_ENABLE_FILE = "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE"
 
 _DEFAULT_GRANTS_RELATIVE = ".jarvis/commit_authority/grants.jsonl"
 _DEFAULT_SECRET_RELATIVE = ("commit_authority", "secret")  # under ~/.jarvis
+_DEFAULT_ENABLE_RELATIVE = ("commit_authority", "enabled")  # under ~/.jarvis
 
 _DEFAULT_TTL_S = 3600
 _MIN_TTL_S = 60
@@ -136,11 +138,20 @@ def _flag(name: str, *, default: bool = False) -> bool:
 def master_enabled() -> bool:
     """§33.1 opt-in safety gate — default-**FALSE**.
 
-    When off, :func:`verify_pre_commit` returns ``DISABLED`` and the
-    hook chain is byte-identical to the pre-substrate world. The
-    operator graduates this flag deliberately after Slice 2 wiring.
+    Master is ON iff EITHER the env flag is truthy OR a valid,
+    HMAC-signed persistent enable record exists (Slice 3 #0). The
+    persistent path is the load-bearing fix for the Cursor/VS Code
+    Source Control button: a GUI git subprocess inherits **no shell
+    env**, so an env-only master could never be ON for it — it would
+    fall back to the legacy token gate and stay blocked. The
+    out-of-repo signed enable file (mirroring how the per-machine
+    secret already lives outside the repo) lets the hook subprocess
+    resolve master=ON regardless of how git was spawned.
+
+    Default remains **FALSE**: no env flag AND no valid enable record
+    → byte-identical to the pre-substrate world. NEVER raises.
     """
-    return _flag(_ENV_MASTER, default=False)
+    return _flag(_ENV_MASTER, default=False) or persistent_enabled()
 
 
 def _read_clamped_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -220,6 +231,22 @@ def secret_path() -> Path:
     return Path.home() / ".jarvis" / Path(*_DEFAULT_SECRET_RELATIVE)
 
 
+def enable_file_path() -> Path:
+    """Persistent master-enable record location. Lives OUTSIDE the
+    repo (``~/.jarvis/commit_authority/enabled``) so the gate's
+    enablement does not depend on a shell env export — that is what
+    makes the Cursor/VS Code Source Control button work (GUI git
+    inherits no shell env). Operator override via
+    ``JARVIS_COMMIT_AUTHORITY_ENABLE_FILE``. NEVER raises."""
+    raw = os.environ.get(_ENV_ENABLE_FILE, "").strip()
+    if raw:
+        try:
+            return Path(raw).expanduser().resolve()
+        except Exception:  # noqa: BLE001
+            pass
+    return Path.home() / ".jarvis" / Path(*_DEFAULT_ENABLE_RELATIVE)
+
+
 # ===========================================================================
 # Per-machine HMAC secret (auto-generated on first issuance)
 # ===========================================================================
@@ -295,6 +322,123 @@ def _verify(payload: Mapping[str, Any], signature_hex: str, secret: str) -> bool
             verify_signature,
         )
         return verify_signature(payload, signature_hex, secret)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ===========================================================================
+# Persistent master enable (Slice 3 #0) — the Cursor SCM-button fix
+# ===========================================================================
+#
+# An env-only master flag can never be ON for a GUI git subprocess
+# (Cursor / VS Code Source Control inherit no shell env). The signed,
+# out-of-repo enable record lets the hook subprocess resolve master=ON
+# independent of how git was spawned. Signed with the SAME per-machine
+# secret as grants (composes _sign/_verify — zero new crypto): a hand-
+# created empty file does NOT flip the gate; tamper is signature-
+# evident; absent file/secret → OFF (default-FALSE preserved).
+
+
+def _enable_signed_payload(
+    issued_at_unix: float, operator_label: str,
+) -> Dict[str, Any]:
+    """Canonical dict the enable HMAC covers. Deterministic."""
+    return {
+        "enabled": True,
+        "issued_at_unix": float(issued_at_unix),
+        "operator_label": str(operator_label),
+        "schema_version": OPERATOR_COMMIT_AUTHORITY_SCHEMA_VERSION,
+    }
+
+
+def persistent_enabled() -> bool:
+    """Return ``True`` iff a valid, HMAC-signed enable record exists.
+    NEVER raises. Missing file, missing secret, malformed JSON, bad
+    signature, or ``enabled != True`` all → ``False`` (fail closed to
+    the safe default — the legacy token gate still applies)."""
+    target = enable_file_path()
+    try:
+        if not target.exists():
+            return False
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(raw, dict):
+        return False
+    record = raw.get("record")
+    signature = raw.get("signature")
+    if not isinstance(record, dict) or not isinstance(signature, str):
+        return False
+    if record.get("enabled") is not True:
+        return False
+    secret = _read_secret()
+    if not secret:
+        return False
+    # Recompute the canonical payload from the trusted fields so a
+    # tampered/extra field cannot ride along under an old signature.
+    payload = _enable_signed_payload(
+        issued_at_unix=float(record.get("issued_at_unix", 0.0)),
+        operator_label=str(record.get("operator_label", "")),
+    )
+    return _verify(payload, signature, secret)
+
+
+def enable_authority(
+    operator_label: str,
+    *,
+    now_unix: Optional[float] = None,
+) -> bool:
+    """Operator-only: write the signed persistent enable record
+    (bootstraps the per-machine secret on first use). Atomic write,
+    0600. Returns ``True`` on success. NEVER raises."""
+    label = str(operator_label or "").strip()
+    if not label:
+        return False
+    secret = _ensure_secret()
+    if not secret:
+        return False
+    now = float(now_unix) if now_unix is not None else time.time()
+    payload = _enable_signed_payload(now, label)
+    signature = _sign(payload, secret)
+    if not signature:
+        return False
+    target = enable_file_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"record": payload, "signature": signature},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:  # noqa: BLE001 — best effort
+            pass
+        os.replace(str(tmp), str(target))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[operator_commit_authority] enable write failed at %s: "
+            "%s",
+            target,
+            type(exc).__name__,
+        )
+        return False
+
+
+def disable_authority() -> bool:
+    """Operator-only: remove the persistent enable record. Master
+    then reverts to env-only (default FALSE). Idempotent. Returns
+    ``True`` iff the gate is persistently-disabled afterwards (file
+    absent). NEVER raises."""
+    target = enable_file_path()
+    try:
+        if target.exists():
+            target.unlink()
+        return not target.exists()
     except Exception:  # noqa: BLE001
         return False
 
@@ -1450,6 +1594,25 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example=f"{_ENV_SECRET_PATH}=/etc/jarvis/oca.secret",
         ),
+        FlagSpec(
+            name=_ENV_ENABLE_FILE,
+            type=FlagType.STR,
+            default="",
+            description=(
+                "Operator override for the persistent master-"
+                "enable record path. Defaults to "
+                "~/.jarvis/commit_authority/enabled (signed, "
+                "out-of-repo). Its presence (valid signature) is "
+                "what makes master ON for GUI git subprocesses "
+                "(Cursor/VS Code SCM) that inherit no shell env. "
+                "Absent + env unset → master FALSE (§33.1)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example=(
+                f"{_ENV_ENABLE_FILE}=/etc/jarvis/oca.enabled"
+            ),
+        ),
     ]
 
     count = 0
@@ -1476,6 +1639,10 @@ __all__ = [
     "plan_mode_ttl_s",
     "grants_path",
     "secret_path",
+    "enable_file_path",
+    "persistent_enabled",
+    "enable_authority",
+    "disable_authority",
     "resolve_repo_root_and_branch",
     "repo_root_fingerprint",
     "verify_pre_commit",

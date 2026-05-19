@@ -32,6 +32,7 @@ def _isolate(monkeypatch, tmp_path):
         "JARVIS_COMMIT_GRANT_PLAN_TTL_S",
         "JARVIS_COMMIT_AUTHORITY_GRANTS_PATH",
         "JARVIS_COMMIT_AUTHORITY_SECRET_PATH",
+        "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE",
         "JARVIS_LEDGER_SOVEREIGNTY_ENABLED",
         "JARVIS_GOVERNANCE_MANIFEST_ENABLED",
         "JARVIS_OPERATION_MODE",
@@ -47,6 +48,10 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "JARVIS_COMMIT_AUTHORITY_SECRET_PATH",
         str(tmp_path / "secret"),
+    )
+    monkeypatch.setenv(
+        "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE",
+        str(tmp_path / "enabled"),
     )
     yield
 
@@ -737,8 +742,9 @@ class TestFlagRegistrySeeds:
                 captured.append(spec.name)
 
         n = oca.register_flags(_Reg())
-        assert n == 5
+        assert n == 6  # Slice 3 #0 added the enable-file seed
         assert "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED" in captured
+        assert "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE" in captured
 
     def test_master_seed_default_false(self):
         captured = {}
@@ -750,3 +756,114 @@ class TestFlagRegistrySeeds:
         oca.register_flags(_Reg())
         master = captured["JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED"]
         assert master.default is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 #0 — persistent file-based master enable (Cursor SCM fix)
+# ---------------------------------------------------------------------------
+
+
+class TestPersistentEnable:
+    def test_default_off_no_env_no_file(self):
+        assert oca.persistent_enabled() is False
+        assert oca.master_enabled() is False
+
+    def test_enable_authority_turns_master_on_without_env(self):
+        # No JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED in env at all —
+        # this is exactly the Cursor-SCM (no shell env) scenario.
+        assert oca.enable_authority("cursor-test") is True
+        assert oca.persistent_enabled() is True
+        assert oca.master_enabled() is True
+
+    def test_enable_requires_label(self):
+        assert oca.enable_authority("   ") is False
+        assert oca.persistent_enabled() is False
+
+    def test_disable_reverts_to_default_false(self):
+        oca.enable_authority("x")
+        assert oca.master_enabled() is True
+        assert oca.disable_authority() is True
+        assert oca.persistent_enabled() is False
+        assert oca.master_enabled() is False
+
+    def test_tampered_enable_file_is_rejected(self, tmp_path):
+        oca.enable_authority("x")
+        ef = tmp_path / "enabled"
+        raw = json.loads(ef.read_text())
+        raw["record"]["operator_label"] = "ATTACKER"  # tamper
+        ef.write_text(json.dumps(raw))
+        # signature no longer matches recomputed payload -> off
+        assert oca.persistent_enabled() is False
+        assert oca.master_enabled() is False
+
+    def test_empty_file_does_not_enable(self, tmp_path):
+        (tmp_path / "enabled").write_text("")
+        assert oca.persistent_enabled() is False
+
+    def test_enabled_false_record_does_not_enable(self, tmp_path):
+        oca.enable_authority("x")
+        ef = tmp_path / "enabled"
+        raw = json.loads(ef.read_text())
+        raw["record"]["enabled"] = False
+        ef.write_text(json.dumps(raw))
+        assert oca.persistent_enabled() is False
+
+    def test_enable_file_without_secret_is_fail_closed(
+        self, tmp_path
+    ):
+        oca.enable_authority("x")
+        (tmp_path / "secret").unlink()  # secret gone -> unverifiable
+        assert oca.persistent_enabled() is False
+        assert oca.master_enabled() is False
+
+    def test_env_flag_still_independently_enables(self, monkeypatch):
+        # No enable file; env path must still work (back-compat).
+        assert oca.persistent_enabled() is False
+        monkeypatch.setenv(
+            "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED", "true"
+        )
+        assert oca.master_enabled() is True
+
+    def test_verify_pre_commit_honors_persistent_enable_no_env(
+        self, tmp_path
+    ):
+        # The end-to-end Cursor-SCM proof at substrate level: NO env
+        # master flag, persistent enable + signed grant -> AUTHORIZED.
+        assert "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED" not in (
+            __import__("os").environ
+        )
+        assert oca.enable_authority("cursor-scm") is True
+        out = oca.issue_grant(
+            channel="ide",
+            operator_label="cursor-scm",
+            repo_root=tmp_path,
+            now_unix=1000.0,
+        )
+        assert out.ok
+        v = oca.verify_pre_commit(
+            _ctx(tmp_path, channel="ide", now_unix=1100.0)
+        )
+        assert v.verdict is oca.CommitAuthorityVerdict.AUTHORIZED
+
+    def test_enable_file_path_env_override(self, monkeypatch, tmp_path):
+        custom = tmp_path / "custom" / "oca.enabled"
+        monkeypatch.setenv(
+            "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE", str(custom)
+        )
+        assert oca.enable_file_path() == custom.resolve() or str(
+            oca.enable_file_path()
+        ) == str(custom)
+        assert oca.enable_authority("x") is True
+        assert custom.exists()
+
+    def test_master_default_false_ast_pin_still_passes(self):
+        import ast as _ast
+
+        src = Path(oca.__file__).read_text(encoding="utf-8")
+        pin = next(
+            p
+            for p in oca.register_shipped_invariants()
+            if p.invariant_name
+            == "operator_commit_authority_master_default_false"
+        )
+        assert not pin.validate(_ast.parse(src), src)
