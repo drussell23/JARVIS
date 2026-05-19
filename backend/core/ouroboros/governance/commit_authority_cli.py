@@ -284,6 +284,47 @@ def cmd_revoke(args: argparse.Namespace) -> int:
     return 0 if n == 1 else 1
 
 
+def cmd_enable(args: argparse.Namespace) -> int:
+    """Persistently graduate OCA (signed, out-of-repo). This is what
+    makes the Cursor/VS Code SCM button work -- no shell env needed."""
+    from backend.core.ouroboros.governance import (
+        operator_commit_authority as oca,
+    )
+
+    label = (
+        args.label
+        or os.environ.get("USER")
+        or "operator"
+    )
+    if oca.enable_authority(label):
+        print(
+            "OCA persistently ENABLED (signed) at "
+            f"{oca.enable_file_path()} -- master is now ON for GUI "
+            "git (Cursor SCM) with no shell env. label=" + label
+        )
+        return 0
+    print(
+        "enable FAILED (could not bootstrap secret or write record)",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_disable(_args: argparse.Namespace) -> int:
+    from backend.core.ouroboros.governance import (
+        operator_commit_authority as oca,
+    )
+
+    if oca.disable_authority():
+        print(
+            "OCA persistently DISABLED (enable record removed); "
+            "master reverts to env-only (default FALSE)."
+        )
+        return 0
+    print("disable FAILED (enable record still present)", file=sys.stderr)
+    return 1
+
+
 def cmd_status(_args: argparse.Namespace) -> int:
     from backend.core.ouroboros.governance import (
         operator_commit_authority as oca,
@@ -291,8 +332,13 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
     root = _repo_root()
     sp = oca.secret_path()
+    ep = oca.enable_file_path()
     print("Operator Commit Authority -- status")
     print(f"  master_enabled        : {oca.master_enabled()}")
+    print(
+        f"  persistent enable     : {oca.persistent_enabled()} "
+        f"({ep} {'present' if ep.exists() else 'absent'})"
+    )
     print(f"  grants ledger         : {oca.grants_path()}")
     print(
         f"  per-machine secret    : {sp} "
@@ -370,6 +416,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="revoke all grants"
     )
 
+    e = sub.add_parser(
+        "enable",
+        help="persistently graduate OCA (signed, out-of-repo) -- "
+        "makes Cursor/VS Code SCM work with no shell env",
+    )
+    e.add_argument("--label", default="", help="operator audit label")
+
+    sub.add_parser(
+        "disable", help="remove the persistent enable record"
+    )
+
     sub.add_parser("status", help="show gate state + dry verify")
     return p
 
@@ -382,6 +439,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_grant(args)
     if args.cmd == "revoke":
         return cmd_revoke(args)
+    if args.cmd == "enable":
+        return cmd_enable(args)
+    if args.cmd == "disable":
+        return cmd_disable(args)
     if args.cmd == "status":
         return cmd_status(args)
     return 2

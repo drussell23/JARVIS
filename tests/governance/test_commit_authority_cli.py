@@ -28,6 +28,7 @@ def _isolate(monkeypatch, tmp_path):
         "JARVIS_COMMIT_CHANNEL",
         "JARVIS_COMMIT_AUTHORITY_GRANTS_PATH",
         "JARVIS_COMMIT_AUTHORITY_SECRET_PATH",
+        "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE",
         "JARVIS_LEDGER_SOVEREIGNTY_ENABLED",
         "JARVIS_GOVERNANCE_MANIFEST_ENABLED",
     ):
@@ -39,6 +40,10 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "JARVIS_COMMIT_AUTHORITY_SECRET_PATH",
         str(tmp_path / "secret"),
+    )
+    monkeypatch.setenv(
+        "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE",
+        str(tmp_path / "enabled"),
     )
     # Pin repo introspection to a deterministic tmp root and stub the
     # chained integrity hook so we test authority in isolation.
@@ -218,3 +223,49 @@ class TestSubcommands:
         assert cli.main(
             ["grant", "--channel", "zzz", "--label", "t"]
         ) == 1
+
+
+class TestEnableDisableCli:
+    def test_enable_then_hook_authorizes_with_no_env(
+        self, monkeypatch, tmp_path
+    ):
+        # No JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED — Cursor SCM
+        # scenario. enable -> persistent master ON -> grant -> hook 0.
+        assert "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED" not in (
+            __import__("os").environ
+        )
+        assert cli.main(["enable", "--label", "cursor"]) == 0
+        from backend.core.ouroboros.governance import (
+            operator_commit_authority as oca,
+        )
+        assert oca.master_enabled() is True
+        oca.issue_grant(
+            channel="ide",
+            operator_label="cursor",
+            repo_root=tmp_path,
+        )
+        assert cli.cmd_hook_pre_commit() == 0
+
+    def test_disable_reverts(self, monkeypatch, tmp_path):
+        cli.main(["enable", "--label", "x"])
+        assert cli.main(["disable"]) == 0
+        from backend.core.ouroboros.governance import (
+            operator_commit_authority as oca,
+        )
+        assert oca.master_enabled() is False
+        # master off + no token -> hook blocked (legacy path)
+        assert cli.cmd_hook_pre_commit() == 1
+
+    def test_status_reports_persistent_enable(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        cli.main(["enable", "--label", "x"])
+        assert cli.main(["status"]) == 0
+        out = capsys.readouterr().out
+        assert "persistent enable" in out
+        assert "master_enabled        : True" in out
+
+    def test_parser_has_enable_disable(self):
+        p = cli.build_parser()
+        assert p.parse_args(["enable", "--label", "z"]) is not None
+        assert p.parse_args(["disable"]) is not None
