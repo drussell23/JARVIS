@@ -269,6 +269,12 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/verbs", self._handle_verbs_list,
         )
+        # OCA Slice 3 #3 — Operator Commit Authority decision ring
+        # projection (read-only; composes commit_authority_archive).
+        app.router.add_get(
+            "/observability/commit-authority",
+            self._handle_commit_authority,
+        )
         # MissionInferrer Slice C — current InferenceResult projection.
         app.router.add_get(
             "/observability/goal-inference",
@@ -490,6 +496,61 @@ class IDEObservabilityRouter:
         we're loopback-only anyway, but some clients still set it)."""
         peer = getattr(request, "remote", "") or "unknown"
         return str(peer)
+
+    async def _handle_commit_authority(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/commit-authority[?limit=N] — read-only
+        projection of the OCA decision ring.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "count": 3,
+              "records": [{"ref": "c-1", "kind": "grant_issue",
+                           "detail": {...}, "inserted_at": 1.0,
+                           "schema_version": "..."}, ...]
+            }
+
+        Composes :func:`commit_authority_archive.recent` (single
+        source — when the archive master flag is off, ``recent``
+        returns ``[]`` so this is an empty 200, NOT a 403; the
+        route's own gate is the global ide_observability flag).
+        ``?limit=N`` clamped to [1, 200]; default 50.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = 50
+        raw = request.query.get("limit", "").strip()
+        if raw:
+            try:
+                limit = max(1, min(200, int(raw)))
+            except (TypeError, ValueError):
+                return self._error_response(
+                    request, 400, "commit_authority.bad_limit",
+                )
+        try:
+            from backend.core.ouroboros.governance import (
+                commit_authority_archive as _arch,
+            )
+            records = _arch.recent(limit)
+        except Exception:  # noqa: BLE001 — empty rather than 500
+            logger.debug(
+                "[IDEObservability] commit_authority projection failed",
+                exc_info=True,
+            )
+            records = []
+        return self._json_response(
+            request, 200,
+            {"count": len(records), "records": records},
+        )
 
     def _check_rate_limit(self, client_key: str) -> bool:
         """Returns True iff this call is within the sliding-window

@@ -143,6 +143,16 @@ EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 # matches the posture_changed keying convention).
 EVENT_TYPE_GIT_INDEX_ANOMALY = "git_index_anomaly"
 
+# OCA Slice 3 #3 — an Operator Commit Authority event was archived
+# (grant_issue / revoke / verify_verdict / consume /
+# bypass_suspected / enable). Single event; payload carries the
+# CommitAuthorityRecord.to_dict() (ref / kind / detail). Keyed by
+# the constant "commit_authority" (organism property, no op_id —
+# same convention as posture_changed / git_index_anomaly).
+EVENT_TYPE_COMMIT_AUTHORITY_DECISION_RECORDED = (
+    "commit_authority_decision_recorded"
+)
+
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 vocabulary.
 # Single event covering all 7 BudgetOutcome branches — payload
 # carries outcome string + reason + per-op snapshot. Operators
@@ -1306,6 +1316,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
     EVENT_TYPE_GIT_INDEX_ANOMALY,
+    EVENT_TYPE_COMMIT_AUTHORITY_DECISION_RECORDED,
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
     EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
     EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
@@ -2536,6 +2547,41 @@ def publish_git_index_anomaly(
     except Exception:  # noqa: BLE001 — best-effort
         logger.debug(
             "[Stream] publish_git_index_anomaly exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_commit_authority_decision(
+    record: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for
+    ``commit_authority_decision_recorded`` SSE frames.
+
+    ``record`` is :meth:`CommitAuthorityRecord.to_dict` output
+    (ref / kind / detail / inserted_at / schema_version). Returns
+    the event_id on success, None when the stream is disabled /
+    broker missing / publish raised / payload is not a mapping.
+    Never raises — it is the fail-silent seam the
+    :mod:`commit_authority_archive` invokes after parking a record.
+
+    Keyed by the constant ``"commit_authority"`` (organism
+    property, no op_id) — identical convention to
+    :func:`publish_posture_event` / :func:`publish_git_index_anomaly`.
+    """
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(record, Mapping):
+            return None
+        payload: Dict[str, Any] = dict(record)
+        return get_default_broker().publish(
+            EVENT_TYPE_COMMIT_AUTHORITY_DECISION_RECORDED,
+            "commit_authority", payload,
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[Stream] publish_commit_authority_decision exception",
             exc_info=True,
         )
         return None

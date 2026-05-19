@@ -220,6 +220,7 @@ class BoundedCommitAuthorityArchive:
                 while len(self._items) > self._capacity:
                     self._items.popitem(last=False)  # drop oldest
             _append_ledger(rec)
+            _publish_sse(rec)
             return rec
         except Exception as exc:  # noqa: BLE001 — never into authority
             logger.debug(
@@ -260,6 +261,22 @@ def _append_ledger(rec: CommitAuthorityRecord) -> None:
         flock_append_line(path, json.dumps(rec.to_dict(), sort_keys=True))
     except Exception as exc:  # noqa: BLE001
         logger.debug("[CommitAuthorityArchive] ledger append: %s", exc)
+
+
+def _publish_sse(rec: CommitAuthorityRecord) -> None:
+    """Emit the ``commit_authority_decision_recorded`` SSE frame.
+    Best-effort, fail-silent — mirrors the git_index_guard
+    on_anomaly seam. Stream absence/disable never affects the ring
+    or the authority path. NEVER raises. (ide_observability_stream
+    is observability, not a decision-side module — no
+    authority-asymmetry violation.)"""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            publish_commit_authority_decision,
+        )
+        publish_commit_authority_decision(rec.to_dict())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[CommitAuthorityArchive] sse publish: %s", exc)
 
 
 # ---------------------------------------------------------------------------
