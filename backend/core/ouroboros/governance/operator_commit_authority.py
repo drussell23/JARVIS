@@ -110,9 +110,11 @@ _ENV_DEFAULT_TTL_S = "JARVIS_COMMIT_GRANT_DEFAULT_TTL_S"
 _ENV_PLAN_TTL_S = "JARVIS_COMMIT_GRANT_PLAN_TTL_S"
 _ENV_GRANTS_PATH = "JARVIS_COMMIT_AUTHORITY_GRANTS_PATH"
 _ENV_SECRET_PATH = "JARVIS_COMMIT_AUTHORITY_SECRET_PATH"
+_ENV_ENABLE_FILE = "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE"
 
 _DEFAULT_GRANTS_RELATIVE = ".jarvis/commit_authority/grants.jsonl"
 _DEFAULT_SECRET_RELATIVE = ("commit_authority", "secret")  # under ~/.jarvis
+_DEFAULT_ENABLE_RELATIVE = ("commit_authority", "enabled")  # under ~/.jarvis
 
 _DEFAULT_TTL_S = 3600
 _MIN_TTL_S = 60
@@ -136,11 +138,20 @@ def _flag(name: str, *, default: bool = False) -> bool:
 def master_enabled() -> bool:
     """§33.1 opt-in safety gate — default-**FALSE**.
 
-    When off, :func:`verify_pre_commit` returns ``DISABLED`` and the
-    hook chain is byte-identical to the pre-substrate world. The
-    operator graduates this flag deliberately after Slice 2 wiring.
+    Master is ON iff EITHER the env flag is truthy OR a valid,
+    HMAC-signed persistent enable record exists (Slice 3 #0). The
+    persistent path is the load-bearing fix for the Cursor/VS Code
+    Source Control button: a GUI git subprocess inherits **no shell
+    env**, so an env-only master could never be ON for it — it would
+    fall back to the legacy token gate and stay blocked. The
+    out-of-repo signed enable file (mirroring how the per-machine
+    secret already lives outside the repo) lets the hook subprocess
+    resolve master=ON regardless of how git was spawned.
+
+    Default remains **FALSE**: no env flag AND no valid enable record
+    → byte-identical to the pre-substrate world. NEVER raises.
     """
-    return _flag(_ENV_MASTER, default=False)
+    return _flag(_ENV_MASTER, default=False) or persistent_enabled()
 
 
 def _read_clamped_int(name: str, default: int, lo: int, hi: int) -> int:
