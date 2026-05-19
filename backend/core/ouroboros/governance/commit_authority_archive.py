@@ -206,6 +206,37 @@ class BoundedCommitAuthorityArchive:
                     v if isinstance(v, (str, int, float, bool))
                     or v is None else _safe_str(v)
                 )
+        # Layer-3 forensic enrichment: a BYPASS_SUSPECTED record
+        # carrying the offending commit message is adaptively
+        # fingerprinted (composed from agent_fingerprint — NOT a
+        # rigid string match here, NOT the OCA gate). Pure detail
+        # enrichment of this existing telemetry record; NEVER
+        # raises, never blocks.
+        if (
+            parsed is CommitAuthorityEventKind.BYPASS_SUSPECTED
+            and isinstance(safe_detail.get("commit_message"), str)
+        ):
+            try:
+                from backend.core.ouroboros.governance.agent_fingerprint import (  # noqa: E501
+                    detect_agent_authored,
+                )
+                fp = detect_agent_authored(
+                    safe_detail["commit_message"]
+                )
+                for fk, fv in fp.to_dict().items():
+                    if fk == "schema_version":
+                        continue
+                    safe_detail.setdefault(
+                        fk,
+                        fv if isinstance(
+                            fv, (str, int, float, bool),
+                        ) or fv is None else _safe_str(fv),
+                    )
+            except Exception as exc:  # noqa: BLE001 — forensics
+                logger.debug(
+                    "[CommitAuthorityArchive] fingerprint "
+                    "enrichment skipped: %s", exc,
+                )
         try:
             with self._lock:
                 ref = f"{REF_PREFIX}{self._next_seq}"

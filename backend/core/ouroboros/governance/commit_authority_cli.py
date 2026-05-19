@@ -372,6 +372,19 @@ def cmd_hook_post_commit() -> int:
             <= _VERIFIED_MARKER_MAX_AGE_S
         )
         if not fresh:
+            # Observability-only: include HEAD's message so the
+            # archive can adaptively fingerprint it (Layer 3). This
+            # is the post-commit forensics path — the L2 sovereign
+            # gate (verify_pre_commit) is NOT involved here.
+            _msg = ""
+            try:
+                mr = _git(
+                    ["log", "-1", "--format=%B"], root,
+                )
+                if mr is not None and mr.returncode == 0:
+                    _msg = (mr.stdout or "").strip()[:4000]
+            except Exception:  # noqa: BLE001
+                pass
             _archive_post_commit(
                 "bypass_suspected",
                 {
@@ -380,6 +393,7 @@ def cmd_hook_post_commit() -> int:
                         "verified-marker absent" if not marker
                         else "verified-marker stale"
                     ),
+                    "commit_message": _msg,
                 },
             )
             sys.stderr.write(

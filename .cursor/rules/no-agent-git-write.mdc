@@ -1,0 +1,63 @@
+---
+description: >-
+  Operator Commit Authority — background AI Agents MUST NOT perform git
+  write operations on the operator's main JARVIS-AI-Agent checkout.
+  Always in context for this workspace.
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# Agent Git-Write Ban (Operator Commit Authority — Layer 1)
+
+This rule is **Layer 1 (prevention/intent)** of a three-layer defense.
+It is advisory. It is acceptable only because **Layer 2 (the OCA
+sovereign gate) hard-refuses** any commit lacking operator presence,
+and **Layer 3 (the commit-authority archive)** records every
+attempt. Do not treat this rule as the protection — treat the OCA
+gate as the protection and this rule as the standing instruction
+that keeps you from triggering it.
+
+## Hard prohibition (background / autonomous Agents)
+
+When you are a background or autonomous Agent operating on this
+repository's **operator main checkout**, you MUST NOT run, schedule,
+or cause to be run any of:
+
+- `git add` / `git commit` / `git commit --amend`
+- `git push` / `git push --force*`
+- `git reset` (`--hard`/`--soft`/`--mixed`) / `git restore --staged`
+- `git checkout <branch>` / `git switch` (branch change of the
+  operator checkout) / `git rm --cached` / `git stash` (push or pop)
+- any equivalent porcelain/plumbing that mutates the index, refs,
+  working tree, or stash of the operator's checkout.
+
+Authoring a commit message and running `git commit` autonomously
+(the verbose-prose + `[integrity-verified: …]` pattern) is the
+**exact failure mode** this rule exists to stop. It contaminates the
+operator's branches and is refused by the sovereign gate anyway.
+
+## What to do instead
+
+- **Autonomous git work belongs in an isolated worktree**, never the
+  operator main checkout. The `WorktreeManager` /
+  `ledger_sovereignty` owned-worktree path is the only sanctioned
+  place an autonomous writer may commit.
+- **Need a commit authorized?** Do not self-commit. The operator
+  holds commit authority. The sanctioned refresh path is the
+  **commit-authority daemon** (`commit_authority_daemon`,
+  `{"verb":"refresh"}`) or `commit_authority_cli grant` /
+  `/commit grant` — operator-driven, not Agent-driven.
+- **Surface, don't act.** If a change should be committed, describe
+  it and let the operator commit it from Cursor Source Control after
+  the presence ritual.
+
+## Why (do not weaken or delete this rule)
+
+A `.cursor/rules` file that can be silently deleted or gutted is no
+defense. This file's existence, non-emptiness, `alwaysApply: true`,
+and the load-bearing prohibition tokens above are **structurally
+pinned** by `cursor_rule_guard.register_shipped_invariants()`
+(auto-discovered shipped-code invariant). Removing or hollowing this
+file fails meta-validation / CI. The pin is the durability
+mechanism; this prose is the instruction.
