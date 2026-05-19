@@ -85,12 +85,30 @@ _MASTER_FLAG = "JARVIS_LEDGER_SOVEREIGNTY_ENABLED"
 def master_enabled() -> bool:
     """Return ``True`` iff the sovereignty gate is master-ON.
 
-    Default is ``False`` per §33.1 — the substrate is pure-add and
-    the operator graduates it deliberately. The whole module is a
-    structural assertion that's only load-bearing when the operator
-    has explicitly turned it on.
+    Two independent enable sources (OR-composed):
+
+      1. ``JARVIS_LEDGER_SOVEREIGNTY_ENABLED=true`` env (byte-
+         identical legacy behavior — when set, returns True
+         without touching disk).
+      2. A signed, out-of-repo persistent enable record (composes
+         :mod:`persistent_master`). This is the ONLY way the gate
+         can be ON for a Cursor/VS Code GUI-git subprocess, which
+         inherits no shell env — the same structural reason OCA
+         needed its persistent enable. Tamper-evident, fail-closed.
+
+    Default remains ``False`` per §33.1 (no env + no signed
+    record). The persistent path NEVER raises and degrades to
+    env-only if the substrate is unavailable.
     """
-    return os.environ.get(_MASTER_FLAG, "false").lower() == "true"
+    if os.environ.get(_MASTER_FLAG, "false").lower() == "true":
+        return True
+    try:
+        from backend.core.ouroboros.governance.persistent_master import (
+            is_persistently_enabled,
+        )
+        return is_persistently_enabled("ledger_sovereignty")
+    except Exception:  # noqa: BLE001 — fail closed to env-only
+        return False
 
 
 # ---------------------------------------------------------------------------
