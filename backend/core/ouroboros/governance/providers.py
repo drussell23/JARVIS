@@ -204,6 +204,209 @@ def _generate_attachments_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+# ---------------------------------------------------------------------------
+# Predictive Provider Resilience Arc — Slice 0: Observability Seam.
+#
+# Pure telemetry. Observes (provider, route, input_tokens, ttft_ms,
+# total_ms, outcome) at the provider call boundary, records it into
+# the EXISTING bounded TtftObserver ring, and durably appends it to a
+# cross-process JSONL so the Slice-1 forecaster has a fittable
+# dataset. It MUST NOT alter timeout / retry / context logic — it
+# only reads values already computed by the existing provider path
+# and writes them out. Master flag default FALSE (Slice 0 ships dark
+# until the dataset shape is operator-confirmed).
+# ---------------------------------------------------------------------------
+
+_PROVIDER_LATENCY_TELEMETRY_ENABLED_ENV = (
+    "JARVIS_PROVIDER_LATENCY_TELEMETRY_ENABLED"
+)
+_PROVIDER_LATENCY_JSONL_PATH_ENV = "JARVIS_PROVIDER_LATENCY_JSONL_PATH"
+_PROVIDER_LATENCY_JSONL_PATH_DEFAULT = ".jarvis/provider_latency.jsonl"
+
+
+def _provider_latency_telemetry_enabled() -> bool:
+    """Master switch. Default ``false`` — Slice 0 is dark until the
+    dataset shape is operator-confirmed (re-read at call time so it
+    can be hot-flipped without a restart)."""
+    raw = os.environ.get(
+        _PROVIDER_LATENCY_TELEMETRY_ENABLED_ENV, "false",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _provider_latency_jsonl_path() -> str:
+    """``JARVIS_PROVIDER_LATENCY_JSONL_PATH`` (default
+    ``.jarvis/provider_latency.jsonl``). The durable, bounded-shutdown
+    -surviving dataset the Slice-1 forecaster consumes."""
+    raw = os.environ.get(
+        _PROVIDER_LATENCY_JSONL_PATH_ENV,
+        _PROVIDER_LATENCY_JSONL_PATH_DEFAULT,
+    ).strip()
+    return raw or _PROVIDER_LATENCY_JSONL_PATH_DEFAULT
+
+
+def _emit_provider_latency(
+    *,
+    provider: str,
+    route: str,
+    op_id: str,
+    input_tokens: int,
+    ttft_ms: int,
+    total_ms: int,
+    outcome: str,
+) -> None:
+    """Record ONE provider-call latency observation. Pure side-channel.
+
+    Zero behavioural drift contract:
+      * gated by the master flag (default off);
+      * NEVER raises — every failure path swallowed (a telemetry
+        fault must not perturb generation);
+      * does NOT touch timeout/retry/context — it only consumes
+        values the existing provider path already computed;
+      * ``input_tokens`` is the provider's OWN server-side tokenizer
+        count (Claude ``usage.input_tokens`` / DW
+        ``CompleteSyncResult.input_tokens``) — passed in by the call
+        site, NEVER a ``len(chars)/4`` estimate computed here.
+
+    Dual sink: (1) the EXISTING bounded ``TtftObserver`` ring
+    (in-memory, ``deque(maxlen=N)`` — composed, not duplicated);
+    (2) cross-process JSONL via ``flock_append_line`` (durable,
+    survives bounded-shutdown, the Slice-1 training set)."""
+    try:
+        if not _provider_latency_telemetry_enabled():
+            return
+        import time as _t
+
+        from backend.core.ouroboros.governance.dw_ttft_observer import (
+            ProviderLatencySample,
+        )
+
+        try:
+            _it = int(input_tokens)
+        except (TypeError, ValueError):
+            _it = 0
+        try:
+            _ttft = int(ttft_ms)
+        except (TypeError, ValueError):
+            _ttft = -1
+        try:
+            _tot = int(total_ms)
+        except (TypeError, ValueError):
+            _tot = 0
+
+        sample = ProviderLatencySample(
+            provider=str(provider or "unknown"),
+            route=str(route or ""),
+            op_id=str(op_id or ""),
+            input_tokens=max(0, _it),
+            ttft_ms=_ttft,
+            total_ms=max(0, _tot),
+            outcome=str(outcome or "unknown"),
+            sample_unix=_t.time(),
+        )
+
+        # Sink 1 — EXISTING in-memory bounded ring (composed).
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                get_ttft_observer,
+            )
+
+            _obs = get_ttft_observer()
+            if _obs is not None:
+                _obs.record_provider_latency(sample)
+        except Exception:  # noqa: BLE001 — telemetry never perturbs
+            pass
+
+        # Sink 2 — durable cross-process JSONL (Slice-1 dataset).
+        try:
+            from pathlib import Path as _Path
+
+            from backend.core.ouroboros.governance.cross_process_jsonl import (
+                flock_append_line,
+            )
+
+            flock_append_line(
+                _Path(_provider_latency_jsonl_path()),
+                json.dumps(sample.to_jsonl_obj(), sort_keys=True),
+            )
+        except Exception:  # noqa: BLE001 — telemetry never perturbs
+            pass
+    except Exception:  # noqa: BLE001 — absolute never-raises boundary
+        return
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for the Slice-0
+    telemetry knobs. NEVER raises. Returns the count registered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    src = "backend/core/ouroboros/governance/providers.py"
+    specs = [
+        FlagSpec(
+            name=_PROVIDER_LATENCY_TELEMETRY_ENABLED_ENV,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Predictive Provider Resilience Slice 0 master "
+                "switch. When true, emits one ProviderLatencySample "
+                "(provider/route/input_tokens/ttft_ms/total_ms/"
+                "outcome) per provider call into the TtftObserver "
+                "ring + cross-process JSONL. Pure telemetry — no "
+                "timeout/retry/context change. Default false (dark)."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=src,
+            example=f"export {_PROVIDER_LATENCY_TELEMETRY_ENABLED_ENV}=true",
+        ),
+        FlagSpec(
+            name=_PROVIDER_LATENCY_JSONL_PATH_ENV,
+            type=FlagType.STR,
+            default=_PROVIDER_LATENCY_JSONL_PATH_DEFAULT,
+            description=(
+                "Path to the durable provider-latency JSONL dataset "
+                "(cross-process flock-appended; survives bounded "
+                "shutdown). The Slice-1 TTFT forecaster's training "
+                "set."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=src,
+            example=(
+                f"export {_PROVIDER_LATENCY_JSONL_PATH_ENV}="
+                f"{_PROVIDER_LATENCY_JSONL_PATH_DEFAULT}"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_PROVIDER_LATENCY_WINDOW_N",
+            type=FlagType.INT,
+            default=200,
+            description=(
+                "Hard upper bound on ProviderLatencySample retained "
+                "per provider in the in-memory ring "
+                "(deque(maxlen=N), drop-oldest). Pure memory bound — "
+                "respects the OOM-hardening boundaries."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file="backend/core/ouroboros/governance/dw_ttft_observer.py",
+            example="export JARVIS_PROVIDER_LATENCY_WINDOW_N=200",
+        ),
+    ]
+    n = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            n += 1
+        except Exception:  # noqa: BLE001 — registration never fatal
+            continue
+    return n
+
+
 def _skill_prompt_injection_enabled() -> bool:
     """``JARVIS_SKILL_PROMPT_INJECTION_ENABLED`` (default ``true``).
 
@@ -7005,6 +7208,31 @@ class ClaudeProvider:
                         "yes" if _is_tool_round else "no",
                         "on" if _thinking_param is not None else "off",
                     )
+                    # Slice 0 — failure-boundary latency emission
+                    # (pure side channel; master-flag-gated; NEVER
+                    # raises; placed BEFORE the re-raise so a
+                    # timeout/cancel still produces a training row —
+                    # this is the ttft=-1 connect-timeout signature
+                    # that masked the element-web capability run).
+                    try:
+                        _emit_provider_latency(
+                            provider="claude-api",
+                            route=getattr(context, "provider_route", "") or "",
+                            op_id=getattr(context, "op_id", "") or "",
+                            input_tokens=0,  # usage never returned on timeout
+                            ttft_ms=(
+                                int((_ttft - _call_start) * 1000.0)
+                                if _ttft is not None else -1
+                            ),
+                            total_ms=int(_elapsed * 1000.0),
+                            outcome=(
+                                "cancelled"
+                                if isinstance(_te, asyncio.CancelledError)
+                                else "timeout"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — never perturbs
+                        pass
                     # On CancelledError we MUST re-raise the exact same
                     # exception (not wrap it) — PEP 479 / asyncio contract.
                     if isinstance(_te, asyncio.CancelledError):
@@ -7119,6 +7347,31 @@ class ClaudeProvider:
             # the pool after an idle gap.  Stream + create paths both
             # converge here on success.
             self._record_successful_call()
+
+            # Slice 0 — provider-latency observability (pure side
+            # channel; master-flag-gated; NEVER raises; reads only
+            # values already computed above). input_tokens is the
+            # Claude server-side tokenizer count (msg.usage), NOT a
+            # client estimate. Stream + create converge here on
+            # success → exactly-once success emission.
+            try:
+                _pl_ttft = _first_token_ms[0]
+                _emit_provider_latency(
+                    provider="claude-api",
+                    route=getattr(context, "provider_route", "") or "",
+                    op_id=getattr(context, "op_id", "") or "",
+                    input_tokens=input_tokens,
+                    ttft_ms=(
+                        int(_pl_ttft) if _pl_ttft is not None else -1
+                    ),
+                    total_ms=int(
+                        (time.monotonic() - _call_start) * 1000.0
+                    ),
+                    outcome="success",
+                )
+            except Exception:  # noqa: BLE001 — telemetry never perturbs
+                pass
+
             if _cached_input > 0:
                 logger.info(
                     "[ClaudeProvider] \U0001f4b0 Prompt cache hit: %d cached tokens "

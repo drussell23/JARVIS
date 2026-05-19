@@ -237,6 +237,32 @@ _MIN_N_FOR_NONDEGENERATE_VARIANCE = 3
 
 SCHEMA_VERSION = "ttft_observer.1"
 
+# Predictive Provider Resilience Arc — Slice 0 (Observability Seam).
+# A SEPARATE schema for the provider-latency sample stream. The
+# existing ``SCHEMA_VERSION`` above (and the TtftSample promotion
+# data it persists) is byte-untouched — Slice 0 is strictly additive
+# so the DW dynamic-promotion path has zero behavioural drift.
+PROVIDER_LATENCY_SCHEMA_VERSION = "provider_latency.1"
+
+
+def _provider_latency_window_n() -> int:
+    """``JARVIS_PROVIDER_LATENCY_WINDOW_N`` (default 200).
+
+    Hard upper bound on ProviderLatencySample retained per
+    ``provider`` key in the in-memory ring. Pure memory bound —
+    respects the OOM-hardening boundaries locked in 2026-05-19
+    (deque(maxlen=N), drop-oldest, no unbounded growth). The
+    Slice-1 forecaster derives its EMA window mathematically; this
+    only caps the maximum N the ring can hold."""
+    try:
+        return max(2, int(
+            os.environ.get(
+                "JARVIS_PROVIDER_LATENCY_WINDOW_N", "200",
+            ).strip()
+        ))
+    except (ValueError, TypeError):
+        return 200
+
 
 @dataclass(frozen=True)
 class TtftSample:
@@ -261,6 +287,47 @@ class TtftStats:
     latest_ms: int             # most recent sample (for cold detection)
     window_start_unix: float   # oldest retained sample timestamp
     window_end_unix: float     # newest sample timestamp
+
+
+@dataclass(frozen=True)
+class ProviderLatencySample:
+    """One provider-call latency observation — the raw training row
+    the Slice-1 TTFT Forecaster regresses on.
+
+    Frozen + hashable. ``input_tokens`` is the provider's OWN
+    server-side tokenizer count (Claude ``usage.input_tokens`` /
+    DoubleWord ``CompleteSyncResult.input_tokens``) — the most
+    precise possible measure of the model tier's true input size,
+    NOT a ``len(chars)/4`` client estimate.
+
+    ``ttft_ms`` = time-to-first-token (``-1`` when no byte ever
+    arrived — the connect/LB-timeout signature). ``total_ms`` =
+    full provider-call wall time. ``outcome`` is a free string
+    (``success`` / ``timeout`` / ``cancelled`` / ``error``)."""
+    provider: str
+    route: str
+    op_id: str
+    input_tokens: int
+    ttft_ms: int
+    total_ms: int
+    outcome: str
+    sample_unix: float
+
+    def to_jsonl_obj(self) -> Dict[str, Any]:
+        """Stable dict for the cross-process JSONL dataset. Key
+        order is fixed so the Slice-1 forecaster parses positionally
+        or by key without schema drift."""
+        return {
+            "schema_version": PROVIDER_LATENCY_SCHEMA_VERSION,
+            "provider": self.provider,
+            "route": self.route,
+            "op_id": self.op_id,
+            "input_tokens": self.input_tokens,
+            "ttft_ms": self.ttft_ms,
+            "total_ms": self.total_ms,
+            "outcome": self.outcome,
+            "sample_unix": self.sample_unix,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +378,12 @@ class TtftObserver:
         self._path = path
         self._autosave = autosave
         self._samples: Dict[str, Deque[TtftSample]] = {}
+        # Slice 0 — provider-latency ring. SEPARATE keyed deque dict
+        # so the existing TtftSample promotion buffers + their
+        # persisted schema are byte-untouched (zero behavioural
+        # drift on the DW dynamic-promotion path). Shares the same
+        # RLock + drop-oldest bounded-deque discipline.
+        self._latency_samples: Dict[str, Deque[ProviderLatencySample]] = {}
         self._lock = threading.RLock()
         self._loaded = False
 
@@ -605,6 +678,82 @@ class TtftObserver:
     # Diagnostics
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Slice 0 — Provider-latency ring (Predictive Provider Resilience)
+    # ------------------------------------------------------------------
+
+    def record_provider_latency(
+        self,
+        sample: ProviderLatencySample,
+    ) -> None:
+        """Append one ProviderLatencySample into the bounded ring,
+        keyed by ``provider``. Pure observer — records and returns.
+        NEVER raises on garbage input (mirrors ``record_ttft``).
+
+        Memory bound: each per-provider deque is created with
+        ``maxlen=_provider_latency_window_n()`` so it physically
+        cannot grow unbounded (drop-oldest on overflow). Does NOT
+        autosave to the TTFT promotion JSON — durable persistence
+        is the caller's cross-process JSONL append (Slice 0
+        contract), keeping the existing promotion schema untouched."""
+        # isinstance also rejects None — single defensive guard,
+        # NEVER-raises contract (mirrors record_ttft house style).
+        if not isinstance(sample, ProviderLatencySample):
+            return
+        try:
+            key = str(sample.provider or "").strip()
+            if not key:
+                return
+            cap = _provider_latency_window_n()
+            with self._lock:
+                buf = self._latency_samples.get(key)
+                if buf is None:
+                    buf = deque(maxlen=cap)
+                    self._latency_samples[key] = buf
+                elif buf.maxlen != cap:
+                    # Window resized via env override since last record:
+                    # rebuild preserving most-recent, keep the bound.
+                    buf = deque(list(buf)[-cap:], maxlen=cap)
+                    self._latency_samples[key] = buf
+                buf.append(sample)
+        except Exception:  # noqa: BLE001 — observer NEVER raises
+            return
+
+    def provider_latency_samples(
+        self,
+        provider: str,
+    ) -> Tuple[ProviderLatencySample, ...]:
+        """Immutable snapshot of the current ring for ``provider``
+        (oldest→newest). Empty tuple for unknown keys. NEVER raises.
+        This is the read surface the Slice-1 forecaster consumes."""
+        if not provider or not provider.strip():
+            return ()
+        try:
+            with self._lock:
+                buf = self._latency_samples.get(provider.strip())
+                return tuple(buf) if buf else ()
+        except Exception:  # noqa: BLE001
+            return ()
+
+    def provider_latency_sample_count(self, provider: str) -> int:
+        """Number of retained samples for ``provider``. NEVER raises."""
+        if not provider or not provider.strip():
+            return 0
+        try:
+            with self._lock:
+                buf = self._latency_samples.get(provider.strip())
+                return len(buf) if buf else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def all_latency_providers(self) -> Tuple[str, ...]:
+        """Sorted provider keys with at least one latency sample."""
+        try:
+            with self._lock:
+                return tuple(sorted(self._latency_samples.keys()))
+        except Exception:  # noqa: BLE001
+            return ()
+
     def all_tracked_models(self) -> Tuple[str, ...]:
         self._ensure_loaded()
         with self._lock:
@@ -621,9 +770,11 @@ class TtftObserver:
 
 __all__ = [
     "SCHEMA_VERSION",
+    "PROVIDER_LATENCY_SCHEMA_VERSION",
     "TtftObserver",
     "TtftSample",
     "TtftStats",
+    "ProviderLatencySample",
     "tracking_enabled",
     "ttft_demotion_enabled",
 ]
