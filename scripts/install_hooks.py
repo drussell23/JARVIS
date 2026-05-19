@@ -23,10 +23,11 @@ Author: JARVIS System
 import os
 import shutil
 import stat
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 # ANSI colors
 class Colors:
@@ -57,10 +58,41 @@ def get_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _git_hooks_dir() -> Optional[Path]:
+    """Resolve the *real* hooks directory via git itself.
+
+    This is correct in plain checkouts AND linked worktrees (where
+    ``.git`` is a gitdir-pointer file, not a directory, and hooks
+    live in the shared common git dir). No hardcoded ``.git/hooks``
+    assumption -- git is the single source of truth for its own
+    layout.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--git-path", "hooks"],
+            cwd=str(get_project_root()),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            hp = Path(r.stdout.strip())
+            if not hp.is_absolute():
+                hp = get_project_root() / hp
+            return hp.resolve()
+    except Exception:
+        pass
+    return None
+
+
 def get_hooks_dir() -> Path:
-    """Get the git hooks directory."""
-    root = get_project_root()
-    return root / ".git" / "hooks"
+    """Get the git hooks directory (worktree-aware)."""
+    resolved = _git_hooks_dir()
+    if resolved is not None:
+        return resolved
+    # Fallback: legacy plain-checkout assumption.
+    return get_project_root() / ".git" / "hooks"
 
 
 def get_source_hooks_dir() -> Path:
@@ -68,7 +100,15 @@ def get_source_hooks_dir() -> Path:
     return Path(__file__).resolve().parent / "hooks"
 
 
-HOOKS_TO_INSTALL = ["pre-commit", "commit-msg", "post-commit"]
+# "pre-commit" is now the OCA dispatcher; "pre-commit.project" is the
+# file-integrity guardian it chains to after authority passes. Both
+# are versioned + installable so there is no orphan bash-only logic.
+HOOKS_TO_INSTALL = [
+    "pre-commit",
+    "pre-commit.project",
+    "commit-msg",
+    "post-commit",
+]
 
 
 def backup_hook(hooks_dir: Path, hook_name: str) -> bool:

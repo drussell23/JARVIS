@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+JARVIS Pre-Commit Hook - File Integrity Guardian
+=================================================
+
+This hook runs before every commit to:
+1. Validate Python file syntax
+2. Detect truncated/corrupted files
+3. Check for common truncation patterns
+4. Block commits that would introduce broken files
+
+Install:
+    ./scripts/install_hooks.py
+
+Usage:
+    - Automatically runs on git commit
+    - Use --no-verify to bypass (not recommended)
+
+Exit Codes:
+    0 - All files pass validation
+    1 - Issues detected, commit blocked
+"""
+
+import ast
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+# ANSI colors for terminal output
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+
+def color(text: str, *styles: str) -> str:
+    """Apply color styles to text."""
+    return ''.join(styles) + text + Colors.RESET
+
+
+# =============================================================================
+# TRUNCATION DETECTION PATTERNS
+# =============================================================================
+
+TRUNCATION_PATTERNS = {
+    "unclosed_docstring": [
+        re.compile(r'"""[^"]*$', re.MULTILINE),
+        re.compile(r"'''[^']*$", re.MULTILINE),
+    ],
+    "unclosed_string": [
+        re.compile(r'"[^"\n\\]*$', re.MULTILINE),
+        re.compile(r"'[^'\n\\]*$", re.MULTILINE),
+        re.compile(r'f"[^"]*\{[^}]*$', re.MULTILINE),
+    ],
+    "incomplete_function": [
+        re.compile(r'^\s*def\s+\w+\s*\([^)]*$', re.MULTILINE),
+        re.compile(r'^\s*async\s+def\s+\w+\s*\([^)]*$', re.MULTILINE),
+    ],
+    "incomplete_import": [
+        re.compile(r'^\s*from\s+\w+\s*$', re.MULTILINE),
+        re.compile(r'^\s*import\s*$', re.MULTILINE),
+    ],
+    "unclosed_bracket": [
+        re.compile(r'\[\s*$', re.MULTILINE),
+        re.compile(r'\{\s*$', re.MULTILINE),
+        re.compile(r'\(\s*$', re.MULTILINE),
+    ],
+}
+
+SUSPICIOUS_EOF_PATTERNS = [
+    re.compile(r'#.*truncat', re.IGNORECASE),
+    re.compile(r'#\s*TODO\s*$', re.IGNORECASE),
+    re.compile(r'^\s*\.\.\.\s*$'),
+]
+
+
+# =============================================================================
+# VALIDATION FUNCTIONS
+# =============================================================================
+
+def get_staged_python_files() -> List[str]:
+    """Get list of staged Python files."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode != 0:
+            return []
+        
+        return [f.strip() for f in result.stdout.split('\n') 
+                if f.strip().endswith('.py') and os.path.exists(f.strip())]
+    except Exception:
+        return []
+
+
+def get_staged_content(file_path: str) -> Optional[str]:
+    """Get the staged content of a file (what will be committed)."""
+    try:
+        result = subprocess.run(
+            ["git", "show", f":{file_path}"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            return result.stdout
+        return None
+    except Exception:
+        return None
+
+
+def check_syntax(content: str, file_path: str) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Check Python syntax using AST."""
+    try:
+        ast.parse(content)
+        return True, None, None
+    except SyntaxError as e:
+        return False, str(e.msg), e.lineno
+    except Exception as e:
+        return False, str(e), None
+
+
+def detect_truncation_patterns(content: str) -> List[str]:
+    """Detect common truncation patterns in content."""
+    detected = []
+    
+    for pattern_name, patterns in TRUNCATION_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.search(content):
+                detected.append(pattern_name)
+                break
+    
+    # Check last few lines for suspicious endings
+    lines = content.strip().split('\n')
+    if lines:
+        last_lines = '\n'.join(lines[-5:])
+        for pattern in SUSPICIOUS_EOF_PATTERNS:
+            if pattern.search(last_lines):
+                detected.append("suspicious_ending")
+                break
+    
+    return list(set(detected))
+
+
+def check_bracket_balance(content: str) -> Tuple[bool, str]:
+    """Check if brackets are balanced."""
+    stack = []
+    pairs = {'(': ')', '[': ']', '{': '}'}
+    
+    in_string = False
+    string_char = None
+    escape_next = False
+    in_triple_string = False
+    
+    i = 0
+    while i < len(content):
+        char = content[i]
+        
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        
+        if char == '\\':
+            escape_next = True
+            i += 1
+            continue
+        
+        # Handle triple-quoted strings
+        if i + 2 < len(content) and content[i:i+3] in ('"""', "'''"):
+            if in_triple_string and content[i:i+3] == string_char:
+                in_triple_string = False
+                string_char = None
+                i += 3
+                continue
+            elif not in_string:
+                in_triple_string = True
+                string_char = content[i:i+3]
+                i += 3
+                continue
+        
+        # Handle single-quoted strings
+        if char in ('"', "'") and not in_triple_string:
+            if in_string:
+                if char == string_char:
+                    in_string = False
+                    string_char = None
+            else:
+                in_string = True
+                string_char = char
+            i += 1
+            continue
+        
+        # Skip if inside string
+        if in_string or in_triple_string:
+            i += 1
+            continue
+        
+        # Skip comments
+        if char == '#':
+            while i < len(content) and content[i] != '\n':
+                i += 1
+            i += 1
+            continue
+        
+        # Check brackets
+        if char in pairs:
+            stack.append(char)
+        elif char in pairs.values():
+            if not stack:
+                return False, f"Unexpected closing '{char}'"
+            expected = pairs[stack.pop()]
+            if char != expected:
+                return False, f"Mismatched brackets: expected '{expected}', got '{char}'"
+        
+        i += 1
+    
+    if in_string or in_triple_string:
+        return False, "Unclosed string literal"
+    
+    if stack:
+        return False, f"Unclosed brackets: {stack}"
+    
+    return True, ""
+
+
+def check_file_completeness(content: str) -> Tuple[bool, List[str]]:
+    """Check if file appears complete."""
+    issues = []
+    
+    lines = content.strip().split('\n')
+    
+    if not lines:
+        return False, ["Empty file"]
+    
+    # Check minimum size for non-empty files
+    if len(content) < 50 and len(lines) < 5:
+        # Very small files might be stubs - check if intentional
+        if not any(kw in content for kw in ['pass', '...', 'raise NotImplementedError']):
+            issues.append("File appears truncated (very small)")
+    
+    return len(issues) == 0, issues
+
+
+# =============================================================================
+# MAIN VALIDATION
+# =============================================================================
+
+def validate_file(file_path: str) -> Dict:
+    """
+    Validate a single file for integrity issues.
+    
+    Key insight: If syntax is valid, the file is almost certainly NOT truncated.
+    Truncation virtually always causes syntax errors. Only check patterns
+    for files with syntax errors.
+    """
+    result = {
+        "file": file_path,
+        "passed": True,
+        "errors": [],
+        "warnings": [],
+    }
+    
+    # Get staged content
+    content = get_staged_content(file_path)
+    
+    if content is None:
+        # Fallback to reading file directly
+        try:
+            content = Path(file_path).read_text(encoding='utf-8')
+        except Exception as e:
+            result["passed"] = False
+            result["errors"].append(f"Cannot read file: {e}")
+            return result
+    
+    # 1. Primary check: Syntax validation
+    # If syntax is valid, the file is healthy - no further checks needed
+    is_valid, error, line = check_syntax(content, file_path)
+    
+    if is_valid:
+        # Valid syntax = healthy file
+        return result
+    
+    # Syntax error found - this is where truncation is likely
+    result["passed"] = False
+    result["errors"].append(f"Syntax error at line {line}: {error}")
+    
+    # 2. Pattern detection only for files with syntax errors
+    patterns = detect_truncation_patterns(content)
+    if patterns:
+        result["errors"].append(f"Truncation patterns detected: {', '.join(patterns)}")
+    
+    # 3. Bracket balance check (provides more detail for syntax errors)
+    balanced, bracket_error = check_bracket_balance(content)
+    if not balanced:
+        result["errors"].append(f"Bracket issue: {bracket_error}")
+    
+    return result
+
+
+def main() -> int:
+    """Main pre-commit hook logic."""
+    print(color("\n🔍 JARVIS File Integrity Pre-Commit Hook", Colors.CYAN, Colors.BOLD))
+    print(color("=" * 50, Colors.CYAN))
+    
+    # Get staged Python files
+    files = get_staged_python_files()
+    
+    if not files:
+        print(color("✓ No Python files staged for commit", Colors.GREEN))
+        return 0
+    
+    print(f"\nChecking {color(str(len(files)), Colors.YELLOW)} Python file(s)...\n")
+    
+    # Validate each file
+    passed = 0
+    failed = 0
+    all_results = []
+    
+    for file_path in files:
+        result = validate_file(file_path)
+        all_results.append(result)
+        
+        if result["passed"]:
+            passed += 1
+            print(f"  {color('✓', Colors.GREEN)} {file_path}")
+        else:
+            failed += 1
+            print(f"  {color('✗', Colors.RED)} {file_path}")
+            for error in result["errors"]:
+                print(f"    {color('→', Colors.RED)} {error}")
+    
+    print()
+    
+    # Summary
+    if failed > 0:
+        print(color("=" * 50, Colors.RED))
+        print(color(f"❌ COMMIT BLOCKED: {failed} file(s) failed validation", Colors.RED, Colors.BOLD))
+        print()
+        print(color("Options:", Colors.YELLOW))
+        print("  1. Fix the issues and try again")
+        print("  2. Use 'git commit --no-verify' to bypass (not recommended)")
+        print()
+        print(color("💡 Tip: Run 'python backend/core/file_integrity_guardian.py check <path>'", Colors.CYAN))
+        print(color("   for detailed analysis of problematic files.", Colors.CYAN))
+        print()
+        return 1
+    else:
+        print(color("=" * 50, Colors.GREEN))
+        print(color(f"✅ All {passed} file(s) passed integrity check", Colors.GREEN, Colors.BOLD))
+        print()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
