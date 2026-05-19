@@ -137,10 +137,37 @@ class TestHookMasterOff:
 
 
 class TestHookMasterOn:
-    def test_no_grant_blocks(self, monkeypatch):
+    def test_no_grant_no_presence_new_model(self, monkeypatch):
+        """Re-encoded for the structural channel-resolution fix
+        (2026-05-19). The legacy ``or "ide"`` default meant
+        master-on + no-grant ALWAYS blocked. Now: no operator-
+        presence marker → channel resolves to AUTONOMOUS, and the
+        verdict is delegated to ledger_sovereignty (composed, NOT
+        reimplemented). Hence the gate is sound ONLY when
+        sovereignty enforcement is also on:
+
+          * sovereignty OFF → autonomous legacy contract authorizes
+            (the documented AutoCommitter behavior; this is WHY
+            operator hygiene mandates enabling sovereignty)
+          * sovereignty ON + unowned tree → DENIED_SOVEREIGNTY,
+            still blocks (the real "no authority ⇒ blocked"
+            guarantee, under the sound configuration)
+        """
         monkeypatch.setenv(
             "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED", "true"
         )
+        # No JARVIS_COMMIT_CHANNEL, no grant, no presence minted.
+        # Sovereignty OFF → autonomous legacy pass-through.
+        monkeypatch.setenv("JARVIS_LEDGER_SOVEREIGNTY_ENABLED", "false")
+        assert cli.cmd_hook_pre_commit() == 0
+
+        # Sovereignty ON + tree not owned → blocked via the
+        # composed sovereignty gate (no parallel denial logic).
+        from backend.core.ouroboros.governance import (
+            ledger_sovereignty as _ls,
+        )
+        monkeypatch.setenv("JARVIS_LEDGER_SOVEREIGNTY_ENABLED", "true")
+        monkeypatch.setattr(_ls, "is_owned", lambda _p: False)
         assert cli.cmd_hook_pre_commit() == 1
 
     def test_signed_grant_authorizes_without_env_token(

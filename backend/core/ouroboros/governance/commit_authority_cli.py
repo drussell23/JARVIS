@@ -193,10 +193,19 @@ def cmd_hook_pre_commit() -> int:
         return 1
 
     if oca.master_enabled():
-        channel = (
-            os.environ.get("JARVIS_COMMIT_CHANNEL", "").strip().lower()
-            or "ide"
-        )
+        # Structural, evidence-based channel resolution. The legacy
+        # ``env or "ide"`` blanket default let a Cursor *Agent*'s
+        # headless git commit borrow the operator's interactive
+        # ``ide`` grant (same process tree / identical env as a
+        # human SCM commit). resolve_commit_channel requires a
+        # signed operator-presence marker to earn an operator
+        # channel; absent it the commit resolves to AUTONOMOUS and
+        # the existing ledger_sovereignty gate decides.
+        channel = oca.resolve_commit_channel(
+            repo_root=Path(root),
+            branch=_branch(root),
+            env_channel=os.environ.get("JARVIS_COMMIT_CHANNEL", ""),
+        ).value
         ctx = oca.CommitAuthorityContext(
             channel=channel,
             repo_root=root,
