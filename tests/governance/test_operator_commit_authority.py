@@ -742,8 +742,9 @@ class TestFlagRegistrySeeds:
                 captured.append(spec.name)
 
         n = oca.register_flags(_Reg())
-        assert n == 5
+        assert n == 6  # Slice 3 #0 added the enable-file seed
         assert "JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED" in captured
+        assert "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE" in captured
 
     def test_master_seed_default_false(self):
         captured = {}
