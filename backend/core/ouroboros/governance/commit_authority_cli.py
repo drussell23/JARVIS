@@ -226,6 +226,17 @@ def cmd_hook_pre_commit() -> int:
             f"{_DIM}# OCA: {verdict.verdict.value} "
             f"({verdict.detail}){_RESET}\n"
         )
+        # OCA Slice 3 #5 — additive verified-marker. Written ONLY
+        # after authorization succeeds; consumed + cleared by the
+        # post-commit hook. Its ABSENCE/staleness after a commit
+        # is the structural bypass_suspected signal (a --no-verify
+        # commit skips this whole dispatcher → no fresh marker).
+        # Additive observability — does NOT alter the verdict.
+        _write_verified_marker(
+            root,
+            channel=channel,
+            matched_grant_id=verdict.matched_grant_id,
+        )
     else:
         ok, reason = legacy_token_ok()
         if not ok:
@@ -241,6 +252,160 @@ def cmd_hook_pre_commit() -> int:
             return 1
 
     return _chain_project_hook(root)
+
+
+# ---------------------------------------------------------------------------
+# OCA Slice 3 #5 — verified-marker + post-commit hook
+# ---------------------------------------------------------------------------
+
+
+_VERIFIED_MARKER_REL = (
+    ".jarvis", "commit_authority", ".last_verified",
+)
+# Max age (s) between pre-commit authorization and the post-commit
+# hook firing for the same commit. A real commit's post-commit
+# runs within milliseconds of pre-commit; a stale/absent marker
+# means the pre-commit dispatcher never ran (--no-verify / bypass).
+_VERIFIED_MARKER_MAX_AGE_S = 60.0
+
+
+def _verified_marker_path(root: str) -> Path:
+    return Path(root, *_VERIFIED_MARKER_REL)
+
+
+def _write_verified_marker(
+    root: str, *, channel: str, matched_grant_id: str,
+) -> None:
+    """Best-effort one-shot marker. NEVER raises into the gate."""
+    try:
+        import json
+        import time as _t
+        p = _verified_marker_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps({
+                "ts": _t.time(),
+                "channel": str(channel),
+                "matched_grant_id": str(matched_grant_id or ""),
+            }),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 — observability, never the gate
+        pass
+
+
+def _read_and_clear_verified_marker(root: str) -> Optional[dict]:
+    """Read + unlink the marker (one-shot). Returns the dict or
+    None (absent/corrupt). NEVER raises."""
+    try:
+        import json
+        p = _verified_marker_path(root)
+        if not p.exists():
+            return None
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return raw if isinstance(raw, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _archive_post_commit(kind: str, detail: dict) -> None:
+    """Best-effort append to the OCA observability ring (#2).
+    Archive absence/disable is silent. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance import (
+            commit_authority_archive as _arch,
+        )
+        _arch.record(kind=kind, detail=detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def cmd_hook_post_commit() -> int:
+    """``hook post-commit`` — runs AFTER a commit lands. Two
+    best-effort, detect-only duties (NEVER blocks; a commit has
+    already happened; NEVER auto-reverts per the operator
+    constraint):
+
+      1. **bypass detection** — a fresh verified-marker proves the
+         pre-commit gate authorized this commit. Absent/stale →
+         ``bypass_suspected`` (``--no-verify`` or a hook bypass).
+         Detect + archive only.
+      2. **grant consume** — when one-shot grants are enabled
+         (``JARVIS_COMMIT_GRANT_ONESHOT`` truthy; default OFF so
+         session-lived grants keep working), the matched grant
+         from the marker is consumed via the canonical
+         :func:`consume_grant`.
+
+    Always returns 0 — a post-commit hook must never fail the
+    (already-completed) commit. NEVER raises.
+    """
+    try:
+        root = _repo_root()
+        try:
+            from backend.core.ouroboros.governance import (
+                operator_commit_authority as oca,
+            )
+            master = oca.master_enabled()
+        except Exception:  # noqa: BLE001
+            return 0
+        if not master:
+            return 0  # OCA not governing — nothing to observe.
+
+        head = ""
+        try:
+            r = _git(["rev-parse", "HEAD"], root)
+            if r is not None and r.returncode == 0:
+                head = (r.stdout or "").strip()[:40]
+        except Exception:  # noqa: BLE001
+            pass
+
+        marker = _read_and_clear_verified_marker(root)
+        import time as _t
+        fresh = bool(
+            marker
+            and isinstance(marker.get("ts"), (int, float))
+            and (_t.time() - float(marker["ts"]))
+            <= _VERIFIED_MARKER_MAX_AGE_S
+        )
+        if not fresh:
+            _archive_post_commit(
+                "bypass_suspected",
+                {
+                    "head": head,
+                    "reason": (
+                        "verified-marker absent" if not marker
+                        else "verified-marker stale"
+                    ),
+                },
+            )
+            sys.stderr.write(
+                f"{_DIM}# OCA post-commit: bypass_suspected "
+                f"(no fresh pre-commit authorization for "
+                f"{head[:12]}){_RESET}\n"
+            )
+            return 0
+
+        # Authorized commit. Optional one-shot consume.
+        oneshot = os.environ.get(
+            "JARVIS_COMMIT_GRANT_ONESHOT", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        gid = str(marker.get("matched_grant_id", "")).strip()
+        if oneshot and gid:
+            try:
+                oca.consume_grant(gid)
+                _archive_post_commit(
+                    "consume",
+                    {"head": head, "grant_id": gid},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
+    except Exception:  # noqa: BLE001 — post-commit MUST NOT fail
+        return 0
 
 
 def cmd_grant(args: argparse.Namespace) -> int:
@@ -389,7 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     h = sub.add_parser("hook", help="git hook dispatcher")
     h.add_argument(
-        "phase", choices=["pre-commit"], help="hook phase"
+        "phase", choices=["pre-commit", "post-commit"],
+        help="hook phase",
     )
 
     g = sub.add_parser("grant", help="issue a signed commit grant")
@@ -444,6 +610,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "hook" and args.phase == "pre-commit":
         return cmd_hook_pre_commit()
+    if args.cmd == "hook" and args.phase == "post-commit":
+        return cmd_hook_post_commit()
     if args.cmd == "grant":
         return cmd_grant(args)
     if args.cmd == "revoke":
