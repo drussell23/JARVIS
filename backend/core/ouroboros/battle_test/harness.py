@@ -726,6 +726,15 @@ class BattleTestHarness:
         _boot_mark("harness_run_pre_boot_done")
         try:
             # Boot sequence — each phase wrapped for boot-timing visibility
+            # GitIndexGuard (Phase C Slice 2) MUST be the first phase:
+            # a missing .git/index (the background-Cursor-Agent unlink
+            # failure mode) corrupts every git-touching subsystem
+            # downstream. §2 Progressive Awakening — mirrors
+            # WorktreeManager.reap_orphans boot recovery. Master-
+            # gated inside the guard (default-OFF → DISABLED no-op);
+            # NEVER raises into boot.
+            with _BootPhase("boot_git_index_guard"):
+                await self._boot_git_index_guard()
             with _BootPhase("boot_oracle"):
                 await self.boot_oracle()
             with _BootPhase("boot_governance_stack"):
@@ -2030,6 +2039,71 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    async def _boot_git_index_guard(self) -> None:
+        """GitIndexGuard boot recovery (Phase C Slice 2).
+
+        Detects a **missing** ``.git/index`` (the background-
+        Cursor-Agent unlink failure mode that produces the false
+        "7856 staged deletions" in Source Control) and advisorily
+        rebuilds it from HEAD via ``git read-tree HEAD`` — working
+        tree untouched, a present index is never modified.
+
+        Pure composition, zero new logic here:
+          * ``git_index_guard.detect_and_rebuild`` does the work
+            (master-gated inside: ``JARVIS_GIT_INDEX_GUARD_ENABLED``
+            default-OFF → ``DISABLED`` no-op, byte-identical boot).
+          * The ``on_anomaly`` seam is wired to
+            ``ide_observability_stream.publish_git_index_anomaly``
+            so a rebuilt/failed index surfaces as a
+            ``git_index_anomaly`` SSE frame. The guard imports NO
+            governance module; the harness owns this wiring.
+
+        NEVER raises into the boot path (mirrors ``_boot_mark`` /
+        ``reap_orphans`` discipline) — a guard failure must not
+        abort the organism boot.
+        """
+        try:
+            from backend.core.ouroboros.governance import (
+                git_index_guard as _gig,
+            )
+
+            def _on_anomaly(anomaly: Any) -> None:
+                try:
+                    from backend.core.ouroboros.governance import (
+                        ide_observability_stream as _stream,
+                    )
+                    _stream.publish_git_index_anomaly(
+                        anomaly.to_dict()
+                    )
+                except Exception:  # noqa: BLE001 — fail-silent seam
+                    logger.debug(
+                        "publish_git_index_anomaly failed",
+                        exc_info=True,
+                    )
+
+            outcome = _gig.detect_and_rebuild(
+                Path(self._config.repo_path),
+                on_anomaly=_on_anomaly,
+            )
+            if outcome.outcome is (
+                _gig.GitIndexGuardOutcome.MISSING_REBUILT
+            ):
+                logger.warning(
+                    "[GitIndexGuard] boot: .git/index was missing "
+                    "— rebuilt from HEAD (working tree untouched)"
+                )
+            elif outcome.outcome is (
+                _gig.GitIndexGuardOutcome.MISSING_REBUILD_FAILED
+            ):
+                logger.error(
+                    "[GitIndexGuard] boot: .git/index missing AND "
+                    "rebuild failed: %s", outcome.detail,
+                )
+        except Exception:  # noqa: BLE001 — never abort boot
+            logger.debug(
+                "_boot_git_index_guard degraded", exc_info=True,
+            )
 
     async def _boot_ledger_sovereignty_workspace(self) -> None:
         """Create the auto-commit worktree under the Ledger
