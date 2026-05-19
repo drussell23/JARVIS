@@ -985,6 +985,19 @@ class BattleTestHarness:
                 self._wall_clock_monitor_task = asyncio.ensure_future(
                     self._monitor_wall_clock(_wall_cap)
                 )
+                # Task #21 — Dynamic Timeout Coherence seam. Publish
+                # the absolute monotonic wall deadline so the
+                # governance layer (swe_bench_pro.evaluator) can
+                # structurally clamp its inner eval timeout BELOW the
+                # outer bounded-shutdown WITHOUT importing battle_test
+                # (env-var seam; mirrors the strategic_direction
+                # session-id module-global precedent). Composes the
+                # already-computed _wall_cap; additive; only set when a
+                # wall cap is armed — absent env ⇒ evaluator no-ops
+                # (byte-identical legacy for non-battle-test callers).
+                os.environ["OUROBOROS_BATTLE_WALL_DEADLINE_MONOTONIC"] = (
+                    repr(time.monotonic() + float(_wall_cap))
+                )
                 # Defect #1 Slice B (2026-05-03) — thread-based safety
                 # net immune to asyncio starvation. The asyncio task
                 # above is the primary path (handles normal termination
@@ -5344,7 +5357,41 @@ class BattleTestHarness:
             )
             _wdg = getattr(self, "_shutdown_watchdog", None)
             if _wdg is not None:
-                _wdg.arm(reason="wall_clock_cap", deadline_s=_bsw_deadline_s())
+                # Task #22 — composed-deadline coherence. The bounded
+                # watchdog arms here IN PARALLEL with the autoscore
+                # drain that runs later in _shutdown_components; with
+                # the bare default_deadline_s() the os._exit(75) can
+                # fire BEFORE harness_inject logs the verdict under a
+                # heavy session (deep-run bt-2026-05-19-011003). When
+                # closed-loop autoscore work is still in flight, extend
+                # the watchdog deadline by the autoscore grace + margin
+                # so the drain (which the evaluator already reserved
+                # via Task #21) completes first. Composes existing
+                # env knobs; no hardcode; bare path unchanged otherwise.
+                _arm_deadline = _bsw_deadline_s()
+                try:
+                    from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (  # noqa: E501
+                        autoscore_work_in_flight,
+                    )
+                    if autoscore_work_in_flight():
+                        _grace = float(os.environ.get(
+                            "JARVIS_SWE_BENCH_PRO_AUTOSCORE_SHUTDOWN_GRACE_S",
+                            "30",
+                        ) or "30")
+                        _margin = float(os.environ.get(
+                            "JARVIS_SWE_BENCH_PRO_EVAL_DRAIN_MARGIN_S",
+                            "15",
+                        ) or "15")
+                        if _grace <= 0:
+                            _grace = 30.0
+                        if _margin <= 0:
+                            _margin = 15.0
+                        _arm_deadline = _arm_deadline + _grace + _margin
+                except Exception:  # noqa: BLE001 — never block the arm
+                    pass
+                _wdg.arm(
+                    reason="wall_clock_cap", deadline_s=_arm_deadline,
+                )
         except Exception:  # noqa: BLE001
             pass
         self._wall_clock_event.set()
