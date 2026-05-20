@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: docker in /. - Update #1376631623
-- **Run Number**: #147
-- **Branch**: `main`
-- **Commit**: `5a96da4b042c18e6afeb8c016bc27d9ec1332a85`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #80789
+- **Branch**: `fix/ci/docker-in-update-1376631623-run147-20260520-141821`
+- **Commit**: `b0786eef6d3a98666b476b487d467e60f121a7ca`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-20T14:16:11Z
-- **Triggered By**: @dependabot[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26168439195)
+- **Timestamp**: 2026-05-20T14:19:28Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26168629603)
 
 ## Failure Overview
 
@@ -17,49 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Dependabot | permission_error | high | 32s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. Dependabot
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-20T14:16:20Z
-**Completed**: 2026-05-20T14:16:52Z
-**Duration**: 32 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26168439195/job/76979052751)
+**Started**: 2026-05-20T14:19:34Z
+**Completed**: 2026-05-20T14:19:37Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26168629603/job/76979736689)
 
 #### Failed Steps
 
-- **Step 3**: Run Dependabot
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 10
-  - Sample matches:
-    - Line 46: `2026-05-20T14:16:37.7596453Z updater | 2026/05/20 14:16:37 INFO <job_1376631623> Job definition: {"j`
-    - Line 69: `2026-05-20T14:16:47.7742197Z updater | 2026/05/20 14:16:47 ERROR <job_1376631623> Error during file `
-    - Line 70: `2026-05-20T14:16:47.9001088Z   proxy | 2026/05/20 14:16:47 [010] POST /update_jobs/1376631623/record`
-
-- Pattern: `FAIL|Failed|failed`
   - Occurrences: 2
   - Sample matches:
-    - Line 24: `2026-05-20T14:16:24.4914918Z 🤖 ~ Failed to parse GITHUB_REGISTRIES_PROXY environment variable ~`
-    - Line 87: `2026-05-20T14:16:48.4881164Z Failure running container 25f23a0758a0a472c7da1d25368bfcdee283a5ea0c8b8`
+    - Line 30: `2026-05-20T14:19:36.1339101Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-20T14:19:37.0491277Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: dock`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 40: `2026-05-20T14:16:34.8207284Z updater | rehash: warning: skipping ca-certificates.crt,it does not con`
+    - Line 58: `2026-05-20T14:19:37.1076628Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -79,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-20T14:18:21.524246*
+📊 *Report generated on 2026-05-20T14:21:23.131756*
 🤖 *JARVIS CI/CD Auto-PR Manager*
