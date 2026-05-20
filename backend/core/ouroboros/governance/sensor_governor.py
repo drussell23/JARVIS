@@ -825,6 +825,112 @@ class SensorGovernor:
             self._global.clear()
             self._decisions.clear()
 
+    # ----------------------------------------------------------------------
+    # PRD §11 (S2) additive composition surface — preemption signal
+    # ----------------------------------------------------------------------
+    # S2's predictive admission gate emits a structured advisory when
+    # forecasted spend approaches the budget AND a high-urgency op is
+    # queued. The governor RECORDS the signal (no new quarantine
+    # machinery: existing posture-weighted caps + emergency brakes are
+    # the authoritative quarantine path; this method only adds a
+    # structured record so the existing decision/snapshot surfaces can
+    # report it).
+    #
+    # Load-bearing invariant (PRD §11.4): the signal's advice path is
+    # restricted to ``BACKGROUND`` / ``SPECULATIVE`` — high-urgency
+    # routes (IMMEDIATE / STANDARD / COMPLEX) are IMMUNE. Enforced
+    # both here (input validation) and at the consumer site.
+    #
+    # NEVER raises. Garbage input silently rejected.
+
+    # Single-source-of-truth for the immune/quarantinable partition.
+    # Authoritative for S2 §11.4 invariant; AST-pinned downstream.
+    _S2_HIGH_URGENCY_IMMUNE: frozenset = frozenset({
+        Urgency.IMMEDIATE.value,
+        Urgency.STANDARD.value,
+        Urgency.COMPLEX.value,
+    })
+    _S2_QUARANTINABLE: frozenset = frozenset({
+        Urgency.BACKGROUND.value,
+        Urgency.SPECULATIVE.value,
+    })
+
+    def apply_preemption_signal(
+        self,
+        *,
+        kind: str,
+        severity: float,
+        high_prio_queued: bool,
+        advice: str,
+    ) -> bool:
+        """Record an S2 preemption-advisory signal (PRD §11). Returns
+        True iff the signal was accepted + recorded.
+
+        Authoritative behavior contract:
+          * High-urgency routes are NEVER quarantined by this signal.
+          * Severity is clipped to [0.0, 1.0]; NaN → rejected.
+          * ``advice`` MUST be ``'quarantine_low_prio_sensors'`` (the
+            only advice S2 is allowed to emit). Other strings are
+            silently rejected — closed surface.
+          * ``kind`` MUST be a short identifier; truncated to 64 chars.
+          * The signal is appended to the decision ring so existing
+            ``recent_decisions()`` + ``snapshot()`` observability
+            paths report it without changing their shape.
+
+        NEVER raises."""
+        try:
+            # Validate advice (closed surface)
+            if advice != "quarantine_low_prio_sensors":
+                return False
+            # Validate kind
+            try:
+                k = str(kind or "").strip()
+            except Exception:  # noqa: BLE001
+                return False
+            if not k:
+                return False
+            k = k[:64]
+            # Validate severity (clip + NaN-reject)
+            try:
+                sev = float(severity)
+            except (TypeError, ValueError):
+                return False
+            if sev != sev:                   # NaN
+                return False
+            sev = max(0.0, min(1.0, sev))
+            hpq = bool(high_prio_queued)
+            with self._lock:
+                # Record into existing decision ring — composes the
+                # existing snapshot/recent_decisions surfaces. The
+                # signal is a distinct record kind, distinguishable
+                # by ``sensor_name`` starting with ``_s2_preempt:``.
+                self._decisions.append(BudgetDecision(
+                    allowed=False,
+                    sensor_name=f"_s2_preempt:{k}",
+                    urgency=Urgency.BACKGROUND,
+                    posture=None,
+                    weighted_cap=0,
+                    current_count=0,
+                    remaining=0,
+                    reason_code=(
+                        f"s2_preemption_signal severity={sev:.3f} "
+                        f"high_prio_queued={hpq} advice={advice}"
+                    ),
+                ))
+            return True
+        except Exception as exc:  # noqa: BLE001 — defensive
+            try:
+                _logger = __import__("logging").getLogger(
+                    "Ouroboros.SensorGovernor",
+                )
+                _logger.debug(
+                    "[SensorGovernor] apply_preemption_signal "
+                    "degraded: %s", exc,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Singleton
