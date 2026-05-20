@@ -482,3 +482,84 @@ canary artifacts attached as the §41.6 evidence row. Standing rule
 from §8b.5 §10.5 holds: **no production-savings claim until the
 canary is recorded and the flip PR is independently approved.**
 
+### 10.7 Live S1 Canary (DW-only) — PASS_STRICT (2026-05-19 UTC)
+
+Operator-authorized canary executed against the real DoubleWord 397B
+API (`api.doubleword.ai`) with master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true`
+**session-only inside the canary subprocess** (outer shell verified
+`response_cache_enabled() == False` before AND after). Hard `--cost-cap`
+$0.10 USD enforced; provider's native `max_cost_per_op=0.10` aligned
+as belt-and-suspenders. Cache file written under `$TMPDIR`, never under
+repo or `.jarvis/`.
+
+| Field | Value |
+|---|---|
+| Branch / HEAD | `ouroboros/zero-waste-s1-evidence` / `e66586574b` |
+| Canary id | `prc_canary_dw_20260520T042126Z` |
+| Model | `Qwen/Qwen3.5-397B-A17B-FP8` (DW 397B) |
+| Route | `ide` (STANDARD cascade) |
+| Tools | `tools_enabled=False`, `tool_loop=None` |
+| Workload | Identical `OperationContext` × 2; `target_files=("x.py",)`, `task_complexity="trivial"`, description: *"Add a no-op helper function named ping that returns the string 'pong'."* |
+| Total spend | **$0.000148** (1.5‰ of cap) |
+| Cache file | `$TMPDIR/prc_canary_dw_20260520T042126Z.jsonl` (764 B) |
+
+**Unvarnished telemetry (canary subprocess stdout, key lines):**
+
+```
+[DoublewordProvider] Batch 785a30fa-3a24-4972-85c0-ccdb62bf37cf submitted async
+   (model=Qwen/Qwen3.5-397B-A17B-FP8, op=dw-1779250890)
+[DoublewordProvider] Batch 785a30fa-3a24-4972-85c0-ccdb62bf37cf completed
+   (output=5f795248-4703-4a7c-90d8-859c67a8d676)
+[PRC] EXACT_HIT — provider skipped, $0.00 (model=Qwen/Qwen3.5-397B-A17B-FP8 route=ide)
+
+call#1 returned: provider_name='doubleword'         cost_usd=0.00014820
+dispatch_count after call#1: 1
+call#2 returned: provider_name='doubleword+cache'   cost_usd=0.0
+dispatch_count after call#2: 1
+```
+
+**§10.6 criteria — all green:**
+
+| Criterion | Required | Observed |
+|---|---|---|
+| Master session-only | only in canary subprocess | ✅ outer shell `False` before AND after |
+| Cache path | `$TMPDIR`, never in repo / `.jarvis/` | ✅ `/var/folders/zk/.../T/prc_canary_dw_<ts>.jsonl` |
+| Hard `--cost-cap` | $0.10 | ✅ total spend $0.000148 (1.5‰ of cap) |
+| Workload | single identical no-tools op × 2 | ✅ same `OperationContext`, `provider_route="ide"`, `task_complexity="trivial"`, `tool_loop=None` |
+| Single provider | DW only (no Claude) | ✅ `DoublewordProvider` exclusively |
+| Call #1 real network | DW API permitted | ✅ Batch `785a30fa-…` submitted + completed against `api.doubleword.ai` |
+| Call #2 zero dispatch | provider-side dispatch telemetry | ✅ wrapped `_dispatch_internal` count stayed at **1** across both calls |
+| Call #2 `cost_usd == 0.0` | strict equality | ✅ `0.0` |
+| Call #2 `provider_name.endswith("+cache")` | suffix check | ✅ `'doubleword+cache'` |
+| `[PRC] EXACT_HIT` log | present | ✅ `EXACT_HIT — provider skipped, $0.00 (model=Qwen/Qwen3.5-397B-A17B-FP8 route=ide)` |
+| Working tree post-canary | clean | ✅ `0 change(s)` |
+| HEAD post-canary | unchanged | ✅ `e66586574b` |
+| Fail-loud abort fired | none | ✅ all guards held (no `cost>cap`, `cost#2>0`, or `dispatch>1`) |
+
+**Claims discipline (held, even on PASS_STRICT):**
+
+- ✅ Architecture-level invariant proven on the DW route: the wired
+  cache gate intercepts a 2nd identical no-tools op against the real
+  DoubleWord API at the `_dispatch_internal` provider seam — confirmed
+  by provider-side dispatch counter, not merely by the `[PRC]` log.
+- ✅ Repo-state digest functioned correctly in a real environment
+  (digest computed during call #1, matched during call #2 → cache key
+  equal → EXACT_HIT). Byte-bounded LRU exercised (cache file 764 bytes,
+  well under the 256 MiB default budget).
+- ❌ **No production-savings claim.** A single-prompt, single-route,
+  single-session canary proves the **mechanism**, not real-workload
+  economics. Hit-rate under operator workloads (mixed prompts,
+  varying repo state, multi-route distribution, cross-session
+  persistence under churn) is **unmeasured** and explicitly out of
+  scope for this row.
+- ❌ **No default-TRUE proposal.** The flip remains a separate
+  operator-authorized PR per §10.6.
+- ❌ No edits to code, flags, OCA, git-index, sovereignty,
+  cursor-agent-ban, S2, S3. No SWE Phase-1 / Phase-3 re-run.
+
+**Side observation (no action proposed here):** the canary subprocess
+emitted `aiohttp ERROR Unclosed client session / Unclosed connector`
+warnings at shutdown — DW provider's aiohttp session isn't async-closed
+in a one-shot harness. Benign for a single canary; tracked for a
+future cleanup arc per operator direction.
+
