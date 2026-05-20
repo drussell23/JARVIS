@@ -603,6 +603,19 @@ class UnifiedIntakeRouter:
                 self._f1_shadow_on,
             )
 
+        # PRD §11 (S2) — auto-register this instance as the
+        # process-wide default for S2's head-of-queue peek. NEVER
+        # raises; failure to register degrades S2 to "no high-prio
+        # signal" (fail-open). Last-write-wins matches the cost_governor
+        # singleton pattern.
+        try:
+            set_default_intake_router(self)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[UnifiedIntakeRouter] auto-register-default "
+                "degraded: %s", exc,
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -876,6 +889,50 @@ class UnifiedIntakeRouter:
     def intake_queue_depth(self) -> int:
         """Current number of items waiting in the dispatch queue."""
         return self._queue.qsize()
+
+    # ----------------------------------------------------------------------
+    # PRD §11 (S2) additive composition surface — head-of-queue inspector
+    # ----------------------------------------------------------------------
+    # S2's preemption-signal predicate needs to know the urgency of the
+    # next-to-be-dispatched envelope. Rather than build a parallel
+    # queue inspector (PRD §3 forbids), this read-only accessor
+    # composes the existing IntakePriorityQueue's heap (already
+    # maintained for dispatch ordering). Does NOT pop. NEVER raises.
+
+    def peek_top_urgency(self) -> Optional[str]:
+        """Return the urgency string (``'critical'`` / ``'high'`` /
+        ``'normal'`` / ``'low'``) of the next-to-be-dispatched
+        envelope in the priority queue, or ``None`` if the queue is
+        empty, the priority scheduler is not active, or any
+        introspection fault occurs.
+
+        Read-only — does NOT pop. Composes ``_priority_queue._heap``
+        (existing dispatch-ordering heap). No parallel queue. NEVER
+        raises (PRD §11.4 fail-open contract).
+        """
+        try:
+            pq = self._priority_queue
+            if pq is None:
+                return None
+            heap = getattr(pq, "_heap", None)
+            if not heap:
+                return None
+            top_entry = heap[0]
+            rank = getattr(top_entry, "urgency_rank", None)
+            if rank is None:
+                return None
+            # Reverse URGENCY_RANK lookup (small dict; O(4)).
+            from .intake_priority_queue import URGENCY_RANK as _RANK
+            for urgency_str, r in _RANK.items():
+                if r == rank:
+                    return urgency_str
+            return None
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[UnifiedIntakeRouter] peek_top_urgency degraded: %s",
+                exc,
+            )
+            return None
 
     def dead_letter_count(self) -> int:
         """Number of envelopes that exhausted all retries."""
@@ -1736,3 +1793,58 @@ class UnifiedIntakeRouter:
             except OSError:
                 pass
             self._lock_fd = None
+
+
+# ---------------------------------------------------------------------------
+# Process-wide default singleton (PRD §11 S2 wiring)
+# ---------------------------------------------------------------------------
+# S2's preemption-signal predicate (s2_predictive_budget.py) consumes
+# the head-of-queue urgency via ``peek_top_urgency()``. To avoid
+# threading the router instance through every provider call site,
+# this module exposes a thread-safe singleton getter/setter. The
+# setter is called from ``UnifiedIntakeRouter.__init__`` so any
+# instantiation auto-registers; last-write-wins (matches the
+# cost_governor singleton pattern).
+#
+# When no router is registered (e.g., S2 is exercised in unit tests
+# that don't construct an IntakeLayer), ``get_default_intake_router``
+# returns ``None`` — S2's ``_peek_high_prio_queued`` treats this as
+# "no signal" and emits nothing. NEVER raises.
+
+_DEFAULT_INTAKE_ROUTER: Optional["UnifiedIntakeRouter"] = None
+_DEFAULT_INTAKE_ROUTER_LOCK = threading.Lock()
+
+
+def set_default_intake_router(router: "UnifiedIntakeRouter") -> None:
+    """Register a router as the process-wide default for S2's
+    head-of-queue inspection. Idempotent; last-write-wins. NEVER
+    raises."""
+    global _DEFAULT_INTAKE_ROUTER
+    try:
+        with _DEFAULT_INTAKE_ROUTER_LOCK:
+            _DEFAULT_INTAKE_ROUTER = router
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[UnifiedIntakeRouter] set_default_intake_router "
+            "degraded: %s", exc,
+        )
+
+
+def get_default_intake_router() -> Optional["UnifiedIntakeRouter"]:
+    """Return the registered default router, or ``None`` if no router
+    has been registered in this process. NEVER raises."""
+    try:
+        with _DEFAULT_INTAKE_ROUTER_LOCK:
+            return _DEFAULT_INTAKE_ROUTER
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+
+
+def reset_default_intake_router_for_tests() -> None:
+    """Test helper — drops the registered default. NEVER raises."""
+    global _DEFAULT_INTAKE_ROUTER
+    try:
+        with _DEFAULT_INTAKE_ROUTER_LOCK:
+            _DEFAULT_INTAKE_ROUTER = None
+    except Exception:  # noqa: BLE001 — defensive
+        pass

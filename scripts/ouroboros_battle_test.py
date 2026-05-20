@@ -1308,6 +1308,15 @@ def main() -> None:
         seed_intents=int(args.seed_intents or 0),
     )
 
+    # PRD §11 (S2) wiring B1 — bridge --cost-cap into S2's session
+    # budget env so the CLI flag transparently flows through. Uses
+    # setdefault: if operator explicitly set JARVIS_S2_SESSION_BUDGET_USD
+    # (Tier 1 of the precedence chain), that wins; otherwise --cost-cap
+    # populates the Tier-2 fallback by way of Tier-1 env.
+    os.environ.setdefault(
+        "JARVIS_S2_SESSION_BUDGET_USD", str(args.cost_cap),
+    )
+
     if _boot_timer is not None:
         with _boot_timer.phase("harness_construct"):
             harness = BattleTestHarness(config)

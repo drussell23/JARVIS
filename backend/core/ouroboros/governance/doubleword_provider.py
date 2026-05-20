@@ -981,6 +981,39 @@ class DoublewordProvider:
                     _zw_model = self._effective_model_id(context)
                 except Exception:  # noqa: BLE001
                     _zw_model = getattr(self, "_model", "doubleword")
+
+                # ── S2 — Predictive Budget Preemption (PRD §11.4) ──
+                # Co-located with assembled _zw_prompt (B3 invariant).
+                # Master OFF ⇒ skipped; behavior byte-identical. S2 is
+                # ADVISORY — does NOT alter this op's dispatch path;
+                # merely emits a preemption signal to nudge
+                # sensor_governor against FUTURE low-priority sensor
+                # emissions. High-urgency routes are immune at the
+                # governor's signal-application surface. Uses
+                # _effective_model_id(context) — the actual model
+                # resolved for dispatch, NOT self._model. NEVER raises.
+                try:
+                    from backend.core.ouroboros.governance.s2_predictive_budget import (  # noqa: E501
+                        evaluate_admission_pressure as _s2_pressure_check,
+                        emit_preemption_signal as _s2_emit,
+                    )
+                    _s2_severity = _s2_pressure_check(
+                        prompt_text=(_zw_prompt or ""),
+                        route=getattr(
+                            context, "provider_route", "",
+                        ) or "standard",
+                        model=str(_zw_model or ""),
+                    )
+                    if _s2_severity is not None:
+                        _s2_emit(severity=_s2_severity,
+                                 high_prio_queued=True)
+                except Exception as _s2_exc:  # noqa: BLE001 — fail-open
+                    logger.debug(
+                        "[S2] DW admission integration degraded: %s",
+                        _s2_exc,
+                    )
+                # ───────────────────────────────────────────────────
+
                 _gr, _ = await _zw_cached_or_generate(
                     prompt=_zw_prompt,
                     model=_zw_model,
@@ -1043,6 +1076,44 @@ class DoublewordProvider:
             raise DoublewordInfraError(
                 "Batch retrieval failed", status_code=self._last_error_status,
             )
+        # ── S2 — record op_outcome for MAD sample stream (PRD §11 B4) ─
+        # Reached ONLY on real provider success (post-batch return).
+        # Belt-and-suspenders: skip if provider_name carries the
+        # "+cache" reconstruction marker. Uses _effective_model_id
+        # (the actual model used for dispatch). Master-gated;
+        # NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.s2_predictive_budget import (  # noqa: E501
+                master_enabled as _s2_master_check,
+            )
+            if _s2_master_check():
+                _pname = str(getattr(result, "provider_name", "") or "")
+                if not _pname.endswith("+cache"):
+                    try:
+                        _s2_eff_model = self._effective_model_id(context)
+                    except Exception:  # noqa: BLE001
+                        _s2_eff_model = getattr(self, "_model", "") or ""
+                    from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
+                        get_default_history as _s2_history,
+                    )
+                    _s2_history().record_op_outcome(
+                        route=getattr(
+                            context, "provider_route", "",
+                        ) or "standard",
+                        model=str(_s2_eff_model or ""),
+                        output_tokens=int(
+                            getattr(result, "total_output_tokens", 0) or 0,
+                        ),
+                        cost_usd=float(
+                            getattr(result, "cost_usd", 0.0) or 0.0,
+                        ),
+                    )
+        except Exception as _s2_rec_exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[S2] DW op_outcome record degraded: %s",
+                _s2_rec_exc,
+            )
+        # ───────────────────────────────────────────────────────────
         return result
 
     # ------------------------------------------------------------------

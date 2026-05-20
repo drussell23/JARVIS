@@ -863,6 +863,40 @@ class CostGovernor:
         """Return the number of currently tracked ops (for tests/diagnostics)."""
         return len(self._entries)
 
+    # ----------------------------------------------------------------------
+    # PRD §11 (S2) additive composition surface — session-wide aggregate
+    # ----------------------------------------------------------------------
+    # S2's predictive admission predicate needs the cross-op cumulative
+    # spend within this process. Rather than maintain a parallel
+    # accumulator (which would risk drift from the per-op ledger), this
+    # method composes the existing ``_entries`` dict via a one-shot
+    # materialized snapshot. NEVER raises; returns 0.0 on any fault.
+    #
+    # No lock is taken — the class does not maintain ``self._lock``.
+    # ``list(dict.values())`` is safe under CPython's GIL for the
+    # bounded read this method performs (no in-flight mutation can
+    # break a list materialization). A concurrent ``charge()`` may
+    # update an entry's ``cumulative_usd`` mid-iteration; the result
+    # reflects either the pre- or post-charge value of that entry,
+    # which is acceptable for an S2 advisory predicate.
+
+    def session_total_cumulative_usd(self) -> float:
+        """Sum of ``cumulative_usd`` across all _entries in this
+        process. Composes the existing per-op ledger — NO parallel
+        accumulator. NEVER raises. Returns 0.0 on any fault."""
+        try:
+            entries_snapshot = list(self._entries.values())
+            return float(sum(
+                float(getattr(entry, "cumulative_usd", 0.0) or 0.0)
+                for entry in entries_snapshot
+            ))
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[CostGovernor] session_total_cumulative_usd "
+                "degraded: %s", exc,
+            )
+            return 0.0
+
 
 # -----------------------------------------------------------------------------
 # Finalize observer registry (Per-Phase Cost Drill-Down arc Slice 3)

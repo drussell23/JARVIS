@@ -7537,6 +7537,33 @@ class ClaudeProvider:
         # Zero-Waste S1 (D2) cache gate. Eligible only when the
         # provider-response cache is enabled AND no tool loop will
         # engage (tools_enabled is False AND tool_loop is None). On
+        # ── S2 — Predictive Budget Preemption (PRD §11.4) ──────────
+        # Master OFF (default) ⇒ entire block skipped; behavior
+        # byte-identical to today. S2 is ADVISORY — does NOT alter
+        # this op's dispatch path; merely emits a preemption signal
+        # to nudge sensor_governor against FUTURE low-priority
+        # sensor emissions. High-urgency routes (IMMEDIATE/STANDARD/
+        # COMPLEX) are immune at the governor's signal-application
+        # surface, regardless of severity. NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.s2_predictive_budget import (  # noqa: E501
+                evaluate_admission_pressure as _s2_pressure_check,
+                emit_preemption_signal as _s2_emit,
+            )
+            _s2_severity = _s2_pressure_check(
+                prompt_text=prompt_text,                  # B3: len(prompt_text) at admission
+                route=getattr(context, "provider_route", "") or "standard",
+                model=self._model,                        # Claude uses self._model
+            )
+            if _s2_severity is not None:
+                _s2_emit(severity=_s2_severity, high_prio_queued=True)
+        except Exception as _s2_exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[S2] Claude admission integration degraded: %s",
+                _s2_exc,
+            )
+        # ───────────────────────────────────────────────────────────
+
         # HIT: skip provider API + tool dispatch (NOT the Python
         # set-up above — that's already paid). On MISS: the nested
         # _no_tools_inner closure runs _generate_raw +
@@ -7852,6 +7879,34 @@ class ClaudeProvider:
             token_usage["input"], token_usage["output"],
             _ftms_str, thinking_reason[0], _route_str,
         )
+        # ── S2 — record op_outcome for MAD sample stream (PRD §11 B4) ─
+        # Reached ONLY on real provider success (cache MISS path);
+        # _finalize_codegen_result is the produce-thunk body in the
+        # cache gate, so cache HITs short-circuit before this. Belt-
+        # and-suspenders: skip if provider_name carries the "+cache"
+        # reconstruction marker. Master-gated; NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.s2_predictive_budget import (  # noqa: E501
+                master_enabled as _s2_master_check,
+            )
+            if _s2_master_check():
+                _pname = str(getattr(result, "provider_name", "") or "")
+                if not _pname.endswith("+cache"):
+                    from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
+                        get_default_history as _s2_history,
+                    )
+                    _s2_history().record_op_outcome(
+                        route=(_route_str if _route_str != "?" else "standard"),
+                        model=str(self._model or ""),
+                        output_tokens=int(token_usage.get("output", 0) or 0),
+                        cost_usd=float(total_cost or 0.0),
+                    )
+        except Exception as _s2_rec_exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[S2] Claude op_outcome record degraded: %s",
+                _s2_rec_exc,
+            )
+        # ───────────────────────────────────────────────────────────
         return result.with_tool_records(
             tool_records
         ).with_venom_edits(venom_edits)

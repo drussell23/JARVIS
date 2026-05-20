@@ -515,8 +515,9 @@ def test_ast_pin_high_urgency_immune():
     })
 
 
-def test_register_flags_seeds_eight():
-    """8 env knobs registered (master + 7 tunables). PRD §11.5."""
+def test_register_flags_seeds_nine():
+    """9 env knobs registered (master + 7 tunables + session_budget_usd).
+    PRD §11.5 + §11 B1 revised."""
     seen: List[str] = []
 
     class _R:
@@ -524,7 +525,7 @@ def test_register_flags_seeds_eight():
             seen.append(spec.name)
 
     n = s2.register_flags(_R())
-    assert n == 8, f"expected 8 seeds, got {n}: {seen}"
+    assert n == 9, f"expected 9 seeds, got {n}: {seen}"
     expected = {
         "JARVIS_S2_PREDICTIVE_BUDGET_ENABLED",
         "JARVIS_S2_BASE_SAFETY_FACTOR",
@@ -534,6 +535,7 @@ def test_register_flags_seeds_eight():
         "JARVIS_S2_CHARS_PER_TOKEN",
         "JARVIS_S2_COST_SAMPLE_WINDOW",
         "JARVIS_S2_PRICING_YAML_PATH",
+        "JARVIS_S2_SESSION_BUDGET_USD",   # PRD §11 B1 wiring
     }
     assert set(seen) == expected
 
