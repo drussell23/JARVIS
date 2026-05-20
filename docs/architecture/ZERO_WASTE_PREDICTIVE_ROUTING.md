@@ -388,3 +388,97 @@ With `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` in-test only:
    existing patterns; which do you want as v1?
 5. **S3 sequencing**: land S3 in parallel with S1 (independent), or strict
    S1 -> S2 -> S3?
+
+
+## 10. S1 wiring evidence (PR #44309 — wired, dormant)
+
+PR `ouroboros/zero-waste-s1-wire` merged to `main@7298aef83e` on
+2026-05-19. S1 is **wired into both providers and remains dormant** —
+master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` default **FALSE**. No
+runtime behavior change on merge (byte-identical when master off).
+
+This section memorializes the evidence supporting that the wired gate
+is structurally correct AND exercisable end-to-end at the provider seam
+under zero-spend conditions. It does **not** assert production
+economics — the live-canary gate in §10.6 is the only remaining step
+required before any default-TRUE proposal.
+
+### 10.1 Test spine (44/44 green)
+
+| File | Count | What it pins |
+|---|---|---|
+| `tests/governance/test_provider_response_cache.py` | 32 | Substrate: byte-LRU + repo-state digest fail-CLOSED + `cached_or_generate` fail-OPEN + EXACT_HIT / MISS / DISABLED / INVALIDATED_REPO_CHANGE / FAULT_FAIL_OPEN; `is_noop` not stored; persistence roundtrip |
+| `tests/governance/test_provider_response_cache_wiring.py` | 12 | **Structural (AST):** providers import ONLY `cached_or_generate` + `response_cache_enabled` (no inline cache class, no `OrderedDict`-LRU); gate-guard predicate + `_no_tools_inner` / `_dw_inner` produce thunks present; cost-contract precedes gate in Claude (source-order pin); `_assemble_codegen_prompt`/`_finalize_codegen_result`/`_dispatch_internal` extracts present. **Behavioral via substrate:** master-OFF byte-identical, master-ON MISS→EXACT_HIT $0 + `+cache`, `is_noop` not cached, fault fail-OPEN, repo-state-change does not serve stale |
+
+### 10.2 ProviderResponseCache substrate runtime — PASS
+
+Runtime evidence from PR #43170 substrate smoke + reconfirmed during
+the wiring PR's review session: with master ON, a 2nd identical request
+returns `CacheLookupOutcome.EXACT_HIT`, `cost_usd=0.0`, the substrate's
+`produce` thunk is invoked exactly once across two calls, repo-digest
+change invalidates the entry, and faults in `compute_cache_key` /
+`repo_state_digest` fall through to `FAULT_FAIL_OPEN` without raising
+into the provider path.
+
+### 10.3 Provider-level mocked E2E smoke (zero spend) — PASS_STRICT (both)
+
+Two no-network smokes were executed against the actual provider
+`generate()` seams, with master set **only inside the smoke subshell**
+(`JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true`) and the cache file
+written under `$TMPDIR` (never under the repo or `.jarvis/`). Outer
+shell verified `response_cache_enabled() = False` before and after.
+Working tree clean throughout; `HEAD` unchanged at `7298aef83e`.
+
+| Provider | Method exercised | Dispatch seam mocked | Calls × identical input | 2nd-call dispatch | 2nd-call `cost_usd` | 2nd-call `provider_name` | `[PRC] EXACT_HIT` log | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| `DoublewordProvider.generate` | stub instance + `is_available` class-property override + real `generate()` | `_dispatch_internal` (merged RT/batch dispatcher extract) | 2 | suppressed (count stayed at 1) | `0.0` | `'doubleword+cache'` | observed | **PASS_STRICT** |
+| `ClaudeProvider.generate` | **real** `ClaudeProvider(api_key="test-key", repo_root=<cwd>, tools_enabled=False, tool_loop=None, daily_budget=100.0)` — `__init__` runs in full; `_state`/`counters` built normally | fake client at `provider._client` matching the canonical pattern from `tests/test_ouroboros_governance/test_tool_use_interface.py:355` (`_mock_claude_client`): `MagicMock` with `messages.create` async closure returning `.content[0].text=<schema 2b.1 JSON>` + `.usage.input_tokens`/`output_tokens` + `.model` | 2 | suppressed (count stayed at 1) | `0.0` | `'claude-api+cache'` | observed | **PASS_STRICT** |
+
+Both smokes used identical `OperationContext.create(...)` with
+`provider_route="ide"` for run #1 and run #2. The DW smoke threaded
+`prompt_override` through the `_dispatch_internal` extract to lock the
+cache key across both calls; the Claude smoke uses the real
+`_assemble_codegen_prompt` path with no monkeypatch on prompt
+construction.
+
+### 10.4 Master flag — remains default-FALSE
+
+`JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` default remains **FALSE** in
+`provider_response_cache.py::response_cache_enabled()`. No default-TRUE
+PR has been proposed or authorized. The wired gate is **dormant** in
+all environments that do not explicitly set the env var.
+
+### 10.5 Claims discipline (held)
+
+- ✅ Provider seams (`DoublewordProvider.generate`, `ClaudeProvider.generate`) verified to suppress downstream dispatch on a 2nd identical no-tools call **at the mock level**.
+- ❌ **No production-savings claim.** Fake-client / fake-dispatch suppression proves the provider seam composes the substrate correctly; it does **not** prove network economics. Real Anthropic / DoubleWord pricing, retry surfaces, latency variance, and prompt-cache interaction are unobserved in these smokes.
+- ❌ **No default-TRUE proposal.** The remaining gate in §10.6 must clear first.
+- ❌ No real provider API calls in this evidence consolidation.
+- ❌ No edits to OCA / git-index / sovereignty / cursor-agent-ban (CLOSED, untouched).
+- ❌ S2 / S3 unchanged (design-only).
+- ❌ SWE-Bench-Pro Phase-1 / Phase-3 not re-run; no spend incurred.
+
+### 10.6 Remaining before default-TRUE — the live S1 canary gate
+
+This is the **only** remaining gate before a default-TRUE proposal may
+be drafted. The canary is a **separately operator-authorized** event;
+nothing about §10 above authorizes it.
+
+| Criterion | Required |
+|---|---|
+| Master | `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` **session-only** (set in the canary subshell; never persisted, never exported in shell rc) |
+| Cache path | `JARVIS_PROVIDER_CACHE_PATH=$TMPDIR/<canary-id>.jsonl` (never under repo or `.jarvis/`) |
+| Spend cap | Hard `--cost-cap` set on the canary harness; budget must be strictly below ordinary Phase-1 levels (operator-defined value, recorded in the canary PR) |
+| Workload | A single identical no-tools op (Green / SAFE_AUTO risk tier; tool loop disabled or guaranteed-trivial complexity) repeated **exactly twice** in the same session with identical `OperationContext`, identical `provider_route`, identical repo state (clean tree or recorded digest) |
+| Provider | Whichever provider the route resolves to (single provider per canary; do not multiplex DoubleWord + Claude in the same canary) |
+| Network | Real provider API permitted on call #1; call #2 must not dispatch |
+| PASS | Call #2 returns `CacheLookupOutcome.EXACT_HIT`, `cost_usd == 0.0`, `provider_name.endswith("+cache")`, **zero network dispatch on call #2** (verified via the provider's own dispatch telemetry, not just `[PRC]` log), and the `[PRC] EXACT_HIT` log line is present |
+| FAIL | Any of: dispatch on call #2, non-zero call-#2 cost, `provider_name` missing `+cache`, EXACT_HIT log absent, master leaked beyond the subshell, cache file landed under repo / `.jarvis/`, working tree dirty post-canary |
+| Artifacts | Subshell transcript + dispatch-telemetry diff + cache file (under `$TMPDIR`) + `git status --short` (empty) + `HEAD` (unchanged) — all recorded in the canary PR body |
+
+Even on PASS, the canary does **not** auto-graduate the flag. A
+separate operator-authorized PR proposes the default flip, with the
+canary artifacts attached as the §41.6 evidence row. Standing rule
+from §8b.5 §10.5 holds: **no production-savings claim until the
+canary is recorded and the flip PR is independently approved.**
+
