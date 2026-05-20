@@ -388,3 +388,303 @@ With `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` in-test only:
    existing patterns; which do you want as v1?
 5. **S3 sequencing**: land S3 in parallel with S1 (independent), or strict
    S1 -> S2 -> S3?
+
+
+## 10. S1 wiring evidence (PR #44309 — wired, dormant)
+
+PR `ouroboros/zero-waste-s1-wire` merged to `main@7298aef83e` on
+2026-05-19. S1 is **wired into both providers and remains dormant** —
+master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` default **FALSE**. No
+runtime behavior change on merge (byte-identical when master off).
+
+This section memorializes the evidence supporting that the wired gate
+is structurally correct AND exercisable end-to-end at the provider seam
+under zero-spend conditions. It does **not** assert production
+economics — the live-canary gate in §10.6 is the only remaining step
+required before any default-TRUE proposal.
+
+### 10.1 Test spine (44/44 green)
+
+| File | Count | What it pins |
+|---|---|---|
+| `tests/governance/test_provider_response_cache.py` | 32 | Substrate: byte-LRU + repo-state digest fail-CLOSED + `cached_or_generate` fail-OPEN + EXACT_HIT / MISS / DISABLED / INVALIDATED_REPO_CHANGE / FAULT_FAIL_OPEN; `is_noop` not stored; persistence roundtrip |
+| `tests/governance/test_provider_response_cache_wiring.py` | 12 | **Structural (AST):** providers import ONLY `cached_or_generate` + `response_cache_enabled` (no inline cache class, no `OrderedDict`-LRU); gate-guard predicate + `_no_tools_inner` / `_dw_inner` produce thunks present; cost-contract precedes gate in Claude (source-order pin); `_assemble_codegen_prompt`/`_finalize_codegen_result`/`_dispatch_internal` extracts present. **Behavioral via substrate:** master-OFF byte-identical, master-ON MISS→EXACT_HIT $0 + `+cache`, `is_noop` not cached, fault fail-OPEN, repo-state-change does not serve stale |
+
+### 10.2 ProviderResponseCache substrate runtime — PASS
+
+Runtime evidence from PR #43170 substrate smoke + reconfirmed during
+the wiring PR's review session: with master ON, a 2nd identical request
+returns `CacheLookupOutcome.EXACT_HIT`, `cost_usd=0.0`, the substrate's
+`produce` thunk is invoked exactly once across two calls, repo-digest
+change invalidates the entry, and faults in `compute_cache_key` /
+`repo_state_digest` fall through to `FAULT_FAIL_OPEN` without raising
+into the provider path.
+
+### 10.3 Provider-level mocked E2E smoke (zero spend) — PASS_STRICT (both)
+
+Two no-network smokes were executed against the actual provider
+`generate()` seams, with master set **only inside the smoke subshell**
+(`JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true`) and the cache file
+written under `$TMPDIR` (never under the repo or `.jarvis/`). Outer
+shell verified `response_cache_enabled() = False` before and after.
+Working tree clean throughout; `HEAD` unchanged at `7298aef83e`.
+
+| Provider | Method exercised | Dispatch seam mocked | Calls × identical input | 2nd-call dispatch | 2nd-call `cost_usd` | 2nd-call `provider_name` | `[PRC] EXACT_HIT` log | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| `DoublewordProvider.generate` | stub instance + `is_available` class-property override + real `generate()` | `_dispatch_internal` (merged RT/batch dispatcher extract) | 2 | suppressed (count stayed at 1) | `0.0` | `'doubleword+cache'` | observed | **PASS_STRICT** |
+| `ClaudeProvider.generate` | **real** `ClaudeProvider(api_key="test-key", repo_root=<cwd>, tools_enabled=False, tool_loop=None, daily_budget=100.0)` — `__init__` runs in full; `_state`/`counters` built normally | fake client at `provider._client` matching the canonical pattern from `tests/test_ouroboros_governance/test_tool_use_interface.py:355` (`_mock_claude_client`): `MagicMock` with `messages.create` async closure returning `.content[0].text=<schema 2b.1 JSON>` + `.usage.input_tokens`/`output_tokens` + `.model` | 2 | suppressed (count stayed at 1) | `0.0` | `'claude-api+cache'` | observed | **PASS_STRICT** |
+
+Both smokes used identical `OperationContext.create(...)` with
+`provider_route="ide"` for run #1 and run #2. The DW smoke threaded
+`prompt_override` through the `_dispatch_internal` extract to lock the
+cache key across both calls; the Claude smoke uses the real
+`_assemble_codegen_prompt` path with no monkeypatch on prompt
+construction.
+
+### 10.4 Master flag — remains default-FALSE
+
+`JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` default remains **FALSE** in
+`provider_response_cache.py::response_cache_enabled()`. No default-TRUE
+PR has been proposed or authorized. The wired gate is **dormant** in
+all environments that do not explicitly set the env var.
+
+### 10.5 Claims discipline (held)
+
+- ✅ Provider seams (`DoublewordProvider.generate`, `ClaudeProvider.generate`) verified to suppress downstream dispatch on a 2nd identical no-tools call **at the mock level**.
+- ❌ **No production-savings claim.** Fake-client / fake-dispatch suppression proves the provider seam composes the substrate correctly; it does **not** prove network economics. Real Anthropic / DoubleWord pricing, retry surfaces, latency variance, and prompt-cache interaction are unobserved in these smokes.
+- ❌ **No default-TRUE proposal.** The remaining gate in §10.6 must clear first.
+- ❌ No real provider API calls in this evidence consolidation.
+- ❌ No edits to OCA / git-index / sovereignty / cursor-agent-ban (CLOSED, untouched).
+- ❌ S2 / S3 unchanged (design-only).
+- ❌ SWE-Bench-Pro Phase-1 / Phase-3 not re-run; no spend incurred.
+
+### 10.6 Remaining before default-TRUE — the live S1 canary gate
+
+This is the **only** remaining gate before a default-TRUE proposal may
+be drafted. The canary is a **separately operator-authorized** event;
+nothing about §10 above authorizes it.
+
+| Criterion | Required |
+|---|---|
+| Master | `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` **session-only** (set in the canary subshell; never persisted, never exported in shell rc) |
+| Cache path | `JARVIS_PROVIDER_CACHE_PATH=$TMPDIR/<canary-id>.jsonl` (never under repo or `.jarvis/`) |
+| Spend cap | Hard `--cost-cap` set on the canary harness; budget must be strictly below ordinary Phase-1 levels (operator-defined value, recorded in the canary PR) |
+| Workload | A single identical no-tools op (Green / SAFE_AUTO risk tier; tool loop disabled or guaranteed-trivial complexity) repeated **exactly twice** in the same session with identical `OperationContext`, identical `provider_route`, identical repo state (clean tree or recorded digest) |
+| Provider | Whichever provider the route resolves to (single provider per canary; do not multiplex DoubleWord + Claude in the same canary) |
+| Network | Real provider API permitted on call #1; call #2 must not dispatch |
+| PASS | Call #2 returns `CacheLookupOutcome.EXACT_HIT`, `cost_usd == 0.0`, `provider_name.endswith("+cache")`, **zero network dispatch on call #2** (verified via the provider's own dispatch telemetry, not just `[PRC]` log), and the `[PRC] EXACT_HIT` log line is present |
+| FAIL | Any of: dispatch on call #2, non-zero call-#2 cost, `provider_name` missing `+cache`, EXACT_HIT log absent, master leaked beyond the subshell, cache file landed under repo / `.jarvis/`, working tree dirty post-canary |
+| Artifacts | Subshell transcript + dispatch-telemetry diff + cache file (under `$TMPDIR`) + `git status --short` (empty) + `HEAD` (unchanged) — all recorded in the canary PR body |
+
+Even on PASS, the canary does **not** auto-graduate the flag. A
+separate operator-authorized PR proposes the default flip, with the
+canary artifacts attached as the §41.6 evidence row. Standing rule
+from §8b.5 §10.5 holds: **no production-savings claim until the
+canary is recorded and the flip PR is independently approved.**
+
+### 10.7 Live S1 Canary (DW-only) — PASS_STRICT (2026-05-19 UTC)
+
+Operator-authorized canary executed against the real DoubleWord 397B
+API (`api.doubleword.ai`) with master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true`
+**session-only inside the canary subprocess** (outer shell verified
+`response_cache_enabled() == False` before AND after). Hard `--cost-cap`
+$0.10 USD enforced; provider's native `max_cost_per_op=0.10` aligned
+as belt-and-suspenders. Cache file written under `$TMPDIR`, never under
+repo or `.jarvis/`.
+
+| Field | Value |
+|---|---|
+| Branch / HEAD | `ouroboros/zero-waste-s1-evidence` / `e66586574b` |
+| Canary id | `prc_canary_dw_20260520T042126Z` |
+| Model | `Qwen/Qwen3.5-397B-A17B-FP8` (DW 397B) |
+| Route | `ide` (STANDARD cascade) |
+| Tools | `tools_enabled=False`, `tool_loop=None` |
+| Workload | Identical `OperationContext` × 2; `target_files=("x.py",)`, `task_complexity="trivial"`, description: *"Add a no-op helper function named ping that returns the string 'pong'."* |
+| Total spend | **$0.000148** (1.5‰ of cap) |
+| Cache file | `$TMPDIR/prc_canary_dw_20260520T042126Z.jsonl` (764 B) |
+
+**Unvarnished telemetry (canary subprocess stdout, key lines):**
+
+```
+[DoublewordProvider] Batch 785a30fa-3a24-4972-85c0-ccdb62bf37cf submitted async
+   (model=Qwen/Qwen3.5-397B-A17B-FP8, op=dw-1779250890)
+[DoublewordProvider] Batch 785a30fa-3a24-4972-85c0-ccdb62bf37cf completed
+   (output=5f795248-4703-4a7c-90d8-859c67a8d676)
+[PRC] EXACT_HIT — provider skipped, $0.00 (model=Qwen/Qwen3.5-397B-A17B-FP8 route=ide)
+
+call#1 returned: provider_name='doubleword'         cost_usd=0.00014820
+dispatch_count after call#1: 1
+call#2 returned: provider_name='doubleword+cache'   cost_usd=0.0
+dispatch_count after call#2: 1
+```
+
+**§10.6 criteria — all green:**
+
+| Criterion | Required | Observed |
+|---|---|---|
+| Master session-only | only in canary subprocess | ✅ outer shell `False` before AND after |
+| Cache path | `$TMPDIR`, never in repo / `.jarvis/` | ✅ `/var/folders/zk/.../T/prc_canary_dw_<ts>.jsonl` |
+| Hard `--cost-cap` | $0.10 | ✅ total spend $0.000148 (1.5‰ of cap) |
+| Workload | single identical no-tools op × 2 | ✅ same `OperationContext`, `provider_route="ide"`, `task_complexity="trivial"`, `tool_loop=None` |
+| Single provider | DW only (no Claude) | ✅ `DoublewordProvider` exclusively |
+| Call #1 real network | DW API permitted | ✅ Batch `785a30fa-…` submitted + completed against `api.doubleword.ai` |
+| Call #2 zero dispatch | provider-side dispatch telemetry | ✅ wrapped `_dispatch_internal` count stayed at **1** across both calls |
+| Call #2 `cost_usd == 0.0` | strict equality | ✅ `0.0` |
+| Call #2 `provider_name.endswith("+cache")` | suffix check | ✅ `'doubleword+cache'` |
+| `[PRC] EXACT_HIT` log | present | ✅ `EXACT_HIT — provider skipped, $0.00 (model=Qwen/Qwen3.5-397B-A17B-FP8 route=ide)` |
+| Working tree post-canary | clean | ✅ `0 change(s)` |
+| HEAD post-canary | unchanged | ✅ `e66586574b` |
+| Fail-loud abort fired | none | ✅ all guards held (no `cost>cap`, `cost#2>0`, or `dispatch>1`) |
+
+**Claims discipline (held, even on PASS_STRICT):**
+
+- ✅ Architecture-level invariant proven on the DW route: the wired
+  cache gate intercepts a 2nd identical no-tools op against the real
+  DoubleWord API at the `_dispatch_internal` provider seam — confirmed
+  by provider-side dispatch counter, not merely by the `[PRC]` log.
+- ✅ Repo-state digest functioned correctly in a real environment
+  (digest computed during call #1, matched during call #2 → cache key
+  equal → EXACT_HIT). Byte-bounded LRU exercised (cache file 764 bytes,
+  well under the 256 MiB default budget).
+- ❌ **No production-savings claim.** A single-prompt, single-route,
+  single-session canary proves the **mechanism**, not real-workload
+  economics. Hit-rate under operator workloads (mixed prompts,
+  varying repo state, multi-route distribution, cross-session
+  persistence under churn) is **unmeasured** and explicitly out of
+  scope for this row.
+- ❌ **No default-TRUE proposal.** The flip remains a separate
+  operator-authorized PR per §10.6.
+- ❌ No edits to code, flags, OCA, git-index, sovereignty,
+  cursor-agent-ban, S2, S3. No SWE Phase-1 / Phase-3 re-run.
+
+**Side observation (no action proposed here):** the canary subprocess
+emitted `aiohttp ERROR Unclosed client session / Unclosed connector`
+warnings at shutdown — DW provider's aiohttp session isn't async-closed
+in a one-shot harness. Benign for a single canary; tracked for a
+future cleanup arc per operator direction.
+
+### 10.8 Live S1 Canary (Claude-only) — PASS_STRICT (2026-05-19 UTC)
+
+Operator-authorized canary executed against the real Anthropic API
+(`api.anthropic.com/v1/messages`) with master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true`
+**session-only inside the canary subprocess** (outer shell verified
+`response_cache_enabled() == False` before AND after). Hard `--cost-cap`
+$0.10 USD enforced; provider's native `max_cost_per_op=0.10` aligned
+as belt-and-suspenders. Cache file written under `$TMPDIR`, never under
+repo or `.jarvis/`.
+
+| Field | Value |
+|---|---|
+| Branch / HEAD | `ouroboros/zero-waste-s1-evidence` / `f251410576` |
+| Canary id | `prc_canary_claude_20260520T043718Z` |
+| Model | `claude-sonnet-4-20250514` |
+| Route | `ide` (STANDARD cascade) |
+| Tools | `tools_enabled=False`, `tool_loop=None` |
+| Workload | Identical `OperationContext` × 2 (same description / target_files / op_id as DW §10.7) |
+| Total spend | **$0.006414** (6.4% of cap) |
+| Cache file | `$TMPDIR/prc_canary_claude_20260520T043718Z.jsonl` (877 B) |
+| Dispatch seam(s) hit | `messages.create` only; `messages.stream` count = 0 |
+
+**Telemetry instrumentation note:** because `ClaudeProvider._client`
+is *lazily* initialized via `_ensure_client()` (unlike DW's eager-init
+pattern), the dispatch counters were attached after a one-line
+`provider._ensure_client()` precondition. **Both** seams the provider's
+`_generate_raw` closure can reach were wrapped (`messages.create`
+*and* `messages.stream`) so the telemetry has no gaps regardless of
+which branch the provider chose. A first attempt without this
+precondition raised `AttributeError: 'NoneType' object has no attribute
+'messages'` *before any API call*, so the bug consumed zero spend.
+
+**Unvarnished telemetry (canary subprocess stdout, key lines):**
+
+```
+[ClaudeProvider] anthropic client initialized (mode=custom; connect=10s
+   read=600s write=600s pool=600s thinking=on max_conn=10 max_keepalive=5
+   keepalive_exp=30s generation=0)
+[ClaudeProvider] → create model=claude-sonnet-4-20250514 timeout=89.5s
+   max_tokens=16384 temp=0.2 thinking=off tool_round=no prompt_chars=2854
+httpx INFO HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+[ClaudeProvider] 1 candidates in 5.5s (tool_rounds=0), cost=$0.0064,
+   1233+181 tokens, first_token=n/a thinking=trivial-skip route=ide
+[PRC] EXACT_HIT — provider skipped, $0.00 (model=claude-sonnet-4-20250514 route=ide)
+
+call#1 returned: provider_name='claude-api'         cost_usd=0.0064139999999999996
+dispatch_count after call#1: 1  seams=['create']
+call#2 returned: provider_name='claude-api+cache'   cost_usd=0.0
+dispatch_count after call#2: 1  seams=['create']
+pre-call#2 count: 1  post-call#2 count: 1  delta: 0
+```
+
+**§10.6 criteria — all green:**
+
+| Criterion | Required | Observed |
+|---|---|---|
+| Master session-only | only in canary subprocess | ✅ outer shell `False` before AND after |
+| Cache path | `$TMPDIR`, never in repo / `.jarvis/` | ✅ `/var/folders/zk/.../T/prc_canary_claude_<ts>.jsonl` (877 B) |
+| Hard `--cost-cap` | $0.10 | ✅ total spend $0.006414 (6.4% of cap) |
+| Workload | single identical no-tools op × 2 | ✅ same `OperationContext`, `provider_route="ide"`, `task_complexity="trivial"`, `tool_loop=None` |
+| Single provider | Claude only (no DW) | ✅ `ClaudeProvider` exclusively |
+| Call #1 real network | Anthropic API permitted | ✅ `httpx INFO HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"` |
+| Call #2 zero dispatch | provider-side dispatch telemetry on **both** seams | ✅ `create` count stayed at 1; `stream` count stayed at 0; delta on call#2 = 0 |
+| Call #2 `cost_usd == 0.0` | strict equality | ✅ `0.0` |
+| Call #2 `provider_name.endswith("+cache")` | suffix check | ✅ `'claude-api+cache'` |
+| `[PRC] EXACT_HIT` log | present | ✅ `EXACT_HIT — provider skipped, $0.00 (model=claude-sonnet-4-20250514 route=ide)` |
+| Working tree post-canary | clean | ✅ `0 change(s)` |
+| HEAD post-canary | unchanged | ✅ `f251410576` |
+| Fail-loud abort fired | none | ✅ all guards held |
+
+### 10.9 Combined live-canary summary (both PASS_STRICT)
+
+| Provider | Model | Call#1 cost | Call#2 cost | Cache file size | Dispatch seam(s) hit |
+|---|---|---|---|---|---|
+| DoubleWord 397B | `Qwen/Qwen3.5-397B-A17B-FP8` | $0.000148 | $0.000000 | 764 B | `_dispatch_internal` (batch) |
+| Anthropic Claude | `claude-sonnet-4-20250514` | $0.006414 | $0.000000 | 877 B | `messages.create` |
+| **Total** | | **$0.006562** | **$0.000000** | | |
+
+**What this evidence proves (precise scope, no euphoria):**
+
+The wired S1 cache gate (`cached_or_generate` substrate + provider-level
+gate predicate) **intercepts a second, byte-identical no-tools
+`OperationContext` against both DoubleWord (`_dispatch_internal` seam)
+AND Anthropic Claude (`messages.create` seam) within a single
+in-process session, when:**
+
+1. master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` is set in the
+   subprocess environment,
+2. `provider_route` is identical between calls,
+3. the repo-state digest (`HEAD` + `SHA(git diff HEAD)`) is identical
+   between calls (working tree did not mutate),
+4. the assembled prompt is byte-identical between calls,
+5. `tool_loop=None` and `tools_enabled=False` (no MCP/Venom branching).
+
+**What this evidence does NOT prove (explicit limits):**
+
+- Cache **hit rate** under operator workloads with varied prompts
+  (the cache key is exact-SHA-256-match; prompts that differ by even
+  one whitespace character produce a cache miss by design).
+- Behavior under **repo-state churn** between calls (digest changes
+  → key changes → MISS; correctness depends on the digest's
+  fail-CLOSED discipline holding under real git states).
+- Byte-LRU **eviction behavior** under sustained workload (single-entry
+  caches were 764 B and 877 B; the 256 MiB default budget was not
+  exercised).
+- **Cross-session persistence** under churn (the cache file persisted
+  to `$TMPDIR` but the canary did not stress a second-process boot
+  reading from a prior session's ledger).
+- Behavior under **tool-loop branches** (Venom rounds disabled in
+  canary; the gate predicate explicitly disengages when tool loop
+  will engage).
+- Interaction with **Anthropic prompt-caching** (the provider logs
+  showed `thinking=trivial-skip` and no prompt-cache hit on call #1 —
+  the response cache and Anthropic's own prompt cache are
+  independent and their composed behavior is unmeasured).
+- Effect on the **16 autonomous sensors** when master is flipped TRUE
+  globally (the canary was a synthetic single-op; no sensor traffic).
+
+**Status:** S1 is **wired, tested at substrate (44/44), wired-tested
+(AST + behavioral), live-canary-validated on the mechanism for both
+providers (§10.7 + §10.8) at a combined real spend of $0.006562**.
+Master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` remains default
+**FALSE**. The §10.6 contract still governs: a default-TRUE flip is a
+separate operator-authorized PR with the canary artifacts attached.
+
