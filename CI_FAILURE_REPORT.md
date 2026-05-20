@@ -3,21 +3,22 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #81446
-- **Branch**: `fix/ci/pr-automation-validation-run81437-20260520-175908`
-- **Commit**: `c9a529d0b1e1be15eb386cf78fd3af70b528ace6`
+- **Run Number**: #81457
+- **Branch**: `fix/ci/pr-automation-validation-run81446-20260520-180125`
+- **Commit**: `ed26395cb6791fc7f20bbf3350cb657303e718b5`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-20T17:59:48Z
+- **Timestamp**: 2026-05-20T18:02:04Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26180510502)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26180627677)
 
 ## Failure Overview
 
-Total Failed Jobs: **1**
+Total Failed Jobs: **2**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
 | 1 | Validate PR Title | timeout | high | 4s |
+| 2 | Check PR Description | permission_error | high | 3s |
 
 ## Detailed Analysis
 
@@ -26,10 +27,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-20T17:59:52Z
-**Completed**: 2026-05-20T17:59:56Z
+**Started**: 2026-05-20T18:02:08Z
+**Completed**: 2026-05-20T18:02:12Z
 **Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26180510502/job/77021982099)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26180627677/job/77022407585)
 
 #### Failed Steps
 
@@ -42,13 +43,13 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-20T17:59:53.9953565Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-20T17:59:54.5274583Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-20T18:02:10.2698644Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-20T18:02:10.8791922Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-20T17:59:54.5741501Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-20T18:02:10.9240647Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -59,6 +60,41 @@ Total Failed Jobs: **1**
 
 1. Consider increasing timeout values or optimizing slow operations
 2. Check service availability and network connectivity
+
+---
+
+### 2. Check PR Description
+
+**Status**: ❌ failure
+**Category**: Permission Error
+**Severity**: HIGH
+**Started**: 2026-05-20T18:02:09Z
+**Completed**: 2026-05-20T18:02:12Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26180627677/job/77022407662)
+
+#### Failed Steps
+
+- **Step 2**: Verify PR Description
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 40: `2026-05-20T18:02:11.2725039Z RequestError [HttpError]: Resource not accessible by integration`
+    - Line 41: `2026-05-20T18:02:11.2768075Z ##[error]Unhandled error: HttpError: Resource not accessible by integra`
+
+- Pattern: `WARN|Warning|warning`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 52: `2026-05-20T18:02:11.2792651Z       'access-control-expose-headers': 'ETag, Link, Location, Retry-Aft`
+
+#### Suggested Fixes
+
+1. Review the logs above for specific error messages
 
 ---
 
@@ -78,5 +114,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-20T18:01:25.362175*
+📊 *Report generated on 2026-05-20T18:03:52.430204*
 🤖 *JARVIS CI/CD Auto-PR Manager*
