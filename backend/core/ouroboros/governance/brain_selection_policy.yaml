@@ -459,3 +459,52 @@ compute_class_rank:
   gpu_l4: 2
   gpu_v100: 3
   gpu_a100: 4
+
+# ---------------------------------------------------------------------------
+# s2_pricing — PRD §11.5 source of truth for per-(route, model) token prices.
+# Consumed by s2_predictive_budget.forecasted_cost(). Prices are USD per
+# SINGLE token (not per million). Documented values mirror the CLAUDE.md
+# provider chain table:
+#   DoubleWord 397B: $0.10 / $0.40 per million tokens (in / out)
+#   Claude Sonnet 4: $3.00 / $15.00 per million tokens (in / out)
+# All values are config — operator-tunable without code edits. Missing
+# entries cause forecasted_cost to fail-open to 0.0 (S2's predicate clause
+# becomes a no-op for unknown (route, model) — admission unaffected).
+s2_pricing:
+  default_per_token_usd:
+    input: 0.0000003       # $0.30 / M tokens — conservative cold-start prior
+    output: 0.000001       # $1.00 / M tokens
+  routes:
+    ide:
+      "claude-sonnet-4-20250514":
+        input: 0.000003                 # $3.00 / M
+        output: 0.000015                # $15.00 / M
+      "Qwen/Qwen3.5-397B-A17B-FP8":
+        input: 0.0000001                # $0.10 / M
+        output: 0.0000004               # $0.40 / M
+    immediate:
+      "claude-sonnet-4-20250514":
+        input: 0.000003
+        output: 0.000015
+    standard:
+      "claude-sonnet-4-20250514":
+        input: 0.000003
+        output: 0.000015
+      "Qwen/Qwen3.5-397B-A17B-FP8":
+        input: 0.0000001
+        output: 0.0000004
+    complex:
+      "claude-sonnet-4-20250514":
+        input: 0.000003
+        output: 0.000015
+      "Qwen/Qwen3.5-397B-A17B-FP8":
+        input: 0.0000001
+        output: 0.0000004
+    background:
+      "Qwen/Qwen3.5-397B-A17B-FP8":
+        input: 0.0000001
+        output: 0.0000004
+    speculative:
+      "Qwen/Qwen3.5-397B-A17B-FP8":
+        input: 0.0000001
+        output: 0.0000004

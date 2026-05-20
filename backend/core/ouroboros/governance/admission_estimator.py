@@ -347,6 +347,98 @@ class RecentDecisionsRing:
         except Exception:  # noqa: BLE001 — defensive
             pass
 
+    # ----------------------------------------------------------------------
+    # PRD §11 (S2) additive composition surface — op-outcome samples
+    # ----------------------------------------------------------------------
+    # S2's dynamic admission safety factor and forecasted-cost layer need a
+    # per-(route, model) stream of completed-op cost + output-token
+    # observations. Rather than build a parallel ring, S2 records these
+    # typed projections into the SAME ring (composes-not-duplicates per
+    # PRD §3). The projections coexist with the legacy AdmissionRecord
+    # dict projections via a ``kind`` discriminator.
+    #
+    # NEVER raise; garbage input silently no-ops; the snapshot filter
+    # tolerates missing/malformed fields by skipping them.
+
+    def record_op_outcome(
+        self,
+        route: str,
+        model: str,
+        output_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        """Append a completed-op outcome (PRD §11). Bounded by the same
+        FIFO eviction as legacy records — NO new ring, NO new lock.
+        Defensive: any non-string route/model, non-int/non-float
+        numbers, NaN/negatives → silent no-op."""
+        try:
+            r = str(route or "").strip()
+            m = str(model or "").strip()
+            if not r or not m:
+                return
+            try:
+                tok = int(output_tokens)
+            except (TypeError, ValueError):
+                return
+            try:
+                cost = float(cost_usd)
+            except (TypeError, ValueError):
+                return
+            # NaN check + non-negative clamp (NaN != NaN)
+            if cost != cost or cost < 0.0:
+                return
+            if tok < 0:
+                return
+            self.record({
+                "kind": "op_outcome",
+                "route": r,
+                "model": m,
+                "output_tokens": tok,
+                "cost_usd": cost,
+                "schema_version": ADMISSION_ESTIMATOR_SCHEMA_VERSION,
+            })
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[RecentDecisionsRing] record_op_outcome degraded: %s",
+                exc,
+            )
+
+    def op_outcome_samples(
+        self,
+        route: str,
+        model: str,
+        *,
+        limit: Optional[int] = None,
+    ) -> tuple:
+        """Return up to ``limit`` most-recent op_outcome projections
+        for ``(route, model)``, newest last. ``limit=None`` returns
+        all. NEVER raises; malformed records silently skipped."""
+        try:
+            r = str(route or "").strip()
+            m = str(model or "").strip()
+            if not r or not m:
+                return tuple()
+            all_records = self.snapshot()  # already thread-safe
+            matched = []
+            for rec in all_records:
+                try:
+                    if not isinstance(rec, dict):
+                        continue
+                    if rec.get("kind") != "op_outcome":
+                        continue
+                    if rec.get("route") != r:
+                        continue
+                    if rec.get("model") != m:
+                        continue
+                    matched.append(rec)
+                except Exception:  # noqa: BLE001 — defensive
+                    continue
+            if limit is not None and limit >= 0:
+                matched = matched[-int(limit):]
+            return tuple(matched)
+        except Exception:  # noqa: BLE001 — defensive
+            return tuple()
+
 
 # ---------------------------------------------------------------------------
 # Process-wide singletons — module-level so the
