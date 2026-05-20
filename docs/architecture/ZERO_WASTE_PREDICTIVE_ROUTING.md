@@ -688,3 +688,330 @@ Master `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` remains default
 **FALSE**. The §10.6 contract still governs: a default-TRUE flip is a
 separate operator-authorized PR with the canary artifacts attached.
 
+
+## 11. S2 — Predictive Budget Preemption + Dynamic Routing (design only)
+
+**Status:** PRD-locked design; no code authorized. Lands only on an
+explicit operator-issued *"S2 implementation approved"* signal. The
+§5 design-only contract from the original PRD draft holds.
+
+S2 makes admission decisions **predictive** — before dispatch, the
+gate evaluates whether the current operation's *forecasted* cost can
+fit in the *remaining* session budget, accounting for the
+**statistical volatility of recent provider behavior** via a robust
+MAD-based estimator. When budget pressure is tight and a high-urgency
+op is queued, the existing `sensor_governor`'s quarantine machinery
+is **driven via a new advisory signal** to starve `BACKGROUND` and
+`SPECULATIVE` sensors. **No new governor, no new throttler, no new
+quarantine machinery** — S2 is admission-time signal-emission only.
+
+### 11.1 Composition diagram (extends, NEVER parallel)
+
+```
+            ┌──────────────────────────────┐
+            │   UnifiedIntakeRouter        │ (existing — priority queue, no parallel)
+            │   + urgency_router (§5 T0)   │
+            └─────────┬────────────────────┘
+                      │ admission predicate
+                      ▼
+            ┌──────────────────────────────┐  composes  ┌─────────────────────────┐
+            │  admission_gate.admit()      │◄──────────►│ admission_estimator     │
+            │  + NEW dimension:            │            │   WaitTimeEstimator     │
+            │  Forecasted_Cost ≤ remaining │            │   (EWMA, existing —     │
+            │     × dynamic_safety_factor  │            │    reused, NO parallel) │
+            └─────────┬────────────────────┘            │   RecentDecisionsRing   │
+                      │ "tight budget AND high-prio     │   (existing, extended   │
+                      │  queued" advisory signal        │    w/ cost samples)     │
+                      ▼                                 └─────────────────────────┘
+            ┌──────────────────────────────┐
+            │  sensor_governor             │ (existing — quarantine machinery)
+            │  +  new signal-driven        │    NO new throttler, NO new
+            │     quarantine selection     │    governor.  Signal drives the
+            │     (low-prio sensors only)  │    EXISTING quarantine path.
+            └──────────────────────────────┘
+```
+
+### 11.2 Forecasted_Cost — deterministic math
+
+```
+Forecasted_Cost(op) =
+      expected_input_tokens(op)   × model_input_price_per_token(route, model)
+    + expected_output_tokens(op)  × model_output_price_per_token(route, model)
+
+expected_input_tokens(op)  = len(op.assembled_prompt) / chars_per_token
+expected_output_tokens(op) = WaitTimeEstimator.ewma(                       ← composed
+                                  key=f"output_tokens|{route}|{model}",
+                                  default_seed=<env>)
+
+(model_input_price_per_token,
+ model_output_price_per_token)  = pricing_from_yaml(brain_selection_policy.yaml,
+                                                    route, model)          ← yaml-driven
+chars_per_token                 = float(os.environ.get(
+                                  "JARVIS_S2_CHARS_PER_TOKEN", "4.0"))     ← env-tunable
+```
+
+Deterministic given `(op, EWMA state, yaml config, env)`. The output-
+token estimator **reuses** `admission_estimator.WaitTimeEstimator`'s
+EWMA discipline — there is no parallel EWMA implementation. Pricing is
+read from `brain_selection_policy.yaml` and cached at first read;
+chars-per-token is env-tunable. **No hardcoded prices or token
+constants.**
+
+### 11.3 Dynamic `admit_safety_factor` — robust MAD-based volatility adjustment
+
+**The static `JARVIS_S2_ADMIT_SAFETY_FACTOR=0.9` from earlier scoping
+is REMOVED.** A static factor cannot adapt to the live volatility
+profile of each provider/route pair. Replacement is a **deterministic
+volatility-adjusted factor** driven by the **Median Absolute Deviation
+(MAD)** of recent cost observations — chosen specifically because it
+is *robust to outliers*. A single anomalous cost (e.g., a timed-out
+provider call billed at `max_tokens`) shifts MAD by O(1), whereas
+sample standard deviation would shift by O(*n*) and poison the safety
+estimate into panic-tightening.
+
+#### 11.3.1 Robust Coefficient of Variation via MAD
+
+```python
+def cost_volatility_cv_mad(samples: Sequence[float]) -> float:
+    """Robust Coefficient of Variation via Median Absolute Deviation.
+
+    Returns CV_MAD = (MAD × 1.4826) / median(samples).
+    The 1.4826 consistency factor scales MAD to a robust stdev
+    estimate under approximate normality; the median-normalized
+    ratio is a scale-invariant volatility coefficient.
+
+    Returns 0.0 (treated as 'no volatility, no penalty') on:
+      - empty samples or len(samples) < 3 (insufficient signal),
+      - non-positive median (degenerate; avoids div-by-zero),
+      - any computation fault.
+    NEVER raises.
+    """
+    try:
+        if not samples or len(samples) < 3:
+            return 0.0
+        med = statistics.median(samples)
+        if med <= 0.0:
+            return 0.0
+        abs_devs = [abs(x - med) for x in samples]
+        mad = statistics.median(abs_devs)
+        robust_sigma = mad * 1.4826        # MAD → robust σ estimate
+        return robust_sigma / med
+    except Exception:
+        return 0.0
+```
+
+The constant **1.4826** is the closed-form consistency factor that
+maps MAD to a robust σ-equivalent under Gaussian assumptions. It is a
+mathematical constant, not a business knob; documenting its origin
+inline is sufficient and it is exempt from the no-hardcode rule (see
+AST pin `consistency_factor_1_4826`).
+
+#### 11.3.2 Dynamic safety factor
+
+```python
+def dynamic_admit_safety_factor(route: str, model: str) -> float:
+    """Volatility-adjusted admission safety factor. Tightens when the
+    provider/route cost distribution is volatile; relaxes when
+    stable.
+
+    safety_factor = clip(
+        base - penalty × CV_MAD(recent_costs[route][model]),
+        floor, ceiling
+    )
+
+    All four envelope knobs env-tunable (no hardcoded thresholds).
+    Composes admission_estimator.RecentDecisionsRing for sample
+    provisioning. NEVER raises (env parse / sample fetch / stats →
+    fail-open to base).
+    """
+    try:
+        base    = float(os.environ.get("JARVIS_S2_BASE_SAFETY_FACTOR", "0.9"))
+        penalty = float(os.environ.get("JARVIS_S2_VOLATILITY_PENALTY", "1.0"))
+        floor   = float(os.environ.get("JARVIS_S2_SAFETY_FLOOR",        "0.5"))
+        ceiling = float(os.environ.get("JARVIS_S2_SAFETY_CEILING",      "0.95"))
+        samples = admission_estimator.recent_cost_samples(route, model)
+        cv      = cost_volatility_cv_mad(samples)
+        raw     = base - penalty * cv
+        return max(floor, min(ceiling, raw))
+    except Exception:
+        # Fail-open to base — never lock admission on a stats fault.
+        try:
+            return float(os.environ.get("JARVIS_S2_BASE_SAFETY_FACTOR", "0.9"))
+        except Exception:
+            return 0.9
+```
+
+#### 11.3.3 Operational intuition (what this does in practice)
+
+| Provider state | Recent costs | `CV_MAD` | `dynamic_safety_factor` | Behavior |
+|---|---|---|---|---|
+| Stable, predictable (e.g., DW 397B in normal range) | `$0.001–0.002` | low (~0.10) | `0.9 − 1.0 × 0.10 = 0.80` → **0.80** | Admits closer to budget; backlog drains efficiently |
+| Volatile (e.g., Claude with extended-thinking spikes) | `$0.003–0.020` | higher (~0.40) | `0.9 − 1.0 × 0.40 = 0.50` → **0.50** (floor) | Tightens to budget × 0.5; preempts low-prio sensors earlier |
+| Anomalous single spike (timeout billed at max-tokens) | `$0.002, 0.002, 0.500, 0.002` | low (MAD ignores outlier) | unchanged near **0.80** | **Robustness**: outlier does NOT poison the safety estimate (MAD vs. stdev) |
+| Cold start (< 3 samples) | insufficient | `0.0` (early return) | `0.9 − 1.0 × 0.0 = 0.90` → **0.90** | Falls back to base; cautious-but-not-locked |
+| Stats fault | n/a | n/a (fail-open) | base **0.90** | Never harder than the historical baseline |
+
+### 11.4 Admission predicate (composed; new clause)
+
+```
+ADMIT(op) iff
+    (existing admission_gate predicates hold)                # PRD §3: extend, don't replace
+  ∧ (current_session_spend + Forecasted_Cost(op)
+       ≤ session_budget × dynamic_admit_safety_factor(route, model))
+```
+
+When the second clause **fails**, the gate does NOT block the op —
+instead it emits a **preemption advisory** to `sensor_governor`:
+
+```python
+# pseudo-API; no new module, no new quarantine machinery
+sensor_governor.apply_preemption_signal(
+    kind="budget_forecast_tight",
+    severity=<0.0..1.0>,                  # f(remaining_budget, forecasted_op_cost)
+    high_prio_queued=<bool>,              # from UnifiedIntakeRouter.peek()
+    advice="quarantine_low_prio_sensors", # signal only — governor decides
+)
+```
+
+`sensor_governor` already implements the emergency-brake / quarantine
+machinery (`cost_burn > 0.9` or `postmortem_rate > 0.6` → 20% caps).
+S2 adds a **new advisory input** the governor evaluates alongside its
+existing brake signals; it does **not** replace any existing logic.
+
+**Load-bearing safety invariant (AST-pinned):** the preemption signal
+**never** quarantines high-urgency sensors. The `urgency_router`'s
+`IMMEDIATE` / `STANDARD` / `COMPLEX` routes are **immune**; only
+`BACKGROUND` and `SPECULATIVE` are eligible for forecast-driven
+quarantine.
+
+### 11.5 Env knobs (master + all S2 tunables, no hardcode)
+
+```
+JARVIS_S2_PREDICTIVE_BUDGET_ENABLED=false   # master, default — byte-identical to today
+JARVIS_S2_BASE_SAFETY_FACTOR=0.9            # base before volatility adjustment (replaces ADMIT_SAFETY_FACTOR)
+JARVIS_S2_VOLATILITY_PENALTY=1.0            # multiplier on CV_MAD before subtracting from base
+JARVIS_S2_SAFETY_FLOOR=0.5                  # clip lower bound (never tighter than 0.5× budget)
+JARVIS_S2_SAFETY_CEILING=0.95               # clip upper bound (never looser than 0.95× budget)
+JARVIS_S2_CHARS_PER_TOKEN=4.0               # forecast granularity
+JARVIS_S2_COST_SAMPLE_WINDOW=50             # RecentDecisionsRing window for MAD volatility
+JARVIS_S2_PRICING_YAML_PATH=brain_selection_policy.yaml   # env-overridable pricing source
+```
+
+Master OFF ⇒ admission gate calls the existing predicates only; no
+Forecasted_Cost computed; no preemption signal emitted; governor
+unaffected. **Byte-identical to current behavior.**
+
+The deprecated static `JARVIS_S2_ADMIT_SAFETY_FACTOR=0.9` is
+**removed** from this design — the `BASE + PENALTY + FLOOR + CEILING`
+quartet defines the dynamic envelope.
+
+### 11.6 AST pins (composes-not-duplicates discipline)
+
+| Pin | Asserts |
+|---|---|
+| `composes_admission_estimator` | imports `WaitTimeEstimator` from `admission_estimator`; no class named `WaitTimeEstimator` defined locally; no inline EWMA class |
+| `composes_admission_estimator_for_samples` | `recent_cost_samples` is sourced from `admission_estimator`; no local parallel ring |
+| `composes_sensor_governor` | imports `sensor_governor`; no class named `SensorGovernor` defined locally; no inline quarantine logic |
+| `pricing_from_yaml_not_hardcoded` | no float literal in `[1e-7, 1e-4]` outside a yaml-read arm (heuristic for per-token prices) |
+| `chars_per_token_env_tunable` | reads `JARVIS_S2_CHARS_PER_TOKEN`; no hardcoded `4.0` outside the env-default arm |
+| `dynamic_safety_factor_never_static_constant` | no literal `0.9` in the gate's predicate body; the four env knobs (`BASE`/`PENALTY`/`FLOOR`/`CEILING`) are the only place `0.9` may appear (as a string default) |
+| `mad_uses_stdlib_statistics_median` | imports `statistics.median`; no parallel median implementation |
+| `consistency_factor_1_4826` | the MAD → robust-σ scaling uses the constant `1.4826` (well-known statistical constant; documented in inline comment; appropriate to live in code) |
+| `volatility_floor_ceiling_clip_present` | `dynamic_admit_safety_factor` body contains both `max(floor, …)` and `min(…, ceiling)` |
+| `dynamic_safety_factor_never_raises` | `cost_volatility_cv_mad` AND `dynamic_admit_safety_factor` both wrap every external read in try/except; fail-open to `base` |
+| `forecasted_cost_never_raises` | `forecasted_cost(op)` function body has try/except wrapping every external read |
+| `high_urgency_immune_from_quarantine` | preemption signal's advice path includes `quarantinable_routes = {BACKGROUND, SPECULATIVE}` exact-set check |
+| `master_default_false` | `S2_predictive_budget_enabled()` reads env, returns False on absent/empty/garbage |
+| `no_parallel_router` | imports `UnifiedIntakeRouter`; no class named `*Router` defined locally |
+
+### 11.7 Spine tests (~30 outline)
+
+**Forecast math + composition (5):**
+
+```
+test_master_default_false_byte_identical          # off ⇒ admission unchanged
+test_forecasted_cost_deterministic_given_inputs   # same (prompt, ewma, pricing) → same cost
+test_ewma_composed_no_parallel_impl               # WaitTimeEstimator reused, not duplicated
+test_pricing_from_yaml_fallback_safe              # missing yaml → forecast = max-safe (fail-CLOSED on budget)
+test_chars_per_token_env_tunable                  # env override honored, no hardcode
+```
+
+**MAD volatility (6 — INCLUDING THE LOAD-BEARING ROBUSTNESS PIN):**
+
+```
+test_cv_mad_zero_on_insufficient_samples          # < 3 samples → 0.0
+test_cv_mad_zero_on_nonpositive_median            # median == 0 → 0.0 (no div-by-zero)
+test_cv_mad_stable_distribution_low_value         # tight cluster → low CV_MAD
+test_cv_mad_volatile_distribution_high_value      # wide spread → high CV_MAD
+test_cv_mad_robust_to_single_outlier              # LOAD-BEARING: MAD vs stdev
+                                                  #   stdev would jump 10×; MAD ~constant
+test_cv_mad_uses_1_4826_consistency_factor        # numeric pin
+```
+
+**Dynamic safety factor (6):**
+
+```
+test_dynamic_factor_clipped_to_floor              # very volatile → clipped to floor (0.5 default)
+test_dynamic_factor_clipped_to_ceiling            # very stable → clipped to ceiling (0.95 default)
+test_dynamic_factor_returns_base_on_zero_volatility  # CV_MAD=0 → returns base verbatim
+test_dynamic_factor_fail_open_to_base             # any stats fault → returns base
+test_dynamic_factor_env_tunable                   # all 4 envelope knobs honored (no hardcode)
+test_dynamic_factor_per_route_per_model           # (route, model) keys independent in ring
+```
+
+**Admission + signal (8):**
+
+```
+test_admit_when_budget_safe                       # current+forecast < budget × safety → admit, no signal
+test_emit_signal_when_budget_tight                # current+forecast ≥ budget × safety → signal emitted
+test_signal_drives_existing_governor              # governor.apply_preemption_signal called w/ correct kwargs
+test_governor_quarantines_only_low_prio           # advice respected; BACKGROUND/SPECULATIVE quarantined
+test_high_urgency_op_never_quarantined            # IMMEDIATE/STANDARD/COMPLEX immune (LOAD-BEARING)
+test_preemption_signal_severity_monotonic         # severity rises monotonically as budget tightens
+test_no_signal_when_no_highprio_queued            # tight budget but only low-prio queued → no signal
+test_forecasted_cost_fail_open                    # any internal fault → forecast = 0, gate doesn't block
+```
+
+**AST pins + flag registry (5):**
+
+```
+test_ast_pin_composes_admission_estimator_ring    # static composition
+test_ast_pin_composes_sensor_governor             # static composition
+test_ast_pin_no_static_0_9_in_predicate_body      # dynamic safety factor required
+test_ast_pin_high_urgency_immune                  # static: BACKGROUND/SPECULATIVE-only set
+test_register_flags_seeds_eight                   # 8 JARVIS_S2_* knobs registered into FlagRegistry
+```
+
+**Observability (1):**
+
+```
+test_signal_observable_via_GET_observability      # composes existing IDEObservabilityRouter, no new endpoint
+```
+
+Total: **~30 spine tests** at S2 implementation time.
+
+### 11.8 Graduation contract (Phase-9 cadence, PRD evidence row)
+
+| Bar | Evidence |
+|---|---|
+| **A** | Phase-1-equivalent soak with master ON shows: `BACKGROUND` / `SPECULATIVE` sensors quarantine **correlate with measured `CV_MAD` spikes** on the active provider; `IMMEDIATE` / `STANDARD` / `COMPLEX` admission unaffected; total spend stays under cap without hard kill. |
+| **B** | Phase-1-equivalent soak with master OFF (control, same workload) shows: same workload, **no preemption signal emitted**, governor unaffected (byte-identical to today). |
+| **C** | **Robustness**: inject a synthetic outlier into the cost stream; verify `dynamic_admit_safety_factor` *does not swing by >5%* — proving MAD's outlier resistance in production. Load-bearing for "adaptive but not panicky". |
+
+Default-FALSE → default-TRUE flip is a **separate operator-authorized
+PR** with the soak artifacts attached as a §41.6 evidence row. **No
+auto-graduation.**
+
+### 11.9 Explicit NON-goals (design boundary)
+
+- ❌ **No static safety factor** (the previous `JARVIS_S2_ADMIT_SAFETY_FACTOR=0.9` is deprecated/removed from this design).
+- ❌ **No `stdev` / `variance`-based volatility metric** (not outlier-robust — explicitly chose MAD for the *adaptive but not panicky* property).
+- ❌ **No new `RecentDecisionsRing` class** — the admission_estimator's existing ring is extended with a cost-sample stream (additive, composes-not-duplicates).
+- ❌ **No new router / governor / throttler / budget substrate** (extend only; PRD §3).
+- ❌ **No coupling to provider-specific implementations** — MAD operates on observed `cost_usd` regardless of source (DW / Claude / Prime alike).
+- ❌ **No hardcoded thresholds anywhere** — all four envelope knobs env-tunable; the only constant in code is `1.4826` (mathematical, not a business knob).
+- ❌ **No edit to S1 cache substrate / shadow / `cached_or_generate`** — S2 is orthogonal admission-time logic.
+- ❌ **No edit to OCA / git-index / sovereignty / cursor-agent-ban / Visual VERIFY / Orange-tier flow / Iron Gate / SemanticGuardian.**
+- ❌ **No SWE-Bench-Pro Phase-1 / Phase-3 re-run in this PRD.**
+- ❌ **No code in this PRD.** Master `JARVIS_S2_PREDICTIVE_BUDGET_ENABLED` does not yet exist in the codebase; this section is the architectural design lock. Implementation lands only on explicit operator authorization (*"S2 implementation approved"*).
+
