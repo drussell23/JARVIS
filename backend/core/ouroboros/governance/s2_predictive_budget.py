@@ -88,6 +88,12 @@ _ENV_SAFETY_CEILING = "JARVIS_S2_SAFETY_CEILING"
 _ENV_CHARS_PER_TOKEN = "JARVIS_S2_CHARS_PER_TOKEN"
 _ENV_COST_SAMPLE_WINDOW = "JARVIS_S2_COST_SAMPLE_WINDOW"
 _ENV_PRICING_YAML_PATH = "JARVIS_S2_PRICING_YAML_PATH"
+# PRD §11 S2 wiring (B1 revised): session budget precedence chain.
+# JARVIS_S2_SESSION_BUDGET_USD > OUROBOROS_BATTLE_COST_CAP > default 0.50.
+# Default 0.50 mirrors the BattleTestHarnessConfig default (NOT 1.0).
+_ENV_SESSION_BUDGET_USD = "JARVIS_S2_SESSION_BUDGET_USD"
+_ENV_BATTLE_COST_CAP = "OUROBOROS_BATTLE_COST_CAP"
+_DEFAULT_SESSION_BUDGET_USD = 0.50
 
 # Documented PRD defaults — these live ONLY as the env-default arm of the
 # os.environ.get(...) reads below. Code paths NEVER inline any of these
@@ -592,6 +598,163 @@ def emit_preemption_signal(
 
 
 # --------------------------------------------------------------------------
+# Session budget — env-driven precedence chain (PRD §11 S2 wiring, B1 revised)
+# --------------------------------------------------------------------------
+
+
+def session_budget_usd() -> float:
+    """Return the session-wide USD budget. Precedence (B1 revised):
+
+      1. ``JARVIS_S2_SESSION_BUDGET_USD`` (explicit S2 override)
+      2. ``OUROBOROS_BATTLE_COST_CAP`` (battle harness env)
+      3. default **0.50** (mirrors BattleTestHarnessConfig default)
+
+    Reads dynamically from ``os.environ`` per call — the *value* lives
+    in env, the *channel* is the operator's interface. No hardcoded
+    budget literal in code; default matches the existing harness
+    contract, not a new authority.
+
+    Clamped to a hard floor of $0.01 (avoid div-by-zero on downstream
+    pressure-ratio math). NEVER raises."""
+    try:
+        # Tier 1: explicit S2 env knob
+        raw_s2 = os.environ.get(_ENV_SESSION_BUDGET_USD, "").strip()
+        if raw_s2:
+            try:
+                v = float(raw_s2)
+                return max(0.01, v)
+            except (TypeError, ValueError):
+                pass  # fall through to harness env
+        # Tier 2: battle harness env knob
+        raw_battle = os.environ.get(_ENV_BATTLE_COST_CAP, "").strip()
+        if raw_battle:
+            try:
+                v = float(raw_battle)
+                return max(0.01, v)
+            except (TypeError, ValueError):
+                pass  # fall through to default
+        # Tier 3: documented default — mirrors BattleTestHarnessConfig.
+        return float(_DEFAULT_SESSION_BUDGET_USD)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug("[S2] session_budget_usd fault: %s", exc)
+        return float(_DEFAULT_SESSION_BUDGET_USD)
+
+
+def _peek_high_prio_queued() -> bool:
+    """True iff the next-to-be-dispatched envelope in the
+    UnifiedIntakeRouter's priority queue is high-priority — i.e.,
+    one of ``critical`` / ``high`` / ``normal`` (which map to
+    governor ``IMMEDIATE`` / ``STANDARD`` / ``COMPLEX``).
+
+    Composes ``UnifiedIntakeRouter.peek_top_urgency()`` exclusively
+    — no parallel queue inspector (PRD §11 B2 directive). Returns
+    False on any fault (fail-open: no signal emitted on lookup
+    fault). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+            get_default_intake_router,
+        )
+        router = get_default_intake_router()
+        if router is None:
+            return False
+        top = router.peek_top_urgency()
+        if top is None:
+            return False
+        return top in ("critical", "high", "normal")
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+# --------------------------------------------------------------------------
+# Provider-side admission predicate (PRD §11.4 wiring) — B3 directive
+# --------------------------------------------------------------------------
+
+
+def evaluate_admission_pressure(
+    prompt_text: str,
+    route: str,
+    model: str,
+    *,
+    cost_governor=None,
+    sample_provider=None,
+    pricing_lookup=None,
+    output_token_estimator=None,
+) -> Optional[float]:
+    """Provider-side S2 admission evaluator (PRD §11.4 + §11 B1-B4).
+
+    Composes the existing data flows exactly:
+      * **Spend**: ``cost_governor.session_total_cumulative_usd()``
+        (additive, composes existing ``_entries`` ledger).
+      * **Budget**: :func:`session_budget_usd` (env precedence chain).
+      * **Prompt-chars**: ``len(prompt_text)`` — dynamically at
+        provider-call time, with assembled ``prompt_text`` in scope.
+        NO pre-calculation. NO prompt re-assembly (B3 invariant).
+      * **Forecast**: :func:`forecasted_cost` over the actual
+        ``len(prompt_text)``.
+      * **Dynamic factor**: :func:`dynamic_admit_safety_factor` —
+        MAD-based, robust to outliers.
+      * **High-prio queued**: composes
+        ``UnifiedIntakeRouter.peek_top_urgency()``.
+
+    Returns the severity ∈ (0.0, 1.0] iff a preemption signal SHOULD
+    be emitted, or ``None`` if no signal is warranted. **The caller
+    (provider) is responsible for invoking
+    :func:`emit_preemption_signal`.**
+
+    **Critical invariant (PRD §11.4)**: S2 is ADVISORY. This function
+    does not block, alter, or defer the current op's provider
+    dispatch — it merely returns whether a preemption-advisory
+    *should* fire to nudge ``sensor_governor`` against future
+    low-priority sensor emissions. The current op proceeds normally.
+
+    NEVER raises (fail-open: any fault ⇒ returns ``None`` ⇒ no
+    signal). Master OFF returns ``None`` immediately."""
+    try:
+        if not master_enabled():
+            return None
+        if cost_governor is None:
+            try:
+                from backend.core.ouroboros.governance.cost_governor import (  # noqa: E501
+                    get_default_cost_governor,
+                )
+                cost_governor = get_default_cost_governor()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[S2] cost_governor lookup fault: %s", exc,
+                )
+                return None
+        if cost_governor is None:
+            return None  # cost ledger not active in this process
+        try:
+            spend = float(cost_governor.session_total_cumulative_usd())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[S2] session_total fault: %s", exc)
+            return None
+        budget = session_budget_usd()
+        factor = dynamic_admit_safety_factor(
+            str(route), str(model), sample_provider=sample_provider,
+        )
+        forecast = forecasted_cost(
+            len(prompt_text or ""), str(route), str(model),
+            output_token_estimator=output_token_estimator,
+            pricing_lookup=pricing_lookup,
+        )
+        denom = max(0.01, budget * factor)
+        ratio = (spend + forecast) / denom
+        if ratio < 1.0:
+            return None
+        if not _peek_high_prio_queued():
+            return None
+        # Severity = how far over the threshold, clipped to [0,1]
+        return float(min(1.0, max(0.0, ratio - 1.0)))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[S2] evaluate_admission_pressure fault: %s", exc,
+        )
+        return None
+
+
+# --------------------------------------------------------------------------
 # Exports
 # --------------------------------------------------------------------------
 
@@ -599,6 +762,8 @@ def emit_preemption_signal(
 __all__ = [
     "S2_PREDICTIVE_BUDGET_SCHEMA_VERSION",
     "master_enabled",
+    "session_budget_usd",
+    "evaluate_admission_pressure",
     "base_safety_factor",
     "volatility_penalty",
     "safety_floor",
@@ -716,6 +881,19 @@ def register_flags(registry) -> int:  # noqa: ANN001
                 "Default: brain_selection_policy.yaml beside this "
                 "module. Missing/absent section ⇒ forecast = 0 "
                 "(predicate clause no-op)."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_SESSION_BUDGET_USD, type=FlagType.FLOAT,
+            default=_DEFAULT_SESSION_BUDGET_USD,
+            category=Category.SAFETY, source_file=tgt,
+            example=f"{_ENV_SESSION_BUDGET_USD}=0.50",
+            description=(
+                "Session-wide USD budget for S2's predictive admission "
+                "predicate (PRD §11 B1 revised). Precedence: this "
+                "env > OUROBOROS_BATTLE_COST_CAP > default 0.50 "
+                "(matches BattleTestHarnessConfig). Read dynamically "
+                "per call."
             ),
         ),
     ]
