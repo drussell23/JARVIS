@@ -63,6 +63,7 @@ logger = logging.getLogger("Ouroboros.ProviderResponseCache")
 PROVIDER_RESPONSE_CACHE_SCHEMA_VERSION: str = "provider_response_cache.v1"
 
 _ENV_MASTER = "JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED"
+_ENV_SHADOW = "JARVIS_PROVIDER_RESPONSE_CACHE_SHADOW"
 _ENV_MAX_BYTES = "JARVIS_PROVIDER_CACHE_MAX_BYTES"
 _ENV_TTL_S = "JARVIS_PROVIDER_CACHE_TTL_S"
 _ENV_PATH = "JARVIS_PROVIDER_CACHE_PATH"
@@ -81,6 +82,19 @@ def response_cache_enabled() -> bool:
     """Master switch, default-FALSE (PRD §7). Re-read each call so a
     flip hot-reverts. NEVER raises."""
     return os.environ.get(_ENV_MASTER, "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def shadow_mode_enabled() -> bool:
+    """Independent of master. When BOTH master ON AND shadow ON, a
+    cache HIT is logged as ``[PRC] SHADOW_HIT cost_would_have_saved=$X``
+    and the request still falls through to ``produce()`` (no behavior
+    change to the upstream provider). When master is OFF, shadow is
+    a no-op regardless of this flag (master takes precedence).
+    Default-FALSE (PRD §10.10). Re-read each call so a flip hot-
+    reverts. NEVER raises."""
+    return os.environ.get(_ENV_SHADOW, "false").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -128,6 +142,7 @@ class CacheLookupOutcome(str, enum.Enum):
     DISABLED = "disabled"
     INVALIDATED_REPO_CHANGE = "invalidated_repo_change"
     FAULT_FAIL_OPEN = "fault_fail_open"
+    SHADOW_HIT_PASSTHROUGH = "shadow_hit_passthrough"  # PRD §10.10 — observed but not acted on
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +240,11 @@ class CachedTrajectory:
     total_input_tokens: int
     total_output_tokens: int
     n_bytes: int
+    # PRD §10.10: original ``cost_usd`` at store time. Powers shadow-mode
+    # ``cost_would_have_saved`` telemetry. Additive: default 0.0 means
+    # "unknown" (older serialized entries without this field roundtrip
+    # cleanly as 0.0; their would-save is reported as $0.000000).
+    original_cost_usd: float = 0.0
     created_at: float = field(default_factory=time.monotonic)
     schema_version: str = PROVIDER_RESPONSE_CACHE_SCHEMA_VERSION
 
@@ -240,6 +260,7 @@ class CachedTrajectory:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "n_bytes": self.n_bytes,
+            "original_cost_usd": self.original_cost_usd,
             "created_at": self.created_at,
             "schema_version": self.schema_version,
         }
@@ -260,6 +281,8 @@ class CachedTrajectory:
                 total_input_tokens=int(d.get("total_input_tokens", 0)),
                 total_output_tokens=int(d.get("total_output_tokens", 0)),
                 n_bytes=int(d.get("n_bytes", 0)),
+                # Additive field: missing in legacy entries → 0.0 fallback.
+                original_cost_usd=float(d.get("original_cost_usd", 0.0) or 0.0),
                 created_at=float(d.get("created_at", time.monotonic())),
                 schema_version=str(
                     d.get("schema_version",
@@ -301,6 +324,13 @@ def _trajectory_from_generation_result(
                 getattr(gr, "total_output_tokens", 0) or 0
             ),
             n_bytes=len(payload.encode("utf-8", "replace")),
+            # PRD §10.10: capture original spend for shadow telemetry.
+            # Clamp negatives to 0.0 defensively (provider should never
+            # report negative cost; this guarantees the would-save log
+            # never displays a misleading negative).
+            original_cost_usd=max(
+                0.0, float(getattr(gr, "cost_usd", 0.0) or 0.0),
+            ),
         )
     except Exception:  # noqa: BLE001
         return None
@@ -515,6 +545,10 @@ async def cached_or_generate(
     full: str = ""
     pref: str = ""
     outcome: CacheLookupOutcome = CacheLookupOutcome.MISS
+    # PRD §10.10: shadow-mode flag captured ONCE per call so a mid-call
+    # env flip cannot make us return cached on the HIT branch but skip
+    # the store on the MISS branch (or vice-versa).
+    shadow: bool = shadow_mode_enabled()
     try:
         full, pref = compute_cache_key(
             str(prompt), str(model), str(route), Path(repo_root),
@@ -522,25 +556,42 @@ async def cached_or_generate(
         cache = get_default_cache()
         outcome, traj = cache.lookup(full, pref)
         if outcome is CacheLookupOutcome.EXACT_HIT and traj is not None:
-            gr = reconstruct_generation_result(traj)
-            if gr is not None:
+            if shadow:
+                # Shadow mode: observe, log, but DO NOT return cached —
+                # fall through to produce() so the upstream provider is
+                # still hit (application state integrity guaranteed).
+                # MISS-path post-store skipped (entry already present).
                 logger.info(
-                    "[PRC] EXACT_HIT — provider skipped, $0.00 "
-                    "(model=%s route=%s)", model, route,
+                    "[PRC] SHADOW_HIT cost_would_have_saved=$%.6f "
+                    "(model=%s route=%s)",
+                    float(traj.original_cost_usd or 0.0), model, route,
                 )
-                return gr, CacheLookupOutcome.EXACT_HIT
-            # reconstruction failed → fall through to real call
+                outcome = CacheLookupOutcome.SHADOW_HIT_PASSTHROUGH
+                # Intentional fall-through: do NOT return here.
+            else:
+                gr = reconstruct_generation_result(traj)
+                if gr is not None:
+                    logger.info(
+                        "[PRC] EXACT_HIT — provider skipped, $0.00 "
+                        "(model=%s route=%s)", model, route,
+                    )
+                    return gr, CacheLookupOutcome.EXACT_HIT
+                # reconstruction failed → fall through to real call
     except Exception as exc:  # noqa: BLE001 — fail-open
         logger.debug("[PRC] gate fault (fail-open): %s", exc)
         return await produce(), CacheLookupOutcome.FAULT_FAIL_OPEN
-    # Miss / invalidated / reconstruction-failed → real generation,
-    # then best-effort store (store-omission is fail-safe).
+    # Miss / invalidated / reconstruction-failed / SHADOW_HIT_PASSTHROUGH
+    # → real generation, then best-effort store (store-omission is
+    # fail-safe). On SHADOW_HIT_PASSTHROUGH the entry already exists at
+    # this key — skip the store to avoid an idempotent re-write thrash
+    # against the LRU.
     gr = await produce()
     try:
         if (
             full
             and gr is not None
             and not getattr(gr, "is_noop", False)
+            and outcome is not CacheLookupOutcome.SHADOW_HIT_PASSTHROUGH
         ):
             t = _trajectory_from_generation_result(full, pref, gr)
             get_default_cache().store(t)
@@ -555,6 +606,7 @@ __all__ = [
     "CachedTrajectory",
     "ProviderResponseCache",
     "response_cache_enabled",
+    "shadow_mode_enabled",
     "cache_max_bytes",
     "cache_ttl_s",
     "repo_state_digest",
@@ -585,6 +637,20 @@ def register_flags(registry) -> int:  # noqa: ANN001
             description=(
                 "Master for the zero-waste provider response cache. "
                 "OFF (default, §33.1) ⇒ provider path byte-identical."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_SHADOW, type=FlagType.BOOL, default=False,
+            category=Category.SAFETY, source_file=tgt,
+            example=f"{_ENV_SHADOW}=true",
+            description=(
+                "Shadow-mode telemetry (PRD §10.10). Independent of "
+                "master. When master ON AND shadow ON, a cache HIT is "
+                "logged as `[PRC] SHADOW_HIT cost_would_have_saved=$X` "
+                "and the request still falls through to the upstream "
+                "provider (no behavior change). Use to gather real-"
+                "workload hit-rate evidence before any default-TRUE "
+                "flip of the master."
             ),
         ),
         FlagSpec(
@@ -661,6 +727,8 @@ def register_shipped_invariants() -> list:
         required = {
             "EXACT_HIT", "SEMANTIC_HIT", "MISS", "DISABLED",
             "INVALIDATED_REPO_CHANGE", "FAULT_FAIL_OPEN",
+            # PRD §10.10 — observed-but-not-acted shadow outcome.
+            "SHADOW_HIT_PASSTHROUGH",
         }
         for node in _ast.walk(tree):
             if isinstance(node, _ast.ClassDef) and (
