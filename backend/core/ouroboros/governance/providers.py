@@ -6455,42 +6455,15 @@ class ClaudeProvider:
         )
         executor = None  # lazy init on first tool call
 
-        # Gap #7: discover MCP tools for prompt injection
-        _mcp_tools = None
-        if self._mcp_client is not None and self._tools_enabled:
-            try:
-                _mcp_tools = await self._mcp_client.discover_tools()
-            except Exception:
-                pass
-        # P0.1: Lean prompt when tool loop is available and not repairing
-        _preloaded_files: List[str] = []
-        if (
-            repair_context is None
-            and _should_use_lean_prompt(context, tools_enabled=self._tools_enabled)
-        ):
-            prompt_text = _build_lean_codegen_prompt(
-                context,
+        # Zero-Waste S1 (D2): MCP discovery + lean/full prompt build
+        # extracted into _assemble_codegen_prompt (low-risk extract).
+        prompt_text, _mcp_tools, _preloaded_files = (
+            await self._assemble_codegen_prompt(
+                context=context,
                 repo_root=repo_root,
-                repo_roots=self._repo_roots,
-                force_full_content=True,
-                mcp_tools=_mcp_tools,
-                preloaded_out=_preloaded_files,
-            )
-            logger.info(
-                "[ClaudeAPI] Using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
-                len(prompt_text), len(prompt_text) // 4, len(_preloaded_files),
-            )
-        else:
-            prompt_text = _build_codegen_prompt(
-                context,
-                repo_root=repo_root,
-                repo_roots=self._repo_roots,
-                tools_enabled=self._tools_enabled,
-                force_full_content=True,
                 repair_context=repair_context,
-                mcp_tools=_mcp_tools,
-                provider_route=getattr(context, "provider_route", "") or "",
             )
+        )
         # Build messages array for multi-turn conversation
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]
         accumulated_chars = len(prompt_text)
@@ -7561,6 +7534,50 @@ class ClaudeProvider:
                 _route,
             )
 
+        # Zero-Waste S1 (D2) cache gate. Eligible only when the
+        # provider-response cache is enabled AND no tool loop will
+        # engage (tools_enabled is False AND tool_loop is None). On
+        # HIT: skip provider API + tool dispatch (NOT the Python
+        # set-up above — that's already paid). On MISS: the nested
+        # _no_tools_inner closure runs _generate_raw +
+        # _finalize_codegen_result, and the result is stored.
+        # Authority asymmetry: providers import cached_or_generate
+        # ONLY; no inline cache class / no OrderedDict LRU here.
+        try:
+            from backend.core.ouroboros.governance.provider_response_cache import (  # noqa: E501
+                cached_or_generate as _cached_or_generate,
+                response_cache_enabled as _response_cache_enabled,
+            )
+        except Exception:  # noqa: BLE001 — substrate optional / fail-open
+            _cached_or_generate = None
+            _response_cache_enabled = lambda: False  # noqa: E731
+        if (
+            _cached_or_generate is not None
+            and _response_cache_enabled()
+            and not self._tools_enabled
+            and self._tool_loop is None
+        ):
+            async def _no_tools_inner():
+                _raw = await _generate_raw(prompt_text)
+                return self._finalize_codegen_result(
+                    raw=_raw, context=context, repo_root=repo_root,
+                    start=start, preloaded_files=_preloaded_files,
+                    token_usage=_token_usage, total_cost=total_cost,
+                    tool_rounds=tool_rounds,
+                    first_token_ms=_first_token_ms,
+                    thinking_reason=_thinking_reason_out,
+                    tool_records=(), venom_edits=(),
+                )
+
+            _gate_gr, _gate_outcome = await _cached_or_generate(
+                prompt=prompt_text,
+                model=self._model,
+                route=getattr(context, "provider_route", "") or "",
+                repo_root=repo_root,
+                produce=_no_tools_inner,
+            )
+            return _gate_gr
+
         tool_records: tuple = ()
         venom_edits: Tuple[Dict[str, Any], ...] = ()
         if self._tool_loop is not None and not _skip_tools:
@@ -7680,13 +7697,118 @@ class ClaudeProvider:
         else:
             raw = await _generate_raw(prompt_text)
 
+        return self._finalize_codegen_result(
+            raw=raw,
+            context=context,
+            repo_root=repo_root,
+            start=start,
+            preloaded_files=_preloaded_files,
+            token_usage=_token_usage,
+            total_cost=total_cost,
+            tool_rounds=tool_rounds,
+            first_token_ms=_first_token_ms,
+            thinking_reason=_thinking_reason_out,
+            tool_records=tool_records,
+            venom_edits=venom_edits,
+        )
+
+    async def _assemble_codegen_prompt(
+        self,
+        *,
+        context: "OperationContext",
+        repo_root: Optional[Path],
+        repair_context: Optional[Any],
+    ) -> Tuple[str, Any, List[str]]:
+        """Zero-Waste S1 (D2) extract — MCP tools discovery + lean/
+        full prompt build. Pulled out of :meth:`generate` so the
+        substrate can compute a cache key on ``prompt_text`` before
+        tool dispatch. Async because MCP discovery awaits.
+
+        Returns
+        -------
+        (prompt_text, mcp_tools, preloaded_files)
+        """
+        # Gap #7: discover MCP tools for prompt injection
+        _mcp_tools = None
+        if self._mcp_client is not None and self._tools_enabled:
+            try:
+                _mcp_tools = await self._mcp_client.discover_tools()
+            except Exception:  # noqa: BLE001 — degrade silently
+                pass
+        # P0.1: Lean prompt when tool loop is available and not repairing
+        _preloaded_files: List[str] = []
+        if (
+            repair_context is None
+            and _should_use_lean_prompt(
+                context, tools_enabled=self._tools_enabled,
+            )
+        ):
+            prompt_text = _build_lean_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                force_full_content=True,
+                mcp_tools=_mcp_tools,
+                preloaded_out=_preloaded_files,
+            )
+            logger.info(
+                "[ClaudeAPI] Using lean prompt "
+                "(%d chars, ~%d tokens, preloaded=%d)",
+                len(prompt_text), len(prompt_text) // 4,
+                len(_preloaded_files),
+            )
+        else:
+            prompt_text = _build_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                tools_enabled=self._tools_enabled,
+                force_full_content=True,
+                repair_context=repair_context,
+                mcp_tools=_mcp_tools,
+                provider_route=getattr(
+                    context, "provider_route", "",
+                ) or "",
+            )
+        return prompt_text, _mcp_tools, _preloaded_files
+
+    def _finalize_codegen_result(
+        self,
+        *,
+        raw: Any,
+        context: "OperationContext",
+        repo_root: Optional[Path],
+        start: float,
+        preloaded_files: List[str],
+        token_usage: Dict[str, int],
+        total_cost: float,
+        tool_rounds: int,
+        first_token_ms: List[Optional[float]],
+        thinking_reason: List[str],
+        tool_records: Tuple[Any, ...],
+        venom_edits: Tuple[Dict[str, Any], ...],
+    ) -> GenerationResult:
+        """Zero-Waste S1 (D2) extract — post-raw result parsing +
+        token/cost finalize. Shared by :meth:`generate`'s normal
+        return path and the S1 gate's ``_no_tools_inner`` thunk.
+        Pure: takes everything it needs as args (no nonlocal)."""
         duration = time.monotonic() - start
         source_hash = ""
-        source_path = context.target_files[0] if context.target_files else ""
+        source_path = (
+            context.target_files[0] if context.target_files else ""
+        )
         if source_path:
-            abs_path = (repo_root / source_path) if repo_root else Path(source_path)
+            abs_path = (
+                (repo_root / source_path)
+                if repo_root else Path(source_path)
+            )
             try:
-                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.is_file() else ""
+                content_bytes = (
+                    abs_path.read_text(
+                        encoding="utf-8", errors="replace",
+                    )
+                    if abs_path.is_file() else ""
+                )
                 source_hash = _file_source_hash(content_bytes)
             except OSError:
                 pass
@@ -7701,31 +7823,38 @@ class ClaudeProvider:
             repo_roots=self._repo_roots,
             repo_root=repo_root,
         )
-        if _preloaded_files:
+        if preloaded_files:
             result = dataclasses.replace(
-                result, prompt_preloaded_files=tuple(_preloaded_files),
+                result,
+                prompt_preloaded_files=tuple(preloaded_files),
             )
 
         # Attach token usage and cost
-        if _token_usage["input"] or _token_usage["output"] or total_cost > 0:
+        if (
+            token_usage["input"] or token_usage["output"]
+            or total_cost > 0
+        ):
             result = dataclasses.replace(
                 result,
-                total_input_tokens=_token_usage["input"],
-                total_output_tokens=_token_usage["output"],
+                total_input_tokens=token_usage["input"],
+                total_output_tokens=token_usage["output"],
                 cost_usd=total_cost,
             )
 
-        _ftms = _first_token_ms[0]
+        _ftms = first_token_ms[0]
         _ftms_str = f"{_ftms:.0f}ms" if _ftms is not None else "n/a"
         _route_str = getattr(context, "provider_route", "") or "?"
         logger.info(
-            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f, "
+            "[ClaudeProvider] %d candidates in %.1fs "
+            "(tool_rounds=%d), cost=$%.4f, "
             "%d+%d tokens, first_token=%s thinking=%s route=%s",
             len(result.candidates), duration, tool_rounds, total_cost,
-            _token_usage["input"], _token_usage["output"],
-            _ftms_str, _thinking_reason_out[0], _route_str,
+            token_usage["input"], token_usage["output"],
+            _ftms_str, thinking_reason[0], _route_str,
         )
-        return result.with_tool_records(tool_records).with_venom_edits(venom_edits)
+        return result.with_tool_records(
+            tool_records
+        ).with_venom_edits(venom_edits)
 
     async def health_probe(self) -> bool:
         """Lightweight API ping. Returns True if API responds.

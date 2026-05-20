@@ -902,6 +902,116 @@ class DoublewordProvider:
                 generation_duration_s=0.0,
             )
 
+        # Zero-Waste S1 (D2) cache gate. Eligible only when the
+        # provider-response cache is enabled AND DW's tool loop will
+        # be skipped (tool_loop is None OR task_complexity in
+        # {trivial,simple} per _generate_realtime's _will_skip_tools
+        # discipline). The prompt is assembled once at this layer and
+        # passed through as prompt_override (existing plumbing) so the
+        # gate keys on the actually-built prompt. Authority-asymmetry:
+        # this file imports cached_or_generate ONLY (no inline cache
+        # class / no OrderedDict LRU). NEVER raises (fail-open).
+        try:
+            from backend.core.ouroboros.governance.provider_response_cache import (  # noqa: E501
+                cached_or_generate as _zw_cached_or_generate,
+                response_cache_enabled as _zw_response_cache_enabled,
+            )
+        except Exception:  # noqa: BLE001 — substrate optional / fail-open
+            _zw_cached_or_generate = None
+            _zw_response_cache_enabled = lambda: False  # noqa: E731
+        if (
+            _zw_cached_or_generate is not None
+            and _zw_response_cache_enabled()
+        ):
+            _zw_prompt = prompt_override
+            if _zw_prompt is None:
+                try:
+                    from backend.core.ouroboros.governance.providers import (
+                        _build_codegen_prompt,
+                        _build_lean_codegen_prompt,
+                        _should_use_lean_prompt,
+                    )
+                    _zw_complexity = getattr(
+                        context, "task_complexity", "",
+                    )
+                    _zw_will_skip = _zw_complexity in (
+                        "trivial", "simple",
+                    )
+                    _zw_tools_available = (
+                        self._tool_loop is not None
+                        and not _zw_will_skip
+                    )
+                    _zw_preloaded: List[str] = []
+                    if _should_use_lean_prompt(
+                        context, tools_enabled=_zw_tools_available,
+                    ):
+                        _zw_prompt = _build_lean_codegen_prompt(
+                            context,
+                            repo_root=self._repo_root,
+                            repo_roots=self._repo_roots or None,
+                            force_full_content=True,
+                            mcp_tools=None,
+                            preloaded_out=_zw_preloaded,
+                        )
+                    else:
+                        _zw_prompt = _build_codegen_prompt(
+                            context,
+                            repo_root=self._repo_root,
+                            repo_roots=self._repo_roots or None,
+                            force_full_content=True,
+                            mcp_tools=None,
+                            provider_route=getattr(
+                                context, "provider_route", "",
+                            ) or "",
+                        )
+                except Exception:  # noqa: BLE001 — fail-open
+                    _zw_prompt = None
+            _zw_will_skip = getattr(
+                context, "task_complexity", "",
+            ) in ("trivial", "simple")
+            _zw_eligible = (self._tool_loop is None) or _zw_will_skip
+            if _zw_prompt is not None and _zw_eligible:
+                async def _dw_inner():
+                    return await self._dispatch_internal(
+                        context, deadline,
+                        prompt_override=_zw_prompt,
+                    )
+
+                try:
+                    _zw_model = self._effective_model_id(context)
+                except Exception:  # noqa: BLE001
+                    _zw_model = getattr(self, "_model", "doubleword")
+                _gr, _ = await _zw_cached_or_generate(
+                    prompt=_zw_prompt,
+                    model=_zw_model,
+                    route=getattr(
+                        context, "provider_route", "",
+                    ) or "",
+                    repo_root=self._repo_root,
+                    produce=_dw_inner,
+                )
+                return _gr
+
+        # Cache disabled / not eligible: fall through to the existing
+        # dispatcher (RT + batch fall-back) verbatim — extracted into
+        # _dispatch_internal so the gate's _dw_inner closure can call
+        # the same code path without duplication.
+        return await self._dispatch_internal(
+            context, deadline, prompt_override=prompt_override,
+        )
+
+    async def _dispatch_internal(
+        self,
+        context: OperationContext,
+        deadline: Any = None,
+        *,
+        prompt_override: Optional[str] = None,
+    ) -> GenerationResult:
+        """RT + batch dispatcher. Extracted from :meth:`generate` so
+        the Zero-Waste S1 cache gate's ``_dw_inner`` thunk can
+        invoke the same dispatch path without duplicating it
+        (single source of dispatch truth). Behavior is byte-
+        identical to the pre-extraction body."""
         # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
         # On 429/503, fall back to batch within DW (stay cheap) instead of
         # cascading to the 150x more expensive Claude fallback.
