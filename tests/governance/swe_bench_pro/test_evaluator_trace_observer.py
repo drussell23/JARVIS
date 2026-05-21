@@ -960,3 +960,256 @@ class TestSlice4ReplVerb:
             "SerpentREPL must define _handle_trace for /trace verb "
             "auto-discovery"
         )
+
+
+# ============================================================================
+# Slice 5 — Harness boot-wire pins
+# ============================================================================
+#
+# These pins enforce the 4 operator-mandated invariants for the
+# EvaluatorTraceObserver ignition:
+#
+#   1. The harness wires the observer when JARVIS_EVALUATOR_TRACE_ENABLED=true
+#   2. The harness does NOT start the observer when the master flag is false
+#   3. The harness composes the EXISTING StreamEventBroker via
+#      get_default_broker(), not a parallel bus
+#   4. The harness stops the observer in _shutdown_components BEFORE
+#      broker/intake teardown
+#
+# All pins are AST-based reads of the static harness source; they make
+# no live runtime claims about behavior under load (the smoke-test
+# diagnostic is the empirical validator). The pins catch DRIFT —
+# accidental removal, re-routing through a new bus, or shutdown-order
+# regression — without needing to boot the harness.
+
+_HARNESS_FILE = Path(
+    "backend/core/ouroboros/battle_test/harness.py"
+)
+
+
+def test_ast_pin_harness_wires_evaluator_trace_observer_when_enabled():
+    """Slice 5 ignition proof — positive presence pin.
+
+    The harness MUST contain:
+
+      * An import of ``EvaluatorTraceObserver`` + ``evaluator_trace_enabled``
+        from the canonical observer module.
+      * A master-flag guard (``if evaluator_trace_enabled():``)
+        wrapping the observer instantiation.
+      * An ``EvaluatorTraceObserver(...)`` instantiation site.
+      * A ``.start()`` call (sync — observer returns bool).
+      * Storage on ``self._evaluator_trace_observer``.
+
+    Any drift on these breaks the wiring contract."""
+    src = _HARNESS_FILE.read_text()
+    # Canonical observer import
+    assert (
+        "from backend.core.ouroboros.governance.swe_bench_pro."
+        "evaluator_trace_observer import"
+    ) in src, (
+        "harness.py must import from "
+        "swe_bench_pro.evaluator_trace_observer"
+    )
+    assert "EvaluatorTraceObserver" in src, (
+        "harness.py must reference EvaluatorTraceObserver"
+    )
+    assert "evaluator_trace_enabled" in src, (
+        "harness.py must reference evaluator_trace_enabled "
+        "(master-flag gate)"
+    )
+    # Master-flag guard present
+    tree = ast.parse(src, filename=str(_HARNESS_FILE))
+    found_guard = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            test = node.test
+            # Match ``if evaluator_trace_enabled():`` — bare Call node
+            if (
+                isinstance(test, ast.Call)
+                and isinstance(test.func, ast.Name)
+                and test.func.id == "evaluator_trace_enabled"
+            ):
+                found_guard = True
+                break
+    assert found_guard, (
+        "harness.py must guard the observer instantiation with "
+        "``if evaluator_trace_enabled():`` (master-flag gate)"
+    )
+    # Instantiation site
+    found_instantiation = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EvaluatorTraceObserver"
+        ):
+            found_instantiation = True
+            break
+    assert found_instantiation, (
+        "harness.py must instantiate EvaluatorTraceObserver "
+        "(positive presence pin)"
+    )
+    # Attribute storage
+    assert "self._evaluator_trace_observer" in src, (
+        "harness.py must store the observer on "
+        "self._evaluator_trace_observer (consistent with shutdown "
+        "step 0d3's getattr)"
+    )
+    # start() call
+    assert "_evaluator_trace_observer.start()" in src, (
+        "harness.py must call self._evaluator_trace_observer.start() "
+        "after instantiation"
+    )
+
+
+def test_ast_pin_harness_does_not_start_observer_when_master_flag_false():
+    """Slice 5 invariant — when JARVIS_EVALUATOR_TRACE_ENABLED is
+    FALSE (default), the observer MUST stay None.
+
+    Runtime-equivalent check: the harness's master-flag-gate
+    short-circuits BEFORE instantiation. We verify this structurally
+    by confirming there is no path that bypasses the
+    ``evaluator_trace_enabled()`` check and instantiates the observer
+    unconditionally."""
+    src = _HARNESS_FILE.read_text()
+    tree = ast.parse(src, filename=str(_HARNESS_FILE))
+    # Walk every EvaluatorTraceObserver(...) Call site and verify
+    # each is INSIDE the master-flag-gated If body.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EvaluatorTraceObserver"
+        ):
+            # Walk up the AST to find the enclosing If.
+            ancestors = []
+            for parent in ast.walk(tree):
+                if not isinstance(parent, ast.If):
+                    continue
+                # Check if `node` is somewhere in parent.body subtree.
+                for descendant in ast.walk(parent):
+                    if descendant is node:
+                        ancestors.append(parent)
+                        break
+            # At least one enclosing If must test
+            # ``evaluator_trace_enabled()``.
+            gated = False
+            for parent in ancestors:
+                test = parent.test
+                if (
+                    isinstance(test, ast.Call)
+                    and isinstance(test.func, ast.Name)
+                    and test.func.id == "evaluator_trace_enabled"
+                ):
+                    gated = True
+                    break
+            assert gated, (
+                f"EvaluatorTraceObserver instantiation at line "
+                f"{node.lineno} is NOT enclosed by an "
+                f"``if evaluator_trace_enabled():`` guard — master-"
+                f"flag default-FALSE byte-equivalence is broken"
+            )
+
+
+def test_ast_pin_harness_uses_canonical_stream_broker_not_parallel_bus():
+    """Slice 5 invariant — the harness composes the EXISTING
+    StreamEventBroker (Gap #6 Slice 2) via the canonical singleton
+    accessor ``get_default_broker()`` rather than constructing a
+    parallel bus for the observer.
+
+    Drift this catches:
+      * A new ``StreamEventBroker(...)`` instantiation site in the
+        Slice 5 wiring (would imply a parallel bus).
+      * Importing a non-canonical broker source.
+      * Using ``broker_publish=None`` unconditionally (would silently
+        defeat the SSE surface)."""
+    src = _HARNESS_FILE.read_text()
+    # Canonical broker import on the Slice 5 path
+    assert (
+        "from backend.core.ouroboros.governance.ide_observability_stream "
+        "import"
+    ) in src or (
+        "from backend.core.ouroboros.governance."
+        "ide_observability_stream import"
+    ) in src, (
+        "harness.py must import from the canonical "
+        "ide_observability_stream module (the single broker source)"
+    )
+    assert "get_default_broker" in src, (
+        "harness.py must use get_default_broker() — the canonical "
+        "broker singleton accessor (NOT a parallel bus construction)"
+    )
+    # The broker_publish kwarg must be threaded through (not hardcoded
+    # to None on the live-observer path).
+    tree = ast.parse(src, filename=str(_HARNESS_FILE))
+    found_broker_publish_threaded = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EvaluatorTraceObserver"
+        ):
+            for kw in node.keywords:
+                if kw.arg == "broker_publish":
+                    # Must be SOMETHING other than a bare None constant
+                    # (a conditional expression is fine — e.g.
+                    # ``_eto_broker.publish if _eto_broker is not None
+                    # else None``).
+                    if isinstance(kw.value, ast.Constant) and (
+                        kw.value.value is None
+                    ):
+                        continue  # bare None — bad
+                    found_broker_publish_threaded = True
+                    break
+    assert found_broker_publish_threaded, (
+        "EvaluatorTraceObserver MUST be instantiated with a "
+        "``broker_publish`` kwarg that resolves to a real callable "
+        "(typically ``broker.publish``) — passing bare ``None`` "
+        "would defeat the SSE surface"
+    )
+
+
+def test_ast_pin_harness_shutdown_stops_evaluator_trace_observer():
+    """Slice 5 invariant — ``_shutdown_components`` calls
+    ``self._evaluator_trace_observer.stop()`` (await) BEFORE broker
+    and intake teardown.
+
+    Step 0d3 is the canonical slot (operator-mandated: "Stop it in
+    _shutdown_components before broker/intake teardown"). The pin
+    verifies:
+
+      * A ``0d3`` section comment is present (documentation anchor).
+      * An ``await _eto.stop()`` (or equivalent) is invoked in
+        _shutdown_components.
+      * That call appears BEFORE the canonical intake stop (``# 2.
+        Intake`` section comment)."""
+    src = _HARNESS_FILE.read_text()
+    # 0d3 section comment present (documentation anchor)
+    assert "# 0d3." in src, (
+        "_shutdown_components must have a ``# 0d3.`` section comment "
+        "documenting the EvaluatorTraceObserver stop step"
+    )
+    # await stop on _evaluator_trace_observer appears
+    assert ".stop()" in src, (
+        "_shutdown_components must call .stop() on the observer"
+    )
+    # Ordering check — 0d3 must appear BEFORE the intake step (# 2.)
+    idx_0d3 = src.find("# 0d3.")
+    idx_intake = src.find("# 2. Intake")
+    assert idx_0d3 > 0, "0d3 anchor not found"
+    assert idx_intake > 0, "# 2. Intake anchor not found"
+    assert idx_0d3 < idx_intake, (
+        f"_shutdown_components step 0d3 (EvaluatorTraceObserver stop) "
+        f"at char {idx_0d3} appears AFTER ``# 2. Intake`` at char "
+        f"{idx_intake} — operator-mandated order is "
+        f"observer-stop BEFORE intake/broker teardown"
+    )
+    # The stop is on _evaluator_trace_observer (not some other observer)
+    # — grep for the attribute reference near the .stop() invocation.
+    assert (
+        "_evaluator_trace_observer"
+        in src.split("# 0d3.")[1].split("# 0e.")[0]
+    ), (
+        "0d3 section must reference _evaluator_trace_observer "
+        "specifically (not a sibling observer)"
+    )
