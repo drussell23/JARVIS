@@ -148,19 +148,22 @@ class TestGuardStateClosedTaxonomy(unittest.TestCase):
 
 
 class TestMasterFlagDefault(unittest.TestCase):
-    """The master flag MUST default FALSE in Slice 7b. The wiring
-    slice (7d) flips it to TRUE — but only after this slice has
-    soaked."""
+    """**Slice 7d graduation** — the master flag now defaults TRUE
+    after the Slice 7b primitive soaked clean. Explicit
+    ``"false"`` / ``"0"`` / ``"off"`` opts out to the legacy
+    47-second ghost path. Any other value (or unset) enables the
+    guard. Per §33.1 inverse for safety guardrails."""
 
-    def test_guard_enabled_default_is_false(self) -> None:
+    def test_guard_enabled_default_is_true_post_7d(self) -> None:
         prior = os.environ.pop(
             "JARVIS_BOUNDED_CANCELLATION_GUARD_ENABLED", None,
         )
         try:
-            self.assertFalse(
+            self.assertTrue(
                 guard_enabled(),
+                "Slice 7d graduation flips "
                 "JARVIS_BOUNDED_CANCELLATION_GUARD_ENABLED default "
-                "should be FALSE in Slice 7b",
+                "to TRUE — safety guardrail per §33.1 inverse",
             )
         finally:
             if prior is not None:
@@ -169,7 +172,10 @@ class TestMasterFlagDefault(unittest.TestCase):
                 ] = prior
 
     def test_guard_enabled_truthy_values(self) -> None:
-        truthy = ["1", "true", "TRUE", "yes", "on", "True"]
+        # When flag is non-falsy (truthy / unset / anything else),
+        # guard is enabled. Post-7d the truthy-list is "everything
+        # except the falsy-list".
+        truthy = ["1", "true", "TRUE", "yes", "on", "True", "garbage"]
         for v in truthy:
             with self.subTest(v=v):
                 with _MasterFlag(False):
@@ -179,14 +185,23 @@ class TestMasterFlagDefault(unittest.TestCase):
                     ] = v
                     self.assertTrue(guard_enabled())
 
-    def test_guard_enabled_falsy_values(self) -> None:
-        falsy = ["0", "false", "FALSE", "no", "off", ""]
+    def test_guard_enabled_falsy_opt_out(self) -> None:
+        """Explicit falsy values disable the guard — the
+        operator's opt-out switch back to the legacy
+        47-second ghost path."""
+        falsy = ["0", "false", "FALSE", "no", "off"]
         for v in falsy:
             with self.subTest(v=v):
                 os.environ[
                     "JARVIS_BOUNDED_CANCELLATION_GUARD_ENABLED"
                 ] = v
                 self.assertFalse(guard_enabled())
+
+    def test_empty_string_treated_as_unset_default_true(self) -> None:
+        # Empty string is treated as "no explicit opt-out" —
+        # graduates with the default (TRUE).
+        os.environ["JARVIS_BOUNDED_CANCELLATION_GUARD_ENABLED"] = ""
+        self.assertTrue(guard_enabled())
 
 
 # ============================================================================
