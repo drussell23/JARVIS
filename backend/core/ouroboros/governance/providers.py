@@ -6389,6 +6389,100 @@ class ClaudeProvider:
         needed = max(needed, self._max_tokens, _CLAUDE_OUTPUT_FLOOR)
         return min(needed, self._output_ceiling)
 
+    # ---------------------------------------------------------------------
+    # Slice 2A-iii — first extraction from _generate_raw closure.
+    #
+    # _claude_boundary_audit_sampler is the proof-of-concept first
+    # extraction in the _generate_raw decomposition arc. It is a PURE
+    # telemetry observer with no mutation of the 5 nonlocals or 4 outer
+    # captures targeted by the dispatch_state substrate — its inputs
+    # are passed explicitly as keyword-only parameters to eliminate the
+    # closure-capture surface.
+    #
+    # No dispatch_state import yet (that lands when the first stateful
+    # helper extracts — likely 2B-ii); this slice proves only the
+    # mechanical extraction pattern (nested closure → class method).
+    # ---------------------------------------------------------------------
+
+    async def _claude_boundary_audit_sampler(
+        self,
+        *,
+        interval_s: float,
+        first_raw_event_logged: List[bool],
+        deadline: float,
+        t0: float,
+        thinking_label: str,
+        op_id: str,
+    ) -> None:
+        """Periodic asyncio task-topology audit log for the streaming
+        boundary diagnostic — env-gated by
+        ``JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED`` at the call
+        site (this method assumes the env check already passed; it
+        does not re-check).
+
+        Self-terminating + hard-capped:
+
+          * Returns on ``asyncio.CancelledError`` mid-sleep.
+          * Returns when ``first_raw_event_logged[0]`` flips True
+            (the stream consumer's "first raw event seen" signal —
+            the audit's whole job is to surface the silence BEFORE
+            that signal, so it must stop the instant it lands).
+          * Returns when ``time.monotonic() >= deadline``.
+          * Hard cap at 60 emitted samples regardless of cadence
+            (defense against pathological long-deadline configs).
+
+        Log-only; NEVER raises out of any iteration — the inner
+        introspection is wrapped so a failed ``asyncio.all_tasks``
+        call doesn't tear down the sampler.
+
+        Inputs are passed explicitly (no closure capture):
+
+          * ``interval_s`` — sleep cadence between samples.
+          * ``first_raw_event_logged`` — list-of-bool used as a
+            shared closure-cell between the audit task and the
+            stream consumer loop; the consumer flips ``[0] = True``
+            on the first raw event and this sampler terminates on
+            its next wake.
+          * ``deadline`` — monotonic-time absolute deadline.
+          * ``t0`` — monotonic-time start (for elapsed_ms log).
+          * ``thinking_label`` — ``"on"`` or ``"off"`` for the log.
+          * ``op_id`` — short op-id slice for the log (already
+            truncated by the caller).
+        """
+        _seq = 0
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                return
+            # Stop conditions (any) — never leak.
+            if first_raw_event_logged[0]:
+                return
+            if time.monotonic() >= deadline:
+                return
+            _seq += 1
+            if _seq > 60:  # absolute hard cap
+                return
+            try:
+                _loop = asyncio.get_running_loop()
+                _all = asyncio.all_tasks(_loop)
+                _nd = [t for t in _all if not t.done()]
+                _names = [t.get_name() for t in _nd[:16]]
+                logger.info(
+                    "[ClaudeProvider.stream.boundary.audit]"
+                    " seq=%d elapsed_ms=%d "
+                    "thinking=%s tasks_total=%d "
+                    "tasks_not_done=%d op_id=%s "
+                    "tasks_sample=%s",
+                    _seq,
+                    int((time.monotonic() - t0) * 1000),
+                    thinking_label,
+                    len(_all), len(_nd),
+                    op_id, _names,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     async def generate(
         self,
         context: OperationContext,
@@ -6921,49 +7015,25 @@ class ClaudeProvider:
                                 float(timeout_s) + 30.0, 900.0,
                             )
 
-                            async def _boundary_audit_sampler() -> None:
-                                _seq = 0
-                                while True:
-                                    try:
-                                        await asyncio.sleep(_audit_interval_s)
-                                    except asyncio.CancelledError:
-                                        return
-                                    # Stop conditions (any) — never leak.
-                                    if _first_raw_event_logged[0]:
-                                        return
-                                    if time.monotonic() >= _audit_deadline:
-                                        return
-                                    _seq += 1
-                                    if _seq > 60:  # absolute hard cap
-                                        return
-                                    try:
-                                        _loop = asyncio.get_running_loop()
-                                        _all = asyncio.all_tasks(_loop)
-                                        _nd = [t for t in _all if not t.done()]
-                                        _names = [
-                                            t.get_name() for t in _nd[:16]
-                                        ]
-                                        logger.info(
-                                            "[ClaudeProvider.stream.boundary.audit]"
-                                            " seq=%d elapsed_ms=%d "
-                                            "thinking=%s tasks_total=%d "
-                                            "tasks_not_done=%d op_id=%s "
-                                            "tasks_sample=%s",
-                                            _seq,
-                                            int(
-                                                (time.monotonic()
-                                                 - _audit_t0) * 1000
-                                            ),
-                                            _audit_thinking,
-                                            len(_all), len(_nd),
-                                            _audit_op_id, _names,
-                                        )
-                                    except Exception:  # noqa: BLE001
-                                        pass
-
+                            # Slice 2A-iii — the sampler body extracted to
+                            # ClaudeProvider._claude_boundary_audit_sampler
+                            # as a class method; all six captures threaded
+                            # explicitly (no closure-cell capture beyond the
+                            # single shared `first_raw_event_logged` list).
+                            # Byte-equivalent telemetry; cleaner extraction
+                            # seam for the upcoming _do_stream refactor.
                             try:
                                 _audit_task = asyncio.create_task(
-                                    _boundary_audit_sampler(),
+                                    self._claude_boundary_audit_sampler(
+                                        interval_s=_audit_interval_s,
+                                        first_raw_event_logged=(
+                                            _first_raw_event_logged
+                                        ),
+                                        deadline=_audit_deadline,
+                                        t0=_audit_t0,
+                                        thinking_label=_audit_thinking,
+                                        op_id=_audit_op_id,
+                                    ),
                                     name="claude_stream_boundary_audit",
                                 )
                             except Exception:  # noqa: BLE001

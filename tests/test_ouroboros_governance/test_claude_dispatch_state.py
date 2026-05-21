@@ -53,10 +53,20 @@ _MODULE_FILE = Path(
 _PROVIDERS_FILE = Path(
     "backend/core/ouroboros/governance/providers.py"
 )
-# Locked from the branch-creation audit; updates ONLY in the PR that
-# starts importing the substrate (Phase 2A-iii at the earliest).
-_PROVIDERS_SHA_AT_2A_II = (
-    "a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d"
+# Per-slice SHA lock — updated by EVERY slice that mutates
+# providers.py. The constant name does not change across slices; the
+# value does. The docstring on
+# ``test_ast_pin_providers_file_sha_matches_lock`` tracks the
+# provenance of each successive update.
+#
+# Slice 2A-ii (PR #48860): a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d
+#                          (providers.py byte-identical to main)
+# Slice 2A-iii (this PR):  d3e409ce032ae3954dbd98d0102682fef968206b
+#                          (_boundary_audit_sampler extracted as
+#                          ClaudeProvider class method; closure
+#                          1036 → 1012 lines, 8 → 7 nested helpers)
+_PROVIDERS_SHA_LOCK = (
+    "d3e409ce032ae3954dbd98d0102682fef968206b"
 )
 
 
@@ -433,39 +443,49 @@ def test_ast_pin_cumulative_cost_has_closed_interface():
 
 
 def test_ast_pin_providers_does_not_import_dispatch_state_yet():
-    """Dormancy invariant: Slice 2A-ii ships the substrate
-    completely unused. ``providers.py`` MUST NOT import from
-    ``claude_dispatch_state`` until Phase 2A-iii (first extraction)
-    lands.
+    """Substrate-import dormancy invariant. ``providers.py`` MUST
+    NOT import from ``claude_dispatch_state`` until a STATEFUL
+    helper extraction lands.
 
-    This pin will be the FIRST one Phase 2A-iii flips."""
+    Slice 2A-iii (this slice's predecessor) extracted
+    ``_boundary_audit_sampler`` — a PURE telemetry observer that
+    does not touch any of the 5 nonlocals / 4 outer captures the
+    substrate targets — so the import was not introduced. The pin
+    will flip in whichever slice first extracts a helper that DOES
+    mutate dispatch state (likely 2B-ii when
+    ``_create_with_resilience`` + ``_create_with_prefill_fallback``
+    extract, since those touch ``input_tokens`` /
+    ``output_tokens`` / ``cached_input``)."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
             assert "claude_dispatch_state" not in module, (
-                f"providers.py prematurely imports claude_dispatch_state "
-                f"(line {node.lineno}); Slice 2A-ii must keep "
-                f"providers.py byte-identical to main"
+                f"providers.py imports claude_dispatch_state at "
+                f"line {node.lineno}; if this is the slice that "
+                f"first extracts a stateful helper, flip this pin "
+                f"deliberately."
             )
         if isinstance(node, ast.Import):
             for alias in node.names:
                 assert "claude_dispatch_state" not in alias.name
 
 
-def test_ast_pin_providers_file_sha_matches_2a_ii_baseline():
-    """Stronger dormancy invariant: providers.py byte-identical to
-    main@72444cc031. This is the canonical proof that Slice 2A-ii
-    introduces zero behavioral change.
+def test_ast_pin_providers_file_sha_matches_lock():
+    """Per-slice SHA lock: providers.py SHA1 equals the constant
+    above. EVERY slice that mutates providers.py updates the
+    constant (see provenance comments at top of file).
 
-    Phase 2A-iii will update this SHA in the same commit that flips
-    the import-yet pin above."""
+    Slice 2A-iii update: ``_boundary_audit_sampler`` extracted to
+    ``ClaudeProvider._claude_boundary_audit_sampler`` — the nested
+    closure (~38 lines) is gone from ``_generate_raw``; the class
+    method (~75 lines including docstring) is the new home.
+    Closure shrunk 1036 → 1012 lines."""
     actual_sha = hashlib.sha1(_PROVIDERS_FILE.read_bytes()).hexdigest()
-    assert actual_sha == _PROVIDERS_SHA_AT_2A_II, (
-        f"providers.py SHA shifted: {actual_sha} (expected "
-        f"{_PROVIDERS_SHA_AT_2A_II}). Slice 2A-ii must keep "
-        f"providers.py byte-identical; any change belongs in "
-        f"Phase 2A-iii or later."
+    assert actual_sha == _PROVIDERS_SHA_LOCK, (
+        f"providers.py SHA shifted: {actual_sha}. Update "
+        f"_PROVIDERS_SHA_LOCK in this file to the new value AND "
+        f"document the provenance in the comment above it."
     )
 
 
@@ -530,6 +550,118 @@ def test_ast_pin_substrate_module_has_no_authority_imports():
                 assert not module.endswith(f".{surface}"), (
                     f"forbidden authority import in substrate: {module}"
                 )
+
+
+def test_ast_pin_boundary_audit_sampler_is_class_method_on_claude_provider():
+    """Slice 2A-iii extraction proof — positive presence pin.
+
+    ``_claude_boundary_audit_sampler`` MUST exist as an
+    ``async def`` method directly under ``class ClaudeProvider``.
+    Future slices that move this method (e.g. into a stream-helper
+    mixin class) MUST update this pin in the same commit."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "_claude_boundary_audit_sampler"
+                ):
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_boundary_audit_sampler not "
+                "found — Slice 2A-iii extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
+    """Slice 2A-iii extraction proof — negative absence pin.
+
+    The original nested ``async def _boundary_audit_sampler`` MUST
+    NOT exist anywhere inside ``_generate_raw``. The closure should
+    only call ``self._claude_boundary_audit_sampler(...)``."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    # Find _generate_raw inside generate.
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            # Walk _generate_raw for any nested def
+                            # named _boundary_audit_sampler.
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name
+                                    == "_boundary_audit_sampler"
+                                ):
+                                    pytest.fail(
+                                        f"_boundary_audit_sampler is "
+                                        f"still nested in "
+                                        f"_generate_raw at line "
+                                        f"{deeper.lineno} — Slice "
+                                        f"2A-iii extraction "
+                                        f"incomplete"
+                                    )
+                            return  # _generate_raw walked clean
+    # Reaching here means the structure changed beyond expectation;
+    # later slices will need to update this pin.
+
+
+def test_ast_pin_generate_raw_size_after_2a_iii():
+    """Slice 2A-iii closure-size envelope: the extraction shaved
+    ~24 lines from ``_generate_raw`` (1036 → ~1012). Future slices
+    will shrink this further; the envelope ceiling drops per slice.
+    Floor protects against accidental over-extraction."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            size = (
+                                sub.end_lineno - sub.lineno + 1
+                            )
+                            assert 950 <= size <= 1025, (
+                                f"_generate_raw size after Slice "
+                                f"2A-iii is {size}; expected window "
+                                f"[950, 1025]. If this slice "
+                                f"intentionally moved more, update "
+                                f"the envelope."
+                            )
+                            return
 
 
 def test_ast_pin_substrate_exports_via_explicit_all():
