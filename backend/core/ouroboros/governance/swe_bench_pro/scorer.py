@@ -327,23 +327,34 @@ async def _git_apply_patch(
         raise
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {str(exc)[:200]}"
-    try:
-        _stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=patch_text.encode("utf-8")),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
+    # Slice 3 subprocess wiring — the evaluator_trace_observer reads
+    # this contextvar via Task.get_context to surface "which subprocess
+    # is this task currently blocked on" in trace frames. Defensive:
+    # trace_subprocess NEVER raises. AST-pinned at the test layer.
+    from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+        trace_subprocess,
+    )
+    with trace_subprocess(
+        proc.pid if proc.pid else 0,
+        f"git apply --index cwd={worktree_path}",
+    ):
         try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        return False, f"git_apply_timeout_after_{timeout:.0f}s"
-    except asyncio.CancelledError:
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        raise
+            _stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=patch_text.encode("utf-8")),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            return False, f"git_apply_timeout_after_{timeout:.0f}s"
+        except asyncio.CancelledError:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            raise
     rc = proc.returncode if proc.returncode is not None else -1
     if rc == 0:
         return True, ""

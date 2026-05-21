@@ -366,8 +366,20 @@ async def _inject_autoscore(
     if not specs:
         return SWEBenchProInjectionVerdict.FAILED_LOAD
 
+    # Slice 2 naming convention — the evaluator_trace_observer (Slice 1)
+    # filters tasks by ``swe_bench_pro:`` prefix and derives the
+    # EvaluatorPhase from the colon-suffixed name. Driver task carries
+    # the first instance id so the trace frame can surface which batch
+    # it owns. AST-pinned: every asyncio.create_task in evaluator path
+    # MUST carry ``name=swe_bench_pro:<phase>:<id>``.
+    _first_id = next(iter(instance_ids), "")
+    _task_name = (
+        f"swe_bench_pro:harness_inject:{_first_id}"
+        if _first_id else "swe_bench_pro:harness_inject"
+    )
     task = asyncio.create_task(
-        _drive_parallel_evaluate(specs, intake_service)
+        _drive_parallel_evaluate(specs, intake_service),
+        name=_task_name,
     )
     _AUTOSCORE_DRIVER_TASKS.add(task)
     task.add_done_callback(_AUTOSCORE_DRIVER_TASKS.discard)
