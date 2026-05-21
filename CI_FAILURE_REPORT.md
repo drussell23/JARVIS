@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #85946
-- **Branch**: `fix/ci/pr-automation-validation-run85934-20260521-074242`
-- **Commit**: `d415ac91f4372b275b1842896e8843e704b0dff8`
+- **Run Number**: #85958
+- **Branch**: `fix/ci/pr-automation-validation-run85946-20260521-074454`
+- **Commit**: `98a02ce3b351d04121948713e82ac1b27f008e9c`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-21T07:43:14Z
+- **Timestamp**: 2026-05-21T07:45:32Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26212625137)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26212729154)
 
 ## Failure Overview
 
@@ -17,7 +17,7 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 6s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-21T07:43:18Z
-**Completed**: 2026-05-21T07:43:24Z
-**Duration**: 6 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26212625137/job/77127004357)
+**Started**: 2026-05-21T07:45:35Z
+**Completed**: 2026-05-21T07:45:38Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26212729154/job/77127347856)
 
 #### Failed Steps
 
@@ -42,13 +42,13 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-21T07:43:21.1019773Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-21T07:43:21.8244411Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-21T07:45:37.1523394Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-21T07:45:37.6663453Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-21T07:43:21.8847702Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-21T07:45:37.7079914Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -78,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-21T07:44:54.003612*
+📊 *Report generated on 2026-05-21T07:47:10.962926*
 🤖 *JARVIS CI/CD Auto-PR Manager*
