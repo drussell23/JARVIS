@@ -138,6 +138,26 @@ EVENT_TYPE_FLAG_REGISTERED = "flag_registered"
 # Keyed by op_id (one overrun per (provider, op_id) instance).
 EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED = "cancellation_overrun_detected"
 
+# Slice 7e (Provider Circuit Breaker) — three event types covering
+# the breaker's externally-observable lifecycle:
+#   * provider_failure_classified — every provider failure that
+#     reaches the Slice 7a classify(); carries the RetryDecision
+#     for downstream ML routing.
+#   * circuit_breaker_state_change — emitted on any CircuitState
+#     transition (CLOSED → OPEN_TRANSIENT, HALF_OPEN → CLOSED, etc.)
+#     EXCEPT for OPEN_TERMINAL trips (which use the more-specific
+#     event below so consumers can route on cause).
+#   * circuit_breaker_tripped — emitted ONLY on transitions into
+#     OPEN_TERMINAL (per-op trip; carries terminal_reason_code +
+#     scope). The parallel evaluator can subscribe to this for
+#     early termination instead of waiting on the broker's
+#     operation_terminal event.
+# All three are keyed by op_id (the breaker is per-op) except the
+# global-session trip which carries op_id="" + scope="global".
+EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED = "provider_failure_classified"
+EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE = "circuit_breaker_state_change"
+EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
+
 # SensorGovernor + MemoryPressureGate (Wave 1 #3 Slice 3) vocabulary.
 EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
@@ -1441,6 +1461,13 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED,    # Slice 7d (Provider Cancellation Guarantee — fires
                                                   # when BoundedCancellationGuard's deadline expires
                                                   # before the streaming __aexit__ chain releases)
+    EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED,      # Slice 7e (Provider Circuit Breaker — every
+                                                  # provider failure that reaches Slice 7a classify())
+    EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE,     # Slice 7e (state machine transitions other than
+                                                  # OPEN_TERMINAL trips)
+    EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED,           # Slice 7e (OPEN_TERMINAL trip — carries the
+                                                  # terminal_reason_code; consumers may collapse
+                                                  # early instead of waiting on operation_terminal)
 })
 
 
@@ -2780,6 +2807,108 @@ def publish_cancellation_overrun(
     except Exception:  # noqa: BLE001 — best-effort
         logger.debug(
             "[Stream] publish_cancellation_overrun exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_provider_failure_classified(
+    *,
+    failure_class: str,
+    failure_mode: str,
+    decision: str,
+    provider: str,
+    op_id: str = "",
+) -> Optional[str]:
+    """Slice 7e — publish every provider failure that reaches
+    Slice 7a's ``classify()``. The ``decision`` field carries the
+    RetryDecision enum value (``retry_transient`` /
+    ``terminal_structural`` / ``terminal_quota`` /
+    ``terminal_config``) so downstream consumers can train on
+    failure-class → decision mappings.
+
+    Best-effort + bounded + NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED,
+            op_id or "provider_failure",
+            {
+                "failure_class": str(failure_class)[:128],
+                "failure_mode": str(failure_mode)[:64],
+                "decision": str(decision)[:64],
+                "provider": str(provider)[:64],
+                "op_id": str(op_id)[:64],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_provider_failure_classified exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_circuit_breaker_state_change(
+    *,
+    prior_state: str,
+    new_state: str,
+    op_id: str = "",
+    scope: str = "per_op",
+) -> Optional[str]:
+    """Slice 7e — publish a CircuitState transition. NOT fired for
+    OPEN_TERMINAL transitions (use ``publish_circuit_breaker_tripped``
+    so consumers can route on cause)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE,
+            op_id or "circuit_breaker",
+            {
+                "prior_state": str(prior_state)[:32],
+                "new_state": str(new_state)[:32],
+                "op_id": str(op_id)[:64],
+                "scope": str(scope)[:32],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_circuit_breaker_state_change exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_circuit_breaker_tripped(
+    *,
+    terminal_reason_code: str,
+    op_id: str = "",
+    scope: str = "per_op",
+    backoff_attempt: int = 0,
+) -> Optional[str]:
+    """Slice 7e — publish a transition into OPEN_TERMINAL. Carries
+    the ``terminal_reason_code`` from the Slice 7c trip table (e.g.
+    ``circuit_breaker_tripped:terminal_structural``). Consumers
+    that need to collapse early on this signal can subscribe and
+    short-circuit instead of waiting on ``operation_terminal``."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED,
+            op_id or "circuit_breaker_tripped",
+            {
+                "terminal_reason_code": str(terminal_reason_code)[:128],
+                "op_id": str(op_id)[:64],
+                "scope": str(scope)[:32],
+                "backoff_attempt": int(backoff_attempt),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_circuit_breaker_tripped exception",
             exc_info=True,
         )
         return None
