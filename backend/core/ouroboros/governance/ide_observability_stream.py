@@ -1276,8 +1276,16 @@ EVENT_TYPE_REPAIR_TREE_WON = "repair_tree_won"
 #   * timestamp:            str       — ISO8601 wall-clock at publish
 EVENT_TYPE_OPERATION_TERMINAL = "operation_terminal"
 
+# SWE-Bench-Pro evaluator structural-probe substrate (Slice 4) —
+# periodic asyncio-task-topology snapshot frames. Payload schema:
+# evaluator_trace_frame.v1 (see evaluator_trace_observer.py). Closes
+# the silent-evaluator blind spot surfaced by Phase-1 wiring smoke
+# bt-2026-05-21-045132.
+EVENT_TYPE_EVALUATOR_TRACE_FRAME = "evaluator_trace_frame"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
+    EVENT_TYPE_EVALUATOR_TRACE_FRAME,
     EVENT_TYPE_TASK_STARTED,
     EVENT_TYPE_TASK_UPDATED,
     EVENT_TYPE_TASK_COMPLETED,

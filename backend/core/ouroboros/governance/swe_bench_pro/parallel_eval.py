@@ -415,20 +415,30 @@ async def parallel_evaluate(
 
     tasks: Set["asyncio.Task[None]"] = set()
     for problem in problems_list:
-        task = asyncio.create_task(_run_one_problem(
-            problem,
-            semaphore=semaphore,
-            intake_service=intake_service,
-            operation_ledger=operation_ledger,
-            broker=broker,
-            eval_timeout_s=eval_timeout_s,
-            score_each=score_each,
-            score_test_timeout_s=score_test_timeout_s,
-            reject_test_modifications=reject_test_modifications,
-            record_each=record_each,
-            store=resolved_store,
-            out_queue=out_queue,
-        ))
+        # Slice 2 naming convention — the evaluator_trace_observer
+        # filters tasks by ``swe_bench_pro:`` prefix and classifies
+        # phase from the suffix. AST-pinned: every asyncio.create_task
+        # in evaluator path MUST carry ``name=swe_bench_pro:<phase>:<id>``.
+        _task_name = (
+            f"swe_bench_pro:parallel:{problem.instance_id}"
+        )
+        task = asyncio.create_task(
+            _run_one_problem(
+                problem,
+                semaphore=semaphore,
+                intake_service=intake_service,
+                operation_ledger=operation_ledger,
+                broker=broker,
+                eval_timeout_s=eval_timeout_s,
+                score_each=score_each,
+                score_test_timeout_s=score_test_timeout_s,
+                reject_test_modifications=reject_test_modifications,
+                record_each=record_each,
+                store=resolved_store,
+                out_queue=out_queue,
+            ),
+            name=_task_name,
+        )
         tasks.add(task)
 
     expected = len(tasks)

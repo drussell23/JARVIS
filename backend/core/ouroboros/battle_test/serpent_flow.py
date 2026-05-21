@@ -7330,6 +7330,94 @@ class SerpentREPL:
         out = handle_verify_undemote_command()
         self._flow.console.print(out, highlight=False)
 
+    def _handle_trace(self, line: str) -> None:
+        """Dispatch ``/trace`` — surface evaluator structural-probe
+        state (Slice 4 of the evaluator_trace_observer arc).
+
+        Subcommands (case-insensitive):
+
+          * ``/trace`` — show the most recent JSONL frame's task list.
+          * ``/trace evaluator`` — alias for the default.
+          * ``/trace latest`` — alias for the default.
+          * ``/trace subprocess`` — show only the subprocess section.
+          * ``/trace status`` — show master-flag + cadence + path.
+
+        Defensive — NEVER raises; renders an error line on any fault.
+        Master flag default-FALSE; surfaces ``[disabled]`` when off."""
+        try:
+            from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+                build_frame,
+                evaluator_trace_enabled,
+                _resolve_interval_s,
+                _resolve_jsonl_path,
+                _resolve_task_prefixes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  /trace: import failed: {exc}",
+                highlight=False,
+            )
+            return
+        parts = line.strip().split()
+        sub = (parts[1] if len(parts) >= 2 else "").lower()
+        c = self._flow.console
+        if sub == "status":
+            c.print(
+                "  [bold]EvaluatorTrace status[/bold]\n"
+                f"    enabled  : {evaluator_trace_enabled()}\n"
+                f"    interval : {_resolve_interval_s():.1f}s\n"
+                f"    prefixes : {_resolve_task_prefixes()}\n"
+                f"    jsonl    : {_resolve_jsonl_path()}",
+                highlight=False,
+            )
+            return
+        try:
+            frame = build_frame(
+                session_id="repl-trace",
+                snapshot_seq=0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            c.print(f"  /trace: snapshot failed: {exc}", highlight=False)
+            return
+        if sub == "subprocess":
+            if not frame.subprocesses:
+                c.print(
+                    "  /trace subprocess: no active subprocesses",
+                    highlight=False,
+                )
+                return
+            for s in frame.subprocesses:
+                c.print(
+                    f"  pid={s.pid:>6}  alive={s.alive}  cmd={s.cmd_repr}",
+                    highlight=False,
+                )
+            return
+        # Default: full task topology view.
+        if not frame.tasks:
+            c.print(
+                f"  /trace: no tracked tasks "
+                f"(total_in_loop={frame.total_tasks_loop}, "
+                f"prefixes={list(_resolve_task_prefixes())})",
+                highlight=False,
+            )
+            return
+        c.print(
+            f"  [bold]EvaluatorTrace[/bold] "
+            f"tasks={len(frame.tasks)} "
+            f"sub={len(frame.subprocesses)} "
+            f"total_loop={frame.total_tasks_loop}",
+            highlight=False,
+        )
+        for ts in frame.tasks:
+            top = ts.stack_top3[0] if ts.stack_top3 else ("", 0, "")
+            c.print(
+                f"    {ts.evaluator_phase.value:<18} "
+                f"{ts.blocked_on_kind.value:<18} "
+                f"{ts.task_name[:60]:<60} "
+                f"@ {top[0]}:{top[1]}:{top[2]}",
+                highlight=False,
+            )
+
     def _mg_print_status(self, mg_mod, mc_mod) -> None:
         f = self._flow
         allowlist = mg_mod.load_allowlist()
