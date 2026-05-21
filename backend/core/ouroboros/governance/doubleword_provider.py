@@ -662,7 +662,10 @@ class DoublewordProvider:
             self._budget_reset_date = today
 
     def _check_budget(self) -> None:
-        """Raise if daily budget is exhausted. Called before each generation."""
+        """Raise if daily budget is exhausted OR session-budget preflight
+        refuses. Called before each generation (including from
+        ``complete_sync``, which means the DW heavy non-streaming lane
+        inherits the gate transparently)."""
         self._maybe_reset_daily_budget()
         if self._daily_spend >= self._daily_budget:
             raise DoublewordInfraError(
@@ -670,6 +673,26 @@ class DoublewordProvider:
                 f">= budget ${self._daily_budget:.2f}",
                 status_code=0,
             )
+        # PRD §session-budget-preflight: hard wallet gate. Refuses BEFORE
+        # any network dispatch when the estimated cost (per-op cap as
+        # conservative upper bound) exceeds remaining session budget.
+        # Composes the duck-typed session_budget_authority — no parallel
+        # ledger. No-op when no session authority is active (fail-OPEN).
+        try:
+            from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                check_preflight as _sba_check_preflight,
+            )
+            _sba_check_preflight(
+                provider_name="doubleword",
+                estimated_cost_usd=float(self._max_cost_per_op or 0.0),
+            )
+        except ImportError:
+            # Module absent on this build — graceful fall-through to
+            # legacy daily-only gate.
+            pass
+        # SessionBudgetPreflightRefused: NOT caught — propagates to
+        # the orchestrator's cascade machinery which routes on the
+        # structured `reason` field.
 
     def _record_cost(self, cost: float) -> None:
         """Record cost from a completed batch and check per-op limit."""

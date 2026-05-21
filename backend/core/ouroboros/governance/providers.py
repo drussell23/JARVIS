@@ -6447,6 +6447,33 @@ class ClaudeProvider:
         if self._daily_spend >= self._daily_budget:
             raise RuntimeError("claude_budget_exhausted")
 
+        # PRD §session-budget-preflight: hard wallet gate. Refuses
+        # BEFORE any client construction / network dispatch if the
+        # estimated cost of this call (self._max_cost_per_op as the
+        # conservative upper bound) exceeds remaining session budget.
+        # Composes the duck-typed session_budget_authority — no
+        # parallel ledger, no battle_test import. No-op when no
+        # session authority is active (fail-OPEN). Closes the load-
+        # bearing $0.10 → $0.1281 overage observed 2026-05-21.
+        try:
+            from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                check_preflight as _sba_check_preflight,
+            )
+            _sba_check_preflight(
+                provider_name="claude",
+                estimated_cost_usd=float(
+                    self._max_cost_per_op or 0.0,
+                ),
+            )
+        except ImportError:
+            # Module absent on this build (graceful) — fall through to
+            # legacy behavior.
+            pass
+        # SessionBudgetPreflightRefused: deliberately NOT caught here —
+        # propagates to the orchestrator's cascade machinery, which
+        # recognizes the structured `reason` field and routes the
+        # refusal appropriately.
+
         client = self._ensure_client()
         repo_root = _resolve_effective_repo_root(
             context,
