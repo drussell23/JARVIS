@@ -94,6 +94,142 @@ _DW_OUTPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_OUTPUT_COST_PER_M", "0.
 _DW_MAX_COST_PER_OP = float(os.environ.get("DOUBLEWORD_MAX_COST_PER_OP", "0.10"))
 _DW_DAILY_BUDGET = float(os.environ.get("DOUBLEWORD_DAILY_BUDGET", "5.00"))
 
+# ---------------------------------------------------------------------------
+# DW Heavy Non-Streaming Lane — "Functions, Not Agents" for codegen
+# ---------------------------------------------------------------------------
+# Composes the existing ``DoublewordProvider.complete_sync()`` primitive
+# (the canonical Functions-not-Agents path, already used by
+# ``CompactionCaller``, ``BlastRadius``, ``FailureClustering``,
+# ``DreamSeed``) and adds a codegen-shaped wrapper that:
+#   * keeps the ``prompt_override`` / S1-cache prompt seam intact,
+#   * parses the response through the existing
+#     ``_parse_generation_response`` (no parallel parser),
+#   * uses ``_resolve_effective_model(context)`` (no hardcoded models),
+#   * returns ``GenerationResult`` (not ``CompleteSyncResult``).
+#
+# Architectural correction (per operator design lock, 2026-05-21):
+# DW heavy routing is constrained by **streaming transport reliability**,
+# not by model reasoning quality. This lane unlocks DW reasoning via a
+# stream-free path; ``enable_thinking=True`` is the default for heavy
+# ops because the lane exists precisely to make DW reasoning reachable
+# without the SSE stall surface.
+#
+# Master flag and all knobs default-FALSE / dormant on merge. Existing
+# behavior unchanged until operator explicitly enables.
+
+_DW_HEAVY_FN_LANE_ENABLED = (
+    os.environ.get("JARVIS_DW_HEAVY_FN_LANE_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_DW_HEAVY_FN_LANE_ELIGIBLE_COMPLEXITIES: tuple = tuple(
+    s.strip().lower()
+    for s in os.environ.get(
+        "JARVIS_DW_HEAVY_FN_LANE_ELIGIBLE_COMPLEXITIES",
+        "complex,heavy_code",
+    ).split(",")
+    if s.strip()
+)
+_DW_HEAVY_FN_LANE_PREFER_OVER_SSE = (
+    os.environ.get(
+        "JARVIS_DW_HEAVY_FN_LANE_PREFER_OVER_SSE", "false",
+    ).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_DW_HEAVY_FN_LANE_PREFER_ON_SSE_STALL = (
+    os.environ.get(
+        "JARVIS_DW_HEAVY_FN_LANE_PREFER_ON_SSE_STALL", "true",
+    ).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_DW_HEAVY_FN_LANE_TIMEOUT_S = float(
+    os.environ.get("JARVIS_DW_HEAVY_FN_LANE_TIMEOUT_S", "120.0")
+)
+_DW_HEAVY_FN_LANE_MAX_TOKENS = int(
+    os.environ.get("JARVIS_DW_HEAVY_FN_LANE_MAX_TOKENS", "16384")
+)
+# Default TRUE: the lane exists to unlock DW reasoning over a
+# stream-free transport. Operators can flip to FALSE per-ops if needed.
+_DW_HEAVY_FN_LANE_ENABLE_THINKING = (
+    os.environ.get(
+        "JARVIS_DW_HEAVY_FN_LANE_ENABLE_THINKING", "true",
+    ).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+
+def _dw_heavy_fn_lane_master_enabled() -> bool:
+    """Re-read env per call so a flip hot-reverts. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_ENABLED", "false",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+def _dw_heavy_fn_lane_eligible_complexities() -> tuple:
+    """Re-read env per call. Default complex,heavy_code."""
+    try:
+        return tuple(
+            s.strip().lower()
+            for s in os.environ.get(
+                "JARVIS_DW_HEAVY_FN_LANE_ELIGIBLE_COMPLEXITIES",
+                "complex,heavy_code",
+            ).split(",")
+            if s.strip()
+        )
+    except Exception:  # noqa: BLE001
+        return ("complex", "heavy_code")
+
+
+def _dw_heavy_fn_lane_prefer_over_sse() -> bool:
+    try:
+        return os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_PREFER_OVER_SSE", "false",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dw_heavy_fn_lane_prefer_on_sse_stall() -> bool:
+    try:
+        return os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_PREFER_ON_SSE_STALL", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _dw_heavy_fn_lane_timeout_s() -> float:
+    try:
+        v = float(os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_TIMEOUT_S", "120.0",
+        ))
+        return max(5.0, min(600.0, v))
+    except Exception:  # noqa: BLE001
+        return 120.0
+
+
+def _dw_heavy_fn_lane_max_tokens() -> int:
+    try:
+        v = int(os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_MAX_TOKENS", "16384",
+        ))
+        return max(256, min(32768, v))
+    except Exception:  # noqa: BLE001
+        return 16384
+
+
+def _dw_heavy_fn_lane_enable_thinking() -> bool:
+    """Default TRUE — the lane exists to unlock DW reasoning over a
+    stream-free transport. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_HEAVY_FN_LANE_ENABLE_THINKING", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return True
+
 
 class DoublewordInfraError(Exception):
     """Infrastructure failure from DoublewordProvider.
@@ -1045,6 +1181,40 @@ class DoublewordProvider:
         invoke the same dispatch path without duplicating it
         (single source of dispatch truth). Behavior is byte-
         identical to the pre-extraction body."""
+        # ── DW Heavy Non-Streaming Lane (PRD: "Functions, Not Agents") ─
+        # Master OFF (default) ⇒ entire block skipped; behavior
+        # byte-identical to today. When master ON AND op eligibility
+        # holds AND PREFER_OVER_SSE is on: skip SSE entirely and
+        # dispatch via the non-streaming compose-of-complete_sync lane.
+        # Failures cascade naturally (the wrapper raises
+        # DoublewordInfraError which the orchestrator already handles).
+        try:
+            if (
+                _dw_heavy_fn_lane_master_enabled()
+                and self._should_use_heavy_nonstreaming_lane(
+                    context, sentinel_recent_sse_stall=False,
+                )
+            ):
+                logger.info(
+                    "[DoublewordProvider] heavy-nonstreaming lane "
+                    "engaged (PREFER_OVER_SSE) for op=%s route=%s "
+                    "complexity=%s",
+                    getattr(context, "op_id", "")[:24],
+                    getattr(context, "provider_route", "") or "",
+                    getattr(context, "task_complexity", "") or "",
+                )
+                return await self._generate_heavy_nonstreaming(
+                    context, deadline, prompt_override=prompt_override,
+                )
+        except Exception as _heavy_exc:  # noqa: BLE001
+            # Master-gated; any fault degrades to the legacy SSE/batch
+            # path. We do NOT silently swallow — log + cascade.
+            logger.warning(
+                "[DoublewordProvider] heavy-nonstreaming lane "
+                "degraded; falling through to legacy dispatch: %s",
+                _heavy_exc,
+            )
+
         # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
         # On 429/503, fall back to batch within DW (stay cheap) instead of
         # cascading to the 150x more expensive Claude fallback.
@@ -1115,6 +1285,193 @@ class DoublewordProvider:
             )
         # ───────────────────────────────────────────────────────────
         return result
+
+    # ------------------------------------------------------------------
+    # DW Heavy Non-Streaming Lane — composes complete_sync()
+    # ------------------------------------------------------------------
+    # See module-level docstring above ``_dw_heavy_fn_lane_master_enabled``
+    # for architectural framing. These two methods are the only
+    # provider-side additions; the existing ``complete_sync`` primitive
+    # is reused verbatim (only additively extended with
+    # ``enable_thinking`` per operator design lock).
+
+    def _should_use_heavy_nonstreaming_lane(
+        self,
+        context: Any,
+        *,
+        sentinel_recent_sse_stall: bool,
+    ) -> bool:
+        """Deterministic routing predicate composing EXISTING state —
+        no new ``OperationContext`` fields. NEVER raises (fail-safe
+        to ``False``).
+
+        Eligibility derives from:
+          * ``context.task_complexity`` ∈ env-configured set
+            (default ``{complex, heavy_code}``)
+          * ``self._tool_loop`` — if a Venom-style multi-turn loop
+            is wired AND the op is heavy, the SSE path is the right
+            tool unless SSE has demonstrably stalled
+          * ``sentinel_recent_sse_stall`` — externally observed
+            transport state from existing
+            ``dw_topology_circuit_breaker`` / ``topology_sentinel``
+            surfaces (caller passes in)
+
+        Returns ``True`` only when the heavy lane should fire.
+        Master-flag check must be done by the caller (this predicate
+        assumes master ON; centralizing the master read at the
+        caller keeps the predicate test-friendly)."""
+        try:
+            complexity = (
+                getattr(context, "task_complexity", "") or ""
+            ).strip().lower()
+            eligible = set(_dw_heavy_fn_lane_eligible_complexities())
+            if complexity not in eligible:
+                return False
+            has_active_tool_loop = (
+                self._tool_loop is not None
+                and complexity in eligible
+            )
+            if has_active_tool_loop:
+                # Multi-turn agent op: stay on SSE unless transport
+                # has stalled AND the operator opts-in via
+                # PREFER_ON_SSE_STALL.
+                return bool(
+                    sentinel_recent_sse_stall
+                    and _dw_heavy_fn_lane_prefer_on_sse_stall()
+                )
+            # No tool loop = naturally single-shot eligible.
+            if _dw_heavy_fn_lane_prefer_over_sse():
+                return True
+            return bool(sentinel_recent_sse_stall)
+        except Exception:  # noqa: BLE001 — defensive
+            return False
+
+    async def _generate_heavy_nonstreaming(
+        self,
+        context: Any,
+        deadline: Any = None,
+        *,
+        prompt_override: Optional[str] = None,
+    ) -> GenerationResult:
+        """Heavy codegen non-streaming lane (PRD: "Functions, Not Agents"
+        for codegen workloads). Composes the existing
+        :meth:`complete_sync` primitive — does NOT duplicate the
+        ``stream=false`` POST logic. Parses the response via the
+        existing ``_parse_generation_response`` (no parallel parser).
+        Returns :class:`GenerationResult` (not
+        :class:`CompleteSyncResult`).
+
+        Model resolved via :meth:`_resolve_effective_model` —
+        **no hardcoded model name**. Prompt assembly composes the
+        existing ``prompt_override`` / ``_build_codegen_prompt`` seam
+        (S1 cache key compatibility preserved).
+
+        Failure modes:
+          * The wrapper raises the same exceptions ``complete_sync``
+            does (``DoublewordInfraError``, ``asyncio.TimeoutError``,
+            ``ValueError``). The orchestrator's existing
+            cascade-to-Claude branch handles them unchanged.
+        """
+        from backend.core.ouroboros.governance.providers import (
+            _build_codegen_prompt,
+            _parse_generation_response,
+        )
+
+        if prompt_override is not None:
+            assembled_prompt = prompt_override
+        else:
+            assembled_prompt = _build_codegen_prompt(
+                context,
+                repo_root=self._repo_root,
+                repo_roots=self._repo_roots or None,
+                force_full_content=True,
+                mcp_tools=None,
+                provider_route=getattr(
+                    context, "provider_route", "",
+                ) or "",
+            )
+
+        try:
+            effective_model = self._resolve_effective_model(context)
+        except Exception:  # noqa: BLE001 — defensive
+            effective_model = getattr(self, "_model", "") or ""
+
+        # Hand off to the canonical Functions-not-Agents primitive.
+        # ``enable_thinking=True`` (env-driven; default TRUE) unlocks
+        # DW reasoning over the stream-free transport — the whole
+        # point of this lane.
+        from backend.core.ouroboros.governance.providers import (
+            _CODEGEN_SYSTEM_PROMPT,
+        )
+        t0 = time.monotonic()
+        sync_result = await self.complete_sync(
+            prompt=assembled_prompt,
+            system_prompt=_CODEGEN_SYSTEM_PROMPT,
+            caller_id="heavy_codegen",
+            model=effective_model or None,
+            max_tokens=_dw_heavy_fn_lane_max_tokens(),
+            timeout_s=_dw_heavy_fn_lane_timeout_s(),
+            temperature=None,                # use _DW_TEMPERATURE default
+            response_format=None,
+            enable_thinking=_dw_heavy_fn_lane_enable_thinking(),
+        )
+
+        # Parse the raw text through the existing codegen parser —
+        # NO parallel parser. The parser builds the multi-candidate
+        # GenerationResult shape the orchestrator expects.
+        source_path = (
+            context.target_files[0]
+            if getattr(context, "target_files", None) else ""
+        )
+        source_hash = ""
+        if source_path:
+            try:
+                from backend.core.ouroboros.governance.providers import (
+                    _file_source_hash,
+                )
+                abs_path = (
+                    (self._repo_root / source_path)
+                    if self._repo_root else Path(source_path)
+                )
+                if abs_path.is_file():
+                    source_hash = _file_source_hash(
+                        abs_path.read_text(
+                            encoding="utf-8", errors="replace",
+                        )
+                    )
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+
+        duration = time.monotonic() - t0
+        parsed = _parse_generation_response(
+            sync_result.content,
+            "doubleword-heavy-nonstreaming",
+            duration,
+            context,
+            source_hash,
+            source_path,
+            repo_roots=self._repo_roots,
+            repo_root=self._repo_root,
+        )
+        # Attach token usage + cost from CompleteSyncResult so the
+        # downstream orchestrator sees the same accounting fields it
+        # gets from the legacy RT / batch paths.
+        import dataclasses as _dc
+        parsed = _dc.replace(
+            parsed,
+            total_input_tokens=int(sync_result.input_tokens or 0),
+            total_output_tokens=int(sync_result.output_tokens or 0),
+            cost_usd=float(sync_result.cost_usd or 0.0),
+            model_id=str(sync_result.model or effective_model or ""),
+        )
+        logger.info(
+            "[DoublewordProvider] heavy-nonstreaming ok in %.2fs: "
+            "%d candidates, %d+%d tokens, cost=$%.4f (model=%s)",
+            duration, len(parsed.candidates),
+            parsed.total_input_tokens, parsed.total_output_tokens,
+            parsed.cost_usd, effective_model,
+        )
+        return parsed
 
     # ------------------------------------------------------------------
     # Real-time generation via /v1/chat/completions (Venom-compatible)
@@ -2459,6 +2816,7 @@ class DoublewordProvider:
         timeout_s: float = 10.0,
         response_format: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
+        enable_thinking: Optional[bool] = None,
     ) -> CompleteSyncResult:
         """Non-streaming, short-output, caller-timed synchronous completion.
 
@@ -2507,6 +2865,16 @@ class DoublewordProvider:
             ``{"type": "json_object"}`` for JSON-mode output.
         temperature:
             Override sampling temperature. Defaults to ``_DW_TEMPERATURE``.
+        enable_thinking:
+            Optional override for the per-request ``chat_template_kwargs``
+            ``enable_thinking`` flag. ``None`` (default) preserves the
+            legacy behavior of disabling DW's reasoning mode for
+            short structured-function callers (CompactionCaller,
+            BlastRadius, FailureClustering, DreamSeed). The heavy
+            codegen non-streaming lane passes ``True`` to unlock
+            DW reasoning over a stream-free transport. Existing
+            callers that omit this parameter remain byte-identical
+            to pre-extension behavior.
 
         Returns
         -------
@@ -2533,6 +2901,14 @@ class DoublewordProvider:
             temperature if temperature is not None else _DW_TEMPERATURE
         )
 
+        # Heavy-codegen non-streaming lane needs DW reasoning; legacy
+        # Functions callers (CompactionCaller, BlastRadius, etc.) call
+        # with enable_thinking=None and get the byte-identical legacy
+        # behavior (False). The new heavy lane explicitly passes True.
+        _effective_enable_thinking: bool = (
+            bool(enable_thinking) if enable_thinking is not None
+            else False
+        )
         body: Dict[str, Any] = {
             "model": effective_model,
             "messages": [
@@ -2542,7 +2918,9 @@ class DoublewordProvider:
             "max_tokens": max_tokens,
             "temperature": effective_temperature,
             "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {
+                "enable_thinking": _effective_enable_thinking,
+            },
         }
         if response_format is not None:
             body["response_format"] = response_format
