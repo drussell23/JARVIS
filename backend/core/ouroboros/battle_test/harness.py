@@ -1142,6 +1142,105 @@ class BattleTestHarness:
                     "%s", _po_exc, exc_info=True,
                 )
 
+            # ──────────────────────────────────────────────────────────
+            # Slice 5 — EvaluatorTraceObserver ignition.
+            # ──────────────────────────────────────────────────────────
+            # Wires the structural-probe observer (Slices 1-4 — PR #48711)
+            # into the harness boot path. Composes existing primitives
+            # only:
+            #   * StreamEventBroker (Gap #6 Slice 2) — observer publishes
+            #     ``evaluator_trace_frame`` events via the canonical
+            #     ``get_default_broker().publish`` surface (NOT a parallel
+            #     bus).
+            #   * PostureObserver (Wave 1 #1) — posture-aware cadence via
+            #     the same store-load pattern the ProductionOracleObserver
+            #     above uses (fail-soft default ``"EXPLORE"``).
+            #
+            # Master flag ``JARVIS_EVALUATOR_TRACE_ENABLED`` default-FALSE
+            # per §33.1 (byte-equivalent boot when the flag is off:
+            # ``evaluator_trace_enabled()`` short-circuits + nothing
+            # else runs). Started here AFTER the broker singleton is
+            # known to be lazily-available + AFTER the production-oracle
+            # observer is wired (preserving boot ordering invariants).
+            #
+            # Fail-soft contract: every call is wrapped — a degraded
+            # observer must NEVER block the main loop's boot. Failures
+            # downgrade to DEBUG, the attribute stays ``None``, and
+            # ``_shutdown_components`` step 0d3 gracefully skips when
+            # the attribute is missing.
+            self._evaluator_trace_observer = None
+            try:
+                from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+                    EvaluatorTraceObserver,
+                    evaluator_trace_enabled,
+                )
+                if evaluator_trace_enabled():
+                    # Canonical broker singleton (Gap #6 Slice 2).
+                    # NEVER raises; lazily-constructed on first call.
+                    _eto_broker = None
+                    try:
+                        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                            get_default_broker as _eto_get_broker,
+                        )
+                        _eto_broker = _eto_get_broker()
+                    except Exception as _eto_b_exc:  # noqa: BLE001
+                        logger.debug(
+                            "[EvaluatorTraceObserver] broker lookup "
+                            "degraded: %s — observer will run without "
+                            "SSE publish (JSONL persistence still active)",
+                            _eto_b_exc,
+                        )
+
+                    def _eto_posture_provider() -> "Optional[str]":
+                        """Fail-soft posture reader. Mirrors the
+                        ProductionOracleObserver pattern above. Returns
+                        ``None`` (= base interval) on any failure —
+                        defensive default keeps the observer ticking
+                        under degraded posture-store conditions."""
+                        try:
+                            from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                                get_default_store as _ps_get_store,
+                            )
+                            store = _ps_get_store()
+                            reading = store.load_current()
+                            if reading is None:
+                                return None
+                            return str(reading.posture.value)
+                        except Exception:  # noqa: BLE001
+                            return None
+
+                    self._evaluator_trace_observer = EvaluatorTraceObserver(
+                        session_id=self._session_id,
+                        broker_publish=(
+                            _eto_broker.publish if _eto_broker is not None
+                            else None
+                        ),
+                        posture_provider=_eto_posture_provider,
+                    )
+                    # start() is sync; returns True on spawn, False on
+                    # master-flag-off OR no running loop. Logs INFO line
+                    # internally on success.
+                    _eto_started = self._evaluator_trace_observer.start()
+                    if not _eto_started:
+                        # Couldn't spawn (most likely no running loop);
+                        # clear the attribute so shutdown step 0d3
+                        # skips it.
+                        self._evaluator_trace_observer = None
+                else:
+                    logger.debug(
+                        "[EvaluatorTraceObserver] master flag "
+                        "JARVIS_EVALUATOR_TRACE_ENABLED is FALSE — "
+                        "observer not started (default behavior)"
+                    )
+            except Exception as _eto_exc:  # noqa: BLE001
+                logger.debug(
+                    "[EvaluatorTraceObserver] boot wire-up degraded: "
+                    "%s — observer not started; investigation will "
+                    "need a separate diagnostic path",
+                    _eto_exc, exc_info=True,
+                )
+                self._evaluator_trace_observer = None
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -5933,6 +6032,30 @@ class BattleTestHarness:
                 except asyncio.CancelledError:
                     pass
         except Exception:
+            pass
+
+        # 0d3. EvaluatorTraceObserver (Slice 5 — PR #48711 ignition wire).
+        # Stop the structural-probe observer BEFORE broker/intake teardown
+        # so its final SSE publish lands cleanly. Master-flag-off boots
+        # leave _evaluator_trace_observer as None (gracefully skipped
+        # here). CancelledError propagates per asyncio contract; every
+        # other exception swallowed defensively (a degraded observer
+        # MUST NOT block the rest of shutdown).
+        try:
+            _eto = getattr(self, "_evaluator_trace_observer", None)
+            if _eto is not None:
+                try:
+                    await _eto.stop()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _eto_stop_exc:  # noqa: BLE001
+                    logger.debug(
+                        "[EvaluatorTraceObserver] stop degraded: %s",
+                        _eto_stop_exc,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
             pass
 
         # 0e. Wall-clock watchdog (Ticket A Guard 2) — may be None when
