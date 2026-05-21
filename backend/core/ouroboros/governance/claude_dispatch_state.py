@@ -1,0 +1,268 @@
+"""Phase 2A-ii — dormant per-dispatch state substrate for the
+upcoming ClaudeProvider._generate_raw decomposition.
+
+This module introduces two pure-data primitives that will replace
+the closure's implicit state cells when Phase 2A-iii through 2C-ii
+land their per-helper extractions:
+
+  * :class:`_ClaudeDispatchState` — the 8-field mutable record
+    that, in the refactored code path, carries the per-dispatch
+    state currently held in the closure's 5 nonlocals
+    (``raw_content`` / ``input_tokens`` / ``output_tokens`` /
+    ``_cached_input``) plus 4 of the 5 outer ``generate()``-scope
+    captures (``_first_token_ms`` / ``_last_msg`` /
+    ``_thinking_reason_out`` / ``_token_usage``).
+
+    Reset semantic: every ``_dispatch_raw`` invocation gets a fresh
+    instance (today this is implicit via closure-cell re-allocation;
+    the refactor makes it explicit via construction).
+
+  * :class:`_CumulativeCost` — a small accumulator that carries the
+    fifth nonlocal (``total_cost``). Unlike the other state, this
+    one survives multiple ``_dispatch_raw`` calls within a single
+    ``generate()`` (e.g. the ``tool_loop.run`` multi-round path).
+    The refactor models this by constructing one instance per
+    ``generate()`` call and threading it explicitly into each
+    dispatch.
+
+DORMANCY INVARIANT — Slice 2A-ii ships this module **completely
+unused** by ``providers.py``. AST pin
+:func:`test_ast_pin_providers_does_not_import_dispatch_state_yet`
+enforces that ``providers.py`` is byte-identical to main: the
+substrate exists, the green-bar test surface for it exists, but
+no caller imports it yet. Phase 2A-iii (extracting
+``_boundary_audit_sampler`` as the proof-of-concept first
+extraction) is the first PR allowed to flip that pin.
+
+Architectural invariants (AST-pinned):
+
+  * No import of ``providers.py``, the orchestrator, the iron gate,
+    the candidate generator, or any authority surface. This module
+    is pure data, no dependency cycles, no behavior.
+
+  * No import of any newly-deployed surface
+    (evaluator_trace_observer, session_budget_authority,
+    provider_response_cache, s2_predictive_budget, swe_bench_pro/*,
+    commit_authority).
+
+  * Closed 8-field shape on the dataclass; closed 3-method interface
+    on the cost accumulator. Adding a field requires bumping
+    :data:`CLAUDE_DISPATCH_STATE_SCHEMA_VERSION` and a paired AST
+    pin update.
+
+  * Mutable dataclass (NOT frozen) — the refactor mutates these in
+    place across the helper extractions, mirroring exactly what the
+    closure's nonlocals do today. ``to_dict()`` / ``from_dict()``
+    provide debug snapshots without compromising mutability.
+
+  * ``_CumulativeCost.add(...)`` clamps non-positive inputs to a
+    no-op. This matches the closure's defensive accounting (a
+    negative cost is the SDK reporting unusable usage; the closure
+    today doesn't subtract from ``total_cost``).
+"""
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Dict, Mapping, Optional
+
+
+CLAUDE_DISPATCH_STATE_SCHEMA_VERSION: str = (
+    "claude_dispatch_state.v1"
+)
+
+
+# Closed field set for the dispatch state — adding requires schema
+# bump + paired AST pin update.
+_CLAUDE_DISPATCH_STATE_FIELD_NAMES: tuple = (
+    "raw_content",
+    "input_tokens",
+    "output_tokens",
+    "cached_input",
+    "first_token_ms",
+    "last_msg",
+    "thinking_reason_out",
+    "token_usage",
+)
+
+
+@dataclass
+class _ClaudeDispatchState:
+    """Per-dispatch mutable state for ClaudeProvider._generate_raw.
+
+    Replaces (when the extraction lands) the 5 closure nonlocals
+    + 4 of the 5 outer-``generate()`` captures with explicit
+    fields. The fifth outer capture (``total_cost``) is carried
+    separately by :class:`_CumulativeCost` because its lifetime
+    spans multiple dispatches.
+
+    Mutable by design — the refactored helper methods will mutate
+    fields in place exactly as the current nested closures mutate
+    their nonlocals. Tests rely on the mutability to characterize
+    per-helper state transitions.
+
+    Field semantics (one-to-one with the closure's current cells):
+
+      * ``raw_content`` — accumulated text content across stream
+        deltas or the final non-streaming message body.
+      * ``input_tokens`` — Claude server-side tokenizer input count
+        (from ``message.usage.input_tokens``).
+      * ``output_tokens`` — Claude server-side tokenizer output
+        count (from ``message_delta.usage.output_tokens``).
+      * ``cached_input`` — cache-read input tokens
+        (``message.usage.cache_read_input_tokens``).
+      * ``first_token_ms`` — monotonic ms timestamp of the first
+        text-delta event (None until first delta lands).
+      * ``last_msg`` — the final ``Message`` object (or its
+        equivalent on the create path) returned by the SDK.
+      * ``thinking_reason_out`` — extracted reason text from
+        thinking blocks (None when thinking is disabled).
+      * ``token_usage`` — open dict of additional per-dispatch
+        token telemetry the closure's outer scope reads after
+        return (kept as a dict to mirror the closure's open
+        shape; the refactor may close this in a later phase).
+    """
+
+    raw_content: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input: int = 0
+    first_token_ms: Optional[float] = None
+    last_msg: Optional[Any] = None
+    thinking_reason_out: Optional[str] = None
+    token_usage: Dict[str, int] = field(default_factory=dict)
+
+    def reset_for_next_dispatch(self) -> None:
+        """Restore every field to its default. Mirrors what the
+        closure achieves implicitly today via closure-cell
+        re-allocation on each ``_dispatch_raw`` invocation.
+
+        Used by call sites that want to reuse a state instance
+        across two dispatches without re-allocating; the canonical
+        path is to construct a fresh state. NEVER raises."""
+        self.raw_content = ""
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cached_input = 0
+        self.first_token_ms = None
+        self.last_msg = None
+        self.thinking_reason_out = None
+        self.token_usage = {}
+
+    def to_dict(self) -> Mapping[str, Any]:
+        """Snapshot the current state as a plain-dict for logging /
+        debugging / SSE pretty-print. ``last_msg`` is coerced to a
+        repr-string when present (the raw Message object is not
+        JSON-friendly). NEVER raises."""
+        try:
+            last_msg_repr = (
+                repr(self.last_msg) if self.last_msg is not None else None
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            last_msg_repr = "<unrenderable>"
+        return {
+            "schema_version": CLAUDE_DISPATCH_STATE_SCHEMA_VERSION,
+            "raw_content_len": len(self.raw_content),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cached_input": self.cached_input,
+            "first_token_ms": self.first_token_ms,
+            "last_msg_repr": last_msg_repr,
+            "thinking_reason_out": self.thinking_reason_out,
+            "token_usage": dict(self.token_usage),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any],
+    ) -> "_ClaudeDispatchState":
+        """Reconstruct from a ``to_dict()`` snapshot. Note: the
+        round-trip is LOSSY on two fields:
+
+          * ``raw_content`` cannot be recovered from
+            ``raw_content_len``; it is restored to ``""``.
+          * ``last_msg`` cannot be recovered from its repr;
+            it is restored to ``None``.
+
+        Other fields round-trip exactly. The asymmetry is
+        intentional — :meth:`to_dict` is a debug snapshot, not a
+        persistence format. NEVER raises."""
+        try:
+            return cls(
+                raw_content="",  # lossy; see docstring
+                input_tokens=int(payload.get("input_tokens", 0) or 0),
+                output_tokens=int(payload.get("output_tokens", 0) or 0),
+                cached_input=int(payload.get("cached_input", 0) or 0),
+                first_token_ms=(
+                    float(payload["first_token_ms"])
+                    if payload.get("first_token_ms") is not None else None
+                ),
+                last_msg=None,  # lossy; see docstring
+                thinking_reason_out=(
+                    str(payload["thinking_reason_out"])
+                    if payload.get("thinking_reason_out") is not None
+                    else None
+                ),
+                token_usage=dict(payload.get("token_usage") or {}),
+            )
+        except (TypeError, ValueError, KeyError):
+            return cls()
+
+
+class _CumulativeCost:
+    """Per-``generate()`` cumulative cost accumulator.
+
+    Replaces (when the extraction lands) the ``total_cost``
+    nonlocal in the closure. One instance per ``generate()`` call;
+    survives multiple ``_dispatch_raw`` invocations within that
+    call (the ``tool_loop.run`` multi-round path); discarded when
+    ``generate()`` returns.
+
+    Thread-safety: this primitive uses an internal lock because
+    the refactored helper methods will be class methods that can
+    in principle be called concurrently in tests or future
+    parallel-fanout paths. The closure today is single-threaded
+    async (no lock needed); we add the lock as cheap insurance
+    for the refactor's wider call surface — the per-add overhead
+    is sub-microsecond. NEVER raises."""
+
+    def __init__(self) -> None:
+        self._total: float = 0.0
+        self._lock: threading.Lock = threading.Lock()
+
+    @property
+    def total(self) -> float:
+        """Current cumulative total. Race-tolerant read (no lock —
+        a stale snapshot is acceptable for telemetry; the lock is
+        held only by :meth:`add`)."""
+        return self._total
+
+    def add(self, cost: float) -> None:
+        """Add ``cost`` to the cumulative total. Non-positive
+        inputs (zero or negative) are silently dropped — matches
+        the closure's defensive accounting where a negative
+        SDK-reported cost cannot subtract from
+        ``provider._daily_spend``. NEVER raises."""
+        try:
+            value = float(cost)
+        except (TypeError, ValueError):
+            return  # defensive; ignore non-numeric input
+        if value <= 0.0:
+            return
+        with self._lock:
+            self._total += value
+
+    def reset(self) -> None:
+        """Zero the accumulator. Used between ``generate()`` calls
+        in test paths that reuse one accumulator across multiple
+        characterization runs. NEVER raises."""
+        with self._lock:
+            self._total = 0.0
+
+
+__all__ = [
+    "CLAUDE_DISPATCH_STATE_SCHEMA_VERSION",
+    "_CLAUDE_DISPATCH_STATE_FIELD_NAMES",
+    "_ClaudeDispatchState",
+    "_CumulativeCost",
+]
