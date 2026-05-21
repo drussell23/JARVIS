@@ -6483,6 +6483,55 @@ class ClaudeProvider:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ---------------------------------------------------------------------
+    # Slice 2B-i — second extraction from _generate_raw closure.
+    #
+    # _claude_retrieve_stream_exc drains a wedged asyncio.Task's stored
+    # exception so the GC "Task exception was never retrieved" warning
+    # does not surface when the stream consumer task finishes carrying
+    # an unawaited exception (Session-13 deadlock-protection path:
+    # fire cancel but do NOT await the task's completion).
+    #
+    # Self-contained: zero outer captures, zero state mutation, zero
+    # `self` reference — declared @staticmethod to make that explicit.
+    # No dispatch_state import yet (the substrate-import dormancy pin
+    # holds: this helper does not touch any of the 5 nonlocals or 4
+    # outer captures that the substrate targets).
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _claude_retrieve_stream_exc(task: "asyncio.Task[Any]") -> None:
+        """Drain an asyncio Task's stored exception without raising.
+
+        Used as a done-callback on the stream consumer task to silence
+        the "Task exception was never retrieved" GC warning that fires
+        when the task finishes with a stored exception (e.g., an
+        Anthropic ``APIStatusError``) but we are NOT awaiting its
+        completion. Preserves the Session-13 deadlock-protection
+        contract: the cancel is fired but never awaited; this
+        callback drains the exception so the GC stays quiet.
+
+        Extracted from the inline ``def _retrieve_stream_exc`` inside
+        ``_generate_raw`` per Slice 2B-i of the decomposition arc.
+
+        Semantics — exactly as before:
+
+          * Cancelled task → return immediately (the cancel sentinel
+            is not an "exception" we need to drain).
+          * Any other terminal state → invoke ``task.exception()`` to
+            retrieve and discard whatever the task stored.
+          * Any exception raised BY the retrieval itself is caught
+            and dropped — this is a hygiene callback, never a fault
+            site. NEVER raises.
+
+        NEVER raises out of any path."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:  # noqa: BLE001 — retrieval only
+            pass
+
     async def generate(
         self,
         context: OperationContext,
@@ -7304,15 +7353,14 @@ class ClaudeProvider:
                 # preserved AND the explicit HARD-KILL logger.error
                 # below still provides the §8 visibility. Visibility
                 # via the explicit log; hygiene via retrieval.
-                def _retrieve_stream_exc(_t: "asyncio.Task") -> None:
-                    if _t.cancelled():
-                        return
-                    try:
-                        _t.exception()
-                    except Exception:  # noqa: BLE001 — retrieval only
-                        pass
-
-                _stream_task.add_done_callback(_retrieve_stream_exc)
+                # Slice 2B-i — the inline retrieval helper was extracted
+                # to ClaudeProvider._claude_retrieve_stream_exc as a
+                # @staticmethod (zero closure capture, zero `self`
+                # use). Byte-equivalent hygiene callback; cleaner
+                # extraction seam for the upcoming _do_stream refactor.
+                _stream_task.add_done_callback(
+                    self._claude_retrieve_stream_exc
+                )
                 try:
                     done, pending = await asyncio.wait(
                         {_stream_task},

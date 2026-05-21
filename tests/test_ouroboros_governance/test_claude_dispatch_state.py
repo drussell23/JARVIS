@@ -59,14 +59,18 @@ _PROVIDERS_FILE = Path(
 # ``test_ast_pin_providers_file_sha_matches_lock`` tracks the
 # provenance of each successive update.
 #
-# Slice 2A-ii (PR #48860): a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d
-#                          (providers.py byte-identical to main)
-# Slice 2A-iii (this PR):  d3e409ce032ae3954dbd98d0102682fef968206b
-#                          (_boundary_audit_sampler extracted as
-#                          ClaudeProvider class method; closure
-#                          1036 → 1012 lines, 8 → 7 nested helpers)
+# Slice 2A-ii  (PR #48860): a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d
+#                           (providers.py byte-identical to main)
+# Slice 2A-iii (PR #48912): d3e409ce032ae3954dbd98d0102682fef968206b
+#                           (_boundary_audit_sampler extracted as
+#                           ClaudeProvider class method; closure
+#                           1036 → 1012 lines, 8 → 7 nested helpers)
+# Slice 2B-i   (this PR):   b2bfe35fe831786e71c56e371f2870fa6b62928d
+#                           (_retrieve_stream_exc extracted as
+#                           ClaudeProvider @staticmethod; closure
+#                           1012 → 1011 lines, 7 → 6 nested helpers)
 _PROVIDERS_SHA_LOCK = (
-    "d3e409ce032ae3954dbd98d0102682fef968206b"
+    "b2bfe35fe831786e71c56e371f2870fa6b62928d"
 )
 
 
@@ -630,11 +634,17 @@ def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
     # later slices will need to update this pin.
 
 
-def test_ast_pin_generate_raw_size_after_2a_iii():
-    """Slice 2A-iii closure-size envelope: the extraction shaved
-    ~24 lines from ``_generate_raw`` (1036 → ~1012). Future slices
-    will shrink this further; the envelope ceiling drops per slice.
-    Floor protects against accidental over-extraction."""
+def test_ast_pin_generate_raw_size_after_2b_i():
+    """Per-slice closure-size envelope. Tightened on each slice that
+    actually shrinks ``_generate_raw``.
+
+    Slice 2A-iii (PR #48912) opened at [950, 1025] for size 1012.
+    Slice 2B-i (this PR) shrinks to 1011 (extracted the 7-line
+    inline ``_retrieve_stream_exc`` + 1-line ``add_done_callback``
+    call site → call site rewritten as a 3-line multi-line call).
+    Tightened envelope [1000, 1015]: floor protects against
+    accidental over-extraction; ceiling protects against accidental
+    re-bloat. Each future slice re-tightens this in-place."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -654,13 +664,100 @@ def test_ast_pin_generate_raw_size_after_2a_iii():
                             size = (
                                 sub.end_lineno - sub.lineno + 1
                             )
-                            assert 950 <= size <= 1025, (
+                            assert 1000 <= size <= 1015, (
                                 f"_generate_raw size after Slice "
-                                f"2A-iii is {size}; expected window "
-                                f"[950, 1025]. If this slice "
+                                f"2B-i is {size}; expected window "
+                                f"[1000, 1015]. If this slice "
                                 f"intentionally moved more, update "
                                 f"the envelope."
                             )
+                            return
+
+
+def test_ast_pin_retrieve_stream_exc_is_static_method_on_claude_provider():
+    """Slice 2B-i extraction proof — positive presence pin.
+
+    ``_claude_retrieve_stream_exc`` MUST exist as a ``@staticmethod``
+    directly under ``class ClaudeProvider``. The ``@staticmethod``
+    decorator is load-bearing: the helper has zero ``self`` usage and
+    is registered as a done-callback (which the asyncio runtime calls
+    with one positional argument). Future slices that change this
+    decorator MUST update this pin in the same commit."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.FunctionDef)
+                    and child.name == "_claude_retrieve_stream_exc"
+                ):
+                    # Confirm @staticmethod decorator present.
+                    deco_names = []
+                    for deco in child.decorator_list:
+                        if isinstance(deco, ast.Name):
+                            deco_names.append(deco.id)
+                        elif isinstance(deco, ast.Attribute):
+                            deco_names.append(deco.attr)
+                    assert "staticmethod" in deco_names, (
+                        f"_claude_retrieve_stream_exc missing "
+                        f"@staticmethod decorator (got: {deco_names})"
+                    )
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_retrieve_stream_exc not "
+                "found — Slice 2B-i extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_retrieve_stream_exc_no_longer_nested_in_generate_raw():
+    """Slice 2B-i extraction proof — negative absence pin.
+
+    The original nested ``def _retrieve_stream_exc`` MUST NOT exist
+    anywhere inside ``_generate_raw``. The closure should only call
+    ``self._claude_retrieve_stream_exc`` (passed to
+    ``add_done_callback``)."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name
+                                    == "_retrieve_stream_exc"
+                                ):
+                                    pytest.fail(
+                                        f"_retrieve_stream_exc is "
+                                        f"still nested in "
+                                        f"_generate_raw at line "
+                                        f"{deeper.lineno} — Slice "
+                                        f"2B-i extraction "
+                                        f"incomplete"
+                                    )
                             return
 
 
