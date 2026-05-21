@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -6674,6 +6674,140 @@ class ClaudeProvider:
             deadline=deadline,
         )
 
+    # ---------------------------------------------------------------------
+    # Slice 2B-iii — paired extraction from _generate_raw closure
+    # (streaming-path analog of the create pair that landed in 2B-ii).
+    #
+    # _claude_stream_with_prefill_fallback and
+    # _claude_stream_with_resilience are the streaming dispatch +
+    # retry pair. Preflight AST audit confirmed:
+    #
+    #   * _claude_stream_with_prefill_fallback touches ONLY:
+    #       - messages       (list — mutated via .pop() on prefill reject)
+    #       - use_prefill    (bool — read-only flag)
+    #       - do_stream_fn   (caller-supplied 0-arg async callable —
+    #                         the closure's _do_stream is passed in)
+    #
+    #   * _claude_stream_with_resilience touches ONLY the parameters
+    #       above + progress_probe (caller-supplied Callable[[], bool])
+    #       + deadline (read-only).
+    #
+    # Critical: the original ``_stream_with_resilience`` captured the
+    # closure's ``raw_content`` via ``progress_probe=lambda:
+    # bool(raw_content)``. That lambda STAYS AT THE CALL SITE inside
+    # _generate_raw — the extracted method accepts the probe as a
+    # ``Callable[[], bool]`` parameter and treats it opaquely. So
+    # neither extracted method directly touches the 5 nonlocals or
+    # 4 outer captures the _ClaudeDispatchState substrate targets —
+    # substrate-import dormancy is honestly preserved through this
+    # slice (per operator's criterion: "If the helpers only touch
+    # _messages, _create_kwargs, deadline/timeout, and return msg,
+    # keep dispatch-state dormancy").
+    #
+    # The substrate goes live in 2C-i when ``_do_stream`` extracts —
+    # that's the heavy mutator of input_tokens / output_tokens /
+    # cached_input / raw_content (4 of the 5 substrate-targeted
+    # nonlocals).
+    # ---------------------------------------------------------------------
+
+    async def _claude_stream_with_prefill_fallback(
+        self,
+        *,
+        do_stream_fn: "Callable[[], Awaitable[None]]",
+        messages: List[Dict[str, Any]],
+        use_prefill: bool,
+    ) -> None:
+        """Streaming dispatch with prefill-rejection fallback.
+
+        Behavior is byte-equivalent to the pre-extraction inline
+        ``async def _stream_with_prefill_fallback`` inside
+        ``_generate_raw``:
+
+          1. Invoke ``do_stream_fn()`` — the caller-supplied 0-arg
+             async callable that wraps the closure's ``_do_stream``
+             (still nested in ``_generate_raw`` until Slice 2C-i).
+          2. On exception, detect the prefill-rejection pattern
+             (``"prefill" in str(exc).lower()`` AND ``use_prefill``
+             AND a trailing assistant turn in ``messages``); if all
+             three hold, ``.pop()`` the trailing assistant turn and
+             retry exactly once.
+          3. Any other exception propagates.
+
+        Mutation contract — kept identical to the original:
+
+          * ``messages`` is mutated in place via ``.pop()`` on the
+            prefill retry. The caller's reference reflects the
+            popped state when this method returns.
+
+        Some model versions reject assistant message prefill even
+        when thinking is off (battle test bt-2026-04-10-073056).
+        This method's contract makes the failure graceful instead
+        of dead-op."""
+        try:
+            await do_stream_fn()
+        except Exception as _exc:
+            _msg = str(_exc).lower()
+            # Anthropic returns BadRequestError subclassed from
+            # APIStatusError; we match on the message signature to
+            # avoid importing the SDK class conditionally.
+            if (
+                use_prefill
+                and "prefill" in _msg
+                and len(messages) >= 2
+                and messages[-1].get("role") == "assistant"
+            ):
+                logger.warning(
+                    "[ClaudeProvider] prefill rejected by model "
+                    "(%s) — retrying without assistant prefill",
+                    type(_exc).__name__,
+                )
+                # Strip the assistant prefill and retry in-place.
+                # do_stream_fn reads messages from the caller's scope,
+                # so modifying the list is visible on retry.
+                messages.pop()
+                await do_stream_fn()
+            else:
+                raise
+
+    async def _claude_stream_with_resilience(
+        self,
+        *,
+        do_stream_fn: "Callable[[], Awaitable[None]]",
+        messages: List[Dict[str, Any]],
+        use_prefill: bool,
+        progress_probe: "Callable[[], bool]",
+        deadline: datetime,
+    ) -> None:
+        """Streaming dispatch with prefill fallback + backoff retry.
+
+        Composes :meth:`_claude_stream_with_prefill_fallback` inside
+        :meth:`_call_with_backoff`. ``progress_probe`` is passed
+        opaquely to the backoff helper — the caller (inside
+        ``_generate_raw``) constructs it as a closure over the
+        ``raw_content`` nonlocal so the backoff can decide whether
+        any partial content has emitted before considering a retry
+        (do-not-retry-after-partial-output discipline).
+
+        The inner ``_do_prefill`` thunk bridges from this method's
+        keyword-only signature to the 0-arg async-callable shape
+        :meth:`_call_with_backoff` requires (``fn: Callable[[],
+        Awaitable[Any]]``). Mirrors the pre-extraction pattern
+        exactly (the original had a nested ``async def
+        _stream_with_resilience`` whose body did the same
+        pass-through)."""
+        async def _do_prefill() -> None:
+            await self._claude_stream_with_prefill_fallback(
+                do_stream_fn=do_stream_fn,
+                messages=messages,
+                use_prefill=use_prefill,
+            )
+        await self._call_with_backoff(
+            _do_prefill,
+            label="claude_stream",
+            progress_probe=progress_probe,
+            deadline=deadline,
+        )
+
     async def generate(
         self,
         context: OperationContext,
@@ -7411,52 +7545,20 @@ class ClaudeProvider:
                         except (TypeError, ValueError):
                             _cached_input = 0
 
-                async def _stream_with_prefill_fallback() -> None:
-                    """Run _do_stream; on prefill-rejection 400, strip the
-                    prefill and retry once. Some model versions reject
-                    assistant message prefill even when thinking is off
-                    (battle test bt-2026-04-10-073056). This makes the
-                    failure graceful instead of dead-op.
-                    """
-                    try:
-                        await _do_stream()
-                    except Exception as _exc:
-                        _msg = str(_exc).lower()
-                        # Anthropic returns BadRequestError subclassed from
-                        # APIStatusError; we match on the message signature
-                        # to avoid importing the SDK class conditionally.
-                        if (
-                            _use_prefill
-                            and "prefill" in _msg
-                            and len(_messages) >= 2
-                            and _messages[-1].get("role") == "assistant"
-                        ):
-                            logger.warning(
-                                "[ClaudeProvider] prefill rejected by model "
-                                "(%s) — retrying without assistant prefill",
-                                type(_exc).__name__,
-                            )
-                            # Strip the assistant prefill and retry in-place.
-                            # _do_stream reads _messages from enclosing scope,
-                            # so modifying the list is visible on retry.
-                            _messages.pop()
-                            await _do_stream()
-                        else:
-                            raise
-
-                # Reinforced transport: wrap the prefill-fallback in an
-                # exponential-backoff retry. Only retries when no tokens
-                # have streamed yet (progress_probe) — mid-stream failures
-                # are fatal because re-running would duplicate output.
-                # Deadline propagates so the backoff respects the remaining
-                # generation budget (Task #4 cascade hardening).
-                async def _stream_with_resilience() -> None:
-                    await self._call_with_backoff(
-                        _stream_with_prefill_fallback,
-                        label="claude_stream",
-                        progress_probe=lambda: bool(raw_content),
-                        deadline=deadline,
-                    )
+                # Slice 2B-iii — the inline stream-pair was extracted to
+                # ClaudeProvider._claude_stream_with_prefill_fallback +
+                # ClaudeProvider._claude_stream_with_resilience class
+                # methods. Reinforced transport: wraps the prefill-
+                # fallback in an exponential-backoff retry, retrying
+                # only when no tokens have streamed yet (progress_probe)
+                # — mid-stream failures are fatal because re-running
+                # would duplicate output. Deadline propagates so the
+                # backoff respects the remaining generation budget
+                # (Task #4 cascade hardening). The progress_probe
+                # lambda STAYS HERE in the closure scope — it captures
+                # ``raw_content`` (a substrate-targeted nonlocal); the
+                # extracted method accepts it opaquely as a
+                # ``Callable[[], bool]`` parameter.
 
                 # Hard-kill wrapper (Option C — Manifesto §3 Disciplined
                 # Concurrency, Derek 2026-04-18). Session 13
@@ -7480,7 +7582,15 @@ class ClaudeProvider:
                 _hard_kill_budget_s = (
                     _soft_wall_rem + _CLAUDE_STREAM_HARD_KILL_GRACE_S
                 )
-                _stream_task = asyncio.create_task(_stream_with_resilience())
+                _stream_task = asyncio.create_task(
+                    self._claude_stream_with_resilience(
+                        do_stream_fn=_do_stream,
+                        messages=_messages,
+                        use_prefill=_use_prefill,
+                        progress_probe=lambda: bool(raw_content),
+                        deadline=deadline,
+                    ),
+                )
 
                 # Hygiene: retrieve the task's exception even on the
                 # paths that abandon it without `await _stream_task`
