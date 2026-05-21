@@ -4155,6 +4155,44 @@ class CandidateGenerator:
                     current_cancel_token as _curr_cancel_token,
                     race_or_wait_for as _race_or_wait_for,
                 )
+                # Slice 7e (Provider Circuit Breaker) — wire the
+                # state machine into the retry loop. Constructed once
+                # per _call_fallback invocation (per op_id). Consumes
+                # Slice 7a's classify() output; emits SSE telemetry.
+                # On TERMINATE_UNRESOLVED short-circuits the loop +
+                # fires _raise_exhausted with the breaker's reason
+                # code — closing the empirical 35-min retry storm
+                # from bt-2026-05-21-214521.
+                #
+                # Master flag ``JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED``
+                # default-FALSE. When off, ``breaker.evaluate()`` always
+                # returns RETRY_OK → byte-identical to the pre-7e retry
+                # loop (FailureMode / outer-retry cap / backoff constant
+                # stay authoritative).
+                #
+                # Lazy imports avoid governance-package cycles
+                # (mirrors the cancel_token import above).
+                from backend.core.ouroboros.governance.circuit_breaker import (  # noqa: E501
+                    CircuitBreaker as _Slice7e_CircuitBreaker,
+                    CircuitScope as _Slice7e_CircuitScope,
+                    VerdictAction as _Slice7e_VerdictAction,
+                )
+                from backend.core.ouroboros.governance.provider_retry_classifier import (  # noqa: E501
+                    classify as _slice7e_classify,
+                )
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    publish_provider_failure_classified as _slice7e_publish_classified,
+                    publish_circuit_breaker_state_change as _slice7e_publish_state_change,
+                    publish_circuit_breaker_tripped as _slice7e_publish_tripped,
+                )
+
+                _slice7e_op_id = str(
+                    getattr(context, "op_id", "") or "",
+                )
+                _slice7e_breaker = _Slice7e_CircuitBreaker(
+                    op_id=_slice7e_op_id,
+                    scope=_Slice7e_CircuitScope.PER_OP,
+                )
                 _outer_attempt = 0
                 # Anthropic resilience pack 2026-04-25 — failure-rate-aware
                 # outer-retry max. When the FSM shows recent transient
@@ -4239,6 +4277,84 @@ class CandidateGenerator:
                         _inner_mode = (
                             FailbackStateMachine.classify_exception(inner_exc)
                         )
+                        # Slice 7e — Consult the Circuit Breaker on
+                        # every failure. When master flag is OFF,
+                        # ``evaluate()`` returns RETRY_OK → byte-
+                        # identical to the pre-7e path. When ON,
+                        # TERMINAL_STRUCTURAL / TERMINAL_CONFIG short-
+                        # circuit immediately (closing the 35-min
+                        # retry storm); TERMINAL_QUOTA + repeated
+                        # RETRY_TRANSIENT trigger Full-Jitter backoff;
+                        # the FSM / outer-retry cap / existing
+                        # eligibility check below remain as additional
+                        # gates (defense in depth — no breaker bypass
+                        # of the pre-existing semantics).
+                        _slice7e_decision = _slice7e_classify(
+                            failure_class=type(inner_exc).__name__,
+                            failure_mode=_inner_mode.name,
+                        )
+                        # Telemetry — every classification is logged,
+                        # regardless of breaker state. Best-effort.
+                        _slice7e_publish_classified(
+                            failure_class=type(inner_exc).__name__,
+                            failure_mode=_inner_mode.name,
+                            decision=_slice7e_decision.value,
+                            provider="claude",
+                            op_id=_slice7e_op_id,
+                        )
+                        _slice7e_prior_state = _slice7e_breaker.state.value
+                        _slice7e_verdict = _slice7e_breaker.evaluate(
+                            _slice7e_decision,
+                        )
+                        _slice7e_new_state = _slice7e_verdict.state_after \
+                            and _slice7e_verdict.state_after.value or \
+                            _slice7e_breaker.state.value
+                        if _slice7e_prior_state != _slice7e_new_state:
+                            # State change → SSE telemetry. Trip
+                            # events use the more-specific publisher
+                            # below; non-trip transitions go here.
+                            if _slice7e_verdict.action != (
+                                _Slice7e_VerdictAction.TERMINATE_UNRESOLVED
+                            ):
+                                _slice7e_publish_state_change(
+                                    prior_state=_slice7e_prior_state,
+                                    new_state=_slice7e_new_state,
+                                    op_id=_slice7e_op_id,
+                                    scope="per_op",
+                                )
+                        if _slice7e_verdict.action == (
+                            _Slice7e_VerdictAction.TERMINATE_UNRESOLVED
+                        ):
+                            # Breaker trip — emit the trip SSE event
+                            # + raise exhausted with the breaker's
+                            # reason code. The orchestrator's existing
+                            # exhaustion handler picks up the cause
+                            # tag end-to-end; the parallel evaluator
+                            # can subscribe to circuit_breaker_tripped
+                            # for early-collapse instead of waiting
+                            # on operation_terminal.
+                            _slice7e_reason = (
+                                _slice7e_verdict.terminal_reason_code
+                                or "circuit_breaker_tripped:unknown"
+                            )
+                            _slice7e_publish_tripped(
+                                terminal_reason_code=_slice7e_reason,
+                                op_id=_slice7e_op_id,
+                                scope="per_op",
+                                backoff_attempt=(
+                                    _slice7e_breaker.backoff_attempt
+                                ),
+                            )
+                            self._raise_exhausted(
+                                _slice7e_reason,
+                                context=context,
+                                deadline=deadline,
+                                fallback_exc=inner_exc,
+                                fallback_failure_mode=_inner_mode.name,
+                                slice7e_decision=(
+                                    _slice7e_decision.value
+                                ),
+                            )
                         # Permanent failures — never retry.
                         if not _is_outer_retry_eligible_mode(_inner_mode):
                             raise
@@ -4266,10 +4382,29 @@ class CandidateGenerator:
                         # remaining-budget/4 so a 12s budget doesn't sleep
                         # 1s of it (which would risk underflow into the
                         # min_viable floor on the next attempt).
-                        _backoff = min(
-                            _FALLBACK_OUTER_RETRY_BACKOFF_S,
-                            max(0.1, _budget_after / 4.0),
-                        )
+                        #
+                        # Slice 7e — when the breaker returned
+                        # RETRY_AFTER_BACKOFF with a non-None backoff_s,
+                        # use the Full-Jitter delay (AWS algorithm)
+                        # instead of the fixed constant. This is the
+                        # anti-thundering-herd path. The budget/4 clamp
+                        # still applies so a tight remaining budget
+                        # doesn't oversleep.
+                        if (
+                            _slice7e_verdict.action == (
+                                _Slice7e_VerdictAction.RETRY_AFTER_BACKOFF
+                            )
+                            and _slice7e_verdict.backoff_s is not None
+                        ):
+                            _backoff = min(
+                                float(_slice7e_verdict.backoff_s),
+                                max(0.1, _budget_after / 4.0),
+                            )
+                        else:
+                            _backoff = min(
+                                _FALLBACK_OUTER_RETRY_BACKOFF_S,
+                                max(0.1, _budget_after / 4.0),
+                            )
                         await asyncio.sleep(_backoff)
                         continue
                 # Unreachable — loop either returns or raises.
