@@ -3,33 +3,75 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #85809
-- **Branch**: `fix/ci/pr-automation-validation-run85797-20260521-071757`
-- **Commit**: `654f19dc4a20fd23056ff1edd2ada85a2ce8b2a1`
+- **Run Number**: #85821
+- **Branch**: `fix/ci/pr-automation-validation-run85809-20260521-071957`
+- **Commit**: `6d3f4f7ad04aead40ce6f5d8d6b00481bdf7fec4`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-21T07:18:24Z
+- **Timestamp**: 2026-05-21T07:20:37Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26211515031)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26211614201)
 
 ## Failure Overview
 
-Total Failed Jobs: **1**
+Total Failed Jobs: **2**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 5s |
+| 1 | Auto-Label PR | permission_error | high | 10s |
+| 2 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Validate PR Title
+### 1. Auto-Label PR
+
+**Status**: ❌ failure
+**Category**: Permission Error
+**Severity**: HIGH
+**Started**: 2026-05-21T07:20:40Z
+**Completed**: 2026-05-21T07:20:50Z
+**Duration**: 10 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26211614201/job/77123630730)
+
+#### Failed Steps
+
+- **Step 3**: Label Based on Files Changed
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 86: `2026-05-21T07:20:49.5088099Z ##[error]HttpError: Requires authentication - https://docs.github.com/r`
+    - Line 87: `2026-05-21T07:20:49.5096977Z ##[error]Requires authentication - https://docs.github.com/rest`
+
+- Pattern: `FAIL|Failed|failed`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 97: `2026-05-21T07:20:49.6441781Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+
+- Pattern: `WARN|Warning|warning`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 20: `2026-05-21T07:20:42.1907924Z hint: to use in all of your new repositories, which will suppress this `
+    - Line 97: `2026-05-21T07:20:49.6441781Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+
+#### Suggested Fixes
+
+1. Review the logs above for specific error messages
+
+---
+
+### 2. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-21T07:18:28Z
-**Completed**: 2026-05-21T07:18:33Z
+**Started**: 2026-05-21T07:20:41Z
+**Completed**: 2026-05-21T07:20:46Z
 **Duration**: 5 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26211515031/job/77123304658)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26211614201/job/77123630757)
 
 #### Failed Steps
 
@@ -42,13 +84,13 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-21T07:18:30.8545909Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-21T07:18:31.5193113Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-21T07:20:43.2011794Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-21T07:20:43.8215513Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-21T07:18:31.5744289Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-21T07:20:43.8784219Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -78,5 +120,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-21T07:19:57.311660*
+📊 *Report generated on 2026-05-21T07:22:10.996244*
 🤖 *JARVIS CI/CD Auto-PR Manager*
