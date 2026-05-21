@@ -671,21 +671,21 @@ def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
     # later slices will need to update this pin.
 
 
-def test_ast_pin_generate_raw_size_after_2c_ii():
-    """Per-slice closure-size envelope. Tightened on each slice that
-    actually shrinks ``_generate_raw``.
+def test_ast_pin_generate_raw_size_post_extraction():
+    """Post-arc closure-size envelope (Slice 2D consolidation).
 
-    Slice 2A-iii (PR #48912) opened at [950, 1025] for size 1012.
-    Slice 2B-i   (PR #49578) tightened to [1000, 1015] for size 1011.
-    Slice 2B-ii  (PR #49606) tightened to [965, 990] for size 977.
-    Slice 2B-iii (PR #49641) tightened to [940, 965] for size 953.
-    Slice 2C-i   (PR #49833) tightened to [690, 740] for size 712.
-    Slice 2C-ii (this PR) extracts the last nested helper
-    ``_stream_fanout`` to the ``_claude_make_stream_fanout``
-    @staticmethod factory. Net closure delta is small (712 → 709)
-    because the factory invocation replaces the 9-line inline def.
-    The structural value is that ``_generate_raw`` now has ZERO
-    nested helpers. Envelope tightens to [695, 720]."""
+    Across Slices 2A-iii / 2B-i / 2B-ii / 2B-iii / 2C-i / 2C-ii,
+    ``_generate_raw`` shrank from 1036 lines (8 nested helpers) to
+    **709 lines (0 nested helpers)**. The per-slice rename chain
+    (``_after_2a_iii`` → ``_after_2b_i`` → … → ``_after_2c_ii``) is
+    consolidated by Slice 2D into this stable post-arc pin name.
+
+    The envelope ``[695, 720]`` is the post-extraction lock. Any
+    future PR that touches ``_generate_raw`` MUST update this pin
+    deliberately. A re-introduction of nested helpers will fail the
+    sibling
+    :func:`test_ast_pin_generate_raw_nested_helper_count_post_extraction`
+    pin first; an unexpected size shift fires HERE."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -706,25 +706,26 @@ def test_ast_pin_generate_raw_size_after_2c_ii():
                                 sub.end_lineno - sub.lineno + 1
                             )
                             assert 695 <= size <= 720, (
-                                f"_generate_raw size after Slice "
-                                f"2C-ii is {size}; expected window "
-                                f"[695, 720]. If this slice "
-                                f"intentionally moved more, update "
-                                f"the envelope."
+                                f"_generate_raw size post-extraction "
+                                f"is {size}; expected window "
+                                f"[695, 720]. If a future PR moves "
+                                f"more (or adds bloat), update this "
+                                f"pin in the same commit."
                             )
                             return
 
 
-def test_ast_pin_generate_raw_nested_helper_count_after_2c_ii():
-    """Per-slice nested-helper-count envelope. Slice 2C-ii drops
-    the count from 1 → 0 (``_stream_fanout`` extracted to
-    ``_claude_make_stream_fanout``).
+def test_ast_pin_generate_raw_nested_helper_count_post_extraction():
+    """Post-arc nested-helper-count invariant (Slice 2D consolidation).
 
-    ``_generate_raw`` is now STRUCTURALLY CLEAN of nested ``def`` /
+    ``_generate_raw`` is STRUCTURALLY CLEAN of nested ``def`` /
     ``async def`` helpers. The closure-extraction phase of the arc
-    is COMPLETE. Any future slice that re-introduces a nested
-    helper inside ``_generate_raw`` MUST update this pin
-    deliberately."""
+    is COMPLETE; all 8 originally-nested helpers were extracted to
+    ``ClaudeProvider._claude_*`` class methods across Slices
+    2A-iii through 2C-ii.
+
+    Any future PR that re-introduces a nested helper inside
+    ``_generate_raw`` MUST update this pin deliberately."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -761,6 +762,225 @@ def test_ast_pin_generate_raw_nested_helper_count_after_2c_ii():
                                 f"Got: {sorted(n.name for n in nested)}"
                             )
                             return
+
+
+# ============================================================================
+# Slice 2D — post-arc structural invariants (closed-set drift detection)
+# ============================================================================
+
+
+# Closed set of the 8 _claude_* class methods extracted across the
+# decomposition arc (Slices 2A-iii through 2C-ii). This tuple is the
+# canonical end-state inventory; any addition or rename MUST be paired
+# with an explicit slice authorization + a corresponding pin update.
+_POST_EXTRACTION_CLAUDE_METHODS: tuple = (
+    "_claude_boundary_audit_sampler",
+    "_claude_create_with_prefill_fallback",
+    "_claude_create_with_resilience",
+    "_claude_do_stream",
+    "_claude_make_stream_fanout",
+    "_claude_retrieve_stream_exc",
+    "_claude_stream_with_prefill_fallback",
+    "_claude_stream_with_resilience",
+)
+
+
+def test_ast_pin_claude_provider_extracted_methods_exact_closed_set():
+    """Post-arc closed-set invariant — ClaudeProvider has EXACTLY
+    the 8 ``_claude_*`` methods that the decomposition arc extracted.
+
+    Drift detection:
+
+      * Adding a new ``_claude_*`` method without operator-authorized
+        slice work fails this pin. The arc is closed; any further
+        extraction is a new design choice that must be deliberately
+        documented + pin-updated.
+
+      * Renaming any of the 8 methods fails this pin. Each method's
+        name is part of the public extraction record (per-slice PRs +
+        commit messages reference these names verbatim); rename
+        churn would invalidate the historical record.
+
+      * Removing a method (e.g. inlining one back into _generate_raw)
+        fails this pin AND fails the sibling
+        ``_nested_helper_count_post_extraction`` pin.
+
+    Operator-authorized changes update :data:`_POST_EXTRACTION_CLAUDE_METHODS`
+    explicitly + bump :data:`CLAUDE_DISPATCH_STATE_SCHEMA_VERSION`
+    if the substrate's consumer surface shifts."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            actual = sorted(
+                m.name for m in node.body
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and m.name.startswith("_claude_")
+            )
+            expected = sorted(_POST_EXTRACTION_CLAUDE_METHODS)
+            assert actual == expected, (
+                f"ClaudeProvider _claude_* method set drifted.\n"
+                f"  Expected ({len(expected)}): {expected}\n"
+                f"  Actual   ({len(actual)}): {actual}\n"
+                f"  Missing:  {sorted(set(expected) - set(actual))}\n"
+                f"  Extra:    {sorted(set(actual) - set(expected))}\n"
+                f"If this is intentional (operator-authorized slice "
+                f"work), update _POST_EXTRACTION_CLAUDE_METHODS in "
+                f"the same commit."
+            )
+            return
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_substrate_consumer_surface_locked():
+    """Post-arc substrate-consumer invariant — both substrate
+    dataclasses are consumed by ClaudeProvider methods (and only
+    by ClaudeProvider methods within providers.py).
+
+    Specifically:
+
+      * ``_ClaudeDispatchState`` appears as a parameter type
+        annotation on at least one ``ClaudeProvider._claude_*``
+        method (verified live at ``_claude_do_stream``).
+
+      * ``_ClaudeStreamContext`` appears as a parameter type
+        annotation on at least one ``ClaudeProvider._claude_*``
+        method (also verified at ``_claude_do_stream`` — the two
+        substrates are consumed paired).
+
+    Any future PR that broadens or narrows the substrate's
+    consumer surface MUST update this pin deliberately."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    dispatch_state_consumers: list = []
+    stream_ctx_consumers: list = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name.startswith("_claude_")
+                ):
+                    # Walk parameter annotations (both positional and
+                    # kw-only). Annotations are AST nodes — match by
+                    # ast.unparse-equivalent name.
+                    for arg in (
+                        list(child.args.args)
+                        + list(child.args.kwonlyargs)
+                    ):
+                        ann = arg.annotation
+                        if ann is None:
+                            continue
+                        # Forward-reference string OR direct Name node.
+                        if isinstance(ann, ast.Constant) and isinstance(
+                            ann.value, str
+                        ):
+                            ann_str = ann.value
+                        else:
+                            try:
+                                ann_str = ast.unparse(ann)
+                            except Exception:
+                                ann_str = ""
+                        if "_ClaudeDispatchState" in ann_str:
+                            dispatch_state_consumers.append(child.name)
+                        if "_ClaudeStreamContext" in ann_str:
+                            stream_ctx_consumers.append(child.name)
+    assert dispatch_state_consumers, (
+        "_ClaudeDispatchState is not consumed by any _claude_* "
+        "method on ClaudeProvider. The substrate would be dormant "
+        "again — verify the Slice 2C-i _claude_do_stream import is "
+        "intact."
+    )
+    assert stream_ctx_consumers, (
+        "_ClaudeStreamContext is not consumed by any _claude_* "
+        "method on ClaudeProvider. The frozen call-context dataclass "
+        "would be unused — verify the Slice 2C-i _claude_do_stream "
+        "import is intact."
+    )
+    # The two substrates are LOAD-BEARING CO-PAIRED at _claude_do_stream
+    # (Slice 2C-i's signature: state + ctx). They MUST be consumed
+    # by at least one method in common.
+    common = (
+        set(dispatch_state_consumers) & set(stream_ctx_consumers)
+    )
+    assert common, (
+        f"_ClaudeDispatchState consumers ({dispatch_state_consumers}) "
+        f"and _ClaudeStreamContext consumers ({stream_ctx_consumers}) "
+        f"have no method in common. Slice 2C-i pinned them as "
+        f"co-paired parameters on _claude_do_stream; they must "
+        f"stay co-paired on at least one method."
+    )
+
+
+def test_ast_pin_generate_raw_invariants_post_arc():
+    """Post-arc structural meta-invariant.
+
+    Locks the three load-bearing properties of ``_generate_raw``
+    that the decomposition arc was designed to achieve:
+
+      1. Still ``async def`` (the tool_loop callable contract).
+      2. Returns ``str`` (the tool_loop callable contract).
+      3. Nested in ``ClaudeProvider.generate`` (NOT a class method
+         — the closure-cell binding to outer-scope state survives
+         because the tool_loop consumes a closure-captured
+         callable).
+
+    These three are the bare-minimum LOAD-BEARING invariants that
+    must NEVER break. Future PRs may tighten or shrink the closure
+    further, but these three are arc-defining."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    found = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            found = True
+                            # Invariant 1: async def
+                            # (already implied by isinstance check)
+                            # Invariant 2: returns str
+                            ret = sub.returns
+                            assert ret is not None, (
+                                "_generate_raw must have a return "
+                                "annotation"
+                            )
+                            ret_str = ""
+                            if isinstance(ret, ast.Constant) and isinstance(
+                                ret.value, str
+                            ):
+                                ret_str = ret.value
+                            elif isinstance(ret, ast.Name):
+                                ret_str = ret.id
+                            else:
+                                try:
+                                    ret_str = ast.unparse(ret)
+                                except Exception:
+                                    ret_str = ""
+                            assert "str" in ret_str, (
+                                f"_generate_raw return annotation is "
+                                f"{ret_str!r}; expected 'str' "
+                                f"(tool_loop callable contract)"
+                            )
+                            # Invariant 3: nested in generate
+                            # (already established by traversal path)
+    assert found, (
+        "_generate_raw not found inside ClaudeProvider.generate — "
+        "the arc's nesting invariant broke."
+    )
 
 
 def test_ast_pin_make_stream_fanout_is_static_method_on_claude_provider():
