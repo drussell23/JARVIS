@@ -7151,6 +7151,71 @@ class ClaudeProvider:
             except (TypeError, ValueError):
                 state.cached_input = 0
 
+    # ---------------------------------------------------------------------
+    # Slice 2C-ii — extract _stream_fanout (the last nested helper).
+    #
+    # _claude_make_stream_fanout is a factory @staticmethod that, given
+    # two per-text callbacks (tool-loop's on_token + the operator-visible
+    # StreamRenderer's on_token, or the Slice-7 ReasoningStream proxy),
+    # returns a single callable that fans the token text to BOTH with
+    # per-call exception swallow.
+    #
+    # Pre-extraction, this was a nested ``def _stream_fanout(text)``
+    # inline-defined inside ``_generate_raw`` under the
+    # ``if _tool_cb is not None and _render_cb is not None:`` branch
+    # of the stream-callback resolution block. The closure captured
+    # _tool_cb + _render_cb from its enclosing scope.
+    #
+    # Post-extraction:
+    #   * The factory is a @staticmethod (zero self usage); the
+    #     returned closure captures tool_cb + render_cb from the
+    #     factory's parameter scope, not from _generate_raw.
+    #   * _generate_raw's nested-helper count drops 1 → 0 — the
+    #     closure is now structurally clean of inner def's at its
+    #     own scope (a small residual inner closure lives inside
+    #     this @staticmethod, but it's scoped to the factory's body,
+    #     not _generate_raw's).
+    #   * Stream callback resolution branches are byte-equivalent:
+    #     when both callbacks exist, use the factory; otherwise
+    #     pass through to whichever single callback exists, or None.
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _claude_make_stream_fanout(
+        tool_cb: Callable[[str], None],
+        render_cb: Callable[[str], None],
+    ) -> Callable[[str], None]:
+        """Build a stream callback that fans token text to BOTH the
+        tool-loop and the render path with per-call exception swallow.
+
+        Behavior is byte-equivalent to the pre-extraction nested
+        ``def _stream_fanout(text)`` closure inside ``_generate_raw``:
+
+          * Invoke ``tool_cb(text)`` wrapped in try/except — failure
+            does not block the render path.
+          * Invoke ``render_cb(text)`` wrapped in try/except — failure
+            does not break the stream consumer.
+
+        Both swallows are deliberately broad ``except Exception`` —
+        a buggy on_token must NOT tear down a live stream. Matches
+        the closure's existing contract.
+
+        Used only when BOTH ``tool_cb`` and ``render_cb`` are non-None
+        (a tool-loop round with an operator watching). When only one
+        callback exists the caller selects it directly; when neither
+        exists the caller falls through to the non-streaming
+        create() path."""
+        def _fanout(text: str) -> None:
+            try:
+                tool_cb(text)
+            except Exception:
+                pass
+            try:
+                render_cb(text)
+            except Exception:
+                pass
+        return _fanout
+
     async def generate(
         self,
         context: OperationContext,
@@ -7473,17 +7538,14 @@ class ClaudeProvider:
             except Exception:  # noqa: BLE001 — defensive fallback
                 pass
 
+            # Slice 2C-ii — the inline _stream_fanout closure was
+            # extracted to ClaudeProvider._claude_make_stream_fanout as
+            # a @staticmethod factory. Per-call swallow semantics
+            # preserved exactly.
             if _tool_cb is not None and _render_cb is not None:
-                def _stream_fanout(text: str) -> None:
-                    try:
-                        _tool_cb(text)
-                    except Exception:
-                        pass
-                    try:
-                        _render_cb(text)
-                    except Exception:
-                        pass
-                _stream_callback = _stream_fanout
+                _stream_callback = self._claude_make_stream_fanout(
+                    _tool_cb, _render_cb,
+                )
             elif _tool_cb is not None:
                 _stream_callback = _tool_cb
             elif _render_cb is not None:

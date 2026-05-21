@@ -874,11 +874,15 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
     Slice 2B-i   update: ``_retrieve_stream_exc`` extracted.
     Slice 2B-ii  update: ``_create_with_*`` pair extracted.
     Slice 2B-iii update: ``_stream_with_*`` pair extracted.
-    Slice 2C-i   update: ``_do_stream`` extracted to
-    ``ClaudeProvider._claude_do_stream``. The required-list
-    contracts to ``_stream_fanout`` (the last small nested helper,
-    Slice 2C-ii's target). Future slices that extract or restructure
-    that helper MUST update this pin in tandem."""
+    Slice 2C-i   update: ``_do_stream`` extracted.
+    Slice 2C-ii  update: ``_stream_fanout`` extracted to
+    ``ClaudeProvider._claude_make_stream_fanout``. With this last
+    extraction, ``_generate_raw`` is STRUCTURALLY CLEAN of nested
+    helpers (count == 0). The Phase-1 SNAPSHOT contract this pin
+    asserts inverts: it now requires the nested-helper set to be
+    EMPTY (proving the closure-extraction phase is complete).
+    Future slices that re-introduce a nested helper MUST flip this
+    pin deliberately."""
     node = _claude_generate_raw_node()
     nested_names = set()
     for sub in ast.walk(node):
@@ -887,11 +891,10 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
             and sub is not node
         ):
             nested_names.add(sub.name)
-    # We do not pin the EXACT set (over-constrains Phase 2). We pin
-    # that AT LEAST the last remaining anchor exists.
-    assert "_stream_fanout" in nested_names, (
-        f"PHASE-1 pin (Slice 2C-i update): _stream_fanout helper "
-        f"missing. Found: {sorted(nested_names)}"
+    assert nested_names == set(), (
+        f"PHASE-1 pin (Slice 2C-ii update): _generate_raw must be "
+        f"structurally clean of nested helpers after Slice 2C-ii. "
+        f"Found: {sorted(nested_names)}"
     )
 
 

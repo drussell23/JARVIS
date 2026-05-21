@@ -77,18 +77,20 @@ _PROVIDERS_FILE = Path(
 #                             (_stream_with_prefill_fallback +
 #                             _stream_with_resilience PAIRED extracted;
 #                             closure 977 → 953 lines, 4 → 2 nested)
-# Slice 2C-i     (this PR):   42ba72372c7024d61c7f545c7c9994eccea774f5
-#                             (_do_stream extracted as ClaudeProvider
-#                             ._claude_do_stream(state, ctx) — the
-#                             heaviest cut. Closure 953 → 712 lines
-#                             (-241), 2 → 1 nested helpers. SUBSTRATE
-#                             GOES LIVE: providers.py now imports
-#                             _ClaudeDispatchState + _ClaudeStreamContext;
-#                             the dormancy AST pin is DELIBERATELY
-#                             FLIPPED in this same commit to a
-#                             positive-presence import pin.)
+# Slice 2C-i     (PR #49833): 42ba72372c7024d61c7f545c7c9994eccea774f5
+#                             (_do_stream extracted; closure 953 →
+#                             712, 2 → 1 nested; SUBSTRATE WENT LIVE)
+# Slice 2C-ii    (this PR):   1090feb3734a4e235cc40a947da5026e13dfeca5
+#                             (_stream_fanout extracted as
+#                             ClaudeProvider._claude_make_stream_fanout
+#                             @staticmethod factory; closure 712 → 709
+#                             (-3), 1 → 0 nested helpers. _generate_raw
+#                             is now structurally clean of nested
+#                             defs — the closure-extraction phase of
+#                             the arc is COMPLETE. 8 _claude_* class
+#                             methods extracted cumulatively.)
 _PROVIDERS_SHA_LOCK = (
-    "42ba72372c7024d61c7f545c7c9994eccea774f5"
+    "1090feb3734a4e235cc40a947da5026e13dfeca5"
 )
 
 
@@ -669,7 +671,7 @@ def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
     # later slices will need to update this pin.
 
 
-def test_ast_pin_generate_raw_size_after_2c_i():
+def test_ast_pin_generate_raw_size_after_2c_ii():
     """Per-slice closure-size envelope. Tightened on each slice that
     actually shrinks ``_generate_raw``.
 
@@ -677,13 +679,13 @@ def test_ast_pin_generate_raw_size_after_2c_i():
     Slice 2B-i   (PR #49578) tightened to [1000, 1015] for size 1011.
     Slice 2B-ii  (PR #49606) tightened to [965, 990] for size 977.
     Slice 2B-iii (PR #49641) tightened to [940, 965] for size 953.
-    Slice 2C-i (this PR) is the HEAVIEST CUT of the arc: 953 → 712
-    (-241) by extracting the 317-line ``_do_stream`` helper to the
-    ``_claude_do_stream`` class method (offset by ~70 lines of new
-    state+ctx construction, boundary translation, and call-site
-    rewrite). Envelope tightens to [690, 740]: floor protects
-    against accidental over-extraction; ceiling protects against
-    accidental re-bloat."""
+    Slice 2C-i   (PR #49833) tightened to [690, 740] for size 712.
+    Slice 2C-ii (this PR) extracts the last nested helper
+    ``_stream_fanout`` to the ``_claude_make_stream_fanout``
+    @staticmethod factory. Net closure delta is small (712 → 709)
+    because the factory invocation replaces the 9-line inline def.
+    The structural value is that ``_generate_raw`` now has ZERO
+    nested helpers. Envelope tightens to [695, 720]."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -703,25 +705,26 @@ def test_ast_pin_generate_raw_size_after_2c_i():
                             size = (
                                 sub.end_lineno - sub.lineno + 1
                             )
-                            assert 690 <= size <= 740, (
+                            assert 695 <= size <= 720, (
                                 f"_generate_raw size after Slice "
-                                f"2C-i is {size}; expected window "
-                                f"[690, 740]. If this slice "
+                                f"2C-ii is {size}; expected window "
+                                f"[695, 720]. If this slice "
                                 f"intentionally moved more, update "
                                 f"the envelope."
                             )
                             return
 
 
-def test_ast_pin_generate_raw_nested_helper_count_after_2c_i():
-    """Per-slice nested-helper-count envelope. Slice 2C-i drops
-    the count from 2 → 1 (``_do_stream`` extracted to
-    ``_claude_do_stream``).
+def test_ast_pin_generate_raw_nested_helper_count_after_2c_ii():
+    """Per-slice nested-helper-count envelope. Slice 2C-ii drops
+    the count from 1 → 0 (``_stream_fanout`` extracted to
+    ``_claude_make_stream_fanout``).
 
-    Remaining nested helper (1): ``_stream_fanout`` — a small
-    9-line text-fanout helper that's set as ``_stream_callback``
-    when both tool-loop and render callbacks coexist. Extracts
-    in Slice 2C-ii alongside the dispatcher-shell reduction."""
+    ``_generate_raw`` is now STRUCTURALLY CLEAN of nested ``def`` /
+    ``async def`` helpers. The closure-extraction phase of the arc
+    is COMPLETE. Any future slice that re-introduces a nested
+    helper inside ``_generate_raw`` MUST update this pin
+    deliberately."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -750,13 +753,96 @@ def test_ast_pin_generate_raw_nested_helper_count_after_2c_i():
                                 and n is not sub
                             ]
                             count = len(nested)
-                            assert count == 1, (
+                            assert count == 0, (
                                 f"_generate_raw has {count} nested "
-                                f"helpers after Slice 2C-i; "
-                                f"expected exactly 1. Remaining "
-                                f"should be _stream_fanout. Got: "
-                                f"{sorted(n.name for n in nested)}"
+                                f"helpers after Slice 2C-ii; "
+                                f"expected exactly 0. The closure "
+                                f"is structurally clean post-arc. "
+                                f"Got: {sorted(n.name for n in nested)}"
                             )
+                            return
+
+
+def test_ast_pin_make_stream_fanout_is_static_method_on_claude_provider():
+    """Slice 2C-ii extraction proof — positive presence pin.
+
+    ``_claude_make_stream_fanout`` MUST exist as a ``@staticmethod``
+    directly under ``class ClaudeProvider``. The @staticmethod
+    decorator is load-bearing: the factory has zero ``self`` usage
+    and returns a closure that captures only its two parameters."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.FunctionDef)
+                    and child.name == "_claude_make_stream_fanout"
+                ):
+                    deco_names = []
+                    for deco in child.decorator_list:
+                        if isinstance(deco, ast.Name):
+                            deco_names.append(deco.id)
+                        elif isinstance(deco, ast.Attribute):
+                            deco_names.append(deco.attr)
+                    assert "staticmethod" in deco_names, (
+                        f"_claude_make_stream_fanout missing "
+                        f"@staticmethod decorator (got: {deco_names})"
+                    )
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_make_stream_fanout not "
+                "found — Slice 2C-ii extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_stream_fanout_no_longer_nested_in_generate_raw():
+    """Slice 2C-ii extraction proof — negative absence pin.
+
+    The original nested ``def _stream_fanout`` MUST NOT exist
+    anywhere inside ``_generate_raw``. With this pin enforced,
+    ``_generate_raw`` is now structurally clean of nested defs
+    (count == 0, verified by the sibling pin
+    ``test_ast_pin_generate_raw_nested_helper_count_after_2c_ii``)."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name == "_stream_fanout"
+                                ):
+                                    pytest.fail(
+                                        f"_stream_fanout is still "
+                                        f"nested in _generate_raw "
+                                        f"at line {deeper.lineno} "
+                                        f"— Slice 2C-ii extraction "
+                                        f"incomplete"
+                                    )
                             return
 
 
