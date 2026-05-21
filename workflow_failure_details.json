@@ -1,0 +1,119 @@
+{
+  "workflow_name": "terraform in /infrastructure - Update #1377848421",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26217197933",
+  "branch": "main",
+  "commit_sha": "72444cc",
+  "run_number": 148,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/terraform-in-infrastructure-update-1377848421-run148-20260521-092133",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: terraform in /infrastructure - Update #1377848421 (Run #148)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 47,
+              "content": "2026-05-21T09:20:10.7166372Z updater | 2026/05/21 09:20:10 INFO <job_1377848421> Job definition: {\"job\":{\"command\":\"version\",\"allowed-updates\":[{\"dependency-type\":\"direct\",\"update-type\":\"all\"}],\"commit-message-options\":{\"prefix\":\"infra\",\"prefix-development\":null,\"include-scope\":null},\"credentials-metadata\":[{\"type\":\"git_source\",\"host\":\"github.com\"}],\"debug\":null,\"dependencies\":null,\"dependency-groups\":[],\"dependency-group-to-refresh\":null,\"existing-pull-requests\":[],\"existing-group-pull-requests\":[],\"experiments\":{\"record-ecosystem-versions\":true,\"record-update-job-unknown-error\":true,\"proxy-cached\":true,\"enable-corepack-for-npm-and-yarn\":true,\"enable-private-registry-for-corepack\":true,\"allow-refresh-for-existing-pr-dependencies\":true,\"allow-refresh-group-with-all-dependencies\":true,\"azure-registry-backup\":true,\"enable-enhanced-error-details-for-updater\":true,\"gradle-lockfile-updater\":true,\"enable-exclude-paths-subdirectory-manifest-files\":true,\"enable-audit-fix-fallback\":true},\"ignore-conditions\":[],\"lockfile-only\":false,\"max-updater-run-time\":2700,\"package-manager\":\"terraform\",\"requirements-update-strategy\":null,\"reject-external-code\":false,\"security-advisories\":[],\"security-updates-only\":false,\"source\":{\"provider\":\"github\",\"repo\":\"drussell23/JARVIS\",\"branch\":null,\"directory\":\"/infrastructure\",\"api-endpoint\":\"https://api.github.com/\",\"hostname\":\"github.com\"},\"updating-a-pull-request\":false,\"update-subdependencies\":false,\"vendor-dependencies\":false,\"enable-beta-ecosystems\":false,\"repo-private\":false,\"multi-ecosystem-update\":false,\"exclude-paths\":null}}",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 69,
+              "content": "2026-05-21T09:20:20.0926792Z updater | 2026/05/21 09:20:20 ERROR <job_1377848421> Error during file fetching; aborting: No files found in /infrastructure",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 70,
+              "content": "2026-05-21T09:20:20.2925448Z   proxy | 2026/05/21 09:20:20 [010] POST /update_jobs/1377848421/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 71,
+              "content": "2026-05-21T09:20:20.3684184Z   proxy | 2026/05/21 09:20:20 [010] 204 /update_jobs/1377848421/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 76,
+              "content": "2026-05-21T09:20:20.5599370Z Dependabot encountered '1' error(s) during execution, please check the logs for more details.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 78,
+              "content": "2026-05-21T09:20:20.5601126Z |                                    Errors                                     |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 87,
+              "content": "2026-05-21T09:20:20.7091464Z Failure running container 50b3b1089ba1bafec76cc7d001afb7b702239d4f7c0d090d738a2a66a4789f80: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 91,
+              "content": "2026-05-21T09:20:21.8881703Z ##[error]Dependabot encountered an error performing the update",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 93,
+              "content": "Error: The updater encountered one or more errors.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-05-21T09:20:21.8892428Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 10
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 25,
+              "content": "2026-05-21T09:19:59.5683607Z \ud83e\udd16 ~ Failed to parse GITHUB_REGISTRIES_PROXY environment variable ~",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 87,
+              "content": "2026-05-21T09:20:20.7091464Z Failure running container 50b3b1089ba1bafec76cc7d001afb7b702239d4f7c0d090d738a2a66a4789f80: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 41,
+              "content": "2026-05-21T09:20:07.5046652Z updater | rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-21T09:21:33.568536"
+}
