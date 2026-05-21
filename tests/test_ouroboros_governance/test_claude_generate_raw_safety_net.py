@@ -1594,11 +1594,22 @@ def test_ast_pin_no_provider_mutation_in_this_pr():
                             )
                             break
     assert found_size is not None
-    # Documents the closure size at safety-net time. Phase 2 will
-    # reduce this; THIS test will need a paired update at that point.
-    assert 1000 <= found_size <= 1100, (
-        f"_generate_raw size shifted: {found_size}; safety net "
-        f"assumed ~1036 lines"
+    # Documents the closure size; Phase 2 reduces this per slice and
+    # THIS test envelope updates in coordination.
+    #
+    #   safety-net @ Slice 2A-i (PR #48857): [1000, 1100] for size 1036
+    #   Slice 2A-iii (PR #48912): 1036 → 1012 (still in envelope)
+    #   Slice 2B-i   (PR #49578): 1012 → 1011 (still in envelope)
+    #   Slice 2B-ii  (this PR):   1011 →  977 — envelope retracts to
+    #                             [800, 1015] to track the per-slice
+    #                             shrinkage. Slice 2C-i (when
+    #                             _do_stream extracts) will retract
+    #                             further; this pin's floor stays low
+    #                             until Slice 2D's final tightening.
+    assert 800 <= found_size <= 1015, (
+        f"_generate_raw size shifted: {found_size}; safety-net "
+        f"envelope after Slice 2B-ii is [800, 1015] (was "
+        f"[1000, 1100] at Slice 2A-i; reduced as extractions land)"
     )
 
 

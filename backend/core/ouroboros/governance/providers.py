@@ -6532,6 +6532,148 @@ class ClaudeProvider:
         except Exception:  # noqa: BLE001 — retrieval only
             pass
 
+    # ---------------------------------------------------------------------
+    # Slice 2B-ii — paired extraction from _generate_raw closure.
+    #
+    # _claude_create_with_prefill_fallback and _claude_create_with_resilience
+    # are the non-streaming dispatch + retry pair. Preflight AST audit
+    # confirmed both helpers touch ONLY:
+    #
+    #   * _messages         (list — mutated via .pop() on prefill reject)
+    #   * _create_kwargs    (dict — mutated via ["timeout"] = ...)
+    #   * _use_prefill      (bool — read-only flag)
+    #   * deadline          (datetime — read-only)
+    #   * timeout_s         (float  — read-only fallback)
+    #
+    # Neither touches any of the 5 nonlocals (raw_content / input_tokens /
+    # output_tokens / cached_input / total_cost) or the 4 outer captures
+    # (first_token_ms / last_msg / thinking_reason_out / token_usage)
+    # that the _ClaudeDispatchState substrate targets — token accounting
+    # happens AFTER the create returns, in the surrounding _generate_raw
+    # body. So this slice preserves substrate dormancy honestly:
+    # the substrate goes live in whichever later slice extracts the
+    # post-call token-accounting code (likely 2C-i when _do_stream
+    # extracts, since that's the heavy mutator).
+    # ---------------------------------------------------------------------
+
+    async def _claude_create_with_prefill_fallback(
+        self,
+        *,
+        create_kwargs: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        use_prefill: bool,
+        deadline: datetime,
+        timeout_s: float,
+    ) -> Any:
+        """Non-streaming dispatch with prefill-rejection fallback.
+
+        Behavior is byte-equivalent to the pre-extraction inline
+        ``async def _create_with_prefill_fallback`` inside
+        ``_generate_raw``:
+
+          1. Re-acquire the client on every attempt via
+             ``self._ensure_client()`` — closure-captured clients go
+             stale after ``_recycle_client()`` fires (Session-13).
+          2. Derive a live per-request HTTPX timeout from the
+             ``deadline`` (floor 1.0s, ``timeout_s`` fallback when
+             the budget helper returns ``None``) and stamp it into
+             ``create_kwargs["timeout"]`` before each SDK call.
+          3. Attempt the create; on success, return the message.
+          4. On exception, detect the prefill-rejection pattern
+             (``"prefill" in str(exc).lower()`` AND ``use_prefill``
+             AND a trailing assistant turn in ``messages``); if all
+             three hold, pop the trailing assistant turn, re-derive
+             the timeout, and retry exactly once.
+          5. Any other exception propagates.
+
+        Mutation contract — kept identical to the original:
+
+          * ``create_kwargs`` is mutated in place; the caller sees
+            the final ``timeout`` value after this call returns.
+          * ``messages`` is mutated in place via ``.pop()`` on the
+            prefill retry; the caller's reference reflects the
+            popped state when this method returns.
+
+        NEVER raises out except for exceptions the SDK or the
+        prefill-rejection branch deliberately re-raises."""
+        _current_client = self._ensure_client()
+        _live_create = _remaining_utc_budget_s(deadline, floor_s=1.0)
+        _live_create = float(
+            _live_create if _live_create is not None else timeout_s,
+        )
+        create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+            _live_create,
+        )
+        try:
+            return await _current_client.messages.create(**create_kwargs)
+        except Exception as _exc:
+            _msg = str(_exc).lower()
+            if (
+                use_prefill
+                and "prefill" in _msg
+                and len(messages) >= 2
+                and messages[-1].get("role") == "assistant"
+            ):
+                logger.warning(
+                    "[ClaudeProvider] prefill rejected by model "
+                    "(%s) — retrying without assistant prefill",
+                    type(_exc).__name__,
+                )
+                messages.pop()
+                _live_create = _remaining_utc_budget_s(
+                    deadline, floor_s=1.0,
+                )
+                _live_create = float(
+                    _live_create if _live_create is not None
+                    else timeout_s,
+                )
+                create_kwargs["timeout"] = (
+                    _derive_per_request_httpx_timeout(_live_create)
+                )
+                return await _current_client.messages.create(
+                    **create_kwargs
+                )
+            raise
+
+    async def _claude_create_with_resilience(
+        self,
+        *,
+        create_kwargs: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        use_prefill: bool,
+        deadline: datetime,
+        timeout_s: float,
+    ) -> Any:
+        """Non-streaming dispatch with prefill fallback + backoff retry.
+
+        Composes :meth:`_claude_create_with_prefill_fallback` inside
+        :meth:`_call_with_backoff` — the non-stream path is fully
+        idempotent (no partial emission to callers), so the backoff
+        wrapper can retry freely. ``deadline`` propagates so the
+        backoff respects the remaining generation budget (Task #4
+        cascade hardening).
+
+        The inner ``_do_create`` thunk bridges from this method's
+        keyword-only signature to the 0-arg async-callable shape
+        :meth:`_call_with_backoff` requires (``fn: Callable[[],
+        Awaitable[Any]]``). Mirrors the pre-extraction pattern
+        exactly (the original had a nested ``async def
+        _create_with_resilience`` whose body did the same
+        pass-through)."""
+        async def _do_create() -> Any:
+            return await self._claude_create_with_prefill_fallback(
+                create_kwargs=create_kwargs,
+                messages=messages,
+                use_prefill=use_prefill,
+                deadline=deadline,
+                timeout_s=timeout_s,
+            )
+        return await self._call_with_backoff(
+            _do_create,
+            label="claude_create",
+            deadline=deadline,
+        )
+
     async def generate(
         self,
         context: OperationContext,
@@ -7479,59 +7621,25 @@ class ClaudeProvider:
                 if _thinking_param is not None:
                     _create_kwargs["thinking"] = _thinking_param
 
-                async def _create_with_prefill_fallback() -> Any:
-                    """Same prefill-rejection fallback as the stream path."""
-                    # Re-acquire the client on every attempt — see the
-                    # matching comment in _do_stream. Closure-captured
-                    # clients go stale after _recycle_client() fires.
-                    _current_client = self._ensure_client()
-                    _live_create = _remaining_utc_budget_s(deadline, floor_s=1.0)
-                    _live_create = float(_live_create if _live_create is not None else timeout_s)
-                    _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
-                        _live_create,
-                    )
-                    try:
-                        return await _current_client.messages.create(**_create_kwargs)
-                    except Exception as _exc:
-                        _msg = str(_exc).lower()
-                        if (
-                            _use_prefill
-                            and "prefill" in _msg
-                            and len(_messages) >= 2
-                            and _messages[-1].get("role") == "assistant"
-                        ):
-                            logger.warning(
-                                "[ClaudeProvider] prefill rejected by model "
-                                "(%s) — retrying without assistant prefill",
-                                type(_exc).__name__,
-                            )
-                            _messages.pop()
-                            _live_create = _remaining_utc_budget_s(deadline, floor_s=1.0)
-                            _live_create = float(
-                                _live_create if _live_create is not None else timeout_s,
-                            )
-                            _create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
-                                _live_create,
-                            )
-                            return await _current_client.messages.create(**_create_kwargs)
-                        raise
-
-                # Reinforced transport: non-stream path is fully idempotent
-                # (no partial emission to callers), so we can retry freely.
-                # Deadline propagates so the backoff respects the remaining
+                # Slice 2B-ii — the inline create-pair was extracted to
+                # ClaudeProvider._claude_create_with_prefill_fallback +
+                # ClaudeProvider._claude_create_with_resilience class
+                # methods. Reinforced transport: non-stream path is
+                # fully idempotent (no partial emission to callers),
+                # so the backoff wrapper can retry freely. Deadline
+                # propagates so the backoff respects the remaining
                 # generation budget (Task #4 cascade hardening).
-                async def _create_with_resilience() -> Any:
-                    return await self._call_with_backoff(
-                        _create_with_prefill_fallback,
-                        label="claude_create",
-                        deadline=deadline,
-                    )
-
                 try:
                     _live_outer = _remaining_utc_budget_s(deadline, floor_s=1.0)
                     _live_outer = float(_live_outer if _live_outer is not None else timeout_s)
                     msg = await asyncio.wait_for(
-                        _create_with_resilience(),
+                        self._claude_create_with_resilience(
+                            create_kwargs=_create_kwargs,
+                            messages=_messages,
+                            use_prefill=_use_prefill,
+                            deadline=deadline,
+                            timeout_s=timeout_s,
+                        ),
                         timeout=_live_outer,
                     )
                 except asyncio.TimeoutError as _te:
