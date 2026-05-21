@@ -76,6 +76,34 @@ logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
+# Session-aware clamp (PRD §session-budget-preflight)
+# -----------------------------------------------------------------------------
+# When the session_budget_authority has an active provider AND this
+# master is ON (default TRUE — fail-closed per operator), the per-op
+# cap derived by `_derive_cap` is clamped down to the remaining
+# session budget. This prevents the route × headroom × readonly
+# multipliers from authorizing a single op to exceed the session cap
+# (the load-bearing $0.10 → $0.1281 overage observed in
+# bt-2026-05-21-010600).
+#
+# Operator emergency override: set =false to revert to legacy
+# unclamped behavior. NEVER raises.
+
+_ENV_SESSION_CLAMP_ENABLED = "JARVIS_COST_GOVERNOR_SESSION_CLAMP_ENABLED"
+
+
+def _session_clamp_enabled() -> bool:
+    """Default TRUE per operator's 'fail-closed for spend authority
+    when a real session cap is active'. NEVER raises."""
+    try:
+        return os.environ.get(
+            _ENV_SESSION_CLAMP_ENABLED, "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — defensive
+        return True  # fail-closed default
+
+
+# -----------------------------------------------------------------------------
 # Env-var helpers
 # -----------------------------------------------------------------------------
 
@@ -437,6 +465,34 @@ class CostGovernor:
 
         # Clamp into [min_cap_usd, max_cap_usd]; protects against env typos.
         cap = max(cfg.min_cap_usd, min(cfg.max_cap_usd, raw_cap))
+
+        # PRD §session-budget-preflight: session-aware clamp.
+        # When a session_budget_authority provider is active (e.g. battle
+        # harness CostTracker) AND the master clamp env is ON (default),
+        # the per-op cap MUST NOT exceed remaining session budget. This
+        # closes the load-bearing $0.10 → $0.1281 overage observed in
+        # bt-2026-05-21-010600 where route[immediate]=5.0 × complexity ×
+        # headroom=3.0 authorized $1.20 per op against a $0.10 session cap.
+        if _session_clamp_enabled():
+            try:
+                from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                    get_session_remaining_usd,
+                )
+                session_remaining = get_session_remaining_usd()
+                if (
+                    session_remaining is not None
+                    and session_remaining < cap
+                ):
+                    # Honor min_cap_usd floor even under session pressure —
+                    # going below min_cap_usd would starve ops below the
+                    # operator's documented operational floor.
+                    cap = max(cfg.min_cap_usd, session_remaining)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[CostGovernor] session-aware clamp degraded: %s",
+                    exc,
+                )
+
         return cap, route_factor, complexity_factor
 
     # --------------------------------------------------------------

@@ -263,6 +263,22 @@ class BattleTestHarness:
             budget_usd=config.cost_cap_usd,
             persist_path=self._session_dir / "cost_tracker.json",
         )
+        # PRD §session-budget-preflight: register the CostTracker as
+        # the authoritative session-budget provider for governance.
+        # Adapter pattern — governance never imports battle_test; this
+        # harness side calls the registration. The duck-typed protocol
+        # (.remaining) means no type-import dependency either.
+        # NEVER raises (helper is defensive).
+        try:
+            from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                set_session_budget_provider,
+            )
+            set_session_budget_provider(self._cost_tracker)
+        except Exception as _sba_reg_exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Harness] session_budget_authority registration "
+                "degraded: %s", _sba_reg_exc,
+            )
         self._idle_watchdog = IdleWatchdog(timeout_s=config.idle_timeout_s)
         self._session_recorder = SessionRecorder(session_id=self._session_id)
         # Session-liveness probes — zero-arg callables returning True
