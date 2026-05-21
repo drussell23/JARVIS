@@ -768,34 +768,60 @@ def test_ast_pin_generate_raw_declares_nonlocal_total_cost():
 
 def test_ast_pin_generate_raw_size_within_phase_1_envelope():
     """PHASE_2_UPDATE: post-extraction the body shrinks dramatically.
-    This pin should be REMOVED in Phase 2, not updated."""
+
+    Original size at HEAD ``739321c1a6``: 1,035 lines (envelope
+    [900, 1200]).
+
+    Per-slice updates (the envelope re-tightens as extractions land):
+      * Slice 2A-iii / 2B-i / 2B-ii / 2B-iii: 1035 → 953 (still in
+        original envelope after first-floor relaxation).
+      * Slice 2C-i (this update): 953 → 712 — the heaviest cut. The
+        envelope retracts to [600, 800]. The substrate (
+        ``_ClaudeDispatchState`` + ``_ClaudeStreamContext``) is now
+        live; ``_claude_do_stream`` carries the 317-line streaming
+        body that used to live nested inside ``_generate_raw``."""
     node = _claude_generate_raw_node()
     size = (node.end_lineno or node.lineno) - node.lineno
-    # Sized at 1,035 lines on HEAD `739321c1a6`. Allow ±10% drift
-    # for normal incidental edits; a Phase 2 refactor will exceed
-    # this floor and trip the pin (which is the desired signal).
-    assert 900 <= size <= 1200, (
-        f"PHASE-1 pin: _generate_raw size {size} outside envelope "
-        f"[900, 1200]. Refactor in progress? Update this pin in "
-        f"Phase 2."
+    assert 600 <= size <= 800, (
+        f"PHASE-1 pin (Slice 2C-i update): _generate_raw size "
+        f"{size} outside envelope [600, 800]. Refactor in progress? "
+        f"Update this pin in tandem."
     )
 
 
 def test_ast_pin_generate_raw_calls_messages_stream_at_one_site():
     """PHASE_2_UPDATE: streaming may be extracted to its own method
-    in Phase 2; the single in-closure call site will move."""
-    node = _claude_generate_raw_node()
+    in Phase 2; the single in-closure call site will move.
+
+    Slice 2C-i update: ``messages.stream`` call site moved OUT of
+    ``_generate_raw`` when ``_do_stream`` extracted to
+    ``ClaudeProvider._claude_do_stream``. The contract this pin now
+    asserts: somewhere inside the ``ClaudeProvider`` class body
+    (either the closure OR an extracted ``_claude_*`` method) there
+    exists at least one ``messages.stream`` reference. Future slices
+    that move the stream path further MUST update this pin
+    accordingly."""
+    import inspect as _inspect
+    from backend.core.ouroboros.governance import providers as _p
+    src = _inspect.getsource(_p.ClaudeProvider)
+    tree = ast.parse(
+        f"class _Wrap:\n" + "\n".join(
+            "    " + line for line in src.splitlines()
+        )
+    )
     stream_sites = []
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Attribute) and sub.attr == "stream":
-            if (
-                isinstance(sub.value, ast.Attribute)
-                and sub.value.attr == "messages"
-            ):
-                stream_sites.append(sub.lineno)
+    for sub in ast.walk(tree):
+        if (
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "stream"
+            and isinstance(sub.value, ast.Attribute)
+            and sub.value.attr == "messages"
+        ):
+            stream_sites.append(sub.lineno)
     assert len(stream_sites) >= 1, (
-        "PHASE-1 pin: _generate_raw must contain at least one "
-        "`messages.stream` reference"
+        "PHASE-1 pin (Slice 2C-i update): ClaudeProvider must "
+        "contain at least one `messages.stream` reference across "
+        "the closure OR extracted class methods"
     )
 
 
@@ -845,13 +871,14 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
     closure-local helpers.
 
     Slice 2A-iii update: ``_boundary_audit_sampler`` extracted.
-    Slice 2B-i  update: ``_retrieve_stream_exc`` extracted.
-    Slice 2B-ii update: ``_create_with_prefill_fallback`` +
-    ``_create_with_resilience`` paired-extracted to
-    ``ClaudeProvider._claude_create_with_*`` methods. This pin's
-    required-list shrinks accordingly. The remaining anchor
-    (``_do_stream``) is the heaviest nested helper and the last to
-    extract (Slice 2C-i)."""
+    Slice 2B-i   update: ``_retrieve_stream_exc`` extracted.
+    Slice 2B-ii  update: ``_create_with_*`` pair extracted.
+    Slice 2B-iii update: ``_stream_with_*`` pair extracted.
+    Slice 2C-i   update: ``_do_stream`` extracted to
+    ``ClaudeProvider._claude_do_stream``. The required-list
+    contracts to ``_stream_fanout`` (the last small nested helper,
+    Slice 2C-ii's target). Future slices that extract or restructure
+    that helper MUST update this pin in tandem."""
     node = _claude_generate_raw_node()
     nested_names = set()
     for sub in ast.walk(node):
@@ -861,10 +888,10 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
         ):
             nested_names.add(sub.name)
     # We do not pin the EXACT set (over-constrains Phase 2). We pin
-    # that AT LEAST the heaviest remaining helper exists.
-    assert "_do_stream" in nested_names, (
-        f"PHASE-1 pin: _do_stream helper missing. Found: "
-        f"{sorted(nested_names)}"
+    # that AT LEAST the last remaining anchor exists.
+    assert "_stream_fanout" in nested_names, (
+        f"PHASE-1 pin (Slice 2C-i update): _stream_fanout helper "
+        f"missing. Found: {sorted(nested_names)}"
     )
 
 

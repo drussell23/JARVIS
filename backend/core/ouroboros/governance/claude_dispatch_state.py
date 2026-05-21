@@ -64,11 +64,15 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 
 CLAUDE_DISPATCH_STATE_SCHEMA_VERSION: str = (
     "claude_dispatch_state.v1"
+)
+CLAUDE_STREAM_CONTEXT_SCHEMA_VERSION: str = (
+    "claude_stream_context.v1"
 )
 
 
@@ -260,9 +264,183 @@ class _CumulativeCost:
             self._total = 0.0
 
 
+# Closed field set for the stream-context dataclass — adding requires
+# schema bump + paired AST pin update. Frozen by design (read-only
+# call context passed to the heavy stream-extraction helper).
+_CLAUDE_STREAM_CONTEXT_FIELD_NAMES: tuple = (
+    "context",
+    "deadline",
+    "timeout_s",
+    "effective_max_tokens",
+    "temperature",
+    "thinking_param",
+    "system_with_cache",
+    "messages",
+    "is_tool_round",
+    "prompt_chars",
+    "call_start",
+    "stream_callback",
+)
+
+
+@dataclass(frozen=True)
+class _ClaudeStreamContext:
+    """Frozen read-only call context for ClaudeProvider's
+    _claude_do_stream extraction (Slice 2C-i).
+
+    Bundles the 14 read-only captures the heavy stream helper
+    needs from its outer ``_generate_raw`` scope, leaving the
+    mutable per-dispatch state to :class:`_ClaudeDispatchState`.
+    The frozen-vs-mutable split is the load-bearing design
+    invariant — the helper RECEIVES this context as immutable
+    config + RECEIVES a separate mutable state to write into.
+
+    Field semantics (one-to-one with the closure's pre-extraction
+    captures, with the leading underscore stripped where the
+    closure used a hungarian-style name):
+
+      * ``context`` — :class:`OperationContext` from the caller;
+        the helper derives the truncated op_id from
+        ``getattr(context, "op_id", "?")[:24]``.
+      * ``deadline`` — :class:`datetime` UTC deadline for the
+        per-attempt budget; the helper computes the per-request
+        HTTPX timeout via the module-level
+        ``_remaining_utc_budget_s(deadline, floor_s=1.0)``.
+      * ``timeout_s`` — float fallback when the live budget
+        helper returns ``None``.
+      * ``effective_max_tokens`` — int passed to the SDK as
+        ``max_tokens``.
+      * ``temperature`` — float passed to the SDK.
+      * ``thinking_param`` — opaque (``Optional[Mapping[str, Any]]``)
+        thinking config; passed through to the SDK unchanged when
+        non-None.
+      * ``system_with_cache`` — the cached-system-blocks payload
+        passed to the SDK as ``system``.
+      * ``messages`` — the messages list passed to the SDK.
+        Mutated EXTERNALLY by the prefill-fallback wrapper (Slice
+        2B-iii) via ``.pop()``; the helper itself reads it but
+        does not write. The list IDENTITY is preserved across
+        prefill retries — the same list reference is passed in
+        twice with the trailing assistant turn popped.
+      * ``is_tool_round`` — bool, used in log lines only.
+      * ``prompt_chars`` — int, used in log lines only.
+      * ``call_start`` — float, monotonic timestamp of the call
+        beginning; the helper computes first-token latency as
+        ``(time.monotonic() - call_start) * 1000.0``.
+      * ``stream_callback`` — ``Optional[Callable[[str], None]]``
+        invoked per text-delta. The caller resolves this to one
+        of: tool-loop callback, render callback, fanout (both),
+        or None (headless). Swallow-on-callback-raise is the
+        helper's responsibility.
+
+    (The Phase-1 TTFT + Phase-2 inter-chunk rupture timeouts
+    are module-level imported functions
+    ``stream_rupture_timeout_s`` / ``stream_inter_chunk_timeout_s``
+    in ``providers.py`` — NOT in this ctx; the helper calls them
+    directly.)
+
+    Architectural notes:
+
+      * ``@dataclass(frozen=True)`` — attribute assignment after
+        construction raises ``FrozenInstanceError``. The CONTAINED
+        objects (``messages`` list, ``system_with_cache`` blocks,
+        ``thinking_param`` dict) are NOT deep-frozen — Python's
+        frozen-dataclass only freezes attribute REBINDING.
+        Mutation of the contained collections by other layers
+        (the prefill wrapper mutates ``messages.pop()`` from
+        outside) is by design.
+
+      * NO ``from_dict()``. This dataclass contains callables
+        (``stream_callback``), opaque SDK objects
+        (``thinking_param``), and a foreign-typed ``context``.
+        Faithful reconstruction from a dict is impossible; we do
+        not pretend otherwise. The :meth:`to_debug_dict` helper
+        below repr-stringifies non-JSON-friendly fields for
+        snapshot debugging only.
+
+      * NO defaults on any field. Every value must be supplied
+        explicitly at construction time. This prevents accidental
+        hardcoding of default ``temperature=0.0`` /
+        ``max_tokens=1024`` / ``deadline=...`` and matches the
+        operator-mandated "no defaults for context fields unless
+        the current code already has a real default" discipline.
+        Currently the closure has NO real defaults for any of
+        these — every cell is set explicitly before _do_stream
+        opens.
+    """
+
+    context: Any
+    deadline: datetime
+    timeout_s: float
+    effective_max_tokens: int
+    temperature: float
+    thinking_param: Optional[Mapping[str, Any]]
+    system_with_cache: Any
+    messages: List[Dict[str, Any]]
+    is_tool_round: bool
+    prompt_chars: int
+    call_start: float
+    stream_callback: Optional[Callable[[str], None]]
+
+    def to_debug_dict(self) -> Mapping[str, Any]:
+        """Snapshot the context as a plain-dict for logging /
+        debugging. Non-JSON-friendly fields are repr-stringified
+        (callables, foreign types). NEVER raises.
+
+        Note: this is the ONLY serialization surface. No
+        ``from_dict`` companion — callables cannot be
+        round-tripped, and we do not pretend otherwise."""
+        def _repr_safe(v: Any) -> Any:
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, (str, int, float, bool)):
+                    return v
+                if isinstance(v, (list, tuple)):
+                    return [_repr_safe(x) for x in v]
+                if isinstance(v, dict):
+                    return {
+                        str(k): _repr_safe(x) for k, x in v.items()
+                    }
+                # Foreign object / callable — repr-stringify with
+                # length cap to avoid log bloat.
+                return repr(v)[:200]
+            except Exception:  # noqa: BLE001 — defensive
+                return "<unrenderable>"
+
+        try:
+            deadline_iso = self.deadline.isoformat()
+        except Exception:  # noqa: BLE001
+            deadline_iso = repr(self.deadline)[:64]
+        try:
+            messages_len = len(self.messages)
+        except Exception:  # noqa: BLE001
+            messages_len = -1
+        return {
+            "schema_version": CLAUDE_STREAM_CONTEXT_SCHEMA_VERSION,
+            "context_repr": _repr_safe(self.context),
+            "deadline_iso": deadline_iso,
+            "timeout_s": float(self.timeout_s),
+            "effective_max_tokens": int(self.effective_max_tokens),
+            "temperature": float(self.temperature),
+            "thinking_param": _repr_safe(self.thinking_param),
+            "system_with_cache_repr": _repr_safe(
+                self.system_with_cache,
+            ),
+            "messages_len": messages_len,
+            "is_tool_round": bool(self.is_tool_round),
+            "prompt_chars": int(self.prompt_chars),
+            "call_start": float(self.call_start),
+            "stream_callback_repr": _repr_safe(self.stream_callback),
+        }
+
+
 __all__ = [
     "CLAUDE_DISPATCH_STATE_SCHEMA_VERSION",
+    "CLAUDE_STREAM_CONTEXT_SCHEMA_VERSION",
     "_CLAUDE_DISPATCH_STATE_FIELD_NAMES",
+    "_CLAUDE_STREAM_CONTEXT_FIELD_NAMES",
     "_ClaudeDispatchState",
+    "_ClaudeStreamContext",
     "_CumulativeCost",
 ]

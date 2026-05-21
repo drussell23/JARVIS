@@ -19,6 +19,7 @@ import ast
 import asyncio
 import base64
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -30,6 +31,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from backend.core.ouroboros.governance.claude_dispatch_state import (
+    _ClaudeDispatchState,
+    _ClaudeStreamContext,
+)
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -6808,6 +6813,344 @@ class ClaudeProvider:
             deadline=deadline,
         )
 
+    # ---------------------------------------------------------------------
+    # Slice 2C-i — the heavy extraction. _do_stream lifts out of
+    # _generate_raw as a class method that takes:
+    #
+    #   * state: _ClaudeDispatchState    — mutable output carrier
+    #     (six substrate fields mutated: raw_content / input_tokens /
+    #      output_tokens / cached_input / first_token_ms / last_msg)
+    #   * ctx:   _ClaudeStreamContext    — frozen 12-field read-only
+    #                                       call context
+    #
+    # This is the slice where _ClaudeDispatchState GOES LIVE for the
+    # first time. The dormant-substrate AST pin from Slice 2A-ii is
+    # deliberately FLIPPED in this same commit; the new pin asserts
+    # providers.py DOES import _ClaudeDispatchState + _ClaudeStreamContext.
+    #
+    # Ephemeral cells the method OWNS LOCALLY (NOT in ctx):
+    #
+    #   * first_raw_event_logged: List[bool] — shared via parameter
+    #     with the boundary-audit task (sibling class method, Slice
+    #     2A-iii). Initialized [False] at method entry; flipped [True]
+    #     on first raw SDK event.
+    #   * stream_first_token_at: List[Optional[float]] — first-text-
+    #     delta monotonic timestamp; same list-cell pattern preserved.
+    #   * _audit_task — Optional[asyncio.Task] tracking the boundary
+    #     audit sampler. Cancelled on first raw event.
+    #   * _stream_kwargs — built fresh per method invocation; never
+    #     captured from the outer closure (re-derived from ctx fields
+    #     + self._model + per-call live HTTPX timeout).
+    #   * _current_client — re-acquired via self._ensure_client() on
+    #     EVERY method invocation; the closure's re-acquisition
+    #     discipline (Session-13 / battle test bf1vf9icr) is
+    #     preserved exactly.
+    #   * _event_iter — fresh raw-event iterator from the SDK stream
+    #     context manager.
+    #   * _stream_chunk_count — local int counter for phase-aware
+    #     heartbeat.
+    #
+    # Byte-equivalence preserved exactly:
+    #
+    #   * Re-acquire client per attempt + live HTTPX timeout per
+    #     attempt (matching the closure's Session-13 discipline).
+    #   * Quiescence-core gate wraps the SDK stream exactly as today
+    #     (lazy-imported inside the method body, mirroring the
+    #     closure's lazy-import pattern).
+    #   * Boundary-log one-shot + boundary-audit sampler ENV-gates
+    #     unchanged.
+    #   * Raw-event iterator (NOT text_stream) — Task #88e's
+    #     thinking-delta resilience preserved.
+    #   * Phase-1 TTFT vs Phase-2 inter-chunk rupture: identical
+    #     two-phase break logic, using module-level
+    #     stream_rupture_timeout_s(thinking_enabled=...) +
+    #     stream_inter_chunk_timeout_s() (no ctx threading needed).
+    #   * StreamRuptureError fields identical (provider, elapsed_s,
+    #     bytes_received, rupture_timeout_s, phase).
+    #   * Stream callback swallow pattern unchanged (try/except
+    #     wrapping the callback call; None tolerated via the same
+    #     swallow path).
+    #   * Final message usage extraction: msg.usage.input_tokens /
+    #     output_tokens / cache_read_input_tokens identical, with
+    #     the same (TypeError, ValueError) guard around cached_input.
+    # ---------------------------------------------------------------------
+
+    async def _claude_do_stream(
+        self,
+        *,
+        state: "_ClaudeDispatchState",
+        ctx: "_ClaudeStreamContext",
+    ) -> None:
+        """Heavy streaming dispatch helper — see the class-level
+        Slice 2C-i comment block above for the design rationale.
+
+        Mutates ``state`` in place across 6 fields:
+          ``raw_content`` (accumulated text deltas),
+          ``input_tokens`` (final message usage),
+          ``output_tokens`` (final message usage),
+          ``cached_input`` (final message cache_read_input_tokens),
+          ``first_token_ms`` (TTFT in ms, set on first text token),
+          ``last_msg`` (the final SDK Message).
+
+        Reads ``ctx`` as a frozen 12-field read-only call context.
+
+        NEVER swallows exceptions silently except:
+          - The stream callback's exception (per the closure's
+            existing swallow contract — callback failures must
+            not break the stream consumer).
+          - The boundary-log try/except (log-only, per the closure).
+          - The boundary-audit-task spawn try/except (log-only).
+        Stream rupture raises StreamRuptureError (module-level
+        import); SDK exceptions propagate to the prefill-fallback /
+        resilience wrappers."""
+        # Re-acquire the client on every attempt so retries after
+        # _recycle_client() pick up the new generation instead of
+        # the original closure-captured instance. Without this,
+        # a hard_pool_signal recycle mid-backoff leaves _do_stream
+        # holding a .close()'d client — battle test bf1vf9icr.
+        _current_client = self._ensure_client()
+        _stream_kwargs: Dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": ctx.effective_max_tokens,
+            "temperature": ctx.temperature,
+            "system": ctx.system_with_cache,
+            "messages": ctx.messages,
+        }
+        if ctx.thinking_param is not None:
+            _stream_kwargs["thinking"] = ctx.thinking_param
+        # D2 (Task #95) + Task #100 — per-request httpx.Timeout from
+        # *live* UTC remaining budget (not the stale snapshot at
+        # method entry), so backoff retries cannot re-inflate the
+        # read window.
+        _live_http_budget = _remaining_utc_budget_s(
+            ctx.deadline, floor_s=1.0,
+        ) or ctx.timeout_s
+        _stream_kwargs["timeout"] = _derive_per_request_httpx_timeout(
+            _live_http_budget,
+        )
+        # Falsification-mode boundary log (operator-bound 2026-05-14):
+        # one-shot, additive, honest asyncio metrics. Env-gated.
+        if os.environ.get(
+            "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                _loop = asyncio.get_running_loop()
+                _all_tasks = asyncio.all_tasks(_loop)
+                _not_done = [t for t in _all_tasks if not t.done()]
+                _names_sample = [
+                    t.get_name() for t in _not_done[:12]
+                ]
+                logger.info(
+                    "[ClaudeProvider.stream.boundary] "
+                    "loop_id=%s tasks_total=%d tasks_not_done=%d "
+                    "thinking=%s prompt_chars=%d op_id=%s "
+                    "tasks_sample=%s",
+                    id(_loop), len(_all_tasks), len(_not_done),
+                    "on" if ctx.thinking_param is not None else "off",
+                    ctx.prompt_chars,
+                    str(getattr(ctx.context, "op_id", "?"))[:24],
+                    _names_sample,
+                )
+            except Exception:  # noqa: BLE001 — log-only, never raise
+                pass
+        # Local ephemeral cells (NOT in ctx — per operator's
+        # minimization-pass directive). Shared only with the
+        # boundary-audit task (via the parameter passed to
+        # _claude_boundary_audit_sampler).
+        _first_raw_event_logged: List[bool] = [False]
+        _stream_first_token_at: List[Optional[float]] = [None]
+        # Task #104 — Autonomous Quiescence Protocol (Core Isolation).
+        # Lazy import avoids a governance-package cycle at load.
+        from backend.core.ouroboros.governance.quiescence import (
+            quiescence_core_active as _quiescence_core_active,
+        )
+        async with _quiescence_core_active(label="claude_stream"), \
+                _current_client.messages.stream(**_stream_kwargs) as stream:
+            # Task #107 — Gate-adoption audit (additive, env-gated,
+            # operator-approved 2026-05-15). Self-terminating +
+            # hard-capped (never leak); log-only, never raises.
+            _audit_task: "Optional[asyncio.Task]" = None
+            if os.environ.get(
+                "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED", ""
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                try:
+                    _audit_interval_s = float(os.environ.get(
+                        "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_INTERVAL_S",
+                        "15.0",
+                    ))
+                except (TypeError, ValueError):
+                    _audit_interval_s = 15.0
+                if _audit_interval_s <= 0.0:
+                    _audit_interval_s = 15.0
+                _audit_thinking = (
+                    "on" if ctx.thinking_param is not None else "off"
+                )
+                _audit_op_id = str(
+                    getattr(ctx.context, "op_id", "?")
+                )[:24]
+                _audit_t0 = time.monotonic()
+                _audit_deadline = _audit_t0 + min(
+                    float(ctx.timeout_s) + 30.0, 900.0,
+                )
+                try:
+                    _audit_task = asyncio.create_task(
+                        self._claude_boundary_audit_sampler(
+                            interval_s=_audit_interval_s,
+                            first_raw_event_logged=(
+                                _first_raw_event_logged
+                            ),
+                            deadline=_audit_deadline,
+                            t0=_audit_t0,
+                            thinking_label=_audit_thinking,
+                            op_id=_audit_op_id,
+                        ),
+                        name="claude_stream_boundary_audit",
+                    )
+                except Exception:  # noqa: BLE001
+                    _audit_task = None
+            # Two-Phase Stream Rupture Breaker (Task #88e — raw-event
+            # iterator preserves thinking-delta activity-reset).
+            _thinking_active = (
+                "thinking" in _stream_kwargs
+                and _stream_kwargs["thinking"] is not None
+            )
+            _rupture_ttft = _stream_rupture_timeout_s(
+                thinking_enabled=_thinking_active,
+            )
+            _rupture_ic = _stream_inter_chunk_timeout_s()
+            # Derive the truncated op_id for activity-pulse identity.
+            _stream_op_id = str(
+                getattr(ctx.context, "op_id", "?")
+            )[:24]
+            _event_iter = stream.__aiter__()
+            _stream_chunk_count = 0
+            while True:
+                _wall_rem = _remaining_utc_budget_s(
+                    ctx.deadline, floor_s=0.01,
+                ) or ctx.timeout_s
+                _wall_rem = max(0.01, float(_wall_rem))
+                _rupt_base = (
+                    _rupture_ttft if _stream_first_token_at[0] is None
+                    else _rupture_ic
+                )
+                _chunk_timeout = min(_rupt_base, _wall_rem)
+                try:
+                    _event = await asyncio.wait_for(
+                        _event_iter.__anext__(),
+                        timeout=_chunk_timeout,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    _rupt_elapsed = time.monotonic() - ctx.call_start
+                    _rupt_phase = (
+                        "ttft" if _stream_first_token_at[0] is None
+                        else "inter_chunk"
+                    )
+                    logger.error(
+                        "[ClaudeProvider] STREAM RUPTURE "
+                        "(phase=%s): no event for %.0fs "
+                        "(elapsed=%.1fs, bytes=%d, "
+                        "tool_round=%s, thinking=%s)",
+                        _rupt_phase,
+                        _chunk_timeout,
+                        _rupt_elapsed,
+                        len(state.raw_content),
+                        "yes" if ctx.is_tool_round else "no",
+                        "on" if ctx.thinking_param is not None else "off",
+                    )
+                    raise StreamRuptureError(
+                        provider="claude-api",
+                        elapsed_s=_rupt_elapsed,
+                        bytes_received=len(state.raw_content),
+                        rupture_timeout_s=_chunk_timeout,
+                        phase=_rupt_phase,
+                    )
+                # Falsification first-raw-event marker (one-shot,
+                # flag-gated). Distinguishes "SDK silent" vs "SDK
+                # sends only thinking_delta" vs "consumer never
+                # scheduled."
+                if (
+                    not _first_raw_event_logged[0]
+                    and os.environ.get(
+                        "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
+                    ).strip().lower() in ("1", "true", "yes", "on")
+                ):
+                    _first_raw_event_logged[0] = True
+                    # Stop the boundary-audit sampler immediately
+                    # (it would self-terminate within one interval
+                    # anyway via the _first_raw_event_logged stop-
+                    # check — this just makes it tidy + instant).
+                    if _audit_task is not None and not _audit_task.done():
+                        _audit_task.cancel()
+                    try:
+                        _raw_ms = int(
+                            (time.monotonic() - ctx.call_start) * 1000
+                        )
+                        logger.info(
+                            "[ClaudeProvider.stream.first_raw_event] "
+                            "type=%s elapsed_ms=%d thinking=%s "
+                            "op_id=%s",
+                            getattr(_event, "type", "?"),
+                            _raw_ms,
+                            "on" if ctx.thinking_param is not None else "off",
+                            str(getattr(ctx.context, "op_id", "?"))[:24],
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Task #88e — Extract text only from text_delta events.
+                # Non-text events (thinking_delta, ping, message_start,
+                # content_block_start/stop, …) count as activity: they
+                # keep wait_for fresh on the next iteration and don't
+                # fire the rupture.
+                text = ""
+                _ev_type = getattr(_event, "type", "")
+                if _ev_type == "content_block_delta":
+                    _delta = getattr(_event, "delta", None)
+                    if _delta is not None and getattr(
+                        _delta, "type", "",
+                    ) == "text_delta":
+                        text = getattr(_delta, "text", "") or ""
+                if not text:
+                    # Activity-only event (thinking, ping, etc).
+                    continue
+                # Text token received — process it.
+                if _stream_first_token_at[0] is None:
+                    _stream_first_token_at[0] = time.monotonic()
+                    state.first_token_ms = (
+                        _stream_first_token_at[0] - ctx.call_start
+                    ) * 1000.0
+                    _emit_stream_activity(_stream_op_id)
+                state.raw_content += text
+                _stream_chunk_count += 1
+                # Phase-Aware Heartbeat — every Nth chunk pulses the
+                # activity hook so a 10-min generation that doesn't
+                # transition phase still looks fresh to
+                # ActivityMonitor.
+                if (
+                    _STREAM_ACTIVITY_CHUNK_INTERVAL > 0
+                    and _stream_chunk_count
+                    % _STREAM_ACTIVITY_CHUNK_INTERVAL == 0
+                ):
+                    _emit_stream_activity(_stream_op_id)
+                try:
+                    ctx.stream_callback(text)
+                except Exception:
+                    pass
+            # Get final message for usage stats.
+            msg = await stream.get_final_message()
+            state.last_msg = msg
+            state.input_tokens = getattr(msg.usage, "input_tokens", 0)
+            state.output_tokens = getattr(msg.usage, "output_tokens", 0)
+            try:
+                state.cached_input = int(
+                    getattr(
+                        msg.usage, "cache_read_input_tokens", 0,
+                    ) or 0
+                )
+            except (TypeError, ValueError):
+                state.cached_input = 0
+
     async def generate(
         self,
         context: OperationContext,
@@ -7209,341 +7552,55 @@ class ClaudeProvider:
             _call_start = time.monotonic()
 
             if _stream_callback is not None:
-                # Streaming path: tokens appear in TUI as they're generated
+                # Streaming path: tokens appear in TUI as they're generated.
+                #
+                # Slice 2C-i — the inline 317-line _do_stream closure has
+                # been extracted to ClaudeProvider._claude_do_stream as a
+                # class method that takes (state, ctx) where:
+                #
+                #   * state: _ClaudeDispatchState  — mutable; 6 fields
+                #     written by the helper (raw_content / input_tokens /
+                #     output_tokens / cached_input / first_token_ms /
+                #     last_msg)
+                #   * ctx:   _ClaudeStreamContext  — frozen; 12 read-only
+                #     fields bundling effective_max_tokens / temperature /
+                #     thinking_param / system_with_cache / messages /
+                #     is_tool_round / prompt_chars / call_start /
+                #     deadline / timeout_s / stream_callback / context
+                #
+                # The closure-level _stream_first_token_at,
+                # _first_raw_event_logged, and _stream_op_id cells that
+                # the original _do_stream needed are now LOCAL to the
+                # extracted method (per operator's minimization-pass
+                # directive — they're ephemeral stream-mutation state,
+                # not part of the substrate's frozen 8-field taxonomy).
+                #
+                # raw_content / input_tokens / output_tokens /
+                # _cached_input remain as _generate_raw-scope locals for
+                # downstream consumption; boundary translation (after
+                # the stream task awaits cleanly) writes state.* back
+                # into the locals before downstream code reads them.
                 raw_content = ""
                 input_tokens = 0
                 output_tokens = 0
                 _cached_input = 0
-                _stream_first_token_at: List[Optional[float]] = [None]
-                # Falsification-mode first-raw-event log state (operator-
-                # bound 2026-05-14): one-shot flag for the very first
-                # SDK event arrival regardless of type, so we can split
-                # "SDK never sends" from "SDK sends thinking_delta only"
-                # from "consumer never scheduled".  Set inside the
-                # iterator the first time _event returns successfully.
-                _first_raw_event_logged: List[bool] = [False]
-                # Closure-captured op_id for stream-tick activity hook.
-                # Move 2 v4 Phase-Aware Heartbeats: read once here so the
-                # nested _do_stream can pulse the harness ActivityMonitor.
-                _stream_op_id = str(getattr(context, "op_id", "") or "")
+                _stream_state = _ClaudeDispatchState()
+                _stream_ctx = _ClaudeStreamContext(
+                    context=context,
+                    deadline=deadline,
+                    timeout_s=timeout_s,
+                    effective_max_tokens=_effective_max_tokens,
+                    temperature=_temperature,
+                    thinking_param=_thinking_param,
+                    system_with_cache=_system_with_cache,
+                    messages=_messages,
+                    is_tool_round=_is_tool_round,
+                    prompt_chars=_prompt_chars,
+                    call_start=_call_start,
+                    stream_callback=_stream_callback,
+                )
+                _SENTINEL_DO_STREAM_PLACEHOLDER = None  # NOQA — pin anchor
 
-                async def _do_stream() -> None:
-                    nonlocal raw_content, input_tokens, output_tokens, _cached_input
-                    # Re-acquire the client on every attempt so retries after
-                    # _recycle_client() pick up the new generation instead of
-                    # the original closure-captured instance. Without this,
-                    # a hard_pool_signal recycle mid-backoff leaves _do_stream
-                    # holding a .close()'d client and the next retry fails
-                    # with "Cannot send a request, as the client has been
-                    # closed" — battle test bf1vf9icr session.
-                    _current_client = self._ensure_client()
-                    _stream_kwargs: Dict[str, Any] = {
-                        "model": self._model,
-                        "max_tokens": _effective_max_tokens,
-                        "temperature": _temperature,
-                        "system": _system_with_cache,
-                        "messages": _messages,
-                    }
-                    if _thinking_param is not None:
-                        _stream_kwargs["thinking"] = _thinking_param
-                    # D2 (Task #95) + Task #100 — per-request httpx.Timeout
-                    # from *live* UTC remaining budget (not the stale
-                    # ``timeout_s`` snapshot at _generate_raw entry), so
-                    # backoff retries cannot re-inflate the read window.
-                    _live_http_budget = _remaining_utc_budget_s(
-                        deadline, floor_s=1.0,
-                    ) or timeout_s
-                    _stream_kwargs["timeout"] = _derive_per_request_httpx_timeout(
-                        _live_http_budget,
-                    )
-                    # Falsification-mode boundary log (operator-bound 2026-05-14):
-                    # one-shot, additive, honest asyncio metrics — fires when
-                    # JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED=true (default
-                    # false; reusable env knob, no new substrate seed).
-                    # Surfaces loop crowdedness at the exact moment the stream
-                    # consumer is about to be installed — helps separate
-                    # "SDK never sends" from "consumer never scheduled".
-                    if os.environ.get(
-                        "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
-                    ).strip().lower() in ("1", "true", "yes", "on"):
-                        try:
-                            _loop = asyncio.get_running_loop()
-                            _all_tasks = asyncio.all_tasks(_loop)
-                            _not_done = [t for t in _all_tasks if not t.done()]
-                            _names_sample = [
-                                t.get_name() for t in _not_done[:12]
-                            ]
-                            logger.info(
-                                "[ClaudeProvider.stream.boundary] "
-                                "loop_id=%s tasks_total=%d tasks_not_done=%d "
-                                "thinking=%s prompt_chars=%d op_id=%s "
-                                "tasks_sample=%s",
-                                id(_loop), len(_all_tasks), len(_not_done),
-                                "on" if _thinking_param is not None else "off",
-                                _prompt_chars,
-                                str(getattr(context, "op_id", "?"))[:24],
-                                _names_sample,
-                            )
-                        except Exception:  # noqa: BLE001 — log-only, never raise
-                            pass
-                    # Task #104 — Autonomous Quiescence Protocol (Core
-                    # Isolation).  Wrapping the stream's critical network
-                    # section in quiescence_core_active CLEARS the global
-                    # quiescence gate for the stream's lifetime: every
-                    # heavy background loop that awaits the gate parks at
-                    # 0% CPU, handing 100% of the event loop to the SDK
-                    # consumer.  Last concurrent stream to exit RESETS
-                    # the gate (refcounted for the BG pool's workers).
-                    # Combined async-with keeps the stream body un-
-                    # reindented; CM enter precedes stream open, CM exit
-                    # follows stream close — correct nesting.  Lazy
-                    # import avoids a governance-package cycle at load.
-                    from backend.core.ouroboros.governance.quiescence import (
-                        quiescence_core_active as _quiescence_core_active,
-                    )
-                    async with _quiescence_core_active(label="claude_stream"), \
-                            _current_client.messages.stream(**_stream_kwargs) as stream:
-                        # Task #107 — Gate-adoption audit (additive,
-                        # env-gated, operator-approved 2026-05-15).  The
-                        # one-shot [stream.boundary] above samples only at
-                        # stream ENTRY; it cannot see WHAT stays runnable
-                        # DURING the minutes-long thinking=on no-byte
-                        # window (the Tier-C 20–158s gap).  This bounded
-                        # concurrent sampler periodically snapshots the
-                        # not-done task population until the first raw
-                        # event arrives, so a thinking=on-vs-off diff can
-                        # NAME the ungated task family.  Gated by its OWN
-                        # default-false flag (distinct from the one-shot
-                        # boundary flag); self-terminating + hard-capped
-                        # so it can never leak; log-only, never raises.
-                        _audit_task: "Optional[asyncio.Task]" = None
-                        if os.environ.get(
-                            "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_ENABLED", ""
-                        ).strip().lower() in ("1", "true", "yes", "on"):
-                            try:
-                                _audit_interval_s = float(os.environ.get(
-                                    "JARVIS_CLAUDE_STREAM_BOUNDARY_AUDIT_INTERVAL_S",
-                                    "15.0",
-                                ))
-                            except (TypeError, ValueError):
-                                _audit_interval_s = 15.0
-                            if _audit_interval_s <= 0.0:
-                                _audit_interval_s = 15.0
-                            _audit_thinking = (
-                                "on" if _thinking_param is not None else "off"
-                            )
-                            _audit_op_id = str(
-                                getattr(context, "op_id", "?")
-                            )[:24]
-                            _audit_t0 = time.monotonic()
-                            _audit_deadline = _audit_t0 + min(
-                                float(timeout_s) + 30.0, 900.0,
-                            )
-
-                            # Slice 2A-iii — the sampler body extracted to
-                            # ClaudeProvider._claude_boundary_audit_sampler
-                            # as a class method; all six captures threaded
-                            # explicitly (no closure-cell capture beyond the
-                            # single shared `first_raw_event_logged` list).
-                            # Byte-equivalent telemetry; cleaner extraction
-                            # seam for the upcoming _do_stream refactor.
-                            try:
-                                _audit_task = asyncio.create_task(
-                                    self._claude_boundary_audit_sampler(
-                                        interval_s=_audit_interval_s,
-                                        first_raw_event_logged=(
-                                            _first_raw_event_logged
-                                        ),
-                                        deadline=_audit_deadline,
-                                        t0=_audit_t0,
-                                        thinking_label=_audit_thinking,
-                                        op_id=_audit_op_id,
-                                    ),
-                                    name="claude_stream_boundary_audit",
-                                )
-                            except Exception:  # noqa: BLE001
-                                _audit_task = None
-                        # Two-Phase Stream Rupture Breaker.
-                        # Phase 1 (TTFT): generous default 120s for first
-                        #   token.  Task #88 (2026-05-13) — widened to
-                        #   360s when ``thinking=on`` is in the SDK
-                        #   kwargs.
-                        # Phase 2 (Inter-Chunk): tight 30s once tokens flow.
-                        #
-                        # Task #88e (2026-05-13) — raw-event consumption.
-                        # v14-rev9 proved the harness STOP condition:
-                        # 'first_token=NEVER bytes_received=0 elapsed=368.9s
-                        # thinking=on' even after all four budget layers
-                        # widened to 360s.  Standalone repro (task_88e_repro.py)
-                        # showed identical config + payload streams text in
-                        # 12s and thinking_delta in 0.001s — bug was the
-                        # SDK's ``stream.text_stream`` filter, which yields
-                        # ONLY content_block_delta(type='text_delta') events
-                        # to its consumer.  During the entire reasoning
-                        # phase Claude emits thinking_delta events instead;
-                        # text_stream consumer sees silence and the TTFT
-                        # wait_for fires falsely.
-                        #
-                        # Fix per operator binding 2026-05-13: 'no cancel
-                        # before first byte unless outer budget truly
-                        # expired'.  Consume raw events from the stream
-                        # iterator (which yields ALL events: message_start,
-                        # content_block_start, thinking_delta, ping,
-                        # text_delta, …).  Any event arrival resets the
-                        # TTFT wait_for — the model is producing.  Text is
-                        # extracted manually from content_block_delta
-                        # events whose delta.type == "text_delta".  Rupture
-                        # fires only on TRUE silence (no events of any
-                        # type for the rupture window).
-                        _thinking_active = (
-                            "thinking" in _stream_kwargs
-                            and _stream_kwargs["thinking"] is not None
-                        )
-                        _rupture_ttft = _stream_rupture_timeout_s(
-                            thinking_enabled=_thinking_active,
-                        )
-                        _rupture_ic = _stream_inter_chunk_timeout_s()
-                        # Task #88e: raw-event iterator instead of text_stream.
-                        # The wait_for now measures stream-level silence,
-                        # not text-only silence.
-                        _event_iter = stream.__aiter__()
-                        # Phase-Aware Heartbeat counter — every Nth chunk
-                        # pulses the harness ActivityMonitor so long
-                        # GENERATEs stay observably fresh.
-                        _stream_chunk_count = 0
-                        while True:
-                            _wall_rem = _remaining_utc_budget_s(
-                                deadline, floor_s=0.01,
-                            ) or timeout_s
-                            _wall_rem = max(0.01, float(_wall_rem))
-                            _rupt_base = (
-                                _rupture_ttft if _stream_first_token_at[0] is None
-                                else _rupture_ic
-                            )
-                            _chunk_timeout = min(_rupt_base, _wall_rem)
-                            try:
-                                _event = await asyncio.wait_for(
-                                    _event_iter.__anext__(),
-                                    timeout=_chunk_timeout,
-                                )
-                            except StopAsyncIteration:
-                                break
-                            except asyncio.TimeoutError:
-                                _rupt_elapsed = time.monotonic() - _call_start
-                                _rupt_phase = (
-                                    "ttft" if _stream_first_token_at[0] is None
-                                    else "inter_chunk"
-                                )
-                                logger.error(
-                                    "[ClaudeProvider] STREAM RUPTURE "
-                                    "(phase=%s): no event for %.0fs "
-                                    "(elapsed=%.1fs, bytes=%d, "
-                                    "tool_round=%s, thinking=%s)",
-                                    _rupt_phase,
-                                    _chunk_timeout,
-                                    _rupt_elapsed,
-                                    len(raw_content),
-                                    "yes" if _is_tool_round else "no",
-                                    "on" if _thinking_param is not None else "off",
-                                )
-                                raise StreamRuptureError(
-                                    provider="claude-api",
-                                    elapsed_s=_rupt_elapsed,
-                                    bytes_received=len(raw_content),
-                                    rupture_timeout_s=_chunk_timeout,
-                                    phase=_rupt_phase,
-                                )
-                            # Falsification first-raw-event marker
-                            # (one-shot, flag-gated).  Logs the very first
-                            # SDK event arrival WITH its type so we can
-                            # distinguish "SDK silent" vs "SDK sends only
-                            # thinking_delta" vs "consumer never scheduled."
-                            if (
-                                not _first_raw_event_logged[0]
-                                and os.environ.get(
-                                    "JARVIS_CLAUDE_STREAM_BOUNDARY_LOG_ENABLED", ""
-                                ).strip().lower() in ("1", "true", "yes", "on")
-                            ):
-                                _first_raw_event_logged[0] = True
-                                # Task #107 — first raw event arrived;
-                                # stop the boundary-audit sampler
-                                # immediately (it would self-terminate
-                                # within one interval anyway via the
-                                # _first_raw_event_logged stop-check —
-                                # this just makes it tidy + instant).
-                                if _audit_task is not None and not _audit_task.done():
-                                    _audit_task.cancel()
-                                try:
-                                    _raw_ms = int(
-                                        (time.monotonic() - _call_start) * 1000
-                                    )
-                                    logger.info(
-                                        "[ClaudeProvider.stream.first_raw_event] "
-                                        "type=%s elapsed_ms=%d thinking=%s "
-                                        "op_id=%s",
-                                        getattr(_event, "type", "?"),
-                                        _raw_ms,
-                                        "on" if _thinking_param is not None else "off",
-                                        str(getattr(context, "op_id", "?"))[:24],
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            # Task #88e — Extract text only from text_delta
-                            # events.  Non-text events (thinking_delta,
-                            # ping, message_start, content_block_start,
-                            # content_block_stop, …) count as activity:
-                            # they keep the wait_for fresh on the next
-                            # iteration and don't fire the rupture.
-                            text = ""
-                            _ev_type = getattr(_event, "type", "")
-                            if _ev_type == "content_block_delta":
-                                _delta = getattr(_event, "delta", None)
-                                if _delta is not None and getattr(
-                                    _delta, "type", "",
-                                ) == "text_delta":
-                                    text = getattr(_delta, "text", "") or ""
-                            if not text:
-                                # Activity-only event (thinking, ping, etc).
-                                # Loop to next __anext__() — wait_for resets
-                                # naturally because we re-enter the await.
-                                continue
-                            # Text token received — process it.
-                            if _stream_first_token_at[0] is None:
-                                _stream_first_token_at[0] = time.monotonic()
-                                _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
-                                # Phase 2: inter-chunk rupture base (combined
-                                # with live wall each loop iteration below).
-                                # First token also pulses activity so the
-                                # transition from "waiting for TTFT" to
-                                # "actively producing" is observable.
-                                _emit_stream_activity(_stream_op_id)
-                            raw_content += text
-                            _stream_chunk_count += 1
-                            # Phase-Aware Heartbeat — every Nth chunk pulse
-                            # the activity hook so a 10-min generation that
-                            # doesn't transition phase still looks fresh to
-                            # ActivityMonitor. Cheap (no I/O), throttled.
-                            if (
-                                _STREAM_ACTIVITY_CHUNK_INTERVAL > 0
-                                and _stream_chunk_count
-                                % _STREAM_ACTIVITY_CHUNK_INTERVAL == 0
-                            ):
-                                _emit_stream_activity(_stream_op_id)
-                            try:
-                                _stream_callback(text)
-                            except Exception:
-                                pass
-                        # Get final message for usage stats
-                        msg = await stream.get_final_message()
-                        _last_msg[0] = msg
-                        input_tokens = getattr(msg.usage, "input_tokens", 0)
-                        output_tokens = getattr(msg.usage, "output_tokens", 0)
-                        try:
-                            _cached_input = int(
-                                getattr(msg.usage, "cache_read_input_tokens", 0) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _cached_input = 0
 
                 # Slice 2B-iii — the inline stream-pair was extracted to
                 # ClaudeProvider._claude_stream_with_prefill_fallback +
@@ -7582,12 +7639,31 @@ class ClaudeProvider:
                 _hard_kill_budget_s = (
                     _soft_wall_rem + _CLAUDE_STREAM_HARD_KILL_GRACE_S
                 )
+                # Slice 2C-i — _do_stream is now the
+                # ClaudeProvider._claude_do_stream class method. Bind
+                # state + ctx via functools.partial to produce the
+                # 0-arg async-callable shape _claude_stream_with_
+                # resilience requires (do_stream_fn:
+                # Callable[[], Awaitable[None]]). The progress_probe
+                # lambda now reads state.raw_content instead of the
+                # outer-scope local — by the time the stream callback
+                # fires any text, the helper has already mutated
+                # state.raw_content. Boundary translation back to the
+                # outer locals (raw_content / input_tokens / etc.)
+                # happens AFTER the stream task completes (post-await
+                # block below).
                 _stream_task = asyncio.create_task(
                     self._claude_stream_with_resilience(
-                        do_stream_fn=_do_stream,
+                        do_stream_fn=functools.partial(
+                            self._claude_do_stream,
+                            state=_stream_state,
+                            ctx=_stream_ctx,
+                        ),
                         messages=_messages,
                         use_prefill=_use_prefill,
-                        progress_probe=lambda: bool(raw_content),
+                        progress_probe=lambda: bool(
+                            _stream_state.raw_content,
+                        ),
                         deadline=deadline,
                     ),
                 )
@@ -7666,7 +7742,20 @@ class ClaudeProvider:
                     # were 56-60s; outer won and the rich TimeoutError
                     # message below never ran).
                     _elapsed = time.monotonic() - _call_start
-                    _ttft = _stream_first_token_at[0]
+                    # Slice 2C-i: derive _ttft (absolute monotonic
+                    # timestamp) from state.first_token_ms (duration
+                    # in ms since _call_start) — the substrate now
+                    # owns the first-token telemetry that
+                    # _stream_first_token_at[0] previously held in the
+                    # closure scope. The reconstruction is
+                    # mathematically equivalent: state.first_token_ms
+                    # was set as (_stream_first_token_at[0] -
+                    # _call_start) * 1000.0 inside _claude_do_stream.
+                    _ttft = (
+                        _call_start + _stream_state.first_token_ms / 1000.0
+                        if _stream_state.first_token_ms is not None
+                        else None
+                    )
                     _ttft_str = (
                         f"{_ttft - _call_start:.1f}s" if _ttft is not None
                         else "NEVER"
@@ -7679,7 +7768,7 @@ class ClaudeProvider:
                         _elapsed,
                         timeout_s,
                         _ttft_str,
-                        len(raw_content),
+                        len(_stream_state.raw_content),
                         "yes" if _is_tool_round else "no",
                         "on" if _thinking_param is not None else "off",
                     )
@@ -7715,10 +7804,23 @@ class ClaudeProvider:
                     raise asyncio.TimeoutError(
                         f"claude stream timed out after {_elapsed:.1f}s "
                         f"(budget={timeout_s:.1f}s, first_token={_ttft_str}, "
-                        f"bytes_received={len(raw_content)}, "
+                        f"bytes_received={len(_stream_state.raw_content)}, "
                         f"tool_round={'yes' if _is_tool_round else 'no'}, "
                         f"thinking={'on' if _thinking_param is not None else 'off'})"
                     ) from _te
+                # Slice 2C-i — boundary translation: write the
+                # extracted helper's state back into the surrounding
+                # _generate_raw locals so all downstream code (cost
+                # estimation, latency emission, candidate parsing,
+                # cache observation, finalize) reads the post-stream
+                # values without any further refactor.
+                raw_content = _stream_state.raw_content
+                input_tokens = _stream_state.input_tokens
+                output_tokens = _stream_state.output_tokens
+                _cached_input = _stream_state.cached_input
+                _first_token_ms[0] = _stream_state.first_token_ms
+                if _stream_state.last_msg is not None:
+                    _last_msg[0] = _stream_state.last_msg
             else:
                 # Non-streaming fallback
                 _create_kwargs: Dict[str, Any] = {
