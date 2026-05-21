@@ -130,6 +130,14 @@ EVENT_TYPE_POSTURE_CHANGED = "posture_changed"
 EVENT_TYPE_FLAG_TYPO_DETECTED = "flag_typo_detected"
 EVENT_TYPE_FLAG_REGISTERED = "flag_registered"
 
+# Slice 7d (Provider Cancellation Guarantee) — emitted when the
+# BoundedCancellationGuard's loop.call_later deadline fires before
+# the streaming __aexit__ chain releases. Carries the overrun
+# magnitude + provider + op_id for ML-bench training rows + IDE
+# alerting. Single event; payload below carries the full record.
+# Keyed by op_id (one overrun per (provider, op_id) instance).
+EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED = "cancellation_overrun_detected"
+
 # SensorGovernor + MemoryPressureGate (Wave 1 #3 Slice 3) vocabulary.
 EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
@@ -1430,6 +1438,9 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # distinct from task_* TaskBoard events; consumed by
                                                   # SWE-Bench-Pro Phase B.2.2 evaluator + IDE clients
                                                   # tracking full-op lifecycle, not just tool-call boards)
+    EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED,    # Slice 7d (Provider Cancellation Guarantee — fires
+                                                  # when BoundedCancellationGuard's deadline expires
+                                                  # before the streaming __aexit__ chain releases)
 })
 
 
@@ -2707,6 +2718,70 @@ def publish_flag_typo_event(
         )
     except Exception:  # noqa: BLE001 — best-effort
         logger.debug("[Stream] publish_flag_typo_event exception", exc_info=True)
+        return None
+
+
+def publish_cancellation_overrun(
+    *,
+    overrun_s: float,
+    provider: str,
+    op_id: str = "",
+    deadline_s: float = 0.0,
+    grace_ms: int = 0,
+) -> Optional[str]:
+    """Slice 7d (Provider Cancellation Guarantee) publisher.
+
+    Fires from ``BoundedCancellationGuard._fire_abort`` (Slice 7b)
+    when the loop.call_later deadline expires before the streaming
+    __aexit__ chain releases. Best-effort + bounded payload + NEVER
+    raises (the probe is non-authoritative; a failed publish
+    silently degrades).
+
+    Parameters
+    ----------
+    overrun_s:
+        Seconds beyond ``deadline_s`` that the stream took to
+        release. Always positive on the abort path.
+    provider:
+        Short identifier (``"claude"``, ``"doubleword"``, etc.) so
+        IDE alerts can route by provider.
+    op_id:
+        Causal op id when known (carries the per-task association
+        from the EvaluatorTraceObserver / orchestrator surface).
+    deadline_s:
+        The configured ``BoundedCancellationGuard.deadline_s``
+        (for ML-bench tagging — distinguishes "tight bounds OK"
+        from "loose bounds bad").
+    grace_ms:
+        The configured grace; combined with overrun_s gives
+        downstream consumers everything they need without
+        re-reading env knobs.
+
+    Returns
+    -------
+    Optional[str]
+        Event id on success; ``None`` when the stream is disabled,
+        broker is unavailable, or publish raised.
+    """
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED,
+            op_id or "cancellation_overrun",
+            {
+                "overrun_s": float(overrun_s),
+                "provider": str(provider)[:64],
+                "op_id": str(op_id)[:64],
+                "deadline_s": float(deadline_s),
+                "grace_ms": int(grace_ms),
+            },
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[Stream] publish_cancellation_overrun exception",
+            exc_info=True,
+        )
         return None
 
 

@@ -6964,8 +6964,74 @@ class ClaudeProvider:
         from backend.core.ouroboros.governance.quiescence import (
             quiescence_core_active as _quiescence_core_active,
         )
-        async with _quiescence_core_active(label="claude_stream"), \
+        # Slice 7d (Provider Cancellation Guarantee) — wrap the
+        # streaming context with the BoundedCancellationGuard
+        # (Slice 7b primitive, PR #50696). The guard schedules a
+        # loop.call_later deadline of ``ctx.timeout_s`` + grace; if
+        # the streaming __aexit__ chain hasn't released by then, it
+        # surgically aborts the per-FD transport (no shared-pool
+        # collateral) and emits cancellation_overrun_detected via
+        # the canonical StreamEventBroker.
+        #
+        # Master flag JARVIS_BOUNDED_CANCELLATION_GUARD_ENABLED
+        # defaults TRUE post Slice 7d graduation; explicit "false"
+        # opts back to the legacy 47-second ghost path.
+        #
+        # The on_overrun callback uses the publish helper from
+        # ide_observability_stream — lazy-imported to avoid a
+        # governance-package cycle (same pattern as the
+        # quiescence import above).
+        from backend.core.ouroboros.governance.bounded_cancellation_guard import (  # noqa: E501
+            BoundedCancellationGuard as _BoundedCancellationGuard,
+        )
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            publish_cancellation_overrun as _publish_cancellation_overrun,
+        )
+
+        _bcg_op_id = str(getattr(ctx.context, "op_id", "") or "")
+        _bcg_deadline_s = float(ctx.timeout_s or 0.0)
+
+        def _bcg_on_overrun(overrun_s: float) -> None:
+            try:
+                _publish_cancellation_overrun(
+                    overrun_s=overrun_s,
+                    provider="claude",
+                    op_id=_bcg_op_id,
+                    deadline_s=_bcg_deadline_s,
+                    grace_ms=_bcg_guard.grace_ms,
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.debug(
+                    "[ClaudeProvider] publish_cancellation_overrun "
+                    "raised — ignoring",
+                )
+
+        _bcg_guard = _BoundedCancellationGuard(
+            deadline_s=_bcg_deadline_s,
+            on_overrun=_bcg_on_overrun,
+        )
+
+        async with _bcg_guard, \
+                _quiescence_core_active(label="claude_stream"), \
                 _current_client.messages.stream(**_stream_kwargs) as stream:
+            # Slice 7d arm — best-effort transport extraction. The
+            # Anthropic SDK uses httpx under the hood; if the
+            # ClientResponse / Transport shape isn't reachable
+            # through the stream object, arm() returns False and
+            # the guard becomes telemetry-only (loop.call_later
+            # still fires; overrun is still detected + published;
+            # surgical abort degrades to the legacy
+            # cooperative-cancel path).
+            try:
+                _candidate_resp = getattr(stream, "response", None) \
+                    or getattr(stream, "_response", None)
+                if _candidate_resp is not None:
+                    _bcg_guard.arm(_candidate_resp)
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[ClaudeProvider] BoundedCancellationGuard "
+                    "arm: defensive skip",
+                )
             # Task #107 — Gate-adoption audit (additive, env-gated,
             # operator-approved 2026-05-15). Self-terminating +
             # hard-capped (never leak); log-only, never raises.

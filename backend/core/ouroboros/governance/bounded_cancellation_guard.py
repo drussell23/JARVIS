@@ -117,14 +117,20 @@ _GRACE_MS_MAX: int = 5000    # above this, the bound stops being meaningful
 
 
 def guard_enabled() -> bool:
-    """Master gate. Default FALSE per §33.1 (substrate ships first;
-    wiring slice 7d flips this TRUE). NEVER raises."""
+    """Master gate. Default **TRUE** (graduated in Slice 7d after
+    the Slice 7b primitive soaked — safety guardrail per §33.1
+    inverse for primitives that ship safe-by-default once their
+    behavioural soak is clean). NEVER raises.
+
+    Explicit ``"false"`` / ``"0"`` / ``"off"`` opts the guard out
+    (returns the pre-Slice-7d 47-second ghost path). Any other
+    value (or unset) returns TRUE."""
     try:
-        return os.environ.get(_MASTER_FLAG_ENV, "").strip().lower() in (
-            "1", "true", "yes", "on",
+        return os.environ.get(_MASTER_FLAG_ENV, "").strip().lower() not in (
+            "0", "false", "no", "off",
         )
     except Exception:  # noqa: BLE001
-        return False
+        return True
 
 
 def _resolve_grace_ms() -> int:
