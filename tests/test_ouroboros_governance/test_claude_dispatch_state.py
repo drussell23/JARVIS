@@ -73,19 +73,22 @@ _PROVIDERS_FILE = Path(
 #                             _create_with_resilience PAIRED extracted;
 #                             closure 1011 → 977 lines (-34),
 #                             6 → 4 nested helpers)
-# Slice 2B-iii   (this PR):   12e0e0f314d8370918858c38d667601c91aa0130
+# Slice 2B-iii   (PR #49641): 12e0e0f314d8370918858c38d667601c91aa0130
 #                             (_stream_with_prefill_fallback +
-#                             _stream_with_resilience PAIRED extracted
-#                             as ClaudeProvider async class methods;
-#                             closure 977 → 953 lines (-24), 4 → 2
-#                             nested helpers. Substrate-import dormancy
-#                             preserved: the progress_probe lambda
-#                             over raw_content stays at the call site
-#                             inside _generate_raw; the extracted
-#                             method accepts the probe as an opaque
-#                             Callable[[], bool] parameter.)
+#                             _stream_with_resilience PAIRED extracted;
+#                             closure 977 → 953 lines, 4 → 2 nested)
+# Slice 2C-i     (this PR):   42ba72372c7024d61c7f545c7c9994eccea774f5
+#                             (_do_stream extracted as ClaudeProvider
+#                             ._claude_do_stream(state, ctx) — the
+#                             heaviest cut. Closure 953 → 712 lines
+#                             (-241), 2 → 1 nested helpers. SUBSTRATE
+#                             GOES LIVE: providers.py now imports
+#                             _ClaudeDispatchState + _ClaudeStreamContext;
+#                             the dormancy AST pin is DELIBERATELY
+#                             FLIPPED in this same commit to a
+#                             positive-presence import pin.)
 _PROVIDERS_SHA_LOCK = (
-    "12e0e0f314d8370918858c38d667601c91aa0130"
+    "42ba72372c7024d61c7f545c7c9994eccea774f5"
 )
 
 
@@ -461,64 +464,50 @@ def test_ast_pin_cumulative_cost_has_closed_interface():
     pytest.fail("_CumulativeCost not found")
 
 
-def test_ast_pin_providers_does_not_import_dispatch_state_yet():
-    """Substrate-import dormancy invariant. ``providers.py`` MUST
-    NOT import from ``claude_dispatch_state`` until a STATEFUL
-    helper extraction lands.
+def test_ast_pin_providers_imports_claude_dispatch_state_substrate():
+    """SUBSTRATE-LIVE INVARIANT — positive-presence pin.
 
-    Slice 2A-iii extracted ``_boundary_audit_sampler`` — a PURE
-    telemetry observer that does not touch any of the 5 nonlocals /
-    4 outer captures the substrate targets.
+    Slice 2C-i FLIPPED the dormancy pin: ``providers.py`` now imports
+    ``_ClaudeDispatchState`` AND ``_ClaudeStreamContext`` from
+    ``claude_dispatch_state``. This is the load-bearing structural
+    transition the substrate was designed for — the
+    ``_claude_do_stream`` class method takes them as keyword-only
+    parameters (``state`` + ``ctx``) and the caller in
+    ``_generate_raw`` constructs both objects, threads them into
+    ``functools.partial(self._claude_do_stream, state=..., ctx=...)``
+    via ``_claude_stream_with_resilience``'s ``do_stream_fn``
+    parameter, and reads ``state.*`` back into outer locals via
+    boundary translation after the stream task completes.
 
-    Slice 2B-i extracted ``_retrieve_stream_exc`` — a stateless
-    hygiene callback (``@staticmethod``, zero captures, zero
-    ``nonlocal``).
+    Provenance history:
+      * Slices 2A-iii / 2B-i / 2B-ii / 2B-iii: substrate dormant
+        (extracted helpers did not touch substrate-targeted cells).
+      * Slice 2C-i (this slice): substrate LIVE — providers.py
+        imports + ``_claude_do_stream(state, ctx)`` mutates 6 of
+        the 8 substrate fields (raw_content / input_tokens /
+        output_tokens / cached_input / first_token_ms / last_msg).
 
-    Slice 2B-ii extracted the
-    ``_create_with_prefill_fallback`` + ``_create_with_resilience``
-    pair. AST preflight CONFIRMED neither helper touches the
-    substrate-targeted cells; pair mutates only ``_messages``
-    (list ``.pop()``) and ``_create_kwargs`` (dict
-    ``["timeout"] = ...``).
-
-    Slice 2B-iii (this slice) extracted the
-    ``_stream_with_prefill_fallback`` + ``_stream_with_resilience``
-    pair — the streaming-path analog. AST preflight surfaced ONE
-    nuance: ``_stream_with_resilience`` carried
-    ``progress_probe=lambda: bool(raw_content)`` which READS
-    ``raw_content`` (a substrate-targeted nonlocal). The extraction
-    resolves this honestly: the lambda STAYS AT THE CALL SITE
-    inside ``_generate_raw``, and the extracted method accepts the
-    probe as an opaque ``Callable[[], bool]`` parameter. So the
-    extracted method itself does NOT touch any substrate-targeted
-    cell.
-
-    Token accounting (input_tokens / output_tokens / cached_input
-    / raw_content MUTATION / last_msg) happens INSIDE ``_do_stream``
-    and in the post-stream body of ``_generate_raw`` — that's the
-    extraction that finally flips this pin (Slice 2C-i when
-    ``_do_stream`` extracts, since it mutates four of the five
-    nonlocals).
-
-    The substrate-import dormancy pin therefore HOLDS across
-    Slices 2A-iii / 2B-i / 2B-ii / 2B-iii — the substrate exists,
-    its 50-test green bar exists, but no caller imports it. The
-    dataclass + accumulator stay genuinely unused until a
-    STATEFUL extraction proves the substrate's design lock-step
-    with reality."""
+    Future slices that move ``_claude_do_stream`` or restructure
+    the substrate import MUST update this pin in the same commit.
+    """
     tree = _load_module_ast(_PROVIDERS_FILE)
+    imported_names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            assert "claude_dispatch_state" not in module, (
-                f"providers.py imports claude_dispatch_state at "
-                f"line {node.lineno}; if this is the slice that "
-                f"first extracts a stateful helper, flip this pin "
-                f"deliberately."
-            )
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert "claude_dispatch_state" not in alias.name
+            if "claude_dispatch_state" in module:
+                for alias in node.names:
+                    imported_names.add(alias.name)
+    assert "_ClaudeDispatchState" in imported_names, (
+        f"providers.py must import _ClaudeDispatchState from "
+        f"claude_dispatch_state. Found imports: "
+        f"{sorted(imported_names)}"
+    )
+    assert "_ClaudeStreamContext" in imported_names, (
+        f"providers.py must import _ClaudeStreamContext from "
+        f"claude_dispatch_state. Found imports: "
+        f"{sorted(imported_names)}"
+    )
 
 
 def test_ast_pin_providers_file_sha_matches_lock():
@@ -680,20 +669,21 @@ def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
     # later slices will need to update this pin.
 
 
-def test_ast_pin_generate_raw_size_after_2b_iii():
+def test_ast_pin_generate_raw_size_after_2c_i():
     """Per-slice closure-size envelope. Tightened on each slice that
     actually shrinks ``_generate_raw``.
 
     Slice 2A-iii (PR #48912) opened at [950, 1025] for size 1012.
     Slice 2B-i   (PR #49578) tightened to [1000, 1015] for size 1011.
     Slice 2B-ii  (PR #49606) tightened to [965, 990] for size 977.
-    Slice 2B-iii (this PR) shrinks 977 → 953 by extracting the
-    paired stream-path helpers (``_stream_with_prefill_fallback``
-    32 lines + ``_stream_with_resilience`` 7 lines + their blanks +
-    call-site rewrite → net −24 inside the closure). Envelope
-    tightens to [940, 965]: floor protects against accidental
-    over-extraction; ceiling protects against accidental re-bloat.
-    Each future slice re-tightens this in-place."""
+    Slice 2B-iii (PR #49641) tightened to [940, 965] for size 953.
+    Slice 2C-i (this PR) is the HEAVIEST CUT of the arc: 953 → 712
+    (-241) by extracting the 317-line ``_do_stream`` helper to the
+    ``_claude_do_stream`` class method (offset by ~70 lines of new
+    state+ctx construction, boundary translation, and call-site
+    rewrite). Envelope tightens to [690, 740]: floor protects
+    against accidental over-extraction; ceiling protects against
+    accidental re-bloat."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -713,25 +703,25 @@ def test_ast_pin_generate_raw_size_after_2b_iii():
                             size = (
                                 sub.end_lineno - sub.lineno + 1
                             )
-                            assert 940 <= size <= 965, (
+                            assert 690 <= size <= 740, (
                                 f"_generate_raw size after Slice "
-                                f"2B-iii is {size}; expected window "
-                                f"[940, 965]. If this slice "
+                                f"2C-i is {size}; expected window "
+                                f"[690, 740]. If this slice "
                                 f"intentionally moved more, update "
                                 f"the envelope."
                             )
                             return
 
 
-def test_ast_pin_generate_raw_nested_helper_count_after_2b_iii():
-    """Per-slice nested-helper-count envelope. Slice 2B-iii drops
-    the count from 4 → 2 (both ``_stream_with_*`` extracted).
+def test_ast_pin_generate_raw_nested_helper_count_after_2c_i():
+    """Per-slice nested-helper-count envelope. Slice 2C-i drops
+    the count from 2 → 1 (``_do_stream`` extracted to
+    ``_claude_do_stream``).
 
-    Remaining nested helpers (2): ``_stream_fanout``, ``_do_stream``.
-    ``_do_stream`` is the heavy mutator (4 nonlocals across 317
-    lines) — its extraction (Slice 2C-i) is the slice that finally
-    flips the substrate-import dormancy pin. ``_stream_fanout`` is
-    a tiny 9-line helper that extracts alongside 2C-i or in 2C-ii."""
+    Remaining nested helper (1): ``_stream_fanout`` — a small
+    9-line text-fanout helper that's set as ``_stream_callback``
+    when both tool-loop and render callbacks coexist. Extracts
+    in Slice 2C-ii alongside the dispatcher-shell reduction."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -760,15 +750,236 @@ def test_ast_pin_generate_raw_nested_helper_count_after_2b_iii():
                                 and n is not sub
                             ]
                             count = len(nested)
-                            assert count == 2, (
+                            assert count == 1, (
                                 f"_generate_raw has {count} nested "
-                                f"helpers after Slice 2B-iii; "
-                                f"expected exactly 2. Remaining "
-                                f"should be _stream_fanout + "
-                                f"_do_stream. Got: "
+                                f"helpers after Slice 2C-i; "
+                                f"expected exactly 1. Remaining "
+                                f"should be _stream_fanout. Got: "
                                 f"{sorted(n.name for n in nested)}"
                             )
                             return
+
+
+def test_ast_pin_claude_do_stream_is_async_method_on_claude_provider():
+    """Slice 2C-i extraction proof — positive presence pin.
+
+    ``_claude_do_stream`` MUST exist as an ``async def`` method
+    directly under ``class ClaudeProvider``. Signature MUST be
+    ``(self, *, state, ctx)`` only — no additional positional or
+    keyword parameters. The two-parameter signature is the
+    Option A-prime structural invariant: state is the mutable
+    output carrier, ctx is the frozen read-only call context."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "_claude_do_stream"
+                ):
+                    args = child.args
+                    # Expect exactly: self + kwonly(state, ctx)
+                    pos_args = [a.arg for a in args.args]
+                    kwonly_args = [a.arg for a in args.kwonlyargs]
+                    assert pos_args == ["self"], (
+                        f"_claude_do_stream positional args: "
+                        f"{pos_args}; expected ['self']"
+                    )
+                    assert sorted(kwonly_args) == ["ctx", "state"], (
+                        f"_claude_do_stream kw-only args: "
+                        f"{sorted(kwonly_args)}; expected "
+                        f"['ctx', 'state']"
+                    )
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_do_stream not found — "
+                "Slice 2C-i extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_do_stream_no_longer_nested_in_generate_raw():
+    """Slice 2C-i extraction proof — negative absence pin.
+
+    The original nested ``async def _do_stream`` MUST NOT exist
+    anywhere inside ``_generate_raw``. The closure should only
+    construct ``_stream_state`` + ``_stream_ctx`` and invoke
+    ``self._claude_do_stream`` via
+    ``functools.partial`` threaded through
+    ``_claude_stream_with_resilience``."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name == "_do_stream"
+                                ):
+                                    pytest.fail(
+                                        f"_do_stream is still "
+                                        f"nested in _generate_raw "
+                                        f"at line {deeper.lineno} "
+                                        f"— Slice 2C-i extraction "
+                                        f"incomplete"
+                                    )
+                            return
+
+
+# ============================================================================
+# Slice 2C-i — _ClaudeStreamContext frozen dataclass spine
+# ============================================================================
+
+
+class TestClaudeStreamContextShape:
+    """Closed-field-count + frozen-by-design + to_debug_dict
+    contract for the new ``_ClaudeStreamContext`` substrate
+    dataclass that landed live in Slice 2C-i."""
+
+    def test_schema_version_is_v1(self) -> None:
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            CLAUDE_STREAM_CONTEXT_SCHEMA_VERSION,
+        )
+        assert CLAUDE_STREAM_CONTEXT_SCHEMA_VERSION == (
+            "claude_stream_context.v1"
+        )
+
+    def test_field_names_tuple_has_exactly_twelve_entries(self) -> None:
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _CLAUDE_STREAM_CONTEXT_FIELD_NAMES,
+        )
+        assert isinstance(_CLAUDE_STREAM_CONTEXT_FIELD_NAMES, tuple)
+        assert len(_CLAUDE_STREAM_CONTEXT_FIELD_NAMES) == 12
+
+    def test_field_names_exact_set(self) -> None:
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _CLAUDE_STREAM_CONTEXT_FIELD_NAMES,
+        )
+        assert set(_CLAUDE_STREAM_CONTEXT_FIELD_NAMES) == {
+            "context", "deadline", "timeout_s",
+            "effective_max_tokens", "temperature", "thinking_param",
+            "system_with_cache", "messages", "is_tool_round",
+            "prompt_chars", "call_start", "stream_callback",
+        }
+
+    def test_dataclass_field_count_matches_declaration(self) -> None:
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _ClaudeStreamContext,
+        )
+        runtime_fields = dataclasses.fields(_ClaudeStreamContext)
+        assert len(runtime_fields) == 12
+
+    def test_dataclass_is_frozen(self) -> None:
+        """Operator-mandated: ``_ClaudeStreamContext`` MUST be
+        ``@dataclass(frozen=True)`` so attribute re-binding raises
+        ``FrozenInstanceError``. Contained-collection mutability
+        (the messages list, system_with_cache blocks) is NOT
+        frozen by this — by design, since the prefill-fallback
+        wrapper mutates ``messages.pop()`` from outside."""
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _ClaudeStreamContext,
+        )
+        # Runtime check: attribute assignment after construction
+        # raises FrozenInstanceError.
+        from datetime import datetime, timezone
+        instance = _ClaudeStreamContext(
+            context=object(),
+            deadline=datetime.now(tz=timezone.utc),
+            timeout_s=60.0,
+            effective_max_tokens=1024,
+            temperature=0.0,
+            thinking_param=None,
+            system_with_cache=[],
+            messages=[],
+            is_tool_round=False,
+            prompt_chars=0,
+            call_start=0.0,
+            stream_callback=None,
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            instance.timeout_s = 999.0  # type: ignore[misc]
+
+    def test_dataclass_has_no_from_dict_method(self) -> None:
+        """Operator-mandated: NO ``from_dict()`` for
+        ``_ClaudeStreamContext``. The dataclass contains callables
+        (``stream_callback``) and opaque objects (``context``,
+        ``thinking_param``) that cannot be faithfully reconstructed
+        from a dict. We do not pretend otherwise. Snapshot via
+        ``to_debug_dict`` only."""
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _ClaudeStreamContext,
+        )
+        assert not hasattr(_ClaudeStreamContext, "from_dict"), (
+            "_ClaudeStreamContext must NOT have from_dict — "
+            "callables / opaque objects cannot be faithfully "
+            "reconstructed from a dict (operator-mandated)."
+        )
+
+    def test_to_debug_dict_returns_documented_keys(self) -> None:
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _ClaudeStreamContext,
+        )
+        from datetime import datetime, timezone
+        ctx = _ClaudeStreamContext(
+            context=object(),
+            deadline=datetime.now(tz=timezone.utc),
+            timeout_s=60.0,
+            effective_max_tokens=1024,
+            temperature=0.2,
+            thinking_param=None,
+            system_with_cache=[],
+            messages=[{"role": "user", "content": "hi"}],
+            is_tool_round=False,
+            prompt_chars=42,
+            call_start=12.3,
+            stream_callback=lambda t: None,
+        )
+        d = ctx.to_debug_dict()
+        for key in (
+            "schema_version", "context_repr", "deadline_iso",
+            "timeout_s", "effective_max_tokens", "temperature",
+            "thinking_param", "system_with_cache_repr",
+            "messages_len", "is_tool_round", "prompt_chars",
+            "call_start", "stream_callback_repr",
+        ):
+            assert key in d, f"missing key: {key}"
+        # Callable repr-stringified, not faithful object.
+        assert isinstance(d["stream_callback_repr"], str)
+        # messages_len, not the messages body (privacy / log-bloat).
+        assert d["messages_len"] == 1
+
+    def test_required_fields_no_defaults(self) -> None:
+        """Operator-mandated: NO defaults on any context field.
+        Construction without all 12 fields MUST raise
+        ``TypeError``."""
+        from backend.core.ouroboros.governance.claude_dispatch_state import (
+            _ClaudeStreamContext,
+        )
+        with pytest.raises(TypeError):
+            _ClaudeStreamContext()  # type: ignore[call-arg]
 
 
 def test_ast_pin_stream_with_prefill_fallback_is_async_method_on_claude_provider():
