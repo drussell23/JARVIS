@@ -339,6 +339,33 @@ gates:
 # acceptable and speed matters. DW is confined to tiny-payload named
 # callers (semantic_triage, ouroboros_plan) until DoubleWord repairs
 # their SSE generation endpoint.
+#
+# ──────────────────────────────────────────────────────────────────────
+# MAY 21 2026 ADDENDUM — DIAGNOSTIC PHASE EMPIRICALLY CLOSED
+# ──────────────────────────────────────────────────────────────────────
+# Three production-faithful isolation tests run against the live DW
+# endpoint on 2026-05-21 (see `scripts/dw_sse_stall_isolation.sh`,
+# `scripts/dw_concurrent_stress.py`, `scripts/dw_tool_loop_stress.py`)
+# eliminated 4 of 5 §25.2 hypotheses from the Apr 16 benchmark report:
+#   * Single-stream agent-scale: clean (446 chunks, max gap 527 ms)
+#   * 10× concurrent agent-scale: clean (11,862 gaps, max 478 ms)
+#   * 3× concurrent × 6-turn native function-calling tool-loop: clean
+#     (746 gaps, 18 tool calls, max 592 ms)
+# Aggregate: 12,608 inter-chunk gaps observed, worst single gap 592 ms,
+# ~50× safety margin below the 30s production stall threshold. Zero
+# StreamRuptureErrors. Only §25.2 hypothesis #1 ("issue resolved")
+# remains — i.e. DoubleWord shipped fixes to the async endpoint between
+# Apr 14 and May 21. Architectural finding: DW emits `reasoning` deltas
+# continuously during long thinking phases (one stream reasoned for
+# 72.7s before first content token with no stall — reasoning frames
+# function as effective keepalives).
+#
+# Topology seal remains in place pending the §14.5 reversal walk with
+# DW's gateway team. Next action: flip standard.dw_allowed -> true with
+# block_mode: shadow_with_claude_cascade (shadow-mode wiring on the
+# O+V side, implemented separately). Promotion ladder per §14.5:
+# STANDARD shadow -> primary, then COMPLEX, then IMMEDIATE, then
+# BG/SPEC. Each promotion gated on its own clean telemetry window.
 doubleword_topology:
   # Schema topology.2 — graduated 2026-04-27 at Phase 12 Slice E.
   #
