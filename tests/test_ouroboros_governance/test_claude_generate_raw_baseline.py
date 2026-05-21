@@ -801,19 +801,40 @@ def test_ast_pin_generate_raw_calls_messages_stream_at_one_site():
 
 def test_ast_pin_generate_raw_calls_messages_create_at_two_sites():
     """PHASE_2_UPDATE: non-stream paths may consolidate or split in
-    Phase 2 — site count may change."""
-    node = _claude_generate_raw_node()
+    Phase 2 — site count may change.
+
+    Slice 2B-ii update: both ``messages.create`` call sites moved
+    OUT of ``_generate_raw`` when
+    ``_create_with_prefill_fallback`` extracted to
+    ``ClaudeProvider._claude_create_with_prefill_fallback``. The
+    contract this pin now asserts: somewhere inside the
+    ``ClaudeProvider`` class body (either the closure OR an
+    extracted ``_claude_*`` method) there exists at least one
+    ``messages.create`` reference. Future slices that move the
+    create path further MUST update this pin accordingly."""
+    import inspect as _inspect
+    from backend.core.ouroboros.governance import providers as _p
+    src = _inspect.getsource(_p.ClaudeProvider)
+    tree = ast.parse(
+        # ast.parse needs a module-level wrapper; classdef body
+        # parses fine via wrapping.
+        f"class _Wrap:\n" + "\n".join(
+            "    " + line for line in src.splitlines()
+        )
+    )
     create_sites = []
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Attribute) and sub.attr == "create":
-            if (
-                isinstance(sub.value, ast.Attribute)
-                and sub.value.attr == "messages"
-            ):
-                create_sites.append(sub.lineno)
+    for sub in ast.walk(tree):
+        if (
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "create"
+            and isinstance(sub.value, ast.Attribute)
+            and sub.value.attr == "messages"
+        ):
+            create_sites.append(sub.lineno)
     assert len(create_sites) >= 1, (
-        "PHASE-1 pin: _generate_raw must contain at least one "
-        "`messages.create` reference"
+        "PHASE-1 pin (Slice 2B-ii update): ClaudeProvider must "
+        "contain at least one `messages.create` reference across "
+        "the closure OR extracted class methods"
     )
 
 
@@ -821,7 +842,16 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
     """PHASE_2_UPDATE: the 8 nested helpers (_do_stream,
     _create_with_prefill_fallback, etc.) will either be inlined,
     moved out, or restructured. Phase 1 pins that they exist as
-    closure-local helpers."""
+    closure-local helpers.
+
+    Slice 2A-iii update: ``_boundary_audit_sampler`` extracted.
+    Slice 2B-i  update: ``_retrieve_stream_exc`` extracted.
+    Slice 2B-ii update: ``_create_with_prefill_fallback`` +
+    ``_create_with_resilience`` paired-extracted to
+    ``ClaudeProvider._claude_create_with_*`` methods. This pin's
+    required-list shrinks accordingly. The remaining anchor
+    (``_do_stream``) is the heaviest nested helper and the last to
+    extract (Slice 2C-i)."""
     node = _claude_generate_raw_node()
     nested_names = set()
     for sub in ast.walk(node):
@@ -831,14 +861,10 @@ def test_ast_pin_generate_raw_has_nested_helper_functions():
         ):
             nested_names.add(sub.name)
     # We do not pin the EXACT set (over-constrains Phase 2). We pin
-    # that AT LEAST the streaming + create-prefill helpers exist.
+    # that AT LEAST the heaviest remaining helper exists.
     assert "_do_stream" in nested_names, (
         f"PHASE-1 pin: _do_stream helper missing. Found: "
         f"{sorted(nested_names)}"
-    )
-    assert "_create_with_prefill_fallback" in nested_names, (
-        f"PHASE-1 pin: _create_with_prefill_fallback helper missing. "
-        f"Found: {sorted(nested_names)}"
     )
 
 

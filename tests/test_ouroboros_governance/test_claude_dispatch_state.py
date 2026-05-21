@@ -59,18 +59,28 @@ _PROVIDERS_FILE = Path(
 # ``test_ast_pin_providers_file_sha_matches_lock`` tracks the
 # provenance of each successive update.
 #
-# Slice 2A-ii  (PR #48860): a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d
-#                           (providers.py byte-identical to main)
-# Slice 2A-iii (PR #48912): d3e409ce032ae3954dbd98d0102682fef968206b
-#                           (_boundary_audit_sampler extracted as
-#                           ClaudeProvider class method; closure
-#                           1036 → 1012 lines, 8 → 7 nested helpers)
-# Slice 2B-i   (this PR):   b2bfe35fe831786e71c56e371f2870fa6b62928d
-#                           (_retrieve_stream_exc extracted as
-#                           ClaudeProvider @staticmethod; closure
-#                           1012 → 1011 lines, 7 → 6 nested helpers)
+# Slice 2A-ii   (PR #48860): a33f9fb67fdcf8e10f8e47fbd3a6b8075aea8a7d
+#                            (providers.py byte-identical to main)
+# Slice 2A-iii  (PR #48912): d3e409ce032ae3954dbd98d0102682fef968206b
+#                            (_boundary_audit_sampler extracted as
+#                            ClaudeProvider class method; closure
+#                            1036 → 1012 lines, 8 → 7 nested helpers)
+# Slice 2B-i    (PR #49578): b2bfe35fe831786e71c56e371f2870fa6b62928d
+#                            (_retrieve_stream_exc extracted as
+#                            ClaudeProvider @staticmethod; closure
+#                            1012 → 1011 lines, 7 → 6 nested helpers)
+# Slice 2B-ii   (this PR):   1be2caaddce0809910deb4e9782499da9eea4b2e
+#                            (_create_with_prefill_fallback +
+#                            _create_with_resilience PAIRED extracted
+#                            as ClaudeProvider async class methods;
+#                            closure 1011 → 977 lines (-34),
+#                            6 → 4 nested helpers. Substrate-import
+#                            dormancy preserved: AST preflight
+#                            confirmed neither helper touches the
+#                            5 nonlocals or 4 outer captures the
+#                            _ClaudeDispatchState substrate targets.)
 _PROVIDERS_SHA_LOCK = (
-    "b2bfe35fe831786e71c56e371f2870fa6b62928d"
+    "1be2caaddce0809910deb4e9782499da9eea4b2e"
 )
 
 
@@ -451,15 +461,35 @@ def test_ast_pin_providers_does_not_import_dispatch_state_yet():
     NOT import from ``claude_dispatch_state`` until a STATEFUL
     helper extraction lands.
 
-    Slice 2A-iii (this slice's predecessor) extracted
-    ``_boundary_audit_sampler`` — a PURE telemetry observer that
-    does not touch any of the 5 nonlocals / 4 outer captures the
-    substrate targets — so the import was not introduced. The pin
-    will flip in whichever slice first extracts a helper that DOES
-    mutate dispatch state (likely 2B-ii when
-    ``_create_with_resilience`` + ``_create_with_prefill_fallback``
-    extract, since those touch ``input_tokens`` /
-    ``output_tokens`` / ``cached_input``)."""
+    Slice 2A-iii extracted ``_boundary_audit_sampler`` — a PURE
+    telemetry observer that does not touch any of the 5 nonlocals /
+    4 outer captures the substrate targets.
+
+    Slice 2B-i extracted ``_retrieve_stream_exc`` — a stateless
+    hygiene callback (``@staticmethod``, zero captures, zero
+    ``nonlocal``).
+
+    Slice 2B-ii (this slice) extracted the
+    ``_create_with_prefill_fallback`` + ``_create_with_resilience``
+    pair. AST preflight CONFIRMED neither helper touches
+    ``input_tokens`` / ``output_tokens`` / ``cached_input`` /
+    ``raw_content`` / ``total_cost`` / ``last_msg`` /
+    ``first_token_ms`` / ``thinking_reason_out`` / ``token_usage``.
+    The pair mutates only ``_messages`` (list ``.pop()``) and
+    ``_create_kwargs`` (dict ``["timeout"] = ...``) — both are
+    sub-helper bookkeeping, not the substrate's frozen 8-field
+    taxonomy. Token accounting happens AFTER the create returns,
+    in the surrounding ``_generate_raw`` body — that's the
+    extraction that finally flips this pin (likely 2C-i when
+    ``_do_stream`` extracts, since it mutates four of the five
+    nonlocals).
+
+    The substrate-import dormancy pin therefore HOLDS across
+    Slices 2A-iii / 2B-i / 2B-ii — the substrate exists, its
+    45-test green bar exists, but no caller imports it. The
+    dataclass + accumulator stay genuinely unused until a
+    STATEFUL extraction proves the substrate's design lock-step
+    with reality."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -634,17 +664,19 @@ def test_ast_pin_boundary_audit_sampler_no_longer_nested_in_generate_raw():
     # later slices will need to update this pin.
 
 
-def test_ast_pin_generate_raw_size_after_2b_i():
+def test_ast_pin_generate_raw_size_after_2b_ii():
     """Per-slice closure-size envelope. Tightened on each slice that
     actually shrinks ``_generate_raw``.
 
     Slice 2A-iii (PR #48912) opened at [950, 1025] for size 1012.
-    Slice 2B-i (this PR) shrinks to 1011 (extracted the 7-line
-    inline ``_retrieve_stream_exc`` + 1-line ``add_done_callback``
-    call site → call site rewritten as a 3-line multi-line call).
-    Tightened envelope [1000, 1015]: floor protects against
-    accidental over-extraction; ceiling protects against accidental
-    re-bloat. Each future slice re-tightens this in-place."""
+    Slice 2B-i   (PR #49578) tightened to [1000, 1015] for size 1011.
+    Slice 2B-ii  (this PR) shrinks 1011 → 977 by extracting the
+    paired create-path helpers (``_create_with_prefill_fallback``
+    36 lines + ``_create_with_resilience`` 6 lines + their blank +
+    call-site rewrite → net −34 inside the closure). Envelope
+    tightens to [965, 990]: floor protects against accidental
+    over-extraction; ceiling protects against accidental re-bloat.
+    Each future slice re-tightens this in-place."""
     tree = _load_module_ast(_PROVIDERS_FILE)
     for node in ast.walk(tree):
         if (
@@ -664,13 +696,213 @@ def test_ast_pin_generate_raw_size_after_2b_i():
                             size = (
                                 sub.end_lineno - sub.lineno + 1
                             )
-                            assert 1000 <= size <= 1015, (
+                            assert 965 <= size <= 990, (
                                 f"_generate_raw size after Slice "
-                                f"2B-i is {size}; expected window "
-                                f"[1000, 1015]. If this slice "
+                                f"2B-ii is {size}; expected window "
+                                f"[965, 990]. If this slice "
                                 f"intentionally moved more, update "
                                 f"the envelope."
                             )
+                            return
+
+
+def test_ast_pin_generate_raw_nested_helper_count_after_2b_ii():
+    """Per-slice nested-helper-count envelope. Slice 2B-ii drops
+    the count from 6 → 4 (both ``_create_with_*`` extracted).
+
+    Remaining nested helpers (4): ``_stream_fanout``,
+    ``_do_stream``, ``_stream_with_prefill_fallback``,
+    ``_stream_with_resilience``. Each subsequent slice removes
+    at least one entry; this pin is updated in-place."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            nested = [
+                                n for n in ast.walk(sub)
+                                if isinstance(
+                                    n,
+                                    (
+                                        ast.FunctionDef,
+                                        ast.AsyncFunctionDef,
+                                    ),
+                                )
+                                and n is not sub
+                            ]
+                            count = len(nested)
+                            assert count == 4, (
+                                f"_generate_raw has {count} nested "
+                                f"helpers after Slice 2B-ii; "
+                                f"expected exactly 4. Remaining "
+                                f"should be _stream_fanout, "
+                                f"_do_stream, "
+                                f"_stream_with_prefill_fallback, "
+                                f"_stream_with_resilience. Got: "
+                                f"{sorted(n.name for n in nested)}"
+                            )
+                            return
+
+
+def test_ast_pin_create_with_prefill_fallback_is_async_method_on_claude_provider():
+    """Slice 2B-ii extraction proof — positive presence pin (1/2).
+
+    ``_claude_create_with_prefill_fallback`` MUST exist as an
+    ``async def`` method directly under ``class ClaudeProvider``.
+    Distinct from ``@staticmethod`` (which 2B-i used for the
+    stateless retrieval callback) because this method composes
+    ``self._ensure_client()`` and may compose other ``self``
+    surfaces in future hardening (e.g. cache reasoning, route
+    stamping). Future slices that move or restructure this method
+    MUST update this pin in the same commit."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name
+                    == "_claude_create_with_prefill_fallback"
+                ):
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_create_with_prefill_fallback "
+                "not found as async method — Slice 2B-ii "
+                "extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_create_with_resilience_is_async_method_on_claude_provider():
+    """Slice 2B-ii extraction proof — positive presence pin (2/2).
+
+    ``_claude_create_with_resilience`` MUST exist as an
+    ``async def`` method directly under ``class ClaudeProvider``.
+    Composes ``self._call_with_backoff`` (the canonical backoff
+    surface) around the prefill-fallback method."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "_claude_create_with_resilience"
+                ):
+                    return
+            pytest.fail(
+                "ClaudeProvider._claude_create_with_resilience "
+                "not found as async method — Slice 2B-ii "
+                "extraction missing"
+            )
+    pytest.fail("ClaudeProvider class not found in providers.py")
+
+
+def test_ast_pin_create_with_prefill_fallback_no_longer_nested_in_generate_raw():
+    """Slice 2B-ii extraction proof — negative absence pin (1/2).
+
+    The original nested ``async def _create_with_prefill_fallback``
+    MUST NOT exist anywhere inside ``_generate_raw``."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name
+                                    == "_create_with_prefill_fallback"
+                                ):
+                                    pytest.fail(
+                                        f"_create_with_prefill_"
+                                        f"fallback is still nested "
+                                        f"in _generate_raw at line "
+                                        f"{deeper.lineno} — Slice "
+                                        f"2B-ii extraction "
+                                        f"incomplete"
+                                    )
+                            return
+
+
+def test_ast_pin_create_with_resilience_no_longer_nested_in_generate_raw():
+    """Slice 2B-ii extraction proof — negative absence pin (2/2).
+
+    The original nested ``async def _create_with_resilience``
+    MUST NOT exist anywhere inside ``_generate_raw``."""
+    tree = _load_module_ast(_PROVIDERS_FILE)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "ClaudeProvider"
+        ):
+            for child in node.body:
+                if (
+                    isinstance(child, ast.AsyncFunctionDef)
+                    and child.name == "generate"
+                ):
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.AsyncFunctionDef)
+                            and sub.name == "_generate_raw"
+                        ):
+                            for deeper in ast.walk(sub):
+                                if deeper is sub:
+                                    continue
+                                if (
+                                    isinstance(
+                                        deeper,
+                                        (
+                                            ast.FunctionDef,
+                                            ast.AsyncFunctionDef,
+                                        ),
+                                    )
+                                    and deeper.name
+                                    == "_create_with_resilience"
+                                ):
+                                    pytest.fail(
+                                        f"_create_with_resilience "
+                                        f"is still nested in "
+                                        f"_generate_raw at line "
+                                        f"{deeper.lineno} — Slice "
+                                        f"2B-ii extraction "
+                                        f"incomplete"
+                                    )
                             return
 
 
