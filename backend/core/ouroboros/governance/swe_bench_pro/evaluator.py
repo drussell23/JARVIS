@@ -103,6 +103,10 @@ from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
 from backend.core.ouroboros.governance.swe_bench_pro.envelope_builder import (
     build_evaluation_envelope,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+    EvaluatorPhase,
+    task_phase,
+)
 from backend.core.ouroboros.governance.swe_bench_pro.per_problem_harness import (
     DiffCaptureOutcome,
     HarnessOutcome,
@@ -561,55 +565,70 @@ async def evaluate_problem(
     terminal_reason_code: str = ""
 
     try:
-        # ---- Phase B.2.1: build envelope (allocates causal_id) ----
-        envelope = build_evaluation_envelope(problem, prepared)
-        op_id = envelope.causal_id
+        # ---- Phase B.2.1 + Canonical intake: envelope + subscribe +
+        # ingest. Slice 6 task-naming wraps this whole block so the
+        # observer can identify when a task is wedged in the intake
+        # path vs the terminal wait (next block). The task name
+        # transitions from the caller's outer name to
+        # ``swe_bench_pro:ingest_envelope:<instance_id>`` for the
+        # duration; restored automatically on async-with exit
+        # (including early-return + raise paths).
+        async with task_phase(EvaluatorPhase.INGEST_ENVELOPE, instance_id):
+            # ---- Phase B.2.1: build envelope (allocates causal_id) ----
+            envelope = build_evaluation_envelope(problem, prepared)
+            op_id = envelope.causal_id
 
-        # ---- Phase B.2.0.5: subscribe BEFORE ingest (race-free) ----
-        # AST-pinned by the B.2.3 spine — source-order invariant.
-        subscriber = resolved_broker.subscribe(op_id_filter=op_id)
-        if subscriber is None:
-            # Broker capacity exhausted. Don't ingest — there's no
-            # observer to rendezvous with, and a polling-only fallback
-            # is forbidden by operator binding.
-            logger.warning(
-                "[SWEBenchPro] broker.subscribe returned None for "
-                "op=%s (subscriber cap exceeded) — aborting eval",
-                op_id,
-            )
-            return EvaluationResult(
-                outcome=EvaluationOutcome.INGEST_FAILED,
-                problem_instance_id=instance_id,
-                op_id=op_id,
-                terminal_reason_code="broker_subscribe_capacity_exceeded",
-                elapsed_s=time.monotonic() - started_at,
-            )
+            # ---- Phase B.2.0.5: subscribe BEFORE ingest (race-free) ----
+            # AST-pinned by the B.2.3 spine — source-order invariant.
+            subscriber = resolved_broker.subscribe(op_id_filter=op_id)
+            if subscriber is None:
+                # Broker capacity exhausted. Don't ingest — there's no
+                # observer to rendezvous with, and a polling-only fallback
+                # is forbidden by operator binding.
+                logger.warning(
+                    "[SWEBenchPro] broker.subscribe returned None for "
+                    "op=%s (subscriber cap exceeded) — aborting eval",
+                    op_id,
+                )
+                return EvaluationResult(
+                    outcome=EvaluationOutcome.INGEST_FAILED,
+                    problem_instance_id=instance_id,
+                    op_id=op_id,
+                    terminal_reason_code="broker_subscribe_capacity_exceeded",
+                    elapsed_s=time.monotonic() - started_at,
+                )
 
-        # ---- Canonical intake: ingest_envelope ----
-        try:
-            ingested = await intake_service.ingest_envelope(envelope)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 — defensive
-            logger.warning(
-                "[SWEBenchPro] intake_service.ingest_envelope raised "
-                "for op=%s", op_id, exc_info=True,
-            )
-            ingested = False
-        if not ingested:
-            return EvaluationResult(
-                outcome=EvaluationOutcome.INGEST_FAILED,
-                problem_instance_id=instance_id,
-                op_id=op_id,
-                terminal_reason_code="ingest_returned_false",
-                elapsed_s=time.monotonic() - started_at,
-            )
+            # ---- Canonical intake: ingest_envelope ----
+            try:
+                ingested = await intake_service.ingest_envelope(envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "[SWEBenchPro] intake_service.ingest_envelope raised "
+                    "for op=%s", op_id, exc_info=True,
+                )
+                ingested = False
+            if not ingested:
+                return EvaluationResult(
+                    outcome=EvaluationOutcome.INGEST_FAILED,
+                    problem_instance_id=instance_id,
+                    op_id=op_id,
+                    terminal_reason_code="ingest_returned_false",
+                    elapsed_s=time.monotonic() - started_at,
+                )
 
         # ---- Phase B.2.0.5: bounded wait_for terminal event ----
+        # THIS is the original 35-min silent-window hang seam
+        # (bgop-37a419353d93 from bt-2026-05-21-045132). Slice 6
+        # names the task ``swe_bench_pro:waiting_terminal:<id>``
+        # for the duration so the EvaluatorTraceObserver can isolate
+        # this phase + emit BlockedOnKind + top stack frame.
         timeout = _resolve_timeout_s(timeout_s)
-        terminal_event = await _await_broker_terminal_event(
-            resolved_broker, subscriber, op_id, timeout,
-        )
+        async with task_phase(EvaluatorPhase.WAITING_TERMINAL, instance_id):
+            terminal_event = await _await_broker_terminal_event(
+                resolved_broker, subscriber, op_id, timeout,
+            )
 
         if terminal_event is not None:
             # SSE primary-path success — broker delivered terminal.

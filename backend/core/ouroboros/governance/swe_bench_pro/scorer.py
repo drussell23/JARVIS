@@ -85,6 +85,10 @@ from backend.core.ouroboros.governance.swe_bench_pro.evaluator import (
     EvaluationOutcome,
     EvaluationResult,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+    EvaluatorPhase,
+    task_phase,
+)
 from backend.core.ouroboros.governance.swe_bench_pro.per_problem_harness import (
     HarnessOutcome,
     PreparedProblem,
@@ -452,98 +456,106 @@ async def score_evaluation(
                 elapsed_s=time.monotonic() - started_at,
             )
 
-    prepared, harness_outcome = await prepare_problem(problem)
-    if prepared is None or harness_outcome != HarnessOutcome.READY:
-        return ScoringResult(
-            outcome=ScoreOutcome.SCORING_ERROR,
-            problem_instance_id=instance_id,
-            diagnostic=(
-                f"prepare_failed:{getattr(harness_outcome, 'value', '')}"
-            ),
-            elapsed_s=time.monotonic() - started_at,
-        )
-
-    try:
-        applied, apply_stderr = await _git_apply_patch(
-            prepared.worktree_path, captured_patch,
-        )
-        if not applied:
+    # Slice 6 — task-naming completeness: from this point the current
+    # task is renamed to ``swe_bench_pro:score_evaluation:<instance_id>``
+    # so the EvaluatorTraceObserver can isolate the scoring phase
+    # (git apply + TestRunner.run) from the upstream evaluator path.
+    # ``prepare_problem`` carries its own ``task_phase(PREPARE_PROBLEM,
+    # ...)`` wrapper — it temporarily takes over the name during that
+    # nested call and restores ``score_evaluation:<id>`` on return.
+    async with task_phase(EvaluatorPhase.SCORE_EVALUATION, instance_id):
+        prepared, harness_outcome = await prepare_problem(problem)
+        if prepared is None or harness_outcome != HarnessOutcome.READY:
             return ScoringResult(
                 outcome=ScoreOutcome.SCORING_ERROR,
                 problem_instance_id=instance_id,
-                diagnostic=f"apply_failed:{apply_stderr[:200]}",
+                diagnostic=(
+                    f"prepare_failed:{getattr(harness_outcome, 'value', '')}"
+                ),
                 elapsed_s=time.monotonic() - started_at,
             )
 
-        test_files = _resolve_test_files_under_worktree(prepared)
-        if not test_files:
-            return ScoringResult(
-                outcome=ScoreOutcome.SCORING_ERROR,
-                problem_instance_id=instance_id,
-                diagnostic="no_test_files_in_test_patch",
-                elapsed_s=time.monotonic() - started_at,
-            )
-
-        timeout = _resolve_test_timeout_s(test_timeout_s)
-        runner = TestRunner(prepared.worktree_path, timeout=timeout)
         try:
-            test_result = await runner.run(test_files)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[SWEBenchPro.Scorer] TestRunner.run raised for "
-                "instance=%s", instance_id, exc_info=True,
+            applied, apply_stderr = await _git_apply_patch(
+                prepared.worktree_path, captured_patch,
             )
-            return ScoringResult(
-                outcome=ScoreOutcome.SCORING_ERROR,
-                problem_instance_id=instance_id,
-                diagnostic="test_runner_raised",
-                elapsed_s=time.monotonic() - started_at,
-            )
-
-        total = max(0, int(getattr(test_result, "total", 0) or 0))
-        failed = max(0, int(getattr(test_result, "failed", 0) or 0))
-        passed = max(0, total - failed)
-        pass_rate = (passed / total) if total > 0 else 0.0
-        outcome = _classify_test_outcome(passed, failed, total)
-
-        diagnostic = ""
-        if outcome != ScoreOutcome.PASS and total > 0:
-            failed_tests = getattr(test_result, "failed_tests", ()) or ()
-            if failed_tests:
-                diagnostic = (
-                    f"failed_tests={','.join(failed_tests[:5])}"
+            if not applied:
+                return ScoringResult(
+                    outcome=ScoreOutcome.SCORING_ERROR,
+                    problem_instance_id=instance_id,
+                    diagnostic=f"apply_failed:{apply_stderr[:200]}",
+                    elapsed_s=time.monotonic() - started_at,
                 )
 
-        return ScoringResult(
-            outcome=outcome,
-            problem_instance_id=instance_id,
-            tests_passed=passed,
-            tests_failed=failed,
-            tests_total=total,
-            pass_rate=round(pass_rate, 4),
-            diagnostic=diagnostic,
-            elapsed_s=time.monotonic() - started_at,
-        )
+            test_files = _resolve_test_files_under_worktree(prepared)
+            if not test_files:
+                return ScoringResult(
+                    outcome=ScoreOutcome.SCORING_ERROR,
+                    problem_instance_id=instance_id,
+                    diagnostic="no_test_files_in_test_patch",
+                    elapsed_s=time.monotonic() - started_at,
+                )
 
-    except asyncio.CancelledError:
-        logger.info(
-            "[SWEBenchPro.Scorer] score_evaluation cancelled for "
-            "instance=%s after %.1fs (cleanup will run)",
-            instance_id, time.monotonic() - started_at,
-        )
-        raise
-    finally:
-        try:
-            await cleanup_prepared(prepared)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "[SWEBenchPro.Scorer] cleanup_prepared raised for "
-                "instance=%s", instance_id, exc_info=True,
+            timeout = _resolve_test_timeout_s(test_timeout_s)
+            runner = TestRunner(prepared.worktree_path, timeout=timeout)
+            try:
+                test_result = await runner.run(test_files)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[SWEBenchPro.Scorer] TestRunner.run raised for "
+                    "instance=%s", instance_id, exc_info=True,
+                )
+                return ScoringResult(
+                    outcome=ScoreOutcome.SCORING_ERROR,
+                    problem_instance_id=instance_id,
+                    diagnostic="test_runner_raised",
+                    elapsed_s=time.monotonic() - started_at,
+                )
+
+            total = max(0, int(getattr(test_result, "total", 0) or 0))
+            failed = max(0, int(getattr(test_result, "failed", 0) or 0))
+            passed = max(0, total - failed)
+            pass_rate = (passed / total) if total > 0 else 0.0
+            outcome = _classify_test_outcome(passed, failed, total)
+
+            diagnostic = ""
+            if outcome != ScoreOutcome.PASS and total > 0:
+                failed_tests = getattr(test_result, "failed_tests", ()) or ()
+                if failed_tests:
+                    diagnostic = (
+                        f"failed_tests={','.join(failed_tests[:5])}"
+                    )
+
+            return ScoringResult(
+                outcome=outcome,
+                problem_instance_id=instance_id,
+                tests_passed=passed,
+                tests_failed=failed,
+                tests_total=total,
+                pass_rate=round(pass_rate, 4),
+                diagnostic=diagnostic,
+                elapsed_s=time.monotonic() - started_at,
             )
+
+        except asyncio.CancelledError:
+            logger.info(
+                "[SWEBenchPro.Scorer] score_evaluation cancelled for "
+                "instance=%s after %.1fs (cleanup will run)",
+                instance_id, time.monotonic() - started_at,
+            )
+            raise
+        finally:
+            try:
+                await cleanup_prepared(prepared)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[SWEBenchPro.Scorer] cleanup_prepared raised for "
+                    "instance=%s", instance_id, exc_info=True,
+                )
 
 
 # ===========================================================================

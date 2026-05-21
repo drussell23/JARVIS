@@ -69,6 +69,7 @@ from pathlib import Path
 from types import FrameType
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Iterator,
     List,
@@ -421,6 +422,122 @@ def trace_subprocess(pid: int, cmd_repr: str) -> Iterator[None]:
             # Context boundary crossed (e.g. task switch) — safe to
             # ignore; the contextvar will GC with its owning context.
             pass
+
+
+# ---------------------------------------------------------------------------
+# Task naming primitives (Slice 6 — task naming completeness)
+# ---------------------------------------------------------------------------
+#
+# The observer's filter discriminates SWE-Bench-Pro work from the rest
+# of the asyncio task population by name prefix
+# (``swe_bench_pro:`` / ``evaluator:`` / ``scorer:`` / ``prepare:``).
+# But the evaluator's deep pipeline runs as INLINE awaits inside a
+# single parent task — ``evaluate_problem`` → ``prepare_problem`` →
+# ``_await_broker_terminal_event`` → ``score_evaluation`` →
+# ``record`` all share one task ID and (without intervention) one
+# task name. The observer can only see the OUTER name, which means
+# it cannot tell whether a stuck task is wedged in prepare, in the
+# terminal-event wait, or in scoring.
+#
+# ``task_phase`` solves this without changing concurrency semantics.
+# It renames the currently-running asyncio task to the canonical
+# ``swe_bench_pro:<phase>:<instance_id>`` for the duration of the
+# block, then restores the prior name on exit. The observer's next
+# tick snapshots the new name; the phase classifier (built on the
+# EvaluatorPhase taxonomy + ``_PHASE_PATTERNS`` substring table)
+# resolves to the correct phase without any additional plumbing.
+#
+# Composition:
+#   * ``asyncio.current_task().set_name(...)`` is the canonical
+#     stdlib API (Python 3.8+; CLAUDE.md mandates 3.9+).
+#   * ``EvaluatorPhase`` is the SINGLE source of phase truth — no
+#     hardcoded phase strings allowed at call sites (the Slice 6
+#     AST pin enforces this).
+#   * The helper is async-context-manager-shaped so it composes
+#     directly with the inline ``async def`` bodies it instruments.
+#
+# Fail-soft contract:
+#   * No-op when ``asyncio.current_task()`` is None (synchronous
+#     context — defensive; production calls happen inside async
+#     functions, but tests may exercise the helper outside).
+#   * No-op when ``set_name()`` raises (Python <3.8 — unreachable
+#     in production, but defensive — never crash the caller).
+#   * NEVER raises. The trace observer is a probe, not authority.
+
+
+def compose_canonical_task_name(
+    phase: "EvaluatorPhase",
+    instance_id: str,
+) -> str:
+    """Build the canonical SWE-Bench-Pro task name from a phase +
+    instance id. Single source of name composition — the AST pin
+    locks every call site to this format string via the
+    EvaluatorPhase enum.
+
+    Format: ``swe_bench_pro:<phase>:<instance_id>``. The observer's
+    ``_classify_phase`` substring table recognises the suffix
+    derived from EvaluatorPhase.value."""
+    safe_id = instance_id if isinstance(instance_id, str) else ""
+    return f"swe_bench_pro:{phase.value}:{safe_id}"
+
+
+@contextlib.asynccontextmanager
+async def task_phase(
+    phase: "EvaluatorPhase",
+    instance_id: str,
+) -> AsyncIterator[None]:
+    """Rename the current asyncio task to the canonical
+    ``swe_bench_pro:<phase>:<instance_id>`` while inside the block,
+    restoring the prior name on exit.
+
+    Composes the existing EvaluatorPhase taxonomy + the trace
+    observer's prefix-filter discipline so the structural probe can
+    identify which phase of the inline evaluator pipeline a task is
+    currently in — even though every phase runs as an inline
+    await inside a single parent task.
+
+    Fail-soft contract:
+      * No-op when ``asyncio.current_task()`` returns None
+        (synchronous context).
+      * No-op when ``set_name()`` raises (older Python; not 3.9+).
+      * NEVER raises; the trace observer is a probe, not authority.
+
+    This is NOT the spawn helper — it modifies the running task's
+    name in place, preserving every existing await / wait_for /
+    gather / semaphore semantic. To spawn a new task with the
+    canonical name, use::
+
+        asyncio.create_task(
+            coro(),
+            name=compose_canonical_task_name(EvaluatorPhase.X, id),
+        )
+
+    The Slice 6 AST pin enforces that EVERY ``asyncio.create_task``
+    call in the swe_bench_pro module carries a ``name=`` kwarg whose
+    value composes to ``swe_bench_pro:...``."""
+    task = asyncio.current_task()
+    new_name = compose_canonical_task_name(phase, instance_id)
+    prior_name: Optional[str] = None
+    if task is not None:
+        try:
+            prior_name = task.get_name()
+        except Exception:  # noqa: BLE001 — defensive; never raise
+            prior_name = None
+        try:
+            task.set_name(new_name)
+        except Exception:  # noqa: BLE001 — defensive; never raise
+            # Python <3.8 OR a Task implementation without set_name;
+            # the observer simply sees the prior name. Probe is
+            # NEVER authoritative — silent degradation is correct.
+            pass
+    try:
+        yield
+    finally:
+        if task is not None and prior_name is not None:
+            try:
+                task.set_name(prior_name)
+            except Exception:  # noqa: BLE001 — defensive
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1159,8 @@ __all__ = [
     "EvaluatorTraceObserver",
     "evaluator_trace_enabled",
     "trace_subprocess",
+    "task_phase",
+    "compose_canonical_task_name",
     "snapshot_tasks",
     "snapshot_subprocesses",
     "build_frame",

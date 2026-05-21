@@ -68,6 +68,10 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from backend.core.ouroboros.governance.cross_process_jsonl import (
     flock_append_line,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+    EvaluatorPhase,
+    task_phase,
+)
 from backend.core.ouroboros.governance.swe_bench_pro.evaluator import (
     EvaluationOutcome,
     EvaluationResult,
@@ -262,26 +266,36 @@ class EvaluationResultStore:
             * Any other exception is swallowed + logged at DEBUG; the
               method returns False rather than crashing the caller.
         """
-        try:
-            record = EvaluationRecord(
-                evaluation=evaluation,
-                scoring=scoring,
-                recorded_at_iso=datetime.now(tz=timezone.utc).isoformat(),
-            )
-            with self._lock:
-                self._records[record.dedup_key] = record
+        # Slice 6 — task-naming completeness: rename the current task
+        # to ``swe_bench_pro:record_result:<instance_id>`` for the
+        # duration of the record (in-memory dict update + optional
+        # flock-protected JSONL append). The instance_id is read from
+        # the EvaluationResult so the observer can correlate this
+        # phase with the matching evaluate / score frames in trace.
+        _instance_id = (
+            getattr(evaluation, "problem_instance_id", "") or ""
+        )
+        async with task_phase(EvaluatorPhase.RECORD_RESULT, _instance_id):
+            try:
+                record = EvaluationRecord(
+                    evaluation=evaluation,
+                    scoring=scoring,
+                    recorded_at_iso=datetime.now(tz=timezone.utc).isoformat(),
+                )
+                with self._lock:
+                    self._records[record.dedup_key] = record
 
-            if not self.is_persistence_enabled():
-                return True
+                if not self.is_persistence_enabled():
+                    return True
 
-            return await self._append_jsonl(record)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - public surface is fail-closed
-            logger.debug(
-                "[SWEBenchPro.ResultStore] record raised", exc_info=True,
-            )
-            return False
+                return await self._append_jsonl(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - public surface is fail-closed
+                logger.debug(
+                    "[SWEBenchPro.ResultStore] record raised", exc_info=True,
+                )
+                return False
 
     async def _append_jsonl(self, record: EvaluationRecord) -> bool:
         """Append a single record to the canonical JSONL audit file

@@ -75,6 +75,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
+    EvaluatorPhase,
+    task_phase,
+)
 from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
     ProblemSpec,
     swe_bench_pro_enabled,
@@ -527,48 +531,59 @@ async def prepare_problem(
     apply test_patch → extract target_paths → return PreparedProblem.
 
     NEVER raises (``asyncio.CancelledError`` propagates).
+
+    Slice 6 — task-naming completeness: the current asyncio task is
+    renamed to ``swe_bench_pro:prepare_problem:<instance_id>`` for
+    the duration of the call so the EvaluatorTraceObserver's
+    structural probe can identify which inline-await phase a stuck
+    task is wedged in. ``task_phase`` is the canonical composing
+    primitive (single source of name truth via the EvaluatorPhase
+    enum); no hardcoded phase string is allowed at the call site,
+    and the Slice 6 AST pin enforces that.
     """
     if not swe_bench_pro_enabled():
         return None, HarnessOutcome.MASTER_FLAG_OFF
-    start = time.monotonic()
-    try:
-        cached = await _ensure_repo_cached(problem.repo_url)
-        if cached is None:
-            return None, HarnessOutcome.CLONE_FAILED
-        wt_pair = await _create_problem_worktree(
-            cached, problem.base_commit, problem.instance_id,
-        )
-        if wt_pair is None:
+    _instance_id = getattr(problem, "instance_id", "") or ""
+    async with task_phase(EvaluatorPhase.PREPARE_PROBLEM, _instance_id):
+        start = time.monotonic()
+        try:
+            cached = await _ensure_repo_cached(problem.repo_url)
+            if cached is None:
+                return None, HarnessOutcome.CLONE_FAILED
+            wt_pair = await _create_problem_worktree(
+                cached, problem.base_commit, problem.instance_id,
+            )
+            if wt_pair is None:
+                return None, HarnessOutcome.WORKTREE_CREATE_FAILED
+            worktree_path, branch_name = wt_pair
+            if not await _apply_test_patch(worktree_path, problem.test_patch):
+                return None, HarnessOutcome.TEST_PATCH_FAILED
+            target_paths = _extract_target_paths_from_patch(problem.test_patch)
+            elapsed = time.monotonic() - start
+            prepared = PreparedProblem(
+                problem_instance_id=problem.instance_id,
+                worktree_path=worktree_path,
+                base_commit=problem.base_commit,
+                repo_url=problem.repo_url,
+                branch_name=branch_name,
+                target_paths=target_paths,
+                elapsed_s=elapsed,
+            )
+            logger.info(
+                "[SWEBenchPro] prepared problem=%r worktree=%r "
+                "branch=%r elapsed=%.1fs targets=%d",
+                problem.instance_id, str(worktree_path), branch_name,
+                elapsed, len(target_paths),
+            )
+            return prepared, HarnessOutcome.READY
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[SWEBenchPro] prepare_problem raised for %r",
+                problem.instance_id, exc_info=True,
+            )
             return None, HarnessOutcome.WORKTREE_CREATE_FAILED
-        worktree_path, branch_name = wt_pair
-        if not await _apply_test_patch(worktree_path, problem.test_patch):
-            return None, HarnessOutcome.TEST_PATCH_FAILED
-        target_paths = _extract_target_paths_from_patch(problem.test_patch)
-        elapsed = time.monotonic() - start
-        prepared = PreparedProblem(
-            problem_instance_id=problem.instance_id,
-            worktree_path=worktree_path,
-            base_commit=problem.base_commit,
-            repo_url=problem.repo_url,
-            branch_name=branch_name,
-            target_paths=target_paths,
-            elapsed_s=elapsed,
-        )
-        logger.info(
-            "[SWEBenchPro] prepared problem=%r worktree=%r "
-            "branch=%r elapsed=%.1fs targets=%d",
-            problem.instance_id, str(worktree_path), branch_name,
-            elapsed, len(target_paths),
-        )
-        return prepared, HarnessOutcome.READY
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[SWEBenchPro] prepare_problem raised for %r",
-            problem.instance_id, exc_info=True,
-        )
-        return None, HarnessOutcome.WORKTREE_CREATE_FAILED
 
 
 # ===========================================================================
