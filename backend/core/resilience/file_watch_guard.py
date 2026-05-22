@@ -28,7 +28,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Phase 5A: Bounded queue backpressure
 try:
@@ -90,12 +90,48 @@ class FileWatchConfig:
     # "OS-to-Organism nervous system severed" failure surfaced by the
     # TodoScanner graduation arc 2026-04-20. Env override
     # ``JARVIS_FILE_WATCH_EXCLUDE_DIRS`` accepts a comma-separated list.
+    #
+    # Slice 12I additions (2026-05-22) — closes the wedge surfaced by the
+    # Slice 12G-2 LoopDeadman in bt-2026-05-22-223333:
+    #   * ``.jarvis``  — runtime state directory; SWE-Bench-Pro
+    #                    worktrees (56K-file element-web clones)
+    #                    live under .jarvis/swe_bench_pro/worktrees/...
+    #                    and were turning PollingObserver into a
+    #                    ~100-thread dirsnapshot.walk storm.
+    #   * ``.claude``  — Claude Code session state; transient.
+    # ``.ouroboros`` was already present.
     exclude_top_level_dirs: frozenset = field(default_factory=lambda: frozenset({
         "venv", ".venv", "venv_py39_backup",
         "node_modules", ".git", ".worktrees",
         "__pycache__", ".pytest_cache", ".mypy_cache",
         "build", "dist", ".ouroboros",
+        ".jarvis", ".claude",  # Slice 12I
     }))
+
+    # Slice 12I — defense-in-depth path-pattern exclusion. Even if
+    # ``exclude_top_level_dirs`` is overridden via
+    # ``JARVIS_FILE_WATCH_EXCLUDE_DIRS`` and drops ``.jarvis``, the
+    # SWE-Bench-Pro worktree root MUST stay unwatched: a single
+    # element-web clone there is ~56K files and turns the
+    # PollingObserver fallback into a CPU storm. These paths are
+    # repo-relative (matched via ``Path.parts`` startswith) so a
+    # symlinked worktree under a different name still hits the
+    # exclusion as long as the canonical repo-relative path matches.
+    # Env override:
+    # ``JARVIS_FILE_WATCH_EXCLUDE_PATH_PATTERNS`` (comma-separated).
+    exclude_path_patterns: frozenset = field(default_factory=lambda: frozenset({
+        ".jarvis/swe_bench_pro/worktrees",
+        ".jarvis/swe_bench_pro/repo_cache",
+        ".jarvis/smoke-logs",
+        ".ouroboros/sessions",
+    }))
+
+    # Slice 12I — warning threshold. If the post-exclusion narrow-
+    # scope schedule resolves to more than this many roots, log a
+    # WARNING line at start so operators see runaway-watching early.
+    # Env override:
+    # ``JARVIS_FILE_WATCH_HIGH_COUNT_WARN`` (int).
+    high_watch_count_warn: int = 30
 
     # Debouncing
     debounce_seconds: float = 0.1  # Wait before firing event
@@ -637,7 +673,10 @@ class FileWatchGuard:
         # parent's depth (e.g. ``backend/_probe.py``) still fire without
         # dragging the nested venv into the snapshot.
         excluded = self._resolve_excluded_dirs()
-        scheduled_paths = self._resolve_watch_paths(excluded)
+        excluded_path_patterns = self._resolve_excluded_path_patterns()
+        scheduled_paths, skipped_by_pattern = self._resolve_watch_paths(
+            excluded, excluded_path_patterns,
+        )
 
         scheduled_ok: List[Tuple[Path, bool]] = []
         for path, recursive in scheduled_paths:
@@ -664,17 +703,54 @@ class FileWatchGuard:
 
         self._scheduled_paths: List[Tuple[Path, bool]] = scheduled_ok
 
+        # Slice 12I — startup telemetry. Operators can read these
+        # lines at boot to confirm the watchdog observer fallback
+        # didn't quietly include a 56K-file SWE-Bench worktree.
         recursive_count = sum(1 for _, r in scheduled_ok if r)
+        polling_fallback_active = (
+            backend_name.lower().startswith("polling")
+            or "polling" in backend_name.lower()
+        )
         self._observer.start()
         logger.info(
-            "[FileWatchGuard] Observer backend: %s, scheduled %d narrow roots "
-            "(%d recursive, %d non-recursive, excluded: %s)",
+            "[FileWatchGuard] Observer backend: %s (polling_fallback=%s), "
+            "scheduled %d narrow roots "
+            "(%d recursive, %d non-recursive, "
+            "excluded_top_level: %s, "
+            "excluded_path_patterns: %s, "
+            "skipped_by_pattern: %d)",
             backend_name,
+            polling_fallback_active,
             len(scheduled_ok),
             recursive_count,
             len(scheduled_ok) - recursive_count,
             sorted(excluded) if excluded else "(none)",
+            sorted(excluded_path_patterns) if excluded_path_patterns else "(none)",
+            skipped_by_pattern,
         )
+
+        # Slice 12I — runaway-watching early warning. The wedge in
+        # bt-2026-05-22-223333 surfaced ~90 polling-observer threads;
+        # any post-exclusion narrow-scope schedule above the threshold
+        # is a red flag worth logging at WARNING. Threshold is env-
+        # overridable via JARVIS_FILE_WATCH_HIGH_COUNT_WARN.
+        try:
+            high_warn = int(
+                os.environ.get(
+                    "JARVIS_FILE_WATCH_HIGH_COUNT_WARN",
+                    str(self.config.high_watch_count_warn),
+                )
+            )
+        except ValueError:
+            high_warn = self.config.high_watch_count_warn
+        if len(scheduled_ok) > high_warn:
+            logger.warning(
+                "[FileWatchGuard] runaway-watching guard: %d narrow roots "
+                "scheduled (> %d threshold). Inspect "
+                "exclude_top_level_dirs / exclude_path_patterns; the "
+                "PollingObserver fallback walks every scheduled root.",
+                len(scheduled_ok), high_warn,
+            )
 
     async def _stop_watchdog(self) -> None:
         """Stop the watchdog observer."""
@@ -704,9 +780,92 @@ class FileWatchGuard:
             )
         return self.config.exclude_top_level_dirs
 
+    def _resolve_excluded_path_patterns(self) -> frozenset:
+        """Slice 12I — resolve repo-relative path patterns to exclude.
+
+        Env override semantics differ from ``_resolve_excluded_dirs``:
+        ``JARVIS_FILE_WATCH_EXCLUDE_PATH_PATTERNS`` is treated as an
+        ADDITIVE extension to the config defaults, NOT a replacement.
+        Operators can extend SWE-Bench-Pro-style transient roots
+        without losing the built-in protection for the worktree dir.
+
+        Each pattern is a repo-relative posix path; matching is done
+        by ``Path.parts`` prefix in ``_resolve_watch_paths`` so both
+        the pattern root and every descendant get excluded.
+
+        Returns the union of config defaults + env additions, with
+        each pattern normalized: leading ``./`` stripped, leading
+        ``/`` stripped (always treated as repo-relative), trailing
+        ``/`` stripped, posix-form. Blank entries silently dropped.
+        """
+        def _normalize(raw: str) -> str:
+            p = raw.strip().replace("\\", "/")
+            while p.startswith("./"):
+                p = p[2:]
+            while p.startswith("/"):
+                p = p[1:]
+            while p.endswith("/"):
+                p = p[:-1]
+            return p
+
+        merged: Set[str] = {
+            _normalize(p) for p in self.config.exclude_path_patterns
+            if _normalize(p)
+        }
+        env_additions = os.environ.get(
+            "JARVIS_FILE_WATCH_EXCLUDE_PATH_PATTERNS", "",
+        ).strip()
+        if env_additions:
+            for chunk in env_additions.split(","):
+                norm = _normalize(chunk)
+                if norm:
+                    merged.add(norm)
+        return frozenset(merged)
+
+    def _path_matches_pattern(
+        self,
+        path: Path,
+        patterns: frozenset,
+    ) -> bool:
+        """Slice 12I — repo-relative parts-prefix match.
+
+        Returns True iff ``path`` resolves to ``watch_dir / <pattern>``
+        OR is a descendant of any such pattern root. Operates on
+        ``Path.parts`` tuples so the comparison is path-component-safe
+        (a pattern ``.jarvis/swe`` cannot accidentally match a sibling
+        directory ``.jarvis/swe_bench_pro`` because the comparison is
+        by tuple-prefix, not string-prefix).
+
+        Patterns are repo-relative; ``path`` may be absolute or
+        relative to ``watch_dir`` — both forms handled. If ``path``
+        is not under ``watch_dir`` at all, returns False (don't filter
+        unrelated paths).
+        """
+        if not patterns:
+            return False
+        try:
+            rel = path.relative_to(self.watch_dir)
+        except ValueError:
+            return False
+        rel_parts = rel.parts
+        if not rel_parts:
+            return False
+        for pattern in patterns:
+            pat_parts = tuple(
+                part for part in pattern.split("/") if part
+            )
+            if not pat_parts:
+                continue
+            if len(rel_parts) >= len(pat_parts) and \
+                    rel_parts[:len(pat_parts)] == pat_parts:
+                return True
+        return False
+
     def _resolve_watch_paths(
-        self, excluded: frozenset,
-    ) -> List[Tuple[Path, bool]]:
+        self,
+        excluded: frozenset,
+        excluded_path_patterns: frozenset = frozenset(),
+    ) -> Tuple[List[Tuple[Path, bool]], int]:
         """Resolve the narrowed set of directories to schedule for watching.
 
         Returns a list of ``(path, recursive)`` tuples. Callers pass each
@@ -735,12 +894,22 @@ class FileWatchGuard:
         ``ignore_patterns`` filter. In practice deep nested venvs are
         vanishingly rare in JARVIS-layout repos.
 
+        Slice 12I addition: ``excluded_path_patterns`` is a frozenset
+        of repo-relative posix paths; any path (depth-1 OR depth-2)
+        whose ``Path.parts`` tuple-prefix matches one of these patterns
+        is dropped from the schedule. This is defense-in-depth for
+        ``.jarvis/swe_bench_pro/worktrees`` even when ``.jarvis`` is
+        explicitly re-included via env override. Returns a tuple
+        ``(paths, skipped_by_pattern_count)`` so the caller can report
+        startup telemetry.
+
         Missing root → empty list (caller's observer.start() still
         succeeds; health loop will notice the missing root and recreate).
         """
         paths: List[Tuple[Path, bool]] = []
+        skipped_by_pattern = 0
         if not self.watch_dir.exists():
-            return paths
+            return paths, skipped_by_pattern
         try:
             depth1 = sorted(self.watch_dir.iterdir())
         except OSError as exc:
@@ -749,12 +918,105 @@ class FileWatchGuard:
                 "falling back to single-root schedule",
                 self.watch_dir, exc,
             )
-            return [(self.watch_dir, True)]
+            return [(self.watch_dir, True)], skipped_by_pattern
+
+        # Slice 12I — pre-tokenize patterns into ``Path.parts`` tuples
+        # once. Used for ancestor/descendant relationship checks
+        # against repo-relative entry paths. Empty tuples (from
+        # ``""``) are dropped so they never match every path.
+        pattern_parts_list: List[Tuple[str, ...]] = [
+            tuple(p for p in pat.split("/") if p)
+            for pat in excluded_path_patterns
+        ]
+        pattern_parts_list = [p for p in pattern_parts_list if p]
+
+        def _matches_pattern(rel_parts: Tuple[str, ...]) -> bool:
+            """rel_parts is AT or BELOW any pattern root."""
+            for pat in pattern_parts_list:
+                if len(rel_parts) >= len(pat) and \
+                        rel_parts[:len(pat)] == pat:
+                    return True
+            return False
+
+        def _has_pattern_descendant(rel_parts: Tuple[str, ...]) -> bool:
+            """Some pattern root is STRICTLY UNDER rel_parts. Means
+            we can't schedule rel_parts recursively — must descend
+            and route around the pattern."""
+            for pat in pattern_parts_list:
+                if len(rel_parts) < len(pat) and \
+                        pat[:len(rel_parts)] == rel_parts:
+                    return True
+            return False
+
+        # Slice 12I — bounded recursive descent for pattern-aware
+        # routing. Used when an entry contains a pattern descendant
+        # at depth > 2 (e.g. ``.jarvis/swe_bench_pro/worktrees``).
+        # Stops at pattern roots (counter++) and name-excluded dirs
+        # (silent). Depth budget caps unbounded recursion; in
+        # practice the deepest known pattern (worktrees) is 3
+        # components so budget 6 is generous.
+        _MAX_PATTERN_DESCENT_DEPTH = 6
+        nonlocal_state = {"skipped": 0}
+
+        def _walk_with_patterns(
+            entry: Path, depth_budget: int,
+        ) -> None:
+            try:
+                rel_parts = entry.relative_to(self.watch_dir).parts
+            except ValueError:
+                return
+            if _matches_pattern(rel_parts):
+                nonlocal_state["skipped"] += 1
+                return
+            if depth_budget <= 0 or \
+                    not _has_pattern_descendant(rel_parts):
+                # Safe to schedule recursively — no pattern below.
+                paths.append((entry, True))
+                return
+            # Has pattern descendants — schedule non-recursively so
+            # file-level events at this depth still fire, and walk
+            # children individually to route around pattern roots.
+            paths.append((entry, False))
+            try:
+                children = list(entry.iterdir())
+            except (OSError, PermissionError):
+                return
+            for child in sorted(children):
+                if not child.is_dir():
+                    continue
+                if child.name in excluded:
+                    continue
+                _walk_with_patterns(child, depth_budget - 1)
 
         for entry in depth1:
             if not entry.is_dir() or entry.name in excluded:
                 continue
-            # Peek at depth 2 children to detect nested venvs.
+            try:
+                entry_rel = entry.relative_to(self.watch_dir).parts
+            except ValueError:
+                entry_rel = ()
+            # Depth-1 pattern match (e.g. operator added a top-level
+            # dir as a pattern). Drop entirely.
+            if _matches_pattern(entry_rel):
+                skipped_by_pattern += 1
+                continue
+            # If this depth-1 entry contains a pattern descendant
+            # (e.g. ``.jarvis`` re-included via env override, and
+            # ``.jarvis/swe_bench_pro/worktrees`` is the protected
+            # pattern), do the pattern-aware recursive descent and
+            # SKIP the legacy depth-2 nested-venv peek (the pattern
+            # walker handles name-excluded children itself).
+            if _has_pattern_descendant(entry_rel):
+                before = nonlocal_state["skipped"]
+                _walk_with_patterns(
+                    entry, _MAX_PATTERN_DESCENT_DEPTH,
+                )
+                skipped_by_pattern += (
+                    nonlocal_state["skipped"] - before
+                )
+                continue
+            # Legacy depth-2 peek for nested-venv-style excluded
+            # name children. Untouched by Slice 12I.
             try:
                 depth2 = list(entry.iterdir())
             except (OSError, PermissionError):
@@ -775,7 +1037,7 @@ class FileWatchGuard:
                         paths.append((grand, True))
             else:
                 paths.append((entry, True))
-        return paths
+        return paths, skipped_by_pattern
 
     # ---- Slice 12A — loop-thread enqueue wrapper -----------------
     #
