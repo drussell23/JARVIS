@@ -1859,6 +1859,12 @@ class ToolExecutor:
         return "\n".join(head) + f"\n\n... [{n_extra} more matches truncated] ...\n\n" + "\n".join(tail)
 
     def _run_tests(self, args: Dict[str, Any]) -> str:
+        """Slice 9 — sync legacy path routes through the canonical
+        ``run_pytest_subprocess_sync`` helper. Discipline + provenance
+        + process-group isolation centralized; behaviour preserved."""
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            run_pytest_subprocess_sync,
+        )
         paths_arg = args.get("paths", [])
         if isinstance(paths_arg, str):
             paths_arg = [paths_arg]
@@ -1871,20 +1877,16 @@ class ToolExecutor:
             except BlockedPathError:
                 return f"(blocked path: {p!r})"
 
-        cmd = ["python3", "-m", "pytest", "--tb=short", "-q"] + safe_paths
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=str(self._repo_root),
-            )
-        except subprocess.TimeoutExpired:
+        result = run_pytest_subprocess_sync(
+            ["python3", "-m", "pytest", "--tb=short", "-q"] + safe_paths,
+            cwd=str(self._repo_root),
+            timeout_s=30.0,
+            caller="tool_executor.ToolExecutor._run_tests",
+            output_cap_chars=_MAX_TOOL_OUTPUT_CHARS,
+        )
+        if result.timed_out:
             return "(pytest timed out after 30s)"
-
-        combined = (proc.stdout or "") + (proc.stderr or "")
-        return combined[-_MAX_TOOL_OUTPUT_CHARS:] if len(combined) > _MAX_TOOL_OUTPUT_CHARS else combined
+        return result.stdout
 
     def _get_callers(self, args: Dict[str, Any]) -> str:
         function_name: str = args["function_name"]
@@ -4326,73 +4328,69 @@ class AsyncProcessToolBackend:
     async def _run_tests_async(
         self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
     ) -> ToolResult:
+        """Slice 9 — async venom run_tests path routes through the
+        canonical ``run_pytest_subprocess`` helper. The helper
+        applies stdin=DEVNULL + process-group isolation +
+        SIGTERM-grace-SIGKILL escalation + provenance logging.
+
+        W3(7) cancel-token semantics preserved: ``CancelledError``
+        propagates through the helper's ``except asyncio.CancelledError``
+        branch, which SIGKILL-pgrp's the child before re-raising.
+        """
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            run_pytest_subprocess,
+        )
         paths_arg = call.arguments.get("paths", [])
         if isinstance(paths_arg, str):
             paths_arg = [paths_arg]
         cmd = ["python3", "-m", "pytest", "--tb=short", "-q"] + list(paths_arg)
-        proc = None
-        # W3(7) Slice 2 — race pytest subprocess against the ambient cancel
-        # token. On Class D/E/F cancel mid-pytest: SIGTERM → grace → SIGKILL.
-        # Master-flag-off → current_cancel_token() returns None →
-        # race_or_wait_for falls through to plain wait_for → unchanged.
-        from backend.core.ouroboros.governance.cancel_token import (
-            OperationCancelledError as _OpCancelledError,
-            current_cancel_token as _curr_cancel_token,
-            race_or_wait_for as _race_or_wait_for,
-            subprocess_grace_s as _subprocess_grace_s,
-        )
-
-        async def _term_then_force(_proc):
-            if _proc is None or _proc.returncode is not None:
-                return
-            try:
-                _proc.terminate()
-            except ProcessLookupError:
-                return
-            try:
-                await asyncio.wait_for(_proc.wait(), timeout=_subprocess_grace_s())
-                return
-            except asyncio.TimeoutError:
-                pass
-            try:
-                _proc.kill()
-                await _proc.wait()
-            except ProcessLookupError:
-                pass
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result = await run_pytest_subprocess(
+                cmd,
                 cwd=str(policy_ctx.repo_root),
+                timeout_s=float(timeout),
+                caller="tool_executor.ToolExecutor._run_tests_async",
             )
-            stdout_b, stderr_b = await _race_or_wait_for(
-                proc.communicate(),
-                timeout=timeout,
-                cancel_token=_curr_cancel_token(),
-            )
-            exit_code = proc.returncode if proc.returncode is not None else -1
+            if result.timed_out:
+                run_result = TestRunResult(status=TestRunStatus.TIMEOUT)
+                output = json.dumps(_dc.asdict(run_result))[:cap]
+                return ToolResult(
+                    tool_call=call, output=output,
+                    status=ToolExecStatus.TIMEOUT,
+                )
+            # The helper merges stderr into stdout; _parse_pytest_output
+            # uses a single combined buffer (Slice 9 contract — merged
+            # drain). Pass the merged stdout for stdout, empty for stderr.
             run_result = _parse_pytest_output(
-                stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), exit_code)
+                result.stdout, "", result.returncode,
+            )
             output = json.dumps(_dc.asdict(run_result))[:cap]
-            exec_status = (ToolExecStatus.SUCCESS
-                if run_result.status in (TestRunStatus.PASS, TestRunStatus.FAIL)
-                else ToolExecStatus.EXEC_ERROR)
-            return ToolResult(tool_call=call, output=output, status=exec_status)
+            exec_status = (
+                ToolExecStatus.SUCCESS
+                if run_result.status in (
+                    TestRunStatus.PASS, TestRunStatus.FAIL,
+                )
+                else ToolExecStatus.EXEC_ERROR
+            )
+            return ToolResult(
+                tool_call=call, output=output, status=exec_status,
+            )
         except asyncio.TimeoutError:
-            await _term_then_force(proc)
+            # The helper enforces timeout internally; if it ever
+            # raises TimeoutError out (e.g. spawn-time wait_for
+            # timeout), surface as a structured TIMEOUT result.
             run_result = TestRunResult(status=TestRunStatus.TIMEOUT)
-            return ToolResult(tool_call=call, output=json.dumps(_dc.asdict(run_result))[:cap],
-                error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
-        except _OpCancelledError:
-            await _term_then_force(proc)
-            raise
-        except asyncio.CancelledError:
-            if proc is not None:
-                proc.kill()
-                await proc.wait()
-            raise
+            return ToolResult(
+                tool_call=call,
+                output=json.dumps(_dc.asdict(run_result))[:cap],
+                error="TIMEOUT", status=ToolExecStatus.TIMEOUT,
+            )
+        # Slice 9 — CancelledError is now handled by the canonical
+        # helper (which SIGKILL-pgrps the child before re-raising).
+        # The outer except blocks that previously did
+        # ``_term_then_force(proc)`` / ``proc.wait()`` (blind wait!)
+        # are removed — the helper owns cleanup.
 
 
 # ---------------------------------------------------------------------------

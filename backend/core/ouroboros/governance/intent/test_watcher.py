@@ -123,64 +123,47 @@ class TestWatcher:
     # ------------------------------------------------------------------
 
     async def run_pytest(self) -> Tuple[str, int]:
-        """Run pytest in a subprocess and return ``(stdout, exit_code)``.
+        """Run pytest via the Slice 9 canonical helper.
 
-        Uses ``asyncio.create_subprocess_exec`` for clean async integration.
-        On timeout (``pytest_timeout_s``), the process is killed and
-        ``("", -1)`` is returned.
-
-        Slice 8 — subprocess pipe-deadlock fix (operator-bound,
-        empirical from bt-2026-05-21-230025): without an explicit
-        ``stdin=DEVNULL`` the pytest child inherits the parent's
-        stdin. Pytest's ``is_interactive_terminal()`` probe / its
-        ``--pdb`` fallback then issues a blocking stdin read that
-        never returns. Children stay at STAT=SN indefinitely; the
-        asyncio event loop starves while ``proc.communicate()``
-        polls for completion (observed: 11+ minute wedge).
-        """
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3",
-                "-m",
-                "pytest",
-                self.test_dir,
-                "--tb=short",
-                "-q",
-                "--no-header",
-                "--color=no",
-                cwd=self.repo_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                # Slice 8 — explicit DEVNULL prevents the pytest
-                # ``is_interactive_terminal()`` / ``--pdb`` blocking
-                # stdin read that wedged bt-2026-05-21-230025.
-                stdin=asyncio.subprocess.DEVNULL,
+        Slice 9 (operator-bound, empirical from bt-2026-05-22-000838):
+        Slice 8's per-site ``stdin=DEVNULL`` patch was correct but
+        narrow — the live runtime has 9 pytest spawn paths and
+        Slice 8 only covered 2. The remaining sites kept the
+        post-Slice-7-proof event-loop starvation alive (PIDs 3554 +
+        3558 at STAT=SN for 9+ minutes). Slice 9 routes EVERY
+        pytest invocation through ``run_pytest_subprocess`` —
+        single source of pipe-discipline + provenance + process-
+        group cleanup. AST pin in
+        ``test_slice9_canonical_pytest_helper.py`` forbids any
+        other path."""
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            run_pytest_subprocess,
+        )
+        argv = [
+            "python3",
+            "-m",
+            "pytest",
+            str(self.test_dir),
+            "--tb=short",
+            "-q",
+            "--no-header",
+            "--color=no",
+        ]
+        result = await run_pytest_subprocess(
+            argv,
+            cwd=str(self.repo_path),
+            timeout_s=float(self.pytest_timeout_s),
+            caller="intent.test_watcher.TestWatcher.run_pytest",
+        )
+        if result.timed_out:
+            logger.warning(
+                "pytest timed out after %.1fs — killed via "
+                "PytestHelper (kill_reason=%s)",
+                self.pytest_timeout_s,
+                result.kill_reason.value,
             )
-            stdout_bytes, _ = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self.pytest_timeout_s,
-            )
-            output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-            exit_code = proc.returncode if proc.returncode is not None else -1
-            return output, exit_code
-        except asyncio.TimeoutError:
-            logger.warning("pytest timed out after %.1fs — killing process", self.pytest_timeout_s)
-            try:
-                proc.kill()  # type: ignore[possibly-undefined]
-                # Slice 8 — drain via ``communicate()`` with a
-                # short bound instead of a blind ``proc.wait()``
-                # (operator binding: no blind .wait() calls). The
-                # communicate() call drains any buffered output as
-                # the child exits, preventing the parent from
-                # accumulating an undrained pipe if the kill races
-                # the buffer flush.
-                await asyncio.wait_for(
-                    proc.communicate(),  # type: ignore[possibly-undefined]
-                    timeout=5.0,
-                )
-            except Exception:
-                pass
             return "", -1
+        return result.stdout, result.returncode
 
     # ------------------------------------------------------------------
     # Output parsing

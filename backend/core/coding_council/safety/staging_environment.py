@@ -524,33 +524,35 @@ class StagingEnvironment:
         return files
 
     async def _run_staged_tests(self, staging_path: Path) -> Dict[str, Any]:
-        """Run tests in staging environment."""
-        try:
-            # Run pytest with isolated path
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(staging_path)
+        """Run tests in staging environment.
 
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pytest",
-                "-x", "--tb=short", "-q",
-                cwd=str(staging_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-
-            return {
-                "passed": proc.returncode == 0,
-                "output": stdout.decode(),
-                "error": stderr.decode(),
-            }
-
-        except asyncio.TimeoutError:
+        Slice 9 — routes through canonical helper (stdin=DEVNULL +
+        process-group isolation + provenance + bounded timeout)."""
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            KillReason,
+            run_pytest_subprocess,
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(staging_path)
+        result = await run_pytest_subprocess(
+            [sys.executable, "-m", "pytest", "-x", "--tb=short", "-q"],
+            cwd=str(staging_path),
+            timeout_s=120.0,
+            caller="coding_council.staging_environment._run_staged_tests",
+            env=env,
+        )
+        if result.timed_out:
             return {"passed": False, "message": "Tests timed out"}
-        except Exception as e:
-            return {"passed": False, "message": str(e)}
+        if result.kill_reason == KillReason.SPAWN_ERROR:
+            return {
+                "passed": False,
+                "message": str(result.spawn_error_class),
+            }
+        return {
+            "passed": result.returncode == 0,
+            "output": result.stdout,
+            "error": "",  # helper merges stderr into stdout
+        }
 
     async def _cleanup_staging(self, task_id: str) -> None:
         """Clean up staging environment."""

@@ -593,36 +593,33 @@ class ValidationLayersAdapter:
                 "provider_error",
                 f"worktree missing: {worktree_path}",
             )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python", "-m", "pytest", "-q", "--no-header",
-                cwd=worktree_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except FileNotFoundError:
-            return ("provider_error", "python not found")
-        except Exception as err:  # noqa: BLE001
+        # Slice 9 — canonical helper (stdin=DEVNULL +
+        # process-group isolation + provenance + bounded
+        # SIGTERM-grace-SIGKILL escalation).
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            KillReason,
+            run_pytest_subprocess,
+        )
+        result = await run_pytest_subprocess(
+            ["python", "-m", "pytest", "-q", "--no-header"],
+            cwd=worktree_path,
+            timeout_s=float(pytest_timeout_s()),
+            caller="m10.bridge_adapters",
+        )
+        if result.kill_reason == KillReason.SPAWN_ERROR:
+            if (result.spawn_error_class or "") == "FileNotFoundError":
+                return ("provider_error", "python not found")
             return (
                 "provider_error",
-                f"spawn failed: {type(err).__name__}",
+                f"spawn failed: {result.spawn_error_class}",
             )
-        try:
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=pytest_timeout_s(),
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await proc.communicate()
-            except Exception:  # noqa: BLE001
-                pass
+        if result.timed_out:
             return (
                 "provider_error",
                 f"pytest timed out at {pytest_timeout_s():.0f}s",
             )
-        rc = proc.returncode
-        out_tail = (stdout.decode(errors="replace") or "")[-512:]
+        rc = result.returncode
+        out_tail = result.stdout[-512:]
         if rc == 0:
             return ("passed", "pytest rc=0")
         if rc == 5:
