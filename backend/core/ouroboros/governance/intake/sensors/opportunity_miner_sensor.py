@@ -496,33 +496,39 @@ class OpportunityMinerSensor:
                 except (OSError, UnicodeDecodeError):
                     errors += 1
                     continue
-                # Slice 11B — route through canonical helper.
-                # Off-loop process-pool parse for source above the
-                # tiny threshold (~4KB); inline-tiny otherwise.
-                # The Slice 11A measure() telemetry is composed
-                # inside the helper — every call still flows into
-                # the provenance ring with caller label.
+                # Slice 11B-fix — route through analyze helper.
+                # Parse + all six dimension AST walks run in a
+                # worker process; the parent receives only a small
+                # primitive payload. NO ast.AST crosses the IPC
+                # boundary, so the main asyncio thread never blocks
+                # on a heavy walk. SyntaxError / TIMEOUT / TOO_LARGE
+                # / INTERNAL_ERROR all map to the legacy
+                # "errors += 1; continue" semantics: failed
+                # parse/analysis → skip file, increment error
+                # counter, never produce a candidate.
                 from backend.core.ouroboros.governance.ast_compile_helper import (  # noqa: E501
-                    ParseOutcome as _S11_PO,
-                    parse_python_source as _s11_parse,
+                    AnalyzeOutcome as _S11B_AO,
+                    analyze_python_source_for_opportunity_miner as _s11b_analyze,
                 )
-                _s11_result = await _s11_parse(
+                _s11b_result = await _s11b_analyze(
                     "opportunity_miner_sensor.scan_once",
                     source,
                     filename=str(py_file),
                 )
-                if _s11_result.outcome != _S11_PO.OK:
-                    # SyntaxError / TIMEOUT / TOO_LARGE /
-                    # INTERNAL_ERROR all fall into the legacy
-                    # "errors += 1; continue" semantics. The
-                    # OpportunityMiner contract: failed parse →
-                    # skip file, increment error counter, never
-                    # produce a candidate.
+                if _s11b_result.outcome != _S11B_AO.OK:
                     errors += 1
                     continue
-                tree = _s11_result.tree
 
-                analysis = _analyze_file(rel, source, tree)
+                analysis = _FileAnalysis(
+                    file_path=rel,
+                    cyclomatic_complexity=_s11b_result.payload.cyclomatic_complexity,
+                    max_function_length=_s11b_result.payload.max_function_length,
+                    cognitive_complexity=_s11b_result.payload.cognitive_complexity,
+                    duplicate_block_count=_s11b_result.payload.duplicate_block_count,
+                    import_fan_out=_s11b_result.payload.import_fan_out,
+                    todo_fixme_count=_s11b_result.payload.todo_fixme_count,
+                    total_lines=_s11b_result.payload.total_lines,
+                )
                 self._analysis_cache[rel] = analysis
 
                 # Strategy-specific threshold gate
@@ -866,23 +872,33 @@ class OpportunityMinerSensor:
             source = py_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return None
-        # Slice 11B — route through canonical helper. SyntaxError +
-        # TIMEOUT + TOO_LARGE + INTERNAL_ERROR all return None
-        # (legacy semantics: failed parse → no candidate).
+        # Slice 11B-fix — analyze helper: parse + all six dimension
+        # walks in a worker process; only a primitive payload
+        # returns to the main thread. SyntaxError / TIMEOUT /
+        # TOO_LARGE / INTERNAL_ERROR all return None (legacy
+        # semantics: failed parse → no candidate).
         from backend.core.ouroboros.governance.ast_compile_helper import (  # noqa: E501
-            ParseOutcome as _S11_PO,
-            parse_python_source as _s11_parse,
+            AnalyzeOutcome as _S11B_AO,
+            analyze_python_source_for_opportunity_miner as _s11b_analyze,
         )
-        _s11_result = await _s11_parse(
+        _s11b_result = await _s11b_analyze(
             "opportunity_miner_sensor.scan_file",
             source,
             filename=str(py_file),
         )
-        if _s11_result.outcome != _S11_PO.OK:
+        if _s11b_result.outcome != _S11B_AO.OK:
             return None
-        tree = _s11_result.tree
 
-        analysis = _analyze_file(rel, source, tree)
+        analysis = _FileAnalysis(
+            file_path=rel,
+            cyclomatic_complexity=_s11b_result.payload.cyclomatic_complexity,
+            max_function_length=_s11b_result.payload.max_function_length,
+            cognitive_complexity=_s11b_result.payload.cognitive_complexity,
+            duplicate_block_count=_s11b_result.payload.duplicate_block_count,
+            import_fan_out=_s11b_result.payload.import_fan_out,
+            todo_fixme_count=_s11b_result.payload.todo_fixme_count,
+            total_lines=_s11b_result.payload.total_lines,
+        )
         self._analysis_cache[rel] = analysis
 
         # Gate on composite score for event-driven path

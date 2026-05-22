@@ -159,13 +159,25 @@ class TestHelperAstCage(unittest.TestCase):
         tree = _parse_module(_HELPER_FILE)
         calls = self._find_ast_parse_calls(tree)
         self.assertGreater(len(calls), 0, "helper must call ast.parse")
+        # 11B-fix extends the allowed set to include
+        # ``_worker_analyze_in_process`` (parse + analyze in the
+        # same worker call, returning a primitive payload).
+        # ``_inline_tiny_parse`` remains for the parse helper's
+        # tiny-source path; ``_inline_tiny_analyze`` is the analyze
+        # helper's tiny-source path (which calls
+        # ``_worker_analyze_in_process`` inline, so it never calls
+        # ast.parse directly).
         for (lineno,) in calls:
             fn_name = self._enclosing_function(tree, lineno)
             self.assertIn(
                 fn_name,
-                {"_worker_parse_in_process", "_inline_tiny_parse"},
+                {
+                    "_worker_parse_in_process",
+                    "_worker_analyze_in_process",
+                    "_inline_tiny_parse",
+                },
                 f"helper ast.parse at L{lineno} in function "
-                f"{fn_name!r} — must be in worker or inline-tiny "
+                f"{fn_name!r} — must be in a worker or inline-tiny "
                 f"path",
             )
 
@@ -365,11 +377,17 @@ class TestOpportunityMinerMigration(unittest.TestCase):
 
     def test_scan_once_imports_helper(self) -> None:
         """The helper import must be present in the scan_once body
-        (lazy import, mirrors the Slice 10 pattern)."""
+        (lazy import, mirrors the Slice 10 pattern). 11B-fix
+        replaces the parse-only entry with the analyze entry —
+        scan_once now imports
+        ``analyze_python_source_for_opportunity_miner`` /
+        ``AnalyzeOutcome`` (no ast.AST consumption)."""
         src = _MINER_FILE.read_text()
         self.assertIn("ast_compile_helper", src)
-        self.assertIn("parse_python_source", src)
-        self.assertIn("ParseOutcome", src)
+        self.assertIn(
+            "analyze_python_source_for_opportunity_miner", src,
+        )
+        self.assertIn("AnalyzeOutcome", src)
 
     def test_scan_once_routes_caller_label(self) -> None:
         """The caller label passed to parse_python_source
@@ -478,10 +496,17 @@ def _fake_result(outcome: ParseOutcome) -> ParseResult:
 
 class TestPublicSurface(unittest.TestCase):
     def test_all_exports(self) -> None:
+        # 11B-fix extends the public surface with the analyze
+        # helper's taxonomy + result types + entry point. The
+        # parse-only API stays exposed for narrow non-walking
+        # callers.
         self.assertEqual(
             set(helper_mod.__all__),
             {
-                "ExecutionMode", "ParseOutcome", "ParseResult",
+                "AnalysisResult", "AnalyzeOutcome",
+                "ExecutionMode", "OpportunityAnalysisPayload",
+                "ParseOutcome", "ParseResult",
+                "analyze_python_source_for_opportunity_miner",
                 "parse_python_source", "shutdown_pool",
             },
         )
