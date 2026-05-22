@@ -480,6 +480,7 @@ class CppAdapter:
                 f"-G{self._CMAKE_GENERATOR}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=cwd,
             )
             try:
@@ -502,6 +503,7 @@ class CppAdapter:
                 "cmake", "--build", str(build_dir), "--parallel",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=cwd,
             )
             try:
@@ -531,6 +533,7 @@ class CppAdapter:
                 "cmake", "--install", str(build_dir), "--prefix", str(install_tmp),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except Exception:
@@ -548,6 +551,7 @@ class CppAdapter:
                     str(so),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    stdin=asyncio.subprocess.DEVNULL,
                 )
                 await asyncio.wait_for(probe.communicate(), timeout=10.0)
                 if probe.returncode != 0:
@@ -568,6 +572,7 @@ class CppAdapter:
                 "ctest", "--output-on-failure", "--test-dir", str(build_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
             stdout = (out or b"").decode(errors="replace")
@@ -1133,11 +1138,26 @@ class TestRunner:
         """Run subprocess with timeout.
 
         Returns dict with keys: stdout, returncode, report_data.
+
+        Slice 8 — subprocess pipe-deadlock fix (operator-bound,
+        empirical from bt-2026-05-21-230025): pytest subprocesses
+        wedged at STAT=SN for 11+ minutes when stdin inherits the
+        parent's terminal. Pytest's ``is_interactive_terminal()``
+        probe / ``--pdb`` fallback issues a blocking stdin read
+        that never returns. The asyncio event loop starves while
+        ``proc.communicate()`` polls for completion.
+
+        Fix: explicit ``stdin=asyncio.subprocess.DEVNULL`` causes
+        stdin reads in the child to return EOF immediately.
+        ``proc.communicate()`` continues to concurrently drain
+        stdout+stderr — the canonical asyncio pattern that
+        prevents OS-pipe-buffer (~64KB) backpressure stalls.
         """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
             cwd=cwd,
         )
 
@@ -1152,7 +1172,9 @@ class TestRunner:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            # Wait for process to actually terminate
+            # Wait for process to actually terminate — use
+            # ``communicate()`` (not a blind ``.wait()``) so the
+            # pipe drains as the child exits. Bounded by 5s.
             try:
                 await asyncio.wait_for(proc.communicate(), timeout=5.0)
             except (asyncio.TimeoutError, ProcessLookupError):

@@ -128,6 +128,15 @@ class TestWatcher:
         Uses ``asyncio.create_subprocess_exec`` for clean async integration.
         On timeout (``pytest_timeout_s``), the process is killed and
         ``("", -1)`` is returned.
+
+        Slice 8 — subprocess pipe-deadlock fix (operator-bound,
+        empirical from bt-2026-05-21-230025): without an explicit
+        ``stdin=DEVNULL`` the pytest child inherits the parent's
+        stdin. Pytest's ``is_interactive_terminal()`` probe / its
+        ``--pdb`` fallback then issues a blocking stdin read that
+        never returns. Children stay at STAT=SN indefinitely; the
+        asyncio event loop starves while ``proc.communicate()``
+        polls for completion (observed: 11+ minute wedge).
         """
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -142,6 +151,10 @@ class TestWatcher:
                 cwd=self.repo_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                # Slice 8 — explicit DEVNULL prevents the pytest
+                # ``is_interactive_terminal()`` / ``--pdb`` blocking
+                # stdin read that wedged bt-2026-05-21-230025.
+                stdin=asyncio.subprocess.DEVNULL,
             )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(),
@@ -154,7 +167,17 @@ class TestWatcher:
             logger.warning("pytest timed out after %.1fs — killing process", self.pytest_timeout_s)
             try:
                 proc.kill()  # type: ignore[possibly-undefined]
-                await proc.wait()  # type: ignore[possibly-undefined]
+                # Slice 8 — drain via ``communicate()`` with a
+                # short bound instead of a blind ``proc.wait()``
+                # (operator binding: no blind .wait() calls). The
+                # communicate() call drains any buffered output as
+                # the child exits, preventing the parent from
+                # accumulating an undrained pipe if the kill races
+                # the buffer flush.
+                await asyncio.wait_for(
+                    proc.communicate(),  # type: ignore[possibly-undefined]
+                    timeout=5.0,
+                )
             except Exception:
                 pass
             return "", -1
