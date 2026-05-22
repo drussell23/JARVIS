@@ -1925,7 +1925,32 @@ class ToolExecutor:
     # ------------------------------------------------------------------
 
     def _glob_files(self, args: Dict[str, Any]) -> str:
-        """Find files by glob pattern (like Claude Code's Glob tool)."""
+        """Find files by glob pattern (like Claude Code's Glob tool).
+
+        Slice 12H — bounded incremental traversal. Replaces the
+        prior ``sorted(resolved.rglob(pattern))`` which materialised
+        every match in a 56K-file worktree BEFORE applying the
+        500-match cap, wedging Phase 3A relaunch
+        (bt-2026-05-22-215354) for 5+ minutes. The bounded walker
+        now:
+
+          * Skips high-cardinality dirs at the directory level
+            (.git, node_modules, dist, build, .venv, venv,
+            __pycache__, .next, coverage by default; extensible
+            via JARVIS_TOOL_GLOB_SKIP_DIRS).
+          * Enforces a wall-clock cap
+            (JARVIS_TOOL_GLOB_TIMEOUT_S, default 5s).
+          * Enforces a scanned-entry cap
+            (JARVIS_TOOL_GLOB_MAX_SCANNED, default 50_000).
+          * Returns partial results with explicit truncation
+            reason ("truncated: max_scanned" / max_matches /
+            timeout).
+
+        Pattern matching: legacy ``**/foo.py`` shape is collapsed
+        to a basename pattern (``foo.py``) since the bounded
+        walker is always recursive — the historical ``**``
+        distinction was vestigial (every walk recurses; skip-dirs
+        is the actual depth control)."""
         pattern: str = args["pattern"]
         base: str = args.get("path", ".")
 
@@ -1933,21 +1958,64 @@ class ToolExecutor:
         if not resolved.is_dir():
             return f"(not a directory: {base})"
 
-        # Use rglob for ** patterns, glob for single-level
-        matches: List[str] = []
+        # Normalize the pattern to the basename form fnmatch expects.
+        # ``**/foo.py`` → ``foo.py``; ``foo/*.py`` → ``*.py``.
+        clean_pattern = pattern
+        if "/" in clean_pattern:
+            clean_pattern = clean_pattern.rsplit("/", 1)[-1] or "*"
+        if clean_pattern.startswith("**"):
+            clean_pattern = clean_pattern.lstrip("*") or "*"
+
         try:
-            for p in sorted(resolved.rglob(pattern) if "**" in pattern else resolved.glob(pattern)):
-                if p.is_file():
-                    matches.append(str(p.relative_to(self._repo_root)))
-        except Exception as exc:
+            from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
+                bounded_glob,
+            )
+            result = bounded_glob(resolved, clean_pattern)
+        except Exception as exc:  # noqa: BLE001
             return f"(glob error: {exc})"
 
-        if not matches:
+        # Project matches into repo-relative paths for parity with
+        # the prior implementation.
+        relmatches: List[str] = []
+        for p in result.matches:
+            path = Path(p)
+            try:
+                relmatches.append(str(path.relative_to(self._repo_root)))
+            except ValueError:
+                # Path outside repo root (symlink etc) — fall back
+                # to absolute so operator still sees the file.
+                relmatches.append(str(path))
+
+        # Structured telemetry on every truncation so operators
+        # can correlate slow glob tool calls with the budget knob
+        # that fired.
+        if result.truncated:
+            try:
+                logger.info(
+                    "[ToolExecutor] glob_files truncated reason=%s "
+                    "root=%s pattern=%r scanned=%d matched=%d "
+                    "elapsed_ms=%.1f",
+                    result.outcome.value, str(resolved),
+                    pattern, result.scanned_count, len(relmatches),
+                    result.elapsed_ms,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not relmatches:
+            if result.truncated:
+                return f"(no matches; {result.truncation_reason()})"
             return "(no matches)"
-        cap = 500
-        if len(matches) > cap:
-            return "\n".join(matches[:cap]) + f"\n... ({len(matches) - cap} more files)"
-        return "\n".join(matches)
+
+        body = "\n".join(relmatches)
+        if result.truncated:
+            return (
+                f"{body}\n... ({result.truncation_reason()}; "
+                f"scanned={result.scanned_count} "
+                f"matched={len(relmatches)} "
+                f"elapsed_ms={result.elapsed_ms:.0f})"
+            )
+        return body
 
     def _list_dir(self, args: Dict[str, Any]) -> str:
         """List directory contents with types and sizes (like ls -la)."""

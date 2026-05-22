@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
 from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog

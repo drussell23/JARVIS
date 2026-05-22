@@ -1141,18 +1141,129 @@ class OperationAdvisor:
                 self._evict_blast_radius_cache_if_oversized()
             return 0
 
+        # Slice 12H — bounded legacy fallback. The prior loop ran
+        # ``scan_root.rglob("*.py")`` with no scan / wall-clock bound
+        # and ``py_file.read_text()`` (unbounded) per file. On the
+        # element-web worktree (56K+ files including a generated
+        # node_modules tree that the substring "venv"/"__pycache__"
+        # skip missed), this was a 5-min sync wedge. LoopDeadman
+        # surfaced the stack trace in bt-2026-05-22-215354.
+        #
+        # The bounded walker now:
+        #   * Skips high-cardinality dirs at the directory level
+        #     (.git, node_modules, dist, build, .venv, venv,
+        #     __pycache__, .next, coverage, ...) using
+        #     ``default_skip_dirs()``.
+        #   * Enforces ``JARVIS_BLAST_RADIUS_MAX_SCANNED`` (default
+        #     20_000) entries scanned ceiling.
+        #   * Enforces ``JARVIS_BLAST_RADIUS_TIMEOUT_S`` (default
+        #     10.0s) wall-clock ceiling.
+        #   * Bounds per-file read to
+        #     ``JARVIS_BLAST_RADIUS_MAX_BYTES_PER_FILE`` (default
+        #     64 KB) — protects against generated min.js / .map
+        #     files even after dir-level skip.
+        #
+        # On budget exhaustion (timeout / scan-cap hit) the method
+        # returns ``JARVIS_BLAST_RADIUS_CONSERVATIVE_CAP`` (default
+        # 50, matching the prior in-loop cap). Bias toward
+        # CAUTION (high blast radius), never toward false safety.
+        from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
+            blast_radius_conservative_cap,
+            blast_radius_max_bytes_per_file,
+            blast_radius_max_scanned,
+            blast_radius_timeout_s,
+            bounded_read_text,
+            default_skip_dirs,
+            iter_bounded_files,
+        )
+        _scan_start = time.monotonic()
+        _scan_max = blast_radius_max_scanned()
+        _scan_timeout_s = blast_radius_timeout_s()
+        _per_file_bytes = blast_radius_max_bytes_per_file()
+        _conservative_cap = blast_radius_conservative_cap()
+        _skip = default_skip_dirs()
+
         importers = 0
-        for py_file in scan_root.rglob("*.py"):
-            if "venv" in str(py_file) or "__pycache__" in str(py_file):
+        _files_examined = 0
+        _budget_exhausted = False
+        for path_str in iter_bounded_files(
+            scan_root,
+            max_scanned=_scan_max,
+            timeout_s=_scan_timeout_s,
+            skip_dirs=_skip,
+        ):
+            # Domain filter: only Python files participate in the
+            # importer scan.
+            if not path_str.endswith(".py"):
                 continue
+            _files_examined += 1
+            # Bounded read — replaces unbounded read_text. Reads
+            # the first _per_file_bytes only; sufficient for
+            # import-statement substring matching (imports live in
+            # the file head). Defensive against multi-MB generated
+            # min.js / build artifacts that slipped past the
+            # directory-level skip filter.
+            content = bounded_read_text(
+                Path(path_str), max_bytes=_per_file_bytes,
+            )
+            if content is None:
+                continue
+            if any(mod in content for mod in target_modules):
+                importers += 1
+            if importers >= _conservative_cap:
+                # Reached the historical in-loop cap with the
+                # scan budget still intact — same semantic as
+                # before but via bounded walker. Not a budget
+                # exhaustion; record the actual count.
+                break
+        else:
+            # ``iter_bounded_files`` terminates cleanly on budget
+            # exhaustion (returns without yielding). Distinguish:
+            # if we didn't hit the importer cap AND the walker
+            # stopped, check elapsed against budget. When walker
+            # returns due to time / scan caps we lack ground truth
+            # on the actual importer count.
+            _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
+            if (
+                importers < _conservative_cap
+                and (
+                    _elapsed_ms >= _scan_timeout_s * 1000.0 * 0.95
+                    or _files_examined >= _scan_max // 4
+                )
+            ):
+                _budget_exhausted = True
+
+        _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
+        if _budget_exhausted:
+            # Conservative return — bias toward caution, NOT false
+            # safety. Operator binding: "If the scan budget is
+            # exhausted, return a conservative high blast-radius
+            # value, e.g. existing cap 50, and log/record
+            # 'blast_radius_scan_budget_exhausted'."
             try:
-                content = py_file.read_text(errors="replace")
-                if any(mod in content for mod in target_modules):
-                    importers += 1
-            except Exception:
+                logger.info(
+                    "[Advisor] blast_radius_scan_budget_exhausted "
+                    "root=%s targets=%d files_examined=%d "
+                    "importers_found_partial=%d elapsed_ms=%.1f "
+                    "conservative_cap=%d — returning cap (bias=caution)",
+                    str(scan_root), len(target_modules),
+                    _files_examined, importers, _elapsed_ms,
+                    _conservative_cap,
+                )
+            except Exception:  # noqa: BLE001
                 pass
-            if importers >= 50:
-                break  # Cap the search
+            importers = _conservative_cap
+        else:
+            try:
+                logger.debug(
+                    "[Advisor] blast_radius_legacy_scan_complete "
+                    "root=%s targets=%d files_examined=%d "
+                    "importers=%d elapsed_ms=%.1f",
+                    str(scan_root), len(target_modules),
+                    _files_examined, importers, _elapsed_ms,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         # Record + bound the cache.  FIFO eviction is acceptable because the
         # TTL already bounds entry age; max-entries is a defensive memory
