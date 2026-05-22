@@ -80,6 +80,7 @@ from backend.core.ouroboros.governance.invariant_drift_auditor import (
     InvariantDriftRecord,
     InvariantSnapshot,
     capture_snapshot,
+    capture_snapshot_async,
     compare_snapshots,
     invariant_drift_auditor_enabled,
 )
@@ -385,8 +386,15 @@ class InvariantDriftObserver:
 
       * ``store``           — required ``InvariantDriftStore``
       * ``emitter``         — defaults to the process-global registry
-      * ``capture``         — defaults to ``capture_snapshot`` from
-                              the auditor
+      * ``capture``         — sync OR async callable returning an
+                              ``InvariantSnapshot``. Slice 11C: the
+                              default is ``capture_snapshot_async``
+                              so the soak's heavy invariant
+                              validation runs off-loop. Tests
+                              injecting a sync ``lambda: snap``
+                              continue to work — ``run_one_cycle``
+                              awaits only when the result is a
+                              coroutine.
       * ``posture_reader``  — callable returning current posture
                               string or None; defaults to reading
                               ``PostureStore.load_current()``"""
@@ -397,13 +405,16 @@ class InvariantDriftObserver:
         *,
         emitter: Optional[InvariantDriftSignalEmitter] = None,
         capture: Optional[
-            Callable[[], InvariantSnapshot]
+            Callable[[], Any]
         ] = None,
         posture_reader: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         self._store = store
         self._emitter_override = emitter
-        self._capture = capture or capture_snapshot
+        # Slice 11C: default to the async capture so the asyncio
+        # control plane stays unblocked during the heavy invariant
+        # validation step (~24 s for 879 invariants on this repo).
+        self._capture = capture or capture_snapshot_async
         self._posture_reader = (
             posture_reader or self._default_posture_reader
         )
@@ -662,10 +673,20 @@ class InvariantDriftObserver:
           4. Compare. No drift → decay vigilance, return clean result.
           5. Drift → check signature ring. Duplicate → mark deduped,
              skip emit. Novel → record signature + escalate vigilance
-             + emit signal."""
-        # 1. Capture
+             + emit signal.
+
+        Slice 11C: ``self._capture`` may be sync OR async — when
+        the result is a coroutine we await it. The default factory
+        returns ``capture_snapshot_async`` which routes invariant
+        validation through the canonical off-loop helper; tests
+        injecting a sync ``lambda: snap`` continue to work."""
+        # 1. Capture (sync or async)
         try:
-            current = self._capture()
+            result = self._capture()
+            if asyncio.iscoroutine(result):
+                current = await result
+            else:
+                current = result
         except Exception as exc:  # noqa: BLE001 — defensive
             with self._lock:
                 self._consecutive_failures += 1
