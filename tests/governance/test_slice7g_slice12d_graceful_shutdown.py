@@ -344,11 +344,35 @@ class TestSlice12DSsePublish(unittest.TestCase):
         )
         self.assertTrue(callable(publish_session_exhausted))
 
+    def test_event_type_is_in_broker_allowlist(self) -> None:
+        """The broker's ``_VALID_EVENT_TYPES`` allowlist must
+        include ``session_exhausted``. Missed in the initial Slice
+        12D commit — the in-process callback shutdown chain still
+        worked (it's the authoritative channel), but every SSE
+        publish was rejected with ``[Stream] publish rejected
+        unknown event_type='session_exhausted'``. Pinned so a
+        future refactor that re-derives the allowlist can't drop
+        this entry silently."""
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_SESSION_EXHAUSTED,
+            _VALID_EVENT_TYPES,
+        )
+        self.assertIn(
+            EVENT_TYPE_SESSION_EXHAUSTED, _VALID_EVENT_TYPES,
+            "EVENT_TYPE_SESSION_EXHAUSTED must be in the broker's "
+            "allowlist so publish_session_exhausted can actually "
+            "ship the event (Slice 12D observability)",
+        )
+
     def test_publish_helper_best_effort_on_malformed_payload(
         self,
     ) -> None:
         """A malformed payload must not crash the publish helper —
-        observability is non-authoritative."""
+        observability is non-authoritative. The contract is
+        explicit: NEVER raises. The return value is whatever the
+        broker hands back (an event_id when the publish lands, or
+        ``None`` when the broker is disabled / publish errors out)
+        — both are acceptable degradation modes."""
         from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
             publish_session_exhausted,
         )
@@ -356,7 +380,6 @@ class TestSlice12DSsePublish(unittest.TestCase):
         class _NoAttrs:
             pass
 
-        # Should return None without raising.
         try:
             result = publish_session_exhausted(_NoAttrs())
         except Exception as exc:  # pragma: no cover
@@ -364,8 +387,14 @@ class TestSlice12DSsePublish(unittest.TestCase):
                 f"publish_session_exhausted must be best-effort; "
                 f"got {type(exc).__name__}: {exc}",
             )
-        # When the broker is disabled the helper returns None.
-        self.assertIn(result, (None, ), "best-effort must degrade silently")
+        # Either degradation mode is fine: None (broker disabled /
+        # publish error) OR an event_id string (broker accepted
+        # zero-valued payload). What matters is no raise.
+        self.assertTrue(
+            result is None or isinstance(result, str),
+            f"publish must return None or event_id string; got "
+            f"{type(result).__name__}: {result!r}",
+        )
 
 
 # ============================================================================
