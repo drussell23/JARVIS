@@ -207,10 +207,19 @@ class TestNoStateDuplicationAstPin(unittest.TestCase):
 
 
 class TestMasterFlagDefault(unittest.TestCase):
-    def test_default_off(self) -> None:
+    """Slice 7g graduated the breaker to default-TRUE on 2026-05-22.
+    Hot-revert is via the explicit opt-out tokens (``"0"`` /
+    ``"false"`` / ``"no"`` / ``"off"``) — but the empty/unset env
+    var now leaves the breaker enabled."""
+
+    def test_default_on(self) -> None:
         os.environ.pop("JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED",
                        None)
-        self.assertFalse(circuit_breaker_enabled())
+        self.assertTrue(
+            circuit_breaker_enabled(),
+            "Slice 7g: empty env must keep breaker enabled "
+            "(graduated default-TRUE 2026-05-22)",
+        )
 
     def test_truthy_values_enable(self) -> None:
         for v in ("1", "true", "TRUE", "yes", "on"):
@@ -221,12 +230,25 @@ class TestMasterFlagDefault(unittest.TestCase):
                     self.assertTrue(circuit_breaker_enabled())
 
     def test_falsy_values_disable(self) -> None:
-        for v in ("0", "false", "no", "off", ""):
+        # Slice 7g: empty string is NO LONGER falsy (graduated
+        # default-TRUE). Only explicit opt-out tokens disable.
+        for v in ("0", "false", "no", "off"):
             with self.subTest(v=v):
                 with _EnvGuard(
                     JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED=v,
                 ):
                     self.assertFalse(circuit_breaker_enabled())
+
+    def test_empty_string_keeps_graduated_default(self) -> None:
+        """Slice 7g explicit: empty env value falls into the
+        graduated-default path (== unset). Pinned separately so a
+        regression to the pre-graduation shape fails loudly."""
+        with _EnvGuard(JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED=""):
+            self.assertTrue(
+                circuit_breaker_enabled(),
+                "empty string must be treated as 'unset' → "
+                "graduated default-TRUE",
+            )
 
 
 # ============================================================================
