@@ -5247,6 +5247,15 @@ _COMPLEX_PROVIDER_ROUTES = frozenset({"complex"})
 _ARCHITECTURAL_COMPLEXITIES = frozenset({"architectural"})
 _REFLEX_ROUTES = frozenset({"immediate"})
 
+# Slice 12G-1 — Benchmark workload signal-source allowlist. These
+# sources stamp envelopes with urgency=high → IMMEDIATE for
+# semaphore preemption (Slice 12F-A) but represent COMPLEX
+# code-generation workloads, not fast reflexes. Membership here
+# overrides the immediate-reflex thinking disable so the model
+# gets the extended-thinking timeout window (360s vs 120s) it
+# needs on massive-context generations like element-web.
+_BENCHMARK_THINKING_SOURCES = frozenset({"swe_bench_pro"})
+
 
 def _compute_thinking_profile(
     context: Any,
@@ -5284,6 +5293,7 @@ def _compute_thinking_profile(
     """
     task_complexity = (getattr(context, "task_complexity", "") or "").lower()
     provider_route = (getattr(context, "provider_route", "") or "").lower()
+    signal_source = (getattr(context, "signal_source", "") or "").lower()
 
     # Env-driven budgets (read every call — cheap, supports live tuning).
     _budget_trivial = int(os.environ.get("JARVIS_THINKING_BUDGET_TRIVIAL", "0"))
@@ -5296,6 +5306,40 @@ def _compute_thinking_profile(
     _force_on_complex = os.environ.get(
         "JARVIS_THINKING_FORCE_ON_COMPLEX", "true"
     ).lower() not in ("false", "0", "no", "off")
+
+    # 0a. Slice 12G-1 — Benchmark workload override (2026-05-22).
+    # SWE-Bench-Pro envelopes set urgency=high → ProviderRoute.IMMEDIATE
+    # to ensure semaphore preemption (Slice 12F-A priority), but the
+    # actual workload is COMPLEX code-generation against massive repos
+    # (element-web: 56K files, ~120KB prompts). The "immediate-reflex"
+    # disable at step 0 below burns these ops: empirical evidence
+    # bt-2026-05-22-184422 + bt-2026-05-22-195721 — Anthropic
+    # consistently severs the stream at ~120s server-side cutoff when
+    # thinking is OFF on element-web. Enabling extended thinking
+    # raises the rupture timeout watchdog from 120s to 360s
+    # (stream_rupture.stream_rupture_timeout_s(thinking_enabled=True))
+    # AND tells Anthropic to allocate a reasoning budget that buys
+    # the model time to actually produce the response.
+    #
+    # Gate is structurally narrow: signal_source must equal the
+    # canonical SWE-Bench-Pro tag, AND must not be a tool-round
+    # (those skip thinking elsewhere). Hot-revert path:
+    # JARVIS_THINKING_BENCHMARK_OVERRIDE_ENABLED=false returns to
+    # the legacy "immediate-reflex" disable for benchmark ops.
+    if signal_source in _BENCHMARK_THINKING_SOURCES:
+        _benchmark_override_enabled = os.environ.get(
+            "JARVIS_THINKING_BENCHMARK_OVERRIDE_ENABLED", "true",
+        ).strip().lower() not in ("false", "0", "no", "off")
+        if _benchmark_override_enabled:
+            _budget_benchmark = int(os.environ.get(
+                "JARVIS_THINKING_BUDGET_BENCHMARK",
+                str(_budget_complex),
+            ))
+            return (
+                True,
+                max(_budget_benchmark, 1024),
+                f"benchmark-source:{signal_source}",
+            )
 
     # 0. IMMEDIATE route: reflex path where wall-clock latency matters more
     # than reasoning depth. Extended thinking burned 94.5s of a 116.7s
