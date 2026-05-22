@@ -28,7 +28,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 # Phase 5A: Bounded queue backpressure
 try:
@@ -133,6 +133,33 @@ class FileWatchConfig:
     # ``JARVIS_FILE_WATCH_HIGH_COUNT_WARN`` (int).
     high_watch_count_warn: int = 30
 
+    # Slice 12J — HARD schedule budget. The watchdog
+    # ``PollingObserver`` fallback spawns one polling thread per
+    # ``observer.schedule()`` call, each doing its own
+    # ``dirsnapshot.walk`` on every tick. With ~150 schedules the
+    # aggregate GIL contention wedges the asyncio loop within ~10s
+    # — bt-2026-05-22-232553 captured 32 concurrent
+    # ``dirsnapshot.walk`` frames with 99 polling threads parked.
+    #
+    # Above this cap, ``_resolve_watch_paths`` COALESCES depth-2
+    # nested-venv splits back to their parent recursive schedule
+    # (operator-binding: "fewer observer schedules beats perfect
+    # nested-dir exclusion"). The legacy ``ignore_patterns``
+    # post-event filter still drops events from the coalesced
+    # subtree, just at a different layer.
+    #
+    # Pattern-descent groups (the load-bearing Slice 12I fix for
+    # ``.jarvis/swe_bench_pro/worktrees``) are PROTECTED from
+    # coalescing — collapsing one back to a recursive parent would
+    # resurrect the original 56K-file element-web walk.
+    #
+    # Default matches ``high_watch_count_warn`` so a non-coalescing
+    # schedule never crosses the warning line. Env override:
+    # ``JARVIS_FILE_WATCH_MAX_SCHEDULED_ROOTS`` (int). Set to ``0``
+    # to disable the cap (legacy unbounded behavior — NOT
+    # recommended; restored only as an operator escape hatch).
+    max_scheduled_roots: int = 30
+
     # Debouncing
     debounce_seconds: float = 0.1  # Wait before firing event
     batch_timeout_seconds: float = 0.5  # Max wait for batch
@@ -181,6 +208,69 @@ class WatchMetrics:
     queue_full_suppressed_logs: int = 0
     last_overflow_at: Optional[float] = None
     last_overflow_log_at: Optional[float] = None
+
+
+# Slice 12J — closed taxonomy of how a depth-1 watch_dir entry made it
+# into the schedule. Drives the coalescing budget enforcement in
+# ``FileWatchGuard._resolve_watch_paths``:
+#
+#   * SIMPLE_RECURSIVE — entry has no nested excluded children and no
+#     pattern descendant; scheduled as a single ``(entry, True)``
+#     tuple. Cannot be coalesced (already 1 schedule).
+#
+#   * NESTED_VENV_SPLIT — entry contains a name-excluded child at
+#     depth 2 (e.g. ``backend/venv``). Splits into one non-recursive
+#     parent schedule + N recursive grandchild schedules.
+#     COALESCABLE: dropping back to a recursive parent re-includes
+#     the nested venv in the polling tree (the post-event
+#     ``ignore_patterns`` filter still drops the events) but
+#     immediately reclaims N-1 polling threads. Operator binding:
+#     "fewer observer schedules beats perfect nested-dir exclusion".
+#
+#   * PATTERN_DESCENT — entry contains an ``exclude_path_patterns``
+#     descendant (load-bearing Slice 12I path for
+#     ``.jarvis/swe_bench_pro/worktrees``). Splits via the recursive
+#     pattern-aware walker. PROTECTED from coalescing: dropping a
+#     coalesced parent recursive schedule would re-include the 56K-
+#     file element-web worktree and resurrect the original wedge.
+#
+# The string form is frozen so AST pins can read it.
+_SCHEDULE_GROUP_KIND_SIMPLE_RECURSIVE = "simple_recursive"
+_SCHEDULE_GROUP_KIND_NESTED_VENV_SPLIT = "nested_venv_split"
+_SCHEDULE_GROUP_KIND_PATTERN_DESCENT = "pattern_descent"
+_SCHEDULE_GROUP_KIND_COALESCED = "nested_venv_split_coalesced"
+
+
+class _ScheduleGroup(NamedTuple):
+    """Slice 12J — schedule group emitted by ``_resolve_watch_paths``.
+
+    Carries the (parent, entries, kind) triple so the coalescing
+    pass can identify which groups are eligible to shrink and which
+    are protected. ``entries`` is the flat list of
+    ``(path, recursive)`` tuples this group would contribute to
+    ``observer.schedule()`` calls. ``parent`` is the depth-1 entry
+    that originated the group (the coalesce target when applicable).
+    """
+
+    parent: Path
+    entries: Tuple[Tuple[Path, bool], ...]
+    kind: str
+
+
+class _ResolvedSchedule(NamedTuple):
+    """Slice 12J — structured return of ``_resolve_watch_paths``.
+
+    Preserves the legacy ``(paths, skipped_by_pattern)`` payload
+    from Slice 12I via positional unpacking-equivalent fields and
+    adds the budget-enforcement telemetry surface so the
+    ``_start_watchdog`` boot log can report
+    ``candidate_count`` / ``coalesced_count`` to the operator.
+    """
+
+    paths: List[Tuple[Path, bool]]
+    skipped_by_pattern: int
+    candidate_count: int  # Schedules BEFORE budget enforcement.
+    coalesced_count: int  # Groups collapsed back to recursive parent.
 
 
 class GlobalWatchRegistry:
@@ -674,9 +764,18 @@ class FileWatchGuard:
         # dragging the nested venv into the snapshot.
         excluded = self._resolve_excluded_dirs()
         excluded_path_patterns = self._resolve_excluded_path_patterns()
-        scheduled_paths, skipped_by_pattern = self._resolve_watch_paths(
+        # Slice 12J — resolve the schedule cap from env first so the
+        # operator escape hatch (``=0`` → unbounded) works even with
+        # the dataclass-default field set.
+        max_scheduled_roots = self._resolve_max_scheduled_roots()
+        resolved = self._resolve_watch_paths(
             excluded, excluded_path_patterns,
+            max_scheduled_roots=max_scheduled_roots,
         )
+        scheduled_paths = resolved.paths
+        skipped_by_pattern = resolved.skipped_by_pattern
+        candidate_count = resolved.candidate_count
+        coalesced_count = resolved.coalesced_count
 
         scheduled_ok: List[Tuple[Path, bool]] = []
         for path, recursive in scheduled_paths:
@@ -691,7 +790,10 @@ class FileWatchGuard:
 
         # Also schedule the root NON-recursively so top-level file changes
         # (e.g. repo-root config files) still fire events without dragging
-        # the venv subtrees into the snapshot.
+        # the venv subtrees into the snapshot. Slice 12J: this single
+        # extra schedule sits OUTSIDE the budget — per operator binding:
+        # "Observer.schedule is never called more than max cap + root
+        # nonrecursive if that remains separate."
         try:
             self._observer.schedule(
                 handler, str(self.watch_dir), recursive=False,
@@ -703,9 +805,13 @@ class FileWatchGuard:
 
         self._scheduled_paths: List[Tuple[Path, bool]] = scheduled_ok
 
-        # Slice 12I — startup telemetry. Operators can read these
-        # lines at boot to confirm the watchdog observer fallback
-        # didn't quietly include a 56K-file SWE-Bench worktree.
+        # Slice 12J — startup telemetry. Operators can read these
+        # lines at boot to verify:
+        #   * the schedule budget is being enforced (scheduled <= cap)
+        #   * which generated roots got excluded by name vs pattern
+        #   * whether the watchdog ``PollingObserver`` fallback is
+        #     active (the bt-2026-05-22-232553 wedge surface)
+        #   * how many nested-venv splits had to be coalesced to fit
         recursive_count = sum(1 for _, r in scheduled_ok if r)
         polling_fallback_active = (
             backend_name.lower().startswith("polling")
@@ -714,14 +820,18 @@ class FileWatchGuard:
         self._observer.start()
         logger.info(
             "[FileWatchGuard] Observer backend: %s (polling_fallback=%s), "
-            "scheduled %d narrow roots "
-            "(%d recursive, %d non-recursive, "
-            "excluded_top_level: %s, "
-            "excluded_path_patterns: %s, "
-            "skipped_by_pattern: %d)",
+            "candidate_roots=%d scheduled_roots=%d "
+            "max_scheduled_roots=%s coalesced_roots=%d "
+            "(recursive=%d, non_recursive=%d, "
+            "excluded_top_level=%s, "
+            "excluded_path_patterns=%s, "
+            "skipped_by_pattern=%d)",
             backend_name,
             polling_fallback_active,
+            candidate_count,
             len(scheduled_ok),
+            max_scheduled_roots if max_scheduled_roots > 0 else "unbounded",
+            coalesced_count,
             recursive_count,
             len(scheduled_ok) - recursive_count,
             sorted(excluded) if excluded else "(none)",
@@ -729,11 +839,29 @@ class FileWatchGuard:
             skipped_by_pattern,
         )
 
-        # Slice 12I — runaway-watching early warning. The wedge in
-        # bt-2026-05-22-223333 surfaced ~90 polling-observer threads;
-        # any post-exclusion narrow-scope schedule above the threshold
-        # is a red flag worth logging at WARNING. Threshold is env-
-        # overridable via JARVIS_FILE_WATCH_HIGH_COUNT_WARN.
+        # Slice 12J — schedule_budget_coalesced WARNING. Surface
+        # ONCE per boot when the cap actually engaged so operators
+        # see the tradeoff in their dashboards. Quiet when the
+        # candidate plan was already within budget.
+        if coalesced_count > 0:
+            logger.warning(
+                "[FileWatchGuard] schedule_budget_coalesced "
+                "candidate=%d scheduled=%d cap=%d coalesced_groups=%d — "
+                "%d nested-venv-split group(s) collapsed to recursive "
+                "parent schedule(s) to stay under the polling-thread "
+                "budget. Coalesced subtrees still drop events via "
+                "ignore_patterns; pattern-descent groups (Slice 12I "
+                "SWE worktree exclusions) were preserved.",
+                candidate_count, len(scheduled_ok),
+                max_scheduled_roots, coalesced_count, coalesced_count,
+            )
+
+        # Slice 12I — runaway-watching early warning (preserved).
+        # Even with the Slice 12J HARD cap, the CANDIDATE count
+        # remains an operator signal: many candidates → many
+        # coalescings → coarser-grained event filtering. Threshold
+        # is env-overridable via
+        # ``JARVIS_FILE_WATCH_HIGH_COUNT_WARN``.
         try:
             high_warn = int(
                 os.environ.get(
@@ -743,13 +871,13 @@ class FileWatchGuard:
             )
         except ValueError:
             high_warn = self.config.high_watch_count_warn
-        if len(scheduled_ok) > high_warn:
+        if candidate_count > high_warn:
             logger.warning(
-                "[FileWatchGuard] runaway-watching guard: %d narrow roots "
-                "scheduled (> %d threshold). Inspect "
-                "exclude_top_level_dirs / exclude_path_patterns; the "
-                "PollingObserver fallback walks every scheduled root.",
-                len(scheduled_ok), high_warn,
+                "[FileWatchGuard] runaway-watching guard: %d candidate "
+                "roots (> %d threshold; scheduled=%d after budget). "
+                "Inspect exclude_top_level_dirs / exclude_path_patterns; "
+                "the PollingObserver fallback walks every scheduled root.",
+                candidate_count, high_warn, len(scheduled_ok),
             )
 
     async def _stop_watchdog(self) -> None:
@@ -779,6 +907,31 @@ class FileWatchGuard:
                 d.strip() for d in env_override.split(",") if d.strip()
             )
         return self.config.exclude_top_level_dirs
+
+    def _resolve_max_scheduled_roots(self) -> int:
+        """Slice 12J — resolve the hard schedule budget.
+
+        Env override ``JARVIS_FILE_WATCH_MAX_SCHEDULED_ROOTS`` takes
+        precedence over the config default. Invalid (non-integer)
+        values fall back to the config default rather than raise —
+        operators should not be able to brick FileWatchGuard boot
+        by mistyping an env value.
+
+        Value ``0`` is the explicit "unbounded" escape hatch. Any
+        positive integer is honored verbatim. Negative integers are
+        clamped to ``0`` (treated as "unbounded") for the same
+        reason a stray ``-30`` shouldn't crash boot.
+        """
+        raw = os.environ.get(
+            "JARVIS_FILE_WATCH_MAX_SCHEDULED_ROOTS", "",
+        ).strip()
+        if not raw:
+            return self.config.max_scheduled_roots
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return self.config.max_scheduled_roots
+        return max(0, parsed)
 
     def _resolve_excluded_path_patterns(self) -> frozenset:
         """Slice 12I — resolve repo-relative path patterns to exclude.
@@ -865,7 +1018,8 @@ class FileWatchGuard:
         self,
         excluded: frozenset,
         excluded_path_patterns: frozenset = frozenset(),
-    ) -> Tuple[List[Tuple[Path, bool]], int]:
+        max_scheduled_roots: Optional[int] = None,
+    ) -> "_ResolvedSchedule":
         """Resolve the narrowed set of directories to schedule for watching.
 
         Returns a list of ``(path, recursive)`` tuples. Callers pass each
@@ -899,17 +1053,32 @@ class FileWatchGuard:
         whose ``Path.parts`` tuple-prefix matches one of these patterns
         is dropped from the schedule. This is defense-in-depth for
         ``.jarvis/swe_bench_pro/worktrees`` even when ``.jarvis`` is
-        explicitly re-included via env override. Returns a tuple
-        ``(paths, skipped_by_pattern_count)`` so the caller can report
-        startup telemetry.
+        explicitly re-included via env override.
 
-        Missing root → empty list (caller's observer.start() still
-        succeeds; health loop will notice the missing root and recreate).
+        Slice 12J addition: ``max_scheduled_roots`` enforces a HARD
+        cap on the total schedule count. If the candidate plan
+        exceeds the cap, nested-venv-split groups are coalesced back
+        to their parent recursive schedule (largest savings first)
+        until the count is within budget. Pattern-descent groups
+        (Slice 12I load-bearing) are PROTECTED from coalescing — they
+        carry the SWE-Bench-Pro worktree exclusion that the original
+        56K-file wedge depended on. Returns a ``_ResolvedSchedule``
+        NamedTuple so the boot log can surface candidate /
+        scheduled / coalesced telemetry to the operator.
+
+        Missing root → empty schedule (caller's observer.start()
+        still succeeds; health loop will notice and recreate).
         """
-        paths: List[Tuple[Path, bool]] = []
-        skipped_by_pattern = 0
+        if max_scheduled_roots is None:
+            max_scheduled_roots = self.config.max_scheduled_roots
+
         if not self.watch_dir.exists():
-            return paths, skipped_by_pattern
+            return _ResolvedSchedule(
+                paths=[],
+                skipped_by_pattern=0,
+                candidate_count=0,
+                coalesced_count=0,
+            )
         try:
             depth1 = sorted(self.watch_dir.iterdir())
         except OSError as exc:
@@ -918,7 +1087,12 @@ class FileWatchGuard:
                 "falling back to single-root schedule",
                 self.watch_dir, exc,
             )
-            return [(self.watch_dir, True)], skipped_by_pattern
+            return _ResolvedSchedule(
+                paths=[(self.watch_dir, True)],
+                skipped_by_pattern=0,
+                candidate_count=1,
+                coalesced_count=0,
+            )
 
         # Slice 12I — pre-tokenize patterns into ``Path.parts`` tuples
         # once. Used for ancestor/descendant relationship checks
@@ -956,37 +1130,50 @@ class FileWatchGuard:
         # practice the deepest known pattern (worktrees) is 3
         # components so budget 6 is generous.
         _MAX_PATTERN_DESCENT_DEPTH = 6
-        nonlocal_state = {"skipped": 0}
+        skipped_by_pattern = 0
 
         def _walk_with_patterns(
-            entry: Path, depth_budget: int,
-        ) -> None:
+            entry: Path,
+            depth_budget: int,
+            sink: List[Tuple[Path, bool]],
+        ) -> int:
+            """Returns the number of pattern-root drops it performed
+            so the caller can aggregate them into the group telemetry.
+            """
             try:
                 rel_parts = entry.relative_to(self.watch_dir).parts
             except ValueError:
-                return
+                return 0
             if _matches_pattern(rel_parts):
-                nonlocal_state["skipped"] += 1
-                return
+                return 1
             if depth_budget <= 0 or \
                     not _has_pattern_descendant(rel_parts):
                 # Safe to schedule recursively — no pattern below.
-                paths.append((entry, True))
-                return
+                sink.append((entry, True))
+                return 0
             # Has pattern descendants — schedule non-recursively so
             # file-level events at this depth still fire, and walk
             # children individually to route around pattern roots.
-            paths.append((entry, False))
+            sink.append((entry, False))
+            drops = 0
             try:
                 children = list(entry.iterdir())
             except (OSError, PermissionError):
-                return
+                return drops
             for child in sorted(children):
                 if not child.is_dir():
                     continue
                 if child.name in excluded:
                     continue
-                _walk_with_patterns(child, depth_budget - 1)
+                drops += _walk_with_patterns(
+                    child, depth_budget - 1, sink,
+                )
+            return drops
+
+        # Slice 12J — Phase 1: build groups (no budget enforcement
+        # yet). Each depth-1 entry produces at most ONE group; the
+        # group's ``entries`` list is the flat schedule contribution.
+        groups: List[_ScheduleGroup] = []
 
         for entry in depth1:
             if not entry.is_dir() or entry.name in excluded:
@@ -1000,28 +1187,31 @@ class FileWatchGuard:
             if _matches_pattern(entry_rel):
                 skipped_by_pattern += 1
                 continue
-            # If this depth-1 entry contains a pattern descendant
-            # (e.g. ``.jarvis`` re-included via env override, and
-            # ``.jarvis/swe_bench_pro/worktrees`` is the protected
-            # pattern), do the pattern-aware recursive descent and
-            # SKIP the legacy depth-2 nested-venv peek (the pattern
-            # walker handles name-excluded children itself).
+            # Slice 12I path-pattern descent (PROTECTED group).
             if _has_pattern_descendant(entry_rel):
-                before = nonlocal_state["skipped"]
-                _walk_with_patterns(
-                    entry, _MAX_PATTERN_DESCENT_DEPTH,
+                sink: List[Tuple[Path, bool]] = []
+                drops = _walk_with_patterns(
+                    entry, _MAX_PATTERN_DESCENT_DEPTH, sink,
                 )
-                skipped_by_pattern += (
-                    nonlocal_state["skipped"] - before
-                )
+                skipped_by_pattern += drops
+                if sink:
+                    groups.append(_ScheduleGroup(
+                        parent=entry,
+                        entries=tuple(sink),
+                        kind=_SCHEDULE_GROUP_KIND_PATTERN_DESCENT,
+                    ))
                 continue
             # Legacy depth-2 peek for nested-venv-style excluded
-            # name children. Untouched by Slice 12I.
+            # name children (COALESCABLE group).
             try:
                 depth2 = list(entry.iterdir())
             except (OSError, PermissionError):
                 # Can't peek — safer to include the dir as-is.
-                paths.append((entry, True))
+                groups.append(_ScheduleGroup(
+                    parent=entry,
+                    entries=((entry, True),),
+                    kind=_SCHEDULE_GROUP_KIND_SIMPLE_RECURSIVE,
+                ))
                 continue
             has_nested_excluded = any(
                 child.is_dir() and child.name in excluded
@@ -1029,15 +1219,74 @@ class FileWatchGuard:
             )
             if has_nested_excluded:
                 # Schedule non-excluded grandchildren recursively
-                # AND the parent itself non-recursively so file-level
-                # events at the parent's depth still fire.
-                paths.append((entry, False))
+                # AND the parent itself non-recursively.
+                split_entries: List[Tuple[Path, bool]] = [
+                    (entry, False),
+                ]
                 for grand in sorted(depth2):
                     if grand.is_dir() and grand.name not in excluded:
-                        paths.append((grand, True))
+                        split_entries.append((grand, True))
+                groups.append(_ScheduleGroup(
+                    parent=entry,
+                    entries=tuple(split_entries),
+                    kind=_SCHEDULE_GROUP_KIND_NESTED_VENV_SPLIT,
+                ))
             else:
-                paths.append((entry, True))
-        return paths, skipped_by_pattern
+                groups.append(_ScheduleGroup(
+                    parent=entry,
+                    entries=((entry, True),),
+                    kind=_SCHEDULE_GROUP_KIND_SIMPLE_RECURSIVE,
+                ))
+
+        # Slice 12J — Phase 2: enforce schedule budget by coalescing
+        # NESTED_VENV_SPLIT groups (largest savings first). The
+        # candidate count is fixed BEFORE coalescing for telemetry;
+        # ``current`` tracks the live count as we coalesce.
+        candidate_count = sum(len(g.entries) for g in groups)
+        coalesced_count = 0
+        # ``max_scheduled_roots <= 0`` is the operator escape hatch
+        # (legacy unbounded behavior; opt-out of the cap entirely).
+        if max_scheduled_roots > 0 and candidate_count > max_scheduled_roots:
+            # Sort coalescable groups by descending entry count so we
+            # take the biggest savings first. Indices preserved so
+            # we can mutate ``groups`` in-place without disturbing
+            # ordering of non-coalesced entries.
+            coalescable_indices = sorted(
+                (
+                    i for i, g in enumerate(groups)
+                    if g.kind == _SCHEDULE_GROUP_KIND_NESTED_VENV_SPLIT
+                ),
+                key=lambda i: -len(groups[i].entries),
+            )
+            current = candidate_count
+            for i in coalescable_indices:
+                if current <= max_scheduled_roots:
+                    break
+                old_group = groups[i]
+                savings = len(old_group.entries) - 1
+                if savings <= 0:
+                    continue
+                groups[i] = _ScheduleGroup(
+                    parent=old_group.parent,
+                    entries=((old_group.parent, True),),
+                    kind=_SCHEDULE_GROUP_KIND_COALESCED,
+                )
+                current -= savings
+                coalesced_count += 1
+
+        # Slice 12J — Phase 3: flatten groups into the final
+        # ``observer.schedule()`` plan, preserving depth-1 order so
+        # operator log lines stay alphabetical.
+        paths: List[Tuple[Path, bool]] = []
+        for g in groups:
+            paths.extend(g.entries)
+
+        return _ResolvedSchedule(
+            paths=paths,
+            skipped_by_pattern=skipped_by_pattern,
+            candidate_count=candidate_count,
+            coalesced_count=coalesced_count,
+        )
 
     # ---- Slice 12A — loop-thread enqueue wrapper -----------------
     #
