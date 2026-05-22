@@ -192,7 +192,7 @@ def test_swe_bench_worktrees_never_scheduled(tmp_path: Path) -> None:
         guard = _build_guard(tmp_path)
         excluded = guard._resolve_excluded_dirs()
         patterns = guard._resolve_excluded_path_patterns()
-        scheduled, _skipped = guard._resolve_watch_paths(excluded, patterns)
+        scheduled = guard._resolve_watch_paths(excluded, patterns).paths
 
         for rel_parts in _scheduled_rel_parts(scheduled, guard):
             assert ".jarvis" not in rel_parts, (
@@ -225,7 +225,9 @@ def test_swe_bench_worktrees_protected_via_pattern_when_jarvis_reincluded(
         # But .jarvis/swe_bench_pro/worktrees is still in pattern set
         assert ".jarvis/swe_bench_pro/worktrees" in patterns
 
-        scheduled, skipped = guard._resolve_watch_paths(excluded, patterns)
+        resolved = guard._resolve_watch_paths(excluded, patterns)
+        scheduled = resolved.paths
+        skipped = resolved.skipped_by_pattern
         # No scheduled path is under <tmp_path>/.jarvis/swe_bench_pro/worktrees
         # Check rel-to-tmp_path parts so the tmp dir name (which may
         # contain literal substrings like ".jarvis") cannot confuse
@@ -257,7 +259,7 @@ def test_source_dirs_remain_watchable(tmp_path: Path) -> None:
         guard = _build_guard(tmp_path)
         excluded = guard._resolve_excluded_dirs()
         patterns = guard._resolve_excluded_path_patterns()
-        scheduled, _ = guard._resolve_watch_paths(excluded, patterns)
+        scheduled = guard._resolve_watch_paths(excluded, patterns).paths
 
         rel_parts_list = _scheduled_rel_parts(scheduled, guard)
         assert any(p == ("backend",) for p in rel_parts_list), (
@@ -457,7 +459,7 @@ def test_element_web_worktree_path_regression(tmp_path: Path) -> None:
         guard = _build_guard(tmp_path)
         excluded = guard._resolve_excluded_dirs()
         patterns = guard._resolve_excluded_path_patterns()
-        scheduled, _ = guard._resolve_watch_paths(excluded, patterns)
+        scheduled = guard._resolve_watch_paths(excluded, patterns).paths
 
         for rel_parts in _scheduled_rel_parts(scheduled, guard):
             assert not any("element-web" in p for p in rel_parts), (
@@ -544,12 +546,17 @@ def test_path_pattern_empty_patterns_returns_false(tmp_path: Path) -> None:
 # ---------------------------------------------------------------
 
 
-def test_resolve_watch_paths_returns_tuple_with_skipped_count(
+def test_resolve_watch_paths_returns_resolved_schedule_named_tuple(
     tmp_path: Path,
 ) -> None:
-    """Frozen signature pin: ``_resolve_watch_paths`` returns a tuple
-    ``(paths, skipped_by_pattern_count)``. Slice 12I telemetry
-    surface — the harness boot log uses ``skipped_by_pattern``.
+    """Slice 12J: ``_resolve_watch_paths`` now returns a
+    ``_ResolvedSchedule`` NamedTuple with 4 fields:
+    ``paths`` / ``skipped_by_pattern`` / ``candidate_count`` /
+    ``coalesced_count``. NamedTuples are tuples (positional access
+    works) AND carry field names (``.paths`` etc.). The Slice 12I
+    field ``skipped_by_pattern`` remains semantically identical;
+    candidate_count + coalesced_count are Slice 12J additions for
+    budget telemetry.
     """
     _make_worktree_layout(tmp_path)
     guard = _build_guard(tmp_path)
@@ -557,12 +564,19 @@ def test_resolve_watch_paths_returns_tuple_with_skipped_count(
         frozenset({"venv", ".git"}),
         frozenset({".jarvis/swe_bench_pro/worktrees"}),
     )
+    # NamedTuple is a tuple
     assert isinstance(result, tuple)
-    assert len(result) == 2
-    paths, skipped = result
-    assert isinstance(paths, list)
-    assert isinstance(skipped, int)
-    assert skipped >= 1
+    assert len(result) == 4
+    # Named field access (Slice 12J surface)
+    assert isinstance(result.paths, list)
+    assert isinstance(result.skipped_by_pattern, int)
+    assert isinstance(result.candidate_count, int)
+    assert isinstance(result.coalesced_count, int)
+    # Slice 12I semantic preserved: pattern hits counted
+    assert result.skipped_by_pattern >= 1
+    # Slice 12J invariant: candidate_count >= len(paths)
+    # (coalescing only reduces total, never increases)
+    assert result.candidate_count >= len(result.paths)
 
 
 # ---------------------------------------------------------------
@@ -654,12 +668,12 @@ def test_ast_pin_swe_bench_worktrees_in_default_path_patterns() -> None:
     )
 
 
-def test_ast_pin_resolve_watch_paths_signature_returns_tuple() -> None:
-    """``_resolve_watch_paths`` annotated return must be
-    ``Tuple[List[Tuple[Path, bool]], int]`` (or a structurally
-    equivalent subscripted Tuple with arity 2). Catches a refactor
-    that accidentally drops the ``skipped_by_pattern`` counter from
-    the return signature.
+def test_ast_pin_resolve_watch_paths_signature_returns_resolved_schedule() -> None:
+    """Slice 12J supersedes the Slice 12I tuple signature.
+    ``_resolve_watch_paths`` MUST return ``_ResolvedSchedule`` —
+    the NamedTuple carrying paths + skipped_by_pattern +
+    candidate_count + coalesced_count. Catches a refactor that
+    accidentally drops budget telemetry from the return.
     """
     tree = _load_ast()
     found = False
@@ -668,24 +682,21 @@ def test_ast_pin_resolve_watch_paths_signature_returns_tuple() -> None:
             continue
         if node.name != "_resolve_watch_paths":
             continue
-        # The return annotation should be a Tuple[...] subscript with
-        # two elements.
         ann = node.returns
         if ann is None:
             continue
-        # ast.Subscript(value=Name('Tuple'), slice=...)
-        if isinstance(ann, ast.Subscript) and \
-                isinstance(ann.value, ast.Name) and \
-                ann.value.id == "Tuple":
-            # Slice may be a Tuple node (arity 2 args)
-            slc = ann.slice
-            elts = getattr(slc, "elts", None)
-            if elts and len(elts) == 2:
-                found = True
-                break
+        # Return annotation is either a Name (_ResolvedSchedule)
+        # or a Constant string "_ResolvedSchedule" (forward ref).
+        if isinstance(ann, ast.Name) and ann.id == "_ResolvedSchedule":
+            found = True
+            break
+        if isinstance(ann, ast.Constant) and \
+                ann.value == "_ResolvedSchedule":
+            found = True
+            break
     assert found, (
         "AST pin failed: _resolve_watch_paths must return "
-        "Tuple[List[Tuple[Path, bool]], int]."
+        "_ResolvedSchedule (Slice 12J NamedTuple)."
     )
 
 
