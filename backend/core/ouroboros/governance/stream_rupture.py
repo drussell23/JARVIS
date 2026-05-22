@@ -93,6 +93,37 @@ def stream_inter_chunk_timeout_s() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Slice 12F-B — Budget-aware dispatch floor
+# ---------------------------------------------------------------------------
+
+
+def stream_minimum_read_budget_s() -> float:
+    """Phase 3 (Budget Floor): the minimum ``wall_remaining`` budget
+    required before dispatching a request to the provider.
+
+    When semaphore wait or upstream cascade burns the op's wall
+    budget down to a sliver, opening a stream is futile — the
+    very first ``await __anext__`` will fire the inter-chunk
+    watchdog at a misleading "no event for 0s" timeout. That
+    looks like a network-side stream rupture but the actual cause
+    is local: we never gave the stream a chance to talk.
+
+    Slice 12F-B's contract: refuse to dispatch when
+    ``wall_remaining < this floor`` — raise
+    ``StreamBudgetTooShortError`` so the orchestrator's existing
+    Slice 7 fallback handles it as a transient transport fault
+    (RETRY_TRANSIENT, NOT terminal structural).
+
+    Default: 10s — generous enough to cover Claude's typical
+    TTFT for warm sessions; tight enough to fail fast when the
+    op is genuinely starved.
+    """
+    return float(
+        os.environ.get("JARVIS_STREAM_MINIMUM_READ_BUDGET_S", "10")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Exception
 # ---------------------------------------------------------------------------
 
@@ -137,4 +168,72 @@ class StreamRuptureError(RuntimeError):
             f"elapsed={elapsed_s:.1f}s:"
             f"bytes={bytes_received}:"
             f"timeout={rupture_timeout_s:.0f}s"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slice 12F-B — Budget-too-short diagnostic exception
+# ---------------------------------------------------------------------------
+
+
+class StreamBudgetTooShortError(RuntimeError):
+    """Raised when the orchestrator declines to dispatch a stream
+    because ``wall_remaining`` after semaphore acquisition is
+    below the ``stream_minimum_read_budget_s`` floor.
+
+    This is structurally distinct from ``StreamRuptureError``:
+    a rupture is a *network-side* fault (the provider stopped
+    sending bytes); a budget-too-short refusal is a *local*
+    decision (we never gave the stream a chance to talk).
+    Conflating the two in the previous "no event for 0s"
+    rupture log was the diagnostic noise Slice 12F-B closes.
+
+    Both errors map to ``FailureMode.TRANSIENT_TRANSPORT`` →
+    ``RetryDecision.RETRY_TRANSIENT`` in the classifier, so the
+    Slice 7 fallback handles them with the same backoff /
+    failover profile. The distinction lives in the postmortem
+    and in IDE / dashboard telemetry, not in the breaker policy.
+
+    Attributes
+    ----------
+    provider : str
+        Target provider that would have received the dispatch.
+    op_id : str
+        Truncated op_id for correlation.
+    wall_remaining_s : float
+        ``wall_rem`` measured *after* semaphore acquisition.
+    minimum_required_s : float
+        The ``stream_minimum_read_budget_s()`` floor at decision
+        time (env-knobbed, default 10s).
+    sem_wait_s : float
+        How long the op waited on the semaphore — the dominant
+        contributor to wall-budget consumption.
+    route : str
+        The op's ``ProviderRoute`` value, for postmortem
+        correlation with the priority-gate ordering.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        op_id: str,
+        wall_remaining_s: float,
+        minimum_required_s: float,
+        sem_wait_s: float,
+        route: str = "",
+    ) -> None:
+        self.provider = provider
+        self.op_id = op_id
+        self.wall_remaining_s = wall_remaining_s
+        self.minimum_required_s = minimum_required_s
+        self.sem_wait_s = sem_wait_s
+        self.route = route
+        super().__init__(
+            f"provider_stream_budget_too_short:{provider}:"
+            f"op={op_id}:"
+            f"wall_remaining={wall_remaining_s:.2f}s:"
+            f"floor={minimum_required_s:.1f}s:"
+            f"sem_wait={sem_wait_s:.1f}s:"
+            f"route={route}"
         )
