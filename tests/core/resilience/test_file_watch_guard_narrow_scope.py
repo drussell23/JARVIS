@@ -107,7 +107,10 @@ def test_resolve_watch_paths_skips_excluded_depth1(tmp_path: Path) -> None:
     """Top-level venv/.venv are dropped; normal dirs kept."""
     _mkrepo(tmp_path, {"backend": {}, "tests": {}, "venv": {}, ".venv": {}})
     guard = _guard(tmp_path)
-    paths = guard._resolve_watch_paths(guard._resolve_excluded_dirs())
+    # Slice 12I: _resolve_watch_paths returns (paths, skipped_count).
+    paths, _skipped = guard._resolve_watch_paths(
+        guard._resolve_excluded_dirs(),
+    )
     names = {p.name for p, _r in paths}
     assert names == {"backend", "tests"}
 
@@ -123,7 +126,9 @@ def test_resolve_watch_paths_descends_on_nested_excluded(tmp_path: Path) -> None
         "tests": {},
     })
     guard = _guard(tmp_path)
-    paths = guard._resolve_watch_paths(guard._resolve_excluded_dirs())
+    paths, _skipped = guard._resolve_watch_paths(
+        guard._resolve_excluded_dirs(),
+    )
     name_to_recursive = {
         str(p.relative_to(tmp_path)): r for p, r in paths
     }
@@ -145,7 +150,9 @@ def test_resolve_watch_paths_ignores_files_at_root(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("top-level file")
     (tmp_path / "setup.py").write_text("")
     guard = _guard(tmp_path)
-    paths = guard._resolve_watch_paths(guard._resolve_excluded_dirs())
+    paths, _skipped = guard._resolve_watch_paths(
+        guard._resolve_excluded_dirs(),
+    )
     names = {p.name for p, _r in paths}
     assert names == {"backend"}
 
@@ -154,8 +161,11 @@ def test_resolve_watch_paths_missing_root_returns_empty(tmp_path: Path) -> None:
     """Missing watch_dir → empty list (no crash)."""
     missing = tmp_path / "does_not_exist"
     guard = _guard(missing)
-    paths = guard._resolve_watch_paths(guard._resolve_excluded_dirs())
+    paths, skipped = guard._resolve_watch_paths(
+        guard._resolve_excluded_dirs(),
+    )
     assert paths == []
+    assert skipped == 0
 
 
 def test_resolve_watch_paths_custom_env_narrows_further(
@@ -170,7 +180,9 @@ def test_resolve_watch_paths_custom_env_narrows_further(
         "docs,scripts",
     )
     guard = _guard(tmp_path)
-    paths = guard._resolve_watch_paths(guard._resolve_excluded_dirs())
+    paths, _skipped = guard._resolve_watch_paths(
+        guard._resolve_excluded_dirs(),
+    )
     names = {p.name for p, _r in paths}
     assert names == {"backend", "tests"}
 
