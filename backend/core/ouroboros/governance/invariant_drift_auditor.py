@@ -67,6 +67,7 @@ Authority invariants (AST-pinned by companion tests):
 """
 from __future__ import annotations
 
+import asyncio as _asyncio
 import enum
 import hashlib
 import json
@@ -577,11 +578,97 @@ def capture_snapshot(
     None). NEVER raises.
 
     ``snapshot_id`` defaults to a fresh uuid4; ``now`` defaults to
-    ``time.time()``. Both injectable for deterministic tests."""
+    ``time.time()``. Both injectable for deterministic tests.
+
+    .. note::
+
+        Slice 11C: this sync entry point still runs ``validate_all``
+        on the calling thread. For async / asyncio-loop contexts
+        (e.g. ``InvariantDriftObserver._run_forever``) prefer
+        ``capture_snapshot_async`` which routes invariant
+        validation through the canonical off-loop helper."""
     sid = snapshot_id if snapshot_id else str(uuid.uuid4())
     captured_at = float(now) if now is not None else time.time()
 
     names, vio_sig, vio_count = _capture_shipped_invariants()
+    flag_hash, flag_count = _capture_flag_registry()
+    floor_pins = _capture_exploration_floors()
+    posture_value, posture_conf = _capture_posture()
+
+    return InvariantSnapshot(
+        snapshot_id=sid,
+        captured_at_utc=captured_at,
+        shipped_invariant_names=names,
+        shipped_violation_signature=vio_sig,
+        shipped_violation_count=vio_count,
+        flag_registry_hash=flag_hash,
+        flag_count=flag_count,
+        exploration_floor_pins=floor_pins,
+        posture_value=posture_value,
+        posture_confidence=posture_conf,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Slice 11C — async snapshot path
+# ---------------------------------------------------------------------------
+
+
+async def _capture_shipped_invariants_async() -> Tuple[
+    Tuple[str, ...], str, int,
+]:
+    """Async variant of ``_capture_shipped_invariants`` that routes
+    invariant validation through ``validate_all_async``. The heavy
+    ast.parse + walk work runs in the canonical process pool — the
+    asyncio control plane keeps ticking. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            list_shipped_code_invariants,
+            validate_all_async,
+        )
+    except Exception:  # noqa: BLE001 — defensive (module optional)
+        return ((), "", 0)
+    try:
+        invariants = list_shipped_code_invariants()
+        names: Tuple[str, ...] = tuple(
+            sorted(inv.invariant_name for inv in invariants)
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        names = ()
+    try:
+        violations = await validate_all_async()
+        pairs: List[Tuple[str, str]] = []
+        for v in violations:
+            name = getattr(v, "invariant_name", "")
+            target = getattr(v, "target_file", "")
+            detail = getattr(v, "detail", "")
+            pairs.append((str(name) + ":" + str(target), str(detail)))
+        return (names, _hash_pairs(pairs), len(violations))
+    except _asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — defensive
+        return (names, "", 0)
+
+
+async def capture_snapshot_async(
+    *,
+    snapshot_id: Optional[str] = None,
+    now: Optional[float] = None,
+) -> InvariantSnapshot:
+    """Async-friendly snapshot capture for asyncio-loop callers.
+
+    Mirrors ``capture_snapshot`` exactly except that the heavy
+    invariant validation step runs **off-loop** via
+    ``validate_all_async``. The other three captures
+    (flag-registry / exploration-floors / posture) are cheap
+    sync reads and stay inline.
+
+    Slice 11C: this is the canonical entry point for
+    ``InvariantDriftObserver`` and any other asyncio consumer."""
+    sid = snapshot_id if snapshot_id else str(uuid.uuid4())
+    captured_at = float(now) if now is not None else time.time()
+
+    names, vio_sig, vio_count = await _capture_shipped_invariants_async()
     flag_hash, flag_count = _capture_flag_registry()
     floor_pins = _capture_exploration_floors()
     posture_value, posture_conf = _capture_posture()

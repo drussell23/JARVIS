@@ -49,9 +49,11 @@ primitive.
 from __future__ import annotations
 
 import ast
+import asyncio as _asyncio
 import logging
 import os
 import threading
+import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -2365,7 +2367,17 @@ def validate_invariant(
     inv: ShippedCodeInvariant,
 ) -> Tuple[InvariantViolation, ...]:
     """Run a single invariant. Returns tuple of violations.
-    NEVER raises."""
+    NEVER raises.
+
+    .. note::
+
+        Slice 11C: this single-invariant entry remains for direct
+        callers but is **no longer used by ``validate_all()``** —
+        that path now groups invariants by ``target_file`` and
+        parses each file once per cycle. For bulk validation,
+        prefer ``validate_invariants_grouped`` (sync) or
+        ``validate_all_async`` (off-loop).
+    """
     if not shipped_code_invariants_enabled():
         return ()
     try:
@@ -2394,17 +2406,283 @@ def validate_invariant(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slice 11C — grouped + off-loop invariant validation
+# ---------------------------------------------------------------------------
+#
+# Closes the empirical wedge from bt-2026-05-22-082157 (Slice 12A
+# acceptance soak): even after the file_watch_events QueueFull
+# cascade was eliminated, the asyncio control plane sustained
+# 288.2 s of cumulative loop-block with max amplification 3500×
+# (parent_await 121.8 s for a 34.8 ms worker call). Provenance
+# walk showed `shipped_code_invariants.validate_all()` looping
+# the registry and calling `validate_invariant()` per pin —
+# read_text + ast.parse PER invariant. At 879 boot-time invariants
+# across 53+ unique target files, that's ~17× redundant parsing of
+# the same source.
+#
+# 11C scope (operator-bound):
+#   1. Group invariants by ``target_file``.
+#   2. Read + ast.parse each file **once per cycle**.
+#   3. Run all validators for that target against the same
+#      parsed AST / source bytes.
+#   4. Add an off-loop async wrapper that runs the grouped sync
+#      primitive in the canonical process pool (the worker
+#      re-imports this module — auto-rebuilds the 879-entry
+#      registry — and returns a primitive tuple payload; no
+#      Callable / ast.AST ever crosses IPC).
+#   5. Telemetry: structured `[ShippedCodeInvariants]` log lines
+#      carrying elapsed_ms / target_files_count / invariants_count
+#      / parse_count_before_grouping / parse_count_after / mode.
+#
+# Why a worker-side re-import instead of shipping invariants
+# across IPC: empirically 726 of the 879 registered validators are
+# non-picklable callables (closures from module-provided pins).
+# Shipping them would require either a registry refactor or a
+# lossy fallback. The worker re-import is byte-equivalent
+# behaviour with no API churn.
+
+
+def _parse_target_file_once(
+    target_file: str,
+) -> Optional[Tuple[ast.Module, str, Path]]:
+    """Resolve, read, and ast.parse a target file. Returns
+    ``(tree, source, resolved_path)`` on success or ``None`` when
+    the file is missing / unreadable / unparseable. NEVER raises.
+
+    Slice 11C: the single permitted read+parse site for grouped
+    bulk validation. ``validate_invariants_grouped`` calls this
+    once per unique ``target_file``, regardless of how many
+    invariants target that file."""
+    try:
+        path = _resolve_target_path(target_file)
+        if not path.exists():
+            logger.debug(
+                "[ShippedCodeInvariants] target missing: %s", path,
+            )
+            return None
+        source = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(path))
+        return tree, source, path
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ShippedCodeInvariants] parse failed for %s: %s",
+            target_file, exc, exc_info=True,
+        )
+        return None
+
+
+def validate_invariants_grouped() -> Tuple[InvariantViolation, ...]:
+    """Slice 11C grouped sync primitive.
+
+    Groups every registered invariant by ``target_file``, parses
+    each file **once**, then runs every validator for that file
+    against the shared ``(ast.Module, source)`` pair. Returns
+    the same tuple shape as ``validate_all`` — no API change
+    visible to callers.
+
+    Discipline:
+      * Master-flag-gated identically to ``validate_all``.
+      * Each validator's exception is swallowed defensively — one
+        bad pin can't abort the entire cycle.
+      * Missing target files are skipped (same semantics as the
+        per-invariant path).
+      * Emits one ``[ShippedCodeInvariants]`` telemetry log per
+        cycle with parse-count delta.
+
+    Returns
+    -------
+    Tuple[InvariantViolation, ...]
+        Concatenated violations, ordered by (target_file,
+        invariant_name) for determinism.
+    """
+    if not shipped_code_invariants_enabled():
+        return ()
+    invariants = list_shipped_code_invariants()
+    if not invariants:
+        return ()
+
+    t0 = _time.monotonic()
+
+    # Group by target_file, preserving registration order for
+    # determinism inside each group.
+    by_target: Dict[str, List[ShippedCodeInvariant]] = {}
+    for inv in invariants:
+        by_target.setdefault(inv.target_file, []).append(inv)
+
+    out: List[InvariantViolation] = []
+    targets_resolved: int = 0
+    targets_missing: int = 0
+    for target_file in sorted(by_target.keys()):
+        target_invs = by_target[target_file]
+        parsed = _parse_target_file_once(target_file)
+        if parsed is None:
+            targets_missing += 1
+            continue
+        targets_resolved += 1
+        tree, source, _ = parsed
+        for inv in target_invs:
+            try:
+                details = inv.validate(tree, source)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[ShippedCodeInvariants] validator %r raised: %s",
+                    inv.invariant_name, exc, exc_info=True,
+                )
+                continue
+            for d in details:
+                out.append(InvariantViolation(
+                    invariant_name=inv.invariant_name,
+                    target_file=inv.target_file,
+                    detail=str(d),
+                ))
+
+    elapsed_ms = (_time.monotonic() - t0) * 1000.0
+    logger.info(
+        "[ShippedCodeInvariants] grouped validation "
+        "elapsed_ms=%.1f invariants_count=%d "
+        "target_files_count=%d parse_count_before_grouping=%d "
+        "parse_count_after=%d violations=%d mode=sync_grouped",
+        elapsed_ms, len(invariants), len(by_target),
+        len(invariants), targets_resolved, len(out),
+    )
+    return tuple(out)
+
+
 def validate_all() -> Tuple[InvariantViolation, ...]:
     """Run every registered invariant. Returns the concatenated
     violation list across all pins. NEVER raises.
 
-    Master-flag-gated: when off, returns ``()`` immediately."""
+    Master-flag-gated: when off, returns ``()`` immediately.
+
+    Slice 11C: now delegates to
+    ``validate_invariants_grouped`` — each target file is read
+    + ast.parse'd once per cycle even when multiple invariants
+    target it. Backward-compat: same return shape, same
+    fail-closed semantics. The legacy O(N_invariants) parse
+    path is gone.
+    """
+    return validate_invariants_grouped()
+
+
+def _worker_validate_all_grouped() -> Tuple[Tuple[str, str, str], ...]:
+    """Process-pool worker — runs the grouped sync primitive in a
+    separate Python interpreter and returns a primitive-only
+    payload. NEVER raises.
+
+    Worker contract:
+      * The worker process re-imports this module on first call;
+        ``_register_seed_invariants()`` and
+        ``_discover_module_provided_invariants()`` at module
+        bottom rebuild the 879-entry registry in the worker.
+      * ``validate_invariants_grouped()`` runs locally in the
+        worker — full grouped parse + validate pipeline.
+      * Returns a tuple of ``(invariant_name, target_file, detail)``
+        string triples so ProcessPoolExecutor's standard IPC can
+        ship it back without crossing any ast.AST / Callable
+        boundary.
+
+    AST-pinned: this is the SOLE permitted worker entry point
+    for off-loop invariant validation. A regression that ships
+    ShippedCodeInvariant objects (with non-picklable validators)
+    across IPC would fail the picklability bar."""
+    try:
+        violations = validate_invariants_grouped()
+        return tuple(
+            (v.invariant_name, v.target_file, v.detail)
+            for v in violations
+        )
+    except Exception:  # noqa: BLE001 — never crash worker
+        return ()
+
+
+async def validate_all_async() -> Tuple[InvariantViolation, ...]:
+    """Slice 11C off-loop wrapper.
+
+    Runs ``validate_invariants_grouped`` in the canonical
+    process pool (``ast_compile_helper._get_pool``) so the
+    asyncio control plane keeps ticking during heavy AST work.
+    Returns the same ``Tuple[InvariantViolation, ...]`` shape
+    as the sync entry point — caller can swap in place.
+
+    Discipline:
+      * Master-flag-gated identically — returns ``()`` when off.
+      * Bounded timeout (default 60 s, env-knobbed via
+        ``JARVIS_SHIPPED_INVARIANTS_ASYNC_TIMEOUT_S``).
+      * Worker exceptions / pool failures degrade to ``()`` —
+        observability is non-authoritative.
+      * Falls back to the sync path on transient pool errors so
+        a temporary executor hiccup never silently disables
+        invariant enforcement.
+      * Emits one ``[ShippedCodeInvariants]`` log per call with
+        parent_await_ms + execution_mode for provenance.
+    """
     if not shipped_code_invariants_enabled():
         return ()
-    out: List[InvariantViolation] = []
-    for inv in list_shipped_code_invariants():
-        out.extend(validate_invariant(inv))
-    return tuple(out)
+    timeout_s = _resolve_async_timeout_s()
+    t0 = _time.monotonic()
+    try:
+        # Lazy import — keeps ast_compile_helper out of the
+        # module-load graph for sync-only callers.
+        from backend.core.ouroboros.governance.ast_compile_helper import (
+            _get_pool,
+        )
+        pool = _get_pool()
+        loop = _asyncio.get_running_loop()
+        payload = await _asyncio.wait_for(
+            loop.run_in_executor(pool, _worker_validate_all_grouped),
+            timeout=timeout_s,
+        )
+    except _asyncio.CancelledError:
+        raise
+    except _asyncio.TimeoutError:
+        elapsed_ms = (_time.monotonic() - t0) * 1000.0
+        logger.warning(
+            "[ShippedCodeInvariants] async validation timed out "
+            "timeout_s=%.1f parent_await_ms=%.1f mode=async_timeout "
+            "— observability degraded for this cycle",
+            timeout_s, elapsed_ms,
+        )
+        return ()
+    except Exception as exc:  # noqa: BLE001 — degrade to sync
+        elapsed_ms = (_time.monotonic() - t0) * 1000.0
+        logger.warning(
+            "[ShippedCodeInvariants] async pool unavailable "
+            "(%s); degrading to sync. parent_await_ms=%.1f",
+            type(exc).__name__, elapsed_ms,
+        )
+        return validate_invariants_grouped()
+
+    elapsed_ms = (_time.monotonic() - t0) * 1000.0
+    logger.info(
+        "[ShippedCodeInvariants] async validation parent_await_ms=%.1f "
+        "violations=%d mode=async_process",
+        elapsed_ms, len(payload),
+    )
+    return tuple(
+        InvariantViolation(
+            invariant_name=str(n),
+            target_file=str(t),
+            detail=str(d),
+        )
+        for n, t, d in payload
+    )
+
+
+def _resolve_async_timeout_s() -> float:
+    """Env-knobbed timeout for ``validate_all_async``. Default
+    60 s — generous so a single soak iteration never silently
+    blocks; clamped to ``[1.0, 600.0]`` for safety."""
+    try:
+        raw = os.environ.get(
+            "JARVIS_SHIPPED_INVARIANTS_ASYNC_TIMEOUT_S", "",
+        ).strip()
+        if not raw:
+            return 60.0
+        v = float(raw)
+        return max(1.0, min(600.0, v))
+    except (TypeError, ValueError):
+        return 60.0
 
 
 # ---------------------------------------------------------------------------
