@@ -1347,6 +1347,111 @@ class BattleTestHarness:
                 )
                 self._control_plane_watchdog = None
 
+            # Slice 12G-2 — LoopDeadman wire-up.
+            #
+            # The Slice 11A ControlPlaneWatchdog above surfaces bursty
+            # asyncio starvation (single events of 100ms+ lag). Empirical
+            # evidence from bt-2026-05-22-195721 proved a stronger class
+            # of wedge: when the loop is TOTALLY dead in sync work, even
+            # the watchdog's own asyncio.sleep cannot fire — it goes
+            # silent and operators see zero symptoms until the wall-cap
+            # Layer-3 SIGKILL fires 82 minutes later.
+            #
+            # LoopDeadman runs in a daemon OS thread independent of the
+            # asyncio loop. The asyncio loop pings ``heartbeat()`` every
+            # ~5s; the deadman thread polls the timestamp. If the loop
+            # hasn't ticked for ``deadman_timeout_s`` (default 300s),
+            # the deadman fires faulthandler stack dump + os._exit(75).
+            # That trades a 82-min silent kill for a 5-min loud
+            # structured exit with forensic trace.
+            #
+            # Fail-soft contract — boot failure of LoopDeadman MUST NOT
+            # block the harness; the legacy wall-cap Layer-3 still
+            # provides a coarser backstop.
+            self._loop_deadman = None
+            try:
+                from backend.core.ouroboros.governance.loop_deadman import (  # noqa: E501
+                    get_default_deadman as _deadman_get_default,
+                    deadman_enabled as _deadman_enabled,
+                )
+                if _deadman_enabled():
+                    _deadman = _deadman_get_default()
+                    _deadman_started = _deadman.start()
+                    if _deadman_started:
+                        self._loop_deadman = _deadman
+                else:
+                    logger.debug(
+                        "[LoopDeadman] master flag FALSE — "
+                        "deadman not started"
+                    )
+            except Exception as _deadman_exc:  # noqa: BLE001
+                logger.debug(
+                    "[LoopDeadman] boot wire-up degraded: %s — "
+                    "deadman not started",
+                    _deadman_exc, exc_info=True,
+                )
+                self._loop_deadman = None
+
+            # Slice 12G-3 — Continuous WAL / atomic summary.json
+            # checkpointing.
+            #
+            # The clean shutdown path writes summary.json once at the
+            # end via session_recorder.save_summary. When the loop
+            # wedges and Layer-3 SIGKILL fires (or LoopDeadman
+            # os._exit(75) trips), that final write never lands.
+            # Empirical evidence: bt-2026-05-22-195721 lost its
+            # verdict artifact after an 82-min wedge.
+            #
+            # Per operator binding ("no panic-saves, build robust
+            # state persistence"), the WAL writes continuously
+            # during normal operation — every ~15s a snapshot of
+            # the current session state is atomically written
+            # (temp + os.replace) to summary.json. When SIGKILL
+            # drops, the latest checkpoint is already at rest.
+            #
+            # Fail-soft contract — WAL boot failure MUST NOT block
+            # the harness; clean shutdown's save_summary remains
+            # the canonical final write.
+            self._session_wal = None
+            self._session_wal_task = None
+            try:
+                from backend.core.ouroboros.governance.session_wal import (  # noqa: E501
+                    install_default_wal as _wal_install,
+                    wal_enabled as _wal_enabled,
+                )
+                if _wal_enabled():
+                    self._session_wal = _wal_install(self._session_dir)
+                    # Start the periodic checkpoint task. Cadence
+                    # is operator-tunable but defaults to 15s — a
+                    # balance between freshness (last checkpoint
+                    # is at most 15s stale on hard kill) and I/O
+                    # cost (<1KB/write, 4 writes/min).
+                    self._session_wal_task = asyncio.create_task(
+                        self._slice12g3_periodic_checkpoint_loop(),
+                        name="session_wal_periodic_checkpoint",
+                    )
+                    logger.info(
+                        "[SessionWAL] armed: summary.json checkpoint "
+                        "every %.1fs (atomic temp+rename; survives "
+                        "Layer-3 SIGKILL / LoopDeadman os._exit)",
+                        float(os.environ.get(
+                            "JARVIS_SESSION_WAL_PERIODIC_S", "15.0",
+                        )),
+                    )
+                else:
+                    logger.debug(
+                        "[SessionWAL] master flag FALSE — "
+                        "continuous WAL not started"
+                    )
+            except Exception as _wal_exc:  # noqa: BLE001
+                logger.debug(
+                    "[SessionWAL] boot wire-up degraded: %s — "
+                    "WAL not started",
+                    _wal_exc, exc_info=True,
+                )
+                self._session_wal = None
+                self._session_wal_task = None
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -6312,6 +6417,95 @@ class BattleTestHarness:
             logger.warning("CostTracker save failed: %s", exc)
 
         logger.info("Shutdown complete for session %s", self._session_id)
+
+    # ------------------------------------------------------------------
+    # Slice 12G-3 — Continuous WAL checkpoint loop
+    # ------------------------------------------------------------------
+
+    def _slice12g3_build_checkpoint_state(
+        self, *, reason: str,
+    ) -> Dict[str, Any]:
+        """Snapshot the minimal-but-useful session state for the
+        continuous WAL. Mirrors a subset of the fields that
+        ``session_recorder.save_summary`` writes at clean shutdown
+        — enough that a forensic reader can resume / diagnose
+        from a hard-killed session.
+
+        NEVER raises (defensive everywhere — checkpoint failure
+        must not block the asyncio loop)."""
+        now = time.time()
+        duration_s = (now - self._started_at) if self._started_at else 0.0
+        try:
+            cost_total = float(self._cost_tracker.total_spent)
+        except Exception:  # noqa: BLE001
+            cost_total = 0.0
+        try:
+            cost_breakdown = dict(self._cost_tracker.breakdown)
+        except Exception:  # noqa: BLE001
+            cost_breakdown = {}
+        # Slice 12G-3 partial-state shape — mirrors the canonical
+        # save_summary fields enough for forensic + audit consumers.
+        state: Dict[str, Any] = {
+            "schema_version": 2,
+            "session_id": self._session_id,
+            "session_outcome": "in_flight",  # overridden by clean-shutdown save_summary
+            "stop_reason": self._stop_reason,
+            "started_at": float(self._started_at) if self._started_at else 0.0,
+            "duration_s": float(duration_s),
+            "cost_total": cost_total,
+            "cost_breakdown": cost_breakdown,
+            "last_activity_ts": now,
+            "suspension_likely": bool(self._suspension_likely),
+            "suspension_ratio": self._suspension_ratio,
+            "wal_checkpoint_reason": str(reason)[:128],
+        }
+        return state
+
+    async def _slice12g3_periodic_checkpoint_loop(self) -> None:
+        """Periodic WAL checkpoint task. Cadence env-tunable via
+        ``JARVIS_SESSION_WAL_PERIODIC_S`` (default 15s).
+        NEVER raises into the asyncio loop — the WAL itself is
+        defensive, and the loop swallows any incidental failures."""
+        try:
+            interval_s = float(os.environ.get(
+                "JARVIS_SESSION_WAL_PERIODIC_S", "15.0",
+            ))
+        except (TypeError, ValueError):
+            interval_s = 15.0
+        interval_s = max(2.0, min(300.0, interval_s))
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                # Clean cancel during shutdown — emit a final
+                # checkpoint with reason=shutdown_cancel before
+                # returning so the in-flight state is captured.
+                try:
+                    if self._session_wal is not None:
+                        state = self._slice12g3_build_checkpoint_state(
+                            reason="shutdown_cancel",
+                        )
+                        self._session_wal.force_checkpoint(
+                            state, "shutdown_cancel",
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            try:
+                if self._session_wal is None:
+                    return  # WAL gone — exit gracefully
+                state = self._slice12g3_build_checkpoint_state(
+                    reason="periodic",
+                )
+                self._session_wal.checkpoint(state, "periodic")
+            except Exception:  # noqa: BLE001 — defensive
+                # Continuous WAL is best-effort; a single failed
+                # checkpoint must not break the periodic cadence.
+                logger.debug(
+                    "[SessionWAL] periodic checkpoint failed "
+                    "(continuing)",
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Report generation
