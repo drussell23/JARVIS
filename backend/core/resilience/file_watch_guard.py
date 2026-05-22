@@ -130,6 +130,21 @@ class WatchMetrics:
     restarts: int = 0
     last_event_time: Optional[float] = None
     avg_processing_time_ms: float = 0.0
+    # Slice 12A — overflow accounting for the loop-thread enqueue
+    # wrapper. ``events_dropped_queue_full`` counts every
+    # ``asyncio.QueueFull`` caught inside ``_queue_event_on_loop``.
+    # ``queue_full_suppressed_logs`` counts overflow events that
+    # were NOT logged because the 1s rate-limit window swallowed
+    # them. ``last_overflow_at`` is wall-clock ``time.time()`` of
+    # the most recent drop. ``last_overflow_log_at`` is
+    # ``time.monotonic()`` of the most recent emitted summary
+    # (used for rate-limit gating; monotonic is correct here
+    # because we measure elapsed time between two log emissions,
+    # not absolute timestamps).
+    events_dropped_queue_full: int = 0
+    queue_full_suppressed_logs: int = 0
+    last_overflow_at: Optional[float] = None
+    last_overflow_log_at: Optional[float] = None
 
 
 class GlobalWatchRegistry:
@@ -294,8 +309,27 @@ class FileWatchGuard:
 
         self._observer = None
         self._running = False
+        # Slice 12A — file_watch_events queue policy.
+        #
+        # WARN_AND_BLOCK is wrong for this producer: the thread
+        # watcher publishes via ``loop.call_soon_threadsafe`` and
+        # the loop-side callback is non-blocking by construction,
+        # so there's no producer to "block". Under bursty load the
+        # prior policy raised ``asyncio.QueueFull`` inside the
+        # callback, leaking the exception into asyncio's default
+        # handler — which formatted a multi-line traceback per
+        # overflow on the loop thread (~16k tracebacks per soak →
+        # 100+ s of cumulative loop-block, empirically validated by
+        # bt-2026-05-22-074210).
+        #
+        # DROP_NEWEST is the right semantic for file watching:
+        # losing the newest event is safe because downstream
+        # debounce + periodic scan recover any drift. The wrapper
+        # ``_queue_event_on_loop`` still catches ``QueueFull``
+        # defensively (covers the asyncio.Queue fallback path
+        # where BoundedAsyncQueue is unavailable + race conditions).
         self._event_queue: asyncio.Queue[FileEvent] = (
-            BoundedAsyncQueue(maxsize=500, policy=OverflowPolicy.WARN_AND_BLOCK, name="file_watch_events")
+            BoundedAsyncQueue(maxsize=500, policy=OverflowPolicy.DROP_NEWEST, name="file_watch_events")
             if BoundedAsyncQueue is not None else asyncio.Queue()
         )
         self._processor_task: Optional[asyncio.Task] = None
@@ -743,6 +777,78 @@ class FileWatchGuard:
                 paths.append((entry, True))
         return paths
 
+    # ---- Slice 12A — loop-thread enqueue wrapper -----------------
+    #
+    # ``_queue_event_on_loop`` runs on the asyncio event-loop thread
+    # (scheduled by ``_queue_event`` via ``call_soon_threadsafe``).
+    # It is the SOLE permitted target for that ``call_soon_threadsafe``
+    # call; the AST pin in the paired test surface enforces this.
+    #
+    # Why a wrapper instead of ``self._event_queue.put_nowait``:
+    #
+    # The producer publishes from a watchdog observer thread under
+    # bursty FS load (e.g., OpportunityMiner scanning 760+ .py files
+    # in one cycle). When the bounded queue overflows, ``put_nowait``
+    # raises ``asyncio.QueueFull`` synchronously. If that callable is
+    # the callback handed to ``call_soon_threadsafe``, asyncio catches
+    # the raise as an unhandled callback exception and routes it to
+    # its default exception handler — which formats the full Python
+    # traceback and logs it on the loop thread. Empirically that
+    # happened ~16k times in bt-2026-05-22-074210, sustaining
+    # 100+ seconds of cumulative loop-block.
+    #
+    # The wrapper swallows ``QueueFull`` (and any other exception)
+    # before asyncio sees it, increments structured metrics, and
+    # rate-limits the warning log so the loop is never starved by
+    # logging overhead.
+
+    def _queue_event_on_loop(self, event: FileEvent) -> None:
+        """Loop-thread enqueue wrapper. Catches ``asyncio.QueueFull``
+        + any other exception so the asyncio default exception
+        handler is never invoked from this codepath.
+
+        Metrics:
+          * ``events_dropped_queue_full`` — total drops.
+          * ``queue_full_suppressed_logs`` — drops in the current
+            rate-limit window that were NOT logged.
+          * ``last_overflow_at`` — wall-clock ``time.time()`` of
+            the most recent drop (for ``/health`` consumers).
+          * ``last_overflow_log_at`` — monotonic timestamp of the
+            most recent emitted summary (rate-limit gate).
+
+        NEVER raises. The behaviour contract: on success, the event
+        is enqueued and the function returns. On overflow, the
+        event is dropped (downstream debounce + periodic scan
+        recover any drift), metrics are bumped, and a summary log
+        may be emitted (≤1 per second per FileWatchGuard instance).
+        """
+        try:
+            self._event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.metrics.events_dropped_queue_full += 1
+            self.metrics.last_overflow_at = time.time()
+            now_mono = time.monotonic()
+            last_log = self.metrics.last_overflow_log_at
+            if last_log is None or (now_mono - last_log) >= 1.0:
+                logger.warning(
+                    "[FileWatchGuard] file_watch_events overflow: "
+                    "dropped=%d (suppressed %d in last window)",
+                    self.metrics.events_dropped_queue_full,
+                    self.metrics.queue_full_suppressed_logs,
+                )
+                self.metrics.last_overflow_log_at = now_mono
+                self.metrics.queue_full_suppressed_logs = 0
+            else:
+                self.metrics.queue_full_suppressed_logs += 1
+        except Exception as exc:  # noqa: BLE001 — never raise on loop
+            # Defensive: catch anything else so asyncio's default
+            # handler is never invoked from this callback.
+            logger.debug(
+                "[FileWatchGuard] _queue_event_on_loop unexpected "
+                "error (handled): %s: %s",
+                type(exc).__name__, exc,
+            )
+
     def _queue_event(self, event: FileEvent) -> None:
         """
         Queue an event for processing (called from watchdog thread).
@@ -756,6 +862,11 @@ class FileWatchGuard:
 
         Fix: Use call_soon_threadsafe with proper None checks and defensive handling.
         Also use a thread-safe fallback queue when async queue isn't available.
+
+        Slice 12A: ``call_soon_threadsafe`` targets
+        ``_queue_event_on_loop`` (wrapper), not ``put_nowait``
+        directly — so ``asyncio.QueueFull`` never leaks into the
+        default exception handler.
         """
         # v2.1: First check if we have a valid main loop reference
         if self._main_loop is None:
@@ -773,10 +884,20 @@ class FileWatchGuard:
                 logger.debug("[FileWatchGuard] Main event loop is closed")
                 return
 
-            # v2.1: Thread-safe call into the main event loop
-            # put_nowait is safe to call from another thread via call_soon_threadsafe
+            # v2.1: Thread-safe call into the main event loop.
+            #
+            # Slice 12A: target is the FileWatchGuard-owned wrapper
+            # ``_queue_event_on_loop``, NOT ``self._event_queue.put_nowait``
+            # directly. The wrapper runs on the loop thread, catches
+            # ``asyncio.QueueFull`` instead of leaking it into asyncio's
+            # default exception handler, increments overflow metrics, and
+            # emits rate-limited summary logs. This is the producer-side
+            # fix for the loop-starvation cascade observed in
+            # bt-2026-05-22-074210 (16k+ QueueFull tracebacks formatted
+            # on-loop). AST-pinned in the paired test surface — must NOT
+            # regress to passing ``put_nowait`` as the callback target.
             self._main_loop.call_soon_threadsafe(
-                self._event_queue.put_nowait, event
+                self._queue_event_on_loop, event
             )
 
         except RuntimeError as e:
