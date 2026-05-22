@@ -1479,6 +1479,12 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED,           # Slice 7e (OPEN_TERMINAL trip — carries the
                                                   # terminal_reason_code; consumers may collapse
                                                   # early instead of waiting on operation_terminal)
+    EVENT_TYPE_SESSION_EXHAUSTED,                 # Slice 12D (global breaker session-wide trip
+                                                  # — fires once at CLOSED → OPEN_TERMINAL with
+                                                  # trip_count + window_s + threshold; the
+                                                  # in-process on_trip callback drives harness
+                                                  # graceful shutdown, this SSE is the IDE
+                                                  # observability surface)
 })
 
 
