@@ -521,26 +521,35 @@ class ExplorationStrategy:
         )
 
     async def _run_pytest(self) -> Tuple[bool, int, int, str, float]:
-        start = time.monotonic()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3", "-m", "pytest", str(self._scratch),
-                "-v", "--tb=short", "--no-header", "-q",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(self._scratch),
+        # Slice 9 — canonical helper.
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            KillReason,
+            run_pytest_subprocess,
+        )
+        result = await run_pytest_subprocess(
+            ["python3", "-m", "pytest", str(self._scratch),
+             "-v", "--tb=short", "--no-header", "-q"],
+            cwd=str(self._scratch),
+            timeout_s=float(self._config.test_timeout_s),
+            caller="topology.exploration_strategy._run_pytest",
+        )
+        if result.timed_out:
+            return (
+                False, 0, 0,
+                f"pytest timed out after {self._config.test_timeout_s}s",
+                result.elapsed_s,
             )
-            stdout_bytes, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=self._config.test_timeout_s,
+        if result.kill_reason == KillReason.SPAWN_ERROR:
+            return (
+                False, 0, 0,
+                f"pytest error: {result.spawn_error_class}",
+                result.elapsed_s,
             )
-            output = stdout_bytes.decode(errors="replace")
-            duration = time.monotonic() - start
-            total, failed = self._parse_pytest_summary(output)
-            return proc.returncode == 0, total, failed, output, duration
-        except asyncio.TimeoutError:
-            return False, 0, 0, f"pytest timed out after {self._config.test_timeout_s}s", time.monotonic() - start
-        except Exception as e:
-            return False, 0, 0, f"pytest error: {e}", time.monotonic() - start
+        total, failed = self._parse_pytest_summary(result.stdout)
+        return (
+            result.returncode == 0, total, failed,
+            result.stdout, result.elapsed_s,
+        )
 
     @staticmethod
     def _parse_pytest_summary(output: str) -> Tuple[int, int]:

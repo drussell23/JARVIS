@@ -333,12 +333,30 @@ class PatchBenchmarker:
                 else:
                     cov_args = []
                     cov_report_args = []
-                r = subprocess.run(
+                # Slice 9 — canonical sync helper (stdin=DEVNULL +
+                # process-group isolation + bounded timeout + provenance).
+                from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+                    run_pytest_subprocess_sync,
+                )
+                _slice9 = run_pytest_subprocess_sync(
                     ["python3", "-m", "pytest", "--tb=no", "--no-header", "-q",
                      "--ignore=docs", "--ignore=.worktrees"]
                     + cov_report_args + cov_args + test_paths,
-                    capture_output=True, text=True, cwd=self._root, timeout=_COVERAGE_BUDGET,
+                    cwd=str(self._root),
+                    timeout_s=float(_COVERAGE_BUDGET),
+                    caller="patch_benchmarker._run_with_coverage",
                 )
+                # Adapt to the legacy ``r`` shape consumed below
+                # (``r.stdout`` / ``r.stderr`` / ``r.returncode``).
+                # The helper merges stderr into stdout (single PIPE),
+                # so legacy ``r.stderr`` becomes empty — code below
+                # already handles this via ``summary = r.stdout + r.stderr``.
+                class _Slice9LegacyAdapter:
+                    def __init__(self, res):
+                        self.stdout = res.stdout
+                        self.stderr = ""
+                        self.returncode = res.returncode
+                r = _Slice9LegacyAdapter(_slice9)
                 cov_pct = 0.0
                 cov_file = Path(cov_json)
                 if cov_file.exists():

@@ -928,18 +928,24 @@ async def _default_test_runner(
                 True,
                 "no test directory found — counted as SURVIVED",
             )
-        result = subprocess.run(
-            ["python3", "-m", "pytest", str(target), "-q", "-x"],
-            capture_output=True,
-            text=True,
-            timeout=float(timeout),
-            check=False,
+        # Slice 9 — canonical sync helper (stdin=DEVNULL +
+        # process-group isolation + bounded timeout + provenance).
+        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            KillReason,
+            run_pytest_subprocess_sync,
         )
+        result = run_pytest_subprocess_sync(
+            ["python3", "-m", "pytest", str(target), "-q", "-x"],
+            timeout_s=float(timeout),
+            caller="mutation_testing_harness._default_test_runner",
+        )
+        if result.timed_out:
+            return False, "test timeout"
+        if result.kill_reason == KillReason.SPAWN_ERROR:
+            return False, f"test runner exception: {result.spawn_error_class}"
         passed = result.returncode == 0
-        tail = (result.stdout or "")[-200:].replace("\n", " | ")
+        tail = result.stdout[-200:].replace("\n", " | ")
         return passed, f"rc={result.returncode}; tail={tail}"
-    except subprocess.TimeoutExpired:
-        return False, "test timeout"
     except Exception as exc:  # noqa: BLE001
         return False, f"test runner exception: {exc!r}"[:200]
 
