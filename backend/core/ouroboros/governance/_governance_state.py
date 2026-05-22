@@ -171,7 +171,14 @@ class GeneratorState:
     """
 
     primary_sem: asyncio.Semaphore
-    fallback_sem: asyncio.Semaphore
+    # Slice 12F-A: ``fallback_sem`` is either a stdlib
+    # ``asyncio.Semaphore`` (legacy / hot-revert path with
+    # ``JARVIS_PRIORITY_SEM_ENABLED=false``) or a
+    # ``priority_semaphore.PrioritySemaphore`` (graduated default).
+    # Both expose ``__aenter__`` / ``__aexit__`` / ``_value`` so
+    # existing callers are byte-equivalent. Annotated as ``Any``
+    # since stdlib ``asyncio.Semaphore`` is not a Protocol.
+    fallback_sem: Any
     fsm: "FailbackStateMachine"
     latency_tracker: "DwLatencyTracker"
     completed_batches: Dict[str, Any] = field(default_factory=dict)
@@ -201,10 +208,29 @@ class GeneratorState:
         """
         from .candidate_generator import FailbackStateMachine
         from .dw_latency_tracker import get_default_tracker
+        # Slice 12F-A — priority-aware fallback semaphore.
+        # Lazy import to keep this module's import graph minimal
+        # (mirrors the FailbackStateMachine import pattern above).
+        # The PrioritySemaphore is a drop-in shape: legacy
+        # ``async with self._fallback_sem:`` still works (defaults
+        # to STANDARD priority, FIFO-equivalent) — call sites that
+        # opt into priority use ``acquire_for_route(route)``.
+        from .priority_semaphore import (
+            PrioritySemaphore,
+            priority_sem_enabled,
+        )
+
+        fallback_sem: object
+        if priority_sem_enabled():
+            fallback_sem = PrioritySemaphore(
+                fallback_concurrency, name="fallback_sem",
+            )
+        else:  # explicit hot-revert via JARVIS_PRIORITY_SEM_ENABLED=false
+            fallback_sem = asyncio.Semaphore(fallback_concurrency)
 
         return cls(
             primary_sem=asyncio.Semaphore(primary_concurrency),
-            fallback_sem=asyncio.Semaphore(fallback_concurrency),
+            fallback_sem=fallback_sem,
             fsm=FailbackStateMachine(),
             latency_tracker=latency_tracker or get_default_tracker(),
         )

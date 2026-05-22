@@ -1091,10 +1091,20 @@ class FailbackStateMachine:
         # provider_stream_rupture:... message. Classify as TRANSIENT_TRANSPORT
         # so the FSM uses the short 5s/30s recovery profile and cascades
         # to Tier 1 immediately.
+        #
+        # Slice 12F-B (2026-05-22) — StreamBudgetTooShortError is the
+        # diagnostic sibling: not a network-side rupture, but a local
+        # decision to refuse dispatch when wall_remaining < the
+        # JARVIS_STREAM_MINIMUM_READ_BUDGET_S floor. Same classifier
+        # mapping (TRANSIENT_TRANSPORT) — same Slice 7 fallback
+        # behaviour — but the postmortem can tell the two apart.
         from backend.core.ouroboros.governance.stream_rupture import (
+            StreamBudgetTooShortError,
             StreamRuptureError,
         )
-        if isinstance(exc, StreamRuptureError):
+        if isinstance(
+            exc, (StreamRuptureError, StreamBudgetTooShortError),
+        ):
             return FailureMode.TRANSIENT_TRANSPORT
 
         chain = _walk_exception_chain(exc)
@@ -3362,7 +3372,19 @@ class CandidateGenerator:
             "[CandidateGenerator] Plan fallback sem acquire: slots_free=%d/%d",
             self._fallback_sem._value, self._fallback_concurrency,
         )
-        async with self._fallback_sem:
+        # Slice 12F-A — priority-aware acquisition. The plan() entry
+        # point doesn't carry context (the prompt was already
+        # composed by the orchestrator), so we use the empty-route
+        # default which falls through to DEFAULT_PRIORITY (STANDARD
+        # bucket — FIFO-equivalent within the bucket). The dominant
+        # starvation wedge is on the call() path which DOES have
+        # _op_route in scope. plan() acquisitions are rare relative
+        # to call() acquisitions in the soak; keeping them at default
+        # priority is structurally safe.
+        from backend.core.ouroboros.governance.priority_semaphore import (  # noqa: E501
+            acquire_priority_aware as _slice12f_acquire,
+        )
+        async with _slice12f_acquire(self._fallback_sem, ""):
             _sem_wait_s = time.monotonic() - _sem_t0
             _parent_remaining = self._remaining_seconds(deadline)
             _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
@@ -3999,7 +4021,17 @@ class CandidateGenerator:
             )
 
         try:
-            async with self._fallback_sem:
+            # Slice 12F-A — priority-aware fallback sem acquire.
+            # urgency=high SWE-Bench-Pro foreground ops (IMMEDIATE
+            # route, priority=0) now preempt urgency=low /
+            # BACKGROUND OpportunityMiner ops (priority=4) on slot
+            # release. Hard concurrency cap preserved by the
+            # underlying PrioritySemaphore counter. Hot-revert via
+            # JARVIS_PRIORITY_SEM_ENABLED=false returns to FIFO.
+            from backend.core.ouroboros.governance.priority_semaphore import (  # noqa: E501
+                acquire_priority_aware as _slice12f_acquire,
+            )
+            async with _slice12f_acquire(self._fallback_sem, _op_route):
                 _sem_wait_s = time.monotonic() - _sem_t0
                 _parent_remaining = self._remaining_seconds(deadline)
 
@@ -4023,24 +4055,46 @@ class CandidateGenerator:
                 # CancelledError 130s later (httpx connect+read
                 # surrender latency).  Fast-fail here is observability +
                 # cost win.
-                if _parent_remaining <= 0.0:
+                #
+                # Slice 12F-B (2026-05-22) — raise the D2 floor from
+                # absolute-zero to JARVIS_STREAM_MINIMUM_READ_BUDGET_S
+                # (default 10s). Phase 3A acceptance (bt-2026-05-22-
+                # 184422) proved the gap: sem_wait_total=142.2s drained
+                # the op's wall to ~0.01s — JUST above the 0.0 floor —
+                # so D2 didn't fire and the stream opened with a
+                # 0.01-second read budget. The subsequent inter-chunk
+                # watchdog fired a misleading "no event for 0s" rupture.
+                # That was a budget-too-short refusal masquerading as a
+                # network rupture. Slice 12F-B raises the typed
+                # StreamBudgetTooShortError BEFORE dispatch, which the
+                # classifier maps to TRANSIENT_TRANSPORT →
+                # RetryDecision.RETRY_TRANSIENT (NOT terminal
+                # structural — Slice 7 fallback handles it as a
+                # transient transport fault).
+                from backend.core.ouroboros.governance.stream_rupture import (  # noqa: E501
+                    StreamBudgetTooShortError,
+                    stream_minimum_read_budget_s,
+                )
+                _min_read_budget_s = stream_minimum_read_budget_s()
+                if _parent_remaining < _min_read_budget_s:
                     logger.info(
-                        "[CandidateGenerator] Post-sem fast-fail: "
-                        "sem_wait=%.1fs drained pre_sem_remaining=%.1fs → "
-                        "parent_remaining=0s.  Honest enforcement per D2 "
-                        "operator binding 2026-05-14 — refusing to open "
-                        "a stream that would violate outer wait_for.",
+                        "[CandidateGenerator] Post-sem budget-floor "
+                        "shed (Slice 12F-B): sem_wait=%.1fs drained "
+                        "pre_sem_remaining=%.1fs → parent_remaining=%.2fs "
+                        "below floor=%.1fs (route=%s). Refusing to "
+                        "dispatch a stream that the wall budget cannot "
+                        "honor; raising StreamBudgetTooShortError → "
+                        "RETRY_TRANSIENT (Slice 7 fallback).",
                         _sem_wait_s, _pre_sem_remaining,
+                        _parent_remaining, _min_read_budget_s, _op_route,
                     )
-                    self._raise_exhausted(
-                        "sem_exhausted_zero_budget",
-                        context=context,
-                        deadline=deadline,
+                    raise StreamBudgetTooShortError(
+                        provider="claude-api",
+                        op_id=str(getattr(context, "op_id", ""))[:48],
+                        wall_remaining_s=round(_parent_remaining, 2),
+                        minimum_required_s=_min_read_budget_s,
                         sem_wait_s=round(_sem_wait_s, 2),
-                        pre_sem_remaining_s=round(_pre_sem_remaining, 2),
-                        parent_remaining_s=0.0,
-                        phase=_phase_hint,
-                        route=_op_route,
+                        route=str(_op_route or ""),
                     )
 
                 # AdmissionGate Slice 2 — feed observed wait
