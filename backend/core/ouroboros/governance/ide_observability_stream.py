@@ -158,6 +158,17 @@ EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED = "provider_failure_classified"
 EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE = "circuit_breaker_state_change"
 EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
 
+# Slice 12D (Graceful Shutdown on Global Breaker Trip) — single
+# event type covering the global-session structural-refusal
+# transition CLOSED → OPEN_TERMINAL. Carries trip_count + window_s
+# + threshold + triggered_at so IDE consumers can render "session
+# exhausted" panels. The event is keyed by ``op_id=""`` (no per-op
+# scope; the global breaker is session-wide). The harness
+# subscribes via the in-process ``_GlobalBreaker.on_trip`` callback
+# registry to drive graceful shutdown; the SSE publish here is the
+# observability surface for external consumers.
+EVENT_TYPE_SESSION_EXHAUSTED = "session_exhausted"
+
 # SensorGovernor + MemoryPressureGate (Wave 1 #3 Slice 3) vocabulary.
 EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
@@ -2909,6 +2920,55 @@ def publish_circuit_breaker_tripped(
     except Exception:  # noqa: BLE001
         logger.debug(
             "[Stream] publish_circuit_breaker_tripped exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_session_exhausted(payload: Any) -> Optional[str]:
+    """Slice 12D — publish a ``session_exhausted`` event when the
+    global breaker transitions CLOSED → OPEN_TERMINAL. Consumed by
+    the IDE observability stream so external tools can render
+    "session exhausted" panels in real time.
+
+    ``payload`` is a ``GlobalBreakerTripPayload`` (duck-typed to
+    keep this module free of a circular import on
+    ``circuit_breaker``). Required attributes: ``reason``,
+    ``trip_count``, ``window_s``, ``threshold``, ``triggered_at``.
+
+    Best-effort: broker missing / observability disabled / publish
+    error all return ``None`` silently. NEVER raises. The
+    in-process callback registry on ``_GlobalBreaker`` is the
+    authoritative shutdown channel; this publish is purely
+    observability."""
+    if not stream_enabled():
+        return None
+    try:
+        reason = str(getattr(payload, "reason", "") or "")[:64]
+        trip_count = int(getattr(payload, "trip_count", 0) or 0)
+        window_s = float(getattr(payload, "window_s", 0.0) or 0.0)
+        threshold = int(getattr(payload, "threshold", 0) or 0)
+        triggered_at = float(
+            getattr(payload, "triggered_at", 0.0) or 0.0,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_SESSION_EXHAUSTED,
+            "session_exhausted",  # op_id placeholder — global scope
+            {
+                "reason": reason,
+                "trip_count": trip_count,
+                "window_s": window_s,
+                "threshold": threshold,
+                "triggered_at": triggered_at,
+                "scope": "global",
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_session_exhausted exception",
             exc_info=True,
         )
         return None

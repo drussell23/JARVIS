@@ -118,10 +118,13 @@ The global breaker is the structural acknowledgement that
 
 ## Master flag + env knobs
 
-  * ``JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED`` — default FALSE.
-    When OFF, ``evaluate()`` always returns ``RETRY_OK``
-    (byte-identical to no breaker). Slice 7e wires it in; the
-    flag stays FALSE until Slice 7f graduation soak passes.
+  * ``JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED`` —
+    **default TRUE (Slice 7g graduated 2026-05-22)**.
+    When OFF (explicit ``=false``), ``evaluate()`` always returns
+    ``RETRY_OK`` (byte-identical to no breaker) — the hot-revert
+    path. Four consecutive forced-budget acceptance soaks proved
+    the cascade: per-op trip → ``[CircuitBreaker.Global]`` →
+    ``global_session_exhausted`` with zero retry storms.
   * ``JARVIS_CIRCUIT_BREAKER_TERMINAL_QUOTA_TRIP`` — default 2
     (operator-bound).
   * ``JARVIS_CIRCUIT_BREAKER_QUOTA_WINDOW_S`` — default 30.0s.
@@ -144,10 +147,11 @@ import enum
 import logging
 import os
 import random
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Optional
+from typing import Any, Callable, Deque, List, Optional
 
 
 logger = logging.getLogger("Ouroboros.CircuitBreaker")
@@ -204,6 +208,23 @@ class CircuitVerdict:
     state_after: Optional[CircuitState] = None
 
 
+@dataclass(frozen=True)
+class GlobalBreakerTripPayload:
+    """Frozen lifecycle payload broadcast when the global breaker
+    transitions CLOSED → OPEN_TERMINAL. Slice 12D substrate —
+    consumed by harness shutdown wiring (in-process callback) and
+    by IDE consumers via ``session_exhausted`` SSE event.
+
+    Fields are kept primitive so the payload can cross both
+    in-process and SSE-publish boundaries without conversion."""
+
+    reason: str               # canonical "session_exhausted"
+    trip_count: int           # structural trips observed within window
+    window_s: float           # window over which trips were counted
+    threshold: int            # trips-to-trip threshold
+    triggered_at: float       # wall-clock time.time() at transition
+
+
 # ============================================================================
 # Env knobs
 # ============================================================================
@@ -222,13 +243,29 @@ _MIN_BUDGET_FLOOR_ENV: str = "JARVIS_CIRCUIT_BREAKER_MIN_BUDGET_FLOOR_USD"
 
 
 def circuit_breaker_enabled() -> bool:
-    """Master gate. Default FALSE per §33.1. NEVER raises."""
+    """Master gate. **Default TRUE — graduated 2026-05-22 (Slice 7g)**.
+
+    Provider Circuit Breaker is now permanently on. The retry-storm
+    + cancellation-overrun wedge that motivated Slice 7 (a–e) is
+    structurally closed; four consecutive forced-budget acceptance
+    soaks (Slice 11B-fix / 12A / 11C / 11C-retry) confirmed:
+      * 20+ ``circuit_breaker_tripped:terminal_structural`` per soak
+      * 0 ``Fallback outer-retry`` storms
+      * 0 ``cancellation_overrun_detected`` events
+      * Clean cascade per-op trip → ``[CircuitBreaker.Global]`` →
+        ``global_session_exhausted`` for subsequent ops
+
+    Hot-revert path: ``export JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED=false``
+    returns the orchestrator to the pre-Slice-7 retry-loop behaviour.
+    Any other value (empty / ``"1"`` / ``"true"`` / ``"yes"`` / ``"on"``)
+    leaves the breaker enabled. NEVER raises."""
     try:
-        return os.environ.get(_MASTER_FLAG_ENV, "").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        raw = os.environ.get(_MASTER_FLAG_ENV, "").strip().lower()
+        if raw == "":
+            return True  # graduated default
+        return raw not in ("0", "false", "no", "off")
     except Exception:  # noqa: BLE001
-        return False
+        return True
 
 
 def _read_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -348,7 +385,16 @@ class _GlobalBreaker:
     If trips within the window exceed the threshold, the global
     breaker enters OPEN_TERMINAL — every subsequent per-op
     ``evaluate()`` immediately returns TERMINATE_UNRESOLVED with
-    ``terminal_reason_code=global_session_exhausted``."""
+    ``terminal_reason_code=global_session_exhausted``.
+
+    Slice 12D: the transition CLOSED → OPEN_TERMINAL is a
+    one-shot lifecycle event. The breaker exposes an ``on_trip``
+    callback registry — subscribers (harness shutdown waiter, SSE
+    publisher, etc.) are notified exactly once at the transition
+    instant. Callbacks fire synchronously inside
+    ``report_structural_trip``; they are defensive-isolated so a
+    raising subscriber cannot break the breaker or starve siblings.
+    """
 
     def __init__(self) -> None:
         self._state: CircuitState = CircuitState.CLOSED
@@ -357,6 +403,14 @@ class _GlobalBreaker:
         self._window: _SlidingWindow = _SlidingWindow(
             _read_float(_GLOBAL_TRIP_WINDOW_ENV, 300.0),
         )
+        # Slice 12D — on-trip callback registry. Append-only;
+        # iterated as a snapshot (defensive copy) so a callback
+        # that mutates the registry (e.g. unsubscribes itself)
+        # can't perturb the in-flight dispatch loop.
+        self._on_trip_callbacks: List[
+            Callable[[GlobalBreakerTripPayload], None]
+        ] = []
+        self._on_trip_lock: threading.Lock = threading.Lock()
 
     @property
     def state(self) -> CircuitState:
@@ -364,11 +418,87 @@ class _GlobalBreaker:
         # the events out).
         return self._state
 
+    def on_trip(
+        self,
+        callback: Callable[[GlobalBreakerTripPayload], None],
+    ) -> None:
+        """Register a callback to fire when this breaker transitions
+        CLOSED → OPEN_TERMINAL. The transition is **sticky** — once
+        OPEN_TERMINAL, the global breaker stays there for the
+        process lifetime and never re-fires callbacks. Multiple
+        subscribers are dispatched in registration order. NEVER
+        raises.
+
+        Callbacks fire synchronously inside the thread that calls
+        ``report_structural_trip`` (typically a Slice 7e GENERATE
+        worker on the asyncio loop thread). Subscribers that need
+        to interact with the asyncio loop from another thread MUST
+        marshal via ``loop.call_soon_threadsafe`` themselves —
+        the registry stays transport-agnostic."""
+        if callback is None or not callable(callback):
+            return
+        with self._on_trip_lock:
+            self._on_trip_callbacks.append(callback)
+        # If the breaker is ALREADY tripped at registration time,
+        # fire the callback immediately with the current trip
+        # payload — late subscribers should see the transition,
+        # not silently miss it. This makes registration order
+        # irrelevant for shutdown-waiter wiring.
+        if self._state == CircuitState.OPEN_TERMINAL:
+            payload = self._build_trip_payload()
+            try:
+                callback(payload)
+            except Exception:  # noqa: BLE001 — defensive
+                logger.exception(
+                    "[CircuitBreaker.Global] late-bind on_trip "
+                    "callback raised (swallowed)",
+                )
+
+    def _build_trip_payload(self) -> GlobalBreakerTripPayload:
+        """Compose the lifecycle payload from current breaker state.
+        Pure-data, NEVER raises."""
+        window_s = _read_float(_GLOBAL_TRIP_WINDOW_ENV, 300.0)
+        threshold = _read_int(_GLOBAL_TRIP_COUNT_ENV, 5)
+        return GlobalBreakerTripPayload(
+            reason="session_exhausted",
+            trip_count=int(self._window.count()),
+            window_s=float(window_s),
+            threshold=int(threshold),
+            triggered_at=time.time(),
+        )
+
+    def _dispatch_on_trip(
+        self, payload: GlobalBreakerTripPayload,
+    ) -> None:
+        """Fire every registered callback with the trip payload.
+        Each callback is isolated in try/except — a raising
+        subscriber cannot starve siblings or propagate into
+        ``report_structural_trip``."""
+        with self._on_trip_lock:
+            snapshot = list(self._on_trip_callbacks)
+        for cb in snapshot:
+            try:
+                cb(payload)
+            except Exception:  # noqa: BLE001 — defensive
+                logger.exception(
+                    "[CircuitBreaker.Global] on_trip callback "
+                    "raised (swallowed); siblings continue",
+                )
+
     def report_structural_trip(self) -> None:
         """Per-op breaker calls this when it trips with
         TERMINAL_STRUCTURAL. The global breaker may transition to
         OPEN_TERMINAL if the threshold is reached within the
-        window."""
+        window.
+
+        Slice 12D: a CLOSED → OPEN_TERMINAL transition publishes
+        the lifecycle event in three places, in this order:
+          1. ``[CircuitBreaker.Global] tripped`` log line (legacy).
+          2. In-process callback dispatch (registered subscribers).
+          3. Best-effort SSE publish for IDE consumers
+             (``session_exhausted`` event type).
+        Steps 2 and 3 are fully defensive — neither can perturb
+        the breaker state, the log, or each other."""
         if self._state == CircuitState.OPEN_TERMINAL:
             return  # already tripped — sticky
         self._window.add()
@@ -382,11 +512,48 @@ class _GlobalBreaker:
                 _read_float(_GLOBAL_TRIP_WINDOW_ENV, 300.0),
                 threshold,
             )
+            # Slice 12D — broadcast lifecycle.
+            payload = self._build_trip_payload()
+            # (2) In-process subscribers (harness shutdown waiter,
+            #     telemetry observers, etc.).
+            self._dispatch_on_trip(payload)
+            # (3) IDE/SSE consumers — lazy, best-effort.
+            _publish_session_exhausted_best_effort(payload)
 
     def reset(self) -> None:
         """For tests. Production code should not need to call this."""
         self._state = CircuitState.CLOSED
         self._window.clear()
+        with self._on_trip_lock:
+            self._on_trip_callbacks.clear()
+
+
+def _publish_session_exhausted_best_effort(
+    payload: GlobalBreakerTripPayload,
+) -> None:
+    """Lazy-import ``publish_session_exhausted`` from the
+    observability-stream module and fire-and-forget. Broker missing
+    / observability disabled / publish raising all degrade to a
+    silent return. NEVER raises.
+
+    Lazy import keeps ``circuit_breaker`` independent of the SSE
+    surface — operators running with ``JARVIS_IDE_STREAM_ENABLED=false``
+    pay zero cost; tests with the broker stubbed see the publish
+    attempt deterministically."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            publish_session_exhausted,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return
+    try:
+        publish_session_exhausted(payload)
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[CircuitBreaker.Global] session_exhausted SSE "
+            "publish swallowed",
+            exc_info=True,
+        )
 
 
 _global_breaker: Optional[_GlobalBreaker] = None

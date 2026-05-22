@@ -698,6 +698,69 @@ class BattleTestHarness:
         # "process_memory_cap" — a graceful, summary-producing stop
         # BEFORE the OS OOM-kills the tree (which leaves no artifacts).
         self._process_memory_event: asyncio.Event = asyncio.Event()
+
+        # Slice 12D (Graceful Shutdown on Global Breaker Trip) —
+        # joins the FIRST_COMPLETED race. Fires when the global
+        # provider circuit breaker transitions CLOSED → OPEN_TERMINAL
+        # (five structural trips within window — see Slice 7c +
+        # circuit_breaker._GlobalBreaker). When this event wins the
+        # race the session terminates with
+        # ``stop_reason="session_exhausted"`` — the harness drains
+        # cleanly, flushes telemetry, writes summary.json with
+        # ``session_outcome=complete`` BEFORE the wall-cap timer
+        # would fire. Replaces the pre-Slice-12D behaviour where
+        # post-global-trip sessions sat idle until Layer-3 SIGKILL.
+        self._session_exhausted_event: asyncio.Event = asyncio.Event()
+        self._session_exhausted_payload: Optional[Any] = None
+        # Register the in-process callback against the global
+        # breaker singleton. Lazy import keeps the harness module
+        # free of a hard dependency on circuit_breaker (mirrors
+        # the publish_invariant_drift_detected lazy-import shape).
+        # The callback marshals via call_soon_threadsafe because
+        # ``_GlobalBreaker.report_structural_trip`` may fire from
+        # a Slice 7e GENERATE worker — possibly off the main
+        # asyncio thread under stress — and ``asyncio.Event.set``
+        # is documented as not thread-safe.
+        try:
+            from backend.core.ouroboros.governance.circuit_breaker import (  # noqa: E501
+                get_global_breaker as _slice12d_get_global_breaker,
+            )
+
+            def _slice12d_on_global_trip(_payload: Any) -> None:
+                """Bridge from the global breaker's on_trip
+                callback (synchronous, possibly off-loop) into
+                the harness's shutdown event (asyncio, must be
+                set from the loop thread)."""
+                self._session_exhausted_payload = _payload
+                try:
+                    _running_loop.call_soon_threadsafe(
+                        self._session_exhausted_event.set,
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    # Loop may already be closing; nothing we
+                    # can do besides record the payload.
+                    logger.debug(
+                        "[Slice12D] session_exhausted callback "
+                        "could not marshal to loop (likely "
+                        "shutdown race)",
+                        exc_info=True,
+                    )
+
+            _slice12d_get_global_breaker().on_trip(
+                _slice12d_on_global_trip,
+            )
+            logger.info(
+                "[Slice12D] session_exhausted shutdown waiter "
+                "registered against global circuit breaker",
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            # Defensive: if circuit_breaker is somehow unavailable
+            # the harness keeps the 5-way race (legacy behaviour).
+            logger.debug(
+                "[Slice12D] global breaker on_trip registration "
+                "failed (legacy 5-way race remains)",
+                exc_info=True,
+            )
         self._process_memory_hard_deadline_stop: Optional[
             threading.Event
         ] = None
@@ -1308,11 +1371,22 @@ class BattleTestHarness:
             process_memory_waiter = asyncio.ensure_future(
                 self._process_memory_event.wait()
             )
+            # Slice 12D — global circuit breaker shutdown waiter
+            # joins the race. Fires when the global breaker
+            # transitions CLOSED → OPEN_TERMINAL (5 structural
+            # trips within window). Same shape as the other
+            # waiters: when the global breaker never trips the
+            # event is never set, so this waiter blocks forever
+            # with zero effect — backwards-compatible.
+            session_exhausted_waiter = asyncio.ensure_future(
+                self._session_exhausted_event.wait()
+            )
 
             done, pending = await asyncio.wait(
                 [
                     shutdown_waiter, budget_waiter, idle_waiter,
                     wall_clock_waiter, process_memory_waiter,
+                    session_exhausted_waiter,
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -1346,6 +1420,26 @@ class BattleTestHarness:
                     "summary-producing stop ahead of an OS OOM-kill "
                     "(ProcessMemoryWatchdog).",
                     self._session_id,
+                )
+            elif session_exhausted_waiter in done:
+                # Slice 12D — global circuit breaker fired. Graceful
+                # summary-producing stop BEFORE the wall-cap timer
+                # would fire. The cascade is structural: per-op trips
+                # (Slice 7c terminal_structural) → 5 within window →
+                # _GlobalBreaker → on_trip callback → asyncio.Event →
+                # this waiter wins the race.
+                self._stop_reason = "session_exhausted"
+                payload = self._session_exhausted_payload
+                trip_count = getattr(payload, "trip_count", "?")
+                window_s = getattr(payload, "window_s", 0.0) or 0.0
+                threshold = getattr(payload, "threshold", "?")
+                logger.warning(
+                    "Session %s stopping: session_exhausted — global "
+                    "circuit breaker tripped (trips=%s threshold=%s "
+                    "window=%.0fs). Slice 12D graceful drain ahead of "
+                    "wall-cap.",
+                    self._session_id,
+                    trip_count, threshold, float(window_s),
                 )
             elif shutdown_waiter in done:
                 self._stop_reason = "shutdown_signal"

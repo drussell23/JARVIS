@@ -100,20 +100,23 @@ class TestSseEventRegistration(unittest.TestCase):
 
 
 class TestMasterFlagDefault(unittest.TestCase):
-    """The breaker master flag stays FALSE until Slice 7f
-    graduation. Slice 7e wires the substrate; the flag flip is a
-    separate operator decision."""
+    """Slice 7g graduated the breaker default to TRUE on 2026-05-22
+    after four consecutive forced-budget acceptance soaks proved
+    the cascade (per-op terminal_structural → global trip →
+    session-exhausted shutdown). Hot-revert is via explicit
+    ``JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED=false``."""
 
-    def test_default_is_false(self) -> None:
+    def test_default_is_true(self) -> None:
         prior = os.environ.pop(
             "JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED", None,
         )
         try:
-            self.assertFalse(
+            self.assertTrue(
                 circuit_breaker_enabled(),
-                "JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED MUST stay "
-                "default-FALSE through Slice 7e — graduation to "
-                "TRUE happens in Slice 7f after soak.",
+                "Slice 7g (graduated 2026-05-22): "
+                "JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED is now "
+                "default-TRUE. Hot-revert path is explicit "
+                "`=false`.",
             )
         finally:
             if prior is not None:
