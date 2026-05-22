@@ -50,6 +50,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import enum
 from enum import Enum, auto
 from pathlib import Path
 from typing import (
@@ -1213,14 +1214,64 @@ class CodebaseKnowledgeGraph:
 # ORACLE SEMANTIC INDEX — ChromaDB + SentenceTransformer
 # =============================================================================
 
+class OracleSemanticBackendStatus(str, enum.Enum):
+    """Closed-taxonomy status of the Oracle's semantic backend.
+
+    Slice 10 — operator-bound telemetry contract:
+    ``oracle_semantic_backend={chroma|stdlib|disabled|degraded}``.
+
+    The closed 5-value taxonomy + the AST pin in
+    ``tests/governance/test_slice10_oracle_semantic_isolation.py``
+    guarantees that downstream consumers can route deterministically
+    on the status. Adding a 6th value requires bumping the pin +
+    every readback caller."""
+
+    PENDING   = "pending"     # constructed; ChromaDB not yet attempted
+    CHROMA    = "chroma"      # ChromaDB loaded + ready
+    STDLIB    = "stdlib"      # fallback (reserved — Slice 11 wires)
+    DISABLED  = "disabled"    # operator opt-out via env
+    DEGRADED  = "degraded"    # init failed / timed out — queries return empty
+
+
+# Backwards-compat alias for any near-term caller that migrates
+# incrementally to the qualified enum name.
+BackendStatus = OracleSemanticBackendStatus
+
+
 class OracleSemanticIndex:
     """Manages ChromaDB embeddings for code symbols (functions, methods, classes).
 
     Embedded text per node: ``"{name} {signature} {docstring}"`` (truncated to 512 chars).
     Indexed node types: CLASS, FUNCTION, METHOD only.
 
-    **Fault isolation guarantee:** ``__init__`` never raises.  All public methods
-    return empty results silently when ``_available`` is ``False``.
+    **Fault isolation guarantee:** ``__init__`` never raises. All public methods
+    return empty results silently when the backend is not in ``CHROMA`` status.
+
+    Slice 10 — Oracle semantic native-runtime isolation (operator-bound,
+    empirical from bt-2026-05-22-010120):
+
+      ChromaDB's Rust extension (``chromadb_rust_bindings``) spawns tokio
+      worker threads that compete with the main Python asyncio thread for
+      the GIL. The pre-Slice-10 constructor loaded ChromaDB synchronously
+      during Oracle boot, which starved the asyncio loop for minutes (the
+      sample showed the main thread blocked at
+      ``PyEval_RestoreThread → _pthread_cond_wait`` while ~6
+      tokio-runtime-workers ran in ``chromadb_rust_bindings.abi3.so``).
+
+    Slice 10 fix:
+      * ``__init__`` is LIGHTWEIGHT — config stash only, NO chromadb import.
+      * ``initialize_backend()`` runs the ChromaDB + embedder load in
+        ``loop.run_in_executor`` under ``asyncio.wait_for`` with bounded
+        timeout (env: ``JARVIS_ORACLE_SEMANTIC_BACKEND_TIMEOUT_S``, default 30s).
+      * Backend status is the closed-taxonomy
+        ``OracleSemanticBackendStatus`` enum.
+      * Boot path NEVER touches chromadb. Oracle.initialize() returns
+        immediately after constructing this object; ChromaDB loads
+        lazily on the first semantic query or via explicit
+        ``initialize_backend()`` call.
+
+    AST pin: the SOLE ``import chromadb`` site in this module is
+    ``_load_chromadb_sync`` (the executor-thread loader).
     """
 
     # Node types worth embedding — others carry no useful semantic content
@@ -1228,84 +1279,214 @@ class OracleSemanticIndex:
     # Max chars fed to the embedding model per node
     _MAX_EMBED_CHARS: int = 512
 
+    # Slice 10 — env knobs (operational; closed taxonomy is structural)
+    _ENV_BACKEND: str = "JARVIS_ORACLE_SEMANTIC_BACKEND"
+    _ENV_INIT_TIMEOUT_S: str = "JARVIS_ORACLE_SEMANTIC_BACKEND_TIMEOUT_S"
+    _DEFAULT_INIT_TIMEOUT_S: float = 30.0
+    _MIN_INIT_TIMEOUT_S: float = 1.0
+    _MAX_INIT_TIMEOUT_S: float = 300.0
+
     def __init__(
         self,
         persist_dir: Optional[Path] = None,
         collection_name: Optional[str] = None,
     ) -> None:
-        self._available: bool = False
+        # Slice 10 — LIGHTWEIGHT constructor. NO chromadb import,
+        # NO embedder load, NO disk writes (persist_dir.mkdir is
+        # deferred to _load_chromadb_sync). Boot path is bounded
+        # by trivial config-stash time.
+        #
+        # AST pin (Slice 10): the body of __init__ MUST NOT
+        # contain ``import chromadb`` or any chromadb attribute
+        # access. The executor-isolated ``_load_chromadb_sync`` is
+        # the SOLE permitted import site in this module.
+        self._available: bool = False  # legacy property; True iff CHROMA
         self._collection: Optional[Any] = None
         self._embedder: Optional[Any] = None
         self._persist_dir = persist_dir or OracleConfig.CHROMA_PERSIST_DIR
         self._collection_name = collection_name or OracleConfig.CHROMA_COLLECTION_NAME
+        self._status: OracleSemanticBackendStatus = (
+            OracleSemanticBackendStatus.PENDING
+        )
+        # One-shot init guard. Lock constructed lazily inside the
+        # async path (we may be on the main thread at __init__ time
+        # but not yet inside an event loop).
+        self._init_lock: Optional[asyncio.Lock] = None
+        self._init_attempted: bool = False
 
+    # ---- Slice 10 status surface ----
+
+    @property
+    def backend_status(self) -> "OracleSemanticBackendStatus":
+        """Closed-taxonomy status. Operator readback API."""
+        return self._status
+
+    @property
+    def backend_status_value(self) -> str:
+        """String form for the telemetry-bound log line
+        ``oracle_semantic_backend=<value>``."""
+        return self._status.value
+
+    # ---- Backend resolution + bounded executor init ----
+
+    @classmethod
+    def _resolve_backend_choice(cls) -> str:
+        """Returns the configured backend preference. Operator
+        opt-out via ``JARVIS_ORACLE_SEMANTIC_BACKEND=disabled``."""
+        return os.environ.get(
+            cls._ENV_BACKEND, "chroma",
+        ).strip().lower()
+
+    @classmethod
+    def _resolve_init_timeout_s(cls) -> float:
+        """Clamped init timeout for the executor-isolated load."""
         try:
-            import chromadb  # type: ignore[import]
-            self._persist_dir.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(
-                path=str(self._persist_dir),
-                settings=chromadb.Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
-                ),
-            )
-            self._collection = client.get_or_create_collection(
-                name=self._collection_name,
-                metadata={
-                    "hnsw:space": "cosine",
-                    "hnsw:construction_ef": 200,
-                    "hnsw:M": 16,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                "[OracleSemanticIndex] ChromaDB unavailable: %s; semantic search disabled", exc
-            )
+            raw = os.environ.get(cls._ENV_INIT_TIMEOUT_S, "").strip()
+            if not raw:
+                return cls._DEFAULT_INIT_TIMEOUT_S
+            v = float(raw)
+        except (TypeError, ValueError):
+            return cls._DEFAULT_INIT_TIMEOUT_S
+        return max(
+            cls._MIN_INIT_TIMEOUT_S,
+            min(cls._MAX_INIT_TIMEOUT_S, v),
+        )
+
+    async def initialize_backend(self) -> "OracleSemanticBackendStatus":
+        """Slice 10 — async one-shot bounded executor init.
+
+        Loads ChromaDB + embedder in ``loop.run_in_executor`` under
+        ``asyncio.wait_for`` so the main asyncio loop continues
+        ticking even when the chromadb Rust workers misbehave.
+
+        On timeout / exception → ``status=DEGRADED``. Queries
+        return empty without raising. Idempotent — subsequent calls
+        return the cached status."""
+        if self._init_attempted:
+            return self._status
+        if self._init_lock is None:
+            self._init_lock = asyncio.Lock()
+        async with self._init_lock:
+            if self._init_attempted:
+                return self._status
+            choice = self._resolve_backend_choice()
+            if choice == "disabled":
+                self._status = OracleSemanticBackendStatus.DISABLED
+                self._init_attempted = True
+                logger.info(
+                    "[OracleSemanticIndex] backend=disabled "
+                    "(JARVIS_ORACLE_SEMANTIC_BACKEND=disabled) — "
+                    "semantic queries return empty; graph "
+                    "readiness is unaffected"
+                )
+                return self._status
+            timeout_s = self._resolve_init_timeout_s()
+            t0 = time.monotonic()
+            try:
+                loop = asyncio.get_running_loop()
+                await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, self._load_chromadb_sync,
+                    ),
+                    timeout=timeout_s,
+                )
+                self._status = OracleSemanticBackendStatus.CHROMA
+                self._available = True  # legacy compat
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "[OracleSemanticIndex] backend=chroma READY "
+                    "(lazy + executor-isolated, elapsed=%.2fs) — "
+                    "collection '%s' at %s",
+                    elapsed, self._collection_name, self._persist_dir,
+                )
+            except asyncio.TimeoutError:
+                self._status = OracleSemanticBackendStatus.DEGRADED
+                logger.warning(
+                    "[OracleSemanticIndex] backend=degraded — init "
+                    "exceeded %.1fs timeout; queries return empty; "
+                    "graph readiness is unaffected",
+                    timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001 — fault isolation
+                self._status = OracleSemanticBackendStatus.DEGRADED
+                logger.warning(
+                    "[OracleSemanticIndex] backend=degraded — init "
+                    "raised %s: %s; queries return empty; graph "
+                    "readiness is unaffected",
+                    type(exc).__name__, exc,
+                )
+            self._init_attempted = True
+            return self._status
+
+    def _load_chromadb_sync(self) -> None:
+        """SYNCHRONOUS executor-thread loader. The SOLE permitted
+        ``import chromadb`` site in this module (AST-pinned).
+
+        Runs in a thread pool worker via ``loop.run_in_executor``.
+        Heavy C-extension allocation + Rust worker spawn happens
+        here, NOT on the main asyncio thread. The main loop ticks
+        under the surrounding ``asyncio.wait_for``."""
+        import chromadb  # type: ignore[import]
+        self._persist_dir.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(
+            path=str(self._persist_dir),
+            settings=chromadb.Settings(
+                anonymized_telemetry=False,
+                allow_reset=True,
+            ),
+        )
+        self._collection = client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:construction_ef": 200,
+                "hnsw:M": 16,
+            },
+        )
+        # Embedder construction via the centralized EmbeddingService
+        # singleton — prevents multiple SentenceTransformer instances
+        # from spawning competing PyTorch/BLAS thread pools (the
+        # libmalloc heap corruption on macOS ARM64 documented above
+        # the original construction).
+        from backend.core.embedding_service import EmbeddingService
+
+        class _SharedEmbedder:
+            """Adapter: wraps centralized EmbeddingService for Oracle."""
+
+            def __init__(self) -> None:
+                self._service = EmbeddingService()  # singleton — no model load yet
+
+            async def embed(self, text: str) -> Any:
+                result = await self._service.encode(
+                    text, normalize=True,
+                )
+                if result is not None and len(result) > 0:
+                    return result[0]
+                return None
+
+            async def embed_batch(self, texts: List[str]) -> List[Any]:
+                result = await self._service.encode(
+                    texts, normalize=True,
+                )
+                return list(result) if result is not None else []
+
+        self._embedder = _SharedEmbedder()
+
+    async def _ensure_initialized(self) -> None:
+        """Internal — called by every async query method. No-op
+        when already settled."""
+        if self._init_attempted:
             return
-
-        try:
-            # Use centralized EmbeddingService singleton — prevents multiple
-            # SentenceTransformer instances from spawning competing PyTorch/BLAS
-            # thread pools, which causes libmalloc heap corruption on macOS ARM64.
-            from backend.core.embedding_service import EmbeddingService
-
-            class _SharedEmbedder:
-                """Adapter: wraps centralized EmbeddingService for Oracle."""
-
-                def __init__(self) -> None:
-                    self._service = EmbeddingService()  # singleton — no model load yet
-
-                async def embed(self, text: str) -> Any:
-                    result = await self._service.encode(
-                        text, normalize=True,
-                    )
-                    if result is not None and len(result) > 0:
-                        return result[0]
-                    return None
-
-                async def embed_batch(self, texts: List[str]) -> List[Any]:
-                    result = await self._service.encode(
-                        texts, normalize=True,
-                    )
-                    return list(result) if result is not None else []
-
-            self._embedder = _SharedEmbedder()
-            self._available = True
-            logger.info(
-                "[OracleSemanticIndex] Ready (shared EmbeddingService) — "
-                "collection '%s' at %s",
-                self._collection_name, self._persist_dir,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[OracleSemanticIndex] EmbeddingService unavailable: %s; "
-                "semantic search disabled",
-                exc,
-            )
+        await self.initialize_backend()
 
     def is_ready(self) -> bool:
-        """Return True if ChromaDB and embedder are both available."""
-        return self._available
+        """Slice 10 — returns True iff the backend has settled to a
+        terminal status (queries won't hang). Equivalent to legacy
+        ``self._available`` only when status is ``CHROMA``; under
+        ``DEGRADED`` / ``DISABLED`` / ``STDLIB`` we ALSO return True
+        so consumers don't hang — they'll get empty results, not
+        wait."""
+        return self._status != OracleSemanticBackendStatus.PENDING
 
     def _build_embed_text(self, node: "NodeData") -> Optional[str]:
         """Build the text to embed for a node. Returns None if nothing to embed."""
@@ -1322,11 +1503,21 @@ class OracleSemanticIndex:
     async def embed_nodes(self, nodes: List["NodeData"]) -> None:
         """Embed a batch of nodes into ChromaDB.
 
+        Slice 10 — calls ``_ensure_initialized()`` so the first
+        semantic operation triggers the bounded executor load.
+        Subsequent calls hit the cached status with no I/O.
+
         Silently skips nodes with no embeddable content.
-        Silently returns if not available.
+        Silently returns if not available (DEGRADED / DISABLED /
+        STDLIB statuses all yield no-op).
         Never raises.
         """
-        if not self._available or self._collection is None or self._embedder is None:
+        await self._ensure_initialized()
+        if (
+            self._status != OracleSemanticBackendStatus.CHROMA
+            or self._collection is None
+            or self._embedder is None
+        ):
             return
 
         try:
@@ -1370,11 +1561,21 @@ class OracleSemanticIndex:
     ) -> List[Tuple[str, float]]:
         """Search for semantically similar code symbols.
 
+        Slice 10 — first semantic query triggers the bounded
+        executor load via ``_ensure_initialized()``. The boot
+        path stays untouched.
+
         Returns ``("repo:file_path", similarity_score)`` tuples sorted by
         similarity descending.  Deduplicates to unique file paths.
-        Returns empty list if not available or on any error.
+        Returns empty list if not available (DEGRADED / DISABLED /
+        STDLIB) or on any error.
         """
-        if not self._available or self._collection is None or self._embedder is None:
+        await self._ensure_initialized()
+        if (
+            self._status != OracleSemanticBackendStatus.CHROMA
+            or self._collection is None
+            or self._embedder is None
+        ):
             return []
 
         try:
@@ -1562,10 +1763,23 @@ class TheOracle:
             # the still-pending semantic index.
             self._readiness.mark_graph_ready()
 
-            # Phase 3 — Initialize semantic index AFTER graph loading to
-            # prevent concurrent C-extension heap allocation. This is the
-            # ChromaDB PersistentClient construction; ordering invariant
-            # MUST stay graph→semantic.
+            # Phase 3 — Slice 10: Construct the OracleSemanticIndex
+            # WITHOUT loading ChromaDB. The constructor is now
+            # lightweight (config stash only); the actual ChromaDB
+            # PersistentClient + tokio Rust workers + embedder load
+            # happens lazily on the first semantic query via
+            # ``await self._semantic_index.initialize_backend()``
+            # (or ``await self._semantic_index._ensure_initialized()``
+            # from any query method). The graph→semantic ordering
+            # invariant is preserved at the readiness-signaling
+            # boundary, but the boot path no longer pays for the
+            # chromadb_rust_bindings tokio-runtime-worker GIL
+            # contention (the empirical bt-2026-05-22-010120 wedge
+            # source). Net effect: Oracle boot completes in
+            # milliseconds for the semantic phase; first query pays
+            # the bounded executor-isolated init cost (default 30s
+            # cap, env-knobbed) and falls through to DEGRADED on
+            # timeout without hanging the asyncio loop.
             if self._semantic_index is None:
                 with _OraclePhase("oracle_semantic_index_init"):
                     self._semantic_index = OracleSemanticIndex()
