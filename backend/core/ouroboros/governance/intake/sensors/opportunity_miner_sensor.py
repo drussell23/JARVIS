@@ -493,13 +493,34 @@ class OpportunityMinerSensor:
                 scanned += 1
                 try:
                     source = py_file.read_text(encoding="utf-8")
-                    tree = ast.parse(source)
-                except SyntaxError:
-                    errors += 1
-                    continue
                 except (OSError, UnicodeDecodeError):
                     errors += 1
                     continue
+                # Slice 11B — route through canonical helper.
+                # Off-loop process-pool parse for source above the
+                # tiny threshold (~4KB); inline-tiny otherwise.
+                # The Slice 11A measure() telemetry is composed
+                # inside the helper — every call still flows into
+                # the provenance ring with caller label.
+                from backend.core.ouroboros.governance.ast_compile_helper import (  # noqa: E501
+                    ParseOutcome as _S11_PO,
+                    parse_python_source as _s11_parse,
+                )
+                _s11_result = await _s11_parse(
+                    "opportunity_miner_sensor.scan_once",
+                    source,
+                    filename=str(py_file),
+                )
+                if _s11_result.outcome != _S11_PO.OK:
+                    # SyntaxError / TIMEOUT / TOO_LARGE /
+                    # INTERNAL_ERROR all fall into the legacy
+                    # "errors += 1; continue" semantics. The
+                    # OpportunityMiner contract: failed parse →
+                    # skip file, increment error counter, never
+                    # produce a candidate.
+                    errors += 1
+                    continue
+                tree = _s11_result.tree
 
                 analysis = _analyze_file(rel, source, tree)
                 self._analysis_cache[rel] = analysis
@@ -843,9 +864,23 @@ class OpportunityMinerSensor:
 
         try:
             source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-        except (SyntaxError, OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError):
             return None
+        # Slice 11B — route through canonical helper. SyntaxError +
+        # TIMEOUT + TOO_LARGE + INTERNAL_ERROR all return None
+        # (legacy semantics: failed parse → no candidate).
+        from backend.core.ouroboros.governance.ast_compile_helper import (  # noqa: E501
+            ParseOutcome as _S11_PO,
+            parse_python_source as _s11_parse,
+        )
+        _s11_result = await _s11_parse(
+            "opportunity_miner_sensor.scan_file",
+            source,
+            filename=str(py_file),
+        )
+        if _s11_result.outcome != _S11_PO.OK:
+            return None
+        tree = _s11_result.tree
 
         analysis = _analyze_file(rel, source, tree)
         self._analysis_cache[rel] = analysis

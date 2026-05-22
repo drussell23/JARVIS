@@ -1241,6 +1241,49 @@ class BattleTestHarness:
                 )
                 self._evaluator_trace_observer = None
 
+            # ──────────────────────────────────────────────────────────
+            # Slice 11A — ControlPlaneWatchdog ignition.
+            # ──────────────────────────────────────────────────────────
+            # Independent watchdog task that detects event-loop lag
+            # (the empirical bt-2026-05-22-011927 pathology: main thread
+            # blocked in builtin_compile → gc_collect_main for many
+            # seconds at a time, asyncio loop unable to tick).
+            #
+            # The watchdog sleeps for ``interval_s`` and measures the
+            # actual wall-clock vs requested sleep delta. When the lag
+            # exceeds the threshold (env-knobbed, default 500ms), logs
+            # ``[ControlPlaneStarvation]`` at WARNING with the exact
+            # observed lag — operators see the wedge in real time.
+            #
+            # Master flag JARVIS_CONTROL_PLANE_WATCHDOG_ENABLED default
+            # TRUE per Phase 11A (pure telemetry, no behavior change).
+            # Explicit "false" opts out.
+            #
+            # Fail-soft contract per Slice 5 precedent.
+            self._control_plane_watchdog = None
+            try:
+                from backend.core.ouroboros.governance.control_plane_watchdog import (  # noqa: E501
+                    get_default_watchdog as _cpw_get_default,
+                    watchdog_enabled as _cpw_enabled,
+                )
+                if _cpw_enabled():
+                    _cpw = _cpw_get_default()
+                    _cpw_started = _cpw.start()
+                    if _cpw_started:
+                        self._control_plane_watchdog = _cpw
+                else:
+                    logger.debug(
+                        "[ControlPlaneWatchdog] master flag FALSE — "
+                        "watchdog not started"
+                    )
+            except Exception as _cpw_exc:  # noqa: BLE001
+                logger.debug(
+                    "[ControlPlaneWatchdog] boot wire-up degraded: "
+                    "%s — watchdog not started",
+                    _cpw_exc, exc_info=True,
+                )
+                self._control_plane_watchdog = None
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -6052,6 +6095,26 @@ class BattleTestHarness:
                     logger.debug(
                         "[EvaluatorTraceObserver] stop degraded: %s",
                         _eto_stop_exc,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
+        # 0d4. ControlPlaneWatchdog (Slice 11A — control-plane
+        # starvation early-warning probe). Stop before broker/intake
+        # teardown so the final lag_events count lands cleanly.
+        try:
+            _cpw = getattr(self, "_control_plane_watchdog", None)
+            if _cpw is not None:
+                try:
+                    await _cpw.stop()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _cpw_stop_exc:  # noqa: BLE001
+                    logger.debug(
+                        "[ControlPlaneWatchdog] stop degraded: %s",
+                        _cpw_stop_exc,
                     )
         except asyncio.CancelledError:
             raise
