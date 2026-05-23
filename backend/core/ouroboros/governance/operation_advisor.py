@@ -130,6 +130,59 @@ def _advisor_oracle_blast_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# ── Slice 12S (2026-05-23) — Cooperative async blast scan ──
+#
+# bt-2026-05-23-171810 surfaced a fresh wedge AFTER Slice 12P+12R proved
+# in production: the Advisor's blast scan, even when dispatched to its
+# dedicated ``advisor-blast`` ThreadPoolExecutor (line ~313), still
+# starves the asyncio loop. Root cause is Python's GIL semantics — the
+# substring-match step (``any(mod in content for mod in target_modules)``)
+# is pure-Python and holds the GIL between read() syscalls, so the
+# heartbeat coroutine + Claude SDK stream consumer can't be scheduled
+# while the scan runs. The soak recorded ``ControlPlaneStarvation
+# lag_ms=32896.7`` during an 84s scan; LoopDeadman tripped at 302.2s.
+#
+# Slice 12S refactors the scan to be GENUINELY cooperative on the
+# asyncio loop using the existing
+# ``event_loop_governance.cooperative_yield_every_n_async`` +
+# ``offload_blocking`` primitives (Task #102, the single source of
+# truth for cooperative yielding). The new path:
+#
+#   * Iterates over ``iter_bounded_files`` via
+#     ``cooperative_yield_every_n_async`` — inserts ``asyncio.sleep(0)``
+#     every N items (default 64), giving the heartbeat + SDK consumer
+#     scheduling slots throughout the scan.
+#   * Reads per-file content via ``offload_blocking(bounded_read_text,
+#     ...)`` — runs the I/O on a worker thread (releases the GIL during
+#     the read() syscall AND the surrounding Python overhead).
+#   * Preserves cache + Oracle-graph shortcut + conservative_cap +
+#     budget-exhausted detection byte-identically — same Advisory shape,
+#     same telemetry lines.
+#
+# Master switch ``JARVIS_ADVISOR_BLAST_COOPERATIVE_ENABLED`` (BOOL/SAFETY,
+# default TRUE) — when FALSE, ``advise_async`` falls through to the
+# legacy ``run_in_executor`` + sync ``advise`` path verbatim for
+# byte-identical rollback. NO new threading mechanism; NO new bounding
+# primitive; reuses every existing knob.
+ADVISOR_BLAST_COOPERATIVE_ENABLED_ENV_VAR: str = (
+    "JARVIS_ADVISOR_BLAST_COOPERATIVE_ENABLED"
+)
+
+
+def _advisor_blast_cooperative_enabled() -> bool:
+    """Master flag for the Slice 12S cooperative async blast path.
+
+    Default TRUE — the cooperative path is the production default
+    post-Slice-12S. Set to ``false`` / ``0`` / ``no`` / ``off`` to
+    revert to the legacy thread-pool dispatch (byte-identical
+    pre-Slice-12S behavior).
+    """
+    raw = os.environ.get(
+        ADVISOR_BLAST_COOPERATIVE_ENABLED_ENV_VAR, "true",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 # Module-level Oracle reference — mirrors the ``_active_goal_tracker``
 # pattern in unified_intake_router.py.  GovernedLoopService sets this
 # after Oracle initialization; advisor reads it at advise() time.
@@ -854,7 +907,30 @@ class OperationAdvisor:
         substitute ``await advisor.advise_async(...)`` for any
         ``advisor.advise(...)`` site they previously wrapped in
         ``asyncio.to_thread``.  AST-pinned at every CLASSIFY call site.
+
+        Slice 12S (2026-05-23): when
+        ``JARVIS_ADVISOR_BLAST_COOPERATIVE_ENABLED`` is on (default
+        TRUE), this method dispatches to
+        :meth:`_advise_async_cooperative` — which runs the blast scan
+        ON the asyncio loop using the
+        ``event_loop_governance.cooperative_yield_every_n_async`` +
+        ``offload_blocking`` primitives. That path no longer holds the
+        GIL through the substring-match step (which on the thread-pool
+        path starved the heartbeat coroutine for 84s in
+        bt-2026-05-23-171810 and tripped LoopDeadman). Setting the
+        flag to ``false`` reverts to the legacy ``run_in_executor``
+        path verbatim — byte-identical rollback.
         """
+        # ── Slice 12S — cooperative dispatch ──
+        if _advisor_blast_cooperative_enabled():
+            return await self._advise_async_cooperative(
+                target_files,
+                description,
+                op_id,
+                is_read_only=is_read_only,
+                repo_root=repo_root,
+            )
+
         loop = asyncio.get_running_loop()
         executor = _get_advisor_blast_executor()
         # Observable queue-depth.  ThreadPoolExecutor exposes
@@ -899,6 +975,245 @@ class OperationAdvisor:
             _advise_with_busy_tracking,
         )
 
+    async def _advise_async_cooperative(
+        self,
+        target_files: Tuple[str, ...],
+        description: str,
+        op_id: str = "",
+        *,
+        is_read_only: bool = False,
+        repo_root: Optional[Path] = None,
+    ) -> "Advisory":
+        """Slice 12S cooperative-async advisor path.
+
+        Runs the blast-radius scan ON the asyncio event loop via
+        :meth:`_compute_blast_radius_async` (which uses
+        :func:`event_loop_governance.cooperative_yield_every_n_async`
+        + :func:`event_loop_governance.offload_blocking`), then
+        delegates the remaining advisory math to the synchronous
+        :meth:`advise` with the result pre-injected. This keeps the
+        heavy work on the loop with periodic ``asyncio.sleep(0)``
+        yields so the heartbeat coroutine + Claude SDK stream consumer
+        can be scheduled, while the rest of ``advise()`` (cache /
+        decision math / reason list) — which is fast and CPU-light —
+        runs unchanged.
+
+        Composition seams (NOT new mechanisms):
+
+        * Async iteration over ``iter_bounded_files`` via the canonical
+          ``cooperative_yield_every_n_async`` (Task #102 single source
+          of truth for cooperative yielding)
+        * Per-file ``bounded_read_text`` via ``offload_blocking`` so
+          the Python-side overhead releases the GIL
+        * Same cache + Oracle-graph + ``conservative_cap`` /
+          ``budget_exhausted`` logic as the sync path — preserved in
+          :meth:`_compute_blast_radius_async`
+
+        Cooperative yield cadence is governed by
+        ``JARVIS_EVENT_LOOP_YIELD_EVERY_N`` (default 64) — operators
+        do NOT tune Slice 12S separately; reusing the existing knob
+        keeps a single source of truth for loop-yield rhythm.
+
+        Busy-counter (``_advisor_busy_incr`` /
+        ``_advisor_busy_decr``) is wrapped around the scan exactly as
+        in the legacy executor path so Oracle's
+        ``_oracle_index_loop`` keeps its disk-I/O contention signal.
+        Hard-fails-safe: any exception decrements the counter via
+        ``finally`` and re-raises.
+        """
+        _advisor_busy_incr()
+        try:
+            blast_radius = await self._compute_blast_radius_async(
+                target_files, root=repo_root,
+            )
+        finally:
+            _advisor_busy_decr()
+        return self.advise(
+            target_files,
+            description,
+            op_id,
+            is_read_only=is_read_only,
+            repo_root=repo_root,
+            _precomputed_blast_radius=blast_radius,
+        )
+
+    async def _compute_blast_radius_async(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+    ) -> int:
+        """Slice 12S cooperative-async sibling of
+        :meth:`_compute_blast_radius`.
+
+        Returns the same integer the sync path returns for the same
+        ``(target_files, root)`` pair — same cache, same Oracle-graph
+        shortcut, same conservative-cap + budget-exhausted semantics,
+        same telemetry lines. The ONLY difference is the iteration
+        shape: the file walker is consumed via
+        :func:`cooperative_yield_every_n_async` so the event loop ticks
+        every N items (default 64), and the per-file
+        :func:`bounded_read_text` runs via :func:`offload_blocking` so
+        the read syscall + UTF-8 decode happen on a worker thread
+        (releasing the GIL).
+
+        This is the structural fix for the bt-2026-05-23-171810 wedge:
+        the legacy thread-pool dispatch held the GIL through the
+        pure-Python substring scan, starving the heartbeat coroutine
+        even though the work was nominally "in a thread". The
+        cooperative path gives the loop a scheduling slot between
+        every 64-file batch.
+        """
+        from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
+            blast_radius_conservative_cap,
+            blast_radius_max_bytes_per_file,
+            blast_radius_max_scanned,
+            blast_radius_timeout_s,
+            bounded_read_text,
+            default_skip_dirs,
+            iter_bounded_files,
+        )
+        from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+            cooperative_yield_every_n_async,
+            offload_blocking,
+        )
+
+        scan_root = root if root is not None else self._project_root
+
+        # Cache lookup — identical key + TTL semantics as sync path.
+        cache_key = (frozenset(target_files), str(scan_root))
+        now = time.monotonic()
+        with _BLAST_RADIUS_CACHE_LOCK:
+            cached = _BLAST_RADIUS_CACHE_SHARED.get(cache_key)
+        if cached is not None:
+            computed_at, result = cached
+            if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
+                return result
+
+        # Oracle-graph shortcut — synchronous, fast, identical to sync.
+        if (
+            _advisor_oracle_blast_enabled()
+            and _active_oracle is not None
+        ):
+            try:
+                oracle_count = _oracle_blast_count(
+                    _active_oracle, target_files,
+                )
+                if oracle_count is not None:
+                    with _BLAST_RADIUS_CACHE_LOCK:
+                        _BLAST_RADIUS_CACHE_SHARED[cache_key] = (
+                            now, oracle_count,
+                        )
+                        self._evict_blast_radius_cache_if_oversized()
+                    return oracle_count
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[Advisor] Oracle blast query failed for "
+                    "target_files=%r — falling back to cooperative scan",
+                    target_files, exc_info=True,
+                )
+
+        # Build the target module set — same as sync path.
+        target_modules: set = set()
+        for f in target_files:
+            if f.endswith(".py"):
+                module = f.replace("/", ".").replace(".py", "")
+                target_modules.add(module)
+                target_modules.add(Path(f).stem)
+
+        if not target_modules:
+            with _BLAST_RADIUS_CACHE_LOCK:
+                _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, 0)
+                self._evict_blast_radius_cache_if_oversized()
+            return 0
+
+        # Bounded-scan config — identical to sync path.
+        _scan_start = time.monotonic()
+        _scan_max = blast_radius_max_scanned()
+        _scan_timeout_s = blast_radius_timeout_s()
+        _per_file_bytes = blast_radius_max_bytes_per_file()
+        _conservative_cap = blast_radius_conservative_cap()
+        _skip = default_skip_dirs()
+
+        importers = 0
+        _files_examined = 0
+        _budget_exhausted = False
+        _cap_hit = False
+
+        # ── Cooperative async iteration ──
+        # ``cooperative_yield_every_n_async`` inserts asyncio.sleep(0)
+        # every N items (default 64) so the heartbeat coroutine + SDK
+        # stream consumer get scheduling slots throughout the scan.
+        # ``offload_blocking`` runs the per-file read on a worker
+        # thread so the GIL releases during the read syscall AND the
+        # surrounding Python overhead (the substring scan inside the
+        # offloaded call also runs off the loop).
+        async for path_str in cooperative_yield_every_n_async(
+            iter_bounded_files(
+                scan_root,
+                max_scanned=_scan_max,
+                timeout_s=_scan_timeout_s,
+                skip_dirs=_skip,
+            ),
+        ):
+            if not path_str.endswith(".py"):
+                continue
+            _files_examined += 1
+            content = await offload_blocking(
+                bounded_read_text,
+                Path(path_str),
+                max_bytes=_per_file_bytes,
+                label="advisor.blast.read",
+            )
+            if content is None:
+                continue
+            if any(mod in content for mod in target_modules):
+                importers += 1
+            if importers >= _conservative_cap:
+                _cap_hit = True
+                break
+
+        # Detect budget exhaustion — identical heuristic to sync path.
+        _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
+        if not _cap_hit and importers < _conservative_cap and (
+            _elapsed_ms >= _scan_timeout_s * 1000.0 * 0.95
+            or _files_examined >= _scan_max // 4
+        ):
+            _budget_exhausted = True
+
+        _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
+        if _budget_exhausted:
+            try:
+                logger.info(
+                    "[Advisor] blast_radius_scan_budget_exhausted "
+                    "root=%s targets=%d files_examined=%d "
+                    "importers_found_partial=%d elapsed_ms=%.1f "
+                    "conservative_cap=%d — returning cap "
+                    "(bias=caution, mode=cooperative_async)",
+                    str(scan_root), len(target_modules),
+                    _files_examined, importers, _elapsed_ms,
+                    _conservative_cap,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            importers = _conservative_cap
+        else:
+            try:
+                logger.debug(
+                    "[Advisor] blast_radius_cooperative_scan_complete "
+                    "root=%s targets=%d files_examined=%d "
+                    "importers=%d elapsed_ms=%.1f",
+                    str(scan_root), len(target_modules),
+                    _files_examined, importers, _elapsed_ms,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        with _BLAST_RADIUS_CACHE_LOCK:
+            _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+            self._evict_blast_radius_cache_if_oversized()
+        return importers
+
     def advise(
         self,
         target_files: Tuple[str, ...],
@@ -906,8 +1221,20 @@ class OperationAdvisor:
         op_id: str = "",
         is_read_only: bool = False,
         repo_root: Optional[Path] = None,
+        _precomputed_blast_radius: Optional[int] = None,
     ) -> Advisory:
         """Evaluate an operation and return advisory judgment.
+
+        ``_precomputed_blast_radius`` (Slice 12S, 2026-05-23) — internal
+        composition seam used by :meth:`_advise_async_cooperative` to
+        inject a blast-radius value already computed via the
+        cooperative async scan path. When ``None`` (default; all
+        external callers) the legacy synchronous
+        :meth:`_compute_blast_radius` runs in-line, preserving
+        byte-identical pre-Slice-12S behavior. Underscore-prefixed
+        because this is NOT a public API — operator binding 2026-05-23:
+        the Advisor's signal authority is its computation, never an
+        injected value from arbitrary callers.
 
         When ``is_read_only`` is True the Advisor skips blast_radius and
         test_coverage signals — the downstream contract is that tool_executor
@@ -940,7 +1267,15 @@ class OperationAdvisor:
         # Signal 1: Blast radius (how many files import the targets)
         # Always computed for observability — surfaced as a reason only
         # for mutating ops.
-        blast_radius = self._compute_blast_radius(target_files, root=repo_root)
+        # Slice 12S — accept a precomputed value when the caller already
+        # ran the cooperative async scan; preserves byte-identical
+        # behavior when the kwarg is absent (None).
+        if _precomputed_blast_radius is not None:
+            blast_radius = _precomputed_blast_radius
+        else:
+            blast_radius = self._compute_blast_radius(
+                target_files, root=repo_root,
+            )
         if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
             reasons.append(
                 f"High blast radius: {blast_radius} files import these targets"

@@ -436,15 +436,36 @@ def test_dedicated_executor_is_bounded_and_named():
 
 
 @pytest.mark.asyncio
-async def test_advise_async_dispatches_to_dedicated_executor(tmp_path):
+async def test_advise_async_dispatches_to_dedicated_executor(
+    tmp_path, monkeypatch,
+):
     """``advise_async`` MUST run the underlying ``advise()`` call on
     a thread from the dedicated ``advisor-blast`` pool — NOT on the
     asyncio main thread, NOT on the default ThreadPoolExecutor.
 
-    This is the isolation contract.  Verified by inspecting
-    ``threading.current_thread().name`` from inside the call.
+    This is the legacy isolation contract for the **master-OFF
+    rollback path** post-Slice 12S (2026-05-23). The default
+    production path post-Slice 12S runs the scan ON the asyncio
+    loop using ``cooperative_yield_every_n_async`` +
+    ``offload_blocking`` (which gives the loop scheduling slots
+    throughout the scan, solving the wedge LoopDeadman tripped on
+    in bt-2026-05-23-171810). The cooperative-on contract is
+    pinned in tests/governance/test_slice12s_advisor_blast_cooperative.py.
+
+    Verified by inspecting ``threading.current_thread().name`` from
+    inside the call when the cooperative master flag is FALSE.
     """
     import threading
+
+    # Force the legacy thread-pool path so this test pins the
+    # rollback contract specifically. Without this, Slice 12S
+    # cooperative dispatch (default) runs the scan on the main
+    # loop thread and the assertion below would fire on a
+    # MainThread name — a SEMANTIC regression of the original
+    # isolation guarantee even though the loop no longer needs it.
+    monkeypatch.setenv(
+        "JARVIS_ADVISOR_BLAST_COOPERATIVE_ENABLED", "false",
+    )
 
     (tmp_path / "a.py").write_text("import x\n")
     advisor = OperationAdvisor(tmp_path)
