@@ -33,6 +33,62 @@ Examples::
 """
 from __future__ import annotations
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║ Slice 12X Phase 1 — ABSOLUTE BOOT-TIME SUPREMACY                 ║
+# ║                                                                  ║
+# ║ This block MUST run before any other import — including          ║
+# ║ ``backend.*`` and any third-party module that transitively       ║
+# ║ imports chromadb / posthog. bt-2026-05-23-204519 proved Slice    ║
+# ║ 12W's __init__-time exorcism fired TOO LATE: posthog's consumer  ║
+# ║ thread + aiosqlite's per-connection workers had already spawned  ║
+# ║ as non-daemon during module-load. By the time                    ║
+# ║ ``BattleTestHarness.__init__`` ran ``exorcise_at_boot``, the     ║
+# ║ rogue threads were alive and blocked ``threading._shutdown`` at  ║
+# ║ teardown.                                                        ║
+# ║                                                                  ║
+# ║ Only stdlib (``os``, ``sys``) is imported here — these never     ║
+# ║ trigger third-party module loads. The env vars are set via       ║
+# ║ ``os.environ.setdefault`` so operator overrides survive (e.g.,   ║
+# ║ a debugging session that explicitly enables telemetry). A boot   ║
+# ║ marker line is written to ``sys.stderr`` so operators can see    ║
+# ║ the exorcism executed before ``backend.*`` imports — visible     ║
+# ║ in any tee/pipe redirection regardless of the file-logger        ║
+# ║ wire-up state.                                                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
+import os as _os_for_boot_exorcism
+import sys as _sys_for_boot_exorcism
+
+# Closed table of (env_var, value). Mirrors
+# ``rogue_thread_exorcism._TELEMETRY_DEFAULTS`` exactly — duplication
+# is intentional and load-bearing because this block runs BEFORE
+# ``backend.*`` is importable. The dedicated test
+# ``test_telemetry_defaults_match_rogue_thread_exorcism`` AST-pins
+# the two tables to stay in sync.
+_SLICE12X_TELEMETRY_DEFAULTS = (
+    ("ANONYMIZED_TELEMETRY", "False"),
+    ("POSTHOG_DISABLED", "True"),
+    ("OTEL_SDK_DISABLED", "true"),
+)
+_slice12x_applied: list = []
+for _env_var, _env_value in _SLICE12X_TELEMETRY_DEFAULTS:
+    try:
+        if _env_var not in _os_for_boot_exorcism.environ:
+            _os_for_boot_exorcism.environ[_env_var] = _env_value
+            _slice12x_applied.append(_env_var)
+    except Exception:  # noqa: BLE001 — never raise during boot
+        pass
+try:
+    _sys_for_boot_exorcism.stderr.write(
+        "[Slice12X.BootExorcism] script-top env hygiene applied — "
+        "pre-import telemetry kill switches set: "
+        + (",".join(_slice12x_applied) if _slice12x_applied
+           else "<none-needed, all pre-set>")
+        + " (operator overrides preserved via setdefault)\n"
+    )
+    _sys_for_boot_exorcism.stderr.flush()
+except Exception:  # noqa: BLE001 — never raise during boot
+    pass
+
 import argparse
 import asyncio
 import atexit
