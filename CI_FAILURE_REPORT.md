@@ -3,22 +3,21 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #91013
-- **Branch**: `fix/ci/pr-automation-validation-run91004-20260523-060327`
-- **Commit**: `e2e6d055e4cdd4ee6c95f71e6d9aba90b28657bf`
+- **Run Number**: #91022
+- **Branch**: `fix/ci/pr-automation-validation-run91013-20260523-060538`
+- **Commit**: `fc85c80b082cf090d13d1761450317bc3f3ac4a3`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T06:04:03Z
+- **Timestamp**: 2026-05-23T06:06:06Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26325311326)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26325352063)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 5s |
-| 2 | Auto-Label PR | permission_error | high | 11s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
@@ -27,10 +26,10 @@ Total Failed Jobs: **2**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-23T06:04:07Z
-**Completed**: 2026-05-23T06:04:12Z
-**Duration**: 5 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26325311326/job/77501834599)
+**Started**: 2026-05-23T06:06:09Z
+**Completed**: 2026-05-23T06:06:12Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26325352063/job/77501950790)
 
 #### Failed Steps
 
@@ -43,13 +42,13 @@ Total Failed Jobs: **2**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-23T06:04:09.4216362Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-23T06:04:10.0081493Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-23T06:06:10.9290189Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-23T06:06:11.4248007Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-23T06:04:10.0665990Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-23T06:06:11.4698749Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -60,47 +59,6 @@ Total Failed Jobs: **2**
 
 1. Consider increasing timeout values or optimizing slow operations
 2. Check service availability and network connectivity
-
----
-
-### 2. Auto-Label PR
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T06:04:06Z
-**Completed**: 2026-05-23T06:04:17Z
-**Duration**: 11 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26325311326/job/77501834604)
-
-#### Failed Steps
-
-- **Step 3**: Label Based on Files Changed
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 86: `2026-05-23T06:04:16.0568493Z ##[error]HttpError: Bad credentials - https://docs.github.com/rest`
-    - Line 87: `2026-05-23T06:04:16.0577823Z ##[error]Bad credentials - https://docs.github.com/rest`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2026-05-23T06:04:16.2052307Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 13: `2026-05-23T06:04:08.9205974Z hint: to use in all of your new repositories, which will suppress this `
-    - Line 97: `2026-05-23T06:04:16.2052307Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
 
 ---
 
@@ -120,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-05-23T06:05:38.235027*
+📊 *Report generated on 2026-05-23T06:07:36.445401*
 🤖 *JARVIS CI/CD Auto-PR Manager*
