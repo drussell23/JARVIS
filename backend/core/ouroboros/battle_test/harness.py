@@ -281,6 +281,21 @@ class BattleTestHarness:
             )
         self._idle_watchdog = IdleWatchdog(timeout_s=config.idle_timeout_s)
         self._session_recorder = SessionRecorder(session_id=self._session_id)
+        # Slice 12Q — register the active session's recorder so the
+        # orchestrator's _record_ledger terminal hook can route
+        # terminal operations into summary.json.operations[].
+        # Cleared at shutdown by reset_active_recorder. NEVER raises.
+        try:
+            from backend.core.ouroboros.battle_test.session_recorder import (
+                set_active_recorder as _slice12q_set_recorder,
+            )
+            _slice12q_set_recorder(self._session_recorder)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Harness] Slice 12Q set_active_recorder raised — "
+                "orchestrator terminal hook will no-op",
+                exc_info=True,
+            )
         # Session-liveness probes — zero-arg callables returning True
         # while background closed-loop work (e.g. autoscore
         # parallel_evaluate) is in flight. The ActivityMonitor pokes
