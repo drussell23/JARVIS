@@ -203,6 +203,171 @@ def _scan_one_file(
 # ---------------------------------------------------------------------------
 
 
+async def scan_governance_tree_async(
+    *,
+    governance_root_override: "Path | None" = None,
+    forbidden_prefix: str = _FORBIDDEN_IMPORT_PREFIX,
+) -> Tuple[str, ...]:
+    """Slice 12Z — async-cooperative sibling of
+    :func:`scan_governance_tree`.
+
+    bt-2026-05-23-221029 (Slice 12Y validation soak) tombstone
+    captured this module's sync ``rglob`` + ``read_text`` loop
+    running directly on the asyncio MainThread when
+    :func:`shipped_code_invariants.validate_all_async` took its
+    PermissionError sync-fallback path. ``LoopDeadman`` fired at
+    301.8s. SidecarProfiler captured 4 in-progress STUCK_FRAME
+    emissions all pointing at ``pathlib.read_text``.
+
+    Slice 12Z composes the canonical Slice 12U
+    :mod:`cooperative_fs_io` substrate — dedicated
+    ``advisor-blast`` executor for per-file reads +
+    ``cooperative_yield_every_n_async`` between batches — so the
+    same scan that wedged on the loop now yields control every
+    N files and dispatches I/O off-thread. Returns the same
+    violation tuple shape as the sync sibling; deterministic
+    result parity is pinned by ``test_result_parity_with_sync``.
+
+    Each violation string format unchanged:
+      ``<relative-path>:<lineno> forbidden import of <module>``
+
+    NEVER raises into the caller — iteration errors terminate
+    the scan cleanly with whatever violations are accumulated.
+    """
+    # Lazy import — keeps cooperative_fs_io off the sync-only
+    # module-load path for callers that only need
+    # :func:`scan_governance_tree`.
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+            iter_files_cooperative,
+            read_text_offloaded,
+        )
+        from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+            offload_blocking,
+        )
+    except Exception:  # noqa: BLE001 — fall back to sync
+        return scan_governance_tree(
+            governance_root_override=governance_root_override,
+            forbidden_prefix=forbidden_prefix,
+        )
+
+    root = (
+        governance_root_override
+        if governance_root_override is not None
+        else _governance_root()
+    )
+
+    violations: List[str] = []
+    try:
+        # Cooperative file iteration — yields control every N
+        # items (default 64 via JARVIS_EVENT_LOOP_YIELD_EVERY_N)
+        # so the heartbeat coroutine + Claude SDK stream
+        # consumer get scheduling slots throughout the scan.
+        async for path_str in iter_files_cooperative(
+            root, pattern="*.py",
+        ):
+            try:
+                # __pycache__ filter matches the sync
+                # implementation byte-for-byte.
+                if "__pycache__" in Path(path_str).parts:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+
+            try:
+                rel = (
+                    Path(path_str).relative_to(root).as_posix()
+                )
+            except ValueError:
+                rel = str(path_str)
+            if rel in _BOUNDARY_EXEMPTIONS:
+                continue
+
+            # Per-file read offloaded to the dedicated
+            # advisor-blast executor (Slice 12T Part 3 +
+            # Slice 12U cooperative_fs_io). The AST parse +
+            # forbidden-import walk also runs off-loop via
+            # ``offload_blocking`` so the substring scan doesn't
+            # hold the GIL on the loop thread.
+            try:
+                source = await read_text_offloaded(
+                    Path(path_str),
+                )
+                if source is None:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+
+            try:
+                # _scan_one_file is fast pure-Python AST work
+                # — offload to the dedicated pool so the
+                # cumulative cost (one parse + one walk per
+                # .py file in governance/, hundreds of files)
+                # doesn't accumulate on the loop thread.
+                file_violations = await offload_blocking(
+                    _scan_one_file_from_source,
+                    source, forbidden_prefix,
+                    label="cross_kingdom.scan_one_file",
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
+            for line, module in file_violations:
+                violations.append(
+                    f"{rel}:{line} forbidden import of "
+                    f"{module!r}"
+                )
+    except Exception:  # noqa: BLE001 — defensive
+        # Swallow iteration faults — return what we collected.
+        pass
+
+    return tuple(violations)
+
+
+def _scan_one_file_from_source(
+    source: str,
+    forbidden_prefix: str,
+) -> Tuple[Tuple[int, str], ...]:
+    """Slice 12Z module-level helper — same AST-walk as
+    :func:`_scan_one_file` but operates on a pre-read ``source``
+    string. Lifted to module level so the
+    :func:`cooperative_fs_io.offload_blocking` worker doesn't
+    capture caller-local state. NEVER raises."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+    violations: List[Tuple[int, str]] = []
+    try:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if (
+                    module == forbidden_prefix
+                    or module.startswith(
+                        forbidden_prefix + ".",
+                    )
+                ):
+                    violations.append(
+                        (int(node.lineno), str(module)),
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.name or ""
+                    if (
+                        name == forbidden_prefix
+                        or name.startswith(
+                            forbidden_prefix + ".",
+                        )
+                    ):
+                        violations.append(
+                            (int(node.lineno), str(name)),
+                        )
+    except Exception:  # noqa: BLE001 — defensive
+        return ()
+    return tuple(violations)
+
+
 def scan_governance_tree(
     *,
     governance_root_override: "Path | None" = None,
@@ -215,6 +380,12 @@ def scan_governance_tree(
 
     Each violation string is formatted:
       ``<relative-path>:<lineno> forbidden import of <module>``
+
+    Slice 12Z note: prefer :func:`scan_governance_tree_async`
+    from any asyncio context — this sync entry point blocks
+    the calling thread for the full scan duration. The async
+    sibling composes :mod:`cooperative_fs_io` for non-blocking
+    iteration on the event loop.
     """
     root = (
         governance_root_override
@@ -324,7 +495,9 @@ def register_flags(registry: Any) -> None:
 
 __all__ = [
     "CROSS_KINGDOM_BOUNDARY_SCHEMA_VERSION",
+    "_scan_one_file_from_source",
     "register_flags",
     "register_shipped_invariants",
     "scan_governance_tree",
+    "scan_governance_tree_async",
 ]
