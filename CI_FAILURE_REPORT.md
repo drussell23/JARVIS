@@ -3,77 +3,33 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #91077
-- **Branch**: `fix/ci/pr-automation-validation-run91076-20260523-064907`
-- **Commit**: `7fe1695739bb3c44b3f6b015682dfbad08520215`
+- **Run Number**: #91078
+- **Branch**: `fix/ci/pr-automation-validation-run91077-20260523-065135`
+- **Commit**: `ec1e7abfd2ffba37176943c988fc7d58803f7259`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T06:49:38Z
+- **Timestamp**: 2026-05-23T06:52:06Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26326176182)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26326227195)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Auto-Label PR | permission_error | high | 36s |
-| 2 | Validate PR Title | timeout | high | 3s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. Auto-Label PR
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T06:49:41Z
-**Completed**: 2026-05-23T06:50:17Z
-**Duration**: 36 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26326176182/job/77504218922)
-
-#### Failed Steps
-
-- **Step 2**: Checkout Code
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 4
-  - Sample matches:
-    - Line 74: `2026-05-23T06:49:43.7145647Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 78: `2026-05-23T06:50:00.7801270Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 82: `2026-05-23T06:50:16.8504394Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 75: `2026-05-23T06:49:43.7153466Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 79: `2026-05-23T06:50:00.7818621Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 83: `2026-05-23T06:50:16.8552313Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 46: `2026-05-23T06:49:43.5250563Z hint: to use in all of your new repositories, which will suppress this `
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Validate PR Title
+### 1. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-23T06:49:41Z
-**Completed**: 2026-05-23T06:49:44Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26326176182/job/77504218929)
+**Started**: 2026-05-23T06:52:09Z
+**Completed**: 2026-05-23T06:52:13Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26326227195/job/77504352336)
 
 #### Failed Steps
 
@@ -86,13 +42,13 @@ Total Failed Jobs: **2**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-23T06:49:43.1386221Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-23T06:49:43.5627881Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-23T06:52:11.3253998Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-23T06:52:11.8296178Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-23T06:49:43.6092466Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-23T06:52:11.8830852Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -122,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-05-23T06:51:35.928971*
+📊 *Report generated on 2026-05-23T06:53:39.776843*
 🤖 *JARVIS CI/CD Auto-PR Manager*
