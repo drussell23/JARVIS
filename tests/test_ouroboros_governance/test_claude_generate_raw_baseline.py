@@ -387,6 +387,244 @@ class TestFamily2NonlocalMutationObservable:
 
 
 # ============================================================================
+# Family 2b — multi-round tool-loop cumulative semantics (PR 2A invariant)
+# ============================================================================
+
+
+class TestFamily2bMultiRoundAccumulation:
+    """Load-bearing invariant for PR 2A mechanical extraction.
+
+    The legacy nested closure `_generate_raw` accumulates token + cost
+    state into the outer-scope `total_cost` (nonlocal) and `_token_usage`
+    (dict) via ``+=`` across multiple invocations within a single
+    `generate()` call (multi-round tool loop). PR 2A introduces a small
+    compatibility wrapper that preserves this `async (prompt: str) -> str`
+    contract for ``tool_loop.run(generate_fn=...)`` — the wrapper must
+    fold per-dispatch deltas back into the outer scope as ``+=``, NOT ``=``.
+
+    This test characterizes the multi-round cost/token preservation
+    BEFORE the refactor (must pass on `9c0932e749`) AND after it (must
+    keep passing — that's the 2A contract).
+
+    Exercised via the existing tool-loop pathway: enable tools, feed N
+    tool-call responses followed by a final patch, observe that the
+    cumulative result tokens & cost are NOT just the last round's
+    contribution.
+    """
+
+    def _tool_call_response(self) -> str:
+        """2b.2-tool schema — a single tool call."""
+        import json as _json
+        return _json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": {
+                "name": "search_code",
+                "arguments": {"pattern": "foo"},
+            },
+        })
+
+    def _final_patch_response(self) -> str:
+        return _prime_2b1_response()
+
+    def _multi_round_client(
+        self, *, n_tool_rounds: int,
+        usage_input_per_round: int,
+        usage_output_per_round: int,
+    ) -> Any:
+        """Builds a mock client that returns ``n_tool_rounds`` tool-call
+        responses, then one final 2b.1 patch response. Each .create
+        call carries the same usage (per_round). Observable cumulative
+        totals must reflect (n_tool_rounds + 1) × per_round."""
+        texts = (
+            [self._tool_call_response()] * n_tool_rounds
+            + [self._final_patch_response()]
+        )
+        call_count = [0]
+        last_kwargs: List[dict] = []
+
+        async def _create(**kwargs):
+            i = min(call_count[0], len(texts) - 1)
+            call_count[0] += 1
+            last_kwargs.append(dict(kwargs))
+            return _make_fake_message(
+                texts[i],
+                input_tokens=usage_input_per_round,
+                output_tokens=usage_output_per_round,
+                stop_reason=(
+                    "tool_use" if i < n_tool_rounds else "end_turn"
+                ),
+            )
+
+        client = MagicMock()
+        client.messages = MagicMock()
+        client.messages.create = _create
+        client._call_count = call_count
+        client._last_kwargs = last_kwargs
+        return client
+
+    # ── 2A LOAD-BEARING INVARIANT (must pass today + post-2A) ─────
+    @pytest.mark.asyncio
+    async def test_two_round_tool_loop_cost_accumulates_across_rounds(
+        self, tmp_path,
+    ):
+        """Two tool-call rounds + one final patch = 3 dispatch calls.
+        The 2A wrapper threading per-dispatch cost deltas back to
+        generate()'s scope MUST use ``+=`` so cumulative cost grows
+        across rounds.
+
+        Current closure behavior: `total_cost += cost` at L7502 inside
+        _generate_raw — cost IS accumulated. PR 2A must preserve.
+
+        If 2A accidentally overwrites with ``=``, this test fails
+        (cost reflects only the last round's contribution).
+        """
+        provider = ClaudeProvider(
+            api_key="test-key", repo_root=tmp_path, tools_enabled=True,
+        )
+        provider._client = self._multi_round_client(
+            n_tool_rounds=2,
+            usage_input_per_round=100,
+            usage_output_per_round=50,
+        )
+        result = await provider.generate(_make_ctx(), _deadline())
+        # 3 dispatch calls total: 2 tool rounds + 1 final patch.
+        assert provider._client._call_count[0] == 3, (
+            f"expected 3 dispatch calls (2 tool + 1 final), got "
+            f"{provider._client._call_count[0]}"
+        )
+        # Cost MUST be strictly positive and reflect multi-round
+        # accumulation. Empirical baseline (3 calls × Sonnet pricing
+        # @ 100 in/50 out per call): ≥ $0.001 (the single-round
+        # contribution); we don't pin a tight upper bound to avoid
+        # over-specifying the pricing math.
+        assert result.cost_usd > 0.0
+        single_round_floor = (100 * 3e-6) + (50 * 1.5e-5)  # ≈ $0.00105
+        assert result.cost_usd >= single_round_floor * 2, (
+            f"PR 2A invariant: cost across 3 rounds must >= 2× a single "
+            f"round's contribution (i.e., NOT just last-round). Got "
+            f"cost_usd={result.cost_usd}, floor={single_round_floor * 2}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_three_round_tool_loop_cost_grows_with_rounds(
+        self, tmp_path,
+    ):
+        """3 tool rounds + 1 final patch = 4 dispatch calls. Cost
+        must strictly exceed the same workload with 1 round."""
+        provider_3 = ClaudeProvider(
+            api_key="test-key", repo_root=tmp_path, tools_enabled=True,
+        )
+        provider_3._client = self._multi_round_client(
+            n_tool_rounds=3,
+            usage_input_per_round=200,
+            usage_output_per_round=80,
+        )
+        r_3 = await provider_3.generate(_make_ctx(), _deadline())
+        assert provider_3._client._call_count[0] == 4
+        assert r_3.cost_usd > 0.0
+        # Cost monotonicity: 4-round cost ≥ baseline-single-round.
+        single = (200 * 3e-6) + (80 * 1.5e-5)
+        assert r_3.cost_usd >= single * 3, (
+            f"cost monotonicity broken: 4-round cost {r_3.cost_usd} "
+            f"< 3× single-round floor {single * 3}"
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE-1 CHARACTERIZATION DIVERGENCE #3 — multi-round token loss
+    # ──────────────────────────────────────────────────────────────────
+    # OBSERVED on HEAD 9c0932e749: after a multi-round tool-loop
+    # generate() call, the final GenerationResult.total_input_tokens
+    # and total_output_tokens both report 0 — despite the log line
+    # showing the correct tool_rounds count AND despite cost being
+    # correctly accumulated across rounds (see the two cost-preservation
+    # tests above which PASS today).
+    #
+    # Example from a 3-call run with 100in/50out per call:
+    #   [ClaudeProvider] 1 candidates in 0.0s (tool_rounds=3),
+    #     cost=$0.0072, 0+0 tokens, ...
+    #
+    # CONTRACT BREACH: token usage MUST surface to the result in the
+    # same way cost does. Cost & tokens are siblings; today they
+    # diverge — cost is preserved in _token_usage["input"] += ... AND
+    # propagates to the result; tokens accumulate in _token_usage but
+    # are dropped somewhere between the dict and _finalize_codegen_result.
+    #
+    # PR 2A boundary: 2A is MECHANICAL EXTRACTION ONLY — the token-loss
+    # asymmetry MUST be preserved verbatim in 2A. This divergence is
+    # NOT fixed in 2A.
+    #
+    # PHASE-2B GRADUATION CRITERION: Phase 2B must fix the token-loss
+    # bug so the final result carries the accumulated multi-round
+    # input/output tokens. Removing these @xfails is a Phase 2B
+    # release gate.
+    @pytest.mark.xfail(
+        reason=(
+            "PHASE-1 divergence #3: multi-round tool-loop token usage "
+            "is dropped from the final GenerationResult (cost is "
+            "preserved but tokens report 0). PR 2A preserves this "
+            "behavior verbatim; PR 2B must fix the asymmetry."
+        ),
+        strict=True,
+    )
+    @pytest.mark.asyncio
+    async def test_two_round_tool_loop_tokens_preserved_in_result(
+        self, tmp_path,
+    ):
+        provider = ClaudeProvider(
+            api_key="test-key", repo_root=tmp_path, tools_enabled=True,
+        )
+        provider._client = self._multi_round_client(
+            n_tool_rounds=2,
+            usage_input_per_round=100,
+            usage_output_per_round=50,
+        )
+        result = await provider.generate(_make_ctx(), _deadline())
+        # The divergence: tokens should reflect the 3-call accumulation
+        # (≥ 3 × 100 input, ≥ 3 × 50 output). Today they're 0.
+        assert result.total_input_tokens >= 3 * 100
+        assert result.total_output_tokens >= 3 * 50
+
+    @pytest.mark.xfail(
+        reason=(
+            "PHASE-1 divergence #3 (also): same multi-round token-loss "
+            "applies at 4 rounds. Phase 2B graduation criterion."
+        ),
+        strict=True,
+    )
+    @pytest.mark.asyncio
+    async def test_three_round_tool_loop_tokens_preserved_in_result(
+        self, tmp_path,
+    ):
+        provider = ClaudeProvider(
+            api_key="test-key", repo_root=tmp_path, tools_enabled=True,
+        )
+        provider._client = self._multi_round_client(
+            n_tool_rounds=3,
+            usage_input_per_round=200,
+            usage_output_per_round=80,
+        )
+        result = await provider.generate(_make_ctx(), _deadline())
+        assert result.total_input_tokens >= 4 * 200
+        assert result.total_output_tokens >= 4 * 80
+
+    @pytest.mark.asyncio
+    async def test_zero_tool_rounds_single_dispatch_path(self, tmp_path):
+        """Sanity counter-test: when tools_enabled=False (default,
+        S1 cache `_no_tools_inner` path), exactly ONE dispatch happens
+        and cumulative tokens equal the single round's contribution.
+        """
+        provider = ClaudeProvider(api_key="test-key", repo_root=tmp_path)
+        # tools_enabled=False by default
+        provider._client = _make_create_only_client(
+            usage_input=300, usage_output=150,
+        )
+        result = await provider.generate(_make_ctx(), _deadline())
+        assert provider._client._call_count[0] == 1
+        assert result.total_input_tokens == 300
+        assert result.total_output_tokens == 150
+
+
+# ============================================================================
 # Family 3 — route-driven thinking gating (per CLAUDE.md §5 docs)
 # ============================================================================
 
