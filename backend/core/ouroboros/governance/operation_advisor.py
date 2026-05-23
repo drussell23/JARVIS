@@ -169,6 +169,34 @@ ADVISOR_BLAST_COOPERATIVE_ENABLED_ENV_VAR: str = (
 )
 
 
+def _read_bounded_text_for_blast(
+    path_str: str, max_bytes: int,
+) -> Optional[str]:
+    """Slice 12T Part 3 — module-level worker for per-file reads
+    dispatched to the dedicated ``advisor-blast`` ThreadPoolExecutor.
+
+    Lifted to module level (NOT a closure inside
+    :meth:`_compute_blast_radius_async`) so the executor's worker
+    thread doesn't capture the OperationAdvisor instance — avoids
+    pickling/reference-cycle surprises and makes the function
+    inspectable for AST pins. Same signature shape as the previous
+    ``offload_blocking(bounded_read_text, Path(path_str),
+    max_bytes=...)`` call site.
+
+    Returns ``None`` on any error (preserves the
+    ``bounded_read_text`` contract). NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.bounded_walker import (
+            bounded_read_text as _bounded_read_text,
+        )
+        return _bounded_read_text(
+            Path(path_str), max_bytes=max_bytes,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+
+
 def _advisor_blast_cooperative_enabled() -> bool:
     """Master flag for the Slice 12S cooperative async blast path.
 
@@ -1069,14 +1097,31 @@ class OperationAdvisor:
             blast_radius_max_bytes_per_file,
             blast_radius_max_scanned,
             blast_radius_timeout_s,
-            bounded_read_text,
             default_skip_dirs,
             iter_bounded_files,
         )
         from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
             cooperative_yield_every_n_async,
-            offload_blocking,
         )
+
+        # ── Slice 12T Part 3 — Concurrency isolation ──
+        # bt-2026-05-23-180315 surfaced that Slice 12S's use of
+        # ``offload_blocking`` (which targets the default
+        # ``asyncio.to_thread`` pool) flooded the contested default
+        # executor — exactly the v7 starvation pattern Task #88f's
+        # dedicated ``advisor-blast`` pool was created to prevent.
+        # ControlPlaneStarvation events DOUBLED (28→62) under
+        # Slice 12S.
+        #
+        # Part 3 routes per-file reads through the dedicated
+        # ``advisor-blast`` ThreadPoolExecutor via
+        # ``loop.run_in_executor(executor, ...)`` — restoring the
+        # isolation contract (sensors + Oracle + DreamEngine no
+        # longer compete with blast-scan I/O) while keeping the
+        # cooperative yield cadence between batches (so the
+        # heartbeat coroutine still gets scheduling slots).
+        loop = asyncio.get_running_loop()
+        _blast_executor = _get_advisor_blast_executor()
 
         scan_root = root if root is not None else self._project_root
 
@@ -1144,10 +1189,16 @@ class OperationAdvisor:
         # ``cooperative_yield_every_n_async`` inserts asyncio.sleep(0)
         # every N items (default 64) so the heartbeat coroutine + SDK
         # stream consumer get scheduling slots throughout the scan.
-        # ``offload_blocking`` runs the per-file read on a worker
-        # thread so the GIL releases during the read syscall AND the
-        # surrounding Python overhead (the substring scan inside the
-        # offloaded call also runs off the loop).
+        #
+        # Per-file reads dispatch to the DEDICATED ``advisor-blast``
+        # ThreadPoolExecutor (Slice 12T Part 3) — NOT
+        # ``asyncio.to_thread`` (which targets the default pool
+        # contested by 16 sensors + Oracle + DreamEngine). This
+        # restores the Task #88f isolation contract that Slice 12S
+        # inadvertently broke. The bounded
+        # _ADVISOR_BLAST_EXECUTOR_MAX_WORKERS (default 2) further
+        # caps concurrent file I/O so even N parallel scans cannot
+        # flood the default pool.
         async for path_str in cooperative_yield_every_n_async(
             iter_bounded_files(
                 scan_root,
@@ -1159,11 +1210,11 @@ class OperationAdvisor:
             if not path_str.endswith(".py"):
                 continue
             _files_examined += 1
-            content = await offload_blocking(
-                bounded_read_text,
-                Path(path_str),
-                max_bytes=_per_file_bytes,
-                label="advisor.blast.read",
+            content = await loop.run_in_executor(
+                _blast_executor,
+                _read_bounded_text_for_blast,
+                path_str,
+                _per_file_bytes,
             )
             if content is None:
                 continue

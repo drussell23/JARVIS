@@ -79,6 +79,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses as _dc
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from backend.core.ouroboros.governance.ledger import OperationState
@@ -279,6 +280,55 @@ class CLASSIFYRunner(PhaseRunner):
                     )
             _advisor = OperationAdvisor(orch._config.project_root)
 
+            # ── Slice 12T Part 2 — Sensor-op Advisor scoping ──
+            # bt-2026-05-23-180315 surfaced that BACKGROUND-tier
+            # sensor ops (todo_scanner, opportunity_miner,
+            # doc_staleness, …) trigger the same heavy blast-radius
+            # scan that foreground ops do — but their cost budget
+            # (~$0.002/op per the urgency_router routing table)
+            # cannot justify a 10-22s scan. Worse, the scan-budget-
+            # exhausted path returns conservative_cap anyway, which
+            # causes the Advisor to BLOCK these ops. So the scan
+            # produces a deterministic outcome (BLOCK) at maximum
+            # cost (10-22s of loop-yielding scan work).
+            #
+            # Slice 12T short-circuits: detect background-tier
+            # signal sources via the existing
+            # ``urgency_router._BACKGROUND_SOURCES`` +
+            # ``_SPECULATIVE_SOURCES`` taxonomy (single source of
+            # truth for cost-tier routing), pre-compute the
+            # conservative_cap blast value, and dispatch directly
+            # to ``advise()`` (sync, fast — only the blast scan is
+            # heavy) with the value injected via
+            # ``_precomputed_blast_radius``. Preserves the
+            # existing BLOCK behavior byte-identically while
+            # skipping the scan. Other Advisor signals (staleness,
+            # large-file, chronic_entropy) still compute normally.
+            #
+            # Master switch
+            # ``JARVIS_ADVISOR_BG_SCAN_SKIP_ENABLED`` (default
+            # TRUE) gates the optimization; ``false`` reverts to
+            # the pre-Slice-12T full-scan path verbatim.
+            _bg_tier_skip = False
+            try:
+                _skip_raw = os.environ.get(
+                    "JARVIS_ADVISOR_BG_SCAN_SKIP_ENABLED", "true",
+                ).strip().lower()
+                if _skip_raw in {"1", "true", "yes", "on"}:
+                    from backend.core.ouroboros.governance.urgency_router import (  # noqa: E501
+                        _BACKGROUND_SOURCES,
+                        _SPECULATIVE_SOURCES,
+                    )
+                    _sig_src = (
+                        getattr(ctx, "signal_source", "") or ""
+                    ).strip().lower()
+                    _bg_tier_skip = (
+                        _sig_src in _BACKGROUND_SOURCES
+                        or _sig_src in _SPECULATIVE_SOURCES
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                _bg_tier_skip = False
+
             # B.2.0 worktree-aware advisor: when the envelope carries a
             # trusted ``repo_root`` in evidence AND the (now-graduated
             # 2026-05-13) master flag is on, scan THAT tree instead of
@@ -321,6 +371,37 @@ class CLASSIFYRunner(PhaseRunner):
                 )
 
                 async def _advise_op() -> Any:
+                    # ── Slice 12T Part 2 fast path ──
+                    # Background-tier short-circuit: skip the heavy
+                    # scan, inject conservative_cap via the
+                    # _precomputed_blast_radius seam (Slice 12S).
+                    # Other Advisor signals still compute.
+                    if _bg_tier_skip:
+                        from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
+                            blast_radius_conservative_cap,
+                        )
+                        _cap = blast_radius_conservative_cap()
+                        logger.info(
+                            "[Advisor] background_tier_skip "
+                            "signal_source=%s op=%s "
+                            "precomputed_blast=%d "
+                            "(heavy scan bypassed — Slice 12T Part 2)",
+                            (
+                                getattr(ctx, "signal_source", "")
+                                or "<unknown>"
+                            ),
+                            ctx.op_id[:16] if ctx.op_id else "-",
+                            _cap,
+                        )
+                        return _advisor.advise(
+                            ctx.target_files,
+                            ctx.description,
+                            ctx.op_id,
+                            is_read_only=ctx.is_read_only,
+                            repo_root=_adv_repo_root,
+                            _precomputed_blast_radius=_cap,
+                        )
+
                     # Dispatch through the dedicated ``advisor-blast``
                     # ThreadPoolExecutor (PR-B 2026-05-13), NOT the
                     # default asyncio executor.  In the live harness
@@ -379,13 +460,32 @@ class CLASSIFYRunner(PhaseRunner):
                 # default-executor contention for the fallback case.
                 # ``repo_root`` threaded for the same worktree-aware
                 # benefit as the primary path above.
-                _advisory = await _advisor.advise_async(
-                    ctx.target_files,
-                    ctx.description,
-                    ctx.op_id,
-                    is_read_only=ctx.is_read_only,
-                    repo_root=_adv_repo_root,
-                )
+                #
+                # Slice 12T Part 2 — fallback honors the same
+                # background-tier skip so the wedge surface is
+                # closed on BOTH paths (capture-wrapper failure
+                # cannot re-open the original wedge).
+                if _bg_tier_skip:
+                    from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
+                        blast_radius_conservative_cap,
+                    )
+                    _cap = blast_radius_conservative_cap()
+                    _advisory = _advisor.advise(
+                        ctx.target_files,
+                        ctx.description,
+                        ctx.op_id,
+                        is_read_only=ctx.is_read_only,
+                        repo_root=_adv_repo_root,
+                        _precomputed_blast_radius=_cap,
+                    )
+                else:
+                    _advisory = await _advisor.advise_async(
+                        ctx.target_files,
+                        ctx.description,
+                        ctx.op_id,
+                        is_read_only=ctx.is_read_only,
+                        repo_root=_adv_repo_root,
+                    )
 
             if _advisory.decision == AdvisoryDecision.BLOCK:
                 logger.warning(
