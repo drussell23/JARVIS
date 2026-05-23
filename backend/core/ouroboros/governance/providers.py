@@ -7396,11 +7396,35 @@ class ClaudeProvider:
             from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
                 check_preflight as _sba_check_preflight,
             )
-            # Slice 12Y Part 1 — pass signal_source so the SBA
-            # can apply the background-spend ceiling for sensor
-            # ops while leaving foreground/complex calls
-            # unchanged. The check is no-op when signal_source
-            # is None or non-background-tier.
+            # Slice 12AA — lazy acquire foreground reservation
+            # on first preflight for this op. Amount is the
+            # provider's _max_cost_per_op (provider-derived, NOT
+            # hardcoded). SBA returns False for background-tier
+            # ops + when no room; preflight check below catches
+            # any violation.
+            try:
+                from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                    acquire_reservation as _sba_acquire,
+                )
+                _ctx_op_id_str = str(
+                    getattr(context, "op_id", "") or ""
+                )
+                if _ctx_op_id_str:
+                    _sba_acquire(
+                        op_id=_ctx_op_id_str,
+                        signal_source=getattr(
+                            context, "signal_source", None,
+                        ),
+                        estimated_total_usd=float(
+                            self._max_cost_per_op or 0.0,
+                        ),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            # Slice 12Y Part 1 — pass signal_source for the
+            # background-spend ceiling. Slice 12AA — pass op_id
+            # so the owning op's OWN reservation is treated as
+            # available (it spends from its own runway).
             _sba_check_preflight(
                 provider_name="claude",
                 estimated_cost_usd=float(
@@ -7409,6 +7433,7 @@ class ClaudeProvider:
                 signal_source=(
                     getattr(context, "signal_source", None)
                 ),
+                op_id=getattr(context, "op_id", None),
             )
         except ImportError:
             # Module absent on this build (graceful) — fall through to

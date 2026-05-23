@@ -10716,6 +10716,24 @@ class GovernedOrchestrator:
                     # future duplicate if the OP_COMPLETED path is
                     # wired up later. NEVER raises into _record_ledger.
                     _slice12q_record_terminal(ctx, state, data)
+                    # ── Slice 12AA — Per-op reservation release ──
+                    # Free the foreground op's reserved session
+                    # runway so subsequent ops can use it. Lazy-
+                    # acquired during provider preflight; released
+                    # at the SAME single-seam terminal chokepoint
+                    # where the SessionRecorder lands the op.
+                    # Idempotent; NEVER raises into _record_ledger.
+                    try:
+                        from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                            release_reservation as _sba_release,
+                        )
+                        _aa_op_id = str(
+                            getattr(ctx, "op_id", "") or ""
+                        )
+                        if _aa_op_id:
+                            _sba_release(_aa_op_id)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001 — observability is best-effort
                 logger.debug(
                     "[Orchestrator] publish_operation_terminal raised "
