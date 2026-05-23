@@ -3,77 +3,33 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #90066
-- **Branch**: `fix/ci/pr-automation-validation-run90058-20260523-020452`
-- **Commit**: `5c0dd4ca9f436ebcf02ce677c86bbd6d889f526f`
+- **Run Number**: #90074
+- **Branch**: `fix/ci/pr-automation-validation-run90066-20260523-020648`
+- **Commit**: `90c8ed29ceadf49f6b9b914e92c45301fe51bfa1`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T02:05:20Z
+- **Timestamp**: 2026-05-23T02:07:18Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26320604050)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26320645464)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | PR Size Check | permission_error | high | 5s |
-| 2 | Validate PR Title | timeout | high | 3s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. PR Size Check
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T02:05:23Z
-**Completed**: 2026-05-23T02:05:28Z
-**Duration**: 5 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26320604050/job/77488749515)
-
-#### Failed Steps
-
-- **Step 2**: Check PR Size
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 77: `2026-05-23T02:05:26.1759425Z RequestError [HttpError]: fetch failed`
-    - Line 78: `2026-05-23T02:05:26.1802168Z ##[error]Unhandled error: HttpError: fetch failed`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 77: `2026-05-23T02:05:26.1759425Z RequestError [HttpError]: fetch failed`
-    - Line 78: `2026-05-23T02:05:26.1802168Z ##[error]Unhandled error: HttpError: fetch failed`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 4
-  - Sample matches:
-    - Line 11: `let warning = '';`
-    - Line 15: `warning = '⚠️  **This PR is very large.** Consider breaking it into smaller PRs for easier review.';`
-    - Line 18: `warning = '💡 **This PR is large.** Ensure it focuses on a single feature or fix.';`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Validate PR Title
+### 1. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-23T02:05:23Z
-**Completed**: 2026-05-23T02:05:26Z
+**Started**: 2026-05-23T02:07:21Z
+**Completed**: 2026-05-23T02:07:24Z
 **Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26320604050/job/77488749520)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26320645464/job/77488865317)
 
 #### Failed Steps
 
@@ -86,13 +42,13 @@ Total Failed Jobs: **2**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-23T02:05:24.4311022Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-23T02:05:24.9533707Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-23T02:07:22.8543156Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-23T02:07:23.3533222Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-23T02:05:24.9980282Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-23T02:07:23.3970022Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -122,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-05-23T02:06:48.815258*
+📊 *Report generated on 2026-05-23T02:08:45.574455*
 🤖 *JARVIS CI/CD Auto-PR Manager*
