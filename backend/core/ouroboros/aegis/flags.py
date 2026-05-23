@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ENV_AEGIS_ENABLED: str = "JARVIS_AEGIS_ENABLED"
+ENV_AEGIS_FORWARDING_ENABLED: str = "JARVIS_AEGIS_FORWARDING_ENABLED"
+ENV_AEGIS_MAX_REQUEST_BODY_BYTES: str = "JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES"
 ENV_AEGIS_BOOTSTRAP_DIR: str = "JARVIS_AEGIS_BOOTSTRAP_DIR"
 ENV_AEGIS_BOOTSTRAP_TIMEOUT_S: str = "JARVIS_AEGIS_BOOTSTRAP_TIMEOUT_S"
 ENV_AEGIS_DAEMON_BIND_HOST: str = "JARVIS_AEGIS_DAEMON_BIND_HOST"
@@ -68,6 +70,20 @@ DEFAULT_WAL_PATH_REL: str = ".jarvis/aegis/spend.jsonl"
 def is_enabled() -> bool:
     """Master switch. Default **false** (Slice 1 dark)."""
     return get_default_registry().get_bool(ENV_AEGIS_ENABLED, default=False)
+
+
+def forwarding_enabled() -> bool:
+    """Slice 2 sub-switch — gates /v1/messages + /v1/chat/completions
+    registration. Default **false** through Slice 4 graduation soak.
+
+    Independent of :func:`is_enabled`: an operator can spin up the
+    Aegis daemon in lease-only mode (Slice 1 substrate) without
+    exposing the forwarding surface. Useful for staged rollout
+    and for the §44 diagnostic harnesses that test the daemon
+    without provider traffic."""
+    return get_default_registry().get_bool(
+        ENV_AEGIS_FORWARDING_ENABLED, default=False,
+    )
 
 
 def daemon_bind_host() -> str:
@@ -177,6 +193,36 @@ def _seeds() -> List[FlagSpec]:
             category=Category.SAFETY,
             source_file=_SRC_AEGIS,
             example=f"{ENV_AEGIS_ENABLED}=true",
+        ),
+        FlagSpec(
+            name=ENV_AEGIS_FORWARDING_ENABLED,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Slice 2 sub-switch. Gates registration of /v1/messages "
+                "(Anthropic-compat) and /v1/chat/completions (OpenAI-compat / "
+                "DW) forwarding routes on the Aegis daemon. Default-FALSE "
+                "through Slice 4 graduation soak. Independent of "
+                "JARVIS_AEGIS_ENABLED so the daemon can run in lease-only "
+                "mode for the §44 diagnostic harnesses."
+            ),
+            category=Category.SAFETY,
+            source_file=_SRC_AEGIS,
+            example=f"{ENV_AEGIS_FORWARDING_ENABLED}=true",
+        ),
+        FlagSpec(
+            name=ENV_AEGIS_MAX_REQUEST_BODY_BYTES,
+            type=FlagType.INT,
+            default=4 * 1024 * 1024,
+            description=(
+                "Maximum bytes Aegis will accept from JARVIS as the "
+                "forwarded request body. Anthropic + OpenAI APIs cap "
+                "well under this; raise only if a model's max prompt "
+                "size grows."
+            ),
+            category=Category.CAPACITY,
+            source_file=_SRC_AEGIS,
+            example=f"{ENV_AEGIS_MAX_REQUEST_BODY_BYTES}=8388608",
         ),
         FlagSpec(
             name=ENV_AEGIS_BOOTSTRAP_DIR,
@@ -362,6 +408,8 @@ __all__ = [
     "ENV_AEGIS_BOOTSTRAP_TIMEOUT_S",
     "ENV_AEGIS_DAEMON_BIND_HOST",
     "ENV_AEGIS_ENABLED",
+    "ENV_AEGIS_FORWARDING_ENABLED",
+    "ENV_AEGIS_MAX_REQUEST_BODY_BYTES",
     "ENV_AEGIS_HOURLY_BURN_CAP_USD",
     "ENV_AEGIS_LEASE_EXPIRY_S",
     "ENV_AEGIS_LEASE_OVERRUN_MULTIPLIER",
@@ -373,6 +421,7 @@ __all__ = [
     "bootstrap_timeout_s",
     "daemon_bind_host",
     "env_route_cap",
+    "forwarding_enabled",
     "hourly_burn_cap_usd",
     "is_enabled",
     "lease_expiry_s",

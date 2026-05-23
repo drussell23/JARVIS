@@ -4,12 +4,18 @@
 credentials + HMAC key K + spend WAL. Slice 1 ships the substrate;
 no upstream forwarding. AST-pin enforces "no /v1/* routes in Slice 1".
 
-Endpoint surface (Slice 1):
+Endpoint surface:
 
-  * ``GET  /health``             — liveness + bind info + redacted snapshot
-  * ``POST /session/establish``  — bootstrap PSK -> scoped session token
-  * ``POST /lease/acquire``      — session token -> lease (cap-checked)
-  * ``POST /lease/redeem``       — lease + actual cost -> reconciled verdict
+  Slice 1 (always registered):
+    * ``GET  /health``             — liveness + bind info + redacted snapshot
+    * ``POST /session/establish``  — bootstrap PSK -> scoped session token
+    * ``POST /lease/acquire``      — session token -> lease (cap-checked)
+    * ``POST /lease/redeem``       — lease + actual cost -> reconciled verdict
+
+  Slice 2 (gated by ``JARVIS_AEGIS_FORWARDING_ENABLED``, default-FALSE
+  until Slice 4 graduation):
+    * ``POST /v1/messages``           — Anthropic-compat forward (lease-gated)
+    * ``POST /v1/chat/completions``   — OpenAI-compat / DW forward (lease-gated)
 
 Process invariants:
 
@@ -88,6 +94,8 @@ _K_SESSION_TTL_S = "_session_ttl_s"
 _K_BIND_PORT = "_bind_port"
 _K_BIND_HOST = "_bind_host"
 _K_BOOT_TS = "_boot_ts"
+_K_FORWARDING_ENABLED = "_forwarding_enabled"
+_K_UPSTREAM_MAP = "_upstream_map"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,7 @@ def build_app(
     lease_ttl_s: int = DEFAULT_LEASE_TTL_S,
     session_ttl_s: int = DEFAULT_SESSION_TOKEN_TTL_S,
     nonce_ledger_capacity: int = DEFAULT_NONCE_LEDGER_CAPACITY,
+    forwarding_enabled: bool = False,
 ) -> web.Application:
     """Construct the aiohttp Application with all routes wired.
 
@@ -109,13 +118,19 @@ def build_app(
     invocation produces an independently-keyed instance — useful for
     tests, mandatory for production (one K per Aegis boot).
 
-    Routes registered:
+    Always-registered routes (Slice 1):
       - GET  /health
       - POST /session/establish
       - POST /lease/acquire
       - POST /lease/redeem
 
-    NO ``/v1/*`` routes. AST-pinned in tests.
+    Forwarding routes (Slice 2, gated by ``forwarding_enabled``):
+      - POST /v1/messages           (Anthropic-compat, forwarded)
+      - POST /v1/chat/completions   (OpenAI-compat / DW, forwarded)
+
+    Set ``forwarding_enabled=True`` to expose the Slice 2 forwarding
+    surface. Default False preserves the Slice 1 dark-substrate
+    posture for any caller that constructs the app directly.
     """
     app = web.Application()
 
@@ -134,11 +149,27 @@ def build_app(
     app[_K_BIND_HOST] = ""
     app[_K_BIND_PORT] = 0
     app[_K_BOOT_TS] = time.time()
+    app[_K_FORWARDING_ENABLED] = bool(forwarding_enabled)
 
     app.router.add_get("/health", _handle_health)
     app.router.add_post("/session/establish", _handle_session_establish)
     app.router.add_post("/lease/acquire", _handle_lease_acquire)
     app.router.add_post("/lease/redeem", _handle_lease_redeem)
+
+    if forwarding_enabled:
+        # Slice 2 — credential confiscation surface. Each route is
+        # paired with its upstream descriptor at registration time
+        # so the handler can look up wire family / auth scheme /
+        # credential env var without re-reading env on the hot path.
+        from backend.core.ouroboros.aegis.upstream_registry import (
+            snapshot as _upstream_snapshot,
+        )
+        upstream_map = _upstream_snapshot()
+        app[_K_UPSTREAM_MAP] = upstream_map
+        for path in upstream_map.keys():
+            # Single shared handler — dispatches on request.path so
+            # adding upstream paths to the registry is a one-line edit.
+            app.router.add_post(path, _handle_forward)
 
     return app
 
@@ -429,6 +460,52 @@ async def _handle_lease_redeem(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Slice 2 — upstream forwarding handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_forward(request: web.Request) -> web.StreamResponse:
+    """Slice 2 forwarding entry point.
+
+    Dispatches on ``request.path`` against the upstream registry
+    captured at ``build_app`` time (so env overrides apply at boot,
+    not per-request). Delegates everything else to
+    :func:`forwarding.forward_request`.
+
+    The HMAC key K is read once from app state and passed to the
+    forwarder; never exposed in any response body or log line.
+    """
+    app = request.app
+    upstream_map = app.get(_K_UPSTREAM_MAP)
+    if upstream_map is None:
+        # Defensive: should never happen because the route is only
+        # registered when forwarding is enabled. If it does, fail
+        # closed.
+        return web.json_response(
+            {"ok": False, "error": "forwarding_disabled"}, status=503,
+        )
+
+    endpoint = upstream_map.get(request.path)
+    if endpoint is None:
+        return web.json_response(
+            {"ok": False, "error": "upstream_path_unregistered"}, status=404,
+        )
+
+    # Lazy-import forwarding so the daemon's substrate can be imported
+    # by tests without paying the aiohttp.ClientSession startup cost.
+    from backend.core.ouroboros.aegis.forwarding import forward_request
+
+    response, _result = await forward_request(
+        request=request,
+        endpoint=endpoint,
+        K=app[_K_HMAC_KEY],
+        nonce_ledger=app[_K_NONCE_LEDGER],
+        budget=app[_K_BUDGET],
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Bind helpers — ephemeral port via socket.bind((host, 0))
 # ---------------------------------------------------------------------------
 
@@ -472,6 +549,7 @@ async def _serve(args: argparse.Namespace) -> None:
     # FlagRegistry-singleton cost when just importing build_app.
     from backend.core.ouroboros.aegis.flags import (
         daemon_bind_host,
+        forwarding_enabled,
         hourly_burn_cap_usd,
         lease_expiry_s,
         lease_overrun_multiplier,
@@ -506,6 +584,7 @@ async def _serve(args: argparse.Namespace) -> None:
         lease_ttl_s=lease_expiry_s(),
         session_ttl_s=session_token_ttl_s(),
         nonce_ledger_capacity=nonce_ledger_capacity(),
+        forwarding_enabled=forwarding_enabled(),
     )
 
     sock = bind_ephemeral_socket(host)
