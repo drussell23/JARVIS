@@ -2,106 +2,63 @@
 
 ## Executive Summary
 
-- **Workflow**: Code Quality Checks
-- **Run Number**: #8089
-- **Branch**: `main`
-- **Commit**: `cbed26056cc50a4ad1cb1a5ea24ccd329fa5ca0f`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #91175
+- **Branch**: `fix/ci/code-quality-checks-run8089-20260523-184535`
+- **Commit**: `8c6565125aefcb64352b7421e7fcd803f04235c1`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T18:41:23Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26340555498)
+- **Timestamp**: 2026-05-23T18:46:04Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26340652809)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Quality Checks (bandit, Security, 🔒) | permission_error | high | 34s |
-| 2 | Generate Summary | permission_error | high | 3s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Quality Checks (bandit, Security, 🔒)
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-23T18:42:41Z
-**Completed**: 2026-05-23T18:43:15Z
-**Duration**: 34 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26340555498/job/77541776117)
+**Started**: 2026-05-23T18:46:07Z
+**Completed**: 2026-05-23T18:46:12Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26340652809/job/77541987317)
 
 #### Failed Steps
 
-- **Step 2**: Checkout Code
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 5
-  - Sample matches:
-    - Line 35: `2026-05-23T18:42:43.7222392Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 36: `2026-05-23T18:42:43.7233114Z ##[error]fatal: expected flush after ref listing`
-    - Line 40: `2026-05-23T18:42:54.8072349Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 37: `2026-05-23T18:42:43.7235581Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 41: `2026-05-23T18:42:54.8092435Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 45: `2026-05-23T18:43:12.9013949Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
   - Occurrences: 2
   - Sample matches:
-    - Line 7: `2026-05-23T18:42:43.4683824Z hint: to use in all of your new repositories, which will suppress this `
-    - Line 98: `2026-05-23T18:43:13.4143742Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Generate Summary
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T18:44:23Z
-**Completed**: 2026-05-23T18:44:26Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26340555498/job/77541896818)
-
-#### Failed Steps
-
-- **Step 3**: Generate Comprehensive Summary
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 86: `2026-05-23T18:44:24.7035749Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 58: `2026-05-23T18:44:24.6868657Z [36;1mQUALITY_RESULT="failure"[0m`
+    - Line 30: `2026-05-23T18:46:10.1204712Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-23T18:46:10.9100435Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Code`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 88: `2026-05-23T18:44:24.7455923Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-23T18:46:10.9544967Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -121,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-05-23T18:45:35.784780*
+📊 *Report generated on 2026-05-23T18:47:39.555940*
 🤖 *JARVIS CI/CD Auto-PR Manager*
