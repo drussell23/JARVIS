@@ -70,10 +70,24 @@ class PredictiveRegressionEngine:
             except asyncio.CancelledError: break
 
     async def analyze(self) -> List[Prediction]:
+        # ── Slice 12U Phase 2 — Exorcism ──
+        # Pre-Slice-12U: _fragility / _test_decay / _resources were
+        # called SYNCHRONOUSLY here (no await). Their internal
+        # rglob + read_text loops then ran ON the asyncio loop,
+        # holding the GIL through the entire scan. bt-2026-05-23-184213
+        # tombstone (Slice 12T Part 1) captured this red-handed at
+        # predictive_engine.py:131 in _fragility. Three soaks in a
+        # row wedged here.
+        #
+        # Slice 12U makes every signal method async and routes its
+        # FS work through the canonical cooperative_fs_io substrate
+        # (dedicated advisor-blast executor + cooperative yields).
+        # _resources stays sync because shutil.disk_usage is a fast
+        # syscall (no scan).
         preds: List[Prediction] = []
         preds.extend(await self._velocity())
-        preds.extend(self._fragility())
-        preds.extend(self._test_decay())
+        preds.extend(await self._fragility())
+        preds.extend(await self._test_decay())
         preds.extend(self._resources())
         preds.sort(key=lambda p: -p.probability)
         return preds[:20]
@@ -90,7 +104,17 @@ class PredictiveRegressionEngine:
         return "\n".join(lines)
 
     async def _velocity(self) -> List[Prediction]:
-        """Files changing too fast = instability risk. Git log, argv-based."""
+        """Files changing too fast = instability risk. Git log, argv-based.
+
+        Slice 12U: per-file ``read_text`` for AST complexity now
+        routes through ``read_text_offloaded`` so the read
+        dispatches to the dedicated executor and releases the GIL.
+        Pre-Slice-12U this called ``full.read_text()`` directly on
+        the loop — same sin pattern as the proven _fragility wedge.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+            read_text_offloaded,
+        )
         preds = []
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -108,8 +132,12 @@ class PredictiveRegressionEngine:
                 full = self._root / fp
                 if full.exists():
                     try:
-                        tree = ast.parse(full.read_text())
-                        complexity = sum(1 for n in ast.walk(tree) if isinstance(n, (ast.If, ast.For, ast.While, ast.ExceptHandler)))
+                        # Slice 12U — off-loop read via dedicated
+                        # advisor-blast executor (not default pool).
+                        content = await read_text_offloaded(full)
+                        if content is not None:
+                            tree = ast.parse(content)
+                            complexity = sum(1 for n in ast.walk(tree) if isinstance(n, (ast.If, ast.For, ast.While, ast.ExceptHandler)))
                     except Exception: pass
                 prob = min(1.0, count / 10 + (0.2 if complexity > 50 else 0))
                 preds.append(Prediction(
@@ -120,15 +148,57 @@ class PredictiveRegressionEngine:
         except Exception: pass
         return preds
 
-    def _fragility(self) -> List[Prediction]:
-        """High fan-in + recent changes = breakage risk."""
+    async def _fragility(self) -> List[Prediction]:
+        """High fan-in + recent changes = breakage risk.
+
+        Slice 12U Phase 2 — THE EXORCISED WEDGE. Pre-Slice-12U
+        this was sync (``def _fragility``) called sync from
+        ``analyze()`` (no await), doing ``self._root.rglob("*.py")``
+        + per-file ``py.read_text(errors="replace")`` directly on
+        the asyncio loop. The pure-Python regex scan held the GIL
+        across thousands of files. LoopDeadman tombstone proved
+        this was the wedge in bt-2026-05-23-184213 (and the
+        two soaks prior).
+
+        Now async, composing the canonical cooperative_fs_io
+        substrate:
+          * iter_files_cooperative — bounded async walker with
+            cooperative yields every N items (default 64) so the
+            heartbeat coroutine + SDK stream consumer get
+            scheduling slots throughout
+          * read_text_offloaded — per-file read dispatches to the
+            dedicated advisor-blast ThreadPoolExecutor (NOT the
+            contested default pool — the Slice 12S antipattern)
+
+        Same result shape; same dependency-fragility predictions;
+        same skip rules (venv / __pycache__ now via
+        default_skip_dirs at the walker level).
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+            iter_files_cooperative,
+            read_text_offloaded,
+        )
         preds = []
         try:
             imports: Dict[str, int] = {}
-            for py in self._root.rglob("*.py"):
-                if "venv" in str(py) or "__pycache__" in str(py): continue
+            async for py_str in iter_files_cooperative(
+                self._root, pattern="*.py",
+            ):
+                # Substring exclusion preserved for byte-identical
+                # filter behavior — the bounded walker's
+                # default_skip_dirs handles the directory-level
+                # skips (.git / __pycache__ / .venv / etc.), but the
+                # legacy substring check on the full path was less
+                # strict and could match nested vendored trees.
+                if "venv" in py_str or "__pycache__" in py_str:
+                    continue
                 try:
-                    for m in re.findall(r"from (\S+) import", py.read_text(errors="replace")):
+                    content = await read_text_offloaded(
+                        Path(py_str),
+                    )
+                    if content is None:
+                        continue
+                    for m in re.findall(r"from (\S+) import", content):
                         mp = m.replace(".", "/") + ".py"
                         imports[mp] = imports.get(mp, 0) + 1
                 except Exception: pass
@@ -147,13 +217,30 @@ class PredictiveRegressionEngine:
         except Exception: pass
         return preds
 
-    def _test_decay(self) -> List[Prediction]:
-        """Stale tests referencing moved/deleted code."""
+    async def _test_decay(self) -> List[Prediction]:
+        """Stale tests referencing moved/deleted code.
+
+        Slice 12U — async, iterates ``tests/`` via the
+        cooperative substrate. The walk is small (single
+        directory) but the immunization is free and consistent
+        with the rest of the engine's signal methods.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+            iter_files_cooperative,
+        )
         preds = []
         tests = self._root / "tests"
         if not tests.exists(): return []
         try:
-            for tf in tests.rglob("test_*.py"):
+            async for tf_str in iter_files_cooperative(
+                tests, pattern="*.py",
+            ):
+                tf = Path(tf_str)
+                # Match the legacy test_*.py filter — the substrate
+                # yields all .py files; we add the prefix filter
+                # here for byte-identical behavior.
+                if not tf.name.startswith("test_"):
+                    continue
                 try:
                     days = (time.time() - tf.stat().st_mtime) / 86400
                     if days > 60:
