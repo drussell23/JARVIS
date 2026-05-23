@@ -110,6 +110,138 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Slice 12O — Foreground macro-cooldown helper
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Composes the canonical ForegroundCooldownPolicy + sleep_cooldown
+# primitives. Module-level so the integration site (the
+# Generation-attempt-failed branch ~L1420) stays single-line:
+#
+#     if await _slice12o_maybe_cooldown(orch, ctx, exc, route):
+#         continue   # macro-retry without decrementing in-window counter
+#
+# Returns True iff cooldown was decided AND the sleep completed
+# normally (op should re-attempt GENERATE). Returns False if the
+# policy refused cooldown OR cooldown was decided but cancelled
+# during shutdown (caller's existing terminal path handles).
+# Re-raises CancelledError so the asyncio cascade can drain WAL +
+# exit before the WallClockWatchdog Layer-3 hard-kill fires.
+
+async def _slice12o_maybe_cooldown(
+    *, orch: Any, ctx: Any, exc: BaseException, route: str,
+) -> bool:
+    """Slice 12O Phase 1+3 — check cooldown policy + execute
+    cancellation-aware sleep if approved. NEVER eats CancelledError
+    (caller catches + records terminal reason); returns False on
+    any other failure path."""
+    from backend.core.ouroboros.governance.foreground_cooldown import (
+        get_default_policy as _slice12o_get_policy,
+        sleep_cooldown as _slice12o_sleep_cooldown,
+    )
+    from backend.core.ouroboros.governance.circuit_breaker import (
+        CircuitTripOrigin as _Slice12O_Origin,
+    )
+
+    # Resolve origin via the canonical ProviderRoute → origin map
+    # (single source of truth, lives in candidate_generator). Empty
+    # / unknown route → FOREGROUND (matches Slice 12N default).
+    try:
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _SLICE12N_ROUTE_TO_ORIGIN as _slice12n_map,
+        )
+        _origin = _slice12n_map.get(
+            (route or "").strip().lower(),
+            _Slice12O_Origin.FOREGROUND,
+        )
+    except Exception:  # noqa: BLE001 — be conservative
+        _origin = _Slice12O_Origin.FOREGROUND
+
+    _is_foreground = _origin == _Slice12O_Origin.FOREGROUND
+
+    # Compose the canonical exception → reason-code shape used by
+    # the breaker. We accept either an explicit code on ctx (set by
+    # the breaker's TERMINATE_UNRESOLVED path) or fall back to the
+    # exception's message.
+    _terminal_reason_code = (
+        getattr(ctx, "terminal_reason_code", None)
+        or str(exc)
+        or ""
+    )
+
+    # Read CostGovernor + WallClockWatchdog snapshots if exposed
+    # on the orchestrator stack. Both are best-effort — the policy
+    # treats None as "caller doesn't know" and skips the gate.
+    _remaining_budget = None
+    _remaining_wall = None
+    try:
+        _cost_gov = getattr(
+            getattr(orch, "_stack", None), "cost_governor", None,
+        )
+        if _cost_gov is not None and hasattr(_cost_gov, "remaining_for_op"):
+            _remaining_budget = _cost_gov.remaining_for_op(
+                getattr(ctx, "op_id", "") or "",
+            )
+    except Exception:  # noqa: BLE001
+        _remaining_budget = None
+    try:
+        _wd = getattr(
+            getattr(orch, "_stack", None), "wall_clock_watchdog", None,
+        )
+        if _wd is not None and hasattr(_wd, "remaining_seconds"):
+            _remaining_wall = _wd.remaining_seconds()
+    except Exception:  # noqa: BLE001
+        _remaining_wall = None
+
+    _policy = _slice12o_get_policy()
+    _decision = _policy.decide(
+        op_id=getattr(ctx, "op_id", "") or "",
+        origin_is_foreground=_is_foreground,
+        terminal_reason_code=_terminal_reason_code,
+        remaining_budget_usd=_remaining_budget,
+        remaining_wall_s=_remaining_wall,
+    )
+
+    if not _decision.should_cooldown:
+        logger.debug(
+            "[ForegroundCooldown] op=%s refused reason=%s",
+            getattr(ctx, "op_id", "?")[:16],
+            _decision.refuse_reason or "?",
+        )
+        return False
+
+    # Decision committed — record the attempt BEFORE sleeping so
+    # the counter is observable in telemetry even if the sleep
+    # gets cancelled mid-flight.
+    _policy.record_attempt(getattr(ctx, "op_id", "") or "")
+    logger.warning(
+        "[ForegroundCooldown] op=%s parking for cooldown "
+        "attempt=%d/%d reason=%s backoff_s=%.0f route=%s "
+        "remaining_budget=%s remaining_wall_s=%s",
+        getattr(ctx, "op_id", "?")[:16],
+        _decision.attempt, _decision.max_attempts,
+        (_decision.reason.value if _decision.reason else "?"),
+        _decision.backoff_s, route,
+        f"${_remaining_budget:.3f}" if _remaining_budget is not None else "?",
+        f"{_remaining_wall:.0f}" if _remaining_wall is not None else "?",
+    )
+
+    # CancellationError propagates — caller catches + records
+    # terminal reason "cooldown_cancelled_shutdown".
+    await _slice12o_sleep_cooldown(
+        _decision.backoff_s,
+        op_id=getattr(ctx, "op_id", "") or "",
+        label=f"attempt_{_decision.attempt}_of_{_decision.max_attempts}",
+    )
+    logger.info(
+        "[ForegroundCooldown] op=%s cooldown complete attempt=%d/%d "
+        "— re-attempting GENERATE",
+        getattr(ctx, "op_id", "?")[:16],
+        _decision.attempt, _decision.max_attempts,
+    )
+    return True
+
+
 class GENERATERunner(PhaseRunner):
     """Verbatim transcription of orchestrator.py GENERATE block (~3138-4748)."""
 
@@ -1417,6 +1549,43 @@ class GENERATERunner(PhaseRunner):
                     ctx.op_id,
                     exc,
                 )
+
+                # ── Slice 12O — Foreground macro-cooldown ─────────
+                # Before decrementing the retry counter or
+                # transitioning to terminal, give a FOREGROUND op
+                # one or more macro-retries with exponential
+                # backoff IF the failure was provider-class
+                # (terminal_structural / all_providers_exhausted
+                # / stream_rupture). Pure decision; never raises.
+                # Sleep is cancellation-aware (Phase 3) — Layer-2
+                # graceful shutdown wakes the sleep immediately so
+                # WAL drain can complete before Layer-3 SIGKILL.
+                try:
+                    _cooldown_decided = await _slice12o_maybe_cooldown(
+                        orch=orch, ctx=ctx, exc=exc, route=_route,
+                    )
+                    if _cooldown_decided:
+                        # Cooldown completed cleanly — re-enter the
+                        # GENERATE attempt WITHOUT decrementing the
+                        # in-window retry counter. This is the macro-
+                        # retry layer ABOVE the per-window retries.
+                        continue
+                except asyncio.CancelledError:
+                    # Phase 3 — graceful shutdown interrupted the
+                    # cooldown sleep. Record a distinct terminal
+                    # reason so operators can attribute the WAL
+                    # drain to a cooperative cancellation rather
+                    # than a wedge, then re-raise so the asyncio
+                    # cancel cascade can complete.
+                    try:
+                        object.__setattr__(
+                            ctx, "terminal_reason_code",
+                            "cooldown_cancelled_shutdown",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
+
                 generate_retries_remaining -= 1
                 if generate_retries_remaining < 0:
                     # ── IMMEDIATE → STANDARD demotion ──
