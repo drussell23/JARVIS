@@ -285,6 +285,93 @@ class BoundedShutdownWatchdog:
                 )
             except Exception:
                 pass
+
+            # ── Slice 12V Phase 1 — Forensic tombstone ──
+            #
+            # bt-2026-05-23-192636 (Slice 12U validation soak) closed
+            # the LoopDeadman wedge for the first time but surfaced a
+            # NEW failure mode: ShutdownWatchdog firing after
+            # _shutdown_components dispatched a 69s dw_heavy_probe
+            # HTTP cleanup that hung past the 30s teardown deadline.
+            # Without forensic capture, operators couldn't attribute
+            # what teardown step actually wedged.
+            #
+            # Mirror Slice 12T Part 1's LoopDeadman tombstone
+            # discipline — three sinks, each individually
+            # try-wrapped (the os._exit MUST always fire):
+            #   (1) stderr faulthandler dump — preserved from
+            #       pre-Slice-12V minimal forensic line above
+            #   (2) <tombstone_dir>/shutdown_watchdog_tombstone.txt
+            #       (JARVIS_SHUTDOWN_TOMBSTONE_DIR; harness sets to
+            #       session_dir at boot)
+            #   (3) per-thread frame dump via the standard logger as
+            #       [ShutdownWatchdog.TOMBSTONE] CRITICAL lines that
+            #       land in debug.log via the harness file handler
+            try:
+                import faulthandler as _fh
+                _fh.dump_traceback(file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                _tombstone_dir = os.environ.get(
+                    "JARVIS_SHUTDOWN_TOMBSTONE_DIR", "",
+                ).strip()
+                if _tombstone_dir:
+                    _tombstone_path = os.path.join(
+                        _tombstone_dir,
+                        "shutdown_watchdog_tombstone.txt",
+                    )
+                    with open(
+                        _tombstone_path, "w", encoding="utf-8",
+                    ) as _tomb:
+                        _tomb.write(
+                            "[ShutdownWatchdog] TEARDOWN TOMBSTONE\n"
+                            "reason=%r\n"
+                            "elapsed_at_fire_s=%.1f deadline_s=%.1f\n"
+                            "pid=%d\n"
+                            "fired_at_monotonic=%.3f\n"
+                            "============================\n"
+                            % (
+                                reason, elapsed_at_fire, deadline,
+                                os.getpid(), time.monotonic(),
+                            )
+                        )
+                        import faulthandler as _fh2
+                        _fh2.dump_traceback(file=_tomb)
+                        _tomb.flush()
+                        try:
+                            os.fsync(_tomb.fileno())
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                _logger_enabled = os.environ.get(
+                    "JARVIS_SHUTDOWN_TOMBSTONE_LOGGER", "true",
+                ).strip().lower() not in (
+                    "0", "false", "no", "off",
+                )
+                if _logger_enabled:
+                    import traceback as _tb
+                    _frames = sys._current_frames()
+                    for _tid, _frame in _frames.items():
+                        try:
+                            _stack = _tb.extract_stack(_frame)
+                            _stack_str = "".join(
+                                _tb.format_list(_stack)
+                            )
+                            logger.critical(
+                                "[ShutdownWatchdog.TOMBSTONE] "
+                                "thread_id=%d\n%s",
+                                _tid, _stack_str,
+                            )
+                        except Exception:  # noqa: BLE001
+                            continue
+            except Exception:  # noqa: BLE001
+                pass
+
             # GO
             self._exit_fn(EXIT_CODE_HARNESS_WEDGED)
             # exit_fn returned (only happens in tests with mocked exit) —
