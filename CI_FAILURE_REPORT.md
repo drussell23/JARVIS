@@ -2,106 +2,63 @@
 
 ## Executive Summary
 
-- **Workflow**: Code Quality Checks
-- **Run Number**: #8085
-- **Branch**: `ouroboros/slice12s-advisor-blast-cooperative`
-- **Commit**: `03f4ec7185ef0c54c8f4d5ed5852ec4faf0f8e23`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #91127
+- **Branch**: `fix/ci/code-quality-checks-run8085-20260523-180341`
+- **Commit**: `04093710c91909335a5d0bbe4b89b480452ed149`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T17:59:35Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26339677495)
+- **Timestamp**: 2026-05-23T18:04:10Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26339776900)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Quality Checks (interrogate, Docstring Coverage, 📝) | permission_error | high | 28s |
-| 2 | Generate Summary | permission_error | high | 3s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. Quality Checks (interrogate, Docstring Coverage, 📝)
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-23T18:01:03Z
-**Completed**: 2026-05-23T18:01:31Z
-**Duration**: 28 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26339677495/job/77539387307)
+**Started**: 2026-05-23T18:05:07Z
+**Completed**: 2026-05-23T18:05:11Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26339776900/job/77539611065)
 
 #### Failed Steps
 
-- **Step 2**: Checkout Code
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 4
-  - Sample matches:
-    - Line 36: `2026-05-23T18:01:05.6833139Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 40: `2026-05-23T18:01:17.7895654Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 44: `2026-05-23T18:01:28.8980944Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 37: `2026-05-23T18:01:05.6842239Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 41: `2026-05-23T18:01:17.7912973Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 45: `2026-05-23T18:01:28.9027653Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
   - Occurrences: 2
   - Sample matches:
-    - Line 8: `2026-05-23T18:01:05.4670785Z hint: to use in all of your new repositories, which will suppress this `
-    - Line 98: `2026-05-23T18:01:29.4299861Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Generate Summary
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T18:02:24Z
-**Completed**: 2026-05-23T18:02:27Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26339677495/job/77539509535)
-
-#### Failed Steps
-
-- **Step 3**: Generate Comprehensive Summary
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 86: `2026-05-23T18:02:26.4890237Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 58: `2026-05-23T18:02:26.4739014Z [36;1mQUALITY_RESULT="failure"[0m`
+    - Line 30: `2026-05-23T18:05:09.4458190Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-23T18:05:10.0510663Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Code`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 88: `2026-05-23T18:02:26.5308655Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-23T18:05:10.0916674Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -121,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-05-23T18:03:41.231153*
+📊 *Report generated on 2026-05-23T18:06:34.533227*
 🤖 *JARVIS CI/CD Auto-PR Manager*
