@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26340056491",
-  "branch": "fix/ci/pr-automation-validation-run91138-20260523-181706",
-  "commit_sha": "955e2cd",
-  "run_number": 91140,
-  "failed_count": 2,
-  "fix_branch": "fix/ci/pr-automation-validation-run91140-20260523-182022",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91140)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26340123054",
+  "branch": "fix/ci/pr-automation-validation-run91140-20260523-182022",
+  "commit_sha": "3633ec3",
+  "run_number": 91143,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run91143-20260523-182222",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91143)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 30,
-              "content": "2026-05-23T18:17:40.5802756Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-05-23T18:20:59.9580603Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-05-23T18:17:41.0535611Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91138)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-05-23T18:21:00.5661473Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91140)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -33,7 +33,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-05-23T18:17:41.0959331Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-05-23T18:21:00.6311106Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -60,65 +60,7 @@
       "severity": "high",
       "category": "timeout",
       "similar_failures": []
-    },
-    {
-      "error_patterns": [
-        {
-          "pattern": "ERROR|Error|error",
-          "matches": [
-            {
-              "line_number": 86,
-              "content": "2026-05-23T18:17:50.0374826Z ##[error]HttpError: Bad credentials - https://docs.github.com/rest",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 87,
-              "content": "2026-05-23T18:17:50.0385452Z ##[error]Bad credentials - https://docs.github.com/rest",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 2
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2026-05-23T18:17:50.1816123Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 17,
-              "content": "2026-05-23T18:17:42.6372407Z hint: to use in all of your new repositories, which will suppress this warning,",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 97,
-              "content": "2026-05-23T18:17:50.1816123Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            }
-          ],
-          "count": 2
-        }
-      ],
-      "suggested_fixes": [
-        "Review the logs above for specific error messages"
-      ],
-      "severity": "high",
-      "category": "permission_error",
-      "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-23T18:20:22.012873"
+  "timestamp": "2026-05-23T18:22:22.869909"
 }
