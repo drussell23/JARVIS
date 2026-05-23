@@ -190,7 +190,42 @@ def _build_evidence(
                                      reaching intake twice within the
                                      idempotency window is deduped at
                                      the router level)
+
+    Slice 12P Phase 1 additions — metadata signals that let the
+    orchestrator's Iron Gate distinguish wiring-validation
+    fixtures from real benchmark problems WITHOUT hardcoding
+    instance_ids. Composed by ``envelope_metadata.
+    is_wiring_validation_envelope`` downstream.
+      * ``swe_bench_pro``      → True (always — this is THE
+                                  SWE-Bench-Pro builder, so any
+                                  envelope it produces is by
+                                  definition a SWE-Bench-Pro
+                                  envelope)
+      * ``gold_patch_empty``   → True iff problem.gold_patch is
+                                  empty (no reference fix → the
+                                  problem is structurally a no-op-
+                                  passes fixture)
+      * ``real_benchmark``     → False when problem.metadata
+                                  explicitly declares
+                                  real_benchmark=False (fixture
+                                  signal); True otherwise (default
+                                  assumption: real benchmark)
+      * ``fixture_purpose``    → problem.metadata["purpose"] if
+                                  present (operator-facing
+                                  telemetry — propagates to
+                                  summary.json attribution)
     """
+    # Slice 12P — read fixture metadata defensively (legacy
+    # ProblemSpecs may not carry the metadata dict at all).
+    _meta = getattr(problem, "metadata", None) or {}
+    _gold_patch = _safe_str(getattr(problem, "gold_patch", ""))
+    _real_benchmark_flag = _meta.get("real_benchmark")
+    # Default: assume real benchmark unless metadata explicitly
+    # says otherwise. Only the literal False value flips the gate.
+    _is_real_benchmark = _real_benchmark_flag is not False
+    _fixture_purpose = _meta.get("purpose")
+    if not isinstance(_fixture_purpose, str):
+        _fixture_purpose = ""
     return {
         EVIDENCE_REPO_ROOT_KEY: str(prepared.worktree_path),
         "problem_instance_id": _safe_str(problem.instance_id),
@@ -198,6 +233,11 @@ def _build_evidence(
         "branch_name": _safe_str(prepared.branch_name),
         "repo_url": _safe_str(problem.repo_url),
         "signature": _safe_str(problem.instance_id),
+        # Slice 12P Phase 1 metadata signals
+        "swe_bench_pro": True,
+        "gold_patch_empty": (_gold_patch == ""),
+        "real_benchmark": _is_real_benchmark,
+        "fixture_purpose": _fixture_purpose,
     }
 
 

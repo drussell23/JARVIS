@@ -324,6 +324,7 @@ class SessionRecorder:
         cached_tokens: int = 0,
         tool_calls: int = 0,
         files_changed: int = 0,
+        terminal_reason_code: str = "",
     ) -> None:
         """Record a completed or queued operation with cost data.
 
@@ -357,6 +358,20 @@ class SessionRecorder:
         files_changed:
             Number of files modified in APPLY phase.
         """
+        # Slice 12P Phase 2 — classify the terminal reason into the
+        # closed TerminalReasonClass taxonomy so summary.json
+        # operations[] carry structured attribution. NEVER raises:
+        # classifier returns OTHER for unrecognized codes, empty
+        # code, or non-string input.
+        try:
+            from backend.core.ouroboros.governance.terminal_reason import (
+                classify_terminal_reason,
+            )
+            _terminal_class = classify_terminal_reason(terminal_reason_code)
+            _terminal_class_value = _terminal_class.value
+        except Exception:  # noqa: BLE001 — defensive
+            _terminal_class_value = "other"
+
         entry: Dict[str, Any] = {
             "op_id": op_id,
             "status": status,
@@ -372,6 +387,11 @@ class SessionRecorder:
             "cached_tokens": cached_tokens,
             "tool_calls": tool_calls,
             "files_changed": files_changed,
+            # Slice 12P Phase 2 — structured terminal-reason
+            # attribution (operators no longer need to grep
+            # debug.log for "why did this op die?")
+            "terminal_reason_code": terminal_reason_code,
+            "terminal_reason_class": _terminal_class_value,
         }
 
         self._operations.append(entry)

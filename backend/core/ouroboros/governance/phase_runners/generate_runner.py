@@ -954,9 +954,40 @@ class GENERATERunner(PhaseRunner):
                     _min_explore = 1
                 else:
                     _min_explore = 2
+                # Slice 12P Phase 1 — envelope-aware exploration
+                # discipline (paired with orchestrator.py:4445).
+                # SWE-Bench-Pro wiring-validation fixtures drop the
+                # exploration floor to 0 so the no-op-passes
+                # structural contract isn't deadlocked by the gate.
+                # Pure envelope-metadata composition; no hardcoded
+                # instance_ids.
+                try:
+                    from backend.core.ouroboros.governance.envelope_metadata import (  # noqa: E501
+                        is_wiring_validation_envelope as _slice12p_is_fixture,
+                    )
+                    if _slice12p_is_fixture(ctx):
+                        logger.info(
+                            "[Orchestrator] Iron Gate — Slice 12P "
+                            "envelope-aware override: wiring-validation "
+                            "fixture detected — exploration floor 0 "
+                            "for op=%s",
+                            ctx.op_id[:12],
+                        )
+                        _min_explore = 0
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[Orchestrator] Slice 12P envelope-aware check "
+                        "raised — falling through to pre-Slice-12P floor",
+                        exc_info=True,
+                    )
                 _explore_gate_enabled = (
                     os.environ.get("JARVIS_EXPLORATION_GATE", "true").lower() == "true"
                     and _task_complexity != "trivial"
+                    # Slice 12P — fixture override drops floor to 0;
+                    # skip the gate path entirely in that case so we
+                    # don't emit confusing "Iron Gate" log lines for
+                    # an envelope with nothing to enforce.
+                    and _min_explore > 0
                 )
                 if _explore_gate_enabled:
                     _explore_count = sum(

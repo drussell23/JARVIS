@@ -4449,9 +4449,50 @@ class GovernedOrchestrator:
                         _min_explore = 1
                     else:
                         _min_explore = 2
+                    # Slice 12P Phase 1 — envelope-aware exploration
+                    # discipline. SWE-Bench-Pro wiring-validation
+                    # fixtures (those with gold_patch="" AND
+                    # metadata.real_benchmark=False) are structurally
+                    # designed to score PASS with a no-op patch, so
+                    # forcing 2+ exploration calls before they can
+                    # propose that no-op patch creates the
+                    # exploration_insufficient ↔ no-op-patch
+                    # deadlock that killed bt-2026-05-23-030130.
+                    # Drop the floor to 0 ONLY for fixtures — real
+                    # benchmark problems (gold_patch != "") still
+                    # require the full exploration discipline. Pure
+                    # envelope-metadata composition; no hardcoded
+                    # instance_ids.
+                    try:
+                        from backend.core.ouroboros.governance.envelope_metadata import (  # noqa: E501
+                            is_wiring_validation_envelope as _slice12p_is_fixture,
+                        )
+                        if _slice12p_is_fixture(ctx):
+                            logger.info(
+                                "[Orchestrator] Iron Gate — Slice 12P "
+                                "envelope-aware override: wiring-validation "
+                                "fixture detected (swe_bench_pro=true, "
+                                "gold_patch_empty=true, real_benchmark=false) "
+                                "— exploration floor 0 for op=%s",
+                                ctx.op_id[:12],
+                            )
+                            _min_explore = 0
+                    except Exception:  # noqa: BLE001 — defensive
+                        logger.debug(
+                            "[Orchestrator] Slice 12P envelope-aware check "
+                            "raised — falling through to pre-Slice-12P floor",
+                            exc_info=True,
+                        )
                     _explore_gate_enabled = (
                         os.environ.get("JARVIS_EXPLORATION_GATE", "true").lower() == "true"
                         and _task_complexity != "trivial"
+                        # Slice 12P — when the envelope-aware override
+                        # drops the floor to 0, the gate itself becomes
+                        # a no-op (nothing to enforce). Skip the gate
+                        # path entirely to avoid emitting confusing
+                        # "Iron Gate" log lines for fixtures that have
+                        # no enforcement to apply.
+                        and _min_explore > 0
                     )
                     if _explore_gate_enabled:
                         _explore_count = sum(
@@ -5361,6 +5402,47 @@ class GovernedOrchestrator:
                                 "- Only after you have at least 2 exploration tool calls in your\n"
                                 "  tool_execution_records may you emit the final patch.\n"
                                 "- Exploration is NOT optional. Patches without context corrupt code.\n"
+                            )
+
+                        # ── Slice 12P Phase 3 — Reflexive healing prepend ──
+                        # Compose a structured <DEVELOPER_FEEDBACK> block
+                        # (closed taxonomy class + canonical remediation
+                        # actions) and prepend it to the existing feedback
+                        # so the model sees:
+                        #   1. NEW Slice 12P structured signal (priority
+                        #      = CRITICAL_SYSTEM_OVERRIDE per the existing
+                        #      attention-mechanism discipline at line ~5285)
+                        #   2. EXISTING ExplorationLedger-aware deep detail
+                        # Pure composition; format helper returns None for
+                        # non-structural rejections so this is a no-op for
+                        # provider exhaustion / wall cap / cancelled
+                        # shutdown classes. NEVER raises.
+                        try:
+                            from backend.core.ouroboros.governance.reflexive_healing import (  # noqa: E501
+                                format_structural_rejection_feedback as _slice12p_format,
+                            )
+                            _slice12p_block = _slice12p_format(
+                                _err_str,
+                                rejection_detail=_err_str[:300],
+                                attempt_number=attempt + 1,
+                                max_attempts=1 + self._config.max_generate_retries,
+                            )
+                            if _slice12p_block:
+                                _error_feedback = (
+                                    _slice12p_block + "\n\n" + _error_feedback
+                                )
+                                logger.debug(
+                                    "[Orchestrator] Slice 12P reflexive "
+                                    "healing prepend added to retry feedback "
+                                    "for op=%s",
+                                    ctx.op_id[:12],
+                                )
+                        except Exception:  # noqa: BLE001 — defensive
+                            logger.debug(
+                                "[Orchestrator] Slice 12P reflexive healing "
+                                "formatter raised — falling through to "
+                                "pre-Slice-12P feedback shape",
+                                exc_info=True,
                             )
                     elif _err_str.startswith("ascii_corruption"):
                         # Extract the specific offending lines from the rejected
