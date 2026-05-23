@@ -4251,6 +4251,62 @@ class GovernedLoopService:
                 self._fsm_contexts.pop(op_id, None)
                 # P2 Slice 3 — registry parity (master-gated).
                 _unregister_op_in_flight_safely(op_id)
+                # ── Slice 12R Phase 1 — Telemetry seal ──
+                # This is the ABSOLUTE BOTTOM of the BG-op
+                # lifecycle: every op that ever registered passes
+                # through here on termination (normal, exhausted,
+                # cancelled-shutdown, blocked, etc.). The Slice
+                # 12Q orchestrator hook fires from _record_ledger
+                # but bt-2026-05-23-063408 proved that path is
+                # bypassed when shutdown-triggered cancellation
+                # propagates through Slice 12O cooldown — the op
+                # gets unregistered via this callback without ever
+                # reaching _record_ledger.
+                #
+                # Slice 12R's fallback uses the SessionRecorder's
+                # own idempotency (Slice 12Q _recorded_op_ids set):
+                # if _record_ledger already recorded this op with
+                # rich terminal_reason_code, the fallback below is
+                # a no-op (first-write-wins). If _record_ledger
+                # never ran (cancellation path), the fallback
+                # writes a "cancelled_shutdown" attribution so the
+                # op appears in summary.json.operations[] with the
+                # correct terminal_reason_class.
+                #
+                # NEVER raises — telemetry must not crash the
+                # critical cleanup path.
+                try:
+                    from backend.core.ouroboros.battle_test.session_recorder import (  # noqa: E501
+                        get_active_recorder,
+                    )
+                    _recorder = get_active_recorder()
+                    if _recorder is not None:
+                        # ``cancelled_during_shutdown`` is the
+                        # canonical code matched by Slice 12P's
+                        # classifier rule at
+                        # terminal_reason.py:80 — emitting it
+                        # ensures the row carries
+                        # ``terminal_reason_class=cancelled_shutdown``
+                        # in summary.json. The bare string
+                        # ``cancelled_shutdown`` would classify
+                        # as OTHER (no substring match).
+                        _recorder.record_operation(
+                            op_id=op_id,
+                            status="cancelled",
+                            sensor="bg_pool",
+                            technique="cancelled_during_shutdown",
+                            composite_score=0.0,
+                            elapsed_s=0.0,
+                            terminal_reason_code=(
+                                "cancelled_during_shutdown"
+                            ),
+                        )
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[GovernedLoop] Slice 12R telemetry seal "
+                        "raised (swallowed) op=%s",
+                        op_id, exc_info=True,
+                    )
                 logger.debug(
                     "[GovernedLoop] BG op unregistered from "
                     "_active_ops: %s",

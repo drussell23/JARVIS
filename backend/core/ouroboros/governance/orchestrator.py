@@ -5624,6 +5624,52 @@ class GovernedOrchestrator:
                             "- Sanity check: every single character in your output must\n"
                             "  be in the range 0x20–0x7E or \\n (0x0A). No exceptions.\n"
                         )
+
+                        # ── Slice 12R Phase 3 — Reflexive ASCII healing ──
+                        # Compose the structured Slice 12P
+                        # <DEVELOPER_FEEDBACK> block ahead of the
+                        # hand-written ASCII feedback above. The
+                        # block surfaces the rejection class
+                        # (ascii_gate_failed) + canonical
+                        # remediation actions so the model's
+                        # attention mechanism gives it priority
+                        # over front-loaded task text. Composes
+                        # the same pattern that Slice 12P already
+                        # wired for exploration_insufficient at
+                        # ~line 5395. Pure prepend; None return
+                        # leaves legacy feedback byte-identical.
+                        # NEVER raises into the retry loop.
+                        try:
+                            from backend.core.ouroboros.governance.reflexive_healing import (  # noqa: E501
+                                format_structural_rejection_feedback as _slice12r_format,
+                            )
+                            # Reflexive healing's classifier matches
+                            # "ascii_gate_failed" substring — pass an
+                            # equivalent canonical code so the
+                            # classifier picks the right action list.
+                            _slice12r_block = _slice12r_format(
+                                "ascii_gate_failed: " + _err_str[:200],
+                                rejection_detail=_err_str[:300],
+                                attempt_number=attempt + 1,
+                                max_attempts=1 + self._config.max_generate_retries,
+                            )
+                            if _slice12r_block:
+                                _error_feedback = (
+                                    _slice12r_block + "\n\n" + _error_feedback
+                                )
+                                logger.debug(
+                                    "[Orchestrator] Slice 12R reflexive "
+                                    "ASCII healing prepend added to retry "
+                                    "feedback for op=%s",
+                                    ctx.op_id[:12],
+                                )
+                        except Exception:  # noqa: BLE001 — defensive
+                            logger.debug(
+                                "[Orchestrator] Slice 12R reflexive ASCII "
+                                "healing formatter raised — falling "
+                                "through to pre-Slice-12R feedback shape",
+                                exc_info=True,
+                            )
                     elif _err_str.startswith("multi_file_coverage_insufficient"):
                         # Gate 5 rejection — name the missing target paths and
                         # reiterate the files: [...] shape. The model saw the
