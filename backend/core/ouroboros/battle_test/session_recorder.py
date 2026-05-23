@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -81,6 +82,16 @@ class SessionRecorder:
 
         # Full operation log
         self._operations: List[Dict[str, Any]] = []
+
+        # Slice 12Q — idempotency tracker. record_operation is now
+        # invoked from TWO independent paths: (1) the existing
+        # OP_COMPLETED event handler in harness.py (which currently
+        # never fires because report_outcome is unwired), and (2) the
+        # new orchestrator._record_ledger terminal hook added by
+        # Slice 12Q. Keying by op_id ensures a single record per
+        # terminal op even if both paths fire — the FIRST recording
+        # wins, subsequent calls for the same op_id are no-ops.
+        self._recorded_op_ids: set = set()
 
         # Ops that need human review (status == "queued")
         self._review_queue: List[Dict[str, Any]] = []
@@ -358,6 +369,15 @@ class SessionRecorder:
         files_changed:
             Number of files modified in APPLY phase.
         """
+        # Slice 12Q — idempotent recording. If this op_id has
+        # already been recorded (via the OP_COMPLETED event handler
+        # OR the orchestrator's _record_ledger Slice 12Q hook),
+        # silently no-op so summary.json.operations[] never
+        # contains duplicates for the same terminal op.
+        # First-write-wins keeps the earliest attribution intact.
+        if op_id and op_id in self._recorded_op_ids:
+            return
+
         # Slice 12P Phase 2 — classify the terminal reason into the
         # closed TerminalReasonClass taxonomy so summary.json
         # operations[] carry structured attribution. NEVER raises:
@@ -395,6 +415,8 @@ class SessionRecorder:
         }
 
         self._operations.append(entry)
+        if op_id:
+            self._recorded_op_ids.add(op_id)
         self._attempted += 1
         self._sensor_counts[sensor] += 1
         self._technique_counts[technique] += 1
@@ -765,3 +787,58 @@ def _convergence_recommendation(state: str) -> str:
         "INSUFFICIENT_DATA": "Not enough data to classify convergence. Run more operations.",
     }
     return recommendations.get(state, "Unknown convergence state.")
+
+
+# ---------------------------------------------------------------------------
+# Slice 12Q — process-singleton accessor for orchestrator terminal hook
+# ---------------------------------------------------------------------------
+#
+# Bridge between the harness-owned SessionRecorder and the orchestrator's
+# _record_ledger terminal site. The harness registers the active recorder
+# at boot via set_active_recorder; the orchestrator reads it via
+# get_active_recorder at every terminal state transition.
+#
+# Why this exists: the orchestrator's terminal chokepoint (_record_ledger)
+# fires for ALL terminal states (FAILED/APPLIED/ROLLED_BACK/BLOCKED) but
+# was not wired to SessionRecorder. The existing OP_COMPLETED autonomy-event
+# handler in harness.py subscribes to a path (governed_loop_service.
+# report_outcome) that nothing actually calls in the runtime — so failed/
+# exhausted ops produced ZERO summary.json.operations[] entries
+# (bt-2026-05-23-042249 captured this gap).
+#
+# Slice 12Q closes the gap by routing the orchestrator's terminal calls
+# directly through this accessor. The existing OP_COMPLETED event handler
+# stays in place as a forward-compat path; SessionRecorder's idempotency
+# (self._recorded_op_ids set) ensures no duplicate records if both paths
+# ever fire for the same op_id.
+
+_active_recorder: Optional["SessionRecorder"] = None
+_active_recorder_lock = threading.Lock()
+
+
+def set_active_recorder(recorder: Optional["SessionRecorder"]) -> None:
+    """Register the active session's recorder. Called by the harness
+    at boot (and again with None at shutdown). NEVER raises."""
+    global _active_recorder
+    try:
+        with _active_recorder_lock:
+            _active_recorder = recorder
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
+
+def get_active_recorder() -> Optional["SessionRecorder"]:
+    """Process-singleton accessor used by the orchestrator's
+    Slice 12Q terminal hook. Returns None when no session is
+    active (tests, headless rigs without a harness, etc.).
+    NEVER raises."""
+    try:
+        with _active_recorder_lock:
+            return _active_recorder
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+
+
+def reset_active_recorder() -> None:
+    """For tests. Clears the singleton."""
+    set_active_recorder(None)

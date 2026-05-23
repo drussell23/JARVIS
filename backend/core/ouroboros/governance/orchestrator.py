@@ -98,6 +98,118 @@ from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# Slice 12Q — SessionRecorder terminal hook
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Bridge from the orchestrator's _record_ledger terminal site into the
+# harness-owned SessionRecorder via the canonical process-singleton
+# accessor. Closes the bt-2026-05-23-042249 gap where
+# summary.json.operations[] was empty despite multiple terminal ops:
+# the existing OP_COMPLETED autonomy-event subscription path subscribed
+# to a callback (gls.report_outcome) that nothing in the runtime
+# actually invokes for failed/exhausted ops, so terminal_reason_class
+# attribution was unreachable.
+#
+# Mapping ledger.OperationState → recorder.status string:
+#   APPLIED     → "completed"
+#   ROLLED_BACK → "rolled_back"
+#   FAILED      → "failed"
+#   BLOCKED     → "failed"   (blocked = unrecoverable failure)
+#
+# Pulls terminal_reason_code from (ledger data dict) → (ctx attribute)
+# → empty string fallback. Slice 12P's classifier in record_operation
+# maps the code to the closed TerminalReasonClass taxonomy.
+#
+# NEVER raises into _record_ledger (the caller wraps in try/except;
+# this helper additionally swallows internally as belt-and-suspenders).
+
+_SLICE12Q_LEDGER_TO_STATUS: Dict[str, str] = {
+    "applied": "completed",
+    "rolled_back": "rolled_back",
+    "failed": "failed",
+    "blocked": "failed",
+}
+
+
+def _slice12q_record_terminal(
+    ctx: Any, state: Any, data: Dict[str, Any],
+) -> None:
+    """Record one terminal op into the active SessionRecorder.
+
+    Composition only — reads the canonical singleton accessor,
+    extracts the smallest correct payload from ctx + state + data,
+    delegates idempotency + classification to SessionRecorder.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.session_recorder import (
+            get_active_recorder,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        recorder = get_active_recorder()
+    except Exception:  # noqa: BLE001
+        return
+    if recorder is None:
+        return
+    try:
+        state_value = getattr(state, "value", str(state)) or ""
+        status = _SLICE12Q_LEDGER_TO_STATUS.get(state_value, "failed")
+        # Terminal reason — prefer the explicit ctx attribute (set by
+        # CircuitBreaker / Iron Gate / cooldown paths), then the
+        # ledger data dict's "reason"/"error" field, then empty.
+        reason_code = (
+            getattr(ctx, "terminal_reason_code", "") or
+            (isinstance(data, dict) and (
+                data.get("reason", "") or data.get("error", "")
+            )) or ""
+        )
+        # Best-effort metadata extraction; all defaults are recorder-safe.
+        op_id = str(getattr(ctx, "op_id", "") or "")
+        if not op_id:
+            return  # nothing useful to record without op_id
+        sensor = ""
+        if isinstance(data, dict):
+            sensor = data.get("source", "") or data.get("sensor", "")
+        sensor = sensor or getattr(ctx, "intake_source", "") or "unknown"
+        provider = (
+            getattr(ctx, "provider_route", "") or
+            (isinstance(data, dict) and data.get("route", "")) or
+            ""
+        )
+        cost_usd = 0.0
+        if isinstance(data, dict):
+            try:
+                cost_usd = float(data.get("cost_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                cost_usd = 0.0
+        elapsed_s = 0.0
+        if isinstance(data, dict):
+            try:
+                elapsed_s = float(data.get("duration_s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                elapsed_s = 0.0
+        recorder.record_operation(
+            op_id=op_id,
+            status=status,
+            sensor=str(sensor),
+            technique="orchestrator_terminal",
+            composite_score=0.0,
+            elapsed_s=elapsed_s,
+            provider=str(provider),
+            cost_usd=cost_usd,
+            terminal_reason_code=str(reason_code),
+        )
+    except Exception:  # noqa: BLE001
+        # Belt-and-suspenders — caller's try/except also catches.
+        logger.debug(
+            "[Orchestrator] Slice 12Q _slice12q_record_terminal raised "
+            "(swallowed)",
+            exc_info=True,
+        )
+
 # Module-level buffer for LearningConsolidator periodic consolidation.
 # Outcomes accumulate here; once the threshold is reached, consolidate()
 # is called to generate new domain-level rules.
@@ -10546,6 +10658,18 @@ class GovernedOrchestrator:
                     self._failfast_exhaust_consec.pop(
                         str(getattr(ctx, "op_id", "") or ""), None,
                     )
+                    # ── Slice 12Q — SessionRecorder terminal wiring ──
+                    # Direct call into the harness-owned SessionRecorder
+                    # via the process-singleton accessor. This closes the
+                    # bt-2026-05-23-042249 gap where summary.json.
+                    # operations[] was empty because the existing
+                    # OP_COMPLETED event handler subscribes to a path
+                    # (gls.report_outcome) that nothing in the runtime
+                    # actually calls. The recorder's own idempotency
+                    # (self._recorded_op_ids) protects against any
+                    # future duplicate if the OP_COMPLETED path is
+                    # wired up later. NEVER raises into _record_ledger.
+                    _slice12q_record_terminal(ctx, state, data)
             except Exception:  # noqa: BLE001 — observability is best-effort
                 logger.debug(
                     "[Orchestrator] publish_operation_terminal raised "
