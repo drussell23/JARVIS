@@ -1,12 +1,12 @@
 {
-  "workflow_name": "Secret Scanning",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26344847736",
-  "branch": "ouroboros/slice12y-budget-reservation",
-  "commit_sha": "f01b728",
-  "run_number": 5274,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26344977984",
+  "branch": "fix/ci/secret-scanning-run5274-20260523-221554",
+  "commit_sha": "2281126",
+  "run_number": 91917,
   "failed_count": 1,
-  "fix_branch": "fix/ci/secret-scanning-run5274-20260523-221554",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #5274)",
+  "fix_branch": "fix/ci/pr-automation-validation-run91917-20260523-221801",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91917)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,46 +14,16 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 5,
-              "content": "2026-05-23T22:10:39.9547241Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID D3C0:18832D:D834DFD:DB14EA1:6A1225DF and timestamp 2026-05-23 22:10:39 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
+              "line_number": 30,
+              "content": "2026-05-23T22:16:28.6592229Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 6,
-              "content": "2026-05-23T22:10:39.9559958Z ##[error]\ud83d\uded1 missing gitleaks license. Go grab one at gitleaks.io and store it as a GitHub Secret named GITLEAKS_LICENSE. For more info about the recent breaking update, see [here](https://github.com/gitleaks/gitleaks-action#-announcement).",
+              "line_number": 42,
+              "content": "2026-05-23T22:16:29.2864610Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #5274)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
-            },
-            {
-              "line_number": 34,
-              "content": "2026-05-23T22:10:40.5042865Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID D3C1:3451E:D72CDDE:DA141E6:6A1225E0 and timestamp 2026-05-23 22:10:40 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 36,
-              "content": "2026-05-23T22:10:40.5052373Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID D3C1:3451E:D72CDDE:DA141E6:6A1225E0 and timestamp 2026-05-23 22:10:40 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 4
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 5,
-              "content": "2026-05-23T22:10:39.9547241Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID D3C0:18832D:D834DFD:DB14EA1:6A1225DF and timestamp 2026-05-23 22:10:39 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 96,
-              "content": "2026-05-23T22:10:40.7269490Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
             }
           ],
           "count": 2
@@ -62,46 +32,35 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 5,
-              "content": "2026-05-23T22:10:39.9547241Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID D3C0:18832D:D834DFD:DB14EA1:6A1225DF and timestamp 2026-05-23 22:10:39 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 12,
-              "content": "2026-05-23T22:10:39.9661477Z   if-no-files-found: warn",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 17,
-              "content": "2026-05-23T22:10:40.1893472Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 96,
-              "content": "2026-05-23T22:10:40.7269490Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 98,
-              "content": "2026-05-23T22:10:40.7663869Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/github-script@v7, actions/upload-artifact@v4, gitleaks/gitleaks-action@v2. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "line_number": 58,
+              "content": "2026-05-23T22:16:29.3323454Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
           ],
-          "count": 5
+          "count": 1
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 34,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 1
         }
       ],
       "suggested_fixes": [
-        "Consider increasing timeout values or optimizing slow operations"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "linting_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-23T22:15:54.508479"
+  "timestamp": "2026-05-23T22:18:01.369656"
 }
