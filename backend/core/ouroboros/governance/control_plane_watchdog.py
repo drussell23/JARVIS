@@ -662,6 +662,23 @@ def _capture_thread_frames(
     (innermost-first) so a deep recursion can't blow the log.
     Filenames are kept as-is (absolute paths); the operator's grep
     line-number link uses them.
+
+    Slice 12L Part A — priority ordering. The bt-2026-05-23-002712
+    soak proved Slice 12K worked but had a load-bearing gap:
+    ``threads=20 truncated_threads=38`` clipped MainThread out of
+    every snapshot, leaving the wedge culprit unidentifiable from
+    the snapshot alone. The fix is to STABLE-SORT items by
+    priority before applying the cap, so that:
+
+      1. MainThread (the asyncio event-loop thread) ALWAYS first
+      2. Then other Python-threading threads (preserves dict
+         insertion order — stable sort)
+      3. Then raw C threads with no Python-threading wrapper
+
+    The max_threads cap is still honored. Within the cap,
+    MainThread cannot be truncated away regardless of the cap
+    value, the thread count, or the underlying dict ordering of
+    ``sys._current_frames()``.
     """
     try:
         current = sys._current_frames()  # type: ignore[attr-defined]
@@ -678,8 +695,31 @@ def _capture_thread_frames(
                 name_by_id[ident] = t.name
     except Exception:  # noqa: BLE001
         pass
+    # Slice 12L Part A — resolve MainThread's ident so the priority
+    # sort can rank it first. ``threading.main_thread()`` is the
+    # canonical accessor; wrap defensively for completeness.
+    main_thread_id: Optional[int] = None
+    try:
+        main_thread_id = threading.main_thread().ident
+    except Exception:  # noqa: BLE001
+        main_thread_id = None
+
+    def _priority(item: tuple) -> int:
+        """0 = MainThread (always first); 1 = named Python-threading
+        thread; 2 = raw C thread / unknown ident."""
+        tid = item[0]
+        if main_thread_id is not None and tid == main_thread_id:
+            return 0
+        if tid in name_by_id:
+            return 1
+        return 2
+
     snapshots: List[ThreadFrameSnapshot] = []
     items = list(current.items())
+    # Stable sort by priority — preserves the original dict order
+    # within each priority class so non-MainThread capture order
+    # is unchanged.
+    items.sort(key=_priority)
     truncated = max(0, len(items) - int(max_threads))
     for tid, frame in items[: int(max_threads)]:
         name = name_by_id.get(tid, f"<thread-{tid}>")

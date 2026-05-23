@@ -479,11 +479,51 @@ class OpportunityMinerSensor:
         skipped_non_package = 0
         errors = 0
 
+        # Slice 12L Part B — event-loop hardening. Compose the
+        # canonical event_loop_governance primitives so the miner
+        # never holds the asyncio loop during filesystem traversal
+        # or file IO. Empirical context: bt-2026-05-23-002712
+        # captured ControlPlaneStarvation lag_ms=17172.9 correlated
+        # with AstCompileHelper parent_await_ms=17243.2 originating
+        # from this scan_once. Worker subprocess only spent 249.7ms
+        # — the remaining ~17s was parent-side blocking (rglob FS
+        # walk + per-file sync read_text accumulating between the
+        # subprocess awaits).
+        #
+        # Composition (NO new primitives — both are pre-existing):
+        #   * offload_blocking(rglob)  — frees loop during FS walk
+        #   * offload_blocking(read_text) — frees loop during disk IO
+        #   * cooperative_yield_every_n_async  — gives other coroutines
+        #     (notably ControlPlaneWatchdog) scheduling slots every N
+        #     files inside the otherwise-tight scan loop.
+        from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+            cooperative_yield_every_n_async,
+            offload_blocking,
+        )
+
         for scan_path in self._scan_paths:
             root = self._repo_root / scan_path
             if not root.exists():
                 continue
-            for py_file in root.rglob("*.py"):
+            # Slice 12L Part B — offload the rglob FS walk to a
+            # worker thread. ``root.rglob("*.py")`` is a sync
+            # generator that walks every directory under ``root``;
+            # on this repo it traverses ~50K dirs and produces ~5K
+            # paths. Building the list in a worker thread frees the
+            # loop entirely during the walk. The returned list is
+            # then iterable with cooperative yields.
+            try:
+                py_files = await offload_blocking(
+                    lambda r=root: list(r.rglob("*.py")),
+                    label="opportunity_miner.rglob",
+                )
+            except Exception:  # noqa: BLE001 — preserve scan loop
+                logger.warning(
+                    "OpportunityMinerSensor: rglob failed for %s",
+                    scan_path, exc_info=True,
+                )
+                continue
+            async for py_file in cooperative_yield_every_n_async(py_files):
                 rel = str(py_file.relative_to(self._repo_root))
 
                 if not self._is_production_code(py_file, root):
@@ -491,8 +531,16 @@ class OpportunityMinerSensor:
                     continue
 
                 scanned += 1
+                # Slice 12L Part B — offload disk read. ``read_text``
+                # is sync IO that can stall the loop on slow disks or
+                # large files. ``offload_blocking`` routes through
+                # ``asyncio.to_thread`` so the loop tick continues.
                 try:
-                    source = py_file.read_text(encoding="utf-8")
+                    source = await offload_blocking(
+                        py_file.read_text,
+                        encoding="utf-8",
+                        label="opportunity_miner.read_text",
+                    )
                 except (OSError, UnicodeDecodeError):
                     errors += 1
                     continue
