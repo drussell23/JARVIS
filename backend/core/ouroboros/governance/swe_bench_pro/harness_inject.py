@@ -89,7 +89,7 @@ _DEFAULT_INJECT_COUNT: int = 1
 
 
 class SWEBenchProInjectionVerdict(str, enum.Enum):
-    """Six canonical outcomes for maybe_inject_swe_bench_at_boot.
+    """Seven canonical outcomes for maybe_inject_swe_bench_at_boot.
 
     ``INJECTED_AUTOSCORE`` is the closed-loop outcome: when the
     autoscore flag is ON the boot hook hands the loaded ProblemSpec
@@ -98,6 +98,19 @@ class SWEBenchProInjectionVerdict(str, enum.Enum):
     auto-scored against its gold patch on its terminal event. The
     legacy ``INJECTED`` outcome is the open-loop path (ingest only,
     no scoring) — preserved byte-identical when the flag is OFF.
+
+    ``MISCONFIGURED_PHASE_A_DISABLED`` is the Slice 12N config-
+    hardening outcome: when the operator has set
+    ``JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=true`` but the
+    Phase A master flag ``JARVIS_SWE_BENCH_PRO_ENABLED`` is OFF,
+    every ``load_problem()`` call would return ``MISSING`` (the
+    Phase A loader short-circuits on the master gate). The prior
+    behavior surfaced this as an ambiguous ``FAILED_LOAD`` per
+    candidate instance — operators couldn't tell "config error"
+    from "real missing problem". Slice 12N halts cleanly with a
+    clear distinct verdict BEFORE any load/ingest attempt, so
+    no budget is burned and the operator sees an unambiguous
+    actionable signal.
     """
 
     INJECTED = "injected"
@@ -106,6 +119,7 @@ class SWEBenchProInjectionVerdict(str, enum.Enum):
     SKIPPED_NO_PROBLEMS = "skipped_no_problems"
     FAILED_LOAD = "failed_load"
     FAILED_INJECT = "failed_inject"
+    MISCONFIGURED_PHASE_A_DISABLED = "misconfigured_phase_a_disabled"
 
 
 # ===========================================================================
@@ -434,6 +448,45 @@ async def maybe_inject_swe_bench_at_boot(
             "cannot inject"
         )
         return SWEBenchProInjectionVerdict.FAILED_INJECT
+
+    # Slice 12N — config-hardening preflight. When operator has
+    # turned the inject hook ON but the Phase A loader master flag
+    # is OFF, every ``load_problem()`` call returns ``MISSING`` (the
+    # Phase A loader short-circuits on the master gate). The prior
+    # behavior surfaced this as ambiguous ``FAILED_LOAD`` per
+    # candidate instance — operators could not tell "config error"
+    # from "real missing problem". Halt cleanly with a distinct
+    # verdict + clear actionable log line BEFORE any load/ingest
+    # attempt, so no budget is burned and no worktree is created.
+    # Composes the canonical ``swe_bench_pro_enabled()`` predicate
+    # rather than re-reading the env directly (single source of
+    # truth — same gate that ``load_problem`` itself uses).
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (  # noqa: E501
+            swe_bench_pro_enabled,
+        )
+        if not swe_bench_pro_enabled():
+            logger.warning(
+                "[SWEBenchPro.HarnessInject] MISCONFIGURED: "
+                "JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=true "
+                "but JARVIS_SWE_BENCH_PRO_ENABLED is OFF — every "
+                "load_problem() call would return MISSING. Set "
+                "JARVIS_SWE_BENCH_PRO_ENABLED=true to proceed. "
+                "No budget burned. No worktree created."
+            )
+            return SWEBenchProInjectionVerdict.MISCONFIGURED_PHASE_A_DISABLED
+    except Exception:  # noqa: BLE001 — boot-must-never-fail
+        # Defensive: if the predicate import itself fails for some
+        # reason, fall through to the legacy resolution path. The
+        # subsequent FAILED_LOAD verdict will at least surface a
+        # downstream signal even if the new distinct verdict is
+        # unreachable.
+        logger.debug(
+            "[SWEBenchPro.HarnessInject] swe_bench_pro_enabled "
+            "predicate raised — falling through to legacy path",
+            exc_info=True,
+        )
+
     try:
         instance_ids = _resolve_instance_ids()
         if not instance_ids:

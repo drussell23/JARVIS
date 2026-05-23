@@ -229,6 +229,42 @@ _FALLBACK_OUTER_RETRY_BACKOFF_S = float(
     os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")
 )
 
+
+# ---------------------------------------------------------------------------
+# Slice 12N — ProviderRoute → CircuitTripOrigin mapping
+# ---------------------------------------------------------------------------
+#
+# Blast-radius isolation: only FOREGROUND-origin per-op breakers
+# escalate structural trips to the global session_exhausted
+# threshold. Background / speculative ops get their own per-op
+# breaker but their structural trips are ISOLATED — they cannot
+# assassinate a healthy in-flight foreground op (the wedge that
+# killed the SWE-Bench-Pro fixture in bt-2026-05-23-015723).
+#
+# Lookup is by lowercased provider_route string so this map stays
+# robust to either Enum-as-value or bare-string population of
+# ``context.provider_route``. Unknown / empty routes default to
+# FOREGROUND at the call site (safer — preserves legacy escalation).
+#
+# Lazy import inside the dict construction is unavoidable here
+# because circuit_breaker would otherwise cycle through
+# candidate_generator at module load. Resolved once at module
+# import time.
+def _slice12n_build_route_origin_map() -> Dict[str, Any]:
+    from backend.core.ouroboros.governance.circuit_breaker import (
+        CircuitTripOrigin,
+    )
+    return {
+        "immediate":   CircuitTripOrigin.FOREGROUND,
+        "standard":    CircuitTripOrigin.FOREGROUND,
+        "complex":     CircuitTripOrigin.FOREGROUND,
+        "background":  CircuitTripOrigin.BACKGROUND,
+        "speculative": CircuitTripOrigin.SPECULATIVE,
+    }
+
+
+_SLICE12N_ROUTE_TO_ORIGIN: Dict[str, Any] = _slice12n_build_route_origin_map()
+
 # Anthropic resilience pack 2026-04-25 — failure-rate-aware outer-retry.
 # When the FailbackStateMachine has logged transient failures recently
 # (a window of consecutive_failures > 0 within the past few cycles), bump
@@ -4229,6 +4265,7 @@ class CandidateGenerator:
                 from backend.core.ouroboros.governance.circuit_breaker import (  # noqa: E501
                     CircuitBreaker as _Slice7e_CircuitBreaker,
                     CircuitScope as _Slice7e_CircuitScope,
+                    CircuitTripOrigin as _Slice12N_CircuitTripOrigin,
                     VerdictAction as _Slice7e_VerdictAction,
                 )
                 from backend.core.ouroboros.governance.provider_retry_classifier import (  # noqa: E501
@@ -4243,9 +4280,25 @@ class CandidateGenerator:
                 _slice7e_op_id = str(
                     getattr(context, "op_id", "") or "",
                 )
+                # Slice 12N — blast-radius isolation. Map the op's
+                # ProviderRoute to a CircuitTripOrigin so background /
+                # speculative ops can trip their per-op breaker
+                # WITHOUT escalating to the global session_exhausted
+                # threshold. Foreground (IMMEDIATE / STANDARD /
+                # COMPLEX) routes still escalate byte-identically to
+                # pre-Slice-12N behavior. Unknown routes default to
+                # FOREGROUND (safer — preserves legacy escalation).
+                _slice12n_route = str(
+                    getattr(context, "provider_route", "") or "",
+                ).strip().lower()
+                _slice12n_origin = _SLICE12N_ROUTE_TO_ORIGIN.get(
+                    _slice12n_route,
+                    _Slice12N_CircuitTripOrigin.FOREGROUND,
+                )
                 _slice7e_breaker = _Slice7e_CircuitBreaker(
                     op_id=_slice7e_op_id,
                     scope=_Slice7e_CircuitScope.PER_OP,
+                    origin=_slice12n_origin,
                 )
                 _outer_attempt = 0
                 # Anthropic resilience pack 2026-04-25 — failure-rate-aware

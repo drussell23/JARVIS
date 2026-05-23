@@ -179,6 +179,62 @@ class CircuitScope(str, enum.Enum):
     GLOBAL = "global"
 
 
+class CircuitTripOrigin(str, enum.Enum):
+    """Slice 12N — closed taxonomy of where a per-op breaker trip
+    originated, governing whether it counts toward the GLOBAL
+    breaker's session_exhausted threshold.
+
+    The wedge surfaced in bt-2026-05-23-015723: a background
+    OpportunityMiner op hit ``TERMINAL_STRUCTURAL``, that incremented
+    the global trip counter, the global breaker fired
+    ``session_exhausted``, and the in-flight SWE-Bench-Pro fixture
+    op (a high-priority foreground op) was assassinated mid-GENERATE.
+
+    Slice 12N isolation: ONLY ``FOREGROUND`` trips count toward
+    the global threshold. Background / speculative / maintenance
+    trips terminate their own op locally but cannot blast-radius
+    out to take down healthy foreground work.
+
+      * ``FOREGROUND`` — high-priority pipeline ops where a structural
+        provider trip IS a session-wide acknowledgement that the
+        budget is gone. Maps from ProviderRoute IMMEDIATE / STANDARD
+        / COMPLEX. These are the only origins that escalate to the
+        global breaker.
+
+      * ``BACKGROUND`` — autonomous sensor / mining ops
+        (OpportunityMiner, DocStaleness, TodoScanner, etc.) where a
+        trip means "this op gave up on its budget"; nothing about
+        foreground work changes. Maps from ProviderRoute BACKGROUND.
+
+      * ``SPECULATIVE`` — fire-and-forget pre-computation
+        (IntentDiscovery, DreamEngine pre-warming). Same isolation
+        as BACKGROUND. Maps from ProviderRoute SPECULATIVE.
+
+      * ``MAINTENANCE`` — periodic upkeep tasks
+        (TopologySentinel probes, health checks, schema validations).
+        Same isolation as BACKGROUND. Default for tasks that don't
+        carry a ProviderRoute at all.
+
+    Backward compatibility: default is ``FOREGROUND`` so any
+    existing caller that doesn't plumb origin preserves the
+    pre-Slice-12N escalation semantics byte-identically. Slice 12N
+    only relaxes escalation for callers that explicitly tag their
+    breaker as non-foreground.
+    """
+
+    FOREGROUND = "foreground"
+    BACKGROUND = "background"
+    SPECULATIVE = "speculative"
+    MAINTENANCE = "maintenance"
+
+
+# Slice 12N — the set of origins that escalate to global. Centralized
+# so the AST pin and the runtime gate read the same source.
+_FOREGROUND_ORIGINS: frozenset = frozenset({
+    CircuitTripOrigin.FOREGROUND,
+})
+
+
 class VerdictAction(str, enum.Enum):
     """Closed 3-value verdict — what the caller should do next."""
 
@@ -622,12 +678,19 @@ class CircuitBreaker:
         *,
         op_id: str = "",
         scope: CircuitScope = CircuitScope.PER_OP,
+        origin: CircuitTripOrigin = CircuitTripOrigin.FOREGROUND,
         consecutive_provider: Optional[Callable[[], int]] = None,
         budget_provider: Optional[Callable[[], Optional[float]]] = None,
         rng: Optional[Any] = None,
     ) -> None:
         self._op_id: str = op_id
         self._scope: CircuitScope = scope
+        # Slice 12N — origin governs whether structural trips on
+        # this breaker escalate to the global session_exhausted
+        # threshold. Default FOREGROUND preserves pre-Slice-12N
+        # behavior byte-identically for any caller that doesn't
+        # plumb origin.
+        self._origin: CircuitTripOrigin = origin
         self._state: CircuitState = CircuitState.CLOSED
         self._backoff_attempt: int = 0
         self._next_attempt_at: Optional[float] = None
@@ -659,6 +722,13 @@ class CircuitBreaker:
     @property
     def scope(self) -> CircuitScope:
         return self._scope
+
+    @property
+    def origin(self) -> CircuitTripOrigin:
+        """Slice 12N — origin of this breaker. Drives whether
+        structural trips escalate to the global session_exhausted
+        threshold (only FOREGROUND origins do)."""
+        return self._origin
 
     @property
     def backoff_attempt(self) -> int:
@@ -793,12 +863,24 @@ class CircuitBreaker:
         # bubble TERMINAL_STRUCTURAL — quota / config are op-specific
         # signals, not session-wide acknowledgements that the budget
         # is dead.
+        #
+        # Slice 12N — blast-radius isolation. Even within structural
+        # trips, ONLY foreground origins escalate to the global
+        # threshold. Background / speculative / maintenance trips
+        # terminate this op locally but cannot blast-radius out to
+        # take down healthy foreground work via session_exhausted.
+        # Pre-Slice-12N behaviour is preserved byte-identically when
+        # origin is FOREGROUND (the constructor default).
+        escalated_to_global = False
         if terminal_reason_code.endswith(":terminal_structural"):
-            get_global_breaker().report_structural_trip()
+            if self._origin in _FOREGROUND_ORIGINS:
+                get_global_breaker().report_structural_trip()
+                escalated_to_global = True
         logger.info(
             "[CircuitBreaker] op=%s tripped → OPEN_TERMINAL "
-            "reason=%s",
+            "reason=%s origin=%s escalated_to_global=%s",
             self._op_id or "?", terminal_reason_code,
+            self._origin.value, escalated_to_global,
         )
         return CircuitVerdict(
             action=VerdictAction.TERMINATE_UNRESOLVED,
