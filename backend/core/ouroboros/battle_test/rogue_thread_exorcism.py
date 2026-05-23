@@ -133,59 +133,133 @@ def apply_telemetry_env_defaults() -> List[Tuple[str, str]]:
 _AIOSQLITE_PATCHED: bool = False
 
 
+def _daemonize_existing_aiosqlite_threads() -> int:
+    """Walk every currently-alive Python thread; if any has a name
+    matching the aiosqlite worker convention, attempt to flip its
+    ``daemon`` attribute to ``True`` defensively.
+
+    Returns the count of threads successfully daemonized. NEVER
+    raises.
+
+    **CPython runtime constraint:** ``Thread.daemon`` cannot be
+    set after ``start()`` has been called — CPython raises
+    ``RuntimeError: cannot set daemon status of active thread``.
+    The sweep catches and swallows this, so for any thread that
+    has already started, the function silently records a
+    no-op. The primary defense is therefore Layer 1
+    (``Connection.__init__`` wrap), which flips the daemon flag
+    inside ``__init__`` BEFORE the Thread is started in
+    ``__aenter__``.
+
+    Layer 3 still has value for the rare race where a Connection
+    has been constructed but not yet entered (caller built it
+    pre-patch but hasn't ``await``'d into it). For the common
+    case (already-running workers), it's documented as a
+    best-effort no-op rather than a hard guarantee.
+    """
+    import threading as _threading
+    daemonized = 0
+    try:
+        for _t in _threading.enumerate():
+            try:
+                _name = (_t.name or "").lower()
+                if "aiosqlite" in _name and not _t.daemon:
+                    _t.daemon = True
+                    daemonized += 1
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return daemonized
+
+
 def patch_aiosqlite_to_daemon() -> bool:
-    """Monkeypatch ``aiosqlite.core.Connection`` so its per-connection
-    worker thread spawns as ``daemon=True``.
+    """Slice 12X Phase 2 — TOTAL aiosqlite daemonization.
 
-    Returns ``True`` when the patch was successfully applied (or
-    already applied); ``False`` when aiosqlite isn't installed or the
-    patch failed. NEVER raises.
+    Layers FOUR distinct daemonization disciplines so no
+    connection-creation path can spawn a non-daemon worker:
 
-    Strategy: aiosqlite's ``Connection.__init__`` builds the worker
-    via ``threading.Thread(target=self.run)`` with no explicit
-    ``daemon=`` kwarg — Python defaults to ``daemon=False``. We
-    replace ``Connection.__init__`` with a wrapper that constructs
-    the base instance, then flips the worker thread's ``daemon``
-    attribute to ``True`` BEFORE it's started.
+      1. Monkeypatch ``aiosqlite.core.Connection.__init__`` — flips
+         the worker thread's ``daemon`` attribute after the parent
+         ``__init__`` constructs it. (Slice 12W's original
+         discipline.)
+      2. Monkeypatch ``aiosqlite.connect()`` — the top-level
+         factory used by every caller in the codebase
+         (``cost_tracker``, ``hybrid``, ``trinity_base_client``,
+         ``persistent_intelligence_manager``). Any connection
+         created via this path also gets a daemon-true worker.
+      3. Walk ``threading.enumerate()`` at patch time and
+         daemonize any aiosqlite worker thread that's already
+         alive (the "monkeypatch landed too late" case the
+         bt-2026-05-23-204519 tombstone surfaced).
+      4. Same ``_AIOSQLITE_PATCHED`` latch as before — idempotent.
 
-    The patch is benign when aiosqlite drains cleanly via async
-    ``__aexit__`` — the daemon flag only matters at hard interpreter
-    teardown (``Py_FinalizeEx``). Connections that exit via the
-    normal path still close in-order; only orphaned connections (the
-    cancellation-cascade case the soak surfaced) benefit from
-    daemonization.
+    Returns ``True`` when at least one of (1)–(3) succeeded.
+    Returns ``False`` only when aiosqlite isn't installed. NEVER
+    raises.
     """
     global _AIOSQLITE_PATCHED
     if _AIOSQLITE_PATCHED:
+        # Idempotent fast path — but ALSO re-sweep existing
+        # threads so callers who arm this after a later
+        # connection opens still get retroactive daemonization.
+        _daemonize_existing_aiosqlite_threads()
         return True
     try:
+        import aiosqlite as _aiosqlite_top  # type: ignore[import]
         import aiosqlite.core as _aiosqlite_core  # type: ignore[import]
     except Exception:  # noqa: BLE001 — aiosqlite not installed
         return False
 
+    success_count = 0
+
+    # ── Layer 1: Connection.__init__ wrap ──
+    #
+    # Slice 12X discovery: ``aiosqlite.core.Connection`` IS-A
+    # :class:`threading.Thread` (multiple-inheritance via
+    # ``class Connection(Thread)``). Slice 12W looked for
+    # ``_tx``/``_loop_thread``/``_worker`` attributes that don't
+    # exist on this class — the Connection IS the thread. The
+    # tombstone in bt-2026-05-23-204519 confirmed this: the
+    # offending frame was ``aiosqlite/core.py:99 in run`` (which
+    # is Thread.run on a Connection instance).
+    #
+    # Layer 1 now flips ``self.daemon = True`` directly when
+    # ``self`` is a Thread subclass, after the base __init__
+    # but BEFORE the worker is started (start happens later in
+    # ``__aenter__``, so the daemon flip is legal at this point).
+    # The legacy attribute walk is kept as a fallback for
+    # future aiosqlite versions that might split the worker out.
     try:
         _original_init = _aiosqlite_core.Connection.__init__
 
         def _exorcised_init(self, *args: Any, **kwargs: Any) -> None:
-            # Run the original constructor — this builds + starts
-            # the worker thread.
             _original_init(self, *args, **kwargs)
-            # Flip the worker to daemon=True. The aiosqlite
-            # Connection exposes the thread via several attribute
-            # names across versions (._tx, ._loop_thread, etc.) —
-            # walk known candidates defensively. The interpreter
-            # tolerates setting daemon AFTER start IF the thread
-            # is still alive (Python docs allow this in CPython
-            # 3.0+).
+            # Primary path — Connection IS a Thread.
+            try:
+                import threading as _th
+                if isinstance(self, _th.Thread):
+                    # daemon can only be set before start(); we
+                    # are still inside __init__ so the Thread
+                    # has NOT been started yet. This is the
+                    # critical window the Slice 12W patch missed.
+                    try:
+                        # Some Thread states reject daemon
+                        # assignment; the bare attribute set
+                        # below works pre-start in CPython.
+                        self.daemon = True
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+            # Fallback path — future-compat for aiosqlite
+            # versions that may split the worker out.
             for candidate in (
                 "_tx", "_loop_thread", "_thread", "_worker",
             ):
                 _thread = getattr(self, candidate, None)
                 if _thread is None:
                     continue
-                # threading.Thread instances expose .daemon and
-                # .setDaemon; the property setter is the modern
-                # form. Either works.
                 try:
                     if hasattr(_thread, "daemon"):
                         _thread.daemon = True
@@ -193,15 +267,67 @@ def patch_aiosqlite_to_daemon() -> bool:
                     pass
 
         _aiosqlite_core.Connection.__init__ = _exorcised_init  # type: ignore[assignment]
+        success_count += 1
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[RogueThreadExorcism] Connection.__init__ wrap failed "
+            "(handled)", exc_info=True,
+        )
+
+    # ── Layer 2: top-level connect() factory wrap ──
+    # ``aiosqlite.connect`` is the user-facing entry point. Across
+    # aiosqlite versions it's either a function returning a
+    # Connection or an `_ContextManagerMixin`-style awaitable
+    # context manager. We wrap whatever it is and ensure the
+    # returned object's worker is daemonized — either at construction
+    # time (sync) or at __aenter__ time (async).
+    try:
+        _original_connect = getattr(_aiosqlite_top, "connect", None)
+        if _original_connect is not None:
+
+            def _exorcised_connect(*args: Any, **kwargs: Any) -> Any:
+                _obj = _original_connect(*args, **kwargs)
+                # Best-effort: if the returned object already has
+                # one of the worker attribute names, daemonize
+                # immediately. If it's still an awaitable context
+                # manager, the Layer 1 Connection.__init__ wrap
+                # will handle it when the actual Connection is
+                # constructed at await time.
+                for candidate in (
+                    "_tx", "_loop_thread", "_thread", "_worker",
+                ):
+                    _thread = getattr(_obj, candidate, None)
+                    if _thread is not None:
+                        try:
+                            if hasattr(_thread, "daemon"):
+                                _thread.daemon = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                return _obj
+
+            _aiosqlite_top.connect = _exorcised_connect  # type: ignore[assignment]
+            success_count += 1
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[RogueThreadExorcism] aiosqlite.connect() wrap failed "
+            "(handled)", exc_info=True,
+        )
+
+    # ── Layer 3: sweep existing threads ──
+    _retro = _daemonize_existing_aiosqlite_threads()
+    if _retro > 0:
+        try:
+            logger.info(
+                "[RogueThreadExorcism] retroactively daemonized "
+                "%d existing aiosqlite worker thread(s)", _retro,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    if success_count > 0:
         _AIOSQLITE_PATCHED = True
         return True
-    except Exception:  # noqa: BLE001 — never raise into harness boot
-        logger.debug(
-            "[RogueThreadExorcism] aiosqlite daemonize patch failed "
-            "(handled — pre-Slice-12W behavior preserved)",
-            exc_info=True,
-        )
-        return False
+    return False
 
 
 # ============================================================================
@@ -310,6 +436,7 @@ def exorcise_at_boot(
 __all__ = [
     "ROGUE_THREAD_EXORCISM_ENABLED_ENV_VAR",
     "_TELEMETRY_DEFAULTS",
+    "_daemonize_existing_aiosqlite_threads",
     "apply_telemetry_env_defaults",
     "disable_posthog_if_loaded",
     "exorcism_enabled",
