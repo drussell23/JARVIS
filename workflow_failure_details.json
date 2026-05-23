@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26325656429",
-  "branch": "fix/ci/pr-automation-validation-run91057-20260523-062131",
-  "commit_sha": "c028b4d",
-  "run_number": 91062,
-  "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run91062-20260523-062336",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91062)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26325693753",
+  "branch": "fix/ci/pr-automation-validation-run91062-20260523-062336",
+  "commit_sha": "625c63e",
+  "run_number": 91065,
+  "failed_count": 2,
+  "fix_branch": "fix/ci/pr-automation-validation-run91065-20260523-062527",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91065)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 30,
-              "content": "2026-05-23T06:22:11.4545284Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-05-23T06:24:06.8791345Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-05-23T06:22:12.0152380Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91057)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-05-23T06:24:07.4642035Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #91062)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -33,7 +33,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-05-23T06:22:12.0568336Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-05-23T06:24:07.5225516Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -60,7 +60,16 @@
       "severity": "high",
       "category": "timeout",
       "similar_failures": []
+    },
+    {
+      "error_patterns": [],
+      "suggested_fixes": [
+        "Check the workflow logs for more details"
+      ],
+      "severity": "medium",
+      "category": "unknown",
+      "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-23T06:23:36.465031"
+  "timestamp": "2026-05-23T06:25:27.661012"
 }
