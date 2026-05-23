@@ -682,9 +682,15 @@ class DoublewordProvider:
             from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
                 check_preflight as _sba_check_preflight,
             )
+            # Slice 12Y Part 1 — pass signal_source so the SBA
+            # can apply the background-spend ceiling for sensor
+            # ops. No-op when source is None or non-background-tier.
             _sba_check_preflight(
                 provider_name="doubleword",
                 estimated_cost_usd=float(self._max_cost_per_op or 0.0),
+                signal_source=(
+                    getattr(context, "signal_source", None)
+                ),
             )
         except ImportError:
             # Module absent on this build — graceful fall-through to

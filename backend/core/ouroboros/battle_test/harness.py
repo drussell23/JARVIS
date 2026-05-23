@@ -6534,6 +6534,54 @@ class BattleTestHarness:
                 "JARVIS_SHUTDOWN_WAL_FIRST_ENABLED", "true",
             ).strip().lower()
             if _wal_second_raw in {"1", "true", "yes", "on"}:
+                # ── Slice 12Y Part 2 — WAL-second telemetry seal ──
+                #
+                # bt-2026-05-23-211212 surfaced that the WAL-second
+                # "fired" log line never appeared in debug.log even
+                # though the WAL-second code path was clearly
+                # reachable. Root cause: when the harness's cleanup
+                # chain hangs upstream (e.g., intake_service.stop()
+                # wedged at step 2 in that soak), execution can
+                # reach WAL-second through a degraded path where
+                # the standard logger handlers are already in a
+                # questionable state OR the atexit fallback fired
+                # first and the _summary_written latch wasn't
+                # actually reset early enough.
+                #
+                # Slice 12Y makes the telemetry airtight via THREE
+                # log emissions:
+                #
+                #   (1) entry-marker logged BEFORE any potentially
+                #       failing operation, so we know WAL-second
+                #       was REACHED even if the write throws
+                #   (2) stderr direct-write (bypasses the logger
+                #       handler chain entirely — survives wedged
+                #       handlers, lands in tee/pipe redirects)
+                #   (3) success-marker via the standard logger
+                #       after the write completes
+                #
+                # All three are individually try-wrapped so a
+                # single failure can't mask the others.
+                try:
+                    sys.stderr.write(
+                        "[Slice12Y.WALSecond.REACHED] "
+                        "Slice 12W WAL-second path entered "
+                        "(post-GLS.stop) — about to persist "
+                        "summary.json with operations[] snapshot\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    logger.info(
+                        "[Harness] Slice 12W WAL-second: ENTRY "
+                        "marker — about to call "
+                        "_atexit_fallback_write with "
+                        "session_outcome=in_flight_shutdown_wal_second"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
                 # Reset the _summary_written latch so the
                 # fallback writer re-fires (the WAL-first path
                 # set it to True; without reset, this would
@@ -6543,23 +6591,45 @@ class BattleTestHarness:
                     self._summary_written = False
                 except Exception:  # noqa: BLE001
                     pass
+                _wal_second_succeeded = False
                 try:
                     self._atexit_fallback_write(
                         session_outcome="in_flight_shutdown_wal_second",
                     )
-                    logger.info(
-                        "[Harness] Slice 12W WAL-second: "
-                        "post-orchestrator summary.json persisted "
-                        "(operations[] now reflects final "
-                        "_active_ops drain)",
-                    )
+                    _wal_second_succeeded = True
                 except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "[Harness] Slice 12W WAL-second write "
-                        "raised (swallowed) — proceeding with "
-                        "remaining cleanup",
-                        exc_info=True,
+                    try:
+                        logger.warning(
+                            "[Harness] Slice 12W WAL-second "
+                            "write raised (swallowed) — "
+                            "proceeding with remaining cleanup",
+                            exc_info=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                # Slice 12Y — success log AND stderr backstop
+                # always emitted (only the write outcome differs).
+                try:
+                    if _wal_second_succeeded:
+                        logger.info(
+                            "[Harness] Slice 12W WAL-second: "
+                            "post-orchestrator summary.json "
+                            "persisted (operations[] now "
+                            "reflects final _active_ops drain)"
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    sys.stderr.write(
+                        "[Slice12Y.WALSecond.RESULT] "
+                        "succeeded=%s\n" % str(
+                            _wal_second_succeeded,
+                        ),
                     )
+                    sys.stderr.flush()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001 — defensive
             pass
 

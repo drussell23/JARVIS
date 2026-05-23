@@ -552,12 +552,19 @@ class TestPhase3WALSecond:
         """``_atexit_fallback_write`` has an early-return on
         ``_summary_written=True``. WAL-first sets the latch; if
         WAL-second doesn't reset it, the second write becomes a
-        no-op and operations[] still lands empty."""
+        no-op and operations[] still lands empty.
+
+        Slice 12Y extended the surrounding block with additional
+        telemetry — search the broader window (8000 chars) to
+        survive future expansions; the position-pin tests
+        guarantee the reset is still INSIDE the WAL-second
+        block (between Phase 3 marker and step 5)."""
         src = Path(
             "backend/core/ouroboros/battle_test/harness.py"
         ).read_text()
         wal_second_idx = src.find("Slice 12W Phase 3")
-        block = src[wal_second_idx:wal_second_idx + 3000]
+        step5_idx = src.find("# 5. Governance stack")
+        block = src[wal_second_idx:step5_idx]
         assert "_summary_written = False" in block, (
             "WAL-second does not reset the _summary_written "
             "latch — the atexit fallback's early-return will "
