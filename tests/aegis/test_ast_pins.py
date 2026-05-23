@@ -38,29 +38,58 @@ def _aegis_modules() -> list:
 # ---------------------------------------------------------------------------
 
 
-def test_ast_pin_no_v1_routes_in_daemon():
-    """daemon.py must register NO route whose path starts with /v1/.
-    Slice 2 will remove this pin (or scope it more narrowly) when it
-    adds /v1/messages + /v1/chat/completions."""
+def test_ast_pin_no_v1_route_literals_in_daemon():
+    """daemon.py must contain NO literal ``/v1/...`` string in any
+    ``router.add_*`` call.
+
+    Slice 2 added /v1/messages + /v1/chat/completions forwarding, but
+    those paths are registered via iteration over the upstream_registry
+    map keys — never as string literals in daemon.py. Keeping this pin
+    enforces the single-source-of-truth discipline:
+    :mod:`upstream_registry` is the only place where /v1/* path
+    literals live, and adding a new upstream endpoint is a one-line
+    edit there + a matching :mod:`credential_registry` entry. A literal
+    here would bypass the boot-time credential-alignment check.
+    """
     tree = ast.parse(DAEMON_FILE.read_text())
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        # Match calls like app.router.add_post("/path", ...)
         if not isinstance(node.func, ast.Attribute):
             continue
         if not node.func.attr.startswith("add_"):
             continue
-        # First arg should be the path string literal.
         if not node.args:
             continue
         first = node.args[0]
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             assert not first.value.startswith("/v1/"), (
-                f"daemon.py registers a /v1/* route ({first.value!r}) — "
-                f"this is forbidden in Slice 1. Slice 2 will add provider "
-                f"forwarding."
+                f"daemon.py registers a /v1/* route literal "
+                f"({first.value!r}) — paths must come from "
+                f"upstream_registry.snapshot(), not literals here. "
+                f"Adding an endpoint is a registry edit, not a daemon edit."
             )
+
+
+def test_ast_pin_v1_paths_known_only_via_upstream_registry():
+    """Crosscheck: every path the upstream_registry exposes must
+    follow the ``/v1/`` family convention, and the registry must
+    align with the credential_registry (enforced at boot via
+    ``upstream_registry._validate_credential_registry_alignment``;
+    pinned here as well so CI catches a misaligned add fast)."""
+    from backend.core.ouroboros.aegis.upstream_registry import (
+        known_aegis_paths,
+        snapshot,
+    )
+    paths = known_aegis_paths()
+    assert paths, "upstream_registry has no known paths"
+    for p in paths:
+        assert p.startswith("/v1/"), (
+            f"upstream_registry path {p!r} doesn't follow the /v1/ "
+            f"convention — Aegis only forwards /v1/* endpoints"
+        )
+    # snapshot() raises at boot if credential_registry doesn't align.
+    snapshot()
 
 
 # ---------------------------------------------------------------------------
