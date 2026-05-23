@@ -1,0 +1,141 @@
+{
+  "workflow_name": "Code Quality Checks",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26328958126",
+  "branch": "chore/passb-graduation-soak-5-20260523T091134Z",
+  "commit_sha": "1101a91",
+  "run_number": 8081,
+  "failed_count": 2,
+  "fix_branch": "fix/ci/code-quality-checks-run8081-20260523-091513",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Code Quality Checks (Run #8081)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 36,
+              "content": "2026-05-23T09:12:53.4580327Z ##[error]fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 40,
+              "content": "2026-05-23T09:13:10.5381664Z ##[error]fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 44,
+              "content": "2026-05-23T09:13:23.6078563Z ##[error]fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 45,
+              "content": "2026-05-23T09:13:23.6131011Z ##[error]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 4
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 37,
+              "content": "2026-05-23T09:12:53.4590195Z The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 41,
+              "content": "2026-05-23T09:13:10.5404382Z The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 45,
+              "content": "2026-05-23T09:13:23.6131011Z ##[error]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 8,
+              "content": "2026-05-23T09:12:53.2680294Z hint: to use in all of your new repositories, which will suppress this warning,",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 98,
+              "content": "2026-05-23T09:13:24.1157165Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/upload-artifact@v4. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 86,
+              "content": "2026-05-23T09:14:02.4365834Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 58,
+              "content": "2026-05-23T09:14:02.4184105Z \u001b[36;1mQUALITY_RESULT=\"failure\"\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 88,
+              "content": "2026-05-23T09:14:02.4815926Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/download-artifact@v4. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-23T09:15:13.056906"
+}
