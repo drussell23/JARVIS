@@ -153,6 +153,88 @@ def _frame_signature(frame) -> str:
         return "<unknown_frame>"
 
 
+# ── Slice 12W Phase 2 — Idle-frame exclusion registry ──
+#
+# bt-2026-05-23-201956 showed 7/8 STUCK_FRAME emissions on
+# ``selectors.py:566:select`` — that's the asyncio event loop's
+# ``kqueue.control()`` / ``epoll.poll()`` syscall in its NORMAL idle
+# position when no scheduled work is ready. False positive: the loop
+# isn't wedged, it's just waiting for I/O.
+#
+# Slice 12W tunes the sidecar: a closed registry of known-harmless
+# wait-state frames. When MainThread's signature matches any entry
+# (by filename basename + function name suffix), the sidecar treats
+# it as legitimate idle and DOES NOT emit STUCK_FRAME. The registry
+# is data-driven (not regex-matched) so adding new exclusions is one
+# tuple — single source of truth.
+#
+# Real wedges (compute, sync I/O, lock acquire, third-party
+# deadlocks) stay outside this registry and continue to fire
+# STUCK_FRAME emissions. The earlier soak's lone true-positive
+# (``threading.py:1590 in _shutdown``) is intentionally NOT in
+# the exclusion list — that's the exact wedge class we want
+# attribution for.
+#
+# Each entry is ``(filename_basename, function_name)``. Match is
+# AND on both: filename endswith basename AND function name equals
+# the second tuple element. This is more precise than substring
+# matching (avoids accidentally excluding a user-defined function
+# named ``select`` in some unrelated module).
+_IDLE_FRAME_EXCLUSIONS: tuple = (
+    # asyncio event loop's selector idle states. The loop blocks
+    # on the OS's I/O multiplexer (kqueue on macOS, epoll on Linux,
+    # select() fallback) when no scheduled task is ready. This is
+    # the normal "loop is alive but no work" position.
+    ("selectors.py", "select"),
+    # asyncio.base_events.run_forever / run_until_complete /
+    # _run_once — these are the loop's outer drivers. If MainThread
+    # is observed inside run_forever() without descending further,
+    # the loop is idle (no current task running).
+    ("base_events.py", "run_forever"),
+    ("base_events.py", "run_until_complete"),
+    ("base_events.py", "_run_once"),
+    # asyncio.events._run — the handle dispatcher; observed
+    # transiently between tasks. Excluded because a single
+    # measurement here means "between tasks," not "stuck on a
+    # specific task."
+    ("events.py", "_run"),
+    # Python's threading.Event.wait + Condition.wait — the
+    # canonical "blocked on a synchronization primitive without
+    # work to do" patterns. These show up on daemon threads that
+    # poll for work; MainThread should rarely hit them, but if
+    # it does, it's legitimately idle (waiting on a signal).
+    ("threading.py", "wait"),
+)
+
+
+def is_idle_frame(filename: str, function_name: str) -> bool:
+    """Return True iff the (filename, function) pair matches any
+    entry in :data:`_IDLE_FRAME_EXCLUSIONS` (legitimate idle state,
+    NOT a wedge). Pure function; testable in isolation.
+
+    Match is endswith-on-filename + equals-on-function:
+
+      * ``selectors.py`` matches anything ending in ``selectors.py``
+        (Python's stdlib path varies by install; basename match
+        avoids hardcoding ``/lib/python3.11/selectors.py``).
+      * Function name must match exactly — substring would be too
+        loose (a user-defined ``select`` should NOT be excluded).
+
+    Returns False for any unrecognized frame so REAL wedges
+    continue to fire STUCK_FRAME emissions.
+    """
+    try:
+        for excl_file, excl_func in _IDLE_FRAME_EXCLUSIONS:
+            if (
+                filename.endswith(excl_file)
+                and function_name == excl_func
+            ):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 class SidecarProfiler:
     """Daemon-thread monitor that catches MainThread wedges in the
     act — NEVER raises into the asyncio loop's context."""
@@ -312,6 +394,26 @@ class SidecarProfiler:
         if age < self._stuck_threshold_s:
             return
 
+        # ── Slice 12W Phase 2 — Idle-frame exclusion ──
+        # If the stuck frame is in the legitimate-idle registry
+        # (selectors.py:select, asyncio loop drivers, threading
+        # Event/Condition.wait), suppress the emission. The
+        # asyncio event loop blocking in kqueue.control() is
+        # NORMAL idle state — not a wedge. Real wedges
+        # (compute, sync I/O, lock contention, third-party
+        # deadlocks) never match the exclusion list and
+        # continue to fire.
+        try:
+            code = frame.f_code
+            if is_idle_frame(code.co_filename, code.co_name):
+                # Reset the throttle so a future REAL wedge on
+                # a different frame is emitted fresh.
+                return
+        except Exception:  # noqa: BLE001
+            # Frame introspection failed — fall through to emit
+            # (better a false positive than missing a wedge).
+            pass
+
         # Log-throttle: don't re-emit the same frame within the
         # throttle window. Different frame (or fresh window after
         # progress) resets the throttle.
@@ -378,7 +480,9 @@ def reset_default_sidecar() -> None:
 
 __all__ = [
     "SidecarProfiler",
+    "_IDLE_FRAME_EXCLUSIONS",
     "get_default_sidecar",
+    "is_idle_frame",
     "reset_default_sidecar",
     "sidecar_enabled",
     "sidecar_poll_interval_s",

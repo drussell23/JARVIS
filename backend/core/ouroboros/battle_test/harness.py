@@ -246,6 +246,33 @@ class BattleTestHarness:
     def __init__(self, config: HarnessConfig) -> None:
         self._config = config
 
+        # ── Slice 12W Phase 1 — Rogue Thread Exorcism ──
+        # MUST run BEFORE any downstream subsystem imports
+        # chromadb / posthog / aiosqlite (which spawn non-daemon
+        # threads that block ``threading._shutdown`` at
+        # ``Py_FinalizeEx`` — root cause of the ShutdownWatchdog
+        # fire in bt-2026-05-23-201956). Sets env vars via
+        # setdefault (operator overrides preserved) +
+        # monkeypatches aiosqlite.Connection for daemon=True
+        # workers + late-disables posthog if already imported.
+        # NEVER raises into boot — failures swallow silently and
+        # the harness continues with pre-Slice-12W behavior.
+        try:
+            from backend.core.ouroboros.battle_test.rogue_thread_exorcism import (  # noqa: E501
+                exorcise_at_boot as _exorcise_at_boot,
+            )
+            _exorcise_at_boot(logger_fn=logger.info)
+        except Exception:  # noqa: BLE001 — never block boot
+            try:
+                logger.debug(
+                    "[Harness] Slice 12W rogue-thread exorcism "
+                    "failed at boot (handled — pre-Slice-12W "
+                    "behavior preserved)",
+                    exc_info=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
         # Session identity
         ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         self._session_id = f"bt-{ts}"
@@ -6473,6 +6500,68 @@ class BattleTestHarness:
                 await self._governed_loop_service.stop()
             except Exception as exc:
                 logger.warning("GovernedLoopService stop failed: %s", exc)
+
+        # ── Slice 12W Phase 3 — WAL-second checkpoint ──
+        # The Phase 1 WAL-first hook (run before step 0) wrote
+        # summary.json at cleanup-start, but at that moment the
+        # SessionRecorder may not yet contain the final operation
+        # records — the circuit-breaker cascade that ended
+        # bt-2026-05-23-201956 was still draining when WAL-first
+        # fired, so operations[] landed empty.
+        #
+        # WAL-second fires AFTER step 4 (GovernedLoopService.stop
+        # completes the orchestrator's _active_ops drain + final
+        # SessionRecorder writes) but BEFORE step 6 (Oracle
+        # Chroma client shutdown) and the subsequent network /
+        # HTTP cleanup steps that can hang past the
+        # ShutdownWatchdog 30s deadline. The two-write pattern
+        # guarantees:
+        #   * WAL-first: captures known-at-cleanup-start state in
+        #     case GLS.stop() itself wedges
+        #   * WAL-second: captures known-at-ops-final state in case
+        #     downstream cleanup wedges (the prior soak's failure
+        #     mode)
+        #
+        # The clean _generate_report path later overwrites both
+        # with the richer final report — but if os._exit fires
+        # mid-shutdown the operator NOW gets the full
+        # operations[] snapshot regardless of where the wedge
+        # lands. Master switch JARVIS_SHUTDOWN_WAL_FIRST_ENABLED
+        # gates BOTH writes (single source of truth — operators
+        # don't tune them separately).
+        try:
+            _wal_second_raw = os.environ.get(
+                "JARVIS_SHUTDOWN_WAL_FIRST_ENABLED", "true",
+            ).strip().lower()
+            if _wal_second_raw in {"1", "true", "yes", "on"}:
+                # Reset the _summary_written latch so the
+                # fallback writer re-fires (the WAL-first path
+                # set it to True; without reset, this would
+                # short-circuit). The clean _generate_report
+                # path still sets it again at the end.
+                try:
+                    self._summary_written = False
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._atexit_fallback_write(
+                        session_outcome="in_flight_shutdown_wal_second",
+                    )
+                    logger.info(
+                        "[Harness] Slice 12W WAL-second: "
+                        "post-orchestrator summary.json persisted "
+                        "(operations[] now reflects final "
+                        "_active_ops drain)",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[Harness] Slice 12W WAL-second write "
+                        "raised (swallowed) — proceeding with "
+                        "remaining cleanup",
+                        exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
         # 5. Governance stack
         if self._governance_stack is not None:
