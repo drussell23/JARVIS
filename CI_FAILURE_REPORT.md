@@ -3,78 +3,33 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #91110
-- **Branch**: `fix/ci/validate-configuration-run3714-20260523-171306`
-- **Commit**: `fbea4e49fe40cd6f6a7b432aa76cca5314cd1d48`
+- **Run Number**: #91113
+- **Branch**: `fix/ci/pr-automation-validation-run91110-20260523-171522`
+- **Commit**: `4c70d03fe7434070e246b314d258255446b7e59c`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-23T17:13:32Z
+- **Timestamp**: 2026-05-23T17:15:52Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26338737324)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26338784932)
 
 ## Failure Overview
 
-Total Failed Jobs: **3**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Auto-Label PR | permission_error | high | 30s |
-| 2 | Validate PR Title | timeout | high | 3s |
-| 3 | Check for Conflicts | permission_error | high | 4s |
+| 1 | Validate PR Title | unknown | medium | 5s |
 
 ## Detailed Analysis
 
-### 1. Auto-Label PR
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T17:13:35Z
-**Completed**: 2026-05-23T17:14:05Z
-**Duration**: 30 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26338737324/job/77536868689)
-
-#### Failed Steps
-
-- **Step 2**: Checkout Code
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 4
-  - Sample matches:
-    - Line 74: `2026-05-23T17:13:38.2580358Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 78: `2026-05-23T17:13:54.3602155Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-    - Line 82: `2026-05-23T17:14:04.4756194Z ##[error]fatal: could not read Username for 'https://github.com': termi`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 75: `2026-05-23T17:13:38.2588874Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 79: `2026-05-23T17:13:54.3617113Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 83: `2026-05-23T17:14:04.4801868Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 46: `2026-05-23T17:13:37.3769555Z hint: to use in all of your new repositories, which will suppress this `
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Validate PR Title
-
-**Status**: ❌ failure
-**Category**: Timeout
-**Severity**: HIGH
-**Started**: 2026-05-23T17:13:35Z
-**Completed**: 2026-05-23T17:13:38Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26338737324/job/77536868709)
+**Category**: Unknown
+**Severity**: MEDIUM
+**Started**: 2026-05-23T17:15:55Z
+**Completed**: 2026-05-23T17:16:00Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26338784932/job/77536991202)
 
 #### Failed Steps
 
@@ -82,58 +37,11 @@ Total Failed Jobs: **3**
 
 #### Error Analysis
 
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 30: `2026-05-23T17:13:36.6371489Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-23T17:13:37.0912231Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Vali`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 58: `2026-05-23T17:13:37.1353399Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
-
-- Pattern: `timeout|timed out`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 34: `- fix: Resolve database connection timeout`
+*No specific error patterns detected*
 
 #### Suggested Fixes
 
-1. Consider increasing timeout values or optimizing slow operations
-2. Check service availability and network connectivity
-
----
-
-### 3. Check for Conflicts
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-23T17:13:35Z
-**Completed**: 2026-05-23T17:13:39Z
-**Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26338737324/job/77536868718)
-
-#### Failed Steps
-
-- **Step 2**: Check Merge Conflicts
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 50: `2026-05-23T17:13:38.0433110Z RequestError [HttpError]: Bad credentials`
-    - Line 68: `2026-05-23T17:13:38.0518903Z ##[error]Unhandled error: HttpError: Bad credentials`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
+1. Check the workflow logs for more details
 
 ---
 
@@ -153,5 +61,5 @@ Total Failed Jobs: **3**
 
 ---
 
-📊 *Report generated on 2026-05-23T17:15:22.692719*
+📊 *Report generated on 2026-05-23T17:18:01.338165*
 🤖 *JARVIS CI/CD Auto-PR Manager*
