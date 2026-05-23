@@ -92,6 +92,48 @@ def test_ast_pin_v1_paths_known_only_via_upstream_registry():
     snapshot()
 
 
+def test_ast_pin_llm_endpoints_have_wire_family_and_passthrough_do_not():
+    """Slice 2B-i invariant: LLM_COMPLETION endpoints declare a
+    wire_family (the forwarder dispatches its usage parser by family);
+    PASSTHROUGH endpoints do NOT declare one (they don't parse usage).
+    Both directions enforced at UpstreamEndpoint.__post_init__ — pinned
+    here as a separate AST/contract verification."""
+    from backend.core.ouroboros.aegis.upstream_registry import (
+        EndpointKind, snapshot,
+    )
+    for path, ep in snapshot().items():
+        if ep.kind is EndpointKind.LLM_COMPLETION:
+            assert ep.wire_family is not None, (
+                f"{path}: LLM_COMPLETION endpoint must declare wire_family"
+            )
+        elif ep.kind is EndpointKind.PASSTHROUGH:
+            assert ep.wire_family is None, (
+                f"{path}: PASSTHROUGH endpoint must NOT declare wire_family"
+            )
+
+
+def test_ast_pin_passthrough_endpoints_audited_set():
+    """The PASSTHROUGH allowlist is operator-bound (Slice 2B-i). New
+    additions must be a deliberate edit + this pin update — prevents
+    a future change from silently expanding the proxy surface."""
+    from backend.core.ouroboros.aegis.upstream_registry import (
+        passthrough_endpoints,
+    )
+    audited = {
+        "/v1/files",                       # POST multipart batch upload
+        "/v1/batches",                     # POST create batch
+        "/v1/batches/{batch_id}",          # GET poll batch
+        "/v1/files/{file_id}/content",     # GET retrieve batch output
+        "/v1/models",                      # GET list models (DW health)
+    }
+    actual = set(passthrough_endpoints().keys())
+    assert actual == audited, (
+        f"passthrough endpoint set drifted from operator-audited allowlist. "
+        f"added={actual - audited}, removed={audited - actual}. "
+        f"Adding a new passthrough requires explicit operator approval."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pin 2: ImmutableBudgetStateMachine has no setter beyond tighten()
 # ---------------------------------------------------------------------------
