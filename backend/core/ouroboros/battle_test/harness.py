@@ -1401,6 +1401,12 @@ class BattleTestHarness:
                         "JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR",
                         str(self._session_dir),
                     )
+                    # ── Slice 12V Phase 1 — ShutdownWatchdog
+                    # tombstone dir wiring (mirrors Slice 12T) ──
+                    os.environ.setdefault(
+                        "JARVIS_SHUTDOWN_TOMBSTONE_DIR",
+                        str(self._session_dir),
+                    )
                 except Exception:  # noqa: BLE001
                     pass
                 if _deadman_enabled():
@@ -1420,6 +1426,41 @@ class BattleTestHarness:
                     _deadman_exc, exc_info=True,
                 )
                 self._loop_deadman = None
+
+            # ── Slice 12V Phase 2 — Sidecar Profiler wire-up ──
+            #
+            # The ControlPlaneStarvation snapshot path runs on the
+            # asyncio loop itself; when MainThread is wedged, that
+            # path is suspended and the snapshot only fires post-
+            # recovery (capturing the watchdog observing itself).
+            # The Sidecar Profiler runs in a dedicated daemon
+            # thread, polling sys._current_frames() out-of-band so
+            # it captures the IN-PROGRESS MainThread frame WHILE
+            # the wedge is active. Same fail-soft contract as
+            # LoopDeadman: boot failure NEVER blocks the harness.
+            self._sidecar_profiler = None
+            try:
+                from backend.core.ouroboros.governance.sidecar_profiler import (  # noqa: E501
+                    get_default_sidecar as _sidecar_get_default,
+                    sidecar_enabled as _sidecar_enabled,
+                )
+                if _sidecar_enabled():
+                    _sidecar = _sidecar_get_default()
+                    _sidecar_started = _sidecar.start()
+                    if _sidecar_started:
+                        self._sidecar_profiler = _sidecar
+                else:
+                    logger.debug(
+                        "[SidecarProfiler] master flag FALSE — "
+                        "profiler not started"
+                    )
+            except Exception as _sidecar_exc:  # noqa: BLE001
+                logger.debug(
+                    "[SidecarProfiler] boot wire-up degraded: %s "
+                    "— profiler not started",
+                    _sidecar_exc, exc_info=True,
+                )
+                self._sidecar_profiler = None
 
             # Slice 12G-3 — Continuous WAL / atomic summary.json
             # checkpointing.
@@ -6219,6 +6260,51 @@ class BattleTestHarness:
         not prevent the remaining components from being cleaned up.
         """
         logger.info("Shutting down session %s ...", self._session_id)
+
+        # ── Slice 12V Phase 1 — WAL-first shutdown ──
+        #
+        # bt-2026-05-23-192636 (Slice 12U validation soak) closed the
+        # LoopDeadman wedge but surfaced that `ShutdownWatchdog` fires
+        # `os._exit(75)` 30s into `_shutdown_components` when a network
+        # cleanup probe (`dw_heavy_probe`) hangs — bypassing both the
+        # clean `_generate_report` path AND the atexit fallback (atexit
+        # doesn't run after `os._exit`). Result: `summary.json` carries
+        # only the last periodic checkpoint with `operations[]` empty.
+        #
+        # Slice 12V flips the dependency: BEFORE any cleanup step that
+        # could hang on network / disk / locks, synchronously persist
+        # the current SessionRecorder state via `_atexit_fallback_write`
+        # so `summary.json` is on disk with the latest operations[]
+        # snapshot. The clean `_generate_report` path later overwrites
+        # this with the richer final report, but if `os._exit` fires
+        # mid-shutdown the operator still gets a usable WAL.
+        #
+        # Wrapped in try/except — telemetry MUST NEVER abort cleanup
+        # itself. Master switch
+        # `JARVIS_SHUTDOWN_WAL_FIRST_ENABLED` (default TRUE) for
+        # byte-identical rollback.
+        try:
+            _wal_first_raw = os.environ.get(
+                "JARVIS_SHUTDOWN_WAL_FIRST_ENABLED", "true",
+            ).strip().lower()
+            if _wal_first_raw in {"1", "true", "yes", "on"}:
+                try:
+                    self._atexit_fallback_write(
+                        session_outcome="in_flight_shutdown_wal",
+                    )
+                    logger.info(
+                        "[Harness] Slice 12V WAL-first: pre-cleanup "
+                        "summary.json persisted (operations[] "
+                        "snapshot survives any teardown os._exit)",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[Harness] Slice 12V WAL-first write raised "
+                        "(swallowed) — proceeding with cleanup",
+                        exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
         # 0. Activity monitor
         try:
