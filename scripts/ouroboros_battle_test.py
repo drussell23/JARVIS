@@ -1335,6 +1335,38 @@ def main() -> None:
         _boot_timer = None
 
     # ------------------------------------------------------------------
+    # Aegis preflight (Arc #1 — out-of-process egress + budget chokepoint)
+    # ------------------------------------------------------------------
+    # Gated on JARVIS_AEGIS_ENABLED. Slice 1 dark substrate, default
+    # FALSE — returns SKIPPED_DISABLED with zero behavior change. When
+    # operator opts in, spawns the Aegis subprocess, atomic-reads its
+    # bootstrap payload, scrubs upstream credentials from this process,
+    # and exposes JARVIS_AEGIS_URL + JARVIS_AEGIS_BOOTSTRAP_PSK for the
+    # Slice 2 provider rewire. Runs BEFORE the harness import so any
+    # provider module that captures creds at import time (e.g.,
+    # doubleword_provider.py:43) sees a scrubbed env.
+    from backend.core.ouroboros.aegis.preflight import (
+        PreflightOutcome as _AegisPreflightOutcome,
+        aegis_preflight as _aegis_preflight,
+    )
+    _aegis_result = asyncio.run(_aegis_preflight())
+    if _aegis_result.outcome not in (
+        _AegisPreflightOutcome.READY,
+        _AegisPreflightOutcome.SKIPPED_DISABLED,
+    ):
+        print(
+            f"[Aegis] preflight failed: {_aegis_result.outcome.value} — "
+            f"{_aegis_result.detail}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _aegis_result.outcome is _AegisPreflightOutcome.READY:
+        print(
+            f"[Aegis] daemon ready at {_aegis_result.aegis_url} "
+            f"(pid={_aegis_result.subprocess_pid})"
+        )
+
+    # ------------------------------------------------------------------
     # Build config + harness
     # ------------------------------------------------------------------
     if _boot_timer is not None:
