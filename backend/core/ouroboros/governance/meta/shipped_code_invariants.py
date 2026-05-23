@@ -2644,14 +2644,53 @@ async def validate_all_async() -> Tuple[InvariantViolation, ...]:
             timeout_s, elapsed_ms,
         )
         return ()
-    except Exception as exc:  # noqa: BLE001 — degrade to sync
+    except Exception as exc:  # noqa: BLE001 — degrade to off-loop
         elapsed_ms = (_time.monotonic() - t0) * 1000.0
         logger.warning(
             "[ShippedCodeInvariants] async pool unavailable "
-            "(%s); degrading to sync. parent_await_ms=%.1f",
+            "(%s); degrading to thread-pool off-loop fallback. "
+            "parent_await_ms=%.1f",
             type(exc).__name__, elapsed_ms,
         )
-        return validate_invariants_grouped()
+        # ── Slice 12Z — sync-fallback off-loop dispatch ──
+        #
+        # bt-2026-05-23-221029 tombstone proved the
+        # "return validate_invariants_grouped()" call here ran
+        # SYNC on the asyncio main loop. validate_invariants_grouped
+        # invokes the cross_kingdom_boundary._validate_cross_kingdom_boundary
+        # validator which calls scan_governance_tree (sync rglob +
+        # read_text over the whole governance/ tree). That stack
+        # held the GIL for 300+ seconds and triggered LoopDeadman.
+        #
+        # Slice 12Z dispatches the entire sync grouped-validation
+        # path through ``offload_blocking`` (Task #102 canonical
+        # offload primitive) — the heavy AST work + file reads
+        # all run on a worker thread, the asyncio loop continues
+        # ticking, and LoopDeadman never trips on this path again.
+        # The async-pool path remains the primary; this is the
+        # second-best degraded path that no longer wedges.
+        try:
+            from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+                offload_blocking as _offload_blocking,
+            )
+            return await _offload_blocking(
+                validate_invariants_grouped,
+                label="shipped_invariants_sync_fallback",
+            )
+        except Exception as _fallback_exc:  # noqa: BLE001
+            # If even the offload path fails (e.g.,
+            # event_loop_governance not importable in some
+            # degraded build), fall back to direct sync as the
+            # absolute last resort — observability is
+            # non-authoritative so a missing pin is preferable
+            # to a hard crash.
+            logger.debug(
+                "[ShippedCodeInvariants] offload_blocking "
+                "fallback raised (%s) — final sync attempt "
+                "(may wedge loop on large trees)",
+                type(_fallback_exc).__name__,
+            )
+            return validate_invariants_grouped()
 
     elapsed_ms = (_time.monotonic() - t0) * 1000.0
     logger.info(
