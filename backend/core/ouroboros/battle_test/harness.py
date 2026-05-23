@@ -1389,6 +1389,20 @@ class BattleTestHarness:
                     get_default_deadman as _deadman_get_default,
                     deadman_enabled as _deadman_enabled,
                 )
+                # ── Slice 12T Part 1 — wire the tombstone dir ──
+                # Set JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR to the
+                # active session dir so the deadman's wedge fire
+                # path writes
+                # ``<session_dir>/loop_deadman_tombstone.txt``
+                # alongside debug.log. setdefault preserves any
+                # explicit operator override.
+                try:
+                    os.environ.setdefault(
+                        "JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR",
+                        str(self._session_dir),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 if _deadman_enabled():
                     _deadman = _deadman_get_default()
                     _deadman_started = _deadman.start()

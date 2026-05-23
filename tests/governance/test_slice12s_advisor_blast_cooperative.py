@@ -339,26 +339,37 @@ class TestNonBlockingBehavior:
         )
 
     @pytest.mark.asyncio
-    async def test_offload_blocking_primitive_invoked(
+    async def test_per_file_reads_dispatched_via_helper(
         self, fake_repo, monkeypatch,
     ):
-        """Direct telemetry: every per-file read in the cooperative
-        scan must go through ``offload_blocking`` so the GIL is
-        released during the read+decode work."""
+        """Per-file reads must go through the module-level
+        ``_read_bounded_text_for_blast`` helper.
+
+        SLICE 12T NOTE: pre-Slice-12T this test pinned
+        ``offload_blocking`` (default ``asyncio.to_thread``
+        pool) — Slice 12T Part 3 intentionally REPLACED that
+        with a dispatch through the dedicated ``advisor-blast``
+        ThreadPoolExecutor to restore the Task #88f isolation
+        contract that Slice 12S broke (default-pool contention
+        with 16 sensors + Oracle + DreamEngine doubled
+        ``ControlPlaneStarvation`` events in
+        bt-2026-05-23-180315). The cooperative-yield contract
+        is preserved; only the executor target changed. The
+        Slice 12T sister test pins the dedicated-pool routing
+        directly.
+        """
         from backend.core.ouroboros.governance import (
-            event_loop_governance as elg,
+            operation_advisor as opa,
         )
         call_count = {"n": 0}
-        original = elg.offload_blocking
+        original = opa._read_bounded_text_for_blast
 
-        async def _spy(fn, *args, **kwargs):
+        def _spy(path_str, max_bytes):
             call_count["n"] += 1
-            return await original(fn, *args, **kwargs)
+            return original(path_str, max_bytes)
 
         monkeypatch.setattr(
-            "backend.core.ouroboros.governance.event_loop_governance."
-            "offload_blocking",
-            _spy,
+            opa, "_read_bounded_text_for_blast", _spy,
         )
 
         adv = _make_advisor(fake_repo)
@@ -366,11 +377,12 @@ class TestNonBlockingBehavior:
             ("mypkg/target.py",), root=fake_repo,
         )
         # 30 .py files in fixture — every read goes through
-        # offload_blocking. (Some non-.py paths may also walk past
-        # but they're filtered before the read call.)
+        # the module-level helper dispatched to the dedicated
+        # executor.
         assert call_count["n"] >= 15, (
-            f"offload_blocking called only {call_count['n']} times — "
-            "Slice 12S scan is bypassing the governance primitive"
+            f"_read_bounded_text_for_blast called only "
+            f"{call_count['n']} times — Slice 12T Part 3 "
+            "scan is bypassing the dedicated executor helper"
         )
 
 
@@ -599,7 +611,20 @@ class TestASTPins:
             "the scan is no longer cooperative on the loop"
         )
 
-    def test_compute_blast_radius_async_uses_offload_blocking(self):
+    def test_compute_blast_radius_async_dispatches_dedicated_executor(
+        self,
+    ):
+        """Per-file reads dispatch to a worker thread.
+
+        SLICE 12T NOTE: pre-Slice-12T this pinned
+        ``offload_blocking`` (default pool). Slice 12T Part 3
+        replaced that with ``loop.run_in_executor`` targeting
+        the dedicated ``advisor-blast`` ThreadPoolExecutor via
+        ``_get_advisor_blast_executor()`` — same off-loop
+        contract, different (isolated) executor. The Slice 12T
+        AST pin asserts the dedicated-executor accessor + no
+        residual ``offload_blocking`` calls.
+        """
         src = self._read_source()
         tree = ast.parse(src)
         target_fn = None
@@ -611,26 +636,23 @@ class TestASTPins:
                 target_fn = node
                 break
         assert target_fn is not None
-        found = False
+        # Walk the function body looking for either form of off-
+        # loop dispatch — must find at least one.
+        found_run_in_executor = False
         for inner in ast.walk(target_fn):
             if isinstance(inner, ast.Call):
                 fn = inner.func
                 if (
-                    isinstance(fn, ast.Name)
-                    and fn.id == "offload_blocking"
-                ):
-                    found = True
-                    break
-                if (
                     isinstance(fn, ast.Attribute)
-                    and fn.attr == "offload_blocking"
+                    and fn.attr == "run_in_executor"
                 ):
-                    found = True
+                    found_run_in_executor = True
                     break
-        assert found, (
-            "_compute_blast_radius_async does not call "
-            "offload_blocking — Slice 12S broken: per-file reads "
-            "are running on the loop and holding the GIL"
+        assert found_run_in_executor, (
+            "_compute_blast_radius_async does not dispatch "
+            "per-file reads off the loop via loop.run_in_executor "
+            "— Slice 12T Part 3 broken: per-file reads run on "
+            "the loop and hold the GIL"
         )
 
     def test_advise_async_dispatches_cooperative_first(self):

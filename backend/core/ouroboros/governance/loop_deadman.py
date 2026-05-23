@@ -128,6 +128,49 @@ def deadman_stack_dump_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def deadman_tombstone_dir() -> Optional[str]:
+    """Slice 12T Part 1 — directory to write the wedge tombstone
+    file ``loop_deadman_tombstone.txt`` into when the deadman fires.
+
+    bt-2026-05-23-180315 surfaced that the existing
+    ``faulthandler.dump_traceback(file=sys.stderr)`` writes ONLY to
+    stderr — which means the dump only lands in the session's
+    ``debug.log`` when the harness was invoked with a ``2>&1 | tee``
+    redirect. Soaks launched without that pipe (notably the
+    background-task path the autonomous loop uses) lose the dump
+    entirely, leaving operators with just a ``WEDGE DETECTED`` line
+    and no diagnosis.
+
+    Slice 12T routes a second copy of the dump to a session-relative
+    file via this env knob (``JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR``).
+    The harness sets it to the active session dir at boot so the
+    tombstone lands next to ``debug.log`` regardless of stderr
+    plumbing. Empty / unset disables the file path (stderr dump
+    still fires) for byte-identical pre-Slice-12T behavior.
+    """
+    raw = os.environ.get(
+        "JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR", "",
+    ).strip()
+    return raw if raw else None
+
+
+def deadman_tombstone_to_logger_enabled() -> bool:
+    """Slice 12T Part 1 — emit per-thread frame dumps via the
+    standard logger (which lands in ``debug.log`` via the harness's
+    file handler) IN ADDITION to the stderr + tombstone-file dumps.
+
+    Default TRUE — costs ~1-5 ms at exit and gives operators a
+    single grep target. Set to ``false`` for byte-identical pre-
+    Slice-12T behavior.
+    """
+    raw = os.environ.get(
+        "JARVIS_LOOP_DEADMAN_TOMBSTONE_LOGGER", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
 # ============================================================================
 # LoopDeadman
 # ============================================================================
@@ -320,13 +363,106 @@ class LoopDeadman:
         except Exception:  # noqa: BLE001 — even logging can wedge
             pass
         if self._stack_dump:
+            # ── Slice 12T Part 1 — Forensic tombstone (three sinks) ──
+            #
+            # bt-2026-05-23-180315 surfaced that the existing
+            # stderr-only dump only landed in debug.log when the
+            # harness was invoked with ``2>&1 | tee`` — background
+            # task launches without that pipe lost the dump
+            # entirely. The wedge then went unattributed even
+            # though faulthandler had captured it.
+            #
+            # Slice 12T routes the dump through THREE sinks (any
+            # one failing leaves the others intact — must NEVER
+            # raise during the exit path):
+            #
+            #   (1) stderr via faulthandler — signal-safe, works
+            #       from any thread; preserved verbatim for
+            #       byte-identical pre-Slice-12T behavior under
+            #       ``2>&1`` redirects.
+            #
+            #   (2) session-relative file
+            #       ``<tombstone_dir>/loop_deadman_tombstone.txt``
+            #       when JARVIS_LOOP_DEADMAN_TOMBSTONE_DIR is set
+            #       (the harness sets it to the active session dir
+            #       at boot). Operators recover the dump without
+            #       stderr plumbing.
+            #
+            #   (3) per-thread frame dump via the standard logger
+            #       (lands in debug.log via the harness file
+            #       handler), one ``[LoopDeadman.TOMBSTONE]`` line
+            #       per frame for grep-friendly analysis.
+
+            # (1) stderr — preserved verbatim.
             try:
-                # Dump every thread's stack to stderr (faulthandler
-                # is signal-safe and works from any thread). The
-                # harness's stderr capture lands this in debug.log.
                 faulthandler.dump_traceback(file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
+
+            # (2) session-relative tombstone file.
+            try:
+                _tombstone_dir = deadman_tombstone_dir()
+                if _tombstone_dir:
+                    _tombstone_path = os.path.join(
+                        _tombstone_dir,
+                        "loop_deadman_tombstone.txt",
+                    )
+                    # Open / write / close — synchronous, no
+                    # asyncio dependency (we're in a daemon
+                    # thread). Truncate on each fire so a
+                    # subsequent wedge in the same session dir
+                    # doesn't append confusion. Header carries
+                    # wedge metadata for fast operator triage.
+                    with open(
+                        _tombstone_path, "w", encoding="utf-8",
+                    ) as _tomb:
+                        _tomb.write(
+                            "[LoopDeadman] WEDGE TOMBSTONE\n"
+                            "wedge_age_s=%.1f timeout_s=%.0f\n"
+                            "pid=%d\n"
+                            "fired_at_monotonic=%.3f\n"
+                            "============================\n"
+                            % (
+                                wedge_age_s, self._timeout_s,
+                                os.getpid(), time.monotonic(),
+                            )
+                        )
+                        faulthandler.dump_traceback(file=_tomb)
+                        _tomb.flush()
+                        try:
+                            os.fsync(_tomb.fileno())
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001 — NEVER raise during exit
+                pass
+
+            # (3) per-thread frame dump via the logger — lands in
+            # debug.log via the harness's file handler, no stderr
+            # plumbing required. ``sys._current_frames()`` returns
+            # a dict {thread_id: frame}; we walk each frame's
+            # f_back chain to produce a compact traceback.
+            try:
+                if deadman_tombstone_to_logger_enabled():
+                    import traceback as _tb
+                    _frames = sys._current_frames()
+                    for _tid, _frame in _frames.items():
+                        try:
+                            _stack = _tb.extract_stack(_frame)
+                            _stack_str = "".join(
+                                _tb.format_list(_stack)
+                            )
+                            logger.critical(
+                                "[LoopDeadman.TOMBSTONE] thread_id=%d\n%s",
+                                _tid, _stack_str,
+                            )
+                        except Exception:  # noqa: BLE001
+                            # Per-thread failure — keep walking
+                            # the rest; never abort the dump for
+                            # one bad frame.
+                            continue
+            except Exception:  # noqa: BLE001
+                pass
+
         # Final, unrecoverable exit. ``os._exit`` bypasses Python
         # cleanup (atexit handlers, asyncio __del__, etc.) — those
         # would re-deadlock on the wedge. The session manager's
@@ -371,6 +507,8 @@ __all__ = [
     "deadman_timeout_s",
     "deadman_heartbeat_s",
     "deadman_stack_dump_enabled",
+    "deadman_tombstone_dir",
+    "deadman_tombstone_to_logger_enabled",
     "get_default_deadman",
     "reset_default_deadman",
 ]
