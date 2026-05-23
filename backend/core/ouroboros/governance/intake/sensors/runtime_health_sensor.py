@@ -17,7 +17,11 @@ Emits IntentEnvelopes to Ouroboros when action thresholds are met.
 from __future__ import annotations
 
 import asyncio
+import enum
+import importlib.metadata
+import importlib.util
 import logging
+import os
 import platform
 import re
 import sys
@@ -29,6 +33,268 @@ from typing import Any, Dict, List, Optional, Tuple
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Slice 12M — non-executing dependency discovery
+# ---------------------------------------------------------------------------
+#
+# Empirical context: bt-2026-05-23-004847 (Slice 12L verification soak)
+# captured a ControlPlaneStarvation lag_ms=14267.9 immediately after
+# RuntimeHealthSensor triggered a synchronous ``__import__("speechbrain")``
+# whose top-level code pulled in torch + torio + FFmpeg extension lookups,
+# blocking the asyncio loop for ~14s.
+#
+# Root fix: the sensor MUST NOT execute target-package top-level code
+# to determine presence. Two stdlib primitives are sufficient:
+#
+#   * ``importlib.metadata.distribution(pkg_name)`` — returns the dist
+#     object if the package was installed (e.g. via pip); raises
+#     ``PackageNotFoundError`` otherwise. NEVER executes target code.
+#
+#   * ``importlib.util.find_spec(module_name)`` — returns the module's
+#     ModuleSpec if found on sys.path; returns None if not. For
+#     TOP-LEVEL modules (no dot in name) this is fully non-executing.
+#     For DOTTED modules (e.g. ``google.api_core``) it DOES import the
+#     parent package, so Slice 12M skips find_spec for dotted modules
+#     and relies on distribution() alone for those.
+#
+# Optional subprocess deep-probe (env-gated, default OFF) handles the
+# rare case where metadata + spec say "installed" but the actual import
+# is broken (missing C extension, ABI mismatch). Uses
+# ``asyncio.create_subprocess_exec`` with a bounded ``asyncio.wait_for``
+# timeout — NEVER on the asyncio loop, NEVER blocks, NEVER raises.
+
+
+class DependencyState(str, enum.Enum):
+    """Closed taxonomy of dependency presence states from non-executing
+    discovery. Slice 12M: replaces the prior ``__import__``-based
+    detection that blocked the loop on heavy package top-level code."""
+
+    INSTALLED_AND_IMPORTABLE = "installed_and_importable"
+    MISSING_DISTRIBUTION = "missing_distribution"      # not pip-installed
+    INSTALLED_BUT_NO_SPEC = "installed_but_no_spec"    # metadata present, spec missing
+    UNKNOWN_ERROR = "unknown_error"                    # defensive bucket
+
+
+class SubprocessProbeOutcome(str, enum.Enum):
+    """Closed taxonomy of subprocess deep-probe results. Used only
+    when the env-gated deep-probe path is enabled — the default
+    Slice 12M behavior never reaches this code."""
+
+    IMPORTED = "imported"
+    IMPORT_ERROR = "import_error"
+    TIMEOUT = "timeout"
+    SUBPROCESS_FAILED = "subprocess_failed"
+    REJECTED_UNSAFE_NAME = "rejected_unsafe_name"
+
+
+@dataclass(frozen=True)
+class SubprocessProbeResult:
+    """Frozen result from the optional subprocess deep-probe. Carries
+    the closed-taxonomy outcome plus the wall-clock duration so
+    operators can detect slow probes via telemetry."""
+
+    outcome: SubprocessProbeOutcome
+    elapsed_s: float
+    error_detail: str = ""
+
+
+# PyPI name -> importable module name (deterministic mapping). Lifted
+# from the body of _check_import_errors so it's testable + AST-walkable
+# and not re-allocated per call.
+_MODULE_MAP: Dict[str, str] = {
+    "google-api-core": "google.api_core",
+    "llama-cpp-python": "llama_cpp",
+    "scikit-learn": "sklearn",
+}
+
+
+# Identifier-only regex for subprocess probe input safety. Module names
+# must match standard Python identifier rules (letters, digits,
+# underscores, dots between identifiers) — defensive against any future
+# refactor that passes operator-controlled strings to the probe.
+_SAFE_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+# Slice 12M env knobs
+_DEEP_PROBE_ENABLED_ENV = "JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_ENABLED"
+_DEEP_PROBE_TIMEOUT_S_ENV = "JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_TIMEOUT_S"
+_DEEP_PROBE_PYTHON_BIN_ENV = "JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_PYTHON_BIN"
+
+_DEFAULT_DEEP_PROBE_TIMEOUT_S = 30.0
+_DEEP_PROBE_TIMEOUT_FLOOR_S = 1.0
+_DEEP_PROBE_TIMEOUT_CEIL_S = 300.0
+
+
+def _resolve_dependency_state(
+    pkg_name: str,
+    module_name: str,
+) -> Tuple[DependencyState, str]:
+    """Pure non-executing dependency presence check.
+
+    Returns ``(state, detail)``. NEVER imports the target module —
+    no ``__import__``, no ``importlib.import_module``. NEVER raises;
+    any unexpected exception maps to ``UNKNOWN_ERROR``.
+
+    Two-layer discovery:
+
+      Layer 1 — ``importlib.metadata.distribution(pkg_name)``:
+        Returns the dist object if pip-installed. Raises
+        ``PackageNotFoundError`` otherwise. Pure metadata read.
+
+      Layer 2 — ``importlib.util.find_spec(module_name)``:
+        Returns the ModuleSpec if found on sys.path; None
+        otherwise. For TOP-LEVEL modules (no dot) this is fully
+        non-executing. DOTTED modules trigger parent-package
+        ``__init__.py`` execution as a side effect, so Slice 12M
+        skips Layer 2 for dotted module names.
+
+    Decision matrix (preserves the prior ``__import__`` semantics
+    while adding PYTHONPATH/namespace-package tolerance):
+
+      dist  spec    →  state
+      ──────────────────────────────────────────────────────────
+      yes   yes     →  INSTALLED_AND_IMPORTABLE   (normal pip install)
+      yes   no      →  INSTALLED_BUT_NO_SPEC      (broken install)
+      yes   N/A     →  INSTALLED_AND_IMPORTABLE   (dotted module trusted)
+      no    yes     →  INSTALLED_AND_IMPORTABLE   (PYTHONPATH/namespace pkg)
+      no    no      →  MISSING_DISTRIBUTION       (truly absent)
+      no    N/A     →  MISSING_DISTRIBUTION       (dotted, no dist-info)
+      ──────────────────────────────────────────────────────────
+    """
+    # Layer 1: distribution metadata
+    dist_present: Optional[bool] = None
+    try:
+        importlib.metadata.distribution(pkg_name)
+        dist_present = True
+    except importlib.metadata.PackageNotFoundError:
+        dist_present = False
+    except Exception as exc:  # noqa: BLE001 — defensive
+        return (DependencyState.UNKNOWN_ERROR, f"metadata: {exc}")
+
+    # Layer 2: spec presence (top-level modules only).
+    # ``find_spec("torch")`` only searches sys.path for torch/__init__.py;
+    # it does NOT execute it. But ``find_spec("google.api_core")`` DOES
+    # import the parent ``google``, which can trigger side effects. So
+    # we skip the spec check for dotted modules and trust the
+    # distribution() result alone for those.
+    spec_present: Optional[bool] = None  # None means "not checked"
+    spec_detail = ""
+    if "." not in module_name:
+        try:
+            spec = importlib.util.find_spec(module_name)
+            spec_present = spec is not None
+            if not spec_present:
+                spec_detail = (
+                    f"importlib.util.find_spec({module_name!r}) returned None"
+                )
+        except (ModuleNotFoundError, ImportError, ValueError) as exc:
+            spec_present = False
+            spec_detail = f"find_spec raised: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return (DependencyState.UNKNOWN_ERROR, f"find_spec: {exc}")
+
+    # Decision matrix — see docstring for the table form.
+    if dist_present:
+        if spec_present is False:
+            return (DependencyState.INSTALLED_BUT_NO_SPEC, spec_detail)
+        return (DependencyState.INSTALLED_AND_IMPORTABLE, "")
+
+    # dist_present is False
+    if spec_present is True:
+        # Edge case: module is importable but not pip-installed
+        # (PYTHONPATH-side install, namespace package, stdlib).
+        # The module IS available — do not emit missing_dependency.
+        return (
+            DependencyState.INSTALLED_AND_IMPORTABLE,
+            "no dist-info but spec present (PYTHONPATH or namespace)",
+        )
+
+    return (
+        DependencyState.MISSING_DISTRIBUTION,
+        f"importlib.metadata.distribution({pkg_name!r}) raised "
+        f"PackageNotFoundError",
+    )
+
+
+async def _subprocess_import_probe(
+    module_name: str,
+    *,
+    timeout_s: float,
+    python_bin: str,
+) -> SubprocessProbeResult:
+    """Run ``<python> -c "import <module>"`` in a bounded subprocess.
+
+    Slice 12M opt-in deep-probe path. Uses ``asyncio.create_subprocess_exec``
+    + ``asyncio.wait_for`` — fully loop-safe, never blocks. NEVER raises;
+    every failure shape maps to a closed taxonomy value. Refuses
+    unsafe module names (anything not matching the standard Python
+    identifier regex) so a future refactor passing operator-controlled
+    strings to this probe cannot be turned into shell injection or
+    arbitrary-code execution.
+
+    Subprocess isolation means the heavy package's top-level code
+    executes in a SEPARATE process — never in the watchdog'd asyncio
+    loop process. The probe's elapsed time is wall-clock; the loop
+    only awaits ``wait_for`` (cheap).
+    """
+    if not _SAFE_MODULE_NAME_RE.match(module_name):
+        return SubprocessProbeResult(
+            outcome=SubprocessProbeOutcome.REJECTED_UNSAFE_NAME,
+            elapsed_s=0.0,
+            error_detail=f"module name {module_name!r} not a valid Python identifier",
+        )
+    t0 = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            python_bin,
+            "-c",
+            f"import {module_name}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise into sensor
+        return SubprocessProbeResult(
+            outcome=SubprocessProbeOutcome.SUBPROCESS_FAILED,
+            elapsed_s=time.monotonic() - t0,
+            error_detail=f"create_subprocess_exec: {exc}",
+        )
+    try:
+        _stdout, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        return SubprocessProbeResult(
+            outcome=SubprocessProbeOutcome.TIMEOUT,
+            elapsed_s=time.monotonic() - t0,
+            error_detail=f"probe exceeded timeout={timeout_s:.1f}s",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return SubprocessProbeResult(
+            outcome=SubprocessProbeOutcome.SUBPROCESS_FAILED,
+            elapsed_s=time.monotonic() - t0,
+            error_detail=f"communicate: {exc}",
+        )
+    elapsed = time.monotonic() - t0
+    if proc.returncode == 0:
+        return SubprocessProbeResult(
+            outcome=SubprocessProbeOutcome.IMPORTED,
+            elapsed_s=elapsed,
+        )
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace") \
+        if stderr_bytes else ""
+    # Truncate stderr to keep findings/log lines bounded.
+    return SubprocessProbeResult(
+        outcome=SubprocessProbeOutcome.IMPORT_ERROR,
+        elapsed_s=elapsed,
+        error_detail=stderr_text[-512:].strip(),
+    )
 
 # ---------------------------------------------------------------------------
 # Deterministic constants — Tier 0 (known, no model inference needed)
@@ -153,8 +419,11 @@ class RuntimeHealthSensor:
         security = await self._check_security_audit()
         findings.extend(security)
 
-        # 4. Import error detection (deterministic — catch ModuleNotFoundError)
-        import_errors = self._check_import_errors()
+        # 4. Import error detection — Slice 12M: non-executing
+        #    discovery via importlib.metadata + importlib.util. Async
+        #    because the optional subprocess deep-probe path uses
+        #    asyncio.create_subprocess_exec.
+        import_errors = await self._check_import_errors()
         findings.extend(import_errors)
 
         # 5. Compat shim detection (deterministic — grep for legacy patterns)
@@ -397,72 +666,185 @@ class RuntimeHealthSensor:
 
         return findings
 
-    def _check_import_errors(self) -> List[HealthFinding]:
-        """Detect missing Python packages by attempting tracked imports.
+    async def _check_import_errors(self) -> List[HealthFinding]:
+        """Slice 12M — non-executing dependency presence detection.
 
-        Distinguishes dependency errors (ModuleNotFoundError, ImportError) from
-        syntax errors or runtime errors. Only dependency errors route to the
-        dependency-resolution prompt path in the Ouroboros pipeline.
+        Replaces the prior ``__import__``-based detection that
+        triggered a 14s ControlPlaneStarvation wedge in bt-2026-05-
+        23-004847 by executing heavy package top-level code (torch
+        + speechbrain + torio + FFmpeg lookup) on the asyncio loop.
+
+        Default behavior NEVER executes target package code:
+          * ``importlib.metadata.distribution`` for pip-installed?
+          * ``importlib.util.find_spec`` for top-level module spec
+            (skipped for dotted modules to avoid parent-package
+            import side effects).
+
+        Optional opt-in deep-probe path (env-gated, default OFF):
+          * ``JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_ENABLED=true``
+          * Per-package subprocess: ``<python> -c "import <module>"``
+          * Bounded ``asyncio.wait_for(timeout_s)``; default 30s,
+            tunable via env knob (clamped to [1.0, 300.0])
+          * Subprocess heavy-load NEVER touches the loop process
+          * No package-specific hardcoding — uniform across the
+            tracked-package list
+
+        Preserves Slice 11A finding categories: ``missing_dependency``
+        when distribution absent, ``broken_dependency`` when spec
+        missing or deep-probe import fails. ``requires_human_ack``
+        and routing surfaces unchanged.
         """
-        findings = []
-
-        # PyPI name -> importable module name (deterministic mapping)
-        _MODULE_MAP: Dict[str, str] = {
-            "google-api-core": "google.api_core",
-            "llama-cpp-python": "llama_cpp",
-            "scikit-learn": "sklearn",
-        }
+        findings: List[HealthFinding] = []
+        deep_probe_enabled = self._resolve_deep_probe_enabled()
+        deep_timeout_s = self._resolve_deep_probe_timeout_s()
+        deep_python_bin = self._resolve_deep_probe_python_bin()
 
         for pkg_name in _TRACKED_PACKAGES:
             module_name = _MODULE_MAP.get(
-                pkg_name, pkg_name.replace("-", "_")
+                pkg_name, pkg_name.replace("-", "_"),
             )
-            try:
-                __import__(module_name)
-            except ModuleNotFoundError:
+            state, detail = _resolve_dependency_state(pkg_name, module_name)
+
+            if state == DependencyState.MISSING_DISTRIBUTION:
                 findings.append(HealthFinding(
                     category="missing_dependency",
                     severity="high",
                     summary=(
-                        f"ModuleNotFoundError: '{module_name}' "
+                        f"Missing dependency: '{module_name}' "
                         f"(PyPI: {pkg_name}) is not installed. "
                         f"Add to requirements.txt and run pip install."
                     ),
                     details={
                         "package": pkg_name,
                         "module": module_name,
-                        "error_type": "ModuleNotFoundError",
+                        "error_type": "MissingDistribution",
+                        "discovery": "importlib.metadata.distribution",
                         "resolution": "dependency_install",
+                        "detail": detail,
                     },
                     target_files=("requirements.txt",),
                 ))
-            except ImportError as exc:
-                # ImportError with a message (e.g., missing C extension,
-                # incompatible version). Different from ModuleNotFoundError —
-                # the package exists but can't load.
+                continue
+
+            if state == DependencyState.INSTALLED_BUT_NO_SPEC:
                 findings.append(HealthFinding(
                     category="broken_dependency",
                     severity="high",
                     summary=(
-                        f"ImportError for '{module_name}' "
-                        f"(PyPI: {pkg_name}): {exc}. "
-                        f"May need reinstall or version change."
+                        f"Broken dependency: '{module_name}' "
+                        f"(PyPI: {pkg_name}) is installed but the "
+                        f"module spec is missing. May need reinstall "
+                        f"or namespace-package fix."
                     ),
                     details={
                         "package": pkg_name,
                         "module": module_name,
-                        "error_type": "ImportError",
-                        "error_message": str(exc),
+                        "error_type": "MissingSpec",
+                        "discovery": "importlib.util.find_spec",
                         "resolution": "dependency_reinstall",
+                        "detail": detail,
                     },
                     target_files=("requirements.txt",),
                 ))
-            except Exception:
-                # SyntaxError, RuntimeError, etc. — not a dependency issue.
-                # Don't emit a finding; this is a code problem, not a pip problem.
-                pass
+                continue
+
+            if state == DependencyState.UNKNOWN_ERROR:
+                # Defensive: log but do not emit a finding — preserves
+                # the prior "code problem, not a pip problem" semantics
+                # of catching unexpected exceptions.
+                logger.debug(
+                    "[RuntimeHealthSensor] dependency state UNKNOWN_ERROR "
+                    "for pkg=%s module=%s detail=%s",
+                    pkg_name, module_name, detail,
+                )
+                continue
+
+            # INSTALLED_AND_IMPORTABLE: by default we trust this.
+            # Optional deep-probe runs the actual import in a
+            # subprocess to catch the rare "spec-present-but-actually-
+            # broken" case (missing C extension, ABI mismatch). Heavy
+            # package top-level code executes in the CHILD process —
+            # the asyncio loop only awaits the bounded wait_for.
+            if deep_probe_enabled:
+                probe = await _subprocess_import_probe(
+                    module_name,
+                    timeout_s=deep_timeout_s,
+                    python_bin=deep_python_bin,
+                )
+                if probe.outcome == SubprocessProbeOutcome.IMPORT_ERROR:
+                    findings.append(HealthFinding(
+                        category="broken_dependency",
+                        severity="high",
+                        summary=(
+                            f"Broken dependency: '{module_name}' "
+                            f"(PyPI: {pkg_name}) subprocess import "
+                            f"failed in {probe.elapsed_s:.1f}s. "
+                            f"May need reinstall or version change."
+                        ),
+                        details={
+                            "package": pkg_name,
+                            "module": module_name,
+                            "error_type": "SubprocessImportError",
+                            "discovery": "subprocess_deep_probe",
+                            "elapsed_s": probe.elapsed_s,
+                            "stderr_tail": probe.error_detail,
+                            "resolution": "dependency_reinstall",
+                        },
+                        target_files=("requirements.txt",),
+                    ))
+                # IMPORTED → no finding (the goal of the probe).
+                # TIMEOUT / SUBPROCESS_FAILED / REJECTED_UNSAFE_NAME
+                # → no finding (instrumentation failure, not a
+                # dependency finding — log at DEBUG only).
+                elif probe.outcome != SubprocessProbeOutcome.IMPORTED:
+                    logger.debug(
+                        "[RuntimeHealthSensor] deep-probe non-actionable "
+                        "for pkg=%s module=%s outcome=%s elapsed=%.1fs "
+                        "detail=%s",
+                        pkg_name, module_name, probe.outcome.value,
+                        probe.elapsed_s, probe.error_detail,
+                    )
 
         return findings
+
+    # ---- Slice 12M — deep-probe env resolvers ----
+
+    def _resolve_deep_probe_enabled(self) -> bool:
+        """``JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_ENABLED`` — opt-in
+        gate for the subprocess deep-probe path. Default FALSE. Any
+        truthy value (``"1"`` / ``"true"`` / ``"yes"`` / ``"on"``,
+        case-insensitive) opts in. NEVER raises."""
+        try:
+            raw = os.environ.get(_DEEP_PROBE_ENABLED_ENV, "").strip().lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return raw in ("1", "true", "yes", "on")
+
+    def _resolve_deep_probe_timeout_s(self) -> float:
+        """``JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_TIMEOUT_S`` —
+        per-package subprocess timeout. Default 30s. Clamped to
+        ``[1.0, 300.0]`` so a typo can't disable the bound. Invalid
+        values fall back to default. NEVER raises."""
+        try:
+            raw = os.environ.get(_DEEP_PROBE_TIMEOUT_S_ENV, "").strip()
+            if not raw:
+                return _DEFAULT_DEEP_PROBE_TIMEOUT_S
+            v = float(raw)
+        except (TypeError, ValueError):
+            return _DEFAULT_DEEP_PROBE_TIMEOUT_S
+        return max(_DEEP_PROBE_TIMEOUT_FLOOR_S,
+                   min(_DEEP_PROBE_TIMEOUT_CEIL_S, v))
+
+    def _resolve_deep_probe_python_bin(self) -> str:
+        """``JARVIS_RUNTIME_HEALTH_DEEP_IMPORT_PROBE_PYTHON_BIN`` —
+        which Python interpreter the subprocess probe spawns.
+        Default ``sys.executable`` (matches the running interpreter,
+        same site-packages). NEVER raises."""
+        try:
+            raw = os.environ.get(_DEEP_PROBE_PYTHON_BIN_ENV, "").strip()
+        except Exception:  # noqa: BLE001
+            raw = ""
+        return raw if raw else sys.executable
 
     def _check_legacy_shims(self) -> List[HealthFinding]:
         """Detect Python 3.9 compatibility shims that are no longer needed."""
