@@ -7401,6 +7401,39 @@ class ClaudeProvider:
             # ops while leaving foreground/complex calls
             # unchanged. The check is no-op when signal_source
             # is None or non-background-tier.
+            #
+            # Slice 12AA Part 1 — pass op_id so the SBA can
+            # treat this op's OWN reservation as available (the
+            # owning op spends from its own runway) while
+            # subtracting OTHER ops' reservations from
+            # effective_remaining. Also lazy-acquires a
+            # foreground reservation on the first preflight call
+            # for this op when the master switch is on — sizing
+            # the reservation from the provider's
+            # _max_cost_per_op (provider-derived, NOT a
+            # hardcoded SWE-Bench value).
+            try:
+                from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                    acquire_reservation as _sba_acquire,
+                )
+                _ctx_op_id = getattr(context, "op_id", None)
+                _ctx_signal = getattr(
+                    context, "signal_source", None,
+                )
+                if _ctx_op_id:
+                    # Lazy acquire — idempotent (re-acquire is
+                    # last-write-wins). Returns False if op is
+                    # background-tier OR no room; either way the
+                    # preflight check below catches violations.
+                    _sba_acquire(
+                        op_id=str(_ctx_op_id),
+                        signal_source=_ctx_signal,
+                        estimated_total_usd=float(
+                            self._max_cost_per_op or 0.0,
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
             _sba_check_preflight(
                 provider_name="claude",
                 estimated_cost_usd=float(
@@ -7409,6 +7442,7 @@ class ClaudeProvider:
                 signal_source=(
                     getattr(context, "signal_source", None)
                 ),
+                op_id=getattr(context, "op_id", None),
             )
         except ImportError:
             # Module absent on this build (graceful) — fall through to

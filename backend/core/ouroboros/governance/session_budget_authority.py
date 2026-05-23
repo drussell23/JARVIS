@@ -41,7 +41,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Optional, Protocol, runtime_checkable
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger("Ouroboros.SessionBudgetAuthority")
 
@@ -150,13 +152,210 @@ def get_session_budget_provider() -> Optional[_SessionBudgetProvider]:
 
 
 def reset_for_tests() -> None:
-    """Test helper — drops the registered provider. NEVER raises."""
+    """Test helper — drops the registered provider AND clears the
+    Slice 12AA reservation ledger. NEVER raises."""
     global _default_provider
     try:
         with _lock:
             _default_provider = None
     except Exception:  # noqa: BLE001 — defensive
         pass
+    try:
+        with _reservations_lock:
+            _reservations.clear()
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
+
+# ============================================================================
+# Slice 12AA — Per-Op Budget Reservation
+# ============================================================================
+#
+# bt-2026-05-23-225740 (Slice 12Z validation soak) proved loop
+# survival across 6 consecutive soaks, but the fixture op still hit
+# ``session_budget_preflight_refused: est=$0.5000 >
+# session_remaining=$0.4150``. The cost-shape audit of that soak
+# + the prior Slice 12X soak showed the fixture needs
+# **~$0.51-$0.59 of contiguous runway** to land its sequence of
+# Claude streaming chunks — that matches Claude provider's
+# ``_max_cost_per_op`` (~$0.585) almost exactly.
+#
+# Slice 12Y's background-spend ceiling prevented sensor ops from
+# burning ALL the budget, but the ceiling guarantees only
+# "$X is reserved for the foreground TIER" — it does NOT guarantee
+# any single foreground op can spend a contiguous $X. The fixture's
+# own earlier successful calls plus a few sensor calls together
+# pushed total_spent past (cap - ceiling), starving the next
+# fixture call.
+#
+# Slice 12AA closes the gap with **per-op reservations**:
+#
+# 1. When a foreground op enters the pipeline (lazy-via-preflight or
+#    explicit acquire), the SBA reserves its expected total runway
+#    (the caller's ``_max_cost_per_op``, NOT a hardcoded constant —
+#    uses whatever the existing CostGovernor / provider already
+#    computed for this op via route + complexity + headroom math).
+# 2. Other ops see the reservation as unavailable budget — their
+#    preflight checks subtract OTHER reservations before computing
+#    effective_remaining.
+# 3. The owning op spends against its own reservation across
+#    multiple provider calls — when checking its own preflight, the
+#    SBA treats its own reservation as available, NOT subtracted.
+# 4. Reservation is released at op terminal state via
+#    :func:`release_reservation` (orchestrator's terminal hook).
+#    Releasing frees the runway for other ops; idempotent.
+# 5. Background/speculative ops can NEVER acquire reservations
+#    (they use the Slice 12Y ceiling instead).
+#
+# NO hardcoded SWE-Bench / provider / route values — every
+# reservation amount comes from the caller. Composes cleanly with
+# the Slice 12Y background-ceiling check; both layers compute
+# against the SAME ``effective_remaining`` after subtracting
+# OTHER reservations.
+#
+# Master switch ``JARVIS_PER_OP_RESERVATION_ENABLED`` (BOOL/SAFETY,
+# default TRUE). Set to ``false`` for byte-identical pre-Slice-12AA
+# behavior (no reservations; legacy preflight against bare
+# ``remaining``).
+
+
+PER_OP_RESERVATION_ENABLED_ENV_VAR: str = (
+    "JARVIS_PER_OP_RESERVATION_ENABLED"
+)
+
+
+def per_op_reservation_enabled() -> bool:
+    """Master flag — default TRUE. NEVER raises."""
+    raw = os.environ.get(
+        PER_OP_RESERVATION_ENABLED_ENV_VAR, "true",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """Slice 12AA per-op reservation entry. Immutable snapshot of
+    a foreground op's reserved-but-not-yet-spent session budget."""
+    op_id: str
+    signal_source: Optional[str]
+    reserved_usd: float
+    acquired_at_monotonic: float
+
+
+_reservations: Dict[str, Reservation] = {}
+_reservations_lock: threading.Lock = threading.Lock()
+
+
+def acquire_reservation(
+    *,
+    op_id: str,
+    signal_source: Optional[str],
+    estimated_total_usd: float,
+) -> bool:
+    """Reserve ``estimated_total_usd`` of session budget for this
+    op. Returns ``True`` on success, ``False`` when:
+
+      * The master switch is disabled
+      * The op is background/speculative tier (uses the ceiling
+        instead of reservations)
+      * The amount is non-positive / non-numeric
+      * Accepting the reservation would push total reservations
+        above session_remaining (i.e., no room)
+
+    Idempotent: re-arming with the SAME op_id replaces the prior
+    reservation in place (first-write-wins semantics would prevent
+    legitimate amount-revisions; last-write-wins is more pragmatic
+    for the provider-driven sizing model). NEVER raises.
+
+    The amount is caller-supplied — typically the provider's
+    ``_max_cost_per_op`` (provider-derived per-op cap, NOT a
+    hardcoded SWE-Bench value). The SBA stores the amount; it
+    doesn't recompute it.
+    """
+    if not per_op_reservation_enabled():
+        return False
+    if not isinstance(op_id, str) or not op_id:
+        return False
+    if is_background_tier_source(signal_source):
+        # Background ops use the Slice 12Y ceiling — no reservations.
+        return False
+    try:
+        amount = float(estimated_total_usd)
+        if amount <= 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        remaining = get_session_remaining_usd()
+    except Exception:  # noqa: BLE001
+        remaining = None
+    if remaining is None:
+        # No authority active — reservation has no meaning.
+        return False
+
+    with _reservations_lock:
+        # Sum reservations from OTHER ops (re-arming same op_id
+        # replaces, so don't double-count own prior).
+        other_reserved = sum(
+            r.reserved_usd
+            for r in _reservations.values()
+            if r.op_id != op_id
+        )
+        if amount > max(0.0, remaining - other_reserved):
+            return False
+        _reservations[op_id] = Reservation(
+            op_id=op_id,
+            signal_source=signal_source,
+            reserved_usd=amount,
+            acquired_at_monotonic=time.monotonic(),
+        )
+        return True
+
+
+def release_reservation(op_id: str) -> bool:
+    """Release the reservation held by ``op_id``. Idempotent —
+    returns ``True`` if a reservation was removed, ``False`` if
+    none existed. NEVER raises.
+
+    Called by the orchestrator's terminal hook (when the op
+    reaches APPLIED / FAILED / ROLLED_BACK / BLOCKED / cancelled
+    state). Releasing frees the runway for other ops.
+    """
+    if not isinstance(op_id, str) or not op_id:
+        return False
+    try:
+        with _reservations_lock:
+            return _reservations.pop(op_id, None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_reservations_snapshot() -> Tuple[Reservation, ...]:
+    """Test + observability accessor. Returns an immutable
+    snapshot of all active reservations. NEVER raises."""
+    try:
+        with _reservations_lock:
+            return tuple(_reservations.values())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _sum_other_reservations(op_id: Optional[str]) -> float:
+    """Internal — sum reserved_usd across all reservations whose
+    op_id != the supplied one. Used by check_preflight to compute
+    effective_remaining. The own-op reservation is INTENTIONALLY
+    excluded so the owning op can spend against its own runway.
+    NEVER raises."""
+    try:
+        with _reservations_lock:
+            return sum(
+                r.reserved_usd
+                for r in _reservations.values()
+                if r.op_id != op_id
+            )
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +516,7 @@ def check_preflight(
     provider_name: str,
     estimated_cost_usd: float,
     signal_source: Optional[str] = None,
+    op_id: Optional[str] = None,
 ) -> None:
     """Hard wallet gate. Call BEFORE provider dispatch.
 
@@ -377,11 +577,26 @@ def check_preflight(
         )
         return
 
+    # ── Slice 12AA Part 1 — Effective-remaining (reservation-aware) ──
+    # Subtract OTHER ops' reservations from ``remaining`` to compute
+    # the effective budget this preflight sees. The owning op's
+    # OWN reservation is intentionally NOT subtracted — the owning
+    # op spends FROM its reservation. When op_id is None (legacy
+    # callers / no orchestrator wiring), the reservation pool is
+    # treated as empty for THIS preflight (other ops' reservations
+    # are still subtracted; the caller just can't claim ownership
+    # of any).
+    other_reserved = _sum_other_reservations(op_id)
+    effective_remaining = max(0.0, remaining - other_reserved)
+
     # ── Slice 12Y Part 1 — Background spend ceiling ──
     # Computed BEFORE the legacy `est > remaining` check so the
     # background-specific refusal carries a distinct telemetry
     # tag ("background_spend_ceiling") instead of falling through
-    # to the generic preflight refusal.
+    # to the generic preflight refusal. Slice 12AA: ceiling
+    # computed against ``effective_remaining`` so other ops'
+    # foreground reservations are correctly excluded from
+    # background's available pool.
     if is_background_tier_source(signal_source):
         try:
             total_cap = get_session_total_cap_usd()
@@ -396,15 +611,20 @@ def check_preflight(
             # Background ops only see the surplus above this
             # reserve as their available budget.
             foreground_reserve = total_cap * (1.0 - limit_pct)
-            bg_remaining = max(0.0, remaining - foreground_reserve)
+            bg_remaining = max(
+                0.0, effective_remaining - foreground_reserve,
+            )
             if est > bg_remaining:
                 logger.info(
                     "[SBA] preflight REFUSED (background_spend_ceiling): "
                     "provider=%s signal_source=%s est=$%.4f > "
                     "bg_remaining=$%.4f (total_cap=$%.4f "
-                    "foreground_reserve=$%.4f limit_pct=%.2f)",
+                    "effective_remaining=$%.4f "
+                    "foreground_reserve=$%.4f limit_pct=%.2f "
+                    "other_reserved=$%.4f)",
                     provider_name, signal_source, est, bg_remaining,
-                    total_cap, foreground_reserve, limit_pct,
+                    total_cap, effective_remaining,
+                    foreground_reserve, limit_pct, other_reserved,
                 )
                 raise SessionBudgetPreflightRefused(
                     provider=str(provider_name),
@@ -416,30 +636,42 @@ def check_preflight(
                     ),
                 )
 
-    if est > remaining:
+    # ── Slice 12AA Part 2 — Reservation-aware generic refusal ──
+    # Check against ``effective_remaining`` (= remaining minus
+    # OTHER ops' active reservations). The owning op spends from
+    # its own reservation; other ops' reservations are off-limits.
+    if est > effective_remaining:
         logger.info(
-            "[SBA] preflight REFUSED: provider=%s est=$%.4f > "
-            "session_remaining=$%.4f",
-            provider_name, est, remaining,
+            "[SBA] preflight REFUSED: provider=%s op_id=%s "
+            "est=$%.4f > effective_remaining=$%.4f "
+            "(remaining=$%.4f other_reserved=$%.4f)",
+            provider_name, op_id, est, effective_remaining,
+            remaining, other_reserved,
         )
         raise SessionBudgetPreflightRefused(
             provider=str(provider_name),
             estimated_cost_usd=est,
-            session_remaining_usd=remaining,
+            session_remaining_usd=effective_remaining,
         )
 
 
 __all__ = [
     "BACKGROUND_SPEND_LIMIT_PCT_ENV_VAR",
+    "PER_OP_RESERVATION_ENABLED_ENV_VAR",
+    "Reservation",
     "SESSION_BUDGET_AUTHORITY_SCHEMA_VERSION",
     "SessionBudgetPreflightRefused",
     "_BACKGROUND_TIER_SIGNAL_SOURCES",
+    "acquire_reservation",
     "check_preflight",
     "get_background_spend_limit_pct",
+    "get_reservations_snapshot",
     "get_session_budget_provider",
     "get_session_remaining_usd",
     "get_session_total_cap_usd",
     "is_background_tier_source",
+    "per_op_reservation_enabled",
+    "release_reservation",
     "reset_for_tests",
     "set_session_budget_provider",
 ]
