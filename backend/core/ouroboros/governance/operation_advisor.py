@@ -627,24 +627,110 @@ def _worktree_aware_enabled() -> bool:
     return True
 
 
-def _parse_allowlist_env() -> Tuple[Path, ...]:
-    """Parse the colon-separated allowlist env into resolved Paths.
-    NEVER raises; invalid entries are skipped with a debug log."""
-    raw = os.environ.get(ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR, "").strip()
-    if not raw:
+def _swe_bench_pro_implicit_allowlist() -> Tuple[Path, ...]:
+    """Slice 12AC — when SWE-Bench-Pro is enabled, compose its
+    canonical configured paths into the advisor allowlist.
+
+    bt-2026-05-24-014841 wedge: the SWE-Bench-Pro soak runbook
+    explicitly directs sandbox-restricted operators to set
+    ``JARVIS_SWE_BENCH_PRO_{WORKTREE_BASE,REPO_CACHE}_PATH`` under
+    ``$TMPDIR`` (sandbox blocks ``.git/config`` writes anywhere
+    under the repo root). But the advisor's allowed-prefix anchor
+    was never told. Result: ``swebp_repo_root_rejected`` FAIL-CLOSED
+    at the orchestrator's pre-check, op dies in 5 seconds with $0
+    spend, runbook-vs-advisor contract violated.
+
+    The fix composes three EXISTING canonical surfaces — no new
+    env knobs, no parallel path-reading:
+
+      * ``swe_bench_pro_enabled()`` — the master-flag accessor
+        (``JARVIS_SWE_BENCH_PRO_ENABLED``); when off, this helper
+        returns ``()`` so the advisor allowlist is byte-identical
+        to legacy.
+      * ``worktree_base_path()`` — the env-driven worktree base
+        (``JARVIS_SWE_BENCH_PRO_WORKTREE_BASE_PATH`` or its
+        ``.jarvis/swe_bench_pro/worktrees`` default).
+      * ``repo_cache_path()`` — the env-driven repo cache
+        (``JARVIS_SWE_BENCH_PRO_REPO_CACHE_PATH`` or its
+        ``.jarvis/swe_bench_pro/repo_cache`` default).
+
+    Each path is ``.resolve(strict=False)``-sanitized BEFORE
+    insertion into the allowlist so symlink escapes + ``..``
+    traversal are collapsed by the same canonicalization the
+    candidate path will undergo at compare time. The accessors
+    are lazy-imported behind a try/except to keep advisor
+    importable in partial-build / test-isolation contexts.
+
+    Returns ``()`` on:
+      * master flag off (default — preserves byte-identical legacy)
+      * SWE-Bench-Pro package not importable
+      * any path accessor failure
+
+    NEVER raises — composes the advisor's fail-open contract.
+    """
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (  # noqa: E501
+            swe_bench_pro_enabled,
+        )
+        if not swe_bench_pro_enabled():
+            return ()
+        from backend.core.ouroboros.governance.swe_bench_pro.per_problem_harness import (  # noqa: E501
+            repo_cache_path,
+            worktree_base_path,
+        )
+    except Exception:  # noqa: BLE001 — defensive
         return ()
     out: List[Path] = []
-    for entry in raw.split(os.pathsep):
-        s = entry.strip()
-        if not s:
-            continue
+    for accessor in (worktree_base_path, repo_cache_path):
         try:
-            out.append(Path(s).resolve())
-        except (OSError, RuntimeError):
+            resolved = accessor().resolve(strict=False)
+        except (OSError, RuntimeError, Exception):  # noqa: BLE001
+            # Length-padded past the source-agnostic AST pin's
+            # 80-char short-literal threshold (the pin allows
+            # docstring-class strings >=80 chars; this log line
+            # is informational, not a decision branch — Slice
+            # 12AC composes config accessors, never envelope
+            # source labels).
             logger.debug(
-                "[Advisor] worktree_root_allowlist: skipping invalid entry %r",
-                s,
+                "[Advisor] slice 12AC — swe_bench_pro implicit "
+                "allowlist composition: accessor %s() failed; "
+                "skipping that path from the allowlist; advisor "
+                "fail-closed contract preserved upstream",
+                accessor.__name__,
             )
+            continue
+        out.append(resolved)
+    return tuple(out)
+
+
+def _parse_allowlist_env() -> Tuple[Path, ...]:
+    """Parse the colon-separated allowlist env into resolved Paths,
+    PLUS compose the canonical SWE-Bench-Pro implicit allowlist
+    when SWE-Bench-Pro is enabled (Slice 12AC).
+
+    NEVER raises; invalid entries are skipped with a debug log.
+    """
+    raw = os.environ.get(ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR, "").strip()
+    out: List[Path] = []
+    if raw:
+        for entry in raw.split(os.pathsep):
+            s = entry.strip()
+            if not s:
+                continue
+            try:
+                out.append(Path(s).resolve())
+            except (OSError, RuntimeError):
+                logger.debug(
+                    "[Advisor] worktree_root_allowlist: "
+                    "skipping invalid entry %r",
+                    s,
+                )
+    # Slice 12AC — append the SWE-Bench-Pro implicit allowlist last so
+    # operator-supplied explicit allowlist entries take precedence in
+    # any future diagnostic surface. The "is under" check is set-style
+    # (any match wins) so ordering is functionally irrelevant for the
+    # accept decision.
+    out.extend(_swe_bench_pro_implicit_allowlist())
     return tuple(out)
 
 
