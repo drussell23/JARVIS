@@ -7397,27 +7397,71 @@ class ClaudeProvider:
                 check_preflight as _sba_check_preflight,
             )
             # Slice 12AA — lazy acquire foreground reservation
-            # on first preflight for this op. Amount is the
-            # provider's _max_cost_per_op (provider-derived, NOT
-            # hardcoded). SBA returns False for background-tier
-            # ops + when no room; preflight check below catches
-            # any violation.
+            # on first preflight for this op. SBA returns False
+            # for background-tier ops + when no room; preflight
+            # check below catches any violation.
+            #
+            # Slice 12AA-fix (bt-2026-05-23-235325 wedge):
+            # the reservation MUST be sized from the
+            # orchestrator's CostGovernor per-op cumulative cap
+            # (the authoritative "how much can this op spend
+            # across ALL provider calls + retries" value),
+            # NOT from the provider's per-CALL cap
+            # (_max_cost_per_op). The fixture's cumulative need
+            # was ~$1.04 across 7 Claude streaming chunks but
+            # per-call cap is only ~$0.585 — under-sizing the
+            # reservation let the SBA short-circuit later
+            # legitimate calls from the same op as "over budget".
+            # Source of cumulative cap:
+            # CostGovernor.get_op_cap_usd(op_id) via the process
+            # singleton accessor get_default_cost_governor().
+            # When CostGov is unregistered / disabled / op not
+            # registered, fall back to the provider's per-call
+            # cap as a conservative floor (NOT zero — zero would
+            # acquire nothing and defeat Slice 12AA entirely).
+            # NO empirical multiplier. NO hardcoded SWE-Bench
+            # fixture values.
             try:
                 from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
                     acquire_reservation as _sba_acquire,
+                )
+                from backend.core.ouroboros.governance.cost_governor import (
+                    get_default_cost_governor as _get_default_cost_gov,
                 )
                 _ctx_op_id_str = str(
                     getattr(context, "op_id", "") or ""
                 )
                 if _ctx_op_id_str:
+                    # Resolve cumulative cap from CostGovernor.
+                    # Returns None when (a) CostGov disabled,
+                    # (b) singleton unregistered, or (c) op was
+                    # never registered via start(). Any of those
+                    # → fall back to provider per-call cap as a
+                    # conservative floor.
+                    _cumulative_cap_usd: Optional[float] = None
+                    try:
+                        _cg = _get_default_cost_gov()
+                        if _cg is not None:
+                            _cumulative_cap_usd = _cg.get_op_cap_usd(
+                                _ctx_op_id_str,
+                            )
+                    except Exception:  # noqa: BLE001 — defensive
+                        _cumulative_cap_usd = None
+                    if (
+                        _cumulative_cap_usd is None
+                        or _cumulative_cap_usd <= 0.0
+                    ):
+                        _reservation_usd = float(
+                            self._max_cost_per_op or 0.0,
+                        )
+                    else:
+                        _reservation_usd = float(_cumulative_cap_usd)
                     _sba_acquire(
                         op_id=_ctx_op_id_str,
                         signal_source=getattr(
                             context, "signal_source", None,
                         ),
-                        estimated_total_usd=float(
-                            self._max_cost_per_op or 0.0,
-                        ),
+                        estimated_total_usd=_reservation_usd,
                     )
             except Exception:  # noqa: BLE001
                 pass
