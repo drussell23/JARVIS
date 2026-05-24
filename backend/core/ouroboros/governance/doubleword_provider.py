@@ -624,8 +624,23 @@ class DoublewordProvider:
 
     @property
     def is_available(self) -> bool:
-        """Check if Doubleword is configured."""
-        return bool(self._api_key)
+        """Check if Doubleword is configured.
+
+        Slice 2B-ii.1 — Aegis-aware availability gate. Composes the
+        canonical ``aegis.client.is_enabled()`` predicate as an
+        OR-fallback when the local API key is absent. Under the
+        Aegis Zero-Trust posture, the real credential lives in the
+        out-of-process daemon and our local env is intentionally
+        scrubbed at preflight (Slice 1) — without this fallback,
+        the provider self-disables despite having a fully-functional
+        upstream route (the Catch-22 surfaced by Aegis Detonation
+        soak bt-2026-05-24-222008).
+
+        Predicate is read at call-time (not cached at __init__) so
+        the gate stays accurate if Aegis is enabled mid-session.
+        """
+        from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
+        return _aegis_is_enabled() or bool(self._api_key)
 
     async def _get_session(self) -> Any:
         """Lazy-init persistent aiohttp session.
