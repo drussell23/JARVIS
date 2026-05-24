@@ -230,6 +230,26 @@ def _compose_bearer(key: str) -> str:
     return f"Bearer {key}"
 
 
+def compose_dw_bearer_header(api_key: str) -> Dict[str, str]:
+    """Public legacy-path bearer composer for callers that already
+    have an explicit ``api_key`` in scope (e.g. ``dw_heavy_probe``
+    which receives it as a method parameter rather than reading env).
+
+    Single seam — keeps the literal ``"Bearer "`` string concentrated
+    in this module so AST pins in other files can forbid the f-string
+    pattern locally (Slice 2B-ii.2's
+    ``test_ast_pin_heavy_probe_session_post_carries_lease_header``).
+
+    Returns ``{"Authorization": "Bearer {api_key}"}`` when ``api_key``
+    is truthy; empty dict otherwise. Callers should typically use
+    :func:`dw_authorization_header` instead (which reads from env);
+    this variant exists for paths that thread the key explicitly.
+    """
+    if not api_key:
+        return {}
+    return {"Authorization": _compose_bearer(api_key)}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Per-call lease acquisition
 # ──────────────────────────────────────────────────────────────────────
@@ -320,6 +340,7 @@ __all__ = [
     "make_async_anthropic_client",
     "dw_aegis_base_url",
     "dw_authorization_header",
+    "compose_dw_bearer_header",
     "acquire_call_lease",
     "merge_lease_header",
     "merge_lease_into_session_headers",
