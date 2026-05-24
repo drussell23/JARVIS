@@ -162,16 +162,58 @@ def build_app(
         # so the handler can look up wire family / auth scheme /
         # credential env var without re-reading env on the hot path.
         from backend.core.ouroboros.aegis.upstream_registry import (
+            EndpointKind,
             snapshot as _upstream_snapshot,
         )
         upstream_map = _upstream_snapshot()
         app[_K_UPSTREAM_MAP] = upstream_map
-        for path in upstream_map.keys():
-            # Single shared handler — dispatches on request.path so
-            # adding upstream paths to the registry is a one-line edit.
-            app.router.add_post(path, _handle_forward)
+
+        # Register one handler per (path, method) pair. Two kinds:
+        #   - LLM_COMPLETION → _handle_forward (lease-gated, reconciled)
+        #   - PASSTHROUGH    → _handle_passthrough (session-gated, transparent)
+        # Closure binds the endpoint descriptor so the handler can dispatch
+        # without re-walking the registry on the hot path.
+        for path, endpoint in upstream_map.items():
+            if endpoint.kind is EndpointKind.LLM_COMPLETION:
+                handler = _make_llm_handler(endpoint)
+            elif endpoint.kind is EndpointKind.PASSTHROUGH:
+                handler = _make_passthrough_handler(endpoint)
+            else:  # pragma: no cover — closed enum
+                continue
+            for method in endpoint.http_methods:
+                add = getattr(app.router, f"add_{method.lower()}")
+                add(path, handler)
 
     return app
+
+
+def _make_llm_handler(endpoint):
+    """Build a closure-bound handler for an LLM_COMPLETION endpoint."""
+    async def _handler(request: web.Request) -> web.StreamResponse:
+        from backend.core.ouroboros.aegis.forwarding import forward_request
+        response, _ = await forward_request(
+            request=request,
+            endpoint=endpoint,
+            K=request.app[_K_HMAC_KEY],
+            nonce_ledger=request.app[_K_NONCE_LEDGER],
+            budget=request.app[_K_BUDGET],
+        )
+        return response
+    return _handler
+
+
+def _make_passthrough_handler(endpoint):
+    """Build a closure-bound handler for a PASSTHROUGH endpoint."""
+    async def _handler(request: web.Request) -> web.StreamResponse:
+        from backend.core.ouroboros.aegis.passthrough import forward_passthrough
+        response, _ = await forward_passthrough(
+            request=request,
+            endpoint=endpoint,
+            K=request.app[_K_HMAC_KEY],
+            active_jti=set(request.app[_K_ACTIVE_SESSIONS].keys()),
+        )
+        return response
+    return _handler
 
 
 # ---------------------------------------------------------------------------
@@ -457,52 +499,6 @@ async def _handle_lease_redeem(request: web.Request) -> web.Response:
         "verdict": reconcile_verdict.to_dict(),
         "lease": lease.to_dict(),
     })
-
-
-# ---------------------------------------------------------------------------
-# Slice 2 — upstream forwarding handler
-# ---------------------------------------------------------------------------
-
-
-async def _handle_forward(request: web.Request) -> web.StreamResponse:
-    """Slice 2 forwarding entry point.
-
-    Dispatches on ``request.path`` against the upstream registry
-    captured at ``build_app`` time (so env overrides apply at boot,
-    not per-request). Delegates everything else to
-    :func:`forwarding.forward_request`.
-
-    The HMAC key K is read once from app state and passed to the
-    forwarder; never exposed in any response body or log line.
-    """
-    app = request.app
-    upstream_map = app.get(_K_UPSTREAM_MAP)
-    if upstream_map is None:
-        # Defensive: should never happen because the route is only
-        # registered when forwarding is enabled. If it does, fail
-        # closed.
-        return web.json_response(
-            {"ok": False, "error": "forwarding_disabled"}, status=503,
-        )
-
-    endpoint = upstream_map.get(request.path)
-    if endpoint is None:
-        return web.json_response(
-            {"ok": False, "error": "upstream_path_unregistered"}, status=404,
-        )
-
-    # Lazy-import forwarding so the daemon's substrate can be imported
-    # by tests without paying the aiohttp.ClientSession startup cost.
-    from backend.core.ouroboros.aegis.forwarding import forward_request
-
-    response, _result = await forward_request(
-        request=request,
-        endpoint=endpoint,
-        K=app[_K_HMAC_KEY],
-        nonce_ledger=app[_K_NONCE_LEDGER],
-        budget=app[_K_BUDGET],
-    )
-    return response
 
 
 # ---------------------------------------------------------------------------

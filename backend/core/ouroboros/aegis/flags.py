@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 ENV_AEGIS_ENABLED: str = "JARVIS_AEGIS_ENABLED"
 ENV_AEGIS_FORWARDING_ENABLED: str = "JARVIS_AEGIS_FORWARDING_ENABLED"
 ENV_AEGIS_MAX_REQUEST_BODY_BYTES: str = "JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES"
+ENV_AEGIS_MAX_RESPONSE_BUFFER_BYTES: str = "JARVIS_AEGIS_MAX_RESPONSE_BUFFER_BYTES"
 ENV_AEGIS_BOOTSTRAP_DIR: str = "JARVIS_AEGIS_BOOTSTRAP_DIR"
 ENV_AEGIS_BOOTSTRAP_TIMEOUT_S: str = "JARVIS_AEGIS_BOOTSTRAP_TIMEOUT_S"
 ENV_AEGIS_DAEMON_BIND_HOST: str = "JARVIS_AEGIS_DAEMON_BIND_HOST"
@@ -225,6 +226,24 @@ def _seeds() -> List[FlagSpec]:
             example=f"{ENV_AEGIS_MAX_REQUEST_BODY_BYTES}=8388608",
         ),
         FlagSpec(
+            name=ENV_AEGIS_MAX_RESPONSE_BUFFER_BYTES,
+            type=FlagType.INT,
+            default=4 * 1024 * 1024,
+            description=(
+                "Slice 2B-i: maximum bytes Aegis will BUFFER from a "
+                "non-streaming upstream response to parse the usage "
+                "field for authoritative reconciliation. Bytes are "
+                "still passed through to JARVIS byte-identically; "
+                "this cap only limits how much Aegis retains for "
+                "parsing. Responses larger than this fall back to the "
+                "pre-flight reserve (warning logged); 4 MiB comfortably "
+                "fits any Anthropic / DW non-streaming JSON response."
+            ),
+            category=Category.CAPACITY,
+            source_file=_SRC_AEGIS,
+            example=f"{ENV_AEGIS_MAX_RESPONSE_BUFFER_BYTES}=8388608",
+        ),
+        FlagSpec(
             name=ENV_AEGIS_BOOTSTRAP_DIR,
             type=FlagType.STR,
             default="",
@@ -410,6 +429,7 @@ __all__ = [
     "ENV_AEGIS_ENABLED",
     "ENV_AEGIS_FORWARDING_ENABLED",
     "ENV_AEGIS_MAX_REQUEST_BODY_BYTES",
+    "ENV_AEGIS_MAX_RESPONSE_BUFFER_BYTES",
     "ENV_AEGIS_HOURLY_BURN_CAP_USD",
     "ENV_AEGIS_LEASE_EXPIRY_S",
     "ENV_AEGIS_LEASE_OVERRUN_MULTIPLIER",

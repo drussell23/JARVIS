@@ -273,6 +273,9 @@ async def _establish_and_acquire(
 
 
 async def test_router_includes_v1_routes_when_forwarding_enabled(full_stack):
+    """Slice 1 substrate (4 endpoints) + Slice 2A LLM completion
+    forwarding (2 endpoints) + Slice 2B-i passthrough (5 endpoints).
+    Total: 11 distinct route paths (some templated)."""
     client, _ = full_stack
     app = client.app
     assert app is not None
@@ -284,6 +287,11 @@ async def test_router_includes_v1_routes_when_forwarding_enabled(full_stack):
         "/lease/redeem",
         "/v1/messages",
         "/v1/chat/completions",
+        "/v1/files",
+        "/v1/batches",
+        "/v1/batches/{batch_id}",
+        "/v1/files/{file_id}/content",
+        "/v1/models",
     })
     assert paths == expected
 
