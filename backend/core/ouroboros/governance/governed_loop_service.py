@@ -91,6 +91,43 @@ except ImportError:
 
 logger = logging.getLogger("Ouroboros.GovernedLoop")
 
+
+# ---------------------------------------------------------------------------
+# Slice 2B-ii.1 — Aegis-aware provider construction gate
+# ---------------------------------------------------------------------------
+# Closes the Catch-22 surfaced by Aegis Detonation soak bt-2026-05-24-222008:
+# Aegis preflight (Slice 1) intentionally scrubs ANTHROPIC_API_KEY +
+# DOUBLEWORD_API_KEY from the harness env at T+~2s. The previous gates
+# `if self._config.claude_api_key:` and `if _dw_api_key:` then refused
+# to construct the providers — despite the fact that the credentials
+# are now safely held in the Aegis daemon and would be injected
+# upstream-side at every forwarded request. This helper composes the
+# canonical `aegis.client.is_enabled()` predicate as an OR-fallback so
+# the providers ARE constructed under the Aegis-enabled path; their
+# downstream `_ensure_client()` calls route through the Slice 2B-ii
+# provider bridge (`aegis_provider_bridge.make_async_anthropic_client`)
+# which transparently uses the daemon's `/v1/*` forwarding surface.
+#
+# The predicate is read at call-time (not cached) so the test
+# monkeypatch path works and so an operator can enable Aegis after
+# the module has been imported.
+def _provider_construction_gate(*, local_api_key: Optional[str]) -> bool:
+    """Decide whether a provider (Claude / DoubleWord) should be
+    constructed at GovernedLoopService boot.
+
+    Returns True iff EITHER the local API key is truthy OR Aegis is
+    enabled (key is in the daemon, not our process). Returns False
+    only when both are absent — the unambiguous "this provider is
+    not configured" case.
+
+    Pure, side-effect-free, no I/O. Extracted as a callable so the
+    AST pin can enforce its composition shape and so unit tests can
+    monkeypatch ``aegis.client.is_enabled`` cleanly.
+    """
+    from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
+    return bool(local_api_key) or _aegis_is_enabled()
+
+
 # ---------------------------------------------------------------------------
 # Sandbox-safe state directory — redirect ~/.jarvis when not writable
 # ---------------------------------------------------------------------------
@@ -3255,15 +3292,22 @@ class GovernedLoopService:
                 )
                 primary = None
 
-        # Build ClaudeProvider if API key available
-        if self._config.claude_api_key:
+        # Build ClaudeProvider if API key available OR Aegis is enabled.
+        # Slice 2B-ii.1 — Aegis-aware gate. When Aegis is on, the local
+        # claude_api_key has been intentionally scrubbed by preflight
+        # (the real key is now confiscated to the daemon). We still
+        # construct the provider; its _ensure_client() routes through
+        # the Aegis bridge (Slice 2B-ii). The api_key is coerced
+        # None → "" so the provider's self._api_key is always a string
+        # (downstream code in the bridge handles the empty case).
+        if _provider_construction_gate(local_api_key=self._config.claude_api_key):
             try:
                 from backend.core.ouroboros.governance.providers import (
                     ClaudeProvider,
                 )
 
                 fallback = ClaudeProvider(
-                    api_key=self._config.claude_api_key,
+                    api_key=(self._config.claude_api_key or ""),
                     model=self._config.claude_model,
                     max_cost_per_op=self._config.claude_max_cost_per_op,
                     daily_budget=self._config.claude_daily_budget,
@@ -3288,9 +3332,14 @@ class GovernedLoopService:
                 fallback = None
 
         # Build DoublewordProvider (Tier 0 — batch 397B MoE) if API key set
+        # OR Aegis is enabled. Slice 2B-ii.1 — Aegis-aware gate (same shape
+        # as the ClaudeProvider gate above). Under Aegis the local
+        # DOUBLEWORD_API_KEY env has been scrubbed; the empty string
+        # propagates to DoublewordProvider.__init__ which is now safe
+        # because is_available also composes the Aegis predicate.
         tier0 = None
         _dw_api_key = os.environ.get("DOUBLEWORD_API_KEY", "")
-        if _dw_api_key:
+        if _provider_construction_gate(local_api_key=_dw_api_key):
             try:
                 from backend.core.ouroboros.governance.doubleword_provider import (
                     DoublewordProvider,
