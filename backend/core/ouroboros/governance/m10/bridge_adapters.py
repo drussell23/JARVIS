@@ -152,8 +152,14 @@ class SynthesisProviderAdapter:
                 error="ANTHROPIC_API_KEY not set",
             )
 
+        # Slice 2B-ii — route through Aegis Provider Bridge.
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            acquire_call_lease as _aegis_acquire_call_lease,
+            make_async_anthropic_client as _aegis_make_anthropic,
+            merge_lease_header as _aegis_merge_lease,
+        )
         try:
-            client = anthropic.AsyncAnthropic(api_key=api_key)
+            client = _aegis_make_anthropic(api_key=api_key)
         except Exception as err:  # noqa: BLE001
             return SynthesisCandidate(
                 code_text="",
@@ -174,12 +180,20 @@ class SynthesisProviderAdapter:
         )
 
         try:
+            # Per-call Aegis lease (M10 synthesis op — synthetic op_id
+            # tag since this is invoked outside the main GENERATE loop).
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id="m10-synthesis",
+                route="complex",
+                estimated_cost_usd=0.03,
+            )
             resp = await client.messages.create(
                 model=synthesis_model(),
                 max_tokens=synthesis_max_tokens(),
                 temperature=0.2,
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
+                extra_headers=_aegis_merge_lease(None, _aegis_lease),
             )
         except Exception as err:  # noqa: BLE001
             return SynthesisCandidate(

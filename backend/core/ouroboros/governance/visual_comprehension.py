@@ -253,13 +253,28 @@ class VisualCodeComprehension:
     # ------------------------------------------------------------------
 
     async def _analyze_with_vision(self, b64_image: str, prompt: str) -> Optional[str]:
-        """Send screenshot to Claude Vision. Returns raw response text."""
+        """Send screenshot to Claude Vision. Returns raw response text.
+
+        Slice 2B-ii — Aegis Provider Bridge transport swap + per-call
+        X-JARVIS-Lease. Synthetic ``vision-comprehension`` op_id since
+        this entry point is not threaded with an OperationContext.
+        """
         try:
-            import anthropic
-            client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            import anthropic  # noqa: F401 — kept for surrounding ImportError gate
+            from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                acquire_call_lease as _aegis_acquire_call_lease,
+                make_async_anthropic_client as _aegis_make_anthropic,
+                merge_lease_header as _aegis_merge_lease,
+            )
+            client = _aegis_make_anthropic(api_key=self._api_key)
 
             media_type = "image/jpeg" if b64_image[:4] == "/9j/" else "image/png"
 
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id="vision-comprehension",
+                route="standard",
+                estimated_cost_usd=0.02,
+            )
             response = await asyncio.wait_for(
                 client.messages.create(
                     model=self._vision_model,
@@ -274,6 +289,7 @@ class VisualCodeComprehension:
                             {"type": "text", "text": prompt},
                         ],
                     }],
+                    extra_headers=_aegis_merge_lease(None, _aegis_lease),
                 ),
                 timeout=_VISION_TIMEOUT_S,
             )
