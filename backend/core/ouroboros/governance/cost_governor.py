@@ -779,6 +779,42 @@ class CostGovernor:
             return float("inf")
         return max(0.0, entry.cap_usd - entry.cumulative_usd)
 
+    def get_op_cap_usd(self, op_id: str) -> Optional[float]:
+        """Slice 12AA-fix — return the per-op cumulative cap (USD)
+        for an ACTIVE op, or ``None`` when the op isn't registered.
+
+        This is the authoritative source of "how much can this op
+        spend in total across all provider calls + retries". The
+        cap was derived at :meth:`start` via
+        ``baseline_usd × route_factor × complexity_factor ×
+        retry_headroom × readonly_factor``.
+
+        Slice 12AA's per-op reservation (in session_budget_authority)
+        sizes the reservation FROM this value — NOT from the
+        provider's per-CALL cap (``_max_cost_per_op``). The
+        bt-2026-05-23-235325 soak proved per-call sizing was too
+        small: the fixture's cumulative need was ~$1.04 across 7
+        Claude streaming chunks but per-call cap is only ~$0.585,
+        leaving the reservation under-sized and starving later
+        legitimate calls from the same op.
+
+        Returns ``None`` when:
+          * CostGovernor is disabled (``config.enabled=False``)
+          * op_id is not registered (``start()`` never called, OR
+            ``finish()`` already pruned the entry)
+
+        Read-only — does NOT mutate the entry. NEVER raises.
+        """
+        if not self._config.enabled:
+            return None
+        try:
+            entry = self._entries.get(op_id)
+            if entry is None:
+                return None
+            return float(entry.cap_usd)
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+
     def finish(self, op_id: str) -> Optional[Mapping[str, object]]:
         """Finalize and remove the op entry. Returns summary or None.
 
