@@ -85,6 +85,31 @@ class ProviderRoute(str, Enum):
     traffic is its own first-class route with isolated cost
     accounting."""
 
+    WIRING_VALIDATION = "wiring_validation"
+    """Slice 12AD — budget-aware route for wiring-validation fixtures.
+    Used for: SWE-Bench-Pro smoke fixtures + any future envelope
+    declaring ``metadata.purpose == "wiring_validation"`` AND
+    ``metadata.real_benchmark == False``. Contract: trivially-passing
+    structural fixtures get a deeply-reduced CostGov factor
+    (``JARVIS_OP_COST_ROUTE_WIRING_VALIDATION`` default 0.1, so the
+    derived per-op cap lands ~$0.05-0.10 vs ~$2.00 for COMPLEX) and
+    skip the Venom multi-round tool loop via
+    ``route_predicates.VENOM_SKIP_ROUTES`` (a no-op patch is the
+    structurally-correct answer; multi-round exploration burns budget
+    on a fixture that needs none). Real benchmarks MUST NEVER take
+    this route — defense via 2-signal AND in
+    :func:`envelope_metadata.is_route_wiring_validation_envelope`
+    (``fixture_purpose == "wiring_validation"`` AND
+    ``real_benchmark is False``). Master flag
+    ``JARVIS_WIRING_VALIDATION_ROUTE_ENABLED`` default-FALSE per
+    §33.1 — when off, classify falls through to the existing
+    Priority 1-5 matrix and the route is never stamped. Adding this
+    route to the closed-6→7 taxonomy is the structural answer to
+    the bt-2026-05-24-033510 finding: governance-pipeline minimum-
+    spend floor ($1.81+ for any op through IronGate exploration +
+    Venom rounds + retry headroom) exceeds runbook Phase-1 estimates
+    for fixtures that don't need any of that work."""
+
 
 # ---------------------------------------------------------------------------
 # Source → urgency affinity tables (deterministic, no LLM calls)
@@ -183,6 +208,33 @@ def _envelope_routing_override_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# Slice 12AD — master flag for budget-aware wiring-validation route.
+WIRING_VALIDATION_ROUTE_ENABLED_ENV_VAR = (
+    "JARVIS_WIRING_VALIDATION_ROUTE_ENABLED"
+)
+
+
+def _wiring_validation_route_enabled() -> bool:
+    """Slice 12AD — re-read
+    ``JARVIS_WIRING_VALIDATION_ROUTE_ENABLED`` at call-time.
+
+    Default-FALSE per §33.1 (operator's binding for any new route
+    behavior). When OFF, ``UrgencyRouter.classify`` ignores the
+    wiring-validation envelope detector entirely and the
+    ``WIRING_VALIDATION`` route is never stamped — every fixture
+    falls through to the existing Priority 1-5 matrix (byte-identical
+    legacy behavior).
+
+    Re-reads from env at every call (not cached at boot) so tests
+    can flip the flag mid-process and so operators can toggle via
+    ``/help flags`` / SSE flag-changed without restart.
+    """
+    raw = os.environ.get(
+        WIRING_VALIDATION_ROUTE_ENABLED_ENV_VAR, "",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # UrgencyRouter — the deterministic classifier
 # ---------------------------------------------------------------------------
@@ -261,6 +313,43 @@ class UrgencyRouter:
                         ProviderRoute(_route_raw),
                         f"{_ENVELOPE_ROUTING_OVERRIDE_REASON_PREFIX}:{_route_raw}",
                     )
+
+        # ── Priority 0.6: WIRING_VALIDATION (Slice 12AD) ──
+        # When ``JARVIS_WIRING_VALIDATION_ROUTE_ENABLED`` is on AND the
+        # envelope carries operator's two-signal wiring-validation
+        # criteria (``fixture_purpose=="wiring_validation"`` AND
+        # ``real_benchmark is False``), short-circuit to the budget-
+        # aware WIRING_VALIDATION route. This bypasses the Priority 1-5
+        # matrix entirely — the IronGate exploration mandate (Slice 12P)
+        # + Venom tool loop (route_predicates.VENOM_SKIP_ROUTES) + low
+        # CostGov factor (route_factors["wiring_validation"]=0.1) all
+        # compose downstream off the route name alone, with no further
+        # envelope inspection.
+        #
+        # Master flag default-FALSE per §33.1: when OFF, this entire
+        # block is byte-identical to pre-Slice-12AD behavior — every
+        # fixture falls through to the existing Priority 1-5 matrix
+        # (typically STANDARD / COMPLEX) and burns the full pipeline
+        # budget (~$1.81 floor per bt-2026-05-24-033510). Real benchmarks
+        # are PERMANENTLY excluded from this route — the detector's
+        # ``real_benchmark is False`` clause is exact-False, not falsy,
+        # so missing key / None / "false" all read as "assume real
+        # benchmark" and the detector returns False. Defense in depth.
+        if _wiring_validation_route_enabled():
+            try:
+                from backend.core.ouroboros.governance.envelope_metadata import (  # noqa: E501
+                    is_route_wiring_validation_envelope,
+                )
+                if is_route_wiring_validation_envelope(ctx):
+                    return (
+                        ProviderRoute.WIRING_VALIDATION,
+                        "wiring_validation_envelope:purpose=wiring_validation,"
+                        "real_benchmark=false",
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                # NEVER let envelope inspection break the route — fall
+                # through to the Priority 1-5 matrix on any failure.
+                pass
 
         urgency = getattr(ctx, "signal_urgency", "") or "normal"
         source = getattr(ctx, "signal_source", "") or ""

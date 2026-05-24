@@ -2298,13 +2298,20 @@ def _should_use_lean_prompt(
     # would confuse the model into returning tool calls that nobody handles.
     if getattr(ctx, "task_complexity", "") in ("trivial",):
         return False
-    # BG/SPEC skip the tool loop for cost reasons. Without this guard the
-    # BG-cascade path (enabled via JARVIS_TOPOLOGY_BG_CASCADE_ENABLED) sees
-    # Claude emit tool_calls → schema_invalid:tool_call_without_tool_loop
-    # → generation fails → op never reaches APPLY. Documented upstream in
-    # providers.py lines 5294-5301 and 3436-3440.
+    # Tool-loop-skipped routes (BG / SPEC / wiring_validation per Slice 12AD's
+    # canonical ``route_predicates.VENOM_SKIP_ROUTES``) must NOT get the
+    # lean (tool-first) prompt — without this guard the BG-cascade path
+    # (enabled via JARVIS_TOPOLOGY_BG_CASCADE_ENABLED) sees Claude emit
+    # tool_calls → schema_invalid:tool_call_without_tool_loop → generation
+    # fails → op never reaches APPLY. Same predicate as the Venom-skip
+    # decision because by construction: "no tool loop" → "tool-first prompt
+    # is unsafe". Documented upstream in providers.py lines 5294-5301 and
+    # 3436-3440.
+    from backend.core.ouroboros.governance.route_predicates import (
+        should_skip_venom_for_route,
+    )
     _route = getattr(ctx, "provider_route", "")
-    if _route in ("background", "speculative"):
+    if should_skip_venom_for_route(_route):
         if os.environ.get(
             "JARVIS_BG_CASCADE_LEAN_PROMPT_ENABLED", "false",
         ).lower() not in ("1", "true", "yes", "on"):
@@ -2367,9 +2374,15 @@ def _build_codegen_prompt(
     # Route-specific pruning: BACKGROUND / SPECULATIVE run on Gemma 4 31B,
     # which can't survive 11K-token prompts within a 180s budget. We strip
     # non-essential context and leave the model with the goal, the target
-    # file, and the output schema.
+    # file, and the output schema. Slice 12AD: canonical predicate is
+    # ``route_predicates.GEMMA_PROMPT_PRUNE_ROUTES`` (deliberately distinct
+    # from ``VENOM_SKIP_ROUTES`` — WIRING_VALIDATION skips Venom but
+    # routes through Claude, not Gemma, so no prompt pruning needed).
+    from backend.core.ouroboros.governance.route_predicates import (
+        should_prune_prompt_for_route,
+    )
     _route_norm = (provider_route or "").strip().lower()
-    _is_bg_route = _route_norm in ("background", "speculative")
+    _is_bg_route = should_prune_prompt_for_route(_route_norm)
     from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
     if repo_root is None:
@@ -4564,12 +4577,18 @@ class PrimeProvider:
         # a read-only op (cartography, gap analysis, call-graph survey) lives
         # in the tool calls. Skipping tools on read-only BG ops would defeat
         # the purpose and leave subagent dispatch structurally unreachable.
+        # Slice 12AD: route-skip set is the canonical
+        # ``route_predicates.VENOM_SKIP_ROUTES`` (background / speculative /
+        # wiring_validation). Single named seam — no more inlined literals.
+        from backend.core.ouroboros.governance.route_predicates import (
+            should_skip_venom_for_route,
+        )
         _route = getattr(context, "provider_route", "")
         _is_read_only = bool(getattr(context, "is_read_only", False))
-        _skip_tools = _route in ("background", "speculative") and not _is_read_only
+        _skip_tools = should_skip_venom_for_route(_route) and not _is_read_only
         if _skip_tools:
             logger.info("[PrimeProvider] %s route — skipping Venom tool loop", _route)
-        elif _route in ("background", "speculative") and _is_read_only:
+        elif should_skip_venom_for_route(_route) and _is_read_only:
             logger.info(
                 "[PrimeProvider] %s route + is_read_only=True — Venom tool "
                 "loop kept active (mutation tools refused by policy Rule 0d)",
@@ -8227,21 +8246,26 @@ class ClaudeProvider:
                 raw_content = "{" + raw_content
             return raw_content
 
-        # Complexity routing: skip Venom only for BACKGROUND/SPECULATIVE routes
-        # where cost optimization trumps capability. IMMEDIATE/STANDARD/COMPLEX
-        # routes always get full Venom — Claude may need tools even for "trivial"
-        # tasks (the model decides, not us).
+        # Complexity routing: skip Venom for routes in
+        # ``VENOM_SKIP_ROUTES`` (background / speculative / wiring_validation
+        # per Slice 12AD's pure-data predicate module) where cost
+        # optimization trumps capability. IMMEDIATE/STANDARD/COMPLEX
+        # routes always get full Venom — Claude may need tools even for
+        # "trivial" tasks (the model decides, not us).
         # EXCEPTION (Option A): read-only ops keep the tool loop enabled. Rule
         # 0d refuses mutation tools under the read-only contract, so there is
         # no cost-escalation risk, and the tool loop is the only way for
         # read-only cartography ops to produce useful output (dispatch_subagent,
         # read_file, search_code, etc.).
+        from backend.core.ouroboros.governance.route_predicates import (
+            should_skip_venom_for_route,
+        )
         _route = getattr(context, "provider_route", "")
         _is_read_only = bool(getattr(context, "is_read_only", False))
-        _skip_tools = _route in ("background", "speculative") and not _is_read_only
+        _skip_tools = should_skip_venom_for_route(_route) and not _is_read_only
         if _skip_tools:
             logger.info("[ClaudeProvider] %s route — skipping Venom tool loop", _route)
-        elif _route in ("background", "speculative") and _is_read_only:
+        elif should_skip_venom_for_route(_route) and _is_read_only:
             logger.info(
                 "[ClaudeProvider] %s route + is_read_only=True — Venom tool "
                 "loop kept active (mutation tools refused by policy Rule 0d)",
