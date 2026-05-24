@@ -28,6 +28,20 @@ from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
 )
+
+# Slice 2B-ii — Aegis Provider Bridge (Zero-Trust transport).
+# When JARVIS_AEGIS_ENABLED is true, all credentialed DW upstream
+# calls route through the Aegis daemon's /v1/* forwarding surface
+# instead of api.doubleword.ai directly. The DW session holds NO
+# real Authorization Bearer token in that path; Aegis injects the
+# confiscated DOUBLEWORD_API_KEY server-side. Per-call leases via
+# X-JARVIS-Lease header (operator correction #4 — never client-wide).
+from backend.core.ouroboros.governance.aegis_provider_bridge import (
+    acquire_call_lease as _aegis_acquire_call_lease,
+    dw_aegis_base_url as _aegis_dw_base_url,
+    dw_authorization_header as _aegis_dw_auth_header,
+    merge_lease_into_session_headers as _aegis_merge_lease_headers,
+)
 from backend.core.ouroboros.governance.stream_rupture import (
     StreamRuptureError,
     stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
@@ -384,7 +398,7 @@ class DoublewordProvider:
     def __init__(
         self,
         api_key: str = _DW_API_KEY,
-        base_url: str = _DW_BASE_URL,
+        base_url: Optional[str] = None,
         model: str = _DW_MODEL,
         max_tokens: int = _DW_MAX_TOKENS,
         repo_root: Optional[Path] = None,
@@ -397,6 +411,16 @@ class DoublewordProvider:
         batch_registry: Optional[Any] = None,
     ) -> None:
         self._api_key = api_key
+        # Slice 2B-ii — Aegis transport swap. Default ``base_url=None``
+        # triggers instance-time resolution via the Aegis bridge: when
+        # JARVIS_AEGIS_ENABLED is true we get ``{JARVIS_AEGIS_URL}/v1``
+        # (so f"{self._base_url}/chat/completions" composes the
+        # Aegis-allowlisted path); when disabled we get the legacy
+        # ``DOUBLEWORD_BASE_URL`` env or ``api.doubleword.ai/v1``.
+        # Resolution at __init__ time (not module-import) ensures the
+        # Aegis preflight has already populated env when we read it.
+        if base_url is None:
+            base_url = _aegis_dw_base_url()
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._max_tokens = max_tokens
@@ -634,8 +658,17 @@ class DoublewordProvider:
             # Solution: create with connector only, no timeout object at all.
             # Per-request timeouts are applied via _request_timeout() instead.
             connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            # Slice 2B-ii — Aegis transport. When Aegis is enabled,
+            # ``_aegis_dw_auth_header()`` returns an empty dict so the
+            # session holds NO real Bearer token (Aegis injects the
+            # confiscated DOUBLEWORD_API_KEY upstream). When disabled,
+            # it returns ``{"Authorization": "Bearer {DOUBLEWORD_API_KEY}"}``
+            # for byte-identical legacy behavior. Per-call X-JARVIS-Lease
+            # is layered on at each session.post/get site (operator
+            # correction #4 — never client-wide).
+            _session_headers = dict(_aegis_dw_auth_header())
             self._session = aiohttp.ClientSession(
-                headers={"Authorization": f"Bearer {self._api_key}"},
+                headers=_session_headers,
                 connector=connector,
                 trust_env=True,  # honour HTTP_PROXY / HTTPS_PROXY env vars
             )
@@ -780,12 +813,17 @@ class DoublewordProvider:
         })
 
         try:
-            file_id = await self._upload_file(jsonl_line)
+            # Slice 2B-ii — thread operation_id to per-call Aegis lease.
+            file_id = await self._upload_file(
+                jsonl_line, op_id=operation_id,
+            )
             if not file_id:
                 logger.warning("[DoublewordProvider] submit_batch: file upload failed")
                 return None
 
-            batch_id = await self._create_batch(file_id)
+            batch_id = await self._create_batch(
+                file_id, op_id=operation_id,
+            )
             if not batch_id:
                 logger.warning("[DoublewordProvider] submit_batch: batch creation failed")
                 return None
@@ -821,7 +859,10 @@ class DoublewordProvider:
         t0 = pending.submitted_at
 
         try:
-            output_file_id = await self._await_batch_result(pending.batch_id)
+            # Slice 2B-ii — forward pending.op_id for per-call Aegis lease.
+            output_file_id = await self._await_batch_result(
+                pending.batch_id, op_id=pending.op_id,
+            )
             if not output_file_id:
                 self._stats.failed_batches += 1
                 logger.warning(
@@ -1803,10 +1844,19 @@ class DoublewordProvider:
                 _ttft_request_start_monotonic = time.monotonic()
                 _ttft_first_chunk_seen = False
 
+                # Slice 2B-ii — per-call Aegis lease (None when disabled
+                # → header is skipped via merge helper).
+                _aegis_lease = await _aegis_acquire_call_lease(
+                    op_id=context.op_id,
+                    route="standard",
+                    estimated_cost_usd=0.05,
+                )
                 async with session.post(
                     f"{self._base_url}/chat/completions",
                     json=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=_aegis_merge_lease_headers(
+                        {"Content-Type": "application/json"}, _aegis_lease,
+                    ),
                     timeout=self._request_timeout(),
                 ) as resp:
                     if resp.status >= 300:
@@ -2125,10 +2175,18 @@ class DoublewordProvider:
                             continue
             else:
                 # Non-streaming path
+                # Slice 2B-ii — per-call Aegis lease.
+                _aegis_lease = await _aegis_acquire_call_lease(
+                    op_id=context.op_id,
+                    route="standard",
+                    estimated_cost_usd=0.05,
+                )
                 async with session.post(
                     f"{self._base_url}/chat/completions",
                     json=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=_aegis_merge_lease_headers(
+                        {"Content-Type": "application/json"}, _aegis_lease,
+                    ),
                     timeout=self._request_timeout(),
                 ) as resp:
                     if resp.status >= 300:
@@ -2439,8 +2497,16 @@ class DoublewordProvider:
     # Batch API stages (all deterministic — Tier 0 protocol)
     # ------------------------------------------------------------------
 
-    async def _upload_file(self, jsonl_content: str) -> Optional[str]:
-        """Stage 1: Upload JSONL file to Doubleword."""
+    async def _upload_file(
+        self, jsonl_content: str, *, op_id: str = "dw-batch-upload",
+    ) -> Optional[str]:
+        """Stage 1: Upload JSONL file to Doubleword.
+
+        Slice 2B-ii — ``op_id`` is threaded for per-call Aegis lease.
+        Default ``"dw-batch-upload"`` allows existing callers that
+        haven't yet plumbed real op_id; production callers pass the
+        live OperationContext op_id.
+        """
         session = await self._get_session()
         import aiohttp
 
@@ -2461,10 +2527,21 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
+            # Slice 2B-ii — per-call Aegis lease + auth offload. When
+            # Aegis enabled: dw_authorization_header()=={} (server-side
+            # injection) + lease via X-JARVIS-Lease. When disabled:
+            # legacy Bearer header restored byte-identically.
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=op_id, route="standard", estimated_cost_usd=0.001,
+            )
+            _call_headers = dict(_aegis_dw_auth_header())
+            _call_headers = _aegis_merge_lease_headers(
+                _call_headers, _aegis_lease,
+            )
             async with session.post(
                 f"{self._base_url}/files",
                 data=data,
-                headers={"Authorization": f"Bearer {self._api_key}"},
+                headers=_call_headers,
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
@@ -2482,8 +2559,13 @@ class DoublewordProvider:
             logger.warning("[DoublewordProvider] File upload error: %s: %s", type(exc).__name__, exc)
             return None
 
-    async def _create_batch(self, input_file_id: str) -> Optional[str]:
-        """Stage 2: Create batch job."""
+    async def _create_batch(
+        self, input_file_id: str, *, op_id: str = "dw-batch-create",
+    ) -> Optional[str]:
+        """Stage 2: Create batch job.
+
+        Slice 2B-ii — ``op_id`` is threaded for per-call Aegis lease.
+        """
         session = await self._get_session()
         _rl_t0 = time.monotonic()
         if self._rate_limiter is not None:
@@ -2493,6 +2575,10 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
+            # Slice 2B-ii — per-call Aegis lease (None when disabled).
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=op_id, route="standard", estimated_cost_usd=0.001,
+            )
             async with session.post(
                 f"{self._base_url}/batches",
                 json={
@@ -2500,7 +2586,9 @@ class DoublewordProvider:
                     "endpoint": "/v1/chat/completions",
                     "completion_window": _DW_COMPLETION_WINDOW,
                 },
-                headers={"Content-Type": "application/json"},
+                headers=_aegis_merge_lease_headers(
+                    {"Content-Type": "application/json"}, _aegis_lease,
+                ),
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
@@ -2526,13 +2614,18 @@ class DoublewordProvider:
     # Batch result awaiting: Tier 1 (webhook future) → Tier 2 (adaptive poll)
     # ------------------------------------------------------------------
 
-    async def _await_batch_result(self, batch_id: str) -> Optional[str]:
+    async def _await_batch_result(
+        self, batch_id: str, *, op_id: str = "dw-batch-await",
+    ) -> Optional[str]:
         """Wait for batch result via webhook future or adaptive poll fallback.
 
         Tier 1: If a ``BatchFutureRegistry`` is wired and the batch has a
         registered future, await it (zero polling — webhook resolves it).
 
         Tier 2: Adaptive exponential backoff polling with jitter.
+
+        Slice 2B-ii — ``op_id`` is forwarded to ``_adaptive_poll_batch``
+        for per-call Aegis lease accounting.
         """
         # Tier 1: webhook-driven (if registry wired)
         registry = getattr(self, "_batch_registry", None)
@@ -2546,7 +2639,7 @@ class DoublewordProvider:
                 pass  # No future registered or rejected — fall through to Tier 2
 
         # Tier 2: adaptive backoff poll
-        return await self._adaptive_poll_batch(batch_id)
+        return await self._adaptive_poll_batch(batch_id, op_id=op_id)
 
     @staticmethod
     def _next_poll_interval(attempt: int, *, network_error: bool = False) -> float:
@@ -2561,12 +2654,17 @@ class DoublewordProvider:
         jitter = interval * 0.25 * (2 * random.random() - 1)
         return max(0.5, interval + jitter)
 
-    async def _adaptive_poll_batch(self, batch_id: str) -> Optional[str]:
+    async def _adaptive_poll_batch(
+        self, batch_id: str, *, op_id: str = "dw-batch-poll",
+    ) -> Optional[str]:
         """Stage 3: Adaptive backoff polling until batch completes.
 
         Replaces the fixed 5s poll with exponential backoff + jitter.
         Network-aware: connection errors trigger aggressive backoff.
         Returns output_file_id or None on failure/timeout.
+
+        Slice 2B-ii — ``op_id`` is threaded for per-call Aegis lease
+        on each poll request.
         """
         deadline = time.monotonic() + _DW_MAX_WAIT_S
         attempt = 0
@@ -2585,8 +2683,14 @@ class DoublewordProvider:
                     except Exception:
                         raise  # Let CircuitBreakerOpen propagate
 
+                # Slice 2B-ii — per-call Aegis lease.
+                _aegis_lease = await _aegis_acquire_call_lease(
+                    op_id=op_id, route="background",
+                    estimated_cost_usd=0.0001,
+                )
                 async with session.get(
                     f"{self._base_url}/batches/{batch_id}",
+                    headers=_aegis_merge_lease_headers({}, _aegis_lease),
                     timeout=self._request_timeout(),
                 ) as resp:
                     if self._rate_limiter is not None:
@@ -2635,7 +2739,12 @@ class DoublewordProvider:
     async def _retrieve_result(
         self, output_file_id: str, operation_id: str
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Stage 4: Retrieve and parse batch output. Returns (content, usage)."""
+        """Stage 4: Retrieve and parse batch output. Returns (content, usage).
+
+        Slice 2B-ii — ``operation_id`` doubles as the Aegis lease op_id
+        (per-call lease binds the retrieve to the same op for cap
+        accounting).
+        """
         session = await self._get_session()
         _rl_t0 = time.monotonic()
         if self._rate_limiter is not None:
@@ -2645,8 +2754,14 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
+            # Slice 2B-ii — per-call Aegis lease bound to operation_id.
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=operation_id, route="standard",
+                estimated_cost_usd=0.001,
+            )
             async with session.get(
                 f"{self._base_url}/files/{output_file_id}/content",
+                headers=_aegis_merge_lease_headers({}, _aegis_lease),
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
@@ -2789,12 +2904,16 @@ class DoublewordProvider:
         t0 = time.monotonic()
 
         try:
-            file_id = await self._upload_file(jsonl_line)
+            # Slice 2B-ii — thread caller-derived synthetic op_id for
+            # per-call Aegis lease. ``prompt_only`` is the no-context
+            # fast-path; the synthetic id is purpose-tagged.
+            _po_op_id = f"dw-prompt-only:{caller_id}:{custom_id}"
+            file_id = await self._upload_file(jsonl_line, op_id=_po_op_id)
             if not file_id:
                 logger.warning("[DoublewordProvider] prompt_only: file upload failed (caller=%s)", caller_id)
                 return ""
 
-            batch_id = await self._create_batch(file_id)
+            batch_id = await self._create_batch(file_id, op_id=_po_op_id)
             if not batch_id:
                 logger.warning("[DoublewordProvider] prompt_only: batch creation failed (caller=%s)", caller_id)
                 return ""
@@ -2804,7 +2923,9 @@ class DoublewordProvider:
                 batch_id, effective_model, caller_id,
             )
 
-            output_file_id = await self._await_batch_result(batch_id)
+            output_file_id = await self._await_batch_result(
+                batch_id, op_id=_po_op_id,
+            )
             if not output_file_id:
                 self._stats.failed_batches += 1
                 logger.warning(
@@ -2982,10 +3103,18 @@ class DoublewordProvider:
         t0 = time.monotonic()
 
         async def _do_request() -> Tuple[str, int, int]:
+            # Slice 2B-ii — per-call Aegis lease bound to caller_id.
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=f"dw-complete-sync:{caller_id}",
+                route="standard",
+                estimated_cost_usd=0.005,
+            )
             async with session.post(
                 f"{self._base_url}/chat/completions",
                 json=body,
-                headers={"Content-Type": "application/json"},
+                headers=_aegis_merge_lease_headers(
+                    {"Content-Type": "application/json"}, _aegis_lease,
+                ),
                 timeout=self._request_timeout(),
             ) as resp:
                 if resp.status >= 300:
@@ -3068,12 +3197,28 @@ class DoublewordProvider:
         )
 
     async def health_probe(self) -> bool:
-        """Quick health check — verify API key works and models endpoint responds."""
+        """Quick health check — verify API key works and models endpoint responds.
+
+        Slice 2B-ii — infrastructure-tier call with no upstream op
+        context: a synthetic ``dw-health-probe`` op_id is used for
+        the per-call Aegis lease. Aegis daemon's cap accounting
+        treats these as low-cost system overhead.
+        """
         if not self.is_available:
             return False
         try:
             session = await self._get_session()
-            async with session.get(f"{self._base_url}/models", timeout=self._request_timeout()) as resp:
+            # Slice 2B-ii — per-call Aegis lease (synthetic infra op_id).
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id="dw-health-probe",
+                route="background",
+                estimated_cost_usd=0.0,
+            )
+            async with session.get(
+                f"{self._base_url}/models",
+                headers=_aegis_merge_lease_headers({}, _aegis_lease),
+                timeout=self._request_timeout(),
+            ) as resp:
                 return resp.status == 200
         except Exception:
             return False

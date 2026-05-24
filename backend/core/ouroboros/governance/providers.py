@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -30,6 +31,49 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+# Slice 2B-ii — Aegis Provider Bridge wiring.
+# Per-op lease scoping uses a ContextVar (asyncio-task-local, safe
+# under concurrent ops) so we don't have to thread op_id through ~20
+# internal methods between generate(ctx) and messages.create(...).
+# The var is set at every entry to ClaudeProvider.generate() and
+# ClaudeProvider.plan(), and read at each messages.create/stream
+# call site to build the per-call X-JARVIS-Lease header.
+from backend.core.ouroboros.governance.aegis_provider_bridge import (
+    acquire_call_lease as _aegis_acquire_call_lease,
+    make_async_anthropic_client as _aegis_make_async_anthropic,  # noqa: F401
+    merge_lease_header as _aegis_merge_lease_header,
+)
+
+_aegis_op_id_var: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "jarvis.aegis.current_op_id", default="claude-provider-unscoped",
+)
+_aegis_route_var: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "jarvis.aegis.current_route", default="standard",
+)
+
+
+async def _aegis_extra_headers_for_call(
+    create_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    estimated_cost_usd: float = 0.05,
+) -> Dict[str, str]:
+    """Build the per-call ``extra_headers`` dict for an Anthropic SDK
+    call, with the Aegis X-JARVIS-Lease header injected when enabled.
+
+    Reads op_id + route from the per-task ContextVars (set by entry
+    points like ClaudeProvider.generate). When Aegis is disabled the
+    lease helper returns None and the returned dict is preserved
+    byte-identically against any caller-supplied ``extra_headers``
+    in ``create_kwargs``.
+    """
+    op_id = _aegis_op_id_var.get()
+    route = _aegis_route_var.get()
+    lease = await _aegis_acquire_call_lease(
+        op_id=op_id, route=route, estimated_cost_usd=estimated_cost_usd,
+    )
+    existing = (create_kwargs or {}).get("extra_headers") if create_kwargs else None
+    return _aegis_merge_lease_header(existing, lease)
 
 from backend.core.ouroboros.governance.claude_dispatch_state import (
     _ClaudeDispatchState,
@@ -5820,6 +5864,18 @@ class ClaudeProvider:
             # ``_call_with_backoff``).
             _client_mode = _resolve_http_client_mode()
 
+            # Slice 2B-ii — Aegis Provider Bridge. The bridge's factory
+            # transparently overrides ``base_url`` + ``api_key`` when
+            # ``aegis.client.is_enabled()`` (transport swap to Aegis
+            # daemon — the SDK still posts to /v1/messages, but base_url
+            # is JARVIS_AEGIS_URL so the final wire path is
+            # {AEGIS}/v1/messages); falls through to byte-identical
+            # legacy construction when disabled. The ``max_retries=0``
+            # + ``http_client`` kwargs flow through unchanged in BOTH
+            # paths via **kwargs.
+            from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                make_async_anthropic_client as _aegis_make_anthropic,
+            )
             if _client_mode == _CLAUDE_HTTP_CLIENT_MODE_STDLIB_DEFAULT:
                 # H1 measurement mode — no construction-time httpx.Timeout,
                 # no Limits.  Reproduces the Step 2 probe's client shape
@@ -5827,7 +5883,7 @@ class ClaudeProvider:
                 # _create_kwargs) still binds connect/read/write/pool to
                 # the outer asyncio.wait_for budget; max_retries=0
                 # preserves the single-retry-authority invariant.
-                self._client = anthropic.AsyncAnthropic(
+                self._client = _aegis_make_anthropic(
                     api_key=self._api_key,
                     max_retries=0,
                 )
@@ -5869,7 +5925,10 @@ class ClaudeProvider:
                     timeout=_http_timeout,
                     limits=_http_limits,
                 )
-                self._client = anthropic.AsyncAnthropic(
+                # Slice 2B-ii — Aegis transport swap (see comment above).
+                # http_client + max_retries pass through verbatim via
+                # **kwargs in both Aegis-enabled + legacy paths.
+                self._client = _aegis_make_anthropic(
                     api_key=self._api_key,
                     http_client=_http_client,
                     # SDK-level retries hide signal and consume our timebox
@@ -6741,8 +6800,19 @@ class ClaudeProvider:
         create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
             _live_create,
         )
+        # Slice 2B-ii — per-call Aegis lease. Computed once per attempt
+        # and passed as an explicit ``extra_headers=`` kwarg (AST pin
+        # #3 requires the literal kwarg form at the call site to prove
+        # every messages.create is gated). create_kwargs no longer
+        # carries ``extra_headers``; the explicit kwarg is the canonical
+        # source so there is no risk of a duplicate-kwarg error.
         try:
-            return await _current_client.messages.create(**create_kwargs)
+            return await _current_client.messages.create(
+                **create_kwargs,
+                extra_headers=await _aegis_extra_headers_for_call(
+                    create_kwargs,
+                ),
+            )
         except Exception as _exc:
             _msg = str(_exc).lower()
             if (
@@ -6767,8 +6837,13 @@ class ClaudeProvider:
                 create_kwargs["timeout"] = (
                     _derive_per_request_httpx_timeout(_live_create)
                 )
+                # Slice 2B-ii — fresh lease for the prefill-retry attempt
+                # (operator correction #4: never reuse a lease across calls).
                 return await _current_client.messages.create(
-                    **create_kwargs
+                    **create_kwargs,
+                    extra_headers=await _aegis_extra_headers_for_call(
+                        create_kwargs,
+                    ),
                 )
             raise
 
@@ -7143,9 +7218,21 @@ class ClaudeProvider:
             on_overrun=_bcg_on_overrun,
         )
 
+        # Slice 2B-ii — per-call Aegis lease for the streaming path.
+        # The SDK's stream() also hits /v1/messages; the lease header
+        # is mandatory at the Aegis daemon (forward_request returns
+        # 401 LEASE_INVALID otherwise). Operator correction #2.
+        # Passed as an explicit ``extra_headers=`` kwarg so AST pin #4
+        # observes the literal at the call site.
+        _stream_extra_headers = await _aegis_extra_headers_for_call(
+            _stream_kwargs,
+        )
         async with _bcg_guard, \
                 _quiescence_core_active(label="claude_stream"), \
-                _current_client.messages.stream(**_stream_kwargs) as stream:
+                _current_client.messages.stream(
+                    **_stream_kwargs,
+                    extra_headers=_stream_extra_headers,
+                ) as stream:
             # Slice 7d arm — best-effort transport extraction. The
             # Anthropic SDK uses httpx under the hood; if the
             # ClientResponse / Transport shape isn't reachable
@@ -7448,6 +7535,13 @@ class ClaudeProvider:
             structural reinforcement; Layer 1 (AST) and Layer 3 (claim)
             compose for defense-in-depth.
         """
+        # Slice 2B-ii — stamp the Aegis op_id + route ContextVars at the
+        # provider entry. Every downstream messages.create / messages.stream
+        # call in this task reads them via _aegis_extra_headers_for_call().
+        # asyncio-task-local — concurrent ops scope independently.
+        _aegis_op_id_var.set(str(getattr(context, "op_id", "") or "claude-provider-unscoped"))
+        _aegis_route_var.set(str(getattr(context, "provider_route", "") or "standard"))
+
         # PRD §26.6.2 — Layer 2 cost contract runtime gate. The
         # ClaudeProvider is the canonical Claude-tier entry point;
         # this barrier catches any path that misroutes a BG/SPEC op
@@ -8461,6 +8555,7 @@ class ClaudeProvider:
                     # Re-acquire per attempt — see _do_stream comment.
                     _current_client = self._ensure_client()
                     # D2 (Task #95) — per-request httpx.Timeout.
+                    # Slice 2B-ii — per-call Aegis lease.
                     return await _current_client.messages.create(
                         model=self._model,
                         max_tokens=self._compute_output_budget(
@@ -8470,6 +8565,7 @@ class ClaudeProvider:
                         system=_legacy_system,
                         messages=messages,
                         timeout=_derive_per_request_httpx_timeout(timeout_s),
+                        extra_headers=await _aegis_extra_headers_for_call(),
                     )
 
                 msg = await asyncio.wait_for(
@@ -8727,10 +8823,18 @@ class ClaudeProvider:
         """
         try:
             client = self._ensure_client()
+            # Slice 2B-ii — infra-tier op_id. Set ContextVars locally so
+            # the lease is bound to a recognizable health-probe scope
+            # (this method is invoked outside the generate() entry).
+            _aegis_op_id_var.set("claude-health-probe")
+            _aegis_route_var.set("background")
             await client.messages.create(
                 model=self._model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
+                extra_headers=await _aegis_extra_headers_for_call(
+                    estimated_cost_usd=0.0001,
+                ),
             )
             return True
         except Exception:
@@ -8766,6 +8870,11 @@ class ClaudeProvider:
                 1.0,
                 (deadline - datetime.now(tz=timezone.utc)).total_seconds(),
             )
+            # Slice 2B-ii — ContextVar scope for plan() (called outside
+            # generate() so the var may default; "claude-plan" is the
+            # synthetic op_id used when no upstream op_id was set).
+            _aegis_op_id_var.set("claude-plan")
+            _aegis_route_var.set("standard")
             return await _current_client.messages.create(
                 model=self._model,
                 max_tokens=512,
@@ -8778,6 +8887,9 @@ class ClaudeProvider:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 timeout=_derive_per_request_httpx_timeout(_attempt_budget_s),
+                extra_headers=await _aegis_extra_headers_for_call(
+                    estimated_cost_usd=0.005,
+                ),
             )
 
         message = await self._call_with_backoff(

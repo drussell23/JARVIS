@@ -471,11 +471,26 @@ async def run_general_tool_loop(
         max_output = int(os.environ.get(
             "JARVIS_GENERAL_LLM_MAX_OUTPUT_TOKENS", "8192",
         ))
+        # Slice 2B-ii — per-call Aegis lease bound to sub_id. The
+        # underlying ``client`` is provider._client (an AsyncAnthropic
+        # constructed in providers.py through make_async_anthropic_client
+        # — transport swap is already in effect); this site contributes
+        # the per-call X-JARVIS-Lease header.
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            acquire_call_lease as _aegis_acquire_call_lease,
+            merge_lease_header as _aegis_merge_lease,
+        )
+        _aegis_lease = await _aegis_acquire_call_lease(
+            op_id=f"general-driver:{sub_id}",
+            route="complex",
+            estimated_cost_usd=0.05,
+        )
         msg = await client.messages.create(
             model=model_name,
             max_tokens=max_output,
             system=system_prompt,
             messages=[{"role": "user", "content": prompt}],
+            extra_headers=_aegis_merge_lease(None, _aegis_lease),
         )
         # Extract text from all text content blocks.
         parts: List[str] = []

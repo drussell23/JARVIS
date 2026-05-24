@@ -64,17 +64,32 @@ async def claude_inference(
         return None
 
     try:
-        import anthropic
+        # Slice 2B-ii — route through Aegis Provider Bridge (transport
+        # swap + per-call lease when JARVIS_AEGIS_ENABLED; byte-identical
+        # legacy AsyncAnthropic when disabled).
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            acquire_call_lease as _aegis_acquire_call_lease,
+            make_async_anthropic_client as _aegis_make_anthropic,
+            merge_lease_header as _aegis_merge_lease,
+        )
 
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = _aegis_make_anthropic(api_key=api_key)
 
         messages = [{"role": "user", "content": prompt}]
 
+        # Per-call Aegis lease (synthetic op_id — this entry point
+        # predates the OperationContext threading).
+        _aegis_lease = await _aegis_acquire_call_lease(
+            op_id=f"claude-fallback:{caller_id}",
+            route="standard",
+            estimated_cost_usd=0.01,
+        )
         response = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=_SYSTEM_MESSAGE,
             messages=messages,
+            extra_headers=_aegis_merge_lease(None, _aegis_lease),
         )
 
         # Extract text content from response blocks.

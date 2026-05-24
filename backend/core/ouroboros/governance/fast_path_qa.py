@@ -828,23 +828,37 @@ async def _default_claude_callable(
     PROVIDER_FAILED. Returns ``(answer_text, cost_usd_estimate)``.
     """
     try:
-        import anthropic  # type: ignore[import-untyped]
+        import anthropic  # type: ignore[import-untyped]  # noqa: F401 — kept for ImportError gate
     except ImportError:
         return ("", 0.0)
     api_key = os.environ.get(_ENV_ANTHROPIC_KEY, "").strip()
     if not api_key:
         return ("", 0.0)
+    # Slice 2B-ii — route through Aegis Provider Bridge.
+    from backend.core.ouroboros.governance.aegis_provider_bridge import (
+        acquire_call_lease as _aegis_acquire_call_lease,
+        make_async_anthropic_client as _aegis_make_anthropic,
+        merge_lease_header as _aegis_merge_lease,
+    )
     try:
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = _aegis_make_anthropic(api_key=api_key)
     except Exception:  # noqa: BLE001
         return ("", 0.0)
     try:
+        # Per-call Aegis lease (FastPathQA is a read-only Q&A surface;
+        # synthetic op_id tags the path for cap accounting).
+        _aegis_lease = await _aegis_acquire_call_lease(
+            op_id="fast-path-qa",
+            route="standard",
+            estimated_cost_usd=0.005,
+        )
         resp = await client.messages.create(
             model=model_name(),
             max_tokens=max_tokens(),
             temperature=temperature(),
             system=system,
             messages=[{"role": "user", "content": user_question}],
+            extra_headers=_aegis_merge_lease(None, _aegis_lease),
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(

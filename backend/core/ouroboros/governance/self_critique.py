@@ -339,13 +339,27 @@ class ClaudeCritiqueProvider:
             raise RuntimeError("Claude client unavailable for critique")
         prompt = build_critique_prompt(request)
 
+        # Slice 2B-ii — per-call Aegis lease + X-JARVIS-Lease header
+        # injection (transport-layer swap is honored by the provider
+        # client itself; this site only owes the per-call lease).
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            acquire_call_lease as _aegis_acquire_call_lease,
+            merge_lease_header as _aegis_merge_lease,
+        )
+
         async def _do_create() -> Any:
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=f"self-critique:{getattr(request, 'op_id', '') or 'unscoped'}",
+                route="standard",
+                estimated_cost_usd=0.005,
+            )
             return await client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 temperature=0.2,
                 system=_CRITIQUE_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
+                extra_headers=_aegis_merge_lease(None, _aegis_lease),
             )
 
         msg = await asyncio.wait_for(_do_create(), timeout=request.deadline_s)
