@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Database Connection Validation
-- **Run Number**: #4302
-- **Branch**: `ouroboros/slice-12ah`
-- **Commit**: `9c8341aadbcc137acf4d54df253ffa0dcee595fd`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #94225
+- **Branch**: `fix/ci/database-connection-validation-run4302-20260524-195616`
+- **Commit**: `997cd41a039264fad426cbdf451321db5e7ef83c`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-24T19:53:07Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26371166163)
+- **Timestamp**: 2026-05-24T19:56:41Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26371245797)
 
 ## Failure Overview
 
@@ -17,52 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate Database Configuration | timeout | high | 41s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. Validate Database Configuration
+### 1. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-24T19:53:10Z
-**Completed**: 2026-05-24T19:53:51Z
-**Duration**: 41 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26371166163/job/77623507302)
+**Started**: 2026-05-24T19:56:44Z
+**Completed**: 2026-05-24T19:56:48Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26371245797/job/77623701808)
 
 #### Failed Steps
 
-- **Step 5**: Validate .env.example Completeness
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 1
+  - Occurrences: 2
   - Sample matches:
-    - Line 63: `2026-05-24T19:53:48.9209867Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2026-05-24T19:53:49.0817705Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-05-24T19:56:46.4746320Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-24T19:56:47.0537432Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Data`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 97: `2026-05-24T19:53:49.0817705Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 58: `2026-05-24T19:56:47.0852493Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
-  - Occurrences: 2
+  - Occurrences: 1
   - Sample matches:
-    - Line 17: `2026-05-24T19:53:46.2410762Z Installing collected packages: urllib3, typing-extensions, pyyaml, pycp`
-    - Line 19: `2026-05-24T19:53:48.6901665Z Successfully installed Requests-2.34.2 aiofiles-25.1.0 aiohappyeyeballs`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -82,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-24T19:56:16.463121*
+📊 *Report generated on 2026-05-24T19:58:27.652378*
 🤖 *JARVIS CI/CD Auto-PR Manager*
