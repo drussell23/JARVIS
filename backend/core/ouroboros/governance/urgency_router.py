@@ -431,6 +431,25 @@ class UrgencyRouter:
                 "tier1_reserve_s": 0.0,  # Claude gets everything
                 "max_dw_wait_s": 0.0,
             }
+        if route is ProviderRoute.WIRING_VALIDATION:
+            # Slice 12AF — wiring-validation fixtures bypass DW
+            # entirely. The CostGov per-op cap (route_factor 0.1 →
+            # cap ≈ $0.05-$0.10) is too tight for a DW-then-Claude
+            # cascade. Single direct Claude call with the full
+            # route budget; composes cleanly with VENOM_SKIP_ROUTES
+            # (no tool loop) + Site 3 (no tool instructions in
+            # prompt) so the model emits 2b.1-noop or 2b.1 patch
+            # directly. Closes the bt-2026-05-24-065236 cosmetic
+            # gap ("route_description='unknown route'") AND
+            # eliminates the wasteful Tier-0 DW attempt that
+            # produced nothing useful + the subsequent fallback to
+            # Claude with tool instructions that triggered the
+            # 2b.2-tool hallucination wedge.
+            return {
+                "tier0_fraction": 0.0,
+                "tier1_reserve_s": 0.0,
+                "max_dw_wait_s": 0.0,
+            }
         if route is ProviderRoute.STANDARD:
             return {
                 "tier0_fraction": 0.65,
