@@ -1335,6 +1335,43 @@ def main() -> None:
         _boot_timer = None
 
     # ------------------------------------------------------------------
+    # Aegis battle-test ledger hygiene (Slice 2B-iii.1)
+    # ------------------------------------------------------------------
+    # Rotates .jarvis/aegis/spend.jsonl + removes its .lock companion
+    # BEFORE the Aegis preflight step spawns the daemon — so the
+    # daemon's ImmutableBudgetStateMachine.replay_for_recovery() reads
+    # a clean WAL and the new session boots with a fresh financial slate.
+    # Closes the cost_ceiling_exceeded:session_cap_exceeded failure
+    # mode surfaced by re-detonation soak bt-2026-05-24-225714 where
+    # the daemon replayed a stale prior-session WAL and denied the
+    # very first lease request. Gated by
+    # JARVIS_AEGIS_BATTLE_TEST_HYGIENE_ENABLED (default TRUE).
+    # NEVER raises — failure folds into HygieneResult(ok=False) and
+    # the harness keeps booting (operator investigates via logs).
+    # Production Aegis use NEVER touches the WAL; the helper is
+    # battle-test-scoped.
+    from backend.core.ouroboros.aegis.ledger_hygiene import (
+        rotate_aegis_wal_for_battle_test as _rotate_aegis_wal_for_battle_test,
+    )
+    _hygiene_session_tag = f"pre-bt-{int(time.time())}"
+    _hygiene_result = _rotate_aegis_wal_for_battle_test(
+        session_tag=_hygiene_session_tag,
+    )
+    if _hygiene_result.skipped:
+        print(f"[LedgerHygiene] skipped (operator opt-out): {_hygiene_result.detail}")
+    elif _hygiene_result.ok:
+        _bits = []
+        if _hygiene_result.rotated_path:
+            _bits.append(f"rotated→{_hygiene_result.rotated_path}")
+        if _hygiene_result.lock_removed:
+            _bits.append("lock_removed")
+        if _hygiene_result.pruned_count:
+            _bits.append(f"pruned={_hygiene_result.pruned_count}")
+        print(f"[LedgerHygiene] {' '.join(_bits) or 'no-op (fresh WAL)'}")
+    else:
+        print(f"[LedgerHygiene] WARNING: {_hygiene_result.detail} — boot continues", file=sys.stderr)
+
+    # ------------------------------------------------------------------
     # Aegis preflight (Arc #1 — out-of-process egress + budget chokepoint)
     # ------------------------------------------------------------------
     # Gated on JARVIS_AEGIS_ENABLED. Slice 1 dark substrate, default

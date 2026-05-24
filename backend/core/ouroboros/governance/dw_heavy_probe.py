@@ -651,10 +651,39 @@ class HeavyProber:
             "temperature": 0.0,
         }
         url = f"{base_url.rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        # Slice 2B-ii.2 — Aegis Provider Bridge wire. When
+        # JARVIS_AEGIS_ENABLED is true: dw_authorization_header()
+        # returns {} (real DOUBLEWORD_API_KEY confiscated to daemon;
+        # ``api_key`` arg is ignored) and a per-call X-JARVIS-Lease
+        # is acquired. When disabled: legacy ``Bearer {api_key}``
+        # restored byte-identically. Closes the missing_lease_header
+        # 401 surfaced by re-detonation soak bt-2026-05-24-225714 —
+        # this is the 11th DW upstream call site that Slice 2B-ii
+        # missed (lives outside doubleword_provider.py).
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            acquire_call_lease as _aegis_acquire_call_lease,
+            compose_dw_bearer_header as _aegis_compose_bearer,
+            dw_authorization_header as _aegis_dw_auth_header,
+            merge_lease_into_session_headers as _aegis_merge_lease_headers,
+        )
+        from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
+        if _aegis_is_enabled():
+            # Aegis-on: real key already confiscated; ignore caller's
+            # api_key; auth header from bridge (empty dict).
+            _call_headers: Dict[str, str] = dict(_aegis_dw_auth_header())
+        else:
+            # Aegis-off: legacy direct-to-DW path; caller-supplied
+            # bearer composed via the bridge (single seam — the
+            # literal ``"Bearer "`` string lives only inside
+            # aegis_provider_bridge._compose_bearer).
+            _call_headers = dict(_aegis_compose_bearer(api_key))
+        _call_headers["Content-Type"] = "application/json"
+        _aegis_lease = await _aegis_acquire_call_lease(
+            op_id=f"dw-heavy-probe:{model_id}",
+            route="background",
+            estimated_cost_usd=0.001,
+        )
+        headers = _aegis_merge_lease_headers(_call_headers, _aegis_lease)
         timeout_s = _adaptive_probe_timeout_s(parameter_count_b)
         t_start = time.monotonic()
         ttft_ms = 0
