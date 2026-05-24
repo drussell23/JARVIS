@@ -1555,8 +1555,25 @@ class DoublewordProvider:
         # When Venom tool loop is available, send a minimal instruction and let
         # the model pull context incrementally via read_file/search_code/etc.
         # Manifesto §5: "Agentic intelligence handles the 5% that is novel."
+        #
+        # Slice 12AF Site 4 — extend the skip-tools predicate to cover
+        # ALL routes in VENOM_SKIP_ROUTES (background / speculative /
+        # wiring_validation) so DW's prompt path mirrors the Claude
+        # provider's gate. Without this, a wiring-validation op routed
+        # to DW would still get the lean tool-first prompt → DW returns
+        # 2b.2-tool → no loop to consume → ``schema_invalid:
+        # tool_call_without_tool_loop`` → cascade exhaustion. Composes
+        # the canonical predicate from Slice 12AD's route_predicates
+        # module — single source of truth for "this route skips Venom".
+        from backend.core.ouroboros.governance.route_predicates import (
+            should_skip_venom_for_route,
+        )
         _complexity = getattr(context, "task_complexity", "")
-        _will_skip_tools = _complexity in ("trivial", "simple")
+        _route = getattr(context, "provider_route", "") or ""
+        _will_skip_tools = (
+            _complexity in ("trivial", "simple")
+            or should_skip_venom_for_route(str(_route))
+        )
         _tools_available = self._tool_loop is not None and not _will_skip_tools
         _preloaded_files: List[str] = []
         if prompt_override:

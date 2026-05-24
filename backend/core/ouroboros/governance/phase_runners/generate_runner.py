@@ -2108,7 +2108,26 @@ class GENERATERunner(PhaseRunner):
                         pass
                 ctx = ctx.advance(OperationPhase.GENERATE_RETRY, **_retry_ctx_kwargs)
 
-        assert generation is not None  # guaranteed by loop logic
+        # Slice 12AF Site 5 — defense-in-depth: convert the bare
+        # ``assert`` into a structured RuntimeError so the cascade
+        # surfaces a useful terminal_reason_code instead of an
+        # uncaught AssertionError → ``unhandled_pipeline_exception``.
+        # bt-2026-05-24-065236 wedge: after 2 successive
+        # ``all_providers_exhausted`` events on a WIRING_VALIDATION
+        # op, the ForegroundCooldown retry returned without a
+        # generation; the bare ``assert`` at this site crashed the
+        # pipeline with no actionable terminal. The "guaranteed by
+        # loop logic" invariant is restored by Sites 1-4 (route
+        # taxonomy + schema parser + DW prompt + budget profile);
+        # this raise is the structural belt for any future path
+        # that reaches here with generation=None.
+        if generation is None:
+            raise RuntimeError(
+                "generate_runner: generation is None after retry "
+                "loop exhausted — upstream provider cascade exited "
+                "without producing a candidate (see preceding "
+                "EXHAUSTION events in debug.log for root cause)"
+            )
 
         # L1: emit tool execution audit records to ledger stream.
         # This runs BEFORE the noop guard so that tool records are always

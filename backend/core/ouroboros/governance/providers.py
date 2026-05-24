@@ -1659,6 +1659,7 @@ def _build_tool_section(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     *,
     voice_plain_language: bool = False,
+    provider_route: str = "",
 ) -> str:
     """Return the 'Available Tools' block injected into the generation prompt.
 
@@ -1669,7 +1670,30 @@ def _build_tool_section(
         Each descriptor has ``name``, ``description``, and ``input_schema``.
     voice_plain_language:
         When True, emit stronger spoken-language guidance for tool preambles.
+    provider_route:
+        Slice 12AF Site 3 — when the route is in
+        ``route_predicates.VENOM_SKIP_ROUTES`` (background /
+        speculative / wiring_validation), return the empty string so
+        the model NEVER sees tool advertisements in its prompt. This
+        cures the 2b.2-tool hallucination at the source: no
+        instructions → no tool_use shape emitted → schema parser
+        always sees 2b.1 or 2b.1-noop (both legal terminal shapes).
+        Composes the canonical ``should_skip_venom_for_route`` from
+        Slice 12AD's predicate module. Default ``""`` preserves
+        legacy behavior for any caller that hasn't yet plumbed the
+        route through (defense for partial adoption).
     """
+    try:
+        from backend.core.ouroboros.governance.route_predicates import (
+            should_skip_venom_for_route,
+        )
+        if should_skip_venom_for_route(str(provider_route or "")):
+            return ""
+    except Exception:  # noqa: BLE001 — defensive
+        # Defense: never let an import failure suppress the full
+        # tool section for legacy routes. Falls through to emit
+        # the normal block.
+        pass
     voice_block = ""
     if voice_plain_language:
         voice_block = (
@@ -2148,10 +2172,16 @@ def _build_lean_codegen_prompt(
             preloaded_out.append(str(raw_path))
 
     # ── 7. Tool instructions (always included in lean mode) ─────────────
+    # Slice 12AF Site 3 — pass ctx.provider_route so _build_tool_section
+    # can suppress for VENOM_SKIP_ROUTES (defense-in-depth: Slice 12AD's
+    # _should_use_lean_prompt should already return False for those
+    # routes, so this path shouldn't be reached for them, but plumb
+    # the route anyway in case of caller drift).
     parts.append(
         _build_tool_section(
             mcp_tools=mcp_tools,
             voice_plain_language=voice_plain_language,
+            provider_route=str(getattr(ctx, "provider_route", "") or ""),
         )
     )
 
@@ -2881,10 +2911,17 @@ Rules:
         if expanded_context_block:
             parts.append(expanded_context_block)
     if tools_enabled:
+        # Slice 12AF Site 3 — thread provider_route so the section is
+        # suppressed for VENOM_SKIP_ROUTES (background / speculative /
+        # wiring_validation). Closes the bt-2026-05-24-065236 wedge
+        # at the source: model never sees tool advertisements →
+        # never emits 2b.2-tool shape → schema parser never reaches
+        # the tool_call_without_tool_loop branch.
         parts.append(
             _build_tool_section(
                 mcp_tools=mcp_tools,
                 voice_plain_language=voice_plain_language,
+                provider_route=provider_route,
             )
         )
     # ── Repair context injection (L2 correction mode) ────────────────────────
@@ -4115,6 +4152,38 @@ def _parse_generation_response(
         # lean prompt (with tool instructions) was used but the tool loop was
         # skipped (e.g. trivial task).  Treat as content failure so the
         # candidate generator can retry or cascade.
+        #
+        # Slice 12AF Site 2 — routes in ``VENOM_SKIP_ROUTES``
+        # (background / speculative / wiring_validation) structurally
+        # cannot consume a 2b.2-tool shape because no tool loop runs.
+        # When the model still emits one (despite Site 3's prompt
+        # gate — model hallucination or upstream prompt path that
+        # bypassed Site 3), classify as ``content_failure`` (soft
+        # cascade-friendly) NOT ``schema_invalid`` (hard ⇒ FSM
+        # penalty + EXHAUSTION). The bt-2026-05-24-065236 wedge:
+        # 2 successive ``schema_invalid:tool_call_without_tool_loop``
+        # → ``all_providers_exhausted:fallback_failed`` → 2/2 retry
+        # → ``generation is not None`` AssertionError in
+        # generate_runner.py. Soft-classifying for VENOM_SKIP_ROUTES
+        # breaks that cascade without weakening the schema-invariant
+        # for non-skip routes (which legitimately should never see
+        # a 2b.2-tool without a loop to consume it).
+        try:
+            from backend.core.ouroboros.governance.route_predicates import (
+                should_skip_venom_for_route,
+            )
+            _ctx_route = (
+                getattr(ctx, "provider_route", "") if ctx is not None else ""
+            )
+            if should_skip_venom_for_route(str(_ctx_route or "")):
+                raise RuntimeError(
+                    f"{pfx}_content_failure:"
+                    f"tool_call_returned_under_venom_skip:{actual_version}"
+                )
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         raise RuntimeError(
             f"{pfx}_schema_invalid:tool_call_without_tool_loop:{actual_version}"
         )
