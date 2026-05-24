@@ -10136,6 +10136,100 @@ class GovernedOrchestrator:
         multi = None
         t0 = time.monotonic()
 
+        # ── Slice 12AE: per-envelope repo_root resolution ──────────
+        # Compose the canonical Slice 12AC seam to honour per-envelope
+        # repo_root promises (SWE-Bench-Pro TMPDIR worktrees). For
+        # NO_PROMISE envelopes (normal in-repo ops), behavior is byte-
+        # identical to pre-Slice-12AE — falls back to project_root.
+        # For RESOLVED, the per-envelope path becomes the anchor for
+        # both original_paths mapping AND a per-op LanguageRouter
+        # instance (so the adapter's repo_root is the TMPDIR worktree,
+        # not the main JARVIS repo). For REJECTED (promised but
+        # invalid/escaped), refuse silent fallback to the shared tree —
+        # return ValidationResult with failure_class="infra" so the
+        # caller terminates the op cleanly (NO test execution in the
+        # wrong tree, NO misleading critiques from the main repo).
+        # Closes the bt-2026-05-24-053214 wedge: wiring-validation
+        # smoke fixture's VALIDATE ran TestRunner Strategy 3 against
+        # /Users/.../JARVIS-AI-Agent (main repo) instead of the
+        # promised TMPDIR worktree, producing 1 unrelated critique +
+        # L2 cancel + insufficient claims. NEVER hardcodes /tmp.
+        from backend.core.ouroboros.governance.operation_advisor import (
+            RepoRootPromiseStatus,
+            envelope_repo_root_status,
+        )
+        _ae_status, _ae_resolved_repo_root, _ae_raw_repo_root = (
+            envelope_repo_root_status(
+                getattr(ctx, "intake_evidence_json", "") or "",
+                project_root=self._config.project_root,
+            )
+        )
+        if _ae_status is RepoRootPromiseStatus.REJECTED:
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=time.monotonic() - t0,
+                error=(
+                    "validation_runner: envelope-promised repo_root "
+                    f"{_ae_raw_repo_root!r} REJECTED by advisor — "
+                    "refusing silent fallback to project_root (would "
+                    "execute tests in the wrong tree)"
+                ),
+                failure_class="infra",
+                short_summary=(
+                    f"slice12ae_repo_root_rejected:{_ae_raw_repo_root[:80]}"
+                ),
+                adapter_names_run=(),
+            )
+        # NO_PROMISE → project_root (legacy byte-identical).
+        # RESOLVED → the per-envelope (e.g. TMPDIR) path.
+        _ae_effective_repo_root: Path = (
+            _ae_resolved_repo_root
+            if _ae_resolved_repo_root is not None
+            else self._config.project_root
+        )
+
+        # Per-op LanguageRouter only when the effective root diverges
+        # from the boot-time project_root. Composes the same adapter
+        # classes (PythonAdapter / CppAdapter) — NO parallel runner
+        # implementation. Lazy-imported here so the orchestrator
+        # doesn't add a hard top-level dep on test_runner module
+        # internals.
+        _ae_effective_runner = self._validation_runner
+        if _ae_effective_repo_root != self._config.project_root:
+            try:
+                from backend.core.ouroboros.governance.test_runner import (
+                    CppAdapter,
+                    LanguageRouter,
+                    PythonAdapter,
+                )
+                _ae_effective_runner = LanguageRouter(
+                    repo_root=_ae_effective_repo_root,
+                    adapters={
+                        "python": PythonAdapter(
+                            repo_root=_ae_effective_repo_root,
+                        ),
+                        "cpp": CppAdapter(
+                            repo_root=_ae_effective_repo_root,
+                        ),
+                    },
+                )
+                logger.info(
+                    "[Slice12AE] per-op LanguageRouter constructed "
+                    "for op=%s repo_root=%s (envelope-promised; "
+                    "advisor-resolved)",
+                    ctx.op_id[:12], _ae_effective_repo_root,
+                )
+            except Exception:  # noqa: BLE001 — defensive: never
+                # break VALIDATE on the per-op router path; fall back
+                # to the boot-time runner with the resolved root used
+                # only for original_paths mapping below.
+                logger.warning(
+                    "[Slice12AE] per-op LanguageRouter construction "
+                    "raised — falling through to boot-time runner",
+                    exc_info=True,
+                )
+
         with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
             sandbox = Path(sandbox_str)
             runner_changed: list[Path] = []
@@ -10150,8 +10244,11 @@ class GovernedOrchestrator:
                 _sandbox_file.write_text(_fc, encoding="utf-8")
                 if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
                     runner_changed.append(_sandbox_file)
+                    # Slice 12AE: anchor on per-envelope effective
+                    # repo_root (TMPDIR worktree for SWE-Bench-Pro
+                    # fixtures; project_root for everything else).
                     _original_paths[_sandbox_file] = (
-                        self._config.project_root / _rel
+                        _ae_effective_repo_root / _rel
                         if not _rel.is_absolute()
                         else _rel
                     )
@@ -10160,15 +10257,20 @@ class GovernedOrchestrator:
                 _primary_rel = Path(target_file_str)
                 _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
                 runner_changed = [_primary_file]
+                # Slice 12AE: same per-envelope anchor for the
+                # primary-file fallback path.
                 _original_paths[_primary_file] = (
-                    self._config.project_root / _primary_rel
+                    _ae_effective_repo_root / _primary_rel
                     if not _primary_rel.is_absolute()
                     else _primary_rel
                 )
 
             # Step 4: Run LanguageRouter (or any duck-typed runner)
+            # Slice 12AE: use the per-op runner when constructed (its
+            # repo_root matches the per-envelope TMPDIR worktree);
+            # otherwise the boot-time runner (project_root anchored).
             try:
-                multi = await self._validation_runner.run(
+                multi = await _ae_effective_runner.run(
                     changed_files=tuple(runner_changed),
                     sandbox_dir=sandbox,
                     timeout_budget_s=remaining_s,
