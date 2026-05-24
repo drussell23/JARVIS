@@ -217,6 +217,22 @@ class CostGovernorConfig:
             "informational": _env_float(
                 "JARVIS_OP_COST_ROUTE_INFORMATIONAL", 0.3,
             ),
+            # Slice 12AD — budget-aware wiring-validation route.
+            # Default 0.1 (lowest of the 7 routes) because the route
+            # is opt-in (gated by JARVIS_WIRING_VALIDATION_ROUTE_ENABLED
+            # at the classifier) AND only matches structurally trivial
+            # fixtures (operator-declared purpose="wiring_validation",
+            # real_benchmark=False) — those don't justify the
+            # SPECULATIVE/BACKGROUND budget. Empirical target: derived
+            # per-op cap lands ~$0.05-0.10 (baseline=$0.10 × 0.1 ×
+            # complexity_factor) vs ~$2.00 for COMPLEX on the same
+            # smoke fixture. Closes the bt-2026-05-24-033510 finding
+            # that the governance-pipeline minimum-spend floor exceeds
+            # runbook Phase-1 estimates for trivial fixtures.
+            # Operator-tunable via ``JARVIS_OP_COST_ROUTE_WIRING_VALIDATION``.
+            "wiring_validation": _env_float(
+                "JARVIS_OP_COST_ROUTE_WIRING_VALIDATION", 0.1,
+            ),
         }
     )
     complexity_factors: Mapping[str, float] = field(

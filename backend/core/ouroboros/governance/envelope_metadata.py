@@ -113,6 +113,68 @@ def envelope_fixture_purpose(ctx: Any) -> Optional[str]:
     return purpose
 
 
+def is_route_wiring_validation_envelope(ctx: Any) -> bool:
+    """Slice 12AD — looser sibling of :func:`is_wiring_validation_envelope`
+    used for **provider routing** (not for IronGate exploration floor).
+
+    True iff the envelope carries operator's exact two-signal
+    wiring-validation criteria:
+
+      1. ``fixture_purpose == "wiring_validation"`` — the operator
+         explicitly tagged this envelope's source ProblemSpec with
+         ``metadata.purpose = "wiring_validation"``
+      2. ``real_benchmark is False`` — defensive belt: real benchmarks
+         MUST NEVER take the WIRING_VALIDATION route
+
+    Why a second helper instead of reusing
+    :func:`is_wiring_validation_envelope`?
+
+      * The existing 3-signal helper requires ``swe_bench_pro==True``
+        AND ``gold_patch_empty==True`` — SWE-Bench-Pro-specific
+        structural signals appropriate for the IronGate exploration-
+        floor override (which only matters when SWE-Bench-Pro fixtures
+        exist).
+      * This route-decision helper is the **operator-canonical** test
+        for "the operator declared this fixture a wiring-validation
+        fixture" — broader so any future non-SWE-Bench-Pro wiring-
+        validation fixture (custom harness, internal test substrate)
+        also qualifies for the budget-aware route.
+      * Defense-in-depth: ``real_benchmark is False`` must be
+        *exactly* False (not falsy) — missing key, ``None``, or
+        ``"false"`` all read as default-true (assume real benchmark),
+        preserving fail-closed posture for any malformed payload.
+
+    Composition (Slice 12AD): consumed by
+    :meth:`backend.core.ouroboros.governance.urgency_router
+    .UrgencyRouter.classify` at Priority 0.6 (between the existing
+    envelope_routing_override at 0.5 and the Priority 1 matrix) when
+    ``JARVIS_WIRING_VALIDATION_ROUTE_ENABLED`` is on. Master flag is
+    default-FALSE per §33.1 — this helper is a pure classifier and
+    NEVER triggers routing without the explicit operator opt-in.
+
+    Returns False for:
+      * Non-fixture envelopes (no ``fixture_purpose`` set, or set to
+        anything other than ``"wiring_validation"``)
+      * Real benchmark envelopes (``real_benchmark`` missing, True,
+        ``None``, or any non-False value)
+      * Malformed / missing evidence JSON
+
+    NEVER raises. Default-safe answer is False (no WIRING_VALIDATION
+    routing → falls through to existing Priority 1-5 matrix).
+    """
+    evidence = _parse_intake_evidence(ctx)
+    if not evidence:
+        return False
+    purpose = evidence.get(EVIDENCE_KEY_FIXTURE_PURPOSE)
+    if purpose != "wiring_validation":
+        return False
+    # Defense-in-depth: ``is False`` not ``== False`` (excludes None,
+    # 0, "", "false" — only the literal boolean False qualifies).
+    if evidence.get(EVIDENCE_KEY_REAL_BENCHMARK) is not False:
+        return False
+    return True
+
+
 def envelope_is_swe_bench_pro(ctx: Any) -> bool:
     """True iff the op's envelope was emitted by the SWE-Bench-
     Pro builder, regardless of fixture/real-benchmark status.
@@ -130,5 +192,6 @@ __all__ = [
     "EVIDENCE_KEY_FIXTURE_PURPOSE",
     "envelope_fixture_purpose",
     "envelope_is_swe_bench_pro",
+    "is_route_wiring_validation_envelope",
     "is_wiring_validation_envelope",
 ]
