@@ -1335,6 +1335,32 @@ def main() -> None:
         _boot_timer = None
 
     # ------------------------------------------------------------------
+    # Aegis battle-test cap defaults (Slice 2B-iii.2)
+    # ------------------------------------------------------------------
+    # Structural fix for the $0.00 fail-closed defaults in
+    # backend/core/ouroboros/aegis/flags.py — those production-safe
+    # defaults refuse every lease, which is correct for production
+    # but catastrophic for the battle-test soak. The helper installs
+    # canonical battle-test caps ONLY if the operator hasn't already
+    # set them (env-precedence preserved). Daemon-side defaults stay
+    # strict per operator binding "ceiling should remain strict".
+    # MUST be invoked before the Aegis preflight step spawns the
+    # daemon (the daemon's BudgetCaps are read from env at boot).
+    # NEVER raises — failure folds into CapsResult(ok=False).
+    from backend.core.ouroboros.aegis.battle_test_defaults import (
+        default_battle_test_caps as _default_battle_test_caps,
+    )
+    _caps_result = _default_battle_test_caps()
+    if _caps_result.ok:
+        print(
+            f"[BattleTestDefaults] session_cap_source={_caps_result.session_cap_source} "
+            f"hourly_burn_cap_source={_caps_result.hourly_burn_cap_source} "
+            f"({_caps_result.detail})"
+        )
+    else:
+        print(f"[BattleTestDefaults] WARNING: {_caps_result.detail} — boot continues", file=sys.stderr)
+
+    # ------------------------------------------------------------------
     # Aegis battle-test ledger hygiene (Slice 2B-iii.1)
     # ------------------------------------------------------------------
     # Rotates .jarvis/aegis/spend.jsonl + removes its .lock companion
