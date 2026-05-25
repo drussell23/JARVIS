@@ -1,0 +1,42 @@
+# Cursor ignore — keeps the AI indexer + @-mention picker out of noisy paths.
+# Format is .gitignore-compatible. Affects Cursor's AI features only;
+# does NOT affect git.
+
+# iCloud / Finder conflicted-copy duplicates ("foo 2.md", "foo 2.py", etc).
+# There are ~2,286 of these in the tree — pure noise for the indexer.
+**/* 2.*
+**/* 3.*
+**/* [0-9].*
+
+# Large legacy / historical docs that should not be retrieved by AI search.
+docs/LEGACY_SESSION_HISTORY.md
+
+# Generated / runtime state (already in .gitignore, listed here for
+# defense-in-depth so Cursor's indexer skips them even if a stray copy
+# slips outside .gitignore).
+.ouroboros/
+.jarvis/
+.worktrees/
+worktrees/
+venv/
+.venv/
+node_modules/
+
+# Build / cache artifacts.
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Logs and large session artifacts.
+*.log
+debug.log
+.ouroboros/sessions/
