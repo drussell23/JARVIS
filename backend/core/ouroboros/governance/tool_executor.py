@@ -4518,6 +4518,20 @@ _DEFAULT_MIN_PER_ROUND_S = float(
 _DEFAULT_FINAL_WRITE_RESERVE_S = float(
     os.environ.get("JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_S", "10.0")
 )
+# Slice 3B — minimum TTFT floor for a viable tool-loop round.
+# Empirical Claude TTFT in tool-loop conditions is 1-3s (proven
+# by soak bt-2026-05-25-012206: first_token=1.9s), but the FULL
+# round needs ~30-45s headroom for: tool-result inspection +
+# next-tool decision + chunk streaming + the inter-chunk silence
+# guard's 30s grace. Below this floor the stream consumer's outer
+# wait_for cancels healthy generations mid-flight. The coordinator's
+# round-entry gate (Layer 1) refuses to START a round below this
+# floor; the stream consumer's clamp (Layer 2) refuses to clamp
+# _chunk_timeout below this floor. Operator-tunable; default 45s =
+# inter-chunk 30s + ~15s streaming overhead.
+_DEFAULT_MIN_TTFT_FLOOR_S = float(
+    os.environ.get("JARVIS_TOOL_LOOP_MIN_TTFT_FLOOR_S", "45.0")
+)
 _BUDGET_TELEMETRY_ENABLED = os.environ.get(
     "JARVIS_TOOL_LOOP_BUDGET_TELEMETRY", "true"
 ).lower() in ("1", "true", "yes", "on")
@@ -4576,6 +4590,14 @@ class BudgetPlan:
     min_per_round_s: float
     max_per_round_s: float
     hard_max_rounds: int
+    # Slice 3B — minimum TTFT floor. When per_round_timeout < this,
+    # is_next_round_viable() returns False so the coordinator exits
+    # the loop cleanly rather than starting a doomed round whose
+    # generation would be murdered by the outer wait_for clock
+    # before the model can even reach first-token. Also consumed by
+    # the stream consumer's _chunk_timeout clamp (Layer 2) as a
+    # floor for the wall_rem expression. Default derived from env.
+    min_ttft_floor_s: float = 0.0
 
     @classmethod
     def build(
@@ -4585,6 +4607,7 @@ class BudgetPlan:
         max_per_round_s: float,
         final_write_reserve_s: Optional[float] = None,
         min_per_round_s: Optional[float] = None,
+        min_ttft_floor_s: Optional[float] = None,
     ) -> "BudgetPlan":
         """Construct a plan with smart defaults derived from ``total_budget_s``.
 
@@ -4593,7 +4616,12 @@ class BudgetPlan:
           20s budget it reserves 5s (25%).
         - ``min_per_round_s`` default: ``max(1s, min(3s, budget / 20))``.
           For a 60s budget this is 3s; for a 10s budget it is 1s.
-        - Both params are hard-clamped into sane ranges below to prevent
+        - ``min_ttft_floor_s`` default: ``_DEFAULT_MIN_TTFT_FLOOR_S``
+          (env: ``JARVIS_TOOL_LOOP_MIN_TTFT_FLOOR_S``, 45s). Slice 3B.
+          The floor below which ``is_next_round_viable()`` returns False
+          so the coordinator stops rather than starting a doomed round
+          whose generation would be murdered by the outer wait_for clock.
+        - All params are hard-clamped into sane ranges below to prevent
           misconfiguration from producing nonsensical plans.
         """
         safe_total = max(float(total_budget_s), 1.0)
@@ -4601,18 +4629,27 @@ class BudgetPlan:
             final_write_reserve_s = min(_DEFAULT_FINAL_WRITE_RESERVE_S, safe_total * 0.25)
         if min_per_round_s is None:
             min_per_round_s = max(1.0, min(_DEFAULT_MIN_PER_ROUND_S + 1.0, safe_total / 20.0))
+        if min_ttft_floor_s is None:
+            min_ttft_floor_s = _DEFAULT_MIN_TTFT_FLOOR_S
         # Clamp the reserve so it can never leave <1s of usable budget.
         safe_reserve = max(0.0, min(float(final_write_reserve_s), safe_total - 1.0))
         safe_min = max(0.5, float(min_per_round_s))
         # max_per_round must be ≥ min_per_round for the clamp in
         # per_round_timeout() to be well-ordered.
         safe_max = max(safe_min, float(max_per_round_s))
+        # min_ttft_floor must be ≥ 0; we intentionally do NOT clamp it
+        # to <= safe_max — operators can set a floor ABOVE the max
+        # per-round to opt into "never start any tool round" mode (e.g.
+        # for one-shot generation tests). The viability gate handles
+        # that case correctly (always returns False).
+        safe_ttft_floor = max(0.0, float(min_ttft_floor_s))
         return cls(
             total_budget_s=safe_total,
             final_write_reserve_s=safe_reserve,
             min_per_round_s=safe_min,
             max_per_round_s=safe_max,
             hard_max_rounds=max(1, int(hard_max_rounds)),
+            min_ttft_floor_s=safe_ttft_floor,
         )
 
     @property
@@ -4684,18 +4721,42 @@ class BudgetPlan:
     ) -> bool:
         """Return True when the next tool round has structural fair share.
 
-        A round is viable when the unclamped fair share of the remaining
-        budget is at least ``min_per_round_s``. Rounds below that floor
-        are guaranteed to burn a doomed sub-floor API call (first_token
-        NEVER, bytes_received 0), and should be failed fast before they
-        poison the rest of the operation sequence (Manifesto §3 —
-        disciplined concurrency; diagnosed in bt-2026-04-12-054855 where
-        a 6.7s tool round died at 0.0s elapsed).
+        Two AND-conditions must hold:
+
+          1. **Min per-round floor** (legacy): unclamped fair share of
+             the remaining budget is at least ``min_per_round_s``. Sub-
+             floor rounds burn a doomed API call (first_token NEVER,
+             bytes_received 0) — diagnosed in bt-2026-04-12-054855
+             where a 6.7s tool round died at 0.0s elapsed.
+
+          2. **Min TTFT floor** (Slice 3B): the clamped
+             ``per_round_timeout`` is at least ``min_ttft_floor_s``.
+             Below this, the outer ``asyncio.wait_for(timeout=
+             per_round_timeout)`` will murder a healthy stream
+             mid-token-flow before the model can reach completion —
+             empirically observed in bt-2026-05-25-012206 where
+             attempt-3 round 3 had per_round_timeout=4.65s, Claude
+             delivered first_token=1.9s, then the wait_for clock
+             cancelled the stream at 80.7s elapsed with only 349
+             bytes received. Slice 3B Layer 1 (preventive) gate —
+             refuse to START a round that's structurally doomed to
+             be cancelled mid-flight.
+
+        When either condition fails, the coordinator should exit the
+        loop with reason ``tool_loop_starved_below_min_ttft_floor``
+        (or the legacy ``min_per_round`` reason) and force the model
+        to produce its final answer with the remaining budget.
         """
-        return (
-            self.unclamped_fair_share_s(remaining_s, remaining_rounds)
-            >= self.min_per_round_s
-        )
+        # Condition 1 — legacy min_per_round floor
+        if self.unclamped_fair_share_s(remaining_s, remaining_rounds) < self.min_per_round_s:
+            return False
+        # Condition 2 — Slice 3B min TTFT floor
+        # Skip this check when floor is 0 (operator opt-out) for
+        # backward-compat with tests that don't set min_ttft_floor_s.
+        if self.min_ttft_floor_s > 0.0:
+            if self.per_round_timeout(remaining_s, remaining_rounds) < self.min_ttft_floor_s:
+                return False
+        return True
 
     def describe(self) -> str:
         """Human-readable one-liner for telemetry logs."""
@@ -5246,6 +5307,48 @@ class ToolLoopCoordinator:
                         f"round={round_index},"
                         f"remaining={_remaining_pre:.2f}s,"
                         f"min_per_round={plan.min_per_round_s:.2f}s"
+                    )
+                # ── Slice 3B Layer 1 — MIN_TTFT_FLOOR viability gate ──
+                # Refuse to START a round whose per_round_timeout would
+                # be below the empirical min-TTFT floor. Below the floor,
+                # the outer asyncio.wait_for(per_round_timeout) is
+                # structurally guaranteed to murder a healthy stream
+                # mid-token-flow (observed in bt-2026-05-25-012206:
+                # per_round_timeout=4.65s, first_token=1.9s, but the
+                # stream was cancelled at 80.7s elapsed with only
+                # 349 bytes received). Exit cleanly here so the next
+                # phase (e.g., final-write or terminal) can use the
+                # remaining budget productively, rather than burning
+                # it on a doomed round.
+                _rounds_left_for_gate = max(
+                    1, plan.effective_max_rounds - round_index,
+                )
+                if not plan.is_next_round_viable(
+                    remaining_s=_remaining_pre,
+                    remaining_rounds=_rounds_left_for_gate,
+                ):
+                    _projected = plan.per_round_timeout(
+                        _remaining_pre, _rounds_left_for_gate,
+                    )
+                    logger.warning(
+                        "[ToolLoop] op=%s round=%d "
+                        "tool_loop_starved_below_min_ttft_floor "
+                        "remaining=%.2fs rounds_left=%d "
+                        "projected_per_round=%.2fs min_ttft_floor=%.2fs "
+                        "— bailing pre-call to spare healthy budget",
+                        op_id[:12] if op_id else "?",
+                        round_index, _remaining_pre,
+                        _rounds_left_for_gate, _projected,
+                        plan.min_ttft_floor_s,
+                    )
+                    self._last_records = list(records)
+                    self._finalize_run(op_id)
+                    raise RuntimeError(
+                        "tool_loop_starved_below_min_ttft_floor:"
+                        f"round={round_index},"
+                        f"remaining={_remaining_pre:.2f}s,"
+                        f"projected_per_round={_projected:.2f}s,"
+                        f"min_ttft_floor={plan.min_ttft_floor_s:.2f}s"
                     )
 
             # Signal to provider: use lower max_tokens for tool rounds
