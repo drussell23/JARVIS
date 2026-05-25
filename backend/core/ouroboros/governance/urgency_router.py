@@ -351,6 +351,50 @@ class UrgencyRouter:
                 # through to the Priority 1-5 matrix on any failure.
                 pass
 
+        # ── Priority 0.7: SWE-Bench-Pro real-benchmark downgrade (Slice 10A) ──
+        # bt-2026-05-25-215404 root: real SWE-Bench-Pro ops were classifying
+        # as IMMEDIATE (test_failure source + high urgency) and routing every
+        # repair generation through Claude direct. The result: 99.83% of soak
+        # spend ($1.43 / $1.43) landed on Claude while DW saw $0.002, the
+        # exact INVERSE of the trinity manifesto's cost-optimization intent
+        # ("DW Tier 0 preferred, Claude Tier 1 fallback").
+        #
+        # Architectural diagnosis: §5 urgency routing was designed for the
+        # human-reflex case (voice command, IDE test failure mid-typing,
+        # runtime health alarm). SWE-Bench-Pro evaluations are BENCHMARK
+        # FIXTURES — no human is waiting on the Ansible repair. They are
+        # urgency-1 signals only because they masquerade as test failures
+        # through the test_failure signal source.
+        #
+        # Fix: if the envelope was emitted by the SWE-Bench-Pro builder
+        # (``envelope_is_swe_bench_pro(ctx) is True``) AND it did NOT
+        # qualify for the narrower WIRING_VALIDATION route above
+        # (i.e., this is a real benchmark or non-wiring-validation
+        # fixture), downgrade to STANDARD. STANDARD = DW primary + Claude
+        # fallback — preserves capability (Claude still steps in if DW
+        # exhausts) while restoring the 87% cost savings the trinity
+        # cascade was designed to deliver.
+        #
+        # Reflex routing for genuine human signals is UNCHANGED — the
+        # SWE-Bench-Pro envelope tag is the ONLY discriminator. Voice,
+        # IDE test failure, runtime health continue to route IMMEDIATE
+        # because their envelopes don't carry ``swe_bench_pro=True``.
+        # Defensive try/except so envelope-inspection failures fall
+        # through to the existing Priority 1-5 matrix.
+        try:
+            from backend.core.ouroboros.governance.envelope_metadata import (  # noqa: E501
+                envelope_is_swe_bench_pro,
+            )
+            if envelope_is_swe_bench_pro(ctx):
+                return (
+                    ProviderRoute.STANDARD,
+                    "swe_bench_pro_envelope:not_human_blocking:"
+                    "downgrade_to_dw_primary",
+                )
+        except Exception:  # noqa: BLE001 — defensive (envelope inspection)
+            # NEVER let envelope inspection break the route — fall through.
+            pass
+
         urgency = getattr(ctx, "signal_urgency", "") or "normal"
         source = getattr(ctx, "signal_source", "") or ""
         complexity = getattr(ctx, "task_complexity", "") or "moderate"
