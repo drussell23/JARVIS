@@ -1,0 +1,107 @@
+{
+  "workflow_name": "pip in /backend - Update #1383180316",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26403098952",
+  "branch": "main",
+  "commit_sha": "085f8f4",
+  "run_number": 149,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pip-in-backend-update-1383180316-run149-20260525-143537",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: pip in /backend - Update #1383180316 (Run #149)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 0,
+              "content": "2026-05-25T13:36:24.9080351Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/lib/dependabot/updater/operations/update_all_versions.rb:99:in 'Dependabot::Updater::Operations::UpdateAllVersions#check_and_create_pr_with_error_handling'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 1,
+              "content": "2026-05-25T13:36:24.9081650Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/vendor/ruby/3.4.0/gems/sorbet-runtime-0.6.13208/lib/types/private/methods/call_validation_2_7.rb:687:in 'UnboundMethod#bind_call'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 2,
+              "content": "2026-05-25T13:36:24.9083105Z updater | 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/vendor/ruby/3.4.0/gems/sorbet-runtime-0.6.13208/lib/types/private/methods/call_validation_2_7.rb:687:in 'block in Dependabot::Updater::Operations::UpdateAllVersions#create_validator_procedure_fast1'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 3,
+              "content": "2026-05-25T13:36:24.9084592Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/lib/dependabot/updater/operations/update_all_versions.rb:59:in 'block in Dependabot::Updater::Operations::UpdateAllVersions#perform'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 4,
+              "content": "2026-05-25T13:36:24.9085671Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/lib/dependabot/updater/operations/update_all_versions.rb:59:in 'Array#each'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 5,
+              "content": "2026-05-25T13:36:24.9088857Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/lib/dependabot/updater/operations/update_all_versions.rb:59:in 'Dependabot::Updater::Operations::UpdateAllVersions#perform'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 6,
+              "content": "2026-05-25T13:36:24.9090773Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/vendor/ruby/3.4.0/gems/sorbet-runtime-0.6.13208/lib/types/private/methods/call_validation.rb:294:in 'UnboundMethod#bind_call'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 7,
+              "content": "2026-05-25T13:36:24.9092989Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/vendor/ruby/3.4.0/gems/sorbet-runtime-0.6.13208/lib/types/private/methods/call_validation.rb:294:in 'T::Private::Methods::CallValidation.validate_call'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 8,
+              "content": "2026-05-25T13:36:24.9095474Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/vendor/ruby/3.4.0/gems/sorbet-runtime-0.6.13208/lib/types/private/methods/_methods.rb:257:in 'block in Dependabot::Updater::Operations::UpdateAllVersions#_on_method_added'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 9,
+              "content": "2026-05-25T13:36:24.9098257Z 2026/05/25 13:36:24 ERROR <job_1383180316> /home/dependabot/dependabot-updater/lib/dependabot/updater/operations/group_update_all_versions.rb:140:in 'block in Dependabot::Updater::Operations::GroupUpdateAllVersions#run_ungrouped_dependency_updates'",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 45
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 79,
+              "content": "2026-05-25T13:36:25.1952018Z |        Dependencies failed to update         |",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-05-25T13:36:25.3589950Z Failure running container 31835de29994ba2eca477a3ceb750494397b2f1d8d2ff5dddea5e3f4786d0d7c: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-25T14:35:37.528057"
+}
