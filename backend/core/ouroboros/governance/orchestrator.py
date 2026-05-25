@@ -6236,6 +6236,39 @@ class GovernedOrchestrator:
                 if validate_retries_remaining < 0:
                     # ── L2 self-repair dispatch ───────────────────────────────────
                     if self._config.repair_engine is not None and best_validation is not None:
+                        # ──────────────────────────────────────────────────
+                        # Slice 6 — bounded L2 re-dispatch loop for SOFT stops
+                        # (bt-2026-05-25-174218 root: L2 used 14s of 120s
+                        # before iter 2 generation returned no candidate;
+                        # pre-Slice-6 hook returned 'cancel' on any L2_STOPPED,
+                        # killing the op despite 106s of unused L2 budget).
+                        #
+                        # JARVIS_L2_DISPATCH_RETRIES (default 1) = number of
+                        # ADDITIONAL L2 dispatches after the first. With
+                        # default=1: up to 2 total L2 dispatches per op, each
+                        # getting a fresh 120s timebox (so ~240s total L2 wall
+                        # time per op in the worst case). The orchestrator's
+                        # CLASSIFY cost cap and the harness wall-clock watchdog
+                        # both cap session-level wall time independently, so
+                        # this never violates a global safety invariant.
+                        # ──────────────────────────────────────────────────
+                        _l2_max_dispatches = int(
+                            os.environ.get("JARVIS_L2_DISPATCH_RETRIES", "1"),
+                        ) + 1
+                        _l2_dispatch_idx = 0
+                        _l2_soft_stop_history: list = []
+                        _l2_break_directive = None
+                    else:
+                        _l2_max_dispatches = 0
+                        _l2_dispatch_idx = 0
+                        _l2_soft_stop_history = []
+                        _l2_break_directive = None
+                    while (
+                        self._config.repair_engine is not None
+                        and best_validation is not None
+                        and _l2_dispatch_idx < _l2_max_dispatches
+                    ):
+                        _l2_dispatch_idx += 1
                         # ── L2 deadline reconciliation (Session V fix) ─────────
                         # Manifesto §8 (Absolute Observability): an env var named
                         # ``JARVIS_L2_TIMEBOX_S`` must mean **the wall time
@@ -6316,24 +6349,94 @@ class GovernedOrchestrator:
                         directive = await self._l2_hook(
                             ctx, best_validation, _l2_deadline,
                         )
-                        _fsm_log("l2_dispatch_post", f"directive={directive[0]!r}")
+                        _fsm_log(
+                            "l2_dispatch_post",
+                            f"directive={directive[0]!r} attempt={_l2_dispatch_idx}/{_l2_max_dispatches}",
+                        )
                         if directive[0] == "break":
-                            best_candidate, best_validation = directive[1], directive[2]
-                            logger.info(
-                                "[Orchestrator] L2 broke VALIDATE_RETRY loop for op=%s — "
-                                "proceeding to source-drift / shadow / entropy / GATE "
-                                "(candidate_id=%s, file=%s, source_hash=%s)",
-                                ctx.op_id,
-                                best_candidate.get("candidate_id", "?"),
-                                best_candidate.get("file_path", "?"),
-                                (best_candidate.get("source_hash") or "")[:12],
+                            # ── Slice 6 — capture for post-loop handling ──
+                            _l2_break_directive = directive
+                            break  # inner Slice 6 retry loop
+                        elif directive[0] == "l2_retry":
+                            # ── Slice 6 — re-dispatch L2 with fresh budget ──
+                            # _l2_hook left ctx unadvanced; we record the soft
+                            # stop reason and loop back for another dispatch
+                            # (if budget allows).
+                            _l2_soft_stop_history.append(
+                                directive[2] if len(directive) > 2 else "unknown"
                             )
-                            _fsm_log("l2_converged_break")
-                            break  # fall through to GATE
+                            if _l2_dispatch_idx >= _l2_max_dispatches:
+                                # Out of retries — convert soft stop to a
+                                # genuine cancel terminal. ctx is still
+                                # unadvanced; advance it now to CANCELLED
+                                # so downstream phases see consistent state.
+                                logger.info(
+                                    "[Orchestrator] L2 soft-stop retries exhausted "
+                                    "op=%s attempts=%d/%d stop_history=%s — "
+                                    "converting to cancel terminal",
+                                    ctx.op_id,
+                                    _l2_dispatch_idx,
+                                    _l2_max_dispatches,
+                                    _l2_soft_stop_history,
+                                )
+                                ctx = ctx.advance(
+                                    OperationPhase.CANCELLED,
+                                    terminal_reason_code=(
+                                        f"l2_soft_stop_retries_exhausted:"
+                                        f"{_l2_dispatch_idx}"
+                                    ),
+                                )
+                                await self._record_ledger(
+                                    ctx,
+                                    OperationState.FAILED,
+                                    {
+                                        "reason": "l2_soft_stop_retries_exhausted",
+                                        "attempts": _l2_dispatch_idx,
+                                        "soft_stop_history": _l2_soft_stop_history,
+                                    },
+                                )
+                                _fsm_log(
+                                    "l2_soft_retries_exhausted",
+                                    f"attempts={_l2_dispatch_idx} history={_l2_soft_stop_history}",
+                                )
+                                return ctx
+                            # Otherwise: keep looping for another L2 dispatch.
+                            logger.info(
+                                "[Orchestrator] L2 soft-stop re-dispatch op=%s "
+                                "attempt=%d/%d prev_stop_reason=%s",
+                                ctx.op_id,
+                                _l2_dispatch_idx + 1,
+                                _l2_max_dispatches,
+                                _l2_soft_stop_history[-1] if _l2_soft_stop_history else "?",
+                            )
+                            _fsm_log(
+                                "l2_redispatch",
+                                f"attempt={_l2_dispatch_idx + 1}/{_l2_max_dispatches} "
+                                f"prev={_l2_soft_stop_history[-1] if _l2_soft_stop_history else '?'}",
+                            )
+                            continue  # next iteration of the inner Slice 6 loop
                         elif directive[0] in ("cancel", "fatal"):
                             _fsm_log("l2_escape_return", f"directive={directive[0]!r}")
                             return directive[1]  # ctx was advanced inside _l2_hook
-                    else:
+                    # ── Post-Slice-6-inner-loop: handle break-out case ──
+                    if _l2_break_directive is not None:
+                        best_candidate = _l2_break_directive[1]
+                        best_validation = _l2_break_directive[2]
+                        logger.info(
+                            "[Orchestrator] L2 broke VALIDATE_RETRY loop for op=%s — "
+                            "proceeding to source-drift / shadow / entropy / GATE "
+                            "(candidate_id=%s, file=%s, source_hash=%s)",
+                            ctx.op_id,
+                            best_candidate.get("candidate_id", "?"),
+                            best_candidate.get("file_path", "?"),
+                            (best_candidate.get("source_hash") or "")[:12],
+                        )
+                        _fsm_log("l2_converged_break")
+                        break  # outer VALIDATE_RETRY while loop → GATE
+                    if (
+                        self._config.repair_engine is None
+                        or best_validation is None
+                    ):
                         _fsm_log(
                             "l2_skipped",
                             f"repair_engine={self._config.repair_engine is not None} "
@@ -9765,6 +9868,63 @@ class GovernedOrchestrator:
                 return ("cancel", ctx)
 
         elif l2_result.terminal == "L2_STOPPED":
+            # ──────────────────────────────────────────────────────────
+            # Slice 6 — dynamic budget reconciliation
+            # (bt-2026-05-25-174218 root: L2 stopped at 14s of a fresh
+            # 120s budget because iter 2 generation produced no candidate;
+            # the orchestrator murdered the op with directive='cancel'
+            # despite L2 having 106s of unused budget. Operator framing:
+            # "ensuring the repair engine gets its full 120 seconds to
+            # iterate.")
+            #
+            # Stop-reason taxonomy:
+            #   HARD (genuinely exhausted — re-dispatch would gain nothing):
+            #     - timebox_exhausted
+            #     - max_iterations_exhausted
+            #     - max_validation_runs_exhausted
+            #     - deadline_budget_exhausted
+            #
+            #   SOFT (transient failure — fresh L2 dispatch could converge):
+            #     - generate_error:<TypeName>  (single bad provider response)
+            #     - empty_candidates           (provider returned no candidates)
+            #     - consecutive_provider_timeouts_exhausted:N (provider flake)
+            #
+            # On SOFT stop, return ("l2_retry", ctx, l2_result.stop_reason)
+            # — the caller (VALIDATE_RETRY loop) tracks attempt count
+            # against JARVIS_L2_DISPATCH_RETRIES and re-runs the L2
+            # dispatch block (which re-reconciles the budget so L2 gets
+            # a fresh 120s window each pass). On HARD stop, preserve the
+            # pre-Slice-6 cancel behavior verbatim.
+            # ──────────────────────────────────────────────────────────
+            _l2_hard_stop_prefixes = (
+                "timebox_exhausted",
+                "max_iterations_exhausted",
+                "max_validation_runs_exhausted",
+                "deadline_budget_exhausted",
+            )
+            _stop_reason_str = l2_result.stop_reason or ""
+            _is_hard_stop = any(
+                _stop_reason_str == p or _stop_reason_str.startswith(p + ":")
+                for p in _l2_hard_stop_prefixes
+            )
+            if not _is_hard_stop:
+                # Soft stop — leave ctx unadvanced; caller may re-dispatch.
+                logger.info(
+                    "[Orchestrator] L2 soft stop op=%s stop_reason=%s "
+                    "iterations_used=%d — eligible for re-dispatch "
+                    "(Slice 6 l2_retry directive)",
+                    ctx.op_id,
+                    _stop_reason_str or "unknown",
+                    len(l2_result.iterations),
+                )
+                await self._record_ledger(ctx, OperationState.SANDBOXING, {
+                    "event": "l2_soft_stop",
+                    "stop_reason": _stop_reason_str,
+                    "iterations_used": len(l2_result.iterations),
+                    "entry_phase": _entry_phase.name,
+                    **l2_result.summary,
+                })
+                return ("l2_retry", ctx, _stop_reason_str)
             # Phase-aware escape: post-apply → POSTMORTEM, pre-apply → CANCELLED.
             ctx = ctx.advance(
                 _escape_terminal,
