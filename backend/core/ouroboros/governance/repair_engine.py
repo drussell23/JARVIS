@@ -94,6 +94,15 @@ class RepairBudget:
     max_files_changed: int = 3
     max_total_validation_runs: int = 8
     no_progress_streak_kill: int = 2
+    # Slice 5A — L2 provider isolation: bound each iteration's provider
+    # generate call so a single 118s Claude stream cannot eat the whole
+    # pipeline budget and starve all remaining iters. Default 45s gives
+    # the provider enough headroom for a reasoned patch while leaving
+    # budget for 2-3 more iters under a 120s timebox.
+    per_iter_provider_timeout_s: float = 45.0
+    # Stop the engine if N consecutive iters timeout on the provider
+    # (avoids burning the full timebox on a wedged provider chain).
+    max_consecutive_provider_timeouts: int = 2
     max_class_retries: Dict[str, int] = dataclasses.field(
         default_factory=lambda: {"syntax": 2, "test": 3, "flake": 2, "env": 1}
     )
@@ -130,6 +139,13 @@ class RepairBudget:
         timebox_s = float(os.environ.get("JARVIS_L2_TIMEBOX_S", "120.0"))
         min_deadline_remaining_s = float(os.environ.get("JARVIS_L2_MIN_DEADLINE_S", "10.0"))
         per_iteration_test_timeout_s = float(os.environ.get("JARVIS_L2_ITER_TEST_TIMEOUT_S", "60.0"))
+        # Slice 5A — L2 provider isolation knobs
+        per_iter_provider_timeout_s = float(
+            os.environ.get("JARVIS_L2_PER_ITER_PROVIDER_TIMEOUT_S", "45.0"),
+        )
+        max_consecutive_provider_timeouts = int(
+            os.environ.get("JARVIS_L2_MAX_CONSECUTIVE_PROVIDER_TIMEOUTS", "2"),
+        )
 
         # JSON parsing with fallback to default
         max_class_retries_json = os.environ.get("JARVIS_L2_CLASS_RETRIES_JSON")
@@ -157,6 +173,8 @@ class RepairBudget:
             no_progress_streak_kill=no_progress_streak_kill,
             max_class_retries=max_class_retries,
             flake_confirm_reruns=flake_confirm_reruns,
+            per_iter_provider_timeout_s=per_iter_provider_timeout_s,
+            max_consecutive_provider_timeouts=max_consecutive_provider_timeouts,
         )
 
 
@@ -643,6 +661,10 @@ class RepairEngine:
         prev_failing_count: Optional[int] = None
         prev_failure_class: Optional[str] = None
         total_validation_runs = 0
+        # Slice 5A — track consecutive provider iter timeouts so a wedged
+        # provider chain hard-stops only after N back-to-back timeouts
+        # (default 2) instead of starving the whole timebox on iter 1.
+        consecutive_provider_timeouts = 0
         t_start = time.monotonic()
         records: list = []
         model_id: str = getattr(ctx.generation, "model_id", "")
@@ -706,10 +728,53 @@ class RepairEngine:
                     hypothesis_seed=None,  # LINEAR FSM does not seed
                 )
                 if gen_outcome.candidate is None:
+                    # ──────────────────────────────────────────────────
+                    # Slice 5A — graceful continue on provider iter
+                    # timeout. The pre-5A behavior hard-stopped the
+                    # engine on ANY generate_error stop_reason; the
+                    # bt-2026-05-25-095834 cascade proved that a single
+                    # provider timeout (Claude stream cap) terminated
+                    # the entire L2 loop and chained into the orchestrator
+                    # ForegroundCooldown. Now: if the stop_reason was
+                    # specifically a provider iter timeout (the only
+                    # source of `provider_iter_timeout:` stop_reason
+                    # under Slice 5A), CONTINUE to next iter until N
+                    # consecutive timeouts (max_consecutive_provider_
+                    # timeouts, default 2). All other generate_error
+                    # shapes preserve byte-equivalent hard-stop behavior.
+                    # ──────────────────────────────────────────────────
+                    _is_provider_timeout = (
+                        gen_outcome.stop_reason is not None
+                        and gen_outcome.stop_reason.startswith(
+                            "provider_iter_timeout:",
+                        )
+                    )
+                    if _is_provider_timeout:
+                        consecutive_provider_timeouts += 1
+                        if (
+                            consecutive_provider_timeouts
+                            >= budget.max_consecutive_provider_timeouts
+                        ):
+                            _logger.warning(
+                                "[L2 Repair] hard-stop: %d consecutive "
+                                "provider iter timeouts >= cap %d",
+                                consecutive_provider_timeouts,
+                                budget.max_consecutive_provider_timeouts,
+                            )
+                            return _stopped(
+                                "consecutive_provider_timeouts_exhausted:"
+                                f"{consecutive_provider_timeouts}",
+                            )
+                        # Soft-skip this iter; the next loop entry will
+                        # re-check kill conditions (remaining_s, timebox,
+                        # etc.) before retrying GENERATE.
+                        continue
                     return _stopped(
                         gen_outcome.stop_reason
                         or "generate_error:unknown",
                     )
+                # Reset the counter on any successful provider call.
+                consecutive_provider_timeouts = 0
                 current_candidate = gen_outcome.candidate
                 # Preserve byte-equivalent getattr-with-fallback semantic
                 # — None (sentinel) means "provider response lacked the
@@ -1056,12 +1121,62 @@ class RepairEngine:
         # composes the same _generate_repair_candidate signature.
         del hypothesis_seed  # Phase A: explicitly unused; Phase C owns
 
+        # ──────────────────────────────────────────────────────────────
+        # Slice 5A — L2 provider isolation (bt-2026-05-25-095834 root)
+        #
+        # The naked ``await self._prime.generate(...)`` saw the FULL
+        # pipeline_deadline (e.g. 118s for Claude streaming) and any
+        # single iter could exhaust the entire L2 timebox. The cascade
+        # from bt-2026-05-25-095834: L2 iter 1 timeout → iter 2 generate
+        # eats remaining budget → engine bails → orchestrator
+        # ForegroundCooldown → 16 ops piled up cancelled.
+        #
+        # Fix: wrap with asyncio.wait_for bounded by the L2-local
+        # per_iter_provider_timeout_s (default 45s). The deadline arg
+        # passed to provider stays unchanged so server-side cap still
+        # honors pipeline_deadline as upper bound; the wait_for is a
+        # CLIENT-side narrower bound. Effective bound is the smaller of
+        # (per_iter_provider_timeout_s, remaining_pipeline_seconds) so
+        # the deadline contract is never violated.
+        #
+        # On asyncio.TimeoutError we emit a structured stop_reason
+        # ("provider_iter_timeout:<s>") which the L2 loop classifies
+        # as a SOFT iter failure (continues to next iter via the new
+        # _consecutive_provider_timeouts counter) instead of the
+        # pre-Slice-5A behavior where any generate_error hard-stopped
+        # the engine. Stops only after N consecutive timeouts (budget
+        # field max_consecutive_provider_timeouts, default 2).
+        # ──────────────────────────────────────────────────────────────
+        _per_iter_bound = self._budget.per_iter_provider_timeout_s
+        _now = datetime.now(timezone.utc)
+        _remaining_pipeline_s = (pipeline_deadline - _now).total_seconds()
+        # Honor pipeline_deadline as hard upper bound — never wait_for
+        # longer than the operation's overall remaining budget.
+        _effective_timeout_s = max(
+            1.0, min(_per_iter_bound, _remaining_pipeline_s),
+        )
         try:
-            gen_result = await self._prime.generate(
-                ctx, pipeline_deadline, repair_context=repair_context,
+            gen_result = await asyncio.wait_for(
+                self._prime.generate(
+                    ctx, pipeline_deadline, repair_context=repair_context,
+                ),
+                timeout=_effective_timeout_s,
             )
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "[L2 Repair] provider iter timeout: effective=%.1fs "
+                "per_iter_bound=%.1fs remaining_pipeline=%.1fs — "
+                "continuing to next iter (Slice 5A graceful continue)",
+                _effective_timeout_s, _per_iter_bound, _remaining_pipeline_s,
+            )
+            return CandidateGenerationResult(
+                candidate=None,
+                model_id=None,
+                provider_name=None,
+                stop_reason=f"provider_iter_timeout:{_effective_timeout_s:.1f}s",
+            )
         except Exception as exc:  # noqa: BLE001 — Protocol contract
             return CandidateGenerationResult(
                 candidate=None,
