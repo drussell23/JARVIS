@@ -4324,6 +4324,21 @@ class CandidateGenerator:
                 else:
                     _outer_max = _FALLBACK_OUTER_RETRY_MAX
                 _last_inner_exc: Optional[BaseException] = None
+                # ── Slice 3C — outer-retry tool-record carryover ──
+                # Iron Gate (post-GENERATE) inspects
+                # ``GenerationResult.tool_execution_records`` to verify the
+                # model met the exploration floor. Each provider attempt
+                # carries only its OWN tool calls (the coordinator resets
+                # ``_last_records`` at run start). If attempt N raises after
+                # genuine exploration but attempt N+1 succeeds with NO tool
+                # calls (the bt-2026-05-25-033000 cascade — direct patch
+                # emit after retries), Iron Gate sees 0 records and rejects
+                # even though the model explored the codebase across
+                # attempts. Accumulator harvests records from each failed
+                # attempt's exception (Slice-3C-stamped via
+                # ``_attach_tool_records`` in tool_executor) and merges
+                # into the winning attempt's GenerationResult below.
+                _carryover_tool_records: List[Any] = []
                 while True:
                     _outer_attempt += 1
                     _attempt_t0 = time.monotonic()
@@ -4370,12 +4385,73 @@ class CandidateGenerator:
                             _phase_hint,
                             getattr(context, "op_id", "?")[:16],
                         )
+                        # Slice 3C — merge carryover records into the
+                        # winning attempt's GenerationResult so Iron Gate
+                        # sees the cumulative exploration across attempts.
+                        # No-op when carryover is empty (single-attempt
+                        # success path) — byte-identical legacy behavior.
+                        if _carryover_tool_records:
+                            try:
+                                _winning_records = tuple(
+                                    getattr(
+                                        _fb_result,
+                                        "tool_execution_records",
+                                        (),
+                                    ) or ()
+                                )
+                                _merged = (
+                                    tuple(_carryover_tool_records)
+                                    + _winning_records
+                                )
+                                _with_tool_records = getattr(
+                                    _fb_result, "with_tool_records", None,
+                                )
+                                if callable(_with_tool_records):
+                                    _fb_result = _with_tool_records(_merged)
+                                    logger.info(
+                                        "[CandidateGenerator] Slice 3C: "
+                                        "merged %d carryover tool records "
+                                        "from %d failed attempt(s) into "
+                                        "winning GenerationResult "
+                                        "(winning=%d, total=%d) op=%s",
+                                        len(_carryover_tool_records),
+                                        _outer_attempt - 1,
+                                        len(_winning_records),
+                                        len(_merged),
+                                        getattr(
+                                            context, "op_id", "?",
+                                        )[:16],
+                                    )
+                            except Exception:  # noqa: BLE001 — defensive
+                                # Carryover merge must NEVER break a
+                                # successful generate. Log + fall through
+                                # with the unmerged result.
+                                logger.exception(
+                                    "[CandidateGenerator] Slice 3C "
+                                    "carryover merge degraded — returning "
+                                    "winning-attempt GenerationResult "
+                                    "unmodified for op=%s",
+                                    getattr(context, "op_id", "?")[:16],
+                                )
                         return _fb_result
                     except _OperationCancelledError:
                         # W3(7) cooperative cancel — operator/watchdog/signal.
                         # NEVER retry; honor the cancel immediately.
                         raise
                     except (Exception, asyncio.CancelledError) as inner_exc:
+                        # Slice 3C — harvest tool-records from the failed
+                        # attempt BEFORE any other handling. Best-effort:
+                        # if the exception didn't carry records (legacy
+                        # provider, untagged path), getattr returns (),
+                        # extend is a no-op, behavior matches pre-Slice-3C.
+                        try:
+                            _harvested = getattr(
+                                inner_exc, "tool_execution_records", (),
+                            ) or ()
+                            if _harvested:
+                                _carryover_tool_records.extend(_harvested)
+                        except Exception:  # noqa: BLE001 — never block retry
+                            pass
                         # Pre-instrumented (e.g. fallback_budget_starved
                         # from a different code path) → propagate as-is.
                         if hasattr(inner_exc, "exhaustion_report"):

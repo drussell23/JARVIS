@@ -194,6 +194,57 @@ def _compute_args_hash(arguments: Dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Slice 3C — tool-record propagation via exception attachment
+# ──────────────────────────────────────────────────────────────────────
+#
+# Closes bt-2026-05-25-033000: Iron Gate counter saw 0 tool calls despite
+# ToolLoopCoordinator accumulating 19 records across 10 rounds. Root: the
+# provider's outer-retry mechanism (candidate_generator) runs the tool
+# loop 1..N times per orchestrator generation. Each FAILED attempt's
+# records (held in ``coordinator._last_records``) were silently dropped
+# because the exception that propagated up didn't carry them — and the
+# next attempt resets ``_last_records`` at run start. The successful
+# attempt's records were the only ones reaching ``GenerationResult``;
+# when the successful attempt skipped tools (e.g. emitted a direct patch),
+# Iron Gate saw 0/2 even though earlier attempts had explored exhaustively.
+#
+# Fix mechanism: every failure-path ``raise`` inside ``ToolLoopCoordinator.
+# run()`` stamps the current ``records`` list onto the exception via
+# ``_attach_tool_records``. The orchestrator already harvests this
+# attribute (orchestrator.py:5135, predates this slice); the candidate
+# generator's outer-retry loop is updated in the same slice to accumulate
+# across attempts so the final ``GenerationResult`` carries every tool
+# call the model made for the op, not just the records from the winning
+# attempt.
+#
+# Why exception attachment vs context-field accumulator: exceptions are
+# the data flow path that was ALREADY in use for failure propagation; a
+# parallel ``ctx.cumulative_tool_records`` field would duplicate the
+# transport. Operator binding "pass data cleanly via context/results" —
+# the exception IS the result on failure paths.
+
+
+def _attach_tool_records(
+    exc: BaseException, records: Any,
+) -> BaseException:
+    """Stamp ``tool_execution_records`` onto an exception so outer-retry
+    callers can harvest the partial-run records. Returns the same exception
+    so the call composes inline with ``raise``.
+
+    Never raises — attribute assignment to built-in exception subclasses
+    is well-defined on Python 3.9+, but the try/except guard keeps the
+    contract that this helper is safe on the re-raise path under any
+    custom exception subclass.
+    """
+    try:
+        # Use tuple — immutable + matches the GenerationResult field type.
+        exc.tool_execution_records = tuple(records)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — never break a re-raise
+        pass
+    return exc
+
+
 # ---------------------------------------------------------------------------
 # L1 Tool-Use: Protocols (B-ready seams)
 # ---------------------------------------------------------------------------
@@ -5231,7 +5282,11 @@ class ToolLoopCoordinator:
         returning a stale tool-call JSON as the "final answer".
         """
         if time.monotonic() >= deadline:
-            raise RuntimeError("tool_loop_deadline_exceeded")
+            # Pre-loop deadline check — no records to attach yet, but stamp
+            # an empty tuple to honor the Slice 3C contract uniformly.
+            raise _attach_tool_records(
+                RuntimeError("tool_loop_deadline_exceeded"), (),
+            )
 
         # ── Structural budget plan ──
         # Built once per run() so all timing decisions are derived from
@@ -5286,7 +5341,10 @@ class ToolLoopCoordinator:
                 )
                 self._last_records = list(records)
                 self._finalize_run(op_id)
-                raise RuntimeError("tool_loop_max_rounds_exceeded")
+                # Slice 3C — propagate accumulated records to outer-retry.
+                raise _attach_tool_records(
+                    RuntimeError("tool_loop_max_rounds_exceeded"), records,
+                )
 
             # ── Pre-round hard-floor viability gate (Manifesto §3) ──
             # Round 0 always runs — the caller's refreshed fallback budget
@@ -5308,7 +5366,10 @@ class ToolLoopCoordinator:
                 if _remaining_pre <= 0:
                     self._last_records = list(records)
                     self._finalize_run(op_id)
-                    raise RuntimeError("tool_loop_deadline_exceeded")
+                    # Slice 3C — propagate accumulated records to outer-retry.
+                    raise _attach_tool_records(
+                        RuntimeError("tool_loop_deadline_exceeded"), records,
+                    )
                 if _remaining_pre < plan.min_per_round_s:
                     logger.warning(
                         "[ToolLoop] op=%s round=%d budget_starved "
@@ -5320,11 +5381,15 @@ class ToolLoopCoordinator:
                     )
                     self._last_records = list(records)
                     self._finalize_run(op_id)
-                    raise RuntimeError(
-                        "tool_loop_round_budget_starved:"
-                        f"round={round_index},"
-                        f"remaining={_remaining_pre:.2f}s,"
-                        f"min_per_round={plan.min_per_round_s:.2f}s"
+                    # Slice 3C — propagate accumulated records to outer-retry.
+                    raise _attach_tool_records(
+                        RuntimeError(
+                            "tool_loop_round_budget_starved:"
+                            f"round={round_index},"
+                            f"remaining={_remaining_pre:.2f}s,"
+                            f"min_per_round={plan.min_per_round_s:.2f}s"
+                        ),
+                        records,
                     )
                 # ── Slice 3B Layer 1 — MIN_TTFT_FLOOR viability gate ──
                 # Refuse to START a round whose per_round_timeout would
@@ -5361,12 +5426,18 @@ class ToolLoopCoordinator:
                     )
                     self._last_records = list(records)
                     self._finalize_run(op_id)
-                    raise RuntimeError(
-                        "tool_loop_starved_below_min_ttft_floor:"
-                        f"round={round_index},"
-                        f"remaining={_remaining_pre:.2f}s,"
-                        f"projected_per_round={_projected:.2f}s,"
-                        f"min_ttft_floor={plan.min_ttft_floor_s:.2f}s"
+                    # Slice 3C — propagate accumulated records to outer-retry
+                    # so Iron Gate sees every tool call across attempts, not
+                    # just the winning attempt (bt-2026-05-25-033000 root).
+                    raise _attach_tool_records(
+                        RuntimeError(
+                            "tool_loop_starved_below_min_ttft_floor:"
+                            f"round={round_index},"
+                            f"remaining={_remaining_pre:.2f}s,"
+                            f"projected_per_round={_projected:.2f}s,"
+                            f"min_ttft_floor={plan.min_ttft_floor_s:.2f}s"
+                        ),
+                        records,
                     )
 
             # Signal to provider: use lower max_tokens for tool rounds
@@ -5379,8 +5450,12 @@ class ToolLoopCoordinator:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._last_records = list(records)
                 self._finalize_run(op_id)
-                raise RuntimeError("tool_loop_deadline_exceeded")
+                # Slice 3C — propagate accumulated records to outer-retry.
+                raise _attach_tool_records(
+                    RuntimeError("tool_loop_deadline_exceeded"), records,
+                )
 
             # ── Final-write reserve enforcement ──
             # If remaining budget is at or below the reserve, stop issuing
@@ -5544,7 +5619,7 @@ class ToolLoopCoordinator:
                     started_ns = time.time_ns()
                     try:
                         tool_result = await self._backend.execute_async(tc, p_ctx, per_tool_deadline)
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as _cancel_exc:
                         ended_ns = time.time_ns()
                         records.append(ToolExecutionRecord(
                             schema_version="tool.exec.v1",
@@ -5569,6 +5644,9 @@ class ToolLoopCoordinator:
                         )
                         self._last_records = list(records)
                         self._finalize_run(op_id)
+                        # Slice 3C — preserve records on the cancellation
+                        # exception so outer-retry callers can harvest.
+                        _attach_tool_records(_cancel_exc, records)
                         raise
                     ended_ns = time.time_ns()
                     exec_results = [(tc, tool_result, c_id, t_ver, started_ns, ended_ns)]
@@ -5784,8 +5862,17 @@ class ToolLoopCoordinator:
                         len(prompt) + _keep + _overflow, len(current_prompt),
                     )
                 else:
+                    self._last_records = list(records)
                     self._finalize_run(op_id)
-                    raise RuntimeError(f"tool_loop_context_overflow:{len(current_prompt)}")
+                    # Slice 3C — propagate accumulated records to outer-retry
+                    # so context-overflow doesn't drop the model's prior
+                    # exploration history.
+                    raise _attach_tool_records(
+                        RuntimeError(
+                            f"tool_loop_context_overflow:{len(current_prompt)}"
+                        ),
+                        records,
+                    )
 
             # ── Upgrade 1 (PRD §31.2) per-round budget observer ──
             # Fires AFTER round body + compaction + force-truncate guard,
