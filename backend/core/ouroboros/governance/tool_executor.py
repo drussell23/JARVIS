@@ -4750,11 +4750,29 @@ class BudgetPlan:
         # Condition 1 — legacy min_per_round floor
         if self.unclamped_fair_share_s(remaining_s, remaining_rounds) < self.min_per_round_s:
             return False
-        # Condition 2 — Slice 3B min TTFT floor
-        # Skip this check when floor is 0 (operator opt-out) for
-        # backward-compat with tests that don't set min_ttft_floor_s.
+        # Condition 2 — Slice 3B + 3B.1 self-tuning TTFT floor.
+        #
+        # The EFFECTIVE floor is the smaller of:
+        #   (a) min_ttft_floor_s — empirical Claude completion floor
+        #   (b) max_per_round_s  — operator's per-round ceiling
+        #
+        # Rationale (Slice 3B.1, post bt-2026-05-25-015301): the
+        # global min_ttft_floor (default 45s) sits ABOVE the legacy
+        # default max_per_round_s (30s). Without self-tuning, the
+        # gate would fire on EVERY round under ample budget because
+        # per_round_timeout clamps to max_per_round_s=30s < floor=45s.
+        # That's a false positive — when max_per_round_s is the
+        # dominant clamp, the operator has tuned the ceiling
+        # intentionally; respect it as the effective per-round
+        # budget AND the effective floor.
+        #
+        # Gate fires ONLY when fair-share squeeze pushes
+        # per_round_timeout below this effective floor — genuine
+        # starvation that would have produced the soak-#2-style
+        # stream rupture.
         if self.min_ttft_floor_s > 0.0:
-            if self.per_round_timeout(remaining_s, remaining_rounds) < self.min_ttft_floor_s:
+            effective_floor = min(self.min_ttft_floor_s, self.max_per_round_s)
+            if self.per_round_timeout(remaining_s, remaining_rounds) < effective_floor:
                 return False
         return True
 
