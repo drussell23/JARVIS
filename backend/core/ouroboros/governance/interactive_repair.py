@@ -178,7 +178,47 @@ class InteractiveRepairLoop:
 
     @staticmethod
     def _extract_error(output: str, default_file: str) -> ExtractedError:
-        """Extract structured error from subprocess output. Deterministic regex."""
+        """Extract structured error from subprocess output. Deterministic
+        regex cascade.
+
+        Slice 3H.3 (2026-05-25) — parser cascade for pytest diagnostic
+        shapes. The pre-3H.3 implementation matched ONLY stdlib
+        ``Traceback (most recent call last)`` followed by
+        ``ErrorClass: msg``. That covered Python script crashes but
+        completely missed pytest's own diagnostic formats — every
+        SWE-Bench-Pro op in the bt-2026-05-25-085310 soak bailed at
+        the hard-guard with ``error_type=UnknownError`` even though
+        pytest had captured rich, well-located failure info in its
+        own format.
+
+        Pattern cascade (first match wins, most-specific first):
+
+          1. Standard Python ``Traceback (most recent call last):`` —
+             stdlib script crashes; preserved verbatim from pre-3H.3.
+
+          2. Pytest collection errors —
+             ``ERROR collecting <path>`` + ``E   <ErrorClass>: <msg>``.
+             Fires when pytest can't import a test module (e.g.,
+             SyntaxError in the patched source).
+
+          3. Pytest import-during-conftest —
+             ``ImportError while loading conftest`` with
+             ``<path>:<line>: in ...``.
+
+          4. Pytest assertion failures — the ``E`` prefix lines
+             pytest emits during failed test output:
+             ``<path>:<line>: in <fn>`` + ``E   <ErrorClass>``.
+
+          5. Pytest short summary — ``FAILED <path>::<test>`` or
+             ``ERROR <path>::<test>`` for last-resort identification.
+
+        Every pattern extracts ``error_type``, ``message``,
+        ``file_path``, ``line_number`` so the downstream micro-prompt
+        builder always sees a usable target. ``UnknownError`` with
+        ``line_number=0`` is the final fallback — only reached when
+        the output is genuinely unparseable.
+        """
+        # ── Cascade #1 — stdlib Traceback (pre-3H.3 path, preserved) ──
         tb = re.search(
             r'Traceback \(most recent call last\):\n(.*?)(\w+Error.*?)$',
             output, re.DOTALL | re.MULTILINE,
@@ -196,6 +236,121 @@ class InteractiveRepairLoop:
                     line_number=int(last_line), traceback_excerpt=tb_text[-500:],
                     full_output=output[-2000:],
                 )
+
+        # ── Cascade #2 — pytest collection errors ──
+        # Pytest collection failures look like:
+        #   ___________ ERROR collecting tests/foo.py ___________
+        #   tests/foo.py:42: in <module>
+        #       from bar import baz
+        #   E   ImportError: cannot import name 'baz' from 'bar'
+        coll = re.search(
+            r'ERROR collecting (\S+).*?'
+            r'^(\S+):(\d+):.*?'
+            r'^E\s+(\w+(?:Error|Exception)):\s*(.*?)$',
+            output, re.DOTALL | re.MULTILINE,
+        )
+        if coll:
+            _coll_path, file_path, line_num, etype, msg = coll.groups()
+            return ExtractedError(
+                error_type=etype.strip(),
+                message=msg.strip(),
+                file_path=file_path,
+                line_number=int(line_num),
+                traceback_excerpt=output[
+                    max(0, coll.start()):coll.end()
+                ][-500:],
+                full_output=output[-2000:],
+            )
+
+        # ── Cascade #3 — import-time error during conftest/loading ──
+        # Pytest emits e.g.:
+        #   ImportError while loading conftest '/path/conftest.py'.
+        #   /path/conftest.py:7: in <module>
+        #       from foo import bar
+        #   E   ImportError: ...
+        import_err = re.search(
+            r'(ImportError|ModuleNotFoundError) while loading conftest.*?'
+            r'^(\S+):(\d+):\s*in.*?'
+            r'^E\s+(\w+(?:Error|Exception)):\s*(.*?)$',
+            output, re.DOTALL | re.MULTILINE,
+        )
+        if import_err:
+            _outer, conftest_path, conftest_line, etype, msg = (
+                import_err.groups()
+            )
+            return ExtractedError(
+                error_type=etype.strip(),
+                message=msg.strip(),
+                file_path=conftest_path,
+                line_number=int(conftest_line),
+                traceback_excerpt=output[
+                    max(0, import_err.start() - 200):import_err.end()
+                ][-500:],
+                full_output=output[-2000:],
+            )
+
+        # ── Cascade #4 — pytest assertion failure (E   ErrorClass) ──
+        # Pytest test failures look like:
+        #   tests/foo.py:42: in test_bar
+        #       assert x == 1
+        #   E   AssertionError: assert 2 == 1
+        # Match the LAST occurrence in case multiple tests failed.
+        assertion_blocks = list(re.finditer(
+            r'^(\S+):(\d+):\s*in\s+\S+\s*$(.*?)'
+            r'^E\s+(\w+(?:Error|Exception)?):\s*(.*?)$',
+            output, re.DOTALL | re.MULTILINE,
+        ))
+        if assertion_blocks:
+            last = assertion_blocks[-1]
+            a_path, a_line, a_block, a_etype, a_msg = last.groups()
+            return ExtractedError(
+                error_type=a_etype.strip() or "AssertionError",
+                message=a_msg.strip(),
+                file_path=a_path,
+                line_number=int(a_line),
+                traceback_excerpt=a_block[-500:],
+                full_output=output[-2000:],
+            )
+
+        # ── Cascade #5 — pytest short summary (last-resort) ──
+        # ``FAILED tests/foo.py::test_bar - AssertionError: ...``
+        # Strict shape: requires ``::<test>`` AND ``- <ErrorClass>:`` to
+        # avoid non-greedy ambiguity. The non-strict variant runs as a
+        # second-tier fallback when the strict shape doesn't match.
+        summary_strict = re.search(
+            r'^(?:FAILED|ERROR)\s+(\S+)::\S+\s*-\s*'
+            r'(\w+(?:Error|Exception))\s*:\s*(.*?)$',
+            output, re.MULTILINE,
+        )
+        if summary_strict:
+            s_path, s_etype, s_msg = summary_strict.groups()
+            return ExtractedError(
+                error_type=s_etype.strip(),
+                message=s_msg.strip(),
+                file_path=s_path,
+                line_number=1,
+                traceback_excerpt=output[-500:],
+                full_output=output[-2000:],
+            )
+        # Non-strict fallback — just need ``FAILED <path>`` to attribute
+        # which file failed; line/error are unknown but file is enough
+        # for the model to inspect.
+        summary_loose = re.search(
+            r'^(?:FAILED|ERROR)\s+(\S+?)(?:::\S+)?\s*(?:-\s*(.*?))?$',
+            output, re.MULTILINE,
+        )
+        if summary_loose:
+            s_path = summary_loose.group(1)
+            s_msg = summary_loose.group(2) or ""
+            return ExtractedError(
+                error_type="PytestFailure",
+                message=s_msg.strip(),
+                file_path=s_path,
+                line_number=1,
+                traceback_excerpt=output[-500:],
+                full_output=output[-2000:],
+            )
+
         return ExtractedError(
             error_type="UnknownError", message="No parseable traceback",
             file_path=default_file, line_number=0,
