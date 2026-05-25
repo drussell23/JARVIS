@@ -916,8 +916,26 @@ class OpportunityMinerSensor:
         if not self._is_production_code(py_file, self._repo_root):
             return None
 
+        # ──────────────────────────────────────────────────────────────
+        # Slice 5B — offload sync read_text from event-driven scan_file
+        # (bt-2026-05-25-095834 main-loop blocker triangulation).
+        # Slice 12L Part B migrated scan_once()'s cyclic-batch read_text
+        # to offload_blocking but missed the per-event scan_file() path
+        # here (fires on every fs.changed.* event). With 6877 cycle scans
+        # + N events per file change, cumulative main-loop blocking
+        # contributed to the 94 ControlPlaneStarvation events in that
+        # soak. Same pattern as scan_once for consistency: offload via
+        # asyncio.to_thread so the loop tick continues during disk IO.
+        # ──────────────────────────────────────────────────────────────
+        from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+            offload_blocking as _s5b_offload_blocking,
+        )
         try:
-            source = py_file.read_text(encoding="utf-8")
+            source = await _s5b_offload_blocking(
+                py_file.read_text,
+                encoding="utf-8",
+                label="opportunity_miner.scan_file.read_text",
+            )
         except (OSError, UnicodeDecodeError):
             return None
         # Slice 11B-fix — analyze helper: parse + all six dimension
