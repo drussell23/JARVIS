@@ -7330,6 +7330,13 @@ class ClaudeProvider:
             )[:24]
             _event_iter = stream.__aiter__()
             _stream_chunk_count = 0
+            # Slice 3B Layer 2 — read the min_ttft_floor once per
+            # stream-open so the clamp below honors it. Lazy-import
+            # to keep the tool_executor module dependency at runtime
+            # (avoid a circular at module-load time).
+            from backend.core.ouroboros.governance.tool_executor import (
+                _DEFAULT_MIN_TTFT_FLOOR_S as _slice3b_min_ttft_floor,
+            )
             while True:
                 _wall_rem = _remaining_utc_budget_s(
                     ctx.deadline, floor_s=0.01,
@@ -7339,7 +7346,19 @@ class ClaudeProvider:
                     _rupture_ttft if _stream_first_token_at[0] is None
                     else _rupture_ic
                 )
-                _chunk_timeout = min(_rupt_base, _wall_rem)
+                # Slice 3B Layer 2 — defense-in-depth clamp relaxation.
+                # Previously: _chunk_timeout = min(_rupt_base, _wall_rem)
+                # — when _wall_rem collapsed to tiny per_round_timeout
+                # (4.65s in bt-2026-05-25-012206), the activity-aware
+                # _rupt_base was overridden + a healthy stream got
+                # cancelled mid-token-flow. Now: floor _wall_rem at
+                # min_ttft_floor so the clamp can never go below that
+                # floor. Layer 1 (coordinator gate) should prevent us
+                # ever reaching here with sub-floor wall_rem; Layer 2
+                # is the structural belt for any path that does.
+                _chunk_timeout = min(
+                    _rupt_base, max(_wall_rem, _slice3b_min_ttft_floor),
+                )
                 try:
                     _event = await asyncio.wait_for(
                         _event_iter.__anext__(),
