@@ -45,6 +45,17 @@ from backend.core.ouroboros.governance.aegis_provider_bridge import (
     merge_lease_header as _aegis_merge_lease_header,
 )
 
+# Slice 3A — Adaptive Cognitive Feedback. Composes an XML-tagged
+# <previous_failure_context> envelope onto the base system prompt
+# when ctx carries retry feedback (ctx.strategic_memory_prompt
+# populated by orchestrator after Iron Gate / ASCII gate / etc.
+# rejection). First-attempt ops get the base unchanged — zero
+# behavior change for non-retry paths. Wired at 3 generate-path
+# sites below. Pure function, no I/O, no env flags.
+from backend.core.ouroboros.governance.adaptive_system_prompt import (
+    compose_system_prompt as _slice3a_compose_system_prompt,
+)
+
 _aegis_op_id_var: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "jarvis.aegis.current_op_id", default="claude-provider-unscoped",
 )
@@ -7120,7 +7131,17 @@ class ClaudeProvider:
             "model": self._model,
             "max_tokens": ctx.effective_max_tokens,
             "temperature": ctx.temperature,
-            "system": ctx.system_with_cache,
+            # Slice 3A — adaptive system-prompt escalation. On a
+            # retry-after-rejection op (ctx.context.strategic_memory_prompt
+            # populated by orchestrator), prepends an XML-tagged
+            # <previous_failure_context> envelope to force Claude's
+            # structured-parsing pathway to process the violated
+            # rules BEFORE generating new tokens. First-attempt ops
+            # get the base unchanged (byte-identical legacy behavior).
+            "system": _slice3a_compose_system_prompt(
+                base_system_prompt=ctx.system_with_cache,
+                ctx=ctx.context,
+            ),
             "messages": ctx.messages,
         }
         if ctx.thinking_param is not None:
@@ -8258,7 +8279,12 @@ class ClaudeProvider:
                     "model": self._model,
                     "max_tokens": _effective_max_tokens,
                     "temperature": _temperature,
-                    "system": _system_with_cache,
+                    # Slice 3A — adaptive system-prompt escalation
+                    # (see _claude_do_stream above for rationale).
+                    "system": _slice3a_compose_system_prompt(
+                        base_system_prompt=_system_with_cache,
+                        ctx=context,
+                    ),
                     "messages": _messages,
                 }
                 if _thinking_param is not None:
@@ -8562,7 +8588,12 @@ class ClaudeProvider:
                             context, is_tool_round=False,
                         ),
                         temperature=0.2,
-                        system=_legacy_system,
+                        # Slice 3A — adaptive system-prompt escalation
+                        # (see _claude_do_stream above for rationale).
+                        system=_slice3a_compose_system_prompt(
+                            base_system_prompt=_legacy_system,
+                            ctx=context,
+                        ),
                         messages=messages,
                         timeout=_derive_per_request_httpx_timeout(timeout_s),
                         extra_headers=await _aegis_extra_headers_for_call(),
