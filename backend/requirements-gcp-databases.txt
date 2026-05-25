@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements-gcp-databases.txt
 
 # PostgreSQL drivers
-asyncpg>=0.29.0  # Async driver for production
+asyncpg>=0.31.0  # Async driver for production
 psycopg2-binary>=2.9.0  # Sync driver for health checks and admin tasks
 
 # Cloud SQL Python Connector (recommended for secure connections)
