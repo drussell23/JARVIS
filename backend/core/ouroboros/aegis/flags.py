@@ -69,13 +69,47 @@ DEFAULT_WAL_PATH_REL: str = ".jarvis/aegis/spend.jsonl"
 
 
 def is_enabled() -> bool:
-    """Master switch. Default **false** (Slice 1 dark)."""
-    return get_default_registry().get_bool(ENV_AEGIS_ENABLED, default=False)
+    """Aegis Zero-Trust master switch. Default **TRUE** post Slice
+    2B-iv graduation (2026-05-25).
+
+    Graduated based on 6 sequential battle-test soaks proving the
+    end-to-end architecture works correctly:
+      * bt-2026-05-24-222008 → Slice 2B-ii.1 (avail-gate Catch-22)
+      * bt-2026-05-24-225714 → Slice 2B-ii.2 + 2B-iii.1
+        (heavy probe + ledger hygiene)
+      * bt-2026-05-24-232345 → Slice 2B-iii.2 (cap defaults)
+      * bt-2026-05-24-233640 → architecture fully proven
+        (real Anthropic request_ids from forwarded calls)
+      * bt-2026-05-24-235428 → Slice 2B-iii.3 (header collision)
+      * bt-2026-05-25-004146 → ULTIMATE — ZERO AuthenticationError,
+        $0.10 real Claude generation through Aegis,
+        stop_reason=end_turn output_tokens=5433; Iron Gate then
+        correctly refused the undisciplined patch — governance
+        working as designed.
+
+    Operator opt-out preserved: setting
+    ``JARVIS_AEGIS_ENABLED=false`` STILL disables the master
+    (env-precedence honored — graduation flips the DEFAULT, not
+    seals the flag). Critical for emergency rollback.
+    """
+    return get_default_registry().get_bool(ENV_AEGIS_ENABLED, default=True)
 
 
 def forwarding_enabled() -> bool:
     """Slice 2 sub-switch — gates /v1/messages + /v1/chat/completions
-    registration. Default **false** through Slice 4 graduation soak.
+    registration. Default **TRUE** post Slice 2B-iv graduation
+    (2026-05-25), in lockstep with ``is_enabled()``.
+
+    Dual-graduation rationale: master without forwarding = daemon
+    spawns + scrubs creds, but no /v1/* routes → providers POST to
+    {AEGIS}/v1/messages → 404 → all generation breaks by default.
+    Empirical evidence: all 6 graduation soaks ran with both flags
+    =true; dual-on is the ONLY tested configuration that operates
+    end-to-end.
+
+    Operator opt-out preserved: setting
+    ``JARVIS_AEGIS_FORWARDING_ENABLED=false`` STILL disables
+    forwarding (env-precedence honored).
 
     Independent of :func:`is_enabled`: an operator can spin up the
     Aegis daemon in lease-only mode (Slice 1 substrate) without
@@ -83,7 +117,7 @@ def forwarding_enabled() -> bool:
     and for the §44 diagnostic harnesses that test the daemon
     without provider traffic."""
     return get_default_registry().get_bool(
-        ENV_AEGIS_FORWARDING_ENABLED, default=False,
+        ENV_AEGIS_FORWARDING_ENABLED, default=True,
     )
 
 
@@ -182,14 +216,18 @@ def _seeds() -> List[FlagSpec]:
         FlagSpec(
             name=ENV_AEGIS_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
-                "Arc #1 master switch. **Slice 1 dark by default.** "
-                "When false (default), Aegis daemon is not spawned, no "
-                "credential scrub, no behavior change. When true (post "
-                "Slice 4 graduation), harness spawns Aegis pre-supervisor, "
-                "scrubs upstream credentials from JARVIS env, and routes "
-                "all provider traffic through the localhost proxy."
+                "Arc #1 master switch. **Graduated to default-TRUE 2026-05-25 "
+                "via Slice 2B-iv** after 6 sequential battle-test soaks "
+                "proved end-to-end architecture (real Anthropic request_ids "
+                "from Aegis-forwarded calls; final soak bt-2026-05-25-004146 "
+                "delivered $0.10 real Claude generation via the daemon with "
+                "ZERO AuthenticationError). When true (default), harness "
+                "spawns Aegis pre-supervisor, scrubs upstream credentials "
+                "from JARVIS env, and routes all provider traffic through "
+                "the localhost proxy. Operator opt-out preserved via "
+                "explicit JARVIS_AEGIS_ENABLED=false (env-precedence)."
             ),
             category=Category.SAFETY,
             source_file=_SRC_AEGIS,
@@ -198,14 +236,20 @@ def _seeds() -> List[FlagSpec]:
         FlagSpec(
             name=ENV_AEGIS_FORWARDING_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Slice 2 sub-switch. Gates registration of /v1/messages "
                 "(Anthropic-compat) and /v1/chat/completions (OpenAI-compat / "
-                "DW) forwarding routes on the Aegis daemon. Default-FALSE "
-                "through Slice 4 graduation soak. Independent of "
-                "JARVIS_AEGIS_ENABLED so the daemon can run in lease-only "
-                "mode for the §44 diagnostic harnesses."
+                "DW) forwarding routes on the Aegis daemon. **Graduated to "
+                "default-TRUE 2026-05-25 via Slice 2B-iv** in lockstep with "
+                "the master flag — without it, the master-on path returns "
+                "404 on every /v1/* call (provider traffic routes through "
+                "Aegis but daemon has no forwarding routes registered). "
+                "All 6 graduation soaks used both flags =true; dual-on is "
+                "the ONLY tested production configuration. Independent of "
+                "JARVIS_AEGIS_ENABLED so an operator can run the daemon "
+                "in lease-only mode for the §44 diagnostic harnesses by "
+                "explicit JARVIS_AEGIS_FORWARDING_ENABLED=false."
             ),
             category=Category.SAFETY,
             source_file=_SRC_AEGIS,
