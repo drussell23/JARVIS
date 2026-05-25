@@ -1615,6 +1615,45 @@ class OracleSemanticIndex:
 
 
 # =============================================================================
+# Teardown-coherence — Oracle shutdown deadline knob
+# =============================================================================
+#
+# bt-2026-05-25-020602 wedged in ``Shutting down The Oracle...`` because a
+# 1.1GB ``codebase_graph.pkl`` serialization held the Python GIL + the
+# process I/O slot in uninterruptible kernel state past the
+# ``BoundedShutdownWatchdog`` 30s window. With every Python thread starved
+# (incl. the watchdog daemon thread), ``os._exit(75)`` could not be
+# scheduled — the only OS-level escape from uninterruptible I/O is the I/O
+# completing or kernel timeout. Preventive fix: bound the cache save.
+#
+# Defaults to 5s — enough for graphs up to ~50K nodes on local SSD with
+# room for jitter; abandon on bigger payloads (cache rebuilds on next
+# boot from index; abandoned save is slower start, NOT correctness loss).
+
+_ORACLE_SHUTDOWN_DEADLINE_ENV = "JARVIS_ORACLE_SHUTDOWN_DEADLINE_S"
+_ORACLE_SHUTDOWN_DEADLINE_DEFAULT_S = 5.0
+
+
+def _oracle_shutdown_deadline_s() -> float:
+    """``JARVIS_ORACLE_SHUTDOWN_DEADLINE_S`` — bound on shutdown cache save.
+
+    Default 5s. Set to ``0`` to skip ``_save_cache`` entirely on shutdown.
+    Set higher than 5s only if the graph genuinely needs more time AND
+    the deployment can tolerate longer teardown — the
+    ``BoundedShutdownWatchdog`` default deadline is 30s, so values above
+    ~25s leave little margin for other teardown steps.
+    """
+    raw = os.environ.get(
+        _ORACLE_SHUTDOWN_DEADLINE_ENV,
+        str(_ORACLE_SHUTDOWN_DEADLINE_DEFAULT_S),
+    )
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _ORACLE_SHUTDOWN_DEADLINE_DEFAULT_S
+
+
+# =============================================================================
 # THE ORACLE - MAIN INDEXER
 # =============================================================================
 
@@ -1808,9 +1847,48 @@ class TheOracle:
         return True
 
     async def shutdown(self) -> None:
-        """Shutdown the Oracle, saving cache."""
+        """Shutdown the Oracle, saving cache (bounded).
+
+        Teardown-coherence (2026-05-24) — closes bt-2026-05-25-020602
+        wedge: a 1.1GB ``codebase_graph.pkl`` synchronous serialization
+        held the Python GIL + the process's I/O slot in uninterruptible
+        kernel state past the ``BoundedShutdownWatchdog`` 30s window,
+        so ``os._exit(75)`` could not be scheduled. Two-layer defense:
+
+        * Layer 1 (``_save_cache`` lifted to ``asyncio.to_thread``)
+          releases the event loop + lets the watchdog daemon thread run.
+        * Layer 2 (this ``asyncio.wait_for``) bounds the cache-save
+          regardless — if the traversal still holds the GIL past
+          the deadline, the asyncio side abandons and returns control
+          so the harness teardown chain completes within the
+          ``BoundedShutdownWatchdog`` budget.
+
+        The graph cache is rebuildable on next boot from index. An
+        abandoned save means slower cold start, NOT correctness loss.
+        Master knob: ``JARVIS_ORACLE_SHUTDOWN_DEADLINE_S`` (default 5s).
+        Set to ``0`` to skip ``_save_cache`` entirely on shutdown.
+        """
         logger.info("Shutting down The Oracle...")
-        await self._save_cache()
+        deadline_s = _oracle_shutdown_deadline_s()
+        if deadline_s <= 0.0:
+            logger.info(
+                "[Oracle.shutdown] cache-save SKIPPED — "
+                "JARVIS_ORACLE_SHUTDOWN_DEADLINE_S=%.2f", deadline_s,
+            )
+        else:
+            try:
+                await asyncio.wait_for(
+                    self._save_cache(), timeout=deadline_s,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Oracle.shutdown] _save_cache exceeded %.2fs "
+                    "deadline — abandoning save (cache rebuilds on "
+                    "next boot). Set JARVIS_ORACLE_SHUTDOWN_DEADLINE_S "
+                    "higher if your graph genuinely needs more time, "
+                    "or =0 to skip saves on shutdown entirely.",
+                    deadline_s,
+                )
         self._running = False
         logger.info("The Oracle shutdown complete")
 
@@ -2220,62 +2298,94 @@ class TheOracle:
         return False
 
     async def _save_cache(self) -> None:
-        """Save graph to cache on disk.
+        """Save graph to cache on disk (event-loop-safe).
 
-        Serializes synchronously to avoid concurrent heap allocation
-        with C extensions (same rationale as _load_cache).
+        Builds the data dict on the asyncio thread (cheap reference
+        copies), then dispatches the heavy work — pickle serialization +
+        ``write_bytes`` + ``os.replace`` — to ``asyncio.to_thread``.
+
+        Why ``to_thread`` matters for teardown coherence
+        (bt-2026-05-25-020602): doing the serialization on the asyncio
+        thread held the Python GIL + the process I/O slot in
+        uninterruptible kernel state for the full duration of a 1.1GB
+        cache write. Every other Python thread — including the
+        ``BoundedShutdownWatchdog`` daemon thread — was starved. The
+        watchdog's ``os._exit(75)`` could not be scheduled because the
+        kernel can't deliver a syscall to a thread that isn't running.
+
+        Lifting to ``to_thread`` lets the asyncio thread + watchdog
+        thread make progress while the worker thread does the I/O.
+        Combined with the ``asyncio.wait_for`` bound in ``shutdown``,
+        even a worker thread that stays in kernel I/O past the deadline
+        cannot block the harness exit chain.
+
         Uses highest available protocol for better ARM64 alignment.
 
-        Note: pickle is used here for internal cache only — the graph
-        contains only our own dataclasses, not untrusted data.
+        Note: ``pickle`` is used here for internal cache only — the
+        graph contains only our own dataclasses, not untrusted data.
 
-        Iron Gate compliance: writes to ``~/.jarvis/oracle/`` may be blocked
-        by the sandbox; ``sandbox_fallback`` routes to
-        ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering shields.
+        Iron Gate compliance: writes to ``~/.jarvis/oracle/`` may be
+        blocked by the sandbox; ``sandbox_fallback`` routes to
+        ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering
+        shields.
         """
-        _tmp_name: Optional[str] = None
+        # Snapshot the data dict on the asyncio thread. These are cheap
+        # reference copies — heavy work is the serialization below.
+        data = {
+            "graph": self._graph._graph,
+            "node_index": self._graph._node_index,
+            "file_index": dict(self._graph._file_index),
+            "repo_index": dict(self._graph._repo_index),
+            "type_index": dict(self._graph._type_index),
+            "metrics": self._graph._metrics,
+            "file_hashes": self._file_hashes,
+        }
+        _final_cache_path = self._resolved_graph_cache_path()
         try:
-            data = {
-                "graph": self._graph._graph,
-                "node_index": self._graph._node_index,
-                "file_index": dict(self._graph._file_index),
-                "repo_index": dict(self._graph._repo_index),
-                "type_index": dict(self._graph._type_index),
-                "metrics": self._graph._metrics,
-                "file_hashes": self._file_hashes,
-            }
-
-            _final_cache_path = self._resolved_graph_cache_path()
-            _final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            # Arc B.1 — atomic durability. Serialize into a temp file in
-            # the SAME directory, then os.replace (POSIX-atomic rename)
-            # so a crash / SIGKILL / ProcessMemoryWatchdog os._exit
-            # mid-write can NEVER leave a torn cache (the
-            # bt-2026-05-18-062703 'invalid load key \\x00' that
-            # defeated checkpoint durability + blocked graduation #6).
-            # Mirrors dw_heavy_probe._atomic_write / dataset_loader.
-            import tempfile as _tempfile
-            _tmp_fd, _tmp_name = _tempfile.mkstemp(
-                prefix=_final_cache_path.name + ".",
-                suffix=".tmp",
-                dir=str(_final_cache_path.parent),
+            await asyncio.to_thread(
+                self._write_cache_blocking, data, _final_cache_path,
             )
-            os.close(_tmp_fd)
+        except Exception as e:  # noqa: BLE001 — never raise from save
+            logger.error(f"Error saving cache: {e}")
+
+    @staticmethod
+    def _write_cache_blocking(
+        data: Dict[str, Any], _final_cache_path: Path,
+    ) -> None:
+        """Synchronous serialization + atomic write — runs in a worker
+        thread so the asyncio event loop + the
+        ``BoundedShutdownWatchdog`` daemon thread can make progress.
+
+        Arc B.1 — atomic durability. Serialize into a temp file in the
+        SAME directory, then ``os.replace`` (POSIX-atomic rename) so a
+        crash / SIGKILL / ProcessMemoryWatchdog ``os._exit`` mid-write
+        can NEVER leave a torn cache (the bt-2026-05-18-062703
+        'invalid load key \\x00' that defeated checkpoint durability +
+        blocked graduation #6). Mirrors
+        ``dw_heavy_probe._atomic_write`` / ``dataset_loader``.
+        """
+        _final_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile as _tempfile
+        _tmp_fd, _tmp_name = _tempfile.mkstemp(
+            prefix=_final_cache_path.name + ".",
+            suffix=".tmp",
+            dir=str(_final_cache_path.parent),
+        )
+        os.close(_tmp_fd)
+        try:
             cache_path = Path(_tmp_name)
             cache_path.write_bytes(
                 pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),  # noqa: S301
             )
-
             os.replace(_tmp_name, str(_final_cache_path))
             _tmp_name = None  # promoted — nothing left to clean up
             logger.info(f"Saved cache to {_final_cache_path}")
-        except Exception as e:
+        finally:
             if _tmp_name is not None:
                 try:
                     os.unlink(_tmp_name)
                 except OSError:
                     pass
-            logger.error(f"Error saving cache: {e}")
 
     # =========================================================================
     # QUERY INTERFACE
