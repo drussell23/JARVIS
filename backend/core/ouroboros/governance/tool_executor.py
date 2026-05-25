@@ -5318,6 +5318,20 @@ class ToolLoopCoordinator:
         round_index = -1
         _explore_only_rounds = 0
         _soft_overflow_warned = False
+        # ── Slice 3E — convergence-force final-write nudge ──
+        # ``_final_nudge_issued`` flips True when the final-write nudge
+        # is appended to the prompt (either time-axis reserve hit OR
+        # round-axis cap approaching). When True, the next iteration's
+        # max-rounds gate grants ONE grace round so the model can emit
+        # its final answer in response to the nudge — without the grace,
+        # ``round_index >= effective_max_rounds`` would fire BEFORE
+        # ``generate_fn`` runs and the model would never see the nudge.
+        # The bt-2026-05-25-043137 diagnostic proved the nudge fired
+        # 0 times across 3 capability soaks because the time-axis
+        # predicate alone never reaches its trigger (model exhausts
+        # ROUNDS at ~232s remaining of 358s budget, far above the 10s
+        # reserve threshold).
+        _final_nudge_issued: bool = False
         raw: str = ""
         while True:
             round_index += 1
@@ -5330,7 +5344,7 @@ class ToolLoopCoordinator:
             # orchestrator's retry loop treats this raise as
             # ``all_providers_exhausted`` and will retry with a bigger
             # budget or different strategy.
-            if round_index >= effective_max_rounds:
+            if round_index >= effective_max_rounds and not _final_nudge_issued:
                 logger.warning(
                     "[ToolLoop] op=%s max rounds exceeded "
                     "(effective=%d, hard=%d, budget=%.1fs)",
@@ -5344,6 +5358,19 @@ class ToolLoopCoordinator:
                 # Slice 3C — propagate accumulated records to outer-retry.
                 raise _attach_tool_records(
                     RuntimeError("tool_loop_max_rounds_exceeded"), records,
+                )
+            # Slice 3E — grace round after final-write nudge. When
+            # ``_final_nudge_issued`` is True, allow ONE round past
+            # ``effective_max_rounds`` so the model can emit its final
+            # answer in response to the nudge. The grace round consumes
+            # the flag immediately so it cannot loop indefinitely.
+            if round_index >= effective_max_rounds and _final_nudge_issued:
+                logger.info(
+                    "[ToolLoop] op=%s GRACE round (round_index=%d, "
+                    "effective_max_rounds=%d, _final_nudge_issued=True) "
+                    "— model has ONE final round to emit a non-tool answer",
+                    op_id[:12] if op_id else "?",
+                    round_index, effective_max_rounds,
                 )
 
             # ── Pre-round hard-floor viability gate (Manifesto §3) ──
@@ -5448,6 +5475,27 @@ class ToolLoopCoordinator:
                 self._finalize_run(op_id)
                 return raw, records   # Final non-tool response
 
+            # Slice 3E — grace round outcome. When ``_final_nudge_issued``
+            # is True we promised the model "any further tool calls will
+            # be IGNORED". If it still emitted tool calls (i.e. did not
+            # converge to a final answer despite the imperative nudge),
+            # return the raw response anyway so downstream parsers and
+            # Iron Gate can inspect it — maybe the response also includes
+            # a parseable patch JSON alongside the tool calls, maybe not,
+            # but either way executing the tool calls and prolonging the
+            # loop violates the contract we just set with the model.
+            if _final_nudge_issued:
+                logger.warning(
+                    "[ToolLoop] op=%s GRACE round used; model emitted "
+                    "%d tool call(s) after FINAL ROUND nudge instead of a "
+                    "final answer — returning raw response unprocessed; "
+                    "downstream parsers will determine validity",
+                    op_id[:12] if op_id else "?", len(tool_calls),
+                )
+                self._last_records = list(records)
+                self._finalize_run(op_id)
+                return raw, records
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._last_records = list(records)
@@ -5457,25 +5505,60 @@ class ToolLoopCoordinator:
                     RuntimeError("tool_loop_deadline_exceeded"), records,
                 )
 
-            # ── Final-write reserve enforcement ──
-            # If remaining budget is at or below the reserve, stop issuing
-            # tool calls and nudge the model to produce its final answer.
-            # Without this, the last tool round eats the write budget and
-            # the model gets cancelled mid-write.
-            if plan.should_stop_for_final_write(remaining):
-                current_prompt += (
-                    "\n\n[SYSTEM] Budget reserve reached — produce your "
-                    "final answer now without calling any more tools.\n"
+            # ── Final-write enforcement — two-axis trigger (Slice 3E) ──
+            # The model is told to emit its final answer when EITHER
+            # axis approaches exhaustion:
+            #
+            #   * Time axis: ``remaining_s <= final_write_reserve_s``
+            #     (legacy; preserved verbatim from pre-Slice-3E behavior)
+            #
+            #   * Round axis: ``rounds_left <= 1`` (Slice 3E; NEW). The
+            #     bt-2026-05-25-043137 diagnostic proved that on COMPLEX
+            #     ops the model exhausts ROUNDS while having ample TIME
+            #     remaining (round 9 of 10 finished with 232.9s of wall
+            #     budget left — vastly above the 10s reserve). The
+            #     time-axis predicate alone leaves the model with NO
+            #     signal that this is its last chance; round 10 then
+            #     trips ``tool_loop_max_rounds_exceeded`` and raises
+            #     before ``generate_fn`` runs.
+            #
+            # Nudge text is IMPERATIVE (you MUST emit ... IGNORED ...) —
+            # the legacy mild "produce your final answer now" was
+            # observed to be insufficient guidance for convergence
+            # under tight conditions.
+            _rounds_left_in_loop = effective_max_rounds - round_index
+            _trigger_time = plan.should_stop_for_final_write(remaining)
+            _trigger_rounds = (
+                not _final_nudge_issued
+                and _rounds_left_in_loop <= 1
+            )
+            if (_trigger_time or _trigger_rounds) and not _final_nudge_issued:
+                _trigger_kind = (
+                    "time_reserve" if _trigger_time else "round_cap"
                 )
+                current_prompt += (
+                    "\n\n[SYSTEM] FINAL ROUND — exploration budget exhausted. "
+                    "You MUST emit your final patch JSON now. Any further "
+                    "tool calls will be IGNORED and the operation will fail. "
+                    "Synthesize what you have learned from your tool calls "
+                    "so far and produce the patch in the required JSON "
+                    "format.\n"
+                )
+                _final_nudge_issued = True
                 if _BUDGET_TELEMETRY_ENABLED:
                     logger.info(
-                        "[ToolLoop] op=%s final-write reserve triggered "
-                        "(remaining=%.1fs, reserve=%.1fs)",
+                        "[ToolLoop] op=%s final-write nudge triggered "
+                        "(trigger=%s, remaining=%.1fs, rounds_left=%d, "
+                        "reserve=%.1fs)",
                         op_id[:12] if op_id else "?",
-                        remaining, plan.final_write_reserve_s,
+                        _trigger_kind, remaining,
+                        _rounds_left_in_loop, plan.final_write_reserve_s,
                     )
                 # Don't execute the tool calls this round — loop back so
                 # the model produces a non-tool response on the next call.
+                # The grace-round bypass at the max-rounds gate (above)
+                # ensures the next iteration runs even at round_index ==
+                # effective_max_rounds.
                 continue
 
             # ── Budget-derived per-round timeout ──
