@@ -77,6 +77,14 @@ ORCHESTRATOR_FILE = (
     REPO_ROOT / "backend" / "core" / "ouroboros" / "governance"
     / "orchestrator.py"
 )
+# bt-2026-05-25-200829 revealed the production VALIDATE_RETRY path
+# lives here, NOT in orchestrator.py's legacy block at line 6235.
+# Slice 6 wiring MUST be present in both files for the soft-stop
+# re-dispatch to actually fire in production.
+VALIDATE_RUNNER_FILE = (
+    REPO_ROOT / "backend" / "core" / "ouroboros" / "governance"
+    / "phase_runners" / "validate_runner.py"
+)
 
 
 def _parse() -> ast.Module:
@@ -275,4 +283,111 @@ def test_spine_legacy_l2_skipped_path_preserved() -> None:
     src = ORCHESTRATOR_FILE.read_text()
     assert '"l2_skipped"' in src, (
         "l2_skipped FSM event lost — no-L2 path broken by Slice 6 restructure"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 6 production-path coverage — validate_runner.py
+#
+# The bt-2026-05-25-200829 soak proved that the production VALIDATE_RETRY
+# path runs through ``phase_runners/validate_runner.py``, NOT the legacy
+# block in orchestrator.py. The l2_retry directive was correctly emitted
+# by _l2_hook but validate_runner.py's caller didn't handle it — the
+# op terminal-cancelled despite Slice 6 being live in orchestrator.py.
+#
+# These pins enforce Slice 6 wiring is present in BOTH files so the
+# regression "I patched the wrong module" never repeats.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_ast_pin_validate_runner_handles_l2_retry() -> None:
+    """validate_runner.py is the production VALIDATE_RETRY phase runner.
+    It must carry the same Slice 6 bounded re-dispatch loop + l2_retry
+    handler as orchestrator.py — otherwise the soft-stop directive
+    falls through to no_candidate_valid_return."""
+    src = VALIDATE_RUNNER_FILE.read_text()
+    # Required Slice 6 primitives (identical to orchestrator.py)
+    assert "JARVIS_L2_DISPATCH_RETRIES" in src, (
+        "validate_runner missing JARVIS_L2_DISPATCH_RETRIES env knob — "
+        "production VALIDATE_RETRY path bypasses Slice 6 entirely"
+    )
+    assert "_l2_max_dispatches" in src, (
+        "validate_runner missing _l2_max_dispatches — production "
+        "retry cap absent"
+    )
+    assert "_l2_soft_stop_history" in src, (
+        "validate_runner missing _l2_soft_stop_history audit list"
+    )
+    assert "_l2_retries_exhausted_ctx" in src, (
+        "validate_runner missing _l2_retries_exhausted_ctx terminal "
+        "carrier — exhausted-retries path can't return PhaseResult"
+    )
+    # l2_retry directive handler
+    assert 'directive[0] == "l2_retry"' in src, (
+        "validate_runner does NOT match l2_retry directive — Slice 6 "
+        "soft-stop wiring is dead code in production"
+    )
+    # FSM observability tags
+    assert '"l2_redispatch"' in src, (
+        "validate_runner missing l2_redispatch FSM tag"
+    )
+    assert '"l2_soft_retries_exhausted"' in src, (
+        "validate_runner missing l2_soft_retries_exhausted FSM tag"
+    )
+    # Terminal advance + ledger record on exhaustion
+    assert "l2_soft_stop_retries_exhausted" in src, (
+        "validate_runner missing l2_soft_stop_retries_exhausted "
+        "terminal_reason_code"
+    )
+
+
+def test_spine_validate_runner_default_retry_count() -> None:
+    """Same +1 conversion check as orchestrator — keeps the two
+    modules in lockstep on the default retry budget."""
+    src = VALIDATE_RUNNER_FILE.read_text()
+    tree = ast.parse(src, filename=str(VALIDATE_RUNNER_FILE))
+    found_conversion = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Add)
+            and isinstance(node.right, ast.Constant)
+            and node.right.value == 1
+            and isinstance(node.left, ast.Call)
+        ):
+            inner_src = ast.unparse(node.left)
+            if "JARVIS_L2_DISPATCH_RETRIES" in inner_src:
+                found_conversion = True
+                break
+    assert found_conversion, (
+        "validate_runner missing `int(env) + 1` retries→dispatches "
+        "conversion — off-by-one on the production retry cap"
+    )
+
+
+def test_spine_validate_runner_break_directive_routes_correctly() -> None:
+    """Break directive in validate_runner must capture into
+    _l2_break_directive, then unwind the outer VALIDATE_RETRY loop
+    via the captured-directive pattern (same shape as orchestrator)."""
+    src = VALIDATE_RUNNER_FILE.read_text()
+    assert "_l2_break_directive = directive" in src, (
+        "validate_runner doesn't capture break directive — outer-loop "
+        "unwind broken"
+    )
+    assert "if _l2_break_directive is not None:" in src, (
+        "Missing post-inner-loop break-directive handler in validate_runner"
+    )
+
+
+def test_spine_validate_runner_returns_phase_result_on_exhaustion() -> None:
+    """When soft-stop retries exhaust in validate_runner, the function
+    must return a PhaseResult(status='fail') — NOT raw ctx like
+    orchestrator.py. Validate_runner's contract requires PhaseResult."""
+    src = VALIDATE_RUNNER_FILE.read_text()
+    # The exhausted-retries path must build a PhaseResult around the
+    # advanced ctx (visible by the next_ctx=_l2_retries_exhausted_ctx
+    # construction pattern).
+    assert "next_ctx=_l2_retries_exhausted_ctx" in src, (
+        "validate_runner doesn't build PhaseResult from exhausted-ctx "
+        "— contract violation (raw ctx returned)"
     )

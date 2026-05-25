@@ -386,7 +386,34 @@ class VALIDATERunner(PhaseRunner):
             validate_retries_remaining -= 1
             if validate_retries_remaining < 0:
                 # ── L2 self-repair dispatch ──
+                # ──────────────────────────────────────────────────
+                # Slice 6 — bounded L2 re-dispatch loop for SOFT stops
+                # (bt-2026-05-25-200829 root: my prior Slice 6 patch
+                # landed in orchestrator.py:6235 but production VALIDATE_RETRY
+                # actually flows through THIS module, not orchestrator.py's
+                # legacy block. _l2_hook DID return 'l2_retry' correctly
+                # but this caller didn't handle that directive — fell
+                # through to no_candidate_valid_return at line 479,
+                # murdering the op the same way pre-Slice-6 did.
+                # JARVIS_L2_DISPATCH_RETRIES (default 1) = number of
+                # ADDITIONAL L2 dispatches after the first.
+                # ──────────────────────────────────────────────────
                 if orch._config.repair_engine is not None and best_validation is not None:
+                    _l2_max_dispatches = int(
+                        os.environ.get("JARVIS_L2_DISPATCH_RETRIES", "1"),
+                    ) + 1
+                else:
+                    _l2_max_dispatches = 0
+                _l2_dispatch_idx = 0
+                _l2_soft_stop_history: list = []
+                _l2_break_directive = None
+                _l2_retries_exhausted_ctx = None
+                while (
+                    orch._config.repair_engine is not None
+                    and best_validation is not None
+                    and _l2_dispatch_idx < _l2_max_dispatches
+                ):
+                    _l2_dispatch_idx += 1
                     # ── L2 deadline reconciliation (Session V fix) ──
                     _l2_timebox_s = float(
                         os.environ.get("JARVIS_L2_TIMEBOX_S", "120.0")
@@ -413,35 +440,86 @@ class VALIDATERunner(PhaseRunner):
                     logger.info(
                         "[Orchestrator] L2 deadline reconciliation: "
                         "pipeline_remaining=%.1fs l2_timebox_env=%.1fs "
-                        "effective=%.1fs winning_cap=%s op=%s",
+                        "effective=%.1fs winning_cap=%s op=%s "
+                        "(Slice 6 attempt=%d/%d)",
                         _orig_remaining_s,
                         _l2_timebox_s,
                         (_l2_deadline - _now_dt).total_seconds(),
                         _winning_cap,
                         ctx.op_id[:16],
+                        _l2_dispatch_idx,
+                        _l2_max_dispatches,
                     )
                     _fsm_log(
                         "l2_dispatch_pre",
                         f"effective_s={(_l2_deadline - _now_dt).total_seconds():.0f} "
-                        f"cap={_winning_cap} l2_timebox_env={_l2_timebox_s:.0f}",
+                        f"cap={_winning_cap} l2_timebox_env={_l2_timebox_s:.0f} "
+                        f"attempt={_l2_dispatch_idx}/{_l2_max_dispatches}",
                     )
                     directive = await orch._l2_hook(
                         ctx, best_validation, _l2_deadline,
                     )
-                    _fsm_log("l2_dispatch_post", f"directive={directive[0]!r}")
+                    _fsm_log(
+                        "l2_dispatch_post",
+                        f"directive={directive[0]!r} attempt={_l2_dispatch_idx}/{_l2_max_dispatches}",
+                    )
                     if directive[0] == "break":
-                        best_candidate, best_validation = directive[1], directive[2]
-                        logger.info(
-                            "[Orchestrator] L2 broke VALIDATE_RETRY loop for op=%s — "
-                            "proceeding to source-drift / shadow / entropy / GATE "
-                            "(candidate_id=%s, file=%s, source_hash=%s)",
-                            ctx.op_id,
-                            best_candidate.get("candidate_id", "?"),
-                            best_candidate.get("file_path", "?"),
-                            (best_candidate.get("source_hash") or "")[:12],
+                        # Slice 6 — capture for post-loop handling
+                        _l2_break_directive = directive
+                        break  # inner Slice 6 retry loop
+                    elif directive[0] == "l2_retry":
+                        # Slice 6 — re-dispatch L2 with fresh budget
+                        _l2_soft_stop_history.append(
+                            directive[2] if len(directive) > 2 else "unknown"
                         )
-                        _fsm_log("l2_converged_break")
-                        break
+                        if _l2_dispatch_idx >= _l2_max_dispatches:
+                            # Out of retries — convert soft stop to cancel.
+                            logger.info(
+                                "[Orchestrator] L2 soft-stop retries exhausted "
+                                "op=%s attempts=%d/%d stop_history=%s — "
+                                "converting to cancel terminal",
+                                ctx.op_id,
+                                _l2_dispatch_idx,
+                                _l2_max_dispatches,
+                                _l2_soft_stop_history,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code=(
+                                    f"l2_soft_stop_retries_exhausted:"
+                                    f"{_l2_dispatch_idx}"
+                                ),
+                            )
+                            await orch._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {
+                                    "reason": "l2_soft_stop_retries_exhausted",
+                                    "attempts": _l2_dispatch_idx,
+                                    "soft_stop_history": _l2_soft_stop_history,
+                                },
+                            )
+                            _fsm_log(
+                                "l2_soft_retries_exhausted",
+                                f"attempts={_l2_dispatch_idx} history={_l2_soft_stop_history}",
+                            )
+                            _l2_retries_exhausted_ctx = ctx
+                            break  # inner Slice 6 retry loop
+                        # Otherwise: keep looping for another L2 dispatch.
+                        logger.info(
+                            "[Orchestrator] L2 soft-stop re-dispatch op=%s "
+                            "attempt=%d/%d prev_stop_reason=%s",
+                            ctx.op_id,
+                            _l2_dispatch_idx + 1,
+                            _l2_max_dispatches,
+                            _l2_soft_stop_history[-1] if _l2_soft_stop_history else "?",
+                        )
+                        _fsm_log(
+                            "l2_redispatch",
+                            f"attempt={_l2_dispatch_idx + 1}/{_l2_max_dispatches} "
+                            f"prev={_l2_soft_stop_history[-1] if _l2_soft_stop_history else '?'}",
+                        )
+                        continue  # next inner Slice 6 retry-loop iteration
                     elif directive[0] in ("cancel", "fatal"):
                         _fsm_log("l2_escape_return", f"directive={directive[0]!r}")
                         # directive[1] is the advanced ctx (CANCELLED/POSTMORTEM)
@@ -451,7 +529,42 @@ class VALIDATERunner(PhaseRunner):
                             reason=_reason,
                             artifacts={"best_candidate": None, "best_validation": best_validation},
                         )
-                else:
+                # ── Post-Slice-6-inner-loop handlers ──
+                if _l2_break_directive is not None:
+                    best_candidate = _l2_break_directive[1]
+                    best_validation = _l2_break_directive[2]
+                    logger.info(
+                        "[Orchestrator] L2 broke VALIDATE_RETRY loop for op=%s — "
+                        "proceeding to source-drift / shadow / entropy / GATE "
+                        "(candidate_id=%s, file=%s, source_hash=%s)",
+                        ctx.op_id,
+                        best_candidate.get("candidate_id", "?"),
+                        best_candidate.get("file_path", "?"),
+                        (best_candidate.get("source_hash") or "")[:12],
+                    )
+                    _fsm_log("l2_converged_break")
+                    break  # outer VALIDATE_RETRY while loop → GATE
+                if _l2_retries_exhausted_ctx is not None:
+                    # Soft-stop retries exhausted: terminal cancel via the
+                    # explicit phase result (ctx already advanced + ledger
+                    # already written inside the inner loop).
+                    return PhaseResult(
+                        next_ctx=_l2_retries_exhausted_ctx,
+                        next_phase=None,
+                        status="fail",
+                        reason=(
+                            _l2_retries_exhausted_ctx.terminal_reason_code
+                            or "l2_soft_stop_retries_exhausted"
+                        ),
+                        artifacts={
+                            "best_candidate": None,
+                            "best_validation": best_validation,
+                        },
+                    )
+                if (
+                    orch._config.repair_engine is None
+                    or best_validation is None
+                ):
                     _fsm_log(
                         "l2_skipped",
                         f"repair_engine={orch._config.repair_engine is not None} "
