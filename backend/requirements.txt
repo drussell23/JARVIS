@@ -95,7 +95,7 @@ geocoder>=1.38.0  # For IP-based location detection
 # ML Enhancement dependencies
 joblib>=1.3.0  # For model persistence
 torchaudio==2.1.2  # For deep audio processing (must match torch version)
-SpeechRecognition>=3.10.0  # For enhanced speech recognition
+SpeechRecognition>=3.16.1  # For enhanced speech recognition
 pygame>=2.5.0  # For audio feedback
 # Note: scikit-learn is already included above as version 1.3.2
 

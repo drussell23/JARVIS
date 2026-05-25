@@ -39,7 +39,7 @@ webrtcvad>=2.0.10
 pyaudio>=0.2.11
 
 # Existing voice requirements
-SpeechRecognition>=3.10.0
+SpeechRecognition>=3.16.1
 pyttsx3>=2.90
 pygame>=2.5.0
 
