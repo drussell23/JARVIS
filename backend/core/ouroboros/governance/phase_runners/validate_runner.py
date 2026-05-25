@@ -494,9 +494,49 @@ class VALIDATERunner(PhaseRunner):
                     pass
             try:
                 from backend.core.ouroboros.governance.interactive_repair import InteractiveRepairLoop
+                # ── Slice 3H.2 — resolve repair root BEFORE constructing
+                # the repair loop, so InteractiveRepair's subprocess (which
+                # uses ``cwd=str(self._project_root)``) executes pytest in
+                # the per-instance worktree, not the host JARVIS repo.
+                #
+                # Closes bt-2026-05-25-082441: the prior soak proved every
+                # other wire (Slice 3G repo_root override, Slice 3H Part 1+2,
+                # Slice 3H.1 candidate fallback) was correct, and
+                # ``InteractiveRepair`` actually RAN (no "disabled" log) —
+                # but it bailed every iter at the hard-guard
+                # (``error_type=UnknownError or line_number <= 0``) because
+                # pytest was running in the JARVIS cwd, finding JARVIS tests,
+                # not seeing any failure attributable to the model's patch
+                # on ``lib/ansible/cli/doc.py``. The error parser's regex
+                # for ``File "..." line N`` never matched JARVIS output
+                # against an Ansible code path → UnknownError → break.
+                #
+                # The fix: resolve the envelope-override root FIRST, then
+                # construct the loop with that root. ``self._project_root``
+                # inside InteractiveRepair flows directly to
+                # ``cwd=str(self._project_root)`` at the
+                # ``asyncio.create_subprocess_exec`` call site — no API
+                # change needed; just feed the right value at construction.
+                _repair_root: Path = orch._config.project_root
+                try:
+                    from backend.core.ouroboros.governance.operation_advisor import (
+                        resolve_envelope_repo_root as _slice3h_resolve_root,
+                    )
+                    _wt_override = _slice3h_resolve_root(
+                        getattr(ctx, "intake_evidence_json", "") or "",
+                        project_root=orch._config.project_root,
+                    )
+                    if _wt_override is not None:
+                        _repair_root = _wt_override
+                        _fsm_log(
+                            "micro_fix_root_envelope_override",
+                            f"root={_wt_override}",
+                        )
+                except Exception:  # noqa: BLE001 — never block micro-fix
+                    _repair_root = orch._config.project_root
                 _repair = InteractiveRepairLoop(
                     provider=orch._generator,
-                    project_root=orch._config.project_root,
+                    project_root=_repair_root,
                 )
                 # ── Slice 3H — repair-target derivation + envelope-override ──
                 # Closes the bt-2026-05-25-072558 VALIDATE_RETRY trap:
@@ -562,34 +602,13 @@ class VALIDATERunner(PhaseRunner):
                                 f"file_path={_cand_path!r} "
                                 f"source={_fallback_source}",
                             )
-                # Part 2 — resolve the repair file against the
-                # envelope's worktree (mirrors Slice 3G's tool-loop
-                # override). Without this, the absolute path
-                # ``orch._config.project_root / target`` resolves to
-                # the JARVIS repo even when the model is editing
-                # Ansible code in a SWE-Bench-Pro worktree. Composes
-                # the canonical
-                # ``operation_advisor.resolve_envelope_repo_root``
-                # (env-flag-gated, allowlist-validated, fail-silent);
-                # ``None`` result → use legacy ``project_root`` →
-                # byte-identical pre-Slice-3H behavior.
-                _repair_root: Path = orch._config.project_root
-                try:
-                    from backend.core.ouroboros.governance.operation_advisor import (
-                        resolve_envelope_repo_root as _slice3h_resolve_root,
-                    )
-                    _wt_override = _slice3h_resolve_root(
-                        getattr(ctx, "intake_evidence_json", "") or "",
-                        project_root=orch._config.project_root,
-                    )
-                    if _wt_override is not None:
-                        _repair_root = _wt_override
-                        _fsm_log(
-                            "micro_fix_root_envelope_override",
-                            f"root={_wt_override}",
-                        )
-                except Exception:  # noqa: BLE001 — never block micro-fix
-                    _repair_root = orch._config.project_root
+                # Part 2 (Slice 3H) — note that ``_repair_root`` is now
+                # resolved ABOVE the InteractiveRepairLoop constructor
+                # (Slice 3H.2 reorder) so the loop's subprocess pytest
+                # invocation lands in the worktree. ``_repair_abs`` below
+                # uses the same resolved root for the patched-file lookup
+                # — single source of truth for both the file system path
+                # and the subprocess cwd.
                 if _repair_target:
                     _repair_abs = _repair_root / _repair_target
                     if _repair_abs.is_file():
