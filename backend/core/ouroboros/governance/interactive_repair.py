@@ -157,13 +157,64 @@ class InteractiveRepairLoop:
     async def _run_and_capture(
         self, file_path: str, content: str, test_argv: List[str],
     ) -> Optional[ExtractedError]:
-        """Run test argv and extract specific error. Argv-based, no shell."""
+        """Run test argv and extract specific error. Argv-based, no shell.
+
+        Slice 4C-A (2026-05-25) — PYTHONPATH injection. The subprocess
+        inherits the JARVIS Python environment by default, which does
+        NOT have the target project's package installed (no ``pip
+        install -e .`` is run during SWE-Bench-Pro prepare_problem).
+        For Ansible-shape projects (src-layout: package code under
+        ``lib/<pkg>/``), the test file's ``from ansible.cli.doc
+        import ...`` fails with ``ModuleNotFoundError: No module
+        named 'ansible'`` — proven by raw pytest replication from
+        soak bt-2026-05-25-094217.
+
+        Surgical fix: build a per-subprocess env dict that inherits
+        ``os.environ`` and PREPENDS the worktree's canonical Python
+        source roots to ``PYTHONPATH``:
+
+          * ``<repo_root>/lib`` — Ansible / Django / Flask / Pandas
+            convention (separate ``lib/`` source dir)
+          * ``<repo_root>/src`` — modern Python packaging convention
+          * ``<repo_root>`` itself — flat-layout projects (single
+            top-level package dir at repo root)
+
+        All three are prepended (PATHSEP-joined) so pytest finds the
+        package regardless of layout convention. Existing PYTHONPATH
+        (if any) is preserved AFTER the new prepends — operator
+        overrides take precedence on conflicting names but the
+        worktree paths win on absent ones.
+
+        The injection is per-subprocess via ``env=`` kwarg — the
+        parent process's ``os.environ`` is NEVER mutated. Stateless,
+        bleeds zero into other code paths.
+        """
+        # Slice 4C-A — build per-subprocess env with PYTHONPATH override
+        _proj_root = str(self._project_root)
+        _existing_pp = os.environ.get("PYTHONPATH", "")
+        _candidates = [
+            os.path.join(_proj_root, "lib"),
+            os.path.join(_proj_root, "src"),
+            _proj_root,
+        ]
+        # Only include candidate paths that actually exist on disk —
+        # avoids polluting PYTHONPATH with non-existent dirs that would
+        # otherwise become noise in import-error tracebacks.
+        _real = [p for p in _candidates if os.path.isdir(p)]
+        _pythonpath_parts = _real + (
+            [_existing_pp] if _existing_pp else []
+        )
+        _subprocess_env = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(_pythonpath_parts),
+        }
         try:
             proc = await asyncio.create_subprocess_exec(
                 *test_argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._project_root),
+                env=_subprocess_env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_MICRO_TIMEOUT_S)
             if proc.returncode == 0:
