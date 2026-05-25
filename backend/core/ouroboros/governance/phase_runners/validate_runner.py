@@ -519,14 +519,49 @@ class VALIDATERunner(PhaseRunner):
                 _repair_target = (
                     list(ctx.target_files)[0] if ctx.target_files else None
                 )
-                if not _repair_target and best_candidate is not None:
-                    _cand_path = best_candidate.get("file_path", "") or ""
-                    if _cand_path:
-                        _repair_target = _cand_path
-                        _fsm_log(
-                            "micro_fix_target_from_candidate",
-                            f"file_path={_cand_path!r}",
+                # ── Slice 3H.1 — failed-candidate propagation ──
+                # The bt-2026-05-25-075811 soak proved Slice 3H Part 1's
+                # original predicate ``best_candidate is not None`` was
+                # DEAD on the failed-validation path: ``best_candidate``
+                # is only assigned at line 295-296 of this file when
+                # ``validation.passed`` is True — but micro-fix runs
+                # precisely when validation FAILED (all candidates rejected
+                # with a critique). The repair module thus saw "no target"
+                # on every iteration even though there WAS a candidate
+                # the model just produced and the validator just critiqued.
+                #
+                # Fallback chain in failure-likelihood order:
+                #   1. ``best_candidate`` (kept first — passed-validation
+                #      pre-existing path; truly was None until Slice 3H.1
+                #      proved insufficient on its own)
+                #   2. ``generation.candidates[0]`` (new — the first
+                #      proposed candidate; in 99% of ops n_cands=1 so this
+                #      IS the candidate that failed validation; for n>1
+                #      the first candidate is also the highest-priority
+                #      one per the candidate ordering contract)
+                #
+                # Both branches feed the same FSM tag with a ``source=``
+                # discriminator so operator grep can attribute correctly.
+                if not _repair_target:
+                    _fallback_cand: Optional[Dict[str, Any]] = None
+                    _fallback_source = ""
+                    if best_candidate is not None:
+                        _fallback_cand = best_candidate
+                        _fallback_source = "best_candidate"
+                    elif generation.candidates:
+                        _fallback_cand = generation.candidates[0]
+                        _fallback_source = "generation_candidates_first"
+                    if _fallback_cand is not None:
+                        _cand_path = (
+                            _fallback_cand.get("file_path", "") or ""
                         )
+                        if _cand_path:
+                            _repair_target = _cand_path
+                            _fsm_log(
+                                "micro_fix_target_from_candidate",
+                                f"file_path={_cand_path!r} "
+                                f"source={_fallback_source}",
+                            )
                 # Part 2 — resolve the repair file against the
                 # envelope's worktree (mirrors Slice 3G's tool-loop
                 # override). Without this, the absolute path
