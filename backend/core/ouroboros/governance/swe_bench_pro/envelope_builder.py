@@ -226,6 +226,43 @@ def _build_evidence(
     _fixture_purpose = _meta.get("purpose")
     if not isinstance(_fixture_purpose, str):
         _fixture_purpose = ""
+    # ── Slice 4B — FAIL_TO_PASS test scoping signal ──
+    # Closes the validate-with-noise trap surfaced by capability soak
+    # bt-2026-05-25-091657: with pytest running the FULL Ansible test
+    # suite (no scope), L2's classifier saw unrelated failures and bailed
+    # on missing_dependency (Slice 4A relaxed that, but the root noise
+    # remained). The FAIL_TO_PASS list in ``problem.metadata`` IS the
+    # set of tests SWE-Bench-Pro expects to flip from FAIL→PASS after
+    # the fix — exactly the right scope for InteractiveRepair's pytest
+    # invocation.
+    #
+    # Defensive extraction: ProblemSpec.metadata is forward-compat (any
+    # non-canonical field is preserved verbatim — see dataset_loader.py
+    # line 294-298). Schema variations: ``FAIL_TO_PASS`` (upstream
+    # SWE-Bench convention), ``fail_to_pass`` (Scale AI), occasionally
+    # JSON-encoded strings. The extraction handles all three shapes
+    # and returns an empty list on any failure — downstream consumers
+    # (validate_runner / InteractiveRepair) treat empty list as
+    # "no scoping" (legacy behavior: run all tests in cwd).
+    _f2p_raw = _meta.get("FAIL_TO_PASS") or _meta.get("fail_to_pass")
+    _fail_to_pass: list = []
+    if isinstance(_f2p_raw, (list, tuple)):
+        _fail_to_pass = [str(t) for t in _f2p_raw if isinstance(t, str) and t]
+    elif isinstance(_f2p_raw, str) and _f2p_raw.strip():
+        # Some datasets carry FAIL_TO_PASS as a JSON-encoded string
+        try:
+            import json as _json
+            _parsed = _json.loads(_f2p_raw)
+            if isinstance(_parsed, list):
+                _fail_to_pass = [
+                    str(t) for t in _parsed if isinstance(t, str) and t
+                ]
+        except (ValueError, TypeError):
+            # Plain comma/newline-separated string fallback
+            _fail_to_pass = [
+                t.strip() for t in _f2p_raw.replace(",", "\n").split("\n")
+                if t.strip()
+            ]
     return {
         EVIDENCE_REPO_ROOT_KEY: str(prepared.worktree_path),
         "problem_instance_id": _safe_str(problem.instance_id),
@@ -238,6 +275,9 @@ def _build_evidence(
         "gold_patch_empty": (_gold_patch == ""),
         "real_benchmark": _is_real_benchmark,
         "fixture_purpose": _fixture_purpose,
+        # Slice 4B — test scoping for InteractiveRepair / L2 (empty
+        # list when source dataset omits the field — legacy behavior).
+        "fail_to_pass": _fail_to_pass,
     }
 
 

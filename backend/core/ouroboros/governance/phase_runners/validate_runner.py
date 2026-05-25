@@ -613,7 +613,42 @@ class VALIDATERunner(PhaseRunner):
                     _repair_abs = _repair_root / _repair_target
                     if _repair_abs.is_file():
                         _repair_content = _repair_abs.read_text(errors="replace")
+                        # ── Slice 4B — FAIL_TO_PASS pytest scoping ──
+                        # Without scoping, ``pytest -x -q`` runs every
+                        # test in the worktree cwd. For SWE-Bench-Pro
+                        # ops on Ansible (1000s of tests) that produces
+                        # noise unrelated to the model's patch and
+                        # causes the L2 classifier to bail on
+                        # spurious env-flagged failures. The envelope's
+                        # ``fail_to_pass`` evidence (Slice 4B
+                        # envelope_builder addition) is exactly the
+                        # set of tests SWE-Bench-Pro expects to flip
+                        # FAIL→PASS after the fix. Scope pytest to
+                        # those specific tests for a clean signal.
+                        # Empty list → legacy unscoped behavior.
+                        _fail_to_pass: list = []
+                        try:
+                            import json as _json
+                            _evidence = _json.loads(
+                                getattr(ctx, "intake_evidence_json", "") or "{}"
+                            )
+                            if isinstance(_evidence, dict):
+                                _raw = _evidence.get("fail_to_pass") or []
+                                if isinstance(_raw, list):
+                                    _fail_to_pass = [
+                                        str(t) for t in _raw
+                                        if isinstance(t, str) and t
+                                    ]
+                        except (ValueError, TypeError):
+                            _fail_to_pass = []
                         _test_argv = ["python3", "-m", "pytest", "-x", "-q"]
+                        if _fail_to_pass:
+                            _test_argv.extend(_fail_to_pass)
+                            _fsm_log(
+                                "micro_fix_pytest_scoped",
+                                f"n_tests={len(_fail_to_pass)} "
+                                f"first={_fail_to_pass[0]!r}",
+                            )
                         _repair_result = await asyncio.wait_for(
                             _repair.repair(
                                 file_path=str(_repair_target),
