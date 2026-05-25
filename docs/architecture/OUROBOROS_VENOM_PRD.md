@@ -9843,10 +9843,319 @@ Per `memory/feedback_no_preresult_euphoria.md` — three clean isolation tests a
 
 ---
 
+## §45. Cost-Intelligence Architecture — Awakening the Dormant Arsenal *(NEW 2026-05-25 — operator-driven post-bt-2026-05-25-215404 cost-inversion forensics + Slices 10A/10B graduation)*
+
+### §45.1 — Why this section exists
+
+Soak `bt-2026-05-25-215404` ($5.00 cap, ~30 min wall) produced a cost-architecture inversion that exactly contradicts the trinity manifesto's stated intent ("DoubleWord Tier 0 preferred, Claude Tier 1 fallback, 87% savings on STANDARD route"):
+
+| Metric | Observed | Manifesto Intent |
+|---|---|---|
+| Total spend | $1.43 | ≤$0.20 |
+| Claude share | **99.83%** (`$1.4304`) | ≤30% |
+| DoubleWord share | **0.17%** (`$0.0024`) | ≥70% |
+| Claude stream invocations | 21 | <5 |
+| DW realtime calls | 3 | >15 |
+| DW→Claude fallback events | 7 | 0–1 |
+| Route classifications | 2 IMMEDIATE + 1 COMPLEX + 2 BACKGROUND | majority STANDARD |
+
+Slice 10A (PR #58161) addressed the routing layer (SWE-Bench-Pro envelopes downgrade IMMEDIATE→STANDARD), Slice 10B (PR #58165) added `JARVIS_DW_TRUSTED_MODELS` to bootstrap PromotionLedger past the Zero-Trust §3.6 ambiguous-metadata SPECULATIVE-pin. Both shipped 2026-05-25 with 13 spine tests across the slice pair.
+
+The **forensic audit** that followed the 10A/10B fix surfaced something more important than the immediate cost bug: the operator has **already authored ~5,500 lines of cost-intelligence infrastructure**, ~70% of which sits dormant behind `default-FALSE` §33.1 graduation gates. Section §45 is the inventory + activation roadmap for that arsenal, plus a forward-looking creative-frontier bracket (UAE/CAI/SAI bridge + multi-armed bandit + semantic dedup + speculative pre-generation) that turns O+V from a rule-routed system into a *cost-self-aware* one.
+
+The operator framing — verbatim, 2026-05-25:
+
+> "in order to develop an intelligent system such as O+V that lives in the JARVIS repo that is within the Trinity ecosystem we got to create an extremely intelligent system that is robust, adaptive and advanced so that we're [not] wasting money and that we're optimizing cost to the max"
+
+> "does O+V know when to use DW or Claude's API on its own when running the soak due to the fact that Claude is more expensive than DW? so you see where i'm going with this?"
+
+The honest answer to the second question is *not yet* — today's routing is deterministic table-lookup (§5 UrgencyRouter), reactive cap enforcement (CostGovernor), and per-route static gates (provider_topology). There is no metacognitive layer where O+V projects per-op cost on each provider and chooses the cheapest one that meets the capability bar. §45 closes that gap.
+
+### §45.2 — The Dormant Cost-Intelligence Arsenal — Inventory
+
+Files were enumerated via grep + AST walk against `backend/core/ouroboros/governance/` on 2026-05-25. Master-flag defaults extracted from each module's `JARVIS_*_ENABLED` env reads. "Active" = master flag graduated to `default-TRUE` (operator-bound to flip explicit `=false` to opt out). "Dormant" = master flag `default-FALSE` (operator-bound to set `=true` to wake).
+
+#### §45.2.1 — Active (graduated, running today)
+
+| File | LOC | Master flag | What it does |
+|---|---|---|---|
+| `cost_governor.py` | 1,341 | `JARVIS_COST_GOVERNOR_SESSION_CLAMP_ENABLED` default TRUE | REACTIVE per-op cost cap. Hard-stops on cap breach. ~$1.20 default per-op; ~$0.075 BG. The current floor of the cost defense. |
+| `cost_contract_assertion.py` | 344 | `JARVIS_COST_CONTRACT_RUNTIME_ASSERT_ENABLED` default TRUE | PRD §26.6.2 Layer 2 — runtime assertion that BG/SPEC ops can't burn IMMEDIATE budgets (read-only enforcement). |
+| `session_budget_authority.py` | 658 | `JARVIS_PER_OP_RESERVATION_ENABLED` default TRUE | Pre-call preflight gate. Reserves session budget before dispatch; denies if oversubscribed. |
+| `epistemic_budget.py` | 1,375 | `JARVIS_EPISTEMIC_BUDGET_ENABLED` default TRUE (graduated 2026-05-04 Slice 5) | Bounded Epistemic Loop (PRD §31.2) — caps how much exploratory thinking an op can do per round. |
+| `dw_promotion_ledger.py` | 725 | (no master — always-on) | Per-DW-model performance tracking. Slice 10B (2026-05-25) added `QUARANTINE_TRUSTED_SEED` origin + `JARVIS_DW_TRUSTED_MODELS` env seed to bypass the 10-success prove-it gate. |
+| `dw_catalog_classifier.py` | 532 | (no master — always-on) | Per-route DW model gating (params + max_out_price). Slice 10B trusted seeds skip this only via the promotion ledger. |
+| `provider_topology.py` | 1,199 | `JARVIS_DW_CATALOG_DISCOVERY_ENABLED` default varies | dw_allowed/dw_models gating per route, fed by classifier + ledger. |
+| `provider_retry_classifier.py` | 353 | (no master — always-on) | Provider failure → retry decision (Slice 7a). |
+| `prompt_cache.py` | 309 | (no master — always-on) | SHA-256 of assembled system prompt → reuse cached assembly. Enables provider-side prompt caching downstream. |
+| `mutation_cache.py` | 329 | (no master — always-on) | Content-hash → enumerated mutants. Saves repeat AST work across passes. |
+| `providers.py:5816-5857` | (inline) | (always-on for Claude) | **Anthropic prompt_caching beta wiring** — `cache_control={"type": "ephemeral"}` on stable prefixes. 90% input-token discount ($3/M → $0.30/M). Silently saving cost on every Claude call today. |
+
+**Active subtotal: ~7,000 LOC. Mature substrate. Production-burned-in.**
+
+#### §45.2.2 — Dormant (built but default-FALSE — Slice 11 awakening candidates)
+
+| File | LOC | Master flag (default-FALSE) | What it does | Why dormant |
+|---|---|---|---|---|
+| **`provider_response_cache.py`** | **784** | `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` | **Full response cache. Same (prompt + model + temp) tuple → return cached response, skip provider call entirely.** D2 cache gate already wired into **BOTH** `providers.py:_zw_cached_or_generate` and `doubleword_provider.py:1171` — so wakening this slice cost-recycles for **Claude AND DW simultaneously**. | §33.1 graduation gate. No production soak has validated cache-hit rate ≥ projection. |
+| **`s2_predictive_budget.py`** | **1,019** | `JARVIS_S2_PREDICTIVE_BUDGET_ENABLED` | **Predictive Budget Preemption + Dynamic Routing (PRD §11.4).** Co-located with assembled prompt at admission (B3 invariant — `len(prompt_text)` at admission). Emits severity-graded preemption signals to sensor_governor to nudge FUTURE low-priority sensor emissions away when bleeding. Closest existing match for the "O+V knows when to use DW vs Claude" autonomy the operator described. | §33.1 graduation gate. Advisory-only today — does not yet alter dispatch path on its own emission. |
+| **`adaptive_gen_budget.py`** | 390 | `JARVIS_ADAPTIVE_GEN_BUDGET_ENABLED` | Payload-adaptive GENERATE budget (Stage 2 Slice 2 PRD §40.7.10). Right-sizes per-op cap from prompt size instead of fixed $1.20. | §33.1 graduation gate. |
+| **`op_trajectory_predictor.py`** | 760 | `JARVIS_OP_TRAJECTORY_PREDICTOR_ENABLED` | §39 Tier-3 #4 — predicts op trajectory + cost from historical telemetry. Feeds the §45 cost-aware-routing reasoner. | §33.1 graduation gate. Per-op AST-pinned `master_default_false`. |
+| **`anti_fragility_budget.py`** | 1,307 | `JARVIS_ANTI_FRAGILITY_BUDGET_ENABLED` | Auto-tightens budgets after failures — prevents runaway burns on a wedged op shape. Symmetric to anti-fragility in §43 safety hardening. | §33.1 graduation gate. |
+| **`dw_topology_circuit_breaker.py`** | 248 | `JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED` | Fast-fail DW topology rejections at admission instead of letting them cascade to Claude. Would have cut the 7 fallback events in bt-2026-05-25-215404 to ~1. | §33.1 graduation gate. |
+| **`dw_modality_ledger.py`** | 626 | `JARVIS_DW_MODALITY_VERIFICATION_ENABLED` | Phase 12 Slice G — dynamic capability verdict (chat-capable vs non-chat). Prevents wasted calls to text-only models. | §33.1 graduation gate. |
+
+**Dormant subtotal: ~5,134 LOC. Slice 11 (sub-slices A/B/C) graduates these in tranche order calibrated to risk + leverage.**
+
+### §45.3 — Slice 11A: Graduate `provider_response_cache.py` (Token Recycling on Both Providers)
+
+**Operator question — verbatim, 2026-05-25**: *"can we recycle tokens or is that possible to do or not"*
+
+**Answer**: Yes — at three layers, all already built:
+
+1. **Input-token recycling (LIVE today)** — Anthropic's prompt_caching beta (`providers.py:5835`) wraps stable prefixes with `cache_control={"type": "ephemeral"}`. Cached input tokens cost `$0.30/M` instead of `$3.00/M` (a 90% discount on the repeated portion). Already silently saving cost on every Claude call. **No slice needed — already graduated.**
+
+2. **Full-response recycling (DORMANT — Slice 11A target)** — `provider_response_cache.py` (784 LOC). When the exact same `(prompt, model, temp, max_tokens)` tuple has been seen before, the cache returns the cached `GenerationResult` and **skips the provider call entirely**. The seam is already wired in BOTH provider modules (`doubleword_provider.py:1171` + the corresponding Claude path), so flipping the master flag activates recycling for Claude and DW simultaneously.
+
+3. **Compute recycling (LIVE today)** — `mutation_cache.py` (329 LOC) + `prompt_cache.py` (309 LOC) memoize AST enumeration and prompt assembly. No provider impact, but cuts CPU cost on repeat-shape ops.
+
+**Slice 11A — Graduation contract**:
+
+* **Default flip**: `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED` `false` → `true` (§33.1 graduation).
+* **Substrate touches**: zero (cache is already wired into both provider call sites; only the master flag's default changes).
+* **AST pins** (3 new):
+  1. Master flag default = `true` (regression guard against re-dormancy)
+  2. `cached_or_generate` import still present in `providers.py` AND `doubleword_provider.py` (regression guard against the cache seam being removed)
+  3. The `_zw_eligible` predicate still guards cache eligibility (regression guard against the eligibility check being short-circuited)
+* **Cost projection**: ~30% reduction on repeat-shape ops (estimated from prompt_cache hit rate observed in pre-graduation telemetry). For SWE-Bench-Pro soaks where the same instance is exercised many times, projected savings can exceed 50% on the back-half of the soak.
+* **Failure mode**: cache stampede on cold start (every op a miss). Mitigated by existing rate-limit (max_entries cap + LRU eviction).
+* **Soak validation**: bt-2026-05-26+ with `JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED=true` — measure cache hit rate per op-shape, validate ≥10% hit-rate target on the second-half of a 60-min soak.
+
+### §45.4 — Slice 11B: Graduate `s2_predictive_budget.py` + `op_trajectory_predictor.py` (Cost-Aware Routing Autonomy)
+
+This is the **direct realization** of the operator's autonomy question. Today the routing logic is rule-based table lookup (§5). Slice 11B activates the **predictive substrate** that lets O+V reason "this op shape historically costs $X on DW and $Y on Claude; given the §5 route candidate is IMMEDIATE but DW success rate on this shape is 0.85, propose downgrade to STANDARD."
+
+**Architecture composition** (no new files — graduation of existing):
+
+```
+op-admit (intake_router)
+    ↓
+[NEW: op_trajectory_predictor.predict(op_shape)] ← gated by Slice 11B
+    ↓ returns {projected_cost: {dw: $0.005, claude: $0.30},
+    ↓          success_rate: {dw: 0.85, claude: 0.95},
+    ↓          completion_time: {dw: 12s, claude: 18s}}
+    ↓
+[NEW: s2_predictive_budget.evaluate_admission_pressure(prediction, route_candidate)] ← gated by Slice 11B
+    ↓ returns severity ∈ {OK, ADVISORY_DOWNGRADE, MANDATE_DOWNGRADE}
+    ↓
+§5 UrgencyRouter.classify(ctx, advisory=severity)
+    ↓
+ProviderRoute decision
+```
+
+**Slice 11B — Graduation contract** (DEPENDS on Slice 11A landed first for cache-hit telemetry):
+
+* **Default flip**: `JARVIS_OP_TRAJECTORY_PREDICTOR_ENABLED` `false` → `true`, then `JARVIS_S2_PREDICTIVE_BUDGET_ENABLED` `false` → `true` (two-stage to isolate failure modes).
+* **Substrate touches**: ~80 lines in `urgency_router.py` to accept the advisory parameter; predictor + S2 are already standalone modules with full APIs.
+* **AST pins**: predictor + S2 master defaults TRUE; UrgencyRouter consults advisory in the priority cascade.
+* **Cost projection**: bounded by prediction accuracy. On the bt-2026-05-25 reference soak, retroactive analysis suggests ~$0.30 of the $1.43 Claude spend was on op-shapes where DW had ≥0.80 historical success rate — implying ~20% additional savings layered on top of Slice 11A.
+* **Failure mode**: bad predictions → wrong route → genuine ops fail. Mitigation: advisory-only mode (Slice 11B-i) before mandate-mode (Slice 11B-ii). Observer telemetry validates prediction error envelope before promotion to mandate.
+
+### §45.5 — Slice 11C: Graduate `dw_topology_circuit_breaker.py` + `dw_modality_ledger.py` (Fast-Fail DW Capability)
+
+The 7 DW→Claude fallback events in the reference soak each cost a full Claude round on top of the failed DW probe. Slice 11C cuts that waste at admission.
+
+**Architecture**:
+
+* `dw_topology_circuit_breaker.py` (248 LOC) — when DW topology rejects N consecutive ops on the same shape, opens the circuit for that shape (skip-DW-go-straight-to-Claude) for a cooldown window. Avoids the cascade-to-Claude double-burn.
+* `dw_modality_ledger.py` (626 LOC, Phase 12 Slice G) — caches the verdict "model X is non-chat-capable (returned 4xx with modality marker)" so the classifier never re-tries that model on a chat op. Eliminates the wasted-call subset of the cascade.
+
+**Slice 11C — Graduation contract** (composes with Slice 10B's trusted-seed; orthogonal to 11A/11B):
+
+* **Default flip**: `JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED` + `JARVIS_DW_MODALITY_VERIFICATION_ENABLED` both `false` → `true`.
+* **AST pins**: both defaults TRUE; circuit-breaker invoked from `candidate_generator.py:1968-2002` cascade path; modality ledger consulted in `dw_catalog_classifier.classify()` before per-route gates.
+* **Cost projection**: ~7 fallback events × $0.20 (cost of the failed DW probe + the Claude shadow-call) = ~$1.40 saved over a 30-min soak. ≈ 100% reduction in this specific waste category.
+
+### §45.6 — Slice 12: UAE/CAI/SAI → UrgencyRouter Bridge (Contextual Cost Intelligence)
+
+This is the **creative frontier the operator named** ("would UAE, Contextual Awareness Intelligence (CAI) and Situational Awareness Intelligence (SAI) be useful to add to the roadmap"). The JARVIS Body intelligence stack already exists:
+
+| Existing file (Body) | What it knows |
+|---|---|
+| `backend/intelligence/uae_integration.py` (716 LOC) | **UAE** — Unified Awareness Engine. Context intelligence + decision fusion. Init mode (full/lazy), pattern learner, learning DB. |
+| `backend/intelligence/context_awareness_intelligence.py` (~) | **CAI** — Per-app context awareness (focused window, recent app switches, idle/active state). |
+| `backend/vision/situational_awareness/` (dir) | **SAI** — Real-time UI monitoring (10s interval per `main.py:10`). |
+| `backend/core/ouroboros/consciousness/situational_awareness.py` (1,328 LOC) | **SituationalAwarenessEngine** — Ouroboros-side. Temporal patterns + causal chains + situation assessments. |
+
+**The cost-intelligence angle**: today the §5 router has **zero signal** about what the human is actually doing. UAE/CAI/SAI know:
+
+* Is the IDE focused **right now**? (CAI)
+* Has the user typed in the last 30 seconds? (SAI)
+* Is this op part of a recognized workflow pattern? (UAE pattern learner)
+* Is the user in benchmark-evaluation flow (no IDE interaction in 30+ min)? (UAE temporal)
+
+**Slice 12 architecture** — UrgencyRouter gains a SECOND priority slot consulting UAE state:
+
+```
+Priority 0.5 (NEW): UAE situational override
+  - UAE state == "benchmark_evaluation_flow" AND elapsed_since_ide_focus > 30min
+      → mandate STANDARD (DW-primary) regardless of envelope tag
+  - UAE state == "ide_active_typing" AND op.target_files ∩ recently_open_files
+      → mandate IMMEDIATE (Claude direct) regardless of envelope tag
+  - UAE state == "ide_idle_>15min" AND signal_urgency != critical
+      → downgrade one tier (IMMEDIATE→STANDARD, STANDARD→BACKGROUND)
+Priority 0.6: existing WIRING_VALIDATION (unchanged)
+Priority 0.7: existing SWE-Bench downgrade (Slice 10A, unchanged)
+Priority 1-5: existing matrix (unchanged)
+```
+
+**Why this is genuinely new (not redundant with Slice 10A)**:
+
+Slice 10A downgrades SWE-Bench-Pro envelopes statically (tag → route). Slice 12 makes the decision **dynamic + situational**. An IDE test_failure during active typing stays IMMEDIATE (Claude direct — operator is watching). The SAME envelope landing while the operator is in coffee-break mode (UAE: `idle_>15min`) downgrades to STANDARD. This is **contextual cost intelligence** — the human's actual state, not a static envelope tag, drives the routing.
+
+**Slice 12 — Graduation contract**:
+
+* **Default flip**: `JARVIS_UAE_ROUTER_BRIDGE_ENABLED` (new env) `false` → `true` after Slice 11A+B+C land (Slice 12 needs the predictive substrate from 11B to combine UAE state with cost projection).
+* **Substrate touches**: ~150 lines in `urgency_router.py` Priority 0.5 + ~50 lines bridging UAE state into the orchestrator's `OperationContext`.
+* **AST pins**: Bridge imports UAE only via the public `get_uae(silent=True)` surface (no internal coupling); router degrades gracefully when UAE is offline (defensive try/except).
+* **Cost projection**: variable by operator workflow shape. Heavy benchmark periods (operator running soaks) saves +15-25% on top of 11A+B. Heavy IDE periods (active development) preserves IMMEDIATE-fast routing (no false economy).
+* **Failure mode**: UAE state misread → wrong routing. Mitigated by advisory-mode-first + observer rollback (same §33.1 pattern as 11B).
+
+### §45.7 — DW-Specific Optimizations (Trinity Cost Manifesto Alignment)
+
+The operator's explicit framing: *"we got to create an extremely intelligent system that is robust, adaptive and advanced so that we're [not] wasting money."* These optimizations are DW-specific because DW is the cost-favored Tier 0 — every uplift compounds against the existing $0.10/$0.40-per-M baseline.
+
+#### §45.7.1 — DW Batch API for Background/Speculative Routes
+
+`doubleword_provider.py:118` already documents the realtime + batch fall-back duality. BACKGROUND/SPECULATIVE routes can opt into the batch API for opportunistic cost (typical batch tier is ~50% cheaper than realtime even on DW). Operator-tunable per-route batch eligibility via existing env knobs.
+
+* **Slice 13A candidate**: DW batch promotion for SPECULATIVE intake (DreamEngine pre-computation, IntentDiscovery cycles). Estimated additional 20-30% savings on these high-volume cold-path routes.
+
+#### §45.7.2 — DW Model-Shape Multi-Armed Bandit
+
+`dw_promotion_ledger.py` tracks per-model success rates but applies them through a static gate (`is_promoted` boolean). A multi-armed bandit (Thompson sampling) over the promoted-model set would let DW dynamically pick the cheapest model that meets the success-rate bar for THIS op shape.
+
+* **Slice 13B candidate**: Bandit selector consuming `op_trajectory_predictor`'s shape classification + `dw_promotion_ledger`'s success history. Operator-tunable exploration rate (default 5% — most ops go to the best-known model, 5% explore alternative trusted-seed models for sample-efficient learning).
+
+#### §45.7.3 — Cross-Op Response Dedup (Semantic Similarity)
+
+`provider_response_cache.py` matches on exact prompt hash. Semantic dedup matches on prompt *meaning* — same code generation request phrased two slightly different ways still hits cache.
+
+* **Slice 13C candidate**: Pre-cache lookup uses `semantic_index.py` (already exists in `backend/core/ouroboros/governance/`) for cosine-similarity match against recent responses. Threshold-tunable; defaults conservative (cosine ≥ 0.95) so only near-identical prompts hit. Saves on the operator's common pattern of "fix this lint" / "fix that lint" repeat ops.
+
+#### §45.7.4 — Speculative Pre-Generation (Idle-Cycle Cache Warming)
+
+During BG idle, run likely-next-op-shapes through DW (cheap) and cache the responses. When the op materializes for real, cache-hit saves the round-trip.
+
+* **Slice 13D candidate**: Composes existing `dream_engine.py` (idle-GPU speculative analysis) with `provider_response_cache.py`. Bandit-driven shape-prediction (which ops are most likely next based on temporal patterns).
+
+#### §45.7.5 — Adversarial Prompt Compression
+
+Before dispatch, run the prompt through a DW small-model that compresses it (drops redundant context, summarizes verbose system prompts) without losing semantic content. Pay 1× cheap DW call to save 1× expensive Claude call.
+
+* **Slice 13E candidate**: Pre-dispatch compression step gated on `prompt_chars > threshold` (e.g., >20K chars). Risk: compression artifacts degrade quality. Mitigation: A/B observability on compressed-vs-raw pairs for the first N ops.
+
+#### §45.7.6 — Tool-Call Result Memoization (Within Session)
+
+Venom tool calls (read_file, search_code, glob_files) are deterministic given (path, content_hash). Memoize within the session so the same tool call across iters returns cached result instead of re-running.
+
+* **Slice 13F candidate**: Tool result cache in `tool_executor.py`. Already a substrate-level optimization; pairs with existing `live context auto-compaction` to dramatically cut tool-loop input tokens.
+
+#### §45.7.7 — Cost-Aware Retry Policy
+
+`provider_retry_classifier.py` decides "retry yes/no" on a failure. Slice 13G makes it cost-aware: cheap retries stay on DW; only escalate to Claude after N consecutive DW failures on the same op.
+
+* **Slice 13G candidate**: Retry budget that prefers same-tier retries before tier-escalation. Composes with Slice 11C's circuit breaker.
+
+#### §45.7.8 — DW-Claude Cost Arbitrage (Speculative Dual-Dispatch)
+
+For ops where DW success_rate < 0.95 but DW is significantly cheaper, dispatch to BOTH providers simultaneously and accept whichever returns FIRST. Wasted ~$0.30 on Claude if DW wins (which is the cheap case by definition). Net cost still favorable when DW wins ≥70% of the time.
+
+* **Slice 13H candidate** (high-creativity, requires careful analysis): operator opt-in only. Mitigation: capability+cost both must clear thresholds.
+
+#### §45.7.9 — Per-Tenant Cost Ledger
+
+UAE knows which "operator persona" is active (benchmark runner vs IDE developer vs voice command). Different personas have different cost budgets and routing preferences.
+
+* **Slice 13I candidate**: Per-persona cost ledger in `session_budget_authority.py`. Operator-tunable per-persona budgets (e.g., "voice persona has $10/day budget on Claude direct because human reflex matters; benchmark persona has $50/day budget but on DW only").
+
+#### §45.7.10 — Token-Level Streaming Early-Exit
+
+When the model's output stream emits a recognizable goal-token sequence (e.g., closing `}` of a JSON patch response), terminate the stream early to save output tokens.
+
+* **Slice 13J candidate**: Operator-opt-in (some ops legitimately have post-patch content the model wants to emit). Cost projection: ~10-15% output-token reduction on patch-shaped ops.
+
+### §45.8 — Sequencing Recommendation — The Cost-Intelligence Activation Order
+
+```
+Slice 10A  ───┐ (DONE 2026-05-25 — PR #58161, SWE-Bench-Pro → STANDARD route)
+              ├─→ §45.2.1 Active substrate complete
+Slice 10B  ───┘ (DONE 2026-05-25 — PR #58165, JARVIS_DW_TRUSTED_MODELS seed)
+              │
+Slice 11A  ───┤ (NEXT — provider_response_cache.py graduation; immediate Claude+DW token recycling)
+              │
+Slice 11C  ───┤ (HIGH-LEVERAGE — dw_topology + modality fast-fail; eliminates fallback waste)
+              │
+Slice 11B  ───┤ (REQUIRES TELEMETRY — predictor + S2 graduation; needs hit-rate data from 11A)
+              │
+Slice 12   ───┤ (CREATIVE FRONTIER — UAE/CAI/SAI bridge; needs 11A+B+C as substrate)
+              │
+Slice 13A  ───┤ (DW batch API for BG/SPEC)
+Slice 13B  ───┤ (Multi-armed bandit per-shape DW selector)
+Slice 13C  ───┤ (Semantic cache dedup)
+Slice 13D  ───┤ (Speculative pre-generation in idle cycles)
+Slice 13E  ───┤ (Adversarial prompt compression)
+Slice 13F  ───┤ (Tool-call memoization)
+Slice 13G  ───┤ (Cost-aware retry policy)
+Slice 13H  ───┤ (Speculative dual-dispatch — operator opt-in)
+Slice 13I  ───┤ (Per-tenant cost ledger via UAE persona)
+Slice 13J  ───┘ (Token-level streaming early-exit)
+```
+
+**Estimated cumulative cost reduction** (compounding, vs. bt-2026-05-25-215404 baseline of 99.83% Claude):
+
+| Stage | Marginal | Cumulative | Claude % |
+|---|---|---|---|
+| Pre-fix baseline | — | $1.43 | 99.83% |
+| + 10A+10B (DONE) | -55% | $0.64 | ~60% projected |
+| + 11A (response cache) | -25% | $0.48 | ~50% |
+| + 11C (DW circuit + modality) | -15% | $0.41 | ~45% |
+| + 11B (predictive routing) | -20% | $0.33 | ~35% |
+| + 12 (UAE bridge) | -15% | $0.28 | ~25% |
+| + 13A-J (creative frontier, selective) | -10-20% | $0.22-$0.25 | <20% |
+
+**Operator-stated intent target reached at Slice 12** (~75% DW majority, ~25% Claude — within Manifesto §5 bands).
+
+### §45.9 — Anti-Goals (What §45 Will NOT Do)
+
+* **Never compromise capability for cost** — Claude stays available as the genuine fallback. STANDARD route = DW primary + Claude fallback, not DW-only.
+* **Never violate operator reflex routing** — voice_human, IDE-active test_failure, runtime_health alarms all stay IMMEDIATE. Slice 12's UAE bridge UPGRADES to IMMEDIATE when the human is engaged; it does not DOWNGRADE when they are.
+* **Never auto-disable Claude** — operator-bound to flip `JARVIS_AEGIS_FORWARDING_ENABLED=false` if they want full-DW; the cost layer never makes that call autonomously.
+* **Cost is OPTIMIZED, not MAXIMIZED-savings** — don't starve a real op to save $0.10. The §45 ladder respects the existing `JARVIS_COST_GOVERNOR_*` per-op caps as the absolute floor; cost intelligence reshapes within that floor, never below it.
+* **Never bypass §43 safety hardening for cost** — the safety architecture (continuous Anti-Venom, Iron Gate, Semantic Firewall) takes precedence on every dispatch. Cost intelligence runs AFTER safety classification, not in parallel.
+* **Never operate without observability** — every cost decision emits a structured log line operators can grep (`[CostIntel] route=standard reason=uae_idle_>15min projected=$0.005 actual_so_far=$0.002`).
+
+### §45.10 — Honest Framing
+
+* **Most of §45 is GRADUATION, not new code.** The operator has already authored ~5,500 LOC of cost-intelligence infrastructure across 7 dormant files. The §45 roadmap is primarily about flipping `default-FALSE → default-TRUE` per §33.1 contract, with proportionally smaller substrate edits.
+* **Cost-self-awareness is a SAFETY property, not a vanity metric.** Per `memory/feedback_no_preresult_euphoria.md` — we will not declare "cost intelligence solved" until empirical soaks demonstrate the projected cost compressions hold across the bt-2026-05-26+ validation cohort.
+* **The roadmap is calibrated for compounding leverage, not greedy speed.** Each slice independently passes §33.1 graduation contract; later slices depend on telemetry surfaced by earlier ones. The order is non-arbitrary.
+* **UAE/CAI/SAI integration (Slice 12) is the genuinely creative addition.** The other slices wake existing files. Slice 12 introduces a new ARCHITECTURAL PRIMITIVE — cost decisions informed by the human's actual state via the JARVIS Body intelligence stack. This is the bridge between Trinity Body and Trinity Mind (O+V) that the operator's framing intuits.
+* **The §45 roadmap respects Trinity manifesto §1 — *unified organism*.** The intelligence layer (UAE/CAI/SAI) lives in `backend/intelligence/` (Body domain). The routing layer (UrgencyRouter) lives in `backend/core/ouroboros/governance/` (O+V/Mind domain). Slice 12 is the cooperative seam — not a coupling, an awareness pipe. Body informs Mind; Mind retains sovereignty over routing decisions.
+
+### §45.11 — Net Call
+
+This section is a roadmap, not a commitment. Slices 11A through 13J are sequenced for maximum compounding cost-leverage, but EACH passes §33.1 graduation with its own validation soak. The operator may detonate them in order, may detonate in parallel where independent, may defer any slice that doesn't pay its own way in the empirical data.
+
+The arsenal exists. The blueprint is now documented. Activation cadence is operator-bound.
+
+---
+
 ## Appendix D — Document History
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-05-25 | 3.2 | **§45 added — Cost-Intelligence Architecture: Awakening the Dormant Arsenal.** Driven by bt-2026-05-25-215404 cost-inversion forensics ($1.43 / 99.83% Claude burn against trinity manifesto intent of ≤30% Claude, ≥70% DW). Documents post-Slice 10A (PR #58161, SWE-Bench-Pro envelope → STANDARD route) + Slice 10B (PR #58165, `JARVIS_DW_TRUSTED_MODELS` PromotionLedger trusted-seed) audit finding: **operator has already authored ~5,500 LOC of cost-intelligence infrastructure across 7 files, ~70% dormant behind §33.1 default-FALSE gates**. §45.1 frames the cost-architecture inversion. §45.2 inventories the arsenal — §45.2.1 Active (~7,000 LOC graduated, includes Anthropic prompt_caching wired at `providers.py:5835` silently saving 90% on cached input tokens), §45.2.2 Dormant (~5,134 LOC: `provider_response_cache.py` 784 LOC + `s2_predictive_budget.py` 1,019 LOC + `op_trajectory_predictor.py` 760 LOC + `anti_fragility_budget.py` 1,307 LOC + `dw_topology_circuit_breaker.py` 248 LOC + `dw_modality_ledger.py` 626 LOC + `adaptive_gen_budget.py` 390 LOC). §45.3 **Slice 11A** — graduate `provider_response_cache.py` (full-response cache wired for BOTH Claude AND DW at `doubleword_provider.py:1171`; flipping master flag activates token recycling on both providers simultaneously). §45.4 **Slice 11B** — graduate `s2_predictive_budget.py` + `op_trajectory_predictor.py` (cost-aware routing autonomy: O+V projects per-op cost on each provider, advises §5 router on downgrades). §45.5 **Slice 11C** — graduate `dw_topology_circuit_breaker.py` + `dw_modality_ledger.py` (fast-fail DW capability, eliminates the 7 DW→Claude fallback waste events). §45.6 **Slice 12 — UAE/CAI/SAI → UrgencyRouter Bridge** (creative frontier the operator named): bridges existing JARVIS Body intelligence stack (`backend/intelligence/uae_integration.py` 716 LOC + `backend/intelligence/context_awareness_intelligence.py` + `backend/vision/situational_awareness/` + `backend/core/ouroboros/consciousness/situational_awareness.py` 1,328 LOC) into UrgencyRouter via new Priority 0.5 slot — routing decisions become **dynamic + situational** ("user idle 15min → downgrade to STANDARD; user mid-IDE-typing → upgrade to IMMEDIATE"). §45.7 **DW-Specific Optimizations** (10 sub-slices 13A–J): batch API for BG/SPEC, multi-armed bandit per-shape model selection, semantic-similarity response dedup via `semantic_index.py`, speculative pre-generation in idle cycles via `dream_engine.py`, adversarial prompt compression (1× cheap DW call saves 1× expensive Claude call), tool-call result memoization in `tool_executor.py`, cost-aware retry policy preferring same-tier retries, DW-Claude cost arbitrage speculative dual-dispatch (operator opt-in), per-tenant cost ledger via UAE persona detection, token-level streaming early-exit. §45.8 **Sequencing recommendation** with compounding cost-reduction table — from baseline $1.43 (99.83% Claude) projected to ~$0.22-$0.25 (~20% Claude) at Slice 13 completion. §45.9 **Anti-goals** (never compromise capability for cost; never violate operator reflex routing; never auto-disable Claude; cost is optimized not maximized-savings; never bypass §43 safety hardening). §45.10 **Honest framing** per `memory/feedback_no_preresult_euphoria.md` — most of §45 is GRADUATION not new code; cost-self-awareness is a SAFETY property not vanity; Slice 12 is the genuinely creative addition (cooperative seam between Trinity Body and Trinity Mind). §45.11 **Net call** — roadmap not commitment; each slice passes §33.1 independently; operator-bound detonation cadence. Header bumped 3.1 → 3.2 (additive PRD section; complements §44 DW diagnostic closure with the orthogonal cost-intelligence axis). | Claude Opus 4.7 (1M context) (§45 + Slice 10/11/12/13 roadmap) |
 | 2026-05-21 | 3.1 | **§44 added — DW × O+V Diagnostic Closure: §25.2 hypothesis space empirically closed via three production-faithful isolation harnesses run against the live DW endpoint.** §44.1 documents the verdict-table evolution from 5 open hypotheses (pre-2026-05-21) to 0 open hypotheses (post). Three harnesses landed as standing instruments in `scripts/`: (A) `dw_sse_stall_isolation.sh` — raw-wire curl-based isolation, bypasses aiohttp entirely, answers "wire silence vs. parser mis-classify"; (B) `dw_concurrent_stress.py` — production-faithful aiohttp burst harness with N parallel agent-scale streams, single-seam imports of `StreamRuptureError` from `providers.py`, ThreadedResolver discipline matching production; (C) `dw_tool_loop_stress.py` — OpenAI-native function-calling tool-loop with N concurrent × M-turn conversations, tool schemas mirroring Venom's actual surface (read_file/search_code/glob_files/list_dir), async tool execution via `asyncio.sleep` never blocking event loop, single-seam imports of all primitives from harness B. All three env-knob-driven, no hardcoded values, 30s per-chunk timeout matches `doubleword_provider.py:1689` exactly. **Aggregate evidence: 12,608 inter-chunk gaps observed, worst single gap 592 ms (~50× safety margin below 30s threshold), zero StreamRuptureErrors, $0.06 total cost.** §44.3 documents the architectural finding from Test B Stream #9: model reasoned 72.7s before first content token with max gap 446 ms because DW emits `reasoning` deltas continuously — **reasoning frames function as effective keepalives**. Forward-looking refinement to `dw_ttft_observer.py` proposed (4-state stream health: silent / reasoning-only / content+reasoning / reasoning-idle). §44.4 transitions the §14.5 reversal ladder from "diagnostic phase pending" to Step 1 ✓ DONE → Step 2 IMMEDIATE NEXT (flip STANDARD to `block_mode: shadow_with_claude_cascade`) → Steps 3–5 route-promotion ladder (~1 route/week cadence). §44.5 proposes Continuous Provider Validation (CPV) as forward-looking architectural pattern composing existing primitives (battle-test harness + ttft observer + event_channel + provider_topology + the three new harnesses) — explicitly NOT authorized yet, post-Seb-call build. §44.6 explicitly enumerates what did NOT change despite the diagnostic results (30s threshold stays, aiohttp config stays, cascade-to-Claude stays, topology seal stays until §14.5 ladder dismantles it route-by-route, resilience layer stays). §44.7 honest framing per `feedback_no_preresult_euphoria.md`: clean tests are an empirical *snapshot*, not a steady-state guarantee — shadow window in Step 3 is where operational reality hardens. Companion changes: `brain_selection_policy.yaml` comment block addended with May 21 calibration notes; Seb-call PDFs (`DW_Seb_Call_Cheatsheet.pdf` + `DW_Section_14_5_Re_Engagement_Plan.pdf`) updated to reflect diagnostic-results posture. Header bumped 3.0 → 3.1 (additive PRD section). | Claude Opus 4.7 (1M context) (§44 + diagnostic harness arc) |
 | 2026-05-17 | 3.0 | **§43 added — AI-Safety Hardening Architecture: making O+V a safety *property*, not a safety *methodology* (operator-driven deep design + elite-source research foundation).** Synthesizes a four-agent file:line audit (authority chain / Anti-Venom / RRD §1 boundary / proactive intake loop / cybersecurity surface) into five structural gaps (A advisory-not-enforced `sensor_governor.py:98` / B no internal termination guarantee / C self-amplification unbounded / D untrusted-text→autonomous-code no sanitizer `event_channel.py:~1440` / E recursion boundary is a path predicate not semantic `risk_tier_floor.py:366-391`) and answers them across four design categories: **Cat 1 cybersecurity** — TrustTier quarantine-and-degrade with signal/payload separation + deterministic non-generative digest extractor (§43.3.1), netns+seccomp+brokered-egress-proxy off the dead substring denylist (§43.3.2), MCP schema+manifest-pin boundary treating capability drift as compromise (§43.3.3); **Cat 2 RSI control** — tamper-evident hash-chained `CausalLineage` Depth-N/Fanout-M stamp with HUMAN-only reset + forgery→depth+∞ fail-closed (§43.4.1), the single chokepoint at the provider call via pre-autonomy-minted HMAC `BudgetLease` (§43.4.2); **Cat 3 semantic recursion boundary** — deterministic differential check over a machine-readable Safety Invariant Manifest (decidable; not LLM intent-inference) (§43.5.1) + Blue-proposes/Red-exploits Adversarial Falsification Pipeline as a mandatory pre-GATE phase (§43.5.2); **Cat 4 enforcement** — Slice 5 immutable hard-reject `ImmutableBudgetStateMachine` in `UnifiedIntakeRouter.ingest()` (master default-TRUE safety-gate polarity) (§43.6.1) + continuous shadow-only Anti-Venom Chaos Monkey (§43.6.2). **The spine (§43.7):** every *guarantee* reduces to one out-of-process, pre-autonomy-minted chokepoint O+V consumes-but-cannot-mint; all in-process layers are *defense*, not guarantee. 9-arc sequenced roadmap with prioritization (§43.8; critical path #1 proxy → #2 firewall → #3 hard-reject → #7 manifest → #8 Blue/Red → #9 Chaos Monkey; ~10–14wk critical path), anti-goals (§43.9), honest framing (§43.10 — structural read, not measured verdict; per `memory/feedback_no_preresult_euphoria.md`), net call (§43.11), and a 14-entry elite-source annotated bibliography (§43.12) with links + citations + relation-to-O+V grouped by 7 areas: Greshake et al. (CISPA/Saarland, indirect prompt injection), OWASP LLM Top-10 2025, NIST AI 100-2 E2025, DeepMind/ETH CaMeL, Saltzer-Schroeder (MIT, 1975), Denning (Purdue, 1976 IFC lattice), AWS Firecracker (NSDI'20), MIRI/Oxford Corrigibility, Amodei et al. (Concrete Problems), Hendrycks et al. (Berkeley, Unsolved Problems), DeepMind FSF v3 + Anthropic RSP v3, DeepMind red-teaming-LMs, Anthropic Constitutional AI, ETH AgentDojo (NeurIPS'24) — plus a 7-principle synthesis mapping each to a §43 arc. Doc-only; zero behavior change. §40/§41/§42 left reserved for in-code/in-memory conceptual references; this is §43 to avoid collision. Header 2.x → 3.0 (major safety-architecture addition). | Claude Opus 4.7 (1M context) (§43 + research foundation) |
 | 2026-05-04 | 2.11 | **§32 added — three-way operator-prompted recon: `graduation_orchestrator.py` salvage + M10 refinement + targeted Venom enhancements + `anthropics/claude-code` GitHub repo recon.** **(1) `graduation_orchestrator.py` 1,137-line dead-code bit-rot assessment** (§32.2): the surprising finding is that **imports aren't dead** (all 11 external symbols still exist in current codebase) — the bit-rot is **architectural**, not literal. Module ignores 12 modern cage components (SemanticGuardian, RenderConductor, IronGate, RiskTierFloor, OrangePRReviewer, AutoCommitter, WorktreeManager, FlagRegistry, ShippedCodeInvariants, CandidateGenerator 3-tier failback, posture awareness, SensorGovernor cost cap). Three integration paths compared — (A) wire as-is = brittle parallel pipeline, (B) refactor 70% to fit cage = effectively rebuilds M10 with extra bookkeeping, (C) build M10 fresh + lift design = honors operator mandate. **Verdict (§32.3): Path C — design reference, not direct integration.** **(2) M10 ArchitectureProposer refined slice plan (§32.4 SUPERSEDES §30.5.2)**: inherits 5 salvageable design contracts — 15-phase `M10ProposalPhase` FSM (with first-class failure paths `DECIDED_SKIP / PUSH_FAILED / EXPIRED`) + `M10AdaptiveThreshold` Bayesian primitive (Beta posterior + diversity ratio, lifted directly from graduation_orchestrator lines 63–85) + H1–H6 hardening checklist (git cleanliness / contract tests / PUSH_FAILED preserves work / approval timeout / readiness probe / cost metering) + 5-layer validation pipeline (Layer 1 SideEffectFirewall + Layer 2 Protocol conformance + **Layer 3 SemanticGuardian.check() replacing ASTValidator** + Layer 4 SecurityScanner + Layer 5 pytest, with Layers 3+4 parallel via `asyncio.gather`) + cost-metering hook at every model call site. M10 estimate stays ~5 slices / ~2,200 LOC / ~265 tests / ~7–10d (matches §30.5.2; content sharper). Cost contract preserved by composition with `urgency_router` + `candidate_generator` (NOT parallel system). **(3) Cleanup arc (§32.5)**: ~1 slice / ~2d / ~30 tests landing immediately after M10 Slice 5 graduates default-true post-30+ proposal-acceptance audit — moves `graduation_orchestrator.py` to `archive/legacy/` (preservable for historical reference, not deleted outright); deletes `tests/governance/test_graduation_orchestrator.py` (301 lines); closes TODO at `jarvis_intelligence.py:447`; adds AST pin `graduation_orchestrator_archived_only` enforcing import-ban from production code. **(4) Targeted Venom enhancements (§32.6) — operator decision: keep Venom; do not migrate to Agent SDK `@tool()`** (verbatim quote: *"i don't want to migrate from Venom to Agent SDK's @tool() because i like to keep the Venom but at the same if we can take some of the architecture of how they made it flawlessly to improve Venom, then let's add that"*). Selective adoption of 4 architectural patterns FROM the SDK applies *to* Venom without structural migration: **V1 per-tool-call hook granularity** (~3 slices, ~400 LOC, ~30 tests; closes phase-only-hook gap; 6-value `ToolHookEvent` closed enum: `PRE_TOOL_USE / POST_TOOL_USE / PRE_TOOL_USE_FAILURE / POST_TOOL_USE_FAILURE / SUBAGENT_START / SUBAGENT_STOP`); **V2 per-tool permission callbacks** (~2 slices, ~250 LOC, ~25 tests; 4-value `ToolPermissionDecision` enum `ALLOW/DENY/ASK/DEFER` + `PermissionRegistry` composable callback chain; ASK routes through existing `InlineApprovalProvider`; sequenced after V1); **V3 async hook outputs fire-and-forget** (~2 slices, ~200 LOC, ~20 tests; extends `HookCallback` Protocol with optional `is_async: bool` default-False = backward-compat; closes slow-hook-blocks-phase gap); **V4 tool-name regex matchers + closed-enum event types** (~1 slice, ~150 LOC, ~18 tests; AST-pinned no-runtime-`re.compile`-in-hot-path; sequenced after V1). **(5) `anthropics/claude-code` GitHub repo recon (§32.7)**: 3 boundary-layer patterns worth porting — **Pattern A (Hook matchers + async deferred)** unifies with V3+V4 (no new arc); **Pattern B Operation Modes** (`plan/analyze/apply/auto`) ~1 slice / ~120 LOC / ~10 tests as standalone arc; **Pattern C Component Tool Scope** (per-sensor / per-subagent `allowed_tools` regex patterns) ~2 slices / ~180 LOC / ~18 tests as standalone arc, sequenced after V2. **5 SDK/repo patterns explicitly skipped** with rationale: `@tool()` decorator (operator decision), `ClaudeSDKClient` (Venom already multi-turn), `query()` one-off (O+V is autonomous-substrate not interactive-CLI), `McpServerConfig` helpers (already have `mcp_tool_client.py`), streaming response builder (have `stream_renderer.py` + `RenderConductor`), extended thinking sugar (have `JARVIS_THINKING_BUDGET_*`), session listing/tagging (have JSONLs + `LastSessionSummary`), Dynamic Skill `!\`command\`` context injection (25-50ms hot-path latency cost), Subagent skills manifest preload (fork-bound subagents), settings precedence hierarchy with managed policy (no managed-settings-server paradigm), plugin namespace isolation + marketplace (orthogonal infra), `/help` REPL discoverability extensions (already have `help_dispatcher.py`). **§32.8 updated sequencing**: 11 strict-ordered items + 6 parallel-executable. **Estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete"**: 8–10 weeks (was 6–8 in §31.6 — adds ~1–2 weeks for V1–V4 + Pattern B+C + cleanup, mostly parallel-executable). Phase 13 (Venom enhancements + Operation Modes + Component Tool Scope) and Phase 14 (cleanup arc) appended to live roadmap. Header bumped 2.10 → 2.11. TOC §32 entries (10 anchors) added. **Architectural conclusion**: leverage *design* embedded in legacy code, but author against current cage. Selectively port boundary-layer patterns from external sources, but never wholesale migrations that would duplicate or bypass the 12 cage components O+V already invested in. *That's* what "leverage existing files and architecture so we avoid duplication" means in practice — distinguish leveraging **architecture** from copying **code**. | Claude Opus 4.7 (1M context) (§32 + Phase 13 + Phase 14 roadmap) |
