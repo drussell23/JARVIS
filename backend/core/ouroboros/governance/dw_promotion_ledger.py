@@ -113,10 +113,20 @@ LEDGER_SCHEMA_VERSION = "dw_promotion.1"
 QUARANTINE_AMBIGUOUS_METADATA = "ambiguous_metadata"
 QUARANTINE_OPERATOR_DEMOTED = "operator_demoted"
 QUARANTINE_DEMOTED_FROM_BG = "demoted_from_bg"   # post-promotion failure
+# Slice 10B — operator-attested trusted promotion (bypasses the
+# prove-it ledger's 10-success requirement). When a model is seeded
+# via ``JARVIS_DW_TRUSTED_MODELS``, the ledger creates a record
+# with origin=``trusted_seed`` and ``promoted=True`` so the
+# classifier's ``is_promoted`` check passes from boot 0. This is
+# the operator's attestation that the model is known-good — used
+# to bootstrap DW catalog when the dw_catalog_classifier's
+# automatic discovery returns only ambiguous-metadata models.
+QUARANTINE_TRUSTED_SEED = "trusted_seed"
 _VALID_QUARANTINE_ORIGINS = frozenset({
     QUARANTINE_AMBIGUOUS_METADATA,
     QUARANTINE_OPERATOR_DEMOTED,
     QUARANTINE_DEMOTED_FROM_BG,
+    QUARANTINE_TRUSTED_SEED,
 })
 
 
@@ -279,43 +289,120 @@ class PromotionLedger:
     def load(self) -> None:
         """Load from disk. Missing file = empty ledger; corrupt =
         log + start empty (caller might want to know but lifecycle
-        continues). NEVER raises."""
+        continues). NEVER raises.
+
+        Slice 10B — after loading persisted records, seed any
+        operator-attested trusted models from
+        ``JARVIS_DW_TRUSTED_MODELS`` (comma-separated). Trusted seeds
+        are force-promoted (bypassing the 10-success ledger gate)
+        with origin=``trusted_seed`` so the classifier's
+        ``is_promoted`` check passes from boot 0. Disk records
+        always take precedence over the env seed — if a model is
+        already on disk as demoted/quarantined, the env seed does
+        NOT override it (operator must clear the disk record first
+        to re-seed). Use case: bootstrap DW catalog when the
+        ``dw_catalog_classifier`` returns only ambiguous-metadata
+        models (typical of fresh installs / sparse provider metadata).
+        """
         with self._lock:
             self._loaded = True
             p = self._resolved_path()
-            if not p.exists():
-                return
-            try:
-                payload = json.loads(p.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.warning(
-                    "[PromotionLedger] corrupt or unreadable ledger at %s — "
-                    "starting empty (%s)", p, exc,
-                )
-                return
-            if not isinstance(payload, Mapping):
-                return
-            if payload.get("schema_version") != LEDGER_SCHEMA_VERSION:
-                logger.warning(
-                    "[PromotionLedger] schema mismatch at %s "
-                    "(found=%r expected=%r) — starting empty",
-                    p, payload.get("schema_version"), LEDGER_SCHEMA_VERSION,
-                )
-                return
-            records_raw = payload.get("records", [])
-            if not isinstance(records_raw, list):
-                return
-            loaded = 0
-            for r in records_raw:
-                if not isinstance(r, Mapping):
-                    continue
-                rec = PromotionRecord.from_json_dict(r)
-                if rec is not None:
-                    self._records[rec.model_id] = rec
-                    loaded += 1
-            logger.info(
-                "[PromotionLedger] loaded %d record(s) from %s", loaded, p,
+            if p.exists():
+                try:
+                    payload = json.loads(p.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError) as exc:
+                    logger.warning(
+                        "[PromotionLedger] corrupt or unreadable ledger at %s — "
+                        "starting empty (%s)", p, exc,
+                    )
+                    payload = None
+                if payload is None or not isinstance(payload, Mapping):
+                    pass
+                elif payload.get("schema_version") != LEDGER_SCHEMA_VERSION:
+                    logger.warning(
+                        "[PromotionLedger] schema mismatch at %s "
+                        "(found=%r expected=%r) — starting empty",
+                        p, payload.get("schema_version"), LEDGER_SCHEMA_VERSION,
+                    )
+                else:
+                    records_raw = payload.get("records", [])
+                    if isinstance(records_raw, list):
+                        loaded = 0
+                        for r in records_raw:
+                            if not isinstance(r, Mapping):
+                                continue
+                            rec = PromotionRecord.from_json_dict(r)
+                            if rec is not None:
+                                self._records[rec.model_id] = rec
+                                loaded += 1
+                        logger.info(
+                            "[PromotionLedger] loaded %d record(s) from %s",
+                            loaded, p,
+                        )
+            # Slice 10B — seed operator-attested trusted models
+            # (after disk load so persisted records win on conflict).
+            self._seed_trusted_models_from_env()
+
+    def _seed_trusted_models_from_env(self) -> None:
+        """Slice 10B — seed PromotionRecord entries for trusted models
+        listed in ``JARVIS_DW_TRUSTED_MODELS`` (comma-separated). Each
+        new entry is force-promoted with origin=``trusted_seed``.
+
+        Operator binding: bootstrap DW catalog when discovery returns
+        sparse metadata (the bt-2026-05-25-215404 cost catastrophe
+        root). The 7 DW→Claude fallback events in that soak were
+        caused by ``background_dw_blocked_by_topology: catalog
+        purged`` — every discovered model failed
+        ``has_ambiguous_metadata`` and pinned to SPECULATIVE-only.
+        Trusted models bypass that gate from boot 0.
+
+        Discipline:
+          * Disk records ALWAYS take precedence. If a model already
+            has a record (promoted, demoted, or quarantined), the env
+            seed is silently skipped for that model. Operator must
+            clear the disk record to re-seed.
+          * Empty/unset env → no-op. Existing behavior byte-equivalent
+            to pre-Slice-10B.
+          * NEVER raises — env parse failures degrade to empty list.
+          * Caller responsibility: ``JARVIS_DW_TRUSTED_MODELS=...``
+            is an operator attestation; if the listed model_ids
+            don't exist on the DW endpoint, the classifier will
+            simply find no card for them and the seed is harmless
+            (no provider call ever lands on a phantom model).
+        """
+        raw = os.environ.get("JARVIS_DW_TRUSTED_MODELS", "").strip()
+        if not raw:
+            return
+        # Comma-separated; tolerate whitespace + empty tokens
+        candidates = [
+            tok.strip() for tok in raw.split(",") if tok.strip()
+        ]
+        if not candidates:
+            return
+        seeded = 0
+        for mid in candidates:
+            if mid in self._records:
+                # Disk record wins — silently skip the env seed.
+                continue
+            rec = PromotionRecord(
+                model_id=mid,
+                quarantine_origin=QUARANTINE_TRUSTED_SEED,
+                success_latencies_ms=[],
+                failure_count=0,
+                promoted=True,  # bypass 10-success requirement
+                promoted_at_unix=time.time(),
+                last_event_unix=time.time(),
             )
+            self._records[mid] = rec
+            seeded += 1
+        if seeded > 0:
+            logger.info(
+                "[PromotionLedger] Slice 10B: seeded %d trusted model(s) "
+                "from JARVIS_DW_TRUSTED_MODELS — these bypass the "
+                "10-success prove-it requirement (origin=trusted_seed)",
+                seeded,
+            )
+            self._maybe_autosave()
 
     def save(self) -> None:
         """Write current state to disk atomically. NEVER raises;
