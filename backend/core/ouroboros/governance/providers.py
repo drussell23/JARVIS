@@ -4718,6 +4718,35 @@ class PrimeProvider:
                 "loop kept active (mutation tools refused by policy Rule 0d)",
                 _route,
             )
+        # ──────────────────────────────────────────────────────────────
+        # Slice 9 — L2 single-shot fast path
+        # (bt-2026-05-25-211028 root: L2's _generate_repair_candidate
+        # was deterministically bailing inside the tool loop with
+        # ``tool_loop_starved_below_min_ttft_floor:projected=9.69s
+        # min_ttft_floor=45s`` because the L2 op budget (97s remaining
+        # with 1 round_left) clamped per_round_timeout to max_per_round_s
+        # which sat just below the effective floor (9.69 < 10).
+        # Both Slice 6.1 re-dispatches hit the same wall.)
+        #
+        # L2 has all context it needs in the prompt (target file,
+        # failing test output, prior critique) — it needs SYNTHESIS,
+        # not multi-turn EXPLORATION. Spinning up Venom for a micro-fix
+        # is a category error: the model would never call a tool.
+        #
+        # Hook: when ``repair_context is not None``, the caller is L2's
+        # _generate_repair_candidate (the only call site that passes
+        # this parameter — verified by repo-wide grep). Force-skip the
+        # tool loop unconditionally on this path. The model receives
+        # the full L2 prompt and produces a patch in a single turn,
+        # completely bypassing the BudgetPlan.is_next_round_viable gate.
+        # ──────────────────────────────────────────────────────────────
+        if repair_context is not None and not _skip_tools:
+            logger.info(
+                "[PrimeProvider] L2 repair_context detected — Slice 9 "
+                "single-shot fast path: skipping Venom tool loop "
+                "(L2 synthesizes from prompt, no tool exploration needed)"
+            )
+            _skip_tools = True
 
         tool_records: tuple = ()
         venom_edits: Tuple[Dict[str, Any], ...] = ()
@@ -8499,6 +8528,20 @@ class ClaudeProvider:
                 "loop kept active (mutation tools refused by policy Rule 0d)",
                 _route,
             )
+        # ──────────────────────────────────────────────────────────────
+        # Slice 9 — L2 single-shot fast path (ClaudeProvider mirror)
+        # See PrimeProvider block at providers.py:4710 for full
+        # rationale. When repair_context is not None the caller is
+        # L2's _generate_repair_candidate; skip Venom unconditionally
+        # so the model produces the patch in a single turn (no tool
+        # rounds = no tool_loop_starved_below_min_ttft_floor bail).
+        # ──────────────────────────────────────────────────────────────
+        if repair_context is not None and not _skip_tools:
+            logger.info(
+                "[ClaudeProvider] L2 repair_context detected — Slice 9 "
+                "single-shot fast path: skipping Venom tool loop"
+            )
+            _skip_tools = True
 
         # Zero-Waste S1 (D2) cache gate. Eligible only when the
         # provider-response cache is enabled AND no tool loop will

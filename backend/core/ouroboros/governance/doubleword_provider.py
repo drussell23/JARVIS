@@ -1658,6 +1658,21 @@ class DoublewordProvider:
             _complexity in ("trivial", "simple")
             or should_skip_venom_for_route(str(_route))
         )
+        # ──────────────────────────────────────────────────────────────
+        # Slice 9 — L2 single-shot fast path (DW mirror)
+        # See PrimeProvider providers.py:4710 for full rationale.
+        # bt-2026-05-25-211028 deterministic tool_loop_starved bail
+        # also affects DW when L2 routes to it. ``repair_context``
+        # presence signals L2's _generate_repair_candidate is the
+        # caller (Slice 8 made the kwarg accepted; Slice 9 routes
+        # L2 around the tool loop entirely).
+        # ──────────────────────────────────────────────────────────────
+        if repair_context is not None and not _will_skip_tools:
+            logger.info(
+                "[DoublewordProvider] L2 repair_context detected — Slice 9 "
+                "single-shot fast path: skipping Venom tool loop"
+            )
+            _will_skip_tools = True
         _tools_available = self._tool_loop is not None and not _will_skip_tools
         _preloaded_files: List[str] = []
         if prompt_override:
