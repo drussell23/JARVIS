@@ -214,21 +214,23 @@ def test_spine_is_next_round_viable_true_with_ample_budget(
     plan_with_default_floor,
 ) -> None:
     """With 600s remaining and 10 rounds left, the per_round_timeout
-    clamps to max_per_round_s=30s — which is below min_ttft_floor=45s.
+    clamps to max_per_round_s=30s.
 
-    EXPECTED: False (round not viable — coordinator should stop and
-    force final-write before starting another doomed round).
+    Post-Slice-3B.1 (self-tuning): the effective floor is
+    ``min(min_ttft_floor=45, max_per_round=30) = 30``. The clamped
+    per_round_timeout (30s) satisfies the effective floor (30s).
+    Round is viable.
 
-    This is the LOAD-BEARING insight: the default max_per_round_s=30s
-    is BELOW the empirical min_ttft_floor=45s, so the coordinator
-    will be more conservative about starting new rounds. This is the
-    INTENDED behavior — the alternative (start a 30s round and have
-    it murdered) is what Slice 3B is fixing.
+    Pre-Slice-3B.1 over-fire behavior is now structurally fixed —
+    when the operator's max_per_round_s is the dominant clamp, the
+    gate defers to it as the effective floor rather than firing on
+    the global min_ttft_floor that exceeds the operator's ceiling.
     """
     plan = plan_with_default_floor
     # per_round_timeout = clamp((600 - 10) / 10, 3, 30) = 30s
-    # is_next_round_viable: 30s >= 45s? False
-    assert plan.is_next_round_viable(remaining_s=600.0, remaining_rounds=10) is False
+    # effective_floor = min(45, 30) = 30s
+    # 30s >= 30s → viable
+    assert plan.is_next_round_viable(remaining_s=600.0, remaining_rounds=10) is True
 
 
 def test_spine_is_next_round_viable_true_with_few_rounds_left(
