@@ -875,7 +875,30 @@ class RepairEngine:
             # CLASSIFY FAILURE
             # ----------------------------------------------------------------
             classification = self._classifier.classify(svr)
-            if classification.is_non_retryable:
+            # ── Slice 4A — L2-local hard-stop subtype narrowing ──
+            # Closes the bt-2026-05-25-091657 L2-after-1-iter trap:
+            # the failure_classifier flags ``missing_dependency`` and
+            # ``interpreter_mismatch`` as non_retryable for ALL
+            # consumers — sensible for general callers (the operator's
+            # environment IS broken, no LLM can pip-install). But in
+            # L2 repair context the model just edited imports/code in
+            # the worktree, so ``ModuleNotFoundError`` is almost
+            # always a CODE issue the next iteration can fix. The
+            # global classifier semantic is preserved (other consumers
+            # still see is_non_retryable=True); L2 narrows its OWN
+            # hard-stop set to subtypes that no patch could resolve:
+            # ``permission_denied`` and ``port_conflict`` (truly
+            # environmental — wrong umask, OS-level binding, etc.).
+            # ``missing_dependency`` and ``interpreter_mismatch`` fall
+            # through to the normal per-class retry path so L2 uses
+            # its iteration budget to fight through them.
+            _L2_HARD_STOP_ENV_SUBTYPES = frozenset({
+                "permission_denied", "port_conflict",
+            })
+            if (
+                classification.is_non_retryable
+                and classification.env_subtype in _L2_HARD_STOP_ENV_SUBTYPES
+            ):
                 return _stopped(f"non_retryable_env:{classification.env_subtype}")
 
             fail_class = classification.failure_class.value
