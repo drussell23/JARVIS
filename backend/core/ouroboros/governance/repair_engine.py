@@ -1178,6 +1178,41 @@ class RepairEngine:
                 stop_reason=f"provider_iter_timeout:{_effective_timeout_s:.1f}s",
             )
         except Exception as exc:  # noqa: BLE001 — Protocol contract
+            # ──────────────────────────────────────────────────────────
+            # Slice 7 — total observability for L2 generation failures
+            # (bt-2026-05-25-203830 root: Slice 6.1 proved both L2
+            # dispatches threw IDENTICAL `generate_error:TypeError` on
+            # iter 2's _prime.generate call. The exception class was
+            # logged but the actual TypeError message, file, line, and
+            # stack frames were swallowed silently by this handler —
+            # operators had no way to see WHAT was actually broken in
+            # the provider chain. Manifesto §8 violation.)
+            #
+            # Fix: log full traceback at ERROR level BEFORE returning
+            # the quarantined CandidateGenerationResult. ``logger.
+            # exception`` captures exc_info automatically; we include
+            # the op_id (when available on ctx) plus the exception
+            # CLASS + MESSAGE in the structured message so grep can
+            # attribute the failure to a specific op.
+            #
+            # The contract is preserved verbatim: still returns
+            # CandidateGenerationResult(candidate=None,
+            # stop_reason=f"generate_error:{TypeName}"). Slice 5A's
+            # provider_iter_timeout path stays intact. Slice 6/6.1's
+            # l2_retry classification still consumes the stop_reason
+            # identically. Pure diagnostic addition — zero behavior
+            # change to the FSM.
+            # ──────────────────────────────────────────────────────────
+            _op_id_for_log = getattr(ctx, "op_id", "<unknown>")
+            _logger.error(
+                "[L2 Repair] _generate_repair_candidate raised %s: %s "
+                "(op=%s) — quarantining as generate_error stop_reason; "
+                "full traceback follows",
+                type(exc).__name__,
+                str(exc) or "(no message)",
+                _op_id_for_log,
+                exc_info=True,
+            )
             return CandidateGenerationResult(
                 candidate=None,
                 model_id=None,
