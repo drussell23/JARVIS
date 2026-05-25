@@ -78,19 +78,30 @@ def test_ast_pin_candidate_fallback_target_derivation() -> None:
     ``micro_fix_skipped_no_target`` and the retry FSM degenerates to
     a single attempt at L2 dispatch with no working target."""
     src = VALIDATE_RUNNER_FILE.read_text()
-    # The fallback construct is unique enough to grep for verbatim
-    assert (
-        "if not _repair_target and best_candidate is not None:" in src
-    ), (
+    # Slice 3H's fallback was originally a single ``best_candidate``
+    # check. Slice 3H.1 expanded it to a two-step chain
+    # (``best_candidate`` → ``generation.candidates[0]``) because
+    # best_candidate is only set on PASSED validations and micro-fix
+    # runs on FAILED ones. The outer predicate is now ``if not
+    # _repair_target:`` with a nested fallback chain inside.
+    assert "if not _repair_target:" in src, (
         "validate_runner.py is missing the Slice 3H candidate-derived "
-        "repair-target fallback. SWE-Bench-Pro ops will continue to "
-        "skip micro-fix and exhaust retries on unfixed errors."
+        "repair-target fallback outer predicate. SWE-Bench-Pro ops "
+        "will continue to skip micro-fix and exhaust retries."
+    )
+    # At minimum the fallback chain must consult best_candidate (the
+    # Slice 3H Part 1 contract — strengthened by Slice 3H.1 with an
+    # additional ``generation.candidates`` branch tested in its own
+    # AST pin file).
+    assert "if best_candidate is not None:" in src, (
+        "validate_runner.py does not check best_candidate in fallback "
+        "chain — Slice 3H Part 1 contract broken."
     )
     assert (
-        'best_candidate.get("file_path", "") or ""' in src
+        '_fallback_cand.get("file_path", "") or ""' in src
     ), (
         "validate_runner.py does not extract file_path from "
-        "best_candidate — Slice 3H candidate-contract consumption broken."
+        "_fallback_cand — Slice 3H candidate-contract consumption broken."
     )
     # The FSM tag is the operator's grep handle for diagnosing
     # whether this path fired in a given soak.
