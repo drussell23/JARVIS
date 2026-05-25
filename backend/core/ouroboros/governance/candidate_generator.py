@@ -4444,10 +4444,64 @@ class CandidateGenerator:
                         # if the exception didn't carry records (legacy
                         # provider, untagged path), getattr returns (),
                         # extend is a no-op, behavior matches pre-Slice-3C.
+                        #
+                        # Slice 3D (2026-05-24) — coordinator-attribute
+                        # fallback. The Slice 3C exception attachment only
+                        # fires on raises through ToolLoopCoordinator's
+                        # ``_attach_tool_records`` sites. When the outer
+                        # ``_race_or_wait_for(... timeout=_attempt_remaining)``
+                        # hits its deadline, it raises asyncio.TimeoutError
+                        # / CancelledError that DOES NOT traverse the tool
+                        # executor's raise sites — the records sit untouched
+                        # in ``coordinator._last_records``. The
+                        # bt-2026-05-25-041717 attempt 1: 244.2s tool loop
+                        # made 13+ tool calls then the outer race timed
+                        # out; Slice 3C harvested nothing because the
+                        # TimeoutError was opaque; Iron Gate saw 0/2 on
+                        # the final attempt and the cumulative exploration
+                        # was lost.
+                        #
+                        # Fallback path: when the exception carries no
+                        # records, read directly from the coordinator's
+                        # instance attribute. ``_last_records`` is reset to
+                        # ``[]`` at every ``run()`` start (tool_executor.py
+                        # line 5250) and re-populated at each round
+                        # boundary, so at except-block time it reflects
+                        # exactly the just-failed attempt's records — no
+                        # cross-attempt double-counting.
                         try:
                             _harvested = getattr(
                                 inner_exc, "tool_execution_records", (),
                             ) or ()
+                            if not _harvested:
+                                # Slice 3D fallback — coordinator probe.
+                                # Defensive getattr chain: any provider
+                                # without ``_tool_loop`` (tools disabled
+                                # config) or coordinator without
+                                # ``_last_records`` (legacy/test stub)
+                                # falls through to empty harvest.
+                                _coord = getattr(
+                                    self._fallback, "_tool_loop", None,
+                                )
+                                if _coord is not None:
+                                    _harvested = tuple(
+                                        getattr(
+                                            _coord, "_last_records", (),
+                                        ) or ()
+                                    )
+                                    if _harvested:
+                                        logger.info(
+                                            "[CandidateGenerator] Slice 3D: "
+                                            "harvested %d records from "
+                                            "coordinator._last_records "
+                                            "(exception %s carried 0; "
+                                            "fallback succeeded) op=%s",
+                                            len(_harvested),
+                                            type(inner_exc).__name__,
+                                            getattr(
+                                                context, "op_id", "?",
+                                            )[:16],
+                                        )
                             if _harvested:
                                 _carryover_tool_records.extend(_harvested)
                         except Exception:  # noqa: BLE001 — never block retry
