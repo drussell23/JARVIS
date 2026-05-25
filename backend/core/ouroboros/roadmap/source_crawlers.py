@@ -43,6 +43,92 @@ def _extract_title(content: str, path: Path) -> str:
     return path.stem
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Slice 3F — Async Engine Hardening
+# ──────────────────────────────────────────────────────────────────────
+#
+# Closes bt-2026-05-25-050449 wedge: ``crawl_rust_subsystems`` used
+# ``Path.rglob("Cargo.toml")`` which walks the ENTIRE directory tree
+# (recurses INTO ``target/``, ``node_modules/``, ``.git/`` then filters
+# them out AFTER walking). On this repo: ~50,664 dirs to walk vs 4,068
+# if pruned — the rglob took ~914s and wedged the asyncio event loop
+# until LoopDeadman fired ``os._exit(75)``.
+#
+# Slice 3B's ``_chunk_timeout`` watchdog DID NOT fire because
+# ``asyncio.wait_for`` schedules its timer on the event loop — when the
+# loop itself is wedged in synchronous I/O, the timer callback never
+# runs. Time-based defenses are unconditionally defeated by event-loop
+# wedges; the structural cure is to never block the loop in the first
+# place.
+#
+# This helper replaces the offending ``rglob`` with ``os.walk()`` plus
+# in-place ``dirnames[:]`` pruning so skip dirs are NEVER descended
+# into. Adds a bounded ``max_walk_s`` deadline as defense-in-depth
+# (returns partial results gracefully on overrun — better a truncated
+# crate map than a 914s wedge). Pure-sync function with deterministic
+# behavior; safe to call from sync code (its on-thread cost is now
+# bounded).
+
+_DEFAULT_CRAWL_MAX_WALK_S = 10.0
+
+
+def _crawl_max_walk_s() -> float:
+    """``JARVIS_STRATEGIC_CRAWL_MAX_WALK_S`` — per-walk deadline.
+
+    Default 10s. The walk should complete in well under 1s on any
+    healthy repo (pruning skip dirs makes the work proportional to
+    first-party source dirs only). The 10s budget is a generous
+    safety net for misconfigured / pathological repos.
+    """
+    raw = os.environ.get(
+        "JARVIS_STRATEGIC_CRAWL_MAX_WALK_S",
+        str(_DEFAULT_CRAWL_MAX_WALK_S),
+    )
+    try:
+        return max(0.5, float(raw))  # floor at 0.5s — never accept 0
+    except (TypeError, ValueError):
+        return _DEFAULT_CRAWL_MAX_WALK_S
+
+
+def _walk_for_filename(
+    search_root: Path,
+    filename: str,
+    skip_dirnames: frozenset[str],
+    max_walk_s: float,
+) -> List[Path]:
+    """Walk ``search_root`` collecting paths to files named ``filename``.
+
+    Prunes ``skip_dirnames`` IN-PLACE via the ``os.walk`` dirnames
+    list — descent into those subtrees is structurally prevented, not
+    filtered post-hoc (the bt-2026-05-25-050449 bug pattern).
+
+    Bounded by ``max_walk_s`` — returns whatever was collected so far
+    on deadline overrun. Operators can tune the deadline via
+    ``JARVIS_STRATEGIC_CRAWL_MAX_WALK_S``; the helper itself never
+    raises on overrun (a truncated crate map is a graceful degradation).
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("Ouroboros.SourceCrawlers")
+    matches: List[Path] = []
+    deadline = time.monotonic() + max_walk_s
+    overrun = False
+    for dirpath, dirnames, filenames in os.walk(search_root):
+        if time.monotonic() > deadline:
+            overrun = True
+            break
+        # In-place prune — os.walk() honors this for descent control.
+        dirnames[:] = [d for d in dirnames if d not in skip_dirnames]
+        if filename in filenames:
+            matches.append(Path(dirpath) / filename)
+    if overrun:
+        _logger.warning(
+            "[source_crawlers] walk for %r exceeded max_walk_s=%.1fs "
+            "(collected %d so far) — returning partial results",
+            filename, max_walk_s, len(matches),
+        )
+    return sorted(matches)
+
+
 def _extract_summary(content: str, max_len: int = 500) -> str:
     """Return the first *max_len* characters of *content* (stripped)."""
     return content.strip()[:max_len]
@@ -277,16 +363,25 @@ def crawl_rust_subsystems(repo_root: Path) -> List[SnapshotFragment]:
     if not search_root.is_dir():
         return []
 
-    _SKIP = (
-        "/target/", "/.git/", "/worktrees/", "/.worktrees/",
-        "/node_modules/",
-    )
+    # Slice 3F — Async Engine Hardening. The pre-Slice-3F implementation
+    # used ``sorted(search_root.rglob("Cargo.toml"))`` which descends
+    # into EVERY directory and filters via ``_SKIP`` substring match
+    # AFTER the walk. On a JARVIS repo with 5 Rust ``target/`` dirs
+    # (~270MB each) + ``node_modules/`` (deeply nested), the walk took
+    # ~914s and wedged the asyncio event loop (bt-2026-05-25-050449).
+    #
+    # _walk_for_filename uses ``os.walk()`` with in-place ``dirnames[:]``
+    # pruning so the skip dirs are NEVER descended into — and adds a
+    # bounded ``max_walk_s`` deadline (env: JARVIS_STRATEGIC_CRAWL_MAX_WALK_S,
+    # default 10s) as defense-in-depth.
+    _SKIP_DIRNAMES = frozenset({
+        "target", ".git", "worktrees", ".worktrees", "node_modules",
+    })
     fragments: List[SnapshotFragment] = []
     seen_names: set[str] = set()
-    for cargo in sorted(search_root.rglob("Cargo.toml")):
-        cargo_str = str(cargo)
-        if any(s in cargo_str for s in _SKIP):
-            continue
+    for cargo in _walk_for_filename(
+        search_root, "Cargo.toml", _SKIP_DIRNAMES, _crawl_max_walk_s(),
+    ):
         try:
             cargo_text = cargo.read_text(encoding="utf-8", errors="replace")
         except OSError:
