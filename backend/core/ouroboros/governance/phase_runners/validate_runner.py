@@ -498,9 +498,65 @@ class VALIDATERunner(PhaseRunner):
                     provider=orch._generator,
                     project_root=orch._config.project_root,
                 )
-                _repair_target = list(ctx.target_files)[0] if ctx.target_files else None
+                # ── Slice 3H — repair-target derivation + envelope-override ──
+                # Closes the bt-2026-05-25-072558 VALIDATE_RETRY trap:
+                # the model wrote a real patch on lib/ansible/cli/doc.py
+                # but micro_fix logged ``micro_fix_skipped_no_target``
+                # because ``ctx.target_files`` is empty for SWE-Bench-Pro
+                # envelopes (per envelope_builder.py:307 — the envelope
+                # intentionally omits target_files since the worktree
+                # itself is the authoritative source). The repair loop
+                # had nothing to operate on, all validate iters hit
+                # the SAME unfixed error, retries exhausted, L2 fired
+                # and returned ``directive='cancel'``.
+                #
+                # Part 1 — when target_files is empty, derive the repair
+                # target from the candidate's own ``file_path`` (the
+                # field the model emits in every 2b.1 candidate; already
+                # consumed by gate_runner.py:305 + episodic_memory at
+                # line 342 above). This composes the existing 2b.1
+                # contract — no new envelope shape needed.
+                _repair_target = (
+                    list(ctx.target_files)[0] if ctx.target_files else None
+                )
+                if not _repair_target and best_candidate is not None:
+                    _cand_path = best_candidate.get("file_path", "") or ""
+                    if _cand_path:
+                        _repair_target = _cand_path
+                        _fsm_log(
+                            "micro_fix_target_from_candidate",
+                            f"file_path={_cand_path!r}",
+                        )
+                # Part 2 — resolve the repair file against the
+                # envelope's worktree (mirrors Slice 3G's tool-loop
+                # override). Without this, the absolute path
+                # ``orch._config.project_root / target`` resolves to
+                # the JARVIS repo even when the model is editing
+                # Ansible code in a SWE-Bench-Pro worktree. Composes
+                # the canonical
+                # ``operation_advisor.resolve_envelope_repo_root``
+                # (env-flag-gated, allowlist-validated, fail-silent);
+                # ``None`` result → use legacy ``project_root`` →
+                # byte-identical pre-Slice-3H behavior.
+                _repair_root: Path = orch._config.project_root
+                try:
+                    from backend.core.ouroboros.governance.operation_advisor import (
+                        resolve_envelope_repo_root as _slice3h_resolve_root,
+                    )
+                    _wt_override = _slice3h_resolve_root(
+                        getattr(ctx, "intake_evidence_json", "") or "",
+                        project_root=orch._config.project_root,
+                    )
+                    if _wt_override is not None:
+                        _repair_root = _wt_override
+                        _fsm_log(
+                            "micro_fix_root_envelope_override",
+                            f"root={_wt_override}",
+                        )
+                except Exception:  # noqa: BLE001 — never block micro-fix
+                    _repair_root = orch._config.project_root
                 if _repair_target:
-                    _repair_abs = orch._config.project_root / _repair_target
+                    _repair_abs = _repair_root / _repair_target
                     if _repair_abs.is_file():
                         _repair_content = _repair_abs.read_text(errors="replace")
                         _test_argv = ["python3", "-m", "pytest", "-x", "-q"]
