@@ -4748,6 +4748,25 @@ class PrimeProvider:
                 )
             except Exception:  # noqa: BLE001 — defensive
                 _eb_observer = None
+            # ── Slice 3G — envelope-override for per-op worktrees ──
+            # Mirrors the ClaudeProvider site below. SWE-Bench-Pro ops
+            # carry the per-instance worktree path via
+            # ``envelope.evidence.repo_root``; without this override the
+            # tool loop searches the host JARVIS repo (wrong codebase).
+            # Composes the canonical
+            # ``operation_advisor.resolve_envelope_repo_root`` resolver;
+            # None result → no override → byte-identical legacy behavior.
+            _evidence_override: Optional[Path] = None
+            try:
+                from backend.core.ouroboros.governance.operation_advisor import (
+                    resolve_envelope_repo_root as _resolve_evidence_root,
+                )
+                _evidence_override = _resolve_evidence_root(
+                    getattr(context, "intake_evidence_json", "") or "",
+                    project_root=self._repo_root,
+                )
+            except Exception:  # noqa: BLE001 — never block tool loop
+                _evidence_override = None
             try:
                 raw, tool_records_list = await self._tool_loop.run(
                     prompt=prompt,
@@ -4759,6 +4778,7 @@ class PrimeProvider:
                     risk_tier=getattr(context, "risk_tier", None),
                     is_read_only=_is_read_only,
                     per_round_observer=_eb_observer,
+                    repo_root_override=_evidence_override,
                 )
             finally:
                 # Idempotent close — no-op when master flag off.
@@ -8558,6 +8578,28 @@ class ClaudeProvider:
                 time.monotonic()
                 + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             )
+            # ── Slice 3G — envelope-override for per-op worktrees ──
+            # Closes bt-2026-05-25-060538 NOOP wiring gap: SWE-Bench-Pro
+            # ops carry their per-instance worktree path via
+            # ``envelope.evidence.repo_root``. Without this override the
+            # tool loop searches the host JARVIS repo (wrong codebase)
+            # and the model correctly emits ``2b.1-noop`` because the
+            # target file genuinely isn't there. Composes the canonical
+            # ``operation_advisor.resolve_envelope_repo_root`` resolver
+            # (env-flag-gated, allowlist-validated, fail-silent); no
+            # parallel path-validation, no shared-state mutation. None
+            # result → no override → byte-identical legacy behavior.
+            _evidence_override: Optional[Path] = None
+            try:
+                from backend.core.ouroboros.governance.operation_advisor import (
+                    resolve_envelope_repo_root as _resolve_evidence_root,
+                )
+                _evidence_override = _resolve_evidence_root(
+                    getattr(context, "intake_evidence_json", "") or "",
+                    project_root=self._repo_root,
+                )
+            except Exception:  # noqa: BLE001 — never block tool loop
+                _evidence_override = None
             raw, tool_records_list = await self._tool_loop.run(
                 prompt=prompt_text,
                 generate_fn=_generate_raw,
@@ -8567,6 +8609,7 @@ class ClaudeProvider:
                 deadline=deadline_mono,
                 risk_tier=getattr(context, "risk_tier", None),
                 is_read_only=bool(getattr(context, "is_read_only", False)),
+                repo_root_override=_evidence_override,
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)

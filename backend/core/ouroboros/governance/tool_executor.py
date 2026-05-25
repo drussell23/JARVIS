@@ -5254,6 +5254,22 @@ class ToolLoopCoordinator:
         # :func:`epistemic_budget_provider_bridge.attach_to_provider_run`'s
         # callback. Return value is ignored; exceptions are swallowed (never
         # propagate into the round loop).
+        repo_root_override: Optional[Path] = None,
+        # Slice 3G (2026-05-25) — envelope-override for per-op worktrees.
+        # When set, the tool loop's resolved ``repo_root`` honors this
+        # path instead of falling back to ``policy.repo_root_for(repo)``.
+        # The bt-2026-05-25-060538 NOOP autopsy proved that SWE-Bench-Pro
+        # ops carried the per-instance worktree path via
+        # ``envelope.evidence.repo_root`` but the ToolExecutor still
+        # resolved against the host JARVIS repo — the model's tool calls
+        # searched the wrong codebase and (correctly) emitted
+        # ``2b.1-noop: file not present in this repository``. The
+        # provider extracts the override via the existing canonical
+        # ``operation_advisor.resolve_envelope_repo_root`` helper
+        # (env-flag-gated, allowlist-validated, fail-silent) so this
+        # fix composes the same path-validation contract the Advisor
+        # already uses — no parallel resolver, no shared-state mutation.
+        # Default ``None`` preserves byte-identical legacy behavior.
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -5309,6 +5325,21 @@ class ToolLoopCoordinator:
         records: List[ToolExecutionRecord] = []
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
+        # ── Slice 3G — envelope-override for per-op worktrees ──
+        # When the caller supplies ``repo_root_override`` (provider has
+        # already resolved + path-validated via
+        # ``operation_advisor.resolve_envelope_repo_root``), honor it
+        # over the policy fallback. This closes the bt-2026-05-25-060538
+        # wiring gap: SWE-Bench-Pro ops now resolve tool calls against
+        # the per-instance worktree (where the actual problem code
+        # lives), not the host JARVIS repo (where the model found
+        # nothing and correctly NOOPed).
+        if repo_root_override is not None:
+            repo_root = Path(repo_root_override)
+            logger.info(
+                "[ToolLoop] op=%s repo_root override (Slice 3G): %s",
+                op_id[:12] if op_id else "?", repo_root,
+            )
 
         # Deadline-based loop: iterate until the provider produces a final
         # answer (no tool call) or the deadline expires. effective_max_rounds
