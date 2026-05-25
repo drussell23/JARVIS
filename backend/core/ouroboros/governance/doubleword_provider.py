@@ -1228,9 +1228,12 @@ class DoublewordProvider:
             _zw_eligible = (self._tool_loop is None) or _zw_will_skip
             if _zw_prompt is not None and _zw_eligible:
                 async def _dw_inner():
+                    # Slice 9.1 — thread repair_context (closure-captured
+                    # from the outer generate() scope, where it IS a parameter)
                     return await self._dispatch_internal(
                         context, deadline,
                         prompt_override=_zw_prompt,
+                        repair_context=repair_context,
                     )
 
                 try:
@@ -1285,8 +1288,11 @@ class DoublewordProvider:
         # dispatcher (RT + batch fall-back) verbatim — extracted into
         # _dispatch_internal so the gate's _dw_inner closure can call
         # the same code path without duplication.
+        # Slice 9.1 — thread repair_context for L2 single-shot.
         return await self._dispatch_internal(
-            context, deadline, prompt_override=prompt_override,
+            context, deadline,
+            prompt_override=prompt_override,
+            repair_context=repair_context,
         )
 
     async def _dispatch_internal(
@@ -1295,6 +1301,7 @@ class DoublewordProvider:
         deadline: Any = None,
         *,
         prompt_override: Optional[str] = None,
+        repair_context: Optional[Any] = None,  # Slice 9.1 — thread for L2 single-shot
     ) -> GenerationResult:
         """RT + batch dispatcher. Extracted from :meth:`generate` so
         the Zero-Waste S1 cache gate's ``_dw_inner`` thunk can
@@ -1340,7 +1347,12 @@ class DoublewordProvider:
         # cascading to the 150x more expensive Claude fallback.
         if self._realtime_enabled:
             try:
-                return await self._generate_realtime(context, deadline, prompt_override=prompt_override)
+                # Slice 9.1 — thread repair_context for L2 single-shot
+                return await self._generate_realtime(
+                    context, deadline,
+                    prompt_override=prompt_override,
+                    repair_context=repair_context,
+                )
             except DoublewordInfraError as exc:
                 if exc.status_code in (429, 503):
                     logger.info(
@@ -1603,6 +1615,7 @@ class DoublewordProvider:
         deadline: Any = None,
         *,
         prompt_override: Optional[str] = None,
+        repair_context: Optional[Any] = None,  # Slice 9.1 — L2 single-shot signal
     ) -> GenerationResult:
         """Generate code via DoubleWord real-time chat completions API.
 

@@ -190,6 +190,44 @@ def test_spine_route_based_skip_preserved_verbatim() -> None:
     )
 
 
+def test_spine_dw_dispatch_chain_threads_repair_context() -> None:
+    """Slice 9.1 regression — when Slice 9's guard lives in DW's
+    _generate_realtime (line 1670), the kwarg must be THREADED through
+    the entire dispatch chain or it raises NameError at runtime
+    (caught by Slice 7 traceback in bt-2026-05-25-213811).
+
+    All three DW functions in the dispatch chain must carry the
+    repair_context parameter:
+      generate() → _dispatch_internal() → _generate_realtime()
+    """
+    dw_file = (
+        REPO_ROOT / "backend" / "core" / "ouroboros" / "governance"
+        / "doubleword_provider.py"
+    )
+    tree = ast.parse(dw_file.read_text(), filename=str(dw_file))
+
+    chain_funcs = ("generate", "_dispatch_internal", "_generate_realtime")
+    found = {name: False for name in chain_funcs}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name in chain_funcs
+        ):
+            args = (
+                [a.arg for a in node.args.args]
+                + [a.arg for a in node.args.kwonlyargs]
+            )
+            if "repair_context" in args:
+                found[node.name] = True
+
+    missing = [name for name, ok in found.items() if not ok]
+    assert not missing, (
+        f"Slice 9.1 dispatch-chain threading broken: {missing} "
+        "missing repair_context parameter. NameError will fire "
+        "at runtime when L2 routes to DW."
+    )
+
+
 def test_spine_dw_carries_slice9_guard_too() -> None:
     """DoublewordProvider DOES run a Venom tool loop in its
     _generate_realtime path. Slice 9 must apply there too so L2's
