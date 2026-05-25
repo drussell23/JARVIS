@@ -1103,6 +1103,7 @@ class DoublewordProvider:
         self,
         context: OperationContext,
         deadline: Any = None,
+        repair_context: Optional[Any] = None,
         *,
         prompt_override: Optional[str] = None,
     ) -> GenerationResult:
@@ -1115,6 +1116,26 @@ class DoublewordProvider:
         deadline:
             datetime deadline from orchestrator (used to cap poll time).
             Conforms to CandidateProvider protocol.
+        repair_context:
+            Slice 8 — accepted to honor the ``CandidateProvider`` Protocol
+            shape used by ``RepairEngine._generate_repair_candidate``.
+            ClaudeProvider and PrimeProvider both accept this positional
+            kwarg (see providers.py:4580 and providers.py:7568). Pre-Slice-8
+            DoublewordProvider omitted it, so L2's call site
+            ``self._prime.generate(ctx, deadline, repair_context=...)``
+            raised ``TypeError: DoublewordProvider.generate() got an
+            unexpected keyword argument 'repair_context'`` whenever the
+            L2 prime provider was DW (bt-2026-05-25-205710 root, fully
+            captured via Slice 7's traceback observability).
+
+            CURRENT BEHAVIOR: accepted and stored as ``_dw_repair_context``
+            attribute on the call (for future telemetry) but NOT
+            incorporated into the DW prompt. DW's batch API isn't yet
+            wired for repair-context-aware prompting — adding that is a
+            separate slice (Slice 9 candidate). For now this preserves
+            Protocol contract uniformity without changing DW's generation
+            behavior. The L2 loop sees the Protocol contract honored;
+            repair-loop reasoning lands on Claude via the route cascade.
         prompt_override:
             Optional prompt to use instead of building from context.
 
@@ -1123,6 +1144,13 @@ class DoublewordProvider:
 
         For non-blocking usage, prefer submit_batch() + poll_and_retrieve().
         """
+        # Slice 8 — repair_context is accepted to match the Protocol shape
+        # used by Claude/Prime providers. Stored for future incorporation
+        # into DW prompting (Slice 9 candidate); currently advisory-only.
+        # NOT used in prompt assembly so byte-equivalence with the
+        # pre-Slice-8 DW generation path is preserved.
+        _dw_repair_context = repair_context  # noqa: F841 — reserved
+        del _dw_repair_context
         if not self.is_available:
             return GenerationResult(
                 candidates=(),
