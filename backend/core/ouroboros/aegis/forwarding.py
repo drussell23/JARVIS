@@ -449,10 +449,24 @@ async def forward_request(
     # Build outbound headers. Start from the inbound (preserves
     # cache-control, anthropic-version, etc.) but strip Host + any
     # JARVIS-side bearer/auth that would leak to upstream.
+    #
+    # Slice 2B-iii.3 — strip endpoint.auth_header.lower() too.
+    # Without this, HEADER_RAW upstreams (e.g. Anthropic's x-api-key)
+    # case-collide: the SDK-side placeholder ``X-Api-Key`` from the
+    # bridge is COPIED into outbound (preserving SDK case), THEN
+    # line ~460 sets ``outbound_headers["x-api-key"]`` (lowercase)
+    # to the real credential — but the Python dict ends up with
+    # BOTH entries, aiohttp serializes both, and Anthropic takes the
+    # FIRST (the placeholder) → HTTP 401 "invalid x-api-key".
+    # HEADER_BEARER upstreams (DW) were already protected by the
+    # existing ``"authorization"`` entry. See
+    # tests/aegis/test_slice2biii3_strip_auth_header.py for the
+    # full collision reproduction + post-fix proof.
     outbound_headers: Dict[str, str] = {}
     for name, value in request.headers.items():
         lname = name.lower()
-        if lname in ("host", "authorization", "x-jarvis-lease", "content-length"):
+        if lname in ("host", "authorization", "x-jarvis-lease",
+                     "content-length", endpoint.auth_header.lower()):
             continue
         outbound_headers[name] = value
     if endpoint.auth_scheme is AuthScheme.HEADER_RAW:
