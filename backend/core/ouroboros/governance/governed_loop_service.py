@@ -111,7 +111,11 @@ logger = logging.getLogger("Ouroboros.GovernedLoop")
 # The predicate is read at call-time (not cached) so the test
 # monkeypatch path works and so an operator can enable Aegis after
 # the module has been imported.
-def _provider_construction_gate(*, local_api_key: Optional[str]) -> bool:
+def _provider_construction_gate(
+    *,
+    local_api_key: Optional[str],
+    provider_name: str = "",
+) -> bool:
     """Decide whether a provider (Claude / DoubleWord) should be
     constructed at GovernedLoopService boot.
 
@@ -123,7 +127,46 @@ def _provider_construction_gate(*, local_api_key: Optional[str]) -> bool:
     Pure, side-effect-free, no I/O. Extracted as a callable so the
     AST pin can enforce its composition shape and so unit tests can
     monkeypatch ``aegis.client.is_enabled`` cleanly.
+
+    # Slice 19a (2026-05-26) — pure provider isolation gate
+
+    Operator binding: "i want to run the soak with only using DW's API's
+    because i want to understand how external API works". To run a
+    DW-only soak (no Claude fallback for empirical isolation), the
+    operator sets ``JARVIS_PROVIDER_CLAUDE_DISABLED=true``. When set
+    AND this call is gating ClaudeProvider construction (signalled by
+    ``provider_name="claude"``), the gate short-circuits to False even
+    if the API key is present and Aegis is enabled. The provider is
+    NEVER constructed; ``self._fallback`` stays None; the
+    candidate_generator's cascade naturally degrades to
+    "all_providers_exhausted" on DW failures instead of cascading to a
+    non-existent fallback.
+
+    IMMEDIATE-routed ops (per Manifesto §5) fail VISIBLY in this mode
+    because §5 specifies Claude-direct for human-reflex routing and
+    there is no Claude. Per operator binding: "if an unrelated process
+    tries to call an IMMEDIATE reflex action while Claude is intentionally
+    pulled, it must fail visibly to maintain absolute system observability."
+
+    SWE-Bench-Pro ops are unaffected because Slice 10A (PR #58161)
+    downgrades them to STANDARD route which uses DW primary.
+
+    The disable knob is ONLY honored when ``provider_name="claude"``;
+    other providers (DoubleWord) ignore it. DW disable would need its
+    own Slice (operator-bound; not authorized here).
+
+    Defensive fail-closed: the env value is parsed as a strict
+    truthy-string set (``true``/``1``/``yes``/``on`` case-insensitive);
+    any other value (including empty, missing, mis-typed) preserves
+    pre-Slice-19a behavior.
     """
+    # Slice 19a — Claude-specific isolation gate
+    if provider_name == "claude":
+        _disable_raw = os.environ.get(
+            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+        ).strip().lower()
+        if _disable_raw in ("true", "1", "yes", "on"):
+            return False
     from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
     return bool(local_api_key) or _aegis_is_enabled()
 
@@ -3300,7 +3343,35 @@ class GovernedLoopService:
         # the Aegis bridge (Slice 2B-ii). The api_key is coerced
         # None → "" so the provider's self._api_key is always a string
         # (downstream code in the bridge handles the empty case).
-        if _provider_construction_gate(local_api_key=self._config.claude_api_key):
+        #
+        # Slice 19a (2026-05-26) — provider_name="claude" lets the gate
+        # honor JARVIS_PROVIDER_CLAUDE_DISABLED for pure DW-only soaks.
+        # When that env is true, ClaudeProvider is NEVER constructed
+        # (self._fallback stays None); IMMEDIATE ops fail visibly per
+        # Manifesto §5 transparency; DW carries all non-IMMEDIATE routes.
+        if not _provider_construction_gate(
+            local_api_key=self._config.claude_api_key,
+            provider_name="claude",
+        ):
+            # Slice 19a — diagnose the skip cause so operators can
+            # distinguish "no API key + no Aegis" (existing case) from
+            # "explicitly disabled via JARVIS_PROVIDER_CLAUDE_DISABLED"
+            # (new Slice 19a case).
+            _claude_disable_env = os.environ.get(
+                "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+            ).strip().lower()
+            if _claude_disable_env in ("true", "1", "yes", "on"):
+                logger.info(
+                    "[GovernedLoop] Slice 19a: ClaudeProvider construction "
+                    "SKIPPED — JARVIS_PROVIDER_CLAUDE_DISABLED=true. "
+                    "self._fallback stays None; IMMEDIATE-routed ops will "
+                    "fail visibly (Manifesto §5 transparency). SWE-Bench "
+                    "ops unaffected (Slice 10A → STANDARD route → DW)."
+                )
+        if _provider_construction_gate(
+            local_api_key=self._config.claude_api_key,
+            provider_name="claude",
+        ):
             try:
                 from backend.core.ouroboros.governance.providers import (
                     ClaudeProvider,
