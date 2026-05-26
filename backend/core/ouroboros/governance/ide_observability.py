@@ -210,6 +210,11 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/tasks/{op_id}", self._handle_task_detail,
         )
+        # PRD §42 Slice 2 — causal Operation Timeline read surface
+        # (authority-free: operation_timeline imports no gate module).
+        app.router.add_get(
+            "/observability/timeline", self._handle_timeline,
+        )
         # Problem #7 Slice 4 — plan approval surface.
         app.router.add_get(
             "/observability/plans", self._handle_plan_list,
@@ -743,6 +748,85 @@ class IDEObservabilityRouter:
                 "board_size": len(snap),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Operation Timeline route (PRD §42 Slice 2)
+    # ------------------------------------------------------------------
+
+    async def _handle_timeline(self, request: "web.Request") -> Any:
+        """GET /observability/timeline — the causal Operation Timeline
+        scrub (PRD §42).
+
+        Read-only projection of the authority-free OperationTimeline
+        read-model: ``signal → op → diff → commit → outcome`` joined
+        per op_id, newest first. Optional ``?op_id=`` filter and
+        ``?limit=`` cap (default 50, hard ceiling 500). 403 when the
+        observability flag is off. NEVER leaks stack traces or paths.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "timeline_schema": "timeline.1",
+              "enabled": true,
+              "count": 7,
+              "rows": [{"ref": "r-7", "op_id": "...",
+                        "signal_source": "TestFailure",
+                        "risk_tier": "notify_apply",
+                        "apply_mode": "single",
+                        "verify_passed": 14, "verify_total": 14,
+                        "commit_hash": "17ae95d7d6", "diff_ref": "d-3",
+                        "updated_iso": "..."}, ...]
+            }
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        op_id_filter = request.query.get("op_id") or None
+        if op_id_filter is not None and not _OP_ID_RE.match(op_id_filter):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_op_id",
+            )
+        try:
+            limit = int(request.query.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 500))  # bounded projection (§8)
+        try:
+            from backend.core.ouroboros.governance.operation_timeline import (
+                TIMELINE_SCHEMA_VERSION,
+                get_default_timeline,
+            )
+            tl = get_default_timeline()
+            rows = tl.query(op_id=op_id_filter, limit=limit)
+            return self._json_response(
+                request, 200,
+                {
+                    "timeline_schema": TIMELINE_SCHEMA_VERSION,
+                    "enabled": tl.is_enabled(),
+                    "count": len(rows),
+                    "rows": [r.to_dict() for r in rows],
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive: empty, never 500
+            logger.debug(
+                "[IDEObservability] timeline projection failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {
+                    "timeline_schema": "timeline.1",
+                    "enabled": False,
+                    "count": 0,
+                    "rows": [],
+                },
+            )
 
     # ------------------------------------------------------------------
     # Plan Approval routes (problem #7 Slice 4)

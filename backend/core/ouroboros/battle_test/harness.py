@@ -844,6 +844,28 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("register_ops_digest_observer(boot) failed", exc_info=True)
 
+        # PRD §42 Slice 2 — add the OperationTimeline read-model to the
+        # fan-out (coexists with SessionRecorder via the composite seam,
+        # NOT by evicting it) and replay the durable causal index so the
+        # cross-session "what did O+V do while I was away" scrub is live
+        # on boot. Master-flag-gated internally (default-FALSE) — this
+        # wiring is a no-op until JARVIS_OPERATION_TIMELINE_ENABLED=true.
+        try:
+            from backend.core.ouroboros.governance.ops_digest_observer import (
+                add_ops_digest_observer,
+            )
+            from backend.core.ouroboros.governance.operation_timeline import (
+                get_default_timeline,
+            )
+            _timeline = get_default_timeline()
+            add_ops_digest_observer(_timeline)
+            _replayed = _timeline.replay_from_disk()
+            logger.debug(
+                "operation_timeline wired (replayed %d rows)", _replayed,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("operation_timeline(boot) wiring failed", exc_info=True)
+
         _boot_mark("harness_run_pre_boot_done")
         try:
             # Boot sequence — each phase wrapped for boot-timing visibility

@@ -2710,6 +2710,28 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("emit_intent failed for op=%s", ctx.op_id, exc_info=True)
 
+            # PRD §42 Slice 2 — emit the causal signal→op edge through
+            # the canonical OpsDigestObserver seam (NOT a parallel
+            # op_id→envelope registry). This is the single place where
+            # op_id + signal_source + urgency + risk_tier are all known
+            # and INTENT telemetry already fires. Same fail-closed
+            # shape as the on_apply/verify/commit emits.
+            try:
+                from backend.core.ouroboros.governance.ops_digest_observer import (
+                    get_ops_digest_observer,
+                )
+                get_ops_digest_observer().on_op_classified(
+                    op_id=ctx.op_id,
+                    signal_source=getattr(ctx, "signal_source", "") or "",
+                    urgency=getattr(ctx, "signal_urgency", "") or "",
+                    risk_tier=risk_tier.name,
+                )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] on_op_classified observer call failed",
+                    exc_info=True,
+                )
+
             # ---- Reasoning chain classification (optional, pre-routing) ----
             reasoning_result = None
             if self._reasoning_bridge and self._reasoning_bridge.is_active:

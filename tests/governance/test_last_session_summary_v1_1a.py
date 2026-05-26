@@ -484,8 +484,14 @@ def test_orchestrator_has_three_observer_call_sites():
         hook_methods.add(func.attr)
 
     required = {"on_apply_succeeded", "on_verify_completed", "on_commit_succeeded"}
+    # Deliberate protocol extension — PRD §42 Slice 2 added the
+    # `on_op_classified` causal signal→op edge, emitted at the INTENT
+    # seam through this SAME canonical observer chain (not a parallel
+    # registry). Sanctioned per this test's own contract ("update this
+    # regression test deliberately if the protocol was extended").
+    sanctioned_extensions = {"on_op_classified"}
     missing = required - hook_methods
-    extra = hook_methods - required
+    extra = hook_methods - required - sanctioned_extensions
     assert not missing, (
         f"orchestrator.py is missing observer call sites: {missing}. "
         f"ops_digest will silently stop populating."

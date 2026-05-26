@@ -10603,3 +10603,187 @@ The fleet is ready. The architecture is ready. The empirical validation is one s
 | 2026-04-26 | 2.12 | **Phase 4 P4 GRADUATED — Convergence Metrics Suite live by default. Phase 4 ENTIRELY CLOSED.** 5-slice arc landed (Slice 1 `MetricsEngine` 7-metric un-stranding wrapper → Slice 2 `MetricsHistoryLedger` JSONL persistence + 7d/30d aggregator → Slice 3 `/metrics` REPL with ASCII sparkline → Slice 4 `MetricsSessionObserver` + 4 IDE GET endpoints + SSE `metrics_updated` event → Slice 5 graduation). `JARVIS_METRICS_SUITE_ENABLED` default flipped `false`→`true` in **three owner modules** (`metrics_engine.py` + `metrics_repl_dispatcher.py` + `metrics_observability.py`). `register_metrics_routes` wired into `EventChannelServer.start` (loopback-asserted, gated on master flag, per-instance rate-limit + shared CORS allowlist via dedicated `IDEObservabilityRouter` helper). Pre-graduation pins renamed in all three owner suites per their embedded discipline. Layered evidence: 204 deterministic Slice 1-4 tests + 38 graduation pins (master flag default-true × 3 owner modules + source-grep `"1"` literal × 3 + pre-graduation pin renames × 3 owner suites + EventChannelServer source-grep × 3 (`register_metrics_routes` import + `_metrics_enabled()` gate + `_assert_loopback_metrics`) + cross-slice authority survival × 4 modules + reachability supplement) + 15 in-process live-fire smoke checks (observer end-to-end with master-on default, all 4 GET endpoints reachable + return correct shape, all 3 REPL commands render, master-off revert proven). Authority invariants survived through all 5 slices: pure-data engine (S1) + ledger-only I/O (S2) + delegating-only REPL (S3) + summary.json + delegated-ledger I/O (S4) + EventChannel-block-only addition (S5). The `INSUFFICIENT_DATA` problem statement that motivated this phase is resolved — operators can now answer "is O+V getting smarter?" with concrete data via `/metrics 7d` REPL or `GET /observability/metrics/window?days=7`. Hot-revert: single env knob (`JARVIS_METRICS_SUITE_ENABLED=false`) → observer short-circuits, GET endpoints return 403, SSE drops silently; ledger remains readable for prior-session recall. **Phase 4 — Cognitive Metrics FULLY GRADUATED 2026-04-26.** Both items closed (P3 + P4). Phases 0-4 all complete. Next per Forward-Looking Priority Roadmap: Phase 5 P5 (AdversarialReviewer subagent). | Claude Opus 4.7 (P4 Slice 5 graduation PR) |
 | 2026-04-26 | 2.11 | **Phase 3 P2 GRADUATED — Conversational mode live by default. Phase 3 ENTIRELY CLOSED.** 4-slice arc landed (Slice 1 IntentClassifier primitive → Slice 2 ConversationOrchestrator + ChatSession → Slice 3 /chat REPL dispatcher + ChatActionExecutor Protocol → Slice 4 graduation). `JARVIS_CONVERSATIONAL_MODE_ENABLED` default flipped `false`→`true`. `build_chat_repl_dispatcher()` factory in `chat_repl_dispatcher.py` is the single SerpentFlow integration point: returns a wired dispatcher (with safe-default `LoggingChatActionExecutor`) when on, `None` when reverted so SerpentFlow can skip surfacing `/chat` entirely. Pre-graduation pins renamed in BOTH env-knob owner suites (intent_classifier + chat_repl_dispatcher) per their embedded discipline. Layered evidence: 171 deterministic Slice 1-3 tests + 45 graduation pins (master flag default-true × 2 owner modules + source-grep `"1"` literal × 2 + factory branch coverage + LoggingExecutor contract pin + cross-slice authority survival × 4 modules + reachability supplement) + 15 in-process live-fire smoke checks (factory→classifier→orchestrator→dispatcher→executor end-to-end across all 4 ChatActionExecutor branches; bounded-ring under load; hot-revert proven). Authority invariants survived through all 4 slices: pure-data classifier (Slice 1) + IO-free orchestrator (Slice 2) + IO-free dispatcher (Slice 3) + LoggingExecutor never raises (Slice 4). Safety-first contract pinned: noop input never invokes executor; CONTEXT_PASTE without prior turn falls back to query_claude (degraded — never attaches to non-existent target). Concrete executors against backlog ingestion / subagent_scheduler / Claude provider tracked as follow-up slices — wiring those crosses authority boundaries that need their own pin suites. Hot-revert: single env knob (`JARVIS_CONVERSATIONAL_MODE_ENABLED=false`) → factory returns None → `/chat` invisible to operators; orchestrator + bridge state remain inspectable for prior-decision recall. **Phase 3 — Operator Symbiosis FULLY GRADUATED 2026-04-26.** All three items closed (P3.5 + P3 + P2). | Claude Opus 4.7 (P2 Slice 4 graduation PR) |
 | 2026-04-26 | 2.10 | **Phase 3 P3 GRADUATED — inline approval UX live by default.** 4-slice arc landed (Slice 1 primitive → Slice 2 provider + audit ledger → Slice 3 renderer + 30s prompt + `$EDITOR` → Slice 4 graduation). `JARVIS_APPROVAL_UX_INLINE_ENABLED` default flipped `false`→`true`. `build_approval_provider()` factory in `inline_approval_provider.py` is the single source of truth for `GovernedLoopService`'s approval-provider selection (returns `InlineApprovalProvider` when on, legacy `CLIApprovalProvider` when off). Pre-graduation pin renamed to `test_master_flag_default_true_post_graduation` per its embedded discipline. Layered evidence: 165 deterministic Slice 1-3 tests + 36 graduation pins (master flag + source-grep `"1"` literal + factory branch coverage + GovernedLoopService source-grep + cross-slice authority survival + reachability supplement) + 15 in-process live-fire smoke checks (factory-built provider end-to-end through queue + renderer + audit ledger). Authority invariants survived through all 4 slices: pure-data primitive (Slice 1) + only-audit-ledger I/O (Slice 2) + argv-only subprocess (Slice 3, no `shell=True`). Safety-first contract pinned: EOF / garbage / 30s timeout all `defer-not-approve`. Hot-revert: single env knob (`JARVIS_APPROVAL_UX_INLINE_ENABLED=false`) — factory returns `CLIApprovalProvider` on the next construction. Phase 3 P3 + P3.5 both COMPLETE; Phase 3 P2 (Conversational mode) remains the only open Phase 3 item. | Claude Opus 4.7 (P3 Slice 4 graduation PR) |
+
+---
+
+## §42 OPERATION TIMELINE + CHECKPOINT-REWIND — THE CAUSAL JOIN LAYER (NEW 2026-05-16)
+
+**Origin.** Operator-commissioned external critique (2026-05-16): *"You've been cloning a reactive tool to power a proactive one."* The audit named five gaps where Claude Code's reactive information architecture is wrong for O+V. This section closes **Gap #1 only** (Checkpoint / Rewind / Time-Travel) — the critique's "single biggest missing piece, and it's cheap because the substrate exists." Gaps #2–#5 are explicitly **out of scope** for this section; §42 is architected so the forensic morning-after surface (Gap #5) can later *compose* the read-model defined here without rework, but no Gap #5 code is authorized by this PRD.
+
+**Why this section exists.** A read-only structural exploration of `backend/core/ouroboros/` (2026-05-16) confirmed the critique's root-cause claim *precisely*: the substrate to answer "what did O+V do while I was away, and undo any of it" already exists, but it is **fragmented across eight modules with no causal join layer**, plus exactly one genuinely missing durable primitive. This is therefore not a "build a rewind feature" ticket. It is a "the system has no standing causal model of its own actions" ticket. The fix is architectural: a durable causal **Operation Timeline read-model** (authority-free projection) plus a **RewindCoordinator** that composes existing git-native plumbing — no new authority, no history rewriting, no hardcoded rules.
+
+### §42.1 The Root Problem (Verbatim Diagnosis)
+
+Claude Code's entire information architecture assumes: *the human just told me what to do, is watching, and will read top-to-bottom*. O+V violates all three — it self-initiates, runs for hours unattended, and the operator arrives **after** things happened. A linear streaming transcript is optimal for reactive work and structurally mediocre for proactive work.
+
+The operator's first three questions on return are causal, not chronological:
+
+1. *What did you do while I was at lunch / overnight?*
+2. *Where are we now — which of those stuck, which rolled back?*
+3. *Undo #4 — and tell me what else #4 affected.*
+
+Git stores **content** but is structurally incapable of storing the **relation** `signal → op → plan → diff → commit → outcome → checkpoint`. `OpsDigestObserver` already *receives* every piece of that relation as it happens (`on_apply_succeeded`, `on_verify_completed`, `on_commit_succeeded`) — it just **scatters them into session-local `summary.json`** instead of one durable causal index. That missing index is the exact reason the three questions above are currently unanswerable.
+
+### §42.2 Architecture — Three Layers, All Composed
+
+```
+Layer A  OperationTimeline (read-model)      authority-free projection
+         subscribes existing OpsDigestObserver protocol
+         + joins existing DiffArchive / WorkspaceCheckpointManager refs
+         → durable .jarvis/operation_timeline.jsonl (flock_append_line seam)
+
+Layer B  RewindCoordinator (action)          operator-initiated ONLY
+         preview  = delegate ReviewBranchManager (proven non-destructive plumbing)
+         revert-committed = `git revert --no-edit <hash>`  (new commit, no rewrite)
+         revert-in-flight = compose existing pre-apply snapshot restore
+         preconditions = clean-tree gate + ancestry check + blast-radius
+
+Layer C  Operator surface                    composed, zero new server
+         /timeline /rewind /revert  (auto-discovered _handle_* verbs)
+         r-N prefix in the existing unified /expand dispatcher
+         GET /observability/timeline  (extend IDEObservabilityRouter)
+         timeline_*/rewind_* SSE via the existing StreamEventBroker
+```
+
+The load-bearing architectural decision: **Layer A is a read-model with zero authority and zero behavior change.** It can never corrupt the loop because it never writes governance state, never assigns risk, never imports the orchestrator. Layer B acts only on an explicit operator verb — it has no autonomous caller anywhere in the import graph.
+
+### §42.3 Zero-Duplication Mapping (Mandatory PRD Requirement #1)
+
+The timeline must not duplicate state or authority. The boundary is drawn precisely:
+
+| Concern | Canonical owner (unchanged) | Timeline's relationship | Anti-duplication mechanism |
+|---|---|---|---|
+| Op governance state machine (`PLANNED→…→APPLIED/ROLLED_BACK`) | `OperationLedger` (`ledger.py:43`, JSONL per op) | **References** `op_id`; copies the *terminal* state string as a denormalized pointer only | AST pin: timeline module makes **zero** `.record(` calls on any ledger symbol; never writes `OperationState` |
+| Apply / verify / commit milestone events | `OpsDigestObserver` protocol (`ops_digest_observer.py:58`) — already a stable observer contract | **Implements & registers against the existing protocol**; receives `on_apply_succeeded` / `on_verify_completed` / `on_commit_succeeded` | AST pin: timeline defines the protocol surface but performs **no detection** (no `git` subprocess, no test invocation in the read-model module) — it consumes events, it does not re-derive them |
+| Full unified-diff text + apply/verify outcome | `DiffArchive` (`diff_archive.py:166`, `d-N` ring) | Stores only the `d-N` **ref** (pointer), never copies `diff_text` | Schema stores `diff_ref`, not diff body; `/expand d-N` remains the single diff-render path |
+| Pre-apply file snapshots / git-stash checkpoints | `WorkspaceCheckpointManager` + orchestrator rollback (`orchestrator.py:7551`) | Stores only the `checkpoint_ref` (pointer) | RewindCoordinator's in-flight revert **calls the existing restore path** — it does not reimplement snapshot logic |
+| Signed commits + O+V signature + intent git-notes | `AutoCommitter` (`auto_committer.py:489`) | Receives `commit_hash` via the **existing** `on_commit_succeeded(op_id, hash)` observer callback | Timeline adds **no** new commit path; the genuinely missing link (durable `op_id ↔ commit_hash`) is captured by *persisting an event the observer already emits* |
+| Non-destructive preview-branch git plumbing | `ReviewBranchManager` (`review_branch_manager.py:517`) — proven never to touch worktree/HEAD/index | RewindCoordinator **delegates** preview construction to it | AST pin: RewindCoordinator constructs **no** `write-tree`/`commit-tree` plumbing in-module — must call the canonical seam |
+| Cross-process JSONL append durability | `cross_process_jsonl.flock_append_line` (canonical seam, SWE-Bench-Pro arc precedent) | Timeline's **only** disk-write path | AST pin: **no** `import fcntl`, no raw `open().write` append, no `json.dump` to the timeline path |
+
+**The single net-new primitive** is therefore not a store — it is the *durable persistence of a causal join that the observer protocol already emits but currently discards*. Everything else is a pointer.
+
+### §42.4 The Causal Index Schema (Mandatory PRD Requirement #3)
+
+One append-only JSONL at `JARVIS_OPERATION_TIMELINE_PATH` (default `.jarvis/operation_timeline.jsonl`). Append-only on disk (full audit history — re-applied/reverted ops add rows, never mutate); the in-memory projection collapses to **latest-write-wins per `op_id`** for the scrub view. This is the exact persistence discipline already proven by `EvaluationResultStore` (SWE-Bench-Pro Phase D) — reused, not reinvented.
+
+Each row is one JSON object. `schema_version` is `"timeline.1"`. Fields:
+
+```jsonc
+{
+  "schema_version": "timeline.1",
+  "ref":            "r-7",            // timeline's own monotonic handle (free prefix; see §42 ref-table). Never reused, drop-oldest on bound.
+  "op_id":          "op-019d8...-testfail",   // FK → OperationLedger (authority); join key, never owned here
+  "session_id":     "bt-2026-05-16-...",      // FK → .ouroboros/sessions/<id>; enables cross-session morning-after scrub
+  "parent_op_id":   "op-019d7...-coalesced",  // causal edge: coalesced/dependent parent (from existing _active_file_ops DAG) or null
+  "signal_source":  "TestFailure",            // sensor/origin from the IntentEnvelope (the WHY); never recomputed
+  "urgency":        "immediate",              // copied from envelope; pointer not authority
+  "risk_tier":      "notify_apply",           // copied string only — AST-pinned: timeline never *assigns* risk
+  "plan_ref":       {"hash":"sha256:9e88...","summary":"add ascii gate retry"},  // digest + 1-line, NOT full plan body (no plan_generator duplication)
+  "diff_ref":       "d-12",                   // FK → DiffArchive ring; full diff via /expand d-12 only
+  "file_paths":     ["backend/.../iron_gate.py"],  // the blast-radius join key (minimal durable copy; DiffArchive ring evicts at 30, timeline persists)
+  "commit_hash":    "17ae95d7d6...",          // THE missing link — from on_commit_succeeded(op_id, hash); null if uncommitted/in-flight
+  "apply_mode":     "single",                 // none|single|multi — from on_apply_succeeded
+  "verify_passed":  14,                       // from on_verify_completed
+  "verify_total":   14,
+  "checkpoint_ref": "ckpt-3",                 // FK → WorkspaceCheckpointManager (pre-apply snapshot id) or null
+  "terminal_state": "APPLIED",                // denormalized pointer to ledger terminal (APPLIED|ROLLED_BACK|FAILED|BLOCKED) — copy, never source of truth
+  "reverted_by":    null,                     // back-edge: if a later /revert created a revert-commit for this op, that op's ref (filled by an amended append row)
+  "wall_time_iso":  "2026-05-16T18:22:04Z",   // operator-facing absolute time (morning-after scrub axis)
+  "monotonic_at":   918273.44                 // intra-session ordering stability (ties broken by ref)
+}
+```
+
+**Causal completeness.** The row IS the join the system currently lacks: `signal_source` (why) → `op_id` (what) → `plan_ref` (intended how) → `diff_ref`/`file_paths` (actual change) → `commit_hash` (where in git) → `verify_*`/`terminal_state` (did it hold) → `checkpoint_ref` (how to undo) → `reverted_by` (was it undone). Every FK points at an authority that already owns that data; the timeline owns **only the edges between them**.
+
+**Bounded by construction.** Load is a bounded tail scan capped at `JARVIS_OPERATION_TIMELINE_MAX_ROWS` (default 5000), read at call time so tests can monkeypatch it — the identical discipline as the SWE-Bench-Pro `_LOCAL_JSONL_MAX_ROWS` precedent. Malformed lines / non-dict records / missing `op_id` are skipped silently (fail-open: a corrupt row must never wedge the scrub).
+
+### §42.5 Irreversibility Ban (Mandatory PRD Requirement #2)
+
+**Principle.** No autonomous-or-operator action through this surface may rewrite git history or perform an unrecoverable destructive operation. Undo must itself be undoable.
+
+| Revert case | Mechanism (composed, never reinvented) | Why it is non-destructive |
+|---|---|---|
+| Committed op | `git revert --no-edit <commit_hash>` | Creates a **new** commit that inverts the change. Original commit stays in history. Safe on shared branches — matches `AutoCommitter`'s protected-branch discipline. The revert is itself revertable. |
+| In-flight / uncommitted op | Compose the **existing** pre-apply snapshot restore (`orchestrator.py:7551` `rollback_files` / `CheckpointManager.restore_checkpoint` via `git stash apply`) | Restores tracked files from a snapshot already captured by the loop; new files unlinked exactly as the existing batch-rollback already does. Zero new restore logic. |
+| Preview (any case) | Delegate to `ReviewBranchManager` plumbing (`hash-object`/`commit-tree`/`branch`) | Already **proven** never to touch working tree, HEAD, or index. The preview branch surfaces natively in VS Code source control (ReviewBranch precedent). |
+
+**Forbidden token denylist (AST-enforced, §42.6 pin 5).** The following may not appear in any subprocess argv literal anywhere in `rewind_coordinator.py`:
+
+- `reset` together with `--hard`
+- `push` together with `--force` / `-f` / a leading-`+` refspec
+- `rebase`, `filter-branch`, `filter-repo`
+- `branch -f`, or `-D`/`-d` of any branch **not** matching the rewind-preview prefix
+- `update-ref -d`, `reflog expire`, `gc --prune=now`/`--prune=all`
+- `checkout`/`switch` of a branch (file-scoped `git checkout -- <path>` restore is permitted; branch-switching the operator's HEAD is not)
+
+The permitted git surface is exactly: `revert`, file-scoped `restore`/`checkout -- <path>`, `stash apply`, and the read-only plumbing delegated through `ReviewBranchManager`. **Operator-initiated only:** `RewindCoordinator` has no autonomous caller — §42.6 pin 6 forbids the orchestrator, governed-loop, any sensor, and the subagent scheduler from importing it. Preconditions before any revert: clean-tree gate (`JARVIS_REWIND_REQUIRE_CLEAN_TREE`, default **TRUE** — security-hardening-on-by-default, the Rule 7 precedent), ancestry reachability check, and an advisory **blast-radius** computed *dynamically* from the `file_paths` join (no hardcoded dependency rules — it lists every later timeline row sharing a path with the target op).
+
+### §42.6 AST Pins (Mandatory PRD Requirement #4)
+
+Seven structural invariants. Pins 1–4 prove the read-model lacks authority; pins 5–7 prove the RewindCoordinator obeys the irreversibility ban.
+
+| # | Invariant | AST assertion |
+|---|---|---|
+| 1 | **Read-model authority-free** | Module import graph of `operation_timeline.py` contains **none** of `{orchestrator, policy_engine, iron_gate, change_engine, candidate_generator, governed_loop_service, repair_engine}`. (Stronger than the grep-enforced `IDEObservabilityRouter` invariant — AST, not grep.) |
+| 2 | **Single persistence seam** | The only disk-append in the module is via `cross_process_jsonl.flock_append_line`. Walk asserts **no** `import fcntl`, no `open(...).write/.writelines` on the timeline path, no `json.dump`/`json.dumps(...)→write` append. |
+| 3 | **Subscribes, never re-derives** | Class defines the `OpsDigestObserver` protocol surface (`on_apply_succeeded`/`on_verify_completed`/`on_commit_succeeded`) **and** the module contains **no** `subprocess`/`create_subprocess_exec`/`git`-arg list and **no** TestRunner invocation — it consumes milestone events, it does not detect them. |
+| 4 | **No state authority** | No `.record(` call on any ledger symbol; no `import` of `policy_engine`/`risk_tier_floor`; `risk_tier` only ever appears as an assignment *target from* an inbound value, never computed (no comparison/derivation expression produces it). |
+| 5 | **Irreversibility denylist** | Walk every `subprocess`/`asyncio.create_subprocess_exec` argv list literal in `rewind_coordinator.py`; assert no element-pair from the §42.5 forbidden denylist co-occurs in any single argv; assert at least one revert path argv contains `revert`. |
+| 6 | **Operator-initiated only (import-graph pin)** | No module under `{orchestrator, governed_loop_service, intake/sensors/**, subagent_scheduler}` imports `rewind_coordinator` or the `RewindCoordinator` symbol. (Cross-module pin; precedent: the authority-invariant import grep.) |
+| 7 | **Preview non-duplication** | `rewind_coordinator.py` constructs **no** `write-tree`/`commit-tree`/`update-index --cacheinfo` argv in-module; the preview path resolves through an imported `ReviewBranchManager` symbol (the canonical non-destructive seam). |
+
+Each pin ships with explicit positive **and** negative fixtures (a deliberately-violating stub must make the pin red) — the discipline already standard across the SWE-Bench-Pro and Treefinement arcs.
+
+### §42.7 FlagRegistry Seeds (Mandatory PRD Requirement #4)
+
+All masters default-**FALSE** per §33.1 (graduate only on empirical evidence — §42.9). Safety-relevant precondition flags default-**TRUE** (security-hardening-on-by-default, Rule 7 precedent).
+
+| Flag | Type / Category | Default | Role |
+|---|---|---|---|
+| `JARVIS_OPERATION_TIMELINE_ENABLED` | BOOL / OBSERVABILITY | **FALSE** | Master — Layer A read-model subscription. Off ⇒ observer registers as a no-op; zero rows written. |
+| `JARVIS_OPERATION_TIMELINE_PATH` | STR / OBSERVABILITY | `.jarvis/operation_timeline.jsonl` | Durable causal index location (not hardcoded inline). |
+| `JARVIS_OPERATION_TIMELINE_MAX_ROWS` | INT / CAPACITY | `5000` | Bounded tail-scan on load; read at call time (monkeypatchable). |
+| `JARVIS_REWIND_COORDINATOR_ENABLED` | BOOL / **SAFETY** | **FALSE** | Master — Layer B `/rewind` `/revert` verbs. SAFETY category because it invokes git. |
+| `JARVIS_REWIND_PREVIEW_BRANCH_PREFIX` | STR / SAFETY | `ouroboros/rewind-preview/` | Preview-branch namespace; composes the `ReviewBranchManager` convention, parameterized not inlined. |
+| `JARVIS_REWIND_REQUIRE_CLEAN_TREE` | BOOL / **SAFETY** | **TRUE** | Refuse any revert when the working tree is dirty (default-on hardening; operator can override in emergency). |
+| `JARVIS_REWIND_BLAST_RADIUS_ENABLED` | BOOL / OBSERVABILITY | **TRUE** | Compute & surface the dependent-op set from the `file_paths` join before a revert (advisory). |
+
+### §42.8 Slice Breakdown (for the post-review authorization)
+
+- **Slice 1 — Read-model substrate (zero behavior change).** `OperationTimeline` projection + `flock_append_line` JSONL + registers against the **existing** `OpsDigestObserver` protocol + bounded load + `JARVIS_OPERATION_TIMELINE_ENABLED` default-FALSE + AST pins 1–4 + FlagRegistry seeds 1–3 + regression spine. **No REPL, no orchestrator edits, no rewind.** Mirrors the Stage-1.6 Park-spike "Slice 1 = zero runtime change" precedent exactly.
+- **Slice 2 — Causal join completion + read surface.** Populate `signal_source`/`urgency`/`risk_tier`/`plan_ref`/`diff_ref`/`checkpoint_ref`/`parent_op_id` by read-only joins over the IntentEnvelope + `DiffArchive` + `WorkspaceCheckpointManager` (still authority-free). `/timeline` verb (auto-discovered `_handle_*`), `r-N` prefix added to the unified `/expand` dispatcher, `GET /observability/timeline` (extend `IDEObservabilityRouter`, authority invariant preserved), `timeline_row_appended` SSE via the existing broker. **Still no rewind.**
+- **Slice 3 — RewindCoordinator (Layer B).** Preview (delegate `ReviewBranchManager`), committed revert (`git revert`), in-flight revert (compose existing snapshot restore), preconditions (clean-tree + ancestry + dynamic blast-radius), `/rewind` `/revert` verbs, `rewind_*` SSE, `reverted_by` back-edge amended row. `JARVIS_REWIND_COORDINATOR_ENABLED` default-FALSE + AST pins 5–7 + FlagRegistry seeds 4–7.
+- **Slice 4 — Graduation.** Soak matrix + evidence gate + default-TRUE flip after the §42.9 criteria are met across 3 consecutive clean soaks.
+
+### §42.9 Graduation Criteria (Concrete)
+
+Masters stay default-FALSE until **all** of the following are demonstrated as artifacts (no pre-result euphoria — no Tier/capability claim until each lands):
+
+1. The timeline JSONL accumulates **≥1 fully-populated causal row with non-null `commit_hash`** during a battle-test session (proves the observer-join works end-to-end).
+2. `/timeline` reconstructs the causal chain on a **fresh boot of a later session** (cross-session morning-after proof — the capability Claude Code structurally cannot have).
+3. `/rewind <r-N>` produces a non-destructive preview branch verifiable in `git branch` with working tree/HEAD/index provably untouched; **and** `/revert <r-N>` of a committed op produces a `git revert` commit where `git log` shows **both** the revert commit and the original commit (history-rewrite-free, the irreversibility ban empirically held).
+4. Blast-radius correctly enumerates the later timeline rows sharing a `file_paths` element with the reverted op.
+5. (3)–(4) hold across **3 consecutive clean soaks** under the Phase 9 cadence with zero AST-pin regressions.
+
+### §42.10 What Is / Is Not Demonstrated Today (Honest Framing)
+
+**Demonstrated (substrate exists, composable):** `DiffArchive` `d-N` lifecycle audit; `ReviewBranchManager` non-destructive plumbing; `AutoCommitter` signed commits + `on_commit_succeeded` observer emission; `OperationLedger` per-op state JSONL; `WorkspaceCheckpointManager` git-stash snapshots + the existing failure-driven batch rollback; the unified `/expand` prefix dispatcher + `_handle_*` auto-discovery; the `IDEObservabilityRouter` authority-free read-only-projection pattern; the `flock_append_line` durable-append seam.
+
+**Not demonstrated (this section closes it):** any **durable, cross-session, causal `op_id ↔ signal ↔ diff ↔ commit_hash ↔ checkpoint ↔ outcome` index**; any **operator-initiated** revert (only failure-driven internal rollback exists today); any **preview-before-revert** surface; any **blast-radius** reasoning over O+V's own change history. The "scrub the timeline / one-key revert" surface is **positioned**, not yet **demonstrated** — §42.9 is the ladder that makes it actually demonstrated.
+
+**Tier placement.** §41.8 roadmap — trust-infrastructure tier. Not a Tier-D capability claim. It is load-bearing **operator-trust** infrastructure: an agent that committed six things while the operator was at lunch is only trustworthy if those six things are causally legible and individually, non-destructively reversible.
+
+### §42.11 Operator Review Checklist (Blueprint Sign-Off)
+
+Before Slice 1 is authorized, confirm:
+
+- [ ] Zero-duplication boundary (§42.3) is correct — timeline owns only edges, every datum is an FK to an existing authority.
+- [ ] Schema `timeline.1` (§42.4) captures the full causal join with no field that re-stores another module's authority.
+- [ ] Irreversibility ban (§42.5) — `git revert` + composed snapshot restore + delegated preview is the intended model; the forbidden denylist is complete.
+- [ ] AST pins 1–7 (§42.6) are the right structural proofs of "read-model lacks authority" + "coordinator obeys the ban."
+- [ ] FlagRegistry seeds (§42.7) — masters default-FALSE, safety preconditions default-TRUE, is the intended posture.
+- [ ] Slice 1 is genuinely zero-behavior-change (read-model + spine only) before any rewind code exists.
+- [ ] Gap #5 (forensic morning-after) deferred — §42 only architects the substrate it will later compose, builds no Gap #5 code.
+
+*Authored 2026-05-16 — blueprint for operator review. No Slice authorized until this checklist is signed.*

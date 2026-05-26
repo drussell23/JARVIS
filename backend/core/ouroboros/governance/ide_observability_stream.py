@@ -125,6 +125,10 @@ EVENT_TYPE_PLAN_EXPIRED = "plan_expired"
 # Single event type: the trigger (inference vs override) is carried in
 # the payload so clients render from one handler.
 EVENT_TYPE_POSTURE_CHANGED = "posture_changed"
+# PRD §42 Slice 2 — one durable causal timeline row was appended
+# (apply/verify/commit/classified merge). Read-surface notification
+# only; the row is authoritative on disk + in the read-model.
+EVENT_TYPE_OPERATION_TIMELINE_ROW = "operation_timeline_row"
 
 # FlagRegistry Slice 3 — flag introspection stream vocabulary.
 EVENT_TYPE_FLAG_TYPO_DETECTED = "flag_typo_detected"
@@ -1357,6 +1361,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SESSION_PINNED,
     EVENT_TYPE_SESSION_UNPINNED,
     EVENT_TYPE_POSTURE_CHANGED,
+    EVENT_TYPE_OPERATION_TIMELINE_ROW,  # PRD §42 Slice 2
     EVENT_TYPE_FLAG_TYPO_DETECTED,
     EVENT_TYPE_FLAG_REGISTERED,
     EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,

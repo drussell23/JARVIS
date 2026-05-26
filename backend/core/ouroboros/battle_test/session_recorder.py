@@ -316,6 +316,22 @@ class SessionRecorder:
         except Exception:  # noqa: BLE001
             pass
 
+    def on_op_classified(
+        self,
+        *,
+        op_id: str,
+        signal_source: str,
+        urgency: str,
+        risk_tier: str,
+    ) -> None:
+        """No-op (PRD §42 Slice 2). SessionRecorder deliberately
+        ignores the causal signal→op edge — that edge exists for the
+        OperationTimeline read-model, not the session digest. Declared
+        explicitly so SessionRecorder structurally satisfies the
+        extended OpsDigestObserver protocol (no per-op AttributeError
+        through the composite fan-out)."""
+        return
+
     # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
