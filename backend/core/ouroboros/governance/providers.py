@@ -4123,6 +4123,49 @@ def _parse_generation_response(
             "[%s] Model returned 2b.1-diff schema despite full_content instruction. "
             "Attempting diff→full_content reconstruction as fallback.", pfx,
         )
+        # Slice 20D — parser-level schema_id_hallucination drift record.
+        # The model returned a schema_version the route prompt explicitly
+        # directed against. Record drift for the active op so the next
+        # GENERATE_RETRY rotates to a sibling model (Slice 20C). The
+        # recovery attempt below still runs — drift is op-scoped and
+        # only affects FUTURE attempts for this op_id, not the current
+        # one. ALWAYS records (even if recovery succeeds) because the
+        # pattern itself indicates trap-prone model behavior worth
+        # rotating away from on subsequent retries.
+        try:
+            from backend.core.ouroboros.governance.topology_sentinel import (
+                get_dw_model_override as _get_dw_model_override,
+            )
+            from backend.core.ouroboros.governance.schema_drift_tracker import (
+                DriftType as _DriftType,
+                get_default_tracker as _get_drift_tracker,
+            )
+            _op_id = getattr(ctx, "op_id", "") if ctx is not None else ""
+            # Read the dispatcher-stamped model_id via the topology
+            # ContextVar (async-safe, NEVER raises). When no override
+            # is active (legacy single-model path), fall back to the
+            # coarse provider_name so the drift record still carries
+            # meaningful provenance.
+            _model_id = _get_dw_model_override() or provider_name or ""
+            if _op_id and _model_id:
+                _get_drift_tracker().record(
+                    op_id=_op_id,
+                    model_id=_model_id,
+                    drift_type=_DriftType.SCHEMA_ID_HALLUCINATION,
+                    raw_excerpt=(
+                        f"actual_version={actual_version!r} "
+                        f"prompt_directed=2b.1 "
+                        f"recovery=attempting_diff_reconstruction"
+                    ),
+                )
+                logger.info(
+                    "[%s] Slice 20D drift recorded: op=%s model=%s "
+                    "drift_type=schema_id_hallucination — next retry "
+                    "will rotate sibling (recovery still attempted)",
+                    pfx, _op_id, _model_id,
+                )
+        except Exception:  # noqa: BLE001 — drift is enhancement, never gate
+            pass
         # Resolve source path: repo_root takes precedence over cwd (Disease 7 fix)
         orig_content = ""
         if source_path:
