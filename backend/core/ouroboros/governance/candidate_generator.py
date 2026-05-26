@@ -2547,6 +2547,32 @@ class CandidateGenerator:
                 )
                 attempts.append(f"{model_id}:skipped_{state.lower()}")
                 continue
+            # Slice 20C — schema drift rotation. If this model has
+            # produced a structurally-bad output earlier in this same
+            # op (json_parse_error_after_heal / schema_id_hallucination
+            # / zero_candidate_return), skip it indistinguishably from
+            # a sentinel-OPEN breaker. Master-flag gated; when off, the
+            # has_drifted() consultation short-circuits to False so the
+            # check is a free no-op (byte-identical legacy behavior).
+            try:
+                from backend.core.ouroboros.governance.schema_drift_tracker import (
+                    get_default_tracker as _get_drift_tracker,
+                )
+                _drift_tracker = _get_drift_tracker()
+                _full_op_id_drift = getattr(context, "op_id", "") or ""
+                if _drift_tracker.has_drifted(_full_op_id_drift, model_id):
+                    logger.info(
+                        "[CandidateGenerator] Sentinel dispatch: route=%s "
+                        "model=%s drifted_on_op — rotating to sibling (op=%s)",
+                        provider_route, model_id, op_id_short,
+                    )
+                    attempts.append(f"{model_id}:skipped_drift")
+                    continue
+            except Exception:  # noqa: BLE001 — rotation is enhancement, not gate
+                # Tracker consultation must NEVER block dispatch. If
+                # the tracker module is missing / unimportable / raises,
+                # fall through to normal attempt (legacy behavior).
+                pass
             attempts.append(f"{model_id}:attempted")
             # Stamp the per-attempt override via ContextVar (async-safe
             # per asyncio task, survives the frozen OperationContext
@@ -2601,6 +2627,44 @@ class CandidateGenerator:
                         "[CandidateGenerator] sentinel.report_success raised",
                         exc_info=True,
                     )
+                # Slice 20C — zero-candidate drift detection. The
+                # parser succeeded (we're on the success branch) but
+                # may have returned an empty candidates tuple while
+                # NOT signaling no-op. That's the v15 "model judgment
+                # flaw" — Venom exploration ran, model returned valid
+                # JSON, but candidates=(). Record drift so the next
+                # GENERATE_RETRY for this op_id rotates to a sibling.
+                try:
+                    _cands = getattr(_attempt_result, "candidates", None)
+                    _is_noop = getattr(_attempt_result, "is_noop", False)
+                    if (
+                        _cands is not None
+                        and len(_cands) == 0
+                        and not _is_noop
+                    ):
+                        from backend.core.ouroboros.governance.schema_drift_tracker import (
+                            DriftType,
+                            get_default_tracker as _zc_tracker,
+                        )
+                        _full_op_zc = getattr(context, "op_id", "") or ""
+                        if _full_op_zc:
+                            _zc_tracker().record(
+                                op_id=_full_op_zc,
+                                model_id=model_id,
+                                drift_type=DriftType.ZERO_CANDIDATE_RETURN,
+                                raw_excerpt=(
+                                    f"route={provider_route} "
+                                    f"is_noop=False candidates=()"
+                                ),
+                            )
+                            logger.info(
+                                "[CandidateGenerator] Slice 20C zero-candidate "
+                                "drift recorded: op=%s model=%s — next retry "
+                                "will rotate to sibling",
+                                op_id_short, model_id,
+                            )
+                except Exception:  # noqa: BLE001 — drift is enhancement
+                    pass
                 return _attempt_result
 
             if _attempt_exc is not None:
