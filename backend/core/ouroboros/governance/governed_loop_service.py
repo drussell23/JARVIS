@@ -3571,11 +3571,44 @@ class GovernedLoopService:
             logger.info("[GovernedLoop] Promoting DoublewordProvider to PRIMARY (J-Prime unhealthy)")
 
         if primary is not None or fallback is not None:
-            # If only one provider, use it as both (FSM still works)
+            # If only one provider, use it as both (FSM still works).
+            #
+            # Slice 20A (2026-05-26) — self-fallback elimination
+            #
+            # Pre-Slice-20A: `effective_fallback = fallback or primary` blindly
+            # promoted primary (e.g., DW) to fallback when no real Tier 1
+            # provider existed. This violated Slice 19a's "Claude disabled
+            # → no fallback" contract: the FSM ended up with primary=DW
+            # AND fallback=DW (same object), and Slice 19b's `fallback is
+            # None` guard never fired. Empirically observed in
+            # bt-2026-05-26-184355 (v15 soak): cascade fired
+            # `fallback_failed` with `fallback_name=doubleword-397b ==
+            # primary_name` — DW was called twice for the same op and
+            # collided on its own scheduler.
+            #
+            # Fix: when JARVIS_PROVIDER_CLAUDE_DISABLED=true AND no
+            # separate physical secondary provider is supplied, keep
+            # effective_fallback strictly None. Slice 19b's `fallback is
+            # None` guard fires correctly. The FSM gracefully emits
+            # `fallback_skipped:no_fallback_configured`; ExhaustionWatcher
+            # filters it; hibernation is reserved for genuine distress.
+            _claude_disabled = os.environ.get(
+                "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+            ).strip().lower() in ("true", "1", "yes", "on")
             effective_primary = primary or fallback
-            effective_fallback = fallback or primary
+            if _claude_disabled and fallback is None:
+                effective_fallback = None
+                logger.info(
+                    "[GovernedLoop] Slice 20A: self-fallback ELIMINATED "
+                    "— Claude disabled AND no Tier 1 provider supplied; "
+                    "effective_fallback=None (Slice 19b's fallback_skipped "
+                    "path will engage on cascade)."
+                )
+            else:
+                effective_fallback = fallback or primary
             assert effective_primary is not None
-            assert effective_fallback is not None
+            # Slice 20A — effective_fallback may legitimately be None now;
+            # the assert was a pre-Slice-19b invariant that no longer holds.
 
             _pool_size = int(os.environ.get("JARVIS_BG_POOL_SIZE", "3"))
             _fallback_concurrency = int(os.environ.get(

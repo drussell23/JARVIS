@@ -1307,7 +1307,7 @@ class CandidateGenerator:
     def __init__(
         self,
         primary: CandidateProvider,
-        fallback: CandidateProvider,
+        fallback: Optional[CandidateProvider] = None,
         primary_concurrency: int = 4,
         fallback_concurrency: int = 2,
         tier0: Optional[Any] = None,  # DoublewordProvider (batch, async)
