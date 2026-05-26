@@ -166,7 +166,19 @@ class SessionWAL:
     ) -> bool:
         """Write ``state`` atomically to ``summary.json``,
         debounced by ``wal_min_interval_s``. Returns True on
-        successful write, False on skip/error. NEVER raises."""
+        successful write, False on skip/error. NEVER raises.
+
+        ⚠️ SYNCHRONOUS — performs blocking disk I/O (json.dumps +
+        write + fsync + os.replace) while holding ``self._lock``.
+        Callers running on the asyncio main thread should prefer
+        :meth:`acheckpoint` (Slice 14) which routes through
+        ``asyncio.to_thread`` so the loop tick continues during the
+        file write. This sync entry point is RETAINED for:
+          * signal handlers (SIGTERM/SIGINT) where the loop may
+            already be cancelled and `to_thread` is unsafe;
+          * atexit fallback paths (interpreter shutdown);
+          * synchronous test harnesses.
+        """
         if not wal_enabled():
             return False
         try:
@@ -186,6 +198,51 @@ class SessionWAL:
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[SessionWAL] checkpoint swallowed exc",
+                exc_info=True,
+            )
+            return False
+
+    async def acheckpoint(
+        self,
+        state: Dict[str, Any],
+        reason: str = "",
+    ) -> bool:
+        """Slice 14 — async-safe variant of :meth:`checkpoint`.
+
+        Routes the blocking file I/O through ``asyncio.to_thread``
+        so the asyncio main loop continues ticking during the
+        ~5-50ms json.dumps + write + fsync + os.replace sequence.
+        Eliminates the LoopDeadman tombstone observed in soak
+        bt-2026-05-25-230029 (v10), where the periodic checkpoint
+        loop (harness.py:6774) called the sync ``checkpoint`` from
+        the asyncio loop and contended with other lock holders
+        until LoopDeadman fired at T+51m.
+
+        Behavior contract identical to sync :meth:`checkpoint` —
+        same return shape, same debounce, same defensive
+        exception-swallow. ONLY difference is that the disk I/O
+        runs on the default thread pool executor instead of
+        blocking the caller's event loop.
+
+        ``threading.Lock`` (not ``asyncio.Lock``) intentionally
+        preserved on ``self._lock`` — signal handlers and atexit
+        fallback paths still call the sync entry point and need
+        to coordinate with this method's worker-thread write.
+
+        NEVER raises. ``asyncio.CancelledError`` propagates per
+        cooperative-cancel contract."""
+        if not wal_enabled():
+            return False
+        try:
+            import asyncio as _asyncio
+            return await _asyncio.to_thread(
+                self.checkpoint, state, reason,
+            )
+        except _asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[SessionWAL] acheckpoint swallowed exc",
                 exc_info=True,
             )
             return False

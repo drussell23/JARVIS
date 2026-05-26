@@ -6771,7 +6771,16 @@ class BattleTestHarness:
                 state = self._slice12g3_build_checkpoint_state(
                     reason="periodic",
                 )
-                self._session_wal.checkpoint(state, "periodic")
+                # Slice 14 — async-safe checkpoint (offloads file I/O
+                # via asyncio.to_thread so the main asyncio loop tick
+                # continues during the ~5-50ms write sequence. Eliminates
+                # the LoopDeadman tombstone observed in bt-2026-05-25-230029
+                # v10 soak where the sync checkpoint() blocked the loop
+                # during periodic firing). Sync .checkpoint() retained on
+                # the shutdown_cancel branch above + force_checkpoint
+                # signal-handler paths because those run when the loop may
+                # already be cancelled and to_thread is unsafe there.
+                await self._session_wal.acheckpoint(state, "periodic")
             except Exception:  # noqa: BLE001 — defensive
                 # Continuous WAL is best-effort; a single failed
                 # checkpoint must not break the periodic cadence.
