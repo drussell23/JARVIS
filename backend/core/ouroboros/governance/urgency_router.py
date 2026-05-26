@@ -236,6 +236,111 @@ def _wiring_validation_route_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Slice 22 — Dynamic Tier Degradation Engine
+# ---------------------------------------------------------------------------
+#
+# v16 forensic (bt-2026-05-26-220930) exposed a structural gap: when
+# ``JARVIS_PROVIDER_CLAUDE_DISABLED=true`` is set, ClaudeProvider is not
+# constructed (Slice 19a). But the UrgencyRouter still routes ops to
+# ``IMMEDIATE`` per §5 ("Claude direct, skip DW"). With Claude absent,
+# the cascade exhausts at the dispatcher with ``fallback_skipped:
+# no_fallback_configured`` (Slice 19b) — the op dies before any provider
+# call lands. v16 burned 22 minutes and $0 of useful spend exactly this
+# way: SWE-Bench-Pro envelopes that didn't match the narrow
+# ``envelope_is_swe_bench_pro`` downgrade got classified IMMEDIATE and
+# vanished.
+#
+# Slice 22 fixes this STRUCTURALLY at the router rather than tagging
+# individual envelopes: when the router resolves to IMMEDIATE AND the
+# Claude tier is structurally absent (Slice 19a env), demote to
+# STANDARD (DW-primary). The healing matrix (Slices 20B/20C/20D +
+# Phase 3) is now actually reachable for the demoted op.
+#
+# The signal "Claude structurally absent" mirrors Slice 19a's contract
+# verbatim — same env var, same parsing rules — so the demotion fires
+# exactly when ClaudeProvider construction was skipped.
+#
+# §5 Manifesto transparency: every demotion logs the operator-attested
+# message at WARNING so the routing change is visible without grep.
+
+#: Slice 22 master switch — default TRUE because a) the only failure
+#: mode it has is the SAME failure mode we have today (cascade exhausts
+#: at dispatcher), b) the demotion path is deterministic + bounded, and
+#: c) Slice 19a's env var is itself opt-in, so this only fires when the
+#: operator has already structurally removed Claude.
+TIER_DECAY_ENABLED_ENV_VAR = "JARVIS_TIER_DECAY_ENABLED"
+
+#: Slice 19a contract — same env var the GovernedLoopService reads at
+#: ClaudeProvider construction time. Reading it here gives us the
+#: structural truth: when this is set, Claude is NOT in the registry.
+CLAUDE_DISABLED_ENV_VAR = "JARVIS_PROVIDER_CLAUDE_DISABLED"
+
+
+def _tier_decay_enabled() -> bool:
+    """Slice 22 master flag — re-read at every classify() call.
+
+    Default-TRUE: in a Claude-disabled environment the router MUST
+    demote IMMEDIATE → STANDARD or the op is structurally lost.
+    Setting to false restores legacy behavior (the v16 failure mode)
+    for forensic comparison.
+    """
+    raw = os.environ.get(TIER_DECAY_ENABLED_ENV_VAR, "").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _claude_tier_structurally_absent() -> bool:
+    """Slice 22 — non-blocking check against the active provider tier.
+
+    Mirrors Slice 19a's env-var contract verbatim
+    (``JARVIS_PROVIDER_CLAUDE_DISABLED``) so the structural signal
+    we read matches the structural signal GovernedLoopService used
+    to skip ClaudeProvider construction.
+
+    Pure env-var lookup — no provider registry import, no network,
+    no async, sub-microsecond. Safe to call inside the router hot
+    path.
+    """
+    raw = os.environ.get(CLAUDE_DISABLED_ENV_VAR, "").strip().lower()
+    return raw in {"true", "1", "yes", "on"}
+
+
+def _apply_immediate_tier_decay(
+    reason: str,
+) -> Tuple["ProviderRoute", str]:
+    """Slice 22 — post-classification IMMEDIATE-to-STANDARD demotion.
+
+    Called by every ``classify()`` return site that would otherwise
+    emit ``ProviderRoute.IMMEDIATE``. When tier decay is enabled
+    AND Claude is structurally absent, demotes to STANDARD with a
+    forensic-trail reason string that preserves the ORIGINAL routing
+    rationale (so postmortems can still attribute "why did this op
+    want to be IMMEDIATE in the first place").
+
+    Logs the §5-attested transition message verbatim at WARNING level
+    so the routing change is visible without grep.
+
+    Returns the (route, reason) tuple the caller passes through
+    unchanged in the no-decay path.
+    """
+    if not _tier_decay_enabled():
+        return ProviderRoute.IMMEDIATE, reason
+    if not _claude_tier_structurally_absent():
+        return ProviderRoute.IMMEDIATE, reason
+    # Decay fires — operator-attested §5 transparency message
+    logger.warning(
+        "[UrgencyRouter] Adaptive tier decay activated: "
+        "IMMEDIATE → STANDARD. Reason: Claude infrastructure "
+        "tier structurally absent."
+    )
+    return (
+        ProviderRoute.STANDARD,
+        f"tier_decay:immediate_to_standard:claude_absent:{reason}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # UrgencyRouter — the deterministic classifier
 # ---------------------------------------------------------------------------
 
@@ -404,24 +509,30 @@ class UrgencyRouter:
         # ── Priority 1: IMMEDIATE ──
         # Critical urgency ALWAYS routes to Claude direct.
         # Speed is the only metric that matters for critical ops.
+        # Slice 22: each IMMEDIATE return flows through
+        # ``_apply_immediate_tier_decay`` which transparently demotes
+        # to STANDARD when Claude is structurally absent. Legacy
+        # behavior preserved when ``JARVIS_TIER_DECAY_ENABLED=false``
+        # or when Claude IS available (the no-decay paths are
+        # byte-identical to the original returns).
         if urgency in _IMMEDIATE_URGENCIES:
             reason = f"critical_urgency:{source or 'unknown'}"
-            return ProviderRoute.IMMEDIATE, reason
+            return _apply_immediate_tier_decay(reason)
 
         # Voice commands are always immediate — human is waiting.
         if source == "voice_human":
             reason = "voice_command:human_waiting"
-            return ProviderRoute.IMMEDIATE, reason
+            return _apply_immediate_tier_decay(reason)
 
         # High-urgency test failures and runtime health — fast reflex.
         if urgency == "high" and source in _IMMEDIATE_SOURCES:
             reason = f"high_urgency_immediate_source:{source}"
-            return ProviderRoute.IMMEDIATE, reason
+            return _apply_immediate_tier_decay(reason)
 
         # Cross-repo operations need Claude's reliable multi-file handling.
         if cross_repo:
             reason = f"cross_repo:{file_count}_files"
-            return ProviderRoute.IMMEDIATE, reason
+            return _apply_immediate_tier_decay(reason)
 
         # ── Priority 2: SPECULATIVE ──
         # Intent discovery with non-urgent signals — fire and forget.
