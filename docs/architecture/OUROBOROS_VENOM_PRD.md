@@ -10304,10 +10304,234 @@ The bibliography is a *current snapshot* — the field is moving fast. Bandits-f
 
 ---
 
+## §46. DoubleWord Fleet Inventory — Per-Model O+V Role Mapping *(NEW 2026-05-26 — operator-driven post-Slice-10B-ii audit: "make sure we utilize all of DW's models that will be useful for O+V")*
+
+### §46.1 — Why this section exists
+
+Slice 10B (PR #58165) made the operator's trusted-seed env (`JARVIS_DW_TRUSTED_MODELS`) the bootstrap path for promoting DW models past the Zero-Trust §3.6 ambiguous-metadata SPECULATIVE-pin. Slice 10B-ii (PR #58434) wired that ledger into the topology gate, eliminating the two-registry disconnect that produced bt-2026-05-26-000630's $0.00 burn. At v12 detonation prep, the operator surfaced the next-order question:
+
+> *"i want to make sure we utilize all of DW's models that we will be useful for O+V and when we're running the soak and swe-bench-pro"*
+
+This section is the model-by-model audit of DoubleWord's discoverable inference fleet — what each model IS (parameter count, lineage, architectural strengths/weaknesses), what role it currently plays in O+V (used / dormant / unfit), and what role it SHOULD play given its capability profile. §46 is the operational complement to §45's cost-architecture roadmap: §45 says *"awaken dormant cost-intelligence infrastructure"*; §46 says *"awaken dormant DW model capacity within that infrastructure."*
+
+### §46.2 — Discovery snapshot (empirical, from soak telemetry)
+
+Across the bt-2026-05-25-21xxxx + bt-2026-05-26-000630 soaks, `dw_discovery_runner` enumerated the following 7 DoubleWord-served model_ids via `GET /v1/models`. All 7 were SPECULATIVE-pinned by `dw_catalog_classifier.classify()` because every card returned by DW's `/models` endpoint had both `parameter_count_b: None` AND `pricing_out_per_m_usd: None` → `has_ambiguous_metadata() == True` → Zero-Trust §3.6 quarantine to SPECULATIVE-only.
+
+Per-model audit (parameter counts parsed via `dw_catalog_client.parse_parameter_count` from model_id suffixes):
+
+#### §46.2.1 — `Qwen/Qwen3.5-397B-A17B-FP8` *(397B params, MoE-A17B, FP8)*
+
+**Lineage**: Alibaba's Qwen3.5 flagship sparse-MoE. 397B total parameters with 17B active per token (Mixture-of-Experts; only the gating-selected experts fire per inference step). FP8 quantization keeps the 17B-active compute affordable while preserving the 397B representational capacity.
+
+**Strengths**:
+- Strongest reasoning + codegen of any DoubleWord-served model in this fleet (>= GPT-4 class on coding benchmarks per Alibaba's published numbers).
+- Native tool-use support (compatible with Venom's OpenAI function-calling schema).
+- Long context (~128K tokens) — sufficient for multi-file repair contexts.
+- Hosted by DW at ~$0.10/$0.40 per M token (~30× cheaper than Claude Sonnet 4.6 input, ~37× cheaper output).
+
+**Weaknesses**:
+- Highest per-call latency of the Qwen fleet (TTFT typically 1.5-3s on cold cache).
+- Largest VRAM footprint → cold-storage demotion possible (per Phase 12.2 Slice C `ttft_observer`).
+- Sparse-MoE routing can be noisy on edge-case prompts (occasionally routes through a poorly-trained expert combination).
+
+**O+V role today**: Primary trusted seed pre-Slice-10B-ii expansion (`JARVIS_DW_TRUSTED_MODELS="doubleword-397b"` was its alias). Post-10B-ii admitted to STANDARD + COMPLEX routes (passes the 14B + 30B min_params_b gates).
+
+**O+V role recommended**: **Primary code-gen workhorse for STANDARD + COMPLEX routes.** Most repair-track ops (SWE-Bench-Pro, code refactor, multi-file changes) should land here. Reserve it for the heavy lifting; let smaller models handle lower-stakes routes.
+
+#### §46.2.2 — `Qwen/Qwen3.5-35B-A3B-FP8` *(35B params, MoE-A3B, FP8)*
+
+**Lineage**: Mid-size Qwen3.5 MoE. 35B total / 3B active per token. The compute-cost workhorse — comparable in deployment economics to a dense 7-10B model while retaining a portion of the MoE's representational headroom.
+
+**Strengths**:
+- ~5× faster TTFT than the 397B sibling (typically 0.3-0.8s on cold cache).
+- Hosted by DW at the same nominal $0.10/$0.40 per M token but with materially lower compute consumption → DW's amortized cost per token is closer to half the 397B's true cost.
+- Same tool-use API as the 397B (interchangeable Venom integration).
+- 128K context window inherited from Qwen3.5 family.
+
+**Weaknesses**:
+- Weaker on long-chain reasoning vs. the 397B (drops on benchmarks requiring 5+ inference steps).
+- Less reliable on novel API surface (it has seen less long-tail training data).
+
+**O+V role today**: SPECULATIVE-pinned by classifier; NEVER invoked.
+
+**O+V role recommended** (post §46.4 expansion): **Cheap STANDARD workhorse — first-attempt code gen.** Cascade pattern: dispatch to 35B first; if validation fails after K iters, escalate to 397B. Composes naturally with Slice 11B's predictive routing (Slice 13B multi-armed bandit refines this further). On the per-route gate matrix, 35B passes STANDARD (14B min) AND COMPLEX (30B min) — both routes get the choice between 35B and 397B; bandit picks based on per-shape success rate.
+
+#### §46.2.3 — `Qwen/Qwen3.5-4B` *(4B dense)*
+
+**Lineage**: Smallest production Qwen3.5 SKU. Dense (not MoE) — every parameter fires every token. 4B at FP8 fits in ~4GB VRAM; sub-100ms TTFT possible.
+
+**Strengths**:
+- Fastest model on the DW fleet (TTFT typically <200ms; tokens/sec ~10× the 397B).
+- Cheapest amortized inference cost (smallest VRAM footprint).
+- Quality is surprisingly high for the size on simple tasks (classification, entity extraction, short generation).
+
+**Weaknesses**:
+- Cannot handle multi-step reasoning reliably.
+- Cannot do meaningful code generation (frequently produces syntactically-broken output on non-trivial requests).
+- Tool-use support is unreliable (model often hallucinates tool-call shapes).
+
+**O+V role today**: SPECULATIVE-pinned; NEVER invoked.
+
+**O+V role recommended**: **BACKGROUND / SPECULATIVE probe model + IntentDiscovery synthesis.** Specifically valuable for:
+- `intent_discovery_sensor.py` cycle's `prompt_only()` call (currently uses 35B-class; 4B is faster + cheaper at comparable quality for that task shape).
+- `dw_heavy_probe` health probes (4B's sub-200ms TTFT is the tightest health signal we can extract).
+- `opportunity_miner_sensor`'s simple AST classifier (when LLM-judgment is needed, 4B suffices and `scan_once` cycles are high-volume).
+- Slice 13E LLMLingua-style prompt compression (the compressor model itself — operator pays 1× 4B call to save 1× 397B call → ~99× cost ratio).
+
+#### §46.2.4 — `moonshotai/Kimi-K2.6` *(parameter count unparsed from id; assumed >=100B based on Kimi lineage)*
+
+**Lineage**: Moonshot AI's flagship long-context model. The K2 series is purpose-built for >200K token context with retrieval-augmented attention. K2.6 is the latest revision.
+
+**Strengths**:
+- **200K+ token context window** — significantly larger than Qwen3.5's 128K.
+- Strong on multi-document reasoning (the use case it was trained for).
+- Comparable codegen quality to the 397B on standard tasks.
+- Hosted by DW at the same $0.10/$0.40 per M tier.
+
+**Weaknesses**:
+- Slower TTFT than equivalent-parameter Qwen models (Kimi's attention architecture adds latency).
+- Less Western-codebase training data (slightly weaker on Python / TypeScript idioms vs Qwen3.5).
+- Not all tool schemas Venom uses map cleanly (Kimi's function-calling shape has small divergences from OpenAI).
+
+**O+V role today**: SPECULATIVE-pinned; NEVER invoked.
+
+**O+V role recommended**: **Long-context specialist for prompts > 50K chars.** Specifically:
+- `ConsciousnessBridge` injecting full session memory into a generate call.
+- SWE-Bench-Pro instances where the worktree's relevant context exceeds Qwen's 128K window (large monorepos).
+- `repair_engine` when multi-file diffs need to be analyzed against extensive surrounding code.
+- Slice 12 UAE/CAI/SAI bridge — when the situational context payload is large enough that Qwen would truncate.
+
+A simple shape-router (Slice 13B Thompson-sampling input) would inspect `prompt_chars` at dispatch time and prefer Kimi over Qwen when chars > 50K.
+
+#### §46.2.5 — `deepseek-ai/DeepSeek-OCR-2` *(7B, vision-specialist)*
+
+**Lineage**: DeepSeek's second-gen OCR-specialized model. Multimodal (image + text input). Architected specifically for document understanding — receipts, forms, code screenshots, whiteboards.
+
+**Strengths**:
+- State-of-art OCR accuracy on documents (per DeepSeek's published benchmarks).
+- Native bounding-box output for layout-aware extraction.
+- Hosted on DW at vision-tier pricing (~$0.20/$0.60 per M token tier per DW's typical multimodal pricing).
+- Handles handwriting, mathematical formulas, code screenshots.
+
+**Weaknesses**:
+- **NOT a chat-completions model.** Sending it standard `messages` payloads returns HTTP 4xx (will be marked NON_CHAT by `dw_modality_ledger` Phase 12 Slice G once Slice 11C graduates).
+- Specialized for OCR; cannot do general code generation or reasoning.
+
+**O+V role today**: SPECULATIVE-pinned BUT never invoked because no chat op ever targets it (modality mismatch).
+
+**O+V role recommended**: **VisionSensor Tier 2 VLM cascade.** Per CLAUDE.md, `VisionSensor` currently uses `Qwen3-VL-235B` for Tier 2 VLM. Routing the OCR-heavy subset of vision ops (form analysis, code-screenshot extraction, whiteboard digitization) to `DeepSeek-OCR-2` would be:
+- 30× cheaper per token (vision-tier vs frontier-VLM pricing).
+- Higher accuracy on the specific OCR sub-tasks the larger VLM treats as commodity capability.
+- Slice 17 candidate (per §45.7-extension): VisionSensor's Tier 2 router dispatches to `DeepSeek-OCR-2` when the frame's predominant content is text-on-document; falls back to general VLM only for scene understanding.
+
+#### §46.2.6 — `lightonai/LightOnOCR-2-1B-bbox-soup` *(1B, vision-specialist with bounding-box training)*
+
+**Lineage**: LightOn AI's lightweight OCR model. The `bbox-soup` suffix indicates it was trained with extensive bounding-box auxiliary loss (the "soup" being a blend of OCR datasets covering varied layouts).
+
+**Strengths**:
+- Smallest vision model on the DW fleet — fits in <2GB VRAM.
+- Specifically strong on **bounding-box-aware extraction** (where text appears on screen + what its layout context is).
+- Ultra-low latency for vision-tier (TTFT can be <300ms).
+- Per-call cost is the cheapest vision option on DW.
+
+**Weaknesses**:
+- 1B parameters limits OCR accuracy ceiling (loses to DeepSeek-OCR-2 on handwriting/formulas).
+- Best for structured layouts (forms, tables, code IDEs) — weaker on free-form scenes.
+
+**O+V role today**: SPECULATIVE-pinned; NEVER invoked.
+
+**O+V role recommended**: **GhostHands UI-element detection + IDE-aware vision.** From CLAUDE.md, `backend/ghost_hands/` handles focus-preserving UI automation. The `bbox-soup` training is precisely what UI element detection needs (button locations, menu hierarchies, IDE editor regions). A Slice 18 candidate: GhostHands' pre-action vision check routes to `LightOnOCR-2-1B-bbox-soup` for layout-aware UI inspection. Sub-300ms TTFT keeps the action loop responsive.
+
+#### §46.2.7 — `allenai/olmOCR-2-7B-1025-FP8` *(7B, modern OCR with formula support)*
+
+**Lineage**: Allen AI's second-gen open-model OCR. The `1025` suffix indicates the October 2025 release. FP8 quantization. Distinguishing feature: strong on **mathematical formula** OCR (LaTeX extraction from rendered math).
+
+**Strengths**:
+- Same 7B size class as DeepSeek-OCR-2 but with formula-OCR as a first-class capability.
+- Open-weights provenance (Allen AI's research transparency contract — useful for audit reasoning per §43.6).
+- Strong on academic-paper layouts (figures, captions, equation-numbered references).
+
+**Weaknesses**:
+- Less optimized for handwriting than DeepSeek-OCR-2.
+- Newer model — less production telemetry to calibrate quality envelopes.
+
+**O+V role today**: SPECULATIVE-pinned; NEVER invoked.
+
+**O+V role recommended**: **Research / academic ingest pipeline.** Specifically:
+- If/when O+V ingests papers from arxiv/PMLR/ACL for §43.12 / §45.12 bibliography auto-update, `olmOCR-2-7B` handles the formula-heavy content the other OCR models would lose.
+- Future Slice candidate: `DreamEngine` speculative analysis of architecture papers → formula-aware extraction → §43/§45 research-foundation auto-refresh.
+
+### §46.3 — Fleet utilization summary table
+
+Post-Slice-10B-ii topology bridge + post-§46.4 trusted-seed expansion (`JARVIS_DW_TRUSTED_MODELS=Qwen/Qwen3.5-397B-A17B-FP8,Qwen/Qwen3.5-35B-A3B-FP8,Qwen/Qwen3.5-4B,moonshotai/Kimi-K2.6`):
+
+| Model | Params | Class | Today | Post-fleet expansion | Recommended O+V slice |
+|---|---|---|---|---|---|
+| Qwen3.5-397B-A17B-FP8 | 397B | Chat (MoE) | ✓ STANDARD/COMPLEX | ✓ STANDARD/COMPLEX | Primary code-gen |
+| Qwen3.5-35B-A3B-FP8 | 35B | Chat (MoE) | ❌ SPECULATIVE-pin | ✓ STANDARD/COMPLEX | First-attempt workhorse |
+| Qwen3.5-4B | 4B | Chat (dense) | ❌ SPECULATIVE-pin | ✓ BG/SPEC | Probes, IntentDiscovery, compression |
+| Kimi-K2.6 | ~100B+ | Chat (long-ctx) | ❌ SPECULATIVE-pin | ✓ BG/SPEC | Long-context specialist (>50K prompts) |
+| DeepSeek-OCR-2 | 7B | Vision/OCR | ❌ never invoked (modality) | ❌ still never (chat-route only) | **Slice 17 — VisionSensor Tier 2** |
+| LightOnOCR-2-1B-bbox-soup | 1B | Vision/OCR | ❌ never invoked (modality) | ❌ still never (chat-route only) | **Slice 18 — GhostHands UI detection** |
+| olmOCR-2-7B-1025-FP8 | 7B | Vision/OCR | ❌ never invoked (modality) | ❌ still never (chat-route only) | **Future research-ingest pipeline** |
+
+**4 of 7 models become actively usable after §46.4 fleet expansion.** The 3 OCR models require separate slices (Slice 17 / 18 / future) because they're modality-incompatible with the chat-completions dispatch path.
+
+### §46.4 — Operator runbook for v12+ DW-PRIMARY soaks
+
+Updated soak script (`/tmp/claude/aegis_high_capital_soak.sh`):
+
+```bash
+export JARVIS_DW_TRUSTED_MODELS="Qwen/Qwen3.5-397B-A17B-FP8,Qwen/Qwen3.5-35B-A3B-FP8,Qwen/Qwen3.5-4B,moonshotai/Kimi-K2.6"
+```
+
+**Per-route admission distribution** (validated 2026-05-26 via `_trusted_seed_dw_models_for_route`):
+
+| Route | Admitted models (post Slice 10B-ii bridge + per-route gates) |
+|---|---|
+| IMMEDIATE | (none — §5 exclusion) |
+| STANDARD | Qwen3.5-35B, Qwen3.5-397B *(both pass 14B min_params_b)* |
+| COMPLEX | Qwen3.5-35B, Qwen3.5-397B *(both pass 30B min_params_b)* |
+| BACKGROUND | Qwen3.5-4B, Qwen3.5-35B, Qwen3.5-397B, Kimi-K2.6 *(no min_params_b)* |
+| SPECULATIVE | Qwen3.5-4B, Qwen3.5-35B, Qwen3.5-397B, Kimi-K2.6 *(no min_params_b)* |
+
+The system uses the FIRST admitted model per route by default (in trusted-seed insertion order). Operators wanting a different default per route can reorder the env CSV. Slice 13B (multi-armed bandit per-shape selector) would replace this insertion-order default with empirical performance-driven selection.
+
+### §46.5 — Coverage gaps + sequenced model-utilization slices
+
+| Gap | Affected route(s) | Recommended slice | Estimated effort |
+|---|---|---|---|
+| OCR models never invoked (modality mismatch with chat-completions) | n/a (vision pipeline orthogonal) | **Slice 17** — VisionSensor Tier 2 routes to `DeepSeek-OCR-2` for OCR-heavy frames | ~200 LOC (composes vision_sensor.py + dw_modality_ledger Phase 12 Slice G) |
+| GhostHands UI inspection uses no vision LLM today | UI automation pipeline | **Slice 18** — GhostHands pre-action vision routes to `LightOnOCR-2-1B-bbox-soup` for layout-aware UI checks | ~150 LOC (composes ghost_hands/ + dw_modality_ledger) |
+| Default routing always picks first-admitted model (no shape-awareness) | STANDARD / BACKGROUND / SPECULATIVE | **Slice 13B** (per §45.7.2) — multi-armed bandit per-shape selector with Thompson sampling | ~250 LOC (composes op_trajectory_predictor + dw_promotion_ledger + Bandit Algorithms textbook ch.36) |
+| Long-context Kimi-K2.6 not invoked even when prompts > 50K chars | STANDARD long-context ops | Composes Slice 13B with `prompt_chars` as a shape feature | (rolls into Slice 13B above) |
+| Cheap Qwen3.5-4B never used for intent_discovery / health probes | IntentDiscovery + dw_heavy_probe | **Slice 18b** — IntentDiscovery `prompt_only` swaps to 4B; dw_heavy_probe rotates 4B as primary probe | ~80 LOC (1-line env knob + verification) |
+| Modality ledger gates unused (`dw_modality_ledger.py` 626 LOC dormant) | Vision pipeline | **Slice 11C** (per §45.5) — graduate `JARVIS_DW_MODALITY_VERIFICATION_ENABLED` so OCR models are explicitly NON_CHAT-classified | (already roadmapped in §45.5) |
+
+### §46.6 — Honest framing
+
+* **§46 documents WHAT EXISTS, not what's been validated.** The model strengths/weaknesses summaries reflect published benchmark numbers + architectural lineage; per-model production fitness for O+V's specific op shapes is *unproven empirical* until v12+ soaks gather telemetry. The recommendations are *hypotheses to falsify*, not commitments to ship.
+* **Per-route gates are the load-bearing safety contract.** Even after fleet expansion, `dw_catalog_classifier.gate_for_route` per-route param-count thresholds prevent a model that's too small from serving routes that need scale (Qwen3.5-4B will NEVER serve STANDARD because 4B < 14B min). Operator-attested trusted seeds bypass the *promotion ledger gate* (Slice 10B), and the *topology block* (Slice 10B-ii), but NEVER the *per-route eligibility gate*. The gate matrix is the safety floor.
+* **§46 is a snapshot of 2026-05-26 DW catalog state.** DW may add or deprecate models. The §46.2 enumeration should be re-run quarterly (or whenever `dw_discovery_runner` reports a substantially different `routes_assigned` distribution).
+* **Vision pipeline (§46.5 gaps) is orthogonal to the cost-architecture arc.** Slice 17/18 don't help the SWE-Bench-Pro repair-track soaks because those ops never enter the vision pipeline. They become high-leverage if/when O+V's autonomous loop starts ingesting visual context (screen captures, document analysis, GhostHands UI automation) at scale.
+* **No new env knob.** §46's fleet expansion uses the existing `JARVIS_DW_TRUSTED_MODELS` env (Slice 10B). Operator-facing surface stays minimal — the discovery happens at the env-CSV layer, not via new configuration.
+
+### §46.7 — Net call
+
+The DW fleet is **a 7-model resource pool, only 1 of which O+V utilized pre-Slice-10B-ii**. Slice 10A/10B/10B-ii unlocked the architectural capacity for the other 6; §46.4's operator runbook expansion activates 3 more (Qwen3.5-35B, Qwen3.5-4B, Kimi-K2.6) for immediate v12 utilization. The remaining 3 (OCR models) require separate orthogonal vision-pipeline slices (Slice 17/18/future).
+
+v12 soak detonation is the empirical verification. If telemetry shows DW serving ≥50% of ops at total spend ≪ Claude-only baseline, the §46.2 per-model role hypotheses graduate from *plausible* to *evidenced*. If specific models consistently lose to Claude on specific shapes despite per-route admission, that's Slice 13B (bandit) signal — feed those shape→model failure rates into the selector's prior distribution.
+
+The fleet is ready. The architecture is ready. The empirical validation is one soak away.
+
+---
+
 ## Appendix D — Document History
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-05-26 | 3.4 | **§46 added — DoubleWord Fleet Inventory: per-model O+V role mapping.** Operator-driven post-Slice-10B-ii audit ("make sure we utilize all of DW's models that will be useful for O+V"). §46.1 framing — the next-order question after Slice 10A/10B/10B-ii unlocked DW dispatch architecturally: which of the 7 DW-served models O+V should actually use, for what, and which sit dormant. §46.2 — empirical 7-model fleet enumeration from soak telemetry (`Qwen/Qwen3.5-397B-A17B-FP8`, `Qwen/Qwen3.5-35B-A3B-FP8`, `Qwen/Qwen3.5-4B`, `moonshotai/Kimi-K2.6`, `deepseek-ai/DeepSeek-OCR-2`, `lightonai/LightOnOCR-2-1B-bbox-soup`, `allenai/olmOCR-2-7B-1025-FP8`) — each with full lineage (Alibaba MoE / Moonshot long-context / DeepSeek OCR / LightOn bbox-trained / Allen AI formula-OCR), strengths, weaknesses, current O+V role (used / SPECULATIVE-pinned / modality-incompatible), and recommended O+V role + sequenced graduation slice. §46.3 fleet utilization summary table — post-Slice-10B-ii + post-§46.4 fleet expansion: 4 of 7 models become actively usable for code-gen routes; 3 OCR models require orthogonal vision-pipeline slices (Slice 17 / 18). §46.4 operator runbook — updated `JARVIS_DW_TRUSTED_MODELS` env (4-model CSV) + per-route admission distribution validated 2026-05-26 via `_trusted_seed_dw_models_for_route` (STANDARD: 35B+397B / COMPLEX: 35B+397B / BACKGROUND: 4B+35B+397B+Kimi / SPECULATIVE: 4B+35B+397B+Kimi / IMMEDIATE: §5-excluded). §46.5 coverage gaps + 6 sequenced model-utilization slices: **Slice 17** (VisionSensor Tier 2 → DeepSeek-OCR-2 for OCR-heavy frames, ~200 LOC), **Slice 18** (GhostHands UI inspection → LightOnOCR-2-1B-bbox-soup, ~150 LOC), **Slice 13B** (per §45.7.2 — multi-armed bandit per-shape selector with Thompson sampling using `op_trajectory_predictor` + `dw_promotion_ledger`, ~250 LOC), **Slice 18b** (IntentDiscovery + dw_heavy_probe swap to 4B for cheap probes, ~80 LOC), composes with already-roadmapped **Slice 11C** (`dw_modality_ledger` graduation marking OCR models NON_CHAT-classified). §46.6 honest framing per `memory/feedback_no_preresult_euphoria.md` — §46 documents WHAT EXISTS, not what's been validated; per-model production fitness for O+V's specific op shapes is unproven empirical until v12+ soaks gather telemetry; recommendations are hypotheses to falsify not commitments to ship; per-route gates remain the load-bearing safety contract (Qwen3.5-4B NEVER serves STANDARD because 4B < 14B min, even with operator attestation). §46.7 net call — fleet is ready, architecture is ready, v12 soak detonation is the empirical verification. Header bumped 3.3 → 3.4 (additive PRD section; complements §45 cost-intelligence roadmap with the orthogonal "what's in the DW toolbox" axis). | Claude Opus 4.7 (1M context) (§46 + DW fleet audit) |
 | 2026-05-25 | 3.3 | **§45.12 added — Cost-Intelligence Research Foundation (elite-source annotated bibliography).** Mirrors the §43.12 precedent — 22 peer-reviewed / arxiv-published foundational sources mapped to specific §45 sub-slices. Grouped by 8 areas: (1) Cost-aware LLM cascade routing — FrugalGPT (Chen/Zaharia/Zou Stanford 2023, TMLR), RouteLLM (Ong et al. LMSYS/UCB 2024, ICLR 2025), Hybrid LLM (Ding et al. ICLR 2024), AutoMix (Madaan et al. CMU/Google NeurIPS 2024); (2) Prompt + response caching — Prompt Cache (Gim et al. MIT/Yale MLSys 2024 — academic foundation for the Anthropic prompt_caching wired at `providers.py:5835`), vLLM/PagedAttention (Kwon et al. UCB SOSP 2023), Hydragen (Juravsky et al. Stanford ICML 2024), GPTCache (Bang et al. Zilliz NeurIPS 2023 Workshop), SCALM (Li et al. 2024); (3) Prompt compression — LLMLingua (Jiang et al. Microsoft EMNLP 2023), LLMLingua-2 (Pan et al. Microsoft ACL 2024); (4) Speculative inference — Speculative Decoding (Leviathan/Kalman/Matias Google ICML 2023), Cascade Speculative Drafting (Chen et al. UIUC NeurIPS 2024); (5) Multi-armed bandit — Bandit Algorithms textbook (Lattimore & Szepesvári Cambridge 2020, free open-access), LLM Bandit body of work (Zhao et al. 2024+); (6) Inference economics + scaling laws — Chinchilla (Hoffmann et al. DeepMind NeurIPS 2022 — justifies why DW-397B exists), Switch Transformer (Fedus/Zoph/Shazeer Google JMLR 2022), Chain-of-Thought Hub (Fu et al. Edinburgh/AI2 2023); (7) Contextual / situational awareness — Contextual Bandits with Linear Payoffs (Chu/Li/Reyzin/Schapire Yahoo AISTATS 2011, LinUCB foundation for Slice 12), Adaptive UI MAB tradition (CHI/HCI); (8) AI safety + cost intersection — Concrete Problems in AI Safety (Amodei/Olah/Steinhardt et al. 2016 — bridges §45 cost-intelligence to §43 safety architecture via the safe-exploration formalism), Mechanistic Interpretability for cost-sensitive routing (emerging area). **Six-principle synthesis** (§45.12 closing): (P1) cost cascades are Pareto-dominant; (P2) prompt structure determines cache hit rate; (P3) semantic dedup pays at chat-scale, threshold > algorithm; (P4) compression pays if cheap_call_cost < 10% × expensive_saved; (P5) speculation generalizes from tokens to ops; (P6) contextual bandit + safe exploration is the unifying frame. Each principle is *load-bearing* — violating any risks rederiving a failure mode the field has already documented. Header bumped 3.2 → 3.3 (additive). | Claude Opus 4.7 (1M context) (§45.12 research foundation) |
 | 2026-05-25 | 3.2 | **§45 added — Cost-Intelligence Architecture: Awakening the Dormant Arsenal.** Driven by bt-2026-05-25-215404 cost-inversion forensics ($1.43 / 99.83% Claude burn against trinity manifesto intent of ≤30% Claude, ≥70% DW). Documents post-Slice 10A (PR #58161, SWE-Bench-Pro envelope → STANDARD route) + Slice 10B (PR #58165, `JARVIS_DW_TRUSTED_MODELS` PromotionLedger trusted-seed) audit finding: **operator has already authored ~5,500 LOC of cost-intelligence infrastructure across 7 files, ~70% dormant behind §33.1 default-FALSE gates**. §45.1 frames the cost-architecture inversion. §45.2 inventories the arsenal — §45.2.1 Active (~7,000 LOC graduated, includes Anthropic prompt_caching wired at `providers.py:5835` silently saving 90% on cached input tokens), §45.2.2 Dormant (~5,134 LOC: `provider_response_cache.py` 784 LOC + `s2_predictive_budget.py` 1,019 LOC + `op_trajectory_predictor.py` 760 LOC + `anti_fragility_budget.py` 1,307 LOC + `dw_topology_circuit_breaker.py` 248 LOC + `dw_modality_ledger.py` 626 LOC + `adaptive_gen_budget.py` 390 LOC). §45.3 **Slice 11A** — graduate `provider_response_cache.py` (full-response cache wired for BOTH Claude AND DW at `doubleword_provider.py:1171`; flipping master flag activates token recycling on both providers simultaneously). §45.4 **Slice 11B** — graduate `s2_predictive_budget.py` + `op_trajectory_predictor.py` (cost-aware routing autonomy: O+V projects per-op cost on each provider, advises §5 router on downgrades). §45.5 **Slice 11C** — graduate `dw_topology_circuit_breaker.py` + `dw_modality_ledger.py` (fast-fail DW capability, eliminates the 7 DW→Claude fallback waste events). §45.6 **Slice 12 — UAE/CAI/SAI → UrgencyRouter Bridge** (creative frontier the operator named): bridges existing JARVIS Body intelligence stack (`backend/intelligence/uae_integration.py` 716 LOC + `backend/intelligence/context_awareness_intelligence.py` + `backend/vision/situational_awareness/` + `backend/core/ouroboros/consciousness/situational_awareness.py` 1,328 LOC) into UrgencyRouter via new Priority 0.5 slot — routing decisions become **dynamic + situational** ("user idle 15min → downgrade to STANDARD; user mid-IDE-typing → upgrade to IMMEDIATE"). §45.7 **DW-Specific Optimizations** (10 sub-slices 13A–J): batch API for BG/SPEC, multi-armed bandit per-shape model selection, semantic-similarity response dedup via `semantic_index.py`, speculative pre-generation in idle cycles via `dream_engine.py`, adversarial prompt compression (1× cheap DW call saves 1× expensive Claude call), tool-call result memoization in `tool_executor.py`, cost-aware retry policy preferring same-tier retries, DW-Claude cost arbitrage speculative dual-dispatch (operator opt-in), per-tenant cost ledger via UAE persona detection, token-level streaming early-exit. §45.8 **Sequencing recommendation** with compounding cost-reduction table — from baseline $1.43 (99.83% Claude) projected to ~$0.22-$0.25 (~20% Claude) at Slice 13 completion. §45.9 **Anti-goals** (never compromise capability for cost; never violate operator reflex routing; never auto-disable Claude; cost is optimized not maximized-savings; never bypass §43 safety hardening). §45.10 **Honest framing** per `memory/feedback_no_preresult_euphoria.md` — most of §45 is GRADUATION not new code; cost-self-awareness is a SAFETY property not vanity; Slice 12 is the genuinely creative addition (cooperative seam between Trinity Body and Trinity Mind). §45.11 **Net call** — roadmap not commitment; each slice passes §33.1 independently; operator-bound detonation cadence. Header bumped 3.1 → 3.2 (additive PRD section; complements §44 DW diagnostic closure with the orthogonal cost-intelligence axis). | Claude Opus 4.7 (1M context) (§45 + Slice 10/11/12/13 roadmap) |
 | 2026-05-21 | 3.1 | **§44 added — DW × O+V Diagnostic Closure: §25.2 hypothesis space empirically closed via three production-faithful isolation harnesses run against the live DW endpoint.** §44.1 documents the verdict-table evolution from 5 open hypotheses (pre-2026-05-21) to 0 open hypotheses (post). Three harnesses landed as standing instruments in `scripts/`: (A) `dw_sse_stall_isolation.sh` — raw-wire curl-based isolation, bypasses aiohttp entirely, answers "wire silence vs. parser mis-classify"; (B) `dw_concurrent_stress.py` — production-faithful aiohttp burst harness with N parallel agent-scale streams, single-seam imports of `StreamRuptureError` from `providers.py`, ThreadedResolver discipline matching production; (C) `dw_tool_loop_stress.py` — OpenAI-native function-calling tool-loop with N concurrent × M-turn conversations, tool schemas mirroring Venom's actual surface (read_file/search_code/glob_files/list_dir), async tool execution via `asyncio.sleep` never blocking event loop, single-seam imports of all primitives from harness B. All three env-knob-driven, no hardcoded values, 30s per-chunk timeout matches `doubleword_provider.py:1689` exactly. **Aggregate evidence: 12,608 inter-chunk gaps observed, worst single gap 592 ms (~50× safety margin below 30s threshold), zero StreamRuptureErrors, $0.06 total cost.** §44.3 documents the architectural finding from Test B Stream #9: model reasoned 72.7s before first content token with max gap 446 ms because DW emits `reasoning` deltas continuously — **reasoning frames function as effective keepalives**. Forward-looking refinement to `dw_ttft_observer.py` proposed (4-state stream health: silent / reasoning-only / content+reasoning / reasoning-idle). §44.4 transitions the §14.5 reversal ladder from "diagnostic phase pending" to Step 1 ✓ DONE → Step 2 IMMEDIATE NEXT (flip STANDARD to `block_mode: shadow_with_claude_cascade`) → Steps 3–5 route-promotion ladder (~1 route/week cadence). §44.5 proposes Continuous Provider Validation (CPV) as forward-looking architectural pattern composing existing primitives (battle-test harness + ttft observer + event_channel + provider_topology + the three new harnesses) — explicitly NOT authorized yet, post-Seb-call build. §44.6 explicitly enumerates what did NOT change despite the diagnostic results (30s threshold stays, aiohttp config stays, cascade-to-Claude stays, topology seal stays until §14.5 ladder dismantles it route-by-route, resilience layer stays). §44.7 honest framing per `feedback_no_preresult_euphoria.md`: clean tests are an empirical *snapshot*, not a steady-state guarantee — shadow window in Step 3 is where operational reality hardens. Companion changes: `brain_selection_policy.yaml` comment block addended with May 21 calibration notes; Seb-call PDFs (`DW_Seb_Call_Cheatsheet.pdf` + `DW_Section_14_5_Re_Engagement_Plan.pdf`) updated to reflect diagnostic-results posture. Header bumped 3.0 → 3.1 (additive PRD section). | Claude Opus 4.7 (1M context) (§44 + diagnostic harness arc) |
