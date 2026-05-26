@@ -356,19 +356,49 @@ class PromotionLedger:
         ``has_ambiguous_metadata`` and pinned to SPECULATIVE-only.
         Trusted models bypass that gate from boot 0.
 
-        Discipline:
-          * Disk records ALWAYS take precedence. If a model already
-            has a record (promoted, demoted, or quarantined), the env
-            seed is silently skipped for that model. Operator must
-            clear the disk record to re-seed.
-          * Empty/unset env → no-op. Existing behavior byte-equivalent
-            to pre-Slice-10B.
-          * NEVER raises — env parse failures degrade to empty list.
-          * Caller responsibility: ``JARVIS_DW_TRUSTED_MODELS=...``
-            is an operator attestation; if the listed model_ids
-            don't exist on the DW endpoint, the classifier will
-            simply find no card for them and the seed is harmless
-            (no provider call ever lands on a phantom model).
+        # Slice 10B-iii state-hierarchy refinement (2026-05-26)
+
+        bt-2026-05-26-062945 (v12 soak) surfaced a design flaw in the
+        original Slice 10B discipline: "disk records always take
+        precedence" conflated TWO distinct kinds of disk state:
+
+          1. **Operator decisions** — `operator_demoted` or
+             `demoted_from_bg` origins. The operator (or operator-driven
+             post-promotion failure) explicitly demoted the model. The
+             env trusted seed MUST NOT override these — that would
+             silently revert an operator action.
+
+          2. **Automatic classifier quarantine** — `ambiguous_metadata`
+             origin. This is an AUTO safety pin assigned by
+             `dw_catalog_classifier.classify()` when the discovered
+             ModelCard has both `parameter_count_b` AND
+             `pricing_out_per_m_usd` as None. It is NOT an operator
+             decision — it is the absence of one. The operator's
+             explicit attestation via JARVIS_DW_TRUSTED_MODELS supplies
+             the warrant the auto-classifier lacks. The env seed
+             SHOULD override this.
+
+        v12 had 18 models on disk from prior discovery, all quarantined
+        with origin=ambiguous_metadata. The pre-10B-iii seed logic
+        skipped 3 of 4 trusted-env models (already on disk) and only
+        promoted the 1 model NOT yet on disk (Qwen3.5-4B). Result:
+        the fleet expansion was silently inert; only 397B (from prior
+        soak's seed under the legacy alias `doubleword-397b`) + the new
+        4B were promoted; 35B + Kimi stayed quarantined.
+
+        Slice 10B-iii state hierarchy:
+          * No disk record         → seed (create promoted=True record)
+          * origin=ambiguous_metadata → OVERRIDE: promote + flip origin
+                                       to trusted_seed (auto-quarantine
+                                       loses to operator attestation)
+          * origin=trusted_seed    → already promoted (idempotent — no-op)
+          * origin=operator_demoted → SKIP (operator decision wins)
+          * origin=demoted_from_bg → SKIP (post-promotion failure wins —
+                                     it's empirical, not auto-classified)
+          * Other origins → SKIP (defensive: unknown disk state wins)
+
+        Empty/unset env → no-op (byte-equivalent to pre-Slice-10B-iii).
+        NEVER raises.
         """
         raw = os.environ.get("JARVIS_DW_TRUSTED_MODELS", "").strip()
         if not raw:
@@ -379,30 +409,66 @@ class PromotionLedger:
         ]
         if not candidates:
             return
-        seeded = 0
+        # ── Slice 10B-iii — state hierarchy override ──
+        # Origins for which env trusted seed OVERRIDES the disk record:
+        _OVERRIDABLE_ORIGINS = frozenset({
+            QUARANTINE_AMBIGUOUS_METADATA,
+        })
+        seeded_new = 0
+        promoted_override = 0
+        skipped_operator = 0
         for mid in candidates:
-            if mid in self._records:
-                # Disk record wins — silently skip the env seed.
+            existing = self._records.get(mid)
+            if existing is None:
+                # No disk record — create fresh promoted entry
+                self._records[mid] = PromotionRecord(
+                    model_id=mid,
+                    quarantine_origin=QUARANTINE_TRUSTED_SEED,
+                    success_latencies_ms=[],
+                    failure_count=0,
+                    promoted=True,
+                    promoted_at_unix=time.time(),
+                    last_event_unix=time.time(),
+                )
+                seeded_new += 1
                 continue
-            rec = PromotionRecord(
-                model_id=mid,
-                quarantine_origin=QUARANTINE_TRUSTED_SEED,
-                success_latencies_ms=[],
-                failure_count=0,
-                promoted=True,  # bypass 10-success requirement
-                promoted_at_unix=time.time(),
-                last_event_unix=time.time(),
-            )
-            self._records[mid] = rec
-            seeded += 1
-        if seeded > 0:
+            if existing.promoted:
+                # Already promoted (likely a prior trusted_seed run);
+                # idempotent — leave as-is.
+                continue
+            if existing.quarantine_origin in _OVERRIDABLE_ORIGINS:
+                # Slice 10B-iii — auto-quarantine LOSES to operator
+                # attestation. Override the disk record: flip to
+                # promoted=True + origin=trusted_seed. Clear any stale
+                # latency history (the prior auto-quarantine never
+                # actually ran the model, so historic latencies don't
+                # apply to the trusted-seed promotion path).
+                existing.promoted = True
+                existing.quarantine_origin = QUARANTINE_TRUSTED_SEED
+                existing.success_latencies_ms.clear()
+                existing.failure_count = 0
+                existing.promoted_at_unix = time.time()
+                existing.last_event_unix = time.time()
+                promoted_override += 1
+                continue
+            # operator_demoted, demoted_from_bg, or unknown origin →
+            # operator decision wins; silently skip.
+            skipped_operator += 1
+        total_promoted = seeded_new + promoted_override
+        if total_promoted > 0 or skipped_operator > 0:
             logger.info(
-                "[PromotionLedger] Slice 10B: seeded %d trusted model(s) "
-                "from JARVIS_DW_TRUSTED_MODELS — these bypass the "
-                "10-success prove-it requirement (origin=trusted_seed)",
-                seeded,
+                "[PromotionLedger] Slice 10B-iii: trusted-seed "
+                "outcome — seeded_new=%d promoted_override=%d "
+                "skipped_operator_decision=%d "
+                "(env=JARVIS_DW_TRUSTED_MODELS; auto-quarantine "
+                "yields to operator attestation; operator demotions "
+                "preserved)",
+                seeded_new,
+                promoted_override,
+                skipped_operator,
             )
-            self._maybe_autosave()
+            if total_promoted > 0:
+                self._maybe_autosave()
 
     def save(self) -> None:
         """Write current state to disk atomically. NEVER raises;
