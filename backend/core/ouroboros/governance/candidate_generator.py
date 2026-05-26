@@ -146,6 +146,53 @@ _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S
 _TIER3_REFLEX_HARD_CAP_S = float(
     os.environ.get("OUROBOROS_TIER3_REFLEX_HARD_CAP_S", "30")
 )
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 18c (2026-05-26) — route-aware Tier 0 RT budget cap
+#
+# Closes the cascade-to-Claude-on-premature-timeout pattern surfaced by
+# soak bt-2026-05-26-070049 (FLEET v13): Slice 10A correctly routed
+# SWE-Bench-Pro to STANDARD; Slice 10B-iii promoted Qwen 397B; Slice
+# 10B-ii bridge unblocked the topology; candidate_generator dispatched
+# DW Tier 0 RT — but the 30s default cap (above) clamped the budget
+# below the 397B's actual TTFT envelope. Result: 8 EXHAUSTION events,
+# each cascading to Claude which then refused on credit-balance.
+#
+# The 30s default was designed for IMMEDIATE-equivalent "reflex"
+# semantics (per Manifesto §5 — speed permanently supersedes cost).
+# Applying it to STANDARD + COMPLEX routes — which are explicitly
+# cost-optimized (DW primary) and have no reflex-time SLA — is a
+# category error.
+#
+# Fix: route-aware cap selector. STANDARD + COMPLEX use the new
+# JARVIS_DW_TIER0_RT_BUDGET_S (default 90s — matches Qwen 397B + Kimi
+# K2.6 TTFT envelope per §46.2). BG/SPEC + everything else keeps the
+# 30s reflex cap (those are either cost-floored or DW-only routes
+# where 30s is the right ceiling).
+#
+# Operator override per route via the env knob; future Slice 13B
+# bandit (§45.7.2) can replace this static cap with per-shape
+# empirical p95 envelope. Until then, 90s is the empirical floor
+# observed on 397B cold-start cold-cache runs.
+# ──────────────────────────────────────────────────────────────────────
+_TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
+    os.environ.get("JARVIS_DW_TIER0_RT_BUDGET_S", "90"),
+)
+
+
+def _tier0_rt_cap_for_route(provider_route: str) -> float:
+    """Slice 18c — return the absolute Tier 0 RT cap for *route*.
+
+    STANDARD + COMPLEX: 90s default (matches 397B/Kimi TTFT envelope).
+    Everything else: 30s reflex cap (preserved for IMMEDIATE/BG/SPEC
+    cost-optimization semantics + pre-Slice-18c byte-equivalence).
+    """
+    r = (provider_route or "").strip().lower()
+    if r in ("standard", "complex"):
+        return _TIER0_RT_BUDGET_STANDARD_COMPLEX_S
+    return _TIER3_REFLEX_HARD_CAP_S
+
+
 # Legacy alias retained for downstream imports + existing test surface.
 # Do not change to a different default without updating the test pins.
 # Reads OUROBOROS_PRIMARY_MAX_TIMEOUT_S as a per-primary override — when
@@ -4809,16 +4856,24 @@ class CandidateGenerator:
         tier1_reserve = min(min_reserve, total_s * (1.0 - effective_fraction))
         # Tier 3 Reflex (Manifesto §5): absolute hard cap on DW calls.
         # Strictest of four constraints wins (fraction, route max_wait,
-        # tier1 reserve, Tier 3 cap). Added 2026-04-24 after F1 Slice 4 S4
+        # tier1 reserve, Tier 0 RT cap). Added 2026-04-24 after F1 Slice 4 S4
         # (bt-2026-04-24-213248) proved the previous patch (inside
         # _call_primary) was inert for the DW-is-Tier0-AND-Primary
         # configuration — this code path is where DW actually gets its
         # 90s max_wait in that configuration.
+        #
+        # Slice 18c (2026-05-26) — the 4th constraint is now route-aware.
+        # STANDARD + COMPLEX get the new JARVIS_DW_TIER0_RT_BUDGET_S
+        # (default 90s — matches 397B/Kimi TTFT envelope) instead of the
+        # 30s reflex cap. Eliminates the FLEET-v13-soak premature-timeout
+        # cascade pattern (8 EXHAUSTION events, each on a DW dispatch
+        # that needed >30s to complete). IMMEDIATE/BG/SPEC preserved at
+        # 30s for cost-optimization semantics.
         budget = min(
             total_s * effective_fraction,
             max_wait,
             total_s - tier1_reserve,
-            _TIER3_REFLEX_HARD_CAP_S,
+            _tier0_rt_cap_for_route(provider_route),
         )
         return max(budget, 0.0)
 
