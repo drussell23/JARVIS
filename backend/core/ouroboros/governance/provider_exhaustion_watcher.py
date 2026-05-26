@@ -233,6 +233,42 @@ class ProviderExhaustionWatcher:
         hibernating / DISABLED / EMERGENCY_STOP).
         """
         async with self._lock:
+            # ──────────────────────────────────────────────────────────
+            # Slice 19b (2026-05-26) — fallback_skipped semantic filter
+            #
+            # Pre-Slice-19b: every all_providers_exhausted event
+            # incremented the consecutive counter. PURE-DW soaks
+            # (Slice 19a JARVIS_PROVIDER_CLAUDE_DISABLED=true) made
+            # _call_fallback always cascade to fallback_failed when
+            # invoked because self._fallback was None — and 3 of those
+            # in a row tripped hibernation.
+            #
+            # Slice 19b adds an explicit ``fallback_skipped:`` cause
+            # prefix for the "no fallback configured" case. Here we
+            # filter it out of the consecutive count: skipped is not
+            # failed; absence of fallback is an operator-attested
+            # configuration, not provider distress.
+            #
+            # The event is still recorded in total_exhaustions for
+            # observability, but does NOT advance the consecutive
+            # counter toward the hibernation threshold.
+            # ──────────────────────────────────────────────────────────
+            _reason_str = reason or ""
+            if "fallback_skipped:" in _reason_str:
+                self._total_exhaustions += 1
+                logger.info(
+                    "[ExhaustionWatcher] record_exhaustion(reason=%r "
+                    "op_id=%s) — Slice 19b fallback_skipped SEMANTIC "
+                    "FILTER — consecutive stays at %d/%d total=%d "
+                    "(skipped is not failed; operator-attested "
+                    "configuration, not provider distress)",
+                    _reason_str,
+                    op_id or "-",
+                    self._consecutive,
+                    self._threshold,
+                    self._total_exhaustions,
+                )
+                return False
             if op_id and op_id in self._counted_op_ids:
                 self._deduped_events += 1
                 self._total_exhaustions += 1
