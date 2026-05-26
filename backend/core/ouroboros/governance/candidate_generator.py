@@ -459,6 +459,99 @@ def _fallback_disabled_for_route(route: str) -> bool:
     return (route or "").strip().lower() in disabled
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Slice 23 — Autonomous Registry-Driven Sentinel Activation
+# ──────────────────────────────────────────────────────────────────────
+#
+# v16/v17 forensic exposed that locking dispatch to a single DW model
+# when an entire trusted-seed fleet sits in the PromotionLedger is an
+# architectural bottleneck. The fix is NOT a per-soak env flag — it is
+# a structural decision the dispatcher makes at every call from the
+# active registry state.
+#
+# Decision matrix (first-match-wins; closed and deterministic):
+#
+#   1. Operator explicit-on  (JARVIS_TOPOLOGY_SENTINEL_ENABLED=true)
+#      → ACTIVATE (legacy explicit-on contract, preserved verbatim).
+#
+#   2. Operator explicit-off (JARVIS_TOPOLOGY_SENTINEL_ENABLED=false)
+#      → DO NOT activate (operator rollback wins over every structural
+#        condition — single-knob hot-revert preserved per §33).
+#
+#   3. Claude tier structurally absent  (JARVIS_PROVIDER_CLAUDE_DISABLED=true)
+#      → ACTIVATE. Slice 19a declares "Claude removed → DW fleet IS
+#        the only intelligence". Iterating the fleet is the architectural
+#        contract that operator-binding implies. Composes with Slice 22
+#        tier-decay (IMMEDIATE→STANDARD demotion when Claude absent).
+#
+#   4. Multi-model trusted fleet for this route  (≥2 promoted ledger
+#      entries that pass the route's eligibility gate)
+#      → ACTIVATE. A multi-model fleet exists precisely so dispatch can
+#        rotate among them on failure. Locking to one when 2+ are
+#        promoted defeats the PromotionLedger's purpose.
+#
+#   5. Default  (Claude enabled + single-model fleet + env unset)
+#      → DO NOT activate. Phase 10 graduation contract preserved for
+#        the Claude-enabled posture this contract was written about.
+#
+# The structural conditions (3, 4) compose `JARVIS_PROVIDER_CLAUDE_DISABLED`
+# (Slice 19a) and `_trusted_seed_dw_models_for_route` (Slice 10B-ii) —
+# both already-existing substrate. No new env knobs, no new state,
+# no parallel ledgers. The PromotionLedger is the autonomous registry;
+# the trusted-seed bridge already enforces per-route eligibility gates.
+#
+# The Phase 10 graduation contract AST pin
+# (`phase10_graduation_contract.py`) asserts the master flag DEFAULT
+# stays false — which it does. Slice 23 adds structural OVERRIDES on
+# top of that default; the literal env-var default is unchanged.
+
+
+_SENTINEL_ENABLED_ENV = "JARVIS_TOPOLOGY_SENTINEL_ENABLED"
+_CLAUDE_DISABLED_ENV = "JARVIS_PROVIDER_CLAUDE_DISABLED"
+_SLICE23_MIN_PROMOTED_FOR_AUTO = 2
+
+
+def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
+    """Slice 23 — autonomous registry-driven sentinel activation.
+
+    Returns ``(activate, reason)`` where ``reason`` is a short
+    classifier string suitable for logging (one of: ``env_explicit_on``,
+    ``env_explicit_off``, ``claude_disabled``, ``multi_model_fleet``,
+    ``default_off_phase10_contract``, ``trusted_seed_probe_failed``).
+
+    Pure function over env + PromotionLedger snapshot. No side effects.
+    Defensive against trusted-seed probe failures — falls through to
+    default-off rather than raising into dispatch.
+    """
+    env_raw = os.environ.get(_SENTINEL_ENABLED_ENV, "").strip().lower()
+    if env_raw in ("1", "true", "yes", "on"):
+        return True, "env_explicit_on"
+    if env_raw in ("0", "false", "no", "off"):
+        return False, "env_explicit_off"
+
+    claude_raw = os.environ.get(_CLAUDE_DISABLED_ENV, "").strip().lower()
+    if claude_raw in ("1", "true", "yes", "on"):
+        return True, "claude_disabled"
+
+    # Multi-model fleet probe — lazy import keeps candidate_generator
+    # bootable when provider_topology is unavailable (e.g., isolated
+    # unit tests). Defensive try/except — bridge failure must NEVER
+    # block dispatch; fall through to default-off if the probe raises.
+    try:
+        from backend.core.ouroboros.governance.provider_topology import (
+            _trusted_seed_dw_models_for_route,
+        )
+        promoted_for_route = _trusted_seed_dw_models_for_route(
+            provider_route or "standard",
+        )
+        if len(promoted_for_route) >= _SLICE23_MIN_PROMOTED_FOR_AUTO:
+            return True, "multi_model_fleet"
+    except Exception:  # noqa: BLE001 — defensive probe
+        return False, "trusted_seed_probe_failed"
+
+    return False, "default_off_phase10_contract"
+
+
 def gen_call_likely_thinking(route: str, task_complexity: str) -> bool:
     """SINGLE SOURCE OF TRUTH: will this generation call have extended
     thinking enabled (per ``providers._resolve_thinking_budget``)?
@@ -1865,9 +1958,15 @@ class CandidateGenerator:
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
         # ── Phase 10 P10.3+P10.3.5 — AsyncTopologySentinel gate ────
-        # When ``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``, the sentinel
-        # walks the route's ranked ``dw_models`` list (yaml v2) and
-        # picks the first model whose breaker is not OPEN.
+        # Pre-Slice-23: env-only check (``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``).
+        # Slice 23 (autonomous registry-driven): the gate now consults
+        # ``_slice23_should_activate_sentinel`` which composes 5
+        # decision conditions (env explicit on/off / Claude disabled /
+        # multi-model trusted fleet / Phase 10 default-off). See helper
+        # docstring for the full closed decision matrix. The Phase 10
+        # graduation contract pin (env DEFAULT stays false) is preserved
+        # — Slice 23 adds structural overrides on top of that default,
+        # the literal default is unchanged.
         #
         # Pre-flight handshake (directive 2026-04-27): instead of a
         # silent try/except that swallows boundary-isolation defects
@@ -1879,10 +1978,16 @@ class CandidateGenerator:
         # defect at the point of decision, not minutes later in the
         # postmortem. Master-flag-off remains byte-identical legacy
         # behavior: this entire block is bypassed.
-        _flag_raw = os.environ.get(
-            "JARVIS_TOPOLOGY_SENTINEL_ENABLED", "",
-        ).strip().lower()
-        if _flag_raw in ("1", "true", "yes", "on"):
+        _slice23_activate, _slice23_reason = _slice23_should_activate_sentinel(
+            _provider_route,
+        )
+        if _slice23_activate:
+            logger.info(
+                "[CandidateGenerator] Slice 23 sentinel activation: "
+                "route=%s reason=%s — walking ranked DW fleet "
+                "(skips OPEN breakers + Slice 20C drifted models)",
+                _provider_route, _slice23_reason,
+            )
             try:
                 from backend.core.ouroboros.governance.topology_sentinel import (
                     preflight_check as _sentinel_preflight,
