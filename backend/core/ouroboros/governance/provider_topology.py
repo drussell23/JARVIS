@@ -268,11 +268,32 @@ class ProviderTopology:
         the legacy DW cascade keeps working when the yaml is absent. The
         whole point of the hard-block is that it is **explicit** — new
         routes are opt-in to the cortex, not opt-out by accident.
+
+        Slice 10B-ii (2026-05-26) — when the YAML returns ``dw_allowed=
+        false`` for a non-IMMEDIATE route, consult
+        :func:`_trusted_seed_dw_models_for_route` for operator-attested
+        models from PromotionLedger that pass the route's per-route
+        eligibility gates. If non-empty, the runtime bypass returns
+        True so the candidate_generator topology block doesn't fire
+        and DW dispatch can proceed via the trusted seeds. IMMEDIATE
+        is excluded from the bypass per Manifesto §5 (Claude-direct
+        by design — speed permanently supersedes cost optimization).
+
+        The YAML ``dw_allowed: false`` stays the SAFETY CONTRACT; the
+        ledger bypass is the RUNTIME AUTHORITY when the operator has
+        explicitly attested specific models via JARVIS_DW_TRUSTED_MODELS.
         """
         if not self.enabled:
             return True
         entry = self.routes.get((route or "").strip().lower())
         if entry is None:
+            return True
+        if entry.dw_allowed:
+            return True
+        # ── Slice 10B-ii — trusted-seed runtime bypass ──
+        # YAML says DW blocked for this route; check whether
+        # operator-attested PromotionLedger seeds qualify.
+        if _trusted_seed_dw_models_for_route(route):
             return True
         return entry.dw_allowed
 
@@ -399,7 +420,17 @@ class ProviderTopology:
         entry = self.routes.get((route or "").strip().lower())
         if entry is None:
             return ()
-        return entry.effective_dw_models
+        effective = entry.effective_dw_models
+        if effective:
+            return effective
+        # ── Slice 10B-ii — trusted-seed runtime bypass ──
+        # YAML + dynamic catalog both returned empty; consult
+        # PromotionLedger for operator-attested trusted seeds that
+        # pass the route's per-route eligibility gates. See
+        # :func:`_trusted_seed_dw_models_for_route` for the gate
+        # composition (re-uses dw_catalog_classifier.gate_for_route
+        # so the same param/price thresholds apply).
+        return _trusted_seed_dw_models_for_route(route)
 
     def fallback_tolerance_for_route(self, route: str) -> str:
         """Return the v2 ``fallback_tolerance`` for *route*.
@@ -990,6 +1021,145 @@ def clear_dynamic_catalog() -> None:
     global _DYNAMIC_CATALOG
     with _DYNAMIC_CATALOG_LOCK:
         _DYNAMIC_CATALOG = None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 10B-ii (2026-05-26) — PromotionLedger trusted-seed bypass
+#
+# Closes the two-registry disconnect surfaced by bt-2026-05-26-000630
+# (v11 DW-PRIMARY soak). Slice 10B seeded ``JARVIS_DW_TRUSTED_MODELS``
+# into PromotionLedger as ``promoted=True`` with origin=trusted_seed,
+# but the topology check (``dw_allowed_for_route`` / ``dw_models_for_
+# route``) never consulted PromotionLedger — it only read
+# ``brain_selection_policy.yaml`` (where ``dw_allowed: false`` +
+# ``dw_models: []`` for STANDARD/COMPLEX/BG/SPEC remained the
+# Phase-12 frozen contract awaiting catalog discovery). Result:
+# operator-attested DW models were structurally invisible to the
+# topology gate; every STANDARD-routed op cascaded to Claude despite
+# the trusted seed.
+#
+# This module is the cooperative bridge between the YAML safety
+# contract (immutable, encodes cost-policy) and the operator-attested
+# runtime authority (mutable, encodes "this model is known-good").
+# Compose discipline: re-use ``dw_promotion_ledger.PromotionLedger``
+# + ``dw_catalog_classifier.gate_for_route`` (same per-route param /
+# price thresholds that the classifier applies during normal discovery).
+# No parallel state, no new env knob; ``JARVIS_DW_TRUSTED_MODELS``
+# stays the single operator-facing surface.
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Routes that MUST NEVER receive a trusted-seed bypass even when seeds
+# exist. Manifesto §5: IMMEDIATE is Claude-direct by design — "survival
+# and execution speed permanently supersede cost optimization." The
+# operator's stated preference for cheap DW does NOT override §5's
+# human-reflex-routing contract.
+_TRUSTED_SEED_BYPASS_FORBIDDEN_ROUTES = frozenset({"immediate"})
+
+
+def _trusted_seed_dw_models_for_route(route: str) -> Tuple[str, ...]:
+    """Slice 10B-ii — return PromotionLedger trusted-seed model_ids
+    that pass the route's per-route eligibility gates, in stable
+    insertion order. Returns empty tuple when:
+
+      * route is IMMEDIATE (Manifesto §5 — bypass forbidden);
+      * PromotionLedger import / read raises (defensive fail-empty);
+      * no promoted models exist in the ledger;
+      * promoted models exist but none have ModelCard metadata
+        that passes the route's ``EligibilityGate`` (per-route
+        min_params_b + max_out_price_per_m thresholds);
+      * any ledger / catalog interaction surfaces an exception
+        (NEVER raises — topology must not crash on bridge errors).
+
+    Composes ``dw_promotion_ledger.PromotionLedger`` (already-existing
+    Slice 10B substrate) + ``dw_catalog_classifier.gate_for_route``
+    (already-existing per-route gate definitions). No parallel state.
+
+    Trusted seeds without catalog ModelCard metadata (the common case
+    — operator attestation is "this model_id is good" without metadata)
+    PASS the gate by construction: per-route gates skip checks when the
+    relevant field is None (see EligibilityGate.admits — checks fire
+    ONLY when both threshold AND card field are non-None). This is
+    intentional — the OPERATOR'S attestation is the warrant, not
+    metadata. Future enhancement: cross-check against
+    dw_catalog_client snapshot if available.
+    """
+    route_lc = (route or "").strip().lower()
+    if not route_lc or route_lc in _TRUSTED_SEED_BYPASS_FORBIDDEN_ROUTES:
+        return ()
+    try:
+        # Lazy imports — keep provider_topology bootable without
+        # forcing the entire promotion-ledger / classifier graph
+        # to load when topology is consulted standalone (e.g., test).
+        from backend.core.ouroboros.governance.dw_promotion_ledger import (  # noqa: E501
+            PromotionLedger,
+        )
+        from backend.core.ouroboros.governance.dw_catalog_classifier import (  # noqa: E501
+            gate_for_route,
+        )
+    except Exception:  # noqa: BLE001 — defensive (fail-closed → empty)
+        return ()
+    try:
+        ledger = PromotionLedger()
+        ledger.load()
+        promoted = ledger.promoted_models()
+    except Exception:  # noqa: BLE001 — defensive
+        return ()
+    if not promoted:
+        return ()
+    try:
+        gate = gate_for_route(route_lc)
+    except Exception:  # noqa: BLE001 — defensive
+        return ()
+    # When we lack ModelCard metadata for a promoted model, the
+    # EligibilityGate.admits() check on a synthetic minimal card
+    # passes by construction (every gate check skips when the
+    # relevant field is None). Build a minimal synthetic ModelCard
+    # for each promoted model_id and let the gate decide.
+    try:
+        from backend.core.ouroboros.governance.dw_catalog_client import (  # noqa: E501
+            ModelCard,
+            parse_parameter_count,
+            parse_family,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        # If ModelCard unavailable, fall back to returning ALL
+        # promoted seeds (defense-in-depth: operator attested them).
+        return tuple(promoted)
+    admitted: list = []
+    for model_id in promoted:
+        try:
+            mid_str = str(model_id)
+            # Parse parameter count from the model_id (e.g.,
+            # "doubleword-397b" → 397.0). The existing
+            # parse_parameter_count helper handles "-NNNb",
+            # "-NN.Mb", and "_NNNb" suffixes; returns None when
+            # no recognizable size token is present.
+            #
+            # When parsing fails (no size in model_id), we set
+            # the field to None — the per-route EligibilityGate
+            # will reject if min_params_b > 0 (STANDARD=14B,
+            # COMPLEX=30B). This is the CORRECT behavior: a
+            # model_id without a parseable size hasn't proven it
+            # meets the per-route cost-shape contract. BG/SPEC
+            # routes (no min_params_b) admit the model regardless.
+            parsed_params = parse_parameter_count(mid_str)
+            parsed_family = parse_family(mid_str)
+            synthetic = ModelCard(
+                model_id=mid_str,
+                family=parsed_family or "unknown",
+                parameter_count_b=parsed_params,
+                context_window=None,
+                pricing_in_per_m_usd=None,
+                pricing_out_per_m_usd=None,
+                supports_streaming=True,
+                raw_metadata_json="{}",
+            )
+            if gate.admits(synthetic):
+                admitted.append(mid_str)
+        except Exception:  # noqa: BLE001 — per-model defensive
+            continue
+    return tuple(admitted)
 
 
 @dataclass(frozen=True)
