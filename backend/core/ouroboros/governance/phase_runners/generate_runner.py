@@ -2178,25 +2178,62 @@ class GENERATERunner(PhaseRunner):
                         pass
                 ctx = ctx.advance(OperationPhase.GENERATE_RETRY, **_retry_ctx_kwargs)
 
-        # Slice 12AF Site 5 — defense-in-depth: convert the bare
-        # ``assert`` into a structured RuntimeError so the cascade
-        # surfaces a useful terminal_reason_code instead of an
-        # uncaught AssertionError → ``unhandled_pipeline_exception``.
-        # bt-2026-05-24-065236 wedge: after 2 successive
-        # ``all_providers_exhausted`` events on a WIRING_VALIDATION
-        # op, the ForegroundCooldown retry returned without a
-        # generation; the bare ``assert`` at this site crashed the
-        # pipeline with no actionable terminal. The "guaranteed by
-        # loop logic" invariant is restored by Sites 1-4 (route
-        # taxonomy + schema parser + DW prompt + budget profile);
-        # this raise is the structural belt for any future path
-        # that reaches here with generation=None.
+        # Slice 21 — Pipeline Supervisor Containment Boundary.
+        #
+        # Historical context: Slice 12AF Site 5 converted the bare
+        # ``assert`` here into a structured ``RuntimeError`` so the
+        # cascade surfaced a useful terminal_reason_code instead of
+        # an uncaught ``AssertionError``. That was a step forward at
+        # the time — but raising into the dispatcher path VIOLATES
+        # the runner contract documented at ``phase_runner.py:103-104``:
+        #
+        #     "Never raise into the dispatcher path — catch
+        #      exceptions, emit telemetry, and return
+        #      PhaseResult(status='fail', ...)."
+        #
+        # v16 forensic (bt-2026-05-26-220930) showed the orchestrator
+        # was already RESILIENT to the raise (a downstream handler
+        # caught it and the BG worker correctly unregistered + picked
+        # up the next op), but the failure mode produced repeated
+        # traceback noise in debug.log and bypassed the structured
+        # PhaseResult artifact channel that the dispatcher's
+        # ``_fire_terminal_postmortem`` hook expects.
+        #
+        # Slice 21 brings the runner into compliance with its own
+        # contract: return a structured ``PhaseResult(status='fail',
+        # reason='generation_exhausted_unrepairable')`` with
+        # ``next_phase=None`` (terminal). The dispatcher at
+        # ``phase_dispatcher.py:1041`` recognizes ``next_phase is
+        # None`` as terminal exit, fires the universal terminal
+        # postmortem hook, and returns the terminated ctx to the
+        # orchestrator. The orchestrator's BG worker loop archives
+        # the op into session history, releases the worker lock, and
+        # advances to the next queued task — all WITHOUT an
+        # exception ever propagating through the dispatcher path.
         if generation is None:
-            raise RuntimeError(
-                "generate_runner: generation is None after retry "
-                "loop exhausted — upstream provider cascade exited "
-                "without producing a candidate (see preceding "
-                "EXHAUSTION events in debug.log for root cause)"
+            _exhaustion_reason = "generation_exhausted_unrepairable"
+            logger.warning(
+                "[GenerateRunner] Slice 21 supervisor containment: "
+                "op=%s status=fail reason=%s — provider cascade "
+                "exited without producing a candidate (see preceding "
+                "EXHAUSTION events in debug.log for root cause)",
+                ctx.op_id, _exhaustion_reason,
+            )
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code=_exhaustion_reason,
+            )
+            return PhaseResult(
+                next_ctx=ctx,
+                # next_phase=None → dispatcher routes to terminal
+                # postmortem hook (phase_dispatcher.py:1041+).
+                next_phase=None,
+                status="fail",
+                reason=_exhaustion_reason,
+                artifacts={
+                    "generation_exhaustion": True,
+                    "supervisor_containment_slice": "21",
+                },
             )
 
         # L1: emit tool execution audit records to ledger stream.
