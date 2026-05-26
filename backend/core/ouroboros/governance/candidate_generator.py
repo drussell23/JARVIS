@@ -3797,6 +3797,48 @@ class CandidateGenerator:
         is still the absolute Iron Gate — grace raised from 5s to 15s after
         bt-2026-04-12-061609 diagnosed 129s Claude streams cut by 125s gate.
         """
+        # ──────────────────────────────────────────────────────────────
+        # Slice 19b (2026-05-26) — fallback=None semantic correction
+        #
+        # Pre-Slice-19b: when self._fallback is None (e.g., Slice 19a
+        # JARVIS_PROVIDER_CLAUDE_DISABLED=true), _call_fallback fell
+        # through to the semaphore acquire + provider call. The
+        # ``self._fallback.generate(...)`` would raise AttributeError,
+        # the exception handler at line ~4731 classified it as
+        # ``fallback_failed`` cause, and ExhaustionWatcher incremented
+        # the consecutive counter. 3 consecutive ops with no-fallback
+        # cascade → hibernation, even though DW (primary) was healthy.
+        #
+        # bt-2026-05-26-180129 (PURE-DW v14 soak) proved this:
+        # DW completed a 265s, 23-tool-call, 76K-token Venom loop on
+        # the SWE-Bench Ansible op and returned 0 candidates (model
+        # judgment). The orchestrator wanted to retry via fallback,
+        # fallback was None (Slice 19a intentional), instant
+        # "fallback_failed", 3 consecutive → hibernation cycle 1.
+        #
+        # Fix: emit a DISTINCT cause prefix ``fallback_skipped:`` for
+        # the "no fallback configured" case (vs ``fallback_failed:``
+        # for genuine fallback failures). ExhaustionWatcher will
+        # filter ``fallback_skipped:`` out of the consecutive count
+        # (separate edit in provider_exhaustion_watcher.py). Hibernation
+        # stays reserved for genuine provider distress, not for the
+        # operator-attested DW-only mode.
+        # ──────────────────────────────────────────────────────────────
+        if self._fallback is None:
+            logger.info(
+                "[CandidateGenerator] Slice 19b: fallback=None "
+                "(provider intentionally absent, e.g., Slice 19a "
+                "JARVIS_PROVIDER_CLAUDE_DISABLED) — raising "
+                "fallback_skipped sentinel (NOT counted toward "
+                "ExhaustionWatcher hibernation threshold)"
+            )
+            self._raise_exhausted(
+                "fallback_skipped:no_fallback_configured",
+                context=context,
+                deadline=deadline,
+                fallback_state="absent_by_configuration",
+            )
+
         # Isolation override: if the op's route is listed in
         # JARVIS_DISABLE_CLAUDE_FALLBACK_ROUTES, skip the fallback entirely
         # and raise through the existing exhaustion path. Used by the Qwen
