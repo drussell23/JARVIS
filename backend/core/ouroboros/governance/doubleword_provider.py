@@ -958,7 +958,10 @@ class DoublewordProvider:
                 # Return None — caller treats as "no candidates" and retries
                 return None
 
-            result = _parse_generation_response(
+            # Slice 20B — _parse_with_heal wraps _parse_generation_response
+            # with an LLM-heal retry on json_parse_error (master-flag gated;
+            # zero-cost no-op when off → byte-identical to direct parser call).
+            result = await self._parse_with_heal(
                 raw=content,
                 provider_name="doubleword",
                 duration_s=elapsed,
@@ -1575,13 +1578,15 @@ class DoublewordProvider:
                 pass
 
         duration = time.monotonic() - t0
-        parsed = _parse_generation_response(
-            sync_result.content,
-            "doubleword-heavy-nonstreaming",
-            duration,
-            context,
-            source_hash,
-            source_path,
+        # Slice 20B — _parse_with_heal wraps _parse_generation_response
+        # with an LLM-heal retry on json_parse_error.
+        parsed = await self._parse_with_heal(
+            raw=sync_result.content,
+            provider_name="doubleword-heavy-nonstreaming",
+            duration_s=duration,
+            ctx=context,
+            source_hash=source_hash,
+            source_path=source_path,
             repo_roots=self._repo_roots,
             repo_root=self._repo_root,
         )
@@ -2497,7 +2502,9 @@ class DoublewordProvider:
             )
             raise DoublewordInfraError("Non-JSON response from real-time API", status_code=0)
 
-        result = _parse_generation_response(
+        # Slice 20B — _parse_with_heal wraps _parse_generation_response
+        # with an LLM-heal retry on json_parse_error (RT path).
+        result = await self._parse_with_heal(
             raw=raw,
             provider_name="doubleword",
             duration_s=elapsed,
@@ -3308,6 +3315,77 @@ class DoublewordProvider:
             "empty_content_retries": self._stats.empty_content_retries,
             "available": self.is_available,
         }
+
+    async def _parse_with_heal(
+        self,
+        *,
+        raw: str,
+        provider_name: str,
+        duration_s: float,
+        ctx,
+        source_hash: str,
+        source_path: str,
+        repo_roots=None,
+        repo_root=None,
+    ):
+        """Slice 20B — call ``_parse_generation_response`` with LLM-heal retry.
+
+        Wraps the sync parser in :func:`json_healer.heal_and_retry_parse`,
+        binding ``self.prompt_only`` as the heal call (zero-governance
+        Qwen3.5-35B fast path) and propagating ``op_id`` / provider
+        identity for the audit ledger.
+
+        Master flag ``JARVIS_JSON_HEAL_LLM_ENABLED`` gates the heal
+        attempt — when off, behavior is byte-identical to a direct
+        ``_parse_generation_response`` call (the helper raises the
+        original ``json_parse_error`` without invoking the heal call,
+        and writes NO audit row).
+
+        Slice 20C — resolves the effective model_id via the existing
+        ``_resolve_effective_model`` path (which reads the dispatcher's
+        ContextVar override stamped at ``candidate_generator.py:2583``).
+        The model_id is passed to ``heal_and_retry_parse`` so that on
+        unrepairable parse failure the drift tracker can record
+        "model X produced unrepairable JSON on op Y" — driving the next
+        dispatch's rotation to a sibling fleet model.
+        """
+        from backend.core.ouroboros.governance.providers import (
+            _parse_generation_response,
+        )
+        from backend.core.ouroboros.governance.json_healer import (
+            heal_and_retry_parse,
+        )
+
+        def _do_parse(r: str):
+            return _parse_generation_response(
+                raw=r,
+                provider_name=provider_name,
+                duration_s=duration_s,
+                ctx=ctx,
+                source_hash=source_hash,
+                source_path=source_path,
+                repo_roots=repo_roots,
+                repo_root=repo_root,
+            )
+
+        # Slice 20C — best-effort model_id resolution. The dispatcher's
+        # _set_override(model_id) ContextVar is what _resolve_effective_model
+        # reads; if no override is active (legacy single-model path),
+        # _resolve_effective_model returns self._model. Empty string is
+        # the "skip drift recording" signal honored by heal_and_retry_parse.
+        try:
+            _model_id_for_drift = self._resolve_effective_model(ctx) or ""
+        except Exception:  # noqa: BLE001 — model resolution must not block parse
+            _model_id_for_drift = ""
+
+        return await heal_and_retry_parse(
+            raw=raw,
+            parse_fn=_do_parse,
+            heal_call=self.prompt_only,
+            op_id=getattr(ctx, "op_id", "") or "",
+            provider_name=provider_name,
+            model_id=_model_id_for_drift,
+        )
 
     async def close(self) -> None:
         """Close the aiohttp session."""

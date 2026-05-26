@@ -2281,6 +2281,36 @@ Rules:
 - NEVER wrap the JSON in ```json ... ``` fences. NEVER emit prose before the opening `{{`. Your first character is `{{`."""
     parts.append(schema_instruction)
 
+    # ── 8a. Slice 20 Phase 3 — DW zero-candidate prohibition ────────────
+    # Addresses v15 soak bt-2026-05-26-184355 "model judgment flaw":
+    # DW occasionally completed 200s+ Venom tool exploration then judged
+    # 0 candidates despite the task requiring code changes. Reinforce
+    # the task envelope on DW-primary routes (STANDARD/COMPLEX use DW
+    # with the full Venom tool loop; BG/SPEC skip Venom and don't have
+    # this failure mode at the same rate).
+    #
+    # Master flag default-FALSE per Slice 20 discipline — operators
+    # enable for v16+ soaks to exercise the reinforcement. Graduate
+    # after the prohibition is empirically shown to reduce zero-candidate
+    # returns without inflating false-positive candidates.
+    _phase3_enabled = (
+        os.environ.get("JARVIS_DW_ZERO_CANDIDATE_PROHIBITION_ENABLED", "")
+        .strip().lower() in ("true", "1", "yes", "on")
+    )
+    _phase3_route = (getattr(ctx, "provider_route", "") or "").lower()
+    if _phase3_enabled and _phase3_route in ("standard", "complex"):
+        # The literal reinforcement text is operator-attested and
+        # AST-pinned by the regression suite — do NOT edit without a
+        # dedicated slice + soak validation.
+        _phase3_reinforcement = (
+            "## DW Synthesis Requirement\n\n"
+            "You have completed tool exploration. "
+            "You are strictly required to synthesize your discoveries "
+            "into an active patch array. "
+            "A zero-candidate return is an execution failure."
+        )
+        parts.append(_phase3_reinforcement)
+
     # ── 8b. Multi-file contract (Session O / Iron Gate 5) ───────────────
     # When the op targets >1 file, the legacy single-file schema above
     # cannot express the full change set. Iron Gate 5 (multi_file_
