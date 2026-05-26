@@ -601,10 +601,26 @@ class TransitionRecord:
     probe_outcome: Optional[str] = None
     probe_latency_s: float = 0.0
     probe_cost_usd: float = 0.0
+    # Slice 24 — completes the half-shipped Phase 12 Slice F /
+    # Slice H "Substrate Error Unmasking" schema. ``report_failure``
+    # was extended (kwargs at line 1265-1267) to accept structured
+    # error fields BUT ``_emit_transition`` + ``TransitionRecord`` +
+    # ``to_json`` were never updated to receive them — so the
+    # ``**extra`` splat in report_failure's two state_change /
+    # failure_report sites raised ``TypeError`` and the bare except
+    # at line 1379 swallowed it silently. Result: sentinel state
+    # machine never recorded ``is_terminal`` transitions, audit
+    # ledger missing structural fields, every terminal failure was a
+    # silent data loss. v18 forensic (bt-2026-05-26-233010) caught 2
+    # fires in the first 20 min while the fleet walker iterated all
+    # 4 trusted DW models. Slice 24 completes the schema additively.
+    status_code: Optional[int] = None
+    response_body: str = ""
+    is_terminal: bool = False
     schema_version: str = SCHEMA_VERSION
 
     def to_json(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "ts_epoch": self.ts_epoch,
             "model_id": self.model_id,
             "transition_kind": self.transition_kind,
@@ -619,6 +635,19 @@ class TransitionRecord:
             "probe_cost_usd": self.probe_cost_usd,
             "schema_version": self.schema_version,
         }
+        # Slice 24 — emit structured-error fields ONLY when non-default
+        # so the existing audit ledger byte-size budget isn't perturbed
+        # for the common state_change / probe paths that don't carry
+        # structured errors. Existing consumers (merkle / SSE bridge)
+        # see legacy-shaped records when the new fields are absent;
+        # new consumers can opt into reading them.
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.response_body:
+            payload["response_body"] = self.response_body[:512]
+        if self.is_terminal:
+            payload["is_terminal"] = True
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1824,6 +1853,16 @@ class TopologySentinel:
         probe_outcome: Optional[str] = None,
         probe_latency_s: float = 0.0,
         probe_cost_usd: float = 0.0,
+        # Slice 24 — accept the structured-error fields that
+        # ``report_failure`` was already passing via ``**extra``
+        # since Phase 12 Slice F. Defaults preserve byte-identical
+        # behavior for the 7 other call sites that don't pass them
+        # (state_change paths after probe_succeeded, half-open
+        # transitions, etc.). Mirror the TransitionRecord field
+        # order so the dataclass forward is mechanical.
+        status_code: Optional[int] = None,
+        response_body: str = "",
+        is_terminal: bool = False,
     ) -> None:
         record = TransitionRecord(
             ts_epoch=time.time(),
@@ -1838,6 +1877,9 @@ class TopologySentinel:
             probe_outcome=probe_outcome,
             probe_latency_s=probe_latency_s,
             probe_cost_usd=probe_cost_usd,
+            status_code=status_code,
+            response_body=response_body,
+            is_terminal=is_terminal,
         )
         self._store.append_history(record)
         for listener in list(self._listeners):
