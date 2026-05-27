@@ -186,6 +186,28 @@ class OracleConfig:
 
 
 # =============================================================================
+# Slice 32 — process-pool master switch (escape hatch only)
+# =============================================================================
+#
+# Default-FALSE per operator binding: the new process-pool path
+# (composing ast_compile_helper.analyze_python_source_for_oracle) is
+# the active path. Setting JARVIS_ORACLE_LEGACY_THREAD_MODE=1
+# restores the pre-Slice-32 asyncio.to_thread path byte-identically —
+# emergency rollback only. Slice 32 closes v25
+# (bt-2026-05-27-194342) 25-min asyncio loop wedge.
+
+_ORACLE_LEGACY_THREAD_MODE_ENV: str = "JARVIS_ORACLE_LEGACY_THREAD_MODE"
+
+
+def _is_oracle_legacy_thread_mode() -> bool:
+    """Slice 32 — return True iff the operator has explicitly opted
+    back into the pre-Slice-32 threadpool path (escape hatch). Empty
+    / unset / unrecognized → False (new path active)."""
+    raw = os.environ.get(_ORACLE_LEGACY_THREAD_MODE_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+# =============================================================================
 # ENUMS AND TYPES
 # =============================================================================
 
@@ -2090,43 +2112,117 @@ class TheOracle:
     async def _index_file(self, repo_name: str, repo_path: Path, file_path: Path) -> None:
         """Index a single Python file.
 
-        The CPU-heavy work (file read + ``ast.parse`` + visitor walk) is
-        dispatched to a worker thread via ``asyncio.to_thread`` so 14
-        threads can chew through files concurrently instead of
-        serializing on the asyncio event loop.  Only the graph mutation
-        runs on the event loop (small + fast dict/list inserts; the
-        single-threaded mutation also avoids needing graph-level
-        thread-safety).
+        Slice 32 (2026-05-27, closes v25 bt-2026-05-27-194342 wedge):
+        the CPU-heavy parse + visitor walk now routes through
+        ``ast_compile_helper.analyze_python_source_for_oracle`` —
+        which dispatches to the existing module-singleton
+        ``ProcessPoolExecutor`` (spawn context). The asyncio main
+        thread keeps ticking during the await; GIL contention from
+        ``asyncio.to_thread`` workers (which wedged v25 for 25
+        minutes between 13:34 and 14:00) is no longer possible —
+        the workers live in child processes with their own GILs.
 
-        Stage-1 wiring soak 2026-05-13 observation: the original
-        implementation moved ONLY ``file_path.read_text`` into a thread
-        and ran ``ast.parse`` + ``visitor.visit`` synchronously on the
-        event loop, which serialized the most expensive work and
-        produced ~24-minute cold-cache index times.  Moving the parse
-        and walk into the same to_thread call lets the default
-        ThreadPoolExecutor's ~14 workers run them in parallel, dropping
-        the cold-cache index to single-digit minutes on typical macOS
-        hardware.
+        The skip-unchanged check stays on the main thread (cheap
+        dict lookup + md5 of pre-read content) so the IPC overhead
+        only pays when work is actually required.
+
+        Operator escape hatch: ``JARVIS_ORACLE_LEGACY_THREAD_MODE=1``
+        restores the legacy ``asyncio.to_thread`` path byte-identically
+        for emergency rollback. Default off.
+
+        Legacy ``_read_parse_visit_blocking`` is retained verbatim
+        below as the fallback's worker; the new path does NOT call it.
+
+        Stage-1 wiring soak 2026-05-13 historical context: the
+        original implementation moved ONLY ``file_path.read_text``
+        into a thread and ran parse + visit synchronously on the
+        event loop. The threadpool fix (~14 workers) reduced cold-
+        cache time to single-digit minutes but introduced the GIL-
+        starvation wedge above. Slice 32 closes that.
         """
+        # Lazy import — avoid main-process cycle (ast_compile_helper
+        # is not imported at oracle.py module init).
+        from backend.core.ouroboros.governance.ast_compile_helper import (
+            AnalyzeOutcome as _AC_AnalyzeOutcome,
+            analyze_python_source_for_oracle as _ac_analyze_for_oracle,
+        )
+
+        if _is_oracle_legacy_thread_mode():
+            # Legacy path — byte-identical pre-Slice-32. Only fires
+            # when operator sets JARVIS_ORACLE_LEGACY_THREAD_MODE=1.
+            try:
+                parse_result = await asyncio.to_thread(
+                    self._read_parse_visit_blocking,
+                    repo_name, repo_path, file_path,
+                )
+            except Exception as e:
+                logger.warning(f"Error indexing {file_path}: {e}")
+                return
+            if parse_result is None:
+                return
+            nodes, edges, cache_key, content_hash = parse_result
+            # Graph mutations on the event loop — fast, atomic per op.
+            self._file_hashes[cache_key] = content_hash
+            for node_data in nodes:
+                self._graph.add_node(node_data)
+            for source, target, edge_data in edges:
+                self._graph.add_edge(source, target, edge_data)
+            return
+
+        # Slice 32 — process-pool path (default).
+        # File read stays on a worker thread (I/O — releases GIL).
         try:
-            parse_result = await asyncio.to_thread(
-                self._read_parse_visit_blocking,
-                repo_name, repo_path, file_path,
+            content = await asyncio.to_thread(
+                file_path.read_text, encoding="utf-8",
             )
         except Exception as e:
-            logger.warning(f"Error indexing {file_path}: {e}")
-            return
-        if parse_result is None:
+            logger.warning(f"Error reading {file_path}: {e}")
             return
 
-        nodes, edges, cache_key, content_hash = parse_result
-        # Graph mutations happen on the event loop — fast, atomic per op,
-        # and the single-threaded write side keeps the graph internally
-        # consistent without per-instance locks.
-        self._file_hashes[cache_key] = content_hash
-        for node_data in nodes:
+        # Skip-unchanged check on the main thread — cheap dict
+        # lookup + md5. If we hash matches the cached value, we skip
+        # the IPC roundtrip entirely (incremental-update fast path).
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        try:
+            relative_path = str(file_path.relative_to(repo_path))
+        except ValueError:
+            relative_path = str(file_path)
+        cache_key = f"{repo_name}:{relative_path}"
+        existing = self._file_hashes.get(cache_key)
+        if existing is not None and existing == content_hash:
+            return
+
+        # Dispatch the heavy ast.parse + CodeStructureVisitor walk to
+        # the spawn-context process pool. No ast.AST crosses IPC; the
+        # worker returns NodeData/EdgeData/NodeID lists directly.
+        result = await _ac_analyze_for_oracle(
+            caller="oracle._index_file",
+            source=content,
+            filename=str(file_path),
+            repo_name=repo_name,
+            relative_path=relative_path,
+        )
+
+        if result.outcome != _AC_AnalyzeOutcome.OK:
+            if result.outcome == _AC_AnalyzeOutcome.SYNTAX_ERROR:
+                logger.warning(
+                    f"Syntax error in {file_path}: {result.error_detail}"
+                )
+            elif result.outcome != _AC_AnalyzeOutcome.TOO_LARGE:
+                logger.warning(
+                    f"Oracle analyze failed for {file_path}: "
+                    f"{result.outcome.value}: {result.error_detail}"
+                )
+            return
+
+        # Use the hash the worker computed — defensive consistency
+        # check against the main-thread hash (they MUST match, but if
+        # they don't we trust the worker's view of what it parsed).
+        self._file_hashes[cache_key] = result.content_hash or content_hash
+        # Graph mutations on the event loop — same as legacy.
+        for node_data in result.nodes:
             self._graph.add_node(node_data)
-        for source, target, edge_data in edges:
+        for source, target, edge_data in result.edges:
             self._graph.add_edge(source, target, edge_data)
 
     def _read_parse_visit_blocking(
