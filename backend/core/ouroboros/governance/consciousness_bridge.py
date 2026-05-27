@@ -47,6 +47,18 @@ class ConsciousnessBridge:
         """
         if self._consciousness is None:
             return None
+        # Slice 33 Arc 0 — diagnostic only.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+        async with _ls_sink_async(
+            "consciousness_bridge.assess_regression_risk",
+        ):
+            return await self._assess_regression_risk_impl(files_changed)
+
+    async def _assess_regression_risk_impl(
+        self, files_changed: List[str],
+    ) -> Optional[Dict[str, Any]]:
         try:
             report = await self._consciousness.detect_regression(files_changed)
             if report is None:

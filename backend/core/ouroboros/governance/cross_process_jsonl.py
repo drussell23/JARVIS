@@ -366,9 +366,15 @@ def flock_append_line(
     ``\\n``. Caller is responsible for ensuring ``line`` does not
     already contain newlines (the JSONL contract — one record per
     line)."""
-    return flock_append_lines(
-        path, (line,), timeout_s=timeout_s,
+    # Slice 33 Arc 0 — diagnostic only. v26 saw 12 CrossProcessJSONL
+    # WARNs (stale-lock detection); under contention this can block.
+    from backend.core.ouroboros.telemetry.loop_sink import (
+        sink_sync as _ls_sink_sync,
     )
+    with _ls_sink_sync("cross_process_jsonl.flock_append_line"):
+        return flock_append_lines(
+            path, (line,), timeout_s=timeout_s,
+        )
 
 
 @contextmanager

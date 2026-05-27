@@ -1664,6 +1664,16 @@ class SemanticIndex:
         Honors the refresh interval unless ``force=True``. Never raises —
         failures log at DEBUG and leave the prior index (if any) in place.
         """
+        # Slice 33 Arc 0 — diagnostic only. Heavy sync rebuild
+        # (centroid + clusters); called from build_async via
+        # threadpool but also potentially on main during cold start.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
+        )
+        with _ls_sink_sync("semantic_index.SemanticIndex.build"):
+            return self._build_impl(force=force)
+
+    def _build_impl(self, *, force: bool = False) -> bool:
         if not _is_enabled():
             return False
         now = time.time()

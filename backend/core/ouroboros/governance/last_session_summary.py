@@ -230,6 +230,17 @@ def _parse_summary(path: Path) -> Tuple[Optional[SessionRecord], List[str]]:
 
     Never raises: filesystem / JSON errors downgrade to ``(None, [...])``.
     """
+    # Slice 33 Arc 0 — diagnostic only.
+    from backend.core.ouroboros.telemetry.loop_sink import (
+        sink_sync as _ls_sink_sync,
+    )
+    with _ls_sink_sync("last_session_summary._parse_summary"):
+        return _parse_summary_impl(path)
+
+
+def _parse_summary_impl(
+    path: Path,
+) -> Tuple[Optional[SessionRecord], List[str]]:
     if not path.exists() or not path.is_file():
         return None, ["file_missing"]
     try:

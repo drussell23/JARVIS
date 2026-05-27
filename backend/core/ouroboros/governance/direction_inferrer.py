@@ -417,6 +417,21 @@ class DirectionInferrer:
         self,
         bundle: SignalBundle,
         arc_context: Optional[ArcContextSignal] = None,
+    ) -> PostureReading:  # noqa: D401 — Slice 33 Arc 0 wrapper below
+        # Slice 33 Arc 0 — diagnostic only. Sync inference over 12
+        # signals; called by PostureObserver on a cadence + by intake
+        # paths. If it shows in the v27 leaderboard, posture math is
+        # the sink.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
+        )
+        with _ls_sink_sync("direction_inferrer.DirectionInferrer.infer"):
+            return self._infer_impl(bundle, arc_context)
+
+    def _infer_impl(
+        self,
+        bundle: SignalBundle,
+        arc_context: Optional[ArcContextSignal] = None,
     ) -> PostureReading:
         """Deterministic pure inference. Always returns a PostureReading
         (never None, never raises on well-formed input).

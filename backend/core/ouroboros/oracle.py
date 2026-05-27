@@ -2220,10 +2220,21 @@ class TheOracle:
         # they don't we trust the worker's view of what it parsed).
         self._file_hashes[cache_key] = result.content_hash or content_hash
         # Graph mutations on the event loop — same as legacy.
-        for node_data in result.nodes:
-            self._graph.add_node(node_data)
-        for source, target, edge_data in result.edges:
-            self._graph.add_edge(source, target, edge_data)
+        # Slice 33 Arc 0 — wrap the bulk write loop. v26 postmortem's
+        # leading hypothesis: 11,999 dispatches × N nodes/edges per
+        # file = millions of dict mutations here. If this site
+        # dominates the v27 leaderboard, Slice 33 Arc A (graph-write
+        # queue) gets scoped against the named target.
+        from backend.core.ouroboros.telemetry.loop_sink import (  # noqa: WPS433
+            sink_sync as _ls_sink_sync,
+        )
+        with _ls_sink_sync(
+            "oracle._index_file.graph_write_bulk",
+        ):
+            for node_data in result.nodes:
+                self._graph.add_node(node_data)
+            for source, target, edge_data in result.edges:
+                self._graph.add_edge(source, target, edge_data)
 
     def _read_parse_visit_blocking(
         self,
@@ -2311,6 +2322,10 @@ class TheOracle:
             cooperative_yield_every_n_async,
             offload_blocking,
         )
+        # Slice 33 Arc 0 — Loop-Sink instrumentation (diagnostic only).
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
+        )
 
         python_files = await self._find_python_files(repo_path)
 
@@ -2328,10 +2343,22 @@ class TheOracle:
                     _read_and_hash, file_path,
                     label="oracle._scan_for_changes.read_and_hash",
                 )
-                relative_path = str(file_path.relative_to(repo_path))
-                cache_key = f"{repo_name}:{relative_path}"
+                # Slice 33 Arc 0 — measure the sync between-await chunk
+                # (relative_to + dict lookup + cache_key compose). At
+                # 29k iterations even tiny per-iter cost compounds; if
+                # this site shows in the v27 leaderboard, the iterator
+                # itself is the sink.
+                with _ls_sink_sync(
+                    "oracle._scan_for_changes.between_await_chunk",
+                ):
+                    relative_path = str(file_path.relative_to(repo_path))
+                    cache_key = f"{repo_name}:{relative_path}"
+                    needs_index = (
+                        cache_key not in self._file_hashes
+                        or self._file_hashes[cache_key] != content_hash
+                    )
 
-                if cache_key not in self._file_hashes or self._file_hashes[cache_key] != content_hash:
+                if needs_index:
                     await self._index_file(repo_name, repo_path, file_path)
             except Exception as e:
                 logger.warning(f"Error scanning {file_path}: {e}")
