@@ -122,11 +122,21 @@ QUARANTINE_DEMOTED_FROM_BG = "demoted_from_bg"   # post-promotion failure
 # to bootstrap DW catalog when the dw_catalog_classifier's
 # automatic discovery returns only ambiguous-metadata models.
 QUARANTINE_TRUSTED_SEED = "trusted_seed"
+# Slice 25 — Pre-Flight Health Probe outcome. When the boot-time
+# entitlement probe (preflight_probe.py) classifies a model's 4xx
+# response via dw_entitlement_classifier as ``ENTITLEMENT_BLOCKED``
+# ("blocked by a routing rule" marker), the model is demoted with this
+# origin so future dispatches don't waste budget on a model the
+# account isn't entitled to call. Distinct from operator_demoted
+# (manual operator decision) so postmortem can tell apart "operator
+# kicked this out" from "DW account doesn't entitle us to call it".
+QUARANTINE_ACCOUNT_NOT_ENTITLED = "account_not_entitled"
 _VALID_QUARANTINE_ORIGINS = frozenset({
     QUARANTINE_AMBIGUOUS_METADATA,
     QUARANTINE_OPERATOR_DEMOTED,
     QUARANTINE_DEMOTED_FROM_BG,
     QUARANTINE_TRUSTED_SEED,
+    QUARANTINE_ACCOUNT_NOT_ENTITLED,
 })
 
 
