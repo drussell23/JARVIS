@@ -586,6 +586,25 @@ class SensorGovernor:
         topology_blocked: bool = False,
         curiosity_multiplier: float = 1.0,
     ) -> int:
+        # Slice 33 Arc 0 — diagnostic only.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
+        )
+        with _ls_sink_sync("sensor_governor.SensorGovernor._weighted_cap"):
+            return self._weighted_cap_impl(
+                spec, urgency, posture, brake, topology_blocked,
+                curiosity_multiplier,
+            )
+
+    def _weighted_cap_impl(
+        self,
+        spec: SensorBudgetSpec,
+        urgency: Urgency,
+        posture: Optional[str],
+        brake: bool,
+        topology_blocked: bool = False,
+        curiosity_multiplier: float = 1.0,
+    ) -> int:
         base = spec.base_cap_per_hour
         posture_mult = spec.weight_for_posture(posture)
         urgency_mult = spec.urgency_mult(urgency)

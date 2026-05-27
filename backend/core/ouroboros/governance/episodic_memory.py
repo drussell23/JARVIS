@@ -65,17 +65,22 @@ class EpisodicFailureMemory:
         line_numbers: Optional[List[int]] = None,
     ) -> None:
         """Record a failure episode for a file."""
-        episode = FailureEpisode(
-            file_path=file_path,
-            attempt=attempt,
-            failure_class=failure_class,
-            error_summary=error_summary,
-            specific_errors=tuple(specific_errors or []),
-            line_numbers=tuple(line_numbers or []),
+        # Slice 33 Arc 0 — diagnostic only.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
         )
-        if file_path not in self._episodes:
-            self._episodes[file_path] = []
-        self._episodes[file_path].append(episode)
+        with _ls_sink_sync("episodic_memory.FailureMemory.record"):
+            episode = FailureEpisode(
+                file_path=file_path,
+                attempt=attempt,
+                failure_class=failure_class,
+                error_summary=error_summary,
+                specific_errors=tuple(specific_errors or []),
+                line_numbers=tuple(line_numbers or []),
+            )
+            if file_path not in self._episodes:
+                self._episodes[file_path] = []
+            self._episodes[file_path].append(episode)
 
     def get_episodes(self, file_path: str) -> List[FailureEpisode]:
         """Get all failure episodes for a specific file."""

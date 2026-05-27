@@ -662,6 +662,17 @@ class PostureObserver:
     async def run_one_cycle(self) -> Optional[PostureReading]:
         """Collect signals, infer, hysteresis-gate, persist. Returns the
         reading that was persisted (or None if collection timed out)."""
+        # Slice 33 Arc 0 — diagnostic only. Periodic posture cycle
+        # ~5 min cadence (env: JARVIS_POSTURE_OBSERVER_INTERVAL_S).
+        # If it shows in the v27 leaderboard, posture collection or
+        # inference is the sink.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+        async with _ls_sink_async("posture_observer.run_one_cycle"):
+            return await self._run_one_cycle_impl()
+
+    async def _run_one_cycle_impl(self) -> Optional[PostureReading]:
         bundle = await self._collect_with_timeout()
         if bundle is None:
             return None

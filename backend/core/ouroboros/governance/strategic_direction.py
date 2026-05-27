@@ -833,11 +833,18 @@ class StrategicDirectionService:
             compute_recent_momentum,
             format_themes,
         )
-        snapshot = compute_recent_momentum(
-            project_root=project_root,
-            max_commits=int(max_commits),
+        # Slice 33 Arc 0 — diagnostic only. Subprocess git log + parse
+        # for 50 commits runs synchronously on the asyncio thread when
+        # this is called from any async caller.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_sync as _ls_sink_sync,
         )
-        return format_themes(snapshot)
+        with _ls_sink_sync("strategic_direction._extract_git_themes"):
+            snapshot = compute_recent_momentum(
+                project_root=project_root,
+                max_commits=int(max_commits),
+            )
+            return format_themes(snapshot)
 
     @staticmethod
     def _format_git_themes(themes: List[str]) -> str:
