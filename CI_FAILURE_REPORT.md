@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #97472
-- **Branch**: `ouroboros/slice-32-process-pool-isolation`
-- **Commit**: `38ef9059727aa8b041ff7e3c0a66e192e3da2970`
+- **Run Number**: #97480
+- **Branch**: `fix/ci/pr-automation-validation-run97472-20260527-220840`
+- **Commit**: `1af5460bb671c89c76261948f81afc2391f6da0b`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-27T22:01:04Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26541319264)
+- **Timestamp**: 2026-05-27T22:09:24Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26541685650)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Check for Conflicts | permission_error | high | 113s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. Check for Conflicts
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-27T22:01:07Z
-**Completed**: 2026-05-27T22:03:00Z
-**Duration**: 113 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26541319264/job/78183187118)
+**Started**: 2026-05-27T22:09:28Z
+**Completed**: 2026-05-27T22:09:31Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26541685650/job/78184378906)
 
 #### Failed Steps
 
-- **Step 2**: Check Merge Conflicts
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,18 +42,23 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 74: `2026-05-27T22:01:19.7255529Z RequestError [HttpError]: fetch failed`
-    - Line 75: `2026-05-27T22:01:19.7289450Z ##[error]Unhandled error: HttpError: fetch failed`
+    - Line 30: `2026-05-27T22:09:29.5175588Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-27T22:09:30.0101771Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
+- Pattern: `WARN|Warning|warning`
+  - Occurrences: 1
   - Sample matches:
-    - Line 74: `2026-05-27T22:01:19.7255529Z RequestError [HttpError]: fetch failed`
-    - Line 75: `2026-05-27T22:01:19.7289450Z ##[error]Unhandled error: HttpError: fetch failed`
+    - Line 58: `2026-05-27T22:09:30.0548802Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -73,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-27T22:08:40.966089*
+📊 *Report generated on 2026-05-27T22:11:28.726144*
 🤖 *JARVIS CI/CD Auto-PR Manager*
