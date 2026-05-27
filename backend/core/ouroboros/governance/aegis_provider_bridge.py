@@ -205,6 +205,64 @@ def dw_aegis_base_url() -> str:
     )
 
 
+async def dw_session_auth_header() -> Dict[str, str]:
+    """Slice 31 — Aegis-aware Authorization header builder for DW HTTP calls.
+
+    Returns the ``Authorization`` header dict that must accompany
+    every outbound HTTP call to the DW endpoint (when routed through
+    Aegis). This is the **session bearer** the Aegis passthrough
+    endpoint requires (``passthrough.py:_bearer_session`` extracts
+    the token from ``Authorization: Bearer <token>``); it is NOT the
+    DW API key and NOT a per-call lease token.
+
+    Behavior matrix:
+
+    * **Aegis enabled** → ``{"Authorization": "Bearer <session_token>"}``
+      where ``session_token`` is fetched from ``AegisClient`` via the
+      cached session state (single ``/session/establish`` per process;
+      subsequent calls return the cached value with no daemon
+      round-trip). On Aegis client error: returns ``{}`` rather than
+      raising — defensive, lets the caller surface the real 401 from
+      the daemon if cred path is broken.
+    * **Aegis disabled** → ``{"Authorization": "Bearer <DOUBLEWORD_API_KEY>"}``
+      (byte-identical to legacy ``dw_authorization_header()`` non-Aegis
+      branch).
+
+    Why this is separate from ``dw_authorization_header()``: the
+    legacy sync helper returns ``{}`` for Aegis-enabled because
+    pre-Slice-31 the assumption was Aegis injects the bearer
+    SERVER-SIDE. v24 forensic (``bt-2026-05-27-183704``) showed the
+    daemon actually requires ``Authorization: Bearer <session_token>``
+    from the CLIENT at the passthrough layer (``missing_session_bearer``
+    401). Slice 31 closes the gap by fetching the session token via
+    this new async helper and including it in every outbound header.
+
+    Composition pattern at call sites::
+
+        auth_headers = await dw_session_auth_header()
+        lease = await acquire_call_lease(op_id=..., route=..., ...)
+        headers = merge_lease_into_session_headers(auth_headers, lease)
+        async with session.post(..., headers=headers) as resp:
+            ...
+    """
+    if aegis_client_mod.is_enabled():
+        try:
+            client = await aegis_client_mod.AegisClient.get()
+            token = await client._ensure_session_token()
+            return {"Authorization": _compose_bearer(token)}
+        except Exception:  # noqa: BLE001 — defensive
+            # Fallback to no Auth header — daemon will return its own
+            # structured 401 which the caller's existing error path
+            # surfaces. This is preferable to raising into the upload
+            # call site which would short-circuit observability.
+            return {}
+    # Aegis disabled — legacy path: real DW API key as Bearer
+    dw_key = os.environ.get("DOUBLEWORD_API_KEY", "").strip()
+    if not dw_key:
+        return {}
+    return {"Authorization": _compose_bearer(dw_key)}
+
+
 def dw_authorization_header() -> Dict[str, str]:
     """Return the Authorization header dict for the DW session.
 
@@ -214,6 +272,15 @@ def dw_authorization_header() -> Dict[str, str]:
     the Zero-Trust posture.
 
     When disabled: ``{"Authorization": "Bearer <DOUBLEWORD_API_KEY>"}``.
+
+    .. note::
+       Slice 31 — for Aegis-routed calls, this legacy sync helper
+       returns ``{}`` which is correct for the *DW Authorization*
+       header (Aegis daemon injects DW key server-side) but is
+       INSUFFICIENT for the *Aegis session bearer* the daemon
+       requires from the client. New code must use
+       :func:`dw_session_auth_header` (async) which returns the
+       session bearer when Aegis is enabled.
     """
     if aegis_client_mod.is_enabled():
         return {}
