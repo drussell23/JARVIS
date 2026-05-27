@@ -222,8 +222,35 @@ def _envs(name: str, default: str) -> str:
 
 
 def is_preflight_enabled() -> bool:
-    """Master flag — read at every call so toggles take effect immediately."""
-    return _envb(_ENV_MASTER, default=False)
+    """Master flag — read at every call so toggles take effect immediately.
+
+    Slice 25B Phase 4 — autonomous activation via Slice 23 pattern:
+    when ``JARVIS_PROVIDER_CLAUDE_DISABLED=true`` is active (the DW-only
+    posture), preflight health-tracking is a hard architectural
+    requirement — not an optional feature. Operator-explicit values
+    still win (``=false`` rolls back even with Claude disabled, mirroring
+    Slice 23's branch-2 precedence).
+
+    Decision matrix (first-match-wins, mirrors Slice 23's structure):
+
+      1. ``JARVIS_PREFLIGHT_PROBE_ENABLED=true``  → True (explicit on)
+      2. ``JARVIS_PREFLIGHT_PROBE_ENABLED=false`` → False (explicit off)
+      3. ``JARVIS_PROVIDER_CLAUDE_DISABLED=true`` → True (Slice 19a posture)
+      4. default                                  → False
+    """
+    raw = os.environ.get(_ENV_MASTER, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    # Slice 25B Phase 4 — Slice 19a composition: DW-only posture requires
+    # pre-flight health tracking
+    claude_raw = os.environ.get(
+        "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+    ).strip().lower()
+    if claude_raw in ("1", "true", "yes", "on"):
+        return True
+    return False
 
 
 def _classify_outcome(outcome: ProbeOutcome) -> Tuple[
@@ -556,3 +583,267 @@ def _report_to_sentinel(
             "[Preflight] sentinel report_failure failed for %s: %r",
             outcome.model_id, exc,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 25B Phase 1 — HeavyProbe → ProbeOutcome adapter
+# ──────────────────────────────────────────────────────────────────────
+#
+# The substrate's ``probe_fn`` parameter is a Callable[[str],
+# Awaitable[ProbeOutcome]]. Production binds it to ``HeavyProber.probe``
+# via the adapter built here. The adapter:
+#
+#   1. Resolves the aiohttp session + base_url + api_key from the
+#      DoublewordProvider instance (no parallel session pool —
+#      reuses the provider's connection lifecycle).
+#   2. Invokes HeavyProber.probe(...) which returns HeavyProbeResult.
+#   3. Parses HeavyProbeResult.error string into structured
+#      ProbeOutcome fields (status_code / error_body / timeout) so
+#      ``_classify_outcome`` can route via the existing 5-branch
+#      verdict matrix without re-parsing.
+#
+# Error-string format reference (from dw_heavy_probe.py:_do_probe):
+#   * ``entitlement_blocked:<marker>:status_<N>`` — Task #86 structured
+#   * ``status_<N>:<body_text>`` — generic 4xx/5xx
+#   * ``ttft_timeout`` — first-token wait exceeded probe timeout
+#   * ``unhandled:<ExcType>:<msg>`` — unexpected; treat as transport
+#   * Other freeform tokens (``stream_closed_early`` etc.) — transport
+#
+# AST-pin invariant: the adapter MUST NOT re-implement entitlement
+# marker matching — when the structured ``entitlement_blocked:`` prefix
+# is present, the error_body carries the marker into ProbeOutcome
+# verbatim so dw_entitlement_classifier (composed in _classify_outcome)
+# does the marker matching on its own.
+
+
+def _parse_heavyprobe_error(
+    error_str: str,
+) -> Tuple[int, str, bool, str]:
+    """Pure-function parser for HeavyProbeResult.error string.
+
+    Returns ``(status_code, error_body, timeout, error_message)``.
+    ``status_code=0`` when the error format doesn't carry an HTTP status
+    (transport / unhandled). ``timeout=True`` for ttft_timeout.
+    ``error_body`` carries the response body excerpt OR the synthesized
+    entitlement marker (so dw_entitlement_classifier can re-detect on
+    the receiving side without re-parsing).
+    """
+    if not error_str:
+        return 0, "", False, ""
+    if error_str == "ttft_timeout":
+        return 0, "", True, "ttft_timeout"
+    if error_str.startswith("entitlement_blocked:"):
+        # entitlement_blocked:<marker>:status_<N>
+        # Body = marker (synthesized — preserves marker-based detection
+        # at the classifier without coupling to HeavyProbe's internal
+        # structured error format).
+        parts = error_str.split(":", 2)
+        marker = parts[1] if len(parts) >= 2 else ""
+        # status suffix
+        status = 0
+        if len(parts) >= 3 and parts[2].startswith("status_"):
+            try:
+                status = int(parts[2][7:])
+            except ValueError:
+                pass
+        return status, marker, False, error_str
+    if error_str.startswith("status_"):
+        # status_<N>:<body>
+        head, sep, body = error_str.partition(":")
+        try:
+            status = int(head[7:])
+        except ValueError:
+            status = 0
+        return status, body, False, error_str
+    # Transport / unhandled / unknown — status_code=0, no body
+    return 0, "", False, error_str
+
+
+def _heavyresult_to_outcome(result) -> ProbeOutcome:
+    """Adapter: HeavyProbeResult → ProbeOutcome (frozen, structured).
+
+    Used by ``build_heavyprobe_adapter`` to close over the per-probe
+    contract. Pure-function — testable independently of aiohttp.
+    """
+    if result.success:
+        return ProbeOutcome(
+            model_id=result.model_id,
+            success=True,
+            status_code=200,
+            latency_ms=int(result.ttft_ms or 0),
+        )
+    status_code, error_body, timeout, msg = _parse_heavyprobe_error(
+        result.error or "",
+    )
+    return ProbeOutcome(
+        model_id=result.model_id,
+        success=False,
+        status_code=status_code,
+        error_body=error_body,
+        latency_ms=int(result.total_latency_ms or 0),
+        timeout=timeout,
+        error_message=msg[:200],
+    )
+
+
+def build_heavyprobe_adapter(
+    dw_provider,
+    *,
+    prober_factory=None,
+) -> "Callable[[str], Awaitable[ProbeOutcome]]":
+    """Build a probe_fn closure suitable for ``run_preflight``.
+
+    Closes over the DoublewordProvider's session/base_url/api_key.
+    Tests can pass a custom ``prober_factory`` (zero-arg callable
+    returning a HeavyProber-compatible instance) to inject mock
+    probers without aiohttp.
+
+    The returned async function takes a model_id and returns a
+    ProbeOutcome. Never raises — HeavyProber.probe is documented
+    as never-raises; the adapter additionally catches at the
+    session-access layer (provider._get_session()) since that's
+    the one site that could surface a transport-level failure.
+    """
+    async def _probe(model_id: str) -> ProbeOutcome:
+        try:
+            session = await dw_provider._get_session()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            return ProbeOutcome(
+                model_id=model_id,
+                success=False,
+                status_code=0,
+                error_message=(
+                    f"session_acquire_failed:{type(exc).__name__}:"
+                    f"{str(exc)[:120]}"
+                ),
+            )
+        # Lazy import — keeps preflight_probe substrate independent of
+        # dw_heavy_probe at module-import time.
+        if prober_factory is not None:
+            prober = prober_factory()
+        else:
+            from backend.core.ouroboros.governance.dw_heavy_probe import (
+                HeavyProber,
+            )
+            prober = HeavyProber()
+        try:
+            result = await prober.probe(
+                session=session,
+                model_id=model_id,
+                base_url=getattr(dw_provider, "_base_url", ""),
+                api_key=getattr(dw_provider, "_api_key", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive belt
+            return ProbeOutcome(
+                model_id=model_id,
+                success=False,
+                status_code=0,
+                error_message=(
+                    f"prober_raised:{type(exc).__name__}:{str(exc)[:120]}"
+                ),
+            )
+        return _heavyresult_to_outcome(result)
+
+    return _probe
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 25B Phase 2 — boot-eager entry point
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def run_boot_preflight(
+    *,
+    dw_provider,
+    prober_factory=None,
+) -> Optional[PreflightReport]:
+    """One-shot boot-eager preflight: composes the adapter + ledger +
+    sentinel + run_preflight. Designed to be called inline from
+    ``GovernedLoopService._build_components`` BEFORE BackgroundAgentPool
+    workers unblock.
+
+    Returns the PreflightReport on completion (whether all-pass or
+    partial-pass). Raises ``PreflightAllFailedError`` (propagated from
+    ``run_preflight``) when every probed model fails — caller's outer
+    ``try/except`` in ``GovernedLoopService.start`` handles the clean
+    halt via the existing FAILED-state transition.
+
+    Returns ``None`` (no exception) when:
+      * master flag is off → preflight skipped
+      * no trusted models promoted in the ledger → nothing to probe
+      * dw_provider is None → no DW substrate to probe against
+
+    Composes:
+      * ``is_preflight_enabled()`` — Slice 25B Phase 4 autonomous gate
+      * ``PromotionLedger.promoted_models()`` — what to probe
+      * ``build_heavyprobe_adapter(dw_provider)`` — probe_fn for run_preflight
+      * ``get_default_sentinel()`` — sentinel for DEGRADED side-effects
+      * ``run_preflight()`` — orchestrator (Slice 25 substrate)
+    """
+    if not is_preflight_enabled():
+        logger.debug(
+            "[Slice25B] preflight skipped: master flag off "
+            "(JARVIS_PREFLIGHT_PROBE_ENABLED + JARVIS_PROVIDER_CLAUDE_DISABLED both unset)"
+        )
+        return None
+    if dw_provider is None:
+        logger.warning(
+            "[Slice25B] preflight skipped: no DW provider in component stack"
+        )
+        return None
+
+    # Lazy imports — keeps preflight_probe acyclic
+    try:
+        from backend.core.ouroboros.governance.dw_promotion_ledger import (
+            PromotionLedger,
+        )
+        from backend.core.ouroboros.governance.topology_sentinel import (
+            get_default_sentinel,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[Slice25B] preflight skipped: substrate import failed: %r", exc,
+        )
+        return None
+
+    ledger = PromotionLedger()
+    try:
+        ledger.load()
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[Slice25B] preflight skipped: ledger.load() failed: %r", exc,
+        )
+        return None
+
+    model_ids = ledger.promoted_models()
+    if not model_ids:
+        logger.info(
+            "[Slice25B] preflight skipped: no promoted models in ledger "
+            "(trusted_seed not configured or all quarantined)"
+        )
+        return None
+
+    sentinel = get_default_sentinel()
+    probe_fn = build_heavyprobe_adapter(
+        dw_provider, prober_factory=prober_factory,
+    )
+
+    logger.info(
+        "[Slice25B] preflight starting: probing %d promoted models "
+        "(%s)", len(model_ids), ", ".join(model_ids),
+    )
+    # run_preflight raises PreflightAllFailedError when halt_on_all_fail
+    # is True (default). The exception propagates up to GLS.start's
+    # outer try/except which transitions state→FAILED with a clean
+    # diagnostic — exactly the "safe exit" the operator directive
+    # specifies for total-blackout.
+    report = await run_preflight(
+        model_ids=model_ids,
+        probe_fn=probe_fn,
+        ledger=ledger,
+        sentinel=sentinel,
+    )
+    logger.info(
+        "[Slice25B] preflight complete: %s", report.summary_line(),
+    )
+    return report
