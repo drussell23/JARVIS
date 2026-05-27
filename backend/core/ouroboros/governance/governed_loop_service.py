@@ -4467,6 +4467,49 @@ class GovernedLoopService:
                 )
 
             # ────────────────────────────────────────────────────────
+            # Slice 26 — process-linked hardware power assertion
+            # ────────────────────────────────────────────────────────
+            # v19 forensic (bt-2026-05-27-003843): operator's Mac
+            # suspended ~6 minutes after SWE-Bench-Pro injection.
+            # LoopDeadman correctly fired os._exit(75) on the wedged
+            # event loop, but soak-class continuity should not depend
+            # on the operator manually wrapping the script with
+            # `caffeinate`. Slice 26 spawns a process-linked
+            # power-assertion subprocess at boot — the kernel
+            # releases automatically when this Python process exits.
+            #
+            # Fired BEFORE Slice 25B preflight so the host can't sleep
+            # during the 10s probe window. Defensive: assertion failure
+            # is logged and boot continues (it's an enhancement, not a
+            # correctness path).
+            try:
+                from backend.core.ouroboros.governance.power_supervisor import (
+                    assert_power_lock,
+                )
+                _power_assertion = await assert_power_lock()
+                if _power_assertion is not None:
+                    logger.debug(
+                        "[GLS] Slice 26 power assertion: platform=%s "
+                        "parent_pid=%d subprocess_pid=%d binary=%s",
+                        _power_assertion.platform,
+                        _power_assertion.parent_pid,
+                        _power_assertion.subprocess_pid,
+                        _power_assertion.binary,
+                    )
+                # Store on self for visibility in /health observability
+                # surfaces (optional; the kernel owns the lifecycle).
+                self._power_assertion_ref = _power_assertion
+            except Exception as _pwr_exc:  # noqa: BLE001
+                # Defensive — power assertion failure must NOT block
+                # boot. The assertion module already swallows internal
+                # errors; this outer catch is belt-and-suspenders.
+                logger.warning(
+                    "[GLS] Slice 26 power assertion setup failure "
+                    "(boot continues): %r",
+                    _pwr_exc,
+                )
+
+            # ────────────────────────────────────────────────────────
             # Slice 25B Phase 2 — boot-eager preflight safety gate
             # ────────────────────────────────────────────────────────
             # Probe every trusted DW model in the PromotionLedger BEFORE
