@@ -374,6 +374,9 @@ class SignalCollector:
             return 0
 
     def build_bundle(self) -> SignalBundle:
+        """Legacy sync entry — retained for backwards compatibility
+        with tests and any call-site that needs a synchronous bundle.
+        Production posture cycle uses :meth:`build_bundle_async`."""
         ratios = self.commit_ratios()
         base = baseline_bundle()
         return SignalBundle(
@@ -389,6 +392,92 @@ class SignalCollector:
             time_since_last_graduation_inv=self.time_since_last_graduation_inv(),
             cost_burn_normalized=self.cost_burn_normalized(),
             worktree_orphan_count=self.worktree_orphan_count(),
+            commit_window=commit_window(),
+            postmortem_window_h=postmortem_window_h(),
+            schema_version=base.schema_version,
+        )
+
+    async def build_bundle_async(self) -> SignalBundle:
+        """Slice 33 Arc 1 — chunked async signal collection.
+
+        Closes v27 (bt-2026-05-27-232749) sink: ``build_bundle`` ran 12
+        synchronous signal collectors sequentially in ONE
+        ``asyncio.to_thread`` call, holding the GIL for 22.56 s on a
+        cold session (LoopSink event_1). The fix: each collector runs
+        in its own ``asyncio.to_thread`` with explicit ``sleep(0)``
+        cooperative yields between them. Per-signal LoopSink wires
+        attribute heavy individual collectors so v28 surfaces them.
+
+        Each individual signal returns to the event loop in milliseconds
+        even under GIL contention — the 22.56 s monolithic block becomes
+        12 short hops, each yielding the loop a scheduling slot.
+        Operator binding: "true non-blocking asyncio primitives or
+        explicit chunked yielding". This is the explicit-chunked path.
+        """
+        import asyncio as _asyncio_ls  # noqa: WPS433 — local alias
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+
+        # Literal callsite labels (not f-strings) so AST pins +
+        # production log greps see the exact string at the call site.
+        async with _ls_sink_async("posture.signal.commit_ratios"):
+            ratios = await _asyncio_ls.to_thread(self.commit_ratios)
+        await _asyncio_ls.sleep(0)
+
+        # The rest of the signals are typically sub-second, so we don't need individual 
+        # sinks for them — one sink wrapping the whole batch is sufficient to surface 
+        # them in the same cycle without overwhelming LoopSink with 12 separate events. 
+        # But we do want to yield between them to avoid blocking the loop, so we interleave 
+        # explicit sleeps.
+        async with _ls_sink_async("posture.signal.postmortem_failure_rate"):
+            # This is the heaviest collector (parsing + iterating over multiple 
+            # summary.json files) so it gets its own sink and label.
+            pm = await _asyncio_ls.to_thread(self.postmortem_failure_rate)
+        # Yield to the event loop before starting the next collector to ensure we don't 
+        # block it for too long.
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.iron_gate_reject_rate"):
+            ig = await _asyncio_ls.to_thread(self.iron_gate_reject_rate)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.l2_repair_rate"):
+            l2 = await _asyncio_ls.to_thread(self.l2_repair_rate)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.open_ops_normalized"):
+            oo = await _asyncio_ls.to_thread(self.open_ops_normalized)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.session_lessons_infra_ratio"):
+            sl = await _asyncio_ls.to_thread(self.session_lessons_infra_ratio)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.time_since_last_graduation_inv"):
+            ts = await _asyncio_ls.to_thread(self.time_since_last_graduation_inv)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.cost_burn_normalized"):
+            cb = await _asyncio_ls.to_thread(self.cost_burn_normalized)
+        await _asyncio_ls.sleep(0)
+
+        async with _ls_sink_async("posture.signal.worktree_orphan_count"):
+            wo = await _asyncio_ls.to_thread(self.worktree_orphan_count)
+        base = baseline_bundle()
+        return SignalBundle(
+            feat_ratio=ratios["feat"],
+            fix_ratio=ratios["fix"],
+            refactor_ratio=ratios["refactor"],
+            test_docs_ratio=ratios["test_docs"],
+            postmortem_failure_rate=pm,
+            iron_gate_reject_rate=ig,
+            l2_repair_rate=l2,
+            open_ops_normalized=oo,
+            session_lessons_infra_ratio=sl,
+            time_since_last_graduation_inv=ts,
+            cost_burn_normalized=cb,
+            worktree_orphan_count=wo,
             commit_window=commit_window(),
             postmortem_window_h=postmortem_window_h(),
             schema_version=base.schema_version,
@@ -777,15 +866,22 @@ class PostureObserver:
         return to_persist
 
     async def _collect_with_timeout(self) -> Optional[SignalBundle]:
-        """Run the synchronous collector with a timeout guard.
+        """Run the collector with a timeout guard.
 
-        Collectors are IO-bound (subprocess / file read); wrap in
-        ``asyncio.to_thread`` + ``wait_for`` so one slow collector can't
-        freeze the observer loop.
+        Slice 33 Arc 1 (v27 LoopSink-confirmed fix): uses the
+        chunked-async ``build_bundle_async()`` which dispatches each
+        of the 12 individual signal collectors via separate
+        ``asyncio.to_thread`` calls with explicit cooperative yields
+        between them. Closes the 22.56 s monolithic GIL hold v27
+        named as the dominant on-loop sink.
+
+        Legacy synchronous ``build_bundle`` path is preserved on the
+        collector for backwards compatibility but no longer used in
+        the production cycle.
         """
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._collector.build_bundle),
+                self._collector.build_bundle_async(),
                 timeout=collector_timeout_s(),
             )
         except asyncio.TimeoutError:
