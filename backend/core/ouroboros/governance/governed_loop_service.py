@@ -4466,6 +4466,74 @@ class GovernedLoopService:
                     op_id,
                 )
 
+            # ────────────────────────────────────────────────────────
+            # Slice 25B Phase 2 — boot-eager preflight safety gate
+            # ────────────────────────────────────────────────────────
+            # Probe every trusted DW model in the PromotionLedger BEFORE
+            # the BackgroundAgentPool unblocks worker allocations. This
+            # is the operator-mandated fail-fast boundary: a network
+            # blackout or fleet-wide entitlement failure halts boot
+            # cleanly here rather than churning 30+ min of wall-clock
+            # via the dispatcher's exhaustion loops (v18 forensic:
+            # bt-2026-05-26-233010).
+            #
+            # Composition:
+            #   * Slice 25B Phase 4 auto-activates when
+            #     JARVIS_PROVIDER_CLAUDE_DISABLED=true (DW-only posture
+            #     makes preflight a hard architectural requirement).
+            #   * 403 entitlement → ledger.demote with origin=
+            #     account_not_entitled (persisted; future boots inherit
+            #     pre-filtered fleet).
+            #   * 5xx / timeout → sentinel.report_failure (breaker trips
+            #     toward OPEN).
+            #   * All-fail → PreflightAllFailedError propagates to
+            #     start()'s outer try/except → state=FAILED with
+            #     structured diagnostic (clean safe-exit per directive).
+            #
+            # The probe runs concurrently via asyncio.gather with per-
+            # probe asyncio.wait_for(10s) — worst-case wall is 10s
+            # regardless of fleet size.
+            try:
+                from backend.core.ouroboros.governance.preflight_probe import (
+                    run_boot_preflight,
+                    PreflightAllFailedError as _PreflightAllFailedError,
+                )
+                _preflight_report = await run_boot_preflight(
+                    dw_provider=self._doubleword_ref,
+                )
+                if _preflight_report is not None:
+                    logger.info(
+                        "[GLS] Slice 25B preflight: %s",
+                        _preflight_report.summary_line(),
+                    )
+            except _PreflightAllFailedError as _pf_exc:
+                # Output structured diagnostic to console (operator
+                # directive: "output the structured network diagnostic
+                # payload to the console") + re-raise for clean halt
+                # via the outer try/except → state=FAILED transition.
+                logger.error(
+                    "[GLS] Slice 25B preflight FAIL-FAST — halting boot. "
+                    "report=%s | per-model verdicts: %s",
+                    _pf_exc.report.summary_line(),
+                    ", ".join(
+                        f"{r.model_id}={r.verdict.value}"
+                        f"(status={r.status_code})"
+                        for r in _pf_exc.report.results
+                    ),
+                )
+                raise
+            except Exception as _pf_setup_exc:  # noqa: BLE001
+                # Defensive — preflight substrate failure must not
+                # block boot. Only PreflightAllFailedError above is
+                # the fail-fast contract; any OTHER exception (import
+                # error, missing ledger, etc.) gets swallowed with a
+                # warning so boot proceeds via legacy path.
+                logger.warning(
+                    "[GLS] Slice 25B preflight setup failure (boot continues "
+                    "via legacy path): %r",
+                    _pf_setup_exc,
+                )
+
             self._bg_pool = BackgroundAgentPool(
                 orchestrator=self._orchestrator,
                 on_op_active_register=_bg_register_active,
