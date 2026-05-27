@@ -2889,12 +2889,23 @@ class CandidateGenerator:
                         context, deadline,
                     )
                 else:
-                    # standard / complex / unknown — use the primary-
-                    # first cascade. This walks the existing tier-0
-                    # → tier-1 logic which honors the ContextVar via
-                    # DoublewordProvider._resolve_effective_model.
+                    # Slice 23 — standard / complex / unknown route uses
+                    # the primary-first cascade. The Slice 23 sentinel
+                    # walker still stamps the ContextVar for the
+                    # provider's INTERNAL routing (DoublewordProvider.
+                    # _resolve_effective_model reads it to pick which
+                    # model to actually call).
+                    #
+                    # Slice 30 — ALSO threads model_id explicitly through
+                    # the orchestrator-side call chain so
+                    # _compute_primary_budget's heavy-model 2.5× scalar
+                    # (Slice 28 Phase 2) engages deterministically. The
+                    # v23 wiring gap (ContextVar invisible across
+                    # async/semaphore boundaries) is eliminated for the
+                    # TIMEOUT decision; provider routing still uses the
+                    # ContextVar (legitimate per-provider internal use).
                     _attempt_result = await self._try_primary_then_fallback(
-                        context, deadline,
+                        context, deadline, model_id=model_id,
                     )
             except Exception as exc:
                 _attempt_exc = exc
@@ -3872,8 +3883,20 @@ class CandidateGenerator:
         self,
         context: OperationContext,
         deadline: datetime,
+        *,
+        model_id: str = "",
     ) -> GenerationResult:
         """Try primary, fall back on any failure.
+
+        Slice 30 — Explicit Parameter Threading & Transport Determinism
+        ─────────────────────────────────────────────────────────────────
+        ``model_id`` is now an explicit keyword-only parameter threaded
+        from the Slice 23 sentinel walker. Forwarded to ``_call_primary``
+        so Slice 28 Phase 2's heavy-model 2.5× scalar engages
+        deterministically. Legacy callers that don't have a specific
+        model_id (pre-Slice-23 fallthroughs) pass nothing → empty
+        string → legacy 30s cap path preserved byte-identically.
+
 
         Note: In Python 3.9, ``CancelledError`` is a ``BaseException`` (not
         ``Exception``), so we must catch it explicitly to handle
@@ -3958,7 +3981,10 @@ class CandidateGenerator:
             return await self._call_fallback(context, deadline)
 
         try:
-            result = await self._call_primary(context, deadline)
+            # Slice 30 — explicit model_id propagation (no ContextVar magic)
+            result = await self._call_primary(
+                context, deadline, model_id=model_id,
+            )
             # Primary succeeded — record recovery if we were in a failure state
             if self.fsm._consecutive_failures > 0:
                 self.fsm.record_primary_success()
@@ -4067,41 +4093,52 @@ class CandidateGenerator:
         self,
         context: OperationContext,
         deadline: datetime,
+        *,
+        model_id: str = "",
     ) -> GenerationResult:
         """Call primary provider with concurrency and budget-capped deadline.
 
         The primary gets at most ``_PRIMARY_BUDGET_FRACTION`` of the
         remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
         fallback provider if the primary hangs until timeout.
+
+        Slice 30 — Explicit Parameter Threading & Transport Determinism
+        ─────────────────────────────────────────────────────────────────
+        ``model_id`` is now an explicit keyword-only parameter threaded
+        from the Slice 23 sentinel walker → ``_try_primary_then_fallback``
+        → here. This eliminates the v23 wiring gap where Slice 28's
+        ContextVar-based model_id resolution silently returned empty
+        across async/semaphore task boundaries, causing the heavy-model
+        2.5× scalar to never engage in production (12 EXHAUSTION events
+        across v20/v21/v23 all firing at the static 30s
+        _PRIMARY_MAX_TIMEOUT_S cap instead of the adaptive 75s budget).
+
+        Legacy callers that don't have a specific model_id (pre-Slice-23
+        dispatch paths, IMMEDIATE route fallthrough, etc.) pass nothing
+        → empty string → _compute_primary_budget skips the heavy scalar
+        → legacy 30s cap behavior preserved byte-identically.
         """
         _primary_sem_t0 = time.monotonic()
         _primary_phase_hint = getattr(getattr(context, "phase", None), "name", "?")
         logger.info(
             "[CandidateGenerator] Primary sem acquire: slots_free=%d "
-            "route=%s phase=%s op=%s",
+            "route=%s phase=%s op=%s model_id=%s",
             self._primary_sem._value,
             getattr(context, "provider_route", "?"),
             _primary_phase_hint,
             getattr(context, "op_id", "?")[:16],
+            model_id or "(unspecified)",
         )
         async with self._primary_sem:
             _primary_sem_wait_s = time.monotonic() - _primary_sem_t0
             remaining = self._remaining_seconds(deadline)
-            # Slice 28 Phase 2 — read the dispatcher's per-attempt
-            # model override (set by Slice 23 sentinel walker via
-            # topology_sentinel.set_dw_model_override) so
-            # _compute_primary_budget can apply the heavy-model
-            # scalar. Defensive: ContextVar accessor never raises;
-            # absent override = empty string → legacy 30s cap path.
-            try:
-                from backend.core.ouroboros.governance.topology_sentinel import (
-                    get_dw_model_override as _slice28_get_model_override,
-                )
-                _attempted_model_id = _slice28_get_model_override() or ""
-            except Exception:  # noqa: BLE001 — defensive
-                _attempted_model_id = ""
+            # Slice 30 — explicit model_id parameter (no ContextVar magic).
+            # Slice 28 Phase 2's heavy-model 2.5× scalar now engages
+            # deterministically when the sentinel walker passes a heavy
+            # model_id. Empty model_id from legacy callers → legacy 30s
+            # cap path (byte-identical to pre-Slice-28).
             primary_budget = self._compute_primary_budget(
-                remaining, model_id=_attempted_model_id,
+                remaining, model_id=model_id,
             )
             # Tier 3 Reflex observability (Manifesto §5): log at INFO when
             # the hard cap is the binding constraint (not the fraction or
@@ -4195,8 +4232,9 @@ class CandidateGenerator:
                     isinstance(_exc, asyncio.TimeoutError)
                     and _envb("JARVIS_TTFT_FAULT_DISCRIMINATOR_ENABLED", False)
                 ):
+                    # Slice 30 — use explicit model_id param (was ContextVar)
                     await self._slice28_phase3_classify_ttft_failure(
-                        attempted_model_id=_attempted_model_id,
+                        attempted_model_id=model_id,
                         op_id=getattr(context, "op_id", "?"),
                         elapsed_s=time.monotonic() - _primary_sem_t0,
                     )
