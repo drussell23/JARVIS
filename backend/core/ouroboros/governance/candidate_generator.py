@@ -220,6 +220,37 @@ _ADAPTIVE_STEP_BONUS_S_DEFAULT = 15.0 # Additional timeout in seconds added for 
 _ADAPTIVE_HEAVY_SCALAR_DEFAULT = 1.5 # Scalar multiplier applied to the timeout when the model is identified as a heavy model (e.g., Qwen-397B or Kimi-K2.6). This accounts for the longer TTFT of heavy models. Default is 1.5x as per operator spec.
 _ADAPTIVE_CAP_S_DEFAULT = 240.0 # Maximum timeout in seconds that can be returned by the adaptive formula, regardless of prompt size or model. This prevents unbounded timeouts for extremely large prompts. Default is 240s as a safe ceiling per operator spec.
 
+# Slice 28 Phase 2 — Adaptive Streaming TTFT Horizon
+# Heavy-reasoning / long-context models legitimately need more cold-start
+# TTFT runway than the static 30s _PRIMARY_MAX_TIMEOUT_S allows. Scale
+# _PRIMARY_MAX_TIMEOUT_S by this factor when the dispatched model is
+# heavy (matched via _is_heavy_model — same Qwen-397B / Kimi-K2.6 markers
+# Slice 27 Phase 3 uses). Hard ceiling at 240s prevents unbounded cost
+# bleed. Per operator directive: base 30s × 2.5 = 75s for heavy models.
+# v21 forensic (bt-2026-05-27-025855) showed 12 EXHAUSTION events on
+# 397B all at elapsed=30.01s with remaining=329.86s — the static cap
+# was the binding constraint, killing primary calls before the streaming
+# layer's 120s TTFT could even fire on the wire.
+_PRIMARY_HEAVY_TTFT_SCALAR_DEFAULT = 2.5 # Scalar multiplier for heavy models' TTFT horizon. When the dispatched model is identified as heavy (e.g., Qwen-397B or Kimi-K2.6), the primary timeout cap is scaled by this factor to allow for longer cold-start TTFT. This is applied on top of the existing _PRIMARY_MAX_TIMEOUT_S cap, which serves as a base for all models. Default is 2.5x as per operator directive, giving heavy models a 75s cap instead of 30s.
+_PRIMARY_HEAVY_TTFT_CAP_S_DEFAULT = 240.0 # Maximum timeout in seconds for heavy models on the primary path. This serves as a hard ceiling to prevent unbounded timeouts even for heavy models. Default is 240s as a safe ceiling per operator directive, ensuring that even with the heavy scalar, the timeout does not exceed this limit.
+
+# Slice 28 Phase 3 — Inline Fault Discriminator probe timeout.
+# When the adaptive primary timeout fires on TimeoutError, this
+# bounded probe (default 5s) discriminates context-lag vs
+# infrastructure-outage. Short by design — the probe MUST NOT
+# itself become a wedge.
+_TTFT_PROBE_TIMEOUT_S_DEFAULT = 5.0
+_TTFT_PROBE_PROMPT = "ping"
+_TTFT_PROBE_MAX_TOKENS = 2
+
+
+def _envb(name: str, default: bool = False) -> bool:
+    """Stdlib-only truthy env reader. Lives alongside _envf/_envi helpers."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
 # Heavy-model substring matchers — checked case-insensitively against
 # model_id. CSV-extensible via env var so operators can add new heavy
 # variants without code edits (a Qwen3.5-512B-MoE release wouldn't need
@@ -3951,6 +3982,87 @@ class CandidateGenerator:
                 self.fsm.record_primary_failure(mode=mode)
             return await self._call_fallback(context, deadline)
 
+    async def _slice28_phase3_classify_ttft_failure(
+        self,
+        *,
+        attempted_model_id: str,
+        op_id: str,
+        elapsed_s: float,
+    ) -> None:
+        """Slice 28 Phase 3 — Inline Fault Discriminator.
+
+        Fires after a TimeoutError in ``_call_primary`` to classify
+        the failure as either:
+
+          * ``context_lag`` — endpoint is alive (probe returns fast);
+            THIS prompt+model combo was just too slow. Sentinel walker
+            will rotate to the next ranked model and may succeed there.
+          * ``infrastructure_outage`` — endpoint is unresponsive (probe
+            also times out). Sentinel rotation is unlikely to help
+            because every model shares the same upstream tier.
+
+        Pure-observability hook — NEVER raises into the caller, NEVER
+        changes return values. The sentinel walker handles rotation
+        structurally on the original raise (which still propagates
+        normally after this returns). The classification just
+        documents WHY the rotation is happening for postmortem
+        attribution.
+
+        Probe uses the Slice 27 Phase 2 Aegis-stabilized prompt_only
+        lane with a 2-token cap + 5s wall budget. Fires only when
+        ``JARVIS_TTFT_FAULT_DISCRIMINATOR_ENABLED=true``.
+        """
+        probe_timeout = _envf_or_default(
+            "JARVIS_TTFT_PROBE_TIMEOUT_S", _TTFT_PROBE_TIMEOUT_S_DEFAULT,
+        )
+        # Resolve the prompt_only-capable primary surface. Not every
+        # primary has prompt_only (e.g., Claude); skip cleanly if absent.
+        prompt_only_fn = getattr(self._primary, "prompt_only", None)
+        if prompt_only_fn is None:
+            logger.info(
+                "[Slice28.Phase3] op=%s elapsed=%.1fs model=%s — "
+                "primary has no prompt_only lane; classification skipped",
+                op_id[:16], elapsed_s, attempted_model_id,
+            )
+            return
+
+        probe_start = time.monotonic()
+        probe_ok = False
+        probe_err = ""
+        try:
+            result_text = await asyncio.wait_for(
+                prompt_only_fn(
+                    _TTFT_PROBE_PROMPT,
+                    model=attempted_model_id or None,
+                    caller_id="ttft_fault_discriminator",
+                    max_tokens=_TTFT_PROBE_MAX_TOKENS,
+                ),
+                timeout=probe_timeout,
+            )
+            probe_ok = bool(result_text and result_text.strip())
+        except asyncio.TimeoutError:
+            probe_err = f"probe_timeout_{probe_timeout}s"
+        except Exception as exc:  # noqa: BLE001 — probe MUST NOT raise
+            probe_err = f"probe_exception:{type(exc).__name__}"
+
+        probe_elapsed = time.monotonic() - probe_start
+        # Classification:
+        #   probe_ok with fast latency → endpoint alive → context_lag
+        #   probe failed → endpoint unresponsive → infrastructure_outage
+        classification = (
+            "context_lag" if probe_ok
+            else "infrastructure_outage"
+        )
+        logger.warning(
+            "[Slice28.Phase3] op=%s model=%s primary_elapsed=%.1fs "
+            "probe_elapsed=%.2fs probe_ok=%s probe_err=%s "
+            "classification=%s — sentinel walker will rotate to next "
+            "ranked model (structural rotation already engaged by raise)",
+            op_id[:16], attempted_model_id, elapsed_s,
+            probe_elapsed, probe_ok, probe_err or "(none)",
+            classification,
+        )
+
     async def _call_primary(
         self,
         context: OperationContext,
@@ -3975,7 +4087,22 @@ class CandidateGenerator:
         async with self._primary_sem:
             _primary_sem_wait_s = time.monotonic() - _primary_sem_t0
             remaining = self._remaining_seconds(deadline)
-            primary_budget = self._compute_primary_budget(remaining)
+            # Slice 28 Phase 2 — read the dispatcher's per-attempt
+            # model override (set by Slice 23 sentinel walker via
+            # topology_sentinel.set_dw_model_override) so
+            # _compute_primary_budget can apply the heavy-model
+            # scalar. Defensive: ContextVar accessor never raises;
+            # absent override = empty string → legacy 30s cap path.
+            try:
+                from backend.core.ouroboros.governance.topology_sentinel import (
+                    get_dw_model_override as _slice28_get_model_override,
+                )
+                _attempted_model_id = _slice28_get_model_override() or ""
+            except Exception:  # noqa: BLE001 — defensive
+                _attempted_model_id = ""
+            primary_budget = self._compute_primary_budget(
+                remaining, model_id=_attempted_model_id,
+            )
             # Tier 3 Reflex observability (Manifesto §5): log at INFO when
             # the hard cap is the binding constraint (not the fraction or
             # the fallback-reserve). Operators can grep for
@@ -4045,6 +4172,34 @@ class CandidateGenerator:
                         remaining_s=self._remaining_seconds(deadline),
                     ),
                 )
+                # Slice 28 Phase 3 — Inline Fault Discriminator
+                # ────────────────────────────────────────────────
+                # On TimeoutError specifically, fire a lightweight
+                # 2-token probe via the primary's prompt_only lane
+                # (now Aegis-stabilized via Slice 27 Phase 2) to
+                # discriminate between:
+                #   * context_lag — endpoint alive, THIS prompt+model
+                #     combination is just slow (probe completes fast)
+                #   * infrastructure_outage — endpoint not responding
+                #     (probe also times out)
+                # The sentinel walker ALREADY rotates to the next
+                # model in ranked_models on any raise from
+                # _call_primary, so Phase 3 doesn't need to add
+                # rotation — it adds the CLASSIFICATION SIGNAL so
+                # postmortem analysis can attribute the rotation
+                # reason structurally. Probe is bounded to 5s; on
+                # outage, the cost is small and the diagnostic is
+                # invaluable. Env-gated default-off; graduate after
+                # v22 proves the probe yields actionable signal.
+                if (
+                    isinstance(_exc, asyncio.TimeoutError)
+                    and _envb("JARVIS_TTFT_FAULT_DISCRIMINATOR_ENABLED", False)
+                ):
+                    await self._slice28_phase3_classify_ttft_failure(
+                        attempted_model_id=_attempted_model_id,
+                        op_id=getattr(context, "op_id", "?"),
+                        elapsed_s=time.monotonic() - _primary_sem_t0,
+                    )
                 raise
 
     # Hard ceiling for fallback provider — fail fast when unreachable
@@ -5291,27 +5446,68 @@ class CandidateGenerator:
         return final_budget
 
     @staticmethod
-    def _compute_primary_budget(total_s: float) -> float:
+    def _compute_primary_budget(
+        total_s: float,
+        *,
+        model_id: str = "",
+    ) -> float:
         """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
 
         Invariants (enforced via ``min()`` — strictest wins):
           - primary_budget <= total_s * _PRIMARY_BUDGET_FRACTION
           - total_s - primary_budget >= _FALLBACK_MIN_RESERVE_S (when possible)
-          - **primary_budget <= _PRIMARY_MAX_TIMEOUT_S** (Tier 3 hard cap,
-            Manifesto §5 — prevents a stalled primary from consuming the
-            whole session budget and starving the Claude fallback)
+          - primary_budget <= effective_max (Slice 28 adaptive Tier 3 cap)
 
         Tier 3 cap added 2026-04-24 after F1 Slice 4 S3 (bt-2026-04-24-204029)
         exposed a 153s DW primary hold that exhausted the session before
         Claude fallback could produce a candidate.
+
+        Slice 28 Phase 2 — Adaptive Streaming TTFT Horizon
+        ---------------------------------------------------
+        v21 forensic (bt-2026-05-27-025855) revealed the actual wedge: 12
+        EXHAUSTION events on the 397B model, all classified as TIMEOUT, all
+        firing at elapsed=30.01s with remaining=329.86s. The static
+        ``_PRIMARY_MAX_TIMEOUT_S`` (30s default) was killing primary calls
+        long before the streaming layer's 120s TTFT could even fire on the
+        wire. Cold-start TTFT for a 397B MoE on a contended endpoint
+        legitimately exceeds 30s — per §46 fleet inventory the 397B is
+        characterized as a heavy-reasoning workhorse whose TTFT envelope
+        is materially larger than the 35B sibling.
+
+        When ``model_id`` is a heavy-reasoning / long-context model
+        (matched against the same marker set Slice 27 Phase 3 uses for the
+        adaptive Tier 0 timeout), multiply ``_PRIMARY_MAX_TIMEOUT_S`` by
+        a heavy scalar (default 2.5×) so the call has runway to receive
+        the first token. Hard ceiling at 240s matches the Slice 27 Phase 3
+        cap (no unbounded cost bleeding).
+
+        Legacy callers that pass only ``total_s`` (no ``model_id``) get the
+        byte-identical pre-Slice-28 behavior — the 30s cap is preserved as
+        the binding constraint. The adaptive widening engages only when
+        the dispatcher has stamped the per-attempt model_id via the
+        topology ContextVar.
         """
         if total_s <= 0:
             return 0.0
         fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
+
+        # Slice 28 Phase 2 — adaptive Tier 3 cap for heavy models
+        effective_max = _PRIMARY_MAX_TIMEOUT_S
+        if model_id and _is_heavy_model(model_id):
+            scalar = _envf_or_default(
+                "JARVIS_PRIMARY_HEAVY_TTFT_SCALAR",
+                _PRIMARY_HEAVY_TTFT_SCALAR_DEFAULT,
+            )
+            cap = _envf_or_default(
+                "JARVIS_PRIMARY_HEAVY_TTFT_CAP_S",
+                _PRIMARY_HEAVY_TTFT_CAP_S_DEFAULT,
+            )
+            effective_max = min(_PRIMARY_MAX_TIMEOUT_S * scalar, cap)
+
         budget = min(
             total_s * _PRIMARY_BUDGET_FRACTION,
             total_s - fb_reserve,
-            _PRIMARY_MAX_TIMEOUT_S,
+            effective_max,
         )
         return max(budget, 0.0)
 
