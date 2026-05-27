@@ -1384,6 +1384,18 @@ class OracleSemanticIndex:
         On timeout / exception → ``status=DEGRADED``. Queries
         return empty without raising. Idempotent — subsequent calls
         return the cached status."""
+        # Slice 33 Arc 1+ widening — ChromaDB lazy init is a known
+        # bootstrap-phase heavyweight; instrument so we know exactly
+        # how much loop time it costs even with the executor wrapper.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+        async with _ls_sink_async(
+            "oracle.OracleSemanticIndex.initialize_backend",
+        ):
+            return await self._initialize_backend_impl()
+
+    async def _initialize_backend_impl(self) -> "OracleSemanticBackendStatus":
         if self._init_attempted:
             return self._status
         if self._init_lock is None:

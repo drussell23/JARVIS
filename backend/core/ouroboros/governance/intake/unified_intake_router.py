@@ -655,6 +655,15 @@ class UnifiedIntakeRouter:
         - ``"pending_ack"``    — parked awaiting human acknowledgement
         - ``"backpressure"``   — queue is full; non-exempt source rejected
         """
+        # Slice 33 Arc 1+ widening — intake routing is on the hot path
+        # for every sensor signal; if it's slow, the loop notices.
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+        async with _ls_sink_async("intake.UnifiedIntakeRouter.ingest"):
+            return await self._ingest_impl(envelope)
+
+    async def _ingest_impl(self, envelope: IntentEnvelope) -> str:
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
