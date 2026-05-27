@@ -1,12 +1,12 @@
 {
-  "workflow_name": "docker in /. - Update #1386244696",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26507338739",
-  "branch": "main",
-  "commit_sha": "909075d",
-  "run_number": 152,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26507481719",
+  "branch": "fix/ci/docker-in-update-1386244696-run152-20260527-110722",
+  "commit_sha": "2131510",
+  "run_number": 97335,
   "failed_count": 1,
-  "fix_branch": "fix/ci/docker-in-update-1386244696-run152-20260527-110722",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: docker in /. - Update #1386244696 (Run #152)",
+  "fix_branch": "fix/ci/pr-automation-validation-run97335-20260527-111005",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #97335)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,82 +14,16 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 46,
-              "content": "2026-05-27T11:05:23.9534874Z updater | 2026/05/27 11:05:23 INFO <job_1386244696> Job definition: {\"job\":{\"command\":\"version\",\"allowed-updates\":[{\"dependency-type\":\"direct\",\"update-type\":\"all\"}],\"commit-message-options\":{\"prefix\":\"deps(docker)\",\"prefix-development\":null,\"include-scope\":null},\"credentials-metadata\":[{\"type\":\"git_source\",\"host\":\"github.com\"}],\"debug\":null,\"dependencies\":null,\"dependency-groups\":[],\"dependency-group-to-refresh\":null,\"existing-pull-requests\":[],\"existing-group-pull-requests\":[],\"experiments\":{\"record-ecosystem-versions\":true,\"record-update-job-unknown-error\":true,\"proxy-cached\":true,\"enable-corepack-for-npm-and-yarn\":true,\"enable-private-registry-for-corepack\":true,\"allow-refresh-for-existing-pr-dependencies\":true,\"allow-refresh-group-with-all-dependencies\":true,\"azure-registry-backup\":true,\"enable-enhanced-error-details-for-updater\":true,\"gradle-lockfile-updater\":true,\"enable-exclude-paths-subdirectory-manifest-files\":true},\"ignore-conditions\":[],\"lockfile-only\":false,\"max-updater-run-time\":2700,\"package-manager\":\"docker\",\"requirements-update-strategy\":null,\"reject-external-code\":false,\"security-advisories\":[],\"security-updates-only\":false,\"source\":{\"provider\":\"github\",\"repo\":\"drussell23/JARVIS\",\"branch\":null,\"directory\":\"/.\",\"api-endpoint\":\"https://api.github.com/\",\"hostname\":\"github.com\"},\"updating-a-pull-request\":false,\"update-subdependencies\":false,\"vendor-dependencies\":false,\"enable-beta-ecosystems\":false,\"repo-private\":false,\"multi-ecosystem-update\":false,\"exclude-paths\":null}}",
+              "line_number": 30,
+              "content": "2026-05-27T11:08:02.4320514Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 69,
-              "content": "2026-05-27T11:05:34.2059920Z updater | 2026/05/27 11:05:34 ERROR <job_1386244696> Error during file fetching; aborting: No Dockerfiles nor Kubernetes YAML found in /",
+              "line_number": 42,
+              "content": "2026-05-27T11:08:03.2448416Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: docker in /. - Update #1386244696 (Run #152)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
-            },
-            {
-              "line_number": 70,
-              "content": "2026-05-27T11:05:34.2973826Z   proxy | 2026/05/27 11:05:34 [010] POST /update_jobs/1386244696/record_update_job_error",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 71,
-              "content": "2026-05-27T11:05:34.5599440Z   proxy | 2026/05/27 11:05:34 [010] 204 /update_jobs/1386244696/record_update_job_error",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 76,
-              "content": "2026-05-27T11:05:34.8651071Z Dependabot encountered '1' error(s) during execution, please check the logs for more details.",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 78,
-              "content": "2026-05-27T11:05:34.8656265Z |                                          Errors                                           |",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 87,
-              "content": "2026-05-27T11:05:35.0085493Z Failure running container 739e8b3f9bfd8e8207890bf59d1ec60173a80f5da693ca916911b4862ed68581: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 91,
-              "content": "2026-05-27T11:05:39.3567937Z ##[error]Dependabot encountered an error performing the update",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 93,
-              "content": "Error: The updater encountered one or more errors.",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 96,
-              "content": "2026-05-27T11:05:39.3578275Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 10
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 24,
-              "content": "2026-05-27T11:04:57.0880283Z \ud83e\udd16 ~ Failed to parse GITHUB_REGISTRIES_PROXY environment variable ~",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 87,
-              "content": "2026-05-27T11:05:35.0085493Z Failure running container 739e8b3f9bfd8e8207890bf59d1ec60173a80f5da693ca916911b4862ed68581: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
             }
           ],
           "count": 2
@@ -98,22 +32,35 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 40,
-              "content": "2026-05-27T11:05:21.9124316Z updater | rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL",
+              "line_number": 58,
+              "content": "2026-05-27T11:08:03.3018740Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 34,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-27T11:07:22.808332"
+  "timestamp": "2026-05-27T11:10:05.777770"
 }
