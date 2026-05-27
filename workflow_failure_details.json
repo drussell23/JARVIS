@@ -1,0 +1,59 @@
+{
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/26541319264",
+  "branch": "ouroboros/slice-32-process-pool-isolation",
+  "commit_sha": "38ef905",
+  "run_number": 97472,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run97472-20260527-220840",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #97472)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 74,
+              "content": "2026-05-27T22:01:19.7255529Z RequestError [HttpError]: fetch failed",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 75,
+              "content": "2026-05-27T22:01:19.7289450Z ##[error]Unhandled error: HttpError: fetch failed",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 74,
+              "content": "2026-05-27T22:01:19.7255529Z RequestError [HttpError]: fetch failed",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 75,
+              "content": "2026-05-27T22:01:19.7289450Z ##[error]Unhandled error: HttpError: fetch failed",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-27T22:08:40.966198"
+}
