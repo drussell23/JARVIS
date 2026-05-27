@@ -40,6 +40,7 @@ from backend.core.ouroboros.governance.aegis_provider_bridge import (
     acquire_call_lease as _aegis_acquire_call_lease,
     dw_aegis_base_url as _aegis_dw_base_url,
     dw_authorization_header as _aegis_dw_auth_header,
+    dw_session_auth_header as _aegis_dw_session_auth_header,
     merge_lease_into_session_headers as _aegis_merge_lease_headers,
 )
 from backend.core.ouroboros.governance.stream_rupture import (
@@ -681,6 +682,15 @@ class DoublewordProvider:
             # for byte-identical legacy behavior. Per-call X-JARVIS-Lease
             # is layered on at each session.post/get site (operator
             # correction #4 — never client-wide).
+            #
+            # Slice 31 — the Aegis SESSION BEARER (Authorization: Bearer
+            # <session_token>) is injected per-call via
+            # ``_aegis_dw_session_auth_header()`` at every outbound site,
+            # NOT at session creation. Rationale: session-bearer tokens
+            # have TTL + may rotate; per-call fetch reads cached state
+            # (no daemon round-trip in steady state) and avoids a stale
+            # baked-in token surviving across reconnects. Per-call
+            # headers override session headers in aiohttp.
             _session_headers = dict(_aegis_dw_auth_header())
             self._session = aiohttp.ClientSession(
                 headers=_session_headers,
@@ -1920,6 +1930,10 @@ class DoublewordProvider:
                 _ttft_request_start_monotonic = time.monotonic()
                 _ttft_first_chunk_seen = False
 
+                # Slice 31 — Aegis session bearer (closes v24
+                # missing_session_bearer 401 wedge on RT streaming).
+                _call_auth = await _aegis_dw_session_auth_header()
+                _call_auth["Content-Type"] = "application/json"
                 # Slice 2B-ii — per-call Aegis lease (None when disabled
                 # → header is skipped via merge helper).
                 _aegis_lease = await _aegis_acquire_call_lease(
@@ -1931,7 +1945,7 @@ class DoublewordProvider:
                     f"{self._base_url}/chat/completions",
                     json=body,
                     headers=_aegis_merge_lease_headers(
-                        {"Content-Type": "application/json"}, _aegis_lease,
+                        _call_auth, _aegis_lease,
                     ),
                     timeout=self._request_timeout(),
                 ) as resp:
@@ -2251,6 +2265,10 @@ class DoublewordProvider:
                             continue
             else:
                 # Non-streaming path
+                # Slice 31 — Aegis session bearer (closes v24
+                # missing_session_bearer 401 wedge).
+                _call_auth = await _aegis_dw_session_auth_header()
+                _call_auth["Content-Type"] = "application/json"
                 # Slice 2B-ii — per-call Aegis lease.
                 _aegis_lease = await _aegis_acquire_call_lease(
                     op_id=context.op_id,
@@ -2261,7 +2279,7 @@ class DoublewordProvider:
                     f"{self._base_url}/chat/completions",
                     json=body,
                     headers=_aegis_merge_lease_headers(
-                        {"Content-Type": "application/json"}, _aegis_lease,
+                        _call_auth, _aegis_lease,
                     ),
                     timeout=self._request_timeout(),
                 ) as resp:
@@ -2605,14 +2623,18 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
-            # Slice 2B-ii — per-call Aegis lease + auth offload. When
-            # Aegis enabled: dw_authorization_header()=={} (server-side
-            # injection) + lease via X-JARVIS-Lease. When disabled:
-            # legacy Bearer header restored byte-identically.
+            # Slice 31 — Aegis-aware Authorization session bearer
+            # injection (closes v24 missing_session_bearer 401 wedge).
+            # When Aegis enabled: dw_session_auth_header() returns
+            # {"Authorization": "Bearer <session_token>"} — the bearer
+            # the Aegis passthrough endpoint requires for /files.
+            # When disabled: returns legacy DW API key Bearer header.
+            # Slice 2B-ii — per-call Aegis lease layered on top via
+            # _aegis_merge_lease_headers (X-JARVIS-Lease).
+            _call_headers = await _aegis_dw_session_auth_header()
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=op_id, route="standard", estimated_cost_usd=0.001,
             )
-            _call_headers = dict(_aegis_dw_auth_header())
             _call_headers = _aegis_merge_lease_headers(
                 _call_headers, _aegis_lease,
             )
@@ -2653,6 +2675,9 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
+            # Slice 31 — Aegis session bearer for /batches POST.
+            _call_auth = await _aegis_dw_session_auth_header()
+            _call_auth["Content-Type"] = "application/json"
             # Slice 2B-ii — per-call Aegis lease (None when disabled).
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=op_id, route="standard", estimated_cost_usd=0.001,
@@ -2665,7 +2690,7 @@ class DoublewordProvider:
                     "completion_window": _DW_COMPLETION_WINDOW,
                 },
                 headers=_aegis_merge_lease_headers(
-                    {"Content-Type": "application/json"}, _aegis_lease,
+                    _call_auth, _aegis_lease,
                 ),
                 timeout=self._request_timeout(),
             ) as resp:
@@ -2761,6 +2786,8 @@ class DoublewordProvider:
                     except Exception:
                         raise  # Let CircuitBreakerOpen propagate
 
+                # Slice 31 — Aegis session bearer for /batches GET poll.
+                _call_auth = await _aegis_dw_session_auth_header()
                 # Slice 2B-ii — per-call Aegis lease.
                 _aegis_lease = await _aegis_acquire_call_lease(
                     op_id=op_id, route="background",
@@ -2768,7 +2795,7 @@ class DoublewordProvider:
                 )
                 async with session.get(
                     f"{self._base_url}/batches/{batch_id}",
-                    headers=_aegis_merge_lease_headers({}, _aegis_lease),
+                    headers=_aegis_merge_lease_headers(_call_auth, _aegis_lease),
                     timeout=self._request_timeout(),
                 ) as resp:
                     if self._rate_limiter is not None:
@@ -2832,6 +2859,8 @@ class DoublewordProvider:
                 raise  # Let CircuitBreakerOpen propagate
 
         try:
+            # Slice 31 — Aegis session bearer for /files retrieve.
+            _call_auth = await _aegis_dw_session_auth_header()
             # Slice 2B-ii — per-call Aegis lease bound to operation_id.
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=operation_id, route="standard",
@@ -2839,7 +2868,7 @@ class DoublewordProvider:
             )
             async with session.get(
                 f"{self._base_url}/files/{output_file_id}/content",
-                headers=_aegis_merge_lease_headers({}, _aegis_lease),
+                headers=_aegis_merge_lease_headers(_call_auth, _aegis_lease),
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
@@ -3207,6 +3236,9 @@ class DoublewordProvider:
         t0 = time.monotonic()
 
         async def _do_request() -> Tuple[str, int, int]:
+            # Slice 31 — Aegis session bearer for sync complete().
+            _call_auth = await _aegis_dw_session_auth_header()
+            _call_auth["Content-Type"] = "application/json"
             # Slice 2B-ii — per-call Aegis lease bound to caller_id.
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=f"dw-complete-sync:{caller_id}",
@@ -3217,7 +3249,7 @@ class DoublewordProvider:
                 f"{self._base_url}/chat/completions",
                 json=body,
                 headers=_aegis_merge_lease_headers(
-                    {"Content-Type": "application/json"}, _aegis_lease,
+                    _call_auth, _aegis_lease,
                 ),
                 timeout=self._request_timeout(),
             ) as resp:
@@ -3312,6 +3344,8 @@ class DoublewordProvider:
             return False
         try:
             session = await self._get_session()
+            # Slice 31 — Aegis session bearer for /models probe.
+            _call_auth = await _aegis_dw_session_auth_header()
             # Slice 2B-ii — per-call Aegis lease (synthetic infra op_id).
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id="dw-health-probe",
@@ -3320,7 +3354,7 @@ class DoublewordProvider:
             )
             async with session.get(
                 f"{self._base_url}/models",
-                headers=_aegis_merge_lease_headers({}, _aegis_lease),
+                headers=_aegis_merge_lease_headers(_call_auth, _aegis_lease),
                 timeout=self._request_timeout(),
             ) as resp:
                 return resp.status == 200
