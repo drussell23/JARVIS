@@ -180,17 +180,172 @@ _TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
 )
 
 
-def _tier0_rt_cap_for_route(provider_route: str) -> float:
-    """Slice 18c — return the absolute Tier 0 RT cap for *route*.
+# ──────────────────────────────────────────────────────────────────────
+# Slice 27 Phase 3 — Context-Aware Adaptive Timeboxing
+# ──────────────────────────────────────────────────────────────────────
+#
+# v20 forensic (bt-2026-05-27-011121): 12 EXHAUSTION events, ALL with
+# fsm_failure_mode=TIMEOUT, on a 3-model fleet (Qwen-397B + Qwen-35B +
+# Kimi-K2.6). DW was reachable (cost recorded $0.0149) but every
+# GENERATE call exceeded the static 90s Tier 0 budget. The model is
+# given a fixed budget regardless of how heavy the prompt is or which
+# model is processing it — defeating the purpose of having a
+# multi-model fleet.
+#
+# Per operator directive: compute the streaming timeout window
+# dynamically at dispatch time from (payload size, model tier).
+#
+#   base               = 60s
+#   +15s per 5000 chars of input payload (step bonus)
+#   × 1.5 scalar for heavy reasoning / long-context models
+#                        (Qwen3.5-397B-A17B-FP8, Kimi-K2.6)
+#   hard cap           = 240s (safe ceiling — no unbounded cost bleed)
+#   non STANDARD/COMPLEX routes → preserve legacy 30s reflex cap
+#
+# Examples (STANDARD/COMPLEX route):
+#   0 chars   + 397B  → 60.0 * 1.5  = 90.0s   (matches v18c default)
+#   10000     + 397B  → (60+30)*1.5 = 135.0s  (50% more for 10KB SWE prompt)
+#   30000     + 397B  → (60+90)*1.5 = 225.0s  (heavy prompt + heavy model)
+#   50000     + 397B  → (60+150)*1.5 = 315 → capped 240.0s
+#   0         + 35B   → 60.0s       (workhorse — no scalar)
+#   10000     + 35B   → (60+30)     = 90.0s
+#
+# Hardcoding-free: every threshold reads from env at call time so
+# operators can tune without code edits. Defaults match the operator's
+# spec exactly.
 
-    STANDARD + COMPLEX: 90s default (matches 397B/Kimi TTFT envelope).
-    Everything else: 30s reflex cap (preserved for IMMEDIATE/BG/SPEC
-    cost-optimization semantics + pre-Slice-18c byte-equivalence).
+_ADAPTIVE_BASE_S_DEFAULT = 60.0
+_ADAPTIVE_STEP_CHARS_DEFAULT = 5000
+_ADAPTIVE_STEP_BONUS_S_DEFAULT = 15.0
+_ADAPTIVE_HEAVY_SCALAR_DEFAULT = 1.5
+_ADAPTIVE_CAP_S_DEFAULT = 240.0
+
+# Heavy-model substring matchers — checked case-insensitively against
+# model_id. CSV-extensible via env var so operators can add new heavy
+# variants without code edits (a Qwen3.5-512B-MoE release wouldn't need
+# a code change to get the 1.5× scalar). Default set codifies operator's
+# §46 fleet inventory: the 397B MoE workhorse + Kimi's 200K-context
+# specialist (both warrant the heavy budget per §46 strengths).
+_HEAVY_MODEL_DEFAULT_MARKERS = ("397B", "Kimi")
+
+
+def _heavy_model_markers() -> Tuple[str, ...]:
+    """CSV-tunable heavy-model match list. Default: ('397B', 'Kimi')."""
+    raw = os.environ.get("JARVIS_ADAPTIVE_HEAVY_MODEL_MARKERS", "").strip()
+    if not raw:
+        return _HEAVY_MODEL_DEFAULT_MARKERS
+    return tuple(m.strip() for m in raw.split(",") if m.strip())
+
+
+def _envf_or_default(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _envi_or_default(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _is_heavy_model(model_id: str) -> bool:
+    """Case-insensitive substring match against the heavy-model marker
+    list. Used to apply the 1.5× scalar in the adaptive formula."""
+    if not model_id:
+        return False
+    mid_lower = model_id.lower()
+    return any(m.lower() in mid_lower for m in _heavy_model_markers())
+
+# Pure function for the adaptive Tier 0 timeout formula. Called by the route-aware cap selector (:func:`_tier0_rt_cap_for_route`) when the caller
+def _compute_adaptive_tier0_timeout_s(
+    *,
+    prompt_chars: int, # Caller-provided prompt size in chars — used to compute the step bonus. Defensive: negative treated as zero.
+    model_id: str,
+    base_s: Optional[float] = None,
+    step_chars: Optional[int] = None,
+    step_bonus_s: Optional[float] = None,
+    heavy_scalar: Optional[float] = None,
+    cap_s: Optional[float] = None,
+) -> float:
+    """Slice 27 Phase 3 — pure-function adaptive Tier 0 timeout.
+
+    Operator's formula, fully env-tunable:
+
+        timeout = (base + step_bonus × floor(prompt_chars / step_chars))
+                  × (heavy_scalar if _is_heavy_model(model_id) else 1.0)
+        timeout = min(timeout, cap)
+
+    Caller-provided kwargs win over env defaults; env defaults win over
+    code defaults. Pure function — no side effects, deterministic.
+    """
+    b = base_s if base_s is not None else _envf_or_default(
+        "JARVIS_ADAPTIVE_TIER0_BASE_S", _ADAPTIVE_BASE_S_DEFAULT,
+    )
+    sc = step_chars if step_chars is not None else _envi_or_default(
+        "JARVIS_ADAPTIVE_TIER0_STEP_CHARS", _ADAPTIVE_STEP_CHARS_DEFAULT,
+    )
+    sb = step_bonus_s if step_bonus_s is not None else _envf_or_default(
+        "JARVIS_ADAPTIVE_TIER0_STEP_BONUS_S", _ADAPTIVE_STEP_BONUS_S_DEFAULT,
+    )
+    hs = heavy_scalar if heavy_scalar is not None else _envf_or_default(
+        "JARVIS_ADAPTIVE_TIER0_HEAVY_SCALAR", _ADAPTIVE_HEAVY_SCALAR_DEFAULT,
+    )
+    cap = cap_s if cap_s is not None else _envf_or_default(
+        "JARVIS_ADAPTIVE_TIER0_CAP_S", _ADAPTIVE_CAP_S_DEFAULT,
+    )
+
+    # Defensive — negative payload chars treated as zero
+    safe_chars = max(0, int(prompt_chars or 0))
+    steps = safe_chars // max(1, sc)  # avoid div-by-zero on misconfigured env
+    timeout = b + sb * steps
+    if _is_heavy_model(model_id):
+        timeout *= hs
+    return min(timeout, cap)
+
+
+def _tier0_rt_cap_for_route(
+    provider_route: str,
+    *,
+    model_id: str = "",
+    prompt_chars: int = 0,
+) -> float:
+    """Tier 0 RT cap — adaptive when model_id/prompt_chars provided,
+    legacy 90s/30s wall when not.
+
+    Slice 18c semantics preserved for callers that don't pass the new
+    kwargs (byte-identical to pre-Slice-27 behavior):
+      STANDARD + COMPLEX → 90s default (env-tunable)
+      everything else    → 30s reflex cap
+
+    Slice 27 Phase 3 — when EITHER model_id or prompt_chars is provided,
+    the STANDARD/COMPLEX path switches to the adaptive formula
+    (:func:`_compute_adaptive_tier0_timeout_s`). The 30s reflex cap for
+    other routes is preserved unconditionally (IMMEDIATE/BG/SPEC have
+    cost-optimization semantics that should not pay the dispatch-time
+    payload-sizing cost).
     """
     r = (provider_route or "").strip().lower()
-    if r in ("standard", "complex"):
+    if r not in ("standard", "complex"):
+        return _TIER3_REFLEX_HARD_CAP_S
+
+    # Slice 27 Phase 3 — adaptive only when caller has context.
+    # Legacy callers that pass only the route get the historical
+    # 90s static cap (matches Slice 18c byte-identically).
+    if not model_id and prompt_chars <= 0:
         return _TIER0_RT_BUDGET_STANDARD_COMPLEX_S
-    return _TIER3_REFLEX_HARD_CAP_S
+    return _compute_adaptive_tier0_timeout_s(
+        prompt_chars=prompt_chars,
+        model_id=model_id,
+    )
 
 
 # Legacy alias retained for downstream imports + existing test surface.
