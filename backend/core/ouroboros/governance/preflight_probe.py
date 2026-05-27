@@ -216,6 +216,17 @@ def _envf(name: str, default: float) -> float:
         return default
 
 
+def _envi(name: str, default: int) -> int:
+    """Slice 29 — stdlib-only int env reader mirroring _envf/_envb shape."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _envs(name: str, default: str) -> str:
     raw = os.environ.get(name, "").strip()
     return raw if raw else default
@@ -832,11 +843,41 @@ async def run_boot_preflight(
         "[Slice25B] preflight starting: probing %d promoted models "
         "(%s)", len(model_ids), ", ".join(model_ids),
     )
-    # run_preflight raises PreflightAllFailedError when halt_on_all_fail
-    # is True (default). The exception propagates up to GLS.start's
-    # outer try/except which transitions state→FAILED with a clean
-    # diagnostic — exactly the "safe exit" the operator directive
-    # specifies for total-blackout.
+    # Slice 29 — Preflight Backoff Daemon Execution
+    # ─────────────────────────────────────────────
+    # v22 forensic (bt-2026-05-27-034646): all 3 trusted DW models
+    # failed preflight at boot with status=0 transport blips. Static
+    # PreflightAllFailedError halted boot — but a transient upstream
+    # blackout is not a terminal condition; an un-killable background
+    # daemon should wait it out with exponential backoff.
+    #
+    # When JARVIS_PREFLIGHT_RECOVERY_DAEMON_ENABLED is on (default
+    # TRUE), the entire preflight gate becomes a polling loop:
+    #
+    #   * Run preflight (halt_on_all_fail=False so we get the report)
+    #   * If active_count >= 1 → recovery; return report (boot
+    #     proceeds normally to bg_pool.start())
+    #   * If active_count == 0 → log heartbeat, sleep backoff,
+    #     double backoff with 300s ceiling, retry
+    #
+    # GLS.start() awaits the entire daemon loop; bg_pool / sensors
+    # are not constructed until preflight succeeds. Functionally
+    # equivalent to "BG pool SUSPENDED" — no dispatches occur during
+    # the wait because nothing exists yet to dispatch.
+    #
+    # Operator opt-out: ``JARVIS_PREFLIGHT_RECOVERY_DAEMON_ENABLED=false``
+    # restores the byte-identical pre-Slice-29 fail-fast behavior.
+    if _is_recovery_daemon_enabled():
+        return await _run_preflight_with_recovery_daemon(
+            model_ids=model_ids,
+            probe_fn=probe_fn,
+            ledger=ledger,
+            sentinel=sentinel,
+        )
+
+    # Legacy path (daemon disabled) — preserves Slice 25B behavior
+    # byte-identically: PreflightAllFailedError raises on total
+    # blackout and propagates up to GLS.start's outer try/except.
     report = await run_preflight(
         model_ids=model_ids,
         probe_fn=probe_fn,
@@ -847,3 +888,117 @@ async def run_boot_preflight(
         "[Slice25B] preflight complete: %s", report.summary_line(),
     )
     return report
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 29 — Preflight Backoff Daemon
+# ──────────────────────────────────────────────────────────────────────
+
+
+_ENV_DAEMON_ENABLED = "JARVIS_PREFLIGHT_RECOVERY_DAEMON_ENABLED"
+_ENV_DAEMON_BASE_S = "JARVIS_PREFLIGHT_DAEMON_BASE_BACKOFF_S"
+_ENV_DAEMON_MULTIPLIER = "JARVIS_PREFLIGHT_DAEMON_BACKOFF_MULTIPLIER"
+_ENV_DAEMON_MAX_BACKOFF_S = "JARVIS_PREFLIGHT_DAEMON_MAX_BACKOFF_S"
+_ENV_DAEMON_MAX_ATTEMPTS = "JARVIS_PREFLIGHT_DAEMON_MAX_ATTEMPTS"
+
+# Operator-specified defaults (Slice 29 directive):
+#   base=30s, multiplier=2.0, max_backoff=300s ceiling.
+# max_attempts=0 (unbounded) — defer to outer harness wall cap
+# (battle_test --max-wall-seconds). This is "un-killable background
+# asset" semantics — the daemon polls forever until either DW
+# recovers or the operator-bound session wall-clock fires.
+_DAEMON_BASE_BACKOFF_S_DEFAULT = 30.0
+_DAEMON_BACKOFF_MULTIPLIER_DEFAULT = 2.0
+_DAEMON_MAX_BACKOFF_S_DEFAULT = 300.0
+_DAEMON_MAX_ATTEMPTS_DEFAULT = 0  # 0 = unbounded
+
+
+def _is_recovery_daemon_enabled() -> bool:
+    """Master flag — default TRUE per Slice 29 operator binding
+    ("un-killable background asset")."""
+    return _envb(_ENV_DAEMON_ENABLED, default=True)
+
+
+async def _run_preflight_with_recovery_daemon(
+    *,
+    model_ids: Tuple[str, ...],
+    probe_fn,
+    ledger,
+    sentinel,
+) -> PreflightReport:
+    """Slice 29 — exponential-backoff polling loop wrapping run_preflight.
+
+    Loops with backoff sequence (default 30s → 60s → 120s → 240s → 300s
+    capped). Breaks the loop on the first iteration where active_count
+    >= 1. Emits a verbatim operator-attested heartbeat on every backoff
+    sleep so operators can grep for daemon activity.
+
+    Returns the recovery PreflightReport when ≥1 model probes ACTIVE.
+
+    Raises PreflightAllFailedError only if max_attempts is reached
+    without recovery (default unbounded — operator wall-clock is the
+    authoritative timeout).
+    """
+    base_s = _envf(_ENV_DAEMON_BASE_S, _DAEMON_BASE_BACKOFF_S_DEFAULT)
+    multiplier = _envf(_ENV_DAEMON_MULTIPLIER, _DAEMON_BACKOFF_MULTIPLIER_DEFAULT)
+    max_backoff_s = _envf(_ENV_DAEMON_MAX_BACKOFF_S, _DAEMON_MAX_BACKOFF_S_DEFAULT)
+    max_attempts = _envi(_ENV_DAEMON_MAX_ATTEMPTS, _DAEMON_MAX_ATTEMPTS_DEFAULT)
+
+    logger.info(
+        "[PreflightDaemon] starting recovery loop: base=%.0fs "
+        "multiplier=%.1fx max_backoff=%.0fs max_attempts=%s",
+        base_s, multiplier, max_backoff_s,
+        max_attempts if max_attempts > 0 else "unbounded",
+    )
+
+    current_backoff = base_s
+    attempt = 0
+    last_report: Optional[PreflightReport] = None
+
+    while True:
+        attempt += 1
+        # Run preflight with halt_on_all_fail=False so we get the
+        # report regardless of all-fail outcome. The recovery
+        # decision is OURS to make here, not the substrate's.
+        report = await run_preflight(
+            model_ids=model_ids,
+            probe_fn=probe_fn,
+            ledger=ledger,
+            sentinel=sentinel,
+            halt_on_all_fail=False,
+        )
+        last_report = report
+
+        if report.active_count >= 1:
+            # Slice 29 — operator-attested recovery message verbatim
+            # (AST-pinned by the regression suite)
+            logger.info(
+                "[PreflightDaemon] Upstream line recovery confirmed. "
+                "Un-pausing agent pool and executing delayed boot-strap "
+                "component initialization. attempt=%d active=%d total=%d",
+                attempt, report.active_count, report.total_probed,
+            )
+            logger.info(
+                "[Slice25B] preflight complete: %s", report.summary_line(),
+            )
+            return report
+
+        # All-fail — decide retry vs give-up
+        if max_attempts > 0 and attempt >= max_attempts:
+            logger.error(
+                "[PreflightDaemon] max_attempts=%d reached without "
+                "recovery; raising PreflightAllFailedError",
+                max_attempts,
+            )
+            raise PreflightAllFailedError(report)
+
+        # Slice 29 — operator-attested heartbeat verbatim
+        # (AST-pinned by the regression suite)
+        logger.warning(
+            "[PreflightDaemon] Active provider fleet empty. "
+            "Entering backoff cycle. Next probe attempt in %.0f seconds.",
+            current_backoff,
+        )
+        await asyncio.sleep(current_backoff)
+        # Exponential growth, capped
+        current_backoff = min(current_backoff * multiplier, max_backoff_s)
