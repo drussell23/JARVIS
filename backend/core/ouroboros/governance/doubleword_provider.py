@@ -2940,9 +2940,35 @@ class DoublewordProvider:
         ValueError
             If DOUBLEWORD_API_KEY is not configured.
         """
-        if not self._api_key:
+        # Slice 27 Phase 2 — Aegis-unified auth bridge.
+        # ``self._api_key`` may be empty (post-Aegis env_scrub at boot) —
+        # Aegis is the secure credential broker that injects the real
+        # DOUBLEWORD_API_KEY server-side at the daemon's forwarding
+        # handler. The presence of either credential source is valid:
+        #
+        #   * Aegis enabled       → Aegis daemon injects the key;
+        #                            session uses `dw_authorization_header()`
+        #                            which returns {} (no client-side bearer).
+        #   * Aegis disabled      → legacy path; self._api_key must be set.
+        #
+        # Pre-Slice-27 this check raised even when Aegis was the
+        # active credential broker, silently breaking all prompt_only
+        # callers (SemanticTriage, IntentDiscovery, Slice 20B json_healer)
+        # post-scrub. v20 forensic (bt-2026-05-27-011121) caught this:
+        # "[SemanticTriage] DOUBLEWORD_API_KEY is not set — cannot call
+        # prompt_only() — proceeding without triage".
+        try:
+            from backend.core.ouroboros.aegis.client import (
+                is_enabled as _aegis_enabled,
+            )
+            _aegis_active = _aegis_enabled()
+        except Exception:  # noqa: BLE001 — defensive
+            _aegis_active = False
+        if not self._api_key and not _aegis_active:
             raise ValueError(
-                "DOUBLEWORD_API_KEY is not set — cannot call prompt_only()"
+                "DOUBLEWORD_API_KEY is not set AND Aegis is not "
+                "enabled — cannot call prompt_only() without a "
+                "credential source"
             )
         self._check_budget()
 
