@@ -1115,6 +1115,580 @@ def _result_from_worker_payload(
 
 
 # ============================================================================
+# Slice 32 — Oracle composition surface
+# ============================================================================
+#
+# Closes the v25 control-plane wedge (bt-2026-05-27-194342): 25-min
+# asyncio loop freeze caused by GIL contention from N
+# ``asyncio.to_thread`` workers running ``CodeStructureVisitor.visit``
+# on pure-Python CPU-bound AST walks. The default ThreadPoolExecutor
+# can't help — every worker holds the GIL during the walk, the asyncio
+# event loop only gets the GIL between releases.
+#
+# Slice 32 composes this module's existing spawn-context
+# ``ProcessPoolExecutor`` singleton (operator-bound: "build cleanly on
+# what already exists, no duplication"). Oracle becomes a second
+# consumer alongside OpportunityMiner — sharing the pool's lifecycle,
+# its closed taxonomies, its fail-closed semantics. No parallel pool.
+#
+# Payload discipline (IPC-pickle safety):
+#
+#   * The worker imports ``CodeStructureVisitor``, ``NodeData``,
+#     ``EdgeData``, ``NodeID``, ``NodeType``, ``EdgeType`` LAZILY at
+#     call time (worker is a spawn process — first call pays the
+#     import cost, subsequent calls reuse).
+#   * The worker returns ``(nodes_list, edges_list, content_hash,
+#     worker_elapsed_ms)`` — ``nodes_list`` is ``list[NodeData]``,
+#     ``edges_list`` is ``list[Tuple[NodeID, NodeID, EdgeData]]``.
+#     All three dataclasses are ``@dataclass`` (frozen for NodeID),
+#     transitively picklable. NodeType + EdgeType are enums (picklable).
+#   * NO ``ast.AST`` ever crosses the IPC boundary (operator binding:
+#     "never pass a raw, un-serializable ast.AST object across IPC").
+#
+# Slow-call alert: the existing pool path already bounds by
+# ``asyncio.wait_for(timeout=timeout_s)``. Slice 32 additionally emits
+# a structured ``oracle_slow_call`` warning when ``parent_await_ms``
+# exceeds 30,000ms — satisfies operator's "alert without stalling"
+# requirement (the loop keeps servicing siblings during the await).
+
+
+@dataclass(frozen=True)
+class OracleAnalysisResult:
+    """Closed-taxonomy result from ``analyze_python_source_for_oracle``.
+
+    Reuses the ``AnalyzeOutcome`` 5-value taxonomy (no new enum —
+    failure modes are identical to OpportunityMiner's). ``nodes`` +
+    ``edges`` are the structurally-equivalent payload that
+    ``Oracle._read_parse_visit_blocking`` returns; on any non-OK
+    outcome both are empty tuples (sentinel for "skip this file").
+
+    NEVER raises into the caller — every code path returns this shape.
+    """
+
+    outcome: AnalyzeOutcome
+    nodes: Tuple[Any, ...] = ()          # tuple of NodeData
+    edges: Tuple[Any, ...] = ()          # tuple of (NodeID, NodeID, EdgeData)
+    content_hash: str = ""
+    elapsed_ms: float = 0.0              # total parent-await wall-clock
+    worker_elapsed_ms: float = 0.0       # worker-side measured time
+    source_bytes: int = 0
+    caller: str = ""
+    execution_mode: ExecutionMode = ExecutionMode.INLINE_TINY
+    error_detail: str = ""
+
+
+def _worker_analyze_for_oracle_in_process(
+    source: str,
+    filename: str,
+    repo_name: str,
+    relative_path: str,
+) -> Tuple[str, Any]:
+    """Process-pool worker for Oracle's _index_file path.
+
+    Runs ``ast.parse()`` + ``CodeStructureVisitor.visit(tree)`` inside
+    a separate Python interpreter (its own GIL — the main asyncio
+    thread keeps ticking during the walk).
+
+    Returns ``("ok", (nodes_list, edges_list, content_hash,
+    worker_elapsed_ms))`` on success, ``("syntax_error", detail)`` on
+    parse failure, ``("internal_error", detail)`` for anything else
+    (including the lazy oracle import failing in the worker).
+
+    NEVER raises out of the worker — an uncaught raise would crash
+    the pool worker and propagate ``BrokenProcessPool`` to the parent.
+
+    Permitted ``ast.parse()`` call site (AST-pinned alongside the
+    OpportunityMiner workers). The visitor walk happens in
+    ``CodeStructureVisitor.visit`` — that's the heavy CPU-bound work
+    we're isolating from the asyncio event loop.
+    """
+    import hashlib as _hashlib_w
+    t0 = time.monotonic()
+
+    # Lazy oracle import — runs ONCE per spawn worker, cached for the
+    # life of that worker process. Avoids a main-process import cycle
+    # (oracle.py imports ast_compile_helper.py for the public coro
+    # below; the worker importing oracle.py at module-init would
+    # cycle).
+    try:
+        from backend.core.ouroboros.oracle import (  # noqa: WPS433
+            CodeStructureVisitor as _CSV,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        return (
+            "internal_error",
+            f"oracle import failed in worker: {type(exc).__name__}: {exc}",
+        )
+
+    try:
+        content_hash = _hashlib_w.md5(source.encode("utf-8")).hexdigest()
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "internal_error",
+            f"hash failed: {type(exc).__name__}: {exc}",
+        )
+
+    try:
+        tree = _ast_mod.parse(source, filename=filename, mode="exec")
+    except SyntaxError as exc:
+        return ("syntax_error", f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return ("internal_error", f"parse: {type(exc).__name__}: {exc}")
+
+    try:
+        visitor = _CSV(repo_name, relative_path, source)
+        visitor.visit(tree)
+    except Exception as exc:  # noqa: BLE001
+        return ("internal_error", f"visit: {type(exc).__name__}: {exc}")
+
+    worker_elapsed_ms = (time.monotonic() - t0) * 1000.0
+    return (
+        "ok",
+        (
+            list(visitor.nodes),
+            list(visitor.edges),
+            content_hash,
+            worker_elapsed_ms,
+        ),
+    )
+
+
+_ORACLE_SLOW_CALL_ALERT_MS_ENV: str = "JARVIS_ORACLE_SLOW_CALL_ALERT_MS" # env var for ops to set the slow-call alert threshold (ms) 
+_DEFAULT_ORACLE_SLOW_CALL_ALERT_MS: float = 30_000.0 # default slow-call alert threshold (30s) — operators can adjust via env var; set high to avoid noise, since the pool call already has a hard timeout and this is just an alert, not a kill switch
+
+# This is a pure alert threshold — it does NOT affect the hard timeout of the pool call, which 
+# remains at 10s by default (configurable via JARVIS_AST_HELPER_DEFAULT_TIMEOUT_S). The alert is 
+# for ops to be aware of slow calls that are approaching the hard timeout, without actually killing 
+# the call. The pool call's hard timeout is the real kill switch to prevent runaway calls; this 
+# alert is just a heads-up for ops to investigate if they see it frequently, or if they want to 
+# adjust the hard timeout based on observed call durations.
+def _resolve_oracle_slow_call_alert_ms() -> float:
+    try: # defensive parsing of the env var, with a fail-safe default if it's not set or invalid
+        raw = os.environ.get(_ORACLE_SLOW_CALL_ALERT_MS_ENV, "").strip() # type: ignore 
+        if not raw: # empty or whitespace-only means "use the default" 
+            return _DEFAULT_ORACLE_SLOW_CALL_ALERT_MS # fail-safe default 
+        return max(0.0, float(raw)) # clamp to non-negative, since negative doesn't make sense for a time threshold 
+    except (TypeError, ValueError): # in case of invalid env var value, log a warning and return the default 
+        return _DEFAULT_ORACLE_SLOW_CALL_ALERT_MS # fail-safe default
+
+# Resolve the alert threshold at module load time, so we don't have to parse the env var on every call. 
+# This is just a single float value that the module-level functions can reference. Operators can set 
+# the env var before starting the service, and it will take effect without needing a code change or 
+# redeploy. The default is 30 seconds, which is intentionally high to avoid noise, since the pool call 
+# already has a hard timeout (default 10s) that will kill runaway calls. This alert is just a heads-up 
+# for ops to investigate if they see it frequently, or if they want to adjust the hard timeout based 
+# on observed call durations. 
+async def analyze_python_source_for_oracle(
+    caller: str, # mandatory provenance label (e.g. "oracle._index_file") for structured logging and telemetry 
+    source: str, # decoded Python source text; caller is responsible for the read_text(encoding="utf-8") step, to keep the file-read cost on the parent and avoid doing it in the worker on every call (also keeps it symmetric with how OpportunityMiner pre-decodes)
+    *, # keyword-only parameters for clarity and to avoid mistakes in argument order; most have defaults 
+    filename: str = "<unknown>", # logical filename for ast.parse error messages; does not affect the IPC payload or the analysis logic, just used for error reporting in the worker if the parse fails
+    repo_name: str = "", # forwarded to CodeStructureVisitor.__init__; does not affect the IPC payload or the analysis logic, just included in the worker for any repo-specific logic the visitor might have (e.g. special handling for certain repos) 
+    relative_path: str = "", # forwarded to CodeStructureVisitor.__init__; does not affect the IPC payload or the analysis logic, just included in the worker for any path-specific logic the visitor might have (e.g. special handling for certain paths) 
+    timeout_s: Optional[float] = None, # hard timeout for the parse+walk operation; defaults to JARVIS_AST_HELPER_DEFAULT_TIMEOUT_S (10s); Oracle scans can include large generated files, so we want a hard timeout to prevent runaway calls; operators can raise this via env if they have larger files and want to allow more time, but the default should be sufficient for most cases and prevents stalling the loop indefinitely; beyond JARVIS_ORACLE_SLOW_CALL_ALERT_MS (default 30s) a structured oracle_slow_call warning is logged but the operation continues to completion (or hard timeout) — this satisfies the operator requirement to "alert without stalling" for slow calls that are approaching the hard timeout   
+    max_bytes: Optional[int] = None, # source-size ceiling; above this returns TOO_LARGE without touching the pool, to fail fast on files that are too big to analyze and avoid the overhead of dispatching to the worker; defaults to JARVIS_AST_HELPER_MAX_BYTES, which is a reasonable upper bound for analyzable files and can be adjusted by operators if needed 
+    tiny_threshold_override: Optional[int] = None, # for tests; sources at/below this size are inline-parsed and analyzed without going through the pool, since the work is genuinely cheap and IPC overhead would dominate; defaults to _resolve_tiny_threshold(), which is typically around 4KB based on empirical measurements of parse+walk times for small files; tests can set this to a smaller value to force the inline path for more cases, or to a larger value to test the process pool path for smaller files 
+) -> OracleAnalysisResult: # always populated; never raises into the caller; on any non-OK outcome nodes and edges are empty tuples (sentinel: "skip this file" — mirrors legacy _read_parse_visit_blocking returning None) 
+    """Slice 32 — off-loop parse + visitor walk for Oracle._index_file.
+
+    Composition counterpart to
+    ``analyze_python_source_for_opportunity_miner``. The worker
+    performs ``ast.parse()`` **and** ``CodeStructureVisitor.visit(tree)``
+    in a separate process; the parent receives only primitive-equivalent
+    dataclass payloads (``NodeData`` + ``EdgeData`` + ``NodeID``). NO
+    ``ast.AST`` ever crosses the IPC boundary.
+
+    Parameters
+    ----------
+    caller:
+        Mandatory provenance label
+        (e.g. ``"oracle._index_file"``). Logged into the structured
+        ``[AstCompileHelper]`` log line on each call.
+    source:
+        Decoded Python source text. Caller is responsible for the
+        ``read_text(encoding="utf-8")`` step (kept on the parent so
+        the worker doesn't pay the file-read cost on every call —
+        symmetric with how OpportunityMiner pre-decodes).
+    filename:
+        Logical filename for ``ast.parse`` error messages.
+    repo_name:
+        Forwarded to ``CodeStructureVisitor.__init__``.
+    relative_path:
+        Forwarded to ``CodeStructureVisitor.__init__``.
+    timeout_s:
+        Hard timeout for the parse+walk operation. Defaults to
+        ``JARVIS_AST_HELPER_DEFAULT_TIMEOUT_S`` (10s). Oracle scans
+        can include large generated files; operators can raise via
+        env. Beyond ``JARVIS_ORACLE_SLOW_CALL_ALERT_MS`` (default
+        30s) a structured ``oracle_slow_call`` warning is logged but
+        the operation continues to completion (or hard timeout).
+    max_bytes:
+        Source-size ceiling. Above this returns ``TOO_LARGE`` without
+        touching the pool.
+    tiny_threshold_override:
+        For tests. Sources at/below this size are inline-parsed.
+
+    Returns
+    -------
+    OracleAnalysisResult
+        Always populated. NEVER raises into the caller. On any
+        non-OK outcome ``nodes`` and ``edges`` are empty tuples
+        (sentinel: "skip this file" — mirrors legacy
+        ``_read_parse_visit_blocking`` returning ``None``).
+    """
+    t0 = time.monotonic() # start the clock immediately on call entry, to capture the full parent-await time including any early fast-paths; the worker will report its own elapsed time for the parse+walk, and the parent can calculate the pure await time by subtracting the worker time from the total elapsed time at the outcome boundary 
+    
+    # Resolve parameters with defaults. The caller can override the defaults for timeout, max_bytes, 
+    # and tiny_threshold, but the common case is to rely on the defaults which are set based on 
+    # empirical measurements and operational experience. The source_bytes calculation is 
+    # straightforward — we need it for the too-large fast-path and for logging; if source is not a 
+    # string (defensive), we treat it as 0 bytes to avoid false positives on the size check. 
+    source_bytes = (
+        len(source.encode("utf-8")) if isinstance(source, str) else 0 # source_bytes is the length of the UTF-8 encoded source, which is what matters for the size checks and logging; if source is not a string, we defensively treat it as 0 bytes to avoid false positives on the size check, since we can't analyze non-string sources anyway 
+    )
+
+    # Resolve the effective timeout, max_bytes, and tiny_threshold based on the provided parameters 
+    # or the defaults. This allows the caller to override these values if needed (e.g. for testing 
+    # or for specific cases), while still having reasonable defaults for the common case. The 
+    # effective_timeout is used for the process pool path; the max_bytes is used for the too-large 
+    # fast-path; the tiny_threshold determines whether we take the inline path or the process pool path. 
+    effective_timeout = (
+        float(timeout_s) if timeout_s is not None # if the caller provided a timeout_s, we use it; otherwise we resolve the default timeout from the environment variable or the hardcoded default 
+        else _resolve_default_timeout_s() # this function reads the JARVIS_AST_HELPER_DEFAULT_TIMEOUT_S env var and falls back to a hardcoded default if it's not set or invalid; this allows operators to configure the default timeout without changing code, while still having a reasonable default for safety
+    )
+
+    # The effective_max_bytes is the ceiling for source size; if the source exceeds this, we return 
+    # TOO_LARGE without dispatching to the worker, to fail fast and avoid the overhead of IPC for files 
+    # that are too big to analyze. The tiny_threshold determines whether we take the inline path (for 
+    # small sources where the work is cheap and IPC overhead would dominate) or the process pool 
+    # path (for larger sources where we want to isolate the CPU-bound work from the asyncio event 
+    # loop). Both of these thresholds can be overridden by the caller, but they have sensible defaults 
+    # based on empirical measurements and operational experience.
+    effective_max_bytes = (
+        int(max_bytes) if max_bytes is not None # if the caller provided a max_bytes, we use it; otherwise we resolve the default max_bytes from the environment variable or the hardcoded default
+        else _resolve_default_max_bytes() # this function reads the JARVIS_AST_HELPER_MAX_BYTES env var and falls back to a hardcoded default if it's not set or invalid; this allows operators to configure the max_bytes threshold without changing code, while still having a reasonable default to prevent trying to analyze files that are too large
+    )
+
+    # The tiny_threshold determines the cutoff for taking the inline path versus the process pool path. 
+    # For sources at or below this size, we parse and analyze inline on the caller's thread, since the 
+    # work is genuinely cheap (empirically under 5ms for sources around 4KB) and IPC overhead would 
+    # dominate. For sources above this threshold, we dispatch to the process pool to isolate the 
+    # CPU-bound work from the asyncio event loop. The default tiny_threshold is based on empirical 
+    # measurements of parse+walk times for small files, but it can be overridden by the caller (e.g. 
+    # in tests) if they want to force more cases through the inline path or the process pool path.
+    tiny_threshold = (
+        int(tiny_threshold_override) # if the caller provided a tiny_threshold_override, we use it; otherwise we resolve the default tiny_threshold from the environment variable or the hardcoded default
+        if tiny_threshold_override is not None # we check explicitly for None to allow the caller to set it to 0 or any other value; if it's not None, we use the provided value; if it is None, we resolve the default tiny_threshold from the environment variable or the hardcoded default; this allows operators to configure the tiny threshold without changing code, while still having a reasonable default based on empirical measurements of when the inline path is actually faster than the process pool path 
+        else _resolve_tiny_threshold() # this function reads the JARVIS_AST_HELPER_TINY_THRESHOLD_BYTES env var and falls back to a hardcoded default if it's not set or invalid; this allows operators to configure the tiny threshold without changing code, while still having a reasonable default based on empirical measurements of when the inline path is actually faster than the process pool path 
+    )
+
+    # Too-large fast-path. If the source exceeds the effective_max_bytes, we return TOO_LARGE without 
+    # dispatching to the worker, to fail fast and avoid the overhead of IPC for files that are too big 
+    # to analyze. We also log this event with an info level, since it's a normal occurrence that we want 
+    # to be aware of but it's not necessarily a problem (e.g. some generated files might be large and 
+    # we just want to skip them). The log includes the caller, the source size, the max_bytes threshold,
+    #  and the elapsed time up to this point.
+    if source_bytes > effective_max_bytes:
+        # Since this is a fast-path that returns early, we want to capture the elapsed time up to this 
+        # point for telemetry purposes. This includes the time taken to calculate source_bytes and resolve 
+        # the effective thresholds, which is part of the overall cost of handling this file even though 
+        # we don't dispatch to the worker. We log this at the info level, since it's a normal occurrence 
+        # that we want to be aware of but it's not necessarily a problem (e.g. some generated files might 
+        # be large and we just want to skip them). The log includes the caller, the source size, the 
+        # max_bytes threshold, and the elapsed time up to this point. Then we return an 
+        # OracleAnalysisResult with the TOO_LARGE outcome, including the elapsed time, source size, 
+        # caller, execution mode (inline tiny, since we didn't dispatch), and an error detail message 
+        # explaining that the source exceeds the max_bytes threshold. 
+        elapsed_ms = (time.monotonic() - t0) * 1000.0 
+        logger.info(
+            "[AstCompileHelper] caller=%s outcome=too_large "
+            "kind=analyze_oracle source_bytes=%d max_bytes=%d "
+            "elapsed_ms=%.2f",
+            caller, source_bytes, effective_max_bytes, elapsed_ms,
+        )
+        # We return an OracleAnalysisResult with the TOO_LARGE outcome, including the elapsed time, 
+        # source size, caller, execution mode (inline tiny, since we didn't dispatch), and an error 
+        # detail message explaining that the source exceeds the max_bytes threshold. The nodes and 
+        # edges are empty tuples as a sentinel for "skip this file". 
+        return OracleAnalysisResult(
+            # We use the TOO_LARGE outcome to indicate that the file was too big to analyze, and we 
+            # didn't even attempt to parse it. This is a normal case that we want to be able to 
+            # distinguish from other failure modes (e.g. syntax errors or internal errors), since 
+            # it just means we skipped the file due to size. The caller can check for this outcome and 
+            # decide how to handle it (e.g. log it, alert on it, etc.) without treating it as an error 
+            # in the analysis logic. 
+            outcome=AnalyzeOutcome.TOO_LARGE,
+            # Since we didn't attempt to parse the file, we set nodes and edges to empty tuples as a 
+            # sentinel for "skip this file". This mirrors the legacy behavior of _read_parse_visit_blocking 
+            # returning None for files that were too large or had syntax errors. The content_hash is 
+            # also empty since we didn't compute it. The elapsed_ms captures the time taken up to this 
+            # point, which includes the size check and any parameter resolution. The worker_elapsed_ms 
+            # is 0 since we didn't dispatch to the worker. The execution_mode is INLINE_TINY since we 
+            # handled this on the caller's thread without dispatching. The error_detail explains that 
+            # the source exceeds the max_bytes threshold, which can be useful for debugging or 
+            # operational awareness. 
+            elapsed_ms=elapsed_ms,
+            # The worker_elapsed_ms is 0 since we didn't dispatch to the worker. This distinguishes this 
+            # case from a case where we dispatched to the worker but it took a long time or failed; in 
+            # this case we didn't even try to parse it, so the worker time is 0.  
+            source_bytes=source_bytes,
+            # The caller is included in the result for structured logging and telemetry purposes, so we 
+            # can track which callers are encountering too-large files. This is important for 
+            # operational awareness and for identifying if certain parts of the codebase are more 
+            # likely to have large files that exceed the threshold. The execution_mode is INLINE_TINY 
+            # since we handled this on the caller's thread without dispatching to the worker. The 
+            # error_detail explains that the source exceeds the max_bytes threshold, which can be 
+            # useful for debugging or operational awareness. 
+            caller=caller,
+            # The execution_mode is INLINE_TINY since we handled this on the caller's thread without 
+            # dispatching to the worker. This distinguishes it from cases where we dispatched to the 
+            # worker and it failed or took a long time; in this case we didn't even try to parse it, 
+            # so it's an inline fast-path result. The error_detail explains that the source exceeds 
+            # the max_bytes threshold, which can be useful for debugging or operational awareness. 
+            execution_mode=ExecutionMode.INLINE_TINY,
+            error_detail=(
+                f"source {source_bytes}B exceeds max_bytes "
+                f"{effective_max_bytes}B"
+            ),
+        )
+
+    # Inline-tiny path. For ≤4KB files the visitor walk is so cheap
+    # (<5ms) that IPC overhead would dominate — direct-call the
+    # worker on the asyncio thread. We accept this minor block: a
+    # 5ms parse for a 4KB file is below the ControlPlaneWatchdog
+    # threshold (500ms).
+    if source_bytes <= tiny_threshold:
+        return _inline_tiny_analyze_for_oracle(
+            caller=caller, source=source, filename=filename,
+            repo_name=repo_name, relative_path=relative_path,
+            source_bytes=source_bytes, t0=t0,
+        )
+
+    # Process-pool path — the heavy case (the v25 wedge driver).
+    return await _process_pool_analyze_for_oracle(
+        caller=caller, source=source, filename=filename,
+        repo_name=repo_name, relative_path=relative_path,
+        source_bytes=source_bytes, t0=t0,
+        timeout_s=effective_timeout,
+    )
+
+
+def _inline_tiny_analyze_for_oracle(
+    *,
+    caller: str,
+    source: str,
+    filename: str,
+    repo_name: str,
+    relative_path: str,
+    source_bytes: int,
+    t0: float,
+) -> OracleAnalysisResult:
+    """Tiny-source inline path — runs the worker fn directly on the
+    asyncio thread. <5ms for sources ≤ tiny_threshold; below the
+    ControlPlaneWatchdog 500ms threshold."""
+    try:
+        outcome_label, payload = _worker_analyze_for_oracle_in_process(
+            source, filename, repo_name, relative_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.INTERNAL_ERROR,
+            elapsed_ms=elapsed_ms,
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=ExecutionMode.INLINE_TINY,
+            error_detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    return _oracle_result_from_worker_payload(
+        outcome_label=outcome_label,
+        payload=payload,
+        caller=caller,
+        source_bytes=source_bytes,
+        elapsed_ms=elapsed_ms,
+        execution_mode=ExecutionMode.INLINE_TINY,
+    )
+
+
+async def _process_pool_analyze_for_oracle(
+    *,
+    caller: str,
+    source: str,
+    filename: str,
+    repo_name: str,
+    relative_path: str,
+    source_bytes: int,
+    t0: float,
+    timeout_s: float,
+) -> OracleAnalysisResult:
+    """Process-pool path — the heavy case. Submits to spawn worker,
+    awaits with bounded ``asyncio.wait_for``, returns structured
+    result. Asyncio main thread keeps ticking during the await — the
+    GIL contention that wedged v25 is now in the child process."""
+    loop = asyncio.get_running_loop()
+    pool = _get_pool()
+
+    try:
+        worker_tuple = await asyncio.wait_for(
+            loop.run_in_executor(
+                pool, _worker_analyze_for_oracle_in_process,
+                source, filename, repo_name, relative_path,
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.warning(
+            "[AstCompileHelper] caller=%s outcome=timeout "
+            "kind=analyze_oracle execution_mode=process "
+            "source_bytes=%d timeout_s=%.1f parent_await_ms=%.1f",
+            caller, source_bytes, timeout_s, elapsed_ms,
+        )
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.TIMEOUT,
+            elapsed_ms=elapsed_ms,
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=ExecutionMode.PROCESS,
+            error_detail=(
+                f"analyze_oracle exceeded {timeout_s:.1f}s in pool"
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.INTERNAL_ERROR,
+            elapsed_ms=elapsed_ms,
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=ExecutionMode.PROCESS,
+            error_detail=(
+                f"pool dispatch failed: {type(exc).__name__}: {exc}"
+            ),
+        )
+
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    try:
+        outcome_label, payload = worker_tuple
+    except (ValueError, TypeError):
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.INTERNAL_ERROR,
+            elapsed_ms=elapsed_ms,
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=ExecutionMode.PROCESS,
+            error_detail=(
+                f"worker returned unexpected shape: "
+                f"{type(worker_tuple).__name__}"
+            ),
+        )
+
+    result = _oracle_result_from_worker_payload(
+        outcome_label=outcome_label,
+        payload=payload,
+        caller=caller,
+        source_bytes=source_bytes,
+        elapsed_ms=elapsed_ms,
+        execution_mode=ExecutionMode.PROCESS,
+    )
+
+    # Slow-call alert — operator binding: "log an event plane alert
+    # without stalling". Fires at WARNING level when total parent
+    # await exceeds the configured threshold (default 30s). The
+    # operation already completed; the asyncio loop did not block
+    # (the await yielded continuously); this is observability only.
+    alert_threshold_ms = _resolve_oracle_slow_call_alert_ms()
+    if (
+        alert_threshold_ms > 0.0
+        and elapsed_ms > alert_threshold_ms
+        and result.outcome == AnalyzeOutcome.OK
+    ):
+        logger.warning(
+            "[AstCompileHelper] oracle_slow_call caller=%s "
+            "execution_mode=process source_bytes=%d "
+            "parent_await_ms=%.1f worker_elapsed_ms=%.1f "
+            "threshold_ms=%.1f — loop kept ticking; this is "
+            "observability, not abort",
+            caller, source_bytes, elapsed_ms,
+            result.worker_elapsed_ms, alert_threshold_ms,
+        )
+    elif result.outcome == AnalyzeOutcome.OK:
+        logger.debug(
+            "[AstCompileHelper] caller=%s outcome=ok "
+            "kind=analyze_oracle execution_mode=process "
+            "source_bytes=%d worker_elapsed_ms=%.1f "
+            "parent_await_ms=%.1f",
+            caller, source_bytes,
+            result.worker_elapsed_ms, elapsed_ms,
+        )
+    return result
+
+
+def _oracle_result_from_worker_payload(
+    *,
+    outcome_label: str,
+    payload: Any,
+    caller: str,
+    source_bytes: int,
+    elapsed_ms: float,
+    execution_mode: ExecutionMode,
+) -> OracleAnalysisResult:
+    """Decode worker ``(label, payload)`` tuple into
+    ``OracleAnalysisResult``. Shared by inline-tiny and process
+    paths so the decode logic lives in exactly one place
+    (mirrors ``_result_from_worker_payload`` for OpportunityMiner)."""
+    if outcome_label == "ok":
+        try:
+            nodes_list, edges_list, content_hash, worker_elapsed_ms = (
+                payload
+            )
+        except (ValueError, TypeError):
+            return OracleAnalysisResult(
+                outcome=AnalyzeOutcome.INTERNAL_ERROR,
+                elapsed_ms=elapsed_ms,
+                source_bytes=source_bytes,
+                caller=caller,
+                execution_mode=execution_mode,
+                error_detail=(
+                    f"ok payload shape unexpected: "
+                    f"{type(payload).__name__}"
+                ),
+            )
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.OK,
+            nodes=tuple(nodes_list),
+            edges=tuple(edges_list),
+            content_hash=str(content_hash),
+            elapsed_ms=elapsed_ms,
+            worker_elapsed_ms=float(worker_elapsed_ms),
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=execution_mode,
+        )
+    if outcome_label == "syntax_error":
+        return OracleAnalysisResult(
+            outcome=AnalyzeOutcome.SYNTAX_ERROR,
+            elapsed_ms=elapsed_ms,
+            source_bytes=source_bytes,
+            caller=caller,
+            execution_mode=execution_mode,
+            error_detail=str(payload),
+        )
+    return OracleAnalysisResult(
+        outcome=AnalyzeOutcome.INTERNAL_ERROR,
+        elapsed_ms=elapsed_ms,
+        source_bytes=source_bytes,
+        caller=caller,
+        execution_mode=execution_mode,
+        error_detail=str(payload),
+    )
+
+
+# ============================================================================
 # Public surface
 # ============================================================================
 
@@ -1124,9 +1698,11 @@ __all__ = [
     "AnalyzeOutcome",
     "ExecutionMode",
     "OpportunityAnalysisPayload",
+    "OracleAnalysisResult",
     "ParseOutcome",
     "ParseResult",
     "analyze_python_source_for_opportunity_miner",
+    "analyze_python_source_for_oracle",
     "parse_python_source",
     "shutdown_pool",
 ]

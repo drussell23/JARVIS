@@ -174,6 +174,10 @@ class TestHelperAstCage(unittest.TestCase):
                 {
                     "_worker_parse_in_process",
                     "_worker_analyze_in_process",
+                    # Slice 32 (2026-05-27): Oracle composition adds
+                    # a third worker. Parse + visitor walk happen in
+                    # the same spawn worker; no ast.AST crosses IPC.
+                    "_worker_analyze_for_oracle_in_process",
                     "_inline_tiny_parse",
                 },
                 f"helper ast.parse at L{lineno} in function "
@@ -500,13 +504,19 @@ class TestPublicSurface(unittest.TestCase):
         # helper's taxonomy + result types + entry point. The
         # parse-only API stays exposed for narrow non-walking
         # callers.
+        #
+        # Slice 32 (2026-05-27): adds
+        # ``analyze_python_source_for_oracle`` + ``OracleAnalysisResult``
+        # for Oracle._index_file composition (closes v25 wedge).
         self.assertEqual(
             set(helper_mod.__all__),
             {
                 "AnalysisResult", "AnalyzeOutcome",
                 "ExecutionMode", "OpportunityAnalysisPayload",
+                "OracleAnalysisResult",
                 "ParseOutcome", "ParseResult",
                 "analyze_python_source_for_opportunity_miner",
+                "analyze_python_source_for_oracle",
                 "parse_python_source", "shutdown_pool",
             },
         )
