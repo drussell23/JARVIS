@@ -214,11 +214,11 @@ _TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
 # operators can tune without code edits. Defaults match the operator's
 # spec exactly.
 
-_ADAPTIVE_BASE_S_DEFAULT = 60.0
-_ADAPTIVE_STEP_CHARS_DEFAULT = 5000
-_ADAPTIVE_STEP_BONUS_S_DEFAULT = 15.0
-_ADAPTIVE_HEAVY_SCALAR_DEFAULT = 1.5
-_ADAPTIVE_CAP_S_DEFAULT = 240.0
+_ADAPTIVE_BASE_S_DEFAULT = 60.0 # Base timeout in seconds for the adaptive formula when prompt_chars is zero. This is the starting point for the timeout calculation before adding the step bonus and applying the heavy model scalar. Default is 60s as per operator spec.
+_ADAPTIVE_STEP_CHARS_DEFAULT = 5000 # Number of prompt characters that trigger each step bonus increment. For every multiple of this number of characters in the prompt, the step bonus is added to the base timeout. Default is 5000 chars as per operator spec.
+_ADAPTIVE_STEP_BONUS_S_DEFAULT = 15.0 # Additional timeout in seconds added for each step of prompt_chars defined by _ADAPTIVE_STEP_CHARS_DEFAULT. For example, with a step_chars of 5000 and a step_bonus of 15s, a prompt of 10000 chars would add 30s to the base timeout. Default is 15s as per operator spec. 
+_ADAPTIVE_HEAVY_SCALAR_DEFAULT = 1.5 # Scalar multiplier applied to the timeout when the model is identified as a heavy model (e.g., Qwen-397B or Kimi-K2.6). This accounts for the longer TTFT of heavy models. Default is 1.5x as per operator spec.
+_ADAPTIVE_CAP_S_DEFAULT = 240.0 # Maximum timeout in seconds that can be returned by the adaptive formula, regardless of prompt size or model. This prevents unbounded timeouts for extremely large prompts. Default is 240s as a safe ceiling per operator spec.
 
 # Heavy-model substring matchers — checked case-insensitively against
 # model_id. CSV-extensible via env var so operators can add new heavy
@@ -226,55 +226,55 @@ _ADAPTIVE_CAP_S_DEFAULT = 240.0
 # a code change to get the 1.5× scalar). Default set codifies operator's
 # §46 fleet inventory: the 397B MoE workhorse + Kimi's 200K-context
 # specialist (both warrant the heavy budget per §46 strengths).
-_HEAVY_MODEL_DEFAULT_MARKERS = ("397B", "Kimi")
+_HEAVY_MODEL_DEFAULT_MARKERS = ("397B", "Kimi") # Default heavy model markers. 
 
-
+# Defensive: this function is called on every Tier 0 dispatch, so we read and parse the env var once per call. The parsing logic is robust to empty/malformed env vars, falling back to the default marker set when necessary. The tuple of markers is returned for efficient substring checks in the hot path.
 def _heavy_model_markers() -> Tuple[str, ...]:
     """CSV-tunable heavy-model match list. Default: ('397B', 'Kimi')."""
-    raw = os.environ.get("JARVIS_ADAPTIVE_HEAVY_MODEL_MARKERS", "").strip()
-    if not raw:
-        return _HEAVY_MODEL_DEFAULT_MARKERS
-    return tuple(m.strip() for m in raw.split(",") if m.strip())
+    raw = os.environ.get("JARVIS_ADAPTIVE_HEAVY_MODEL_MARKERS", "").strip() # Read the raw env var value as a string and strip whitespace. If the env var is not set or is empty after stripping, return the default heavy model markers. Defensive: if the raw value is empty, return the default immediately without trying to parse it. This handles both unset and explicitly empty env vars gracefully.
+    if not raw: # Defensive: if the raw value is empty, return the default immediately without trying to parse it. This handles both unset and explicitly empty env vars gracefully.
+        return _HEAVY_MODEL_DEFAULT_MARKERS # Return the default heavy model markers if the env var is not set or is empty. This ensures that we have a sensible default set of markers to identify heavy models without requiring operator configuration.
+    return tuple(m.strip() for m in raw.split(",") if m.strip()) # Split the raw string by commas, strip whitespace from each marker, and return a tuple of non-empty markers. This allows operators to specify a custom list of heavy model markers via the env var, while ensuring that empty entries are ignored. 
 
-
+# Float env vars are used for time thresholds to allow fractional seconds and to keep the env interface simple. Defensive: negative values are treated as zero.
 def _envf_or_default(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
+    raw = os.environ.get(name, "").strip() # Read the raw env var value as a string and strip whitespace. If the env var is not set or is empty after stripping, return the default value.
+    if not raw: # Defensive: if the raw value is empty, return the default immediately without trying to parse it. This handles both unset and explicitly empty env vars gracefully.
+        return default # Return the default value if the env var is not set or is empty.
+    try: # Try to parse the raw string as a float. If parsing fails (e.g., due to invalid format), catch the ValueError and return the default instead.
+        return float(raw) # Convert the raw string to a float and return it. This allows for fractional seconds in time thresholds.
+    except ValueError: # If the raw value cannot be parsed as a float, return the default. This ensures that invalid env var values don't cause crashes and instead fall back to safe defaults.
+        return default # Return the default value if parsing fails due to invalid format.
 
-
+# Integer env vars are used for char counts to avoid fractional chars and to keep the env interface simple. Defensive: negative values are treated as zero.
 def _envi_or_default(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+    raw = os.environ.get(name, "").strip() # Read the raw env var value as a string and strip whitespace. If the env var is not set or is empty after stripping, return the default value.
+    if not raw: # Defensive: if the raw value is empty, return the default immediately without trying to parse it. This handles both unset and explicitly empty env vars gracefully.
+        return default # Return the default value if the env var is not set or is empty.
+    try: # Try to parse the raw string as an integer. If parsing fails (e.g., due to invalid format), catch the ValueError and return the default instead.
+        return int(raw) # Convert the raw string to an integer and return it. This is used for char count thresholds where fractional chars don't make sense.
+    except ValueError: # If the raw value cannot be parsed as an integer, return the default. This ensures that invalid env var values don't cause crashes and instead fall back to safe defaults.
+        return default # Return the default value if parsing fails due to invalid format.
 
-
+# Model ID substring matchers for heavy models. Case-insensitive, CSV-extensible via env var. Used to apply the heavy-model scalar in the adaptive formula.
 def _is_heavy_model(model_id: str) -> bool:
     """Case-insensitive substring match against the heavy-model marker
     list. Used to apply the 1.5× scalar in the adaptive formula."""
-    if not model_id:
-        return False
-    mid_lower = model_id.lower()
-    return any(m.lower() in mid_lower for m in _heavy_model_markers())
+    if not model_id: # Defensive: empty model_id is not heavy, avoids unnecessary env lookup.
+        return False # If model_id is empty or None, return False immediately without checking markers.
+    mid_lower = model_id.lower() # Lowercase once for efficiency since we check multiple markers.
+    return any(m.lower() in mid_lower for m in _heavy_model_markers()) # Check if any heavy model marker is a substring of the model_id (case-insensitive). Returns True if a match is found, False otherwise.
 
 # Pure function for the adaptive Tier 0 timeout formula. Called by the route-aware cap selector (:func:`_tier0_rt_cap_for_route`) when the caller
 def _compute_adaptive_tier0_timeout_s(
     *,
     prompt_chars: int, # Caller-provided prompt size in chars — used to compute the step bonus. Defensive: negative treated as zero.
-    model_id: str,
-    base_s: Optional[float] = None,
-    step_chars: Optional[int] = None,
-    step_bonus_s: Optional[float] = None,
-    heavy_scalar: Optional[float] = None,
-    cap_s: Optional[float] = None,
+    model_id: str, # Caller-provided model ID — used to determine if the heavy-model scalar applies. Defensive: empty treated as non-heavy.
+    base_s: Optional[float] = None, # Optional override for the base timeout in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_BASE_S or defaults to _ADAPTIVE_BASE_S_DEFAULT.
+    step_chars: Optional[int] = None, # Optional override for the number of chars per step in the adaptive formula. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_STEP_CHARS or defaults to _ADAPTIVE_STEP_CHARS_DEFAULT.
+    step_bonus_s: Optional[float] = None, # Optional override for the step bonus in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_STEP_BONUS_S or defaults to _ADAPTIVE_STEP_BONUS_S_DEFAULT. 
+    heavy_scalar: Optional[float] = None, # Optional override for the heavy model scalar. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_HEAVY_SCALAR or defaults to _ADAPTIVE_HEAVY_SCALAR_DEFAULT.
+    cap_s: Optional[float] = None, # Optional override for the maximum timeout cap in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_CAP_S or defaults to _ADAPTIVE_CAP_S_DEFAULT.
 ) -> float:
     """Slice 27 Phase 3 — pure-function adaptive Tier 0 timeout.
 
@@ -304,12 +304,12 @@ def _compute_adaptive_tier0_timeout_s(
     )
 
     # Defensive — negative payload chars treated as zero
-    safe_chars = max(0, int(prompt_chars or 0))
+    safe_chars = max(0, int(prompt_chars or 0)) # Ensure prompt_chars is a non-negative integer. If prompt_chars is None or negative, treat it as zero. This prevents the formula from producing a smaller timeout due to negative char counts.
     steps = safe_chars // max(1, sc)  # avoid div-by-zero on misconfigured env
-    timeout = b + sb * steps
-    if _is_heavy_model(model_id):
-        timeout *= hs
-    return min(timeout, cap)
+    timeout = b + sb * steps # Calculate the timeout based on the base, step bonus, and number of steps determined by the prompt size. The step bonus increases the timeout for larger prompts according to the operator's formula.
+    if _is_heavy_model(model_id): # Apply the heavy model scalar if the model_id matches any of the heavy model markers. This accounts for the longer TTFT of heavy models.
+        timeout *= hs # Scale the timeout by the heavy model scalar if applicable.
+    return min(timeout, cap) # Apply the maximum cap to ensure the timeout does not exceed the specified limit, preventing unbounded timeouts for extremely large prompts or heavy models.
 
 
 def _tier0_rt_cap_for_route(
