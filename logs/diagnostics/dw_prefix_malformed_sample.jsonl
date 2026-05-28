@@ -1,0 +1,9 @@
+{
+    "custom_id": "dw-prefix-malformed-sample", 
+    "method": "POST", "url": "/v1/chat/completions", 
+    "body": {
+        "model": "Qwen/Qwen3.5-35B-A3B-FP8", 
+        "messages": [{"role": "user", "content": "ping"}],
+         "max_tokens": 1
+    }
+}
