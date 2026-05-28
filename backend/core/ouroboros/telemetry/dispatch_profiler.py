@@ -379,6 +379,55 @@ async def dispatch_stage(
             )
 
 
+def record_stage(
+    stage_name: str,
+    *,
+    op_id: str,
+    model_id: str,
+    duration_ms: float,
+    outcome: str = "ok",
+    error_class: str = "",
+) -> None:
+    """Slice 35 — manual stage record helper for the dual-path
+    profiler wiring.
+
+    Use when async-context-manager wrapping would require dangerous
+    indent restructuring (e.g., inside large branchy async functions
+    like ``DoublewordProvider._generate_realtime``). Caller measures
+    ``duration_ms`` themselves via ``time.monotonic()`` deltas.
+
+    Records into the active op accumulator (if an :func:`op_session`
+    is active for this op_id + model_id) AND emits a per-stage log
+    row. NEVER raises into the caller — internal errors swallowed.
+    """
+    if not is_enabled():
+        return
+    try:
+        logger.log(
+            _stage_log_level(),
+            "[DispatchProfiler] stage op=%s model=%s stage=%s "
+            "duration_ms=%.1f outcome=%s%s",
+            op_id[:16], model_id, stage_name,
+            duration_ms, outcome,
+            f" error_class={error_class}" if error_class else "",
+        )
+        key = _active_key(op_id, model_id)
+        with _active_ops_lock:
+            summary = _active_ops.get(key)
+        if summary is not None:
+            summary.stages.append(StageRecord(
+                stage_name=stage_name,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                error_class=error_class,
+            ))
+    except Exception as inner:  # noqa: BLE001 — fail-closed
+        logger.warning(
+            "[DispatchProfiler] record_stage(%s) failed: %s",
+            stage_name, inner,
+        )
+
+
 def get_recent_op_summaries(limit: int = 50) -> List[OpDispatchSummary]:
     """Read-only snapshot of recent per-op dispatch summaries
     (most recent first). For REPL inspection + observability."""
