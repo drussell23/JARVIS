@@ -881,7 +881,10 @@ class DoublewordProvider:
         operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
         _effective_model = self._resolve_effective_model(ctx)
 
-        jsonl_line = json.dumps({
+        # Slice 38 — canonical JSONL composition via single helper.
+        # Replaces raw ``json.dumps(...)`` which omitted the trailing
+        # ``\n`` and made DW reject the upload with HTTP 500.
+        jsonl_line = self._compose_jsonl_batch_entry({
             "custom_id": operation_id,
             "method": "POST",
             "url": "/v1/chat/completions",
@@ -2810,6 +2813,78 @@ class DoublewordProvider:
     # Batch API stages (all deterministic — Tier 0 protocol)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Slice 38 — Canonical JSONL batch entry composer (single source
+    # of truth for /v1/files content framing).
+    #
+    # Why this is its own function instead of two raw json.dumps()
+    # call sites:
+    #
+    # The DW ``/v1/files`` endpoint validates uploaded files as
+    # newline-delimited JSON ("JSONL" / ndjson per RFC 7464). A
+    # single JSON object without a terminating ``\n`` is structurally
+    # valid JSON but structurally INVALID JSONL. DW's validator
+    # (post-2026-05-28 tightening, surfaced via direct support
+    # contact peter@doubleword.ai) rejects this with HTTP 500
+    # ``Internal server error`` and logs it on their side as
+    # "invalid multi part files" — referring to the content of the
+    # multipart ``file`` field, not the multipart envelope itself.
+    #
+    # Pre-Slice 38 the JSONL composition happened at two sites
+    # (``submit_batch`` + ``prompt_only``), both calling
+    # ``json.dumps(...)`` and both omitting the trailing ``\n``. The
+    # v33 capability soak (2026-05-28, session bt-2026-05-28-162729)
+    # captured 3/3 HTTP 500s via Slice 37's diagnostic logs — full
+    # payload context confirmed the failure mode is structurally
+    # identical across payload sizes (4 KB / 18 KB / 33 KB).
+    #
+    # This helper is now the single source of truth. ``_upload_file``
+    # additionally enforces a belt-and-braces guard against any
+    # future bypass.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compose_jsonl_batch_entry(entry: Dict[str, Any]) -> str:
+        """Compose a single batch entry as a properly-terminated
+        JSONL line (RFC 7464 / ndjson).
+
+        Args:
+            entry: dict with required keys ``custom_id``,
+                ``method``, ``url``, ``body``. Additional keys are
+                preserved as-is.
+
+        Returns:
+            ``json.dumps(entry) + "\\n"`` — RFC 7464 compliant.
+
+        Raises:
+            TypeError: if ``entry`` is not a dict.
+            ValueError: if any required field is missing or if
+                ``body`` is not a dict.
+        """
+        if not isinstance(entry, dict):
+            raise TypeError(
+                "_compose_jsonl_batch_entry expects dict, got "
+                f"{type(entry).__name__}"
+            )
+        for _field in ("custom_id", "method", "url", "body"):
+            if _field not in entry:
+                raise ValueError(
+                    "_compose_jsonl_batch_entry: missing required "
+                    f"field {_field!r} (entry keys: "
+                    f"{list(entry.keys())})"
+                )
+        if not isinstance(entry.get("body"), dict):
+            raise ValueError(
+                "_compose_jsonl_batch_entry: 'body' must be dict, "
+                f"got {type(entry.get('body')).__name__}"
+            )
+        # NB: do NOT change serialization params (ensure_ascii /
+        # separators) — keep the byte shape identical to pre-Slice-38
+        # except for the structural \n terminator. That way any
+        # remaining DW upload failures are unambiguously
+        # newline-independent.
+        return json.dumps(entry) + "\n"
+
     async def _upload_file(
         self, jsonl_content: str, *, op_id: str = "dw-batch-upload",
     ) -> Optional[str]:
@@ -2838,6 +2913,24 @@ class DoublewordProvider:
         session = await self._get_session()
         import aiohttp
 
+        # Slice 38 belt-and-braces — guarantee the upload payload is
+        # newline-terminated JSONL even if a future caller bypasses
+        # ``_compose_jsonl_batch_entry``. A single JSON object without
+        # a trailing ``\n`` is valid JSON but invalid JSONL/ndjson; DW
+        # rejects it with HTTP 500 ``Internal server error``. Per
+        # operator binding: no workarounds — the canonical fix is in
+        # the composer at the call sites; this guard is defense in
+        # depth and warns loudly so the offending site can be fixed.
+        if jsonl_content and not jsonl_content.endswith("\n"):
+            logger.warning(
+                "[DoublewordProvider] _upload_file: payload missing "
+                "trailing newline — auto-appending. Caller "
+                "should use _compose_jsonl_batch_entry() to avoid "
+                "this fallback (op=%s, len_before=%d)",
+                op_id[:16], len(jsonl_content),
+            )
+            jsonl_content = jsonl_content + "\n"
+
         # Slice 37 Phase 1 — payload diagnostic. Extract custom_id +
         # model_id from the JSONL line (single line, JSON-parseable)
         # so operators can correlate HTTP 500s with payload shape.
@@ -2845,7 +2938,12 @@ class DoublewordProvider:
         _payload_custom_id = "?"
         _payload_model = "?"
         try:
-            _parsed = json.loads(jsonl_content)
+            # Strip trailing \n before json.loads — json.loads accepts
+            # it but cleaner to parse the bare object so future
+            # multi-line payloads (>1 entry) parse only the first
+            # line for diagnostic extraction.
+            _first_line = jsonl_content.split("\n", 1)[0]
+            _parsed = json.loads(_first_line)
             _payload_custom_id = str(_parsed.get("custom_id", "?"))[:40]
             _payload_body = _parsed.get("body", {}) or {}
             _payload_model = str(_payload_body.get("model", "?"))
@@ -3469,7 +3567,10 @@ class DoublewordProvider:
         if response_format is not None:
             body["response_format"] = response_format
 
-        jsonl_line = json.dumps({
+        # Slice 38 — canonical JSONL composition via single helper.
+        # Same fix as submit_batch — trailing ``\n`` mandatory for
+        # DW ``/v1/files`` acceptance.
+        jsonl_line = self._compose_jsonl_batch_entry({
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/chat/completions",
