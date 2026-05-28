@@ -103,6 +103,80 @@ _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
 _DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "10"))
 _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
 
+
+# ============================================================================
+# Slice 36 — Adaptive Transport Selector
+# ============================================================================
+#
+# v31 empirical evidence (bt-2026-05-28-065235):
+#
+#   * STAGE_RT_HTTP_POST p50 TTFT     = 66,775 ms (DW /v1/chat/completions)
+#   * STAGE_RT_VENOM_TOOL_LOOP p50    = 66,849 ms (nested with above)
+#   * Phase 0 probe via prompt_only   =  4,000-8,000 ms end-to-end (BATCH)
+#
+# Same DW account, same Qwen3.5-397B model, same prompt sizes (1-50KB).
+# DW's RT streaming endpoint has fundamentally different latency
+# characteristics than its batch API. Production picked RT; v25-v31
+# produced 0 APPLY events across 6 capability soaks.
+#
+# Slice 36 makes the transport selection ADAPTIVE: when Claude is
+# disabled (pure-DW config), STANDARD/COMPLEX routes auto-switch to
+# the empirically-faster BATCH API path. RT path preserved for
+# IMMEDIATE / BG / SPECULATIVE (latency-sensitive low-context paths
+# where Venom adds value).
+#
+# Trade-off acknowledged: BATCH path does NOT support the Venom tool
+# loop (single-shot generation). v31 evidence: 0 successful Venom
+# rounds across all production ops anyway (every RT call timed out).
+# Net delta = positive (some candidates >> zero candidates).
+#
+# Operator escape hatch: ``JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX=0``
+# reverts to legacy RT-only routing for STANDARD/COMPLEX.
+
+_SLICE36_FORCE_BATCH_ENV: str = "JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX"
+
+
+def _slice36_should_force_batch(context: Any) -> bool:
+    """Slice 36 — adaptive transport selector decision.
+
+    Returns True when the BATCH API path should be used in place of
+    the RT streaming path for THIS specific op.
+
+    Decision matrix:
+
+      * ``JARVIS_PROVIDER_CLAUDE_DISABLED != true`` (Claude available
+        as fallback) → False (RT path; Claude catches any RT failure)
+      * Master flag explicitly off → False (operator opt-out)
+      * Route NOT in {standard, complex} → False (preserve RT for
+        IMMEDIATE / BG / SPECULATIVE where Venom adds value AND
+        prompt sizes are small)
+      * All conditions hold → True (force batch)
+
+    NEVER raises — defensive on any attribute lookup or env parse
+    failure (returns False = preserve legacy RT behavior).
+    """
+    try:
+        # Claude must be disabled — Slice 36 is the "pure-DW
+        # production" path optimization. With Claude available, RT
+        # failures cascade to Claude fallback and the empirical
+        # cost-benefit shifts.
+        _claude_disabled = os.environ.get(
+            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not _claude_disabled:
+            return False
+        # Master opt-out (default ON per operator authorization)
+        _raw = os.environ.get(_SLICE36_FORCE_BATCH_ENV, "1").strip().lower()
+        if _raw in ("0", "false", "no", "off"):
+            return False
+        # Route gate — only STANDARD + COMPLEX get the batch path
+        _route = (
+            getattr(context, "provider_route", "") or ""
+        ).strip().lower()
+        return _route in ("standard", "complex")
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
 # Pricing (March 2026)
 _DW_INPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_INPUT_COST_PER_M", "0.10"))
 _DW_OUTPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_OUTPUT_COST_PER_M", "0.40"))
@@ -1395,10 +1469,25 @@ class DoublewordProvider:
                 _heavy_exc,
             )
 
+        # Slice 36 — adaptive transport selector. v31 proved DW RT
+        # streaming TTFT p50 = 66.8s vs batch end-to-end 4-8s for
+        # the same prompts. STANDARD/COMPLEX routes under pure-DW
+        # config skip RT entirely and go straight to batch.
+        _slice36_force_batch = _slice36_should_force_batch(context)
+        if _slice36_force_batch:
+            logger.info(
+                "[DoublewordProvider] Slice 36 transport selector: "
+                "STANDARD/COMPLEX + Claude-disabled → BATCH path "
+                "(skipping RT; v31 evidence: RT TTFT 66s vs BATCH 4-8s) "
+                "op=%s route=%s",
+                getattr(context, "op_id", "?")[:16],
+                getattr(context, "provider_route", "?"),
+            )
+
         # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
         # On 429/503, fall back to batch within DW (stay cheap) instead of
         # cascading to the 150x more expensive Claude fallback.
-        if self._realtime_enabled:
+        if self._realtime_enabled and not _slice36_force_batch:
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
                 return await self._generate_realtime(

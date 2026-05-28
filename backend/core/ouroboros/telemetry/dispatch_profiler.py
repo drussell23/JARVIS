@@ -411,9 +411,30 @@ def record_stage(
             duration_ms, outcome,
             f" error_class={error_class}" if error_class else "",
         )
+        # Slice 36 Phase 2 — model_id tolerant lookup. v31 surfaced
+        # the bug: Slice 34's op_session uses (op_id, model_id_kwarg
+        # from sentinel walker, e.g. "Qwen3.5-35B") but Slice 35's
+        # record_stage call sites in DW provider use self._model
+        # (provider default, e.g. "Qwen3.5-397B"). Exact key mismatch
+        # → record_stage finds no active op → stage drops from
+        # summary aggregation (per-stage log row still emitted —
+        # that's how we diagnosed in v31).
+        #
+        # Fix: try exact (op_id, model_id) match first; on miss,
+        # fall back to "any active op for this op_id" (typically
+        # there's at most one concurrent op per op_id). This
+        # preserves model_id when it matches AND tolerates
+        # walker-rotation mismatches.
         key = _active_key(op_id, model_id)
         with _active_ops_lock:
             summary = _active_ops.get(key)
+            if summary is None:
+                # Tolerant fallback — find any active entry for op_id
+                _prefix = f"{op_id}|"
+                for k, s in _active_ops.items():
+                    if k.startswith(_prefix):
+                        summary = s
+                        break
         if summary is not None:
             summary.stages.append(StageRecord(
                 stage_name=stage_name,
