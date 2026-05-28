@@ -10905,11 +10905,100 @@ Honest framing per *"no euphoria, only artifacts"*:
 - **Cost tracking lag:** `cost_total` reported in `summary.json` only counts ops that returned (success or terminal failure). EXHAUSTION events that fire mid-call leave the cost unaccrued. v25-v29's $0.017-$0.24 spend is an under-count of actual DW request volume.
 - **Per-soak fresh state cost:** every soak starts from cold (no chroma cache, no oracle graph cache from prior soak, no warm git in DW endpoint). First 4-6 minutes of every soak is dominated by warmup — not a fair comparison to a true production deployment that runs continuously.
 
-### §48.7 — Forward arc: Adaptive routing layer
+### §48.7 — Forward arc: Upstream DW capacity investigation (Slice 34 — capability-bar blocker)
 
-The operator's binding: *"place [DW models] in different roles where they'll succeed."* §46 documented the *capability* mapping. §48.7 scopes the *adaptive* runtime layer that routes ops based on observed per-model behavior.
+**Priority: HIGHEST among §48 forward arcs.** Every §48.8-11 forward-arc design assumes DW will eventually serve a candidate. v25→v29 evidence is unambiguous: DW 397B has produced **zero successful candidates** across 5 soaks. Until the upstream blocker is diagnosed, the entire forward-arc layer is theoretical. This is the structural problem we still need to work on — separate from but blocking everything else.
 
-#### §48.7.1 — Per-shape success-rate ledger (Slice 34 candidate)
+§48.5 documented the 4 diagnostic hypotheses (a-d). §48.7 scopes the actual investigation arc that will resolve which one is true and what to do about it.
+
+#### §48.7.1 — The four hypotheses, ranked by addressability
+
+| # | Hypothesis | Addressable by | Effort if true |
+|---|---|---|---|
+| (a) | DW endpoint capacity limit on this account | Account upgrade / org-side request | external — operator action |
+| (b) | Slice 28 adaptive budget math wrong | Env knob tuning + re-soak | low — env tweak + 1 soak |
+| (c) | Prompt complexity > DW response budget | Prompt-size-stratified probe + slimming | medium — prompt refactor |
+| (d) | Network/regional latency | Raw RTT measurement | external — region change / VPN |
+
+The investigation arc MUST disambiguate which hypothesis (or combination) holds before any fix is shipped. Per *"no euphoria, only artifacts"* — guessing wrong here wastes another soak cycle.
+
+#### §48.7.2 — Phase 0: Out-of-band probe harness (the diagnostic substrate)
+
+**Goal:** Run ONE DW call manually, outside the full O+V orchestrator + sensor + intake stack. Isolate the variable — is it the harness or the endpoint?
+
+**Proposal:** New standalone script `scripts/dw_capacity_probe.py`:
+- Loads brain selection policy + DW provider config (NO governance / NO sensors / NO intake / NO Aegis daemon required — pure provider client)
+- Sends 1 op with the SAME prompt shape v28/v29 produced (capture an actual prompt from `.ouroboros/sessions/<v29>/debug.log` as the test input)
+- Records: wall-clock TTFT, full response time, response token count, response content first/last 200 chars, HTTP status, raw error if any
+- Runs N=10 trials at each of 4 prompt sizes (1KB, 5KB, 20KB, 50KB)
+- Outputs structured JSONL at `.jarvis/dw_capacity_probe_results.jsonl`
+
+**What this disambiguates:**
+- If probe succeeds with same prompt → harness is the variable → hypothesis (a) eliminated, (b) confirmed; investigate harness-side timeout math
+- If probe TIMEOUTs at small prompt → endpoint capacity / network → (a) or (d) likely
+- If probe succeeds at small prompt but fails at large prompt → (c) confirmed; investigate prompt slimming
+- If probe latency variance is huge → (a) saturation, intermittent
+
+**Architecture:**
+- Pure-script (no governance imports — operator binding "avoid coupling for diagnostic tools")
+- ~200 LOC + minimal regression tests
+- Master flag NOT needed — script is invoked manually
+- Output schema versioned for follow-up regression
+
+#### §48.7.3 — Phase 1: Hypothesis-specific probes (conditional on Phase 0 findings)
+
+**If Phase 0 confirms (b) Slice 28 budget math:**
+- Audit `_compute_primary_budget` math against actual observed cold-MoE warmup times
+- Test `JARVIS_DW_PRIMARY_BUDGET_MULTIPLIER` overrides (2×, 3×, 5×) in successive soaks
+- Look for a stable multiplier that produces 1+ APPLY without infinite-loop retry
+- Graduation: 1 successful APPLY at the new multiplier before promoting default
+
+**If Phase 0 confirms (c) Prompt complexity:**
+- Stratify failing prompts by size from v25→v29 debug logs
+- Identify smallest failing size → quantifies endpoint's effective input ceiling
+- Slim prompts via §48.9 prompt-prefix-trie (deferred dependency) OR explicit per-route prompt truncation
+- Test in isolated soak before integrating
+
+**If Phase 0 confirms (a) Account capacity:**
+- This is OUT-OF-CODE — operator action required (contact DW for capacity bump or trial different account)
+- BUT this also unlocks §48.10 three-tier Claude policy implementation since pure-DW config wouldn't work for capacity-bound shapes anyway
+- Document the account-side constraint in `memory/project_dw_account_capacity_findings.md` so future sessions don't re-investigate
+
+**If Phase 0 confirms (d) Network latency:**
+- Measure mean RTT to DW endpoint from operator's M1 vs alternate locations (VPS, different region)
+- If RTT-bound, recommend operator VPN/region switch OR redirect DW via regional proxy
+- Slice 28 budget math may need RTT-aware adjustment
+
+#### §48.7.4 — Phase 2: Fix integration + soak validation
+
+After Phase 1 identifies the actionable fix path, integrate as a focused slice:
+- Single-axis change (don't combine fixes — keeps causality clean)
+- Re-soak with v30 capability run ($10/3600s, same envelope as v28/v29)
+- Bar: ≥1 APPLY event must fire in v30 to declare the upstream blocker addressed
+- If v30 hits APPLY → graduate the fix's default + capability bar finally moves
+- If v30 still 0 APPLY → return to §48.7.1 hypothesis matrix with new evidence
+
+#### §48.7.5 — What §48.7 does NOT promise
+
+- **No code shipped yet.** §48.7 is an investigation plan; Phase 0 is ~200 LOC + a manual probe run.
+- **No timeline.** Operator-paced. Phase 0 is the only step that can land without further architectural authorization.
+- **No guarantee any single hypothesis holds.** The 4 hypotheses may be correlated (e.g., capacity AND prompt complexity together). Phase 0's stratified probe specifically tests for combinations.
+- **No claim that fixing the upstream unlocks SWE-Bench-Pro.** Even after APPLY fires, VERIFY + RESOLVED add more steps. SWE-Bench is multi-blocker by design.
+
+#### §48.7.6 — Why this is the highest priority forward arc
+
+- §48.8 (DSA) optimizes provider-call performance — useless if no provider call succeeds.
+- §48.9 (ML) predicts capacity — but the training data is "every call fails," which collapses the predictor to a trivial constant.
+- §48.10 (Claude policy) assumes Claude is a viable fallback — but v25/v26 evidence showed Claude bails under loop pressure, not improving capability.
+- §48.11 (DSA enhancements) all depend on having a working baseline to optimize.
+
+**Until DW 397B produces a candidate, the entire downstream architecture is in a closed loop validating its own structural correctness without ever proving capability.** §48.7 breaks that loop.
+
+### §48.8 — Forward arc: Adaptive routing layer
+
+The operator's binding: *"place [DW models] in different roles where they'll succeed."* §46 documented the *capability* mapping. §48.8 scopes the *adaptive* runtime layer that routes ops based on observed per-model behavior.
+
+#### §48.8.1 — Per-shape success-rate ledger (Slice 35 candidate)
 
 **Problem:** Slice 23 sentinel walker rotates DW models in a static-ranked order (`Qwen3.5-397B → Qwen3.5-35B → Kimi-K2.6` per `JARVIS_DW_RANKED_MODELS`). The walker doesn't learn from observed outcomes — an op that just failed on 397B will be sent to 397B again on the next dispatch.
 
@@ -10925,7 +11014,7 @@ The operator's binding: *"place [DW models] in different roles where they'll suc
 
 **Operator binding:** *"more advanced, robust, intelligent, adaptive, and dynamic"* — this is the intelligent/adaptive part.
 
-#### §48.7.2 — Per-model circuit breaker enhancement (extends §44.5 CPV)
+#### §48.8.2 — Per-model circuit breaker enhancement (extends §44.5 CPV)
 
 **Problem:** Current `TopologySentinel` per-model circuit breakers are state-based (CLOSED / OPEN / TERMINAL_OPEN) but transition thresholds are uniform across models. A 397B that timed out once is treated identically to a 35B that returned an infra error once.
 
@@ -10936,19 +11025,19 @@ The operator's binding: *"place [DW models] in different roles where they'll suc
 
 Master flag `JARVIS_DW_PER_MODEL_BREAKER_PROFILE_ENABLED`. Each profile is a `dataclass` in `dw_per_model_profiles.py`. Composes existing `topology_sentinel` state machine — no new state, just per-model thresholds.
 
-#### §48.7.3 — Predictive pre-rotation (extends §44.5 CPV)
+#### §48.8.3 — Predictive pre-rotation (extends §44.5 CPV)
 
 **Problem:** Current architecture routes to a model, waits for failure, then rotates. On a 5-second-deadline op, this means up to N×5s = 25s wasted before successful dispatch.
 
-**Proposal:** When per-shape success-rate ledger (§48.7.1) shows <20% success for a model on the current shape, pre-emptively skip that model in the walker order. Combined with a "warm probe" — periodic background `health_probe()` to each non-trusted model — to detect recovery.
+**Proposal:** When per-shape success-rate ledger (§48.8.1) shows <20% success for a model on the current shape, pre-emptively skip that model in the walker order. Combined with a "warm probe" — periodic background `health_probe()` to each non-trusted model — to detect recovery.
 
 Master flag `JARVIS_DW_PREDICTIVE_PRE_ROTATION_ENABLED`. Reuses existing `dw_heavy_probe` infrastructure. AST-pinned: pre-rotation is advisory; walker can override via env knob.
 
-### §48.8 — Forward arc: Advanced DSA for provider performance
+### §48.9 — Forward arc: Advanced DSA for provider performance
 
 The operator's binding: *"advanced DSA for DW and Claude providers for performance."* Targeted data structures + algorithms for the hot paths in `doubleword_provider.py` and `providers.py`:
 
-#### §48.8.1 — Bloom filter for duplicate prompt elision
+#### §48.9.1 — Bloom filter for duplicate prompt elision
 
 **Problem:** Across v25→v29, multiple sensors (OpportunityMiner, IntentDiscovery, etc.) often generate near-identical prompts for the same file. Each prompt costs a DW call. **Empirically observed:** 4 EXHAUSTION events per op are 4 retries of the SAME prompt.
 
@@ -10962,7 +11051,7 @@ The operator's binding: *"advanced DSA for DW and Claude providers for performan
 - Master flag `JARVIS_PROVIDER_DEDUP_FILTER_ENABLED`
 - Telemetry: `[ProviderDedup] hit=N miss=N false_positive_rate=R cache_size=S`
 
-#### §48.8.2 — Priority queue for op latency budgets
+#### §48.9.2 — Priority queue for op latency budgets
 
 **Problem:** Current `UnifiedIntakeRouter` uses a single PriorityQueue across all 16 sensors. Ops with tight deadlines (IMMEDIATE) compete with BACKGROUND ops on the same provider call queue. Slow provider responses can starve high-priority ops.
 
@@ -10974,7 +11063,7 @@ The operator's binding: *"advanced DSA for DW and Claude providers for performan
 - Round-robin between lanes with `_fast_lane` weighted 4:1
 - Bounded by `JARVIS_DUAL_PQ_FAST_LANE_SIZE` (default 32)
 
-#### §48.8.3 — Connection pool with per-model affinity
+#### §48.9.3 — Connection pool with per-model affinity
 
 **Problem:** `doubleword_provider.py` uses a single `aiohttp.ClientSession` for all DW calls. Connection reuse is per-host, not per-model. If 397B endpoint warms up a TCP connection, that warmth doesn't help 35B routing.
 
@@ -10986,7 +11075,7 @@ The operator's binding: *"advanced DSA for DW and Claude providers for performan
 - Per-model bounded `lru_cache` for session reuse
 - Master flag `JARVIS_DW_PER_MODEL_CONNECTION_POOL_ENABLED`
 
-#### §48.8.4 — Adaptive token-bucket rate limiter
+#### §48.9.4 — Adaptive token-bucket rate limiter
 
 **Problem:** Current `RateLimiter` uses fixed `JARVIS_DW_RATE_LIMIT_RPS`. Doesn't account for DW endpoint's observed throughput (which varies). Over-throttles when DW is healthy; under-throttles when DW is saturated → cascade failures.
 
@@ -11001,7 +11090,7 @@ The operator's binding: *"advanced DSA for DW and Claude providers for performan
 - Master flag `JARVIS_DW_ADAPTIVE_RATE_LIMITER_ENABLED`
 - Composes existing `RateLimiter` rather than replacing — adaptive layer on top
 
-#### §48.8.5 — Trie-based prompt template detection
+#### §48.9.5 — Trie-based prompt template detection
 
 **Problem:** Many O+V prompts share a common prefix (sensor type + provenance + system instructions = ~2KB before the per-op tail). Each call re-sends the full prompt. DW supports prompt caching via partial-prefix matching but O+V doesn't surface what's shared.
 
@@ -11014,11 +11103,11 @@ The operator's binding: *"advanced DSA for DW and Claude providers for performan
 - Master flag `JARVIS_PROMPT_PREFIX_CACHING_ENABLED`
 - Requires DW endpoint support — currently unverified per §46
 
-### §48.9 — Forward arc: ML for capacity prediction
+### §48.10 — Forward arc: ML for capacity prediction
 
-The operator's binding: *"machine learning since external APIs exhaust especially for DW's LLMs."* The empirical observation across v25→v29 is that DW behaviour is variable and unpredictable — a non-stationary process. ML's value-add over §48.7's heuristic adaptive routing is **predicting failures BEFORE they happen** rather than reacting after.
+The operator's binding: *"machine learning since external APIs exhaust especially for DW's LLMs."* The empirical observation across v25→v29 is that DW behaviour is variable and unpredictable — a non-stationary process. ML's value-add over §48.8's heuristic adaptive routing is **predicting failures BEFORE they happen** rather than reacting after.
 
-#### §48.9.1 — Latency time-series prediction (Slice 35 candidate)
+#### §48.10.1 — Latency time-series prediction (Slice 36 candidate)
 
 **Goal:** Predict DW endpoint latency for the next N minutes based on recent observations. If predicted p95 > 30s, pre-emptively route to a different model.
 
@@ -11035,14 +11124,14 @@ The operator's binding: *"machine learning since external APIs exhaust especiall
 - Master flag `JARVIS_DW_LATENCY_PREDICTOR_ENABLED`
 - Telemetry: `[LatencyPredictor] model=X predicted_p95=Y actual_p95=Z accuracy=W`
 
-#### §48.9.2 — Capacity-saturation classifier
+#### §48.10.2 — Capacity-saturation classifier
 
 **Goal:** Distinguish "DW endpoint is slow" from "DW endpoint is saturated" — the former benefits from waiting; the latter benefits from rotation.
 
 **Proposal:** Binary classifier on per-call features:
 - Inputs: `prompt_chars`, `model_id`, `route`, `recent_p95_latency`, `consecutive_failures`, `time_since_last_success`
 - Output: P(saturation) ∈ [0,1]
-- Training: post-hoc from `dw_per_shape_success.jsonl` ledger
+- Training: post-hoc from `dw_per_shape_success.jsonl` ledger (per §48.8.1)
 - Inference: gradient-boosted decision tree (XGBoost or hand-rolled) — fast inference, no GPU
 
 **Architecture:**
@@ -11051,11 +11140,11 @@ The operator's binding: *"machine learning since external APIs exhaust especiall
 - Inference function: pure-Python, sub-1ms
 - Master flag `JARVIS_DW_SATURATION_CLASSIFIER_ENABLED`
 
-#### §48.9.3 — Reinforcement learning for model selection (long-horizon)
+#### §48.10.3 — Reinforcement learning for model selection (long-horizon)
 
 **Goal:** Learn the optimal model-per-shape policy from observed reward (successful APPLY = +1, EXHAUSTION = -1, cost-per-op = -ε × cost).
 
-**Proposal:** Multi-armed bandit per (route, complexity, prompt_chars_bucket) shape. Thompson sampling on per-(shape, model) Beta distributions over success rate. Composes with §48.7.1 ledger as data source.
+**Proposal:** Multi-armed bandit per (route, complexity, prompt_chars_bucket) shape. Thompson sampling on per-(shape, model) Beta distributions over success rate. Composes with §48.8.1 ledger as data source.
 
 **Architecture:**
 - `backend/core/ouroboros/governance/dw_thompson_routing.py`
@@ -11065,11 +11154,11 @@ The operator's binding: *"machine learning since external APIs exhaust especiall
 - Master flag `JARVIS_DW_THOMPSON_ROUTING_ENABLED`
 - **Critical caveat:** RL requires a stationary reward function. DW endpoint capacity varies → reward shifts → policy converges to wrong optimum. Mitigate via aggressive recency decay (24h half-life) but the bandit's "convergence" is **soft** — really a sliding-window heuristic dressed as RL.
 
-#### §48.9.4 — Cost optimization model
+#### §48.10.4 — Cost optimization model
 
 **Goal:** Per-op model selection that minimizes `cost_per_op × P(failure) + claude_fallback_cost × P(claude_fallback)`.
 
-**Proposal:** Closed-form expected-cost calculator using per-model latency predictor (§48.9.1) + saturation classifier (§48.9.2):
+**Proposal:** Closed-form expected-cost calculator using per-model latency predictor (§48.10.1) + saturation classifier (§48.10.2):
 
 ```
 expected_cost(op, model) =
@@ -11078,7 +11167,7 @@ expected_cost(op, model) =
   + P(timeout) × retry_orchestration_overhead   # ~$0.001 per retry
 ```
 
-Router picks model with minimum `expected_cost`. Composes §48.7.1 + §48.9.1 + §48.9.2.
+Router picks model with minimum `expected_cost`. Composes §48.8.1 + §48.10.1 + §48.10.2.
 
 **Architecture:**
 - `backend/core/ouroboros/governance/cost_optimizing_router.py`
@@ -11086,15 +11175,15 @@ Router picks model with minimum `expected_cost`. Composes §48.7.1 + §48.9.1 + 
 - Master flag `JARVIS_COST_OPTIMIZING_ROUTING_ENABLED`
 - Telemetry: `[CostRouter] op=X model_chosen=Y expected_cost=$Z alternatives=...`
 
-### §48.10 — Cost-aware Claude fallback policy (extends §45)
+### §48.11 — Cost-aware Claude fallback policy (extends §45)
 
-The operator's binding: *"Claude only when really needed since it is expensive."* §45 documented cost-intelligence infrastructure. §48.10 specifies the Claude-fallback discipline given v25→v29 evidence that Claude as fallback **introduced more cost than capability** (the `tool_loop_starved` failures were Claude bailing under loop pressure, costing $0.1+/op for zero produced candidates).
+The operator's binding: *"Claude only when really needed since it is expensive."* §45 documented cost-intelligence infrastructure. §48.11 specifies the Claude-fallback discipline given v25→v29 evidence that Claude as fallback **introduced more cost than capability** (the `tool_loop_starved` failures were Claude bailing under loop pressure, costing $0.1+/op for zero produced candidates).
 
-#### §48.10.1 — Three-tier Claude usage policy
+#### §48.11.1 — Three-tier Claude usage policy
 
 **Tier A — Forbidden Claude (default):** SAFE_AUTO + BACKGROUND + SPECULATIVE routes. Claude provides no value Add over DW's smaller models at 30× the cost. Already partly enforced via Slice 22 tier decay; should be hardened via explicit env `JARVIS_CLAUDE_DISALLOWED_ROUTES=safe_auto,background,speculative`.
 
-**Tier B — Conditional Claude:** STANDARD + COMPLEX after K consecutive DW failures (K configurable, default 3). The "K" insures we've exhausted cheap options before paying Claude rates. Composes Slice 22 tier-decay + §48.9.2 saturation classifier (skip Claude if DW saturation is transient).
+**Tier B — Conditional Claude:** STANDARD + COMPLEX after K consecutive DW failures (K configurable, default 3). The "K" insures we've exhausted cheap options before paying Claude rates. Composes Slice 22 tier-decay + §48.10.2 saturation classifier (skip Claude if DW saturation is transient).
 
 **Tier C — Always Claude:** IMMEDIATE route only. Already implemented by Slice 22. Tier C is rare (test failures, voice commands, runtime health crises).
 
@@ -11104,35 +11193,37 @@ The operator's binding: *"Claude only when really needed since it is expensive."
 - Master flag `JARVIS_THREE_TIER_CLAUDE_POLICY_ENABLED` (default off until soaked)
 - Telemetry: `[ClaudePolicy] tier=X reason=Y` per fallback decision
 
-#### §48.10.2 — Per-session Claude budget cap
+#### §48.11.2 — Per-session Claude budget cap
 
 **Problem:** Current Claude per-call cost cap exists but no per-session ceiling. A pathological soak could rack up $50+ in Claude calls before the session-cost-cap triggers wall-cap.
 
 **Proposal:** `JARVIS_CLAUDE_SESSION_CAP_USD` (default $2.00 = 20% of typical $10 session cap). After cumulative Claude spend hits cap, Claude is disabled for the rest of the session. Composes existing `CostGovernor` state.
 
-#### §48.10.3 — Pre-call Claude cost preview
+#### §48.11.3 — Pre-call Claude cost preview
 
 **Proposal:** Before any Claude call, project the cost based on prompt + expected output tokens. If projected > $0.10/call (1 std dev above typical), emit `[ClaudeCostWarning]` log line so operators can audit which call sites are expensive.
 
 Telemetry-only; no behavior change. Helps surface accidental Claude over-use in CI / soak runs.
 
-### §48.11 — What this section does NOT promise
+### §48.12 — What this section does NOT promise
 
 Per operator binding *"no euphoria, only artifacts"* — this section is documentation, not commitment:
 
-1. **§48.7 + §48.8 + §48.9 + §48.10 are PROPOSALS, not slices in flight.** Each requires operator authorization before any code lands. The §48 numbering reserves architectural space, not implementation calendar.
+1. **§48.7-11 are PROPOSALS, not slices in flight.** Each requires operator authorization before any code lands. The §48 numbering reserves architectural space, not implementation calendar.
 
 2. **§48.3.5 Phase 3 graph-write queue ships eventual consistency.** Operators relying on strict graph-query consistency immediately after `_index_file` MUST set `JARVIS_ORACLE_GRAPH_QUEUE_ENABLED=0` until §48.6.2's reconciliation gap is closed.
 
-3. **The capability bar (APPLY/VERIFY/RESOLVED) is NOT claimed closed by this section.** v29 produced 0 APPLY across 79 minutes and $0.018 of DW spend. Closing the bar requires the §48.5 upstream defect (DW endpoint capacity / Slice 28 budget math / prompt complexity) — orthogonal to Slice 31/32/33.
+3. **The capability bar (APPLY/VERIFY/RESOLVED) is NOT claimed closed by this section.** v29 produced 0 APPLY across 79 minutes and $0.018 of DW spend. Closing the bar requires the §48.5 upstream defect (DW endpoint capacity / Slice 28 budget math / prompt complexity) — orthogonal to Slice 31/32/33 and scoped explicitly in §48.7.
 
-4. **Per-model empirical observations in §48.4 are based on ≤5 dispatches per non-397B model.** The 35B's "100% failure" rate is a sample size of 3. Statistically meaningless; included as honest signal not statistical claim.
+4. **§48.7 Phase 0 probe is the ONLY substep that can land without further architectural authorization.** Phases 1-2 conditional on Phase 0 evidence. The 4 hypotheses may be combined; Phase 0's stratified probe specifically tests for combinations.
 
-5. **§48.9 ML proposals are speculative.** The DW endpoint's non-stationary behaviour means *any* learned model has a fundamentally unstable target. The honest framing is "smart heuristics dressed as ML" — not actual capacity prediction with confidence bounds.
+5. **Per-model empirical observations in §48.4 are based on ≤5 dispatches per non-397B model.** The 35B's "100% failure" rate is a sample size of 3. Statistically meaningless; included as honest signal not statistical claim.
 
-6. **The session-dir iteration scaling issue (§48.6.2) is bounded but not fixed.** As O+V accumulates session dirs over weeks of operation, `recent_summaries()` cost grows linearly. The fs-executor isolates the cost but doesn't bound the per-cycle work. Future arc: TTL-aware cache or partitioned session storage.
+6. **§48.10 ML proposals are speculative.** The DW endpoint's non-stationary behaviour means *any* learned model has a fundamentally unstable target. The honest framing is "smart heuristics dressed as ML" — not actual capacity prediction with confidence bounds.
 
-### §48.12 — Summary table — what's closed vs what's next
+7. **The session-dir iteration scaling issue (§48.6.2) is bounded but not fixed.** As O+V accumulates session dirs over weeks of operation, `recent_summaries()` cost grows linearly. The fs-executor isolates the cost but doesn't bound the per-cycle work. Future arc: TTL-aware cache or partitioned session storage.
+
+### §48.13 — Summary table — what's closed vs what's next
 
 | Layer | Status | Evidence | Next-arc target |
 |---|---|---|---|
@@ -11143,15 +11234,17 @@ Per operator binding *"no euphoria, only artifacts"* — this section is documen
 | Git subprocess (Slice 33 A2 P1) | **CLOSED** | 78% reduction cold-cache | n/a |
 | FS executor (Slice 33 A2 P2) | **CLOSED** | 55% reduction postmortem | TTL cache for recent_summaries |
 | Graph write queue (Slice 33 A2 P3) | **CLOSED** | 0 on-loop graph_write events | reconciliation gap on consumer failure |
-| DW 397B TIMEOUT (capability blocker) | **OPEN** | every v28/v29 op | Slice 34 — DW endpoint capacity diagnosis |
-| Adaptive per-shape routing | **PROPOSED** | §48.7.1 design | Slice 34/35 — depends on capability blocker |
-| Per-model breaker tuning | **PROPOSED** | §48.7.2 design | Slice 35 |
-| Bloom filter / response cache | **PROPOSED** | §48.8.1 design | Slice 36 — depends on per-shape ledger |
-| Adaptive rate limiter | **PROPOSED** | §48.8.4 design | Slice 36 |
-| Latency predictor (ML) | **PROPOSED** | §48.9.1 design | Slice 37 |
-| Three-tier Claude policy | **PROPOSED** | §48.10.1 design | Slice 38 — depends on per-shape ledger |
+| **DW 397B TIMEOUT (capability blocker)** | **OPEN — HIGHEST PRIORITY** | every v28/v29 op | **Slice 34 (§48.7) — Upstream DW capacity investigation: Phase 0 probe → Phase 1 hypothesis-specific fix → Phase 2 soak validation** |
+| Adaptive per-shape routing | **PROPOSED** | §48.8.1 design | Slice 35 — gated on §48.7 producing 1+ APPLY |
+| Per-model breaker tuning | **PROPOSED** | §48.8.2 design | Slice 35 |
+| Bloom filter / response cache | **PROPOSED** | §48.9.1 design | Slice 36 — depends on per-shape ledger |
+| Adaptive rate limiter | **PROPOSED** | §48.9.4 design | Slice 36 |
+| Latency predictor (ML) | **PROPOSED** | §48.10.1 design | Slice 37 |
+| Three-tier Claude policy | **PROPOSED** | §48.11.1 design | Slice 38 — depends on per-shape ledger |
 
-The loop-health stack is **structurally closed.** The capability bar will not move until the §48.5 upstream defect is diagnosed and addressed.
+**Dependency chain:** Slice 34 (§48.7) MUST land first — every subsequent forward-arc proposal assumes DW eventually serves a successful candidate. Slices 35-38 are theoretical until §48.7 Phase 0 produces evidence that resolves which of the 4 hypotheses (a-d) is true.
+
+The loop-health stack is **structurally closed.** The capability bar will not move until the §48.7 upstream investigation lands and Phase 1 fixes the named hypothesis.
 
 ---
 
