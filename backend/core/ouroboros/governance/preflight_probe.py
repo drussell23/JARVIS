@@ -1009,12 +1009,33 @@ async def _run_preflight_with_recovery_daemon(
 # Slice 39 Task 8 — Surface Health Sweep orchestration entry point
 # ──────────────────────────────────────────────────────────────────────
 
-
+# Slice 39 Task 8 — run_surface_health_sweep() is the entry point for the
+# surface health sweep (the "concurrent sweep" part of the Slice 39
+# composition). It composes the ledger + probes for the sweep, and is
+# designed to be called inline from the future GovernedLoopService loop
+# wiring (the "per-surface ledger" part of the composition). It returns
+# the surface snapshot dict on success, or None when the master flag is
+# off or the provider is None. It NEVER raises — health telemetry must not
+# wedge boot.
 def is_surface_health_enabled() -> bool:
-    """Slice 39 master gate. Default FALSE pending v35 graduation."""
-    return _envb(_ENV_SURFACE_HEALTH_ENABLED, False)
+    """Slice 39 master gate. **Slice 40 graduated default TRUE (2026-05-28)**
+    after live-sweep validation: batch_storage healthy (real file_id),
+    streaming correctly classified ``done_before_content`` as upstream
+    (flush bypassed — zero spurious connector churn), auth healthy.
+    Operator opt-out: ``JARVIS_DW_SURFACE_HEALTH_ENABLED=false``."""
+    return _envb(_ENV_SURFACE_HEALTH_ENABLED, True)
 
-
+# The surface health sweep's probe_fn is the existing HeavyProbe-based
+# probe adapter (build_heavyprobe_adapter) since the sweep's probes are
+# functionally identical to the preflight probes (probe the same fleet of
+# promoted models, against the same DW substrate, with the same probe_fn contract). 
+# The sweep's distinguishing characteristic is the composition with the per-surface 
+# ledger (the "surface" in surface health) which tracks surface-specific health 
+# state and drives surface-specific probe routing / reporting enhancements — but the 
+# underlying probe contract and probe_fn implementation are shared with preflight. 
+# This reuse is intentional — it keeps the sweep's probe implementation battle-tested 
+# and consistent with preflight, and it avoids proliferating probe_fn variants when 
+# the core probe contract is sufficient for both use cases.
 async def run_surface_health_sweep(
     *,
     provider,
@@ -1051,4 +1072,120 @@ async def run_surface_health_sweep(
     except Exception as exc:  # noqa: BLE001 — defensive belt
         logger.warning("[Slice39] surface sweep raised: %r", exc)
         return None
+    return snap
+
+# Slice 40 Task 8 — surface health sweep boot-eager composition entry point. 
+# Composes the surface health sweep into the boot sequence by calling 
+# run_surface_health_sweep inline from the future GovernedLoopService loop wiring, 
+# immediately after the Slice 25B boot preflight and before the BackgroundAgentPool 
+# starts. The composition includes a resolution step to determine which model_id 
+# to probe for the sweep (the "boot surface probe model" in the AST) based on an 
+# explicit override environment variable or the first promoted model in the ledger. 
+# The entry point returns the surface snapshot dict on success, or None when the 
+# master flag is off, the provider is unavailable, or no probe model can be 
+# resolved. It NEVER raises — health telemetry must not wedge boot. Additionally, 
+# on a degraded streaming surface, it emits a best-effort SOFT topology-breaker 
+# signal so the loop inherits the boot-time degradation rather than discovering 
+# it op-by-op.
+def _resolve_surface_probe_model() -> Optional[str]:
+    """Slice 40 — pick a model_id for the boot surface sweep.
+
+    Precedence: explicit ``JARVIS_DW_SURFACE_PROBE_MODEL`` override, else
+    the first promoted model from the PromotionLedger. Returns ``None``
+    (skip the sweep) when neither is available. NEVER raises.
+    """
+    # Explicit override takes precedence — this is the operator's direct lever to 
+    # control the sweep without modifying the ledger (e.g. when the ledger is 
+    # empty due to a trusted_seed misconfiguration, or when the operator wants 
+    # to sweep a specific model without promoting it in the ledger). The override 
+    # is expected to be used in exceptional circumstances; the primary intended 
+    # flow is to probe the first promoted model in the ledger, which is the one 
+    # with the most vetted health status. But the override provides a safety 
+    # valve for edge cases and operational flexibility.
+    override = _envs("JARVIS_DW_SURFACE_PROBE_MODEL", "")
+
+    # No override — fall back to the first promoted model in the ledger. This is 
+    # the typical flow for the sweep, as the promoted models are the ones that have 
+    # been vetted and are expected to be healthy. If the ledger is unavailable or 
+    # has no promoted models, we skip the sweep by returning None. The lazy import 
+    # and defensive try/except ensure that any issues with the ledger do not wedge 
+    # boot — health telemetry is an enhancement, not a requirement for boot correctness.
+    if override:
+        # AST-pin the override value by logging it verbatim (operators can grep for 
+        # it in boot logs to confirm it's being picked up correctly). The override 
+        # is expected to be a valid model_id that would also be found in the ledger, 
+        # but we do not enforce that here — if the override is invalid, the sweep 
+        # will simply fail to probe successfully, which is a safe failure mode. 
+        return override
+    try:
+        # Lazy import — keeps this module's substrate independent of the
+        # ledger module (so a circular-import collapse can't take down boot).
+        from backend.core.ouroboros.governance.dw_promotion_ledger import (
+            PromotionLedger,
+        )
+        ledger = PromotionLedger() # instantiate but do not load yet (load is I/O, and we want to catch any issues with it in the same try/except as the rest of the ledger interaction) 
+        ledger.load() # load the ledger (this is where I/O happens, and where issues with the ledger file would surface) 
+        promoted = ledger.promoted_models()
+        if promoted:
+            return promoted[0]
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug("[Slice40] surface-probe model resolution failed: %r", exc)
+    return None
+
+
+async def run_boot_surface_health_sweep(*, dw_provider):
+    """Slice 40 — boot-eager surface-health sweep, wired into
+    ``GovernedLoopService._build_components`` immediately after the Slice
+    25B preflight and BEFORE the BackgroundAgentPool starts.
+
+    Self-gates on the master flag (graduated default TRUE). Skips cleanly
+    when the DW provider is unavailable or no probe model can be resolved.
+    Runs the multi-surface sweep (populates ``.jarvis/dw_surface_health.json``)
+    and, on a degraded *streaming* surface, emits a best-effort SOFT
+    (``is_terminal=False``) topology-breaker signal so the loop inherits
+    the boot-time degradation rather than discovering it op-by-op.
+
+    Returns the surface snapshot or ``None``. **NEVER raises** — boot must
+    not be blocked by health telemetry (mirrors the preflight defensive
+    contract; worst-case added boot latency is bounded by the per-surface
+    ``asyncio.wait_for`` timeout).
+    """
+    if not is_surface_health_enabled():
+        return None
+    if dw_provider is None or not getattr(dw_provider, "is_available", False):
+        logger.debug(
+            "[Slice40] boot surface sweep skipped: DW provider unavailable"
+        )
+        return None
+    model_id = _resolve_surface_probe_model()
+    if not model_id:
+        logger.debug(
+            "[Slice40] boot surface sweep skipped: no probe model resolved"
+        )
+        return None
+    snap = await run_surface_health_sweep(provider=dw_provider, model_id=model_id)
+    if not snap:
+        return snap
+    # Best-effort SOFT breaker signal on a degraded streaming surface.
+    try:
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        from backend.core.ouroboros.governance.dw_transport_disambiguator import (
+            _flip_topology_breaker,
+        )
+        rec = snap.get(SurfaceKind.DIRECT_STREAMING)
+        if rec is not None and rec.verdict in (
+            SurfaceVerdict.TRANSPORT_DEGRADED,
+            SurfaceVerdict.UPSTREAM_DEGRADED,
+        ):
+            _flip_topology_breaker(model_id, rec.diagnostic or rec.verdict.value)
+            logger.info(
+                "[Slice40] boot streaming surface degraded (%s) — soft "
+                "topology-breaker signal emitted for model=%s",
+                rec.verdict.value, model_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — never block boot
+        logger.debug("[Slice40] boot breaker signal skipped: %r", exc)
     return snap

@@ -4577,6 +4577,38 @@ class GovernedLoopService:
                     _pf_setup_exc,
                 )
 
+            # ---- Slice 40: boot-eager multi-surface DW transport-health ----
+            # Probes /v1/files (Surface A) + streaming (Surface B) + Aegis
+            # auth (Surface C) once, populates .jarvis/dw_surface_health.json,
+            # and emits a SOFT topology-breaker signal if the streaming
+            # surface is degraded — so the loop inherits the boot-time
+            # health classification (e.g. done_before_content → upstream,
+            # flush bypassed) instead of discovering it op-by-op. Self-gated
+            # on JARVIS_DW_SURFACE_HEALTH_ENABLED (graduated default TRUE);
+            # NEVER raises — must not block boot. Runs AFTER preflight,
+            # BEFORE the worker fleet so the first dispatched op sees the
+            # populated ledger.
+            try:
+                from backend.core.ouroboros.governance.preflight_probe import (
+                    run_boot_surface_health_sweep,
+                )
+                _surf_snap = await run_boot_surface_health_sweep(
+                    dw_provider=self._doubleword_ref,
+                )
+                if _surf_snap:
+                    logger.info(
+                        "[GLS] Slice 40 surface-health sweep: %s",
+                        " ".join(
+                            f"{k.value}={v.verdict.value}"
+                            for k, v in _surf_snap.items()
+                        ),
+                    )
+            except Exception as _surf_exc:  # noqa: BLE001 — never block boot
+                logger.warning(
+                    "[GLS] Slice 40 surface sweep skipped (boot continues): %r",
+                    _surf_exc,
+                )
+
             self._bg_pool = BackgroundAgentPool(
                 orchestrator=self._orchestrator,
                 on_op_active_register=_bg_register_active,
