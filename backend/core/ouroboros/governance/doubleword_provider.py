@@ -837,17 +837,38 @@ class DoublewordProvider:
             },
         })
 
+        # Slice 35 Phase 2 — batch path stage profiler (composes
+        # Slice 34 dispatch_profiler). Default OFF; records stages
+        # only when JARVIS_DISPATCH_PROFILER_ENABLED=1.
+        from backend.core.ouroboros.telemetry import (
+            dispatch_profiler as _s35b_dp,
+        )
+        _s35b_model = self._model or "(unspecified)"
         try:
             # Slice 2B-ii — thread operation_id to per-call Aegis lease.
+            _s35b_t_upload = time.monotonic()
             file_id = await self._upload_file(
                 jsonl_line, op_id=operation_id,
+            )
+            _s35b_dp.record_stage(
+                "STAGE_BATCH_UPLOAD",
+                op_id=operation_id, model_id=_s35b_model,
+                duration_ms=(time.monotonic() - _s35b_t_upload) * 1000.0,
+                outcome="ok" if file_id else "error",
             )
             if not file_id:
                 logger.warning("[DoublewordProvider] submit_batch: file upload failed")
                 return None
 
+            _s35b_t_create = time.monotonic()
             batch_id = await self._create_batch(
                 file_id, op_id=operation_id,
+            )
+            _s35b_dp.record_stage(
+                "STAGE_BATCH_CREATE",
+                op_id=operation_id, model_id=_s35b_model,
+                duration_ms=(time.monotonic() - _s35b_t_create) * 1000.0,
+                outcome="ok" if batch_id else "error",
             )
             if not batch_id:
                 logger.warning("[DoublewordProvider] submit_batch: batch creation failed")
@@ -883,10 +904,22 @@ class DoublewordProvider:
         """
         t0 = pending.submitted_at
 
+        # Slice 35 Phase 2 — batch path stage profiler.
+        from backend.core.ouroboros.telemetry import (
+            dispatch_profiler as _s35p_dp,
+        )
+        _s35p_model = self._model or "(unspecified)"
         try:
             # Slice 2B-ii — forward pending.op_id for per-call Aegis lease.
+            _s35p_t_await = time.monotonic()
             output_file_id = await self._await_batch_result(
                 pending.batch_id, op_id=pending.op_id,
+            )
+            _s35p_dp.record_stage(
+                "STAGE_BATCH_AWAIT",
+                op_id=pending.op_id, model_id=_s35p_model,
+                duration_ms=(time.monotonic() - _s35p_t_await) * 1000.0,
+                outcome="ok" if output_file_id else "error",
             )
             if not output_file_id:
                 self._stats.failed_batches += 1
@@ -896,8 +929,15 @@ class DoublewordProvider:
                 )
                 return None
 
+            _s35p_t_retrieve = time.monotonic()
             content, usage = await self._retrieve_result(
                 output_file_id, pending.op_id,
+            )
+            _s35p_dp.record_stage(
+                "STAGE_BATCH_RETRIEVE",
+                op_id=pending.op_id, model_id=_s35p_model,
+                duration_ms=(time.monotonic() - _s35p_t_retrieve) * 1000.0,
+                outcome="ok" if content else "error",
             )
 
             elapsed = time.monotonic() - t0
@@ -1655,6 +1695,18 @@ class DoublewordProvider:
         total_cost = 0.0
         self._last_chunk_at = 0.0  # reset — prevents stale timestamps from prior generation
 
+        # Slice 35 Phase 1 — RT stage profiler. Composes Slice 34's
+        # dispatch_profiler (no parallel telemetry surface). Default
+        # OFF via JARVIS_DISPATCH_PROFILER_ENABLED so production stays
+        # byte-identical until operator opts into the v31 telemetry
+        # probe. record_stage() never raises into the caller.
+        from backend.core.ouroboros.telemetry import (
+            dispatch_profiler as _s35_dp,
+        )
+        _s35_op_id = getattr(context, "op_id", "?") or "?"
+        _s35_model = self._model or "(unspecified)"
+        _s35_stage_t0 = time.monotonic()
+
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
         if self._mcp_client is not None:
@@ -1732,6 +1784,14 @@ class DoublewordProvider:
                 len(prompt), len(prompt) // 4,
                 getattr(context, "provider_route", "") or "unknown",
             )
+
+        # Slice 35 Phase 1 — record STAGE_RT_PROMPT_BUILD: prompt
+        # assembly + MCP discovery + lean detection ended here.
+        _s35_dp.record_stage(
+            "STAGE_RT_PROMPT_BUILD",
+            op_id=_s35_op_id, model_id=_s35_model,
+            duration_ms=(time.monotonic() - _s35_stage_t0) * 1000.0,
+        )
 
         _SYSTEM_PROMPT = (
             "You are a code generation assistant for the JARVIS Trinity AI Ecosystem. "
@@ -1930,6 +1990,8 @@ class DoublewordProvider:
                 _ttft_request_start_monotonic = time.monotonic()
                 _ttft_first_chunk_seen = False
 
+                # Slice 35 Phase 1 — STAGE_RT_AEGIS_AUTH timer.
+                _s35_auth_t0 = time.monotonic()
                 # Slice 31 — Aegis session bearer (closes v24
                 # missing_session_bearer 401 wedge on RT streaming).
                 _call_auth = await _aegis_dw_session_auth_header()
@@ -1941,6 +2003,18 @@ class DoublewordProvider:
                     route="standard",
                     estimated_cost_usd=0.05,
                 )
+                _s35_dp.record_stage(
+                    "STAGE_RT_AEGIS_AUTH",
+                    op_id=_s35_op_id, model_id=_s35_model,
+                    duration_ms=(time.monotonic() - _s35_auth_t0) * 1000.0,
+                )
+                # Slice 35 Phase 1 — STAGE_RT_HTTP_POST + STAGE_RT_STREAM_CONSUME
+                # timers. The post() context manager handle is the
+                # HTTP handshake; the chunk loop INSIDE the `async
+                # with` is the stream consumption. We capture the
+                # handshake-only time by measuring up to the first
+                # chunk arrival via _ttft_first_chunk_seen.
+                _s35_post_t0 = time.monotonic()
                 async with session.post(
                     f"{self._base_url}/chat/completions",
                     json=body,
@@ -2250,6 +2324,19 @@ class DoublewordProvider:
                                                 context, "op_id", "",
                                             ) or "",
                                         )
+                                        # Slice 35 Phase 1 — record
+                                        # STAGE_RT_HTTP_POST at first-chunk
+                                        # arrival (TTFT closes the HTTP
+                                        # handshake stage).
+                                        _s35_dp.record_stage(
+                                            "STAGE_RT_HTTP_POST",
+                                            op_id=_s35_op_id,
+                                            model_id=_s35_model,
+                                            duration_ms=float(_ttft_ms),
+                                        )
+                                        # Reset stream-consume timer
+                                        # to start AT first chunk.
+                                        _s35_stream_t0 = time.monotonic()
                                     except Exception:  # noqa: BLE001
                                         pass
                                 try:
@@ -2420,6 +2507,24 @@ class DoublewordProvider:
         venom_edits: Tuple[Dict[str, Any], ...] = ()
         raw: str = ""
 
+        # Slice 35 Phase 1 — STAGE_RT_STREAM_CONSUME: record the time
+        # from first-chunk arrival to here (Venom loop entry / parse).
+        # When tools are skipped, the stream consume window covered the
+        # entire chat completion. _s35_stream_t0 was set at first chunk.
+        try:
+            _s35_dp.record_stage(
+                "STAGE_RT_STREAM_CONSUME",
+                op_id=_s35_op_id, model_id=_s35_model,
+                duration_ms=(
+                    (time.monotonic() - _s35_stream_t0) * 1000.0
+                ) if "_s35_stream_t0" in dir() else 0.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # Slice 35 Phase 1 — STAGE_RT_VENOM_TOOL_LOOP timer. Strongest
+        # suspect for the v25-v29 30-111s inflation: tool_loop rounds
+        # against DW often spin multiple times per op.
+        _s35_venom_t0 = time.monotonic()
         if self._tool_loop is not None and not _skip_tools:
             deadline_mono = time.monotonic() + max(
                 0.0,
@@ -2520,6 +2625,20 @@ class DoublewordProvider:
             )
             raise DoublewordInfraError("Non-JSON response from real-time API", status_code=0)
 
+        # Slice 35 Phase 1 — record STAGE_RT_VENOM_TOOL_LOOP (covers
+        # the entire Venom block whether or not the loop ran; when
+        # _skip_tools is true this records the streaming-only-time as
+        # a near-zero Venom stage). Then begin STAGE_RT_RESPONSE_PARSE.
+        try:
+            _s35_dp.record_stage(
+                "STAGE_RT_VENOM_TOOL_LOOP",
+                op_id=_s35_op_id, model_id=_s35_model,
+                duration_ms=(time.monotonic() - _s35_venom_t0) * 1000.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        _s35_parse_t0 = time.monotonic()
+
         # Slice 20B — _parse_with_heal wraps _parse_generation_response
         # with an LLM-heal retry on json_parse_error (RT path).
         result = await self._parse_with_heal(
@@ -2532,6 +2651,15 @@ class DoublewordProvider:
             repo_roots=self._repo_roots or None,
             repo_root=self._repo_root,
         )
+        # Slice 35 Phase 1 — record STAGE_RT_RESPONSE_PARSE.
+        try:
+            _s35_dp.record_stage(
+                "STAGE_RT_RESPONSE_PARSE",
+                op_id=_s35_op_id, model_id=_s35_model,
+                duration_ms=(time.monotonic() - _s35_parse_t0) * 1000.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if _preloaded_files:
             result = dataclasses.replace(
                 result, prompt_preloaded_files=tuple(_preloaded_files),
@@ -2748,13 +2876,42 @@ class DoublewordProvider:
     def _next_poll_interval(attempt: int, *, network_error: bool = False) -> float:
         """Compute next poll interval with exponential backoff + jitter.
 
-        Starting interval: 2s (normal) or 15s (network error).
-        Multiplier: 1.5x per attempt. Cap: 30s. Jitter: +/-25%.
+        Slice 35 Phase 2 — operator-tightened calibration based on
+        Phase 0 probe empirical p99 of 4-8s. The pre-Slice-35 defaults
+        (base 2s, cap 30s) were sized for a much slower baseline; the
+        operator's calibration reflects the actual measured DW endpoint
+        responsiveness:
+
+          * Normal start: 1.5s (was 2.0s) — aggressive first 3 cycles
+            (1.5s, 2.25s, 3.4s) match the 4-8s probe p99
+          * Network error start: 8.0s (was 15.0s) — still defensive
+            but proportional
+          * Multiplier: 1.5x per attempt (unchanged)
+          * Cap: 10s (was 30s) — caps at empirical p99 × ~1.5 safety
+            factor instead of the prior 30s which exceeded the
+            measured ceiling by 3-7x
+          * Jitter: +/-25% (unchanged)
+          * Floor: 0.5s (unchanged)
+
+        Env knobs (operator-tunable without code change):
+          JARVIS_DW_POLL_BASE_S         (default 1.5)
+          JARVIS_DW_POLL_NETWORK_BASE_S (default 8.0)
+          JARVIS_DW_POLL_MULTIPLIER     (default 1.5)
+          JARVIS_DW_POLL_CAP_S          (default 10.0)
+          JARVIS_DW_POLL_JITTER_FRACTION (default 0.25)
         """
-        import random
-        base = 15.0 if network_error else 2.0
-        interval = min(base * (1.5 ** attempt), 30.0)
-        jitter = interval * 0.25 * (2 * random.random() - 1)
+        import os as _os, random
+        try:
+            _base_normal = float(_os.environ.get("JARVIS_DW_POLL_BASE_S", "1.5"))
+            _base_network = float(_os.environ.get("JARVIS_DW_POLL_NETWORK_BASE_S", "8.0"))
+            _mult = float(_os.environ.get("JARVIS_DW_POLL_MULTIPLIER", "1.5"))
+            _cap = float(_os.environ.get("JARVIS_DW_POLL_CAP_S", "10.0"))
+            _jit_frac = float(_os.environ.get("JARVIS_DW_POLL_JITTER_FRACTION", "0.25"))
+        except (TypeError, ValueError):
+            _base_normal, _base_network, _mult, _cap, _jit_frac = 1.5, 8.0, 1.5, 10.0, 0.25
+        base = _base_network if network_error else _base_normal
+        interval = min(base * (_mult ** attempt), _cap)
+        jitter = interval * _jit_frac * (2 * random.random() - 1)
         return max(0.5, interval + jitter)
 
     async def _adaptive_poll_batch(
