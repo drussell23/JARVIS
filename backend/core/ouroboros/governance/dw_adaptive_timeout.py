@@ -87,12 +87,25 @@ _DEFAULT_CAP_S: float = 600.0      # 10 minute hard ceiling
 
 
 def is_enabled() -> bool:
-    """Default FALSE — substrate ships before behaviour change.
-    Graduates after v30 soak proves adaptive math doesn't regress."""
+    """Slice 34 Phase 3 GRADUATED default TRUE.
+
+    Original Slice 34 Phase 0 shipped default-FALSE pending v30 soak
+    proof. v30 itself depends on adaptive timeout being ON to consume
+    the 40-record probe ledger — operator-bound flip per §48.7.4
+    Phase 3. Operators wanting to revert can set
+    ``JARVIS_DW_ADAPTIVE_TIMEOUT_ENABLED=0`` to restore static
+    Slice 27 formula byte-identically.
+
+    Safety: ``compute_adaptive_timeout`` invariant — NEVER returns
+    less than ``static_floor_s``. So even with master ON, the
+    pre-Slice-34 static math is always the floor. Worst case
+    adaptive does: same as static (cold-start, no samples) OR
+    raises timeout to accommodate observed slower endpoint (always
+    safer than premature timeout)."""
     raw = os.environ.get(_ENABLED_ENV, "").strip().lower()
     if not raw:
-        return False
-    return raw in ("1", "true", "yes", "on")
+        return True
+    return raw not in ("0", "false", "no", "off")
 
 
 def _safety_factor() -> float:

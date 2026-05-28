@@ -130,18 +130,24 @@ def test_ast_pin_stats_composes_ledger_no_parallel_storage() -> None:
     )
 
 
-def test_ast_pin_adaptive_timeout_default_off() -> None:
-    """``JARVIS_DW_ADAPTIVE_TIMEOUT_ENABLED`` default FALSE. Substrate
-    ships before behaviour change; v30 graduation flips later."""
+def test_ast_pin_adaptive_timeout_graduated_default_on() -> None:
+    """Slice 34 Phase 3 GRADUATED: ``JARVIS_DW_ADAPTIVE_TIMEOUT_ENABLED``
+    default flipped FALSE → TRUE after Phase 0 probe established the
+    40-record healthy baseline + adaptive math invariant
+    (`max(static_floor, p99 × safety_factor)`) means worst-case
+    behavior is identical to the pre-graduation static path."""
     from backend.core.ouroboros.governance.dw_adaptive_timeout import (
         is_enabled, _ENABLED_ENV,
     )
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop(_ENABLED_ENV, None)
-        assert is_enabled() is False, "default must be FALSE (substrate-first)"
-    for truthy in ("1", "true", "TRUE", "yes", "on"):
-        with mock.patch.dict(os.environ, {_ENABLED_ENV: truthy}):
-            assert is_enabled() is True
+        assert is_enabled() is True, (
+            "Phase 3 graduation reverted — default must be TRUE"
+        )
+    # Operator opt-out via explicit-false still works
+    for falsy in ("0", "false", "FALSE", "no", "off"):
+        with mock.patch.dict(os.environ, {_ENABLED_ENV: falsy}):
+            assert is_enabled() is False
 
 
 def test_ast_pin_adaptive_timeout_never_below_static_floor() -> None:
@@ -458,12 +464,13 @@ def test_spine_stats_cache_ttl_honored(
     asyncio.run(run())
 
 
-def test_spine_adaptive_timeout_default_off_returns_static(
+def test_spine_adaptive_timeout_master_off_returns_static(
     monkeypatch,
 ) -> None:
-    """Master flag OFF → static_floor_s returned unchanged regardless
-    of stats."""
-    monkeypatch.delenv("JARVIS_DW_ADAPTIVE_TIMEOUT_ENABLED", raising=False)
+    """Master flag explicitly OFF → static_floor_s returned unchanged
+    regardless of stats (operator-opt-out path preserved post-Phase-3
+    graduation)."""
+    monkeypatch.setenv("JARVIS_DW_ADAPTIVE_TIMEOUT_ENABLED", "0")
     from backend.core.ouroboros.governance.dw_adaptive_timeout import (
         compute_adaptive_timeout,
     )
