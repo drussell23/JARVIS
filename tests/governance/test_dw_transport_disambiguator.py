@@ -4,6 +4,7 @@ from backend.core.ouroboros.governance.preflight_probe import ProbeOutcome
 from backend.core.ouroboros.governance.dw_transport_disambiguator import (
     FailureClass,
     classify_surface_failure,
+    disambiguate_and_recover,
 )
 
 
@@ -94,3 +95,77 @@ def test_done_before_content_beats_5xx_and_transport_substring():
     assert classify_surface_failure(
         _fail(msg="done_before_content stream_closed_early", status=500)
     ) is FailureClass.UPSTREAM
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — disambiguate_and_recover + DisambiguationResult
+# ---------------------------------------------------------------------------
+
+
+class _Mgr:
+    def __init__(self):
+        self.flushes = 0
+
+    async def flush_transport_pool(self, provider, *, reason):
+        self.flushes += 1
+        return True
+
+
+async def test_upstream_done_before_content_does_NOT_flush():
+    # The whole point of Slice 39: upstream → flush-bypass.
+    mgr = _Mgr()
+    oc = ProbeOutcome(
+        model_id="m", success=False, status_code=0,
+        error_message="done_before_content",
+    )
+    res = await disambiguate_and_recover(
+        provider=object(), outcome=oc, lifecycle=mgr, raw_probe_fn=None,
+    )
+    assert res.failure_class is FailureClass.UPSTREAM
+    assert res.flushed is False
+    assert mgr.flushes == 0
+    assert res.surface_verdict_value == "upstream_degraded"
+
+
+async def test_transport_with_healthy_raw_probe_flushes():
+    mgr = _Mgr()
+    oc = ProbeOutcome(model_id="m", success=False, error_message="stream_closed_early")
+
+    async def raw_ok(provider, model_id):
+        return ProbeOutcome(model_id=model_id, success=True, status_code=200)
+
+    res = await disambiguate_and_recover(
+        provider=object(), outcome=oc, lifecycle=mgr, raw_probe_fn=raw_ok,
+    )
+    assert res.failure_class is FailureClass.TRANSPORT
+    assert res.raw_probe_succeeded is True
+    assert res.flushed is True
+    assert mgr.flushes == 1
+
+
+async def test_transport_with_failing_raw_probe_does_NOT_flush():
+    mgr = _Mgr()
+    oc = ProbeOutcome(model_id="m", success=False, error_message="stream_closed_early")
+
+    async def raw_fail(provider, model_id):
+        return ProbeOutcome(model_id=model_id, success=False, error_message="stream_closed_early")
+
+    res = await disambiguate_and_recover(
+        provider=object(), outcome=oc, lifecycle=mgr, raw_probe_fn=raw_fail,
+    )
+    assert res.failure_class is FailureClass.TRANSPORT
+    assert res.raw_probe_succeeded is False
+    assert res.flushed is False
+    assert mgr.flushes == 0
+
+
+async def test_none_failure_class_is_noop():
+    mgr = _Mgr()
+    ok = ProbeOutcome(model_id="m", success=True, status_code=200)
+    res = await disambiguate_and_recover(
+        provider=object(), outcome=ok, lifecycle=mgr, raw_probe_fn=None,
+    )
+    assert res.failure_class is FailureClass.NONE
+    assert res.flushed is False
+    assert res.surface_verdict_value == "healthy"
+    assert mgr.flushes == 0
