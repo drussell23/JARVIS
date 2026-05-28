@@ -4140,6 +4140,40 @@ class CandidateGenerator:
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id,
             )
+            # Slice 34 Phase 2 — dispatch profiler (default OFF; zero
+            # overhead when disabled). Records the sem-wait + budget
+            # stages into the per-op summary; STAGE_PROVIDER_GENERATE
+            # below brackets the actual provider call so we can see
+            # how much time is spent IN the orchestrator overhead vs
+            # the provider's own dispatch path.
+            from backend.core.ouroboros.telemetry import (
+                dispatch_profiler as _dp_mod,
+            )
+            _dp_op_id = getattr(context, "op_id", "?") or "?"
+            _dp_route = getattr(context, "provider_route", "?") or "?"
+            _dp_model = model_id or "(unspecified)"
+            if _dp_mod.is_enabled():
+                _dp_key = _dp_mod._active_key(_dp_op_id, _dp_model)
+                _dp_summary = _dp_mod.OpDispatchSummary(
+                    op_id=_dp_op_id, model_id=_dp_model,
+                    route=_dp_route, started_unix=time.time(),
+                )
+                with _dp_mod._active_ops_lock:
+                    _dp_mod._active_ops[_dp_key] = _dp_summary
+                # Record the already-measured sem-wait as a stage.
+                _dp_summary.stages.append(_dp_mod.StageRecord(
+                    stage_name="STAGE_SEM_WAIT",
+                    duration_ms=_primary_sem_wait_s * 1000.0,
+                ))
+                # And a synthetic ~0 stage for the trivial budget
+                # computation (kept for shape consistency in the
+                # per-op summary — actual sub-ms math is recorded
+                # below via the dispatch_stage wrap if anyone ever
+                # makes _compute_primary_budget heavy).
+                _dp_summary.stages.append(_dp_mod.StageRecord(
+                    stage_name="STAGE_BUDGET_COMPUTATION",
+                    duration_ms=0.0,
+                ))
             # Tier 3 Reflex observability (Manifesto §5): log at INFO when
             # the hard cap is the binding constraint (not the fraction or
             # the fallback-reserve). Operators can grep for
@@ -4176,11 +4210,67 @@ class CandidateGenerator:
                     current_cancel_token as _curr_cancel_token,
                     race_or_wait_for as _race_or_wait_for,
                 )
-                _pri_result = await _race_or_wait_for(
-                    self._primary.generate(context, deadline),
-                    timeout=primary_budget,
-                    cancel_token=_curr_cancel_token(),
+                # Slice 34 Phase 2 — Stage 3: STAGE_PROVIDER_GENERATE
+                # brackets the entire provider call so we can see how
+                # much wall-time is spent in the provider's own dispatch
+                # path (Aegis auth + lease + HTTP POST + response parse).
+                # Profiler is fail-closed default-OFF — zero overhead
+                # when JARVIS_DISPATCH_PROFILER_ENABLED is unset.
+                from backend.core.ouroboros.telemetry.dispatch_profiler import (
+                    dispatch_stage as _dp_stage,
                 )
+                _dp_provider_outcome = "ok"
+                _dp_provider_err = ""
+                _dp_provider_t0 = time.monotonic()
+                try:
+                    _pri_result = await _race_or_wait_for(
+                        self._primary.generate(context, deadline),
+                        timeout=primary_budget,
+                        cancel_token=_curr_cancel_token(),
+                    )
+                except asyncio.CancelledError:
+                    _dp_provider_outcome = "cancelled"
+                    raise
+                except Exception as _dp_exc:  # noqa: BLE001
+                    _dp_provider_outcome = "error"
+                    _dp_provider_err = type(_dp_exc).__name__
+                    raise
+                finally:
+                    # Slice 34 Phase 2 — record STAGE_PROVIDER_GENERATE
+                    # + emit the per-op summary. Fail-closed if profiler
+                    # is disabled or accumulator was never created.
+                    try:
+                        _dp_provider_ms = (
+                            time.monotonic() - _dp_provider_t0
+                        ) * 1000.0
+                        if _dp_mod.is_enabled():
+                            _dp_key2 = _dp_mod._active_key(_dp_op_id, _dp_model)
+                            with _dp_mod._active_ops_lock:
+                                _dp_summary2 = _dp_mod._active_ops.pop(
+                                    _dp_key2, None,
+                                )
+                            if _dp_summary2 is not None:
+                                _dp_summary2.stages.append(
+                                    _dp_mod.StageRecord(
+                                        stage_name="STAGE_PROVIDER_GENERATE",
+                                        duration_ms=_dp_provider_ms,
+                                        outcome=_dp_provider_outcome,
+                                        error_class=_dp_provider_err,
+                                    )
+                                )
+                                _dp_summary2.total_duration_ms = sum(
+                                    s.duration_ms for s in _dp_summary2.stages
+                                )
+                                _dp_summary2.outcome = _dp_provider_outcome
+                                _dp_summary2.error_class = _dp_provider_err
+                                with _dp_mod._recent_summaries_lock:
+                                    _dp_mod._recent_summaries.append(_dp_summary2)
+                                logger.info(
+                                    "[DispatchProfiler] op_summary %s",
+                                    _dp_summary2.to_log_kv(),
+                                )
+                    except Exception:  # noqa: BLE001 — never raise from profiler
+                        pass
                 logger.info(
                     "[CandidateGenerator] Primary sem release: "
                     "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=ok",
