@@ -141,6 +141,84 @@ _CONV_COMMIT_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Slice 33 Arc 2 Phase 2 — dedicated filesystem signal executor
+# ---------------------------------------------------------------------------
+#
+# Closes the v28 (bt-2026-05-27-235042) LoopSink-confirmed sink:
+#   posture.signal.postmortem_failure_rate blocked_ms=5322.57
+#
+# Root cause: 4 of the 9 signal collectors (postmortem_failure_rate,
+# iron_gate_reject_rate, l2_repair_rate, session_lessons_infra_ratio)
+# all iterate .ouroboros/sessions/*/summary.json synchronously. Under
+# Arc 1, each runs in the DEFAULT ThreadPoolExecutor via asyncio.
+# to_thread — contending with every other to_thread caller in the
+# process (oracle file reads, oracle parse-result dispatches, etc.).
+#
+# Phase 2 routes these 4 specifically to a DEDICATED 2-worker
+# ThreadPoolExecutor reserved for filesystem signal collection.
+# Bounded (operators with more cores can raise via env). Lazy
+# singleton (no startup cost when posture observer isn't active).
+
+import threading as _threading_fs  # noqa: E402
+from concurrent.futures import (  # noqa: E402
+    ThreadPoolExecutor as _ThreadPoolExecutor_fs,
+)
+
+_FS_SIGNAL_EXECUTOR_MAX_WORKERS_ENV: str = (
+    "JARVIS_POSTURE_FS_SIGNAL_EXECUTOR_MAX_WORKERS"
+)
+_DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS: int = 2
+_fs_signal_executor: Optional[_ThreadPoolExecutor_fs] = None
+_fs_signal_executor_lock = _threading_fs.Lock()
+
+
+def _fs_signal_executor_max_workers() -> int:
+    try:
+        raw = os.environ.get(_FS_SIGNAL_EXECUTOR_MAX_WORKERS_ENV, "").strip()
+        if not raw:
+            return _DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS
+
+
+def _get_fs_signal_executor() -> _ThreadPoolExecutor_fs:
+    """Slice 33 Arc 2 Phase 2 — lazy singleton dedicated to filesystem
+    signal collection (recent_summaries-backed signals). Separate from
+    asyncio's default ThreadPoolExecutor so heavy session-dir scans
+    don't contend with oracle file reads / parse dispatches."""
+    global _fs_signal_executor
+    if _fs_signal_executor is not None:
+        return _fs_signal_executor
+    with _fs_signal_executor_lock:
+        if _fs_signal_executor is None:
+            _fs_signal_executor = _ThreadPoolExecutor_fs(
+                max_workers=_fs_signal_executor_max_workers(),
+                thread_name_prefix="posture-fs-signal",
+            )
+            logger.info(
+                "[PostureObserver] fs_signal_executor initialised "
+                "max_workers=%d",
+                _fs_signal_executor_max_workers(),
+            )
+    return _fs_signal_executor
+
+
+def shutdown_fs_signal_executor() -> None:
+    """Slice 33 Arc 2 Phase 2 — clean shutdown. NEVER raises."""
+    global _fs_signal_executor
+    with _fs_signal_executor_lock:
+        if _fs_signal_executor is None:
+            return
+        try:
+            _fs_signal_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _fs_signal_executor = None
+
+
 # Callable the wiring layer can inject to surface in-flight op count.
 OpenOpsProvider = Callable[[], int]
 
@@ -164,6 +242,9 @@ class SignalCollector:
         self._open_ops_provider = open_ops_provider
 
     def _git_subjects(self, n: int) -> List[str]:
+        """Legacy sync entry — retained for backwards compat with the
+        sync ``commit_ratios`` / ``build_bundle`` path. Production
+        chunked-async cycle uses :meth:`_git_subjects_async`."""
         try:
             result = subprocess.run(
                 ["git", "log", f"-{n}", "--pretty=format:%s"],
@@ -175,6 +256,83 @@ class SignalCollector:
         if result.returncode != 0:
             return []
         return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+
+    async def _git_subjects_async(self, n: int) -> List[str]:
+        """Slice 33 Arc 2 Phase 1 — async git subprocess.
+
+        Replaces ``subprocess.run`` (which ties up a ThreadPool worker
+        for the full duration even via ``asyncio.to_thread``) with
+        ``asyncio.create_subprocess_exec`` which is genuinely
+        non-blocking from asyncio's perspective. The cold-cache 18 s
+        git log on a 29k-file repo no longer holds a thread-pool
+        slot, freeing default-executor capacity for sibling work.
+
+        Bounded by ``asyncio.wait_for(timeout=5.0)`` — on timeout the
+        subprocess is killed cleanly. NEVER raises — returns ``[]``
+        on any failure (timeout / git missing / nonzero exit /
+        decode error).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "log", f"-{n}", "--pretty=format:%s",
+                cwd=str(self._root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError):
+            return []
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            return []
+        except asyncio.CancelledError:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        except Exception:  # noqa: BLE001 — defensive
+            return []
+        if proc.returncode != 0:
+            return []
+        try:
+            text = stdout_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return []
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    async def commit_ratios_async(self) -> Dict[str, float]:
+        """Slice 33 Arc 2 Phase 1 — async-native commit ratios.
+
+        Same semantics as sync :meth:`commit_ratios`, but the git log
+        runs via ``create_subprocess_exec`` — no thread-pool slot
+        consumed even during cold-cache 18 s scans.
+        """
+        subjects = await self._git_subjects_async(commit_window())
+        if not subjects:
+            return {"feat": 0.0, "fix": 0.0, "refactor": 0.0, "test_docs": 0.0}
+        counts = {"feat": 0, "fix": 0, "refactor": 0, "test": 0, "docs": 0}
+        for subj in subjects:
+            m = _CONV_COMMIT_RE.match(subj)
+            if not m:
+                continue
+            ctype = m.group("type").lower()
+            if ctype in counts:
+                counts[ctype] += 1
+        total = len(subjects)
+        return {
+            "feat": counts["feat"] / total,
+            "fix": counts["fix"] / total,
+            "refactor": counts["refactor"] / total,
+            "test_docs": (counts["test"] + counts["docs"]) / total,
+        }
 
     def commit_ratios(self) -> Dict[str, float]:
         """feat / fix / refactor / test+docs ratios over last N commits."""
@@ -421,29 +579,40 @@ class SignalCollector:
 
         # Literal callsite labels (not f-strings) so AST pins +
         # production log greps see the exact string at the call site.
+        # Slice 33 Arc 2 Phase 1 — commit_ratios uses async-native
+        # subprocess (create_subprocess_exec) instead of to_thread
+        # wrapping subprocess.run; no thread-pool slot consumed even
+        # during cold-cache 18 s scans.
         async with _ls_sink_async("posture.signal.commit_ratios"):
-            ratios = await _asyncio_ls.to_thread(self.commit_ratios)
+            ratios = await self.commit_ratios_async()
         await _asyncio_ls.sleep(0)
 
-        # The rest of the signals are typically sub-second, so we don't need individual 
-        # sinks for them — one sink wrapping the whole batch is sufficient to surface 
-        # them in the same cycle without overwhelming LoopSink with 12 separate events. 
-        # But we do want to yield between them to avoid blocking the loop, so we interleave 
-        # explicit sleeps.
+        # Slice 33 Arc 2 Phase 2 — 4 filesystem-bound signals
+        # (postmortem/iron_gate/l2_repair/session_lessons all call
+        # recent_summaries which iterates .ouroboros/sessions/*/
+        # summary.json) route through a DEDICATED 2-worker
+        # ThreadPoolExecutor so heavy session-dir scans don't contend
+        # with the default executor's other consumers (oracle file
+        # reads / parse dispatches / etc.).
+        _loop_fs = _asyncio_ls.get_running_loop()
+        _fs_exec = _get_fs_signal_executor()
+
         async with _ls_sink_async("posture.signal.postmortem_failure_rate"):
-            # This is the heaviest collector (parsing + iterating over multiple 
-            # summary.json files) so it gets its own sink and label.
-            pm = await _asyncio_ls.to_thread(self.postmortem_failure_rate)
-        # Yield to the event loop before starting the next collector to ensure we don't 
-        # block it for too long.
+            pm = await _loop_fs.run_in_executor(
+                _fs_exec, self.postmortem_failure_rate,
+            )
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.iron_gate_reject_rate"):
-            ig = await _asyncio_ls.to_thread(self.iron_gate_reject_rate)
+            ig = await _loop_fs.run_in_executor(
+                _fs_exec, self.iron_gate_reject_rate,
+            )
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.l2_repair_rate"):
-            l2 = await _asyncio_ls.to_thread(self.l2_repair_rate)
+            l2 = await _loop_fs.run_in_executor(
+                _fs_exec, self.l2_repair_rate,
+            )
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.open_ops_normalized"):
@@ -451,7 +620,9 @@ class SignalCollector:
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.session_lessons_infra_ratio"):
-            sl = await _asyncio_ls.to_thread(self.session_lessons_infra_ratio)
+            sl = await _loop_fs.run_in_executor(
+                _fs_exec, self.session_lessons_infra_ratio,
+            )
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.time_since_last_graduation_inv"):
