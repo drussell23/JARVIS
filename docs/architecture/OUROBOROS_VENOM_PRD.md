@@ -11234,17 +11234,170 @@ Per operator binding *"no euphoria, only artifacts"* — this section is documen
 | Git subprocess (Slice 33 A2 P1) | **CLOSED** | 78% reduction cold-cache | n/a |
 | FS executor (Slice 33 A2 P2) | **CLOSED** | 55% reduction postmortem | TTL cache for recent_summaries |
 | Graph write queue (Slice 33 A2 P3) | **CLOSED** | 0 on-loop graph_write events | reconciliation gap on consumer failure |
-| **DW 397B TIMEOUT (capability blocker)** | **OPEN — HIGHEST PRIORITY** | every v28/v29 op | **Slice 34 (§48.7) — Upstream DW capacity investigation: Phase 0 probe → Phase 1 hypothesis-specific fix → Phase 2 soak validation** |
-| Adaptive per-shape routing | **PROPOSED** | §48.8.1 design | Slice 35 — gated on §48.7 producing 1+ APPLY |
-| Per-model breaker tuning | **PROPOSED** | §48.8.2 design | Slice 35 |
-| Bloom filter / response cache | **PROPOSED** | §48.9.1 design | Slice 36 — depends on per-shape ledger |
-| Adaptive rate limiter | **PROPOSED** | §48.9.4 design | Slice 36 |
-| Latency predictor (ML) | **PROPOSED** | §48.10.1 design | Slice 37 |
-| Three-tier Claude policy | **PROPOSED** | §48.11.1 design | Slice 38 — depends on per-shape ledger |
+| ~~**DW 397B TIMEOUT (capability blocker)**~~ → **CLOSED 2026-05-28** | ~~OPEN — HIGHEST PRIORITY~~ | v31 per-stage telemetry | **ROOT CAUSE FOUND: it was not a model timeout but an RT-streaming TTFT of 66,775 ms (8× slower than the BATCH corridor). Slice 36 forced BATCH on standard/complex. Superseded by §49.3.1-3.3.** |
+| ~~Adaptive per-shape routing~~ *(planned "Slice 35")* | **RENUMBERED → Slice 40+** | §48.8.1 design | Number consumed by shipped Slice 35 (dual-path profiling). See §49.4 drift note. |
+| ~~Per-model breaker tuning~~ *(planned "Slice 35")* | **RENUMBERED → Slice 40+** | §48.8.2 design | See §49.4 drift note. |
+| ~~Bloom filter / response cache~~ *(planned "Slice 36")* | **RENUMBERED → Slice 40+** | §48.9.1 design | Number consumed by shipped Slice 36 (adaptive transport dispatcher). See §49.4. |
+| ~~Adaptive rate limiter~~ *(planned "Slice 36")* | **RENUMBERED → Slice 40+** | §48.9.4 design | See §49.4 drift note. |
+| ~~Latency predictor (ML)~~ *(planned "Slice 37")* | **RENUMBERED → Slice 40+** | §48.10.1 design | Number consumed by shipped Slice 37 (multipart diagnostic). See §49.4. |
+| ~~Three-tier Claude policy~~ *(planned "Slice 38")* | **RENUMBERED → Slice 40+** | §48.11.1 design | Number consumed by shipped Slice 38 (JSONL composer). See §49.4. |
+| **DW `/v1/files` HTTP 500 (multipart)** | **CLOSED 2026-05-28** | v32/v33 — 3/3 HTTP 500 | **Slice 37 diagnostic + Slice 38 RFC 7464 trailing-`\n` canonical composer. DW Support (peter@doubleword.ai) externally validated the malformation. See §49.3.4-3.7.** |
+| **DW streaming `done_before_content` (capability blocker)** | **OPEN — HIGHEST PRIORITY** | v34 — all 3 models `status=0`, clean SSE + empty completion | **Slice 39 (§49.6) — Multi-surface transport-health substrate + bifurcated disambiguation. Upstream-class signal → flush-bypass by design.** |
 
-**Dependency chain:** Slice 34 (§48.7) MUST land first — every subsequent forward-arc proposal assumes DW eventually serves a successful candidate. Slices 35-38 are theoretical until §48.7 Phase 0 produces evidence that resolves which of the 4 hypotheses (a-d) is true.
+> **§48.13 → §49 reconciliation (doc-drift fix per operator binding "we do not allow our documentation to drift"):** the planned forward-arc names "Slice 35–38" above were authored 2026-05-27, *before* the v30→v34 arc shipped. The actually-merged Slices 35–38 (§48.7.4 Phase 2 work — dual-path profiling, adaptive transport dispatcher, multipart diagnostic, JSONL composer) **consumed those numbers for entirely different work.** The planned cost-intelligence forward arcs (per-shape routing, response cache, ML latency predictor, three-tier Claude policy) are therefore **renumbered to Slice 40+ and deferred** — they remain gated on the capability bar (APPLY) first moving. Full planned-vs-actual mapping in §49.4.
 
-The loop-health stack is **structurally closed.** The capability bar will not move until the §48.7 upstream investigation lands and Phase 1 fixes the named hypothesis.
+**Dependency chain (revised 2026-05-28):** ~~Slice 34 (§48.7) MUST land first~~ — the §48.7 upstream investigation was *executed* as the empirical v30→v34 arc (§49). It peeled three successive blocker layers (RT TTFT → `/v1/files` 500 → streaming empty-completion). The capability bar (APPLY) remains **0/0/0 across 10 cumulative soaks (v25→v34)**; the live blocker is now the streaming `done_before_content` upstream signal, which **Slice 39 (§49.6)** addresses with a multi-surface health substrate. The deferred cost-intelligence arcs (Slice 40+) stay theoretical until APPLY first fires.
+
+The loop-health stack is **structurally closed.** ~~The capability bar will not move until the §48.7 upstream investigation lands and Phase 1 fixes the named hypothesis.~~ — the investigation landed and traced the blocker through three distinct transport layers; see §49 for the v30→v34 narrative, the codified moving-blocker lesson, and the Slice 39 forward design.
+
+---
+
+## §49. The v30 → v34 Transport Evolution Arc + Slice 39 Multi-Surface Transport-Health Substrate *(NEW 2026-05-28 — operator-driven post v30→v34 soak arc: "update the PRD in detail and in depth, cross out what we've done and the mistakes we learned from ... solve the root problem directly without workarounds, brute force, or shortcuts ... super duper beef it up")*
+
+### §49.1 — Why this section exists
+
+§48 closed at v29 (2026-05-27) with the capability blocker named as "DW 397B TIMEOUT" and a planned investigation arc (§48.7 "Slice 34"). Between 2026-05-27 and 2026-05-28 that investigation was **executed** — five capability soaks (v30→v34) and four merged slices (35, 36, 37, 38) plus a v34 gatekick smoke harness. The arc did exactly what §48.7 promised: it disambiguated the blocker. But the blocker turned out to be **not one defect** — it was a *stack* of three independent transport-layer defects, each masking the next. §49 is the granular closure record of that arc, the codified lesson, and the forward design (Slice 39) that addresses the layer still open.
+
+Operator binding for this section (verbatim): *"solve the root problem directly — without workarounds, brute force, or shortcut solutions — and significantly strengthen the system into something advanced, asynchronous, dynamic, adaptive, intelligent, and highly robust, with no hardcoding. Fully leverage the existing files and architecture so we avoid duplication and build cleanly on what already exists."* Written to that bar.
+
+### §49.2 — The moving-blocker pattern (lesson learned — codified for future loops)
+
+Across v25→v34 the capability bar (APPLY/VERIFY/RESOLVED) stayed **0/0/0 for 10 consecutive soaks**, but the *reason* changed every 1–2 soaks:
+
+```
+v24  →  Aegis 401 missing_session_bearer        (Slice 31 — CLOSED)
+v25  →  Oracle GIL loop-wedge                    (Slice 32 — CLOSED)
+v26-29 → posture / loop-health stalls            (Slice 33 A0-A2 — CLOSED)
+v28-29 → "DW 397B TIMEOUT"                        (mis-named; see below)
+v30-31 → RT-streaming TTFT 66,775 ms             (Slice 35 diag → Slice 36 force-BATCH — CLOSED)
+v32-33 → /v1/files HTTP 500 (multipart malformed)(Slice 37 diag → Slice 38 trailing-\n — CLOSED)
+v34    → streaming done_before_content (upstream) (Slice 39 — OPEN)
+```
+
+**The lesson (codified):** in a deep provider-integration stack, *each fix exposes the next layer.* A single soak only ever measures the **topmost** blocker; the layers beneath are invisible until it is removed. Three corollaries now binding on future loops:
+
+1. **Never declare the capability problem "solved" from a single surface's success.** The v34 `/v1/files` HTTP 200 (gatekick preflight) was real *and* the soak still produced 0 APPLY — because the soak's hot path uses a *different* surface (streaming chat). Surface-level success ≠ capability. (Cross-ref `memory/feedback_no_preresult_euphoria.md`.)
+2. **Burning a full 60-min soak to discover the next blocker is the brute-force anti-pattern.** A multi-surface up-front health sweep (Slice 39) catches the next layer in *seconds*, not after a soak burn. This is the structural strengthening §49.6 delivers.
+3. **Classify by protocol semantics, not by symptom co-location.** "DW 397B TIMEOUT" (v28/v29) and "done_before_content" (v34) both *look* like "DW didn't answer," but the first was an 8× RT-vs-BATCH latency asymmetry and the second is a clean-stream-empty-completion. Conflating them would have shipped the wrong fix.
+
+### §49.3 — v30 → v34 chronological narrative (granular)
+
+#### §49.3.1 — v30/v31: the RT-streaming TTFT lag discovery
+
+v30's `op_summary` bisection named `STAGE_PROVIDER_GENERATE` as **99.99% of the 30–111s timeout budget** — but that stage is a black box wrapping the entire provider call. To disambiguate *which* sub-stage burned the time, Slice 35 instrumented it.
+
+#### §49.3.2 — Slice 35: Dual-path dispatch profiling *(b014f1c6d7, PR #61727 — §48.7.4 Phase 2)*
+
+Opened `generate()`'s internal sub-stages on **both** corridors so v31 could compare them:
+- **Real-Time (6 stages):** `STAGE_RT_PROMPT_BUILD`, `STAGE_RT_AEGIS_AUTH`, `STAGE_RT_HTTP_POST` (closes at TTFT first-chunk), `STAGE_RT_STREAM_CONSUME`, `STAGE_RT_VENOM_TOOL_LOOP`, `STAGE_RT_RESPONSE_PARSE`.
+- **Batch fallback (4 stages + poll calibration):** `STAGE_BATCH_UPLOAD` (`_upload_file`), `STAGE_BATCH_CREATE`, `STAGE_BATCH_AWAIT`, `STAGE_BATCH_RETRIEVE`.
+
+Wired via manual `time.monotonic()` deltas + `dispatch_profiler.record_stage()` (avoided restructuring the 900-line `_generate_realtime`).
+
+#### §49.3.3 — Slice 36: Adaptive Transport Dispatcher *(e5d4c86e1e, PR #62027 — closed v25→v31 blocker)*
+
+v31's per-stage telemetry was unambiguous, on the **same account, same Qwen3.5-397B, same prompts:**
+
+| Stage | p50 |
+|---|---|
+| `STAGE_RT_HTTP_POST` (TTFT) | **66,775 ms** |
+| `STAGE_RT_VENOM_TOOL_LOOP` | 66,849 ms (nested with above) |
+| Phase 0 probe via **BATCH API** end-to-end | **4,000–8,000 ms** |
+
+The RT endpoint's *time-to-first-token* was **8× slower than BATCH's entire end-to-end**. Production defaulted to RT → 0 APPLY across 6 soaks. **Fix:** `_slice36_should_force_batch(context)` decision function + `generate()` wiring. Routes through BATCH instead of RT when all three hold: (1) `JARVIS_PROVIDER_CLAUDE_DISABLED=true`, (2) `JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX=true` (default TRUE, opt-out `=0`), (3) route ∈ {standard, complex}. RT preserved for IMMEDIATE/BG/SPECULATIVE (small-context paths where Venom adds value). **Acknowledged tradeoff (AST-pinned):** BATCH does not support the Venom tool loop — but v31 showed **0 successful Venom rounds** across all production ops anyway (every RT call timed out before first token), so net delta is strictly positive: *some* candidates ≫ *zero*. Phase 2 fixed a model-ID-tolerant aggregation bug (Slice 34 `op_session` keyed on walker's `model_id` "35B" vs Slice 35 `record_stage`'s `self._model` "397B" → key mismatch dropped stages from aggregation).
+
+#### §49.3.4 — v32/v33: the `/v1/files` HTTP 500 multipart defect
+
+With BATCH now the hot path, v32 wedged on a new shape: **every `/v1/files` upload inside the harness returned HTTP 500** ("Internal server error", 21-byte body) — *while a bare-metal probe was 5/5 OK at the same moment.* v33 (`bt-2026-05-28-162729`) confirmed it: 3/3 HTTP 500 across 4 KB / 18 KB / 33 KB payloads on Qwen3.5-35B-A3B-FP8; Aegis daemon confirmed `upstream_host=api.doubleword.ai`. Cost $0.007 / $10 (0.07%); idle_timeout at 31 min.
+
+#### §49.3.5 — Slice 37: Multipart payload diagnostic + cleanup discipline *(c2de840edc, PR #63659)*
+
+Made the opaque 500 diagnostically rich. `_upload_file` gained a pre-call diagnostic log (payload bytes + custom_id + model + op) + a pre-flight size guard (`JARVIS_DW_UPLOAD_MAX_BYTES`, default 5 MB → 413 fail-fast) + error-body capture widened 500→2000 chars across 4 lifecycle methods. Phase 2 added uniform `try/finally` cleanup across `_upload_file`/`_create_batch`/`_adaptive_poll_batch`/`_retrieve_result` (`_aegis_lease=None` before `try` → no unbound name on early-throw; `_rate_limiter_recorded` sentinel → no metric drift). The diagnostic captured the exact payload on 3/3 500s — which is what enabled the external diagnosis.
+
+#### §49.3.6 — DW Support external validation (peter@doubleword.ai, 2026-05-28 10:23 AM)
+
+DW Support confirmed the `/v1/files` uploads were **"invalid multi part files"**: both `submit_batch` and `prompt_only` built `jsonl_line = json.dumps({...})` with **no trailing newline** — structurally valid JSON, structurally **invalid JSONL per RFC 7464** (which requires each record be newline-terminated). DW's `/v1/files` validator rejected the missing line terminator with a 500. The operator emailed Peter back confirming the fix shipped.
+
+#### §49.3.7 — Slice 38: Canonical JSONL composer + trailing newline *(2594b2c38e, PR #63660)*
+
+The minimal, correct fix: **+1 byte.** New `DoublewordProvider._compose_jsonl_batch_entry()` `@staticmethod` = single source of truth (validates 4 required fields + body-is-dict + emits `json.dumps(...) + '\n'`; serialization params otherwise unchanged for min-diff). Both raw call sites replaced. Belt-and-braces guard in `_upload_file` warns + auto-appends `\n` if any future caller bypasses the composer. AST pin against `json.dumps → _upload_file` chains so it cannot regress. **Empirical proof, v33-shaped payload:** LEGACY 357 B, last byte `}`, `ends_nl=False` → DW 500; SLICE38 358 B, last byte `\n`, `ends_nl=True` → accept. Delta = exactly the +1 byte DW asked for. 13 tests (5 AST + 8 spine) + 173/173 cross-arc regression. *(This also resolved the v30 "40/40 OK" paradox — the bare-metal probe used the same broken `prompt_only` path but predated DW's validator tightening.)*
+
+#### §49.3.8 — v34: gatekick HTTP 200, then the blocker migrates again
+
+The v34 gatekick (`scripts/ouroboros_v34_gatekick.py`, `1b566347cb`) ran an isolated `/v1/files` smoke test via the canonical composer and got **HTTP 200, `file_id=dcb7e506-02c3-4c20-8618-1c15cc1504cc`, 0.71 s — the first-ever `/v1/files` success in the arc.** The `/v1/files` root cause is **closed and externally validated.**
+
+**But the v34 capability soak (`bt-2026-05-28-180523`, 11:05→11:28, 23 min, no `summary.json`, 5 Exhaustions) still produced 0 APPLY** — because the soak's hot path uses the **streaming chat-completions** surface (preflight gate + every STANDARD/COMPLEX op), *not* `/v1/files`. The preflight probed all three promoted models on every backoff cycle (30→60→120→240→300 s) and every probe returned:
+
+```
+Qwen3.5-35B   → DEGRADED_5XX status=0  diag=transport_error: done_before_content
+Qwen3.5-397B  → DEGRADED_5XX status=0  diag=transport_error: done_before_content
+Kimi-K2.6     → DEGRADED_5XX / DEGRADED_TIMEOUT (10s)
+  → active=0 for the entire run → fleet never populated → 0 ops dispatched → 0 APPLY
+```
+
+**`done_before_content` precisely defined** (`dw_heavy_probe.py:732-764`): the request got **HTTP 200**, DW opened a **valid SSE stream**, sent `data: [DONE]`, but emitted **zero content deltas** (`first_chunk_seen` never flipped). This is a *clean stream with an empty completion* — an **upstream** signal (model returned nothing / capacity), structurally distinct from the transport-failure branches in the same function (`stream_closed_early` line 745-751, `ttft_timeout` line 738-743, connection exceptions line 785). The blocker migrated from the batch-upload surface to the real-time wire.
+
+### §49.4 — Slice numbering reconciliation (planned vs. actual)
+
+The doc-drift the operator flagged. §48.13 (authored 2026-05-27) used "Slice 34–38" as *planned* names; the v30→v34 arc *shipped* Slices 35–38 for different work. Canonical mapping:
+
+| Number | §48.13 *planned* (now renumbered → Slice 40+) | *Actually shipped* (2026-05-27/28) |
+|---|---|---|
+| Slice 34 | §48.7 upstream DW capacity investigation | *Executed* as the empirical v30→v34 arc (not a single PR); v34 gatekick `1b566347cb` |
+| Slice 35 | Adaptive per-shape routing / breaker tuning | **Dual-path dispatch profiling** (b014f1c6d7, #61727) |
+| Slice 36 | Bloom filter / response cache / rate limiter | **Adaptive Transport Dispatcher** (e5d4c86e1e, #62027) |
+| Slice 37 | Latency predictor (ML) | **Multipart payload diagnostic + cleanup** (c2de840edc, #63659) |
+| Slice 38 | Three-tier Claude policy | **Canonical JSONL composer + trailing `\n`** (2594b2c38e, #63660) |
+| Slice 39 | — | **Multi-surface transport-health substrate** (this section, §49.6) |
+| Slice 40+ | The four deferred cost-intelligence arcs above | gated on capability bar (APPLY) first firing |
+
+### §49.5 — Mistakes made + lessons learned (honest, per "no euphoria")
+
+- **Mistake — single-surface optimism.** The v34 gatekick HTTP 200 created a momentary read that "the capability problem is solved." It was not: the soak's streaming surface was independently degraded. **Lesson:** validate the *hot-path surface*, not a convenient adjacent one (→ §49.2 corollary 1, → Slice 39 multi-surface sweep).
+- **Mistake — symptom-name conflation.** "DW 397B TIMEOUT" (v28/v29) framed an 8× RT/BATCH latency asymmetry as a model fault. The fix (force BATCH) only emerged once Slice 35 instrumented the sub-stages. **Lesson:** instrument before hypothesizing; classify by protocol semantics.
+- **Mistake — one-soak-per-defect cost.** Ten soaks burned to peel four blocker layers. **Lesson:** front-load a concurrent multi-surface health probe so the *next* layer surfaces in seconds.
+- **What went right:** every fix was minimal and structural — Slice 38 was literally +1 byte through a single canonical composer with an AST pin; Slice 36 composed the existing BATCH corridor rather than building a parallel one; Slice 37's diagnostic is what made the external diagnosis possible. No brute-force retries, no hardcoded model names, no parallel transport paths.
+
+### §49.6 — Forward design: Slice 39 — Multi-Surface Transport-Health Substrate *(AUTHORIZED 2026-05-28; design approved, implementation plan via writing-plans)*
+
+**Goal:** replace the one-soak-per-blocker discovery loop with a concurrent up-front health sweep across **all** DW transport surfaces, classify each failure by protocol semantics, persist a per-surface ledger, and route recovery by failure *class* — composing existing modules, zero duplication.
+
+#### §49.6.1 — Phase 2: multi-surface health matrix (extend `preflight_probe.py`)
+
+A concurrent `asyncio.gather` sweep of three surfaces, reusing existing client code (no new transport):
+
+| Surface | Tests | Composes (existing) |
+|---|---|---|
+| **A — Batch storage** | `/v1/files` upload | `DoublewordProvider._upload_file` + `_compose_jsonl_batch_entry` (the gatekick pattern) |
+| **B — Direct streaming** | 1-token `/v1/chat/completions` | `dw_heavy_probe` (already returns the 5 failure shapes) |
+| **C — Auth sync** | Aegis session-bearer handshake | `aegis_provider_bridge.dw_session_auth_header` |
+
+Per-surface ledger at `.jarvis/dw_surface_health.json`, modeled on the **existing `ModalityLedger` persistence pattern** (snapshot dataclass + `to_json_dict`/`from_json_dict` + flock'd write). `ModalityLedger` is per-*model*; this adds the orthogonal per-*surface* dimension — it composes the proven pattern, it does not duplicate the ledger. All surfaces / thresholds / model list are env- or policy-driven (mirrors `preflight_probe`'s `_envb/_envf/_envi` convention) — **no hardcoding.**
+
+#### §49.6.2 — Phase 3: bifurcated disambiguation routing (the root-cause-respecting core)
+
+On a Surface B failure, classify by protocol semantics, **not** by symptom:
+
+- **Transport class** (`ServerDisconnectedError`, connection reset, connect timeout, `stream_closed_early`, `ttft_timeout`): fire a **raw-HTTP disambiguation probe** that bypasses the pooled `aiohttp.ClientSession` (one-shot fresh `TCPConnector`). If raw **succeeds** while pooled **fails** → classify **client-side pool stagnation** → `ClientLifecycleManager` hard-flushes the `TCPConnector` socket cache + rebuilds the session. *This is the only branch where a flush is correct.*
+- **Upstream class** (`done_before_content` — HTTP 200, clean SSE, `[DONE]` with zero deltas): **bypass the flush entirely** (the socket is healthy — flushing it and re-probing the same empty stream is a brute-force retry loop, forbidden by the zero-shortcut mandate). Flip the existing `dw_topology_circuit_breaker` to active and mark the surface `upstream_degraded`. The raw probe may still run to *record evidence* that it is upstream, but it never triggers a flush.
+
+**Why this matters:** v34's signature (all 3 models, `status=0`, clean stream, empty completion) is the upstream class. The correct outcome is the flush *not* firing — honoring socket health and surfacing the real (upstream-capacity) constraint rather than masking it behind pointless client churn.
+
+#### §49.6.3 — Phase 1/4 wrappers
+
+- **Phase 1** (this section): PRD unification — §49 authored, §48.13 drift reconciled, moving-blocker lesson codified.
+- **Phase 4:** new health-matrix test hooks + full cross-arc regression green; merge to `main`; cost-insulated **v35 health-telemetry probe** ($1.00 / 600 s) to observe the multi-surface ledger populate under live load.
+
+#### §49.6.4 — Anti-goals / what Slice 39 does NOT promise
+
+- **No claim that Slice 39 produces an APPLY.** If `done_before_content` confirms upstream capacity exhaustion, *no client-side substrate moves the capability bar* — that is hypothesis (a) from §48.5, which is operator/account-side (cross-ref `memory/project_v33_capability_soak_postmortem.md`'s "blocker moved across stack but unmet"). Slice 39's value is **fast, correct disambiguation** + **not masking upstream faults with client churn**, not a capability guarantee.
+- **No new transport path.** Surfaces A/B/C all reuse existing client code.
+- **No hardcoded models or thresholds.** Env/policy-driven throughout.
+- **No flush-on-`done_before_content`.** Explicitly rejected; see §49.6.2.
+
+### §49.7 — Honest framing
+
+The `/v1/files` root cause is closed and externally validated — a genuine, externally-confirmed win. The capability bar (APPLY/VERIFY/RESOLVED) remains **0/0/0 across 10 cumulative soaks**; the live blocker is the streaming `done_before_content` upstream signal. Slice 39 makes the system *detect and classify* that blocker in seconds instead of a soak-burn, and refuses to paper over an upstream fault with a client-pool flush — but it does not, and does not claim to, manufacture upstream capacity. Per `memory/feedback_no_preresult_euphoria.md`: methodology validated, capability still unmeasured.
 
 ---
 

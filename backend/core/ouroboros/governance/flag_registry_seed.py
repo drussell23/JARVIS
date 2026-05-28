@@ -4753,6 +4753,106 @@ SEED_SPECS: list = [
         example="86400",
         since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
     ),
+
+    # ====================================================================
+    # Slice 39 — Multi-Surface DW Transport-Health Substrate — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_DW_SURFACE_HEALTH_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Slice 39 master gate for the multi-surface DW transport-health "
+            "substrate. When true, run_surface_health_sweep probes all three "
+            "surfaces (DIRECT_STREAMING, BATCH_STORAGE, AUTH_SYNC) at boot "
+            "and records results in the SurfaceHealthLedger. Default FALSE "
+            "pending v35 graduation soak."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/preflight_probe.py"
+        ),
+        example="true",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_DW_SURFACE_HEALTH_PATH",
+        type=FlagType.STR, default=".jarvis/dw_surface_health.json",
+        description=(
+            "File path override for the SurfaceHealthLedger on-disk "
+            "JSON store. Relative paths are resolved from the repo root."
+        ),
+        category=Category.INTEGRATION,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_surface_health.py"
+        ),
+        example=".jarvis/dw_surface_health.json",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+    ),
+    FlagSpec(
+        name="JARVIS_DW_SURFACE_PROBE_TIMEOUT_S",
+        type=FlagType.FLOAT, default=10.0,
+        description=(
+            "Per-surface probe timeout in seconds. Each of the three "
+            "surface probes (DIRECT_STREAMING, BATCH_STORAGE, AUTH_SYNC) "
+            "is wrapped in asyncio.wait_for with this cap."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_surface_probes.py"
+        ),
+        example="10.0",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+    ),
+    FlagSpec(
+        name="JARVIS_DW_TRANSPORT_FLUSH_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Allow lifecycle.flush_transport_pool to be called when the "
+            "raw bypass probe confirms pool stagnation on a TRANSPORT-class "
+            "failure. Set to false to disable pool hard-flushes entirely "
+            "(useful during capacity debugging)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_transport_disambiguator.py"
+        ),
+        example="true",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_DW_TRANSPORT_FLUSH_COOLDOWN_S",
+        type=FlagType.FLOAT, default=60.0,
+        description=(
+            "Minimum seconds between successive flush_transport_pool calls "
+            "to prevent brute-force re-probe loops during sustained "
+            "transport degradation."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_transport_disambiguator.py"
+        ),
+        example="60.0",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+    ),
+    FlagSpec(
+        name="JARVIS_DW_RAW_BYPASS_PROBE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Run the raw bypass probe (fresh one-shot aiohttp session) on "
+            "TRANSPORT-class failures to confirm pool stagnation before "
+            "flushing. When false, TRANSPORT failures skip the probe and "
+            "never flush (conservative no-flush default)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_transport_disambiguator.py"
+        ),
+        example="true",
+        since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
 ]
 
 

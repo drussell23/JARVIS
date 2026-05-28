@@ -773,6 +773,24 @@ class DoublewordProvider:
             )
         return self._session
 
+    async def force_session_reset(self) -> None:
+        """Slice 39 — hard-flush the aiohttp transport pool.
+
+        Closes the current ClientSession (and its TCPConnector socket
+        cache) and nulls it so the NEXT ``_get_session()`` rebuilds a
+        fresh connector. Composes the existing rebuild path in
+        ``_get_session`` — no duplicate connector logic. Used by the
+        transport disambiguator ONLY for the transport-failure class
+        (never for upstream ``done_before_content``). NEVER raises.
+        """
+        sess = self._session
+        self._session = None
+        if sess is not None and not getattr(sess, "closed", True):
+            try:
+                await sess.close()
+            except Exception:  # noqa: BLE001 — flush must not raise
+                pass
+
     @staticmethod
     def _request_timeout() -> "aiohttp.ClientTimeout":
         """Per-request timeout safe to use inside aiohttp 3.9+ tasks."""

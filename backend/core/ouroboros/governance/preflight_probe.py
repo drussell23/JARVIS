@@ -91,6 +91,7 @@ _ENV_MASTER = "JARVIS_PREFLIGHT_PROBE_ENABLED"
 _ENV_TIMEOUT_PER_MODEL_S = "JARVIS_PREFLIGHT_TIMEOUT_PER_MODEL_S"
 _ENV_TEST_PROMPT = "JARVIS_PREFLIGHT_TEST_PROMPT"
 _ENV_HALT_ON_ALL_FAIL = "JARVIS_PREFLIGHT_HALT_ON_ALL_FAIL"
+_ENV_SURFACE_HEALTH_ENABLED = "JARVIS_DW_SURFACE_HEALTH_ENABLED"
 
 _DEFAULT_TIMEOUT_PER_MODEL_S = 10.0
 _DEFAULT_TEST_PROMPT = "ping"
@@ -1002,3 +1003,52 @@ async def _run_preflight_with_recovery_daemon(
         await asyncio.sleep(current_backoff)
         # Exponential growth, capped
         current_backoff = min(current_backoff * multiplier, max_backoff_s)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Slice 39 Task 8 — Surface Health Sweep orchestration entry point
+# ──────────────────────────────────────────────────────────────────────
+
+
+def is_surface_health_enabled() -> bool:
+    """Slice 39 master gate. Default FALSE pending v35 graduation."""
+    return _envb(_ENV_SURFACE_HEALTH_ENABLED, False)
+
+
+async def run_surface_health_sweep(
+    *,
+    provider,
+    model_id: str,
+):
+    """Slice 39 — composes the per-surface ledger + concurrent sweep.
+
+    Returns the surface snapshot dict, or None when the master flag is
+    off / provider is None. NEVER raises (health telemetry must not wedge
+    boot). Callable inline from GovernedLoopService (future wiring slice)
+    or manually from the v35 health-telemetry probe.
+    """
+    if not is_surface_health_enabled():
+        logger.debug("[Slice39] surface health sweep skipped: master flag off")
+        return None
+    if provider is None:
+        logger.warning("[Slice39] surface health sweep skipped: no provider")
+        return None
+    try:
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+        )
+        from backend.core.ouroboros.governance.dw_surface_probes import (
+            run_surface_sweep,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Slice39] surface sweep skipped: import failed: %r", exc)
+        return None
+    ledger = SurfaceHealthLedger()
+    try:
+        snap = await run_surface_sweep(
+            provider=provider, model_id=model_id, ledger=ledger,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive belt
+        logger.warning("[Slice39] surface sweep raised: %r", exc)
+        return None
+    return snap
