@@ -3,72 +3,33 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #101370
-- **Branch**: `fix/ci/pr-automation-validation-run101345-20260528-105038`
-- **Commit**: `88ea97aa348c7caa8e6631c4896a8e95f5c3e9a4`
+- **Run Number**: #101380
+- **Branch**: `fix/ci/pr-automation-validation-run101370-20260528-105357`
+- **Commit**: `d82d9ed4e5d4199523bbea342b8d596f97043f7a`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-28T10:51:25Z
+- **Timestamp**: 2026-05-28T10:54:31Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26570266347)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26570404986)
 
 ## Failure Overview
 
-Total Failed Jobs: **5**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | PR Size Check | permission_error | high | 4s |
-| 2 | Validate PR Title | timeout | high | 4s |
-| 3 | Check for Conflicts | permission_error | high | 4s |
-| 4 | Auto-Label PR | permission_error | high | 12s |
-| 5 | Check PR Description | permission_error | high | 4s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. PR Size Check
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-28T10:51:50Z
-**Completed**: 2026-05-28T10:51:54Z
-**Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570266347/job/78275297655)
-
-#### Failed Steps
-
-- **Step 2**: Check PR Size
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 45: `2026-05-28T10:51:52.9002206Z RequestError [HttpError]: API rate limit exceeded for installation. If `
-    - Line 97: `2026-05-28T10:51:52.9146058Z ##[error]Unhandled error: HttpError: API rate limit exceeded for instal`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 1: `${warning}`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 2. Validate PR Title
+### 1. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-28T10:51:52Z
-**Completed**: 2026-05-28T10:51:56Z
+**Started**: 2026-05-28T10:54:35Z
+**Completed**: 2026-05-28T10:54:39Z
 **Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570266347/job/78275297663)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570404986/job/78275769211)
 
 #### Failed Steps
 
@@ -81,123 +42,23 @@ Total Failed Jobs: **5**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 16: `2026-05-28T10:51:54.0291633Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 28: `2026-05-28T10:51:54.3351383Z ##[error]API rate limit exceeded for installation. If you reach out to `
+    - Line 30: `2026-05-28T10:54:37.3886440Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-28T10:54:38.0177952Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 30: `2026-05-28T10:51:54.3812997Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-28T10:54:38.0635574Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 20: `- fix: Resolve database connection timeout`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
 2. Check service availability and network connectivity
-
----
-
-### 3. Check for Conflicts
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-28T10:52:06Z
-**Completed**: 2026-05-28T10:52:10Z
-**Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570266347/job/78275297669)
-
-#### Failed Steps
-
-- **Step 2**: Check Merge Conflicts
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 45: `2026-05-28T10:52:08.9424807Z RequestError [HttpError]: API rate limit exceeded for installation. If `
-    - Line 46: `2026-05-28T10:52:08.9466632Z ##[error]Unhandled error: HttpError: API rate limit exceeded for instal`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 4. Auto-Label PR
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-28T10:51:52Z
-**Completed**: 2026-05-28T10:52:04Z
-**Duration**: 12 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570266347/job/78275297699)
-
-#### Failed Steps
-
-- **Step 4**: Intelligent Auto-Labeling
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 33: `2026-05-28T10:52:02.0077219Z RequestError [HttpError]: API rate limit exceeded for installation. If `
-    - Line 87: `2026-05-28T10:52:02.0113921Z ##[error]Unhandled error: HttpError: API rate limit exceeded for instal`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2026-05-28T10:52:02.1487249Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2026-05-28T10:52:02.1487249Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 5. Check PR Description
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-05-28T10:52:02Z
-**Completed**: 2026-05-28T10:52:06Z
-**Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26570266347/job/78275297795)
-
-#### Failed Steps
-
-- **Step 2**: Verify PR Description
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 43: `2026-05-28T10:52:04.4223899Z RequestError [HttpError]: API rate limit exceeded for installation. If `
-    - Line 44: `2026-05-28T10:52:04.4271714Z ##[error]Unhandled error: HttpError: API rate limit exceeded for instal`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
 
 ---
 
@@ -217,5 +78,5 @@ Total Failed Jobs: **5**
 
 ---
 
-📊 *Report generated on 2026-05-28T10:53:57.618806*
+📊 *Report generated on 2026-05-28T10:56:58.460546*
 🤖 *JARVIS CI/CD Auto-PR Manager*
