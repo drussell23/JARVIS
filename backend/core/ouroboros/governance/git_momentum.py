@@ -106,6 +106,117 @@ class MomentumSnapshot:
         return self.commit_count == 0
 
 
+async def compute_recent_momentum_async(
+    project_root: Path,
+    max_commits: int = _DEFAULT_MAX_COMMITS,
+    timeout_s: float = _DEFAULT_TIMEOUT_S,
+) -> Optional[MomentumSnapshot]:
+    """Slice 33 Arc 2 Phase 1 — async-native git momentum.
+
+    Same return shape as :func:`compute_recent_momentum` but uses
+    ``asyncio.create_subprocess_exec`` so no thread-pool slot is
+    consumed during the git log scan. NEVER raises — every failure
+    path returns ``None``.
+    """
+    import asyncio as _asyncio_gm
+    n = max(1, int(max_commits))
+    try:
+        proc = await _asyncio_gm.create_subprocess_exec(
+            "git", "log", f"-{n}", "--pretty=format:%H|%ct|%s",
+            cwd=str(project_root),
+            stdout=_asyncio_gm.subprocess.PIPE,
+            stderr=_asyncio_gm.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        stdout_bytes, _ = await _asyncio_gm.wait_for(
+            proc.communicate(), timeout=float(timeout_s),
+        )
+    except _asyncio_gm.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    except _asyncio_gm.CancelledError:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        text = stdout_bytes.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+    return _parse_git_log_output(text)  # noqa: F821 — defined below
+
+
+def _parse_git_log_output(text: str) -> Optional[MomentumSnapshot]:
+    """Pure parse — shared by sync + async entries. NEVER raises.
+    Extracted from the legacy ``compute_recent_momentum`` body so
+    the async variant doesn't duplicate parsing logic."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    scope_counts: Dict[str, int] = {}
+    type_counts: Dict[str, int] = {}
+    latest_subjects: List[str] = []
+    non_conventional = 0
+    timestamps: List[int] = []
+    parsed = 0
+
+    for raw in lines:
+        parts = raw.split("|", 2)
+        if len(parts) != 3:
+            continue
+        _hash, ts_str, subject = parts
+        subject = subject.strip()
+        if not subject:
+            continue
+        parsed += 1
+        try:
+            timestamps.append(int(ts_str))
+        except ValueError:
+            pass
+
+        m = _CONVENTIONAL_COMMIT_RE.match(subject)
+        if not m:
+            non_conventional += 1
+            latest_subjects.append(subject[:_SUBJECT_TRUNCATION])
+            continue
+        t = (m.group("type") or "").lower()
+        s = (m.group("scope") or "").lower()
+        sub = (m.group("subject") or "").strip()
+        if t:
+            type_counts[t] = type_counts.get(t, 0) + 1
+        if s:
+            scope_counts[s] = scope_counts.get(s, 0) + 1
+        if sub:
+            latest_subjects.append(sub[:_SUBJECT_TRUNCATION])
+
+    if parsed == 0:
+        return None
+
+    span = 0.0
+    if len(timestamps) >= 2:
+        span = float(max(timestamps) - min(timestamps))
+
+    return MomentumSnapshot(
+        commit_count=parsed,
+        scope_counts=scope_counts,
+        type_counts=type_counts,
+        latest_subjects=tuple(latest_subjects),
+        non_conventional_count=non_conventional,
+        wall_seconds_span=span,
+    )
+
+
 def compute_recent_momentum(
     project_root: Path,
     max_commits: int = _DEFAULT_MAX_COMMITS,
@@ -153,64 +264,9 @@ def compute_recent_momentum(
 
     if result.returncode != 0:
         return None
-
-    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
-    if not lines:
-        return None
-
-    scope_counts: Dict[str, int] = {}
-    type_counts: Dict[str, int] = {}
-    latest_subjects: List[str] = []
-    non_conventional = 0
-    timestamps: List[int] = []
-    parsed = 0
-
-    for raw in lines:
-        # Split on the first two pipes only. Subjects may contain pipes.
-        parts = raw.split("|", 2)
-        if len(parts) != 3:
-            # Malformed line — skip but do not abort the whole snapshot.
-            continue
-        _hash, ts_str, subject = parts
-        subject = subject.strip()
-        if not subject:
-            continue
-        parsed += 1
-        try:
-            timestamps.append(int(ts_str))
-        except ValueError:
-            pass
-
-        m = _CONVENTIONAL_COMMIT_RE.match(subject)
-        if not m:
-            non_conventional += 1
-            latest_subjects.append(subject[:_SUBJECT_TRUNCATION])
-            continue
-        t = (m.group("type") or "").lower()
-        s = (m.group("scope") or "").lower()
-        sub = (m.group("subject") or "").strip()
-        if t:
-            type_counts[t] = type_counts.get(t, 0) + 1
-        if s:
-            scope_counts[s] = scope_counts.get(s, 0) + 1
-        if sub:
-            latest_subjects.append(sub[:_SUBJECT_TRUNCATION])
-
-    if parsed == 0:
-        return None
-
-    span = 0.0
-    if len(timestamps) >= 2:
-        span = float(max(timestamps) - min(timestamps))
-
-    return MomentumSnapshot(
-        commit_count=parsed,
-        scope_counts=scope_counts,
-        type_counts=type_counts,
-        latest_subjects=tuple(latest_subjects),
-        non_conventional_count=non_conventional,
-        wall_seconds_span=span,
-    )
+    # Slice 33 Arc 2 Phase 1 — shared parser keeps sync + async byte-
+    # identical. Extracted from the legacy inline parse loop.
+    return _parse_git_log_output(result.stdout)
 
 
 def format_themes(snapshot: Optional[MomentumSnapshot]) -> List[str]:

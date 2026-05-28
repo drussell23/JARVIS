@@ -207,6 +207,48 @@ def _is_oracle_legacy_thread_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Slice 33 Arc 2 Phase 3 — async graph-write queue master switch.
+# Default TRUE — closes the v28 LoopSink-confirmed sink:
+#   oracle._index_file.graph_write_bulk 76 occurrences peak 3,580 ms
+# Setting JARVIS_ORACLE_GRAPH_QUEUE_ENABLED=0 restores the pre-
+# Slice-33-Arc-2-P3 inline-write path byte-identically (escape hatch).
+
+_ORACLE_GRAPH_QUEUE_ENABLED_ENV: str = "JARVIS_ORACLE_GRAPH_QUEUE_ENABLED"
+_ORACLE_GRAPH_QUEUE_MAX_SIZE_ENV: str = "JARVIS_ORACLE_GRAPH_QUEUE_MAX_SIZE"
+_ORACLE_GRAPH_QUEUE_BATCH_SIZE_ENV: str = "JARVIS_ORACLE_GRAPH_QUEUE_BATCH_SIZE"
+_DEFAULT_GRAPH_QUEUE_MAX_SIZE: int = 1000
+_DEFAULT_GRAPH_QUEUE_BATCH_SIZE: int = 50
+
+
+def _is_oracle_graph_queue_enabled() -> bool:
+    """Slice 33 Arc 2 Phase 3 — default TRUE. Explicit falsy values
+    restore inline-write path (escape hatch only)."""
+    raw = os.environ.get(_ORACLE_GRAPH_QUEUE_ENABLED_ENV, "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def _oracle_graph_queue_max_size() -> int:
+    try:
+        raw = os.environ.get(_ORACLE_GRAPH_QUEUE_MAX_SIZE_ENV, "").strip()
+        if not raw:
+            return _DEFAULT_GRAPH_QUEUE_MAX_SIZE
+        return max(10, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_GRAPH_QUEUE_MAX_SIZE
+
+
+def _oracle_graph_queue_batch_size() -> int:
+    try:
+        raw = os.environ.get(_ORACLE_GRAPH_QUEUE_BATCH_SIZE_ENV, "").strip()
+        if not raw:
+            return _DEFAULT_GRAPH_QUEUE_BATCH_SIZE
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_GRAPH_QUEUE_BATCH_SIZE
+
+
 # =============================================================================
 # ENUMS AND TYPES
 # =============================================================================
@@ -1729,6 +1771,22 @@ class TheOracle:
         from backend.core.ouroboros.oracle_readiness import OracleReadiness
         self._readiness = OracleReadiness()
 
+        # Slice 33 Arc 2 Phase 3 — async graph-write queue substrate.
+        # When the master flag JARVIS_ORACLE_GRAPH_QUEUE_ENABLED is
+        # enabled (default TRUE), _index_file enqueues
+        # (nodes, edges, cache_key, content_hash) batches and the
+        # consumer task drains+applies them via asyncio.to_thread —
+        # the NetworkX bulk mutations happen on a worker thread
+        # instead of the asyncio main loop. Closes v28 LoopSink
+        # graph_write_bulk pressure (76 occurrences, peak 3,580 ms).
+        self._graph_write_queue: Optional[asyncio.Queue] = None
+        self._graph_write_consumer_task: Optional[asyncio.Task] = None
+        self._graph_write_consumer_started: bool = False
+        self._graph_write_consumer_stop_event: Optional[asyncio.Event] = None
+        self._graph_writes_enqueued: int = 0
+        self._graph_writes_applied: int = 0
+        self._graph_writes_dropped: int = 0
+
         logger.info("The Oracle initialized")
 
     # ------------------------------------------------------------------
@@ -2230,16 +2288,52 @@ class TheOracle:
         # Use the hash the worker computed — defensive consistency
         # check against the main-thread hash (they MUST match, but if
         # they don't we trust the worker's view of what it parsed).
-        self._file_hashes[cache_key] = result.content_hash or content_hash
-        # Graph mutations on the event loop — same as legacy.
-        # Slice 33 Arc 0 — wrap the bulk write loop. v26 postmortem's
-        # leading hypothesis: 11,999 dispatches × N nodes/edges per
-        # file = millions of dict mutations here. If this site
-        # dominates the v27 leaderboard, Slice 33 Arc A (graph-write
-        # queue) gets scoped against the named target.
+        _effective_hash = result.content_hash or content_hash
+        # Slice 33 Arc 2 Phase 3 — async graph-write queue (default
+        # TRUE per JARVIS_ORACLE_GRAPH_QUEUE_ENABLED). When enabled,
+        # enqueue the write batch and return; the consumer task
+        # drains and applies via asyncio.to_thread off-loop. Closes
+        # the v28 LoopSink 76-occurrence graph_write_bulk pressure
+        # (peak 3,580 ms on large files).
+        if _is_oracle_graph_queue_enabled():
+            await self._ensure_graph_write_consumer()
+            assert self._graph_write_queue is not None
+            try:
+                # put_nowait if there's room, otherwise await to
+                # apply backpressure. Backpressure here means
+                # _index_file slows to match consumer drain rate —
+                # which is appropriate; otherwise we'd OOM on a 29k-
+                # file index burst.
+                self._graph_write_queue.put_nowait(
+                    (result.nodes, result.edges,
+                     cache_key, _effective_hash),
+                )
+                self._graph_writes_enqueued += 1
+            except asyncio.QueueFull:
+                # Backpressure path: await the put. The asyncio loop
+                # still ticks because we're awaiting.
+                try:
+                    await self._graph_write_queue.put(
+                        (result.nodes, result.edges,
+                         cache_key, _effective_hash),
+                    )
+                    self._graph_writes_enqueued += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to enqueue graph write for "
+                        f"{file_path}: {exc}"
+                    )
+                    self._graph_writes_dropped += 1
+            return
+
+        # Legacy inline-write path (escape hatch
+        # JARVIS_ORACLE_GRAPH_QUEUE_ENABLED=0). Slice 33 Arc 0
+        # LoopSink instrumentation retained for parity with the
+        # async-queue path's telemetry.
         from backend.core.ouroboros.telemetry.loop_sink import (  # noqa: WPS433
             sink_sync as _ls_sink_sync,
         )
+        self._file_hashes[cache_key] = _effective_hash
         with _ls_sink_sync(
             "oracle._index_file.graph_write_bulk",
         ):
@@ -2374,6 +2468,139 @@ class TheOracle:
                     await self._index_file(repo_name, repo_path, file_path)
             except Exception as e:
                 logger.warning(f"Error scanning {file_path}: {e}")
+
+    # ------------------------------------------------------------------
+    # Slice 33 Arc 2 Phase 3 — async graph-write queue
+    # ------------------------------------------------------------------
+
+    async def _ensure_graph_write_consumer(self) -> None:
+        """Lazy-start the graph-write consumer task on first enqueue.
+        Idempotent — safe to call concurrently."""
+        if self._graph_write_consumer_started:
+            return
+        # Lock-free initialization is fine here: _index_file is the
+        # only enqueue caller, runs in a single asyncio loop, so
+        # concurrent first-calls don't happen in practice. We use
+        # the flag check + immediate assignment for forward safety.
+        self._graph_write_consumer_started = True
+        max_size = _oracle_graph_queue_max_size()
+        self._graph_write_queue = asyncio.Queue(maxsize=max_size)
+        self._graph_write_consumer_stop_event = asyncio.Event()
+        self._graph_write_consumer_task = asyncio.create_task(
+            self._graph_write_consumer_loop(),
+            name="oracle.graph_write_consumer",
+        )
+        logger.info(
+            "[Oracle] graph_write_consumer started max_size=%d batch_size=%d",
+            max_size, _oracle_graph_queue_batch_size(),
+        )
+
+    async def _graph_write_consumer_loop(self) -> None:
+        """Drain the graph-write queue and apply batches off-loop.
+
+        Uses ``asyncio.to_thread`` to run the actual NetworkX bulk
+        mutations in a worker thread — the asyncio main loop is free
+        to schedule other coroutines during the apply window. Each
+        batch is up to ``JARVIS_ORACLE_GRAPH_QUEUE_BATCH_SIZE``
+        (default 50) records to amortize the per-call scheduling
+        overhead.
+        """
+        assert self._graph_write_queue is not None
+        assert self._graph_write_consumer_stop_event is not None
+        batch_size = _oracle_graph_queue_batch_size()
+        stop_event = self._graph_write_consumer_stop_event
+        queue = self._graph_write_queue
+        while True:
+            try:
+                # Wait for the first item OR a stop signal — whichever
+                # comes first. asyncio.wait drops the loser.
+                get_task = asyncio.create_task(queue.get())
+                stop_task = asyncio.create_task(stop_event.wait())
+                done, pending = await asyncio.wait(
+                    {get_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for p in pending:
+                    p.cancel()
+                if stop_task in done and get_task not in done:
+                    # Stop signal received with no pending item — exit
+                    break
+                if get_task not in done:
+                    continue
+                first = get_task.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Oracle] graph_write_consumer wait error: %s", exc,
+                )
+                continue
+            # Coalesce additional ready items into the batch
+            batch: List[Any] = [first]
+            while len(batch) < batch_size:
+                try:
+                    batch.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            # Apply batch off-loop. Worker thread holds GIL during
+            # mutations but asyncio loop ticks during the await.
+            try:
+                await asyncio.to_thread(self._apply_graph_batch_sync, batch)
+                self._graph_writes_applied += len(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Oracle] graph_write_consumer apply error: %s "
+                    "batch_size=%d", exc, len(batch),
+                )
+            finally:
+                for _ in batch:
+                    try:
+                        queue.task_done()
+                    except ValueError:
+                        # task_done() called more times than get() —
+                        # defensive; shouldn't happen but keep going.
+                        pass
+
+    def _apply_graph_batch_sync(self, batch: List[Any]) -> None:
+        """Sync NetworkX mutation worker — runs in asyncio.to_thread.
+
+        Each batch item is the tuple ``(nodes, edges, cache_key,
+        content_hash)`` produced by ``_index_file``. We apply the
+        cache hash + nodes + edges atomically per item, then move
+        to the next item. NEVER raises — per-item failures are
+        logged and the batch continues.
+        """
+        for item in batch:
+            try:
+                nodes, edges, cache_key, content_hash = item
+                self._file_hashes[cache_key] = content_hash
+                for node_data in nodes:
+                    self._graph.add_node(node_data)
+                for source, target, edge_data in edges:
+                    self._graph.add_edge(source, target, edge_data)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Oracle] graph batch item apply failed: %s", exc,
+                )
+
+    async def stop_graph_write_consumer(self) -> None:
+        """Signal the consumer to stop + drain remaining queue.
+        NEVER raises. Idempotent."""
+        if not self._graph_write_consumer_started:
+            return
+        if self._graph_write_consumer_stop_event is not None:
+            self._graph_write_consumer_stop_event.set()
+        if self._graph_write_consumer_task is not None:
+            try:
+                await asyncio.wait_for(
+                    self._graph_write_consumer_task, timeout=5.0,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._graph_write_consumer_task.cancel()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Oracle] graph_write_consumer stop error: %s", exc,
+                )
 
     @staticmethod
     def _resolved_graph_cache_path() -> Path:
