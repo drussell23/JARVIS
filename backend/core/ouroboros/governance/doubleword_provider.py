@@ -2819,9 +2819,65 @@ class DoublewordProvider:
         Default ``"dw-batch-upload"`` allows existing callers that
         haven't yet plumbed real op_id; production callers pass the
         live OperationContext op_id.
+
+        Slice 37 Phase 1+2 — payload diagnostics + ironclad cleanup:
+
+          * Per-call diagnostic log line BEFORE the POST: payload
+            byte size + custom_id + model_id from the JSONL line.
+            Lets operators correlate HTTP 500s with payload shape
+            without re-running the soak.
+          * Pre-flight size guard: ``JARVIS_DW_UPLOAD_MAX_BYTES``
+            (default 5 MB) rejects oversized payloads BEFORE the
+            HTTP round-trip with a structured error so the orchestrator
+            can fail fast + the operator gets a named cause.
+          * Full response body on HTTP error (was truncated to 500
+            chars; now 2000 chars for diagnostic depth).
+          * try/finally: explicit ``_aegis_release_call_lease`` call
+            on any failure path (was implicit; now explicit + bounded).
         """
         session = await self._get_session()
         import aiohttp
+
+        # Slice 37 Phase 1 — payload diagnostic. Extract custom_id +
+        # model_id from the JSONL line (single line, JSON-parseable)
+        # so operators can correlate HTTP 500s with payload shape.
+        _payload_bytes = len(jsonl_content.encode("utf-8"))
+        _payload_custom_id = "?"
+        _payload_model = "?"
+        try:
+            _parsed = json.loads(jsonl_content)
+            _payload_custom_id = str(_parsed.get("custom_id", "?"))[:40]
+            _payload_body = _parsed.get("body", {}) or {}
+            _payload_model = str(_payload_body.get("model", "?"))
+        except Exception:  # noqa: BLE001 — diagnostic only
+            pass
+
+        # Slice 37 Phase 1 — pre-flight size guard. DW's /v1/files
+        # endpoint returns opaque HTTP 500 on oversized payloads;
+        # fail-fast with named cause before the round-trip.
+        _max_upload_bytes = 5 * 1024 * 1024  # 5 MB default
+        try:
+            _env_max = os.environ.get("JARVIS_DW_UPLOAD_MAX_BYTES", "").strip()
+            if _env_max:
+                _max_upload_bytes = max(1024, int(_env_max))
+        except (TypeError, ValueError):
+            pass
+        if _payload_bytes > _max_upload_bytes:
+            logger.error(
+                "[DoublewordProvider] File upload PRE-FLIGHT REJECTED: "
+                "payload %d bytes exceeds JARVIS_DW_UPLOAD_MAX_BYTES=%d "
+                "(custom_id=%s model=%s op=%s) — failing fast",
+                _payload_bytes, _max_upload_bytes,
+                _payload_custom_id, _payload_model, op_id[:16],
+            )
+            self._last_error_status = 413  # Payload Too Large semantic
+            return None
+
+        logger.info(
+            "[DoublewordProvider] File upload START: payload=%d bytes "
+            "custom_id=%s model=%s op=%s",
+            _payload_bytes, _payload_custom_id, _payload_model, op_id[:16],
+        )
 
         data = aiohttp.FormData()
         data.add_field(
@@ -2839,6 +2895,9 @@ class DoublewordProvider:
             except Exception:
                 raise  # Let CircuitBreakerOpen propagate
 
+        # Slice 37 Phase 2 — explicit lease acquire BEFORE try block so
+        # the lease handle is visible to the finally cleanup.
+        _aegis_lease = None
         try:
             # Slice 31 — Aegis-aware Authorization session bearer
             # injection (closes v24 missing_session_bearer 401 wedge).
@@ -2867,14 +2926,48 @@ class DoublewordProvider:
                 if resp.status >= 300:
                     self._last_error_status = resp.status
                     body = await resp.text()
-                    logger.error("[DoublewordProvider] File upload failed: %s %s", resp.status, body[:500])
+                    # Slice 37 Phase 1 — full body (2000 chars vs 500),
+                    # payload size + model so operators can correlate
+                    # HTTP errors with what was actually sent.
+                    logger.error(
+                        "[DoublewordProvider] File upload FAILED: "
+                        "status=%d payload=%d bytes custom_id=%s "
+                        "model=%s op=%s body=%s",
+                        resp.status, _payload_bytes,
+                        _payload_custom_id, _payload_model, op_id[:16],
+                        body[:2000],
+                    )
                     return None
                 result = await resp.json()
                 return result.get("id")
         except Exception as exc:
             self._last_error_status = 0  # non-HTTP failure
-            logger.warning("[DoublewordProvider] File upload error: %s: %s", type(exc).__name__, exc)
+            logger.warning(
+                "[DoublewordProvider] File upload exception: %s: %s "
+                "(payload=%d bytes custom_id=%s model=%s op=%s)",
+                type(exc).__name__, exc, _payload_bytes,
+                _payload_custom_id, _payload_model, op_id[:16],
+            )
             return None
+        finally:
+            # Slice 37 Phase 2 — explicit lease release on any path
+            # (success, HTTP error, exception). Aegis client treats
+            # release as advisory + idempotent; defensive no-op when
+            # _aegis_lease is None (e.g. lease acquire failed) OR
+            # when Aegis is disabled (release helper handles None).
+            if _aegis_lease is not None:
+                try:
+                    from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                        release_call_lease as _aegis_release_call_lease,
+                    )
+                    await _aegis_release_call_lease(_aegis_lease)
+                except (ImportError, AttributeError):
+                    pass  # release helper not available — legacy behavior
+                except Exception as _rel_exc:  # noqa: BLE001
+                    logger.debug(
+                        "[DoublewordProvider] lease release suppressed: %s",
+                        _rel_exc,
+                    )
 
     async def _create_batch(
         self, input_file_id: str, *, op_id: str = "dw-batch-create",
@@ -2891,6 +2984,11 @@ class DoublewordProvider:
             except Exception:
                 raise  # Let CircuitBreakerOpen propagate
 
+        # Slice 37 Phase 2 — explicit try/finally cleanup discipline.
+        # Lease initialized to None before try so finally never
+        # references an unbound name on early-throw paths.
+        _aegis_lease = None
+        _rate_limiter_recorded = False
         try:
             # Slice 31 — Aegis session bearer for /batches POST.
             _call_auth = await _aegis_dw_session_auth_header()
@@ -2914,10 +3012,14 @@ class DoublewordProvider:
                 if self._rate_limiter is not None:
                     self._rate_limiter.record("doubleword", "batches_create",
                                               latency_s=time.monotonic() - _rl_t0, status=resp.status)
+                    _rate_limiter_recorded = True
                 if resp.status >= 300:
                     self._last_error_status = resp.status
                     body = await resp.text()
-                    logger.error("[DoublewordProvider] Batch create failed: %s %s", resp.status, body[:500])
+                    logger.error(
+                        "[DoublewordProvider] Batch create failed: %s %s",
+                        resp.status, body[:2000],
+                    )
                     return None
                 result = await resp.json()
                 batch_id = result.get("id")
@@ -2929,6 +3031,37 @@ class DoublewordProvider:
             self._last_error_status = 0
             logger.exception("[DoublewordProvider] Batch create error")
             return None
+        finally:
+            # Slice 37 Phase 2 — rate-limiter accounting must never
+            # drift on early-throw paths. If the response context
+            # never entered (e.g., POST raised before headers), record
+            # a synthetic status=0 with the elapsed wall clock.
+            if not _rate_limiter_recorded and self._rate_limiter is not None:
+                try:
+                    self._rate_limiter.record(
+                        "doubleword", "batches_create",
+                        latency_s=time.monotonic() - _rl_t0,
+                        status=self._last_error_status or 0,
+                    )
+                except Exception:
+                    pass
+            # Forward-looking lease release (no-op until Aegis bridge
+            # publishes a release helper). ImportError suppressed so
+            # the discipline is in place without coupling to bridge
+            # surface that doesn't exist yet.
+            if _aegis_lease is not None:
+                try:
+                    from backend.core.ouroboros.governance.aegis_provider_bridge import (  # noqa: E501
+                        release_call_lease as _aegis_release_call_lease,
+                    )
+                    await _aegis_release_call_lease(_aegis_lease)
+                except (ImportError, AttributeError):
+                    pass
+                except Exception as _rel_exc:
+                    logger.debug(
+                        "[DoublewordProvider] _create_batch lease "
+                        "release suppressed: %s", _rel_exc,
+                    )
 
     # ------------------------------------------------------------------
     # Batch result awaiting: Tier 1 (webhook future) → Tier 2 (adaptive poll)
@@ -3019,13 +3152,20 @@ class DoublewordProvider:
         attempt = 0
 
         while time.monotonic() < deadline:
+            # Slice 37 Phase 2 — per-iteration cleanup discipline.
+            # Each poll iteration is its own lease/rate-limiter
+            # accounting unit; cleanup MUST be scoped to the iteration
+            # so a failure on iteration N doesn't leak resources into
+            # iteration N+1.
+            _aegis_lease = None
+            _rate_limiter_recorded = False
+            _rl_t0 = time.monotonic()
             try:
                 # Re-acquire session each iteration: if the connector was
                 # poisoned by a CancelledError on a prior iteration,
                 # _get_session() detects session.closed and creates a fresh one.
                 session = await self._get_session()
 
-                _rl_t0 = time.monotonic()
                 if self._rate_limiter is not None:
                     try:
                         await self._rate_limiter.acquire("doubleword", "batches_poll")
@@ -3047,6 +3187,7 @@ class DoublewordProvider:
                     if self._rate_limiter is not None:
                         self._rate_limiter.record("doubleword", "batches_poll",
                                                   latency_s=time.monotonic() - _rl_t0, status=resp.status)
+                        _rate_limiter_recorded = True
                     if resp.status >= 300:
                         self._last_error_status = resp.status
                         logger.warning("[DoublewordProvider] Poll error: %s", resp.status)
@@ -3080,6 +3221,33 @@ class DoublewordProvider:
                 )
                 if _is_network:
                     attempt = max(attempt, 3)  # Jump to higher backoff for network errors
+            finally:
+                # Slice 37 Phase 2 — per-iteration cleanup.
+                if (
+                    not _rate_limiter_recorded
+                    and self._rate_limiter is not None
+                ):
+                    try:
+                        self._rate_limiter.record(
+                            "doubleword", "batches_poll",
+                            latency_s=time.monotonic() - _rl_t0,
+                            status=self._last_error_status or 0,
+                        )
+                    except Exception:
+                        pass
+                if _aegis_lease is not None:
+                    try:
+                        from backend.core.ouroboros.governance.aegis_provider_bridge import (  # noqa: E501
+                            release_call_lease as _aegis_release_call_lease,
+                        )
+                        await _aegis_release_call_lease(_aegis_lease)
+                    except (ImportError, AttributeError):
+                        pass
+                    except Exception as _rel_exc:
+                        logger.debug(
+                            "[DoublewordProvider] _adaptive_poll_batch "
+                            "lease release suppressed: %s", _rel_exc,
+                        )
 
             await asyncio.sleep(self._next_poll_interval(attempt))
             attempt += 1
@@ -3104,6 +3272,9 @@ class DoublewordProvider:
             except Exception:
                 raise  # Let CircuitBreakerOpen propagate
 
+        # Slice 37 Phase 2 — explicit cleanup discipline mirror.
+        _aegis_lease = None
+        _rate_limiter_recorded = False
         try:
             # Slice 31 — Aegis session bearer for /files retrieve.
             _call_auth = await _aegis_dw_session_auth_header()
@@ -3120,6 +3291,7 @@ class DoublewordProvider:
                 if self._rate_limiter is not None:
                     self._rate_limiter.record("doubleword", "batches_retrieve",
                                               latency_s=time.monotonic() - _rl_t0, status=resp.status)
+                    _rate_limiter_recorded = True
                 if resp.status >= 300:
                     self._last_error_status = resp.status
                     logger.error("[DoublewordProvider] Retrieve failed: %s", resp.status)
@@ -3169,6 +3341,30 @@ class DoublewordProvider:
         except Exception:
             logger.exception("[DoublewordProvider] Retrieve error")
             return ("", None)
+        finally:
+            # Slice 37 Phase 2 — rate-limiter and lease cleanup mirror.
+            if not _rate_limiter_recorded and self._rate_limiter is not None:
+                try:
+                    self._rate_limiter.record(
+                        "doubleword", "batches_retrieve",
+                        latency_s=time.monotonic() - _rl_t0,
+                        status=self._last_error_status or 0,
+                    )
+                except Exception:
+                    pass
+            if _aegis_lease is not None:
+                try:
+                    from backend.core.ouroboros.governance.aegis_provider_bridge import (  # noqa: E501
+                        release_call_lease as _aegis_release_call_lease,
+                    )
+                    await _aegis_release_call_lease(_aegis_lease)
+                except (ImportError, AttributeError):
+                    pass
+                except Exception as _rel_exc:
+                    logger.debug(
+                        "[DoublewordProvider] _retrieve_result lease "
+                        "release suppressed: %s", _rel_exc,
+                    )
 
     # ------------------------------------------------------------------
     # Governance-free inference: prompt_only()
