@@ -165,16 +165,51 @@ def _slice36_should_force_batch(context: Any) -> bool:
         ).strip().lower() in ("1", "true", "yes", "on")
         if not _claude_disabled:
             return False
-        # Master opt-out (default ON per operator authorization)
-        _raw = os.environ.get(_SLICE36_FORCE_BATCH_ENV, "1").strip().lower()
-        if _raw in ("0", "false", "no", "off"):
-            return False
         # Route gate — only STANDARD + COMPLEX get the batch path
         _route = (
             getattr(context, "provider_route", "") or ""
         ).strip().lower()
-        return _route in ("standard", "complex")
+        if _route not in ("standard", "complex"):
+            return False
+        # Slice 36 static opt-out (default ON per operator authorization).
+        _raw = os.environ.get(_SLICE36_FORCE_BATCH_ENV, "1").strip().lower()
+        _static_on = _raw not in ("0", "false", "no", "off")
+        # Slice 41 — ledger-driven failover. Even if the static opt-in is OFF,
+        # force batch when the surface-health ledger shows the streaming wire
+        # degraded but the batch lane healthy (don't fail closed / halt loops).
+        return _static_on or _slice41_ledger_force_batch()
     except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+def _slice41_ledger_force_batch() -> bool:
+    """Slice 41 — True iff the Slice 39/40 surface-health ledger shows the
+    DIRECT_STREAMING surface degraded AND BATCH_STORAGE healthy (gated on the
+    surface-health master flag). This is the autonomous, ledger-driven failover
+    trigger: when the real-time wire is dropping content upstream but batch
+    generation works, route standard/complex ops through the batch lane.
+    NEVER raises — returns False (legacy RT) on any error / flag-off."""
+    try:
+        from backend.core.ouroboros.governance.preflight_probe import (
+            is_surface_health_enabled,
+        )
+        if not is_surface_health_enabled():
+            return False
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        led = SurfaceHealthLedger()
+        stream = led.verdict_for(SurfaceKind.DIRECT_STREAMING)
+        batch = led.verdict_for(SurfaceKind.BATCH_STORAGE)
+        streaming_degraded = stream is not None and stream.verdict in (
+            SurfaceVerdict.TRANSPORT_DEGRADED,
+            SurfaceVerdict.UPSTREAM_DEGRADED,
+        )
+        batch_healthy = batch is not None and batch.verdict == SurfaceVerdict.HEALTHY
+        return streaming_degraded and batch_healthy
+    except Exception:  # noqa: BLE001 — defensive, fail to legacy RT
         return False
 
 # Pricing (March 2026)

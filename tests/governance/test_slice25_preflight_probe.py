@@ -51,10 +51,12 @@ LEDGER_FILE = (
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_ast_pin_preflight_verdict_taxonomy_closed_at_5() -> None:
-    """PreflightVerdict MUST be exactly the 5 documented values.
-    Adding a 6th drift kind requires updating this pin + the
-    classifier + side-effect router — that friction is intentional."""
+def test_ast_pin_preflight_verdict_taxonomy_closed_at_6() -> None:
+    """PreflightVerdict MUST be exactly the 6 documented values.
+    Slice 41 added ACTIVE_BATCH_ONLY (streaming degraded + batch healthy →
+    keep eligible, route via batch). Adding a 7th drift kind requires
+    updating this pin + the classifier + side-effect router — that friction
+    is intentional."""
     src = PF_FILE.read_text()
     tree = ast.parse(src, filename=str(PF_FILE))
     found = []
@@ -67,6 +69,7 @@ def test_ast_pin_preflight_verdict_taxonomy_closed_at_5() -> None:
                             found.append(target.id)
     expected = {
         "ACTIVE",
+        "ACTIVE_BATCH_ONLY",
         "DEMOTED_ENTITLEMENT",
         "DEGRADED_5XX",
         "DEGRADED_TIMEOUT",

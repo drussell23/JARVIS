@@ -102,6 +102,11 @@ class PreflightVerdict(str, Enum):
     """Closed taxonomy — each probed model lands in exactly one bucket."""
 
     ACTIVE = "active"
+    # Slice 41 — streaming track degraded (done_before_content) BUT the
+    # batch_storage surface is healthy: the model is still usable via the
+    # batch lane, so it stays ELIGIBLE (counted as active) with a
+    # FORCE_BATCH routing modifier instead of being dropped from the fleet.
+    ACTIVE_BATCH_ONLY = "active_batch_only"
     DEMOTED_ENTITLEMENT = "demoted_entitlement"
     DEGRADED_5XX = "degraded_5xx"
     DEGRADED_TIMEOUT = "degraded_timeout"
@@ -159,9 +164,16 @@ class PreflightReport:
     degraded_5xx_count: int
     degraded_timeout_count: int
     error_other_count: int
+    # Slice 41 — subset of active_count that is ACTIVE_BATCH_ONLY (streaming
+    # degraded, kept eligible via the batch lane). Observability only;
+    # active_count already includes these so every fleet-empty / halt
+    # consumer treats them as eligible without further changes.
+    active_batch_only_count: int = 0
 
     @property
     def all_failed(self) -> bool:
+        # active_count includes ACTIVE_BATCH_ONLY, so a fleet with only
+        # batch-routable models is NOT "all failed".
         return self.active_count == 0 and len(self.results) > 0
 
     @property
@@ -171,6 +183,7 @@ class PreflightReport:
     def summary_line(self) -> str:
         return (
             f"active={self.active_count} "
+            f"active_batch_only={self.active_batch_only_count} "
             f"demoted_entitlement={self.demoted_entitlement_count} "
             f"degraded_5xx={self.degraded_5xx_count} "
             f"degraded_timeout={self.degraded_timeout_count} "
@@ -339,6 +352,73 @@ def _classify_outcome(outcome: ProbeOutcome) -> Tuple[
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Slice 41 — batch-aware fleet eligibility helpers
+# ──────────────────────────────────────────────────────────────────────
+
+# Slice 41 adds a nuance to the classification + routing: when the batch surface is healthy, 
+# a streaming-only degradation pattern (``done_before_content``) is recoverable via the 
+# batch lane, so we keep the model eligible with a FORCE_BATCH routing modifier instead of 
+# demoting it from the fleet. These helpers implement that logic without muddying the core 
+# classification or the main orchestration flow. 
+def _is_streaming_only_degradation(outcome: "ProbeOutcome") -> bool:
+    """Pure — True iff this probe failure is the streaming-transport-specific
+    empty-completion (``done_before_content``) that the BATCH lane bypasses.
+
+    This is the ONLY failure shape eligible for batch-failover: it means the
+    request reached DW, the model executed, but the RT-streaming wire emitted
+    zero content tokens before ``[DONE]``. Batch execution of the same request
+    completes with real content (empirically confirmed). Timeouts / 5xx /
+    entitlement / connection faults are NOT streaming-only — they are not
+    upgraded (a 5xx or auth fault would break batch too)."""
+    # Defensive: the presence of "done_before_content" in either the error_message or 
+    # error_body is the heuristic for this classification, so we check both fields just 
+    # in case the probe substrate shifts where it puts this info in the future. We also 
+    # guard against missing fields and non-string types just in case of unexpected probe 
+    # outcomes, since this logic is purely an eligibility enhancement and should fail 
+    # closed (not upgrade) if we can't confidently identify the streaming-only pattern.
+    if getattr(outcome, "success", False):
+        # Success outcomes are not degradations at all, so they can't be streaming-only 
+        # degradations. This is a quick check to avoid false positives in the string 
+        # matching below if the probe substrate returns an unexpected success outcome 
+        # with empty fields.
+        return False
+    # The "done_before_content" pattern has been observed in the error_message field, 
+    # but we check both fields to be safe. We also convert to lowercase to make the 
+    # check case-insensitive, just in case of future changes in the probe substrate's 
+    # formatting.
+    blob = (
+        f"{getattr(outcome, 'error_message', '') or ''} "
+        f"{getattr(outcome, 'error_body', '') or ''}"
+    ).lower()
+    # The presence of "done_before_content" is the heuristic for identifying this specific 
+    # degradation pattern. If we see it, we consider this a streaming-only degradation that 
+    # is eligible for batch failover. If we don't see it, we treat this as a regular 
+    # degradation that is not eligible for batch failover. This logic is based on empirical 
+    # observations of the probe outcomes and the known behavior of the DW surfaces.
+    return "done_before_content" in blob
+
+
+def _batch_surface_healthy() -> bool:
+    """Read the Slice 39/40 surface-health ledger; True iff batch_storage is
+    HEALTHY. Gated on the master flag. Reads ``.jarvis/dw_surface_health.json``
+    (or the env-overridden path). NEVER raises — returns False on any error so
+    a missing/unreadable ledger fails CLOSED (no spurious batch-failover)."""
+    if not is_surface_health_enabled():
+        return False
+    try:
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        rec = SurfaceHealthLedger().verdict_for(SurfaceKind.BATCH_STORAGE)
+        return rec is not None and rec.verdict == SurfaceVerdict.HEALTHY
+    except Exception as exc:  # noqa: BLE001 — fail closed
+        logger.debug("[Slice41] batch surface health read failed: %r", exc)
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────
 
@@ -437,13 +517,31 @@ async def run_preflight(
     # Classify + route side-effects
     results: List[ModelPreflightResult] = []
     active = 0
+    active_batch_only = 0
     dem_ent = 0
     deg_5xx = 0
     deg_timeout = 0
     err_other = 0
 
+    # Slice 41 — read the batch-surface health ONCE per cycle (not per model).
+    # When batch_storage is healthy, a streaming-only degradation
+    # (done_before_content) is recoverable via the batch lane → keep the
+    # model eligible instead of emptying the fleet.
+    batch_failover_ok = _batch_surface_healthy()
+
     for outcome in outcomes:
         verdict, marker, diag = _classify_outcome(outcome)
+
+        # Slice 41 — batch-aware fleet eligibility upgrade.
+        if (
+            verdict is PreflightVerdict.DEGRADED_5XX
+            and batch_failover_ok
+            and _is_streaming_only_degradation(outcome)
+        ):
+            verdict = PreflightVerdict.ACTIVE_BATCH_ONLY
+            marker = "FORCE_BATCH"
+            diag = f"streaming_degraded_batch_healthy: {diag}"
+
         results.append(ModelPreflightResult(
             model_id=outcome.model_id,
             verdict=verdict,
@@ -458,6 +556,19 @@ async def run_preflight(
             logger.info(
                 "[Preflight] model=%s ACTIVE latency=%dms",
                 outcome.model_id, outcome.latency_ms,
+            )
+            continue
+
+        if verdict is PreflightVerdict.ACTIVE_BATCH_ONLY:
+            # Counts as active (fleet not empty) — usable via the batch lane.
+            # NO sentinel failure report: the model is healthy enough to serve.
+            active += 1
+            active_batch_only += 1
+            logger.info(
+                "[Preflight] model=%s ACTIVE_BATCH_ONLY — streaming degraded "
+                "(done_before_content) but batch_storage healthy; kept "
+                "eligible with FORCE_BATCH routing modifier",
+                outcome.model_id,
             )
             continue
 
@@ -514,6 +625,7 @@ async def run_preflight(
         degraded_5xx_count=deg_5xx,
         degraded_timeout_count=deg_timeout,
         error_other_count=err_other,
+        active_batch_only_count=active_batch_only,
     )
 
     logger.info("[Preflight] complete: %s", report.summary_line())
