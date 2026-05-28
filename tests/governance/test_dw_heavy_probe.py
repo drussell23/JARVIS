@@ -681,7 +681,7 @@ class _StubProber:
         self.probed_ids: List[str] = []
 
     async def probe(self, *, session, model_id, base_url, api_key,
-                    observer=None):
+                    observer=None, parameter_count_b=None, **_kw):
         self.probed_ids.append(model_id)
         return HeavyProbeResult(
             model_id=model_id,
