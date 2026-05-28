@@ -4759,13 +4759,14 @@ SEED_SPECS: list = [
     # ====================================================================
     FlagSpec(
         name="JARVIS_DW_SURFACE_HEALTH_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
             "Slice 39 master gate for the multi-surface DW transport-health "
-            "substrate. When true, run_surface_health_sweep probes all three "
-            "surfaces (DIRECT_STREAMING, BATCH_STORAGE, AUTH_SYNC) at boot "
-            "and records results in the SurfaceHealthLedger. Default FALSE "
-            "pending v35 graduation soak."
+            "substrate. When true, run_boot_surface_health_sweep probes all "
+            "three surfaces (DIRECT_STREAMING, BATCH_STORAGE, AUTH_SYNC) at "
+            "GLS boot (Slice 40 wiring) and records results in the "
+            "SurfaceHealthLedger. Slice 40 graduated default TRUE 2026-05-28 "
+            "after live-sweep validation; operator opt-out via =false."
         ),
         category=Category.SAFETY,
         source_file=(
