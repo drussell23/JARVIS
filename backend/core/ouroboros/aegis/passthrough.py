@@ -56,6 +56,10 @@ from backend.core.ouroboros.aegis.lease import (
     TokenVerdictKind,
     validate_session_token,
 )
+from backend.core.ouroboros.aegis.request_body import (
+    BodyTooLarge,
+    read_body_capped,
+)
 from backend.core.ouroboros.aegis.upstream_registry import (
     AuthScheme,
     EndpointKind,
@@ -86,13 +90,16 @@ _INBOUND_HEADERS_TO_STRIP: Tuple[str, ...] = (
 
 
 class PassthroughOutcome(str, enum.Enum):
-    """Closed 5-value taxonomy of passthrough outcomes."""
+    """Closed 6-value taxonomy of passthrough outcomes."""
 
     SUCCESS = "success"
     AUTH_MISSING = "auth_missing"
     AUTH_INVALID = "auth_invalid"
     UPSTREAM_UNREACHABLE = "upstream_unreachable"
     CLIENT_DISCONNECTED = "client_disconnected"
+    # Slice 42 — inbound body exceeded the DoS cap; rejected with HTTP 413
+    # (distinct from CLIENT_DISCONNECTED: we refuse it, the client didn't drop).
+    REQUEST_TOO_LARGE = "request_too_large"
 
 
 @dataclass(frozen=True)
@@ -227,9 +234,27 @@ async def forward_passthrough(
             ),
         )
 
-    # --- 3. Request body (cap-enforced; passthrough never parses) ----------
+    # --- 3. Request body (FULL read, cap-enforced; passthrough never parses) -
+    # Slice 42 — read the ENTIRE body via read_body_capped (chunk-accumulation
+    # loop). The prior single ``request.content.read(cap)`` truncated bodies
+    # that arrived across multiple TCP segments (e.g. an 18 KB multipart batch
+    # upload), forwarding a broken multipart upstream → DW HTTP 400. The DoS
+    # cap is preserved: over-cap → HTTP 413, no unbounded buffering.
     try:
-        body_bytes = await request.content.read(_max_request_body_bytes())
+        body_bytes = await read_body_capped(request, _max_request_body_bytes())
+    except BodyTooLarge as exc:
+        return (
+            web.json_response(
+                {"ok": False, "error": "request_body_too_large",
+                 "detail": str(exc)}, status=413,
+            ),
+            PassthroughResult(
+                outcome=PassthroughOutcome.REQUEST_TOO_LARGE,
+                upstream_status=None,
+                response_bytes=0,
+                detail=str(exc),
+            ),
+        )
     except (asyncio.CancelledError, aiohttp.ClientError):
         raise
     except Exception as exc:  # noqa: BLE001

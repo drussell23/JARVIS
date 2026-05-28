@@ -60,6 +60,10 @@ from backend.core.ouroboros.aegis.pricing import (
     TokenPrice,
     cost_per_token_usd,
 )
+from backend.core.ouroboros.aegis.request_body import (
+    BodyTooLarge,
+    read_body_capped,
+)
 from backend.core.ouroboros.aegis.upstream_registry import (
     AuthScheme,
     UpstreamEndpoint,
@@ -267,7 +271,7 @@ import enum  # noqa: E402 — local to the module bottom is fine
 
 
 class ForwardOutcome(str, enum.Enum):
-    """Closed 6-value taxonomy of how a forwarding attempt resolved."""
+    """Closed 7-value taxonomy of how a forwarding attempt resolved."""
 
     SUCCESS = "success"
     LEASE_INVALID = "lease_invalid"
@@ -275,6 +279,8 @@ class ForwardOutcome(str, enum.Enum):
     UPSTREAM_ERROR_STATUS = "upstream_error_status"
     BUDGET_GUILLOTINE = "budget_guillotine"
     CLIENT_DISCONNECTED = "client_disconnected"
+    # Slice 42 — inbound body exceeded the DoS cap; rejected with HTTP 413.
+    REQUEST_TOO_LARGE = "request_too_large"
 
 
 @dataclass(frozen=True)
@@ -394,9 +400,25 @@ async def forward_request(
             detail=str(exc),
         )
 
-    # 2. Request body --------------------------------------------------------
+    # 2. Request body (FULL read, cap-enforced) ------------------------------
+    # Slice 42 — read the ENTIRE body via read_body_capped. The prior single
+    # ``request.content.read(cap)`` truncated multi-TCP-segment bodies (the
+    # same StreamReader.read(n) bug as passthrough). For JSON requests a
+    # truncated body then failed json.loads → body_parse_failed; for any
+    # large legitimate request body it silently corrupted the upstream call.
+    # DoS cap preserved: over-cap → HTTP 413, no unbounded buffering.
     try:
-        body_bytes = await request.content.read(_max_request_body_bytes())
+        body_bytes = await read_body_capped(request, _max_request_body_bytes())
+    except BodyTooLarge as exc:
+        resp = web.json_response({
+            "ok": False, "error": "request_body_too_large", "detail": str(exc),
+        }, status=413)
+        return resp, ForwardResult(
+            outcome=ForwardOutcome.REQUEST_TOO_LARGE,
+            usage_input_tokens=0, usage_output_tokens=0,
+            actual_cost_usd=0.0, upstream_status=None,
+            detail=str(exc),
+        )
     except (asyncio.CancelledError, aiohttp.ClientError):
         raise
     except Exception as exc:  # noqa: BLE001

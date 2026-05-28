@@ -20,6 +20,7 @@ Verify:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -79,6 +80,10 @@ def _make_dw_passthrough_stub(recorder: _Recorder) -> web.Application:
             ),
             "body_len": len(body),
             "body_preview": body[:64],  # for byte-identity checks
+            # Slice 42 — full-body hash so large multi-segment uploads can be
+            # asserted byte-identical (catches mid-body truncation, not just
+            # length/front).
+            "body_sha256": __import__("hashlib").sha256(body).hexdigest(),
         }
 
     async def files_handler(request: web.Request) -> web.Response:
@@ -201,6 +206,52 @@ async def test_files_multipart_credential_injected(stack):
     assert rec["body_len"] == len(multipart_body)
     assert rec["body_preview"] == multipart_body[:64]
     assert "multipart/form-data" in rec["content_type"]
+
+
+def _large_multipart(total_bytes: int) -> bytes:
+    """Build a valid multipart/form-data body of ~total_bytes (field 'file'
+    padded + 'purpose'), large enough to span multiple loopback TCP segments."""
+    head = (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="batch.jsonl"\r\n'
+        b"Content-Type: application/jsonl\r\n\r\n"
+    )
+    tail = (
+        b"\n\r\n--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="purpose"\r\n\r\n'
+        b"batch\r\n--BOUNDARY--\r\n"
+    )
+    pad = total_bytes - len(head) - len(tail)
+    file_line = b'{"custom_id":"req1","content":"' + (b"X" * max(pad - 40, 0)) + b'"}'
+    return head + file_line + tail
+
+
+@pytest.mark.parametrize("size", [18 * 1024, 64 * 1024])
+async def test_files_large_multipart_forwarded_byte_identical(stack, size):
+    # Slice 42 regression: an 18 KB / 64 KB multipart upload arrives over the
+    # loopback socket in MULTIPLE TCP segments. Pre-fix, Aegis' single
+    # request.content.read(cap) returned only the first segment → the upstream
+    # stub received a TRUNCATED body (body_len < len) → DW 400 in production.
+    # Post-fix, read_body_capped reads the full body → byte-identical forward.
+    client, recorder, _ = stack
+    session = await _session_token(client)
+    body = _large_multipart(size)
+    resp = await client.post(
+        "/v1/files",
+        headers={
+            "Authorization": f"Bearer {session}",
+            "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        },
+        data=body,
+    )
+    assert resp.status == 200
+    assert len(recorder.received) == 1
+    rec = recorder.received[0]
+    # FULL byte-identity at the upstream — proves no multi-segment truncation.
+    assert rec["body_len"] == len(body), (
+        f"truncated forward: upstream saw {rec['body_len']} of {len(body)} bytes"
+    )
+    assert rec["body_sha256"] == hashlib.sha256(body).hexdigest()
 
 
 # ---------------------------------------------------------------------------
