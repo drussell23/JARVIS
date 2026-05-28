@@ -105,3 +105,65 @@ async def test_run_surface_sweep_error_sentinel(monkeypatch, tmp_path):
     rec = snap[SurfaceKind.DIRECT_STREAMING]
     assert rec.verdict is SurfaceVerdict.ERROR_OTHER
     assert "RuntimeError" in rec.diagnostic
+
+
+# ---------------------------------------------------------------------------
+# Slice 39 Task 8 — run_surface_health_sweep orchestration + AST pin
+# ---------------------------------------------------------------------------
+
+
+async def test_surface_health_sweep_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("JARVIS_DW_SURFACE_HEALTH_ENABLED", raising=False)
+    from backend.core.ouroboros.governance.preflight_probe import (
+        run_surface_health_sweep,
+    )
+    out = await run_surface_health_sweep(provider=object(), model_id="m")
+    assert out is None
+
+
+async def test_surface_health_sweep_runs_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_DW_SURFACE_HEALTH_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_DW_SURFACE_HEALTH_PATH", str(tmp_path / "h.json"))
+    import backend.core.ouroboros.governance.dw_surface_probes as probes
+
+    async def fake_sweep(*, provider, model_id, ledger, timeout_s=None):
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceKind, SurfaceVerdict,
+        )
+        ledger.record(SurfaceKind.DIRECT_STREAMING, SurfaceVerdict.UPSTREAM_DEGRADED)
+        return ledger.snapshot()
+
+    monkeypatch.setattr(probes, "run_surface_sweep", fake_sweep)
+    from backend.core.ouroboros.governance.preflight_probe import (
+        run_surface_health_sweep,
+    )
+    out = await run_surface_health_sweep(provider=object(), model_id="m")
+    assert out is not None
+
+
+def test_ast_pin_flush_bypass_on_upstream():
+    """AST pin: disambiguate_and_recover must NOT call flush in the
+    UPSTREAM branch. Guards the load-bearing Slice 39 invariant."""
+    import ast
+    import pathlib
+    src = pathlib.Path(
+        "backend/core/ouroboros/governance/dw_transport_disambiguator.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    func = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef)
+        and n.name == "disambiguate_and_recover"
+    )
+    upstream_blocks = [
+        node for node in ast.walk(func)
+        if isinstance(node, ast.If) and "UPSTREAM" in ast.dump(node.test)
+    ]
+    assert upstream_blocks, "UPSTREAM branch not found"
+    for blk in upstream_blocks:
+        for sub in ast.walk(blk):
+            if isinstance(sub, ast.Attribute):
+                assert sub.attr != "flush_transport_pool", (
+                    "flush_transport_pool must NEVER be called in the "
+                    "UPSTREAM branch (Slice 39 invariant — PRD §49.6.2)"
+                )
