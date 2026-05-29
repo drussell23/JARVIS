@@ -175,6 +175,12 @@ class OracleConfig:
         "*.egg-info",
         "build",
         "dist",
+        # Slice 44 — never index worktree checkouts (each is a full repo
+        # copy → 62 of them = 492k duplicate .py files; the recursive
+        # scan_dir walk held the GIL and starved the asyncio loop) or the
+        # session/telemetry tree.
+        ".worktrees",
+        ".ouroboros",
     ]
 
     # File types to index
