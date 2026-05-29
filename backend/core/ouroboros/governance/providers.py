@@ -1738,17 +1738,41 @@ def _build_tool_section(
         legacy behavior for any caller that hasn't yet plumbed the
         route through (defense for partial adoption).
     """
+    _route_str = str(provider_route or "")
+    _route_skips_venom = False
     try:
         from backend.core.ouroboros.governance.route_predicates import (
             should_skip_venom_for_route,
         )
-        if should_skip_venom_for_route(str(provider_route or "")):
-            return ""
+        _route_skips_venom = should_skip_venom_for_route(_route_str)
     except Exception:  # noqa: BLE001 — defensive
-        # Defense: never let an import failure suppress the full
-        # tool section for legacy routes. Falls through to emit
-        # the normal block.
-        pass
+        # route_predicates import failed: fall through to emit the normal
+        # block (legacy behavior for non-skip routes; never suppress).
+        _route_skips_venom = False
+    if _route_skips_venom:
+        # Slice 45 — terminal-worker exception. When DW is the terminal
+        # worker (Claude disabled), the BACKGROUND route must STILL see the
+        # tool advertisements: the Venom loop already runs for non-trivial
+        # background ops (doubleword_provider ``_skip_tools = complexity ==
+        # "trivial"``), so suppressing the tool section here left the model
+        # with a running loop and no instructions -> 0 tool calls -> Iron
+        # Gate 0/1 deadlock (v40b bt-2026-05-29-200702). Phase 1 trace
+        # proved Qwen emits a clean 2b.2-tool envelope the instant tools
+        # are advertised. Env-gated + BACKGROUND-only -> byte-identical
+        # legacy when Claude is enabled or the master flag is off.
+        _terminal_worker = False
+        try:
+            from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+                background_is_terminal_worker,
+            )
+            _terminal_worker = background_is_terminal_worker(_route_str)
+        except Exception:  # noqa: BLE001 — defensive
+            # Policy import failed: SUPPRESS (safe default — preserves the
+            # Slice 12AF suppression for VENOM_SKIP_ROUTES rather than
+            # leaking tool advertisements to a loop-less route).
+            _terminal_worker = False
+        if not _terminal_worker:
+            return ""
     voice_block = ""
     if voice_plain_language:
         voice_block = (
@@ -2427,9 +2451,24 @@ def _should_use_lean_prompt(
     )
     _route = getattr(ctx, "provider_route", "")
     if should_skip_venom_for_route(_route):
-        if os.environ.get(
+        # Slice 45 — terminal-worker exception. When DW is the terminal
+        # worker (Claude disabled), the BACKGROUND route MUST use the lean
+        # tool-first prompt: the Venom loop runs (exec layer), so the model
+        # needs the advertised tools, AND the lean builder's preloaded
+        # target files grant Iron Gate exploration credit. Without this,
+        # background fell through to the full prompt whose ``if
+        # tools_enabled:`` gate (and the DW call site's defaulted
+        # tools_enabled=False) left the model with a running loop and no
+        # tool instructions -> 0 tool calls -> exploration_insufficient
+        # (v40b bt-2026-05-29-200702). Env-gated + BACKGROUND-only ->
+        # byte-identical legacy when Claude is enabled / flag off.
+        from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+            background_is_terminal_worker,
+        )
+        _legacy_lean_override = os.environ.get(
             "JARVIS_BG_CASCADE_LEAN_PROMPT_ENABLED", "false",
-        ).lower() not in ("1", "true", "yes", "on"):
+        ).lower() in ("1", "true", "yes", "on")
+        if not background_is_terminal_worker(_route) and not _legacy_lean_override:
             return False
     if getattr(ctx, "cross_repo", False):
         return False
