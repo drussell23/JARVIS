@@ -4854,6 +4854,25 @@ SEED_SPECS: list = [
         since="Slice 39 Task 8 (PRD §49.6.2, 2026-05-28)",
         posture_relevance=_HARDEN_CRITICAL,
     ),
+    FlagSpec(
+        name="JARVIS_DW_BACKGROUND_VENOM_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 45 — when DW is the terminal worker (Claude disabled), "
+            "advertise the Venom tool section + run the tool loop for the "
+            "BACKGROUND route so the model can explore and clear the Iron "
+            "Gate. Only takes effect when JARVIS_PROVIDER_CLAUDE_DISABLED "
+            "is set; BACKGROUND-only (speculative/wiring_validation stay "
+            "suppressed). False restores the legacy suppression."
+        ),
+        category=Category.ROUTING,
+        source_file=(
+            "backend/core/ouroboros/governance/dw_terminal_worker_policy.py"
+        ),
+        example="true",
+        since="Slice 45 (v40b deadlock fix, 2026-05-29)",
+        posture_relevance=_EXPLORE_CRITICAL,
+    ),
 ]
 
 

@@ -1373,6 +1373,16 @@ class DoublewordProvider:
                     _zw_complexity = getattr(
                         context, "task_complexity", "",
                     )
+                    # Slice 45 note: this dormant response-cache path uses
+                    # the legacy complexity-only skip test, NOT the
+                    # terminal-worker policy. Harmless today — the cache is
+                    # default-OFF and ``_zw_eligible`` below gates this path
+                    # to loop-less / trivial-simple ops, so a moderate/heavy
+                    # terminal-worker background op never assembles its
+                    # prompt here (it falls through to the main path). If
+                    # JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED is ever turned
+                    # on, mirror background_is_terminal_worker here to keep
+                    # the assembled prompt coherent with the main path.
                     _zw_will_skip = _zw_complexity in (
                         "trivial", "simple",
                     )
@@ -1877,12 +1887,29 @@ class DoublewordProvider:
         from backend.core.ouroboros.governance.route_predicates import (
             should_skip_venom_for_route,
         )
+        from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+            background_is_terminal_worker,
+        )
         _complexity = getattr(context, "task_complexity", "")
         _route = getattr(context, "provider_route", "") or ""
-        _will_skip_tools = (
-            _complexity in ("trivial", "simple")
-            or should_skip_venom_for_route(str(_route))
-        )
+        # Slice 45 — keep the prompt-layer tool advertisement coherent with
+        # the exec-layer tool-loop run condition. When DW is the terminal
+        # worker (Claude disabled), a BACKGROUND op runs the Venom loop
+        # whenever it is non-trivial (line ~2632 ``_skip_tools =
+        # complexity == "trivial"``) and therefore MUST be told the tools
+        # exist. We mirror that exec gate EXACTLY here (skip only trivial)
+        # so the prompt's tool advertisement matches whether the loop
+        # actually runs — for simple AND moderate/heavy background alike
+        # (the simple-background half of the v40b deadlock would otherwise
+        # remain: loop runs, tools suppressed). Env-gated + BACKGROUND-only
+        # -> byte-identical legacy when Claude is enabled / flag off.
+        if background_is_terminal_worker(str(_route)):
+            _will_skip_tools = (_complexity == "trivial")
+        else:
+            _will_skip_tools = (
+                _complexity in ("trivial", "simple")
+                or should_skip_venom_for_route(str(_route))
+            )
         # ──────────────────────────────────────────────────────────────
         # Slice 9 — L2 single-shot fast path (DW mirror)
         # See PrimeProvider providers.py:4710 for full rationale.
