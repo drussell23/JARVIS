@@ -4137,8 +4137,20 @@ class CandidateGenerator:
             # deterministically when the sentinel walker passes a heavy
             # model_id. Empty model_id from legacy callers → legacy 30s
             # cap path (byte-identical to pre-Slice-28).
+            # Slice 43 — if this op will force-batch (Slice 36/41), compute a
+            # batch-appropriate budget so the outer wait_for doesn't sever the
+            # async batch poll at the 30s RT reflex cap. The force-batch
+            # decision is owned by the provider; we consult the same pure
+            # predicate. NEVER raises → legacy budget on any failure.
+            try:
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    _slice36_should_force_batch,
+                )
+                _force_batch = _slice36_should_force_batch(context)
+            except Exception:  # noqa: BLE001 — defensive, legacy budget
+                _force_batch = False
             primary_budget = self._compute_primary_budget(
-                remaining, model_id=model_id,
+                remaining, model_id=model_id, force_batch=_force_batch,
             )
             # Slice 34 Phase 2 — dispatch profiler (default OFF; zero
             # overhead when disabled). Records the sem-wait + budget
@@ -5578,6 +5590,7 @@ class CandidateGenerator:
         total_s: float,
         *,
         model_id: str = "",
+        force_batch: bool = False,
     ) -> float:
         """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
 
@@ -5617,6 +5630,22 @@ class CandidateGenerator:
         """
         if total_s <= 0:
             return 0.0
+
+        # Slice 43 — Async Batch Timeout Alignment.
+        # When the op will be dispatched through the BATCH lane (Slice 36/41
+        # FORCE_BATCH), the provider's internal poll_and_retrieve legitimately
+        # runs for minutes — the batch_future_registry waits up to
+        # _DW_MAX_WAIT_S (3600s). Wrapping that in the 30s RT reflex cap
+        # (_PRIMARY_MAX_TIMEOUT_S) severs the async batch mid-flight (v37
+        # bt-2026-05-28-235234: batch 7b7a7b52 submitted then abandoned at
+        # 30s). Give batch ops a batch-appropriate budget instead, capped by
+        # remaining session time. force_batch implies Claude is disabled
+        # (Slice 36 precondition) → no fallback to reserve for, so the batch
+        # gets the full remaining runway up to the batch cap.
+        if force_batch:
+            batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
+            return max(min(total_s, batch_cap), 0.0)
+
         fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
 
         # Slice 28 Phase 2 — adaptive Tier 3 cap for heavy models
