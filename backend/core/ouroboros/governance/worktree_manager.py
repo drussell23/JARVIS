@@ -106,6 +106,41 @@ def _parse_worktree_porcelain(text: str) -> "list[dict[str, str]]":
     return entries
 
 
+# Slice 44 — campaign-debris worktree prefixes reaped at boot, in addition to
+# the L3 isolation ``unit-`` prefix. ``ouroboros__auto__bt-*`` are auto-soak
+# worktrees (full repo checkouts) that the original reaper (``unit-`` only)
+# never swept, so they accumulated to 492k files / 13GB and starved the loop.
+# Env-tunable (comma-separated) so the set stays dynamic with no hardcoding.
+# NOTE the slash form ``ouroboros/auto/bt-`` is FIRST and load-bearing: the
+# auto-soak worktree's git BRANCH is ``ouroboros/auto/bt-<session>`` (slashes),
+# while its on-disk DIR is ``ouroboros__auto__bt-<session>`` (slashes→``__``).
+# ``git worktree list --porcelain`` is repo-global, so matching the branch form
+# reaps the debris via ``branch_matches`` regardless of which ``worktree_base``
+# the boot WorktreeManager was constructed with (the prod base differs from the
+# repo-root ``.worktrees`` where the debris actually lives). The ``__`` dir form
+# + ``soak-`` cover the unregistered-on-disk-dir path under this manager's base.
+_DEFAULT_REAP_EXTRA_PREFIXES = (
+    "ouroboros/auto/bt-", "ouroboros__auto__bt-", "soak-",
+)
+
+
+def _resolve_reap_prefixes(primary: str) -> "tuple[str, ...]":
+    """Return the deduped, order-preserving prefix array the boot reaper
+    matches against: the caller's ``primary`` prefix first, then the
+    campaign-debris extras (``JARVIS_WORKTREE_REAP_PREFIXES`` override, else
+    the defaults). Empty / whitespace entries are dropped. NEVER raises."""
+    raw = os.environ.get("JARVIS_WORKTREE_REAP_PREFIXES", "").strip()
+    if raw:
+        extras = tuple(p.strip() for p in raw.split(",") if p.strip())
+    else:
+        extras = _DEFAULT_REAP_EXTRA_PREFIXES
+    out: list = []
+    for p in (primary, *extras):
+        if p and p not in out:
+            out.append(p)
+    return tuple(out)
+
+
 class WorktreeManager:
     """Manages git worktree creation and cleanup for subagent isolation.
 
@@ -341,6 +376,16 @@ class WorktreeManager:
         a second call on the same clean repo returns 0.
         """
         reaped: Set[str] = set()
+        # Slice 44 — match against a multi-prefix array (legacy "unit-" PLUS
+        # campaign-debris prefixes ouroboros__auto__bt- / soak-, env-tunable).
+        # These auto-soak worktrees (full repo checkouts) were never reaped
+        # before — 62 of them accumulated to 492k files / 13GB, which Oracle's
+        # _find_python_files indexer recursively walked (its EXCLUDE_PATTERNS
+        # lacked .worktrees), holding the GIL and starving the asyncio loop
+        # (v38/v39 SidecarProfiler: oracle scan_dir + 51s thread.join wedge).
+        # (The file-watch guard already excluded .worktrees at the scheduling
+        # layer — Oracle was the scanner.)
+        prefixes = _resolve_reap_prefixes(branch_prefix)
 
         porcelain = await self._run_git_capture(["worktree", "list", "--porcelain"])
         for entry in _parse_worktree_porcelain(porcelain):
@@ -359,8 +404,8 @@ class WorktreeManager:
                 lives_under_base = wt_path.parent.resolve() == base_resolved
             except OSError:
                 lives_under_base = False
-            name_matches = wt_path.name.startswith(branch_prefix)
-            branch_matches = branch_short.startswith(branch_prefix)
+            name_matches = any(wt_path.name.startswith(p) for p in prefixes)
+            branch_matches = any(branch_short.startswith(p) for p in prefixes)
             if not (branch_matches or (lives_under_base and name_matches)):
                 continue
 
@@ -383,7 +428,7 @@ class WorktreeManager:
             for child in self._worktree_base.iterdir():
                 if not child.is_dir():
                     continue
-                if not child.name.startswith(branch_prefix):
+                if not any(child.name.startswith(p) for p in prefixes):
                     continue
                 if str(child) in reaped:
                     continue
@@ -400,13 +445,14 @@ class WorktreeManager:
                         child, exc,
                     )
 
-        branches = await self._run_git_capture(
-            ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch_prefix}*"]
-        )
-        for name in branches.splitlines():
-            name = name.strip()
-            if name.startswith(branch_prefix):
-                await self._git_delete_branch(name)
+        for _p in prefixes:
+            branches = await self._run_git_capture(
+                ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{_p}*"]
+            )
+            for name in branches.splitlines():
+                name = name.strip()
+                if name.startswith(_p):
+                    await self._git_delete_branch(name)
 
         await self._run_git_capture(["worktree", "prune"])
 
