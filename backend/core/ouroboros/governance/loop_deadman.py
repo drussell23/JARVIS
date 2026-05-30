@@ -23,9 +23,13 @@ the very signal we needed was silent for the entire duration.
   * **Heartbeat protocol** — the asyncio loop periodically calls
     ``heartbeat()`` from an asyncio task. The deadman thread
     polls the last-heartbeat timestamp from its own thread.
-  * **Bounded wedge ceiling** — when ``time.time() - last_heartbeat
+  * **Bounded wedge ceiling** — when ``time.monotonic() - last_heartbeat
     > deadman_timeout_s`` (default 300s = 5 min), the deadman
-    fires:
+    fires. (Slice 46: the age is measured on the MONOTONIC clock so a
+    host sleep / suspend / forward NTP jump cannot forge a wedge; such a
+    wall-clock jump is detected via the wall-vs-monotonic skew and
+    absorbed by ``_handle_host_wake_recovery`` instead.) On a genuine
+    wedge it fires:
       1. Log a structured ``[LoopDeadman] WEDGE DETECTED`` line.
       2. (Optional) Trigger a sample-stack-dump via ``faulthandler``
          and/or ``sample`` subprocess to capture forensic state.
@@ -57,6 +61,7 @@ the very signal we needed was silent for the entire duration.
   * ``JARVIS_LOOP_DEADMAN_HEARTBEAT_S``   — async heartbeat cadence (default 5s).
   * ``JARVIS_LOOP_DEADMAN_STACK_DUMP``    — dump faulthandler stack to debug.log on fire (default TRUE).
   * ``JARVIS_LOOP_DEADMAN_SAMPLE``        — invoke macOS ``sample`` for richer forensics (default FALSE — slow + macOS-only).
+  * ``JARVIS_SUSPENSION_SKEW_THRESHOLD``  — wall-vs-monotonic skew (s) above which a wedge is reclassified as host suspension and absorbed instead of fired (default 5.0; Slice 46).
 """
 
 from __future__ import annotations
@@ -112,6 +117,25 @@ def deadman_heartbeat_s() -> float:
         ).strip()
         v = float(raw) if raw else 5.0
         return max(0.5, min(60.0, v))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def suspension_skew_threshold_s() -> float:
+    """Slice 46 — host-suspension detection threshold. When the
+    wall-clock delta between two deadman polls exceeds the monotonic
+    delta by more than this many seconds, the gap is classified as a
+    host sleep / suspend / forward NTP jump (NOT a loop wedge) and the
+    deadman re-arms instead of firing ``os._exit(75)``.
+
+    Default 5.0s. Floored at 1.0s (below that, normal scheduling jitter
+    between the two clocks could false-trigger), ceilinged at 300s."""
+    try:
+        raw = os.environ.get(
+            "JARVIS_SUSPENSION_SKEW_THRESHOLD", "",
+        ).strip()
+        v = float(raw) if raw else 5.0
+        return max(1.0, min(300.0, v))
     except (TypeError, ValueError):
         return 5.0
 
@@ -185,8 +209,9 @@ class LoopDeadman:
     __slots__ = (
         "_timeout_s", "_heartbeat_s", "_stack_dump",
         "_thread", "_async_task",
-        "_last_heartbeat_at", "_lock",
+        "_last_heartbeat_at", "_last_heartbeat_wall", "_lock",
         "_stop_event",
+        "_suspension_skew_threshold_s", "_suspension_count",
     )
 
     def __init__(
@@ -209,9 +234,19 @@ class LoopDeadman:
         )
         self._thread: Optional[threading.Thread] = None
         self._async_task: Optional[asyncio.Task] = None
-        self._last_heartbeat_at: float = time.time()
+        # Slice 46 — wedge age is measured on the MONOTONIC clock so a
+        # host sleep / suspend / forward NTP jump (which warps
+        # ``time.time()``) can never forge a wedge. ``_last_heartbeat_wall``
+        # is kept ALONGSIDE purely so the daemon thread can detect a
+        # suspension (wall delta >> monotonic delta) and re-arm rather than
+        # kill the process. v41 (bt-2026-05-29-213224) fired os._exit(75)
+        # on a phantom: monotonic=86s but wall=605s after the Mac slept.
+        self._last_heartbeat_at: float = time.monotonic()
+        self._last_heartbeat_wall: float = time.time()
         self._lock: threading.Lock = threading.Lock()
         self._stop_event: threading.Event = threading.Event()
+        self._suspension_skew_threshold_s: float = suspension_skew_threshold_s()
+        self._suspension_count: int = 0
 
     # ---- introspection ----
 
@@ -232,8 +267,17 @@ class LoopDeadman:
         )
 
     def last_heartbeat_age_s(self) -> float:
+        # Slice 46 — MONOTONIC age. Immune to wall-clock warps (host
+        # sleep / NTP). On macOS + Linux the monotonic clock pauses during
+        # suspend, so a slept host yields a near-zero age (no false wedge);
+        # a genuine CPU-bound wedge advances monotonic and is still caught.
         with self._lock:
-            return time.time() - self._last_heartbeat_at
+            return time.monotonic() - self._last_heartbeat_at
+
+    @property
+    def suspension_count(self) -> int:
+        """Number of host-suspension events absorbed without firing."""
+        return self._suspension_count
 
     # ---- lifecycle ----
 
@@ -249,7 +293,8 @@ class LoopDeadman:
         if self.running:
             return False
         with self._lock:
-            self._last_heartbeat_at = time.time()
+            self._last_heartbeat_at = time.monotonic()
+            self._last_heartbeat_wall = time.time()
         # Daemon thread — OS thread, no asyncio dependency.
         self._thread = threading.Thread(
             target=self._run_deadman_loop,
@@ -301,17 +346,37 @@ class LoopDeadman:
         """Public API — call from the asyncio loop to prove
         liveness. Thread-safe. NEVER raises."""
         with self._lock:
-            self._last_heartbeat_at = time.time()
+            self._last_heartbeat_at = time.monotonic()
+            self._last_heartbeat_wall = time.time()
 
     # ---- the daemon thread loop ----
 
     def _run_deadman_loop(self) -> None:
-        """Polls the heartbeat age from the daemon thread. On wedge
-        detection, logs + dumps stack + ``os._exit(75)``."""
+        """Polls the (monotonic) heartbeat age from the daemon thread.
+        On genuine wedge detection, logs + dumps stack + ``os._exit(75)``.
+        A host suspension (wall-clock jumps far past monotonic) is NOT a
+        wedge — it is detected and absorbed via ``_handle_host_wake_recovery``
+        instead of killing the process (Slice 46)."""
         while not self._stop_event.is_set():
             try:
-                age = self.last_heartbeat_age_s()
+                age = self.last_heartbeat_age_s()  # monotonic
                 if age > self._timeout_s:
+                    # Slice 46 — before firing, rule out a host suspension.
+                    # On macOS/Linux the monotonic clock pauses during
+                    # suspend, so this branch is usually unreachable after a
+                    # sleep (age stays small). This guard is the defense for
+                    # platforms/configs where the monotonic-ish clock DID
+                    # advance across the suspend, or a forward NTP jump: if
+                    # the wall delta outran the monotonic delta by more than
+                    # the skew threshold, it was a sleep, not a wedge.
+                    with self._lock:
+                        age_wall = time.time() - self._last_heartbeat_wall
+                    skew = age_wall - age
+                    if skew > self._suspension_skew_threshold_s:
+                        self._handle_host_wake_recovery(
+                            skew_s=skew, age_wall_s=age_wall, age_mono_s=age,
+                        )
+                        continue  # re-armed inside; do NOT fire
                     self._fire_wedge(age)
                     return  # unreachable in practice (os._exit fires)
                 # Sleep half the timeout so wedge detection latency
@@ -324,6 +389,32 @@ class LoopDeadman:
                     time.sleep(1.0)
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _handle_host_wake_recovery(
+        self, *, skew_s: float, age_wall_s: float, age_mono_s: float,
+    ) -> None:
+        """Slice 46 — absorb a host sleep / suspend / forward-NTP jump
+        instead of firing ``os._exit(75)``. Re-baselines the heartbeat
+        timestamps so the suspension interval is not counted as wedge age,
+        logs the event for observability (§7), and counts it. NEVER raises
+        — runs on the daemon thread and must keep the monitor alive."""
+        self._suspension_count += 1
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        with self._lock:
+            self._last_heartbeat_at = now_mono
+            self._last_heartbeat_wall = now_wall
+        try:
+            logger.warning(
+                "[LoopDeadman] host suspension absorbed (NOT a wedge): "
+                "wall_gap=%.1fs monotonic_gap=%.1fs skew=%.1fs "
+                "(threshold=%.1fs) — re-armed, os._exit(75) suppressed "
+                "[suspension_count=%d]",
+                age_wall_s, age_mono_s, skew_s,
+                self._suspension_skew_threshold_s, self._suspension_count,
+            )
+        except Exception:  # noqa: BLE001 — logging must never crash the daemon
+            pass
 
     # ---- the asyncio heartbeat task ----
 

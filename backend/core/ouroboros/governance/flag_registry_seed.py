@@ -4873,6 +4873,22 @@ SEED_SPECS: list = [
         since="Slice 45 (v40b deadlock fix, 2026-05-29)",
         posture_relevance=_EXPLORE_CRITICAL,
     ),
+    FlagSpec(
+        name="JARVIS_SUSPENSION_SKEW_THRESHOLD",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Slice 46 — wall-vs-monotonic skew (seconds) above which the "
+            "LoopDeadman reclassifies an apparent wedge as a host "
+            "sleep/suspend/forward-NTP jump and absorbs it (logs + re-arms) "
+            "instead of firing os._exit(75). Floored 1.0s, ceiled 300s. "
+            "Closes the v41 phantom-wedge kill (monotonic=86s vs wall=605s)."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/loop_deadman.py",
+        example="5.0",
+        since="Slice 46 (monotonic heartbeat alignment, 2026-05-29)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
 ]
 
 
