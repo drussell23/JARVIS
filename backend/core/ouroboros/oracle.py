@@ -181,6 +181,13 @@ class OracleConfig:
         # session/telemetry tree.
         ".worktrees",
         ".ouroboros",
+        # Slice 49 — the substring match below (``pattern in path_str``)
+        # means ``.worktrees`` never matched ``.jarvis/swe_bench_pro/
+        # worktrees`` (437MB / 26,839 files), so v44 walked + ast-parsed
+        # that whole tree at 107% CPU. ``.jarvis`` is the repo-local state
+        # dir (swe_bench checkouts, session telemetry, locks) — never source
+        # to index. Substring ``.jarvis`` covers the entire subtree.
+        ".jarvis",
     ]
 
     # File types to index

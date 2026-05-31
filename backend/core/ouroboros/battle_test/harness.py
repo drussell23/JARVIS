@@ -1110,6 +1110,7 @@ class BattleTestHarness:
             self._wall_clock_hard_deadline_stop: Optional[
                 threading.Event
             ] = None
+            self._external_watchdog: Optional[Any] = None  # Slice 49
             _wall_cap = self._config.max_wall_seconds_s
             if _wall_cap is not None and _wall_cap > 0:
                 self._wall_clock_monitor_task = asyncio.ensure_future(
@@ -1140,6 +1141,12 @@ class BattleTestHarness:
                     "terminate with stop_reason=wall_clock_cap if not already stopped.",
                     _wall_cap,
                 )
+                # Slice 49 — external subprocess watchdog: a GIL-immune
+                # backstop for the in-process resource-zero thread, which v44
+                # proved can be starved out (73min > 40min cap, never fired).
+                # Budget = cap + margin so the in-process layers get their full
+                # window first; this fires ONLY if even they were starved.
+                self._arm_external_watchdog(_wall_cap)
 
             # ProcessMemoryWatchdog — adaptive RSS ceiling on the soak
             # process TREE. Protective by default (the 52GB OOM had NO
@@ -5408,6 +5415,71 @@ class BattleTestHarness:
     # Hot-reload Restart Monitor
     # ------------------------------------------------------------------
 
+    def _arm_external_watchdog(self, cap_s: float) -> None:
+        """Slice 49 — spawn the out-of-process GIL-immune kill sentinel.
+
+        Belt-and-braces beyond the in-process resource-zero thread (which v44
+        proved can be GIL-starved). Default ON; opt out via
+        ``JARVIS_EXTERNAL_WATCHDOG_ENABLED=false``. Budget = cap + margin so
+        the in-process graceful + resource-zero layers always get first crack;
+        this only fires if they were starved. NEVER raises into boot.
+        """
+        if os.environ.get(
+            "JARVIS_EXTERNAL_WATCHDOG_ENABLED", "true",
+        ).strip().lower() in ("false", "0", "no", "off"):
+            return
+        try:
+            from backend.core.ouroboros.governance.external_watchdog import (
+                ExternalProcessWatchdog,
+            )
+
+            def _env_f(name: str, default: float) -> float:
+                raw = os.environ.get(name, "").strip()
+                try:
+                    return float(raw) if raw else default
+                except (TypeError, ValueError):
+                    return default
+
+            margin_s = max(30.0, _env_f("JARVIS_EXTERNAL_WATCHDOG_MARGIN_S", 90.0))
+            stale_s = max(30.0, _env_f("JARVIS_EXTERNAL_WATCHDOG_STALE_S", 120.0))
+            hb_path = self._session_dir / "heartbeat.tick"
+            self._external_watchdog = ExternalProcessWatchdog(
+                target_pid=os.getpid(),
+                heartbeat_path=hb_path,
+                budget_s=float(cap_s) + margin_s,
+                stale_window_s=stale_s,
+            )
+            self._external_watchdog.arm()
+            logger.info(
+                "[ExternalWatchdog] armed: budget=%.0fs stale=%.0fs pid=%d "
+                "(out-of-process, GIL-immune backstop)",
+                float(cap_s) + margin_s, stale_s, os.getpid(),
+            )
+        except Exception as exc:  # noqa: BLE001 -- never break boot
+            self._external_watchdog = None
+            logger.warning(
+                "[ExternalWatchdog] arm failed (non-fatal): %s", exc,
+            )
+
+    def _beat_external_watchdog(self) -> None:
+        """Touch the heartbeat so the external sentinel sees liveness."""
+        wd = getattr(self, "_external_watchdog", None)
+        if wd is not None:
+            try:
+                wd.beat()
+            except Exception:  # noqa: BLE001 -- best-effort liveness
+                pass
+
+    def _disarm_external_watchdog(self) -> None:
+        """Terminate the external sentinel on clean shutdown."""
+        wd = getattr(self, "_external_watchdog", None)
+        if wd is not None:
+            try:
+                wd.disarm()
+            except Exception:  # noqa: BLE001
+                pass
+            self._external_watchdog = None
+
     def _start_wall_clock_hard_deadline_thread(
         self, cap_s: float,
     ) -> None:
@@ -5745,6 +5817,10 @@ class BattleTestHarness:
                 )
                 return
             _tick += 1
+            # Slice 49 — refresh the external sentinel's heartbeat each tick.
+            # If THIS loop is wedged, beats stop and the external staleness
+            # window fires; the external budget fires regardless of beats.
+            self._beat_external_watchdog()
             elapsed_monotonic = time.monotonic() - anchor_monotonic
             elapsed_wall = max(0.0, time.time() - anchor_wall)
             # Layer 7 dual-clock cap check — fire on whichever ticks
@@ -6287,6 +6363,12 @@ class BattleTestHarness:
         not prevent the remaining components from being cleaned up.
         """
         logger.info("Shutting down session %s ...", self._session_id)
+
+        # Slice 49 — clean shutdown has begun, so the main loop is no longer
+        # the concern; retire the external sentinel before teardown so it
+        # cannot SIGKILL during a legitimate (BoundedShutdownWatchdog-governed)
+        # cleanup. The in-process ShutdownWatchdog covers shutdown-path hangs.
+        self._disarm_external_watchdog()
 
         # ── Slice 12V Phase 1 — WAL-first shutdown ──
         #

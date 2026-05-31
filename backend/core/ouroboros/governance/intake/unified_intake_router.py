@@ -259,9 +259,36 @@ def goal_alignment_failure_stats() -> Dict[str, int]:
     return {"failures": _goal_alignment_failures}
 
 
+def _ingest_stratification_enabled() -> bool:
+    """Slice 49 master switch (default ON). Off → byte-identical pre-Slice-49
+    priority (no penalty, no file reads in the hot intake path)."""
+    return os.environ.get(
+        "JARVIS_INGEST_STRATIFICATION_ENABLED", "true",
+    ).strip().lower() not in ("false", "0", "no", "off")
+
+
+def _is_test_generation_intent(envelope: "IntentEnvelope") -> bool:
+    """Slice 49 escape hatch — True when the op's intent is adding test
+    coverage, so the blast-radius penalty is suppressed (lets the organism
+    target and heal its own large uncovered core modules). Conservative:
+    matches explicit coverage/test-generation phrasing or source tags."""
+    src = (getattr(envelope, "source", "") or "").lower()
+    if "coverage" in src or "test_gen" in src or "testgen" in src:
+        return True
+    desc = (getattr(envelope, "description", "") or "").lower()
+    return (
+        "add test" in desc
+        or "test coverage" in desc
+        or "coverage for" in desc
+        or "write tests" in desc
+    )
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
+    *,
+    repo_root: "Optional[Path]" = None,
 ) -> Tuple[int, Optional[Any]]:
     """Compute cost-aware priority score + rich goal alignment for an envelope.
 
@@ -413,10 +440,34 @@ def _compute_priority(
             "[Router] inferred-direction boost skipped: %s", exc,
         )
 
+    # Slice 49 — universal ingestion stratification (SOFT). Add a bounded
+    # penalty for ops targeting large uncovered files so they are processed
+    # last fleet-wide (across -miner AND -cau tracks). This ONLY reorders the
+    # queue; OperationAdvisor.advise() remains the hard blast-radius gate, and
+    # the penalty is fully reachable (no drop) with a test-generation escape.
+    # Authority invariant: priority ordering ONLY — never fed to UrgencyRouter,
+    # Iron Gate, risk tier, policy engine, FORBIDDEN_PATH, or approval gating.
+    stratification_penalty = 0
+    if repo_root is not None and _ingest_stratification_enabled():
+        try:
+            from backend.core.ouroboros.governance.target_stratification import (
+                ingest_priority_penalty,
+            )
+            stratification_penalty = ingest_priority_penalty(
+                envelope.target_files or (),
+                repo_root,
+                suppress=_is_test_generation_intent(envelope),
+            )
+            if stratification_penalty > 0 and isinstance(envelope.evidence, dict):
+                envelope.evidence["stratification_penalty"] = stratification_penalty
+        except Exception as exc:  # noqa: BLE001 -- fail-soft, never break intake
+            logger.debug("[Router] ingest stratification skipped: %s", exc)
+
     priority = (
         base - urgency + cost_penalty - confidence_bonus
         - dep_bonus - goal_boost - semantic_boost
         - inferred_direction_boost
+        + stratification_penalty
     )
     return priority, alignment
 
@@ -749,6 +800,7 @@ class UnifiedIntakeRouter:
                 _dep_credit += len(self._queued_behind.get(_blocking_id, []))
         priority, alignment = _compute_priority(
             envelope, dependency_credit=_dep_credit,
+            repo_root=self._config.project_root,
         )
         # Stash goal-alignment diagnostics on the envelope so downstream
         # phases (orchestrator, SerpentFlow postmortems, dead-letter audit)
