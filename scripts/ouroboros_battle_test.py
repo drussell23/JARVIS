@@ -387,6 +387,49 @@ def _cleanup_stale_router_lock(
         pass  # Different user — leave it alone
 
 
+def _reap_stale_jarvis_locks(
+    jarvis_dir: "Path",
+    max_age_s: float = 86400.0,
+    now: "float | None" = None,
+) -> int:
+    """Slice 48 — purge stale ``.jarvis/**/*.lock`` debris at boot.
+
+    flock auto-releases on process death, so an old ``.lock`` *file* left by a
+    crashed session is inert crumbs — but it accumulates and pollutes the
+    workspace (v43 flagged a ~53h-old ``metrics_history.jsonl.lock``). Any
+    ``.lock`` whose mtime is older than ``max_age_s`` (default 24h) is removed.
+
+    ``intake_router.lock`` is intentionally skipped — it has a dedicated
+    PID-aware handler (:func:`_cleanup_stale_router_lock`) that must own the
+    single-flight decision. Returns the number of lock files removed; never
+    raises (best-effort hygiene).
+    """
+    if not jarvis_dir.exists():
+        return 0
+    cutoff = (time.time() if now is None else now) - max_age_s
+    reaped = 0
+    try:
+        candidates = list(jarvis_dir.rglob("*.lock"))
+    except OSError:
+        return 0
+    for lock in candidates:
+        if lock.name == "intake_router.lock":
+            continue  # PID-aware handler owns this one
+        try:
+            if lock.stat().st_mtime >= cutoff:
+                continue
+            lock.unlink()
+            reaped += 1
+        except OSError:
+            continue  # raced/removed/permission — leave it
+    if reaped:
+        print(
+            f"  {_DIM}  reaped {reaped} stale .jarvis lock file(s) "
+            f"(>{max_age_s / 3600:.0f}h old){_RESET}"
+        )
+    return reaped
+
+
 def _single_flight_preflight() -> None:
     """Harness Epic Slice 2 — single-flight launcher enforcement.
 
@@ -1199,6 +1242,15 @@ def main() -> None:
     if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
         _reaped = _reap_zombies()
         _cleanup_stale_router_lock(reaped_pids=_reaped)
+        # Slice 48 — sweep multi-day stale .jarvis/*.lock debris (flock
+        # auto-releases on death; these are inert crumbs that accumulate).
+        with contextlib.suppress(Exception):
+            _stale_lock_age_s = float(
+                os.environ.get("JARVIS_STALE_LOCK_REAP_AGE_S", "86400") or "86400"
+            )
+            _reap_stale_jarvis_locks(
+                _PROJECT_ROOT / ".jarvis", max_age_s=_stale_lock_age_s,
+            )
 
     # ------------------------------------------------------------------
     # P1 Slice 3 — Ledger Sovereignty B1.2 singleton lock.

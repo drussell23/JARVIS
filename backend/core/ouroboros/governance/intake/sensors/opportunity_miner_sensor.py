@@ -38,6 +38,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
+from backend.core.ouroboros.governance.target_stratification import (
+    file_has_test_coverage,
+    stratification_penalty_multiplier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,13 @@ class _FileAnalysis:
     import_fan_out: int = 0
     todo_fixme_count: int = 0
     total_lines: int = 0
+    # Slice 48: stratification inputs. Default True so an un-stamped analysis
+    # (repo_root unknown) carries NO penalty — the bias only ever down-ranks
+    # files we positively know are large AND uncovered.
+    has_test_coverage: bool = True
+    # When the operation's intent IS adding coverage, suppress the penalty so
+    # the organism can still target its own large uncovered core modules.
+    suppress_stratification_penalty: bool = False
 
     @property
     def composite_score(self) -> float:
@@ -87,6 +98,26 @@ class _FileAnalysis:
             + 0.10 * import_norm
             + 0.10 * todo_norm
         )
+
+    @property
+    def stratification_penalty(self) -> float:
+        """Soft down-rank multiplier (Slice 48) in (1 - alpha, 1.0].
+
+        1.0 for covered files or when the penalty is suppressed; otherwise
+        proportional to line-count. Applied to BOTH the exploit sort key and
+        the explore weights so huge uncovered modules lose priority in both
+        selection phases without being permanently excluded.
+        """
+        return stratification_penalty_multiplier(
+            self.total_lines,
+            self.has_test_coverage,
+            suppress=self.suppress_stratification_penalty,
+        )
+
+    @property
+    def stratified_score(self) -> float:
+        """Baseline composite priority after the stratification penalty."""
+        return self.composite_score * self.stratification_penalty
 
 
 @dataclass
@@ -228,8 +259,24 @@ def _todo_fixme_count(source: str) -> int:
     return len(re.findall(r"#\s*(?:TODO|FIXME|HACK|XXX)\b", source, re.IGNORECASE))
 
 
-def _analyze_file(file_path: str, source: str, tree: ast.AST) -> _FileAnalysis:
-    """Run all analysis dimensions on a parsed file."""
+def _analyze_file(
+    file_path: str,
+    source: str,
+    tree: ast.AST,
+    repo_root: Optional[Path] = None,
+) -> _FileAnalysis:
+    """Run all analysis dimensions on a parsed file.
+
+    ``repo_root`` (Slice 48) — when provided, stamps the file's test-coverage
+    signal so selection can down-rank large uncovered modules. When ``None``,
+    coverage defaults to True (no penalty) — an un-stamped analysis is never
+    penalized.
+    """
+    has_cov = (
+        file_has_test_coverage(file_path, repo_root)
+        if repo_root is not None
+        else True
+    )
     return _FileAnalysis(
         file_path=file_path,
         cyclomatic_complexity=_cyclomatic_complexity(tree),
@@ -239,6 +286,7 @@ def _analyze_file(file_path: str, source: str, tree: ast.AST) -> _FileAnalysis:
         import_fan_out=_import_fan_out(tree),
         todo_fixme_count=_todo_fixme_count(source),
         total_lines=len(source.splitlines()),
+        has_test_coverage=has_cov,
     )
 
 
@@ -410,8 +458,13 @@ class OpportunityMinerSensor:
             return 0, []
         eligible_count = len(eligible)
 
-        # Sort by the strategy's primary metric
-        eligible.sort(key=lambda a: getattr(a, sort_field, 0), reverse=True)
+        # Sort by the strategy's primary metric, soft-weighted by the
+        # stratification penalty (Slice 48) so huge uncovered modules lose
+        # exploit priority to small / covered files with the same raw metric.
+        eligible.sort(
+            key=lambda a: getattr(a, sort_field, 0) * a.stratification_penalty,
+            reverse=True,
+        )
 
         n_total = min(self._max_per_scan, len(eligible))
         n_exploit = max(1, int(n_total * (1.0 - self._explore_ratio)))
@@ -434,9 +487,10 @@ class OpportunityMinerSensor:
         # Explore: weighted random from remaining pool
         remaining = [a for a in eligible if a not in selected]
         if remaining and n_explore > 0:
-            # Weight by composite score so we're biased toward interesting
-            # files but not locked to the absolute top
-            weights = [max(0.01, a.composite_score) for a in remaining]
+            # Weight by stratified score (composite × stratification penalty,
+            # Slice 48) so we're biased toward interesting files but not locked
+            # to the absolute top — and huge uncovered modules are down-ranked.
+            weights = [max(0.01, a.stratified_score) for a in remaining]
             n_sample = min(n_explore, len(remaining))
             try:
                 explored = random.choices(remaining, weights=weights, k=n_sample)
@@ -576,6 +630,9 @@ class OpportunityMinerSensor:
                     import_fan_out=_s11b_result.payload.import_fan_out,
                     todo_fixme_count=_s11b_result.payload.todo_fixme_count,
                     total_lines=_s11b_result.payload.total_lines,
+                    has_test_coverage=file_has_test_coverage(
+                        rel, self._repo_root,
+                    ),
                 )
                 self._analysis_cache[rel] = analysis
 
@@ -964,6 +1021,7 @@ class OpportunityMinerSensor:
             import_fan_out=_s11b_result.payload.import_fan_out,
             todo_fixme_count=_s11b_result.payload.todo_fixme_count,
             total_lines=_s11b_result.payload.total_lines,
+            has_test_coverage=file_has_test_coverage(rel, self._repo_root),
         )
         self._analysis_cache[rel] = analysis
 
