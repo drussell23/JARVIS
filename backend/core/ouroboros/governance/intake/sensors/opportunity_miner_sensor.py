@@ -259,6 +259,41 @@ def _todo_fixme_count(source: str) -> int:
     return len(re.findall(r"#\s*(?:TODO|FIXME|HACK|XXX)\b", source, re.IGNORECASE))
 
 
+# Slice 49 — directory segments PRUNED during the file walk itself. rglob()
+# cannot prune (it stats every descendant before any filter), so v44 walked
+# the 437MB .jarvis/swe_bench_pro tree at 107% CPU. os.walk with in-place
+# ``dirs[:]`` pruning never descends into these trees → the OS never stats
+# them. Distinct from _NON_PROJECT_SEGMENTS (post-walk production-code
+# classification): this set is about NEVER TRAVERSING heavy/non-source trees.
+_WALK_PRUNE_SEGMENTS: frozenset = frozenset({
+    ".jarvis", ".worktrees", ".ouroboros",
+    ".git", "node_modules", "__pycache__",
+    ".venv", "venv", ".mypy_cache", ".pytest_cache",
+    "build", "dist", ".eggs",
+})
+
+
+def _iter_python_files_pruned(
+    root: "Path",
+    skip_segments: "frozenset",
+) -> "List[Path]":
+    """Walk ``root`` for ``*.py`` files, pruning ``skip_segments`` dirs.
+
+    Uses ``os.walk`` with in-place ``dirs[:]`` mutation so excluded trees are
+    NEVER descended into — the OS never scandir/stats inside them (unlike
+    ``rglob`` which traverses the entire subtree before any filter). This is
+    the Slice 49 fix for the v44 FS-scan wedge.
+    """
+    found: "List[Path]" = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune in place so os.walk does not descend into excluded dirs.
+        dirnames[:] = [d for d in dirnames if d not in skip_segments]
+        for name in filenames:
+            if name.endswith(".py"):
+                found.append(Path(dirpath) / name)
+    return found
+
+
 def _analyze_file(
     file_path: str,
     source: str,
@@ -567,8 +602,13 @@ class OpportunityMinerSensor:
             # loop entirely during the walk. The returned list is
             # then iterable with cooperative yields.
             try:
+                # Slice 49 — pruning walk (never descends into .jarvis/
+                # .worktrees/.ouroboros etc.) replaces rglob, which stat'd
+                # the entire 437MB .jarvis/swe_bench_pro tree in v44.
                 py_files = await offload_blocking(
-                    lambda r=root: list(r.rglob("*.py")),
+                    lambda r=root: _iter_python_files_pruned(
+                        r, _WALK_PRUNE_SEGMENTS,
+                    ),
                     label="opportunity_miner.rglob",
                 )
             except Exception:  # noqa: BLE001 — preserve scan loop
