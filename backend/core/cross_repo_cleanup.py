@@ -620,25 +620,56 @@ class CrossRepoCleanupCoordinator:
         return self.registry.cleanup_orphaned()
     
     def _sync_emergency_cleanup(self) -> None:
-        """Emergency cleanup for atexit - fast and synchronous."""
+        """Emergency cleanup for atexit — budget-bounded (Slice 48).
+
+        Runs at atexit, so there is NO running event loop (asyncio.to_thread is
+        unavailable). The cleanup body — callbacks + registry clear + GC — is
+        run in a daemon thread joined for at most
+        ``JARVIS_CROSS_REPO_EMERGENCY_CLEANUP_BUDGET_S`` (default 5s). If a
+        registry ``open()``/``stat`` stalls (e.g. the post-host-resume FS that
+        blocked v43 for 38.6s), the join times out and teardown proceeds — the
+        leaked daemon thread dies with the process. This keeps the atexit path
+        comfortably under the 30s BoundedShutdownWatchdog deadline so a slow
+        cleanup can never force an unclean os._exit(75).
+        """
         if self._cleaned_up:
             return
-        
-        try:
-            # Quick cleanup without waiting
-            for callback in self._cleanup_callbacks.values():
-                with suppress(Exception):
-                    callback()
-            
-            # Clear registry entries
-            self.registry.clear_repo_resources(self._repo_name)
-            
-            # Quick GC
-            gc.collect()
-            
-            self._cleaned_up = True
-        except Exception:
-            pass  # Swallow all errors during emergency cleanup
+        # Mark cleaned up BEFORE dispatching so a stalled thread can never be
+        # re-entered (idempotent even if the budget is exceeded).
+        self._cleaned_up = True
+
+        def _run_body() -> None:
+            try:
+                for callback in self._cleanup_callbacks.values():
+                    with suppress(Exception):
+                        callback()
+                self.registry.clear_repo_resources(self._repo_name)
+                gc.collect()
+            except Exception:
+                pass  # Swallow all errors during emergency cleanup
+
+        budget_s = 5.0
+        raw = os.environ.get(
+            "JARVIS_CROSS_REPO_EMERGENCY_CLEANUP_BUDGET_S", "",
+        ).strip()
+        if raw:
+            with suppress(TypeError, ValueError):
+                budget_s = max(0.1, float(raw))
+
+        worker = threading.Thread(
+            target=_run_body,
+            name="cross-repo-emergency-cleanup",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=budget_s)
+        if worker.is_alive():
+            with suppress(Exception):
+                logger.warning(
+                    "[CrossRepoCleanup] emergency cleanup exceeded %.1fs "
+                    "budget — abandoning to stay under shutdown deadline",
+                    budget_s,
+                )
     
     def get_status(self) -> Dict[str, Any]:
         """Get coordinator status."""

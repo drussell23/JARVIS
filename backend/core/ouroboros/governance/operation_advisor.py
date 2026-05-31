@@ -1785,12 +1785,14 @@ class OperationAdvisor:
         if not py_files:
             return 1.0
 
-        covered = 0
-        for f in py_files:
-            stem = Path(f).stem
-            if any((scan_root / "tests" / f"test_{stem}.py").exists()
-                   for _ in [1]):
-                covered += 1
+        # Slice 48: delegate to the canonical per-file coverage signal so the
+        # sensor-side stratification bias and the Advisor gate can never drift.
+        from backend.core.ouroboros.governance.target_stratification import (
+            file_has_test_coverage,
+        )
+        covered = sum(
+            1 for f in py_files if file_has_test_coverage(f, scan_root)
+        )
         return covered / len(py_files)
 
     def _get_chronic_entropy(
