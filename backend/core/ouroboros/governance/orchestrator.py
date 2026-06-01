@@ -4270,6 +4270,52 @@ class GovernedOrchestrator:
                             "skipped (fail-open to route base)",
                             exc_info=True,
                         )
+                    # ── Slice 50 Phase 2: force-batch deadline floor ──
+                    # When this op will be dispatched through the DW BATCH
+                    # lane (Slice 36/41 FORCE_BATCH), the provider's async
+                    # batch poll legitimately runs up to
+                    # JARVIS_DW_BATCH_TIMEOUT_S (Slice 43, default 300s). If
+                    # the route-base GENERATE deadline is shorter than that
+                    # lease (e.g. standard=220s for a trivial op the R1 floor
+                    # skips), the OUTER deadline severs the async batch poll
+                    # before its own lease expires — v45 probe
+                    # bt-2026-06-01-034745: op-...e944 (standard/trivial) got
+                    # remaining=220s, min(220,300)=220, batch killed at 220s
+                    # with 300s lease runway unused (TimeoutError elapsed=220s,
+                    # 0 APPLY). Floor the GENERATE window to batch_cap +
+                    # overhead so the inner _call_primary hold gets the full
+                    # batch lease. Mirror of the R1 thinking-cap floor above;
+                    # outer >= inner by construction. Safe: Slice 36
+                    # force-batch only engages when Claude is disabled (pure-DW
+                    # mode), so no Claude-cascade calibration is regressed.
+                    # Fail-open to route base on any error.
+                    try:
+                        from backend.core.ouroboros.governance.doubleword_provider import (  # noqa: E501
+                            _slice36_should_force_batch,
+                        )
+                        from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501
+                            apply_force_batch_deadline_floor,
+                        )
+                        if _slice36_should_force_batch(ctx):
+                            _fb_floored = apply_force_batch_deadline_floor(
+                                _gen_timeout, force_batch=True,
+                            )
+                            if _fb_floored > _gen_timeout:
+                                logger.info(
+                                    "[Orchestrator] Slice 50 force-batch "
+                                    "deadline floor: gen_timeout %.0fs → "
+                                    "%.0fs route=%s op=%s — batch lease no "
+                                    "longer severed by outer deadline",
+                                    _gen_timeout, _fb_floored, _route,
+                                    getattr(ctx, "op_id", "?"),
+                                )
+                            _gen_timeout = _fb_floored
+                    except Exception:  # noqa: BLE001 — fail-open
+                        logger.debug(
+                            "[Orchestrator] force-batch deadline floor "
+                            "skipped (fail-open to route base)",
+                            exc_info=True,
+                        )
                     # Slice 2 — payload-adaptive GENERATE budget.
                     # Scales the FINAL route-base _gen_timeout by
                     # deterministic op-context geometry so a heavy

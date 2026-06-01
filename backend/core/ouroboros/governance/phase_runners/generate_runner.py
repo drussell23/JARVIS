@@ -646,6 +646,43 @@ class GENERATERunner(PhaseRunner):
                         "[Orchestrator] R1 thinking-cap floor skipped "
                         "(fail-open to route base)", exc_info=True,
                     )
+                # ── Slice 50 Phase 2: force-batch deadline floor ──────
+                # LIVE phase-dispatcher copy (mirror of orchestrator.py).
+                # When this op force-batches (Slice 36/41), the DW async
+                # batch poll runs up to JARVIS_DW_BATCH_TIMEOUT_S (Slice 43,
+                # 300s). A route-base deadline shorter than that lease
+                # (standard=220s for a trivial op the R1 floor skips) lets
+                # the OUTER deadline sever the batch mid-poll — v45 probe
+                # bt-2026-06-01-034745: op-...e944 remaining=220s,
+                # min(220,300)=220, batch killed at 220s, 0 APPLY. Floor to
+                # batch_cap + overhead so the inner hold gets the full lease.
+                # Safe: force-batch only engages when Claude is disabled.
+                try:
+                    from backend.core.ouroboros.governance.doubleword_provider import (  # noqa: E501
+                        _slice36_should_force_batch,
+                    )
+                    from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501
+                        apply_force_batch_deadline_floor,
+                    )
+                    if _slice36_should_force_batch(ctx):
+                        _fb_floored = apply_force_batch_deadline_floor(
+                            _gen_timeout, force_batch=True,
+                        )
+                        if _fb_floored > _gen_timeout:
+                            logger.info(
+                                "[Orchestrator] Slice 50 force-batch "
+                                "deadline floor: gen_timeout %.0fs → %.0fs "
+                                "route=%s op=%s — batch lease no longer "
+                                "severed by outer deadline",
+                                _gen_timeout, _fb_floored, _route,
+                                getattr(ctx, "op_id", "?"),
+                            )
+                        _gen_timeout = _fb_floored
+                except Exception:  # noqa: BLE001 — fail-open to route base
+                    logger.debug(
+                        "[Orchestrator] force-batch deadline floor skipped "
+                        "(fail-open to route base)", exc_info=True,
+                    )
                 # Slice 2 parity — payload-adaptive GENERATE budget runs
                 # AFTER the thinking-cap floor so one scaled value
                 # propagates to deadline + outer wait_for + tool-loop
