@@ -421,6 +421,12 @@ class FileWatchGuard:
     _global_watched_paths: Dict[str, "FileWatchGuard"] = {}
     _global_lock = threading.Lock()
 
+    # Slice 50 Phase 1 — count of observer teardowns abandoned past the
+    # JARVIS_EMITTER_TEARDOWN_DEADLINE_S deadline (watchdog emitter.join()
+    # still walking). Surfaced to metrics so a silent resource leak is
+    # observable rather than masquerading as a clean shutdown.
+    _emitter_teardown_abandoned: int = 0
+
     def __init__(
         self,
         watch_dir: Path,
@@ -880,12 +886,93 @@ class FileWatchGuard:
                 candidate_count, high_warn, len(scheduled_ok),
             )
 
+    @staticmethod
+    def _emitter_teardown_deadline_s() -> float:
+        """Policy-driven observer-teardown deadline (seconds).
+
+        Env ``JARVIS_EMITTER_TEARDOWN_DEADLINE_S`` (default 10.0).
+        Non-positive or malformed values fall back to the default so
+        teardown is always bounded.
+        """
+        raw = os.environ.get("JARVIS_EMITTER_TEARDOWN_DEADLINE_S", "")
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+        return 10.0
+
     async def _stop_watchdog(self) -> None:
-        """Stop the watchdog observer."""
-        if self._observer:
-            self._observer.stop()
-            self._observer.join(timeout=5.0)
-            self._observer = None
+        """Stop the watchdog observer with a BOUNDED teardown.
+
+        Slice 50 Phase 1 — the third-party watchdog ``BaseObserver.stop()``
+        synchronously runs ``on_thread_stop() -> unschedule_all() ->
+        _clear_emitters() -> emitter.join()`` with NO timeout. Under the
+        runaway-watching guard (dozens of ``PollingObserver`` roots, each a
+        polling thread mid ``os.scandir`` walk of nested venvs) that join
+        blocks for as long as the slowest walk takes, loop-locking component
+        shutdown. v45 probe ``bt-2026-06-01-034745`` wedged ~57s here, past
+        the in-process ShutdownWatchdog deadline — only the Slice 49 external
+        watchdog guaranteed death.
+
+        watchdog observer + emitter threads are ``daemon=True``, so we run
+        the blocking ``stop()``/``join()`` on a daemon helper thread and
+        bound-join it against ``JARVIS_EMITTER_TEARDOWN_DEADLINE_S``
+        (default 10s). On timeout we ABANDON the daemon handle — the
+        interpreter never waits on a daemon thread, so the exit path is
+        cleared — flag the leak to metrics, and advance teardown. The
+        observer reference is detached up front so the guard is idempotent
+        and re-entrancy safe.
+        """
+        observer = self._observer
+        if observer is None:
+            return
+        # Detach immediately: the handle is abandoned-or-joined either way,
+        # making _stop_watchdog idempotent + safe under concurrent stop().
+        self._observer = None
+
+        deadline_s = self._emitter_teardown_deadline_s()
+
+        def _blocking_teardown() -> None:
+            try:
+                observer.stop()
+                observer.join(timeout=5.0)
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                logger.debug(
+                    "[FileWatchGuard] observer teardown raised (ignored)",
+                    exc_info=True,
+                )
+
+        helper = threading.Thread(
+            target=_blocking_teardown,
+            name="filewatch-observer-teardown",
+            daemon=True,
+        )
+        helper.start()
+
+        # Bound-join the daemon helper OFF the event loop. ``Thread.join(t)``
+        # returns after ``t`` seconds regardless, so the executor thread is
+        # busy for at most ``deadline_s`` and never itself leaks.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, helper.join, deadline_s)
+
+        if helper.is_alive():
+            FileWatchGuard._emitter_teardown_abandoned += 1
+            logger.warning(
+                "[FileWatchGuard] observer teardown exceeded %.1fs deadline "
+                "— abandoning daemon thread (watchdog emitter.join() still "
+                "walking; resource leak flagged, total_abandoned=%d). Exit "
+                "path cleared.",
+                deadline_s,
+                FileWatchGuard._emitter_teardown_abandoned,
+            )
+        else:
+            logger.debug(
+                "[FileWatchGuard] observer teardown completed within "
+                "%.1fs deadline",
+                deadline_s,
+            )
 
     # ------------------------------------------------------------------
     # Narrow-scheduling helpers (fixes PollingObserver-at-scale failure)

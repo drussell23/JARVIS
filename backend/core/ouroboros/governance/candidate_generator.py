@@ -772,6 +772,52 @@ def fallback_thinking_cap_s() -> float:
     except (TypeError, ValueError):
         return 360.0
 
+
+def force_batch_gen_timeout_floor_s() -> float:
+    """Slice 50 Phase 2 — minimum GENERATE-phase deadline for a force-batch op.
+
+    The DW BATCH lane's async poll legitimately runs up to
+    ``JARVIS_DW_BATCH_TIMEOUT_S`` (Slice 43, default 300s). The OUTER
+    GENERATE deadline must STRICTLY exceed that lease so the batch poll is
+    never severed by the outer ``wait_for`` at exactly its own expiry —
+    add a small overhead (``JARVIS_FORCE_BATCH_GEN_OVERHEAD_S``, default
+    30s) for the sentinel + Iron-Gate processing that follows the poll.
+
+    Derived from the Slice 43 batch-timeout constant, NOT a second
+    hardcoded value: change ``JARVIS_DW_BATCH_TIMEOUT_S`` and the floor
+    tracks it. Mirror of :func:`fallback_thinking_cap_s` — a single shared
+    resolver for the outer/inner deadline-coherence invariant.
+    """
+    batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
+    overhead = _envf_or_default("JARVIS_FORCE_BATCH_GEN_OVERHEAD_S", 30.0)
+    return batch_cap + overhead
+
+
+def apply_force_batch_deadline_floor(
+    gen_timeout_s: float, *, force_batch: bool
+) -> float:
+    """Floor a GENERATE-phase deadline so a force-batch op's outer window
+    exceeds the DW batch lease (Slice 50 Phase 2).
+
+    Forensic basis — v45 probe ``bt-2026-06-01-034745``: a
+    ``route=standard, complexity=trivial`` op force-batched (Slice 36:
+    Claude disabled + standard route) but its route-base GENERATE deadline
+    was only ``JARVIS_GEN_TIMEOUT_STANDARD_S=220s`` — the R1 thinking-cap
+    floor (-> 360s) does not fire for trivial ops. So
+    ``_compute_primary_budget(remaining=220, force_batch=True) =
+    min(220, 300) = 220`` and the async batch poll was severed at 220s
+    while its own 300s lease still had runway (TimeoutError elapsed=220s).
+
+    ``force_batch=False`` ops pass through unchanged (zero regression).
+    The floor is a ``max()`` so an already-wide window (e.g. COMPLEX
+    R1-floored to 360s) is preserved, never reduced. Safe by construction:
+    Slice 36 force-batch only engages when Claude is disabled (pure-DW
+    mode), so there is no Claude-cascade calibration to regress.
+    """
+    if not force_batch:
+        return gen_timeout_s
+    return max(gen_timeout_s, force_batch_gen_timeout_floor_s())
+
 # ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
