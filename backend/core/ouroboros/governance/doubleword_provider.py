@@ -103,8 +103,35 @@ _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
 _DW_REASONING_EFFORT = os.environ.get("JARVIS_DW_REASONING_EFFORT", "none")
 
 
-def _reasoning_request_params(effort: str = "") -> dict:
-    """Slice 54 — DoubleWord reasoning-control request params.
+# Slice 55 — complexity → reasoning_effort map. Leaf/utility work goes fast &
+# cheap (no chain-of-thought); high-impact core changes get a CoT buffer for
+# quality. Derived from the op's task_complexity; the env var remains an
+# explicit override / kill-switch (NOT eliminated).
+_COMPLEXITY_REASONING_EFFORT = {
+    "trivial": "none",
+    "simple": "none",
+    "moderate": "low",
+    "complex": "medium",
+    "heavy_code": "high",
+    "architectural": "high",
+}
+
+
+def _reasoning_effort_for(complexity: str = "") -> str:
+    """Slice 55 — resolve reasoning_effort. Explicit
+    ``JARVIS_DW_REASONING_EFFORT`` wins (operator override / kill-switch);
+    otherwise derive from the op's ``task_complexity`` (unknown → ``none``,
+    preserving Slice 54's default)."""
+    env = os.environ.get("JARVIS_DW_REASONING_EFFORT", "").strip().lower()
+    if env:
+        return env
+    return _COMPLEXITY_REASONING_EFFORT.get(
+        (complexity or "").strip().lower(), "none",
+    )
+
+
+def _reasoning_request_params(effort: str = "", *, complexity: str = "") -> dict:
+    """Slice 54/55 — DoubleWord reasoning-control request params.
 
     Qwen3.5 are reasoning models that burn the token budget on chain-of-thought
     before emitting ``content``. Verified 2026-06-01: the OpenAI-standard
@@ -114,13 +141,14 @@ def _reasoning_request_params(effort: str = "") -> dict:
     (still 62 reasoning tokens, empty content) — which is why suppression never
     worked and every DW candidate came back empty / done_before_content.
 
-    Default effort ``none`` → straight-to-content (fast, cheap, content-only).
-    Raise via ``JARVIS_DW_REASONING_EFFORT`` (or the ``effort`` arg) to
-    ``low``/``medium``/``high`` when chain-of-thought is wanted for quality;
-    the streaming parser then treats reasoning deltas as liveness and the
-    complexity-tiered budget covers think + answer.
+    Slice 55 — effort is now derived from ``complexity`` (via
+    :func:`_reasoning_effort_for`) so leaf/utility ops stay fast & cheap
+    (``none``) while high-impact core changes get a CoT buffer. An explicit
+    ``effort`` arg or the ``JARVIS_DW_REASONING_EFFORT`` env override either
+    still wins. When effort resolves to ``none`` the (DW-ignored but harmless)
+    enable_thinking flag is also sent for intent clarity.
     """
-    eff = (effort or os.environ.get("JARVIS_DW_REASONING_EFFORT", "none") or "none").strip().lower()
+    eff = (effort or _reasoning_effort_for(complexity) or "none").strip().lower()
     params: dict = {"reasoning_effort": eff}
     if eff == "none":
         # Belt-and-braces: harmless (DW ignores it) but keeps intent explicit
@@ -1015,10 +1043,13 @@ class DoublewordProvider:
                 ],
                 "max_tokens": self._max_tokens,
                 "temperature": _DW_TEMPERATURE,
-                # Slice 54 — Qwen3.5 reasoning control. reasoning_effort
-                # (default "none") IS honored by DW; the old enable_thinking
-                # flag was silently ignored. Straight-to-content when "none".
-                **_reasoning_request_params(),
+                # Slice 54/55 — Qwen3.5 reasoning control. reasoning_effort
+                # (DW-honored; the old enable_thinking flag was ignored) is
+                # derived from task_complexity (Slice 55) — leaf work stays
+                # "none" (fast/cheap), high-impact core gets a CoT buffer.
+                **_reasoning_request_params(
+                    complexity=getattr(ctx, "task_complexity", "") or "",
+                ),
             },
         })
 
@@ -2118,8 +2149,9 @@ class DoublewordProvider:
                 ],
                 "max_tokens": _eff_max_tokens,
                 "temperature": _DW_TEMPERATURE,
-                # Slice 54 — reasoning control (see _reasoning_request_params).
-                **_reasoning_request_params(),
+                # Slice 54/55 — reasoning control, effort derived from
+                # task_complexity (see _reasoning_request_params).
+                **_reasoning_request_params(complexity=_complexity or ""),
             }
 
             if _stream_callback is not None:
