@@ -101,6 +101,24 @@ _COMPLEX_FLOOR_SOURCES = frozenset({
 })
 
 
+def _is_concrete_file_target(target: str) -> bool:
+    """Slice 59 — True iff ``target`` names a specific file (not a directory).
+
+    Text-only (the classifier is no-FS by contract). A concrete file target is
+    non-empty, does not end with ``/``, and its basename contains a ``.``
+    (an extension or a dotfile like ``.gitignore``). Directory-level targets
+    such as ``backend/core/`` or ``backend/core`` are NOT concrete — an op
+    aimed at a directory has no specific file to full-rewrite, so a fast-path
+    generation only yields a fragment (v57 truncation). Extension-less real
+    files (e.g. ``Makefile``) read as non-concrete here; escalating those is a
+    safe, conservative over-classification (more reasoning, never less).
+    """
+    t = (target or "").strip()
+    if not t or t.endswith("/"):
+        return False
+    return "." in t.rsplit("/", 1)[-1]
+
+
 class OperationComplexityClassifier:
     """Classifies operations by complexity and persistence at CLASSIFY phase.
 
@@ -189,6 +207,19 @@ class OperationComplexityClassifier:
         # a real pre-known edit set and would misclassify a no-target
         # localize-from-issue task as SIMPLE (starving PLAN + budget).
         if source in _COMPLEX_FLOOR_SOURCES:
+            return ComplexityClass.COMPLEX
+
+        # Slice 59 — non-concrete (directory-level) targets must never fast-path.
+        # An op aimed at e.g. ['backend/core/'] has no specific file to
+        # full-rewrite; classified TRIVIAL/SIMPLE it gets reasoning_effort=none
+        # + fast_path and the model emits a fragment (v57 truncation). Escalate
+        # to COMPLEX so it receives full reasoning headroom (or is gated by the
+        # Advisor blast-radius check upstream). Architectural keywords and the
+        # source-floor above still win; empty target_files are untouched
+        # (the no-target SWE-bench path is owned by the source-floor).
+        if target_files and any(
+            not _is_concrete_file_target(t) for t in target_files
+        ):
             return ComplexityClass.COMPLEX
 
         # Check for trivial indicators
