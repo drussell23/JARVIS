@@ -240,6 +240,11 @@ class SignalCollector:
     ) -> None:
         self._root = project_root.resolve()
         self._open_ops_provider = open_ops_provider
+        # Slice 52 Phase 2 — reactive commit-ratio cache keyed by
+        # (HEAD hash, window). Lets the 300s posture cycle skip the
+        # 100-commit ``git log`` whenever HEAD has not advanced (the
+        # common case). ``None`` until first computation.
+        self._commit_ratios_cache: Optional[Tuple[str, int, Dict[str, float]]] = None
 
     def _git_subjects(self, n: int) -> List[str]:
         """Legacy sync entry — retained for backwards compat with the
@@ -308,14 +313,46 @@ class SignalCollector:
             return []
         return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    async def commit_ratios_async(self) -> Dict[str, float]:
-        """Slice 33 Arc 2 Phase 1 — async-native commit ratios.
+    async def _git_head_async(self) -> str:
+        """Resolve current HEAD sha (``git rev-parse HEAD``), async + bounded.
 
-        Same semantics as sync :meth:`commit_ratios`, but the git log
-        runs via ``create_subprocess_exec`` — no thread-pool slot
-        consumed even during cold-cache 18 s scans.
+        Slice 52 Phase 2 — a cheap (sub-tens-of-ms) anchor for the
+        commit-ratio cache. Returns "" on any failure (no git / detached /
+        timeout / nonzero exit) so callers treat HEAD as unresolvable and
+        skip caching rather than pinning a stale value. NEVER raises.
         """
-        subjects = await self._git_subjects_async(commit_window())
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                cwd=str(self._root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError):
+            return ""
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        if proc.returncode != 0:
+            return ""
+        try:
+            return out.decode("utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _compute_commit_ratios(subjects: List[str]) -> Dict[str, float]:
+        """Pure ratio math over Conventional-Commit subjects (Slice 52
+        — extracted so the cached async path and any future caller share
+        one implementation)."""
         if not subjects:
             return {"feat": 0.0, "fix": 0.0, "refactor": 0.0, "test_docs": 0.0}
         counts = {"feat": 0, "fix": 0, "refactor": 0, "test": 0, "docs": 0}
@@ -333,6 +370,31 @@ class SignalCollector:
             "refactor": counts["refactor"] / total,
             "test_docs": (counts["test"] + counts["docs"]) / total,
         }
+
+    async def commit_ratios_async(self) -> Dict[str, float]:
+        """Slice 33 Arc 2 Phase 1 — async-native commit ratios.
+
+        Same semantics as sync :meth:`commit_ratios`, but the git log
+        runs via ``create_subprocess_exec`` — no thread-pool slot
+        consumed even during cold-cache 18 s scans.
+
+        Slice 52 Phase 2 — reactive cache: a cheap ``git rev-parse HEAD``
+        gate short-circuits the 100-commit ``git log`` whenever HEAD has
+        not advanced since the last computation (the common case at the
+        300s cadence — this is what was costing up to 9.8s/cycle in v46).
+        Recomputes when HEAD moves; never caches when HEAD is unresolvable
+        so a stale value can't pin the posture.
+        """
+        window = commit_window()
+        head = await self._git_head_async()
+        cache = self._commit_ratios_cache
+        if head and cache is not None and cache[0] == head and cache[1] == window:
+            return dict(cache[2])
+        subjects = await self._git_subjects_async(window)
+        ratios = self._compute_commit_ratios(subjects)
+        if head:
+            self._commit_ratios_cache = (head, window, dict(ratios))
+        return ratios
 
     def commit_ratios(self) -> Dict[str, float]:
         """feat / fix / refactor / test+docs ratios over last N commits."""
