@@ -1989,6 +1989,40 @@ class GovernedLoopService:
         """
         start_time = time.monotonic()
 
+        # Gate: Slice 53 dual-lane total-outage breaker. When a verified total
+        # vendor blackout has tripped the breaker (JARVIS_TOTAL_OUTAGE_THRESHOLD
+        # consecutive ops exhausted BOTH the streaming and batch lanes with no
+        # candidate), pause target allocations — refuse new ops so the loop
+        # idles into a clean idle_timeout exit-0 rather than burning retry
+        # tokens against a confirmed-dead provider. Single-lane degradation
+        # never trips it (a working batch lane yields candidates that reset the
+        # counter), so Slice 41 ACTIVE_BATCH_ONLY is preserved.
+        try:
+            from backend.core.ouroboros.governance.dual_lane_breaker import (
+                get_dual_lane_breaker,
+            )
+            _dlb = get_dual_lane_breaker()
+        except Exception:  # noqa: BLE001 — defensive; never block submit on import
+            _dlb = None
+        if _dlb is not None and _dlb.is_tripped():
+            if not getattr(self, "_dual_lane_pause_logged", False):
+                logger.error(
+                    "[GovernedLoop] Dual-lane outage breaker TRIPPED (diag=%s) "
+                    "— pausing target allocations; loop will idle to a clean "
+                    "exit. Disable via JARVIS_DUAL_LANE_BREAKER_ENABLED=false.",
+                    _dlb.snapshot().last_diagnostic,
+                )
+                self._dual_lane_pause_logged = True
+            result = OperationResult(
+                op_id=ctx.op_id,
+                terminal_phase=OperationPhase.CANCELLED,
+                reason_code="dual_lane_outage_paused",
+                trigger_source=trigger_source,
+                terminal_class="DEGRADED",
+            )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
+
         # Gate: service must be active
         if self._state not in (ServiceState.ACTIVE, ServiceState.DEGRADED):
             result = OperationResult(

@@ -818,6 +818,36 @@ def apply_force_batch_deadline_floor(
         return gen_timeout_s
     return max(gen_timeout_s, force_batch_gen_timeout_floor_s())
 
+
+def _note_dw_total_outage(diagnostic: str) -> None:
+    """Slice 53 — record one GENERATE op that exhausted ALL DW models with no
+    candidate from streaming OR batch (the total-vendor-blackout signature).
+
+    Routed through the dual-lane breaker singleton. NEVER raises (defensive
+    lazy import) — recording is best-effort observability + breaker state, it
+    must not perturb the generation error path it sits on.
+    """
+    try:
+        from backend.core.ouroboros.governance.dual_lane_breaker import (
+            get_dual_lane_breaker,
+        )
+        get_dual_lane_breaker().record_total_outage(diagnostic or "all_models_open")
+    except Exception:  # noqa: BLE001 — never perturb the error path
+        pass
+
+
+def _note_dw_candidate_success() -> None:
+    """Slice 53 — record that some DW lane (or fallback) yielded a candidate,
+    resetting the breaker's consecutive-outage counter. Preserves Slice 41
+    single-lane resilience. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dual_lane_breaker import (
+            get_dual_lane_breaker,
+        )
+        get_dual_lane_breaker().record_success()
+    except Exception:  # noqa: BLE001
+        pass
+
 # ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
@@ -2255,6 +2285,7 @@ class CandidateGenerator:
                 context, deadline, _provider_route,
             )
             if _result is not None:
+                _note_dw_candidate_success()  # Slice 53 — a lane yielded a candidate
                 return _result
             # _dispatch_via_sentinel returns None to signal "fall
             # through to legacy path" (e.g. the route has empty
@@ -3202,10 +3233,12 @@ class CandidateGenerator:
             # Same exception shape the orchestrator's existing
             # accept-failure branch already handles for BG/SPEC.
             if provider_route == "speculative":
+                _note_dw_total_outage(last_failure or "")  # Slice 53
                 raise RuntimeError(
                     f"speculative_deferred:dw_severed_queued:"
                     f"{(last_failure or 'all_models_open')[:120]}"
                 )
+            _note_dw_total_outage(last_failure or "")  # Slice 53
             raise RuntimeError(
                 f"background_dw_blocked_by_topology:"
                 f"dw_severed_queued:"
@@ -3213,6 +3246,7 @@ class CandidateGenerator:
             )
         # cascade_to_claude — Claude is the explicit cost contract.
         if self._fallback is None:
+            _note_dw_total_outage(last_failure or "")  # Slice 53
             raise RuntimeError(
                 f"sentinel_dispatch_no_fallback:"
                 f"{(last_failure or 'all_models_open')[:120]}"
