@@ -404,6 +404,46 @@ class ChangeEngine:
         self._risk_engine = risk_engine or RiskEngine()
         self._tool_hook_registry: Optional[ToolCallHookRegistry] = tool_hook_registry
 
+    # ------------------------------------------------------------------
+    # Slice 56 — cross-worktree write alignment (Option A)
+    # ------------------------------------------------------------------
+
+    def _effective_write_root(self) -> Path:
+        """Resolve the root that APPLY writes into.
+
+        When ``JARVIS_AUTO_COMMIT_WORKSPACE`` is set (harness ledger-sovereignty
+        owned worktree), writes are redirected there so they land in the SAME
+        tree AutoCommitter commits from (``AutoCommitter._effective_repo_root``)
+        — coherent by construction — and the operator's main tree is never
+        touched. Unset → ``self._project_root`` (byte-identical legacy path).
+        """
+        override = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE")
+        if override:
+            return Path(override)
+        return self._project_root
+
+    def _redirect_target(self, target: Path) -> Path:
+        """Rebase a write target onto :meth:`_effective_write_root`.
+
+        No-op when the env override is unset (root == project_root). Absolute
+        paths are rebased by their path relative to ``project_root``; relative
+        paths are joined to the write root. A target NOT under ``project_root``
+        is left unchanged (defensive — never silently cross-write elsewhere).
+        NEVER raises — falls back to the original target on any resolution error.
+        """
+        root = self._effective_write_root()
+        try:
+            if root.resolve() == self._project_root.resolve():
+                return target
+            if target.is_absolute():
+                rel = target.resolve().relative_to(self._project_root.resolve())
+            else:
+                rel = target
+            return root / rel
+        except (ValueError, OSError):
+            # Not under project_root (or unresolvable) — leave as-is.
+            return target
+
     async def execute(self, request: ChangeRequest) -> ChangeResult:
         """Execute the 8-phase transactional change pipeline.
 
@@ -569,7 +609,12 @@ class ChangeEngine:
                 op_id=op_id, phase="apply", progress_pct=70.0
             )
 
-            target = Path(request.target_file)
+            # Slice 56 — redirect the write into the owned auto-commit worktree
+            # when active, so the patch lands in the SAME tree AutoCommitter
+            # commits from (and never the operator's main tree). No-op when
+            # JARVIS_AUTO_COMMIT_WORKSPACE is unset. Rollback snapshot + lock +
+            # signature all follow the redirected target (Phase 2 coherence).
+            target = self._redirect_target(Path(request.target_file))
             rollback = RollbackArtifact.capture(target)
 
             await self._ledger.append(
