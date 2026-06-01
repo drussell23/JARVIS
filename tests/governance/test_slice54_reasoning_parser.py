@@ -88,7 +88,9 @@ def test_reasoning_param_wired_into_request_bodies():
     # The working param helper must be spread into the request bodies, and the
     # ineffective bare enable_thinking literal must no longer be the sole knob.
     assert "_reasoning_request_params(" in src
-    assert src.count("**_reasoning_request_params()") >= 3, (
+    # Slice 55 — batch + streaming now pass complexity=...; prompt_only stays
+    # bare. Count any form of the helper spread into a request body.
+    assert src.count("**_reasoning_request_params(") >= 3, (
         "reasoning params must be wired into the batch + streaming + sync bodies"
     )
 

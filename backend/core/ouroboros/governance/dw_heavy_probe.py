@@ -649,6 +649,15 @@ class HeavyProber:
             "max_tokens": max_tokens,
             "stream": True,
             "temperature": 0.0,
+            # Slice 55 — reasoning models (Qwen3.5) otherwise burn the whole
+            # probe budget on chain-of-thought and emit NO content within the
+            # window, producing a false done_before_content health verdict that
+            # forces unnecessary batch-routing. The DW-honored reasoning_effort
+            # knob makes the probe go straight to content (verified Slice 54).
+            # The probe is a liveness check, so always "none" regardless of the
+            # generation-path effort.
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         url = f"{base_url.rstrip('/')}/chat/completions"
         # Slice 2B-ii.2 — Aegis Provider Bridge wire. When
