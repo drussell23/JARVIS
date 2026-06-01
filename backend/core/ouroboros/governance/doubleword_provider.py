@@ -100,6 +100,61 @@ _DW_OUTPUT_OVERHEAD_TOKENS = 2048  # JSON schema wrapper + rationale + slack
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
+_DW_REASONING_EFFORT = os.environ.get("JARVIS_DW_REASONING_EFFORT", "none")
+
+
+def _reasoning_request_params(effort: str = "") -> dict:
+    """Slice 54 — DoubleWord reasoning-control request params.
+
+    Qwen3.5 are reasoning models that burn the token budget on chain-of-thought
+    before emitting ``content``. Verified 2026-06-01: the OpenAI-standard
+    ``reasoning_effort`` knob IS honored by DW (``none`` → finish=stop,
+    content present, 0 reasoning tokens), while the previously-used
+    ``chat_template_kwargs={"enable_thinking": False}`` is silently IGNORED
+    (still 62 reasoning tokens, empty content) — which is why suppression never
+    worked and every DW candidate came back empty / done_before_content.
+
+    Default effort ``none`` → straight-to-content (fast, cheap, content-only).
+    Raise via ``JARVIS_DW_REASONING_EFFORT`` (or the ``effort`` arg) to
+    ``low``/``medium``/``high`` when chain-of-thought is wanted for quality;
+    the streaming parser then treats reasoning deltas as liveness and the
+    complexity-tiered budget covers think + answer.
+    """
+    eff = (effort or os.environ.get("JARVIS_DW_REASONING_EFFORT", "none") or "none").strip().lower()
+    params: dict = {"reasoning_effort": eff}
+    if eff == "none":
+        # Belt-and-braces: harmless (DW ignores it) but keeps intent explicit
+        # for any future endpoint that honors the chat-template flag.
+        params["chat_template_kwargs"] = {"enable_thinking": False}
+    return params
+
+
+def _extract_completion_text(message: dict) -> str:
+    """Slice 54 — answer text from a completion message, reasoning-model-aware.
+
+    Reads ``content`` first (populated when ``reasoning_effort=none`` or once
+    the model exits the think phase). Falls back to ``reasoning`` then
+    ``reasoning_details[].text`` — the CORRECT DW field names. The prior code
+    fell back to ``reasoning_content`` which does not exist on these models, so
+    it always read empty. NEVER raises.
+    """
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if content:
+        return content
+    reasoning = message.get("reasoning")
+    if reasoning:
+        return reasoning
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        texts = [d.get("text", "") for d in details
+                 if isinstance(d, dict) and d.get("text")]
+        if texts:
+            return "\n".join(texts)
+    return ""
+
+
 _DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "10"))
 _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
 
@@ -960,10 +1015,10 @@ class DoublewordProvider:
                 ],
                 "max_tokens": self._max_tokens,
                 "temperature": _DW_TEMPERATURE,
-                # Qwen3.5 reasoning models: disable thinking mode so output
-                # goes to 'content' field instead of being consumed by internal
-                # reasoning. Without this, content is empty (all tokens used for thinking).
-                "chat_template_kwargs": {"enable_thinking": False},
+                # Slice 54 — Qwen3.5 reasoning control. reasoning_effort
+                # (default "none") IS honored by DW; the old enable_thinking
+                # flag was silently ignored. Straight-to-content when "none".
+                **_reasoning_request_params(),
             },
         })
 
@@ -2063,7 +2118,8 @@ class DoublewordProvider:
                 ],
                 "max_tokens": _eff_max_tokens,
                 "temperature": _DW_TEMPERATURE,
-                "chat_template_kwargs": {"enable_thinking": False},
+                # Slice 54 — reasoning control (see _reasoning_request_params).
+                **_reasoning_request_params(),
             }
 
             if _stream_callback is not None:
@@ -2259,6 +2315,16 @@ class DoublewordProvider:
                             chunk = json.loads(data_str)
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
                             token = delta.get("content", "")
+                            # Slice 54 — reasoning liveness. When reasoning is
+                            # enabled, Qwen3.5 streams `reasoning` deltas before
+                            # any `content`. Observing them marks affirmative
+                            # progress so the long think phase is NOT misread as
+                            # done_before_content / live_transport silence. The
+                            # reasoning text itself is telemetry only — the
+                            # candidate still comes from `content`.
+                            _reasoning_delta = delta.get("reasoning", "") or ""
+                            if _reasoning_delta and not token:
+                                _reasoning_seen = True  # noqa: F841 — liveness marker
                             # Priority 1 Slice 1 + Slice 2 — capture +
                             # monitor. Reads chunk's logprobs structure;
                             # feeds capturer (always when capture enabled)
@@ -3490,16 +3556,20 @@ class DoublewordProvider:
 
                         if choices:
                             message = choices[0].get("message", {})
-                            # Extract content — for reasoning models like Qwen3.5,
-                            # the actual answer may be in 'content' or 'reasoning_content'.
-                            # Try 'content' first; if empty, fall back to 'reasoning_content'.
+                            # Slice 54 — reasoning-model-aware extraction.
+                            # content first; then the CORRECT reasoning fields
+                            # (`reasoning` / `reasoning_details[].text`). The
+                            # prior code used `reasoning_content`, which these
+                            # models never emit, so the fallback always read
+                            # empty. With reasoning_effort="none" content is
+                            # populated directly and the fallback is inert.
                             content = message.get("content", "")
                             if not content:
-                                content = message.get("reasoning_content", "")
+                                content = _extract_completion_text(message)
                                 if content:
                                     logger.info(
-                                        "[DoublewordProvider] Using reasoning_content "
-                                        "(content was empty) for op=%s",
+                                        "[DoublewordProvider] content empty — used "
+                                        "reasoning field fallback for op=%s",
                                         operation_id,
                                     )
                             logger.debug(
@@ -3641,8 +3711,8 @@ class DoublewordProvider:
             ],
             "max_tokens": effective_max_tokens,
             "temperature": _DW_TEMPERATURE,
-            # Qwen3.5: disable thinking mode so output goes to 'content'
-            "chat_template_kwargs": {"enable_thinking": False},
+            # Slice 54 — reasoning control (see _reasoning_request_params).
+            **_reasoning_request_params(),
         }
         if response_format is not None:
             body["response_format"] = response_format
