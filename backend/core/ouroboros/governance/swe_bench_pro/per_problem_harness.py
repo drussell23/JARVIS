@@ -73,7 +73,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.swe_bench_pro.evaluator_trace_observer import (  # noqa: E501
     EvaluatorPhase,
@@ -517,6 +517,70 @@ def _extract_target_paths_from_patch(test_patch: str) -> Tuple[str, ...]:
     return tuple(paths)
 
 
+def _strip_test_patch_sections(
+    diff_text: str, test_paths: Iterable[str],
+) -> str:
+    """Drop the diff sections that touch any path in the test-patch manifest.
+
+    Slice 69 — the clean-delta invariant. ``prepare_problem`` applies the
+    held-out ``test_patch`` into the worktree BEFORE the model runs, so the
+    working-tree capture (``git add -A && git diff --cached base_commit``) also
+    sees those test files. The container scorer runs
+    ``git apply <test_patch> && git apply <model_patch>`` — and step 2 has NO
+    ``|| true`` guard, so a model patch carrying the already-applied test hunks
+    HARD-FAILS (``scoring_error``). Stripping the test footprint here leaves
+    100% pure model source changes in the captured patch.
+
+    Splits the unified diff on ``diff --git`` section boundaries and removes any
+    section whose paths (parsed from the ``diff --git`` header AND the
+    ``--- a/`` / ``+++ b/`` lines — same convention as
+    ``_extract_target_paths_from_patch``) intersect the manifest. Path matching
+    is EXACT on the repo-relative path (never basename), so a source file that
+    merely shares a basename with a test survives. Pure; NEVER raises — on any
+    error it returns the input unfiltered (capture is fail-safe, not fail-shut).
+    """
+    test_set = {p.strip() for p in test_paths if p and p.strip()}
+    if not test_set or not diff_text:
+        return diff_text
+    try:
+        sections: List[Tuple[set, List[str]]] = []
+        cur_lines: List[str] = []
+        cur_paths: set = set()
+
+        def _flush() -> None:
+            if cur_lines:
+                sections.append((set(cur_paths), list(cur_lines)))
+
+        for line in diff_text.splitlines(keepends=True):
+            if line.startswith("diff --git "):
+                _flush()
+                cur_lines = [line]
+                cur_paths = set()
+                # "diff --git a/<p1> b/<p2>" — parse both (renames differ).
+                rest = line[len("diff --git "):].rstrip("\r\n")
+                if " b/" in rest:
+                    a_part, b_part = rest.split(" b/", 1)
+                    if a_part.startswith("a/"):
+                        cur_paths.add(a_part[2:].strip())
+                    cur_paths.add(b_part.strip())
+            else:
+                cur_lines.append(line)
+                if line.startswith("+++ b/"):
+                    cur_paths.add(line[len("+++ b/"):].rstrip("\r\n").strip())
+                elif line.startswith("--- a/"):
+                    cur_paths.add(line[len("--- a/"):].rstrip("\r\n").strip())
+        _flush()
+
+        kept: List[str] = []
+        for paths, sec_lines in sections:
+            if paths & test_set:
+                continue  # contaminating test-patch section — drop it
+            kept.extend(sec_lines)
+        return "".join(kept)
+    except Exception:  # noqa: BLE001 — capture is fail-safe, never fail-shut
+        return diff_text
+
+
 # ===========================================================================
 # Public API — prepare_problem
 # ===========================================================================
@@ -595,11 +659,31 @@ async def prepare_problem(
 async def capture_produced_patch(
     prepared: PreparedProblem,
 ) -> Tuple[Optional[str], DiffCaptureOutcome]:
-    """Compute the diff from base_commit to the current worktree
-    HEAD (the patch the model produced)."""
+    """Capture the patch the model produced — the full diff vs ``base_commit``
+    of the worktree's CURRENT state, with the harness's pre-applied
+    ``test_patch`` footprint stripped.
+
+    Slice 68 substrate — APPLY writes the candidate into the worktree's WORKING
+    TREE (uncommitted; any commit goes to the separate AutoCommitter workspace),
+    so the previous ``git diff base_commit HEAD`` (committed-only) returned
+    ``no_changes`` even when the patch was applied. Stage everything (incl. new
+    files) then diff the index vs ``base_commit`` — the canonical SWE-bench
+    ``git add -A && git diff`` capture — which recovers the patch whether it was
+    left in the working tree OR committed, and includes added files. Staging is
+    safe: the worktree is ephemeral (``cleanup_prepared`` removes it).
+
+    Slice 69 clean-delta invariant — that capture ALSO sees the held-out
+    ``test_patch`` (applied at prepare time). Filter it out via
+    ``prepared.target_paths`` so the scorer's
+    ``git apply <test_patch> && git apply <model_patch>`` doesn't double-apply
+    the test hunks (step 2 has no ``|| true`` guard → ``scoring_error``)."""
     try:
+        # Stage all changes (modified + added + deleted) so the diff vs
+        # base_commit also sees untracked files. Best-effort: a non-zero rc
+        # here is non-fatal — the diff below is authoritative.
+        await _run_git(["add", "-A"], cwd=prepared.worktree_path)
         rc, stdout, stderr = await _run_git(
-            ["diff", prepared.base_commit, "HEAD"],
+            ["diff", "--cached", prepared.base_commit],
             cwd=prepared.worktree_path,
         )
         if rc != 0:
@@ -608,9 +692,13 @@ async def capture_produced_patch(
                 prepared.problem_instance_id, rc, stderr.strip()[:200],
             )
             return None, DiffCaptureOutcome.CAPTURE_FAILED
-        if not stdout.strip():
+        # Strip the pre-applied test_patch footprint (clean-delta invariant).
+        cleaned = _strip_test_patch_sections(stdout, prepared.target_paths)
+        if not cleaned.strip():
+            # Either no change at all, or the ONLY change was the test_patch
+            # (the model produced nothing) — both are NO_CHANGES.
             return None, DiffCaptureOutcome.NO_CHANGES
-        return stdout, DiffCaptureOutcome.CAPTURED
+        return cleaned, DiffCaptureOutcome.CAPTURED
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001
