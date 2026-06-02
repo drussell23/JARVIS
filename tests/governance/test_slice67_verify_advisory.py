@@ -35,3 +35,16 @@ def test_empty_source_keeps_error():
 def test_no_error_passthrough():
     assert _swe_bench_verify_advisory("swe_bench_pro", None, "op1") is None
     assert _swe_bench_verify_advisory("opportunity_miner", None, "op1") is None
+
+
+def test_advisory_wired_in_BOTH_verify_paths():
+    # Dead-code guard: the soak proved the LIVE VERIFY is the extracted
+    # slice4b_runner, NOT the inline orchestrator block. Pin BOTH so the gate
+    # is covered whichever path is active (the Slice-45 trap must not recur,
+    # and the live-runner wiring must not get dropped from a commit again).
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    runner = (repo / "backend/core/ouroboros/governance/phase_runners/slice4b_runner.py").read_text()
+    inline = (repo / "backend/core/ouroboros/governance/orchestrator.py").read_text()
+    assert "_swe_bench_verify_advisory" in runner, "LIVE VERIFYRunner must call the advisory"
+    assert "_swe_bench_verify_advisory" in inline, "inline VERIFY block must call the advisory"
