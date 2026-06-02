@@ -917,6 +917,22 @@ class Slice4bRunner(PhaseRunner):
         if _verify_error is None and not _verify_test_passed:
             _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
+        # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (LIVE
+        # extracted-runner path; mirrors the inline orchestrator block). The
+        # repo tests can't run without the container env; the held-out
+        # container scoring (Slice 65) is authoritative. Clearing the error
+        # keeps the patch applied (no rollback) so the autoscore layer captures
+        # it. Lazy import avoids a runner↔orchestrator module cycle.
+        try:
+            from backend.core.ouroboros.governance.orchestrator import (
+                _swe_bench_verify_advisory,
+            )
+            _verify_error = _swe_bench_verify_advisory(
+                getattr(ctx, "signal_source", "") or "", _verify_error, ctx.op_id,
+            )
+        except Exception:  # noqa: BLE001 — advisory must never break VERIFY
+            pass
+
         if _verify_error is not None:
             logger.warning(
                 "[Orchestrator] VERIFY regression gate fired: %s [%s]",
