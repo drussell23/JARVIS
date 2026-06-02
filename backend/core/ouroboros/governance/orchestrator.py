@@ -460,6 +460,57 @@ def _phase_runner_validate_extracted() -> bool:
     )
 
 
+def _swe_bench_test_advisory(
+    signal_source: str,
+    op_id: str,
+    candidate: "Dict[str, Any]",
+    result: "ValidationResult",
+) -> "ValidationResult":
+    """Slice 66 — for swe_bench_pro ops, a VALIDATE ``test`` failure is ADVISORY.
+
+    The benchmark repo's test env lives ONLY in the per-problem Docker image
+    (the bare local env can't import qutebrowser/PyQt etc.), AND running the
+    held-out ``fail_to_pass`` tests inside VALIDATE would LEAK them into the L2
+    repair loop — the model would iterate against the evaluation oracle and game
+    the score. So a ``test``-class failure is promoted to passed: the candidate
+    proceeds to APPLY (captured), and the ONE-SHOT container scoring (Slice 65,
+    in the autoscore layer that holds the ProblemSpec) is the authoritative
+    held-out judge — exactly once, no leakage.
+
+    This is NOT a bypass: syntax / build / infra failures STILL block (those are
+    valid LOCAL checks — a patch must be well-formed). Pure + gated; non-
+    swe_bench ops, non-``test`` failures, and already-passed results are returned
+    unchanged (byte-identical). NEVER raises."""
+    try:
+        if result.passed:
+            return result
+        if result.failure_class != "test":
+            return result
+        if (signal_source or "") != "swe_bench_pro":
+            return result
+        from dataclasses import replace
+        logger.info(
+            "[Orchestrator] Slice 66 — swe_bench_pro 'test' failure is ADVISORY "
+            "for op=%s (local env can't run repo tests; running held-out tests "
+            "here would leak them). Promoting candidate to APPLY; the one-shot "
+            "container scoring is the authoritative held-out judge.",
+            op_id,
+        )
+        return replace(
+            result,
+            passed=True,
+            best_candidate=candidate,
+            error=None,
+            failure_class=None,
+            short_summary=(
+                "swe_bench_pro: local test-gate advisory; container scoring "
+                "is authoritative (Slice 66)"
+            ),
+        )
+    except Exception:  # noqa: BLE001 — advisory must never break validation
+        return result
+
+
 def _phase_runner_slice3_fully_extracted() -> bool:
     """All three Slice 3 flags set — routes ROUTE+CTX+PLAN through runners.
 
@@ -10156,6 +10207,26 @@ class GovernedOrchestrator:
         return None
 
     async def _run_validation(
+        self,
+        ctx: OperationContext,
+        candidate: Dict[str, Any],
+        remaining_s: float,
+    ) -> ValidationResult:
+        """Validation seam — runs the core pipeline, then applies the Slice 66
+        swe_bench_pro advisory test-gate. A ``test`` failure for a benchmark op
+        is promoted to passed (the held-out container scoring is authoritative;
+        running the held-out tests here would leak them); non-swe_bench ops and
+        non-``test`` failures are byte-identical. Wrapping HERE covers all three
+        callers — the inline VALIDATE block, the extracted VALIDATERunner, and
+        L2 re-validation — so the advisory holds on every validation path."""
+        result = await self._run_validation_core(ctx, candidate, remaining_s)
+        return _swe_bench_test_advisory(
+            getattr(ctx, "signal_source", "") or "",
+            getattr(ctx, "op_id", "") or "",
+            candidate, result,
+        )
+
+    async def _run_validation_core(
         self,
         ctx: OperationContext,
         candidate: Dict[str, Any],
