@@ -211,7 +211,7 @@ def _local_dataset_instance_ids() -> List[str]:
 
 
 def _resolve_instance_ids() -> List[str]:
-    """Three-tier resolution (strict precedence; NEVER raises):
+    """Four-tier resolution (strict precedence; NEVER raises):
 
       1. ``INJECT_INSTANCE_IDS`` CSV override — explicit operator
          control always wins.
@@ -222,27 +222,25 @@ def _resolve_instance_ids() -> List[str]:
          own gold-patch geometry — zero hardcoded IDs.  This is the
          Stage-2 rubric path.  If the sampler cannot form a valid
          pair it returns ``None`` and resolution falls through.
-      3. First-N from ``list_cached_problems()`` (legacy default).
+      3. Explicit ``LOCAL_DATASET_PATH`` fixture first-N (wiring/dry-run
+         determinism, sampler OFF).
+      4. First-N from ``list_cached_problems()`` (legacy default).
 
-    Pure function over env + dataset state."""
+    Pure function over env + dataset state.
+
+    Slice 62 ordering fix — the geometric sampler (an explicit opt-in)
+    now precedes the local-dataset first-N. The #65644 Tier-1.5 was
+    mis-placed ahead of the sampler, so enabling the sampler over a
+    local dataset blind-took the first id and never sampled.
+    """
     explicit = inject_instance_ids()
     if explicit:
         return explicit
 
-    # Tier 1.5 — explicit LOCAL_DATASET_PATH fixture (wiring/dry-run
-    # determinism). When the operator pins a local dataset (the phase-1
-    # dry-run contract), resolve from THAT fixture's own records rather than
-    # the persistent cache, so the dry-run runs the intended fixture
-    # (e.g. jarvis__harness-smoke-001) instead of a stale-cached real problem
-    # (the phase1 bt-2026-06-01 django__django-16255 mis-injection). Inert
-    # when LOCAL_DATASET_PATH is unset (real HF runs) — falls through below.
-    local_ids = _local_dataset_instance_ids()
-    if local_ids:
-        return local_ids[: inject_count()]
-
-    # Tier 2 — geometric self-curation (opt-in). Compose the
-    # sampler; never let an import/scan failure break the legacy
-    # fallthrough (fail-open per §7).
+    # Tier 2 — geometric self-curation (opt-in, explicit). When the
+    # operator turns the sampler ON they want a *sampled* discriminator
+    # pair, so it precedes the blind local/cache first-N tiers below.
+    # Fail-open per §7: any import/scan failure falls through.
     try:
         from backend.core.ouroboros.governance.swe_bench_pro.geometric_sampler import (  # noqa: E501
             geometric_sampler_enabled,
@@ -263,15 +261,28 @@ def _resolve_instance_ids() -> List[str]:
             logger.warning(
                 "[SWEBenchPro.HarnessInject] geometric sampler ON "
                 "but yielded no valid pair — falling through to "
-                "cache first-N"
+                "local/cache first-N"
             )
     except Exception:  # noqa: BLE001 — fail-open (legacy path intact)
         logger.warning(
             "[SWEBenchPro.HarnessInject] geometric sampler tier "
-            "raised — falling through to cache first-N",
+            "raised — falling through to local/cache first-N",
             exc_info=True,
         )
 
+    # Tier 3 — explicit LOCAL_DATASET_PATH fixture (wiring/dry-run
+    # determinism, sampler OFF). When the operator pins a local dataset
+    # (the phase-1 dry-run contract) WITHOUT the sampler, resolve from
+    # THAT fixture's own records rather than the persistent cache, so the
+    # dry-run runs the intended fixture (e.g. jarvis__harness-smoke-001)
+    # instead of a stale-cached real problem (the phase1 bt-2026-06-01
+    # django__django-16255 mis-injection). Inert when LOCAL_DATASET_PATH
+    # is unset (real HF runs) — falls through below.
+    local_ids = _local_dataset_instance_ids()
+    if local_ids:
+        return local_ids[: inject_count()]
+
+    # Tier 4 — first-N from list_cached_problems() (legacy default).
     cached = list_cached_problems()
     if not cached:
         return []
