@@ -25,7 +25,10 @@ REPO="$(git rev-parse --show-toplevel)"
 cd "$REPO"
 
 # ---- Phase 0 rails (MANDATORY; composed via battle-test flags) -------------
-COST_CAP="2.00"          # operator-bound USD ceiling
+# Slice 63 — COST_CAP is operator-overridable: DW-down forces the costly
+# Claude-only lane (~$0.50/op), so a 106-file instance needs more headroom than
+# the $2 default (e.g. COST_CAP=8 bash scripts/swe_bench_pro_soak.sh phase3 ...).
+COST_CAP="${COST_CAP:-2.00}"   # operator-bound USD ceiling (env-overridable)
 MAX_WALL="2400"          # hard wall-clock seconds (retry-storm-proof)
 IDLE_TIMEOUT="1800"      # per-op liveness seconds
 # Restricted-env: sandbox blocks .git/config under the repo root, so the
@@ -56,6 +59,14 @@ export JARVIS_OP_LIFECYCLE_SSE_ENABLED=true
 # AND real phase3 benchmark) is lost on process exit — no verdict artifact.
 # This is the durable-row gate the report_card reads.
 export JARVIS_SWE_BENCH_PRO_RESULT_PERSISTENCE_ENABLED=true
+# Slice 63 — benchmark isolation: suppress ALL autonomous sensors so the
+# injected benchmark instances own 100% of the execution + token budget.
+# The bt-2026-06-02-074655 soak burned its budget on OpportunityMiner ('torch')
+# + GitHubIssue ('#65637') noise ops before either swe_bench instance could
+# GENERATE. Injected ops are sensor-independent, so this never blocks the
+# benchmark. (Budget Safe-Halt already exists — candidate_generator's
+# SessionBudgetPreflightRefused — so isolation + an adequate COST_CAP is the fix.)
+export JARVIS_BENCHMARK_ISOLATION_MODE=true
 
 _battle() {
   # Single composition point. The harness owns the caps.
