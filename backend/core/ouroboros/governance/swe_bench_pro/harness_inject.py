@@ -286,6 +286,7 @@ _AUTOSCORE_DRIVER_TASKS: "set" = set()
 
 async def _drive_parallel_evaluate(
     specs: "List[ProblemSpec]", intake_service: Any,
+    *, operation_ledger: Any = None,
 ) -> None:
     """Consume the EXISTING ``parallel_evaluate`` async generator
     (Phase E → B.2.2 evaluate_problem → Phase C score → Phase D
@@ -295,7 +296,15 @@ async def _drive_parallel_evaluate(
     Runs as a fire-and-forget background task so the soak loop keeps
     running (solve ops must reach their terminal event for the
     broker to wake the scorer). NEVER raises into the loop;
-    asyncio.CancelledError propagates."""
+    asyncio.CancelledError propagates.
+
+    Slice 61 — ``operation_ledger`` is forwarded to ``parallel_evaluate``
+    (and thence to ``evaluate_problem``) so the evaluator's one-shot
+    ledger-authoritative fallback is armed. Without it, a solve op whose
+    ``operation_terminal`` SSE was never published (e.g. when
+    ``JARVIS_OP_LIFECYCLE_SSE_ENABLED`` is off) can ONLY ever time out
+    (``TERMINAL_TIMEOUT`` is the sole timeout outcome when the ledger is
+    None). ``None`` preserves pre-Slice-61 behaviour byte-identically."""
     from backend.core.ouroboros.governance.swe_bench_pro.parallel_eval import (  # noqa: E501
         parallel_evaluate,
     )
@@ -307,7 +316,10 @@ async def _drive_parallel_evaluate(
     # `async for` was suspended at the generator's yield and a
     # concurrent aclose ran. Owning the agen + closing it in `finally`
     # (suppressing the benign races) keeps cancellation clean.
-    agen = parallel_evaluate(specs, intake_service=intake_service)
+    agen = parallel_evaluate(
+        specs, intake_service=intake_service,
+        operation_ledger=operation_ledger,
+    )
     try:
         async for record in agen:
             ev = getattr(record, "evaluation", None)
@@ -399,6 +411,7 @@ async def await_autoscore_drain(grace_s: float = 30.0) -> None:
 
 async def _inject_autoscore(
     instance_ids: "List[str]", intake_service: Any,
+    *, operation_ledger: Any = None,
 ) -> SWEBenchProInjectionVerdict:
     """Closed-loop injection: load each ProblemSpec (its ``gold_patch``
     rides in-memory — the operator's "contextual state passing",
@@ -409,7 +422,41 @@ async def _inject_autoscore(
     (race-free), prepare, build_envelope, ingest, await the
     ``operation_terminal`` event, capture the produced patch, score
     (Phase C) and record (Phase D) — so this function adds NO
-    evaluation/scoring/ingest logic of its own. NEVER raises."""
+    evaluation/scoring/ingest logic of its own. NEVER raises.
+
+    Slice 61 — two wake-path guarantees for the closed loop:
+
+    * ``operation_ledger`` is threaded into the driver so the
+      evaluator's ledger-authoritative fallback is armed (correctness,
+      flag-independent).
+    * If op-lifecycle SSE is OFF, the evaluator can only be woken by the
+      (slow, post-timeout) ledger fallback — emit a WARNING surfacing the
+      coupling so a misconfigured soak is diagnosable rather than silently
+      slow. The soak script sets ``JARVIS_OP_LIFECYCLE_SSE_ENABLED=true``
+      for the fast path."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            op_lifecycle_sse_enabled,
+        )
+        if not op_lifecycle_sse_enabled():
+            logger.warning(
+                "[SWEBenchPro.HarnessInject] autoscore ON but "
+                "JARVIS_OP_LIFECYCLE_SSE_ENABLED is OFF — the closed-loop "
+                "evaluator subscribes to the operation_terminal SSE, which "
+                "is therefore never published. The eval will rely on the "
+                "slower post-timeout operation_ledger fallback%s. Set "
+                "JARVIS_OP_LIFECYCLE_SSE_ENABLED=true for fast (+seconds) "
+                "terminal wake.",
+                "" if operation_ledger is not None
+                else " — which is ALSO unavailable (no operation_ledger "
+                     "wired), so every eval will TERMINAL_TIMEOUT",
+            )
+    except Exception:  # noqa: BLE001 — diagnostic must never break inject
+        logger.debug(
+            "[SWEBenchPro.HarnessInject] SSE-coupling preflight raised",
+            exc_info=True,
+        )
+
     specs: "List[ProblemSpec]" = []
     for instance_id in instance_ids:
         problem, load_outcome = load_problem(instance_id)
@@ -437,7 +484,8 @@ async def _inject_autoscore(
         if _first_id else "swe_bench_pro:harness_inject"
     )
     task = asyncio.create_task(
-        _drive_parallel_evaluate(specs, intake_service),
+        _drive_parallel_evaluate(specs, intake_service,
+                                 operation_ledger=operation_ledger),
         name=_task_name,
     )
     _AUTOSCORE_DRIVER_TASKS.add(task)
@@ -459,6 +507,7 @@ async def _inject_autoscore(
 
 async def maybe_inject_swe_bench_at_boot(
     intake_service: Any,
+    *, operation_ledger: Any = None,
 ) -> SWEBenchProInjectionVerdict:
     """Battle-test harness boot hook for SWE-Bench-Pro injection.
 
@@ -548,7 +597,8 @@ async def maybe_inject_swe_bench_at_boot(
         # Flag-gated; the legacy open-loop path below is byte-
         # identical when the flag is OFF (default).
         if autoscore_enabled():
-            return await _inject_autoscore(instance_ids, intake_service)
+            return await _inject_autoscore(instance_ids, intake_service,
+                                           operation_ledger=operation_ledger)
 
         # ── Legacy open-loop path (autoscore OFF — byte-identical) ─
         loaded_count = 0
