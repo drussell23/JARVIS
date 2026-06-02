@@ -116,8 +116,16 @@ case "$PHASE" in
     fi
     export JARVIS_SWE_BENCH_PRO_ENABLED=true                    # Phase A master (session-only)
     export JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=true     # Path B: full autonomous loop
+    export JARVIS_SWE_BENCH_PRO_AUTOSCORE_ENABLED=true          # closed loop (score + record)
     export JARVIS_SWE_BENCH_PRO_INJECT_INSTANCE_IDS="$SWEBP_INSTANCE_IDS"  # operator-chosen
     export JARVIS_SWE_BENCH_PRO_SCORE_REJECT_TEST_MODS=true     # cheat-detection ON (rubric integrity)
+    # Slice 65 — score inside each problem's prepared Docker image (full repo
+    # env). REQUIRES a running Docker daemon + the image pullable
+    # (jefzda/sweap-images:<dockerhub_tag>); on Apple Silicon the engine injects
+    # --platform linux/amd64 automatically. Without this, scoring runs in the
+    # bare local python env and real repos (PyQt/Node/etc.) can't execute their
+    # tests → unresolved. Opt-out: SWEBP_CONTAINER_EVAL=off.
+    export JARVIS_SWE_BENCH_PRO_CONTAINER_EVAL_ENABLED="${SWEBP_CONTAINER_EVAL:-true}"
     # Path A (cheaper, rubric-only) opt-in; Path B is default.
     if [ "${SWEBP_PATH:-B}" = "A" ]; then
       export JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=false

@@ -15,8 +15,27 @@ so the orchestration is unit-testable without a daemon.
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import re
 
 import pytest
+
+_REPO = pathlib.Path(__file__).resolve().parents[2]
+
+
+def test_soak_phase3_enables_container_eval():
+    src = (_REPO / "scripts/swe_bench_pro_soak.sh").read_text()
+    assert re.search(
+        r"JARVIS_SWE_BENCH_PRO_CONTAINER_EVAL_ENABLED=", src,
+    ), "phase3 must enable the container scoring backend"
+
+
+def test_scorer_routes_to_container_when_enabled():
+    # Wiring pin: scorer composes container_engine.should_use_container +
+    # run_container_scoring (not a duplicated scoring path).
+    src = (_REPO / "backend/core/ouroboros/governance/swe_bench_pro/scorer.py").read_text()
+    assert "should_use_container" in src and "run_container_scoring" in src
+    assert "_finalize_score" in src  # shared classify, no duplication
 
 from backend.core.ouroboros.governance.swe_bench_pro import container_engine as ce
 from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import ProblemSpec
