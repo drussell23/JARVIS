@@ -511,6 +511,37 @@ def _swe_bench_test_advisory(
         return result
 
 
+def _swe_bench_verify_advisory(
+    signal_source: str, verify_error: "Optional[str]", op_id: str,
+) -> "Optional[str]":
+    """Slice 67 — for swe_bench_pro ops, the post-APPLY VERIFY regression gate
+    is ADVISORY (companion to the Slice 66 VALIDATE gate).
+
+    The scoped/benchmark tests the VERIFY gate runs live only in the per-problem
+    container, so locally they always regress (pass_rate=0.00). Worse, the gate
+    ROLLS THE PATCH BACK on regression — which would wipe the candidate before
+    the autoscore layer can capture + score it. Clearing ``verify_error`` for a
+    benchmark op keeps the patch APPLIED (op ends state=applied → eval=resolved)
+    so the ONE-SHOT held-out container scoring (Slice 65) is the authoritative
+    judge. Pure + gated: non-swe_bench ops keep the strict gate (byte-identical);
+    syntax/build are already enforced upstream. NEVER raises."""
+    try:
+        if not verify_error:
+            return verify_error
+        if (signal_source or "") != "swe_bench_pro":
+            return verify_error
+        logger.info(
+            "[Orchestrator] Slice 67 — swe_bench_pro VERIFY regression gate "
+            "ADVISORY for op=%s (local tests can't run without the container "
+            "env; the held-out container scoring is authoritative). Keeping "
+            "patch applied for capture: %s",
+            op_id, verify_error,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — advisory must never break VERIFY
+        return verify_error
+
+
 def _phase_runner_slice3_fully_extracted() -> bool:
     """All three Slice 3 flags set — routes ROUTE+CTX+PLAN through runners.
 
@@ -8614,6 +8645,14 @@ class GovernedOrchestrator:
             # Combine scoped-test failure with benchmark regression
             if _verify_error is None and not _verify_test_passed:
                 _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
+
+            # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (the
+            # repo tests can't run locally; the held-out container scoring is
+            # authoritative). Clearing the error keeps the patch applied (no
+            # rollback) so the autoscore layer captures + scores it.
+            _verify_error = _swe_bench_verify_advisory(
+                getattr(ctx, "signal_source", "") or "", _verify_error, ctx.op_id,
+            )
 
             if _verify_error is not None:
                 logger.warning(
