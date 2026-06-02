@@ -73,7 +73,7 @@ Pillow>=10.0.0  # For image manipulation
 
 # ============== LOCAL LLM DEPENDENCIES (Phase 3.1) ==============
 # LLaMA 3.1 70B deployment on GCP 32GB Spot VM
-bitsandbytes>=0.41.0  # For 4-bit quantization (requires CUDA)
+bitsandbytes>=0.49.2  # For 4-bit quantization (requires CUDA)
 transformers>=4.36.2  # Already included above, but ensure latest
 accelerate>=0.25.0  # Already included above
 torch>=2.1.2  # Already included above
