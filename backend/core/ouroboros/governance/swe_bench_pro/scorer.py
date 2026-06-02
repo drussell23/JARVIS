@@ -296,6 +296,40 @@ def _classify_test_outcome(
     return ScoreOutcome.PARTIAL
 
 
+def _finalize_score(
+    test_result: Any, instance_id: str, started_at: float,
+) -> "ScoringResult":
+    """Shared classify + ScoringResult build from a test-result object.
+
+    Slice 65 — extracted so BOTH execution backends compose it: the local
+    TestRunner path and the containerized backend (container_engine
+    ``ContainerScoreResult``). Both expose ``total`` / ``failed`` /
+    ``failed_tests``, so this reads them via getattr — byte-identical to the
+    pre-Slice-65 inline block for the local path. Pure; NEVER raises."""
+    total = max(0, int(getattr(test_result, "total", 0) or 0))
+    failed = max(0, int(getattr(test_result, "failed", 0) or 0))
+    passed = max(0, total - failed)
+    pass_rate = (passed / total) if total > 0 else 0.0
+    outcome = _classify_test_outcome(passed, failed, total)
+
+    diagnostic = ""
+    if outcome != ScoreOutcome.PASS and total > 0:
+        failed_tests = getattr(test_result, "failed_tests", ()) or ()
+        if failed_tests:
+            diagnostic = f"failed_tests={','.join(failed_tests[:5])}"
+
+    return ScoringResult(
+        outcome=outcome,
+        problem_instance_id=instance_id,
+        tests_passed=passed,
+        tests_failed=failed,
+        tests_total=total,
+        pass_rate=round(pass_rate, 4),
+        diagnostic=diagnostic,
+        elapsed_s=time.monotonic() - started_at,
+    )
+
+
 # ===========================================================================
 # Canonical safe git-apply subprocess (mirrors B.1 shape)
 # ===========================================================================
@@ -464,6 +498,31 @@ async def score_evaluation(
     # ...)`` wrapper — it temporarily takes over the name during that
     # nested call and restores ``score_evaluation:<id>`` on return.
     async with task_phase(EvaluatorPhase.SCORE_EVALUATION, instance_id):
+        # Slice 65 — containerized execution backend (gated, default-OFF).
+        # When enabled AND the problem carries a Docker image tag, run
+        # apply+test inside the prepared per-problem image (full repo env —
+        # PyQt/Node/etc. the bare local env lacks) instead of the local
+        # worktree path below. Composes the SAME _finalize_score classify.
+        # NEVER raises into here — infra failures come back as result.error
+        # and map to SCORING_ERROR (the local path stays byte-identical when
+        # the flag is off). No prepare/cleanup: the container is ephemeral.
+        from backend.core.ouroboros.governance.swe_bench_pro import (
+            container_engine as _container,
+        )
+        if _container.should_use_container(problem):
+            c_result = await _container.run_container_scoring(
+                problem, captured_patch,
+                timeout_s=_resolve_test_timeout_s(test_timeout_s),
+            )
+            if c_result.error:
+                return ScoringResult(
+                    outcome=ScoreOutcome.SCORING_ERROR,
+                    problem_instance_id=instance_id,
+                    diagnostic=f"container:{c_result.error}",
+                    elapsed_s=time.monotonic() - started_at,
+                )
+            return _finalize_score(c_result, instance_id, started_at)
+
         prepared, harness_outcome = await prepare_problem(problem)
         if prepared is None or harness_outcome != HarnessOutcome.READY:
             return ScoringResult(
@@ -514,30 +573,7 @@ async def score_evaluation(
                     elapsed_s=time.monotonic() - started_at,
                 )
 
-            total = max(0, int(getattr(test_result, "total", 0) or 0))
-            failed = max(0, int(getattr(test_result, "failed", 0) or 0))
-            passed = max(0, total - failed)
-            pass_rate = (passed / total) if total > 0 else 0.0
-            outcome = _classify_test_outcome(passed, failed, total)
-
-            diagnostic = ""
-            if outcome != ScoreOutcome.PASS and total > 0:
-                failed_tests = getattr(test_result, "failed_tests", ()) or ()
-                if failed_tests:
-                    diagnostic = (
-                        f"failed_tests={','.join(failed_tests[:5])}"
-                    )
-
-            return ScoringResult(
-                outcome=outcome,
-                problem_instance_id=instance_id,
-                tests_passed=passed,
-                tests_failed=failed,
-                tests_total=total,
-                pass_rate=round(pass_rate, 4),
-                diagnostic=diagnostic,
-                elapsed_s=time.monotonic() - started_at,
-            )
+            return _finalize_score(test_result, instance_id, started_at)
 
         except asyncio.CancelledError:
             logger.info(
