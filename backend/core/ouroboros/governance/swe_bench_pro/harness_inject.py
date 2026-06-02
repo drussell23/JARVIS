@@ -176,6 +176,40 @@ def autoscore_enabled() -> bool:
 # ===========================================================================
 
 
+def _local_dataset_instance_ids() -> List[str]:
+    """instance_ids from an EXPLICITLY-set ``LOCAL_DATASET_PATH`` fixture.
+
+    Phase-1 triage (soak bt-2026-06-01-235707): the wiring dry-run sets
+    ``LOCAL_DATASET_PATH`` to the checked-in fixture, but
+    :func:`_resolve_instance_ids` Tier-3 read ``list_cached_problems()`` (the
+    persistent cache) and injected a stale-cached real problem
+    (``django__django-16255``) instead of the fixture's
+    ``jarvis__harness-smoke-001``. This resolves the fixture's OWN ids.
+
+    Returns ``[]`` when the env var is unset/blank — so real HF-source runs
+    (which unset ``LOCAL_DATASET_PATH`` per the runbook) are completely
+    unaffected. Composes ``dataset_loader._iter_local_jsonl_records`` (the
+    single source of truth for local-JSONL scanning). NEVER raises.
+    """
+    from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
+        LOCAL_DATASET_PATH_ENV_VAR,
+    )
+    if not os.environ.get(LOCAL_DATASET_PATH_ENV_VAR, "").strip():
+        return []
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
+            _iter_local_jsonl_records,
+        )
+        ids: List[str] = []
+        for record in _iter_local_jsonl_records():
+            iid = record.get("instance_id")
+            if isinstance(iid, str) and iid:
+                ids.append(iid)
+        return ids
+    except Exception:  # noqa: BLE001 — fail-open to legacy tiers
+        return []
+
+
 def _resolve_instance_ids() -> List[str]:
     """Three-tier resolution (strict precedence; NEVER raises):
 
@@ -194,6 +228,17 @@ def _resolve_instance_ids() -> List[str]:
     explicit = inject_instance_ids()
     if explicit:
         return explicit
+
+    # Tier 1.5 — explicit LOCAL_DATASET_PATH fixture (wiring/dry-run
+    # determinism). When the operator pins a local dataset (the phase-1
+    # dry-run contract), resolve from THAT fixture's own records rather than
+    # the persistent cache, so the dry-run runs the intended fixture
+    # (e.g. jarvis__harness-smoke-001) instead of a stale-cached real problem
+    # (the phase1 bt-2026-06-01 django__django-16255 mis-injection). Inert
+    # when LOCAL_DATASET_PATH is unset (real HF runs) — falls through below.
+    local_ids = _local_dataset_instance_ids()
+    if local_ids:
+        return local_ids[: inject_count()]
 
     # Tier 2 — geometric self-curation (opt-in). Compose the
     # sampler; never let an import/scan failure break the legacy
