@@ -328,6 +328,12 @@ class ChangeRequest:
     verify_fn: Optional[Any] = None
     break_glass_op_id: Optional[str] = None
     op_id: Optional[str] = None
+    # Slice 64 — per-request APPLY write root. When set (e.g. a swe_bench_pro
+    # op's prepared per-problem worktree, carried in the envelope repo_root),
+    # it takes precedence over JARVIS_AUTO_COMMIT_WORKSPACE so the patch lands
+    # in the correct tree (the cloned benchmark repo), not the JARVIS auto-
+    # commit workspace. None = byte-identical legacy resolution.
+    write_root: Optional[Path] = None
 
 
 @dataclass
@@ -408,30 +414,39 @@ class ChangeEngine:
     # Slice 56 — cross-worktree write alignment (Option A)
     # ------------------------------------------------------------------
 
-    def _effective_write_root(self) -> Path:
+    def _effective_write_root(self, request_write_root: Optional[Path] = None) -> Path:
         """Resolve the root that APPLY writes into.
 
-        When ``JARVIS_AUTO_COMMIT_WORKSPACE`` is set (harness ledger-sovereignty
-        owned worktree), writes are redirected there so they land in the SAME
-        tree AutoCommitter commits from (``AutoCommitter._effective_repo_root``)
-        — coherent by construction — and the operator's main tree is never
-        touched. Unset → ``self._project_root`` (byte-identical legacy path).
+        Precedence (Slice 64):
+          1. ``request_write_root`` — a per-op root (e.g. a swe_bench_pro
+             prepared per-problem worktree from the envelope repo_root). Wins
+             so the patch lands in the correct cloned-repo tree, not the JARVIS
+             auto-commit workspace (the bt-2026-06-02-081453 mis-route).
+          2. ``JARVIS_AUTO_COMMIT_WORKSPACE`` (harness ledger-sovereignty owned
+             worktree) — writes land in the SAME tree AutoCommitter commits from
+             (coherent by construction); the operator's main tree is untouched.
+          3. ``self._project_root`` (byte-identical legacy path).
         """
+        if request_write_root is not None:
+            return Path(request_write_root)
         override = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE")
         if override:
             return Path(override)
         return self._project_root
 
-    def _redirect_target(self, target: Path) -> Path:
+    def _redirect_target(
+        self, target: Path, request_write_root: Optional[Path] = None,
+    ) -> Path:
         """Rebase a write target onto :meth:`_effective_write_root`.
 
-        No-op when the env override is unset (root == project_root). Absolute
-        paths are rebased by their path relative to ``project_root``; relative
-        paths are joined to the write root. A target NOT under ``project_root``
-        is left unchanged (defensive — never silently cross-write elsewhere).
-        NEVER raises — falls back to the original target on any resolution error.
+        No-op when the effective root equals ``project_root`` (no per-request
+        root and no env override). Absolute paths are rebased by their path
+        relative to ``project_root``; relative paths are joined to the write
+        root. A target NOT under ``project_root`` is left unchanged (defensive —
+        never silently cross-write elsewhere). NEVER raises — falls back to the
+        original target on any resolution error.
         """
-        root = self._effective_write_root()
+        root = self._effective_write_root(request_write_root)
         try:
             if root.resolve() == self._project_root.resolve():
                 return target
@@ -614,7 +629,12 @@ class ChangeEngine:
             # commits from (and never the operator's main tree). No-op when
             # JARVIS_AUTO_COMMIT_WORKSPACE is unset. Rollback snapshot + lock +
             # signature all follow the redirected target (Phase 2 coherence).
-            target = self._redirect_target(Path(request.target_file))
+            # Slice 64 — a per-request write_root (e.g. a swe_bench_pro prepared
+            # worktree) takes precedence over the auto-commit workspace so the
+            # patch lands in the correct cloned-repo tree.
+            target = self._redirect_target(
+                Path(request.target_file), request.write_root,
+            )
             rollback = RollbackArtifact.capture(target)
 
             await self._ledger.append(

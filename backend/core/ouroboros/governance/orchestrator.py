@@ -10525,6 +10525,35 @@ class GovernedOrchestrator:
             adapter_names_run=adapter_names,
         )
 
+    def _swe_bench_write_root(self, ctx: OperationContext) -> Optional[Path]:
+        """Slice 64 — the APPLY write root for a swe_bench_pro op.
+
+        Returns the VALIDATED envelope ``repo_root`` (the prepared per-problem
+        worktree — a cloned benchmark repo) so APPLY writes there instead of the
+        JARVIS ``JARVIS_AUTO_COMMIT_WORKSPACE`` (the bt-2026-06-02-081453 mis-
+        route where ``src/Markdown.ts`` was rebased onto a JARVIS worktree and
+        APPLY failed). Composes the SAME ``guard_envelope_repo_root`` anchor-
+        validator the Advisor uses (operation_advisor) — no raw-evidence trust.
+        Returns ``None`` for every non-swe_bench op (legacy write resolution
+        unchanged) and on any error (never breaks APPLY)."""
+        try:
+            if getattr(ctx, "signal_source", "") != "swe_bench_pro":
+                return None
+            from backend.core.ouroboros.governance.operation_advisor import (
+                guard_envelope_repo_root,
+            )
+            return guard_envelope_repo_root(
+                ctx.intake_evidence_json,
+                project_root=self._config.project_root,
+            )
+        except Exception:  # noqa: BLE001 — APPLY must never break on this
+            logger.debug(
+                "[Orchestrator] _swe_bench_write_root resolution raised "
+                "for op=%s — falling back to legacy write root",
+                getattr(ctx, "op_id", "?"), exc_info=True,
+            )
+            return None
+
     def _build_change_request(
         self, ctx: OperationContext, candidate: Dict[str, Any]
     ) -> ChangeRequest:
@@ -10550,6 +10579,7 @@ class GovernedOrchestrator:
             proposed_content=proposed_content,
             profile=profile,
             op_id=ctx.op_id,
+            write_root=self._swe_bench_write_root(ctx),
         )
 
     def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
@@ -10628,6 +10658,7 @@ class GovernedOrchestrator:
                 proposed_content=fc,
                 profile=profile,
                 op_id=f"{ctx.op_id}::{idx:02d}",
+                write_root=self._swe_bench_write_root(ctx),  # Slice 64
             )
 
             try:
