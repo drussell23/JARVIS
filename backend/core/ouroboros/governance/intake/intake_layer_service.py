@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
@@ -34,6 +34,33 @@ def _sensor_disabled(env_name: str) -> bool:
     """
     raw = os.environ.get(f"JARVIS_{env_name}_ENABLED", "true").strip().lower()
     return raw in {"0", "false", "no", "off"}
+
+
+def benchmark_isolation_mode() -> bool:
+    """Slice 63 — True when ``JARVIS_BENCHMARK_ISOLATION_MODE`` is set truthy.
+
+    In isolation mode every autonomous sensor is suppressed so an injected
+    curated benchmark (e.g. ``swe_bench_pro``) owns 100% of the execution +
+    token budget. The benchmark ops are delivered by the harness boot hook
+    (``maybe_inject_swe_bench_at_boot`` -> intake), which is sensor-INDEPENDENT,
+    so isolation never blocks the benchmark itself — it only removes the
+    cross-task budget dilution that starved the bt-2026-06-02-074655 soak
+    (OpportunityMiner 'torch' + GitHubIssue '#65637' ops ate the Claude budget
+    before either benchmark instance could GENERATE). Default-FALSE."""
+    return os.environ.get(
+        "JARVIS_BENCHMARK_ISOLATION_MODE", "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apply_benchmark_isolation(sensors: List[Any]) -> Tuple[List[Any], int]:
+    """Return ``([], n_suppressed)`` under benchmark isolation, else
+    ``(sensors, 0)`` unchanged. Pure — the single decision seam the intake
+    layer composes after building ``self._sensors`` (covers BOTH the poll-loop
+    ``start()`` and the FS-event-bridge subscription, which both iterate
+    ``self._sensors``)."""
+    if benchmark_isolation_mode():
+        return [], len(sensors)
+    return sensors, 0
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +886,23 @@ class IntakeLayerService:
             logger.debug(
                 "[IntakeLayer] VisionSensor registered enabled=false "
                 "(set JARVIS_VISION_SENSOR_ENABLED=1 to opt in)",
+            )
+
+        # ---- Slice 63: benchmark-isolation gate (single seam) ----
+        # When JARVIS_BENCHMARK_ISOLATION_MODE is set, suppress ALL autonomous
+        # sensors so an injected curated benchmark owns 100% of the budget.
+        # Placed AFTER the full sensor list is built and BEFORE the FS event
+        # bridge subscription below — both the start() poll loop and the bridge
+        # iterate self._sensors, so clearing it here covers both activation
+        # paths. The harness-injected benchmark ops are sensor-independent and
+        # are unaffected.
+        self._sensors, _n_suppressed = apply_benchmark_isolation(self._sensors)
+        if _n_suppressed:
+            logger.info(
+                "[IntakeLayer] BENCHMARK ISOLATION MODE — suppressed %d "
+                "autonomous sensor(s); only injected benchmark ops will flow "
+                "(JARVIS_BENCHMARK_ISOLATION_MODE=true)",
+                _n_suppressed,
             )
 
         # ---- ReactorEventConsumer (P3) ----
