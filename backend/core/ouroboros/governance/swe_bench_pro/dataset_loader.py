@@ -392,6 +392,75 @@ def _local_dataset_path() -> Path:
     return Path(raw) if raw else Path(_DEFAULT_LOCAL_DATASET_PATH)
 
 
+class HFTokenPlaceholderError(ValueError):
+    """Slice 62 — raised when an HF dataset is configured but the ambient
+    Hugging Face token is an un-substituted placeholder.
+
+    A CONFIG error (not transient): the recurring 2026-06-02 misconfig where
+    auth used a literal placeholder (``hf_YOUR_REAL_TOKEN_HERE`` /
+    ``your_actual_token_here`` / ``<paste_your_huggingface_token_here>``),
+    which otherwise 401s deep inside huggingface_hub with a cryptic traceback.
+    Aborts loudly with an actionable message BEFORE the network call.
+    """
+
+
+# Obvious un-substituted-placeholder fingerprints (lower-cased substring
+# match). Closed, additive list — covers the example strings handed out in
+# the runbooks + the generic "<paste …>" / "…token_here" shapes.
+_HF_TOKEN_PLACEHOLDER_MARKERS: tuple = (
+    "paste_your", "your_actual_token", "your_real_token", "your_token",
+    "your_huggingface_token", "yourtoken", "hf_your", "<paste",
+    "real_token_here", "token_here", "your_hf_token",
+)
+
+
+def hf_token_appears_placeholder(token: Optional[str]) -> bool:
+    """True iff a NON-EMPTY ``token`` is an obvious un-substituted placeholder.
+
+    Pure + deterministic. Empty/blank/None returns False — an unset HF_TOKEN
+    is valid (a disk-cached ``hf auth login`` token resolves ambiently), so
+    only a non-empty bogus value is a misconfiguration worth aborting on.
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return False
+    return any(marker in t for marker in _HF_TOKEN_PLACEHOLDER_MARKERS)
+
+
+def _ambient_hf_token() -> str:
+    """The Hugging Face token huggingface_hub will resolve from the env, in
+    its precedence order. Empty string when none is set in the environment
+    (a disk-cached login token is not visible here — and that's fine, it is
+    never a placeholder)."""
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _assert_hf_token_not_placeholder(hf_name: str) -> None:
+    """Slice 62 sentinel — abort with a clear, actionable error when an HF
+    dataset is requested but the ambient token is a placeholder. Logs at
+    ERROR (unmissable even if a fail-open caller later swallows the raise)
+    then raises :class:`HFTokenPlaceholderError`."""
+    tok = _ambient_hf_token()
+    if not hf_token_appears_placeholder(tok):
+        return
+    logger.error(
+        "[SWEBenchPro] HF dataset %r requested but the Hugging Face token "
+        "looks like an un-substituted placeholder (%r). Put your REAL token "
+        "in .env (gitignored + loaded at boot + wins over shell exports): "
+        "HF_TOKEN=hf_xxxxx — and accept the gated license at "
+        "https://huggingface.co/datasets/%s . Aborting before the 401.",
+        hf_name, tok[:16], hf_name,
+    )
+    raise HFTokenPlaceholderError(
+        f"HF_TOKEN is a placeholder ({tok[:16]!r}); set a REAL Hugging Face "
+        f"token in .env to access {hf_name}"
+    )
+
+
 def _hf_dataset_name() -> str:
     """HuggingFace dataset path; empty default = HF fetch disabled."""
     return os.environ.get(HF_DATASET_ENV_VAR, "").strip()
@@ -631,6 +700,11 @@ def _iter_hf_records() -> Iterator[Dict[str, Any]]:
     hf_name = _hf_dataset_name()
     if not hf_name:
         return
+    # Slice 62 — placeholder-token sentinel BEFORE any import/network so a
+    # fake token aborts with a clear message instead of a cryptic 401. Placed
+    # outside the fail-open try below so a CONFIG error propagates (transient
+    # fetch errors below stay fail-open).
+    _assert_hf_token_not_placeholder(hf_name)
     try:
         try:
             import datasets  # type: ignore  # noqa: I001 — lazy import
@@ -677,6 +751,9 @@ def _load_from_huggingface(instance_id: str) -> Optional[ProblemSpec]:
                     return None
         return None
     except asyncio.CancelledError:
+        raise
+    except HFTokenPlaceholderError:
+        # Slice 62 — config error: surface it, don't fail-open to None.
         raise
     except Exception:  # noqa: BLE001 — defensive
         logger.warning(
@@ -732,6 +809,10 @@ def iter_all_dataset_records(
             if emitted >= cap:
                 return
     except asyncio.CancelledError:
+        raise
+    except HFTokenPlaceholderError:
+        # Slice 62 — config error: the sampler must see the misconfig, not a
+        # silently-empty distribution.
         raise
     except Exception:  # noqa: BLE001 — defensive (fail-open scan)
         logger.warning(
