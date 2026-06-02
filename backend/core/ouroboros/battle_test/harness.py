@@ -2868,8 +2868,18 @@ class BattleTestHarness:
                         SWEBenchProInjectionVerdict.SKIPPED_DISABLED
                     )
                 else:
+                    # Slice 61 — pass the operation_ledger so the closed-loop
+                    # autoscore evaluator's ledger-authoritative fallback is
+                    # armed (the operation_terminal SSE alone is not enough
+                    # when JARVIS_OP_LIFECYCLE_SSE_ENABLED is off). Defensive
+                    # getattr: the ledger is set on the GLS from stack.ledger;
+                    # None preserves the legacy SSE-only wake path.
+                    _swebp_ledger = getattr(
+                        self._governed_loop_service, "_ledger", None,
+                    )
                     _swebp_verdict = await maybe_inject_swe_bench_at_boot(
                         self._intake_service,
+                        operation_ledger=_swebp_ledger,
                     )
                 logger.info(
                     "[Harness] SWE-Bench-Pro boot hook: verdict=%s",

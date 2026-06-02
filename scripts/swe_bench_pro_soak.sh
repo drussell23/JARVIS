@@ -42,6 +42,20 @@ for a in "$@"; do [ "$a" = "--confirm-spend" ] && CONFIRM_SPEND="yes"; done
 # phase explicitly sets below). Documented per flag.
 export JARVIS_SWE_BENCH_PRO_REPO_CACHE_PATH="$SWEBP_CACHE"     # benchmark clones (TMPDIR)
 export JARVIS_SWE_BENCH_PRO_WORKTREE_BASE_PATH="$SWEBP_WT"     # per-problem worktrees (TMPDIR)
+# Slice 61 — the closed-loop autoscore evaluator subscribes to the
+# operation_terminal SSE to wake on each solve op's terminal. That publish
+# is gated by JARVIS_OP_LIFECYCLE_SSE_ENABLED (§33.1 default-FALSE). Without
+# it the eval can only fall back to the slow post-timeout ledger query, so a
+# bounded soak times out before scoring. Enable it for the fast (+seconds)
+# wake. (The operation_ledger fallback, wired in harness.py, remains the
+# correctness backstop if this is ever off.)
+export JARVIS_OP_LIFECYCLE_SSE_ENABLED=true
+# Slice 61 — result persistence is also §33.1 default-FALSE: EvaluationResultStore
+# .record() updates the in-memory cache but only appends the durable
+# results.jsonl row when this is ON. Without it EVERY scored result (fixture
+# AND real phase3 benchmark) is lost on process exit — no verdict artifact.
+# This is the durable-row gate the report_card reads.
+export JARVIS_SWE_BENCH_PRO_RESULT_PERSISTENCE_ENABLED=true
 
 _battle() {
   # Single composition point. The harness owns the caps.
@@ -60,11 +74,19 @@ case "$PHASE" in
     export JARVIS_SWE_BENCH_PRO_HARNESS_INJECT_ENABLED=true     # boot auto-inject (session-only)
     export JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH="tests/fixtures/swe_bench_pro/problems.jsonl"
     export JARVIS_SWE_BENCH_PRO_INJECT_COUNT=1                  # first-1 from the fixture
-    echo "=== Phase 1 — wiring dry-run (~\$0.01-0.10) ==="
+    # Slice 61 — phase1 is the FULL closed-loop wiring proof: the solve op is
+    # scored against its gold test_patch (Phase C) and recorded (Phase D) so
+    # the run writes the pristine results.jsonl validation row. Composes the
+    # existing parallel_evaluate rig; no new code. (Pre-Slice-61 phase1 ran the
+    # open-loop ingest only, which never wrote a row.) The fixture is trivially-
+    # passing so cost stays ~$0.01-0.10.
+    export JARVIS_SWE_BENCH_PRO_AUTOSCORE_ENABLED=true          # closed loop (score + record)
+    echo "=== Phase 1 — closed-loop wiring proof (~\$0.01-0.10) ==="
     echo "fixture : $JARVIS_SWE_BENCH_PRO_LOCAL_DATASET_PATH"
     echo "cache   : $SWEBP_CACHE"
     echo "worktree: $SWEBP_WT"
     echo "caps    : cost=$COST_CAP wall=$MAX_WALL idle=$IDLE_TIMEOUT headless"
+    echo "loop    : autoscore=ON sse=ON (fast terminal wake + ledger backstop)"
     _battle
     echo
     echo "=== Phase 1 proof (verdict source — NOT stdout) ==="
