@@ -3,22 +3,21 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #105002
-- **Branch**: `fix/ci/pr-automation-validation-run104988-20260602-075233`
-- **Commit**: `72316a958f3f99c118ad4f099fd7c689a52abf5b`
+- **Run Number**: #105016
+- **Branch**: `fix/ci/pr-automation-validation-run105002-20260602-075508`
+- **Commit**: `7c9b3515bce35855b1ed7ae38af0408d82fae99d`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-06-02T07:53:15Z
+- **Timestamp**: 2026-06-02T07:55:45Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26806297405)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/26806417993)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 3s |
-| 2 | PR Size Check | permission_error | high | 19s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
@@ -27,10 +26,10 @@ Total Failed Jobs: **2**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-06-02T07:53:19Z
-**Completed**: 2026-06-02T07:53:22Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26806297405/job/79024532501)
+**Started**: 2026-06-02T07:55:49Z
+**Completed**: 2026-06-02T07:55:53Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26806417993/job/79024935869)
 
 #### Failed Steps
 
@@ -43,13 +42,13 @@ Total Failed Jobs: **2**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-06-02T07:53:20.8988357Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-06-02T07:53:21.4728026Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-06-02T07:55:51.3822764Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-06-02T07:55:51.9933571Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-06-02T07:53:21.5184991Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-06-02T07:55:52.0365917Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -60,42 +59,6 @@ Total Failed Jobs: **2**
 
 1. Consider increasing timeout values or optimizing slow operations
 2. Check service availability and network connectivity
-
----
-
-### 2. PR Size Check
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-06-02T07:53:20Z
-**Completed**: 2026-06-02T07:53:39Z
-**Duration**: 19 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/26806297405/job/79024532564)
-
-#### Failed Steps
-
-- **Step 2**: Check PR Size
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 3
-  - Sample matches:
-    - Line 55: `2026-06-02T07:53:38.5041458Z RequestError [HttpError]: Server Error`
-    - Line 58: `2026-06-02T07:53:38.5082173Z ##[error]Unhandled error: HttpError: Server Error`
-    - Line 79: `2026-06-02T07:53:38.5105704Z     data: { message: 'Server Error' }`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 11: `${warning}`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
 
 ---
 
@@ -115,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-06-02T07:55:08.358115*
+📊 *Report generated on 2026-06-02T07:57:40.023186*
 🤖 *JARVIS CI/CD Auto-PR Manager*
