@@ -56,6 +56,7 @@ empty tuple on internal failure.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import os
@@ -63,7 +64,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.cross_process_jsonl import (
     flock_append_line,
@@ -107,6 +108,26 @@ _DEFAULT_RESULT_PATH: str = ".jarvis/swe_bench_pro/results.jsonl"
 # ===========================================================================
 
 
+class EvaluationCategory(str, enum.Enum):
+    """Slice 76 Phase 3 — the dual-metric analytics category derived from the
+    authoritative (eval, score) outcomes (PRD §50.11). Closed taxonomy.
+
+    Separates a *capability* verdict from an *infrastructure* exclusion so the
+    strict and operational (fairly-attempted) pass rates are computed natively,
+    never by manual recalculation.
+    """
+
+    #: eval=resolved AND score=pass — held-out container suite passed.
+    RESOLVED = "resolved"
+    #: the model got a fair shot and did not pass (eval=resolved fail/partial,
+    #: or eval=unresolved — failed to produce a working fix). NEVER excluded.
+    CAPABILITY_MISS = "capability_miss"
+    #: the op never got a fair attempt (prepare_failed / terminal_timeout) or
+    #: the patch existed but scoring infra broke (scoring_error). Excluded from
+    #: the OPERATIONAL denominator — not a capability failure.
+    INFRASTRUCTURE_EXCLUSION = "infrastructure_exclusion"
+
+
 @dataclass(frozen=True)
 class EvaluationRecord:
     """One (evaluation, scoring) pair persisted to the result store.
@@ -146,6 +167,29 @@ class EvaluationRecord:
         except Exception:  # noqa: BLE001
             return False
 
+    @property
+    def category(self) -> EvaluationCategory:
+        """Slice 76 Phase 3 — derived dual-metric category (PRD §50.11). Pure;
+        NEVER raises. Ordering is load-bearing: the never-fairly-attempted infra
+        cases are caught first so they are excluded from capability, while a
+        model that got a fair shot and failed (incl. eval=unresolved) is a
+        CAPABILITY_MISS — the derivation never flatters the model."""
+        try:
+            eval_v = getattr(self.evaluation.outcome, "value", "")
+            score_v = getattr(self.scoring.outcome, "value", "")
+            if eval_v == "resolved" and score_v == "pass":
+                return EvaluationCategory.RESOLVED
+            # never got a fair attempt (preparation / provider) → excluded
+            if eval_v in ("prepare_failed", "terminal_timeout"):
+                return EvaluationCategory.INFRASTRUCTURE_EXCLUSION
+            # the patch was produced but scoring infra broke → excluded
+            if eval_v == "resolved" and score_v == "scoring_error":
+                return EvaluationCategory.INFRASTRUCTURE_EXCLUSION
+            # the model got a fair shot and did not pass → capability failure
+            return EvaluationCategory.CAPABILITY_MISS
+        except Exception:  # noqa: BLE001
+            return EvaluationCategory.INFRASTRUCTURE_EXCLUSION
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -155,6 +199,10 @@ class EvaluationRecord:
             # without re-deriving from the nested eval+score outcomes. Always a
             # concrete bool (never None) for clean aggregation.
             "resolved": self.resolved,
+            # Slice 76 Phase 3 — derived dual-metric category (RESOLVED /
+            # CAPABILITY_MISS / INFRASTRUCTURE_EXCLUSION) for native strict-vs-
+            # operational rate aggregation without re-deriving from outcomes.
+            "category": self.category.value,
             "evaluation": self.evaluation.to_dict(),
             "scoring": self.scoring.to_dict(),
         }
@@ -171,6 +219,41 @@ class EvaluationRecord:
             evaluation=evaluation,
             scoring=scoring,
         )
+
+
+def dual_metric_rates(records: Iterable["EvaluationRecord"]) -> Dict[str, Any]:
+    """Slice 76 Phase 3 — native strict-vs-operational aggregation (PRD §50.11).
+
+    Buckets records by :class:`EvaluationCategory` and returns both honest
+    rates with zero manual recalculation:
+
+      * ``strict_rate``      = resolved / total (every row counted).
+      * ``operational_rate`` = resolved / fairly_attempted, where
+        ``fairly_attempted = total − infrastructure_exclusion`` (the cases that
+        never got a fair shot are excluded — NOT the capability misses).
+
+    Pure; never raises. Empty input → all-zero rates (no division by zero).
+    """
+    counts = {c.value: 0 for c in EvaluationCategory}
+    total = 0
+    for rec in records:
+        total += 1
+        try:
+            counts[rec.category.value] += 1
+        except Exception:  # noqa: BLE001 — a malformed row counts as infra
+            counts[EvaluationCategory.INFRASTRUCTURE_EXCLUSION.value] += 1
+    resolved = counts[EvaluationCategory.RESOLVED.value]
+    excluded = counts[EvaluationCategory.INFRASTRUCTURE_EXCLUSION.value]
+    fairly = total - excluded
+    return {
+        "resolved": resolved,
+        "capability_miss": counts[EvaluationCategory.CAPABILITY_MISS.value],
+        "infrastructure_exclusion": excluded,
+        "total": total,
+        "fairly_attempted": fairly,
+        "strict_rate": (resolved / total) if total else 0.0,
+        "operational_rate": (resolved / fairly) if fairly else 0.0,
+    }
 
 
 # ===========================================================================

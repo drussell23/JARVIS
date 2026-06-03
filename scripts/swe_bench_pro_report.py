@@ -63,36 +63,75 @@ def build(target_ids):
     return rows, None
 
 
+_CATEGORY_MARK = {
+    "resolved": "✅ resolved",
+    "capability_miss": "❌ capability_miss",
+    "infrastructure_exclusion": "⚠️ infra_exclusion",
+}
+
+
+def _category(row) -> str:
+    """Slice 76 Phase 3 — read the persisted `category` if present, else derive
+    it from the (eval, score) outcomes (back-compat for pre-Slice-76 rows).
+    Mirrors result_store.EvaluationRecord.category exactly."""
+    cat = row.get("category")
+    if cat in _CATEGORY_MARK:
+        return cat
+    ev = ((row.get("evaluation") or {}).get("outcome")) or ""
+    sc = ((row.get("scoring") or {}).get("outcome")) or ""
+    if ev == "resolved" and sc == "pass":
+        return "resolved"
+    if ev in ("prepare_failed", "terminal_timeout"):
+        return "infrastructure_exclusion"
+    if ev == "resolved" and sc == "scoring_error":
+        return "infrastructure_exclusion"
+    return "capability_miss"
+
+
 def render(rows) -> str:
     items = sorted(rows.items())
-    scored = [(k, v) for k, v in items if v is not None]
+    cats = {iid: (_category(v) if v is not None else None) for iid, v in items}
     total = len(items)
-    resolved = sum(1 for _, v in scored if v.get("resolved") is True)
-    rate = (resolved / total * 100.0) if total else 0.0
+    # a requested instance that produced NO row at all never got a fair attempt
+    resolved = sum(1 for c in cats.values() if c == "resolved")
+    excluded = sum(1 for c in cats.values()
+                   if c == "infrastructure_exclusion" or c is None)
+    cap_miss = sum(1 for c in cats.values() if c == "capability_miss")
+    fairly = total - excluded
+    strict = (resolved / total * 100.0) if total else 0.0
+    operational = (resolved / fairly * 100.0) if fairly else 0.0
     out = []
     out.append("# O+V — SWE-Bench-Pro Report Card")
     out.append("")
-    out.append(f"## Resolved: **{resolved} / {total} = {rate:.1f}%**")
+    out.append(f"## Strict: **{resolved} / {total} = {strict:.1f}%**  ·  "
+               f"Operational (fairly-attempted): **{resolved} / {fairly} = "
+               f"{operational:.1f}%**")
     out.append("")
-    out.append("| Repo | Instance | eval_outcome | score_outcome | resolved |")
+    out.append(f"- ✅ resolved: **{resolved}**  ·  ❌ capability_miss: "
+               f"**{cap_miss}**  ·  ⚠️ infrastructure_exclusion: **{excluded}**")
+    out.append("")
+    out.append("| Repo | Instance | eval_outcome | score_outcome | category |")
     out.append("|---|---|---|---|:---:|")
     for iid, r in items:
         if r is None:
-            out.append(f"| {_repo(iid)} | {_short(iid)} | _(no row)_ | _(no row)_ | — |")
+            out.append(f"| {_repo(iid)} | {_short(iid)} | _(no row)_ | "
+                       f"_(no row)_ | ⚠️ infra_exclusion |")
             continue
         ev = r.get("evaluation") or {}
         sc = r.get("scoring") or {}
-        mark = "✅" if r.get("resolved") is True else "❌"
         out.append(
             f"| {_repo(iid)} | {_short(iid)} | {ev.get('outcome')} | "
-            f"{sc.get('outcome')} | {mark} |"
+            f"{sc.get('outcome')} | {_CATEGORY_MARK.get(cats[iid] or '', cats[iid] or '?')} |"
         )
     out.append("")
     out.append(
         "_Methodology: each instance is the latest durable verdict in "
-        "results.jsonl; `resolved` = held-out container suite passed "
-        "(eval=resolved AND score=pass). Provider: Claude. Platform: "
-        "linux/amd64 via Apple-Silicon emulation._"
+        "results.jsonl. **Strict** counts every row; **Operational** excludes "
+        "`infrastructure_exclusion` rows (prepare_failed / terminal_timeout / "
+        "scoring_error — never a fair attempt), NOT the capability misses. "
+        "`resolved` = held-out container suite passed (eval=resolved AND "
+        "score=pass). Provider: Claude. Platform: linux/amd64 via Apple-Silicon "
+        "emulation._"
     )
     return "\n".join(out)
 

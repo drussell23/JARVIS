@@ -100,11 +100,16 @@ REPO_CACHE_PATH_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_REPO_CACHE_PATH"
 WORKTREE_BASE_PATH_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_WORKTREE_BASE_PATH"
 GIT_CLONE_TIMEOUT_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_GIT_CLONE_TIMEOUT_S"
 GIT_OP_TIMEOUT_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_GIT_OP_TIMEOUT_S"
+# Slice 76 (Resilient Ingress) — bounded purge-and-retry around the cold clone.
+CLONE_MAX_ATTEMPTS_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_CLONE_MAX_ATTEMPTS"
+CLONE_RETRY_BACKOFF_MS_ENV_VAR: str = "JARVIS_SWE_BENCH_PRO_CLONE_RETRY_BACKOFF_MS"
 
 _DEFAULT_REPO_CACHE_PATH: str = ".jarvis/swe_bench_pro/repo_cache"
 _DEFAULT_WORKTREE_BASE_PATH: str = ".jarvis/swe_bench_pro/worktrees"
 _DEFAULT_GIT_CLONE_TIMEOUT_S: int = 600  # 10 min
 _DEFAULT_GIT_OP_TIMEOUT_S: int = 60      # 1 min
+_DEFAULT_CLONE_MAX_ATTEMPTS: int = 3     # cold-clone attempts before fail-closed
+_DEFAULT_CLONE_RETRY_BACKOFF_MS: int = 500  # linear backoff base between attempts
 
 # Branch prefix for per-problem worktrees — distinct from L3
 # unit-* + L2 exercise ouroboros/l2-exercise/* branches.
@@ -224,6 +229,17 @@ def git_op_timeout_s() -> int:
     return _env_int(GIT_OP_TIMEOUT_ENV_VAR, _DEFAULT_GIT_OP_TIMEOUT_S)
 
 
+def clone_max_attempts() -> int:
+    return _env_int(CLONE_MAX_ATTEMPTS_ENV_VAR, _DEFAULT_CLONE_MAX_ATTEMPTS)
+
+
+def clone_retry_backoff_ms() -> int:
+    # minimum=0 so an operator (and the test suite) can disable backoff entirely.
+    return _env_int(
+        CLONE_RETRY_BACKOFF_MS_ENV_VAR, _DEFAULT_CLONE_RETRY_BACKOFF_MS, minimum=0,
+    )
+
+
 # ===========================================================================
 # Path sanitization
 # ===========================================================================
@@ -316,55 +332,105 @@ def _cached_repo_path_for(repo_url: str) -> Path:
     return repo_cache_path() / _sanitize_for_filename(cleaned)
 
 
+# Slice 76 (Resilient Ingress) — per-repo-path clone lock registry. Concurrent
+# same-repo cold clones (e.g. two ansible instances at different commits, EVAL-2
+# PRD §50.11) would otherwise race into the SAME cache path and the second
+# aborts with ``rc=128 destination already exists and is not empty``. Keying the
+# lock per target path serializes ONLY same-repo clones — distinct repos still
+# clone concurrently. Locks live on the single asyncio loop, so plain-dict
+# lazy creation is race-free (no await between membership check and insert).
+_repo_clone_locks: Dict[str, "asyncio.Lock"] = {}
+
+
+def _clone_lock_for(target: Path) -> "asyncio.Lock":
+    key = str(target)
+    lock = _repo_clone_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _repo_clone_locks[key] = lock
+    return lock
+
+
 async def _ensure_repo_cached(repo_url: str) -> Optional[Path]:
     """Ensure the upstream repo is cloned into the cache.  Returns
-    the cache path on success, None on failure.  Idempotent."""
+    the cache path on success, None on failure.  Idempotent.
+
+    Slice 76 (Resilient Ingress): the clone critical section is guarded by a
+    per-repo-path :class:`asyncio.Lock` so concurrent same-repo cold clones
+    SERIALIZE — the second caller waits and then takes the now-valid cache-hit
+    instead of racing into the same directory (the EVAL-2 ``rc=128`` race, PRD
+    §50.11). Within the lock a bounded purge-and-retry recovers from a stale /
+    partial cache dir left by a crashed prior run (or a genuine transient
+    upstream blip), fail-closing to ``None`` only after the attempt budget.
+    """
     if not repo_url.strip():
         logger.warning("[SWEBenchPro] empty repo_url — cannot cache")
         return None
     target = _cached_repo_path_for(repo_url)
-    try:
-        if target.is_dir() and (target / ".git").is_dir():
-            return target
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_dir():
-            shutil.rmtree(str(target), ignore_errors=True)
-        # ``--template=`` (empty string) disables template-hook copying
-        # from git's global templates directory. SWE-Bench-Pro clones
-        # don't need or want pre-commit / commit-msg / etc. hooks —
-        # they're benchmark eval substrates, not contributor checkouts.
-        # As a side effect this also unblocks restricted environments
-        # where git's global templates dir is non-writable (a real
-        # failure mode observed in stage-1 wiring soak 2026-05-12:
-        # ``fatal: cannot copy '/opt/homebrew/opt/git/share/git-core/
-        # templates/hooks/commit-msg.sample' to ...``). The flag is
-        # AST-pinned by the spine to prevent drift.
-        rc, _stdout, stderr = await _run_git(
-            [
-                "clone",
-                "--filter=blob:none",
-                "--template=",  # AST-pinned: benchmark cleanliness
-                repo_url,
-                str(target),
-            ],
-            timeout_s=git_clone_timeout_s(),
-        )
-        if rc != 0:
-            logger.warning(
-                "[SWEBenchPro] git clone %r failed rc=%d: %s",
-                repo_url, rc, stderr.strip()[:200],
-            )
-            shutil.rmtree(str(target), ignore_errors=True)
-            return None
+    # Fast-path OUTSIDE the lock: an already-valid cache never contends.
+    if target.is_dir() and (target / ".git").is_dir():
         return target
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[SWEBenchPro] _ensure_repo_cached raised for %r",
-            repo_url, exc_info=True,
-        )
-        return None
+    async with _clone_lock_for(target):
+        try:
+            # Double-checked under the lock: a sibling caller may have populated
+            # the cache while we waited — take the cache-hit, skip the clone.
+            if target.is_dir() and (target / ".git").is_dir():
+                return target
+            target.parent.mkdir(parents=True, exist_ok=True)
+            max_attempts = clone_max_attempts()
+            backoff_ms = clone_retry_backoff_ms()
+            last_stderr = ""
+            for attempt in range(1, max_attempts + 1):
+                # Purge any stale / partial dir before EACH attempt — a crashed
+                # prior clone, or this loop's own prior failed attempt, leaves a
+                # non-empty non-``.git`` directory that git refuses to clone into.
+                if target.exists():
+                    shutil.rmtree(str(target), ignore_errors=True)
+                # ``--template=`` (empty string) disables template-hook copying
+                # from git's global templates directory. SWE-Bench-Pro clones
+                # don't need or want pre-commit / commit-msg / etc. hooks —
+                # they're benchmark eval substrates, not contributor checkouts.
+                # As a side effect this also unblocks restricted environments
+                # where git's global templates dir is non-writable (a real
+                # failure mode observed in stage-1 wiring soak 2026-05-12:
+                # ``fatal: cannot copy '/opt/homebrew/opt/git/share/git-core/
+                # templates/hooks/commit-msg.sample' to ...``). The flag is
+                # AST-pinned by the spine to prevent drift.
+                rc, _stdout, stderr = await _run_git(
+                    [
+                        "clone",
+                        "--filter=blob:none",
+                        "--template=",  # AST-pinned: benchmark cleanliness
+                        repo_url,
+                        str(target),
+                    ],
+                    timeout_s=git_clone_timeout_s(),
+                )
+                if rc == 0:
+                    return target
+                last_stderr = stderr.strip()[:200]
+                logger.warning(
+                    "[SWEBenchPro] git clone %r attempt %d/%d failed rc=%d: %s",
+                    repo_url, attempt, max_attempts, rc, last_stderr,
+                )
+                if attempt < max_attempts and backoff_ms > 0:
+                    # Linear backoff — let a transient upstream blip clear
+                    # before the next purge-and-retry.
+                    await asyncio.sleep((backoff_ms / 1000.0) * attempt)
+            shutil.rmtree(str(target), ignore_errors=True)
+            logger.warning(
+                "[SWEBenchPro] git clone %r exhausted %d attempt(s): %s",
+                repo_url, max_attempts, last_stderr,
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[SWEBenchPro] _ensure_repo_cached raised for %r",
+                repo_url, exc_info=True,
+            )
+            return None
 
 
 # ===========================================================================

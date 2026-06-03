@@ -879,6 +879,62 @@ def _note_dw_candidate_success() -> None:
     except Exception:  # noqa: BLE001
         pass
 
+
+def dw_preflight_gate_enabled() -> bool:
+    """Slice 76 Phase 2 master flag — default TRUE. When off, dispatch is
+    byte-identical to the pre-Slice-76 path (no pre-flight short-circuit)."""
+    raw = os.environ.get(
+        "JARVIS_DW_PREFLIGHT_GATE_ENABLED", "true",
+    ).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _dw_preflight_freshness_s() -> float:
+    """Max age (seconds) of a TRANSPORT_DEGRADED surface verdict for the
+    pre-flight gate to act on it. Stale evidence is ignored so the gate never
+    starves DW on an old reading. Env-tunable; non-positive / invalid → 120s."""
+    raw = os.environ.get("JARVIS_DW_PREFLIGHT_FRESHNESS_S", "120").strip()
+    try:
+        val = float(raw)
+        return val if val > 0 else 120.0
+    except (ValueError, TypeError):
+        return 120.0
+
+
+def dw_transport_degraded_preflight() -> bool:
+    """Slice 76 Phase 2 — pre-flight DW transport health gate.
+
+    Consults the EXISTING ``dw_surface_health`` ledger (kept fresh by the
+    surface probes — NO new probe is issued here): returns True iff the
+    ``DIRECT_STREAMING`` surface carries a FRESH ``TRANSPORT_DEGRADED`` verdict.
+    That means the socket/TLS to the DW endpoint is down RIGHT NOW — every
+    ranked sibling model shares that dead transport (cf.
+    :func:`should_sever_dw_lane`), so the op should cascade to Claude with its
+    full budget BEFORE the ``_primary_sem`` wait + per-model timeout cascade
+    burns it (the EVAL-2 ``terminal_timeout``, PRD §50.11).
+
+    Conservative by construction: unknown / stale / HEALTHY / UPSTREAM_DEGRADED
+    (server responded — transport is up) all return False, so the DW lane
+    proceeds normally and we never starve DW on thin evidence. NEVER raises
+    (fail-open: a gate error must not block DW dispatch)."""
+    if not dw_preflight_gate_enabled():
+        return False
+    try:
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        rec = SurfaceHealthLedger(autosave=False).verdict_for(
+            SurfaceKind.DIRECT_STREAMING,
+        )
+        if rec is None or rec.verdict is not SurfaceVerdict.TRANSPORT_DEGRADED:
+            return False
+        age_s = time.time() - float(rec.last_probe_unix or 0.0)
+        return 0.0 <= age_s <= _dw_preflight_freshness_s()
+    except Exception:  # noqa: BLE001 — never block dispatch on a gate error
+        return False
+
 # ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
@@ -2913,6 +2969,26 @@ class CandidateGenerator:
                 provider_route,
             )
             return None
+
+        # Slice 76 Phase 2 — pre-flight DW transport gate. If the existing
+        # dw_surface_health ledger shows the DIRECT_STREAMING surface FRESHLY
+        # TRANSPORT_DEGRADED, the whole ranked list shares that dead transport
+        # (cf. should_sever_dw_lane). Cascade to Claude with the FULL untouched
+        # budget NOW — before the _primary_sem wait + per-model timeout cascade
+        # burns it (the EVAL-2 terminal_timeout, PRD §50.11). Only when the
+        # route already cascades to Claude (a "queue"-tolerance route keeps its
+        # contract). Gated + fail-open; default-on.
+        if (
+            fallback_tolerance == "cascade_to_claude"
+            and dw_transport_degraded_preflight()
+        ):
+            logger.info(
+                "[CandidateGenerator] Slice 76 pre-flight: DW DIRECT_STREAMING "
+                "TRANSPORT_DEGRADED (fresh) — severing DW lane pre-budget, "
+                "cascading to Claude with full budget (op=%s route=%s)",
+                getattr(context, "op_id", "?"), provider_route,
+            )
+            return await self._call_fallback(context, deadline)
 
         sentinel = get_default_sentinel()
         # Register every model in the ranked list (idempotent). The
