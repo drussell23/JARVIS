@@ -131,10 +131,30 @@ class EvaluationRecord:
             self.evaluation.op_id,
         )
 
+    @property
+    def resolved(self) -> bool:
+        """Canonical SWE-bench ``resolved`` — the held-out container suite
+        PASSED. Derived (not stored) from the authoritative outcomes:
+        True iff the eval reached scoring AND the score outcome is ``pass``.
+        ``partial``/``fail``/``scoring_error``/``skipped`` ⇒ False. Pure;
+        NEVER raises (a malformed outcome resolves to False, not None)."""
+        try:
+            return (
+                getattr(self.evaluation.outcome, "value", "") == "resolved"
+                and getattr(self.scoring.outcome, "value", "") == "pass"
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "recorded_at_iso": self.recorded_at_iso,
+            # Slice 75 — top-level derived `resolved` boolean so the durable
+            # ledger is directly queryable for pass-rate / report-card %
+            # without re-deriving from the nested eval+score outcomes. Always a
+            # concrete bool (never None) for clean aggregation.
+            "resolved": self.resolved,
             "evaluation": self.evaluation.to_dict(),
             "scoring": self.scoring.to_dict(),
         }
