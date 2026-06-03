@@ -11513,6 +11513,25 @@ The goal the operator named: evaluate O+V the way frontier AI labs evaluate agen
 
 **Anti-goals (per the operator binding):** never a parallel eval framework (extend `parallel_evaluate`); never hardcode instance IDs or sample membership (drive from `geometric_sampler` + env); never report a percentage without a methodology footnote + durable ledger backing it; never let a fast happy-path number hide the §50.4 caveats (provider, N, arch). Honest framing per `feedback_no_preresult_euphoria.md`: §50.9 is a *roadmap*, EVAL-1/EVAL-2 are the immediate next work, and the first published percentage is earned only after EVAL-2 runs clean.
 
+### §50.10 — First multi-instance sample (N=2): EVAL-1 closed, EVAL-2 seeded *(2026-06-03, session bt-2026-06-03-090724)*
+
+After **Slice 74** (instant terminal wake + durable persistence) and **Slice 75** (derived `resolved:bool` + tolerant multi-instance parsing), O+V ran its **first concurrent multi-instance batch** — the seed of the percentage program (§50.9 EVAL-2). Two SWE-Bench-Pro instances were parsed from a single comma-delimited token, prepared into **isolated per-problem `$TMPDIR` worktrees**, dispatched as **two distinct solve ops**, and each independently container-scored.
+
+**The result — O+V SWE-Bench-Pro, N=2 sample: 1/2 resolved = 50%:**
+
+| Instance | Repo | Held-out outcome | `resolved` |
+|---|---|---|---|
+| `instance_qutebrowser__…b3c171` | qutebrowser (Python) | `eval=resolved score=pass` — held-out suite (21 tests) PASSED | **True** |
+| `instance_element-hq__element-web-…vnan` | element-web (TypeScript) | `eval=resolved score=fail` — O+V produced a patch (`src/Markdown.ts` domain), container ran the 7 `Markdown-test.ts` held-out tests, patch did NOT pass | **False** |
+
+Both rows are durable in `.jarvis/swe_bench_pro/results.jsonl` with the Slice 75 `resolved` boolean populated correctly (`True` / `False`, no `None`). This simultaneously **closed EVAL-1** (durable, schemaful, queryable result ledger) and produced the first sample data point.
+
+**What this proves (and what it doesn't):**
+- ✅ The full pipeline scales from 1 → N: native stream parse, sandbox isolation, concurrent dispatch, per-instance container scoring, durable `resolved`-stamped rows.
+- ✅ O+V autonomously produced a coherent patch for BOTH unseen problems — including a **cross-language** result (a TypeScript repo it had never seen), even though that patch did not pass the held-out tests.
+- ⚠️ **N=2 is a seed, not a benchmark percentage.** 50% on two cherry-adjacent instances (one known-good Python, one known-good-but-harder TypeScript) is a methodology proof, not a citable rate. The honest, resume-grade statement remains: *"O+V resolved 1 of 2 SWE-Bench-Pro instances it attempted; one cross-language attempt produced a patch that failed the held-out suite."*
+- The defensible **rate** comes from EVAL-2 (the 6-instance cached sweep: qutebrowser + element-web known-good poles vs ansible×2 + NodeBB×2 known-hard poles) → `report_card.render_markdown(build_report_card(replay_from_disk(results.jsonl)))` → `resolved/6 = Y%` with a methodology footnote (N, Claude-served, Apple-Silicon arch caveat). That sweep is the immediate next work; this §50.10 row is appended with the N=6 result when it lands.
+
 ---
 
 ## Appendix D — Document History
