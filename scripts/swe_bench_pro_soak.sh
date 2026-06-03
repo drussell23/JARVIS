@@ -29,8 +29,9 @@ cd "$REPO"
 # Claude-only lane (~$0.50/op), so a 106-file instance needs more headroom than
 # the $2 default (e.g. COST_CAP=8 bash scripts/swe_bench_pro_soak.sh phase3 ...).
 COST_CAP="${COST_CAP:-2.00}"   # operator-bound USD ceiling (env-overridable)
-MAX_WALL="2400"          # hard wall-clock seconds (retry-storm-proof)
-IDLE_TIMEOUT="1800"      # per-op liveness seconds
+MAX_WALL="${MAX_WALL:-2400}"   # hard wall-clock seconds (env-overridable for
+                               # multi-instance sweeps; retry-storm-proof)
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-1800}"  # per-op liveness seconds (env-overridable)
 # Restricted-env: sandbox blocks .git/config under the repo root, so the
 # benchmark repo cache + worktrees live under TMPDIR (NOT the repo).
 SWEBP_CACHE="${TMPDIR:-/tmp}/swebp_cache"
