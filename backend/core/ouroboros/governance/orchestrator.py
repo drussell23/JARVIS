@@ -45,6 +45,14 @@ from backend.core.ouroboros.governance.ascii_strict_gate import (
     AsciiStrictGate,
     build_retry_feedback as _ascii_gate_retry_feedback,
 )
+from backend.core.ouroboros.governance.target_existence_guard import (
+    guard_enabled as _target_guard_enabled,
+    find_missing_targets as _find_missing_targets,
+    build_retry_feedback as _target_missing_retry_feedback,
+    missing_target_error_message as _target_missing_error_message,
+    should_insulate_prompt as _should_insulate_prompt,
+    TARGET_MISSING_PREFIX as _TARGET_MISSING_PREFIX,
+)
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 from backend.core.ouroboros.governance.context_expander import ContextExpander
 from backend.core.ouroboros.governance.approval_provider import (
@@ -2323,10 +2331,17 @@ class GovernedOrchestrator:
                     logger.debug("[Orchestrator] Goal memory injection failed", exc_info=True)
 
             # ---- Strategic Direction injection (Manifesto + architecture docs) ----
+            # Slice 72 Phase 3 — withhold host-framework strategic context from
+            # benchmark ops (it biased the model toward host paths like
+            # backend/core/...). INERT for every non-swe_bench op.
             _strategic_svc = None
             if _gls_for_gmb is not None:
                 _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
-            if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
+            if (
+                _strategic_svc is not None
+                and getattr(_strategic_svc, "is_loaded", False)
+                and not _should_insulate_prompt(getattr(ctx, "signal_source", ""))
+            ):
                 try:
                     _strat_prompt = _strategic_svc.format_for_prompt(
                         op_id=getattr(ctx, "op_id", None),
@@ -2667,7 +2682,9 @@ class GovernedOrchestrator:
                     target_files=list(ctx.target_files),
                     description=ctx.description or "",
                 )
-                if _goal_prompt:
+                if _goal_prompt and not _should_insulate_prompt(
+                    getattr(ctx, "signal_source", "")
+                ):
                     _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                     ctx = ctx.with_strategic_memory_context(
                         strategic_intent_id=ctx.strategic_intent_id or "goals-v1",
@@ -4977,6 +4994,36 @@ class GovernedOrchestrator:
                                 _ascii_exc._ascii_rejected_content = _rejected_content  # type: ignore[attr-defined]
                                 raise _ascii_exc
 
+                    # Gate 4 — Target existence (Slice 72). For a benchmark op
+                    # the candidate MUST target a file that already exists in the
+                    # prepared worktree. Catches the bt-2026-06-03 generation-
+                    # steering failure where the Claude fallback, after a rushed
+                    # single exploration round, emitted a HOST path
+                    # (backend/core/process_manager.py) for a qutebrowser repo →
+                    # APPLY ENOENT. Routes the miss back to GENERATE_RETRY with
+                    # self-correcting feedback instead of crashing APPLY. INERT
+                    # for every non-swe_bench op (host self-dev legitimately
+                    # creates new files) and when write_root can't be resolved.
+                    if (
+                        getattr(ctx, "signal_source", "") == "swe_bench_pro"
+                        and _target_guard_enabled()
+                    ):
+                        _tg_write_root = self._swe_bench_write_root(ctx)
+                        _tg_missing = _find_missing_targets(
+                            generation.candidates, _tg_write_root,
+                        )
+                        if _tg_missing:
+                            logger.warning(
+                                "[Orchestrator] Iron Gate — target_file_missing: "
+                                "%s not in worktree %s op=%s (attempt=%d)",
+                                ",".join(_tg_missing), _tg_write_root,
+                                ctx.op_id[:12], attempt + 1,
+                            )
+                            generation = None
+                            raise RuntimeError(
+                                _target_missing_error_message(_tg_missing)
+                            )
+
                     # Gate 3 — Dependency file integrity. Catches hallucinated
                     # package-name renames/truncations in requirements.txt (and
                     # future: package.json, Cargo.toml, etc.). Engineered in
@@ -5684,6 +5731,16 @@ class GovernedOrchestrator:
                                 "pre-Slice-12P feedback shape",
                                 exc_info=True,
                             )
+                    elif _err_str.startswith(_TARGET_MISSING_PREFIX):
+                        # Slice 72 — target file doesn't exist in the worktree.
+                        # Surface the host-vs-worktree steering correction so the
+                        # model re-explores and targets a real repo file.
+                        _tg_paths = [
+                            p.strip()
+                            for p in _err_str[len(_TARGET_MISSING_PREFIX):].split(",")
+                            if p.strip()
+                        ]
+                        _error_feedback = _target_missing_retry_feedback(_tg_paths)
                     elif _err_str.startswith("ascii_corruption"):
                         # Extract the specific offending lines from the rejected
                         # candidate so the model sees its own bad code in context
@@ -5914,6 +5971,8 @@ class GovernedOrchestrator:
                         _gen_failure_class = "content"
                         if "exploration_insufficient" in _err_str:
                             _gen_failure_class = "exploration"
+                        elif _err_str.startswith(_TARGET_MISSING_PREFIX):
+                            _gen_failure_class = "target_missing"
                         elif "ascii_corruption" in _err_str:
                             _gen_failure_class = "ascii"
                         elif _err_str.startswith("multi_file_coverage_insufficient"):
