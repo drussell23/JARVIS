@@ -5782,7 +5782,15 @@ class ClaudeProvider:
         self,
         api_key: str,
         model: str = "claude-sonnet-4-20250514",
-        max_tokens: int = 16384,
+        # Slice 81 — base output budget raised 16384→32768. The dynamic
+        # per-call max_tokens scaling keys off target-file sizes, but
+        # SWE-bench ops carry NO target_files (the agent localizes the bug
+        # itself), so the dynamic path never fires and a large single-file
+        # rewrite (~1800 lines ≈ >16k tokens) truncated at 16384 mid-patch.
+        # Cost is per-token-GENERATED (a short reply stops at end_turn well
+        # below the cap), so this only RAISES the ceiling for the few ops
+        # that genuinely need it; capped by `_output_ceiling`.
+        max_tokens: int = 32768,
         max_cost_per_op: float = 0.50,
         daily_budget: float = 10.00,
         repo_root: Optional[Path] = None,
