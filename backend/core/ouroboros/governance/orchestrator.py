@@ -11192,6 +11192,19 @@ class GovernedOrchestrator:
         # already documents NEVER-raise, but this defensive wrapper
         # honors the operator binding verbatim ("never raise into
         # _record_ledger — swallow + DEBUG").
+        # Slice 74 probe — did the TERMINAL ledger write land (written=True →
+        # publish fires) or get DEDUPED (written=False → publish skipped → the
+        # eval never wakes, falls back to the 25-min ledger scan)? Captures the
+        # `written` boolean for terminal states. Zero-risk; remove after diag.
+        try:
+            _s74_sv = str(getattr(state, "value", state)).upper()
+            if _s74_sv in ("COMPLETED", "FAILED", "BLOCKED", "COMPLETE", "ROLLED_BACK"):
+                logger.info(
+                    "[Slice74Probe] LEDGER_TERMINAL op_id=%s state=%s written=%s",
+                    getattr(ctx, "op_id", "?"), _s74_sv, written,
+                )
+        except Exception:  # noqa: BLE001
+            pass
         if written:
             try:
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501

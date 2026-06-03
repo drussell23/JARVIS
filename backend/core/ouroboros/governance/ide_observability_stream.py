@@ -2271,6 +2271,19 @@ def publish_operation_terminal(ctx: Any, state: Any) -> Optional[str]:
             "phase_entered_at": phase_entered_iso,
             "timestamp": _iso_now(),
         }
+        # Slice 74 rendezvous telemetry — broker IDENTITY + live subscriber
+        # count at the publish seam. Compared against the eval's SUBSCRIBE
+        # probe: same broker_id + subs>0 ⇒ rendezvous should fire; different
+        # broker_id ⇒ singleton mismatch; subs=0 ⇒ no listener registered for
+        # this op_id. Zero-risk INFO probe; remove after diagnosis.
+        try:
+            _s74_b = get_default_broker()
+            logger.info(
+                "[Slice74Probe] PUBLISH_TERMINAL op_id=%s broker_id=0x%x subs=%d",
+                op_id, id(_s74_b), len(getattr(_s74_b, "_subscribers", {})),
+            )
+        except Exception:  # noqa: BLE001 — probe never perturbs publish
+            pass
         return publish_task_event(
             EVENT_TYPE_OPERATION_TERMINAL, op_id, payload,
         )

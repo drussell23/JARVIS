@@ -581,6 +581,15 @@ async def evaluate_problem(
             # ---- Phase B.2.0.5: subscribe BEFORE ingest (race-free) ----
             # AST-pinned by the B.2.3 spine — source-order invariant.
             subscriber = resolved_broker.subscribe(op_id_filter=op_id)
+            # Slice 74 rendezvous telemetry — capture the broker IDENTITY +
+            # target op_id at the subscribe seam so we can prove whether the
+            # publish-side broker is the SAME singleton instance the eval
+            # awaits on. Zero-risk INFO probe; remove after diagnosis.
+            logger.info(
+                "[Slice74Probe] SUBSCRIBE op_id=%s broker_id=0x%x subscriber=%s",
+                op_id, id(resolved_broker),
+                "ok" if subscriber is not None else "None",
+            )
             if subscriber is None:
                 # Broker capacity exhausted. Don't ingest — there's no
                 # observer to rendezvous with, and a polling-only fallback

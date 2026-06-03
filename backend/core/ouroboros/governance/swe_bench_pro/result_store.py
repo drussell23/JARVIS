@@ -285,10 +285,30 @@ class EvaluationResultStore:
                 with self._lock:
                     self._records[record.dedup_key] = record
 
-                if not self.is_persistence_enabled():
+                # Slice 74 persistence probe — was record() reached with the
+                # real verdict, and is durable persistence even enabled? If the
+                # durable results.jsonl row was None, either record() was never
+                # called with the RESOLVED verdict (data-mapping / wiring) or
+                # persistence was off / the append failed (cache-line). This
+                # disambiguates. Zero-risk; remove after diagnosis.
+                _s74_persist = self.is_persistence_enabled()
+                logger.info(
+                    "[Slice74Probe] RECORD instance=%s eval=%s score=%s persist_enabled=%s",
+                    _instance_id,
+                    getattr(getattr(evaluation, "outcome", None), "value", "?"),
+                    getattr(getattr(scoring, "outcome", None), "value", "?"),
+                    _s74_persist,
+                )
+
+                if not _s74_persist:
                     return True
 
-                return await self._append_jsonl(record)
+                _s74_appended = await self._append_jsonl(record)
+                logger.info(
+                    "[Slice74Probe] RECORD_PERSIST instance=%s appended=%s path=%s",
+                    _instance_id, _s74_appended, self._persistence_path,
+                )
+                return _s74_appended
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - public surface is fail-closed
