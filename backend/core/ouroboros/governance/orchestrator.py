@@ -11192,13 +11192,43 @@ class GovernedOrchestrator:
         # already documents NEVER-raise, but this defensive wrapper
         # honors the operator binding verbatim ("never raise into
         # _record_ledger — swallow + DEBUG").
+        # Slice 74 probe — did the TERMINAL ledger write land (written=True →
+        # publish fires) or get DEDUPED (written=False → publish skipped → the
+        # eval never wakes, falls back to the 25-min ledger scan)? Captures the
+        # `written` boolean for terminal states. Zero-risk; remove after diag.
+        try:
+            # Canonical terminal set is lowercase {applied, rolled_back, failed,
+            # blocked} — 'applied' is the SUCCESS terminal (there is no
+            # 'completed'). Match the real set so the success path is observed.
+            _s74_sv = str(getattr(state, "value", state)).lower()
+            if _s74_sv in ("applied", "rolled_back", "failed", "blocked"):
+                logger.info(
+                    "[Slice74Probe] LEDGER_TERMINAL op_id=%s state=%s written=%s",
+                    getattr(ctx, "op_id", "?"), _s74_sv, written,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        # Slice 74 — Immutable Lifecycle Boundary: the terminal SSE broadcast is
+        # DECOUPLED from the ledger's physical-write dedup. A definitive terminal
+        # state MUST notify the system (the autoscore eval rendezvous + IDE
+        # consumers) even when the ledger deduped the row (written=False) —
+        # otherwise a deduped COMPLETED/FAILED write silently drops the wake
+        # (the bt-2026-06-03-063919 25-min-lag class). publish_operation_terminal
+        # is internally a no-op for non-terminal states and carries its own
+        # (op_id, state) idempotency guard, so this is exactly-once regardless of
+        # how many times _record_ledger fires for the state. NEVER raises here.
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                publish_operation_terminal as _s74_publish_terminal,
+            )
+            _s74_publish_terminal(ctx, state)
+        except Exception:  # noqa: BLE001 — never raise into _record_ledger
+            pass
         if written:
             try:
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
                     TERMINAL_OPERATION_STATES,
-                    publish_operation_terminal,
                 )
-                publish_operation_terminal(ctx, state)
                 # Fail-Fast counter prune — single terminal chokepoint.
                 # Composes the SAME canonical terminal set the SSE
                 # publisher uses (no duplicated state list). Pruning
