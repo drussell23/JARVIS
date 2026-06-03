@@ -2128,6 +2128,36 @@ _default_broker: Optional[StreamEventBroker] = None
 _default_broker_lock = threading.Lock()
 
 
+# Slice 74 — notification-layer terminal idempotency. Decoupling the terminal
+# SSE broadcast from the ledger's physical-write dedup (orchestrator) means the
+# broadcast can now be invoked even on a deduped storage write — so exactly-once
+# semantics must live HERE (the notification layer), not ride on storage state.
+# Bounded FIFO set of (op_id, state) already published; thread-safe; fail-open
+# (a possible duplicate event beats a dropped terminal wake).
+_TERMINAL_PUBLISHED_MAX = 4096
+_terminal_published_set: set = set()
+_terminal_published_order: deque = deque()
+_terminal_published_lock = threading.Lock()
+
+
+def _terminal_publish_once(op_id: str, state_value: str) -> bool:
+    """Return True iff this ``(op_id, state)`` terminal event has not been
+    broadcast before (and records it). Bounded; thread-safe; NEVER raises —
+    on any internal error it returns True (fail-open toward delivery)."""
+    key = (op_id, state_value)
+    try:
+        with _terminal_published_lock:
+            if key in _terminal_published_set:
+                return False
+            _terminal_published_set.add(key)
+            _terminal_published_order.append(key)
+            while len(_terminal_published_order) > _TERMINAL_PUBLISHED_MAX:
+                _terminal_published_set.discard(_terminal_published_order.popleft())
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def get_default_broker() -> StreamEventBroker:
     global _default_broker
     with _default_broker_lock:
@@ -2249,6 +2279,13 @@ def publish_operation_terminal(ctx: Any, state: Any) -> Optional[str]:
             return None
         op_id = getattr(ctx, "op_id", None)
         if not isinstance(op_id, str) or not op_id:
+            return None
+        # Slice 74 — exactly-once at the notification layer. The orchestrator no
+        # longer gates this call on the ledger's `written` dedup, so idempotency
+        # for (op_id, terminal state) lives here. Returns None on a repeat so a
+        # deduped storage write still fires the FIRST terminal broadcast but
+        # never double-fires.
+        if not _terminal_publish_once(op_id, state_value):
             return None
         phase_obj = getattr(ctx, "phase", None)
         phase_value = getattr(phase_obj, "name", None)
