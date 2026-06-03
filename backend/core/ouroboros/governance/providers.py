@@ -5375,6 +5375,63 @@ def _remaining_utc_budget_s(
     return max(float(floor_s), rem)
 
 
+# ---------------------------------------------------------------------------
+# Slice 71 — Envelope Inheritance Invariant (fallback synthesis floor)
+# ---------------------------------------------------------------------------
+# Root cause (bt-2026-06-02-232715): the Claude tool loop derives its per-round
+# / stream budget from the GENERATE-phase ``deadline``. A *continuation* round
+# (``is_tool_round = round_index > 0``) runs after earlier rounds CONSUMED that
+# phase window, so ``_remaining_utc_budget_s(deadline)`` collapses to its 1.0s
+# floor → Claude gets ``budget=1.0s`` → ``first_token=NEVER`` → fallback_failed
+# → no candidate → no score, even though the op's wall envelope still had 313s.
+#
+# Fix: tool-loop synthesis inherits the MORE generous of the phase deadline and
+# the op's wall envelope (``OperationContext.pipeline_deadline``, stamped once
+# at submit()). Inheritance only RAISES the inner budget; the outer
+# ``_call_fallback`` ``_race_or_wait_for(timeout=_attempt_remaining)`` + the
+# wall-clock watchdog remain the absolute ceilings, so a continuation round can
+# never run past the op's true wall envelope.
+_SYNTHESIS_ENVELOPE_ENABLED_ENV = "JARVIS_FALLBACK_SYNTHESIS_ENVELOPE_ENABLED"
+
+
+def _synthesis_envelope_enabled() -> bool:
+    """Slice 71 master flag (default TRUE — graduates on for the scored soak).
+
+    Single-knob hot-revert: setting the env to a falsey value restores the
+    byte-identical pre-Slice-71 phase-deadline behavior.
+    """
+    raw = os.environ.get(_SYNTHESIS_ENVELOPE_ENABLED_ENV, "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _synthesis_envelope_deadline(
+    context: Any, phase_deadline: Optional[datetime],
+) -> Optional[datetime]:
+    """Return the deadline tool-loop synthesis should inherit.
+
+    The MORE generous (later) of ``phase_deadline`` and the op's wall envelope
+    ``context.pipeline_deadline``. NEVER shrinks the budget (``max`` semantics),
+    NEVER raises (a tz naive/aware mismatch or a context without the attribute
+    falls back to ``phase_deadline``), and is a byte-identical passthrough when
+    the master flag is off or no wall envelope is present.
+    """
+    if not _synthesis_envelope_enabled():
+        return phase_deadline
+    try:
+        wall = getattr(context, "pipeline_deadline", None)
+    except Exception:  # noqa: BLE001 — defensive; never perturb generation
+        return phase_deadline
+    if wall is None:
+        return phase_deadline
+    if phase_deadline is None:
+        return wall
+    try:
+        return wall if wall > phase_deadline else phase_deadline
+    except (TypeError, ValueError):
+        # tz naive/aware mismatch (or non-comparable) — fail safe to phase.
+        return phase_deadline
+
+
 # Exponential backoff retry — 2s, 4s, 8s between attempts.
 _CLAUDE_RETRY_MAX_ATTEMPTS = int(
     os.environ.get("JARVIS_CLAUDE_RETRY_MAX_ATTEMPTS", "3")
@@ -7902,7 +7959,13 @@ class ClaudeProvider:
 
         async def _generate_raw(p: str) -> str:
             nonlocal total_cost
-            _r0 = _remaining_utc_budget_s(deadline, floor_s=1.0)
+            # Slice 71 — inherit the op's wall envelope so a continuation round
+            # whose phase deadline was consumed by earlier rounds isn't starved
+            # to the 1.0s floor (first_token=NEVER). max() semantics never shrink
+            # round 0's budget; the outer wait_for stays the ceiling.
+            _r0 = _remaining_utc_budget_s(
+                _synthesis_envelope_deadline(context, deadline), floor_s=1.0,
+            )
             timeout_s = float(_r0 if _r0 is not None else 1.0)
 
             # Multi-modal path. Two sources of image content merge here:
@@ -8729,9 +8792,31 @@ class ClaudeProvider:
         tool_records: tuple = ()
         venom_edits: Tuple[Dict[str, Any], ...] = ()
         if self._tool_loop is not None and not _skip_tools:
+            # Slice 71 — the ToolLoopCoordinator's total budget (and thus its
+            # per-round BudgetPlan) inherits the op's wall envelope, so a
+            # consumed phase deadline can't collapse continuation rounds to the
+            # 1.0s floor. Bounded by the outer wait_for + wall watchdog.
+            _synth_deadline = _synthesis_envelope_deadline(context, deadline)
+            # Slice 71 — instrument the inheritance so the scored soak is
+            # diagnostic regardless of outcome: phase-remaining vs wall-remaining
+            # vs the inherited synthesis budget the tool loop will plan against.
+            try:
+                _phase_rem = _remaining_utc_budget_s(deadline, floor_s=0.0)
+                _synth_rem = _remaining_utc_budget_s(_synth_deadline, floor_s=0.0)
+                if _synth_rem is not None and _phase_rem is not None and _synth_rem > _phase_rem + 1.0:
+                    logger.info(
+                        "[ClaudeProvider] Slice71 synthesis envelope inherited: "
+                        "phase_remaining=%.1fs → synthesis_remaining=%.1fs "
+                        "(wall envelope, op=%s route=%s)",
+                        _phase_rem, _synth_rem,
+                        str(getattr(context, "op_id", "?"))[:16],
+                        getattr(context, "provider_route", "?"),
+                    )
+            except Exception:  # noqa: BLE001 — instrumentation never perturbs
+                pass
             deadline_mono = (
                 time.monotonic()
-                + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+                + max(0.0, (_synth_deadline - datetime.now(tz=timezone.utc)).total_seconds())
             )
             # ── Slice 3G — envelope-override for per-op worktrees ──
             # Closes bt-2026-05-25-060538 NOOP wiring gap: SWE-Bench-Pro
@@ -8782,7 +8867,11 @@ class ClaudeProvider:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             raw = None
             while True:
-                _r_loop = _remaining_utc_budget_s(deadline, floor_s=1.0)
+                # Slice 71 — legacy inline tool loop inherits the wall envelope
+                # too (parity with the coordinator path above).
+                _r_loop = _remaining_utc_budget_s(
+                    _synthesis_envelope_deadline(context, deadline), floor_s=1.0,
+                )
                 timeout_s = float(_r_loop if _r_loop is not None else 1.0)
                 if timeout_s <= 5.0:
                     logger.warning(
