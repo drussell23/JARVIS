@@ -5121,8 +5121,21 @@ class BattleTestHarness:
     # Per-op staleness threshold: if an operation hasn't transitioned FSM
     # state in this many seconds, it's considered stale. The watchdog is
     # NOT poked for stale ops — if ALL ops are stale the idle timer fires.
+    #
+    # Slice 81 — CALIBRATION INVARIANT (load-bearing): this threshold MUST
+    # exceed the largest single-phase budget an op can legitimately consume,
+    # else a long-but-active phase is mis-classified stale and the session is
+    # shut down mid-flight (the EVAL-2 sweep-#4 `stale_ops_detected` false-
+    # positive: a Slice 80 GENERATE got budget=1287s but the 600s threshold
+    # fired first). The Move-2-v4 streaming heartbeat (`_emit_stream_activity`
+    # → `last_activity_at_utc`) keeps a *streaming* phase fresh, but a long
+    # NON-streaming phase (a VERIFY pytest, a heavy tool exec) still has no
+    # heartbeat — so the threshold itself is the backstop. Default raised
+    # 600→1200; a soak with large adaptive budgets MUST set
+    # `OUROBOROS_OP_STALE_THRESHOLD_S` above its per-op budget ceiling
+    # (= `--max-wall-seconds` × `JARVIS_ADAPTIVE_GEN_WALL_FRACTION`).
     _OP_STALE_THRESHOLD_S: float = float(
-        os.environ.get("OUROBOROS_OP_STALE_THRESHOLD_S", "600")
+        os.environ.get("OUROBOROS_OP_STALE_THRESHOLD_S", "1200")
     )
 
     # After this many seconds of zero phase transitions we forcibly cancel

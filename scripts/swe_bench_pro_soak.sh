@@ -32,6 +32,18 @@ COST_CAP="${COST_CAP:-2.00}"   # operator-bound USD ceiling (env-overridable)
 MAX_WALL="${MAX_WALL:-2400}"   # hard wall-clock seconds (env-overridable for
                                # multi-instance sweeps; retry-storm-proof)
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-1800}"  # per-op liveness seconds (env-overridable)
+# Slice 81 — temporal CALIBRATION for the Slice 79/80 adaptive budgets.
+# An op's adaptive GENERATE budget can reach MAX_WALL × ADAPTIVE_WALL_FRACTION;
+# the per-op staleness threshold MUST exceed that, else a long-but-active op is
+# false-killed (`stale_ops_detected`, the sweep-#4 failure). We cap the per-op
+# budget fraction AND set the stale threshold above the resulting ceiling.
+export JARVIS_ADAPTIVE_GEN_WALL_FRACTION="${JARVIS_ADAPTIVE_GEN_WALL_FRACTION:-0.40}"
+# stale threshold = ceil(MAX_WALL × fraction) + 300s grace, floored at 1200s.
+_PEROP_CEIL=$(python3 -c "import math,os; print(int(math.ceil(${MAX_WALL}*float(os.environ['JARVIS_ADAPTIVE_GEN_WALL_FRACTION']))+300))" 2>/dev/null || echo 2700)
+export OUROBOROS_OP_STALE_THRESHOLD_S="${OUROBOROS_OP_STALE_THRESHOLD_S:-$_PEROP_CEIL}"
+# Slice 81 — raise Claude's base output budget so large single-file rewrites
+# (~1800 lines) complete in one round instead of truncating at 16384.
+export JARVIS_CLAUDE_MAX_OUTPUT_TOKENS="${JARVIS_CLAUDE_MAX_OUTPUT_TOKENS:-32768}"
 # Restricted-env: sandbox blocks .git/config under the repo root, so the
 # benchmark repo cache + worktrees live under TMPDIR (NOT the repo).
 SWEBP_CACHE="${TMPDIR:-/tmp}/swebp_cache"
