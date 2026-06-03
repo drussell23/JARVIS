@@ -44,6 +44,7 @@ import asyncio
 import enum
 import logging
 import os
+import re
 from typing import Any, List, Optional
 
 from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
@@ -155,7 +156,18 @@ def inject_instance_ids() -> List[str]:
     raw = os.environ.get(INJECT_INSTANCE_IDS_ENV_VAR, "").strip()
     if not raw:
         return []
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    # Slice 75 — tolerant multi-instance delimiter. Accept comma- AND/OR
+    # whitespace-separated lists (operators paste either form;
+    # ``"a,b"`` / ``"a b"`` / ``"a, b"`` all parse identically). Order-
+    # preserving dedup so a repeated id is evaluated once, not N times.
+    seen: set = set()
+    out: List[str] = []
+    for s in re.split(r"[,\s]+", raw):
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def autoscore_enabled() -> bool:
