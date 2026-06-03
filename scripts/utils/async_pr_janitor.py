@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp  # hard dependency of the async network path
+
 REPO = os.environ.get("PR_JANITOR_REPO", "drussell23/JARVIS")
 API = "https://api.github.com"
 
@@ -154,21 +156,31 @@ async def _fetch_open_page(session, token: str, per_page: int) -> List[Dict[str,
     """Fetch the newest page of open PRs (we close as we go, so re-fetching
     the first page each round walks the shrinking set without cursor drift)."""
     url = f"{API}/repos/{REPO}/pulls?state=open&per_page={per_page}&sort=created&direction=desc"
-    async with session.get(url, headers=_headers(token)) as resp:
-        if resp.status != 200:
-            ra = _retry_after_from(dict(resp.headers))
-            return [{"__error__": resp.status, "__retry_after__": ra}]
-        return await resp.json()
+    # Self-healing: a transient connection reset (Errno 54) / timeout must back
+    # the loop off and retry, never crash the unattended ~18h drain. Return the
+    # existing error sentinel so the run loop's backoff path handles it.
+    try:
+        async with session.get(url, headers=_headers(token)) as resp:
+            if resp.status != 200:
+                ra = _retry_after_from(dict(resp.headers))
+                return [{"__error__": resp.status, "__retry_after__": ra}]
+            return await resp.json()
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+        return [{"__error__": "transient", "__retry_after__": None}]
 
 
 async def _close_pr(session, token: str, number: int) -> Tuple[bool, Optional[float]]:
     url = f"{API}/repos/{REPO}/pulls/{number}"
-    async with session.patch(url, headers=_headers(token),
-                             json={"state": "closed"}) as resp:
-        if resp.status == 200:
-            return True, None
-        ra = _retry_after_from(dict(resp.headers))
-        return False, ra if ra is not None else 0.0
+    try:
+        async with session.patch(url, headers=_headers(token),
+                                 json={"state": "closed"}) as resp:
+            if resp.status == 200:
+                return True, None
+            ra = _retry_after_from(dict(resp.headers))
+            return False, ra if ra is not None else 0.0
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+        # transient — signal the loop to back off (no Retry-After → exp backoff)
+        return False, 0.0
 
 
 async def run(rate_per_s: float, dry_run: bool, max_closes: Optional[int]) -> int:
