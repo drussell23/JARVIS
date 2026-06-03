@@ -819,6 +819,37 @@ def apply_force_batch_deadline_floor(
     return max(gen_timeout_s, force_batch_gen_timeout_floor_s())
 
 
+def structural_fast_cascade_enabled() -> bool:
+    """Slice 73 master flag — default TRUE. When off, the dispatch loop tries
+    every ranked DW model before cascading (byte-identical legacy behavior)."""
+    raw = os.environ.get(
+        "JARVIS_DW_STRUCTURAL_FAST_CASCADE_ENABLED", "true",
+    ).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def should_sever_dw_lane(failure_source: Any) -> bool:
+    """Slice 73 — True iff this failure is a STRUCTURAL transport break.
+
+    A ``LIVE_TRANSPORT`` failure (socket/connection break, ``live_transport:
+    RuntimeError``) means the transport to the DW endpoint is down — every
+    ranked sibling model shares that dead transport, so trying the next one
+    just burns another ~30s before the inevitable cascade. Sever the lane and
+    hand Claude the full remaining budget.
+
+    Model-SPECIFIC failures (429 rate-limit, 5xx, parse) are NOT severed — a
+    sibling model may be healthy, so the loop still rotates to it. Pure;
+    never raises (unknown source → don't sever).
+    """
+    try:
+        from backend.core.ouroboros.governance.topology_sentinel import (
+            FailureSource,
+        )
+        return failure_source is FailureSource.LIVE_TRANSPORT
+    except Exception:  # noqa: BLE001 — never block dispatch
+        return False
+
+
 def _note_dw_total_outage(diagnostic: str) -> None:
     """Slice 53 — record one GENERATE op that exhausted ALL DW models with no
     candidate from streaming OR batch (the total-vendor-blackout signature).
@@ -3167,6 +3198,26 @@ class CandidateGenerator:
                         type(exc).__name__, op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
+                # Slice 73 — structural transport short-circuit. A LIVE_TRANSPORT
+                # break affects the whole DW endpoint, so trying the next ranked
+                # model just burns another ~30s on the same dead transport
+                # before the inevitable cascade — starving the Claude fallback
+                # (the bt-2026-06-03 deadline_exhausted_pre_fallback failure).
+                # Sever the lane NOW and fall through to cascade with the full
+                # remaining budget. Model-specific failures still rotate.
+                if (
+                    structural_fast_cascade_enabled()
+                    and should_sever_dw_lane(failure_source)
+                ):
+                    _severed = len(ranked_models) - len(attempts)
+                    logger.warning(
+                        "[CandidateGenerator] Slice 73 structural fast-cascade: "
+                        "model=%s LIVE_TRANSPORT — severing DW lane, cascading to "
+                        "fallback with full budget (op=%s, skipped %d sibling "
+                        "model(s))",
+                        model_id, op_id_short, max(0, _severed),
+                    )
+                    break
                 continue
         # All DW models exhausted (either OPEN or failed). The
         # per-attempt ContextVar was already reset by each loop

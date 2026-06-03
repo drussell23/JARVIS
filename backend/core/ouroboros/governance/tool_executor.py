@@ -4587,6 +4587,16 @@ _BUDGET_TELEMETRY_ENABLED = os.environ.get(
     "JARVIS_TOOL_LOOP_BUDGET_TELEMETRY", "true"
 ).lower() in ("1", "true", "yes", "on")
 
+
+def _adaptive_turn_gate_enabled() -> bool:
+    """Slice 73 master flag — default TRUE. When off, the viability gate keeps
+    its legacy fair-share semantics (``per_round_timeout`` divided across all
+    hypothetical rounds_left), preserving byte-identical rollback."""
+    raw = os.environ.get(
+        "JARVIS_TOOL_LOOP_ADAPTIVE_TURN_GATE_ENABLED", "true",
+    ).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 # Sentinel parked on ``ToolLoopCoordinator._karen_voice`` when the lazy
 # import of KarenPreambleVoice fails — headless envs, missing audio stack,
 # import errors. Using a sentinel (not ``None``) prevents the import
@@ -4798,8 +4808,15 @@ class BudgetPlan:
         (or the legacy ``min_per_round`` reason) and force the model
         to produce its final answer with the remaining budget.
         """
-        # Condition 1 — legacy min_per_round floor
-        if self.unclamped_fair_share_s(remaining_s, remaining_rounds) < self.min_per_round_s:
+        # Condition 1 — min_per_round floor
+        if _adaptive_turn_gate_enabled():
+            # Slice 73 — immediate-turn semantics (mirrors Condition 2): the
+            # round receives the full remaining budget, so bail only when even
+            # one min_per_round-sized turn won't fit, not when the fair-share
+            # across all hypothetical rounds_left dips below the floor.
+            if remaining_s < self.min_per_round_s:
+                return False
+        elif self.unclamped_fair_share_s(remaining_s, remaining_rounds) < self.min_per_round_s:
             return False
         # Condition 2 — Slice 3B + 3B.1 self-tuning TTFT floor.
         #
@@ -4823,8 +4840,21 @@ class BudgetPlan:
         # stream rupture.
         if self.min_ttft_floor_s > 0.0:
             effective_floor = min(self.min_ttft_floor_s, self.max_per_round_s)
-            if self.per_round_timeout(remaining_s, remaining_rounds) < effective_floor:
-                return False
+            if _adaptive_turn_gate_enabled():
+                # Slice 73 — assess the IMMEDIATE turn against the ACTUAL
+                # remaining budget, not the fair-share across all hypothetical
+                # rounds_left. Post-Slice-71 the round receives the full
+                # remaining deadline (generate_fn's own timeout), NOT
+                # per_round_timeout — so dividing by rounds_left is a false-
+                # positive bail that truncated a healthy 148s runway to tiny
+                # responses (16 bails in bt-2026-06-03-053511). Bail ONLY when
+                # the budget can't fit even one floor-sized turn.
+                if remaining_s < effective_floor:
+                    return False
+            else:
+                # Legacy fair-share gate (flag off → byte-identical rollback).
+                if self.per_round_timeout(remaining_s, remaining_rounds) < effective_floor:
+                    return False
         return True
 
     def describe(self) -> str:
