@@ -98,6 +98,31 @@ _MAX_REQUEST_BODY_BYTES_DEFAULT: int = 4 * 1024 * 1024
 #   - Sock-read: same 30s — single source of truth
 _DEFAULT_CONNECT_TIMEOUT_S: float = 10.0
 _DEFAULT_SOCK_READ_TIMEOUT_S: float = 30.0
+# Slice 78 Track 2 — make the upstream sock-read window operator-tunable. The
+# 30s default matches the DW inter-chunk SSE stall threshold (§44.6), but the
+# SAME window also governs the time-to-FIRST-token: a reasoning model in
+# thinking-mode can stay silent past 30s before its first byte, and the DW
+# provider itself tolerates a far longer TTFT rupture window (120s / 360s). When
+# that happens this proxy would cut the upstream read BEFORE the client it serves
+# would — so an operator can raise it via JARVIS_AEGIS_UPSTREAM_SOCK_READ_S
+# (e.g. 120/360) to stop the proxy pre-empting the provider's own rupture logic.
+# Default UNCHANGED (30s) — verify-first: not raised blindly without confirmed
+# TTFT>30s evidence (direct probes showed ~1-2s TTFT on the bare models).
+_AEGIS_SOCK_READ_ENV_VAR: str = "JARVIS_AEGIS_UPSTREAM_SOCK_READ_S"
+
+
+def _upstream_sock_read_timeout_s() -> float:
+    """Env-tunable upstream per-chunk read timeout. Invalid / non-positive →
+    the 30s default. NEVER raises."""
+    raw = os.environ.get(_AEGIS_SOCK_READ_ENV_VAR, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return _DEFAULT_SOCK_READ_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +526,7 @@ async def forward_request(
     )
     timeout = aiohttp.ClientTimeout(
         connect=_DEFAULT_CONNECT_TIMEOUT_S,
-        sock_read=_DEFAULT_SOCK_READ_TIMEOUT_S,
+        sock_read=_upstream_sock_read_timeout_s(),
     )
 
     # 4. Open upstream + stream pass-through ---------------------------------
@@ -553,6 +578,7 @@ async def forward_request(
 
         guillotine_fired = False
         client_disconnected = False
+        upstream_read_failed = False  # Slice 78 — upstream read timeout/error
         # Slice 2B-i: for non-streaming responses, buffer the body
         # (capped) so we can parse `usage` for authoritative reconcile.
         # Bytes are STILL written to the client byte-identically as they
@@ -611,6 +637,22 @@ async def forward_request(
                     if remaining > 0:
                         nonstreaming_buffer.extend(chunk[:remaining])
 
+        except (asyncio.TimeoutError, aiohttp.ServerTimeoutError,
+                aiohttp.ClientError) as _read_exc:
+            # Slice 78 Track 2 — the upstream read (iter_any) raised: a sock_read
+            # timeout (proxy cut before the provider's own rupture window) or a
+            # mid-stream connection break. Previously this ESCAPED forward_request
+            # (which documents "NEVER raises") and EOF'd the client with zero SSE
+            # bytes — the DW provider then saw an empty stream → StreamRuptureError
+            # → exhaustion → misclassified `live_transport:RuntimeError`. Catch it
+            # here, mark the clean UPSTREAM_UNREACHABLE outcome, and let the
+            # `finally` flush a graceful EOF.
+            upstream_read_failed = True
+            logger.warning(
+                "[AegisForward] upstream read failed mid-stream "
+                "(%s: %s) lease=%s — UPSTREAM_UNREACHABLE",
+                type(_read_exc).__name__, str(_read_exc)[:120], lease.nonce,
+            )
         finally:
             # IMPORTANT ordering: parse non-streaming body + reconcile
             # budget BEFORE write_eof. Once write_eof flushes EOF to
@@ -691,6 +733,9 @@ async def forward_request(
             f"actual {actual_cost:.6f} exceeded lease.max_cost_usd "
             f"{lease.max_cost_usd:.6f}"
         )
+    elif upstream_read_failed:
+        outcome = ForwardOutcome.UPSTREAM_UNREACHABLE
+        detail = "upstream read failed mid-stream (timeout / connection break)"
     elif client_disconnected:
         outcome = ForwardOutcome.CLIENT_DISCONNECTED
         detail = "client closed connection mid-stream"
