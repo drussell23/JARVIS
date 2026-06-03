@@ -43,10 +43,11 @@ Invariants (spine-pinned)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ ADAPTIVE_GEN_BUDGET_ENABLED_ENV_VAR: str = (
 _CHARS_PER_TOKEN_ENV_VAR: str = "JARVIS_ADAPTIVE_GEN_CHARS_PER_TOKEN"
 _TOKEN_REF_ENV_VAR: str = "JARVIS_ADAPTIVE_GEN_TOKEN_REF"
 _FILE_REF_ENV_VAR: str = "JARVIS_ADAPTIVE_GEN_FILE_REF"
+_LINES_REF_ENV_VAR: str = "JARVIS_ADAPTIVE_GEN_LINES_REF"  # Slice 80
 _MAX_MULTIPLIER_ENV_VAR: str = "JARVIS_ADAPTIVE_GEN_MAX_MULTIPLIER"
 _WALL_CAP_ENV_VAR: str = "OUROBOROS_BATTLE_MAX_WALL_SECONDS"
 
@@ -65,6 +67,7 @@ _WALL_CAP_ENV_VAR: str = "OUROBOROS_BATTLE_MAX_WALL_SECONDS"
 _DEFAULT_CHARS_PER_TOKEN: float = 4.0   # standard ~4 chars/token heuristic
 _DEFAULT_TOKEN_REF: float = 4000.0      # ~a heavy problem-statement payload
 _DEFAULT_FILE_REF: float = 12.0         # multi-file change reference
+_DEFAULT_LINES_REF: float = 200.0       # Slice 80 — changed-line reference
 _DEFAULT_MAX_MULTIPLIER: float = 6.0    # weight saturates here
 # Fraction of the session wall cap a single op may claim (so two
 # discriminator ops can't both demand the entire wall). Env-tunable.
@@ -140,10 +143,40 @@ def _ctx_text_len(ctx: Any) -> int:
     return total
 
 
+def _ctx_static_geometry(ctx: Any) -> Tuple[int, int]:
+    """Slice 80 — read the budget-only geometry stamp (file_count, changed_lines)
+    that the SWE-bench envelope_builder writes into ``intake_evidence_json``.
+    Returns ``(0, 0)`` when absent / malformed / non-swe_bench. NEVER raises.
+
+    This is the pre-exploration fallback: SWE-bench ops carry NO target_files
+    (the agent must localize the bug itself), so without this stamp a multi-file
+    instance is indistinguishable from a 1-file fix at GENERATE time."""
+    try:
+        raw = getattr(ctx, "intake_evidence_json", "") or ""
+        if not raw:
+            return (0, 0)
+        ev = json.loads(raw)
+        if not isinstance(ev, dict):
+            return (0, 0)
+        geom = ev.get("swe_bench_geometry") or {}
+        return (
+            max(0, int(geom.get("file_count", 0) or 0)),
+            max(0, int(geom.get("changed_lines", 0) or 0)),
+        )
+    except Exception:  # noqa: BLE001 — best-effort budget metadata
+        return (0, 0)
+
+
 def _ctx_file_count(ctx: Any) -> int:
     try:
         tf = getattr(ctx, "target_files", ()) or ()
-        return len(tuple(tf))
+        n = len(tuple(tf))
+        if n > 0:
+            return n
+        # Slice 80 — pre-exploration fallback: the static geometry stamp.
+        # target_files takes precedence (a normal op that has localized its
+        # files); only when it's empty (SWE-bench GENERATE) do we use the stamp.
+        return _ctx_static_geometry(ctx)[0]
     except Exception:  # noqa: BLE001 — defensive
         return 0
 
@@ -165,16 +198,27 @@ def compute_payload_weight(ctx: Any) -> PayloadWeight:
     file_ref = _env_float(
         _FILE_REF_ENV_VAR, _DEFAULT_FILE_REF, minimum=1.0,
     )
+    lines_ref = _env_float(
+        _LINES_REF_ENV_VAR, _DEFAULT_LINES_REF, minimum=1.0,
+    )
 
     text_len = _ctx_text_len(ctx)
     file_count = _ctx_file_count(ctx)
+    # Slice 80 — the reference-patch changed-line count (budget-only stamp).
+    # Captures the "few files but 2028 lines" ansible profile that file_count
+    # alone misses. Zero for non-swe_bench ops → byte-identical legacy score.
+    _, changed_lines = _ctx_static_geometry(ctx)
     tokens_est = int(text_len / chars_per_token)
 
     # Projected Venom rounds: monotone in file_count (more files →
     # more read/edit rounds). Derived, not a separate input.
     projected_rounds = max(1, file_count)
 
-    score = (tokens_est / token_ref) + (file_count / file_ref)
+    score = (
+        (tokens_est / token_ref)
+        + (file_count / file_ref)
+        + (changed_lines / lines_ref)
+    )
     if score < 0.0:
         score = 0.0
     return PayloadWeight(
@@ -341,6 +385,21 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example=str(_DEFAULT_FILE_REF),
             since="v3.7 Stage 2 Slice 2 adaptive gen budget (2026-05-16)",
+        ),
+        FlagSpec(
+            name=_LINES_REF_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_LINES_REF,
+            description=(
+                "Slice 80 — reference changed-line count that contributes "
+                "1.0 to the payload weight score, read from the SWE-bench "
+                "geometry stamp (captures the 'few files / many lines' "
+                "profile file_count alone misses). Env-tunable calibration."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example=str(_DEFAULT_LINES_REF),
+            since="Slice 80 geometry enrichment (2026-06-03)",
         ),
         FlagSpec(
             name=_CHARS_PER_TOKEN_ENV_VAR,

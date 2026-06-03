@@ -263,6 +263,46 @@ def _build_evidence(
                 t.strip() for t in _f2p_raw.replace(",", "\n").split("\n")
                 if t.strip()
             ]
+    # ── Slice 80 — static geometry stamp (BUDGET-ONLY metadata) ──
+    # The adaptive GENERATE budget (adaptive_gen_budget.compute_payload_weight)
+    # sizes the temporal envelope from ctx geometry, but SWE-bench ops carry NO
+    # target_files (deliberate — see build_evaluation_envelope; the agent must
+    # localize the bug itself). So at GENERATE the file-count signal is 0 and a
+    # genuinely multi-file instance gets the same tight budget as a 1-file fix,
+    # starving the multi-round patch (the §50.11 EVAL-2 timeout). This stamps the
+    # reference-patch SCOPE (file + changed-line counts) so the budget calculator
+    # can size runway BEFORE exploration. It is metadata for budget sizing ONLY —
+    # `intake_evidence_json` is consumed for repo-root resolution + budget, NEVER
+    # injected into the model's GENERATE prompt — so it does not leak the
+    # solution (the model still localizes + writes the fix independently; only
+    # the *amount of compute time* scales with problem scope). Best-effort:
+    # any failure → zeros → byte-identical pre-Slice-80 budget.
+    _geometry = {"file_count": 0, "changed_lines": 0} # default zero geometry (empty patch or geometry failure) 
+    try:
+        # Import the geometric sampler here to contain any potential import-time side 
+        # effects or heavy dependencies within this try-except block, ensuring that 
+        # any issues with the sampler don't affect the overall envelope construction. 
+        # The sampler is a best-effort signal, so we want to be extra defensive in 
+        # both its import and usage.
+        from backend.core.ouroboros.governance.swe_bench_pro.geometric_sampler import (  # noqa: E501
+            compute_patch_geometry,
+        )
+        # compute_patch_geometry is robust to malformed patches and returns zero geometry 
+        # on failure, but we wrap the whole call in a try-except to be extra 
+        # defensive — geometry is a best-effort signal and should never cause the envelope 
+        # construction to fail. 
+        _g = compute_patch_geometry(_safe_str(problem.instance_id), _gold_patch)
+        # Explicitly coerce to int here to guard against any non-int types that might 
+        # slip through (e.g., if compute_patch_geometry's robustness logic returns None 
+        # or a non-int type on failure). The envelope expects integers, so this ensures 
+        # type consistency and that any such anomalies result in zero geometry rather 
+        # than a type error.
+        _geometry = {
+            "file_count": int(getattr(_g, "changed_files", 0) or 0), # defensive fallback to 0 if the attribute is missing or falsy
+            "changed_lines": int(getattr(_g, "changed_lines", 0) or 0), # defensive fallback to 0 if the attribute is missing or falsy
+        }
+    except Exception:  # noqa: BLE001 — geometry is best-effort budget metadata
+        pass
     return {
         EVIDENCE_REPO_ROOT_KEY: str(prepared.worktree_path),
         "problem_instance_id": _safe_str(problem.instance_id),
@@ -278,6 +318,8 @@ def _build_evidence(
         # Slice 4B — test scoping for InteractiveRepair / L2 (empty
         # list when source dataset omits the field — legacy behavior).
         "fail_to_pass": _fail_to_pass,
+        # Slice 80 — budget-only geometry stamp (NOT surfaced to the model).
+        "swe_bench_geometry": _geometry,
     }
 
 
