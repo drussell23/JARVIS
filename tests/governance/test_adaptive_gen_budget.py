@@ -63,9 +63,26 @@ def _clean(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_flag_off_is_byte_identical():
-    # flag unset → exactly base (the float-cast of it)
+def test_flag_off_is_byte_identical(monkeypatch):
+    # Slice 79 graduated the master to default-TRUE, so the OFF path must be
+    # set explicitly. With the flag OFF, scaling is byte-identical (== base).
+    monkeypatch.setenv("JARVIS_ADAPTIVE_GEN_BUDGET_ENABLED", "false")
     assert agb.scale_gen_timeout(_BASE, _Ctx("x" * 99999, files=range(50))) == _BASE
+
+
+def test_graduated_default_on_scales_heavy_payload(monkeypatch):
+    # Slice 79 — flag UNSET now defaults ON, so a heavy multi-file swe_bench-
+    # shaped payload gets a scaled (larger) budget without any env opt-in.
+    monkeypatch.delenv("JARVIS_ADAPTIVE_GEN_BUDGET_ENABLED", raising=False)
+    assert agb.adaptive_gen_budget_enabled() is True
+    heavy = _Ctx("x" * 80000, files=range(11))  # big problem statement, 11 files
+    assert agb.scale_gen_timeout(_BASE, heavy) > _BASE
+
+
+def test_graduated_default_on_trivial_still_unchanged(monkeypatch):
+    # the Floor invariant still holds at default-on: a trivial op is unchanged.
+    monkeypatch.delenv("JARVIS_ADAPTIVE_GEN_BUDGET_ENABLED", raising=False)
+    assert agb.scale_gen_timeout(_BASE, _Ctx()) == pytest.approx(_BASE)
 
 
 def test_floor_never_below_base_even_with_huge_payload(monkeypatch):
@@ -231,7 +248,7 @@ def test_orchestrator_composes_scale_gen_timeout_single_seam():
 # ---------------------------------------------------------------------------
 
 
-def test_flag_registry_master_default_false():
+def test_flag_registry_master_default_true():
     captured = []
 
     class _Reg:
@@ -244,5 +261,6 @@ def test_flag_registry_master_default_false():
         s for s in captured
         if s.name == "JARVIS_ADAPTIVE_GEN_BUDGET_ENABLED"
     )
-    assert master.default is False
+    # Slice 79 — graduated default-FALSE → default-TRUE.
+    assert master.default is True
     assert "adaptive_gen_budget.py" in master.source_file

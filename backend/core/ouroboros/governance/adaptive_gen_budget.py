@@ -89,11 +89,15 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
 
 
 def adaptive_gen_budget_enabled() -> bool:
-    """Master switch — §33.1 default-FALSE.  NEVER raises."""
+    """Master switch — GRADUATED to default-TRUE (Slice 79). The Floor
+    invariant guarantees zero regression (trivial payload → multiplier 1.0 →
+    byte-identical), so only heavy multi-file payloads (e.g. the ansible /
+    NodeBB SWE-bench instances) gain runway. Set the env to a falsey value to
+    restore the pre-graduation byte-identical path. NEVER raises."""
     raw = os.environ.get(
-        ADAPTIVE_GEN_BUDGET_ENABLED_ENV_VAR, "",
+        ADAPTIVE_GEN_BUDGET_ENABLED_ENV_VAR, "true",
     ).strip().lower()
-    return raw in ("true", "1", "yes", "on")
+    return raw not in ("0", "false", "no", "off")
 
 
 # ===========================================================================
@@ -280,20 +284,21 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=ADAPTIVE_GEN_BUDGET_ENABLED_ENV_VAR,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Payload-adaptive GENERATE budget master switch "
-                "(§33.1 default-FALSE). When ON, the route-base "
+                "(GRADUATED default-TRUE, Slice 79). The route-base "
                 "_gen_timeout is scaled by deterministic payload "
                 "geometry (text tokens + file count) at the "
-                "orchestrator deadline seam — floor=route base "
-                "(zero regression), ceiling=session wall cap. "
-                "Byte-identical when OFF."
+                "generate_runner deadline seam — floor=route base "
+                "(zero regression on trivial ops), ceiling=session "
+                "wall cap. Set falsey to restore the pre-graduation "
+                "byte-identical path."
             ),
             category=Category.SAFETY,
             source_file=src,
-            example="false",
-            since="v3.7 Stage 2 Slice 2 adaptive gen budget (2026-05-16)",
+            example="true",
+            since="v3.7 Stage 2 Slice 2 (2026-05-16); graduated Slice 79 (2026-06-03)",
         ),
         FlagSpec(
             name=_MAX_MULTIPLIER_ENV_VAR,
