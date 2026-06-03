@@ -880,6 +880,37 @@ def _note_dw_candidate_success() -> None:
         pass
 
 
+def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
+    """Slice 77 — the millisecond a LIVE dispatch hits a transport break
+    (``live_transport:RuntimeError`` / socket drop), stamp the
+    ``dw_surface_health`` ledger ``DIRECT_STREAMING → TRANSPORT_DEGRADED`` so
+    the NEXT op's Slice 76 P2 pre-flight gate (:func:`dw_transport_degraded_preflight`)
+    fires and cascades straight to Claude with the full budget — instead of
+    burning the next op's allowance on the same dead transport (the EVAL-2
+    Phase-4 ``deadline_exhausted_pre_fallback`` failure, PRD §50.11).
+
+    This converts the ledger from a one-shot BOOT probe into a live,
+    event-driven status map. Recovery is automatic: once live generations stop
+    failing, no further degraded records are written and the gate's freshness
+    window lapses the stale verdict, re-enabling the DW lane. A fresh ledger
+    instance per call reads-latest-then-saves, so this never clobbers a
+    concurrent probe's record for another surface. NEVER raises (best-effort
+    observability must not perturb the dispatch error path it sits on)."""
+    try:
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        SurfaceHealthLedger(autosave=True).record(
+            SurfaceKind.DIRECT_STREAMING,
+            SurfaceVerdict.TRANSPORT_DEGRADED,
+            diagnostic=(diagnostic or "live_transport")[:120],
+        )
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
+        pass
+
+
 def dw_preflight_gate_enabled() -> bool:
     """Slice 76 Phase 2 master flag — default TRUE. When off, dispatch is
     byte-identical to the pre-Slice-76 path (no pre-flight short-circuit)."""
@@ -3274,6 +3305,17 @@ class CandidateGenerator:
                         type(exc).__name__, op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
+                # Slice 77 — dynamic transport telemetry. The moment a LIVE
+                # generation confirms a transport break, feed it into the
+                # dw_surface_health ledger so the NEXT op's Slice 76 P2
+                # pre-flight gate fires and skips the dead DW lane (closes the
+                # stale-boot-probe gap found in the EVAL-2 Phase-4 re-run,
+                # §50.11). Only LIVE_TRANSPORT — 429/5xx/parse are model- or
+                # request-specific, not a transport-wide break.
+                if failure_source is FailureSource.LIVE_TRANSPORT:
+                    _note_dw_live_transport_degraded(
+                        f"{model_id}:{type(exc).__name__}",
+                    )
                 # Slice 73 — structural transport short-circuit. A LIVE_TRANSPORT
                 # break affects the whole DW endpoint, so trying the next ranked
                 # model just burns another ~30s on the same dead transport
