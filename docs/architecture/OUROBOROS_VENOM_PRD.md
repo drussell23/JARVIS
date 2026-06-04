@@ -2795,6 +2795,20 @@ Acceptance gate: **≤4.4% catastrophic-error rate** (matching Anthropic's bench
 
 **Tier placement.** §41.8 Phase 2 candidate (months 12–18). Closing this ticket retires the §92.16 thread (3) caveat (Constitutional Classifiers comparison stops being "structural analog" and becomes "empirical parity result"). **The substrate prerequisite is now CLOSED** — the remaining work is corpus *scale* (≥3,000 inputs via wired LLM MutationProvider + AdversarialReviewer corpus-batch extension) and the empirical parity soak, not the generator itself.
 
+### Slice 86 — Adversarial Mutation Harness & Reflection Closure (2026-06-03)
+
+**Honesty invariant:** This measures O+V's OWN threat model — adversarial *code patches* attempting to escape the autonomous-dev sandbox (reflection / module-level side effects / dynamic execution). It is NOT a reproduction of Anthropic's Constitutional Classifiers chatbot-jailbreak benchmark (arXiv:2501.18837, 86%→4.4%); that result is cited as inspiration only, and the threat models differ. No external number is claimed as O+V's.
+
+**Harness:** `governance/graduation/adversarial_sweep.py` (+ CLI `scripts/security/run_adversarial_sweep.py`) composes `build_corpus()` (39 entries: 32 adversarial + 7 clean controls) × the 8 deterministic `MutationStrategy` operators through the existing `adversarial_cage.evaluate_entry` — no new evaluator, no reimplemented operators. Single-operator-per-seed. The report card attributes the cage's escape rate by category / gate (AST rule, SemanticGuardian) / mutation strategy, tracks mutation-induced escapes, and counts clean-control false positives (using the distinct `clean_passed` verdict, never conflated with `passed_through`).
+
+**Result:** raw adversarial escape rate **7/32 = 21.9% → 6/32 = 18.8%** after closing `chr_constructed_attr` with a bounded static constant-folder (chr-of-int / literal concat / "".join / best-effort .format), scoped to banned-name-into-banned-sink, fail-open, with zero clean-control false positives. The prior Apr-2026 31.6% figure was stale: the AST validator (`meta/ast_phase_runner_validator.py`) was already a NodeVisitor with 5 of the 6 original static gaps closed before this slice; the harness establishes the reproducible measurement that proves it.
+
+**Static/runtime boundary (spec criteria for §43 Arc 5 — netns + seccomp):** the residual 6 escapes are runtime-defense gaps, architecturally out of scope for static analysis — `run_body_popen`, `run_body_shell_exec`, `run_body_eval`, `run_body_dynamic_compile`, `run_body_importlib`, `multi_step_string_assembly`. A `subprocess.Popen` in a function body cannot be statically proven malicious; these define the requirements for the OS-containment layer.
+
+**Known pre-existing drift (separate follow-up, NOT closed here):** two cage tests (`test_full_corpus_documented_known_gaps_match_brutal_review`, `test_render_markdown_lists_open_vectors_section` in `tests/governance/test_p9_4_adversarial_cage.py`) fail on `main` because the corpus's `known_gap` flags and `RESULTS.md` were never refreshed after the validator hardening closed vars/dir/globals/mro/alias. A corpus-documentation refresh slice should reconcile them.
+
+**Deferred (named follow-ups):** LLM MutationProvider + 3,000-input corpus (§41.11.2 parity-scale), operator chains, the runtime-containment layer itself, and the §43.6.2 Chaos Monkey daemon (the harness engine is importable by it).
+
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
 **The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
