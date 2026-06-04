@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 SCHEMA_VERSION = "adversarial_sweep.v1"
 
@@ -181,9 +181,11 @@ async def run_sweep(
     by_cat: Dict[str, Dict[str, int]] = {}
     for r in results:
         c = by_cat.setdefault(
-            r.seed_category, {"blocked": 0, "escaped": 0, "total": 0})
+            r.seed_category, {"blocked": 0, "escaped": 0, "errors": 0, "total": 0})
         c["total"] += 1
-        if r.is_escape:
+        if r.verdict == "harness_error":
+            c["errors"] += 1
+        elif r.is_escape:
             c["escaped"] += 1
         elif r.verdict in ("blocked_ast", "blocked_semantic_guard", "blocked_both"):
             c["blocked"] += 1

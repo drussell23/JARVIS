@@ -49,7 +49,7 @@ import asyncio
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_run_sweep_reproduces_raw_baseline_and_taxonomy():
@@ -70,6 +70,8 @@ def test_run_sweep_with_mutations_tracks_mutation_induced_escapes():
     # mutation_induced_escapes: seed blocked raw but a mutation escaped
     for m in rep.mutation_induced_escapes:
         assert "seed" in m and "strategy" in m
+    # live corpus produces mutation-induced escapes (implementer's smoke run: 52)
+    assert len(rep.mutation_induced_escapes) > 0
     # clean controls still never false-positive, even under mutation
     assert rep.clean_control_false_positive_count == 0
 
@@ -87,6 +89,34 @@ def test_evaluate_regression_passes_at_baseline_and_fails_above():
     assert "escape" in msg2.lower()
 
 
+def test_evaluate_regression_flags_clean_fp():
+    """evaluate_regression returns False with a meaningful message when
+    clean_control_false_positive_count exceeds max_clean_fp (= 0)."""
+    v = S.SweepVariantResult(
+        seed_name="clean_1", seed_category="clean_control", strategy="raw",
+        verdict="blocked_ast", gate_reason="blocked_ast:stub",
+        is_escape=False, is_clean_fp=True,
+    )
+    rep = S.SweepReport(
+        schema_version=S.SCHEMA_VERSION,
+        total_variants=1, raw_seed_count=1, mutation_variant_count=0,
+        adversarial_seed_count=0, adversarial_escape_count_raw=0,
+        adversarial_escape_rate_raw=0.0,
+        adversarial_variant_total=0, adversarial_escape_count_with_mutations=0,
+        adversarial_escape_rate_with_mutations=0.0,
+        clean_control_false_positive_count=1,
+        by_category={"clean_control": {"blocked": 1, "escaped": 0, "errors": 0, "total": 1}},
+        by_gate_attribution={"blocked_ast": 1},
+        by_mutation_strategy={"raw": {"variants": 1, "escapes": 0}},
+        mutation_induced_escapes=(),
+        escaping_entries_raw=(),
+        results=(v,),
+    )
+    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=100.0, max_clean_fp=0)
+    assert ok is False
+    assert any(kw in msg.lower() for kw in ("false positive", "clean")), msg
+
+
 def test_report_json_is_serializable():
     rep = _run(S.run_sweep(include_mutations=False))
     s = json.dumps(rep.to_dict())
@@ -101,9 +131,10 @@ def test_render_console_report_is_str():
 
 
 def test_cli_main_writes_json_and_returns_exit_code(tmp_path):
-    import importlib.util, sys
+    import importlib.util
     path = "scripts/security/run_adversarial_sweep.py"
     spec = importlib.util.spec_from_file_location("run_adversarial_sweep", path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     out = tmp_path / "sweep.json"
@@ -113,3 +144,6 @@ def test_cli_main_writes_json_and_returns_exit_code(tmp_path):
     import json
     data = json.loads(out.read_text())
     assert data["schema_version"] == "adversarial_sweep.v1"
+    # exit-code-1 when regression gate trips on a zero baseline
+    assert mod.main(["--mutations", "off", "--baseline-escape-rate", "0.0",
+                     "--fail-on-regression"]) == 1
