@@ -4540,6 +4540,51 @@ _COMPACT_THRESHOLD_CHARS = int(
 )  # Trigger compaction at 75% of max to avoid hard crash
 
 
+# ── Slice 85 Phase 3 — cumulative convergence axis ──
+# The existing convergence nudges miss a model that EXPLORES forever by varying
+# its tools: the exploration-budget nudge only counts rounds where EVERY tool is
+# in the narrow {read_file, search_code, get_callers} set, so a round that mixes
+# in glob_files / list_dir / git_log slips past it (the 114k-token / 25-call
+# wander, sweep bt-2026-06-04-041943). This superset is the EVASION-PROOF set of
+# read-only NAVIGATION tools — any of them is "still just looking, not changing
+# anything", so all of them feed the cumulative convergence counter. Mutating /
+# progress tools (edit_file, write_file, bash, run_tests) are deliberately
+# excluded: a round that touches one is making progress, not wandering.
+_READONLY_EXPLORATION_TOOLS: frozenset = frozenset({
+    "read_file", "search_code", "get_callers", "glob_files", "list_dir",
+    "list_symbols", "git_log", "git_diff", "git_blame",
+})
+
+
+def _convergence_explore_call_threshold() -> int:
+    """Slice 85 — cumulative read-only-call count that forces convergence.
+
+    Once this many read-only navigation calls have accrued across ALL rounds,
+    the loop fires the existing Slice 3E final-write nudge ("stop exploring,
+    emit the patch"). Tool-agnostic + cumulative, so mixed-tool wandering can't
+    evade it. Default 14 (the wander hit 25; 14 catches it at ~round 4-5 while
+    leaving room for genuine multi-file localization). ``0`` opts out entirely
+    (legacy behavior). Invalid / negative → default. Env-tunable; never raises."""
+    raw = os.environ.get("JARVIS_TOOL_LOOP_CONVERGENCE_EXPLORE_CALLS", "").strip()
+    if not raw:
+        return 14
+    try:
+        v = int(raw)
+        return v if v >= 0 else 14
+    except ValueError:
+        return 14
+
+
+def _should_force_convergence(
+    *, cumulative_explore_calls: int, threshold: int,
+) -> bool:
+    """Pure trigger decision for the cumulative convergence axis. ``threshold``
+    of ``0`` disables the axis (never fires). Pure; never raises."""
+    if threshold <= 0:
+        return False
+    return cumulative_explore_calls >= threshold
+
+
 # ---------------------------------------------------------------------------
 # BudgetPlan — structural per-round timeout derivation
 # ---------------------------------------------------------------------------
@@ -5378,6 +5423,10 @@ class ToolLoopCoordinator:
         # generation deadline.
         round_index = -1
         _explore_only_rounds = 0
+        # Slice 85 Phase 3 — cumulative read-only-call counter (evasion-proof
+        # convergence axis; mixed-tool wandering still accrues here).
+        _cumulative_explore_calls = 0
+        _convergence_call_threshold = _convergence_explore_call_threshold()
         _soft_overflow_warned = False
         # ── Slice 3E — convergence-force final-write nudge ──
         # ``_final_nudge_issued`` flips True when the final-write nudge
@@ -5593,9 +5642,26 @@ class ToolLoopCoordinator:
                 not _final_nudge_issued
                 and _rounds_left_in_loop <= 1
             )
-            if (_trigger_time or _trigger_rounds) and not _final_nudge_issued:
+            # Slice 85 Phase 3 — cumulative read-only-call axis. Fires EARLY
+            # (not just at the time/round end) when the model has accrued
+            # enough read-only navigation across all rounds — the evasion-proof
+            # signal the per-round exploration-budget counter missed on the
+            # 114k wander. Reuses the same nudge + grace-round machinery.
+            _trigger_context = (
+                not _final_nudge_issued
+                and _should_force_convergence(
+                    cumulative_explore_calls=_cumulative_explore_calls,
+                    threshold=_convergence_call_threshold,
+                )
+            )
+            if (
+                (_trigger_time or _trigger_rounds or _trigger_context)
+                and not _final_nudge_issued
+            ):
                 _trigger_kind = (
-                    "time_reserve" if _trigger_time else "round_cap"
+                    "time_reserve" if _trigger_time
+                    else "round_cap" if _trigger_rounds
+                    else "context_horizon"
                 )
                 current_prompt += (
                     "\n\n[SYSTEM] FINAL ROUND — exploration budget exhausted. "
@@ -5933,6 +5999,17 @@ class ToolLoopCoordinator:
             # Count rounds where ONLY exploration tools were called.
             # When the cap is reached, inject a nudge to produce the final answer.
             _round_tool_names = {tc.name for tc, *_ in exec_results} if exec_results else set()
+            # Slice 85 Phase 3 — accrue EVERY read-only navigation call this
+            # round onto the cumulative axis (evaluated at the top of the next
+            # iteration's nudge gate). This is the evasion-proof signal: a round
+            # that mixes glob_files/list_dir/git_log into search_code is NOT
+            # "exploration-only" below, so it slips the per-round counter — but
+            # those calls are still pure looking-around, so they accrue here.
+            if exec_results:
+                _cumulative_explore_calls += sum(
+                    1 for tc, *_ in exec_results
+                    if tc.name in _READONLY_EXPLORATION_TOOLS
+                )
             if _round_tool_names and _round_tool_names <= self._EXPLORATION_TOOLS:
                 _explore_only_rounds += 1
                 if _explore_only_rounds >= self._max_exploration_rounds:
