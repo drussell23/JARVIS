@@ -92,6 +92,30 @@ def stream_inter_chunk_timeout_s() -> float:
     )
 
 
+def cognitive_stall_timeout_s() -> float:
+    """Slice 87 — max seconds a DW reasoning model may stream REASONING with
+    ZERO functional content before the cognitive-stall watchdog fires and
+    cascades to the Tier-1 fallback.
+
+    Distinct from the inter-chunk watchdog (which sees reasoning bytes and stays
+    alive): this measures elapsed-since-first-progress while ``content`` is still
+    empty. Default 90s — comfortably above the legitimate reasoning-then-content
+    band (direct probes: DW emits content at 21-34s at ``medium`` on a 21k-token
+    prompt) yet far below the 240s budget the capability-stalled ops burned. So
+    a model that WILL emit content is never killed mid-think, while a model stuck
+    in a reasoning loop it can't exit cascades ~150s sooner. ``0`` disables the
+    watchdog (legacy: wait the full primary budget). Invalid → default. Never
+    raises."""
+    raw = os.environ.get("JARVIS_DW_COGNITIVE_STALL_S", "").strip()
+    if not raw:
+        return 90.0
+    try:
+        v = float(raw)
+        return v if v >= 0 else 90.0
+    except ValueError:
+        return 90.0
+
+
 # ---------------------------------------------------------------------------
 # Slice 12F-B — Budget-aware dispatch floor
 # ---------------------------------------------------------------------------
@@ -168,6 +192,48 @@ class StreamRuptureError(RuntimeError):
             f"elapsed={elapsed_s:.1f}s:"
             f"bytes={bytes_received}:"
             f"timeout={rupture_timeout_s:.0f}s"
+        )
+
+
+class CognitiveStallError(StreamRuptureError):
+    """Slice 87 — the stream is ALIVE (reasoning deltas flowing) but the model
+    has emitted ZERO functional content for longer than the cognitive-stall
+    watchdog. Distinct from a byte-level rupture: bytes ARE arriving, the model
+    is just stuck in a reasoning loop it can't exit (the 240s/0-content stalls
+    on capability-hard problems, sweep bt-2026-06-04-061913).
+
+    Subclasses :class:`StreamRuptureError` so the FSM classifier's existing
+    ``isinstance`` check routes it to TRANSIENT_TRANSPORT → an IMMEDIATE cascade
+    to the Tier-1 fallback (Claude), instead of burning the rest of the DW
+    primary budget. ``phase`` is fixed to ``"cognitive_stall"`` and the message
+    carries a distinct ``cognitive_stall:`` prefix so postmortems can tell a
+    reasoning-stall apart from a network rupture."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        elapsed_s: float,
+        bytes_received: int,
+        stall_timeout_s: float,
+        reasoning_seen: bool = True,
+    ) -> None:
+        self.reasoning_seen = reasoning_seen
+        self.stall_timeout_s = stall_timeout_s
+        super().__init__(
+            provider=provider,
+            elapsed_s=elapsed_s,
+            bytes_received=bytes_received,
+            rupture_timeout_s=stall_timeout_s,
+            phase="cognitive_stall",
+        )
+        # Override the message with a distinct, greppable prefix.
+        self.args = (
+            f"cognitive_stall:{provider}:"
+            f"elapsed={elapsed_s:.1f}s:"
+            f"reasoning_seen={reasoning_seen}:"
+            f"content_bytes={bytes_received}:"
+            f"stall_timeout={stall_timeout_s:.0f}s",
         )
 
 
