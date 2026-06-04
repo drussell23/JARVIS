@@ -5409,6 +5409,64 @@ class CandidateGenerator:
                             fallback_budget_s=round(_attempt_remaining, 2),
                             min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
                         )
+                    # Slice 89 — Build ExplorationManifest from DW's just-
+                    # completed tool loop and stamp onto context BEFORE the
+                    # Claude fallback generate() call.  NEVER raises
+                    # (try/except guards the full block).  When
+                    # JARVIS_EXPLORATION_MANIFEST_ENABLED is OFF (default
+                    # §33.1), behavior is byte-identical to today.
+                    #
+                    # Gate: stamp only on the FIRST Claude attempt —
+                    # DW's `_last_salient_args`/`_last_records` are only
+                    # valid until DW's next run() resets them.  On outer
+                    # attempt 1 _carryover_tool_records is always empty
+                    # (populated only INSIDE the except block below), so
+                    # the old `_carryover_tool_records and _outer_attempt==1`
+                    # condition was mutually exclusive — dead code (C1 fix).
+                    # We now harvest directly from the primary coordinator.
+                    if _outer_attempt == 1:
+                        try:
+                            _s89_enabled = os.environ.get(
+                                "JARVIS_EXPLORATION_MANIFEST_ENABLED", "false",
+                            ).strip().lower() not in ("false", "0", "no", "off")
+                            if _s89_enabled:
+                                from backend.core.ouroboros.governance.op_context import (
+                                    ExplorationManifest as _ExplorationManifest,
+                                )
+                                # Harvest BOTH records and salient_args from
+                                # the primary provider's coordinator — these
+                                # are the DW tool loop results just before
+                                # DW's generate() failed/timed-out.  Using
+                                # the same coordinator source keeps them
+                                # length-aligned (C2 alignment preserved).
+                                _coord = getattr(
+                                    self._primary, "_tool_loop", None,
+                                )
+                                _s89_records = tuple(
+                                    getattr(_coord, "_last_records", ()) or ()
+                                ) if _coord is not None else ()
+                                _s89_salient = list(
+                                    getattr(_coord, "_last_salient_args", ()) or ()
+                                ) if _coord is not None else []
+                                _s89_manifest = _ExplorationManifest.from_telemetry(
+                                    records=_s89_records,
+                                    salient_args=_s89_salient,
+                                    reason="dw_failure",
+                                )
+                                context = context.with_exploration_manifest(_s89_manifest)
+                                logger.info(
+                                    "[CandidateGenerator] Slice 89: stamped "
+                                    "ExplorationManifest onto context "
+                                    "(tool_calls=%d, target_files=%d, "
+                                    "search_tokens=%d, failed_tests=%d) op=%s",
+                                    _s89_manifest.tool_call_count,
+                                    len(_s89_manifest.verified_target_files),
+                                    len(_s89_manifest.high_signal_search_tokens),
+                                    len(_s89_manifest.failed_test_commands),
+                                    getattr(context, "op_id", "?")[:16],
+                                )
+                        except Exception:  # noqa: BLE001 — never break the cascade
+                            pass
                     try:
                         _fb_result = await _race_or_wait_for(
                             self._fallback.generate(context, deadline),

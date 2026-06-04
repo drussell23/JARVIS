@@ -225,6 +225,45 @@ def _compute_args_hash(arguments: Dict[str, Any]) -> str:
 # the exception IS the result on failure paths.
 
 
+# ---------------------------------------------------------------------------
+# Slice 89 — out-of-band salient-arg extractor
+# ---------------------------------------------------------------------------
+
+
+def _extract_salient_arg(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """Extract the single most informative argument from a tool call.
+
+    Used to build the out-of-band ``(tool_name, salient_arg)`` list that
+    supplements ``ToolExecutionRecord`` (which only stores a hash).  The
+    raw arguments are available AT DISPATCH — this function is called there,
+    before ``ToolExecutionRecord`` is created.
+
+    Returns an empty string for unknown tools or missing arguments so the
+    caller can safely skip the entry without raising.
+
+    Slice 89 — never raises.
+    """
+    try:
+        if tool_name in ("read_file", "edit_file", "write_file"):
+            return str(arguments.get("file_path", "") or "")
+        if tool_name == "search_code":
+            return str(
+                arguments.get("query", "")
+                or arguments.get("pattern", "")
+                or ""
+            )
+        if tool_name == "run_tests":
+            # Real tool arg is `paths` (a list) — see tool manifest (~675)
+            # and handlers (~1957, ~4500) reading args.get("paths", []).
+            # The old "test_path"/"cmd" keys do not exist in production →
+            # always returned "" (I1 fix).
+            _paths = arguments.get("paths", [])
+            return " ".join(str(p) for p in _paths) if _paths else ""
+        return ""
+    except Exception:  # noqa: BLE001 — never break the tool loop
+        return ""
+
+
 def _attach_tool_records(
     exc: BaseException, records: Any,
 ) -> BaseException:
@@ -4954,6 +4993,11 @@ class ToolLoopCoordinator:
         self._min_per_round_s = min_per_round_s
         self._final_write_reserve_s = final_write_reserve_s
         self._last_records: List[ToolExecutionRecord] = []
+        # Slice 89 — out-of-band (tool_name, salient_arg) list captured at
+        # dispatch where raw arguments are still available.  Parallel to
+        # _last_records; reset at run() start alongside it.  Never stored
+        # in ToolExecutionRecord (frozen audit type, hash contract preserved).
+        self._last_salient_args: List[Tuple[str, str]] = []
         self._last_budget_plan: Optional[BudgetPlan] = None  # for telemetry/tests
         # Edit history captured from the per-op ToolExecutor at run() exit.
         # Populated by _finalize_run(); reset at the start of each run().
@@ -5394,10 +5438,13 @@ class ToolLoopCoordinator:
             )
 
         self._last_records = []
+        self._last_salient_args = []  # Slice 89 — reset alongside _last_records
         # Reset per-run edit history capture. Populated in the finally
         # block below from the per-op ToolExecutor before it's released.
         self._last_edit_history: List[Dict[str, Any]] = []
         records: List[ToolExecutionRecord] = []
+        # Slice 89 — parallel salient-arg list; populated at dispatch alongside records
+        salient_args: List[Tuple[str, str]] = []
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
         # ── Slice 3G — envelope-override for per-op worktrees ──
@@ -5464,6 +5511,7 @@ class ToolLoopCoordinator:
                     plan.total_budget_s,
                 )
                 self._last_records = list(records)
+                self._last_salient_args = list(salient_args)  # Slice 89
                 self._finalize_run(op_id)
                 # Slice 3C — propagate accumulated records to outer-retry.
                 raise _attach_tool_records(
@@ -5502,6 +5550,7 @@ class ToolLoopCoordinator:
                 _remaining_pre = deadline - time.monotonic()
                 if _remaining_pre <= 0:
                     self._last_records = list(records)
+                    self._last_salient_args = list(salient_args)  # Slice 89
                     self._finalize_run(op_id)
                     # Slice 3C — propagate accumulated records to outer-retry.
                     raise _attach_tool_records(
@@ -5517,6 +5566,7 @@ class ToolLoopCoordinator:
                         plan.final_write_reserve_s,
                     )
                     self._last_records = list(records)
+                    self._last_salient_args = list(salient_args)  # Slice 89
                     self._finalize_run(op_id)
                     # Slice 3C — propagate accumulated records to outer-retry.
                     raise _attach_tool_records(
@@ -5562,6 +5612,7 @@ class ToolLoopCoordinator:
                         plan.min_ttft_floor_s,
                     )
                     self._last_records = list(records)
+                    self._last_salient_args = list(salient_args)  # Slice 89
                     self._finalize_run(op_id)
                     # Slice 3C — propagate accumulated records to outer-retry
                     # so Iron Gate sees every tool call across attempts, not
@@ -5603,12 +5654,14 @@ class ToolLoopCoordinator:
                     op_id[:12] if op_id else "?", len(tool_calls),
                 )
                 self._last_records = list(records)
+                self._last_salient_args = list(salient_args)  # Slice 89
                 self._finalize_run(op_id)
                 return raw, records
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._last_records = list(records)
+                self._last_salient_args = list(salient_args)  # Slice 89
                 self._finalize_run(op_id)
                 # Slice 3C — propagate accumulated records to outer-retry.
                 raise _attach_tool_records(
@@ -5751,6 +5804,11 @@ class ToolLoopCoordinator:
                         started_at_ns=None, ended_at_ns=None, duration_ms=None,
                         output_bytes=0, error_class=None, status=ToolExecStatus.POLICY_DENIED,
                     ))
+                    # Slice 89 C2 — keep salient_args length-equal to records.
+                    # A denied call grows records but never reached pending_execs
+                    # where salient_args is appended → zip() in from_telemetry
+                    # would mispair the tail. Placeholder keeps the lists aligned.
+                    salient_args.append((tc.name, ""))
                     prompt_appendix += _format_denial(tc.name, policy_result)
                     # Narrate policy denial so the operator sees *why* the
                     # model was blocked (Manifesto §7 — absolute observability).
@@ -5791,6 +5849,9 @@ class ToolLoopCoordinator:
                             output_bytes=0, error_class=None,
                             status=ToolExecStatus.POLICY_DENIED,
                         ))
+                        # Slice 89 C2 — placeholder keeps salient_args and
+                        # records length-equal across the inline-deny path too.
+                        salient_args.append((tc.name, ""))
                         synth = PolicyResult(
                             decision=PolicyDecision.DENY,
                             reason_code=reason_code, detail=detail,
@@ -5812,6 +5873,12 @@ class ToolLoopCoordinator:
                         args_summary=self._args_summary_for(tc),
                     )
                     pending_execs.append((tc, policy_ctx, call_id, tool_version))
+                    # Slice 89 — capture salient arg at dispatch (raw args available here)
+                    try:
+                        _salient = _extract_salient_arg(tc.name, tc.arguments)
+                        salient_args.append((tc.name, _salient))
+                    except Exception:  # noqa: BLE001 — never break the tool loop
+                        salient_args.append((tc.name, ""))
 
             # Execute allowed tools — parallel when >1, sequential when 1
             if pending_execs:
@@ -5853,6 +5920,7 @@ class ToolLoopCoordinator:
                             status="cancelled",
                         )
                         self._last_records = list(records)
+                        self._last_salient_args = list(salient_args)  # Slice 89
                         self._finalize_run(op_id)
                         # Slice 3C — preserve records on the cancellation
                         # exception so outer-retry callers can harvest.
@@ -5973,6 +6041,7 @@ class ToolLoopCoordinator:
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)
+            self._last_salient_args = list(salient_args)  # Slice 89
             # Persist tool-round audit BEFORE the next synthesis stream.
             # Without this, a cancelled fallback stream leaves the
             # ExplorationLedger(shadow,partial) exception handler with
@@ -6084,6 +6153,7 @@ class ToolLoopCoordinator:
                     )
                 else:
                     self._last_records = list(records)
+                    self._last_salient_args = list(salient_args)  # Slice 89
                     self._finalize_run(op_id)
                     # Slice 3C — propagate accumulated records to outer-retry
                     # so context-overflow doesn't drop the model's prior
