@@ -72,3 +72,29 @@ def test_run_sweep_with_mutations_tracks_mutation_induced_escapes():
         assert "seed" in m and "strategy" in m
     # clean controls still never false-positive, even under mutation
     assert rep.clean_control_false_positive_count == 0
+
+
+import json
+
+
+def test_evaluate_regression_passes_at_baseline_and_fails_above():
+    rep = _run(S.run_sweep(include_mutations=False))
+    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=21.9, max_clean_fp=0)
+    assert ok is True, msg
+    # a stricter baseline (lower than current) must fail
+    bad, msg2 = S.evaluate_regression(rep, baseline_escape_rate_raw=10.0, max_clean_fp=0)
+    assert bad is False
+    assert "escape" in msg2.lower()
+
+
+def test_report_json_is_serializable():
+    rep = _run(S.run_sweep(include_mutations=False))
+    s = json.dumps(rep.to_dict())
+    assert "adversarial_sweep.v1" in s
+
+
+def test_render_console_report_is_str():
+    rep = _run(S.run_sweep(include_mutations=False))
+    text = S.render_console_report(rep)
+    assert "Adversarial escape" in text
+    assert "21.9" in text

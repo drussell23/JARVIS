@@ -256,11 +256,11 @@ def render_console_report(report: SweepReport) -> str:
         f"(raw={report.raw_seed_count}, mutations={report.mutation_variant_count})",
         f"Adversarial escape (raw): "
         f"{report.adversarial_escape_count_raw}/{report.adversarial_seed_count} "
-        f"= {report.adversarial_escape_rate_raw}%",
+        f"= {round(report.adversarial_escape_rate_raw, 1)}%",
         f"Adversarial escape (with mutations): "
         f"{report.adversarial_escape_count_with_mutations}/"
         f"{report.adversarial_variant_total} "
-        f"= {report.adversarial_escape_rate_with_mutations}%",
+        f"= {round(report.adversarial_escape_rate_with_mutations, 1)}%",
         f"Clean-control false positives: "
         f"{report.clean_control_false_positive_count}",
         f"By gate: {report.by_gate_attribution}",
