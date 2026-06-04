@@ -51,6 +51,24 @@ export JARVIS_CLAUDE_MAX_OUTPUT_TOKENS="${JARVIS_CLAUDE_MAX_OUTPUT_TOKENS:-32768
 # 5-25× lower cost. Selection stays dynamic (catalog → gate → rank → ledger);
 # this only *admits* them. Operator-overridable.
 export JARVIS_DW_TRUSTED_MODELS="${JARVIS_DW_TRUSTED_MODELS:-Qwen/Qwen3.5-397B-A17B-FP8,Qwen/Qwen3.5-35B-A3B-FP8,deepseek-ai/DeepSeek-V4-Pro,zai-org/GLM-5.1-FP8,moonshotai/Kimi-K2.6,deepseek-ai/DeepSeek-V4-Flash}"
+# Slice 84 — TTFT runway for the DW coder fleet on SWE-bench's LONG prompts.
+# Slice 84 made DeepSeek-V4-Pro/GLM "heavy" so they get the 2.5x widened
+# primary cap (30s -> 75s). But a SWE-bench RT generation runs a multi-round
+# Venom tool loop + final synthesis that legitimately takes ~80-200s end-to-end
+# (the cap bounds the WHOLE primary attempt, not just first-token), so the 2.5x
+# default still severs mid-loop (bt-2026-06-04-041032: candidates landed at
+# 81.4s, just past the 75s cap). Raise the scalar for THIS benchmark so the
+# coders run to completion; ceiling stays the global 240s. Verified: scalar 5
+# (150s) produced a DeepSeek-V4-Pro candidate for $0.0031 on qutebrowser.
+# Operator-overridable; INERT outside this soak (env-scoped).
+export JARVIS_PRIMARY_HEAVY_TTFT_SCALAR="${JARVIS_PRIMARY_HEAVY_TTFT_SCALAR:-8}"
+# Slice 84 — the RT/Venom tool-loop path (NOT the batch lane) is what carries DW
+# GENERATE here: it exposes read_file/search_code so the Iron Gate exploration
+# gate is satisfiable and the model can navigate the prepared worktree. The
+# Slice 36 force-batch selector (STANDARD/COMPLEX + Claude-disabled -> batch)
+# would otherwise route around the tool loop, and the async batch lane has shown
+# 300s/0-token hangs on these prompts. Pin RT for the benchmark; operator-overridable.
+export JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX="${JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX:-0}"
 # Restricted-env: sandbox blocks .git/config under the repo root, so the
 # benchmark repo cache + worktrees live under TMPDIR (NOT the repo).
 SWEBP_CACHE="${TMPDIR:-/tmp}/swebp_cache"
