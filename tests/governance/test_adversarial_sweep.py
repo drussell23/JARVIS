@@ -98,3 +98,18 @@ def test_render_console_report_is_str():
     text = S.render_console_report(rep)
     assert "Adversarial escape" in text
     assert "21.9" in text
+
+
+def test_cli_main_writes_json_and_returns_exit_code(tmp_path):
+    import importlib.util, sys
+    path = "scripts/security/run_adversarial_sweep.py"
+    spec = importlib.util.spec_from_file_location("run_adversarial_sweep", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    out = tmp_path / "sweep.json"
+    rc = mod.main(["--mutations", "off", "--json-out", str(out)])
+    assert rc == 0
+    assert out.exists()
+    import json
+    data = json.loads(out.read_text())
+    assert data["schema_version"] == "adversarial_sweep.v1"
