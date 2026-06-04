@@ -1,4 +1,4 @@
-"""Slice 84 — chr_constructed_attr reflection closure tests.
+"""Slice 86 — chr_constructed_attr reflection closure tests.
 
 Task 6 (TDD step): These tests define the gap to close.
 
@@ -80,7 +80,7 @@ def test_chr_constructed_subclasses_is_blocked() -> None:
         source=_CHR_CONSTRUCTED_SUBCLASSES_SOURCE,
         description=(
             "Constructs '__subclasses__' via chr() — must be blocked "
-            "after Slice-84 constant-folder lands."
+            "after Slice-86 constant-folder lands."
         ),
     )
     result = evaluate_entry(entry)
@@ -138,7 +138,7 @@ def test_benign_chr_string_is_not_blocked() -> None:
 
 #: Source constructs "__subclasses__" entirely via chr() — no string literals.
 #: The original _FOLD_MAX_NODES=64 budget was too small (~82 nodes required).
-#: Slice-84 review raised the cap to 96; this test ensures the full chr-only
+#: Slice-86 review raised the cap to 96; this test ensures the full chr-only
 #: form is blocked.
 _ALL_CHR_SUBCLASSES_SOURCE = _runner_with_run_body(
     # "__subclasses__" = chr(95)+chr(95)+chr(115)+chr(117)+chr(98)+
@@ -155,7 +155,7 @@ def test_all_chr_subclasses_is_blocked() -> None:
     """getattr with a fully all-chr()-encoded '__subclasses__' MUST be blocked.
 
     The original _FOLD_MAX_NODES=64 cap was too small to fold this expression
-    (~82 AST nodes for 14 chr() calls chained with BinOp(Add)).  Slice-84
+    (~82 AST nodes for 14 chr() calls chained with BinOp(Add)).  Slice-86
     review raised the cap to 96, which is sufficient.  This test would FAIL
     with the old cap of 64 and PASSES with the new cap of 96.
     """
@@ -252,7 +252,7 @@ _NESTED_SCOPE_ISOLATION_SOURCE = (
 def test_nested_scope_name_pollution_does_not_block() -> None:
     """Banned name assigned in NESTED function MUST NOT pollute outer name map.
 
-    Regression guard for the _walk_own_body fix introduced in Slice-84 review.
+    Regression guard for the _walk_own_body fix introduced in Slice-86 review.
 
     Scenario:
       * outer run() sets n = "safe_name" and calls getattr(ctx, n) — benign.

@@ -54,7 +54,7 @@ def _run(coro):
 
 def test_run_sweep_reproduces_raw_baseline_and_taxonomy():
     rep = _run(S.run_sweep(include_mutations=False))
-    # Slice-84 closure: chr_constructed_attr now BLOCKED by the
+    # Slice-86 closure: chr_constructed_attr now BLOCKED by the
     # constant-folder; residual 6 are all runtime-defense gaps.
     # 32 adversarial seeds, 6 escape (6 runtime gaps) -> 18.8%
     assert rep.adversarial_seed_count == 32

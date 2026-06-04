@@ -1,4 +1,4 @@
-"""Slice 84 — async combinatorial adversarial sweep harness.
+"""Slice 86 — async combinatorial adversarial sweep harness.
 
 Composes the EXISTING corpus, the 8 deterministic mutation operators, and the
 cage's evaluate_entry. NO new evaluator; NO reimplemented operators.

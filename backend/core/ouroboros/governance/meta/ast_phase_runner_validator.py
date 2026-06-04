@@ -876,12 +876,12 @@ def _check_module_name(
 
 
 # ---------------------------------------------------------------------------
-# Slice-84: bounded constant string folder (chr_constructed_attr closure)
+# Slice-86: bounded constant string folder (chr_constructed_attr closure)
 # ---------------------------------------------------------------------------
 
 #: Maximum AST nodes visited while folding one expression.
 #: Prevents a hand-crafted deeply-nested expression from pinning the walk.
-#: 96 (raised from 64 in Slice-84 review) so a fully all-chr()-encoded
+#: 96 (raised from 64 in Slice-86 review) so a fully all-chr()-encoded
 #: ``__subclasses__`` (~82 AST nodes) folds within budget.
 _FOLD_MAX_NODES: int = 96
 
@@ -1070,7 +1070,7 @@ def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
          that resolves (via literal, direct constant-folding, or
          intra-scope name-assignment) to a banned attribute name. Defends
          against operator string-encoding the attr to bypass Pattern 1
-         (Slice-84 closure: chr()-constructed names, concat-constructed
+         (Slice-86 closure: chr()-constructed names, concat-constructed
          names, and named-variable intermediates).
       3. ast.Call to ``__import__("...")`` / ``importlib.import_module``
          with a string literal — these are NOT directly the introspection
@@ -1103,7 +1103,7 @@ def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
             if _is_getattr_call(node) and len(node.args) >= 2:
                 second = node.args[1]
                 attr_name = _string_constant_value(second)
-                # Slice-84: if not a bare literal, try constant-folding
+                # Slice-86: if not a bare literal, try constant-folding
                 # (handles chr()-constructed and concat-constructed names
                 # passed directly as the second argument).
                 folded = (

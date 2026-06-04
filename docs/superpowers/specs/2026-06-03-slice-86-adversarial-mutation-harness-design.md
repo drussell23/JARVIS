@@ -1,7 +1,7 @@
-# Slice 84 — Asynchronous Combinatorial Mutation Harness & Reflection Closure
+# Slice 86 — Asynchronous Combinatorial Mutation Harness & Reflection Closure
 
 **Date:** 2026-06-03
-**Branch:** `security/slice-84-combinatorial-mutation-harness`
+**Branch:** `security/slice-86-combinatorial-mutation-harness`
 **Maps to:** PRD §41.11.2 (Anti-Venom parity-scale evaluation), §40.1 #3 (self-immunization), §43 (Safety Invariant Manifest)
 **Status:** Design approved 2026-06-03; pending implementation plan.
 

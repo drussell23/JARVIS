@@ -417,7 +417,7 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
         ),
         description=(
             "Construct '__subclasses__' via chr() + string concat, fed "
-            "through a local variable to getattr. CLOSED by Slice-84 "
+            "through a local variable to getattr. CLOSED by Slice-86 "
             "constant-folder (_fold_const_str + _build_folded_name_map): "
             "the folder resolves the chr-concat to '__subclasses__', "
             "the introspection rule fires, and the candidate is BLOCKED."
@@ -623,7 +623,7 @@ def _clean_control_corpus() -> List[CorpusEntry]:
         description=(
             "Benign chr() building ordinary string data ('Hi') — "
             "must NOT trip the introspection rule. Precision guard for "
-            "Slice-84 constant-folder: chr() is only blocked when the "
+            "Slice-86 constant-folder: chr() is only blocked when the "
             "folded value feeds a banned-attr sink."
         ),
     ))
