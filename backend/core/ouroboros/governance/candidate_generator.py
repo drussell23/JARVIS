@@ -850,6 +850,28 @@ def should_sever_dw_lane(failure_source: Any) -> bool:
         return False
 
 
+def _live_transport_sever_threshold() -> int:
+    """Slice 83 Phase 2 — consecutive LIVE_TRANSPORT failures required before
+    the whole DW lane is severed (Slice 73 behavior).
+
+    Slice 73 severed the lane on the FIRST ``live_transport`` failure on the
+    theory that all ranked siblings share one dead transport. But Slice 82/83
+    made the ranked stack HETEROGENEOUS — DeepSeek-V4-Pro, Kimi-K2.6, GLM-5.1,
+    Qwen397B, Qwen35B are distinct served endpoints. One model being briefly
+    unavailable (deploy bounce, per-model 5xx surfacing as a transport break)
+    is NOT a lane outage: the next coder may be perfectly healthy. So we now
+    ROTATE to the next model on a single failure and only sever once
+    ``threshold`` consecutive models have all failed with LIVE_TRANSPORT — the
+    signature of a genuine endpoint-wide blackout. A success (or a non-transport
+    failure on a reachable model) resets the streak. Default 3; floored at 1 so
+    ``=1`` reproduces exact Slice 73 first-failure sever. Env-tunable."""
+    try:
+        raw = os.environ.get("JARVIS_DW_LIVE_TRANSPORT_SEVER_THRESHOLD", "3")
+        return max(1, int(str(raw).strip()))
+    except Exception:  # noqa: BLE001 — bad value → safe default
+        return 3
+
+
 def _note_dw_total_outage(diagnostic: str) -> None:
     """Slice 53 — record one GENERATE op that exhausted ALL DW models with no
     candidate from streaming OR batch (the total-vendor-blackout signature).
@@ -3036,6 +3058,12 @@ class CandidateGenerator:
         # Walk the ranked list. For each model not OPEN, attempt DW.
         attempts: List[str] = []
         last_failure: Optional[str] = None
+        # Slice 83 Phase 2 — consecutive LIVE_TRANSPORT streak across the
+        # heterogeneous coder stack. A single model's transport break rotates
+        # to the next coder; only a `threshold`-long streak (genuine lane-wide
+        # blackout) severs. Reset by any success / non-transport failure.
+        _consecutive_lt: int = 0
+        _lt_sever_threshold: int = _live_transport_sever_threshold()
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
             # Phase 12 Slice H — TERMINAL_OPEN bypasses dispatch
@@ -3316,26 +3344,51 @@ class CandidateGenerator:
                     _note_dw_live_transport_degraded(
                         f"{model_id}:{type(exc).__name__}",
                     )
-                # Slice 73 — structural transport short-circuit. A LIVE_TRANSPORT
-                # break affects the whole DW endpoint, so trying the next ranked
-                # model just burns another ~30s on the same dead transport
-                # before the inevitable cascade — starving the Claude fallback
-                # (the bt-2026-06-03 deadline_exhausted_pre_fallback failure).
-                # Sever the lane NOW and fall through to cascade with the full
-                # remaining budget. Model-specific failures still rotate.
+                    _consecutive_lt += 1
+                else:
+                    # Slice 83 Phase 2 — a non-transport failure (429/5xx/parse)
+                    # proves THIS model's transport is reachable, so the prior
+                    # transport breaks were per-model, not lane-wide. Reset the
+                    # streak: a genuine blackout is N transport breaks in a row.
+                    _consecutive_lt = 0
+                # Slice 73 + Slice 83 Phase 2 — structural transport short-circuit,
+                # now streak-gated. A LIVE_TRANSPORT break MIGHT mean the whole DW
+                # endpoint is down — but with the Slice 82/83 heterogeneous coder
+                # stack (DeepSeek-V4-Pro / Kimi / GLM / Qwen are distinct served
+                # endpoints) a single break may just be one model bouncing. So we
+                # ROTATE to the next coder on the first break and only sever once
+                # `threshold` consecutive models have ALL failed transport — the
+                # signature of a real lane-wide blackout. Severing too early
+                # starves the Claude fallback (bt-2026-06-03
+                # deadline_exhausted_pre_fallback); rotating too long burns budget
+                # on a dead lane. The streak threshold balances both. `=1`
+                # reproduces exact Slice 73 first-failure sever.
                 if (
                     structural_fast_cascade_enabled()
                     and should_sever_dw_lane(failure_source)
+                    and _consecutive_lt >= _lt_sever_threshold
                 ):
                     _severed = len(ranked_models) - len(attempts)
                     logger.warning(
-                        "[CandidateGenerator] Slice 73 structural fast-cascade: "
-                        "model=%s LIVE_TRANSPORT — severing DW lane, cascading to "
-                        "fallback with full budget (op=%s, skipped %d sibling "
-                        "model(s))",
-                        model_id, op_id_short, max(0, _severed),
+                        "[CandidateGenerator] Slice 73/83 structural fast-cascade: "
+                        "model=%s LIVE_TRANSPORT streak=%d>=%d — severing DW lane, "
+                        "cascading to fallback with full budget (op=%s, skipped %d "
+                        "sibling model(s))",
+                        model_id, _consecutive_lt, _lt_sever_threshold,
+                        op_id_short, max(0, _severed),
                     )
                     break
+                if (
+                    failure_source is FailureSource.LIVE_TRANSPORT
+                    and structural_fast_cascade_enabled()
+                ):
+                    logger.info(
+                        "[CandidateGenerator] Slice 83 granular isolation: "
+                        "model=%s LIVE_TRANSPORT streak=%d<%d — rotating to next "
+                        "coder, DW lane stays open (op=%s)",
+                        model_id, _consecutive_lt, _lt_sever_threshold,
+                        op_id_short,
+                    )
                 continue
         # All DW models exhausted (either OPEN or failed). The
         # per-attempt ContextVar was already reset by each loop

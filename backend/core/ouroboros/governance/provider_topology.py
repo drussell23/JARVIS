@@ -1159,6 +1159,47 @@ def _trusted_seed_dw_models_for_route(route: str) -> Tuple[str, ...]:
                 admitted.append(mid_str)
         except Exception:  # noqa: BLE001 — per-model defensive
             continue
+    # Slice 83 — capability-priority sort. Previously this returned the
+    # promoted models in INSERTION order, which buried the strong agentic
+    # coders (GLM-5.1 754B, Kimi-K2.6 / DeepSeek-V4-Pro 1000B) behind the
+    # baseline Qwen (35/397B): the dispatch tried Qwen first, it hit
+    # live_transport, and Slice 73 severed the lane before the coders were
+    # ever reached (the Sweep-#6 mis-dispatch). Reuse the classifier's existing
+    # `_score` (params-weighted +1 for COMPLEX/STANDARD, pricing-weighted for
+    # BG/SPEC) so the highest-CAPABILITY model leads — metadata-driven, not a
+    # hardcoded order. Fail-soft: any scoring error → original insertion order.
+    try:
+        from backend.core.ouroboros.governance.dw_catalog_classifier import (  # noqa: E501
+            _score as _cap_score_fn,
+            _ranking_weights,
+            _family_preference,
+        )
+        from backend.core.ouroboros.governance.pricing_oracle import (
+            resolve_pricing,
+        )
+        _weights = _ranking_weights()
+        _fam = _family_preference()
+        _prefer_cheap = route_lc in ("background", "speculative")
+
+        def _capability_score(mid: str) -> float:
+            try:
+                _pr = resolve_pricing(mid) or (None, None)
+                _card = ModelCard(
+                    model_id=mid, family=parse_family(mid),
+                    parameter_count_b=parse_parameter_count(mid),
+                    context_window=None, pricing_in_per_m_usd=_pr[0],
+                    pricing_out_per_m_usd=_pr[1], supports_streaming=True,
+                    raw_metadata_json="{}",
+                )
+                return float(_cap_score_fn(
+                    _card, _weights, _fam, prefer_cheap=_prefer_cheap,
+                ))
+            except Exception:  # noqa: BLE001
+                return 0.0
+
+        admitted.sort(key=lambda _m: (-_capability_score(_m), _m))
+    except Exception:  # noqa: BLE001 — never break dispatch on ranking error
+        pass
     return tuple(admitted)
 
 
