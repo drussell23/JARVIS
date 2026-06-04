@@ -611,6 +611,20 @@ def _clean_control_corpus() -> List[CorpusEntry]:
         description="Module docstring + simple assign.",
     ))
 
+    out.append(CorpusEntry(
+        name="clean_with_benign_chr",
+        category=CorpusCategory.CLEAN_CONTROL,
+        source=_runner_with_module_prologue(
+            "_GREETING = chr(72) + chr(105)",
+        ),
+        description=(
+            "Benign chr() building ordinary string data ('Hi') — "
+            "must NOT trip the introspection rule. Precision guard for "
+            "Slice-84 constant-folder: chr() is only blocked when the "
+            "folded value feeds a banned-attr sink."
+        ),
+    ))
+
     return out
 
 
