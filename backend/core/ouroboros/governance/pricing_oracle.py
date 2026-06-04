@@ -399,6 +399,27 @@ def _register_seed_patterns() -> None:
             description="Generic DeepSeek fallback",
         ),
     )
+    # ---- Slice 82 — DW agentic-coder fleet (the cheap Claude alternatives) ----
+    register_pricing_pattern(
+        PricingPattern(
+            pattern_kind="glm_5",
+            glob_pattern="*glm-5*",
+            pricing_in_per_m_usd=0.95,
+            pricing_out_per_m_usd=2.85,
+            description="z.ai GLM-5.x — DoubleWord-served agentic coder "
+                        "(SWE-bench Pro 58.4%, beats Claude Opus 4.6)",
+        ),
+    )
+    register_pricing_pattern(
+        PricingPattern(
+            pattern_kind="kimi_k2",
+            glob_pattern="*kimi-k2*",
+            pricing_in_per_m_usd=0.60,
+            pricing_out_per_m_usd=2.50,
+            description="Moonshot Kimi-K2.x — DoubleWord-served agentic coder "
+                        "(SWE-bench Pro 58.6%, Verified 80.2%)",
+        ),
+    )
     # ---- Llama 3 family (size-aware) ----
     register_pricing_pattern(
         PricingPattern(
