@@ -320,13 +320,49 @@ async def _real_docker_run(argv: Sequence[str], timeout_s: float) -> Tuple[int, 
     )
 
 
-def build_docker_argv(image: str, script: str, patch_dir: str) -> List[str]:
+# Slice 92 — zero-trust container hardening profile. These flags neutralize the
+# CAPABILITIES of the 5 residual run_body_* runtime sinks (which §50.12 correctly
+# leaves open at the STATIC AST layer): the sink may still execute inside the
+# jail, but it cannot exfiltrate (no network route), reach the host filesystem
+# (read-only rootfs, no host bind), escalate privilege (all caps dropped,
+# no-new-privileges + Docker's default seccomp), or fork-bomb (pids-limit). The
+# flags are ADDITIVE + OPT-IN: the scoring path (build_docker_argv default) is
+# UNCHANGED, because --read-only / --network none would break legitimate held-out
+# test execution. Only the runtime verification harness (and any future
+# untrusted-eval path) opts in.
+def build_hardened_security_argv(*, allow_tmp: bool = True) -> List[str]:
+    """The zero-trust docker security flags. Pure (no I/O); composed into a
+    ``docker run`` argv by callers that evaluate UN-VETTED code."""
+    argv = [
+        "--network", "none",            # drop ALL outbound — no exfil/reverse-shell
+        "--cap-drop", "ALL",            # strip every Linux capability
+        "--security-opt", "no-new-privileges",  # block setuid privilege gain
+        "--read-only",                  # immutable rootfs — no host/system writes
+        "--pids-limit", "128",          # fork-bomb ceiling
+    ]
+    if allow_tmp:
+        # a writable scratch tmpfs so benign code still runs (capped, non-exec
+        # so a dropped payload can't stage + exec a binary from /tmp)
+        argv += ["--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"]
+    return argv
+
+
+def build_docker_argv(
+    image: str, script: str, patch_dir: str, *, harden: bool = False,
+) -> List[str]:
     """The ``docker run`` argv (adaptive --platform, ephemeral --rm, bash
-    entrypoint, patches bind-mounted read-only)."""
+    entrypoint, patches bind-mounted read-only).
+
+    ``harden=True`` (Slice 92) appends the zero-trust security profile. It is
+    OFF by default: the scoring path must NOT enable it (--read-only / --network
+    none break legitimate held-out test execution). Only callers evaluating
+    un-vetted code (the runtime verification harness) opt in."""
     argv: List[str] = [docker_bin(), "run", "--rm"]
     plat = host_platform_flag()
     if plat:
         argv += ["--platform", plat]
+    if harden:
+        argv += build_hardened_security_argv()
     argv += [
         "--entrypoint", container_entrypoint(),
         "-v", f"{patch_dir}:/jarvis:ro",
