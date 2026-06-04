@@ -43,3 +43,32 @@ def test_build_sweep_matrix_raw_plus_mutations():
         assert entry.category.value in ("sandbox_escape", "quine_attempt", "clean_control")
         if label != "raw":
             assert "::" in entry.name
+
+
+import asyncio
+
+
+def _run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_run_sweep_reproduces_raw_baseline_and_taxonomy():
+    rep = _run(S.run_sweep(include_mutations=False))
+    # 32 adversarial seeds, 7 escape today (chr + 6 runtime) -> 21.9%
+    assert rep.adversarial_seed_count == 32
+    assert rep.adversarial_escape_count_raw == 7
+    assert round(rep.adversarial_escape_rate_raw, 1) == 21.9
+    names = {e["name"] for e in rep.escaping_entries_raw}
+    assert "chr_constructed_attr" in names
+    # clean controls must NEVER count as escapes (clean_passed != passed_through)
+    assert rep.clean_control_false_positive_count == 0
+
+
+def test_run_sweep_with_mutations_tracks_mutation_induced_escapes():
+    rep = _run(S.run_sweep(include_mutations=True))
+    assert rep.mutation_variant_count > 0
+    # mutation_induced_escapes: seed blocked raw but a mutation escaped
+    for m in rep.mutation_induced_escapes:
+        assert "seed" in m and "strategy" in m
+    # clean controls still never false-positive, even under mutation
+    assert rep.clean_control_false_positive_count == 0
