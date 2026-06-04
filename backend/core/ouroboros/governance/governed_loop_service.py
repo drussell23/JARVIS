@@ -303,6 +303,29 @@ _COMPUTE_RANK: dict[str, int] = {
 }
 
 
+def _oracle_full_scan_suppressed_by_benchmark() -> bool:
+    """Slice 86 — True when the periodic full-repo Oracle scan must be skipped
+    because a benchmark run is in flight.
+
+    Composes the canonical ``benchmark_isolation_mode()`` (Slice 63) with a
+    dedicated kill-switch ``JARVIS_BENCHMARK_SUPPRESS_ORACLE_FULL_SCAN`` (default
+    ON) so an operator can re-enable the scan inside isolation if ever needed.
+    Pure + defensive: any import/parse error returns ``False`` (preserve legacy —
+    never silently stop indexing on an unrelated fault)."""
+    try:
+        from backend.core.ouroboros.governance.intake.intake_layer_service import (
+            benchmark_isolation_mode,
+        )
+        if not benchmark_isolation_mode():
+            return False
+        raw = os.environ.get(
+            "JARVIS_BENCHMARK_SUPPRESS_ORACLE_FULL_SCAN", "true",
+        ).strip().lower()
+        return raw not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — never block the index loop
+        return False
+
+
 class ComputeClassMismatch(RuntimeError):
     """Raised when VM compute_class is below the brain's min_compute_class."""
 
@@ -5555,6 +5578,22 @@ class GovernedLoopService:
         while True:
             try:
                 await asyncio.sleep(self._config.oracle_incremental_poll_interval_s)
+                # ── Slice 86 — benchmark-isolation event-loop hygiene ──
+                # The periodic poll below calls ``incremental_update([])``; an
+                # EMPTY list is falsy, so it falls to the else-branch FULL scan
+                # of every repo — 48-72s of CPU-bound work that FREEZES the
+                # event loop. During a benchmark run that freeze starves the DW
+                # stream-reading coroutines mid-generation (bt-2026-06-04-041943:
+                # first_token_ms=-1 / 175-242s "stalls" were ControlPlaneStarvation
+                # lag up to 10s, NOT upstream delay — DW streams content in <=35s).
+                # The consciousness Oracle index is not needed for a benchmark op
+                # (search_code uses ripgrep, not the semantic graph; the targeted
+                # post-APPLY reindex still runs via the orchestrator with the
+                # actual applied_files), so skip ONLY the periodic full scan. The
+                # loop stays alive so it resumes the moment isolation clears
+                # (hot-flip), matching the master-flag short-circuit pattern.
+                if _oracle_full_scan_suppressed_by_benchmark():
+                    continue
                 # Cooperative yield decision — Task #88f.  Read the
                 # advisor busy count via the official public surface
                 # (NOT executor._work_queue.qsize() which is private +
