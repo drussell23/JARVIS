@@ -126,13 +126,14 @@ def test_validation_status_five_values():
     }
 
 
-def test_validation_failure_reason_twelve_values():
+def test_validation_failure_reason_thirteen_values():
     """Pin: 7 rules + 2 supporting failure shapes (RUN_NOT_ASYNC +
     RUN_BAD_SIGNATURE split rule 3 into actionable detail).
     Phase 7.7 (2026-04-26) added INTROSPECTION_ESCAPE as the 9th value.
     Rule 8 (post-P7.7 followup, 2026-04-26) added MODULE_LEVEL_SIDE_EFFECT
     as the 10th value. Vector #7 closure (2026-05-12) added
-    INTROSPECTION_BUILTIN_CALL + ALIAS_DEFEAT as the 11th and 12th."""
+    INTROSPECTION_BUILTIN_CALL + ALIAS_DEFEAT as the 11th and 12th.
+    Slice 90 (2026-06-04) added TAINT_EXPLOIT (Rule 11) as the 13th."""
     assert {r.name for r in ValidationFailureReason} == {
         "NO_PHASE_RUNNER_SUBCLASS",
         "MISSING_PHASE_ATTR",
@@ -146,6 +147,7 @@ def test_validation_failure_reason_twelve_values():
         "INTROSPECTION_BUILTIN_CALL",  # Vector #7 Rule 9
         "ALIAS_DEFEAT",  # Vector #7 Rule 10
         "MODULE_LEVEL_SIDE_EFFECT",  # Rule 8 — post-P7.7 followup
+        "TAINT_EXPLOIT",  # Slice 90 Rule 11 — string-taint → sink
     }
 
 
