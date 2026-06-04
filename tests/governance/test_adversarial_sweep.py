@@ -28,3 +28,18 @@ def test_schema_version_and_report_to_dict_roundtrip():
     assert d["adversarial_escape_rate_raw"] == 100.0
     assert d["results"][0]["seed_name"] == "x"
     assert d["clean_control_false_positive_count"] == 0
+
+
+def test_build_sweep_matrix_raw_plus_mutations():
+    raw_only = S.build_sweep_matrix(include_mutations=False)
+    assert len(raw_only) == 38                      # full corpus, raw only
+    assert all(label == "raw" for _, label in raw_only)
+    with_mut = S.build_sweep_matrix(include_mutations=True)
+    assert len(with_mut) > 38                        # raw + applicable mutations
+    raw_count = sum(1 for _, lbl in with_mut if lbl == "raw")
+    assert raw_count == 38
+    # every mutation variant carries its seed's category + a strategy label
+    for entry, label in with_mut:
+        assert entry.category.value in ("sandbox_escape", "quine_attempt", "clean_control")
+        if label != "raw":
+            assert "::" in entry.name
