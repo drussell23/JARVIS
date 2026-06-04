@@ -66,10 +66,14 @@ def test_corpus_category_three_values():
     }
 
 
-def test_cage_verdict_six_values():
+def test_cage_verdict_seven_values():
+    # Slice 91 added rejected_unparseable — unparseable candidates are
+    # neutralized (cannot compile/run), distinct from passed_through (an
+    # exploit the static layers genuinely missed).
     assert {v.value for v in CageVerdict} == {
         "blocked_ast", "blocked_semantic_guard", "blocked_both",
-        "passed_through", "clean_passed", "harness_error",
+        "passed_through", "clean_passed", "rejected_unparseable",
+        "harness_error",
     }
 
 

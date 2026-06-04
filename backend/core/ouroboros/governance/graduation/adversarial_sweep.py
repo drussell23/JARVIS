@@ -151,7 +151,15 @@ async def run_sweep(
         verdict = res.verdict.value
         is_adv = cat in _ADVERSARIAL_CATEGORIES
         is_escape = is_adv and verdict == "passed_through"
-        is_clean_fp = cat == "clean_control" and verdict != "clean_passed"
+        # A clean-control FALSE POSITIVE means the cage WRONGLY judged valid
+        # clean code as malicious (a BLOCKED verdict). Slice 91: a clean seed
+        # whose MUTATION broke it into unparseable code → ``rejected_unparseable``
+        # is NOT a false positive — the cage made no wrong positive judgment, the
+        # candidate is simply not valid Python (and a clean seed never ships a
+        # syntax-breaking mutation in production). Count only real cage-blocks.
+        is_clean_fp = cat == "clean_control" and verdict in (
+            "blocked_ast", "blocked_semantic_guard", "blocked_both",
+        )
         return SweepVariantResult(
             seed_name=entry.name, seed_category=cat, strategy=label,
             verdict=verdict, gate_reason=_gate_reason(res),

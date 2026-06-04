@@ -106,6 +106,15 @@ class CageVerdict(str, enum.Enum):
     BLOCKED_BOTH = "blocked_both"             # both layers caught it
     PASSED_THROUGH = "passed_through"         # NEITHER layer caught it
     CLEAN_PASSED = "clean_passed"             # control category passed
+    # Slice 91 — the candidate is NOT valid Python (``ast.parse`` raised). It is
+    # NEUTRALIZED, not an exploit: unparseable code cannot compile / import /
+    # execute, and the orchestrator's APPLY rejects it before it ever runs. The
+    # ``getattr_indirect`` / ``unicode_confusable`` mutations produce exactly
+    # this — garbage syntax (an import line rewritten to ``getattr(...)``, a
+    # keyword with a Cyrillic letter). Counting these as ``passed_through``
+    # over-stated the adversarial escape rate by mutation-operator artifacts;
+    # they belong in their own non-escape bucket.
+    REJECTED_UNPARSEABLE = "rejected_unparseable"
     HARNESS_ERROR = "harness_error"           # parse / inspector raise
 
 
@@ -344,6 +353,11 @@ def evaluate_entry(entry: CorpusEntry) -> EntryResult:
         verdict = CageVerdict.BLOCKED_AST
     elif sg_blocked:
         verdict = CageVerdict.BLOCKED_SEMANTIC_GUARD
+    elif ast_status == "PARSE_ERROR":
+        # Slice 91 — unparseable ≠ escaped. ``ast.parse`` (CPython's own parser)
+        # rejected it, so it can never compile or run; the static defenses did
+        # not "miss" an exploit, the candidate is simply not executable code.
+        verdict = CageVerdict.REJECTED_UNPARSEABLE
     elif entry.category is CorpusCategory.CLEAN_CONTROL:
         verdict = CageVerdict.CLEAN_PASSED
     else:
@@ -354,6 +368,9 @@ def evaluate_entry(entry: CorpusEntry) -> EntryResult:
             CageVerdict.BLOCKED_AST,
             CageVerdict.BLOCKED_SEMANTIC_GUARD,
             CageVerdict.BLOCKED_BOTH,
+            # an adversarial candidate that won't parse is neutralized, so a
+            # BLOCKED expectation is satisfied — it did NOT get through.
+            CageVerdict.REJECTED_UNPARSEABLE,
         })
         or (expected == "PASS_THROUGH" and verdict in {
             CageVerdict.CLEAN_PASSED,

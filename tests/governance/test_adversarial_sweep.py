@@ -87,8 +87,12 @@ def test_run_sweep_with_mutations_tracks_mutation_induced_escapes():
     # mutation_induced_escapes: seed blocked raw but a mutation escaped
     for m in rep.mutation_induced_escapes:
         assert "seed" in m and "strategy" in m
-    # live corpus produces mutation-induced escapes (implementer's smoke run: 52)
-    assert len(rep.mutation_induced_escapes) > 0
+    # Slice 91 — mutation-induced escapes are now 0: every variant that used to
+    # be counted as a mutation-induced escape was actually a PARSE_ERROR
+    # (getattr_indirect mangling an import line / unicode_confusable breaking a
+    # token = unparseable garbage), now correctly classified rejected_unparseable
+    # (neutralized, not an exploit) rather than passed_through.
+    assert len(rep.mutation_induced_escapes) == 0
     # clean controls still never false-positive, even under mutation
     assert rep.clean_control_false_positive_count == 0
 
