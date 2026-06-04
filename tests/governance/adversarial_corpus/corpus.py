@@ -416,10 +416,13 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
             "            _ = getattr(object, n)()\n",
         ),
         description=(
-            "Construct '__subclasses__' via chr() — bypasses Rule 7 "
-            "string-literal getattr check."
+            "Construct '__subclasses__' via chr() + string concat, fed "
+            "through a local variable to getattr. CLOSED by Slice-84 "
+            "constant-folder (_fold_const_str + _build_folded_name_map): "
+            "the folder resolves the chr-concat to '__subclasses__', "
+            "the introspection rule fires, and the candidate is BLOCKED."
         ),
-        known_gap=True,
+        known_gap=False,
         tracking_ticket="PRD §3.6.2 vector #7 — dynamic-string getattr",
     ))
 

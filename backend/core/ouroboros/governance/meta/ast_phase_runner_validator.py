@@ -881,7 +881,9 @@ def _check_module_name(
 
 #: Maximum AST nodes visited while folding one expression.
 #: Prevents a hand-crafted deeply-nested expression from pinning the walk.
-_FOLD_MAX_NODES: int = 64
+#: 96 (raised from 64 in Slice-84 review) so a fully all-chr()-encoded
+#: ``__subclasses__`` (~82 AST nodes) folds within budget.
+_FOLD_MAX_NODES: int = 96
 
 
 def _fold_const_str(node: ast.AST, _budget: Optional[List[int]] = None) -> Optional[str]:
@@ -991,6 +993,30 @@ def _fold_const_str(node: ast.AST, _budget: Optional[List[int]] = None) -> Optio
 # ---------------------------------------------------------------------------
 
 
+def _walk_own_body(func_node: ast.AST):
+    """ast.walk but STOPS at nested function/async-function boundaries.
+
+    Yields every descendant of ``func_node`` except nodes inside inner
+    ``FunctionDef`` / ``AsyncFunctionDef`` children.  Used by
+    :func:`_build_folded_name_map` so that a name assigned inside a nested
+    helper (e.g. ``n = chr(95)+...+"subclasses"+...``) does NOT pollute the
+    outer function's name map and create false-positive introspection blocks.
+
+    The outer loop in :func:`_find_introspection_escape_via_name_map` already
+    visits each nested function as its own ``func_node``, so per-function
+    isolation is preserved — only the internal walk of
+    ``_build_folded_name_map`` needs this restriction.
+
+    NEVER raises.
+    """
+    work = list(ast.iter_child_nodes(func_node))
+    while work:
+        node = work.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            work.extend(ast.iter_child_nodes(node))
+
+
 def _build_folded_name_map(func_node: ast.AST) -> dict:
     """Walk all Assign nodes within a function (including nested blocks
     such as ``try``/``with``/``if``) for simple ``name = <foldable>``
@@ -1002,15 +1028,21 @@ def _build_folded_name_map(func_node: ast.AST) -> dict:
     attr gap: a candidate may assign the constructed name to a local before
     passing it to getattr.
 
-    Walks with ``ast.walk`` so it handles assignments inside ``try``,
-    ``with``, nested ``if``, etc. — the typical real-world pattern is
-    ``try: n = chr(...)+...; getattr(x, n)()``.
+    Uses :func:`_walk_own_body` (not ``ast.walk``) so that assignments inside
+    nested function defs do NOT bleed into the outer function's map — last-
+    write-wins dict semantics would otherwise cause a false positive when a
+    benign outer ``getattr(x, n)`` shares a variable name with a banned
+    assignment inside an inner helper.
+
+    Note: ``ast.AugAssign`` (``n += ...``) is deliberately NOT tracked here
+    — the result depends on the prior value of ``n``, which requires flow
+    analysis beyond what this fail-open folder provides.  Fail-open by design.
 
     NEVER raises; returns empty dict on any error.
     """
     result: dict = {}
     try:
-        for sub in ast.walk(func_node):
+        for sub in _walk_own_body(func_node):
             if (
                 isinstance(sub, ast.Assign)
                 and len(sub.targets) == 1
