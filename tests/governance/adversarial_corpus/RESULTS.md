@@ -1,19 +1,13 @@
 # Adversarial Cage Stress Test — Results
 
-_Schema: `1.0` · Total: 38 · Blocked: 20 · Clean controls passed: 6 · Harness errors: 0_
+_Schema: `1.0` · Total: 39 · Blocked: 26 · Clean controls passed: 7 · Harness errors: 0_
 
-**Pass-through rate**: 12/38 = 31.58%
+**Pass-through rate**: 6/39 = 15.38%
 **Open vectors** (regressions / not yet patched): 0
-**Known gaps** (documented + tracked): 12
+**Known gaps** (documented + tracked): 6
 
 ## Known gaps (documented passes)
 
-- `alias_defeats_resolver` — Alias-defeats-resolver: assign banned name to local then call local. Rule 8 only resolves dotted names. (tracking: PRD §3.6.2 vector #7 — alias)
-- `mro_not_banned` — type(x).__mro__ not in Rule 7 banned attribute set. (tracking: PRD §3.6.2 vector #7 — Rule 7 charset gap)
-- `vars_introspection` — vars not blocked by static rules. (tracking: PRD §3.6.2 vector #7 — vars)
-- `dir_introspection` — dir not blocked. (tracking: PRD §3.6.2 vector #7 — dir)
-- `globals_walk` — globals introspection not blocked. (tracking: PRD §3.6.2 vector #7 — globals)
-- `chr_constructed_attr` — Construct '__subclasses__' via chr() — bypasses Rule 7 string-literal getattr check. (tracking: PRD §3.6.2 vector #7 — dynamic-string getattr)
 - `run_body_popen` — subprocess Popen in run body — process spawn. (tracking: Function-body process-spawn — runtime sandbox cage is the defense.)
 - `run_body_shell_exec` — Shell-exec call in run body. (tracking: Function-body shell-exec — runtime defense)
 - `run_body_eval` — eval call in run body. (tracking: Function-body dynamic-eval — runtime defense)
@@ -45,12 +39,12 @@ _Schema: `1.0` · Total: 38 · Blocked: 20 · Clean controls passed: 6 · Harnes
 | 18 | `no_phaserunner_subclass` | sandbox_escape | blocked_ast | FAILED/no_phase_runner_subclass | - | ✅ |
 | 19 | `run_not_async` | sandbox_escape | blocked_ast | FAILED/run_not_async | - | ✅ |
 | 20 | `no_top_level_try` | sandbox_escape | blocked_ast | FAILED/no_top_level_try | - | ✅ |
-| 21 | `alias_defeats_resolver` | sandbox_escape | passed_through | PASSED | - | ✅ |
-| 22 | `mro_not_banned` | sandbox_escape | passed_through | PASSED | - | ✅ |
-| 23 | `vars_introspection` | sandbox_escape | passed_through | PASSED | - | ✅ |
-| 24 | `dir_introspection` | sandbox_escape | passed_through | PASSED | - | ✅ |
-| 25 | `globals_walk` | sandbox_escape | passed_through | PASSED | - | ✅ |
-| 26 | `chr_constructed_attr` | sandbox_escape | passed_through | PASSED | - | ✅ |
+| 21 | `alias_defeats_resolver` | sandbox_escape | blocked_ast | FAILED/alias_defeat | - | ✅ |
+| 22 | `mro_not_banned` | sandbox_escape | blocked_ast | FAILED/introspection_escape | - | ✅ |
+| 23 | `vars_introspection` | sandbox_escape | blocked_ast | FAILED/introspection_builtin_call | - | ✅ |
+| 24 | `dir_introspection` | sandbox_escape | blocked_ast | FAILED/introspection_builtin_call | - | ✅ |
+| 25 | `globals_walk` | sandbox_escape | blocked_ast | FAILED/introspection_builtin_call | - | ✅ |
+| 26 | `chr_constructed_attr` | sandbox_escape | blocked_ast | FAILED/introspection_escape | - | ✅ |
 | 27 | `run_body_popen` | quine_attempt | passed_through | PASSED | - | ✅ |
 | 28 | `run_body_shell_exec` | quine_attempt | passed_through | PASSED | - | ✅ |
 | 29 | `run_body_eval` | quine_attempt | passed_through | PASSED | - | ✅ |
@@ -63,3 +57,4 @@ _Schema: `1.0` · Total: 38 · Blocked: 20 · Clean controls passed: 6 · Harnes
 | 36 | `clean_with_helper_function` | clean_control | clean_passed | PASSED | - | ✅ |
 | 37 | `clean_with_dataclass_helper` | clean_control | clean_passed | PASSED | - | ✅ |
 | 38 | `clean_with_module_docstring` | clean_control | clean_passed | PASSED | - | ✅ |
+| 39 | `clean_with_benign_chr` | clean_control | clean_passed | PASSED | - | ✅ |
