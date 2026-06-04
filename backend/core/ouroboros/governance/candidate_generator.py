@@ -287,14 +287,54 @@ def _envi_or_default(name: str, default: int) -> int:
     except ValueError: # If the raw value cannot be parsed as an integer, return the default. This ensures that invalid env var values don't cause crashes and instead fall back to safe defaults.
         return default # Return the default value if parsing fails due to invalid format.
 
-# Model ID substring matchers for heavy models. Case-insensitive, CSV-extensible via env var. Used to apply the heavy-model scalar in the adaptive formula.
+# Slice 84 — param-aware heavy threshold. The marker fast-path ("397B","Kimi")
+# only covered two models; Slice 83 then ranked DeepSeek-V4-Pro (1000B) and
+# GLM-5.1 (754B) FIRST, but they carried NO marker → got the bare 30s TTFT cap →
+# killed at elapsed=30.01s before first token (the v44-v64 "DW down" mirage).
+# Any model at/above this parameter count is treated as heavy (deserves the
+# longer TTFT runway), so the whole frontier-coder fleet — present AND future —
+# qualifies WITHOUT a per-model marker. 100B cleanly separates the 397B+/754B+
+# workhorses (+ DeepSeek-V4-Flash 100B) from the cheap Qwen-35B fast-path model.
+_HEAVY_MODEL_MIN_PARAMS_B_DEFAULT: float = 100.0
+
+
+def _heavy_model_min_params_b() -> float:
+    """Env-tunable parameter-count floor for param-aware heavy detection."""
+    return _envf_or_default(
+        "JARVIS_HEAVY_MODEL_MIN_PARAMS_B", _HEAVY_MODEL_MIN_PARAMS_B_DEFAULT,
+    )
+
+
+# Model ID matchers for heavy models. Two paths: (1) the curated/CSV marker
+# fast-path, (2) Slice 84 param-aware fallback. Used to apply the heavy-model
+# TTFT scalar in the adaptive primary-budget formula.
 def _is_heavy_model(model_id: str) -> bool:
-    """Case-insensitive substring match against the heavy-model marker
-    list. Used to apply the 1.5× scalar in the adaptive formula."""
-    if not model_id: # Defensive: empty model_id is not heavy, avoids unnecessary env lookup.
-        return False # If model_id is empty or None, return False immediately without checking markers.
-    mid_lower = model_id.lower() # Lowercase once for efficiency since we check multiple markers.
-    return any(m.lower() in mid_lower for m in _heavy_model_markers()) # Check if any heavy model marker is a substring of the model_id (case-insensitive). Returns True if a match is found, False otherwise.
+    """True iff ``model_id`` warrants the heavy-model TTFT runway.
+
+    A model qualifies if EITHER it matches a curated/CSV marker
+    (``397B``/``Kimi``, operator-extensible) OR — Slice 84 — its resolved
+    parameter count is at/above ``JARVIS_HEAVY_MODEL_MIN_PARAMS_B`` (default
+    100B). The param path reuses Slice 82's catalog resolver (curated map +
+    ``\\d+B`` regex), so the strong DW coders (DeepSeek-V4-Pro 1000B, GLM-5.1
+    754B, …) auto-qualify with no per-model hardcoding. Fail-soft: an
+    unresolvable param count + no marker → not heavy. Pure; never raises."""
+    if not model_id:  # Defensive: empty model_id is not heavy.
+        return False
+    mid_lower = model_id.lower()  # Lowercase once for efficiency.
+    # (1) curated / CSV marker fast-path
+    if any(m.lower() in mid_lower for m in _heavy_model_markers()):
+        return True
+    # (2) Slice 84 — param-aware fallback
+    try:
+        from backend.core.ouroboros.governance.dw_catalog_client import (
+            parse_parameter_count,
+        )
+        pb = parse_parameter_count(model_id)
+        if pb is not None and pb >= _heavy_model_min_params_b():
+            return True
+    except Exception:  # noqa: BLE001 — never block dispatch on a catalog hiccup
+        pass
+    return False
 
 # Pure function for the adaptive Tier 0 timeout formula. Called by the route-aware cap selector (:func:`_tier0_rt_cap_for_route`) when the caller
 def _compute_adaptive_tier0_timeout_s(

@@ -394,8 +394,14 @@ def test_spine_phase3_heavy_marker_env_csv_override(monkeypatch) -> None:
     assert _heavy_model_markers() == ("MyCustomModel", "512B")
     assert _is_heavy_model("vendor/MyCustomModel-XL") is True
     assert _is_heavy_model("Qwen/Qwen3.5-512B-MoE") is True
-    # 397B no longer in marker list → not heavy under this config
-    assert _is_heavy_model("Qwen/Qwen3.5-397B-A17B-FP8") is False
+    # Slice 84 — markers are now ADDITIVE to a param-aware path: a 397B model
+    # stays heavy even when it is absent from the custom marker list, because
+    # 397B >= the 100B param floor (the v44-v64 regression was exactly a large
+    # coder NOT matching a marker and getting the bare 30s TTFT cap). To fully
+    # exclude a large model an operator raises JARVIS_HEAVY_MODEL_MIN_PARAMS_B.
+    assert _is_heavy_model("Qwen/Qwen3.5-397B-A17B-FP8") is True
+    monkeypatch.setenv("JARVIS_HEAVY_MODEL_MIN_PARAMS_B", "500")
+    assert _is_heavy_model("Qwen/Qwen3.5-397B-A17B-FP8") is False  # 397 < 500
 
 
 def test_spine_phase3_legacy_route_only_returns_static_90s(monkeypatch) -> None:

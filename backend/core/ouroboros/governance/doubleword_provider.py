@@ -117,17 +117,51 @@ _COMPLEXITY_REASONING_EFFORT = {
 }
 
 
+# Slice 84 — ordered effort scale + serveability clamp. Direct boundary probes
+# (2026-06-03) proved DW streams effort=none/low/medium cleanly (ttfb 1.4-6.3s,
+# real content) but RUPTURES the chunked stream at effort=high
+# (ClientPayloadError: TransferEncodingError) — which the dispatch then mislabels
+# live_transport. So a complexity that derives "high" (heavy_code/architectural)
+# must be clamped to a serveable ceiling before it reaches the wire. Default cap
+# "medium" (verified serveable, keeps a real CoT buffer); env-tunable up/down.
+# The explicit JARVIS_DW_REASONING_EFFORT override is NOT clamped — operator
+# intent wins (e.g. a future DW build that serves "high" cleanly).
+_EFFORT_ORDER: Tuple[str, ...] = ("none", "low", "medium", "high")
+_DW_MAX_EFFORT_DEFAULT: str = "medium"
+
+
+def _dw_max_reasoning_effort() -> str:
+    """Env-tunable serveability ceiling for DW reasoning_effort. Invalid →
+    default ``medium``. NEVER raises."""
+    raw = os.environ.get("JARVIS_DW_MAX_REASONING_EFFORT", "").strip().lower()
+    return raw if raw in _EFFORT_ORDER else _DW_MAX_EFFORT_DEFAULT
+
+
+def _clamp_reasoning_effort(eff: str) -> str:
+    """Clamp ``eff`` down to the serveable ceiling (never exceed it). An
+    unknown effort string is returned unchanged (fail-open). Pure."""
+    cap = _dw_max_reasoning_effort()
+    try:
+        if _EFFORT_ORDER.index(eff) > _EFFORT_ORDER.index(cap):
+            return cap
+    except ValueError:
+        pass
+    return eff
+
+
 def _reasoning_effort_for(complexity: str = "") -> str:
-    """Slice 55 — resolve reasoning_effort. Explicit
-    ``JARVIS_DW_REASONING_EFFORT`` wins (operator override / kill-switch);
-    otherwise derive from the op's ``task_complexity`` (unknown → ``none``,
-    preserving Slice 54's default)."""
+    """Slice 55/84 — resolve reasoning_effort. Explicit
+    ``JARVIS_DW_REASONING_EFFORT`` wins (operator override / kill-switch,
+    UNCLAMPED); otherwise derive from the op's ``task_complexity`` (unknown →
+    ``none``) and clamp to the DW-serveable ceiling (Slice 84 — ``high``
+    ruptures DW's chunked stream)."""
     env = os.environ.get("JARVIS_DW_REASONING_EFFORT", "").strip().lower()
     if env:
         return env
-    return _COMPLEXITY_REASONING_EFFORT.get(
+    derived = _COMPLEXITY_REASONING_EFFORT.get(
         (complexity or "").strip().lower(), "none",
     )
+    return _clamp_reasoning_effort(derived)
 
 
 def _reasoning_request_params(effort: str = "", *, complexity: str = "") -> dict:
@@ -2949,6 +2983,14 @@ class DoublewordProvider:
             len(result.candidates), elapsed, total_cost, len(tool_records),
             _token_usage["input"], _token_usage["output"],
         )
+
+        # Slice 84 — attach the Venom tool-loop execution records so the Iron
+        # Gate exploration gate can count this op's read_file/search_code calls
+        # (mirrors ClaudeProvider, providers.py ~5048). Without this the records
+        # were dropped and the gate saw 0/2 → rejected every DW candidate as
+        # exploration_insufficient even after a full 7-tool-call loop.
+        if tool_records:
+            result = result.with_tool_records(tool_records)
 
         # Attach Venom mutation audit (empty when no mutating tools fired).
         if venom_edits:
