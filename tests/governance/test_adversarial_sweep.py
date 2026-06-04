@@ -32,12 +32,12 @@ def test_schema_version_and_report_to_dict_roundtrip():
 
 def test_build_sweep_matrix_raw_plus_mutations():
     raw_only = S.build_sweep_matrix(include_mutations=False)
-    assert len(raw_only) == 38                      # full corpus, raw only
+    assert len(raw_only) == 39                      # full corpus (38 + 1 benign-chr control)
     assert all(label == "raw" for _, label in raw_only)
     with_mut = S.build_sweep_matrix(include_mutations=True)
-    assert len(with_mut) > 38                        # raw + applicable mutations
+    assert len(with_mut) > 39                        # raw + applicable mutations
     raw_count = sum(1 for _, lbl in with_mut if lbl == "raw")
-    assert raw_count == 38
+    assert raw_count == 39
     # every mutation variant carries its seed's category + a strategy label
     for entry, label in with_mut:
         assert entry.category.value in ("sandbox_escape", "quine_attempt", "clean_control")
@@ -54,12 +54,25 @@ def _run(coro):
 
 def test_run_sweep_reproduces_raw_baseline_and_taxonomy():
     rep = _run(S.run_sweep(include_mutations=False))
-    # 32 adversarial seeds, 7 escape today (chr + 6 runtime) -> 21.9%
+    # Slice-84 closure: chr_constructed_attr now BLOCKED by the
+    # constant-folder; residual 6 are all runtime-defense gaps.
+    # 32 adversarial seeds, 6 escape (6 runtime gaps) -> 18.8%
     assert rep.adversarial_seed_count == 32
-    assert rep.adversarial_escape_count_raw == 7
-    assert round(rep.adversarial_escape_rate_raw, 1) == 21.9
+    assert rep.adversarial_escape_count_raw == 6
+    assert round(rep.adversarial_escape_rate_raw, 1) == 18.8
     names = {e["name"] for e in rep.escaping_entries_raw}
-    assert "chr_constructed_attr" in names
+    # chr_constructed_attr is now closed by the static constant-folder
+    assert "chr_constructed_attr" not in names
+    # Residual 6 are all runtime-defense gaps (architecturally out of scope
+    # for static analysis; spec criteria for §43 Arc 5 netns+seccomp).
+    assert names == {
+        "run_body_popen",
+        "run_body_shell_exec",
+        "run_body_eval",
+        "run_body_dynamic_compile",
+        "run_body_importlib",
+        "multi_step_string_assembly",
+    }
     # clean controls must NEVER count as escapes (clean_passed != passed_through)
     assert rep.clean_control_false_positive_count == 0
 
@@ -81,7 +94,7 @@ import json
 
 def test_evaluate_regression_passes_at_baseline_and_fails_above():
     rep = _run(S.run_sweep(include_mutations=False))
-    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=21.9, max_clean_fp=0)
+    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=18.8, max_clean_fp=0)
     assert ok is True, msg
     # a stricter baseline (lower than current) must fail
     bad, msg2 = S.evaluate_regression(rep, baseline_escape_rate_raw=10.0, max_clean_fp=0)
@@ -127,7 +140,7 @@ def test_render_console_report_is_str():
     rep = _run(S.run_sweep(include_mutations=False))
     text = S.render_console_report(rep)
     assert "Adversarial escape" in text
-    assert "21.9" in text
+    assert "18.8" in text
 
 
 def test_cli_main_writes_json_and_returns_exit_code(tmp_path):
