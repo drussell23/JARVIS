@@ -35,7 +35,7 @@ The AST validator (`meta/ast_phase_runner_validator.py`, 1290 LOC) is **already 
 ## 3. Scope
 
 **In scope (v1):**
-- An async batch harness producing a multi-dimensional report card over the corpus × the 8 existing deterministic mutation operators (single-operator-per-seed; ~304 variants).
+- An async batch harness producing a multi-dimensional report card over the corpus × the 8 existing deterministic mutation operators (single-operator-per-seed). **Adversarial escape matrix:** 32 adversarial raw seeds + up to 32×8 = **256** single-operator mutation variants = up to **288 adversarial rows** (minus non-applicable operator cases). The 7 clean controls are a **separate precision track** (false-positive metric), not part of the escape-rate denominator.
 - Closing the `chr_constructed_attr` gap via a bounded static constant-folder.
 - A PRD writeup documenting the run + the static/runtime boundary.
 

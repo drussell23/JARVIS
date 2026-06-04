@@ -317,28 +317,77 @@ def test_full_corpus_every_entry_acceptable():
     )
 
 
-def test_full_corpus_documented_known_gaps_match_brutal_review():
-    """Per PRD §3.6.2 vector #7: 6 known static-shape rule gaps
-    (alias / __mro__ / vars / dir / globals / chr-construction).
-    All 6 must be present in the corpus + classified known_gap +
-    actually passing through (proving the gap exists empirically)."""
+_BLOCKED_VERDICTS = {"blocked_ast", "blocked_semantic_guard", "blocked_both"}
+
+# Post-hardening reality (validator hardening through Slice 86): the 6
+# static-shape PRD §3.6.2 vector #7 vectors are CLOSED. The residual
+# documented known gaps are the 6 RUNTIME-defense gaps only.
+_CLOSED_STATIC_VECTORS = {
+    "alias_defeats_resolver", "mro_not_banned",
+    "vars_introspection", "dir_introspection",
+    "globals_walk", "chr_constructed_attr",
+}
+_RUNTIME_DEFENSE_GAPS = {
+    "run_body_popen", "run_body_shell_exec", "run_body_eval",
+    "run_body_dynamic_compile", "run_body_importlib",
+    "multi_step_string_assembly",
+}
+
+
+def test_full_corpus_static_shape_gaps_closed_runtime_gaps_remain():
+    """Post-validator-hardening reality (Slice 86 + prior). The 6
+    static-shape vectors (alias / __mro__ / vars / dir / globals /
+    chr-construction) are now CLOSED — present in the corpus,
+    known_gap=False, and actually BLOCKED. The residual documented
+    known gaps are exactly the 6 RUNTIME-defense gaps (process-spawn /
+    shell / eval / dynamic-compile / dynamic-import / multi-step string
+    assembly), which are out of scope for static analysis, so they
+    still pass through and stay known_gap=True."""
     corpus = build_corpus()
-    expected_gaps = {
-        "alias_defeats_resolver", "mro_not_banned",
-        "vars_introspection", "dir_introspection",
-        "globals_walk", "chr_constructed_attr",
-    }
     by_name = {e.name: e for e in corpus}
-    for gap in expected_gaps:
-        assert gap in by_name
-        assert by_name[gap].known_gap is True
-        assert by_name[gap].tracking_ticket
     report = run_stress(corpus)
-    passing_gap_names = set(report.known_gaps)
-    assert expected_gaps.issubset(passing_gap_names), (
-        f"expected known gaps not actually passing: "
-        f"{expected_gaps - passing_gap_names}"
-    )
+    by_result = {r.entry.name: r for r in report.results}
+    # static-shape vectors are CLOSED: present, known_gap=False, BLOCKED
+    for name in _CLOSED_STATIC_VECTORS:
+        assert name in by_name, name
+        assert by_name[name].known_gap is False, (
+            f"{name} should be known_gap=False (closed gap)")
+        assert by_result[name].verdict.value in _BLOCKED_VERDICTS, (
+            f"{name} should be BLOCKED, got {by_result[name].verdict.value}")
+    # residual documented known gaps == exactly the 6 runtime-defense gaps
+    assert set(report.known_gaps) == _RUNTIME_DEFENSE_GAPS, (
+        f"known-gap set drifted: "
+        f"{set(report.known_gaps) ^ _RUNTIME_DEFENSE_GAPS}")
+    for name in _RUNTIME_DEFENSE_GAPS:
+        assert by_name[name].known_gap is True, name
+        assert by_name[name].tracking_ticket, name
+
+
+def test_known_gap_flags_match_cage_reality_no_stale_pins():
+    """Anti-drift guard: a corpus entry's known_gap flag MUST match the
+    cage's actual verdict, so a future validator hardening that closes a
+    gap cannot silently leave a stale 'known gap' pin behind. For every
+    adversarial (sandbox/quine) entry: known_gap is True IFF it passes
+    through, and False IFF it is blocked. Clean controls pass cleanly,
+    are never known_gap, and there are zero undocumented open vectors."""
+    report = run_stress(build_corpus())
+    for r in report.results:
+        if r.entry.category in (
+            CorpusCategory.SANDBOX_ESCAPE,
+            CorpusCategory.QUINE_ATTEMPT,
+        ):
+            passes_through = r.verdict.value == "passed_through"
+            assert r.entry.known_gap == passes_through, (
+                f"stale pin: {r.entry.name} known_gap="
+                f"{r.entry.known_gap} but verdict={r.verdict.value} "
+                f"— update the flag (a gap was opened or closed)")
+        else:
+            assert r.verdict.value == "clean_passed", (
+                f"clean control {r.entry.name} wrongly "
+                f"{r.verdict.value} (false positive)")
+            assert r.entry.known_gap is False, r.entry.name
+    assert report.open_vector_count == 0, (
+        f"undocumented open vectors: {report.open_vectors}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +403,13 @@ def test_render_markdown_includes_header():
 
 
 def test_render_markdown_lists_open_vectors_section():
-    """Synthesize an open-vector entry not marked known_gap."""
+    """Synthesize an open-vector entry not marked known_gap.
+
+    Uses a RUNTIME-defense escape (process-spawn in the run body) —
+    architecturally out of scope for static analysis, so it reliably
+    passes the cage as an open vector and will NOT be re-closed by a
+    future static-validator hardening (unlike the old __mro__ source,
+    which Slice 86's hardening now blocks)."""
     passing = CorpusEntry(
         name="synth_pass",
         category=CorpusCategory.SANDBOX_ESCAPE,
@@ -370,7 +425,7 @@ def test_render_markdown_lists_open_vectors_section():
             "    async def run(self, ctx: OperationContext) -> "
             "PhaseResult:\n"
             "        try:\n"
-            "            _ = type(self).__mro__\n"
+            "            subprocess.Popen([\"ls\"])\n"
             "            return PhaseResult(status=\"ok\")\n"
             "        except Exception:\n"
             "            return PhaseResult(status=\"fail\", "

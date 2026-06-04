@@ -355,10 +355,11 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
         ),
         description=(
             "Alias-defeats-resolver: assign banned name to local "
-            "then call local. Rule 8 only resolves dotted names."
+            "then call local. CLOSED — now BLOCKED by the hardened "
+            "AST validator."
         ),
-        known_gap=True,
-        tracking_ticket="PRD §3.6.2 vector #7 — alias",
+        known_gap=False,
+        tracking_ticket="PRD §3.6.2 vector #7 — alias (CLOSED)",
     ))
 
     out.append(CorpusEntry(
@@ -368,10 +369,11 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
             "            _ = type(self).__mro__\n",
         ),
         description=(
-            "type(x).__mro__ not in Rule 7 banned attribute set."
+            "type(x).__mro__ — CLOSED; now BLOCKED by the hardened "
+            "AST validator (banned-introspection-attr set)."
         ),
-        known_gap=True,
-        tracking_ticket="PRD §3.6.2 vector #7 — Rule 7 charset gap",
+        known_gap=False,
+        tracking_ticket="PRD §3.6.2 vector #7 — Rule 7 charset gap (CLOSED)",
     ))
 
     out.append(CorpusEntry(
@@ -380,9 +382,9 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
         source=_runner_with_run_body(
             "            _ = vars(self)\n",
         ),
-        description="vars not blocked by static rules.",
-        known_gap=True,
-        tracking_ticket="PRD §3.6.2 vector #7 — vars",
+        description="vars() introspection — CLOSED; now BLOCKED by the hardened AST validator.",
+        known_gap=False,
+        tracking_ticket="PRD §3.6.2 vector #7 — vars (CLOSED)",
     ))
 
     out.append(CorpusEntry(
@@ -391,9 +393,9 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
         source=_runner_with_run_body(
             "            _ = dir(self)\n",
         ),
-        description="dir not blocked.",
-        known_gap=True,
-        tracking_ticket="PRD §3.6.2 vector #7 — dir",
+        description="dir() introspection — CLOSED; now BLOCKED by the hardened AST validator.",
+        known_gap=False,
+        tracking_ticket="PRD §3.6.2 vector #7 — dir (CLOSED)",
     ))
 
     out.append(CorpusEntry(
@@ -402,9 +404,9 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
         source=_runner_with_run_body(
             "            _ = globals().get('os')\n",
         ),
-        description="globals introspection not blocked.",
-        known_gap=True,
-        tracking_ticket="PRD §3.6.2 vector #7 — globals",
+        description="globals() introspection — CLOSED; now BLOCKED by the hardened AST validator.",
+        known_gap=False,
+        tracking_ticket="PRD §3.6.2 vector #7 — globals (CLOSED)",
     ))
 
     out.append(CorpusEntry(
