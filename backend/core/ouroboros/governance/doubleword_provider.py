@@ -44,7 +44,9 @@ from backend.core.ouroboros.governance.aegis_provider_bridge import (
     merge_lease_into_session_headers as _aegis_merge_lease_headers,
 )
 from backend.core.ouroboros.governance.stream_rupture import (
+    CognitiveStallError,
     StreamRuptureError,
+    cognitive_stall_timeout_s as _cognitive_stall_timeout_s,
     stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
     stream_rupture_timeout_s as _stream_rupture_timeout_s,
 )
@@ -2344,6 +2346,16 @@ class DoublewordProvider:
                     # DW stream stays observably fresh (Move 2 v4).
                     _stream_op_id = str(getattr(context, "op_id", "") or "")
                     _stream_chunk_count = 0
+                    # Slice 87 — cognitive-stall watchdog state. The inter-chunk
+                    # rupture watchdog above sees reasoning deltas and stays
+                    # alive, so a model stuck reasoning with no content runs the
+                    # FULL primary budget (the 240s/0-content capability stalls).
+                    # Track elapsed-since-first-progress while content is empty;
+                    # cascade to Tier 1 once it crosses the stall threshold.
+                    _reasoning_seen = False
+                    _content_seen = False
+                    _first_progress_at = 0.0
+                    _cognitive_stall_s = _cognitive_stall_timeout_s()
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
                     while True:
                         try:
@@ -2390,7 +2402,42 @@ class DoublewordProvider:
                             # candidate still comes from `content`.
                             _reasoning_delta = delta.get("reasoning", "") or ""
                             if _reasoning_delta and not token:
-                                _reasoning_seen = True  # noqa: F841 — liveness marker
+                                _reasoning_seen = True  # liveness marker
+                            # Slice 87 — cognitive-stall watchdog. Mark first
+                            # progress (any reasoning OR content byte), flip
+                            # content_seen on the first real content token, and
+                            # cascade if content stays empty past the threshold
+                            # while the stream is otherwise alive.
+                            if (_reasoning_delta or token) and _first_progress_at == 0.0:
+                                _first_progress_at = time.monotonic()
+                            if token:
+                                _content_seen = True
+                            if (
+                                _cognitive_stall_s > 0
+                                and not _content_seen
+                                and _reasoning_seen
+                                and _first_progress_at > 0.0
+                                and (time.monotonic() - _first_progress_at)
+                                > _cognitive_stall_s
+                            ):
+                                _stall_elapsed = (
+                                    time.monotonic()
+                                    - _ttft_request_start_monotonic
+                                )
+                                logger.warning(
+                                    "[DoublewordProvider] COGNITIVE STALL: "
+                                    "model=%s reasoned %.0fs with 0 content — "
+                                    "cascading to Tier-1 fallback (op=%s)",
+                                    _effective_model, _stall_elapsed,
+                                    _stream_op_id[:24],
+                                )
+                                raise CognitiveStallError(
+                                    provider="doubleword",
+                                    elapsed_s=_stall_elapsed,
+                                    bytes_received=len(content),
+                                    stall_timeout_s=_cognitive_stall_s,
+                                    reasoning_seen=_reasoning_seen,
+                                )
                             # Priority 1 Slice 1 + Slice 2 — capture +
                             # monitor. Reads chunk's logprobs structure;
                             # feeds capturer (always when capture enabled)
