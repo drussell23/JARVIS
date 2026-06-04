@@ -23,7 +23,11 @@ def test_complexity_maps_to_effort(monkeypatch):
     assert _reasoning_effort_for("simple") == "none"
     assert _reasoning_effort_for("moderate") == "low"
     assert _reasoning_effort_for("complex") == "medium"
-    assert _reasoning_effort_for("heavy_code") == "high"
+    # Slice 84 — heavy_code/architectural map to "high" in the table, but
+    # _reasoning_effort_for now clamps to the DW-serveable ceiling (default
+    # "medium"): effort=high ruptures DW's chunked stream (ClientPayloadError:
+    # TransferEncodingError, verified by direct probe 2026-06-03).
+    assert _reasoning_effort_for("heavy_code") == "medium"
 
 
 def test_unknown_complexity_defaults_none(monkeypatch):
