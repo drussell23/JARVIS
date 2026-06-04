@@ -135,15 +135,60 @@ CATALOG_SCHEMA_VERSION = "dw_catalog.1"
 # downgrades to SPECULATIVE quarantine per Zero-Trust §3.6).
 _PARAM_COUNT_RE = re.compile(r"-(\d+(?:\.\d+)?)B(?:[-_/]|$)", re.IGNORECASE)
 
+# Slice 82 — known parameter counts (billions) for DW-served agentic coders
+# whose model_id carries NO parseable ``\\d+B`` token (Kimi-K2.6, GLM-5.1,
+# DeepSeek-V4-Pro). Without these the regex returns None and the COMPLEX route's
+# ``min_params_b=30`` gate REJECTS them (EligibilityGate.admits line 84-89) — so
+# the strong, cheap DW coders would never carry GENERATE and Claude keeps eating
+# the spend. This is accurate model METADATA (not hardcoded routing): the catalog
+# stays dynamic, the gate/rank/trusted machinery selects from it. Substring match
+# on the lowercased id (most-specific first). Env-extensible via
+# JARVIS_DW_KNOWN_MODEL_PARAMS (``id_substr:params_b,...``).
+_KNOWN_MODEL_PARAMS_B: Tuple[Tuple[str, float], ...] = (
+    ("deepseek-v4-flash", 100.0),  # V4 Flash tier (smaller, still ≥ COMPLEX floor)
+    ("deepseek-v4-pro", 1000.0),   # DeepSeek V4 (≈1T MoE)
+    ("deepseek-v4", 671.0),        # generic V4 fallback
+    ("kimi-k2", 1000.0),           # Moonshot Kimi K2.x (1T MoE)
+    ("glm-5", 754.0),              # z.ai GLM-5.x
+)
+
+
+def _known_param_count(model_id: str) -> Optional[float]:
+    """Slice 82 — return a curated parameter count for a model whose id has no
+    parseable size token, else None. Env override merged first. NEVER raises."""
+    low = (model_id or "").lower()
+    pairs = list(_KNOWN_MODEL_PARAMS_B)
+    try:
+        raw = os.environ.get("JARVIS_DW_KNOWN_MODEL_PARAMS", "").strip()
+        if raw:
+            extra = []
+            for item in raw.split(","):
+                if ":" in item:
+                    sub, val = item.rsplit(":", 1)
+                    extra.append((sub.strip().lower(), float(val)))
+            pairs = extra + pairs  # operator entries win
+    except Exception:  # noqa: BLE001 — defensive, ignore malformed override
+        pass
+    for sub, params in pairs:
+        if sub in low:
+            return params
+    return None
+
 
 def parse_parameter_count(model_id: str) -> Optional[float]:
     """Heuristic: extract the parameter count (in billions) from a
     model id when the API doesn't expose it as metadata.
 
-    Returns ``None`` for ids without a recognizable ``\\d+B`` token.
-    Intentionally conservative — a misparse promotes a model into a
-    higher-cost route, so we prefer ``None`` (→ Zero-Trust quarantine
+    Slice 82 — consults the curated :data:`_KNOWN_MODEL_PARAMS_B` map FIRST for
+    agentic coders whose id carries no size token, then the regex.
+
+    Returns ``None`` for ids without a recognizable ``\\d+B`` token (and not in
+    the curated map). Intentionally conservative — a misparse promotes a model
+    into a higher-cost route, so we prefer ``None`` (→ Zero-Trust quarantine
     in SPECULATIVE) over a guess."""
+    known = _known_param_count(model_id)
+    if known is not None:
+        return known
     m = _PARAM_COUNT_RE.search(model_id or "")
     if m is None:
         return None

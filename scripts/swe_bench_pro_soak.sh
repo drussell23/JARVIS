@@ -44,6 +44,13 @@ export OUROBOROS_OP_STALE_THRESHOLD_S="${OUROBOROS_OP_STALE_THRESHOLD_S:-$_PEROP
 # Slice 81 — raise Claude's base output budget so large single-file rewrites
 # (~1800 lines) complete in one round instead of truncating at 16384.
 export JARVIS_CLAUDE_MAX_OUTPUT_TOKENS="${JARVIS_CLAUDE_MAX_OUTPUT_TOKENS:-32768}"
+# Slice 82 — attest DW's strong agentic coders as TRUSTED so the cheap DW
+# fleet carries GENERATE instead of Claude (PRD §50 spend audit: Claude was
+# ~99.9% of spend). These are live on the account + Claude-class on SWE-bench
+# Pro (GLM-5.1 58.4%, Kimi-K2.6 58.6%, DeepSeek-V4-Pro 80.6% Verified) at
+# 5-25× lower cost. Selection stays dynamic (catalog → gate → rank → ledger);
+# this only *admits* them. Operator-overridable.
+export JARVIS_DW_TRUSTED_MODELS="${JARVIS_DW_TRUSTED_MODELS:-Qwen/Qwen3.5-397B-A17B-FP8,Qwen/Qwen3.5-35B-A3B-FP8,deepseek-ai/DeepSeek-V4-Pro,zai-org/GLM-5.1-FP8,moonshotai/Kimi-K2.6,deepseek-ai/DeepSeek-V4-Flash}"
 # Restricted-env: sandbox blocks .git/config under the repo root, so the
 # benchmark repo cache + worktrees live under TMPDIR (NOT the repo).
 SWEBP_CACHE="${TMPDIR:-/tmp}/swebp_cache"

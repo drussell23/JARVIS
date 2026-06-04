@@ -253,8 +253,10 @@ def test_parse_parameter_count_known_ids(
 
 
 @pytest.mark.parametrize("model_id", [
-    "moonshotai/Kimi-K2.6",   # no Bn suffix
-    "zai-org/GLM-5.1-FP8",    # version dot, no Bn
+    # Slice 82 — Kimi-K2.6 / GLM-5.1 now resolve via the curated known-params
+    # map (they're first-class DW agentic coders), so the "unparseable" cases
+    # are ids with neither a size token NOR a curated entry.
+    "acme/MysteryModel",      # no Bn suffix, uncurated family
     "",
     None,
     "no-slash-no-suffix",
@@ -263,6 +265,13 @@ def test_parse_parameter_count_known_ids(
 def test_parse_parameter_count_returns_none_for_unparseable(model_id: Any) -> None:
     """Conservative — when in doubt, return None (→ Zero-Trust quarantine)."""
     assert parse_parameter_count(model_id) is None
+
+
+def test_slice82_known_coders_now_parse() -> None:
+    """Slice 82 — the curated agentic coders resolve params (clear COMPLEX gate)."""
+    assert parse_parameter_count("moonshotai/Kimi-K2.6") == 1000.0
+    assert parse_parameter_count("zai-org/GLM-5.1-FP8") == 754.0
+    assert parse_parameter_count("deepseek-ai/DeepSeek-V4-Pro") == 1000.0
 
 
 def test_parse_family() -> None:
@@ -281,7 +290,7 @@ def test_parse_family() -> None:
 
 def test_ambiguous_metadata_when_both_missing() -> None:
     """No param count AND no out-pricing → SPECULATIVE quarantine signal."""
-    card = ModelCard.from_api_dict({"id": "moonshotai/Kimi-K2.6"})
+    card = ModelCard.from_api_dict({"id": "acme/MysteryModel"})
     assert card is not None
     assert card.parameter_count_b is None
     assert card.pricing_out_per_m_usd is None
@@ -455,7 +464,7 @@ async def test_fetch_openai_envelope(isolated_cache: Path) -> None:
     body = {
         "data": [
             {"id": "Qwen/Qwen3.5-397B-A17B"},
-            {"id": "moonshotai/Kimi-K2.6"},
+            {"id": "acme/MysteryModel"},
             {"id": "Qwen/Qwen3.5-9B",
              "pricing": {"input": 0.04, "output": 0.06}},
         ],
