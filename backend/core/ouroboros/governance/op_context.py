@@ -724,6 +724,155 @@ def _validate_dag(edges: Tuple[Tuple[str, str], ...]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Slice 89 — ExplorationManifest (DW→Claude neural handoff mesh)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExplorationManifest:
+    """Structured summary of DW's tool-loop exploration, carried forward to Claude.
+
+    Built in the CandidateGenerator DW-failure window and stamped onto
+    OperationContext via ``with_exploration_manifest()`` BEFORE the Claude
+    fallback ``generate()`` call.  Claude's prompt builders inject this as
+    an observation block ("## Prior Exploration (DoubleWord)") so Claude
+    can compile the patch without repeating directory scans and initial
+    searches that DW already completed.
+
+    Authority-free — it is an observation block, not a hard constraint.
+    Claude's tool autonomy is preserved.
+
+    Fields
+    ------
+    verified_target_files:
+        File paths that DW successfully read, edited, or wrote.  These have
+        been pre-localized — Claude should analyse them directly.
+    high_signal_search_tokens:
+        Query/pattern strings from successful ``search_code`` calls.
+        Represents what DW found relevant to the task.
+    failed_test_commands:
+        Commands from ``run_tests`` calls that FAILED.  Claude should know
+        these tests were already attempted and broke.
+    tool_call_count:
+        Total number of tool calls DW made (``len(records)``).
+    exploration_reason:
+        Why the manifest was built (e.g. ``"dw_failure"``).
+    schema_version:
+        Manifest schema version — bump when fields are added/removed.
+
+    Slice 89 markers are ``# Slice 89`` comments at call sites.
+    """
+
+    verified_target_files: Tuple[str, ...]
+    high_signal_search_tokens: Tuple[str, ...]
+    failed_test_commands: Tuple[str, ...]
+    tool_call_count: int
+    exploration_reason: str
+    schema_version: str = "manifest.1"  # Slice 89
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a plain dict representation suitable for serialisation."""
+        return {
+            "schema_version": self.schema_version,
+            "verified_target_files": self.verified_target_files,
+            "high_signal_search_tokens": self.high_signal_search_tokens,
+            "failed_test_commands": self.failed_test_commands,
+            "tool_call_count": self.tool_call_count,
+            "exploration_reason": self.exploration_reason,
+        }
+
+    @classmethod
+    def from_telemetry(
+        cls,
+        records: Any,
+        salient_args: Any,
+        reason: str,
+    ) -> "ExplorationManifest":
+        """Build a manifest from ToolExecutionRecord list + salient-arg list.
+
+        Never raises — any parsing failure returns a valid empty manifest.
+
+        Parameters
+        ----------
+        records:
+            List of ToolExecutionRecord objects from the DW tool loop.
+        salient_args:
+            Parallel list of ``(tool_name, salient_arg)`` tuples captured
+            out-of-band by ToolLoopCoordinator at dispatch time.
+        reason:
+            Human-readable reason for building the manifest.
+
+        Derivation rules
+        ----------------
+        * ``verified_target_files`` — salient_arg from SUCCESS read_file /
+          edit_file / write_file calls (deduplicated, non-empty).
+        * ``high_signal_search_tokens`` — salient_arg from SUCCESS search_code
+          calls (deduplicated, non-empty).
+        * ``failed_test_commands`` — salient_arg from non-SUCCESS run_tests
+          calls (deduplicated, non-empty).
+        """
+        try:
+            if records is None:
+                records = []
+            if salient_args is None:
+                salient_args = []
+
+            # Safely zip — use min length to avoid IndexError
+            _records = list(records) if records else []
+            _salient = list(salient_args) if salient_args else []
+            pairs = list(zip(_records, _salient))
+
+            _target_files: list = []
+            _search_tokens: list = []
+            _failed_tests: list = []
+
+            _READ_WRITE_TOOLS = frozenset({"read_file", "edit_file", "write_file"})
+            _SEARCH_TOOLS = frozenset({"search_code"})
+            _TEST_TOOLS = frozenset({"run_tests"})
+
+            for rec, (tool_name, salient_arg) in pairs:
+                try:
+                    status_val = getattr(rec, "status", None)
+                    # Normalize status to string for comparison
+                    if hasattr(status_val, "value"):
+                        status_str = str(status_val.value)
+                    else:
+                        status_str = str(status_val) if status_val is not None else ""
+                    is_success = (status_str == "success")
+                    salient_arg = str(salient_arg) if salient_arg is not None else ""
+                    if not salient_arg:
+                        continue
+
+                    if tool_name in _READ_WRITE_TOOLS and is_success:
+                        if salient_arg not in _target_files:
+                            _target_files.append(salient_arg)
+                    elif tool_name in _SEARCH_TOOLS and is_success:
+                        if salient_arg not in _search_tokens:
+                            _search_tokens.append(salient_arg)
+                    elif tool_name in _TEST_TOOLS and not is_success:
+                        if salient_arg not in _failed_tests:
+                            _failed_tests.append(salient_arg)
+                except Exception:  # noqa: BLE001 — never break build
+                    continue
+
+            return cls(
+                verified_target_files=tuple(_target_files),
+                high_signal_search_tokens=tuple(_search_tokens),
+                failed_test_commands=tuple(_failed_tests),
+                tool_call_count=len(_records),
+                exploration_reason=reason,
+            )
+        except Exception:  # noqa: BLE001 — Slice 89 never-raises contract
+            return cls(
+                verified_target_files=(),
+                high_signal_search_tokens=(),
+                failed_test_commands=(),
+                tool_call_count=0,
+                exploration_reason=reason,
+            )
+
+
+# ---------------------------------------------------------------------------
 # OperationContext
 # ---------------------------------------------------------------------------
 
@@ -916,6 +1065,14 @@ class OperationContext:
     # _ATTACHMENT_MAX_PER_CTX entries. Default empty tuple — non-vision
     # ops traverse the pipeline exactly as before.
     attachments: Tuple[Attachment, ...] = ()
+
+    # ---- Slice 89: ExplorationManifest (DW→Claude handoff context) ----
+    # Stamped by CandidateGenerator in the DW-failure window (before
+    # _fallback.generate()) when JARVIS_EXPLORATION_MANIFEST_ENABLED=true.
+    # Carries DW's pre-localized file list and search findings so Claude
+    # skips redundant re-exploration. Authority-free (observation block).
+    # Default None — non-handoff ops are byte-identical to today.
+    exploration_manifest: Optional["ExplorationManifest"] = None  # Slice 89
 
     # ------------------------------------------------------------------
     # Post-init
@@ -1454,6 +1611,27 @@ class OperationContext:
         re-validates element types.
         """
         return self.with_attachments(self.attachments + (attachment,))
+
+    def with_exploration_manifest(
+        self,
+        manifest: "Optional[ExplorationManifest]",
+    ) -> "OperationContext":
+        """Stamp a Slice 89 ExplorationManifest onto the context (no phase change).
+
+        Called by CandidateGenerator in the DW-failure window before the
+        Claude fallback generate() call.  Mirror of with_pipeline_deadline()
+        hash-chain mechanics — previous_hash set, context_hash recomputed.
+        """
+        # Slice 89 — follow the exact with_*-helper hash pattern
+        intermediate = dataclasses.replace(
+            self,
+            exploration_manifest=manifest,
+            previous_hash=self.context_hash,
+            context_hash="",  # placeholder — recomputed below
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
 
 
 # ---------------------------------------------------------------------------

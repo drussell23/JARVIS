@@ -2109,6 +2109,78 @@ def _build_lean_strategic_context() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Slice 89 — ExplorationManifest prompt block builder
+# ---------------------------------------------------------------------------
+
+
+def _build_exploration_manifest_block(manifest: Any) -> str:
+    """Build the '## Prior Exploration (DoubleWord)' prompt block.
+
+    Called by both ``_build_lean_codegen_prompt`` and ``_build_codegen_prompt``
+    when ``JARVIS_EXPLORATION_MANIFEST_ENABLED=true`` and ``ctx.exploration_manifest``
+    is non-None.
+
+    The block is an OBSERVATION, not a hard constraint — tool autonomy is
+    preserved.  The directive "do not redo directory scans/initial searches"
+    is advisory so the model can still call tools if it needs more context.
+
+    Slice 89 — never raises.
+    """
+    # m1 — per-list caps prevent prompt-token blowup on long DW loops.
+    _MAX_TARGET_FILES = 20
+    _MAX_SEARCH_TOKENS = 10
+    _MAX_FAILED_TESTS = 10
+    try:
+        target_files = getattr(manifest, "verified_target_files", ()) or ()
+        search_tokens = getattr(manifest, "high_signal_search_tokens", ()) or ()
+        failed_tests = getattr(manifest, "failed_test_commands", ()) or ()
+        tool_count = getattr(manifest, "tool_call_count", 0) or 0
+
+        lines = [
+            "## Prior Exploration (DoubleWord)",
+            "",
+            f"The primary provider (DoubleWord) completed {tool_count} tool call(s) "
+            "before failing. The repository workspace has been pre-localized. "
+            "Do not redo directory scans or initial searches for these already-"
+            "identified files; analyze them directly and compile the patch.",
+        ]
+
+        if target_files:
+            lines.append("")
+            lines.append("### Pre-localized target files")
+            _shown_tf = target_files[:_MAX_TARGET_FILES]
+            _extra_tf = len(target_files) - len(_shown_tf)
+            for f in _shown_tf:
+                lines.append(f"- `{f}`")
+            if _extra_tf > 0:
+                lines.append(f"- _(+{_extra_tf} more)_")
+
+        if search_tokens:
+            lines.append("")
+            lines.append("### High-signal search patterns (already resolved)")
+            _shown_st = search_tokens[:_MAX_SEARCH_TOKENS]
+            _extra_st = len(search_tokens) - len(_shown_st)
+            for tok in _shown_st:
+                lines.append(f"- `{tok}`")
+            if _extra_st > 0:
+                lines.append(f"- _(+{_extra_st} more)_")
+
+        if failed_tests:
+            lines.append("")
+            lines.append("### Failed test commands (known failing)")
+            _shown_ft = failed_tests[:_MAX_FAILED_TESTS]
+            _extra_ft = len(failed_tests) - len(_shown_ft)
+            for cmd in _shown_ft:
+                lines.append(f"- `{cmd}`")
+            if _extra_ft > 0:
+                lines.append(f"- _(+{_extra_ft} more)_")
+
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — Slice 89 never-raises contract
+        return ""
+
+
 def _build_lean_codegen_prompt(
     ctx: "OperationContext",
     repo_root: Optional[Path] = None,
@@ -2397,6 +2469,20 @@ Rules:
                 "(tool, arguments_hash) and that earns zero new credit.\n"
                 "</model_self_commitment>"
             )
+
+    # Slice 89 — Prior Exploration block (DW→Claude handoff mesh).
+    # Injected only when JARVIS_EXPLORATION_MANIFEST_ENABLED=true AND
+    # the context carries a non-None ExplorationManifest.
+    # When flag is OFF (default §33.1), this block is a no-op and the
+    # prompt is byte-identical to today.
+    _s89_manifest = getattr(ctx, "exploration_manifest", None)
+    _s89_enabled = (
+        os.environ.get(
+            "JARVIS_EXPLORATION_MANIFEST_ENABLED", "false",
+        ).strip().lower() not in ("false", "0", "no", "off")
+    )
+    if _s89_enabled and _s89_manifest is not None:
+        parts.append(_build_exploration_manifest_block(_s89_manifest))
 
     return "\n\n".join(parts)
 
@@ -3093,6 +3179,20 @@ Rules:
         )
         if _mf_block:
             parts.append(_mf_block)
+
+    # Slice 89 — Prior Exploration block (DW→Claude handoff mesh).
+    # Injected only when JARVIS_EXPLORATION_MANIFEST_ENABLED=true AND
+    # the context carries a non-None ExplorationManifest.
+    # When flag is OFF (default §33.1), this block is a no-op and the
+    # prompt is byte-identical to today.
+    _s89_manifest = getattr(ctx, "exploration_manifest", None)
+    _s89_enabled = (
+        os.environ.get(
+            "JARVIS_EXPLORATION_MANIFEST_ENABLED", "false",
+        ).strip().lower() not in ("false", "0", "no", "off")
+    )
+    if _s89_enabled and _s89_manifest is not None:
+        parts.append(_build_exploration_manifest_block(_s89_manifest))
 
     prompt = "\n\n".join(parts)
 
