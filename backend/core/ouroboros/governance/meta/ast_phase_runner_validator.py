@@ -876,8 +876,184 @@ def _check_module_name(
 
 
 # ---------------------------------------------------------------------------
+# Slice-86: bounded constant string folder (chr_constructed_attr closure)
+# ---------------------------------------------------------------------------
+
+#: Maximum AST nodes visited while folding one expression.
+#: Prevents a hand-crafted deeply-nested expression from pinning the walk.
+#: 96 (raised from 64 in Slice-86 review) so a fully all-chr()-encoded
+#: ``__subclasses__`` (~82 AST nodes) folds within budget.
+_FOLD_MAX_NODES: int = 96
+
+
+def _fold_const_str(node: ast.AST, _budget: Optional[List[int]] = None) -> Optional[str]:
+    """Best-effort bounded constant-folder for string expressions.
+
+    Resolves constant-foldable string expressions to their string value so
+    that a chr()-constructed banned attribute name (e.g. ``"__subclasses__"``
+    built via ``chr(95)+chr(95)+"subclasses"+chr(95)+chr(95)``) can be
+    detected by Pattern 2 of :func:`_find_introspection_escape`.
+
+    Foldable forms:
+      * String literal constant:       ``"__sub"``  →  ``"__sub"``
+      * ``chr(<int constant>)``:        ``chr(95)``  →  ``"_"``
+      * ``BinOp(a, Add, b)`` concat:   ``"a" + "b"``  →  ``"ab"``
+      * ``"".join([...literals...])``:  ``"".join([chr(95), "x"])``  →  ``"_x"``
+      * ``.format()`` best-effort:      only when no ``{`` remains after folding
+
+    Invariants (load-bearing):
+      * FAIL-OPEN: returns ``None`` on ANY ambiguous, unrecognised, or
+        oversized expression — NEVER raises.
+      * NEVER blocks on its own (the caller only flags when the folded value
+        is also a banned attr name in a banned sink).
+      * Node-budget cap of ``_FOLD_MAX_NODES`` prevents CPU pinning.
+      * Only ADDS detections; existing rules apply independently.
+    """
+    if _budget is None:
+        _budget = [_FOLD_MAX_NODES]
+    if _budget[0] <= 0:
+        return None
+    _budget[0] -= 1
+
+    try:
+        # Case 1: bare string constant
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return node.value
+            return None
+
+        # Case 2: chr(<int constant>)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "chr"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                return chr(arg.value)
+            return None
+
+        # Case 3: BinOp string concatenation ("a" + "b")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = _fold_const_str(node.left, _budget)
+            if left is None:
+                return None
+            right = _fold_const_str(node.right, _budget)
+            if right is None:
+                return None
+            return left + right
+
+        # Case 4: "".join([...string/chr literals...])
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            # Separator must be a foldable string (typically "")
+            sep = _fold_const_str(node.func.value, _budget)
+            if sep is None:
+                return None
+            arg = node.args[0]
+            # Argument must be a List or Tuple of foldable elements
+            if not isinstance(arg, (ast.List, ast.Tuple)):
+                return None
+            parts: List[str] = []
+            for elt in arg.elts:
+                v = _fold_const_str(elt, _budget)
+                if v is None:
+                    return None
+                parts.append(v)
+            return sep.join(parts)
+
+        # Case 5: best-effort .format() — only when no { remains after fold
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and not node.keywords
+        ):
+            template = _fold_const_str(node.func.value, _budget)
+            if template is None or "{" in template:
+                return None
+            # No placeholders in template — result is just the template
+            return template
+
+    except Exception:  # pragma: no cover — fail-open on any unexpected error
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Rule-7 helper: introspection-escape detector (Phase 7.7)
 # ---------------------------------------------------------------------------
+
+
+def _walk_own_body(func_node: ast.AST):
+    """ast.walk but STOPS at nested function/async-function boundaries.
+
+    Yields every descendant of ``func_node`` except nodes inside inner
+    ``FunctionDef`` / ``AsyncFunctionDef`` children.  Used by
+    :func:`_build_folded_name_map` so that a name assigned inside a nested
+    helper (e.g. ``n = chr(95)+...+"subclasses"+...``) does NOT pollute the
+    outer function's name map and create false-positive introspection blocks.
+
+    The outer loop in :func:`_find_introspection_escape_via_name_map` already
+    visits each nested function as its own ``func_node``, so per-function
+    isolation is preserved — only the internal walk of
+    ``_build_folded_name_map`` needs this restriction.
+
+    NEVER raises.
+    """
+    work = list(ast.iter_child_nodes(func_node))
+    while work:
+        node = work.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            work.extend(ast.iter_child_nodes(node))
+
+
+def _build_folded_name_map(func_node: ast.AST) -> dict:
+    """Walk all Assign nodes within a function (including nested blocks
+    such as ``try``/``with``/``if``) for simple ``name = <foldable>``
+    patterns and return a ``{name: folded_str}`` map.
+
+    Only captures single-target Assign nodes where the target is a bare
+    Name and the RHS folds to a non-None string via :func:`_fold_const_str`.
+    This is the intra-scope complement to Pattern 2 for the chr-constructed-
+    attr gap: a candidate may assign the constructed name to a local before
+    passing it to getattr.
+
+    Uses :func:`_walk_own_body` (not ``ast.walk``) so that assignments inside
+    nested function defs do NOT bleed into the outer function's map — last-
+    write-wins dict semantics would otherwise cause a false positive when a
+    benign outer ``getattr(x, n)`` shares a variable name with a banned
+    assignment inside an inner helper.
+
+    Note: ``ast.AugAssign`` (``n += ...``) is deliberately NOT tracked here
+    — the result depends on the prior value of ``n``, which requires flow
+    analysis beyond what this fail-open folder provides.  Fail-open by design.
+
+    NEVER raises; returns empty dict on any error.
+    """
+    result: dict = {}
+    try:
+        for sub in _walk_own_body(func_node):
+            if (
+                isinstance(sub, ast.Assign)
+                and len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Name)
+            ):
+                folded = _fold_const_str(sub.value)
+                if folded is not None:
+                    result[sub.targets[0].id] = folded
+    except Exception:  # pragma: no cover
+        pass
+    return result
 
 
 def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
@@ -890,9 +1066,12 @@ def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
          e.g. ``object.__subclasses__()``, ``cls.__bases__``,
          ``instance.__class__``. Catches any Attribute node anywhere
          in any function body.
-      2. ast.Call to ``getattr(x, "<banned>")`` with a string-literal
-         second argument matching a banned name. Defends against
-         operator string-encoding the attr to bypass Pattern 1.
+      2. ast.Call to ``getattr(x, "<banned>")`` with a second argument
+         that resolves (via literal, direct constant-folding, or
+         intra-scope name-assignment) to a banned attribute name. Defends
+         against operator string-encoding the attr to bypass Pattern 1
+         (Slice-86 closure: chr()-constructed names, concat-constructed
+         names, and named-variable intermediates).
       3. ast.Call to ``__import__("...")`` / ``importlib.import_module``
          with a string literal — these are NOT directly the introspection
          vector but they're the *next-step* escape primitive (once you
@@ -918,19 +1097,72 @@ def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
                     f"introspection_escape:attr={node.attr}:"
                     f"shape={shape}"
                 )
-        # Pattern 2: getattr(x, "<banned>") with string literal
+        # Pattern 2: getattr(x, <banned>) — literal or directly
+        # chr-constructed / concat-constructed expression.
         if isinstance(node, ast.Call):
             if _is_getattr_call(node) and len(node.args) >= 2:
                 second = node.args[1]
                 attr_name = _string_constant_value(second)
+                # Slice-86: if not a bare literal, try constant-folding
+                # (handles chr()-constructed and concat-constructed names
+                # passed directly as the second argument).
+                folded = (
+                    attr_name
+                    if attr_name is not None
+                    else _fold_const_str(second)
+                )
                 if (
-                    attr_name is not None
-                    and attr_name in _BANNED_INTROSPECTION_ATTRS
+                    folded is not None
+                    and folded in _BANNED_INTROSPECTION_ATTRS
                 ):
-                    return (
-                        f"introspection_escape:getattr_string="
-                        f"{attr_name}"
+                    kind = (
+                        "getattr_string"
+                        if attr_name is not None
+                        else "getattr_constructed"
                     )
+                    return (
+                        f"introspection_escape:{kind}="
+                        f"{folded}"
+                    )
+    # Second pass: walk function bodies with intra-scope name maps for
+    # the two-step chr-constructed pattern: ``n = chr(...)+...`` then
+    # ``getattr(x, n)`` where the constructed name is a banned attr.
+    return _find_introspection_escape_via_name_map(tree)
+
+
+def _find_introspection_escape_via_name_map(tree: ast.AST) -> Optional[str]:
+    """Second-pass helper: walk all function bodies, build a per-body
+    ``name→folded`` map, and flag any getattr call whose second argument
+    is a Name that maps to a banned attr.
+
+    Called by :func:`_find_introspection_escape` after the main walk
+    (which handles direct-literal and direct-chr-expr patterns).
+
+    NEVER raises.
+    """
+    try:
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name_map = _build_folded_name_map(node)
+            if not name_map:
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Call):
+                    continue
+                if not (_is_getattr_call(sub) and len(sub.args) >= 2):
+                    continue
+                second = sub.args[1]
+                if not isinstance(second, ast.Name):
+                    continue
+                folded = name_map.get(second.id)
+                if folded is not None and folded in _BANNED_INTROSPECTION_ATTRS:
+                    return (
+                        f"introspection_escape:getattr_constructed="
+                        f"{folded}"
+                    )
+    except Exception:  # pragma: no cover
+        pass
     return None
 
 

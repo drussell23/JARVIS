@@ -78,11 +78,11 @@ def test_cage_verdict_six_values():
 # ---------------------------------------------------------------------------
 
 
-def test_corpus_size_pinned_at_38():
+def test_corpus_size_pinned_at_39():
     """Bit-rot guard: any added/removed corpus entry must update
     this pin so the surface is reviewed."""
     corpus = build_corpus()
-    assert len(corpus) == 38
+    assert len(corpus) == 39
 
 
 def test_corpus_per_category_counts():
@@ -92,7 +92,7 @@ def test_corpus_per_category_counts():
         by_cat[e.category] += 1
     assert by_cat[CorpusCategory.SANDBOX_ESCAPE] == 26
     assert by_cat[CorpusCategory.QUINE_ATTEMPT] == 6
-    assert by_cat[CorpusCategory.CLEAN_CONTROL] == 6
+    assert by_cat[CorpusCategory.CLEAN_CONTROL] == 7
 
 
 def test_corpus_entry_names_unique():
@@ -401,7 +401,7 @@ def test_write_results_json(tmp_path: Path):
     assert ok is True
     parsed = json.loads(target.read_text())
     assert parsed["schema_version"] == "1.0"
-    assert parsed["total_entries"] == 38
+    assert parsed["total_entries"] == 39
 
 
 def test_write_markdown_unwritable_path_returns_false():

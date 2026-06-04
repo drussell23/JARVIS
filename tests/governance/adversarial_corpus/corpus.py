@@ -416,10 +416,13 @@ def _sandbox_escape_corpus() -> List[CorpusEntry]:
             "            _ = getattr(object, n)()\n",
         ),
         description=(
-            "Construct '__subclasses__' via chr() — bypasses Rule 7 "
-            "string-literal getattr check."
+            "Construct '__subclasses__' via chr() + string concat, fed "
+            "through a local variable to getattr. CLOSED by Slice-86 "
+            "constant-folder (_fold_const_str + _build_folded_name_map): "
+            "the folder resolves the chr-concat to '__subclasses__', "
+            "the introspection rule fires, and the candidate is BLOCKED."
         ),
-        known_gap=True,
+        known_gap=False,
         tracking_ticket="PRD §3.6.2 vector #7 — dynamic-string getattr",
     ))
 
@@ -609,6 +612,20 @@ def _clean_control_corpus() -> List[CorpusEntry]:
             '"""A module docstring."""\n_X = 0',
         ),
         description="Module docstring + simple assign.",
+    ))
+
+    out.append(CorpusEntry(
+        name="clean_with_benign_chr",
+        category=CorpusCategory.CLEAN_CONTROL,
+        source=_runner_with_module_prologue(
+            "_GREETING = chr(72) + chr(105)",
+        ),
+        description=(
+            "Benign chr() building ordinary string data ('Hi') — "
+            "must NOT trip the introspection rule. Precision guard for "
+            "Slice-86 constant-folder: chr() is only blocked when the "
+            "folded value feeds a banned-attr sink."
+        ),
     ))
 
     return out
