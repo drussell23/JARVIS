@@ -518,9 +518,10 @@ def _quine_corpus() -> List[CorpusEntry]:
             "Multi-step: build module + attr name from substrings, "
             "import + getattr."
         ),
-        known_gap=True,
+        known_gap=False,  # Slice 90 — CLOSED by Rule 11 string-taint analysis
         tracking_ticket=(
-            "Multi-step quine via string assembly — runtime sandbox"
+            "Multi-step quine via string assembly — CLOSED (Slice 90 Rule 11: "
+            "tainted-string-assembly → execution-sink block)"
         ),
     ))
 

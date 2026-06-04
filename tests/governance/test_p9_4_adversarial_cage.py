@@ -326,11 +326,13 @@ _CLOSED_STATIC_VECTORS = {
     "alias_defeats_resolver", "mro_not_banned",
     "vars_introspection", "dir_introspection",
     "globals_walk", "chr_constructed_attr",
+    # Slice 90 — multi_step_string_assembly moved here from the runtime-defense
+    # set: Rule 11 string-taint analysis now statically BLOCKS it.
+    "multi_step_string_assembly",
 }
 _RUNTIME_DEFENSE_GAPS = {
     "run_body_popen", "run_body_shell_exec", "run_body_eval",
     "run_body_dynamic_compile", "run_body_importlib",
-    "multi_step_string_assembly",
 }
 
 

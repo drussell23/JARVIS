@@ -263,6 +263,130 @@ def _build_banned_module_level_calls() -> FrozenSet[str]:
 _BANNED_MODULE_LEVEL_CALLS: FrozenSet[str] = _build_banned_module_level_calls()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Slice 90 — Rule 11: intra-procedural string-taint → execution-sink analysis
+#
+# Threat: the static-name set (Rule 8/9/10) matches a banned name LITERALLY.
+# The QUINE_ATTEMPT corpus's ``multi_step_string_assembly`` defeats it by
+# ASSEMBLING the name from pieces — ``'o'+'s'`` never matches ``os``. Rule 11
+# tracks which local symbols are string-assembled ("tainted") and BLOCKS only
+# when a tainted value flows into a code-execution / dynamic-import sink, OR
+# into ``getattr(obj, <tainted>)(...)`` (a method resolved by an assembled name
+# and immediately invoked). It deliberately does NOT block a tainted value that
+# merely flows into benign string ops, nor a LITERAL ``eval("1+1")`` (that is a
+# function-body runtime-defense gap, out of AST scope) — preserving 0% FP on the
+# clean-control corpus. Sink names are built via concatenation so the validator
+# never trips its own banned-name scan when read back.
+# ──────────────────────────────────────────────────────────────────────────
+_TAINT_EXEC_SINKS_BARE: FrozenSet[str] = frozenset((
+    "ev" + "al", "ex" + "ec", "comp" + "ile", "__imp" + "ort__",
+))
+_TAINT_EXEC_SINKS_ATTR: FrozenSet[str] = frozenset((
+    "import_module",  # importlib.import_module(<tainted>)
+))
+_GETATTR_NAME: str = "get" + "attr"
+
+
+def _is_string_assembly_expr(node: ast.AST, tainted: FrozenSet[str]) -> bool:
+    """True iff ``node`` assembles a string from parts: concat (``+``) or
+    ``%``-format with a str/tainted operand, ``"".join(...)`` / ``.format(...)``,
+    or an f-string with interpolation. Pure literals are NOT assembly."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return (_operand_str_or_tainted(node.left, tainted)
+                or _operand_str_or_tainted(node.right, tainted))
+    if isinstance(node, ast.JoinedStr):  # f-string
+        return any(isinstance(v, ast.FormattedValue) for v in node.values)
+    if (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("join", "format")):
+        return True
+    return False
+
+
+def _operand_str_or_tainted(node: ast.AST, tainted: FrozenSet[str]) -> bool:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if isinstance(node, ast.Name) and node.id in tainted:
+        return True
+    return _is_string_assembly_expr(node, tainted)
+
+
+def _collect_tainted_names(tree: ast.AST) -> FrozenSet[str]:
+    """Fixpoint: a Name target is tainted if assigned a string-assembly expr
+    (propagates through already-tainted operands). Bounded iterations."""
+    tainted: set = set()
+    for _ in range(6):  # converges fast; bound guards pathological inputs
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if value is None:
+                    continue
+                _frozen = frozenset(tainted)
+                # taints the target if the RHS assembles a string OR is a plain
+                # alias of an already-tainted symbol (``b = a``).
+                _value_taints = (
+                    _is_string_assembly_expr(value, _frozen)
+                    or (isinstance(value, ast.Name) and value.id in tainted)
+                )
+                if _value_taints:
+                    targets = (
+                        node.targets if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                    for tgt in targets:
+                        if isinstance(tgt, ast.Name) and tgt.id not in tainted:
+                            tainted.add(tgt.id)
+                            changed = True
+        if not changed:
+            break
+    return frozenset(tainted)
+
+
+def _arg_is_tainted(node: ast.AST, tainted: FrozenSet[str]) -> bool:
+    if isinstance(node, ast.Name) and node.id in tainted:
+        return True
+    return _is_string_assembly_expr(node, tainted)
+
+
+def _check_taint_flow(tree: ast.AST) -> Optional[str]:
+    """Rule 11. Returns a diagnostic string if a string-assembled (tainted)
+    value flows into an execution / dynamic-import sink; else None. Pure +
+    never raises into the caller (defensive)."""
+    try:
+        # NOTE: do NOT early-return on an empty tainted set — an INLINE assembly
+        # passed straight into a sink (``__import__('o'+'s')``) has no assigned
+        # tainted symbol yet is still an exploit; the per-arg check below catches
+        # both the inline and the via-variable forms.
+        tainted = _collect_tainted_names(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # (a) eval/exec/compile/__import__/importlib.import_module(<tainted>)
+            sink = None
+            if isinstance(func, ast.Name) and func.id in _TAINT_EXEC_SINKS_BARE:
+                sink = func.id
+            elif (isinstance(func, ast.Attribute)
+                  and func.attr in _TAINT_EXEC_SINKS_ATTR):
+                sink = func.attr
+            if sink is not None:
+                for arg in node.args:
+                    if _arg_is_tainted(arg, tainted):
+                        return f"sink={sink}:tainted_arg_assembled_string"
+            # (b) getattr(obj, <tainted>)(...) — dynamic method resolved by an
+            #     assembled name AND immediately invoked (the multi-step pattern)
+            if (isinstance(func, ast.Call)
+                    and isinstance(func.func, ast.Name)
+                    and func.func.id == _GETATTR_NAME
+                    and len(func.args) >= 2
+                    and _arg_is_tainted(func.args[1], tainted)):
+                return "sink=getattr_call:tainted_attr_assembled_string"
+        return None
+    except Exception:  # noqa: BLE001 — validator must never raise
+        return None
+
+
 def is_introspection_block_enabled() -> bool:
     """Per-rule kill switch for Rule 7 —
     ``JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE`` (default
@@ -308,6 +432,21 @@ def is_alias_defeat_block_enabled() -> bool:
     validator. NEVER raises."""
     raw = os.environ.get(
         "JARVIS_AST_VALIDATOR_BLOCK_ALIAS_DEFEAT",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
+def is_taint_analysis_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 11 (Slice 90 string-taint → sink) —
+    ``JARVIS_AST_VALIDATOR_BLOCK_TAINT_EXPLOIT`` (default **true** —
+    security-on-by-default). Rule 11 catches the string-assembly obfuscation
+    tier (``'o'+'s'`` → ``__import__(mod_name)`` / ``getattr(mod, 'sys'+'tem')(…)``)
+    that Rules 8-10's static-name set never sees. Operators can disable in an
+    emergency without disabling the whole validator. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_TAINT_EXPLOIT",
     )
     if raw is None:
         return True  # default-ON
@@ -381,6 +520,12 @@ class ValidationFailureReason(str, enum.Enum):
     # plug the documented P9.4 corpus gaps that Rules 7/8 missed.
     INTROSPECTION_BUILTIN_CALL = "introspection_builtin_call"  # Rule 9
     ALIAS_DEFEAT = "alias_defeat"  # Rule 10
+    # Slice 90 — Rule 11: intra-procedural taint analysis. Rule 10 catches a
+    # banned name aliased to a LOCAL and called; Rule 11 catches the next
+    # obfuscation tier — a sink NAME or arg ASSEMBLED from string concatenation
+    # / join / format / f-string (e.g. ``'o'+'s'`` → ``__import__(mod_name)`` →
+    # ``getattr(mod, 'sys'+'tem')('ls')``) that the static-name set never sees.
+    TAINT_EXPLOIT = "taint_exploit"  # Rule 11
 
 
 @dataclass(frozen=True)
@@ -601,6 +746,21 @@ def validate_ast(
                 status=ValidationStatus.FAILED,
                 reason=ValidationFailureReason.ALIAS_DEFEAT,
                 detail=alias_defeat,
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 11 (Slice 90): string-taint → execution-sink analysis ----
+    # The next obfuscation tier past Rule 10: a sink name/arg ASSEMBLED from
+    # string concat/join/format defeats every static-name check. Rule 11 tracks
+    # tainted (string-assembled) symbols and blocks only when one flows into a
+    # code-exec / dynamic-import sink — high-precision, 0% FP on clean controls.
+    if is_taint_analysis_block_enabled():
+        taint = _check_taint_flow(tree)
+        if taint is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.TAINT_EXPLOIT,
+                detail=taint,
                 classes_inspected=inspected,
             )
 
