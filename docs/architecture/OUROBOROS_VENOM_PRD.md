@@ -2849,6 +2849,20 @@ Closes open items (1) and (2) above; surfaces an honest FAIL on (3). Ledger arti
 
 **Honest limitation.** The corpus cache persists only metadata (`mutated_source_bytes`, `strategy`, `verdict`) — not the escaped source — so a rigorous *runtime-vs-static-fixable* per-escape split is not computable from this run. Slice 95d adds escaped-source capture; Slice 95e publishes the split + a true-scale (≥3,000) `production_parity_ledger_v2.json`; Slice 95f+ hardens the static-catchable surface forms via dynamic AST tree-walking (no hardcoded string matches), re-measuring after each.
 
+##### §41.11.2-95e — True-scale batched run + honest dual-metric ledger v2 (2026-06-05)
+
+Supersedes the §41.11.2-95c v1 baseline. Ledger artifact: `docs/security/production_parity_ledger_v2.json`. Batching engine (Slice 95d) + escape-source capture both on.
+
+**Result (1,566 mutations, Aegis-routed $5.27, canary-attested): `8.91%` gross escape → FAIL (> 4.4%).** The escape rate ROSE vs v1 (6.42% over 658) — a larger, more diverse LLM sample finds more bypasses, so **v1 underestimated**; v2 is the more trustworthy baseline. Dual metric: deterministic-operator escape **0.0%** (the 8 mechanical operators never escaped); all 135 escapes were novel LLM `identity`-strategy variants (~10.6% LLM-only). Budget bound the run at 1,566 (literal ≥3,000 ≈ $10); a transient daemon cold-start `TimeoutError` on the first attempt was non-deterministic (retry succeeded — recorded for honesty).
+
+**Rigorous classification (derived by READING the 135 captured escaped sources, not guessing).** The bypasses are dominated by a small set of evasion TECHNIQUES that cut across all 19 escaping families — which is why per-family hardcoding would be wrong:
+1. **Indirection/aliasing** (defeats name-matching): `[os.system][0]('ls')`, `lambda o,n: getattr(o,n)`, helper-fn wrapping, `setattr(self,'_x',eval)`, aliased-import `_pkl.loads(...)`. Fix: light intra-procedural taint of banned callables/names through assignments/containers/lambdas/setattr/module-aliases into call sinks. *Static-fixable.*
+2. **Synonym constructs** (defeats node-type/builtin-name enumeration): list-comprehension vs `for`/`if` statement (Rule 8 P2 only walks statements — `module_level_for_with_call`=32 escapes), `inspect.getmembers` vs `dir`, `setattr(ctx,…)` vs `ctx.x=` (Rule 4), `__getattribute__` vs `getattr`. Fix: walk comprehension/genexp nodes; expand introspection-sink + ctx-mutation node sets. *Static-fixable.*
+3. **Constant-in-variable** (defeats string-literal matching): `lookup='__subclasses__'; …__getattribute__(o,lookup)()`. Fix: bounded constant propagation (the Slice 86 folder is the precedent). *Static-fixable.*
+4. **Runtime-primitive residual**: eval/deserialize of a runtime-constructed value once the reference is dynamically built — the irreducible core is OS-containment (§43 Arc 5 netns+seccomp), not static analysis. *Small residual.*
+
+**Honest conclusion.** The large majority of escapes are static-fixable via three composable AST-tree-walking techniques (no hardcoded matches); a small residual defines the OS-containment boundary. The 135 full-source escapes are captured at `.jarvis/antivenom_escapes.jsonl` (gitignored) for Phase-4 hardening. Roadmap: 95f (synonym constructs — lowest-risk, highest-count) → 95g (indirection taint) → 95h (constant propagation), re-measuring the escape-rate descent after each.
+
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
 **The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
