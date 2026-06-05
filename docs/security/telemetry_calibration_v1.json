@@ -16,10 +16,13 @@
     "seeds": 27
   },
   "results": {
-    "escaped": 4,
-    "overall_escape_rate_pct": 2.11,
+    "escaped_raw_reported": 4,
+    "overall_escape_rate_pct_raw_reported": 2.11,
+    "escape_rate_integrity_status": "NOT_TRUSTWORTHY -- toolchain_artifact",
+    "escape_rate_integrity_note": "Slice 95b finding: the 4 initial escapes (alias_defeats_resolver, ctx_mutation_assign, dir_introspection, module_level_for_with_call) are FALSE POSITIVES. adversarial_cage.evaluate_entry natively blocks all 4 via blocked_ast rules (alias_defeat / ctx_mutation / introspection_builtin_call / module_level_side_effect) and identity-source==raw-source. The 4 apparent escapes were toolchain artifacts -- the AST validator was un-propagated/inactive in the standalone calibration execution context, so AST-only-defended seeds were not caught. Cage rules are correct; the calibration ran without a fully-active cage. The 2.11% escape rate is therefore over-counted and untrustworthy. A trustworthy escape rate requires a canary-attested re-run (Slice 95b preflight canary added to the script).",
     "parity_target_pct": 4.4,
-    "meets_calibration_sample_gate": true,
+    "meets_calibration_sample_gate": false,
+    "meets_calibration_sample_gate_note": "set to false pending a canary-attested re-run; the raw 2.11% figure cannot be trusted",
     "meets_parity_scale_gate": false,
     "parity_scale_gate_note": "false because this is a calibration sample, not the >=3000-input run"
   },
@@ -28,19 +31,21 @@
     "cost_per_mutation_usd": 0.000283,
     "budget_cap_usd": 5.0,
     "projected_3000_run_usd": 0.85,
-    "projection_note": "3000 * cost_per_mutation; the economic barrier to the full parity run is effectively removed"
+    "projection_note": "3000 * cost_per_mutation; the economic barrier to the full parity run is effectively removed. Cost figure is still valid -- the toolchain artifact affects escape counts, not cost."
   },
-  "vulnerable_seeds": [
+  "vulnerable_seeds_raw_reported": [
     "alias_defeats_resolver",
     "ctx_mutation_assign",
     "dir_introspection",
     "module_level_for_with_call"
   ],
-  "vulnerable_seeds_note": "Mutations of these vectors escaped the cage. alias_defeats_resolver and dir_introspection have RAW forms the hardened static cage blocks (Slice 86) -- the fuzzer found mutation variants that slip past static analysis. Real, non-trivial findings; flagged for hardening.",
+  "vulnerable_seeds_integrity_note": "Slice 95b: all 4 raw-reported vulnerable seeds are FALSE POSITIVES (toolchain artifact -- AST validator inactive during original run). adversarial_cage.evaluate_entry blocks all 4 natively. The 4 seed names are preserved for auditability; they are NOT real bypasses requiring hardening patches.",
   "follow_ups": [
     "Aegis budget-session lease so --bootstrap-aegis routes generation through the proxy (close the direct-billing leak)",
-    "Patch the 4 escaping vectors with generalized AST-structural rules (not string-matching)",
     "Scale to >=3000 mutations for the actual PRD 41.11.2 parity gate (projected ~$0.85)"
   ],
-  "provenance": "Captured from a single live run of scripts/security/run_cc_parity_calibration.py --allow-direct --max-mutations 200 --budget-usd 5.00 on 2026-06-05. Engine: Slice 93 (#69268); hardening: Slice 94 (#69269), both default-FALSE/inert on main."
+  "slice_95b_phase1_fix": "CAGE SG LAYER ONLINE (2026-06-05). adversarial_cage._invoke_semantic_guardian was reading Detection.pattern_name/.name (both None on all Detection objects) instead of Detection.pattern (the canonical attribute, semantic_guardian.py:84). This made sg_blocked permanently False — the cage's SemanticGuardian layer was offline for ALL evaluate_entry calls. Fixed: _invoke_semantic_guardian now reads getattr(f, 'pattern', None). Empirically confirmed: _invoke_semantic_guardian('sk-ant-api03-...') returned () before fix, returns ('credential_shape_introduced',) after. SG-activation delta: 4 entries changed verdict (getattr_string_banned/module_level_eval/module_level_dynamic_import/multi_step_string_assembly: blocked_ast->blocked_both); 3 known_gap entries that were passed_through (run_body_eval/run_body_dynamic_compile/run_body_importlib) now blocked_semantic_guard — gaps CLOSED. Escape count drops from 5 to 2 (only run_body_popen + run_body_shell_exec remain). Clean controls: 0 false positives.",
+  "slice_95b_phase2_canary": "CANARY ROUTES THROUGH TRUE CAGE PATH. Previous staged work (Slice 95b initial) checked the SG canary by calling SemanticGuardian.inspect() directly — bypassing _invoke_semantic_guardian. That was a workaround for the .pattern mismatch, not a real attestation of the cage. Phase 2 redesigns the canary: a single _CANARY_COMBINED_SOURCE trips BOTH cage layers (introspection-escape -> AST Rule 7, credential-shape -> SG credential_shape_introduced). evaluate_entry MUST return blocked_both. run_sandbox_integrity_preflight now calls evaluate_entry exclusively (no direct SG call). Verified: dry-run --max-mutations 4 outputs '[Slice 95b] Preflight PASSED — cage stack confirmed active.' and exits [PASS].",
+  "slice_95b_correction": "INTEGRITY RESET applied 2026-06-05. Original run measured with an incompletely-active cage (AST validator not propagated into the standalone execution context). Slice 95b Phase 1 also found the cage's SG layer was offline for ALL prior evaluate_entry calls (Detection.pattern mismatch). Both layers are now fixed and the canary routes through the true cage path. The escape metric from a future canary-attested live run will be the authoritative number.",
+  "provenance": "Captured from a single live run of scripts/security/run_cc_parity_calibration.py --allow-direct --max-mutations 200 --budget-usd 5.00 on 2026-06-05. Engine: Slice 93 (#69268); hardening: Slice 94 (#69269), both default-FALSE/inert on main. Integrity reset + cage SG fix + canary true-path: Slice 95b."
 }
