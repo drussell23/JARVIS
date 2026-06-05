@@ -341,6 +341,16 @@ _TAINT_EXEC_SINKS_ATTR: FrozenSet[str] = frozenset((
     "import_module",  # importlib.import_module(<tainted>)
 ))
 _GETATTR_NAME: str = "get" + "attr"
+# Slice 95h — the attr-resolution sinks whose KEY argument (position 1) is an
+# attribute name. ``getattr``/``setattr``/``delattr`` all take ``(obj, name,
+# ...)``; a banned reflection attr name in that key position is unambiguous
+# reflection-escape intent regardless of whether the result is called. Built
+# via concatenation so the validator never trips its own banned-name scan.
+_SETATTR_NAME: str = "set" + "attr"
+_DELATTR_NAME: str = "del" + "attr"
+_ATTR_KEY_SINKS: FrozenSet[str] = frozenset((
+    _GETATTR_NAME, _SETATTR_NAME, _DELATTR_NAME,
+))
 
 
 def _is_string_assembly_expr(node: ast.AST, tainted: FrozenSet[str]) -> bool:
@@ -399,6 +409,70 @@ def _collect_tainted_names(tree: ast.AST) -> FrozenSet[str]:
     return frozenset(tainted)
 
 
+def _collect_banned_const_names(tree: ast.AST) -> FrozenSet[str]:
+    """Slice 95h. Fixpoint collecting names bound to a PLAIN string ``Constant``
+    whose VALUE is a banned reflection attr name (``_BANNED_INTROSPECTION_ATTRS``),
+    propagating through plain aliases (``b = a``). Mirrors ``_collect_tainted_names``'
+    shape and bound.
+
+    Conservative by construction:
+      * ONLY ``ast.Constant`` strings whose value is in the banned reflection
+        attr set are seeded (a benign ``x = "hello"`` / ``s = "__main__"`` is
+        NEVER collected — ``__main__``/``__doc__``/``__name__`` are not banned
+        reflection attrs).
+      * String-ASSEMBLY exprs are intentionally NOT collected here (those remain
+        Rule 11's existing taint domain) — only literal constants.
+
+    Never raises (caller wraps, but this is also independently defensive)."""
+    banned: set = set()
+    for _ in range(6):  # converges fast; bound guards pathological inputs
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            # seed: plain string Constant whose value is a banned reflection attr
+            if (isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                    and value.value in _BANNED_INTROSPECTION_ATTRS):
+                _value_is_banned_const = True
+            # propagate: plain alias of an already-banned-const symbol
+            elif isinstance(value, ast.Name) and value.id in banned:
+                _value_is_banned_const = True
+            else:
+                _value_is_banned_const = False
+            if _value_is_banned_const:
+                targets = (
+                    node.targets if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name) and tgt.id not in banned:
+                        banned.add(tgt.id)
+                        changed = True
+        if not changed:
+            break
+    return frozenset(banned)
+
+
+def _attr_key_is_banned_const(
+    node: ast.AST, banned_consts: FrozenSet[str],
+) -> bool:
+    """Slice 95h. True iff ``node`` (the KEY/attr-name argument of a
+    getattr/setattr/delattr call) is a banned reflection attr name —
+    EITHER as a plain inline string ``Constant`` whose value is banned, OR a
+    ``Name`` proven to hold such a constant (``banned_consts``)."""
+    if (isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _BANNED_INTROSPECTION_ATTRS):
+        return True
+    if isinstance(node, ast.Name) and node.id in banned_consts:
+        return True
+    return False
+
+
 def _arg_is_tainted(node: ast.AST, tainted: FrozenSet[str]) -> bool:
     if isinstance(node, ast.Name) and node.id in tainted:
         return True
@@ -415,10 +489,26 @@ def _check_taint_flow(tree: ast.AST) -> Optional[str]:
         # tainted symbol yet is still an exploit; the per-arg check below catches
         # both the inline and the via-variable forms.
         tainted = _collect_tainted_names(tree)
+        # Slice 95h — names proven to hold a PLAIN string literal that IS a
+        # banned reflection attr name. Drives the additive (c) check below.
+        banned_consts = _collect_banned_const_names(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
+            # (c) Slice 95h: getattr/setattr/delattr(obj, <banned-attr-name>, ...)
+            #     where the KEY arg is a banned reflection attr name held in a
+            #     plain-literal local (banned-const propagation) OR an inline
+            #     banned string Constant. A banned reflection attr name in the
+            #     key position is unambiguous reflection-escape intent — flagged
+            #     WHETHER OR NOT the result is immediately called (unlike (b),
+            #     which only caught the immediately-called assembled form). This
+            #     is additive; (a)/(b) below remain intact.
+            if (isinstance(func, ast.Name)
+                    and func.id in _ATTR_KEY_SINKS
+                    and len(node.args) >= 2
+                    and _attr_key_is_banned_const(node.args[1], banned_consts)):
+                return f"sink={func.id}:banned_attr_const_propagated"
             # (a) eval/exec/compile/__import__/importlib.import_module(<tainted>)
             sink = None
             if isinstance(func, ast.Name) and func.id in _TAINT_EXEC_SINKS_BARE:
