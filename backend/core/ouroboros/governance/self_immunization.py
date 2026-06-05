@@ -92,6 +92,37 @@ logger = logging.getLogger(__name__)
 
 SELF_IMMUNIZATION_SCHEMA_VERSION: str = "1.0"
 
+
+# ===========================================================================
+# Slice 94 — Adversarial telemetry panic (loud-fail on zero LLM throughput)
+# ===========================================================================
+
+
+class AdversarialTelemetryPanic(RuntimeError):
+    """Slice 94 — raised when an LLM-enabled calibration run produces
+    ZERO valid mutations, regardless of spend.
+
+    A zero-valid-mutation outcome defeats the purpose of Phase 2 calibration
+    — printing [PASS] would be a lie in either case below:
+
+      * generated_count == 0 AND accumulated_usd == 0.0: auth unresolved /
+        Aegis proxy unreachable — no request ever reached the model.
+      * generated_count == 0 AND accumulated_usd > 0.0: model was reached,
+        tokens were spent, but returned empty/unparseable completions
+        (the "done_before_content" / empty-stream class).
+
+    Raised by ``run_calibration`` in ``run_cc_parity_calibration.py``
+    after the campaign, ONLY when:
+      * dry_run is False (live run was requested)
+      * an LLM provider was injected (not deterministic-only fallback)
+      * provider.generated_count == 0 (zero valid mutations from the LLM)
+
+    The per-mutation provider boundary still NEVER raises
+    (``LLMMutationProvider.mutate`` always returns []).  One bad mutation
+    is not a panic.  Only zero-valid-mutations (with OR without spend) is
+    the signal that the LLM path produced no usable output.
+    """
+
 _ENV_MASTER: str = "JARVIS_ANTIVENOM_SELF_IMMUNIZATION_ENABLED"
 _ENV_MUTATIONS_PER_PATTERN: str = "JARVIS_ANTIVENOM_MUTATIONS_PER_PATTERN"
 _ENV_TARGET_ESCAPE_RATE: str = "JARVIS_ANTIVENOM_TARGET_ESCAPE_RATE"
@@ -592,6 +623,10 @@ class LLMMutationProvider:
         self._budget_guard = budget_guard
         self._model = model
         self._max_tokens = max_tokens
+        # Slice 94 — monotonically-increasing count of mutations returned
+        # by this provider across all mutate() calls in a session.  Used by
+        # run_calibration to detect zero-throughput auth failures.
+        self.generated_count: int = 0
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -716,6 +751,10 @@ class LLMMutationProvider:
             valid = [
                 c for c in raw_candidates if self._is_valid_python(c)
             ]
+            # Slice 94 — increment generated_count so run_calibration can
+            # detect zero-throughput auth failures (never > 0 when auth
+            # silently fails and response is empty).
+            self.generated_count += len(valid)
             return valid
 
         except asyncio.CancelledError:
