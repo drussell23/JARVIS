@@ -144,6 +144,27 @@ _BANNED_INTROSPECTION_ATTRS: FrozenSet[str] = frozenset({
     "f_back",
     "f_globals",
     "f_locals",
+    # Slice 95f (2026-06-05) — adaptive synonym hardening. The Slice
+    # 95e2 true-scale benchmark (8.8% escape) captured the
+    # ``__getattribute__`` / ``__getattr__`` reflection dunders used to
+    # bypass Rule-7's attribute-NAME matching and Rule-9's bare-name
+    # ``getattr`` check:
+    #   * ``object.__getattribute__(object, "__subclasses__")``
+    #   * ``type.__getattribute__(object, '__subclasses__')()``
+    # These are introspection/reflection dunders with effectively NO
+    # benign use in a phase runner — the existing visit_Attribute path
+    # (Pattern 1 of _find_introspection_escape) catches them once they
+    # are in this set. Reuses the existing
+    # JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE kill-switch (same
+    # rule's attribute set — no new flag).
+    #
+    # DELIBERATELY EXCLUDED for FP-safety: ``__setattr__`` /
+    # ``__delattr__`` (object's normal write protocol — benign uses
+    # exist) are NOT added; the ctx-write synonym is handled
+    # structurally by Rule 4's setattr/delattr(ctx, ...) extension
+    # instead, which is scoped to the ctx name and so FP-free.
+    "__getattribute__",
+    "__getattr__",
 })
 
 
@@ -174,6 +195,41 @@ _BANNED_INTROSPECTION_BUILTIN_CALLS: FrozenSet[str] = frozenset({
     "globals",
     "locals",
     "type",
+})
+
+
+# Slice 95f (2026-06-05) — Rule 12: the ``inspect`` module reflection API.
+# The Slice 95e2 benchmark captured ``inspect.getmembers(self)`` /
+# ``inspect.getattr_static(...)`` escapes. These are ``ast.Attribute`` calls
+# (``inspect.<name>``), NOT bare-Name calls, so Rule 9
+# (_BANNED_INTROSPECTION_BUILTIN_CALLS) never sees them. Rule 12 flags an
+# ``ast.Call`` whose func is ``ast.Attribute(value=Name(id="inspect"),
+# attr=<in this set>)``.
+#
+# Scoped to the REFLECTION-ONLY surface of the inspect module — the functions
+# that project object/type internals (member tables, the MRO, static attribute
+# resolution, annotation maps). Each has effectively no benign use in a phase
+# runner and is a documented introspection-escape primitive:
+#   * getmembers      — walks every (name, value) pair on an object/type
+#   * getattr_static  — resolves attributes bypassing __getattribute__
+#   * getmro          — returns the method-resolution order (→ object →
+#                       __subclasses__)
+#   * get_annotations — projects the annotation map (computed-name mining)
+#
+# DELIBERATELY EXCLUDED for FP-safety (benign, kept allowed): ``signature``,
+# ``isfunction``, ``ismethod``, ``getdoc``, ``getsource``, ``cleandoc``,
+# ``currentframe`` (frame attrs are already caught by Rule 7) and the rest of
+# the inspect surface. Banning those would false-positive on legitimate
+# introspection of a runner's OWN helpers (signature/doc inspection is a
+# common, harmless pattern).
+#
+# Per-rule kill-switch JARVIS_AST_VALIDATOR_BLOCK_INSPECT_INTROSPECTION
+# (default TRUE — security-on-by-default).
+_BANNED_INSPECT_INTROSPECTION: FrozenSet[str] = frozenset({
+    "getmembers",
+    "getattr_static",
+    "getmro",
+    "get_annotations",
 })
 
 
@@ -453,6 +509,38 @@ def is_taint_analysis_block_enabled() -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
+def is_inspect_introspection_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 12 (Slice 95f inspect-reflection API) —
+    ``JARVIS_AST_VALIDATOR_BLOCK_INSPECT_INTROSPECTION`` (default **true** —
+    security-on-by-default). Rule 12 catches ``inspect.getmembers`` /
+    ``getattr_static`` / ``getmro`` / ``get_annotations`` Calls (ast.Attribute
+    on the ``inspect`` module) that Rule 9's bare-Name check never sees.
+    Operators can disable in an emergency without disabling the whole
+    validator. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_INSPECT_INTROSPECTION",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
+def is_ctx_mutation_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 4 (ctx mutation) —
+    ``JARVIS_AST_VALIDATOR_BLOCK_CTX_MUTATION`` (default **true** —
+    security-on-by-default). Rule 4 was historically always-on; Slice 95f
+    adds a kill-switch alongside extending it to the ``setattr(ctx, ...)`` /
+    ``delattr(ctx, ...)`` functional-form synonyms. When disabled, BOTH the
+    attribute form (``ctx.x = v``) and the functional form are skipped.
+    NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_CTX_MUTATION",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
 def is_module_side_effect_block_enabled() -> bool:
     """Per-rule kill switch for Rule 8 —
     ``JARVIS_AST_VALIDATOR_BLOCK_MODULE_SIDE_EFFECTS`` (default
@@ -526,6 +614,11 @@ class ValidationFailureReason(str, enum.Enum):
     # / join / format / f-string (e.g. ``'o'+'s'`` → ``__import__(mod_name)`` →
     # ``getattr(mod, 'sys'+'tem')('ls')``) that the static-name set never sees.
     TAINT_EXPLOIT = "taint_exploit"  # Rule 11
+    # Slice 95f (2026-06-05) — Rule 12: the inspect-module reflection API
+    # (``inspect.getmembers`` / ``getattr_static`` / ``getmro`` /
+    # ``get_annotations``). These are ast.Attribute calls that Rule 9's
+    # bare-Name builtin check never sees.
+    INSPECT_INTROSPECTION = "inspect_introspection"  # Rule 12
 
 
 @dataclass(frozen=True)
@@ -664,14 +757,18 @@ def validate_ast(
             )
 
         # ---- Rule 4: no ctx mutation ----
-        ctx_mut = _find_ctx_mutation(run_node)
-        if ctx_mut is not None:
-            return ValidationResult(
-                status=ValidationStatus.FAILED,
-                reason=ValidationFailureReason.CTX_MUTATION,
-                detail=f"class {cls.name}.run mutates ctx: {ctx_mut}",
-                classes_inspected=inspected,
-            )
+        # Slice 95f: gated behind a per-rule kill-switch (historically
+        # always-on) and extended to the setattr/delattr(ctx, ...)
+        # functional-form synonyms inside _find_ctx_mutation.
+        if is_ctx_mutation_block_enabled():
+            ctx_mut = _find_ctx_mutation(run_node)
+            if ctx_mut is not None:
+                return ValidationResult(
+                    status=ValidationStatus.FAILED,
+                    reason=ValidationFailureReason.CTX_MUTATION,
+                    detail=f"class {cls.name}.run mutates ctx: {ctx_mut}",
+                    classes_inspected=inspected,
+                )
 
         # ---- Rule 5: top-level try/except ----
         if not _has_top_level_try(run_node):
@@ -761,6 +858,22 @@ def validate_ast(
                 status=ValidationStatus.FAILED,
                 reason=ValidationFailureReason.TAINT_EXPLOIT,
                 detail=taint,
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 12 (Slice 95f): inspect-module reflection API ----
+    # The Slice 95e2 benchmark captured inspect.getmembers(self) /
+    # inspect.getattr_static(...) escapes. These are ast.Attribute calls on
+    # the ``inspect`` module, so Rule 9's bare-Name builtin check never sees
+    # them. Rule 12 flags a Call whose func is Attribute(value=Name("inspect"),
+    # attr in _BANNED_INSPECT_INTROSPECTION) anywhere in the module.
+    if is_inspect_introspection_block_enabled():
+        inspect_call = _find_inspect_introspection_call(tree)
+        if inspect_call is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.INSPECT_INTROSPECTION,
+                detail=inspect_call,
                 classes_inspected=inspected,
             )
 
@@ -920,6 +1033,34 @@ def _find_ctx_mutation(run_node: ast.AsyncFunctionDef) -> Optional[str]:
         elif isinstance(node, ast.AnnAssign):
             if _is_ctx_attribute(node.target) and node.value is not None:
                 return _describe_ctx_target(node.target) + " (ann-assign)"
+        # Slice 95f: functional-form synonym — setattr(ctx, ...) /
+        # delattr(ctx, ...) is the same mutation intent on a different
+        # surface. Flag ONLY when the FIRST positional arg is literally the
+        # ``ctx`` Name; ``setattr(other_obj, ...)`` must NOT be flagged.
+        elif isinstance(node, ast.Call):
+            desc = _describe_ctx_setattr_call(node)
+            if desc is not None:
+                return desc
+    return None
+
+
+def _describe_ctx_setattr_call(node: ast.Call) -> Optional[str]:
+    """Return a short description if ``node`` is a bare-name ``setattr`` /
+    ``delattr`` Call whose FIRST positional arg is ``Name(id="ctx")``; else
+    None.
+
+    Scoped tightly so benign functional mutation of OTHER objects
+    (``setattr(self, ...)``, ``setattr(obj, ...)``) is never flagged. A
+    custom ``mod.setattr(...)`` (ast.Attribute func) is also NOT matched —
+    only the builtin invoked by bare name."""
+    func = node.func
+    if not isinstance(func, ast.Name) or func.id not in ("setattr", "delattr"):
+        return None
+    if not node.args:
+        return None
+    first = node.args[0]
+    if isinstance(first, ast.Name) and first.id == "ctx":
+        return f"{func.id}(ctx, ...) (functional-form mutation)"
     return None
 
 
@@ -1503,6 +1644,8 @@ __all__ = [
     "ValidationStatus",
     "is_enabled",
     "is_introspection_block_enabled",
+    "is_inspect_introspection_block_enabled",
+    "is_ctx_mutation_block_enabled",
     "is_module_side_effect_block_enabled",
     "validate_ast",
     "validate_ast_strict",
@@ -1540,6 +1683,51 @@ def _find_introspection_builtin_call(
                     f"Call to {func.id!r} at line "
                     f"{getattr(node, 'lineno', '?')} — see PRD "
                     f"§3.6.2 Vector #7 closure"
+                )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rule 12 (Slice 95f): inspect-module reflection-API detector
+# ---------------------------------------------------------------------------
+
+
+def _find_inspect_introspection_call(
+    tree: ast.AST,
+) -> Optional[str]:
+    """Walk the FULL AST (function bodies + comprehensions + module level)
+    for any ``ast.Call`` whose ``.func`` is an ``ast.Attribute`` of the form
+    ``inspect.<name>`` where ``<name>`` is in
+    :data:`_BANNED_INSPECT_INTROSPECTION`. Returns a structured detail string
+    on first hit, None when clean.
+
+    Matches ONLY ``Name(id="inspect").<attr>(...)`` — i.e. the module-qualified
+    reflection call. ``self.getmembers(...)`` or some other object's
+    ``.getmembers`` is NOT matched (the value must be the bare ``inspect``
+    name), keeping the rule tightly scoped and FP-free.
+
+    ``ast.walk`` recurses into comprehensions / genexps, so
+    ``[m for m in inspect.getmembers(self)]`` is caught automatically.
+
+    NEVER raises."""
+    try:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr not in _BANNED_INSPECT_INTROSPECTION:
+                continue
+            value = func.value
+            if isinstance(value, ast.Name) and value.id == "inspect":
+                return (
+                    f"Rule 12 (inspect_introspection): Call to "
+                    f"inspect.{func.attr} at line "
+                    f"{getattr(node, 'lineno', '?')} — reflection-API "
+                    f"escape (Slice 95f synonym hardening)"
                 )
     except Exception:  # noqa: BLE001 — defensive
         return None

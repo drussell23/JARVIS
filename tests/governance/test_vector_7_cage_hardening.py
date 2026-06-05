@@ -139,8 +139,10 @@ def _module_prologue(prologue: str) -> str:
 
 
 def test_banned_attrs_grew_from_three_to_nine():
-    """The set expanded by 6 entries for Vector #7 closure."""
-    assert len(_BANNED_INTROSPECTION_ATTRS) == 9
+    """The set expanded by 6 entries for Vector #7 closure, then by 2 more
+    for Slice 95f's reflection-dunder synonyms (__getattribute__ /
+    __getattr__) — total 11."""
+    assert len(_BANNED_INTROSPECTION_ATTRS) == 11
     # Original 3 (P7.7 ship).
     assert "__subclasses__" in _BANNED_INTROSPECTION_ATTRS
     assert "__bases__" in _BANNED_INTROSPECTION_ATTRS
@@ -152,6 +154,9 @@ def test_banned_attrs_grew_from_three_to_nine():
     assert "f_back" in _BANNED_INTROSPECTION_ATTRS
     assert "f_globals" in _BANNED_INTROSPECTION_ATTRS
     assert "f_locals" in _BANNED_INTROSPECTION_ATTRS
+    # Slice 95f reflection-dunder synonyms.
+    assert "__getattribute__" in _BANNED_INTROSPECTION_ATTRS
+    assert "__getattr__" in _BANNED_INTROSPECTION_ATTRS
 
 
 def test_rule_7_blocks_mro_walk():
