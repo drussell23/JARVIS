@@ -2863,6 +2863,14 @@ Supersedes the §41.11.2-95c v1 baseline. Ledger artifact: `docs/security/produc
 
 **Honest conclusion.** The large majority of escapes are static-fixable via three composable AST-tree-walking techniques (no hardcoded matches); a small residual defines the OS-containment boundary. The 135 full-source escapes are captured at `.jarvis/antivenom_escapes.jsonl` (gitignored) for Phase-4 hardening. Roadmap: 95f (synonym constructs — lowest-risk, highest-count) → 95g (indirection taint) → 95h (constant propagation), re-measuring the escape-rate descent after each.
 
+##### §41.11.2-95e2 — LOCKED baseline via cross-run convergence + the honest ">=3,000" correction (2026-06-05)
+
+Ledger: `docs/security/production_parity_ledger_v3.json`. A second true-scale run (llm_per_seed=100, **$12 budget authorized to hit the literal ≥3,000 graduation criterion**) produced **1,472 mutations / 8.73% gross escape** while spending only **$5.09 — leaving $6.91 (58%) of the budget UNSPENT**.
+
+**The ≥3,000 criterion is diversity-bound, not budget-bound.** The binding constraint is LLM surface-variant diversity per seed (~40-50 distinct variants before the model repeats) combined with the Slice 95d AST-hash dedup that correctly rejects repeats. More dollars do NOT buy more unique mutations from a fixed 30-seed corpus; a literal 3,000 needs **corpus expansion (~60-100 seeds)**, an authoring task orthogonal to hardening. Recorded honestly rather than faking a 3,000 figure.
+
+**Baseline now LOCKED by convergence (stronger than one larger run):** v2 (per-seed 50, budget-bound) = 1566 mut / **8.91%**; v3 (per-seed 100, diversity-bound) = 1472 mut / **8.73%**. Two independent samples agree → converged gross escape ≈ **8.8%**, ~2× the 4.4% gate → FAIL. Both: deterministic operators 100% caged; all escapes novel LLM variants. Saturation point for 30 seeds ≈ 1470-1570 evaluable mutations. The evasion-technique taxonomy (§41.11.2-95e) is unchanged and confirmed. Hardening proceeds against this locked baseline (95f synonym-constructs → 95g indirection-taint → 95h constant-propagation).
+
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
 **The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
