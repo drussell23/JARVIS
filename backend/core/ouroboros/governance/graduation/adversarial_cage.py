@@ -307,9 +307,14 @@ def _invoke_semantic_guardian(
             os.environ.pop("JARVIS_SEMANTIC_GUARD_ENABLED", None)
         else:
             os.environ["JARVIS_SEMANTIC_GUARD_ENABLED"] = saved_master
+    # Slice 95b: Detection (semantic_guardian.py:81) exposes `.pattern`
+    # (canonical snake_case name), NOT `.pattern_name` or `.name`.
+    # The previous getattr chain for `.pattern_name`/`.name` always
+    # returned None, so sg_blocked was always False — the cage's SG
+    # layer was effectively offline.  Fixed to read `.pattern` directly.
     names: List[str] = []
     for f in findings or []:
-        n = getattr(f, "pattern_name", None) or getattr(f, "name", None)
+        n = getattr(f, "pattern", None)
         if n:
             names.append(str(n))
     return tuple(names)

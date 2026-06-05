@@ -473,8 +473,10 @@ def _quine_corpus() -> List[CorpusEntry]:
             f'            {_EV}("1+1")\n',
         ),
         description=("ev" + "al call in run body."),
-        known_gap=True,
-        tracking_ticket="Function-body dynamic-eval — runtime defense",
+        # Slice 95b: SemanticGuardian.dynamic_import_chain now BLOCKS this
+        # via _invoke_semantic_guardian (fixed .pattern attribute read).
+        # Gap closed — known_gap=False.
+        known_gap=False,
     ))
 
     out.append(CorpusEntry(
@@ -484,10 +486,10 @@ def _quine_corpus() -> List[CorpusEntry]:
             f'            {_EX}("x = 1")\n',
         ),
         description=("ex" + "ec call in run body."),
-        known_gap=True,
-        tracking_ticket=(
-            "Function-body dynamic-compile — runtime defense"
-        ),
+        # Slice 95b: SemanticGuardian.dynamic_import_chain now BLOCKS this
+        # via _invoke_semantic_guardian (fixed .pattern attribute read).
+        # Gap closed — known_gap=False.
+        known_gap=False,
     ))
 
     out.append(CorpusEntry(
@@ -499,10 +501,10 @@ def _quine_corpus() -> List[CorpusEntry]:
         description=(
             "imp" + "ortlib import_module in run body."
         ),
-        known_gap=True,
-        tracking_ticket=(
-            "Function-body dynamic import — runtime defense"
-        ),
+        # Slice 95b: SemanticGuardian.dynamic_import_chain now BLOCKS this
+        # via _invoke_semantic_guardian (fixed .pattern attribute read).
+        # Gap closed — known_gap=False.
+        known_gap=False,
     ))
 
     out.append(CorpusEntry(

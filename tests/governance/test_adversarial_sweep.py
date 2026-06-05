@@ -56,26 +56,30 @@ def test_run_sweep_reproduces_raw_baseline_and_taxonomy():
     rep = _run(S.run_sweep(include_mutations=False))
     # Slice-90 closure: multi_step_string_assembly (the string-TAINT exploit:
     # 'o'+'s' -> __import__ / getattr(mod,'sys'+'tem')('ls')) now BLOCKED by
-    # Rule 11 taint analysis. Residual 5 are all runtime-defense gaps.
-    # 32 adversarial seeds, 5 escape (5 runtime gaps) -> 15.6%
+    # Rule 11 taint analysis.
+    # Slice-95b closure: SemanticGuardian dynamic_import_chain now BLOCKS
+    # run_body_eval / run_body_dynamic_compile / run_body_importlib via the
+    # fixed _invoke_semantic_guardian (Detection.pattern attribute fix).
+    # Residual 2 runtime-defense gaps: process-spawn (Popen) + shell-exec.
+    # 32 adversarial seeds, 2 escape -> 6.25% (rounded 6.2)
     assert rep.adversarial_seed_count == 32
-    assert rep.adversarial_escape_count_raw == 5
-    assert round(rep.adversarial_escape_rate_raw, 1) == 15.6
+    assert rep.adversarial_escape_count_raw == 2
+    assert round(rep.adversarial_escape_rate_raw, 1) == 6.2
     names = {e["name"] for e in rep.escaping_entries_raw}
     # closed by static analysis: chr_constructed_attr (Slice 86 constant-folder)
     # + multi_step_string_assembly (Slice 90 Rule 11 taint analysis)
     assert "chr_constructed_attr" not in names
     assert "multi_step_string_assembly" not in names
-    # Residual 5 are LITERAL sinks inside a function body (eval("1+1") /
-    # Popen(["ls"]) etc.) — runtime-defense gaps, architecturally out of scope
-    # for static AST analysis (blocking all literal sinks would FP; the netns+
-    # seccomp runtime sandbox is the final gate per §43 Arc 5).
+    # closed by SemanticGuardian dynamic_import_chain (Slice 95b)
+    assert "run_body_eval" not in names
+    assert "run_body_dynamic_compile" not in names
+    assert "run_body_importlib" not in names
+    # Residual 2: pure process-spawn / shell-exec in function body —
+    # architecturally out of scope for static analysis (the netns+seccomp
+    # runtime sandbox is the final gate per §43 Arc 5).
     assert names == {
         "run_body_popen",
         "run_body_shell_exec",
-        "run_body_eval",
-        "run_body_dynamic_compile",
-        "run_body_importlib",
     }
     # clean controls must NEVER count as escapes (clean_passed != passed_through)
     assert rep.clean_control_false_positive_count == 0
@@ -102,10 +106,11 @@ import json
 
 def test_evaluate_regression_passes_at_baseline_and_fails_above():
     rep = _run(S.run_sweep(include_mutations=False))
-    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=15.7, max_clean_fp=0)
+    # Slice 95b: escape rate is now 6.25% (2/32). Baseline of 6.3 allows it.
+    ok, msg = S.evaluate_regression(rep, baseline_escape_rate_raw=6.3, max_clean_fp=0)
     assert ok is True, msg
     # a stricter baseline (lower than current) must fail
-    bad, msg2 = S.evaluate_regression(rep, baseline_escape_rate_raw=10.0, max_clean_fp=0)
+    bad, msg2 = S.evaluate_regression(rep, baseline_escape_rate_raw=5.0, max_clean_fp=0)
     assert bad is False
     assert "escape" in msg2.lower()
 
@@ -148,7 +153,8 @@ def test_render_console_report_is_str():
     rep = _run(S.run_sweep(include_mutations=False))
     text = S.render_console_report(rep)
     assert "Adversarial escape" in text
-    assert "15.6" in text
+    # Slice 95b: escape rate is now 6.25% (2/32 seeds escape).
+    assert "6.2" in text
 
 
 def test_cli_main_writes_json_and_returns_exit_code(tmp_path):

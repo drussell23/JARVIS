@@ -323,9 +323,11 @@ def test_full_corpus_every_entry_acceptable():
 
 _BLOCKED_VERDICTS = {"blocked_ast", "blocked_semantic_guard", "blocked_both"}
 
-# Post-hardening reality (validator hardening through Slice 86): the 6
-# static-shape PRD §3.6.2 vector #7 vectors are CLOSED. The residual
-# documented known gaps are the 6 RUNTIME-defense gaps only.
+# Post-hardening reality (Slice 86 + Slice 95b): the static-shape PRD
+# §3.6.2 vector #7 vectors are CLOSED, PLUS the SemanticGuardian
+# dynamic_import_chain pattern now BLOCKS the run-body eval/exec/importlib
+# entries (Slice 95b: fixed _invoke_semantic_guardian to read
+# Detection.pattern instead of .pattern_name/.name).
 _CLOSED_STATIC_VECTORS = {
     "alias_defeats_resolver", "mro_not_banned",
     "vars_introspection", "dir_introspection",
@@ -333,22 +335,24 @@ _CLOSED_STATIC_VECTORS = {
     # Slice 90 — multi_step_string_assembly moved here from the runtime-defense
     # set: Rule 11 string-taint analysis now statically BLOCKS it.
     "multi_step_string_assembly",
+    # Slice 95b — these three are now blocked by SG dynamic_import_chain.
+    "run_body_eval", "run_body_dynamic_compile", "run_body_importlib",
 }
+# Slice 95b: only 2 residual known gaps remain — the pure process-spawn
+# and shell-exec entries (no dynamic_import_chain SG pattern fires on them).
 _RUNTIME_DEFENSE_GAPS = {
-    "run_body_popen", "run_body_shell_exec", "run_body_eval",
-    "run_body_dynamic_compile", "run_body_importlib",
+    "run_body_popen", "run_body_shell_exec",
 }
 
 
 def test_full_corpus_static_shape_gaps_closed_runtime_gaps_remain():
-    """Post-validator-hardening reality (Slice 86 + prior). The 6
-    static-shape vectors (alias / __mro__ / vars / dir / globals /
-    chr-construction) are now CLOSED — present in the corpus,
+    """Post-validator-hardening reality (Slice 86 + Slice 95b). The
+    static-shape vectors plus the SG-now-active run-body dynamic
+    eval/exec/importlib entries are all CLOSED — present in the corpus,
     known_gap=False, and actually BLOCKED. The residual documented
-    known gaps are exactly the 6 RUNTIME-defense gaps (process-spawn /
-    shell / eval / dynamic-compile / dynamic-import / multi-step string
-    assembly), which are out of scope for static analysis, so they
-    still pass through and stay known_gap=True."""
+    known gaps are exactly the 2 remaining RUNTIME-defense gaps
+    (process-spawn / shell-exec), which are out of scope for static
+    analysis, so they still pass through and stay known_gap=True."""
     corpus = build_corpus()
     by_name = {e.name: e for e in corpus}
     report = run_stress(corpus)

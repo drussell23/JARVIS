@@ -348,6 +348,19 @@ async def run_calibration(
         )
         return 1
 
+    # ── Slice 95b: Preflight sandbox integrity canary ────────────────────────
+    # Runs BEFORE any mutation is counted. Verifies the FULL cage stack
+    # (AST validator + SemanticGuardian) is active in this execution context.
+    # Raises SandboxIntegrityPanic and aborts if either layer is inactive —
+    # escape metrics from an incompletely-active cage are untrustworthy.
+    print("[Slice 95b] Running sandbox integrity preflight canary...")
+    try:
+        si.run_sandbox_integrity_preflight()
+        print("[Slice 95b] Preflight PASSED — cage stack confirmed active.")
+    except si.SandboxIntegrityPanic as exc:
+        print(f"\n{exc}\n")
+        return 1
+
     # ── Budget guard ─────────────────────────────────────────────────────────
     eff_budget = budget_usd
     if eff_budget is None:

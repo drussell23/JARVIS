@@ -196,7 +196,11 @@ def test_join_constructed_subclasses_is_blocked() -> None:
 
     The constant-folder's Case 4 handles "".join([literal, literal, ...]);
     the result "__subclasses__" is in _BANNED_INTROSPECTION_ATTRS so Pattern 2
-    of _find_introspection_escape must fire and return BLOCKED_AST.
+    of _find_introspection_escape must fire and return BLOCKED_AST or
+    BLOCKED_BOTH. Slice 95b: SemanticGuardian also fires (dynamic_import_chain
+    pattern catches getattr with a constructed string), so the verdict may
+    be BLOCKED_BOTH — that is strictly better than BLOCKED_AST and is
+    acceptable.
     """
     entry = CorpusEntry(
         name="join_constructed_subclasses",
@@ -207,8 +211,9 @@ def test_join_constructed_subclasses_is_blocked() -> None:
         ),
     )
     result = evaluate_entry(entry)
-    assert result.verdict == CageVerdict.BLOCKED_AST, (
-        f"Expected BLOCKED_AST (''.join subclasses) but got {result.verdict!r}. "
+    assert result.verdict in (CageVerdict.BLOCKED_AST, CageVerdict.BLOCKED_BOTH), (
+        f"Expected BLOCKED_AST or BLOCKED_BOTH (''.join subclasses) but got "
+        f"{result.verdict!r}. "
         f"ast_failure_detail={result.ast_failure_detail!r}. "
         "Folder Case 4 (.join) may not be folding the joined value correctly."
     )
