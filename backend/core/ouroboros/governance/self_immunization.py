@@ -222,6 +222,14 @@ _DEFAULT_CORPUS_CACHE_PATH: str = ".jarvis/antivenom_corpus_cache.jsonl"
 _LLM_INPUT_COST_PER_M: float = 3.00
 _LLM_OUTPUT_COST_PER_M: float = 15.00
 
+# Slice 95a-3 — the Aegis provider-route the mutation LLM leases under.
+# Single seam: ``mutate()`` requests its call-lease on this route, and the
+# calibration harness reads it to authorize the matching per-route cap
+# (``JARVIS_AEGIS_ROUTE_CAP_IMMEDIATE_USD``) from the operator's --budget-usd.
+# If these two diverged, the daemon's fail-closed 0.0 route cap would deny
+# every lease (cost_ceiling_exceeded) — the root cause of the $0/0 calibration.
+_MUTATION_LEASE_ROUTE: str = "IMMEDIATE"
+
 
 # ===========================================================================
 # Closed taxonomies (AST-pinned)
@@ -954,7 +962,7 @@ class LLMMutationProvider:
                     op_id=(
                         f"antivenom_mutate_{id(self):x}"
                     ),
-                    route="IMMEDIATE",
+                    route=_MUTATION_LEASE_ROUTE,
                     estimated_cost_usd=MutationBudgetGuard.estimate_cost(
                         2048, self._max_tokens
                     ),
@@ -1730,6 +1738,14 @@ async def run_immunization_campaign(
                         break
             except asyncio.CancelledError:
                 raise
+            except AegisLeaseError:
+                # Slice 95a-3 — ZERO-LEAK fatal: a lease denial (e.g. the
+                # daemon's per-route cost_ceiling) MUST propagate, never be
+                # swallowed into "0 LLM candidates".  Swallowing it here made
+                # a cost_ceiling_exceeded denial masquerade as config
+                # starvation (call_attempts==0) downstream.  Re-raise so the
+                # operator sees the real cause.
+                raise
             except TypeError as _te:
                 # Fix #6: a sync MutationProvider raises TypeError when
                 # awaited.  Make this operator-visible — keep the swallow
@@ -1811,6 +1827,12 @@ async def run_immunization_campaign(
                     yield task.result()
                 except asyncio.CancelledError:
                     raise
+                except AegisLeaseError:
+                    # Slice 95a-3 — ZERO-LEAK fatal: a per-seed lease denial
+                    # must propagate, never be swallowed into a missing report
+                    # (which downstream misread as config starvation).  The
+                    # finally below still cancels the sibling seed tasks.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
                         "[SelfImmunization] seed task failed: %s",
@@ -1836,7 +1858,10 @@ async def summarize_campaign(
 
     The §41.11.2 acceptance gate reads ``overall_escape_rate`` against
     the Constitutional-Classifiers ``target_escape_rate`` (≤0.044).
-    NEVER raises.
+    NEVER raises EXCEPT :class:`AegisLeaseError` — a lease denial is a
+    ZERO-LEAK fatal signal (Slice 95a-3) that must propagate so the operator
+    sees the real cause (e.g. ``cost_ceiling_exceeded``) instead of a silent
+    empty campaign that downstream misreads as config starvation.
 
     Args:
         llm_per_seed: Slice 95a-2 — forwarded to run_immunization_campaign.
@@ -1854,6 +1879,9 @@ async def summarize_campaign(
         ):
             reports.append(rep)
     except asyncio.CancelledError:
+        raise
+    except AegisLeaseError:
+        # Slice 95a-3 — ZERO-LEAK fatal; propagate the lease denial loudly.
         raise
     except Exception:  # noqa: BLE001
         logger.debug(

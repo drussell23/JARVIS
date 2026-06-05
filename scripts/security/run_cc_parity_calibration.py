@@ -57,7 +57,7 @@ import enum
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 _DEFAULT_MAX_MUTATIONS: int = 200
@@ -239,6 +239,45 @@ def _parse_args(argv=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _authorize_aegis_caps(eff_budget: float, route: str) -> Dict[str, float]:
+    """Slice 95a-3 — authorize the Aegis daemon's fail-closed budget caps.
+
+    The daemon fail-closes the per-route, session, AND hourly-burn caps to
+    0.0 when their env vars are unset, which denies EVERY mutation lease with
+    ``cost_ceiling_exceeded`` — the root cause of the $0/0 calibration.  The
+    operator's ``--budget-usd`` is the authorization for the run, so we raise
+    each of the three caps to at least ``eff_budget``.  We never LOWER a cap an
+    operator set explicitly to a larger value (``max(eff_budget, existing)``).
+
+    Returns the {env_var: value} map that was set (empty when eff_budget<=0,
+    i.e. dry-run / zero-budget, which leaves the daemon fail-closed by design).
+    Pure except for the os.environ writes — must run BEFORE the daemon is
+    constructed (it snapshots the caps at preflight).
+    """
+    out: Dict[str, float] = {}
+    if eff_budget <= 0:
+        return out
+    from backend.core.ouroboros.aegis.flags import (
+        env_route_cap,
+        ENV_AEGIS_SESSION_CAP_USD,
+        ENV_AEGIS_HOURLY_BURN_CAP_USD,
+    )
+
+    for cap_env in (
+        env_route_cap(route),
+        ENV_AEGIS_SESSION_CAP_USD,
+        ENV_AEGIS_HOURLY_BURN_CAP_USD,
+    ):
+        try:
+            existing = float(os.environ.get(cap_env, "") or 0.0)
+        except ValueError:
+            existing = 0.0
+        value = max(float(eff_budget), existing)
+        os.environ[cap_env] = repr(value)
+        out[cap_env] = value
+    return out
+
+
 def _derive_llm_per_seed(
     *,
     max_mutations: int,
@@ -370,11 +409,31 @@ async def run_calibration(
     """
     from backend.core.ouroboros.governance import self_immunization as si
 
+    # ── Resolve the authorized budget early (Slice 95a-3) ────────────────────
+    # The daemon reads its per-route caps at construction (inside
+    # aegis_preflight below), so the route-cap env MUST be set before the
+    # bootstrap block runs.  eff_budget is reused by the guard further down.
+    eff_budget = budget_usd
+    if eff_budget is None:
+        eff_budget = float(
+            os.environ.get("JARVIS_ANTIVENOM_MUTATION_BUDGET_USD", "0.10")
+        )
+
     # ── Slice 94 Phase 1 — Aegis bootstrap / readiness check ────────────────
     _preflight_result = None
     if bootstrap_aegis:
         # (a) Load .env into environ so credentials are available.
         _load_env_file_into_environ()
+        # Slice 95a-3 — authorize the daemon's fail-closed budget caps from
+        # --budget-usd.  Aegis fail-closes the route, session, AND hourly caps
+        # to 0.0 when unset, denying EVERY mutation lease (cost_ceiling_exceeded
+        # — the $0/0 root cause).  Budget 0 / dry-run leaves them fail-closed.
+        _authorized = _authorize_aegis_caps(eff_budget, si._MUTATION_LEASE_ROUTE)
+        if _authorized:
+            print(
+                f"[Aegis] caps authorized from --budget-usd=${eff_budget:.4f}: "
+                + ", ".join(f"{k}=${v:.4f}" for k, v in _authorized.items())
+            )
         # (b) Run the canonical aegis_preflight() — PSK handshake +
         #     credential scrub.  NEVER spawn a daemon ourselves.
         try:
@@ -484,13 +543,7 @@ async def run_calibration(
         print(f"\n{exc}\n")
         return 1
 
-    # ── Budget guard ─────────────────────────────────────────────────────────
-    eff_budget = budget_usd
-    if eff_budget is None:
-        eff_budget = float(
-            os.environ.get("JARVIS_ANTIVENOM_MUTATION_BUDGET_USD", "0.10")
-        )
-
+    # ── Budget guard (eff_budget resolved above, before the Aegis bootstrap) ──
     guard = si.MutationBudgetGuard(budget_usd=eff_budget)
 
     # ── Provider (skipped on dry-run or zero budget) ─────────────────────────
@@ -564,6 +617,23 @@ async def run_calibration(
             corpus_sink=corpus_sink,
             llm_per_seed=_llm_per_seed,
         )
+    except si.AegisLeaseError as _ale:
+        # Slice 95a-3 — a lease denial is now surfaced honestly instead of
+        # being swallowed into call_attempts==0 (which misread as config
+        # starvation).  The most common cause is an insufficient per-route
+        # cap: --budget-usd authorizes JARVIS_AEGIS_ROUTE_CAP_<ROUTE>_USD, and
+        # the daemon enforces it cumulatively across the run.
+        from backend.core.ouroboros.aegis.flags import env_route_cap
+
+        print(
+            "\n[AEGIS] Lease denied — mutation run aborted (ZERO-LEAK).\n"
+            f"  cause : {_ale}\n"
+            f"  route : {si._MUTATION_LEASE_ROUTE} "
+            f"(cap env: {env_route_cap(si._MUTATION_LEASE_ROUTE)})\n"
+            "  hint  : raise --budget-usd (it authorizes the per-route cap) "
+            "or the Aegis session/hourly caps; this is NOT config starvation.\n"
+        )
+        return 1
     finally:
         # Restore the per-pattern env so the process environment is not
         # permanently mutated if run_calibration is called programmatically.
