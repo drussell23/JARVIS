@@ -648,14 +648,15 @@ class TestAstPinsSyntheticRegression:
 
 class TestFlagSeeds:
     def test_register_flags_seeds_all_five(self):
-        # Slice 93 added 2 new flags (mutation budget + corpus cache path):
-        # the count is now 7. Updated from 5 → 7.
+        # Slice 93 added 2 (mutation budget + corpus cache path): 5 → 7.
+        # Slice 95d added 4 (batching enabled + max-calls-per-seed +
+        # escape-capture enabled + escape-capture path): 7 → 11.
         from backend.core.ouroboros.governance.flag_registry import (
             FlagRegistry,
         )
 
         reg = FlagRegistry()
-        assert si.register_flags(reg) == 7
+        assert si.register_flags(reg) == 11
 
     def test_master_flag_seeded_default_false(self):
         from backend.core.ouroboros.governance.flag_registry import (

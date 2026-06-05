@@ -66,6 +66,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import os
@@ -195,6 +196,14 @@ _ENV_CONCURRENCY: str = "JARVIS_ANTIVENOM_IMMUNIZATION_CONCURRENCY"
 _ENV_MUTATION_BUDGET_USD: str = "JARVIS_ANTIVENOM_MUTATION_BUDGET_USD"
 _ENV_CORPUS_CACHE_PATH: str = "JARVIS_ANTIVENOM_CORPUS_CACHE_PATH"
 
+# Slice 95d — per-seed multi-call batching engine + AST-hash dedup +
+# escaped-source capture.  All three sub-flags default-FALSE so the
+# legacy single-call path stays byte-identical for existing tests.
+_ENV_BATCHING: str = "JARVIS_ANTIVENOM_BATCHING_ENABLED"
+_ENV_MAX_CALLS_PER_SEED: str = "JARVIS_ANTIVENOM_MAX_CALLS_PER_SEED"
+_ENV_ESCAPE_CAPTURE: str = "JARVIS_ANTIVENOM_ESCAPE_CAPTURE_ENABLED"
+_ENV_ESCAPE_CAPTURE_PATH: str = "JARVIS_ANTIVENOM_ESCAPE_CAPTURE_PATH"
+
 _TRUTHY = ("true", "1", "yes", "on")
 
 # Constitutional Classifiers (arXiv:2501.18837): the post-deployment
@@ -214,6 +223,10 @@ _MAX_MUTATED_SOURCE_BYTES: int = 64 * 1024
 # Slice 93 — LLM provider defaults
 _DEFAULT_MUTATION_BUDGET_USD: float = 0.10
 _DEFAULT_CORPUS_CACHE_PATH: str = ".jarvis/antivenom_corpus_cache.jsonl"
+
+# Slice 95d — batching / escape-capture defaults
+_DEFAULT_MAX_CALLS_PER_SEED: int = 12
+_DEFAULT_ESCAPE_CAPTURE_PATH: str = ".jarvis/antivenom_escapes.jsonl"
 # Claude Sonnet-class pricing (per-million tokens).  Used for cost estimation.
 # NOTE: these constants match claude-sonnet-4-5 (the default model).  If the
 # ``model`` param of LLMMutationProvider is overridden to Opus or Haiku these
@@ -710,6 +723,63 @@ def _corpus_cache_path() -> Path:
 
 
 # ===========================================================================
+# Slice 95d — batching engine / dedup / escape-capture env readers + helpers
+# ===========================================================================
+
+
+def _batching_enabled() -> bool:
+    """Slice 95d — per-seed multi-call batching loop. Default-FALSE so the
+    legacy single-call LLM path stays byte-identical for existing tests."""
+    raw = os.environ.get(_ENV_BATCHING, "").strip().lower()
+    return raw in _TRUTHY
+
+
+def _max_calls_per_seed() -> int:
+    """Slice 95d — hard per-seed call cap (min 1) preventing an infinite
+    pagination loop when the model keeps returning duplicates/empties."""
+    raw = os.environ.get(_ENV_MAX_CALLS_PER_SEED, "")
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_CALLS_PER_SEED
+    if v < 1:
+        return 1
+    return v
+
+
+def _escape_capture_enabled() -> bool:
+    """Slice 95d — escaped-source instrumentation sink. Default-FALSE."""
+    raw = os.environ.get(_ENV_ESCAPE_CAPTURE, "").strip().lower()
+    return raw in _TRUTHY
+
+
+def _escape_capture_path() -> Path:
+    raw = os.environ.get(_ENV_ESCAPE_CAPTURE_PATH, "").strip()
+    return Path(raw) if raw else Path(_DEFAULT_ESCAPE_CAPTURE_PATH)
+
+
+def _ast_structural_hash(source: str) -> Optional[str]:
+    """Slice 95d — O(1) structural fingerprint of a Python source string.
+
+    Parses ``source`` then hashes a normalized ``ast.dump`` that drops
+    field names and node positions — so two sources differing ONLY in
+    whitespace / comments / formatting collapse to the SAME hash, while
+    structurally-different sources hash differently.
+
+    Returns ``None`` on :class:`SyntaxError` (caller treats None as
+    "can't hash" → does not dedup, falls through to the UNPARSEABLE path).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    dumped = ast.dump(
+        tree, annotate_fields=False, include_attributes=False
+    )
+    return hashlib.sha256(dumped.encode("utf-8", "replace")).hexdigest()
+
+
+# ===========================================================================
 # Slice 93 — MutationBudgetGuard
 # ===========================================================================
 
@@ -1125,6 +1195,70 @@ class CorpusCacheSink:
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[CorpusCacheSink] record_candidate failed", exc_info=True
+            )
+            return False
+
+
+class EscapeCaptureSink:
+    """Slice 95d — captures the FULL source of every ESCAPED mutation.
+
+    The corpus cache (``CorpusCacheSink``) deliberately stores only
+    ``mutated_source_bytes`` (a byte count, not the source) for every
+    candidate.  That is fine for reproducibility metadata but useless for
+    *analyzing a bypass*: when a mutation escapes the cage we need the
+    exact source that defeated it.  This sink writes that full source
+    (plus forensic context) to a dedicated escapes JSONL, gated behind
+    ``JARVIS_ANTIVENOM_ESCAPE_CAPTURE_ENABLED`` (default-FALSE).
+
+    Mirrors :class:`CorpusCacheSink` — composes the canonical
+    ``cross_process_jsonl.flock_append_line`` primitive and NEVER raises
+    (best-effort instrumentation, swallow + debug-log on any failure).
+
+    Env: ``JARVIS_ANTIVENOM_ESCAPE_CAPTURE_PATH``
+    (default ``.jarvis/antivenom_escapes.jsonl``).
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._path = path or _escape_capture_path()
+
+    async def record_escape(self, result: "MutationResult") -> bool:
+        """Append one ESCAPED ``MutationResult`` (with its FULL source) to
+        the escapes JSONL.  MUST NOT raise.  Returns True on success."""
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[EscapeCaptureSink] flock primitive import failed",
+                exc_info=True,
+            )
+            return False
+        try:
+            cand = result.candidate
+            payload = {
+                "schema_version": SELF_IMMUNIZATION_SCHEMA_VERSION,
+                "kind": "escaped_variant",
+                "seed_entry_name": cand.seed_entry_name,
+                "seed_category": cand.seed_category,
+                "strategy": cand.strategy.value,
+                "cage_verdict": result.cage_verdict,
+                "semguard_findings": list(result.semguard_findings),
+                # The whole point of this sink: the full escaping source.
+                "mutated_source": cand.mutated_source,
+                "wrote_at_unix": time.time(),
+            }
+            line = json.dumps(payload, sort_keys=True, default=str)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, flock_append_line, self._path, line
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[EscapeCaptureSink] record_escape failed", exc_info=True
             )
             return False
 
@@ -1638,6 +1772,19 @@ async def run_immunization_campaign(
     except Exception:  # noqa: BLE001 — degrade to serial, never abort
         sem = None
 
+    # Slice 95d — batching engine run-level state (only meaningful when
+    # _batching_enabled()).  The dedup set is shared across ALL seeds =
+    # global structural dedup; the call-cap bounds per-seed pagination.
+    _batching: bool = _batching_enabled()
+    _max_calls: int = _max_calls_per_seed()
+    _seen_hashes: set[str] = set()
+
+    # Slice 95d — escaped-source capture sink (constructed once per run,
+    # only when enabled).  Best-effort instrumentation; never authoritative.
+    _escape_sink: Optional["EscapeCaptureSink"] = (
+        EscapeCaptureSink() if _escape_capture_enabled() else None
+    )
+
     async def _run_one_seed(seed: Any) -> ImmunizationReport:
         seed_name = str(getattr(seed, "name", "?"))
         seed_cat = str(
@@ -1673,6 +1820,15 @@ async def run_immunization_campaign(
                 )
             )
 
+        # Slice 95d — when batching, seed the global dedup set with the
+        # deterministic operators' structural hashes so an LLM variant that
+        # is structurally identical to a deterministic mutation is filtered.
+        if _batching:
+            for _det in candidates:
+                _dh = _ast_structural_hash(_det.mutated_source)
+                if _dh is not None:
+                    _seen_hashes.add(_dh)
+
         # Optional LLM augmentation — appended, never replacing the
         # deterministic operators. Failures == zero augmentation.
         # Slice 93: mutate is now async; campaign awaits it.
@@ -1687,55 +1843,144 @@ async def run_immunization_campaign(
         # compat (callers that don't pass llm_per_seed are unaffected).
         if mutation_provider is not None:
             try:
-                if llm_per_seed is not None:
-                    # Slice 95a-2 — decoupled explicit quota; cap at max.
-                    _llm_n = min(
+                if _batching and llm_per_seed is not None:
+                    # ----------------------------------------------------------
+                    # Slice 95d — per-seed multi-call batching loop.
+                    #
+                    # A single max_tokens=2048 response holds only ~14 variants,
+                    # so one mutate() call cannot reach a large quota.  Paginate:
+                    # accumulate UNIQUE valid mutations across multiple calls
+                    # until the target is met, the call-cap is hit, the model
+                    # returns empty (exhausted), or the budget is exhausted.
+                    #
+                    # Per-variant filtering is IDENTICAL to the legacy path
+                    # (non-str skip / oversize skip / ast.parse → UNPARSEABLE
+                    # else accept) PLUS O(1) structural dedup against the
+                    # run-global _seen_hashes set.  AegisLeaseError still
+                    # propagates (the loop is inside this try whose
+                    # ``except AegisLeaseError: raise`` is preserved below).
+                    # ----------------------------------------------------------
+                    _target = min(
                         max(0, int(llm_per_seed)),
                         _MAX_MUTATIONS_PER_PATTERN,
                     )
-                else:
-                    # Legacy formula — can be 0 when deterministic fills budget.
-                    _llm_n = max(0, per_pattern - len(candidates))
-                extra = await mutation_provider.mutate(
-                    seed_src, n=_llm_n
-                )
-                for src in (extra or ()):
-                    if not isinstance(src, str):
-                        continue
-                    if len(src.encode("utf-8", "replace")) > (
-                        _MAX_MUTATED_SOURCE_BYTES
+                    _accepted_llm = 0
+                    _calls = 0
+                    while (
+                        _accepted_llm < _target
+                        and _calls < _max_calls
                     ):
-                        continue
-                    # Slice 93 validity filter — ast.parse gate.
-                    try:
-                        ast.parse(src)
-                        _src_valid = True
-                    except SyntaxError:
-                        _src_valid = False
-                    cand = MutationCandidate(
-                        seed_entry_name=seed_name,
-                        seed_category=seed_cat,
-                        strategy=MutationStrategy.IDENTITY,
-                        mutated_source=src,
-                    )
-                    if not _src_valid:
-                        # Record UNPARSEABLE directly — skip cage evaluation.
-                        inapplicable_results.append(
-                            MutationResult(
-                                candidate=cand,
-                                verdict=ImmunizationVerdict.UNPARSEABLE,
-                                cage_verdict="",
-                                semguard_findings=(),
-                                detail="llm_output_unparseable",
-                            )
+                        _batch_ask = min(
+                            _target - _accepted_llm,
+                            _MAX_MUTATIONS_PER_PATTERN,
                         )
-                        continue
-                    candidates.append(cand)
-                    # Slice 95a-2: in decoupled llm_per_seed mode, the LLM
-                    # is additive — don't cap at per_pattern.  In legacy
-                    # mode (llm_per_seed=None), honour the per_pattern bound.
-                    if llm_per_seed is None and len(candidates) >= per_pattern:
-                        break
+                        if _batch_ask <= 0:
+                            break
+                        extra = await mutation_provider.mutate(
+                            seed_src, n=_batch_ask
+                        )
+                        _calls += 1
+                        if not extra:
+                            # Empty return → model exhausted or budget guard
+                            # short-circuited.  Stop (don't burn the call-cap).
+                            break
+                        for src in extra:
+                            if not isinstance(src, str):
+                                continue
+                            if len(src.encode("utf-8", "replace")) > (
+                                _MAX_MUTATED_SOURCE_BYTES
+                            ):
+                                continue
+                            _h = _ast_structural_hash(src)
+                            if _h is None:
+                                # Unparseable — record UNPARSEABLE, don't dedup.
+                                inapplicable_results.append(
+                                    MutationResult(
+                                        candidate=MutationCandidate(
+                                            seed_entry_name=seed_name,
+                                            seed_category=seed_cat,
+                                            strategy=MutationStrategy.IDENTITY,
+                                            mutated_source=src,
+                                        ),
+                                        verdict=ImmunizationVerdict.UNPARSEABLE,
+                                        cage_verdict="",
+                                        semguard_findings=(),
+                                        detail="llm_output_unparseable",
+                                    )
+                                )
+                                continue
+                            if _h in _seen_hashes:
+                                # Duplicate — does NOT count toward target,
+                                # not recorded.  Keeps the loop O(1) per check.
+                                continue
+                            _seen_hashes.add(_h)
+                            candidates.append(
+                                MutationCandidate(
+                                    seed_entry_name=seed_name,
+                                    seed_category=seed_cat,
+                                    strategy=MutationStrategy.IDENTITY,
+                                    mutated_source=src,
+                                )
+                            )
+                            _accepted_llm += 1
+                            if _accepted_llm >= _target:
+                                break
+                else:
+                    # ----------------------------------------------------------
+                    # Legacy single-call path — byte-identical to pre-Slice95d.
+                    # ----------------------------------------------------------
+                    if llm_per_seed is not None:
+                        # Slice 95a-2 — decoupled explicit quota; cap at max.
+                        _llm_n = min(
+                            max(0, int(llm_per_seed)),
+                            _MAX_MUTATIONS_PER_PATTERN,
+                        )
+                    else:
+                        # Legacy formula — 0 when deterministic fills budget.
+                        _llm_n = max(0, per_pattern - len(candidates))
+                    extra = await mutation_provider.mutate(
+                        seed_src, n=_llm_n
+                    )
+                    for src in (extra or ()):
+                        if not isinstance(src, str):
+                            continue
+                        if len(src.encode("utf-8", "replace")) > (
+                            _MAX_MUTATED_SOURCE_BYTES
+                        ):
+                            continue
+                        # Slice 93 validity filter — ast.parse gate.
+                        try:
+                            ast.parse(src)
+                            _src_valid = True
+                        except SyntaxError:
+                            _src_valid = False
+                        cand = MutationCandidate(
+                            seed_entry_name=seed_name,
+                            seed_category=seed_cat,
+                            strategy=MutationStrategy.IDENTITY,
+                            mutated_source=src,
+                        )
+                        if not _src_valid:
+                            # Record UNPARSEABLE directly — skip cage eval.
+                            inapplicable_results.append(
+                                MutationResult(
+                                    candidate=cand,
+                                    verdict=ImmunizationVerdict.UNPARSEABLE,
+                                    cage_verdict="",
+                                    semguard_findings=(),
+                                    detail="llm_output_unparseable",
+                                )
+                            )
+                            continue
+                        candidates.append(cand)
+                        # Slice 95a-2: in decoupled llm_per_seed mode, the LLM
+                        # is additive — don't cap at per_pattern.  In legacy
+                        # mode (llm_per_seed=None), honour the per_pattern bound.
+                        if (
+                            llm_per_seed is None
+                            and len(candidates) >= per_pattern
+                        ):
+                            break
             except asyncio.CancelledError:
                 raise
             except AegisLeaseError:
@@ -1811,6 +2056,18 @@ async def run_immunization_campaign(
                         "[SelfImmunization] hardening sink raised",
                         exc_info=True,
                     )
+                # Slice 95d — capture the FULL escaping source for analysis.
+                # Best-effort instrumentation; the sink itself never raises.
+                if _escape_sink is not None:
+                    try:
+                        await _escape_sink.record_escape(res)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "[SelfImmunization] escape capture sink raised",
+                            exc_info=True,
+                        )
 
         return _build_report(seed_name, seed_cat, results, target)
 
@@ -2298,6 +2555,70 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example=".jarvis/antivenom_corpus_cache.jsonl",
             since="v2.0",
+        ),
+        # Slice 95d — async multi-call batching engine + escape capture
+        FlagSpec(
+            name=_ENV_BATCHING,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Slice 95d: when true (and llm_per_seed is set), the "
+                "campaign paginates multiple mutate() calls per seed, "
+                "deduping by AST-structural hash, until the per-seed "
+                "quota is met (breaks the single-call max_tokens ceiling "
+                "that capped a 3000-request run to ~418 mutations). "
+                "Default FALSE — the legacy single-call path is "
+                "byte-identical when off."
+            ),
+            category=Category.CAPACITY,
+            source_file=src,
+            example="true",
+            since="v2.1",
+        ),
+        FlagSpec(
+            name=_ENV_MAX_CALLS_PER_SEED,
+            type=FlagType.INT,
+            default=_DEFAULT_MAX_CALLS_PER_SEED,
+            description=(
+                "Slice 95d: hard cap on mutate() calls per seed in "
+                "batching mode — bounds cost and prevents an unbounded "
+                "loop when the model keeps returning duplicates/empties. "
+                "Floored at 1."
+            ),
+            category=Category.CAPACITY,
+            source_file=src,
+            example="12",
+            since="v2.1",
+        ),
+        FlagSpec(
+            name=_ENV_ESCAPE_CAPTURE,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Slice 95d: when true, the full source of every ESCAPED "
+                "mutation is persisted (via EscapeCaptureSink) so the "
+                "bypass surface forms can be analyzed for cage hardening "
+                "(the corpus cache stores only metadata, not the source). "
+                "Default FALSE."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=src,
+            example="true",
+            since="v2.1",
+        ),
+        FlagSpec(
+            name=_ENV_ESCAPE_CAPTURE_PATH,
+            type=FlagType.STR,
+            default=_DEFAULT_ESCAPE_CAPTURE_PATH,
+            description=(
+                "Slice 95d: JSONL path for captured escaped-mutation "
+                "source (EscapeCaptureSink). Written via the canonical "
+                "cross-process flock primitive."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=src,
+            example=".jarvis/antivenom_escapes.jsonl",
+            since="v2.1",
         ),
     ]
     n = 0
