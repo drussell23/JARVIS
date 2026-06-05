@@ -172,6 +172,14 @@ class DriftKind(str, enum.Enum):
     # compare_snapshots() primitive (which remains a pure binary
     # comparison between two snapshots).
     GRADIENT_DRIFT_DETECTED = "gradient_drift_detected"
+    # §40 #14 Mirror-Self spec-drift (added 2026-06-05): CLAUDE.md
+    # CLAIMS an env-flag default that the FlagRegistry ACTUALLY
+    # registers differently — the system testing itself against its
+    # own documentation. Emitted by ``mirror_self_spec_drift`` (a
+    # pure read-only validator), NOT by the compare_snapshots()
+    # primitive. Flows into the existing auto_action bridge so spec
+    # drift files an advisory repair op like any other drift kind.
+    SPEC_DRIFT = "spec_drift"
 
 
 # ---------------------------------------------------------------------------
