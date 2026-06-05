@@ -1742,7 +1742,14 @@ def _find_inspect_introspection_call(
 def _resolves_to_banned_name(node: ast.AST) -> Optional[str]:
     """If ``node`` is a Name or Attribute chain whose canonical
     dotted form is in Rule 8's or Rule 9's banned set, return
-    that canonical form. Else None. NEVER raises."""
+    that canonical form. Else None. NEVER raises.
+
+    Slice 95g — container-unwrap: also recurses through a SINGLE-element
+    list/tuple literal subscripted by a literal index 0 or -1, e.g.
+    ``[os.system][0]`` → ``os.system``. Deliberately conservative — only a
+    one-element literal container indexed by a literal 0/-1 unwraps, so a
+    multi-element container or a non-literal index is NEVER tainted. This
+    composes into Rule 10's alias collection (and any other caller)."""
     try:
         # ast.Name → bare name (e.g. ``open``, ``eval``).
         if isinstance(node, ast.Name):
@@ -1750,6 +1757,31 @@ def _resolves_to_banned_name(node: ast.AST) -> Optional[str]:
                 return node.id
             if node.id in _BANNED_INTROSPECTION_BUILTIN_CALLS:
                 return node.id
+            return None
+        # Slice 95g container-unwrap: ``[E][0]`` / ``(E,)[0]`` / ``[E][-1]``.
+        if isinstance(node, ast.Subscript):
+            container = node.value
+            if isinstance(container, (ast.List, ast.Tuple)) and (
+                len(container.elts) == 1
+            ):
+                idx = node.slice
+                # Py3.9+: subscript slice is the index expression directly.
+                # ``[E][0]`` parses as Constant(0); ``[E][-1]`` parses as
+                # UnaryOp(USub, Constant(1)) — handle both literal forms.
+                idx_val: Optional[int] = None
+                if isinstance(idx, ast.Constant) and isinstance(
+                    idx.value, int
+                ):
+                    idx_val = idx.value
+                elif (
+                    isinstance(idx, ast.UnaryOp)
+                    and isinstance(idx.op, ast.USub)
+                    and isinstance(idx.operand, ast.Constant)
+                    and isinstance(idx.operand.value, int)
+                ):
+                    idx_val = -idx.operand.value
+                if idx_val in (0, -1):
+                    return _resolves_to_banned_name(container.elts[0])
             return None
         # ast.Attribute → walk the chain (e.g. ``os.system`` →
         # "os.system").
@@ -1780,8 +1812,73 @@ def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
     try/if/with/for inside the function body). Cross-function
     aliases remain a known gap (runtime sandbox is the final
     gate). NEVER raises.
+
+    Slice 95g extends this with two more indirection forms (still under the
+    same ALIAS_DEFEAT reason + kill-switch — they are the same rule class):
+
+      B. from-import banned bindings — ``from os import system`` /
+         ``from inspect import getmembers`` bind the local name (asname or
+         name) into the alias table, so Pass 2's bare-Name Call check flags
+         ``system()`` / ``getmembers(x)``. The dotted matcher never sees a
+         from-imported name; this closes that bypass (and the known 95f
+         from-import-inspect gap).
+
+      C. import-as module aliasing — ``import pickle as _p`` records
+         ``_p -> pickle``; Pass 2 then flags ``_p.loads(...)`` whose resolved
+         dotted form (``pickle.loads``) is banned. Defeats the
+         ``pickle.loads`` / ``inspect.getmembers`` dotted matcher.
+
+    Module-level imports apply to EVERY scope (they bind at module load), so
+    the from-import / import-as tables are collected once over the whole tree
+    and threaded into every per-scope pass.
     """
     try:
+        # --- collect module-load-time import bindings ONCE (Slice 95g) ---
+        # These bind at the module scope and are visible in every function
+        # body, so they seed every per-scope alias table below.
+        import_aliases: dict = {}        # local-name -> canonical banned form
+        module_aliases: dict = {}        # import-as alias -> real module name
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module is None:
+                    continue  # relative import: from . import X
+                module = node.module
+                for alias in node.names:
+                    name = alias.name
+                    if name == "*":
+                        continue
+                    local = alias.asname or name
+                    dotted = f"{module}.{name}"
+                    banned = None
+                    if dotted in _BANNED_MODULE_LEVEL_CALLS:
+                        banned = dotted
+                    elif (
+                        module == "inspect"
+                        and name in _BANNED_INSPECT_INTROSPECTION
+                    ):
+                        banned = dotted
+                    # NOTE (Slice 95g zero-FP fix): we MUST be module-specific
+                    # here. The earlier bare-name fallbacks (``name in
+                    # _BANNED_MODULE_LEVEL_CALLS`` / ``..._INTROSPECTION_BUILTIN
+                    # _CALLS``) were module-BLIND and false-positived on benign
+                    # stdlib idioms that merely share a bare builtin's name —
+                    # ``from re import compile``, ``from gzip import open``,
+                    # ``from io import open``, ``from codecs import open``. A
+                    # from-imported name is the BANNED primitive only when its
+                    # source module makes the full dotted form banned (matched
+                    # above). A literal ``from builtins import eval`` is exotic
+                    # vs. the everyday FP, and zero clean-control FP is the hard
+                    # cage invariant — so the bare-name fallback is removed.
+                    if banned is not None:
+                        import_aliases[local] = banned
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        # Only an explicit ``as`` alias is tracked — a plain
+                        # ``import pickle`` followed by ``pickle.loads(...)``
+                        # is already caught by the dotted Rule-8 matcher.
+                        module_aliases[alias.asname] = alias.name
+
         scopes: List[ast.AST] = [tree]
         # Collect every function-scope as its own tracking unit.
         for n in ast.walk(tree):
@@ -1795,7 +1892,9 @@ def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
             # Walking via ast.walk descends into nested control-
             # flow blocks (try/if/with/for/while) so an alias
             # inside ``try:`` is still tracked.
-            aliases: dict = {}
+            # Seed with module-level from-import bindings (Slice 95g B) —
+            # they are visible in every scope.
+            aliases: dict = dict(import_aliases)
             for node in ast.walk(scope):
                 # Don't recurse into nested function definitions —
                 # those are their own scope (handled in the outer
@@ -1814,7 +1913,7 @@ def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
                     banned = _resolves_to_banned_name(node.value)
                     if banned is not None:
                         aliases[node.targets[0].id] = banned
-            if not aliases:
+            if not aliases and not module_aliases:
                 continue
             for node in ast.walk(scope):
                 if scope is not tree and isinstance(
@@ -1824,6 +1923,7 @@ def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
+                # Pass 2a: bare-Name Call to an aliased / from-imported name.
                 if (
                     isinstance(func, ast.Name)
                     and func.id in aliases
@@ -1836,6 +1936,32 @@ def _find_alias_defeat(tree: ast.AST) -> Optional[str]:
                         f"{aliases[func.id]!r} (P9.4 documented "
                         f"gap; runtime sandbox is the final gate)"
                     )
+                # Pass 2b (Slice 95g C): ``<import-as-alias>.<attr>(...)``
+                # whose resolved dotted form is banned.
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in module_aliases
+                ):
+                    real_module = module_aliases[func.value.id]
+                    dotted = f"{real_module}.{func.attr}"
+                    banned_dotted = None
+                    if dotted in _BANNED_MODULE_LEVEL_CALLS:
+                        banned_dotted = dotted
+                    elif (
+                        real_module == "inspect"
+                        and func.attr in _BANNED_INSPECT_INTROSPECTION
+                    ):
+                        banned_dotted = dotted
+                    if banned_dotted is not None:
+                        return (
+                            f"Rule 10 (alias_defeat): Call to "
+                            f"{func.value.id}.{func.attr} at line "
+                            f"{getattr(node, 'lineno', '?')} — "
+                            f"import-as module alias for banned "
+                            f"{banned_dotted!r} (Slice 95g; runtime "
+                            f"sandbox is the final gate)"
+                        )
     except Exception:  # noqa: BLE001 — defensive
         return None
     return None
