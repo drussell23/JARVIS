@@ -99,12 +99,21 @@ class TestSysPathBootstrap:
 
 
 class _MockProviderZero:
-    """Always returns [] — simulates auth failure / silent empty completions."""
+    """Always returns [] — simulates auth failure / silent empty completions.
+
+    Slice 95a-2: call_attempts is incremented when n>0 (matching real
+    LLMMutationProvider behaviour) so the loud-fail logic correctly
+    routes to AdversarialTelemetryPanic (LLM was invoked but returned
+    nothing) rather than ConfigStarvationError (LLM never invoked).
+    """
 
     def __init__(self) -> None:
         self.generated_count: int = 0
+        self.call_attempts: int = 0  # Slice 95a-2
 
     async def mutate(self, seed_source: str, *, n: int) -> Sequence[str]:
+        if n > 0:
+            self.call_attempts += 1  # Slice 95a-2: attempted, returned nothing
         return []
 
 

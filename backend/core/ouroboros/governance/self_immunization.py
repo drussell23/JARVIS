@@ -98,6 +98,20 @@ SELF_IMMUNIZATION_SCHEMA_VERSION: str = "1.0"
 # ===========================================================================
 
 
+class ConfigStarvationError(RuntimeError):
+    """Slice 95a-2 — raised when the LLM was NEVER INVOKED because n=0
+    for every seed (deterministic operators filled the per-seed budget,
+    leaving the generative provider starved with n=0).
+
+    This is a CONFIGURATION issue — not an auth/Aegis fault.  The fix is
+    to raise ``--max-mutations`` or pass an explicit ``llm_per_seed`` quota
+    so the generative provider is actually exercised.
+
+    Distinct from :class:`AdversarialTelemetryPanic` (which fires when the
+    LLM WAS invoked but returned no usable output).
+    """
+
+
 class AdversarialTelemetryPanic(RuntimeError):
     """Slice 94 — raised when an LLM-enabled calibration run produces
     ZERO valid mutations, regardless of spend.
@@ -839,6 +853,13 @@ class LLMMutationProvider:
         # by this provider across all mutate() calls in a session.  Used by
         # run_calibration to detect zero-throughput auth failures.
         self.generated_count: int = 0
+        # Slice 95a-2 — count of mutate() calls where n>0 AND the request
+        # actually reached messages.create (i.e. past the n<=0 early-return
+        # and budget-exhausted short-circuit).  Stays 0 when the LLM was
+        # never invoked (config-starvation).  Distinguished from
+        # generated_count: call_attempts>0 + generated_count==0 means the
+        # LLM was reached but returned nothing (auth/empty-stream).
+        self.call_attempts: int = 0
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -963,6 +984,11 @@ class LLMMutationProvider:
         # Per-mutation generation — genuine model/parse errors are swallowed.
         # AegisLeaseError (raised above) has already propagated before here.
         # ------------------------------------------------------------------
+        # Slice 95a-2 — increment call_attempts here, just before the request.
+        # This fires for every n>0 call that reaches the model path (past
+        # the early-returns above).  Stays 0 for n=0 (early-return) and when
+        # the budget is exhausted (short-circuit before this point).
+        self.call_attempts += 1
         try:
             client = self._get_client()
             prompt = self._prompt_factory(seed_source, n)
@@ -1541,6 +1567,7 @@ async def run_immunization_campaign(
     mutation_provider: Optional[MutationProvider] = None,
     hardening_sink: Optional[HardeningSink] = None,
     corpus_sink: Optional["CorpusCacheSink"] = None,
+    llm_per_seed: Optional[int] = None,
 ) -> AsyncGenerator[ImmunizationReport, None]:
     """Async generator yielding one :class:`ImmunizationReport` per seed
     in *completion order*.
@@ -1553,6 +1580,16 @@ async def run_immunization_campaign(
 
     Concurrency is bounded by the canonical process-singleton semaphore
     (no homegrown ``asyncio.Semaphore`` literal in this module).
+
+    Args:
+        llm_per_seed: Slice 95a-2 — explicit LLM quota per seed.  When
+            provided (and mutation_provider is set), the LLM is called
+            with ``n = min(llm_per_seed, _MAX_MUTATIONS_PER_PATTERN)``
+            regardless of how many deterministic candidates were produced.
+            Deterministic-8 still run first as the baseline/control; the
+            LLM adds its quota on top.  When None (default), the legacy
+            ``n = max(0, per_pattern - len(candidates))`` formula applies
+            (backward-compatible — other callers unaffected).
     """
     if not master_enabled():
         yield _master_off_report()
@@ -1633,10 +1670,26 @@ async def run_immunization_campaign(
         # Slice 93: mutate is now async; campaign awaits it.
         # Validity filter: LLM candidates failing ast.parse are recorded
         # as UNPARSEABLE and excluded from the escape-rate denominator.
+        #
+        # Slice 95a-2: llm_per_seed decoupling.
+        # When llm_per_seed is provided, the LLM quota is independent of
+        # the deterministic count — the LLM ALWAYS gets its quota (capped
+        # at _MAX_MUTATIONS_PER_PATTERN).  When None, the legacy formula
+        # max(0, per_pattern - len(candidates)) is preserved for backward-
+        # compat (callers that don't pass llm_per_seed are unaffected).
         if mutation_provider is not None:
             try:
+                if llm_per_seed is not None:
+                    # Slice 95a-2 — decoupled explicit quota; cap at max.
+                    _llm_n = min(
+                        max(0, int(llm_per_seed)),
+                        _MAX_MUTATIONS_PER_PATTERN,
+                    )
+                else:
+                    # Legacy formula — can be 0 when deterministic fills budget.
+                    _llm_n = max(0, per_pattern - len(candidates))
                 extra = await mutation_provider.mutate(
-                    seed_src, n=max(0, per_pattern - len(candidates))
+                    seed_src, n=_llm_n
                 )
                 for src in (extra or ()):
                     if not isinstance(src, str):
@@ -1670,7 +1723,10 @@ async def run_immunization_campaign(
                         )
                         continue
                     candidates.append(cand)
-                    if len(candidates) >= per_pattern:
+                    # Slice 95a-2: in decoupled llm_per_seed mode, the LLM
+                    # is additive — don't cap at per_pattern.  In legacy
+                    # mode (llm_per_seed=None), honour the per_pattern bound.
+                    if llm_per_seed is None and len(candidates) >= per_pattern:
                         break
             except asyncio.CancelledError:
                 raise
@@ -1774,12 +1830,18 @@ async def summarize_campaign(
     mutation_provider: Optional[MutationProvider] = None,
     hardening_sink: Optional[HardeningSink] = None,
     corpus_sink: Optional["CorpusCacheSink"] = None,
+    llm_per_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Drain :func:`run_immunization_campaign` into one aggregate dict.
 
     The §41.11.2 acceptance gate reads ``overall_escape_rate`` against
     the Constitutional-Classifiers ``target_escape_rate`` (≤0.044).
     NEVER raises.
+
+    Args:
+        llm_per_seed: Slice 95a-2 — forwarded to run_immunization_campaign.
+            When provided, LLM is invoked with this quota per seed
+            independent of the deterministic count.  None = legacy behavior.
     """
     reports: List[ImmunizationReport] = []
     try:
@@ -1788,6 +1850,7 @@ async def summarize_campaign(
             mutation_provider=mutation_provider,
             hardening_sink=hardening_sink,
             corpus_sink=corpus_sink,
+            llm_per_seed=llm_per_seed,
         ):
             reports.append(rep)
     except asyncio.CancelledError:
@@ -1797,6 +1860,23 @@ async def summarize_campaign(
             "[SelfImmunization] summarize_campaign drain failed",
             exc_info=True,
         )
+
+    # Slice 95a-2 — extract LLM observability from the provider.
+    _llm_call_attempts: int = (
+        getattr(mutation_provider, "call_attempts", 0) or 0
+    )
+    _llm_generated_count: int = (
+        getattr(mutation_provider, "generated_count", 0) or 0
+    )
+    # spend is read from the budget_guard if available; fall back to 0.0.
+    _llm_spend_usd: float = 0.0
+    if mutation_provider is not None:
+        _guard = getattr(mutation_provider, "_budget_guard", None)
+        if _guard is not None:
+            try:
+                _llm_spend_usd = float(_guard.accumulated_usd)
+            except Exception:  # noqa: BLE001
+                pass
 
     if reports and reports[0].outcome is ImmunizationOutcome.MASTER_OFF:
         return {
@@ -1809,6 +1889,11 @@ async def summarize_campaign(
             "target_escape_rate": _target_escape_rate(),
             "meets_parity_gate": False,
             "vulnerable_seeds": [],
+            # Slice 95a-2 observability
+            "llm_call_attempts": _llm_call_attempts,
+            "llm_generated_count": _llm_generated_count,
+            "llm_spend_usd": _llm_spend_usd,
+            "llm_per_seed": llm_per_seed,
         }
 
     total_escaped = sum(r.escaped_count for r in reports)
@@ -1839,6 +1924,12 @@ async def summarize_campaign(
             for r in reports
             if r.outcome is ImmunizationOutcome.NO_EVALUABLE_MUTATIONS
         ),
+        # Slice 95a-2 — LLM observability fields for auditability.
+        # Enables panic message grounding and run-level telemetry.
+        "llm_call_attempts": _llm_call_attempts,
+        "llm_generated_count": _llm_generated_count,
+        "llm_spend_usd": _llm_spend_usd,
+        "llm_per_seed": llm_per_seed,
     }
 
 
