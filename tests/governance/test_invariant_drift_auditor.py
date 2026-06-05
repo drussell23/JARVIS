@@ -846,6 +846,9 @@ class TestAuthorityInvariants:
             # auto_action_router edge-case race-condition fix
             # (a0782f7d5f); pre-existing addition CIGW will surface
             # via Slice 4 advisory bridge.
+            "spec_drift",  # added 2026-06-05 by §40 #14 Mirror-Self
+            # spec-drift validator (mirror_self_spec_drift) —
+            # CLAUDE.md claimed flag-default ≠ FlagRegistry actual.
         }
         assert {k.value for k in DriftKind} == expected
 
