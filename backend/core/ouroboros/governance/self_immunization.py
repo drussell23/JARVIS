@@ -123,6 +123,30 @@ class AdversarialTelemetryPanic(RuntimeError):
     the signal that the LLM path produced no usable output.
     """
 
+
+# ===========================================================================
+# Slice 95a — Aegis lease error (fatal; never swallowed)
+# ===========================================================================
+
+
+class AegisLeaseError(RuntimeError):
+    """Slice 95a — raised (and propagated) when Aegis is enabled but a
+    per-call lease cannot be obtained.
+
+    This is a FATAL condition: an Aegis-enabled run MUST NOT issue an
+    unleased (unauthenticated/un-proxied) upstream call.  The error is
+    deliberately raised OUTSIDE the per-mutation ``except Exception`` swallow
+    so it propagates to the caller rather than silently returning [].
+
+    Raised by ``LLMMutationProvider.mutate`` in two scenarios:
+      * ``acquire_call_lease`` returns None despite Aegis being enabled.
+      * ``acquire_call_lease`` raises for any reason (daemon unreachable,
+        cap exceeded, session expired, …).
+
+    The zero-leak invariant: ``--bootstrap-aegis`` = lease-or-abort.
+    ``--allow-direct`` (Aegis disabled) = explicit direct, unchanged.
+    """
+
 _ENV_MASTER: str = "JARVIS_ANTIVENOM_SELF_IMMUNIZATION_ENABLED"
 _ENV_MUTATIONS_PER_PATTERN: str = "JARVIS_ANTIVENOM_MUTATIONS_PER_PATTERN"
 _ENV_TARGET_ESCAPE_RATE: str = "JARVIS_ANTIVENOM_TARGET_ESCAPE_RATE"
@@ -675,10 +699,12 @@ class LLMMutationProvider:
     async def mutate(self, seed_source: str, *, n: int) -> Sequence[str]:
         """Return up to ``n`` novel structural mutations of ``seed_source``.
 
-        Never raises.  Exceptions (model errors, timeout, parse failure)
-        → returns [] (or partial results if some were collected before
-        the error).  Budget guard short-circuits before making any call
-        if already exhausted.
+        Never raises for genuine model/parse/timeout errors — those return [].
+        DOES raise :class:`AegisLeaseError` when Aegis is enabled and a lease
+        cannot be obtained (ZERO-LEAK invariant, Slice 95a): an unleased call
+        is never issued, and the error propagates to abort the run loudly.
+
+        Budget guard short-circuits before making any call if already exhausted.
         """
         if n <= 0:
             return []
@@ -693,6 +719,62 @@ class LLMMutationProvider:
             )
             return []
 
+        # ------------------------------------------------------------------
+        # Slice 95a — Aegis session-lease enforcement (ZERO-LEAK invariant)
+        #
+        # Lease acquisition is OUTSIDE the per-mutation except-swallow block.
+        # A lease failure is fatal — it must propagate, not become [].
+        # ------------------------------------------------------------------
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            aegis_provider_bridge as _apb,
+        )
+        from backend.core.ouroboros.aegis import (  # noqa: PLC0415
+            client as _aegis_client_mod,
+        )
+
+        _aegis_enabled: bool = _aegis_client_mod.is_enabled()
+        _lease_token: Optional[str] = None
+
+        if _aegis_enabled:
+            # Aegis is active: acquire a lease or abort loudly.
+            # acquire_call_lease returns None only when Aegis is disabled;
+            # under the enabled path it either returns a token or raises.
+            # We treat None-under-enabled as a misconfiguration and abort.
+            try:
+                _lease_token = await _apb.acquire_call_lease(
+                    op_id=(
+                        f"antivenom_mutate_{id(self):x}"
+                    ),
+                    route="IMMEDIATE",
+                    estimated_cost_usd=MutationBudgetGuard.estimate_cost(
+                        2048, self._max_tokens
+                    ),
+                )
+            except Exception as _exc:  # noqa: BLE001
+                raise AegisLeaseError(
+                    "[CRITICAL] Aegis enabled but lease unobtainable — "
+                    "aborting; will not issue an unleased (401) or "
+                    f"un-proxied call.  Cause: {_exc!r}"
+                ) from _exc
+
+            if _lease_token is None:
+                raise AegisLeaseError(
+                    "[CRITICAL] Aegis enabled but lease unobtainable — "
+                    "aborting; will not issue an unleased (401) or "
+                    "un-proxied call.  acquire_call_lease returned None "
+                    "despite is_enabled() == True."
+                )
+
+        # Build the extra_headers dict (empty dict when Aegis disabled /
+        # _lease_token is None — merge_lease_header handles both cleanly).
+        _extra_headers: Dict[str, str] = _apb.merge_lease_header(
+            None, _lease_token
+        )
+
+        # ------------------------------------------------------------------
+        # Per-mutation generation — genuine model/parse errors are swallowed.
+        # AegisLeaseError (raised above) has already propagated before here.
+        # ------------------------------------------------------------------
         try:
             client = self._get_client()
             prompt = self._prompt_factory(seed_source, n)
@@ -704,6 +786,7 @@ class LLMMutationProvider:
                 max_tokens=self._max_tokens,
                 system=system_text,
                 messages=[{"role": "user", "content": user_text}],
+                extra_headers=_extra_headers,  # Slice 95a: lease header
             )
 
             # Extract cost and record in guard.
