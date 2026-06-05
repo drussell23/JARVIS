@@ -57,7 +57,7 @@ import enum
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 _DEFAULT_MAX_MUTATIONS: int = 200
@@ -217,7 +217,125 @@ def _parse_args(argv=None):
             "NO_DAEMON to prevent silent budget overruns)."
         ),
     )
+    # Slice 95a-2 — explicit LLM-per-seed quota override.
+    p.add_argument(
+        "--llm-per-seed",
+        type=int,
+        default=None,
+        help=(
+            "Slice 95a-2: explicit LLM quota (mutations per seed). "
+            "Overrides the auto-derived max_mutations // num_seeds formula. "
+            "When set, the LLM is called with exactly this many mutations "
+            "per seed regardless of deterministic count. "
+            "Capped at JARVIS_ANTIVENOM_MUTATIONS_PER_PATTERN (default 200). "
+            "Default: None (auto-derived from --max-mutations)."
+        ),
+    )
     return p.parse_args(argv)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slice 95a-2 — LLM quota helpers + honest loud-fail
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _derive_llm_per_seed(
+    *,
+    max_mutations: int,
+    num_seeds: int,
+    override: Optional[int],
+) -> int:
+    """Slice 95a-2 — compute the per-seed LLM quota.
+
+    When ``override`` is provided (from ``--llm-per-seed``), return it
+    directly (the caller is responsible for capping at
+    ``_MAX_MUTATIONS_PER_PATTERN``).
+
+    Otherwise: ``max(1, max_mutations // num_seeds)`` — ensures ≥1 so the
+    LLM is always exercised when a provider is active.  The ≥1 floor is
+    load-bearing: prevents the config-starvation class where ``n=0`` for
+    all seeds when ``max_mutations < num_seeds``.
+    """
+    if override is not None:
+        return max(1, int(override))
+    n = max(1, max_mutations // max(num_seeds, 1))
+    return n
+
+
+def _loud_fail_on_zero_llm_throughput(
+    *,
+    provider: Optional[Any],
+    guard: Any,
+    dry_run: bool,
+) -> None:
+    """Slice 95a-2 — honest loud-fail: distinguish config-starvation from
+    auth/empty-stream failure.
+
+    Three mutually exclusive paths:
+
+    1. ``provider is None`` or ``dry_run=True`` → no-op (not an LLM run).
+    2. ``provider.call_attempts == 0`` → the LLM was NEVER INVOKED (n=0 for
+       all seeds — a CONFIG issue, not an auth fault).  Raises
+       :class:`ConfigStarvationError` with a ``[CONFIG]`` header.
+    3. ``provider.call_attempts > 0`` and ``provider.generated_count == 0``
+       → the LLM WAS invoked but produced nothing.  Two sub-cases:
+         a. ``$0 spend`` — auth unresolved / Aegis unreachable.
+         b. ``spend > 0`` — model returned empty/unparseable completions.
+       Both raise :class:`AdversarialTelemetryPanic` (real failure).
+    4. ``provider.generated_count > 0`` → normal operation; no panic.
+    """
+    if dry_run or provider is None:
+        return
+
+    # Import here — script runs sys.path bootstrap at module level; these
+    # imports must not happen at import time.
+    from backend.core.ouroboros.governance.self_immunization import (
+        AdversarialTelemetryPanic,
+        ConfigStarvationError,
+    )
+
+    call_attempts: int = getattr(provider, "call_attempts", 0) or 0
+    generated_count: int = getattr(provider, "generated_count", 0) or 0
+    accumulated_usd: float = 0.0
+    try:
+        accumulated_usd = float(getattr(guard, "accumulated_usd", 0.0) or 0.0)
+    except Exception:
+        pass
+
+    if generated_count > 0:
+        # Normal operation — LLM produced usable mutations.
+        return
+
+    if call_attempts == 0:
+        # Config starvation — LLM was never even called (n=0 for every seed).
+        raise ConfigStarvationError(
+            "[CONFIG] LLM was never invoked (n=0 for all seeds — the "
+            "deterministic operators filled the per-seed budget, leaving "
+            "the generative provider starved). "
+            "Raise --max-mutations or set --llm-per-seed so the generative "
+            "provider is exercised.  No auth/Aegis fault."
+        )
+
+    # call_attempts > 0 and generated_count == 0 → real LLM failure.
+    if accumulated_usd == 0.0:
+        _panic_detail = (
+            f"[CRITICAL FAULT] Generative mutation throughput = 0 under "
+            f"an LLM-enabled run AND $0 spend — auth unresolved / Aegis "
+            f"proxy unreachable (call_attempts={call_attempts}, "
+            f"generated_count=0, spend=$0.000000). "
+            f"No [PASS] emitted.  "
+            f"Check ANTHROPIC_API_KEY / Aegis /health."
+        )
+    else:
+        _panic_detail = (
+            f"[CRITICAL FAULT] Generative mutation throughput = 0 under "
+            f"an LLM-enabled run despite ${accumulated_usd:.6f} spend — "
+            f"the model returned empty/unparseable completions "
+            f"(call_attempts={call_attempts}, generated_count=0, "
+            f"possible done_before_content / empty-stream condition). "
+            f"No [PASS] emitted."
+        )
+    raise AdversarialTelemetryPanic(_panic_detail)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,18 +350,23 @@ async def run_calibration(
     budget_usd: Optional[float] = None,
     bootstrap_aegis: bool = False,
     allow_direct: bool = False,
+    llm_per_seed_override: Optional[int] = None,
 ) -> int:
     """Run the bounded calibration sweep and print results.
 
     Returns 0 on success (parity gate passed), 1 on failure
     (escape rate exceeded target or master off).
     Raises AdversarialTelemetryPanic on zero LLM throughput in a live run.
+    Raises ConfigStarvationError when the LLM is never invoked (n=0 all
+    seeds) — distinct from auth failures.
 
     Args:
         allow_direct: When True, permit the run even if Aegis is unreachable
             (NO_DAEMON verdict).  CAUTION: bypasses the Aegis budget proxy —
             only the app-level MutationBudgetGuard cap applies.  Must be
             explicitly set; default False hard-fails on NO_DAEMON.
+        llm_per_seed_override: Slice 95a-2 — explicit LLM quota per seed.
+            When provided, overrides the auto-derived formula.  None = auto.
     """
     from backend.core.ouroboros.governance import self_immunization as si
 
@@ -400,11 +523,25 @@ async def run_calibration(
     _prev_per_pattern = os.environ.get(si._ENV_MUTATIONS_PER_PATTERN)
     os.environ[si._ENV_MUTATIONS_PER_PATTERN] = str(per_pattern)
 
+    # Slice 95a-2 — derive llm_per_seed (≥1 so the LLM is always exercised).
+    # The ≥1 floor is load-bearing: prevents config-starvation where n=0 for
+    # every seed when deterministic-8 fills the per_pattern budget.
+    _llm_per_seed: Optional[int] = None
+    if provider is not None:
+        _llm_per_seed = _derive_llm_per_seed(
+            max_mutations=max_mutations,
+            num_seeds=n_seeds,
+            override=llm_per_seed_override,
+        )
+        # Cap at _MAX_MUTATIONS_PER_PATTERN.
+        _llm_per_seed = min(_llm_per_seed, si._MAX_MUTATIONS_PER_PATTERN)
+
     print(
-        f"\n[CC Parity Calibration] Slice 93/94\n"
+        f"\n[CC Parity Calibration] Slice 93/94/95a-2\n"
         f"  seeds             : {n_seeds}\n"
         f"  max_mutations     : {max_mutations}\n"
         f"  per_pattern       : {per_pattern}\n"
+        f"  llm_per_seed      : {_llm_per_seed if _llm_per_seed is not None else 'N/A (dry-run/no provider)'}\n"
         f"  budget_usd        : ${eff_budget:.4f}\n"
         f"  dry_run           : {dry_run}\n"
         f"  provider          : {'LLMMutationProvider' if provider else 'deterministic-only'}\n"
@@ -425,6 +562,7 @@ async def run_calibration(
             seeds=seeds,
             mutation_provider=provider,
             corpus_sink=corpus_sink,
+            llm_per_seed=_llm_per_seed,
         )
     finally:
         # Restore the per-pattern env so the process environment is not
@@ -444,35 +582,14 @@ async def run_calibration(
 
     elapsed = time.monotonic() - t0
 
-    # ── Slice 94 Phase 2 — loud-fail on zero LLM throughput ─────────────────
-    # A zero-valid-mutation LLM run MUST ALWAYS loud-fail regardless of spend:
-    #
-    #   generated_count == 0, accumulated_usd == 0.0  → auth unresolved / Aegis
-    #     proxy unreachable (no request ever reached the model).
-    #
-    #   generated_count == 0, accumulated_usd > 0.0   → model was reached and
-    #     tokens were spent, but returned empty/unparseable completions (the
-    #     "done_before_content" / empty-stream class).
-    #
-    # Both cases defeat the purpose of Phase 2 — printing [PASS] would be a
-    # lie.  We MUST NOT emit [PASS] in either case.
-    if not dry_run and provider is not None and provider.generated_count == 0:
-        if guard.accumulated_usd == 0.0:
-            _panic_detail = (
-                f"[CRITICAL FAULT] Generative mutation throughput = 0 under "
-                f"an LLM-enabled run AND $0 spend — auth unresolved / Aegis "
-                f"proxy unreachable. No [PASS] emitted. "
-                f"Check ANTHROPIC_API_KEY / Aegis /health."
-            )
-        else:
-            _panic_detail = (
-                f"[CRITICAL FAULT] Generative mutation throughput = 0 under "
-                f"an LLM-enabled run despite ${guard.accumulated_usd:.6f} "
-                f"spend — the model returned empty/unparseable completions "
-                f"(possible done_before_content / empty-stream condition). "
-                f"No [PASS] emitted."
-            )
-        raise si.AdversarialTelemetryPanic(_panic_detail)
+    # ── Slice 95a-2 — honest loud-fail (config-starvation vs auth-failure) ────
+    # Replaces the Slice 94 Phase 2 inline block with the extracted helper
+    # _loud_fail_on_zero_llm_throughput, which distinguishes:
+    #   call_attempts==0 → ConfigStarvationError ("[CONFIG]" — not auth)
+    #   call_attempts>0, generated==0 → AdversarialTelemetryPanic (real fail)
+    _loud_fail_on_zero_llm_throughput(
+        provider=provider, guard=guard, dry_run=dry_run
+    )
 
     # ── Results ───────────────────────────────────────────────────────────────
     total_mut = summary.get("total_mutations", 0)
@@ -487,6 +604,12 @@ async def run_calibration(
         guard.accumulated_usd / max(total_mut, 1) if total_mut > 0 else 0.0
     )
 
+    # Slice 95a-2 — observability fields from summary (backed by provider counters).
+    _obs_call_attempts: int = summary.get("llm_call_attempts", 0)
+    _obs_generated: int = summary.get("llm_generated_count", 0)
+    _obs_spend: float = summary.get("llm_spend_usd", 0.0)
+    _obs_llm_per_seed = summary.get("llm_per_seed", _llm_per_seed)
+
     print(
         f"[Results]\n"
         f"  elapsed_s         : {elapsed:.1f}\n"
@@ -498,6 +621,9 @@ async def run_calibration(
         f"  llm_spend_usd     : ${guard.accumulated_usd:.6f}\n"
         f"  remaining_usd     : ${guard.remaining_usd:.6f}\n"
         f"  cost_per_mutation : ${cost_per_mut:.6f}\n"
+        f"  llm_call_attempts : {_obs_call_attempts}\n"
+        f"  llm_generated_cnt : {_obs_generated}\n"
+        f"  llm_per_seed      : {_obs_llm_per_seed}\n"
     )
 
     if guard.cost_ledger():
@@ -550,6 +676,7 @@ def main(argv=None) -> int:
             budget_usd=args.budget_usd,
             bootstrap_aegis=args.bootstrap_aegis,
             allow_direct=args.allow_direct,
+            llm_per_seed_override=getattr(args, "llm_per_seed", None),
         )
     )
 
