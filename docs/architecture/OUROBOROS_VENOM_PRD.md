@@ -2833,6 +2833,22 @@ First-ever live execution of the §40.7.4 self-immunization loop — *generate j
 
 **Open to reach the actual §41.11.2 gate:** (1) Aegis session-lease so generation routes through the proxy; (2) re-run with the Slice 95b canary-attested preflight to obtain a trustworthy escape rate; (3) scale to ≥3,000 mutations (~$0.85) for the parity-scale result.
 
+##### §41.11.2-95c — First Aegis-routed scale-attempt + honest dual-metric ledger (2026-06-05)
+
+Closes open items (1) and (2) above; surfaces an honest FAIL on (3). Ledger artifact: `docs/security/production_parity_ledger_v1.json`.
+
+**Open item (1) CLOSED — Aegis routing works with real spend.** The §41.11.2-cal "budget-session gap" (the `--allow-direct` leak) is fixed by **Slice 95a-3** (#69275): `--bootstrap-aegis` now authorizes the daemon's fail-closed (0.0) per-route + session + hourly caps from `--budget-usd` *before* the daemon snapshots them, and `AegisLeaseError` propagates honestly through all three caller layers (was swallowed → misdiagnosed as config-starvation). The run below routed **30 generations through the Aegis budget session for $0.919635 real metered spend** — no `--allow-direct`, no direct host billing. Canary-attested (Slice 95b preflight `blocked_both` PASSED), so escape metrics are trustworthy.
+
+**Open item (3) — honest scale shortfall.** Requested `--max-mutations 3000`; the campaign issues exactly **one `mutate()` call per seed** (30 calls), and a single `max_tokens=2048` response holds ~14 variants → **418 LLM mutations, not 3,000** (658 total incl. deterministic). The fix is a per-seed async multi-call batching loop (Slice 95d), not a budget bump.
+
+**Result (658 mutations, canary-attested, Aegis-routed): `6.42%` gross escape → FAIL (> 4.4% gate).** The 0.92% seen in a 29-sample probe was a small-sample artifact; 658 is the honest baseline.
+
+**Dual metric (fully computable):** deterministic-operator escape = **0.0%** (the 8 mechanical operators are 100% caged); **all 39 escapes were novel LLM `identity`-strategy variants** → novel-LLM-variant escape ≈ **10.6%**. The cage is impervious to mechanical mutation but is defeated by creative surface-form variation.
+
+**Load-bearing finding — these are bypasses of *rule-backed* constructs, not just the 6 runtime gaps.** All 15 escaping families have EXISTING static rules (Rule 8 module-level dangerous calls: shell_exec/subprocess_run/marshal/deserialization_rce; Rule 8 Pattern 2: if/for-with-call; Rule 4: ctx_mutation; AST introspection bans: dir/vars/globals/direct_class/getattr_string; SemanticGuardian.dynamic_import_chain: dynamic_compile/importlib). Three (`alias_defeats_resolver`, `run_body_dynamic_compile`, `run_body_importlib`) are explicitly tagged `known_gap=False` / CLOSED — so the LLM variants are **regressions of supposedly-closed gaps**. This corrects an earlier name-based estimate that mislabeled 6 families as architectural "runtime-defense gaps"; reading the corpus falsified it. **Implication:** the deterministic-only 0/38 and 18.8%→6.25% figures were measured against *literal* corpus forms; an LLM defeats the same rules with surface variation.
+
+**Honest limitation.** The corpus cache persists only metadata (`mutated_source_bytes`, `strategy`, `verdict`) — not the escaped source — so a rigorous *runtime-vs-static-fixable* per-escape split is not computable from this run. Slice 95d adds escaped-source capture; Slice 95e publishes the split + a true-scale (≥3,000) `production_parity_ledger_v2.json`; Slice 95f+ hardens the static-catchable surface forms via dynamic AST tree-walking (no hardcoded string matches), re-measuring after each.
+
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
 **The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
