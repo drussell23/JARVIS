@@ -211,7 +211,10 @@ class TestClassifyAndReport:
         assert rep.escape_rate == 0.0
         assert rep.outcome is si.ImmunizationOutcome.HARDENED
 
-    def test_zero_evaluable_is_hardened_not_div_zero(self):
+    def test_zero_evaluable_is_no_evaluable_not_div_zero(self):
+        """Fix #2: zero evaluable with total_mutations > 0 → NO_EVALUABLE_MUTATIONS,
+        not HARDENED.  The cage was never exercised — HARDENED would be a false
+        positive.  Still no ZeroDivisionError."""
         results = [
             self._mk(
                 si.MutationStrategy.WHITESPACE_PAD,
@@ -220,7 +223,8 @@ class TestClassifyAndReport:
         ]
         rep = si._build_report("s", "sandbox_escape", results, 0.044)
         assert rep.escape_rate == 0.0
-        assert rep.outcome is si.ImmunizationOutcome.HARDENED
+        assert rep.outcome is si.ImmunizationOutcome.NO_EVALUABLE_MUTATIONS
+        assert rep.outcome is not si.ImmunizationOutcome.HARDENED
 
 
 # ===========================================================================
@@ -644,12 +648,14 @@ class TestAstPinsSyntheticRegression:
 
 class TestFlagSeeds:
     def test_register_flags_seeds_all_five(self):
+        # Slice 93 added 2 new flags (mutation budget + corpus cache path):
+        # the count is now 7. Updated from 5 → 7.
         from backend.core.ouroboros.governance.flag_registry import (
             FlagRegistry,
         )
 
         reg = FlagRegistry()
-        assert si.register_flags(reg) == 5
+        assert si.register_flags(reg) == 7
 
     def test_master_flag_seeded_default_false(self):
         from backend.core.ouroboros.governance.flag_registry import (
