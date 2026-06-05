@@ -133,7 +133,9 @@ def test_validation_failure_reason_thirteen_values():
     Rule 8 (post-P7.7 followup, 2026-04-26) added MODULE_LEVEL_SIDE_EFFECT
     as the 10th value. Vector #7 closure (2026-05-12) added
     INTROSPECTION_BUILTIN_CALL + ALIAS_DEFEAT as the 11th and 12th.
-    Slice 90 (2026-06-04) added TAINT_EXPLOIT (Rule 11) as the 13th."""
+    Slice 90 (2026-06-04) added TAINT_EXPLOIT (Rule 11) as the 13th.
+    Slice 95f (2026-06-05) added INSPECT_INTROSPECTION (Rule 12) as the
+    14th — the inspect-module reflection-API synonym detection."""
     assert {r.name for r in ValidationFailureReason} == {
         "NO_PHASE_RUNNER_SUBCLASS",
         "MISSING_PHASE_ATTR",
@@ -148,6 +150,7 @@ def test_validation_failure_reason_thirteen_values():
         "ALIAS_DEFEAT",  # Vector #7 Rule 10
         "MODULE_LEVEL_SIDE_EFFECT",  # Rule 8 — post-P7.7 followup
         "TAINT_EXPLOIT",  # Slice 90 Rule 11 — string-taint → sink
+        "INSPECT_INTROSPECTION",  # Slice 95f Rule 12 — inspect reflection API
     }
 
 
