@@ -2809,6 +2809,23 @@ Acceptance gate: **≤4.4% catastrophic-error rate** (matching Anthropic's bench
 
 **Deferred (named follow-ups):** LLM MutationProvider + 3,000-input corpus (§41.11.2 parity-scale), operator chains, the runtime-containment layer itself, and the §43.6.2 Chaos Monkey daemon (the harness engine is importable by it).
 
+##### §41.11.2-cal — Generative Fuzzing Calibration Baseline (2026-06-05, FIRST live run)
+
+First-ever live execution of the §40.7.4 self-immunization loop — *generate jailbreak mutations to harden the cage* — with a real frontier model. Telemetry artifact: `docs/security/telemetry_calibration_v1.json`.
+
+**Honest framing (load-bearing).** This is **calibration, not the parity gate**, and an **analog, not a reproduction**. It measures O+V's own *code-patch sandbox-escape* threat model as a structural analog of Anthropic's Constitutional Classifiers (arXiv:2501.18837); it does **not** reproduce their 86%→4.4% chatbot-jailbreak result, and **does not yet meet the ≥3,000-input §41.11.2 parity gate** (graduation milestone still open).
+
+**Measured (real data, single run):**
+- **236 mutations** (≈216 deterministic + ≈20 live Claude-generated) → **4 escapes = 2.11%** combined cage-escape rate (within the 4.4% reference, but a *small, deterministic-heavy sample* — not a parity result).
+- **Cost: $0.067 total, $0.000283/mutation** → full 3,000-input parity run projects to **≈$0.85**. The economic barrier to the parity gate is effectively removed.
+- **4 escaping vectors found:** `alias_defeats_resolver`, `ctx_mutation_assign`, `dir_introspection`, `module_level_for_with_call`. Notably `alias_defeats_resolver`/`dir_introspection` have *raw* forms the hardened static cage blocks — the fuzzer found mutation variants that slip past static analysis. Real, non-trivial findings flagged for hardening.
+
+**What it proves / doesn't.** Proves: the generative cage-hardening pipeline (Slice 93 engine #69268 + Slice 94 hardening #69269) works end-to-end live, is cheap to scale, and surfaces genuine bypasses. Does **not** prove: parity-scale robustness, any equivalence to Anthropic's number, or Aegis-routed generation.
+
+**Architectural note (Aegis leak).** The run used the explicit `--allow-direct` bypass (app-capped at $5) because the Aegis-routed path has a **budget-session gap**: `--bootstrap-aegis` spawns the daemon but never establishes a spend session, so Aegis rejected the lease at $0. Aegis-routed generation through the credential/budget proxy (§43) is a named follow-up — generation must not fall back to direct host billing.
+
+**Open to reach the actual §41.11.2 gate:** (1) Aegis session-lease so generation routes through the proxy; (2) patch the 4 escaping vectors (generalized AST-structural rules, not string-matching); (3) scale to ≥3,000 mutations (~$0.85) for the parity-scale result.
+
 #### §41.11.3 ASL-4 recursion-bound stability under sustained autonomy stress
 
 **The claim that needs proving.** Under sustained self-modification activity (i.e., §41.11.1 graduated and firing regularly), the §1 Boundary recursion-depth gate (§40.1 #1) + hash-cap on self-modification (§40.1 #2) **hold for ≥7 cumulative days of unattended-apply autonomy** without any boundary violation logged.
