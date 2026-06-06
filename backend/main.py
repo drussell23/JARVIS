@@ -5973,6 +5973,22 @@ except ImportError as e:
 except Exception as e:
     logger.warning(f"⚠️  Failed to mount Trinity Health API: {e}")
 
+# ═══════════════════════════════════════════════════════════════
+# Slice 110 — Native Command Center: Observability API Gateway
+# Mounted at MODULE LEVEL (not inside mount_routers()) so the gateway is live
+# under BOTH the standalone `python3 backend/main.py` boot AND the full
+# supervisor boot — mount_routers() is not invoked on the standalone path, so
+# the gateway (and the bus→WS bridge it feeds) must register at import like the
+# Trinity/Voice-Unlock module-level routers above. Read-only over the web for
+# everything authority-bearing (§1 sovereignty, fail-closed).
+# ═══════════════════════════════════════════════════════════════
+try:
+    from api.observability_gateway import build_router as _build_obs_router
+    app.include_router(_build_obs_router())
+    logger.info("✅ Observability Command-Center gateway mounted at /api/observability")
+except Exception as e:  # noqa: BLE001
+    logger.warning(f"⚠️  Observability gateway not available: {e}")
+
 
 # =============================================================================
 # Lightweight Health Check Endpoints (Non-blocking)
@@ -8161,17 +8177,10 @@ def mount_routers():
     except ImportError as e:
         logger.warning(f"⚠️ Broadcast API not available: {e}")
 
-    # Slice 110 — Native Command Center: Observability API Gateway. Composing
-    # bridge (NOT a parallel server) that exposes the internal TrinityEventBus /
-    # Slice-109 Why-Snapshots over typed WebSockets + REST for the React command
-    # center. Read-only over the web for everything authority-bearing; the bus→WS
-    # bridge self-subscribes at GLS boot. Mounts onto THIS app.
-    try:
-        from api.observability_gateway import build_router as _build_obs_router
-        app.include_router(_build_obs_router())
-        logger.info("✅ Observability Command-Center gateway mounted at /api/observability")
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"⚠️ Observability gateway not available: {e}")
+    # NOTE (Slice 110): the Observability Command-Center gateway is mounted at
+    # MODULE LEVEL (near the Trinity Health mount), NOT here — mount_routers()
+    # is not invoked on the standalone `python3 backend/main.py` boot, so a
+    # module-level mount guarantees the gateway is live under every entrypoint.
 
     # Context Intelligence API (router already has /context prefix)
     context = components.get("context", {})
