@@ -13,6 +13,23 @@ cd "$REPO_ROOT"
 SBX="backend/core/ouroboros/governance/sandbox_profiles"
 IMAGE="jarvis-governance-sandbox:latest"
 
+# Slice 115: --siege-mode runs the Blue/Red Adversarial Falsification Matrix in
+# the background DURING the soak — firing hostile payloads at the cage + the
+# recursion-depth bound and recording tamper-evident receipts into
+# dissertation_evidence.jsonl, accelerating the evidence clock without touching
+# the production state (read-only over the cage; siege fires off-hot-path).
+SIEGE_ARGS=()
+for _a in "$@"; do
+  case "$_a" in
+    --siege-mode)
+      export JARVIS_RED_BLUE_MATRIX_ENABLED=1
+      export JARVIS_SIEGE_MODE=1
+      ;;
+    *) SIEGE_ARGS+=("$_a") ;;
+  esac
+done
+set -- "${SIEGE_ARGS[@]:-}"
+
 log() { printf '\033[36m[shadow-soak]\033[0m %s\n' "$*"; }
 
 # ---- 1. Docker daemon ----
