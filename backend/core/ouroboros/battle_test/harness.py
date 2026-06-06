@@ -445,6 +445,8 @@ class BattleTestHarness:
         self._oracle_init_task: Optional[asyncio.Task] = None
         self._governance_stack: Any = None
         self._governed_loop_service: Any = None
+        # Slice 110 follow-up — co-boot command-center gateway server task.
+        self._gateway_task: Optional[asyncio.Task] = None
         self._predictive_engine: Any = None
         self._branch_manager: Any = None
         self._branch_name: Optional[str] = None
@@ -2156,6 +2158,30 @@ class BattleTestHarness:
 
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
+
+            # ── Slice 110 follow-up — co-boot the Command-Center gateway ──
+            # GLS is up, so the bus→WS bridge is registered (it self-gated on
+            # the cognitive bus + gateway flags during GLS boot). Serving the
+            # gateway HTTP/WS on THIS event loop means the bridge's live
+            # broadcasts reach connected command-center clients — the producer
+            # and the server now share one process. Fire-and-forget task,
+            # gated + non-fatal; cancelled in _shutdown_components.
+            try:
+                from backend.api.observability_gateway import (
+                    command_center_gateway_enabled,
+                    gateway_host,
+                    gateway_port,
+                    serve_gateway,
+                )
+                if command_center_gateway_enabled():
+                    self._gateway_task = asyncio.create_task(serve_gateway())
+                    logger.info(
+                        "[CommandCenter] observability gateway co-booting on "
+                        "http://%s:%d (Slice 110)",
+                        gateway_host(), gateway_port(),
+                    )
+            except Exception as exc:  # noqa: BLE001 — never fatal to the soak
+                logger.debug("[CommandCenter] gateway co-boot skipped: %s", exc)
 
             # ── Glanceable operator status line (Priority 2B) ─────────
             # Aggregates cost / idle / phase / op / route data from the
@@ -6444,6 +6470,19 @@ class BattleTestHarness:
                 self._activity_monitor_task.cancel()
                 try:
                     await self._activity_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0-cc. Command-Center gateway server (Slice 110 follow-up). Ask the
+        # uvicorn server to exit gracefully (serve_gateway sets should_exit on
+        # cancel), then await the task.
+        try:
+            if getattr(self, "_gateway_task", None):
+                self._gateway_task.cancel()
+                try:
+                    await self._gateway_task
                 except asyncio.CancelledError:
                     pass
         except Exception:
