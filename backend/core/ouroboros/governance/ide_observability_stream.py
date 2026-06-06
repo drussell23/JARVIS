@@ -174,6 +174,13 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# Dynamic Risk-State Convergence Engine (Slice 98 Phase 2) — emitted
+# ONLY on a convergence-band TRANSITION (NORMAL/ELEVATED/PARANOIA).
+# Payload carries the ConvergenceVerdict.to_dict() snapshot. Keyed by
+# the constant "risk_convergence" (organism property, no op_id —
+# matches the posture_changed / memory_pressure_changed convention).
+EVENT_TYPE_SCHELLING_CONVERGENCE_CHANGED = "schelling_convergence_changed"
+
 # GitIndexGuard (Phase C Slice 2) — a missing .git/index was
 # detected at boot and advisorily rebuilt (or the rebuild failed /
 # the probe failed). Single event; payload carries the full
@@ -1362,6 +1369,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,
     EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
+    EVENT_TYPE_SCHELLING_CONVERGENCE_CHANGED,  # Slice 98 Phase 2 (dynamic risk convergence)
     EVENT_TYPE_GIT_INDEX_ANOMALY,
     EVENT_TYPE_COMMIT_AUTHORITY_DECISION_RECORDED,
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
