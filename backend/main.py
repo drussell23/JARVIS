@@ -8161,6 +8161,18 @@ def mount_routers():
     except ImportError as e:
         logger.warning(f"⚠️ Broadcast API not available: {e}")
 
+    # Slice 110 — Native Command Center: Observability API Gateway. Composing
+    # bridge (NOT a parallel server) that exposes the internal TrinityEventBus /
+    # Slice-109 Why-Snapshots over typed WebSockets + REST for the React command
+    # center. Read-only over the web for everything authority-bearing; the bus→WS
+    # bridge self-subscribes at GLS boot. Mounts onto THIS app.
+    try:
+        from api.observability_gateway import build_router as _build_obs_router
+        app.include_router(_build_obs_router())
+        logger.info("✅ Observability Command-Center gateway mounted at /api/observability")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ Observability gateway not available: {e}")
+
     # Context Intelligence API (router already has /context prefix)
     context = components.get("context", {})
     if context and context.get("router"):
