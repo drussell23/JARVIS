@@ -240,7 +240,41 @@ class ProactiveExplorationSensor:
         curiosity_explored = await self._emit_curiosity_signals()
         explored.extend(curiosity_explored)
 
+        # Slice 101 Phase 8 — entropy-driven proactive exploration. Fourth
+        # independent signal source: the Dynamic Entropy Engine computes Shannon
+        # entropy over the SemanticIndex domain distribution and schedules
+        # governed exploration of the SPARSEST (least-mapped) zones. The budget
+        # is a recoverable function of cognitive load. Master-gated (default-
+        # FALSE); emits governed low-urgency ops through the SAME router.ingest
+        # cage path — never runs a probe directly. NEVER raises.
+        entropy_explored = await self._emit_entropy_signals()
+        explored.extend(entropy_explored)
+
         return explored
+
+    async def _emit_entropy_signals(self) -> List[str]:
+        """Compose the Dynamic Entropy Engine (Slice 101 Phase 8). Schedules
+        governed exploration of the sparsest semantic domains via the shared
+        ``self._router.ingest`` path — cage-protected, never a direct probe.
+        Inert (returns []) when ``JARVIS_DOMAIN_ENTROPY_ENGINE_ENABLED`` is off.
+        NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.domain_entropy_engine import (
+                domain_entropy_engine_enabled,
+                run_curiosity_scan_once,
+            )
+            if not domain_entropy_engine_enabled():
+                return []
+            report = await run_curiosity_scan_once(
+                router=self._router, repo=self._repo,
+            )
+            return list(report.ingest_results)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ExplorationSensor] entropy scan error", exc_info=True,
+            )
+            return []
 
     async def _emit_cluster_coverage_signals(self) -> List[str]:
         """Emit IntentEnvelopes for under-touched semantic clusters.
