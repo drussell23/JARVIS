@@ -5664,7 +5664,7 @@ class GovernedLoopService:
             if self._oracle is not None:
                 logger.info(
                     "[GovernedLoop] Oracle already injected (%s nodes), skipping re-init",
-                    self._oracle.get_metrics().get("total_nodes", "?"),
+                    (await self._oracle.get_metrics()).get("total_nodes", "?"),
                 )
             elif TheOracle is None:
                 raise ImportError("TheOracle not available")
@@ -5696,7 +5696,7 @@ class GovernedLoopService:
                 )
             logger.info(
                 "[GovernedLoop] Oracle indexed %s nodes across all repos",
-                self._oracle.get_metrics().get("total_nodes", "?"),
+                (await self._oracle.get_metrics()).get("total_nodes", "?"),
             )
         except asyncio.CancelledError:
             return

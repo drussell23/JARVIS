@@ -1723,67 +1723,29 @@ class BattleTestHarness:
         prerequisite to op #1.
         """
         try:
-            from backend.core.ouroboros.oracle import TheOracle
+            from backend.core.ouroboros.oracle_adapter import make_oracle_adapter
 
-            # Construct synchronously — the constructor only touches
-            # filesystem (cache dir mkdir) and Python objects; cheap.
-            # The Oracle reference is now valid for downstream wiring
-            # (GovernanceStack, GLS) even before init completes.
-            self._oracle = TheOracle()
-
-            block_on_boot = (
-                os.environ.get("JARVIS_ORACLE_BLOCK_BOOT", "")
-                .strip().lower() in _TRUTHY
-            )
-
-            if block_on_boot:
-                # Legacy synchronous-await path. Single env flag, no
-                # secret modes — operators who need deterministic boot
-                # ordering opt in explicitly.
-                logger.info(
-                    "Oracle init: synchronous (JARVIS_ORACLE_BLOCK_BOOT=true)",
-                )
-                await self._oracle.initialize()
-                logger.info("Oracle booted (synchronous)")
-                return
-
-            # Deferred path — spawn initialize() as a tracked task and
-            # return immediately so the harness boot continues. The
-            # Oracle object is wired into GLS / governance stack at
-            # the normal sites; consumers awaiting graph or semantic
-            # readiness unblock the moment each phase finishes.
+            # Slice 113: the unified async Oracle adapter. Default path is the
+            # in-process adapter — a TRANSPARENT drop-in over ``TheOracle``
+            # (``__getattr__`` delegates every non-overridden method) that only
+            # changes the 5 engine call sites to ``await``. When
+            # ``JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED`` is set, the factory
+            # returns the process-isolated proxy (Slice 112) so the 1.1 GB /
+            # 166 s graph load runs in the Oracle's OWN process and never
+            # freezes this event loop. ``start()`` encapsulates the
+            # deferred-vs-blocking init (``JARVIS_ORACLE_BLOCK_BOOT``) and, for
+            # isolation, the subprocess spawn — it returns fast; the graph
+            # hydrates in the background and queries degrade to {} until ready.
+            self._oracle = make_oracle_adapter()
+            await self._oracle.start()
+            # Surface the adapter's deferred-init task for the existing shutdown
+            # cancellation path (adapter.shutdown() also cancels it — idempotent).
+            self._oracle_init_task = getattr(self._oracle, "_init_task", None)
             logger.info(
-                "Oracle init: deferred to background task "
-                "(JARVIS_ORACLE_BLOCK_BOOT=false; default)",
+                "Oracle adapter started (process_isolation=%s, block_on_boot=%s)",
+                os.environ.get("JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED", "false"),
+                os.environ.get("JARVIS_ORACLE_BLOCK_BOOT", "false"),
             )
-
-            async def _deferred_init() -> None:
-                try:
-                    await self._oracle.initialize()
-                    logger.info("Oracle booted (deferred)")
-                except asyncio.CancelledError:
-                    # Shutdown cancellation — propagate cleanly.
-                    raise
-                except Exception as inner_exc:  # noqa: BLE001
-                    # Failure already recorded via OracleReadiness
-                    # (initialize()'s except branch); waiters will
-                    # surface OracleInitFailed instead of hanging.
-                    logger.warning(
-                        "Oracle deferred init failed: %s", inner_exc,
-                    )
-
-            self._oracle_init_task = asyncio.ensure_future(_deferred_init())
-            # Defensive: install a done_callback that swallows
-            # CancelledError so the asyncio loop-level handler
-            # doesn't classify shutdown cancellation as a leak.
-            def _swallow(task: asyncio.Task) -> None:
-                try:
-                    if task.cancelled():
-                        return
-                    task.exception()  # consume so it isn't logged as unhandled
-                except Exception:  # noqa: BLE001
-                    pass
-            self._oracle_init_task.add_done_callback(_swallow)
         except Exception as exc:
             logger.warning("Oracle failed to boot: %s", exc)
 
