@@ -1,0 +1,43 @@
+{
+  "_comment": "Slice 105 strict-runtime seccomp profile (§43 Arc 5). DEFENSE-IN-DEPTH, opt-in via JARVIS_RUNTIME_SANDBOX_SECCOMP_PROFILE. Default action ALLOW with an explicit ERRNO deny-list of host-escape / privilege-escalation / kernel-module / debug syscalls that a benign Python APPLY/VERIFY payload never issues — so it hardens the jail WITHOUT risking a broken interpreter. It complements (does not replace) the active controls: --cap-drop ALL, --security-opt no-new-privileges, --network none, --read-only, --pids-limit, plus Docker's own default seccomp profile. HONEST: this profile is NOT exercised in CI (no Docker daemon on the macOS/arm64 dev host) — validate it against your production image on a Docker/GCP host before relying on it as a primary control.",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [],
+  "syscalls": [
+    {
+      "names": [
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "reboot",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "bpf",
+        "unshare",
+        "setns",
+        "add_key",
+        "keyctl",
+        "request_key",
+        "acct",
+        "quotactl",
+        "swapon",
+        "swapoff",
+        "perf_event_open",
+        "open_by_handle_at",
+        "name_to_handle_at",
+        "_sysctl",
+        "nfsservctl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "host-escape / privilege / kernel-module / debug syscalls — denied; a benign python payload never issues these, so the interpreter is unaffected."
+    }
+  ]
+}
