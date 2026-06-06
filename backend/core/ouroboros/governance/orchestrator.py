@@ -7244,6 +7244,44 @@ class GovernedOrchestrator:
                     ctx.op_id,
                 )
 
+            # Slice 119 — Bounded M10 synapse (Order-2 RSI, human-gated). On high
+            # domain entropy / repeated algorithmic failures, the orchestrator
+            # routes to M10 for a STRUCTURAL cognitive-upgrade proposal and FORCES
+            # APPROVAL_REQUIRED — the proposal is queued PENDING the operator's
+            # signature; nothing self-applies (§1 Zero-Order Doll). The Slice-104
+            # recursion-depth gate bounds it independently. Gated, §33.1
+            # default-FALSE → byte-identical when off; this is M10's live-path ref.
+            try:
+                from backend.core.ouroboros.governance.m10_synapse import (
+                    evaluate_m10_routing,
+                    m10_synapse_enabled,
+                )
+                if m10_synapse_enabled():
+                    _m10_entropy = None
+                    try:
+                        from backend.core.ouroboros.governance.domain_entropy_engine import (
+                            compute_domain_entropy,
+                            domain_entropy_engine_enabled,
+                        )
+                        if domain_entropy_engine_enabled():
+                            _m10_entropy = getattr(compute_domain_entropy(), "normalized_entropy", None)
+                    except Exception:  # noqa: BLE001
+                        _m10_entropy = None
+                    _m10_fails = int(getattr(ctx, "recent_algorithmic_failures", 0) or 0)
+                    _m10 = evaluate_m10_routing(
+                        shannon_entropy=_m10_entropy, recent_algorithmic_failures=_m10_fails,
+                    )
+                    if _m10.route_to_m10 and risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                        risk_tier = RiskTier.APPROVAL_REQUIRED
+                        logger.warning(
+                            "[Orchestrator] M10 SYNAPSE: %s → APPROVAL_REQUIRED "
+                            "(structural upgrade PENDING operator signature; "
+                            "self-apply blocked); op=%s",
+                            _m10.reason, ctx.op_id,
+                        )
+            except Exception:  # noqa: BLE001 — synapse must never break the FSM
+                logger.debug("[Orchestrator] M10 synapse hook skipped", exc_info=True)
+
             # ---- Risk floor override (REPL /risk command) ----
             # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
             # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.

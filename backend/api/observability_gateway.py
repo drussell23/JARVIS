@@ -532,6 +532,25 @@ def build_router() -> Any:
             "armed": False,  # shadow only — promotion is operator-gated
         }
 
+    @router.get("/m10-proposals")
+    async def m10_proposals(limit: int = 25) -> Dict[str, Any]:
+        """Slice 119 — the Zero-Order-Doll Approval Matrix: PENDING M10
+        structural cognitive-upgrade proposals + their AST diff, awaiting the
+        operator's signature. The FSM pauses (APPROVAL_REQUIRED) and applies
+        NOTHING until the human signs — these are proposals, not changes."""
+        try:
+            from backend.core.ouroboros.governance.m10_synapse import pending_m10_proposals
+            props = pending_m10_proposals(limit)
+        except Exception:  # noqa: BLE001
+            props = []
+        return {
+            "proposals": props,
+            "count": len(props),
+            "alert": ("[STRUCTURAL UPGRADE PROPOSAL] M10 cognitive upgrade(s) — "
+                      "Awaiting Operator Signature (Zero-Order Doll)") if props else "",
+            "armed": False,  # never auto-applied; operator signs to graduate
+        }
+
     @router.post("/voice/{action}")
     async def voice_control(action: str, request: Request) -> Dict[str, Any]:
         """COSMETIC-ONLY write surface: mute/unmute Karen's voice. Routed through
