@@ -102,6 +102,37 @@ def ledger_path() -> Path:
     return Path(".jarvis") / "graduation_overrides.jsonl"
 
 
+def shadow_mode_enabled() -> bool:
+    """Slice 103 SHADOW MODE — fail-closed by DEFAULT TRUE.
+
+    When on (the default), an AUTO_FLIP receipt is written to the SHADOW ledger
+    for operator review but NEVER to the override ledger the boot applier reads
+    — so the production graduation engine accrues real wall-clock evidence and
+    generates the mathematical receipts, but NEVER executes the OS-level flip.
+    The human remains the SOLE actuator until ``JARVIS_GRADUATION_SHADOW_MODE``
+    is EXPLICITLY set to a falsey value. Fail-closed: an unset OR garbage value
+    keeps the system in shadow (no flip) — ONLY an explicit ``0/false/no/off``
+    un-shadows. (We do NOT use ``_env_truthy``: a default-True truthy check would
+    treat a typo'd value as un-shadowed, the wrong way to fail for an actuator.)
+    """
+    raw = os.environ.get("JARVIS_GRADUATION_SHADOW_MODE")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def shadow_ledger_path() -> Path:
+    """Shadow-mode receipt ledger. Env-overridable via
+    ``JARVIS_GRADUATION_SHADOW_LEDGER_PATH``; defaults to
+    ``.jarvis/graduation_shadow.jsonl`` under cwd. The boot applier
+    (:func:`apply_overrides_to_environ`) and :func:`all_overrides` read ONLY the
+    override ledger — shadow receipts are structurally un-actuatable."""
+    raw = os.environ.get("JARVIS_GRADUATION_SHADOW_LEDGER_PATH")
+    if raw:
+        return Path(raw)
+    return Path(".jarvis") / "graduation_shadow.jsonl"
+
+
 # ---------------------------------------------------------------------------
 # Receipt record
 # ---------------------------------------------------------------------------
@@ -194,19 +225,34 @@ def record_graduation(decision: Any, *, now_unix: Optional[float] = None) -> boo
             decided_at_iso=_utc_now_iso(),
             authorized_by="autonomous_graduation_engine",
         )
-        return _append_record(record)
+        # Slice 103 SHADOW GATE (fail-closed, DEFAULT TRUE) — the actuator
+        # boundary. In shadow mode the receipt is written to the SHADOW ledger
+        # (operator-reviewable evidence) but NOT to the override ledger the boot
+        # applier reads, and we return False so the engine never tallies it as an
+        # actuated flip. No override → no OS-level activation, even with the
+        # engine + applier on. Un-shadowing requires an EXPLICIT operator flag.
+        if shadow_mode_enabled():
+            _append_record(record, path=shadow_ledger_path(), kind="shadow")
+            return False
+        return _append_record(record, path=ledger_path(), kind="override")
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.debug("[GraduationOverride] record failed: %s", exc)
         return False
 
 
-def _append_record(record: OverrideRecord) -> bool:
+def _append_record(
+    record: OverrideRecord,
+    *,
+    path: Optional[Path] = None,
+    kind: str = "override",
+) -> bool:
     try:
         line = json.dumps(record.to_dict(), separators=(",", ":"))
     except (TypeError, ValueError) as exc:
         logger.debug("[GraduationOverride] serialize failed: %s", exc)
         return False
-    path = ledger_path()
+    if path is None:
+        path = ledger_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -229,8 +275,8 @@ def _append_record(record: OverrideRecord) -> bool:
     ok = bool(flock_append_line(path, line))
     if ok:
         logger.info(
-            "[GraduationOverride] recorded flag=%s tier=%s receipt=%s",
-            record.flag_name, record.tier, record.receipt_id,
+            "[GraduationOverride] %s recorded flag=%s tier=%s receipt=%s",
+            kind, record.flag_name, record.tier, record.receipt_id,
         )
     return ok
 

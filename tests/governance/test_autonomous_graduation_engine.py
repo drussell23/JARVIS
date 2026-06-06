@@ -114,6 +114,9 @@ def _drift_on(source_file):
 def _engine_on(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_AUTONOMOUS_GRADUATION_ENGINE_ENABLED", "true")
     monkeypatch.setenv("JARVIS_GRADUATION_OVERRIDE_APPLY_ENABLED", "true")
+    # Slice 103: these tests exercise the real ACTUATION path, so un-shadow.
+    # Production defaults to shadow-mode TRUE (the human is the sole actuator).
+    monkeypatch.setenv("JARVIS_GRADUATION_SHADOW_MODE", "false")
     monkeypatch.setenv(
         "JARVIS_GRADUATION_OVERRIDE_LEDGER_PATH",
         str(tmp_path / "graduation_overrides.jsonl"),
