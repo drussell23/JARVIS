@@ -860,6 +860,43 @@ class CodebaseKnowledgeGraph:
         if _is_new_node:
             self._metrics["total_nodes"] += 1
 
+    def prune_isolated_nodes(self) -> int:
+        """Slice 112 graph hygiene — drop degree-0 (isolated) nodes: symbols
+        with NO callers and NO callees. They are pure serialization bloat —
+        ``shortest_path`` / ``simple_cycles`` traverse *edges*, so a node with
+        zero edges can never appear in any path or cycle. Removing them shrinks
+        the cache to the minimum required for graph traversal without changing
+        a single traversal result. Keeps every index + the node/edge metrics
+        consistent. Returns the count pruned. NEVER raises."""
+        try:
+            import networkx as nx
+            isolated = list(nx.isolates(self._graph))
+            if not isolated:
+                return 0
+            for node_key in isolated:
+                try:
+                    self._graph.remove_node(node_key)
+                except Exception:  # noqa: BLE001
+                    continue
+                nid = self._node_index.pop(node_key, None)
+                if nid is not None:
+                    self._file_index.get(nid.file_path, set()).discard(node_key)
+                    self._repo_index.get(nid.repo, set()).discard(node_key)
+                    self._type_index.get(nid.node_type, set()).discard(node_key)
+            # Drop now-empty index buckets so they don't re-bloat the pickle.
+            for idx in (self._file_index, self._repo_index, self._type_index):
+                for k in [k for k, v in idx.items() if not v]:
+                    idx.pop(k, None)
+            # Recompute authoritative counts from the live graph.
+            self._metrics["total_nodes"] = self._graph.number_of_nodes()
+            self._metrics["total_edges"] = self._graph.number_of_edges()
+            logger.info("[GraphHygiene] pruned %d isolated node(s) → %d nodes / %d edges",
+                        len(isolated), self._metrics["total_nodes"], self._metrics["total_edges"])
+            return len(isolated)
+        except Exception as exc:  # noqa: BLE001 — hygiene must never break save
+            logger.warning("[GraphHygiene] prune_isolated_nodes failed (non-fatal): %s", exc)
+            return 0
+
     def add_edge(
         self,
         source: NodeID,
@@ -2722,6 +2759,18 @@ class TheOracle:
         ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering
         shields.
         """
+        # Slice 112 graph hygiene (gated, default-OFF): crush serialization
+        # bloat by pruning isolated (degree-0) nodes BEFORE the snapshot. Pure
+        # bloat removal — traversal results (shortest_path / simple_cycles) are
+        # invariant under it. Cheap (O(nodes)); never raises.
+        try:
+            if os.environ.get(
+                "JARVIS_ORACLE_GRAPH_PRUNE_ENABLED", "",
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                self._graph.prune_isolated_nodes()
+        except Exception:  # noqa: BLE001 — hygiene must never break save
+            pass
+
         # Snapshot the data dict on the asyncio thread. These are cheap
         # reference copies — heavy work is the serialization below.
         data = {
