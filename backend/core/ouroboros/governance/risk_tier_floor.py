@@ -391,6 +391,52 @@ def _governance_boundary_floor(
     return None
 
 
+def _convergence_floor(
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Slice 98 Phase 2 — compose the Dynamic Risk-State Convergence
+    Engine's recommended floor.
+
+    The convergence engine raises the floor toward observation-only /
+    paranoia under measurable cross-repo / contradictory-output /
+    malformed-intent ambiguity, and **relaxes automatically** (its
+    floor is a pure function of the rolling window — no latch).
+
+    Master-OFF (default) → the engine returns ``None`` → this helper
+    returns ``None`` → ``recommended_floor`` is byte-identical to the
+    engine not existing.
+
+    Lazy-imports the engine to avoid a hard dependency cycle, and wraps
+    the call in try/except so a convergence-engine failure can NEVER
+    break the floor computation (the floor must stay robust). NEVER
+    raises.
+    """
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: E501
+            dynamic_risk_convergence,
+        )
+        # recommended_convergence_floor uses time.time() when now_unix
+        # is None; pass the explicit `now` (converted to unix) so a
+        # caller-supplied clock stays coherent.
+        now_unix: Optional[float] = None
+        if now is not None:
+            try:
+                if now.tzinfo is None:
+                    now_unix = now.replace(tzinfo=timezone.utc).timestamp()
+                else:
+                    now_unix = now.timestamp()
+            except Exception:  # noqa: BLE001 — defensive
+                now_unix = None
+        return dynamic_risk_convergence.recommended_convergence_floor(
+            now_unix=now_unix,
+        )
+    except Exception:  # noqa: BLE001 — floor must stay robust
+        logger.debug(
+            "[RiskFloor] convergence floor lookup failed", exc_info=True,
+        )
+        return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
@@ -446,6 +492,9 @@ def recommended_floor(
     boundary = _governance_boundary_floor(target_files)
     if boundary is not None:
         candidates.append(boundary)
+    convergence = _convergence_floor(now)
+    if convergence is not None:
+        candidates.append(convergence)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
