@@ -281,3 +281,35 @@ async def run_payload_contained(
             stdout="", stderr=str(exc), duration_s=0.0, platform="linux-container",
             guarantees=_CONTAINER_GUARANTEES, diagnostic=f"wire error (fell back): {exc}",
         )
+
+
+def record_containment_breach_belief(op_id: str, result: ContainmentResult, target_files: Any) -> None:
+    """Slice 106 quarantine signal: when a candidate breaches containment at
+    runtime, record a FALSIFYING belief about its target files — so the Phase-3
+    learning loop + the GENERATE avoidance digest steer away from this paradigm,
+    and the Phase-6 sleep consolidation absorbs it. Composes belief_revision_
+    ledger (no new memory logic). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.belief_revision_ledger import (
+            EvidenceKind,
+            master_enabled,
+            record_claim,
+            record_evidence,
+        )
+        if not master_enabled():
+            return
+        files = list(target_files or [])
+        sig = ", ".join(sorted({str(f) for f in files if f})[:6]) or "(no target files)"
+        claim = record_claim(
+            f"generation in [{sig}] is runtime-safe", "containment/breach",
+            target_files=files, confidence=0.7,
+        )
+        if claim is not None:
+            breach_val = str(getattr(result.breach, "value", result.breach))
+            record_evidence(
+                claim.claim_id, EvidenceKind.FALSIFYING,
+                source_op_id=str(op_id or ""),
+                note=f"containment_breach:{breach_val}",
+            )
+    except Exception as exc:  # noqa: BLE001 — quarantine bookkeeping must never raise
+        logger.debug("[ContainerSandbox] breach-belief record swallowed: %s", exc)
