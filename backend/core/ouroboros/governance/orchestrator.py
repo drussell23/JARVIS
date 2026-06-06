@@ -7282,6 +7282,39 @@ class GovernedOrchestrator:
             except Exception:  # noqa: BLE001 — synapse must never break the FSM
                 logger.debug("[Orchestrator] M10 synapse hook skipped", exc_info=True)
 
+            # ---- Slice 120: Sovereign Layer-4 Roadmap Authority (escalation-only) ----
+            # In unattended evidence-clock mode, the operator-signed roadmap may
+            # suppress the human prompt for SAFE, explicitly-authorized scopes.
+            # Here in the orchestrator we wire only the FAIL-CLOSED direction:
+            # for any op the roadmap does NOT authorize for suppression — every
+            # safety op (Order-2/M10, recursion-breach, governance-touch,
+            # APPROVAL_REQUIRED/BLOCKED tier) and every out-of-scope op — we
+            # RE-ASSERT APPROVAL_REQUIRED. The un-signable floor (§1) cannot be
+            # reasoned around: no signature suppresses approval on a safety op.
+            # Default-off (JARVIS_LAYER4_ROADMAP_ENABLED) → byte-identical.
+            try:
+                from backend.core.ouroboros.governance import layer4_roadmap_authority as _L4
+
+                if _L4.layer4_enabled() and risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                    _l4_auth = _L4.load_and_verify_roadmap(now=int(time.time()))
+                    _l4_scope = str(getattr(ctx, "scope", "") or getattr(ctx, "category", "") or "")
+                    _l4_is_m10 = bool(getattr(ctx, "is_order2_rsi", False) or getattr(ctx, "m10_routed", False))
+                    if not _L4.may_suppress_approval(
+                        _l4_auth,
+                        op_scope=_l4_scope,
+                        risk_tier=risk_tier.name,
+                        is_order2_rsi=_l4_is_m10,
+                    ):
+                        # Op is NOT cleared for unattended auto-resolution → the
+                        # human still owns it.
+                        risk_tier = RiskTier.APPROVAL_REQUIRED
+                        logger.info(
+                            "[Orchestrator] LAYER4: %s → APPROVAL_REQUIRED; op=%s",
+                            _L4.degrade_reason(_l4_auth), ctx.op_id,
+                        )
+            except Exception:
+                logger.debug("[Orchestrator] Layer-4 authority hook skipped", exc_info=True)
+
             # ---- Risk floor override (REPL /risk command) ----
             # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
             # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.
