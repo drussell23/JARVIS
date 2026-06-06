@@ -259,6 +259,16 @@ class StrategicDirectionService:
         rust_map_block = self._render_rust_subsystems_section(op_id=op_id)
         if rust_map_block:
             body = f"{body}\n\n{rust_map_block}"
+        # Slice 101 — Recently-Failing Areas (Adaptive Intelligence
+        # Invariant). Reads recent DRIFTING/FALSIFIED beliefs recorded by
+        # the cognitive-bus belief subscriber on post_failure, biasing
+        # generation away from recently-failing files. Authority-free,
+        # ImportError-safe, master-gated inside the substrate, empty when
+        # no signal. Placed among the additive blocks (before causal
+        # lineage, which stays closest to the generation point).
+        avoidance_block = self._render_avoidance_section()
+        if avoidance_block:
+            body = f"{body}\n\n{avoidance_block}"
         # §31 U2 Slice 2 — Causal-lineage injection. Mirrors the
         # failure-modes / action-outcomes discipline: ImportError-
         # safe, master-flag-checked inside the substrate, empty
@@ -272,6 +282,29 @@ class StrategicDirectionService:
         if causal_lineage_block:
             body = f"{body}\n\n{causal_lineage_block}"
         return body
+
+    def _render_avoidance_section(self) -> str:
+        """Compose the optional ``## Recently-Failing Areas`` block (Slice 101).
+
+        Authority-free read-side of the cognitive learning loop. Composes
+        :func:`cognitive_subscribers.recent_avoidance_digest`, which self-gates
+        on the cognitive-bus + belief-revision masters and returns '' when there
+        is no signal. Gated first on ``cognitive_bus_enabled()`` so the whole
+        path is byte-identical to pre-Slice-101 when the bus is off.
+        ImportError-safe; NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.cognitive_bus import (
+                cognitive_bus_enabled,
+            )
+            if not cognitive_bus_enabled():
+                return ""
+            from backend.core.ouroboros.governance.cognitive_subscribers import (
+                recent_avoidance_digest,
+            )
+            return recent_avoidance_digest() or ""
+        except Exception:  # noqa: BLE001 — advisory injection is best-effort
+            return ""
 
     def _render_dev_memory_section(
         self, op_id: Optional[str] = None,

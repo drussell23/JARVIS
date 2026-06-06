@@ -1579,6 +1579,18 @@ class GovernedLoopService:
 
         self._state = ServiceState.STOPPING
 
+        # Slice 101 — publish session_end onto the cognitive bus before the
+        # drain so observational subscribers can react. Fire-and-forget,
+        # NEVER raises, inert unless JARVIS_COGNITIVE_BUS_ENABLED.
+        try:
+            from backend.core.ouroboros.governance.cognitive_bus import (
+                LIFECYCLE_SESSION_END,
+                publish_lifecycle_event as _cb_session_end,
+            )
+            _cb_session_end(LIFECYCLE_SESSION_END, {"service": "GLS"})
+        except Exception:  # noqa: BLE001
+            pass
+
         # P2 Slice 3 — stop the Convergence Reaper first so its
         # background task doesn't race the drain. Master-gated
         # NEVER-raise; idempotent on an already-stopped reaper.
@@ -1915,6 +1927,38 @@ class GovernedLoopService:
                 exc_info=True,
             )
             self._trajectory_auditor_observer = None
+
+        # Slice 101 — Cognitive Integration Bus subscriber registration.
+        # Registers the cognitive subscribers (belief-revision learning loop,
+        # ...) onto the production TrinityEventBus so they react to FSM
+        # lifecycle events published from _record_ledger. Inert (returns [])
+        # unless JARVIS_COGNITIVE_BUS_ENABLED (§33.1 default-FALSE). Each
+        # subscriber self-gates on its own substrate master. NEVER fatal.
+        self._cognitive_bus_subscription_ids = []
+        try:
+            from backend.core.ouroboros.governance.cognitive_bus import (
+                register_cognitive_subscribers,
+            )
+            from backend.core.ouroboros.governance.cognitive_subscribers import (
+                build_default_subscribers,
+            )
+            self._cognitive_bus_subscription_ids = (
+                await register_cognitive_subscribers(build_default_subscribers())
+            )
+            if self._cognitive_bus_subscription_ids:
+                _incr_observer_boot("cognitive_bus")
+                logger.info(
+                    "[GovernedLoop] Cognitive Integration Bus: %d subscriber(s) "
+                    "registered (Slice 101)",
+                    len(self._cognitive_bus_subscription_ids),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] Cognitive bus subscriber registration failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._cognitive_bus_subscription_ids = []
 
     async def _stop_governance_observers(self) -> None:
         """Stop the Tier 0.5 (batches 1+2) observers gracefully.
