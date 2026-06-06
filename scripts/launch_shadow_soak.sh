@@ -25,6 +25,17 @@ for _a in "$@"; do
       export JARVIS_RED_BLUE_MATRIX_ENABLED=1
       export JARVIS_SIEGE_MODE=1
       ;;
+    --layer4-autonomous)
+      # Slice 120: arm the Sovereign Layer-4 Roadmap Authority. The system
+      # reads .jarvis/roadmap.signed.yaml, verifies the operator's HMAC
+      # signature, and — for the SAFE, explicitly-authorized scopes ONLY —
+      # auto-resolves the approval prompt so the evidence clock runs unattended.
+      # The un-signable floor still holds absolutely: Order-2/M10, recursion
+      # breach, governance touches, and APPROVAL_REQUIRED/BLOCKED tiers ALWAYS
+      # escalate to a live operator, regardless of signature. A missing/forged/
+      # expired roadmap fails CLOSED → per-PR human review (legacy behavior).
+      export JARVIS_LAYER4_ROADMAP_ENABLED=1
+      ;;
     *) SIEGE_ARGS+=("$_a") ;;
   esac
 done
