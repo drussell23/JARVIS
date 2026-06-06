@@ -11292,6 +11292,46 @@ class GovernedOrchestrator:
             _s74_publish_terminal(ctx, state)
         except Exception:  # noqa: BLE001 — never raise into _record_ledger
             pass
+        # ── Slice 101 — Cognitive Integration Bus lifecycle fan-out ──
+        # Mirror the terminal state onto the cognitive bus so dormant
+        # substrates (belief revision, counterfactual rehearsal, ...) can
+        # react in the BACKGROUND via async subscribers. Sync-safe, fire-
+        # and-forget, NEVER raises into _record_ledger; inert unless
+        # JARVIS_COGNITIVE_BUS_ENABLED (§33.1 default-FALSE). Decoupled from
+        # `written` just like the SSE publish above — a deduped terminal row
+        # must still wake the cognitive layer (the publisher is internally a
+        # no-op when the bus isn't running, so this is exactly-once-safe).
+        try:
+            _cb_sv = str(getattr(state, "value", state)).lower()
+            _cb_kind = None
+            if _cb_sv == "applied":
+                _cb_kind = "post_apply"
+            elif _cb_sv in ("failed", "blocked", "rolled_back"):
+                _cb_kind = "post_failure"
+            if _cb_kind is not None:
+                from backend.core.ouroboros.governance.cognitive_bus import (  # noqa: E501
+                    publish_lifecycle_event as _cb_publish,
+                )
+                try:
+                    _cb_tf = [
+                        str(p)
+                        for p in (getattr(ctx, "target_files", None) or [])
+                    ][:32]
+                except Exception:  # noqa: BLE001
+                    _cb_tf = []
+                _cb_publish(
+                    _cb_kind,
+                    {
+                        "op_id": str(getattr(ctx, "op_id", "") or ""),
+                        "state": _cb_sv,
+                        "phase": str(getattr(ctx, "current_phase", "") or ""),
+                        "target_files": _cb_tf,
+                        "reason": str((data or {}).get("reason", "")),
+                    },
+                    correlation_id=str(getattr(ctx, "op_id", "") or "") or None,
+                )
+        except Exception:  # noqa: BLE001 — bus fan-out must never touch the FSM
+            pass
         if written:
             try:
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
