@@ -91,18 +91,24 @@ export OUROBOROS_NARRATOR_ENABLED=1                 # Karen master (unmuted)
 export JARVIS_KAREN_TOOL_VOICE_ENABLED=1            # tool/phase sub-voice (unmuted)
 export JARVIS_KAREN_VOICE="${JARVIS_KAREN_VOICE:-Karen}"
 
-# ---- 3c. Slice 110 — Native Command Center (FastAPI gateway + React UI) ----
-# COMMAND_CENTER=1 brings up the SOVEREIGN INTERFACE instead of the headless
-# soak: the FastAPI backend (backend/main.py) hosts the O+V engine + the
-# observability gateway + the bus→WS bridge in ONE process, and the React
-# command center is served on :3000. The cognitive bus, the Why-Snapshot
-# bridge, and the WS fan-out all share that process, so the dashboard paints
-# live cognitive telemetry. The headless evidence soak and the native UI are
-# alternative front-ends to the same engine — we never double-boot it.
+# ---- 3c. Slice 110 — Native Command Center (live engine + gateway + React UI) ----
+# COMMAND_CENTER=1 brings up the SOVEREIGN INTERFACE: it runs the SOAK HARNESS
+# (the O+V engine — the cognitive-event PRODUCER) with the gateway co-booted IN
+# THE SAME PROCESS + EVENT LOOP (JARVIS_COMMAND_CENTER_GATEWAY=1). Because the
+# producer (GLS, which registers the bus→WS bridge at boot) and the gateway WS
+# server share one process, the bridge's live broadcasts reach the dashboard —
+# so the command center PULSES with real cognitive telemetry, not an idle shell.
+# The React UI is served on :3000. (Running backend/main.py would serve the UI
+# but NOT boot the engine → an idle dashboard; that was the prior gap.)
 export JARVIS_OBSERVABILITY_GATEWAY_ENABLED=1
 if [ "${COMMAND_CENTER:-0}" = "1" ]; then
   BACKEND_PORT="${JARVIS_BACKEND_PORT:-8000}"
   FRONTEND_PORT="${JARVIS_FRONTEND_PORT:-3000}"
+  CC_COST_CAP="${SHADOW_COST_CAP:-0.50}"
+  CC_IDLE="${SHADOW_IDLE_TIMEOUT:-600}"
+  CC_WALL="${SHADOW_MAX_WALL_SECONDS:-3600}"   # 60-min default watch session
+  export JARVIS_COMMAND_CENTER_GATEWAY=1        # co-boot the gateway inside the engine loop
+  export JARVIS_BACKEND_PORT FRONTEND_PORT JARVIS_FRONTEND_PORT="$FRONTEND_PORT"
   CC_PIDS=()
   cleanup_cc() {
     log "shutting down command center..."
@@ -112,14 +118,17 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
   }
   trap cleanup_cc EXIT INT TERM
 
-  log "starting O+V engine + FastAPI observability gateway on :$BACKEND_PORT..."
-  python3 backend/main.py --port "$BACKEND_PORT" &
+  log "booting O+V engine (soak) + co-booted gateway on :$BACKEND_PORT (cost=\$$CC_COST_CAP wall=${CC_WALL}s)..."
+  python3 scripts/ouroboros_battle_test.py \
+    --cost-cap "$CC_COST_CAP" --idle-timeout "$CC_IDLE" --max-wall-seconds "$CC_WALL" \
+    --headless -v &
   CC_PIDS+=("$!")
 
-  # Wait for the gateway health endpoint (async, bounded).
-  for i in $(seq 1 60); do
+  # Wait for the co-booted gateway health endpoint (async, bounded — the engine
+  # boots the full 6-layer stack before serving, so allow generous time).
+  for i in $(seq 1 90); do
     if curl -sf "http://127.0.0.1:$BACKEND_PORT/api/observability/health" >/dev/null 2>&1; then
-      log "observability gateway is live (/api/observability/health)."
+      log "live gateway up — engine producing telemetry (/api/observability/health)."
       break
     fi
     sleep 1
@@ -132,10 +141,10 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
     CC_PIDS+=("$!")
     log "OPEN → http://localhost:$FRONTEND_PORT/command-center"
   else
-    log "frontend/ or npm missing — gateway REST/WS is live at :$BACKEND_PORT, build the UI with 'cd frontend && npm install && npm start'."
+    log "frontend/ or npm missing — live gateway REST/WS is up at :$BACKEND_PORT; build the UI with 'cd frontend && npm install && npm start'."
   fi
 
-  log "command center up. Ctrl-C to tear down. (engine + gateway + UI share one process tree)"
+  log "command center LIVE. Engine + gateway + UI share one process tree; the dashboard pulses as the engine works. Ctrl-C to tear down."
   wait
   exit 0
 fi

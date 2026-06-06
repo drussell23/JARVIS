@@ -46,6 +46,7 @@ envelope ``{kind, op_id, ts, payload}`` where ``kind`` ∈ {``why_snapshot``,
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -374,6 +375,101 @@ def _is_loopback(request: Any) -> bool:
         return str(host) in _LOOPBACK_HOSTS
     except Exception:  # noqa: BLE001
         return False
+
+
+# ===========================================================================
+# Co-boot server (Slice 110 follow-up) — run the gateway IN the engine process
+# ===========================================================================
+#
+# Process-topology fix: the bus→WS bridge broadcasts to ``observability_manager``,
+# a module global. For LIVE cognitive frames, the producer (the governed loop,
+# which registers the bridge at GLS boot) and the gateway HTTP/WS server must
+# share ONE process + event loop. ``serve_gateway`` runs a lightweight uvicorn
+# server for ONLY the gateway router (it does NOT import the monolith) on the
+# CURRENT running loop — co-booted by the soak harness once GLS is up. Then a
+# WS client connected to this server receives the bridge's live broadcasts.
+
+
+def command_center_gateway_enabled() -> bool:
+    """Co-boot switch — when TRUE, the harness serves the gateway in-process so
+    live cognitive frames reach the command center. §33.1 default FALSE (the
+    headless evidence soak does not open a port unless asked)."""
+    return _env_truthy("JARVIS_COMMAND_CENTER_GATEWAY", default=False)
+
+
+def _cors_origins() -> List[str]:
+    """Dev CORS allow-list for the command-center frontend. Env-driven (no
+    hardcoded port): the frontend port comes from ``JARVIS_FRONTEND_PORT`` and we
+    permit the standard local hostnames (incl. the Docker bridge host)."""
+    port = (os.environ.get("JARVIS_FRONTEND_PORT", "3000") or "3000").strip()
+    hosts = ("localhost", "127.0.0.1", "host.docker.internal")
+    return [f"http://{h}:{port}" for h in hosts]
+
+
+def gateway_host() -> str:
+    return (os.environ.get("JARVIS_GATEWAY_HOST", "127.0.0.1") or "127.0.0.1").strip()
+
+
+def gateway_port() -> int:
+    try:
+        return int(os.environ.get("JARVIS_BACKEND_PORT", "8000") or "8000")
+    except Exception:  # noqa: BLE001
+        return 8000
+
+
+def build_gateway_app() -> Any:
+    """A MINIMAL standalone FastAPI app hosting ONLY the observability gateway
+    router + CORS for the frontend. Deliberately does NOT import the monolith
+    (`backend.main`) — keeps the co-boot lightweight + fast. Requires FastAPI."""
+    if not _HAVE_FASTAPI:
+        raise RuntimeError("FastAPI unavailable — cannot build gateway app")
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app = FastAPI(title="O+V Observability Gateway", docs_url=None, redoc_url=None)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(build_router())
+    return app
+
+
+async def serve_gateway(*, host: Optional[str] = None, port: Optional[int] = None,
+                        log_level: str = "warning") -> None:
+    """Run the gateway as a uvicorn ``Server`` on the CURRENT event loop (co-boot
+    inside the engine process). Blocks until cancelled. NEVER raises out — a
+    bind failure or shutdown is logged, not propagated into the soak. On
+    cancellation it asks the server to exit gracefully."""
+    try:
+        import uvicorn
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ObsGateway] uvicorn unavailable — gateway not served: %s", exc)
+        return
+    h = host or gateway_host()
+    p = int(port if port is not None else gateway_port())
+    try:
+        config = uvicorn.Config(build_gateway_app(), host=h, port=p,
+                                log_level=log_level, loop="asyncio", lifespan="off")
+        server = uvicorn.Server(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ObsGateway] gateway server config failed: %s", exc)
+        return
+    logger.info("[ObsGateway] command-center gateway serving on http://%s:%d (co-boot)", h, p)
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        # Graceful shutdown on soak teardown.
+        try:
+            server.should_exit = True
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ObsGateway] gateway server stopped: %s", exc)
 
 
 def build_router() -> Any:

@@ -13,6 +13,8 @@ verification; this proves the data path that feeds it.)
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from backend.api import observability_gateway as OG
@@ -228,6 +230,94 @@ class TestRouter:
         with c.websocket_connect("/api/observability/ws") as ws:
             first = ws.receive_json()
             assert first["kind"] == OG.KIND_HELLO
+
+
+# ===========================================================================
+# Co-boot server (Slice 110 follow-up) — engine + gateway in one process
+# ===========================================================================
+
+
+class TestCoBoot:
+    def test_gateway_flag_default_false(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_COMMAND_CENTER_GATEWAY", raising=False)
+        assert OG.command_center_gateway_enabled() is False
+        monkeypatch.setenv("JARVIS_COMMAND_CENTER_GATEWAY", "1")
+        assert OG.command_center_gateway_enabled() is True
+
+    def test_cors_origins_are_env_driven_no_hardcode(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FRONTEND_PORT", "4321")
+        origins = OG._cors_origins()
+        assert "http://localhost:4321" in origins
+        assert "http://127.0.0.1:4321" in origins
+        assert any("host.docker.internal:4321" in o for o in origins)
+
+    def test_gateway_port_host_env_driven(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BACKEND_PORT", "9123")
+        monkeypatch.setenv("JARVIS_GATEWAY_HOST", "0.0.0.0")
+        assert OG.gateway_port() == 9123
+        assert OG.gateway_host() == "0.0.0.0"
+
+    def test_build_gateway_app_mounts_router_with_cors(self):
+        from fastapi.testclient import TestClient
+        app = OG.build_gateway_app()
+        # CORS middleware present.
+        assert any("CORSMiddleware" in str(m) for m in app.user_middleware)
+        # The gateway router is mounted on the standalone app.
+        r = TestClient(app).get("/api/observability/health")
+        assert r.status_code == 200
+        assert r.json()["schema_version"] == OG.GATEWAY_FRAME_SCHEMA_VERSION
+
+    @pytest.mark.asyncio
+    async def test_serve_gateway_builds_and_serves(self, monkeypatch):
+        import uvicorn
+        captured = {}
+
+        class _FakeServer:
+            def __init__(self, config):
+                captured["config"] = config
+                self.should_exit = False
+                self.served = False
+            async def serve(self):
+                self.served = True
+                captured["server"] = self
+
+        monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: {"args": a, "kw": k})
+        monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+        await OG.serve_gateway(port=0)
+        assert captured["server"].served is True
+
+    @pytest.mark.asyncio
+    async def test_serve_gateway_graceful_on_cancel(self, monkeypatch):
+        import uvicorn
+        captured = {}
+
+        class _FakeServer:
+            def __init__(self, config):
+                self.should_exit = False
+                captured["server"] = self
+            async def serve(self):
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: object())
+        monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+        with pytest.raises(asyncio.CancelledError):
+            await OG.serve_gateway(port=0)
+        # On cancel it requests graceful exit.
+        assert captured["server"].should_exit is True
+
+    @pytest.mark.asyncio
+    async def test_serve_gateway_swallows_missing_uvicorn(self, monkeypatch):
+        # If uvicorn import fails, serve_gateway returns quietly (never raises).
+        import builtins
+        real_import = builtins.__import__
+
+        def _boom(name, *a, **k):
+            if name == "uvicorn":
+                raise ImportError("no uvicorn")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", _boom)
+        await OG.serve_gateway(port=0)  # must not raise
 
 
 class TestLoopbackGate:
