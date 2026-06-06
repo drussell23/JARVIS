@@ -269,6 +269,13 @@ class StrategicDirectionService:
         avoidance_block = self._render_avoidance_section()
         if avoidance_block:
             body = f"{body}\n\n{avoidance_block}"
+        # Slice 101 Phase 6 — Consolidated Strategic Priors (the Synthetic Soul
+        # retrieval). Cross-session meta-prior calibration distilled by the
+        # sleep-consolidation cascade; persistent across reboots. Authority-free,
+        # empty when the meta-prior substrate is dormant.
+        consolidated_block = self._render_consolidated_memory_section()
+        if consolidated_block:
+            body = f"{body}\n\n{consolidated_block}"
         # §31 U2 Slice 2 — Causal-lineage injection. Mirrors the
         # failure-modes / action-outcomes discipline: ImportError-
         # safe, master-flag-checked inside the substrate, empty
@@ -303,6 +310,62 @@ class StrategicDirectionService:
                 recent_avoidance_digest,
             )
             return recent_avoidance_digest() or ""
+        except Exception:  # noqa: BLE001 — advisory injection is best-effort
+            return ""
+
+    def _render_consolidated_memory_section(self) -> str:
+        """Compose the optional ``## Consolidated Strategic Priors`` block
+        (Slice 101 Phase 6 — the Synthetic Soul retrieval surface).
+
+        This is how a FRESH boot "knows" what worked / failed across prior
+        sessions: it reads the consolidated meta-prior calibration that the
+        Sleep Daemon refreshes (``meta_prior_learning.compute_meta_distribution``,
+        backed by a persistent JSONL ledger that survives reboots) and surfaces
+        DECLINING priors (strategic paradigms losing favor across sessions →
+        avoid) and DOMINANT priors (consistently winning → prefer). Authority-
+        free advice; the substrate self-gates (returns empty ``per_prior`` when
+        ``JARVIS_META_PRIOR_LEARNING_ENABLED`` is off) so this is byte-identical
+        to legacy when dormant. ImportError-safe; NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.meta_prior_learning import (
+                MetaPriorVerdict,
+                compute_meta_distribution,
+            )
+            report = compute_meta_distribution()
+            declining = [
+                p for p in getattr(report, "per_prior", ())
+                if getattr(p, "verdict", None) is MetaPriorVerdict.DECLINING
+            ]
+            dominant = [
+                p for p in getattr(report, "per_prior", ())
+                if getattr(p, "verdict", None) is MetaPriorVerdict.DOMINANT
+            ]
+            if not declining and not dominant:
+                return ""
+            lines = [
+                "## Consolidated Strategic Priors (cross-session memory)",
+                "",
+                "Distilled from prior sessions by the sleep-consolidation pass. "
+                "Let this bias your approach; it is advisory, not a hard rule.",
+                "",
+            ]
+            if declining:
+                lines.append("**Declining (recently losing favor — avoid unless justified):**")
+                for p in declining[:6]:
+                    lines.append(
+                        f"- `{p.prior_kind}` "
+                        f"(recent win-rate {p.win_rate_recent:.0%}, trend {p.trend:+.2f})"
+                    )
+                lines.append("")
+            if dominant:
+                lines.append("**Dominant (consistently working — prefer):**")
+                for p in dominant[:6]:
+                    lines.append(
+                        f"- `{p.prior_kind}` "
+                        f"(recent win-rate {p.win_rate_recent:.0%})"
+                    )
+            return "\n".join(lines).rstrip()
         except Exception:  # noqa: BLE001 — advisory injection is best-effort
             return ""
 

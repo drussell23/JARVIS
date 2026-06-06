@@ -1988,6 +1988,33 @@ class GovernedLoopService:
             )
             self._cognitive_bus_subscription_ids = []
 
+        # Slice 101 Phase 6 — Sleep Consolidation Daemon. Background async task
+        # that runs the cross-session memory cascade (belief + postmortem-fusion
+        # → consolidation → meta-prior calibration) OFF the hot path on an idle-
+        # gated cadence. Inert (no task spawned) unless JARVIS_SLEEP_DAEMON_
+        # ENABLED (§33.1 default-FALSE). Stored on self for graceful cancel.
+        self._sleep_daemon_task = None
+        try:
+            from backend.core.ouroboros.governance.sleep_daemon import (
+                run_sleep_daemon_loop,
+                sleep_daemon_enabled,
+            )
+            if sleep_daemon_enabled():
+                self._sleep_daemon_task = asyncio.create_task(
+                    run_sleep_daemon_loop()
+                )
+                _incr_observer_boot("sleep_daemon")
+                logger.info(
+                    "[GovernedLoop] Sleep Consolidation Daemon started "
+                    "(Slice 101 Phase 6)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] Sleep daemon startup failed (non-fatal)",
+                exc_info=True,
+            )
+            self._sleep_daemon_task = None
+
     async def _stop_governance_observers(self) -> None:
         """Stop the Tier 0.5 (batches 1+2) observers gracefully.
 
@@ -1995,6 +2022,21 @@ class GovernedLoopService:
         independently — one observer's stop failure does NOT prevent
         the others from stopping. NEVER raises.
         """
+        # Slice 101 Phase 6 — cancel the Sleep Consolidation Daemon first so its
+        # background cycle doesn't race the drain. Idempotent; NEVER raises.
+        _sleep_task = getattr(self, "_sleep_daemon_task", None)
+        if _sleep_task is not None and not _sleep_task.done():
+            _sleep_task.cancel()
+            try:
+                await _sleep_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] sleep daemon stop failed (non-fatal)",
+                    exc_info=True,
+                )
+
         for attr_name in (
             "_invariant_drift_observer",
             "_coherence_observer",
