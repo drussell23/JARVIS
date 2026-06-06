@@ -1998,6 +1998,30 @@ class GovernedLoopService:
                     "swallowed (non-fatal)",
                     exc_info=True,
                 )
+            # Slice 110 — Native Command Center. Bind the bus→WebSocket bridge so
+            # cognitive lifecycle frames fan out to the React command center
+            # (when this process also serves the FastAPI app). Inert when the
+            # gateway is disabled or no WS clients are connected. NEVER fatal.
+            try:
+                from backend.api.observability_gateway import (
+                    register_gateway_bridge,
+                )
+                gw_ids = await register_gateway_bridge()
+                if gw_ids:
+                    self._cognitive_bus_subscription_ids = list(
+                        self._cognitive_bus_subscription_ids
+                    ) + list(gw_ids)
+                    logger.info(
+                        "[GovernedLoop] Command-Center gateway: %d bridge "
+                        "subscriber(s) bound to cognitive bus (Slice 110)",
+                        len(gw_ids),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] gateway bridge registration swallowed "
+                    "(non-fatal)",
+                    exc_info=True,
+                )
             if self._cognitive_bus_subscription_ids:
                 _incr_observer_boot("cognitive_bus")
                 logger.info(

@@ -91,7 +91,56 @@ export OUROBOROS_NARRATOR_ENABLED=1                 # Karen master (unmuted)
 export JARVIS_KAREN_TOOL_VOICE_ENABLED=1            # tool/phase sub-voice (unmuted)
 export JARVIS_KAREN_VOICE="${JARVIS_KAREN_VOICE:-Karen}"
 
-# ---- 4. Launch the soak ----
+# ---- 3c. Slice 110 — Native Command Center (FastAPI gateway + React UI) ----
+# COMMAND_CENTER=1 brings up the SOVEREIGN INTERFACE instead of the headless
+# soak: the FastAPI backend (backend/main.py) hosts the O+V engine + the
+# observability gateway + the bus→WS bridge in ONE process, and the React
+# command center is served on :3000. The cognitive bus, the Why-Snapshot
+# bridge, and the WS fan-out all share that process, so the dashboard paints
+# live cognitive telemetry. The headless evidence soak and the native UI are
+# alternative front-ends to the same engine — we never double-boot it.
+export JARVIS_OBSERVABILITY_GATEWAY_ENABLED=1
+if [ "${COMMAND_CENTER:-0}" = "1" ]; then
+  BACKEND_PORT="${JARVIS_BACKEND_PORT:-8000}"
+  FRONTEND_PORT="${JARVIS_FRONTEND_PORT:-3000}"
+  CC_PIDS=()
+  cleanup_cc() {
+    log "shutting down command center..."
+    for pid in "${CC_PIDS[@]:-}"; do
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
+  }
+  trap cleanup_cc EXIT INT TERM
+
+  log "starting O+V engine + FastAPI observability gateway on :$BACKEND_PORT..."
+  python3 backend/main.py --port "$BACKEND_PORT" &
+  CC_PIDS+=("$!")
+
+  # Wait for the gateway health endpoint (async, bounded).
+  for i in $(seq 1 60); do
+    if curl -sf "http://127.0.0.1:$BACKEND_PORT/api/observability/health" >/dev/null 2>&1; then
+      log "observability gateway is live (/api/observability/health)."
+      break
+    fi
+    sleep 1
+  done
+
+  if [ -d frontend ] && command -v npm >/dev/null 2>&1; then
+    log "serving the React command center on :$FRONTEND_PORT (→ /command-center)..."
+    ( cd frontend && BROWSER=none PORT="$FRONTEND_PORT" \
+        REACT_APP_API_URL="http://127.0.0.1:$BACKEND_PORT" npm start ) &
+    CC_PIDS+=("$!")
+    log "OPEN → http://localhost:$FRONTEND_PORT/command-center"
+  else
+    log "frontend/ or npm missing — gateway REST/WS is live at :$BACKEND_PORT, build the UI with 'cd frontend && npm install && npm start'."
+  fi
+
+  log "command center up. Ctrl-C to tear down. (engine + gateway + UI share one process tree)"
+  wait
+  exit 0
+fi
+
+# ---- 4. Launch the soak (headless evidence-accrual mode) ----
 COST_CAP="${SHADOW_COST_CAP:-0.50}"
 IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-600}"
 MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-2400}"

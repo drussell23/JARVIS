@@ -1,0 +1,113 @@
+/* CommandCenter — Slice 110. Elite dark cyber console aesthetic.
+   Matches the existing MatrixBackground palette (cyan/amber on near-black). */
+
+.cc-root {
+  --cc-bg: #06090f;
+  --cc-panel: #0b1018;
+  --cc-border: #1c2733;
+  --cc-cyan: #22d3ee;
+  --cc-amber: #f59e0b;
+  --cc-green: #34d399;
+  --cc-red: #f87171;
+  --cc-text: #cbd5e1;
+  --cc-dim: #64748b;
+  font-family: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+  background: radial-gradient(circle at 30% 10%, #0a1422 0%, var(--cc-bg) 70%);
+  color: var(--cc-text);
+  min-height: 100vh;
+  padding: 14px 18px;
+  box-sizing: border-box;
+}
+
+.cc-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-bottom: 12px; border-bottom: 1px solid var(--cc-border); margin-bottom: 14px;
+}
+.cc-brand { font-size: 15px; letter-spacing: 2px; color: var(--cc-cyan); font-weight: 600; }
+.cc-brand-mark { color: var(--cc-amber); margin-right: 6px; }
+.cc-status { display: flex; gap: 12px; align-items: center; font-size: 12px; }
+.cc-conn-up { color: var(--cc-green); }
+.cc-conn-down { color: var(--cc-amber); animation: cc-blink 1.4s infinite; }
+@keyframes cc-blink { 50% { opacity: 0.4; } }
+.cc-badge { font-size: 10px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--cc-border); letter-spacing: 1px; }
+.cc-ok { color: var(--cc-green); }
+.cc-warn { color: var(--cc-amber); }
+
+.cc-grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  grid-template-rows: auto auto;
+  gap: 14px;
+  border-radius: 10px;
+}
+
+.cc-panel {
+  background: var(--cc-panel);
+  border: 1px solid var(--cc-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  position: relative;
+  overflow: hidden;
+}
+.cc-panel-title {
+  font-size: 11px; letter-spacing: 2px; color: var(--cc-dim);
+  margin-bottom: 10px; text-transform: uppercase;
+}
+
+/* Causality graph */
+.cc-causality { grid-row: span 2; }
+.cc-graph-svg { width: 100%; height: auto; display: block; background: #070b11; border-radius: 6px; }
+.cc-node-label { font-size: 9px; fill: var(--cc-dim); }
+.cc-legend { display: flex; gap: 16px; margin-top: 8px; font-size: 10px; color: var(--cc-dim); }
+.cc-legend .cc-dot, .cc-legend .cc-line { display: inline-block; margin-right: 4px; vertical-align: middle; }
+.cc-dot { width: 8px; height: 8px; border-radius: 50%; }
+.cc-cyan { background: var(--cc-cyan); }
+.cc-amber { background: var(--cc-amber); }
+.cc-line { width: 14px; height: 0; border-top: 2px solid; }
+.cc-blue { border-color: #3b82f6; }
+.cc-dash { border-top: 2px dashed #52525b; }
+
+/* Telemetry gauges */
+.cc-gauge-row { display: flex; gap: 8px; justify-content: space-around; }
+.cc-gauge-svg { width: 130px; height: 130px; }
+.cc-gauge-track { fill: none; stroke: #16202c; stroke-width: 9; }
+.cc-gauge-arc { fill: none; stroke-width: 9; stroke-linecap: round; }
+.cc-gauge-value { font-size: 18px; text-anchor: middle; font-weight: 700; }
+.cc-gauge-label { font-size: 9px; text-anchor: middle; fill: var(--cc-dim); letter-spacing: 1px; }
+.cc-telemetry-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--cc-dim); margin: 8px 2px; }
+.cc-telemetry-meta b { color: var(--cc-text); }
+.cc-prior-title { font-size: 10px; color: var(--cc-dim); margin: 6px 0 4px; }
+.cc-prior-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #16202c; }
+.cc-prior-seg { height: 100%; }
+.cc-prior-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; font-size: 10px; color: var(--cc-dim); }
+.cc-prior-legend .cc-dot { margin-right: 4px; display: inline-block; }
+
+/* Live terminal */
+.cc-terminal-body { height: 220px; overflow-y: auto; font-size: 11px; line-height: 1.55; }
+.cc-term-line { display: flex; gap: 8px; white-space: nowrap; }
+.cc-term-ts { color: #3a4655; flex: 0 0 auto; }
+.cc-term-msg { overflow: hidden; text-overflow: ellipsis; }
+.cc-line-breach .cc-term-msg { color: var(--cc-red); font-weight: 600; }
+.cc-line-why .cc-term-msg { color: var(--cc-cyan); }
+.cc-line-tele .cc-term-msg { color: var(--cc-dim); }
+.cc-line-causal .cc-term-msg { color: #a78bfa; }
+.cc-line-hello .cc-term-msg { color: var(--cc-green); }
+
+/* Voice */
+.cc-voice-btn {
+  display: flex; align-items: center; gap: 8px; justify-content: center;
+  width: 100%; padding: 12px; border-radius: 8px; cursor: pointer;
+  font-family: inherit; font-size: 13px; letter-spacing: 2px; font-weight: 600;
+  border: 1px solid var(--cc-border); transition: all 0.2s;
+}
+.cc-voice-btn.cc-live { background: rgba(52,211,153,0.1); color: var(--cc-green); border-color: var(--cc-green); }
+.cc-voice-btn.cc-muted { background: rgba(248,113,113,0.1); color: var(--cc-red); border-color: var(--cc-red); }
+.cc-voice-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.cc-voice-state { margin-top: 8px; font-size: 11px; display: flex; align-items: center; gap: 4px; }
+.cc-voice-note { margin-top: 6px; font-size: 11px; color: var(--cc-cyan); }
+.cc-voice-disclaimer { margin-top: 10px; font-size: 9px; color: var(--cc-dim); border-top: 1px solid var(--cc-border); padding-top: 8px; }
+
+@media (max-width: 900px) {
+  .cc-grid { grid-template-columns: 1fr; }
+  .cc-causality { grid-row: auto; }
+}
