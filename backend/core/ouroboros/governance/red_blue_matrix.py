@@ -270,16 +270,72 @@ async def run_containment_siege(ledger: BlueEvidenceLedger, *, include_mutations
             verdict=f"blocked={blocked}/{total}",
             blocked=(escapes == 0), blocked_by="cage" if escapes == 0 else "",
         )
-        # Individual receipts for each mutation-induced escape (the gap evidence).
+        # Individual receipts for each mutation-induced escape (the gap evidence)
+        # + Slice 117 SYNAPSE: re-derive the exact escape AST source and feed it
+        # to the Adaptive Immune Synthesizer → a SHADOW antibody proposal awaiting
+        # operator approval. The synapse never arms the cage.
+        clean = _clean_controls()
         for esc in (getattr(report, "mutation_induced_escapes", ()) or ()):
             ledger.record(
                 attack_class=ATTACK_CONTAINMENT,
                 payload=json.dumps(esc, sort_keys=True),
                 verdict="passed_through", blocked=False, blocked_by="",
             )
+            _feed_escape_to_immunity(esc, clean)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[RedSiege] containment siege swallowed: %s", exc)
     return attacks, blocked
+
+
+def _clean_controls() -> List[str]:
+    """The corpus's clean-control sources — the zero-FP guard the immune
+    synthesizer validates every antibody against. NEVER raises."""
+    try:
+        from tests.governance.adversarial_corpus.corpus import build_corpus
+        return [str(getattr(e, "source", "")) for e in build_corpus()
+                if "clean" in str(getattr(e, "category", "")).lower()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _re_derive_escape_source(seed_name: str, strategy: str) -> Optional[str]:
+    """Deterministically reconstruct the EXACT source that escaped, from its
+    (seed, strategy) — the sweep records metadata only, so we replay the same
+    mutation. NEVER raises; returns None if it can't be reproduced."""
+    try:
+        from tests.governance.adversarial_corpus.corpus import build_corpus
+        seed = next((e for e in build_corpus() if getattr(e, "name", None) == seed_name), None)
+        if seed is None:
+            return None
+        base = str(getattr(seed, "source", ""))
+        if not strategy or strategy == "raw":
+            return base
+        from backend.core.ouroboros.governance.self_immunization import generate_mutations
+        for strat, mutated in generate_mutations(base):
+            if getattr(strat, "value", str(strat)) == strategy and mutated:
+                return mutated
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _feed_escape_to_immunity(esc: Dict[str, Any], clean_controls: List[str]) -> None:
+    """The live synapse: a verified breach → the Adaptive Immune Synthesizer
+    (Slice 116) proposes a deterministic shadow antibody. Gated by the immunity
+    master; never arms the cage; NEVER raises into the siege."""
+    try:
+        from backend.core.ouroboros.governance.antibody_synthesizer import (
+            adaptive_immunity_enabled,
+            on_escape,
+        )
+        if not adaptive_immunity_enabled():
+            return
+        src = _re_derive_escape_source(str(esc.get("seed_name", "")), str(esc.get("strategy", "")))
+        if not src:
+            return
+        on_escape(src, clean_controls)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Synapse] escape→immunity hook swallowed", exc_info=True)
 
 
 async def run_siege(*, ledger: Optional[BlueEvidenceLedger] = None,
