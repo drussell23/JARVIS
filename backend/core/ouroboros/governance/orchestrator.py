@@ -11368,6 +11368,20 @@ class GovernedOrchestrator:
                 )
         except Exception:  # noqa: BLE001 — bus fan-out must never touch the FSM
             pass
+        # ── Slice 104 — Operator-Independent Recursion-Depth tracker ──
+        # On a successful APPLY, advance the self-modification chain counter: a
+        # governance-touching apply increments it, any other apply resets it.
+        # The recursion-depth floor reads this counter at GATE to halt a runaway
+        # self-modification chain (RRD §23.5). Master-gated (default-TRUE);
+        # NEVER raises into _record_ledger.
+        try:
+            if str(getattr(state, "value", state)).lower() == "applied":
+                from backend.core.ouroboros.governance.recursion_depth_gate import (  # noqa: E501
+                    note_apply as _rdg_note_apply,
+                )
+                _rdg_note_apply(getattr(ctx, "target_files", None))
+        except Exception:  # noqa: BLE001 — recursion tracker must never touch the FSM
+            pass
         if written:
             try:
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501

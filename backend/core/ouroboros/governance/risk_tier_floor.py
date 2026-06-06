@@ -473,6 +473,27 @@ def _rehearsal_floor(
     return None
 
 
+def _recursion_depth_floor(
+    target_files: Optional[Sequence[Any]],
+) -> Optional[str]:
+    """Slice 104 — compose the Operator-Independent Recursion-Depth Gate. Returns
+    ``"blocked"`` when a self-modification chain would exceed MAX_RECURSION_DEPTH
+    (the un-bypassable HALT), else None. Reads the live process depth counter.
+    Master-gated inside the substrate (default-TRUE). NEVER raises — the floor
+    must stay robust regardless of the gate's health.
+    """
+    try:
+        from backend.core.ouroboros.governance.recursion_depth_gate import (
+            recursion_depth_floor,
+        )
+        return recursion_depth_floor(target_files)
+    except Exception:  # noqa: BLE001 — floor must stay robust
+        logger.debug(
+            "[RiskFloor] recursion-depth floor lookup failed", exc_info=True,
+        )
+        return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
@@ -537,6 +558,14 @@ def recommended_floor(
     rehearsal = _rehearsal_floor(target_files)
     if rehearsal is not None:
         candidates.append(rehearsal)
+    # Slice 104 — Operator-Independent Recursion-Depth Gate (RRD §23.5). When a
+    # self-modification chain (consecutive governance-touching APPLYs) would
+    # exceed MAX_RECURSION_DEPTH, this returns "blocked" — the strictest, un-
+    # bypassable tier — severing the runaway loop autonomously. Master-gated
+    # (default-TRUE safety gate); None for non-governance ops / chains in bound.
+    recursion = _recursion_depth_floor(target_files)
+    if recursion is not None:
+        candidates.append(recursion)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
