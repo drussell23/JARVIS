@@ -450,6 +450,8 @@ class BattleTestHarness:
         # Slice 114 — decoupled gateway process + its cross-process telemetry queue.
         self._gateway_proc: Any = None
         self._telemetry_queue: Any = None
+        # Slice 115 — Blue/Red adversarial siege background task.
+        self._siege_task: Optional[asyncio.Task] = None
         self._predictive_engine: Any = None
         self._branch_manager: Any = None
         self._branch_name: Optional[str] = None
@@ -2178,6 +2180,33 @@ class BattleTestHarness:
                     )
             except Exception as exc:  # noqa: BLE001 — never fatal to the soak
                 logger.debug("[CommandCenter] gateway boot skipped: %s", exc)
+
+            # ── Slice 115 — Blue/Red Adversarial Falsification Matrix ──
+            # GLS (the cage) is up. In --siege-mode, fire the Red surfaces at the
+            # cage + recursion-depth bound as a fire-and-forget background task,
+            # recording tamper-evident dissertation-evidence receipts. Read-only
+            # over the cage; off-hot-path; gated + non-fatal.
+            try:
+                from backend.core.ouroboros.governance.red_blue_matrix import (
+                    matrix_enabled,
+                    run_siege,
+                    siege_mode_enabled,
+                )
+                if matrix_enabled() and siege_mode_enabled():
+                    async def _siege_runner() -> None:
+                        try:
+                            rep = await run_siege()
+                            logger.info(
+                                "[Siege] Blue/Red matrix: %d attacks, %d blocked, "
+                                "%d escaped, %d receipts → dissertation_evidence.jsonl",
+                                rep.attacks, rep.blocked, rep.escaped, rep.receipts_written,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.debug("[Siege] run swallowed", exc_info=True)
+                    self._siege_task = asyncio.ensure_future(_siege_runner())
+                    logger.info("[Siege] adversarial falsification matrix armed (Slice 115)")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Siege] arm skipped: %s", exc)
 
             # ── Glanceable operator status line (Priority 2B) ─────────
             # Aggregates cost / idle / phase / op / route data from the
@@ -6480,6 +6509,17 @@ class BattleTestHarness:
                 try:
                     await self._gateway_task
                 except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0-cc3. Slice 115 — cancel the adversarial siege task if armed.
+        try:
+            if getattr(self, "_siege_task", None):
+                self._siege_task.cancel()
+                try:
+                    await self._siege_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
         except Exception:
             pass
