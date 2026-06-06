@@ -1329,7 +1329,17 @@ EVENT_TYPE_OPERATION_TERMINAL = "operation_terminal"
 # bt-2026-05-21-045132.
 EVENT_TYPE_EVALUATOR_TRACE_FRAME = "evaluator_trace_frame"
 
+# Slice 109 — God-Tier Observability Matrix. The structured "Why-Snapshot"
+# the TUI consumes for time-travel debugging: at post_apply / post_failure
+# the cognitive bus publishes the decision context at the moment of the
+# decision — confidence_aura, shannon_entropy, decision_prior_distribution,
+# recursion_depth, rehearsal_verdict. Payload schema: cognitive_why_snapshot.v1
+# (see cognitive_observability.build_why_snapshot). NOT flat text — a JSON
+# object the dashboard renders as a prior distribution + confidence band.
+EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT = "cognitive_why_snapshot"
+
 _VALID_EVENT_TYPES = frozenset({
+    EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_EVALUATOR_TRACE_FRAME,
     EVENT_TYPE_TASK_STARTED,

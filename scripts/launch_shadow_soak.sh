@@ -72,11 +72,42 @@ unset JARVIS_GRADUATION_OVERRIDE_APPLY_ENABLED 2>/dev/null || true
 
 log "SHADOW INVARIANT: graduation is fail-closed (default-TRUE). No master flag will flip."
 
+# ---- 3b. Slice 109 — God-Tier Observability Matrix + Karen's voice ----
+# The SSE Why-Snapshot stream (confidence_aura + Shannon entropy + decision
+# prior distribution + recursion depth) is published on every post_apply /
+# post_failure for the TUI / VS Code extension to render. Karen narrates only
+# HIGH-severity cognitive events (containment breach, graduation threshold,
+# load shedding, failure) — gated + mute-respecting.
+log "igniting observability matrix + Karen's voice..."
+export JARVIS_COGNITIVE_OBSERVABILITY_ENABLED=1     # SSE Why-Snapshot projection
+export JARVIS_IDE_STREAM_ENABLED=1                  # SSE transport (GET /observability/stream)
+export JARVIS_IDE_OBSERVABILITY_ENABLED=1           # read-only GET projections
+export JARVIS_OP_LIFECYCLE_SSE_ENABLED=1            # operation_terminal SSE wake
+
+# Karen's voice (macOS `say` — needs an audio device, NOT a TTY → works in the
+# headless soak too). Unmuted by default; say "Karen mute" any time to silence.
+export JARVIS_KAREN_VOICE_ENABLED=1                 # autonomous cognitive narration channel
+export OUROBOROS_NARRATOR_ENABLED=1                 # Karen master (unmuted)
+export JARVIS_KAREN_TOOL_VOICE_ENABLED=1            # tool/phase sub-voice (unmuted)
+export JARVIS_KAREN_VOICE="${JARVIS_KAREN_VOICE:-Karen}"
+
 # ---- 4. Launch the soak ----
 COST_CAP="${SHADOW_COST_CAP:-0.50}"
 IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-600}"
 MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-2400}"
-log "launching O+V shadow soak (cost-cap=\$$COST_CAP idle=$IDLE_TIMEOUT wall=$MAX_WALL)..."
+
+# SHADOW_INTERACTIVE=1 drops --headless so the operator watches the live Rich
+# TUI (token stream + diff overlays + status line) and the SerpentFlow REPL on
+# a real terminal — the "let Karen narrate the boot" ignition session. The
+# default (unset) stays headless for the long unattended soak; the TUI's visual
+# surface needs a TTY, so it falls through to plain rendering when headless.
+HEADLESS_FLAG="--headless"
+if [ "${SHADOW_INTERACTIVE:-0}" = "1" ]; then
+  HEADLESS_FLAG="--no-headless"
+  log "INTERACTIVE ignition: live TUI + REPL enabled (TTY required)."
+fi
+
+log "launching O+V shadow soak (cost-cap=\$$COST_CAP idle=$IDLE_TIMEOUT wall=$MAX_WALL ${HEADLESS_FLAG})..."
 exec python3 scripts/ouroboros_battle_test.py \
   --cost-cap "$COST_CAP" --idle-timeout "$IDLE_TIMEOUT" --max-wall-seconds "$MAX_WALL" \
-  --headless -v
+  "$HEADLESS_FLAG" -v

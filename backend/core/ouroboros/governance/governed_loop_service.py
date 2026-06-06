@@ -1973,6 +1973,31 @@ class GovernedLoopService:
             self._cognitive_bus_subscription_ids = (
                 await register_cognitive_subscribers(build_default_subscribers())
             )
+            # Slice 109 — God-Tier Observability Matrix. Bind the SSE
+            # Why-Snapshot publisher + Karen's voice narrator onto the SAME
+            # cognitive bus. Both self-gate (SSE on JARVIS_IDE_STREAM_ENABLED,
+            # voice on JARVIS_KAREN_VOICE_ENABLED + mute state); neither holds
+            # authority. Inert when the cognitive bus is off. NEVER fatal.
+            try:
+                from backend.core.ouroboros.governance.cognitive_observability import (
+                    register_observability,
+                )
+                obs_ids = await register_observability()
+                if obs_ids:
+                    self._cognitive_bus_subscription_ids = list(
+                        self._cognitive_bus_subscription_ids
+                    ) + list(obs_ids)
+                    logger.info(
+                        "[GovernedLoop] Observability Matrix: %d subscriber(s) "
+                        "bound to cognitive bus (Slice 109)",
+                        len(obs_ids),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] observability subscriber registration "
+                    "swallowed (non-fatal)",
+                    exc_info=True,
+                )
             if self._cognitive_bus_subscription_ids:
                 _incr_observer_boot("cognitive_bus")
                 logger.info(

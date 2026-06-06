@@ -11405,6 +11405,24 @@ class GovernedOrchestrator:
                     ][:32]
                 except Exception:  # noqa: BLE001
                     _cb_tf = []
+                # Slice 109 — enrich the lifecycle payload with the decision
+                # context (confidence + risk tier) so the cognitive
+                # observability subscriber can build a complete Why-Snapshot
+                # (confidence_aura band) at the moment of the decision.
+                try:
+                    _cb_conf = getattr(ctx, "confidence", None)
+                    _cb_conf = float(_cb_conf) if _cb_conf is not None else None
+                except Exception:  # noqa: BLE001
+                    _cb_conf = None
+                try:
+                    _cb_rt = getattr(ctx, "risk_tier", None)
+                    _cb_rt = (
+                        _cb_rt.name.lower()
+                        if _cb_rt is not None and hasattr(_cb_rt, "name")
+                        else (str(_cb_rt) if _cb_rt is not None else "")
+                    )
+                except Exception:  # noqa: BLE001
+                    _cb_rt = ""
                 _cb_publish(
                     _cb_kind,
                     {
@@ -11413,6 +11431,8 @@ class GovernedOrchestrator:
                         "phase": str(getattr(ctx, "current_phase", "") or ""),
                         "target_files": _cb_tf,
                         "reason": str((data or {}).get("reason", "")),
+                        "confidence": _cb_conf,
+                        "risk_tier": _cb_rt,
                     },
                     correlation_id=str(getattr(ctx, "op_id", "") or "") or None,
                 )
