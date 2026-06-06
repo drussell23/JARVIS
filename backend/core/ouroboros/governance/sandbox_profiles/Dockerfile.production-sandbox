@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# J.A.R.M.A.T.R.I.X. — Production VERIFY Sandbox (Slice 108)
+# =============================================================================
+# Layer-cached, multi-stage, multi-arch image for running the TRUE O+V test suite
+# inside the OS-level runtime cage (§43 Arc 5).
+#
+#   THE IMMUTABILITY INVARIANT (load-bearing):
+#     Heavy dependencies are SEVERED from the volatile project source. Stage 1
+#     installs OS-level + Python deps into an isolated venv — this layer is keyed
+#     ONLY on the requirements file, so it caches IMMUTABLY across every code
+#     mutation. The project source is NEVER COPY'd into any image layer; the live
+#     L3 worktree is volume-mounted READ-ONLY at run time. A single-file mutation
+#     by O+V triggers ZERO rebuild — the pre-warmed container runs instantly.
+#
+#   BuildKit pip cache mount → fast cold rebuilds when deps DO change.
+#   Parameterizable: ARG REQUIREMENTS lets the SAME Dockerfile build the medium
+#   governance image (default) OR the heavy full-ML image (point at requirements.txt).
+#
+# Build (governance variant — the true O+V self-dev suite; buildable in minutes):
+#   DOCKER_BUILDKIT=1 docker build \
+#     -f backend/core/ouroboros/governance/sandbox_profiles/Dockerfile.production-sandbox \
+#     --build-arg REQUIREMENTS=requirements-governance.txt \
+#     -t jarvis-governance-sandbox:latest \
+#     backend/core/ouroboros/governance/sandbox_profiles
+#
+# Multi-arch (arm64 M1 + amd64 GCP):
+#   docker buildx build --platform linux/arm64,linux/amd64 ... (same flags)
+#
+# Heavy full-ML variant (vision/voice ops — multi-GB, a deployment build):
+#   --build-arg REQUIREMENTS=requirements.txt  (copy the repo-root requirements.txt
+#   into the build context first; expect a long torch/whisper build)
+# =============================================================================
+
+ARG PYTHON_VERSION=3.11-slim
+ARG REQUIREMENTS=requirements-governance.txt
+
+# ---- Stage 1: builder — IMMUTABLE deps layer (cached on the requirements file) ----
+FROM python:${PYTHON_VERSION} AS builder
+ARG REQUIREMENTS
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+# Minimal toolchain for any C-extension that lacks a wheel on the target arch.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/* || true
+WORKDIR /build
+# The requirements file is the SOLE input to this layer → it caches independently
+# of any source churn. (Source is NEVER copied here — the Immutability Invariant.)
+COPY ${REQUIREMENTS} ./requirements.in
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir -r requirements.in
+
+# ---- Stage 2: runtime — slim, non-root, no build tooling, no source ----
+FROM python:${PYTHON_VERSION} AS runtime
+LABEL org.jarvis.image="jarvis-production-sandbox" \
+      org.jarvis.purpose="layer-cached VERIFY containment for the true O+V suite (Slice 108 / §43 Arc 5)"
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+RUN useradd --uid 65532 --create-home --shell /usr/sbin/nologin sandbox || true
+# /work = the read-only live-worktree mount at run time. NO source is baked in.
+WORKDIR /work
+USER 65532
+ENTRYPOINT ["python", "-m", "pytest"]
+CMD ["--version"]

@@ -29,9 +29,13 @@ _ENV_MASTER = "JARVIS_IMAGE_PROVISIONER_ENABLED"
 _ENV_IMAGE = "JARVIS_RUNTIME_SANDBOX_VERIFY_IMAGE"
 _TRUTHY = ("1", "true", "yes", "on")
 
+_ENV_REQ = "JARVIS_SANDBOX_REQUIREMENTS_FILE"
+_ENV_DOCKERFILE = "JARVIS_SANDBOX_DOCKERFILE"
 _DEFAULT_IMAGE = "jarvis-verify-sandbox:latest"
+_DEFAULT_REQ = "requirements-sandbox.txt"
+_DEFAULT_DOCKERFILE = "Dockerfile.verify-sandbox"
 _STATE_LABEL = "org.jarvis.state-hash"
-_BUILD_TIMEOUT_S = 600.0
+_BUILD_TIMEOUT_S = 1800.0  # accommodates the heavier production (governance/ML) image
 
 
 def provisioner_enabled() -> bool:
@@ -51,13 +55,25 @@ def verify_image() -> str:
     return os.environ.get(_ENV_IMAGE, _DEFAULT_IMAGE).strip() or _DEFAULT_IMAGE
 
 
+def requirements_file() -> str:
+    """The requirements file this image is built from — light governance default,
+    or the production governance / full-ML variant via env."""
+    return os.environ.get(_ENV_REQ, _DEFAULT_REQ).strip() or _DEFAULT_REQ
+
+
+def dockerfile_name() -> str:
+    return os.environ.get(_ENV_DOCKERFILE, _DEFAULT_DOCKERFILE).strip() or _DEFAULT_DOCKERFILE
+
+
 def image_state_hash() -> str:
-    """Deterministic hash over the sandbox image's INPUTS (requirements + Dockerfile).
-    A change to either flips the hash → the daemon rebuilds. NEVER raises."""
+    """Deterministic hash over the sandbox image's INPUTS (the CONFIGURED
+    requirements file + Dockerfile). A change to either flips the hash → the
+    daemon rebuilds; an unchanged requirements.txt → the heavy deps layer is
+    re-used immutably and the pre-warmed container serves instantly. NEVER raises."""
     h = hashlib.sha256()
     try:
         d = sandbox_profiles_dir()
-        for name in ("requirements-sandbox.txt", "Dockerfile.verify-sandbox"):
+        for name in (requirements_file(), dockerfile_name()):
             p = d / name
             h.update(name.encode("utf-8"))
             h.update(p.read_bytes() if p.exists() else b"<missing>")
@@ -139,7 +155,8 @@ async def provision_image(
         dbin = "docker"
     ctx = str(sandbox_profiles_dir())
     build_argv = [
-        dbin, "build", "-f", f"{ctx}/Dockerfile.verify-sandbox",
+        dbin, "build", "-f", f"{ctx}/{dockerfile_name()}",
+        "--build-arg", f"REQUIREMENTS={requirements_file()}",
         "-t", img, "--label", f"{_STATE_LABEL}={want}", ctx,
     ]
     try:
