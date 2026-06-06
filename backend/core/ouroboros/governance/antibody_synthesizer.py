@@ -316,6 +316,29 @@ def on_escape(
     if ab is None:
         return None
     propose_antibody(ab, path=proposals)
-    logger.info("[Antibody] proposed %s (blocks introspection %s) — SHADOW; awaits operator promotion",
-                ab.antibody_id, list(ab.attr_block) + list(ab.getattr_block))
+    logger.warning(
+        "[IMMUNE SYSTEM ALERT] Antibody Proposal Generated — Awaiting Operator "
+        "Approval (id=%s blocks introspection %s; SHADOW, cage NOT armed)",
+        ab.antibody_id, list(ab.attr_block) + list(ab.getattr_block),
+    )
     return ab
+
+
+def recent_proposals(limit: int = 25, *, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Read the most recent SHADOW antibody proposals (newest last) for the
+    operator-approval UI. Read-only; NEVER raises."""
+    out: List[Dict[str, Any]] = []
+    try:
+        p = path or proposals_path()
+        if not p.exists():
+            return []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        return []
+    return out[-max(0, int(limit)):]

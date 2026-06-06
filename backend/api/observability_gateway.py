@@ -514,6 +514,24 @@ def build_router() -> Any:
     async def causality(limit: int = 30) -> Dict[str, Any]:
         return build_causality_graph(limit)
 
+    @router.get("/antibody-proposals")
+    async def antibody_proposals(limit: int = 25) -> Dict[str, Any]:
+        """Slice 117 — the operator Approval Matrix surface: SHADOW antibody
+        proposals from the Adaptive Immune Synthesizer, awaiting promotion. The
+        cage is NOT armed by these — promotion is the operator's gated act."""
+        try:
+            from backend.core.ouroboros.governance.antibody_synthesizer import recent_proposals
+            props = recent_proposals(limit)
+        except Exception:  # noqa: BLE001
+            props = []
+        return {
+            "proposals": props,
+            "count": len(props),
+            "alert": ("[IMMUNE SYSTEM ALERT] Antibody Proposal(s) Generated — "
+                      "Awaiting Operator Approval") if props else "",
+            "armed": False,  # shadow only — promotion is operator-gated
+        }
+
     @router.post("/voice/{action}")
     async def voice_control(action: str, request: Request) -> Dict[str, Any]:
         """COSMETIC-ONLY write surface: mute/unmute Karen's voice. Routed through
