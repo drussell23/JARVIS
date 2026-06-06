@@ -7561,6 +7561,42 @@ class GovernedOrchestrator:
                     exc_info=True,
                 )
 
+            # ── Slice 101 Phase 5: Proof Carrier (pre-APPLY proof artifact) ──
+            # Aggregates the available pre-APPLY signals (counterfactual
+            # rehearsal, cross-session coherence, MCP/credential scan) into ONE
+            # per-candidate proof-of-correctness artifact and self-publishes it
+            # to the IDE SSE stream (proof_carrier_built) for operator
+            # visibility. This is the observability aggregator over signals
+            # already individually gated — rehearsal via the risk-tier floor
+            # just above, credentials via the tool-emit scanner (Phase 4),
+            # boundary via the governance gate — so it raises visibility, not a
+            # redundant second gate. Master JARVIS_PROOF_CARRIER_ENABLED §33.1
+            # default-FALSE → DISABLED (zero cost) when off. NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.proof_carrier_transport import (  # noqa: E501
+                    ProofVerdict as _ProofVerdict,
+                    build_proof_carrier as _build_proof_carrier,
+                )
+                _proof = _build_proof_carrier(
+                    getattr(ctx, "op_id", "") or "",
+                    list(getattr(ctx, "target_files", ()) or ()),
+                )
+                if _proof.verdict not in (
+                    _ProofVerdict.CLEAN, _ProofVerdict.DISABLED,
+                ):
+                    logger.info(
+                        "[Orchestrator] GATE proof_carrier op=%s verdict=%s "
+                        "source=%s mcp=%d rehearsal=%d drift=%s",
+                        getattr(ctx, "op_id", "?"),
+                        _proof.verdict.value,
+                        _proof.dominant_source.value,
+                        _proof.mcp_finding_count,
+                        _proof.rehearsal_concern_count,
+                        _proof.coherence_drift_level,
+                    )
+            except Exception:  # noqa: BLE001 — proof artifact must never touch GATE
+                pass
+
             # ---- Phase 5a-green: SAFE_AUTO diff preview (Green — when human is watching) ----
             # Mythos §7.4 UX: when a human is watching (TTY or explicit flag),
             # show a brief diff preview even for Green ops so the operator can
