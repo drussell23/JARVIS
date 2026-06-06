@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# =============================================================================
+# launch_shadow_soak.sh — Slice 108
+# Ignite O+V into full production SHADOW MODE for 12–18 month wall-clock evidence
+# accrual. The advanced cognitive substrates + the OS-level Docker runtime cage run
+# live; the fail-closed graduation actuator accrues receipts/advisories but NEVER
+# flips a master flag. The human is the sole actuator (§51.11.2 / shadow_soak_runbook.md).
+# =============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+SBX="backend/core/ouroboros/governance/sandbox_profiles"
+IMAGE="jarvis-governance-sandbox:latest"
+
+log() { printf '\033[36m[shadow-soak]\033[0m %s\n' "$*"; }
+
+# ---- 1. Docker daemon ----
+log "verifying Docker daemon..."
+if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  log "Docker not responding — attempting to start Docker Desktop..."
+  open -a Docker 2>/dev/null || true
+  for i in $(seq 1 60); do
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1 && break
+    sleep 2
+  done
+  docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || {
+    log "ERROR: Docker daemon did not come up. Start Docker Desktop and re-run."; exit 1; }
+fi
+log "Docker $(docker version --format '{{.Server.Version}}') is live."
+
+# ---- 2. Layer-cached production VERIFY image (build only if requirements/Dockerfile changed) ----
+export JARVIS_RUNTIME_SANDBOX_VERIFY_IMAGE="$IMAGE"
+export JARVIS_SANDBOX_REQUIREMENTS_FILE="requirements-governance.txt"
+export JARVIS_SANDBOX_DOCKERFILE="Dockerfile.production-sandbox"
+WANT_HASH="$(python3 -c 'from backend.core.ouroboros.governance.image_provisioner import image_state_hash; print(image_state_hash())')"
+HAVE_HASH="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.jarvis.state-hash"}}' 2>/dev/null || true)"
+if [ "$WANT_HASH" != "$HAVE_HASH" ]; then
+  log "building layer-cached production image ($IMAGE, hash=$WANT_HASH)..."
+  DOCKER_BUILDKIT=1 docker build \
+    -f "$SBX/Dockerfile.production-sandbox" \
+    --build-arg REQUIREMENTS=requirements-governance.txt \
+    --label "org.jarvis.state-hash=$WANT_HASH" \
+    -t "$IMAGE" "$SBX"
+else
+  log "production image $IMAGE is hash-current ($WANT_HASH) — pre-warmed, no rebuild."
+fi
+
+# ---- 3. Ignite the cognitive bus + substrates (observational / shadow) ----
+log "enabling cognitive substrates + OS-level runtime cage (shadow)..."
+export JARVIS_COGNITIVE_BUS_ENABLED=1
+export JARVIS_BELIEF_REVISION_ENABLED=1
+export JARVIS_SLEEP_DAEMON_ENABLED=1
+export JARVIS_DOMAIN_ENTROPY_ENGINE_ENABLED=1
+export JARVIS_ADVERSARIAL_AUTOBIOGRAPHY_ENABLED=1
+export JARVIS_COUNTERFACTUAL_REHEARSAL_ENABLED=1
+export JARVIS_PROOF_CARRIER_ENABLED=1
+# Recursion bound is default-ON (JARVIS_RECURSION_DEPTH_GATE_ENABLED / MAX=3).
+
+# OS-level Docker containment for VERIFY (uses the layer-cached production image).
+export JARVIS_RUNTIME_SANDBOX_ENABLED=1
+export JARVIS_RUNTIME_SANDBOX_BACKEND=container
+export JARVIS_IMAGE_PROVISIONER_ENABLED=1
+
+# Graduation engine in SHADOW — fail-closed: receipts/advisories only, NO OS flip.
+export JARVIS_AUTONOMOUS_GRADUATION_ENGINE_ENABLED=1
+# JARVIS_GRADUATION_SHADOW_MODE defaults TRUE — DO NOT unset/falsify it here.
+# The apply gate is left OFF so the boot applier never flips. The human un-shadows
+# manually, later, only after the empirical threshold is undeniable.
+unset JARVIS_GRADUATION_SHADOW_MODE 2>/dev/null || true
+unset JARVIS_GRADUATION_OVERRIDE_APPLY_ENABLED 2>/dev/null || true
+
+log "SHADOW INVARIANT: graduation is fail-closed (default-TRUE). No master flag will flip."
+
+# ---- 4. Launch the soak ----
+COST_CAP="${SHADOW_COST_CAP:-0.50}"
+IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-600}"
+MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-2400}"
+log "launching O+V shadow soak (cost-cap=\$$COST_CAP idle=$IDLE_TIMEOUT wall=$MAX_WALL)..."
+exec python3 scripts/ouroboros_battle_test.py \
+  --cost-cap "$COST_CAP" --idle-timeout "$IDLE_TIMEOUT" --max-wall-seconds "$MAX_WALL" \
+  --headless -v
