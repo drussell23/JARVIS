@@ -266,16 +266,31 @@ class FlagRegistry:
 
     def register(
         self,
-        spec: FlagSpec,
+        spec: Optional[FlagSpec] = None,
         *,
         override: bool = True,
+        **legacy: Any,
     ) -> None:
         """Install a FlagSpec. ``override=True`` silently replaces an
         existing entry (with a DEBUG log) so seed files can be re-run
-        during tests. ``override=False`` raises if name already exists."""
+        during tests. ``override=False`` raises if name already exists.
+
+        Backward-compatible call conventions (Slice 111): the canonical
+        form is ``register(FlagSpec(...))``. The legacy seed convention —
+        used by 1000+ ``register_flags()`` sites across 150+ modules —
+        passes flat kwargs ``register(name=, type_=, default=,
+        description=, category=, source_file=, example=,
+        posture_relevance=)``. When ``spec`` is omitted and kwargs are
+        present, we normalize them into a proper ``FlagSpec`` via
+        :meth:`_spec_from_legacy` (string→enum mapping, never raising).
+        This single API-boundary adapter reconciles both conventions —
+        no per-caller migration, no latent debt, zero boot tracebacks."""
+        if spec is None and legacy:
+            spec = self._spec_from_legacy(legacy)
         if not isinstance(spec, FlagSpec):
             raise TypeError(
-                f"register expects FlagSpec, got {type(spec).__name__}"
+                f"register expects FlagSpec (or legacy kwargs), got "
+                f"{type(spec).__name__}"
             )
         with self._lock:
             if spec.name in self._specs and not override:
@@ -289,6 +304,51 @@ class FlagRegistry:
                     spec.name,
                 )
             self._specs[spec.name] = spec
+
+    @staticmethod
+    def _spec_from_legacy(kw: Mapping[str, Any]) -> "FlagSpec":
+        """Normalize a legacy ``register(name=, type_=, ...)`` kwargs dict into
+        a canonical :class:`FlagSpec`. Tolerant by construction — unknown
+        type/category strings degrade to safe defaults rather than raising, so
+        a malformed seed can never abort boot. String→enum mapping:
+
+        * ``type_`` / ``type`` (``"bool"``/``"int"``/...) → :class:`FlagType`
+        * ``category`` (``"Observability"`` etc., case-insensitive) → :class:`Category`
+        * ``posture_relevance`` — legacy passed a bare string (e.g. ``"RELEVANT"``)
+          which does NOT map to the new ``Mapping[str, Relevance]`` shape, so it
+          is dropped unless a real mapping is supplied (advisory field only)."""
+        name = str(kw.get("name", "") or "").strip()
+
+        raw_type = str(kw.get("type_") or kw.get("type") or "str").strip().lower()
+        try:
+            ftype = FlagType(raw_type)
+        except Exception:  # noqa: BLE001
+            ftype = FlagType.STR
+
+        raw_cat = str(kw.get("category") or "experimental").strip().lower()
+        try:
+            cat = Category(raw_cat)
+        except Exception:  # noqa: BLE001
+            cat = Category.EXPERIMENTAL
+
+        pr = kw.get("posture_relevance")
+        posture: Mapping[str, Relevance] = pr if isinstance(pr, Mapping) else {}
+
+        aliases = kw.get("aliases")
+        aliases_t = tuple(aliases) if isinstance(aliases, (list, tuple)) else ()
+
+        return FlagSpec(
+            name=name,
+            type=ftype,
+            default=kw.get("default"),
+            description=str(kw.get("description", "") or ""),
+            category=cat,
+            source_file=str(kw.get("source_file", "") or ""),
+            example=kw.get("example"),
+            since=str(kw.get("since", "v1.0") or "v1.0"),
+            posture_relevance=posture,
+            aliases=aliases_t,
+        )
 
     def bulk_register(self, specs: List[FlagSpec], *, override: bool = True) -> None:
         for s in specs:

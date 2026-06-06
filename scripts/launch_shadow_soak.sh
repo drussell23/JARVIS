@@ -106,7 +106,7 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
   FRONTEND_PORT="${JARVIS_FRONTEND_PORT:-3000}"
   CC_COST_CAP="${SHADOW_COST_CAP:-0.50}"
   CC_IDLE="${SHADOW_IDLE_TIMEOUT:-600}"
-  CC_WALL="${SHADOW_MAX_WALL_SECONDS:-3600}"   # 60-min default watch session
+  CC_WALL="${SHADOW_MAX_WALL_SECONDS:-0}"      # 0 = INFINITE (12–18 mo deployment); set SHADOW_MAX_WALL_SECONDS for a bounded watch
   export JARVIS_COMMAND_CENTER_GATEWAY=1        # co-boot the gateway inside the engine loop
   export JARVIS_BACKEND_PORT FRONTEND_PORT JARVIS_FRONTEND_PORT="$FRONTEND_PORT"
   CC_PIDS=()
@@ -150,9 +150,14 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
 fi
 
 # ---- 4. Launch the soak (headless evidence-accrual mode) ----
+# Slice 111: the wall cap defaults to 0 = INFINITE for the true 12–18 month
+# evidence-accrual deployment (the harness treats 0/unset as "no wall cap" —
+# liveness then rests on --idle-timeout + the cost budget). NOTE: this removes
+# the OOM/hang safety ceiling the watchdog provides; set SHADOW_MAX_WALL_SECONDS
+# (e.g. 2400) to restore a bounded soak for graduation runs or CI.
 COST_CAP="${SHADOW_COST_CAP:-0.50}"
 IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-600}"
-MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-2400}"
+MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-0}"
 
 # SHADOW_INTERACTIVE=1 drops --headless so the operator watches the live Rich
 # TUI (token stream + diff overlays + status line) and the SerpentFlow REPL on
