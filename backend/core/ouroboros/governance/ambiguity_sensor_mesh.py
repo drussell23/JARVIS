@@ -80,6 +80,20 @@ _ENV_DECAY_HANDSHAKE = "JARVIS_SENSOR_MESH_HANDSHAKE_DECAY_S"
 _ENV_DECAY_CONTRADICTORY = "JARVIS_SENSOR_MESH_CONTRADICTORY_DECAY_S"
 _ENV_DECAY_MALFORMED = "JARVIS_SENSOR_MESH_MALFORMED_DECAY_S"
 
+# Slice 100 — FSM Sentinel. The orchestrator GENERATE_RETRY loop calls
+# observe_generate_retry(...) with the current attempt number. The sentinel
+# fires note_llm_contradiction ONLY when the attempt count reaches this
+# threshold — i.e. the model is on at least its 2nd attempt = repeatedly
+# fighting the validator. A single first-attempt retry is NOT ambiguity.
+_ENV_SENTINEL_ATTEMPT_THRESHOLD = "JARVIS_SENTINEL_CONTRADICTION_ATTEMPT_THRESHOLD"
+_DEFAULT_SENTINEL_ATTEMPT_THRESHOLD = 2
+
+
+def _sentinel_attempt_threshold() -> int:
+    return max(1, _env_int(
+        _ENV_SENTINEL_ATTEMPT_THRESHOLD, _DEFAULT_SENTINEL_ATTEMPT_THRESHOLD,
+    ))
+
 _DEFAULT_WINDOW_S = 60.0
 _DEFAULT_INTERVAL_S = 5.0
 _DEFAULT_MAX_EVENTS = 500
@@ -311,6 +325,54 @@ def note_malformed_intent(
 
     O(1), best-effort, inert when master off. NEVER raises."""
     _append(SignalClass.MALFORMED_INTENT, now_unix)
+
+
+# ===========================================================================
+# Slice 100 — FSM Sentinel: the localized guard wired into the orchestrator
+# GENERATE_RETRY loop. Self-contained, pull-model, NEVER raises.
+# ===========================================================================
+
+
+def observe_generate_retry(
+    op_id: str,
+    attempt_num: int,
+    *,
+    detail: str = "",
+    now_unix: Optional[float] = None,
+) -> bool:
+    """FSM Sentinel — observe one GENERATE retry-advance from the
+    orchestrator and, if the model is repeatedly fighting the validator,
+    feed a contradiction signal to the sensor mesh.
+
+    Fires ``note_llm_contradiction`` (a PULL-model accumulator append —
+    NOT ``record_ambiguity``; the async sampler decides that later) ONLY
+    when ``attempt_num >= JARVIS_SENTINEL_CONTRADICTION_ATTEMPT_THRESHOLD``
+    (default 2). A single first-attempt retry is NOT ambiguity; a
+    sustained run of validation/Iron-Gate failures across retries is.
+
+    Returns ``True`` iff a contradiction was recorded. ENTIRELY wrapped in
+    try/except — NEVER raises (this is wired into a ~6k-line hot path and
+    a telemetry failure can NEVER crash or alter the FSM). Inert when the
+    sensor-mesh master flag is off (``note_llm_contradiction`` already
+    no-ops). This is the sentinel: a localized guard, not a whole-FSM
+    decorator."""
+    try:
+        try:
+            attempt = int(attempt_num)
+        except (TypeError, ValueError):
+            return False
+        if attempt < _sentinel_attempt_threshold():
+            return False
+        # PULL model — append to the accumulator only. The async sampler
+        # (run_sensor_mesh_once) reads it and decides whether to fire
+        # record_ambiguity. The sentinel does NOT call record_ambiguity.
+        note_llm_contradiction(
+            f"op={op_id} attempt={attempt} {detail}".strip(),
+            now_unix=now_unix,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — sentinel NEVER raises (hot path)
+        return False
 
 
 # ===========================================================================
@@ -859,6 +921,20 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example=f"{_ENV_DECAY_MALFORMED}=60.0",
         ),
+        FlagSpec(
+            name=_ENV_SENTINEL_ATTEMPT_THRESHOLD,
+            type=FlagType.INT,
+            default=_DEFAULT_SENTINEL_ATTEMPT_THRESHOLD,
+            description=(
+                "Slice 100 FSM Sentinel — minimum GENERATE attempt number "
+                "at which a retry-advance records an LLM-contradiction "
+                "signal (the model is repeatedly fighting the validator). "
+                "Default 2: a single first-attempt retry is not ambiguity."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example=f"{_ENV_SENTINEL_ATTEMPT_THRESHOLD}=2",
+        ),
     ]
 
     count = 0
@@ -879,6 +955,7 @@ __all__ = [
     "note_cross_repo_emit_failure",
     "note_llm_contradiction",
     "note_malformed_intent",
+    "observe_generate_retry",
     "run_sensor_mesh_once",
     "run_sensor_mesh_loop",
     "reset_accumulators",

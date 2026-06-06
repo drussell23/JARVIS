@@ -5623,6 +5623,24 @@ class GovernedOrchestrator:
                         _replan_text = ""
                         pass
 
+                    # Slice 100 — FSM Sentinel: signal repeated LLM-vs-validator
+                    # contradiction to the ambiguity sensor mesh (Slice 99).
+                    # Best-effort; NEVER affects the FSM. Lazy-import is INSIDE
+                    # the try so even an ImportError can't break generation.
+                    try:
+                        from backend.core.ouroboros.governance.ambiguity_sensor_mesh import (  # noqa: E501
+                            observe_generate_retry as _sentinel_observe,
+                        )
+                        _sentinel_attempt = (
+                            self._config.max_generate_retries
+                            - generate_retries_remaining + 1
+                        )
+                        _sentinel_observe(
+                            ctx.op_id, _sentinel_attempt, detail=str(exc)[:120],
+                        )
+                    except Exception:
+                        pass
+
                     # Retry: advance to GENERATE_RETRY with episodic memory context
                     _retry_ctx_kwargs = {}
 
