@@ -6038,6 +6038,47 @@ class ToolLoopCoordinator:
                     except Exception:  # noqa: BLE001 — defensive
                         pass  # never break the tool loop
 
+                    # ── Slice 101 Phase 4: tool-output credential interception ──
+                    # Native credential-leak defense. Composes the canonical
+                    # Tier-1 redactor (conversation_bridge.redact_secrets) via
+                    # mcp_output_scanner: on a CREDENTIAL_FOUND verdict, redact
+                    # the secret shapes from the tool output BEFORE it reaches
+                    # the model context or logs. Scans ALL tool outputs —
+                    # web_fetch / bash / read_file are credential vectors too,
+                    # not only MCP servers. Master JARVIS_MCP_OUTPUT_SCANNER_
+                    # ENABLED §33.1 default-FALSE → inert when off. Mirrors the
+                    # injection-scan precedent above; NEVER breaks the tool loop.
+                    try:
+                        from backend.core.ouroboros.governance.mcp_output_scanner import (  # noqa: E501
+                            McpScanVerdict,
+                            scan_mcp_output,
+                        )
+                        _cred_scan = scan_mcp_output(
+                            tool_result.output or "",
+                            source_label=tc.name,
+                        )
+                        if _cred_scan.verdict == McpScanVerdict.CREDENTIAL_FOUND:
+                            from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+                                redact_secrets as _redact_secrets,
+                            )
+                            _redacted, _ = _redact_secrets(tool_result.output or "")
+                            tool_result = type(tool_result)(
+                                output=_redacted,
+                                error=tool_result.error,
+                                status=tool_result.status,
+                            )
+                            logger.warning(
+                                "[Venom] credential scan REDACTED shape(s) in "
+                                "tool=%s findings=%d bytes=%d",
+                                tc.name,
+                                len(_cred_scan.findings),
+                                _cred_scan.bytes_redacted,
+                            )
+                    except ImportError:
+                        pass  # scanner unavailable — skip
+                    except Exception:  # noqa: BLE001 — never break the tool loop
+                        pass
+
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)

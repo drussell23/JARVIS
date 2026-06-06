@@ -203,6 +203,29 @@ def _intake_governor_mode() -> str:
     return "shadow"
 
 
+# Slice 101 Phase 4 — only the lowest-urgency (deferrable background /
+# speculative) signals are eligible for cognitive load-shedding. "low" maps to
+# the background provider route (0.5x). critical/high/normal are NEVER shed.
+_SHEDDABLE_URGENCIES = frozenset({"low"})
+
+
+def _intake_cognitive_shed_mode() -> str:
+    """off / shadow / enforce — Slice 101 Phase 4 cognitive load-shed gate.
+
+    Mirrors :func:`_intake_governor_mode`. Default ``shadow``: the
+    ``cognitive_load_shedding`` substrate master
+    (``JARVIS_COGNITIVE_LOAD_SHEDDING_ENABLED``, §33.1 default-FALSE) returns a
+    DISABLED verdict until explicitly enabled, so ``shadow`` is inert by
+    default. ``enforce`` sheds ONLY the lowest-urgency deferrable signals.
+    """
+    raw = os.environ.get(
+        "JARVIS_INTAKE_COGNITIVE_SHED_MODE", "shadow",
+    ).strip().lower()
+    if raw in ("off", "shadow", "enforce"):
+        return raw
+    return "shadow"
+
+
 def _allow_log_mode() -> str:
     """Follow-up #1 — visibility for "governor allowed this op" decisions.
 
@@ -773,6 +796,52 @@ class UnifiedIntakeRouter:
             elif gov_decision is not None and gov_decision.allowed:
                 # Follow-up #1 — visibility into "governor allowed this"
                 self._note_governor_allow(envelope, gov_decision)
+
+        # 4b-ii. Slice 101 Phase 4 — Cognitive load-shedding gate. Composes
+        # cognitive_load_shedding.evaluate_cognitive_load() (which reads the
+        # anti-fragility + predictive-postmortem forecast) to shed ONLY the
+        # lowest-urgency deferrable signals when overload is forecast. Mirrors
+        # the SensorGovernor shadow/enforce discipline. Bounded: only evaluates
+        # for sheddable urgencies, so the forecast ledger I/O never fires on
+        # critical/high/normal intake. The substrate master keeps it inert by
+        # default. NEVER raises into intake.
+        shed_mode = _intake_cognitive_shed_mode()
+        if shed_mode != "off" and str(
+            getattr(envelope, "urgency", ""),
+        ) in _SHEDDABLE_URGENCIES:
+            try:
+                from backend.core.ouroboros.governance.cognitive_load_shedding import (  # noqa: E501
+                    LoadVerdict,
+                    ShedKind,
+                    evaluate_cognitive_load,
+                )
+                _load = evaluate_cognitive_load()
+                _should_shed = _load.verdict in (
+                    LoadVerdict.ELEVATED, LoadVerdict.OVERLOADED,
+                ) and _load.shed_kind in (
+                    ShedKind.SPECULATIVE_SHED,
+                    ShedKind.BACKGROUND_SHED,
+                    ShedKind.FULL_SHED,
+                )
+                if _should_shed:
+                    if shed_mode == "enforce":
+                        logger.info(
+                            "[Router] cognitive-shed ENFORCE: source=%s "
+                            "urgency=%s verdict=%s shed=%s load=%.3f",
+                            envelope.source, envelope.urgency,
+                            _load.verdict.value, _load.shed_kind.value,
+                            _load.load_score,
+                        )
+                        return "cognitive_shed"
+                    logger.info(
+                        "[Router] cognitive-shed SHADOW (would shed): "
+                        "source=%s urgency=%s verdict=%s shed=%s load=%.3f",
+                        envelope.source, envelope.urgency,
+                        _load.verdict.value, _load.shed_kind.value,
+                        _load.load_score,
+                    )
+            except Exception:  # noqa: BLE001 — never break intake
+                pass
 
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")

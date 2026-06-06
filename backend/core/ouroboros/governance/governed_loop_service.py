@@ -1591,6 +1591,34 @@ class GovernedLoopService:
         except Exception:  # noqa: BLE001
             pass
 
+        # Slice 101 Phase 4 — Autonomous Graduation Engine session-end pass.
+        # Runs SYNCHRONOUSLY here (NOT via the fire-and-forget bus) so it
+        # completes before the drain/shutdown. evaluate + execute are sync;
+        # execute records AUTO_FLIP overrides to the durable
+        # graduation_override_ledger (applied at next boot) and emits SAFETY-
+        # tier APPROVAL advisories — it never mutates os.environ live and
+        # never auto-flips a SAFETY flag. Master
+        # JARVIS_AUTONOMOUS_GRADUATION_ENGINE_ENABLED §33.1 default-FALSE.
+        # NEVER blocks shutdown.
+        try:
+            from backend.core.ouroboros.governance.autonomous_graduation_engine import (  # noqa: E501
+                autonomous_graduation_engine_enabled,
+                evaluate_graduations,
+                execute_graduations,
+            )
+            if autonomous_graduation_engine_enabled():
+                _grad_report = evaluate_graduations()
+                _grad_exec = execute_graduations(_grad_report)
+                if _grad_exec.recorded_overrides or _grad_exec.advisories_emitted:
+                    logger.info(
+                        "[GovernedLoop] Autonomous graduation (session-end): "
+                        "auto_flipped=%d advisories=%d",
+                        len(_grad_exec.recorded_overrides),
+                        len(_grad_exec.advisories_emitted),
+                    )
+        except Exception:  # noqa: BLE001 — never block shutdown
+            pass
+
         # P2 Slice 3 — stop the Convergence Reaper first so its
         # background task doesn't race the drain. Master-gated
         # NEVER-raise; idempotent on an already-stopped reaper.
