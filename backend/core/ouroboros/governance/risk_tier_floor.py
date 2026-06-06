@@ -437,6 +437,42 @@ def _convergence_floor(
         return None
 
 
+def _rehearsal_floor(
+    target_files: Optional[Sequence[Any]],
+) -> Optional[str]:
+    """Slice 101 Phase 5 — compose the Counterfactual Rehearsal pre-APPLY
+    verdict into the strictest-wins floor.
+
+    A candidate whose target files overlap a recent postmortem failure zone
+    raises friction (``notify_apply``); a cage-boundary crossing escalates
+    (``approval_required``). This is the "structural failure-memory checked
+    before a patch lands" gate — it composes EXACTLY like the convergence and
+    boundary floors above, so the orchestrator GATE seam needs no change (it
+    already passes ``target_files``). Master-gated inside the substrate
+    (``JARVIS_COUNTERFACTUAL_REHEARSAL_ENABLED``, §33.1 default-FALSE → DISABLED
+    verdict → None → byte-identical legacy). NEVER raises — the floor must stay
+    robust regardless of the rehearsal substrate's health.
+    """
+    if not target_files:
+        return None
+    try:
+        from backend.core.ouroboros.governance.counterfactual_rehearsal_mode import (  # noqa: E501
+            RehearsalVerdict,
+            evaluate_rehearsal,
+        )
+        report = evaluate_rehearsal(target_files)
+        if report.verdict is RehearsalVerdict.ESCALATE:
+            return "approval_required"
+        if report.verdict is RehearsalVerdict.CONCERN_RAISED:
+            return "notify_apply"
+    except Exception:  # noqa: BLE001 — floor must stay robust
+        logger.debug(
+            "[RiskFloor] rehearsal floor lookup failed", exc_info=True,
+        )
+        return None
+    return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
@@ -495,6 +531,12 @@ def recommended_floor(
     convergence = _convergence_floor(now)
     if convergence is not None:
         candidates.append(convergence)
+    # Slice 101 Phase 5 — Counterfactual Rehearsal pre-APPLY gate. Overlap with
+    # a recent postmortem failure zone → notify_apply; cage-boundary cross →
+    # approval_required. Master-gated (default-FALSE) → None when off.
+    rehearsal = _rehearsal_floor(target_files)
+    if rehearsal is not None:
+        candidates.append(rehearsal)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
