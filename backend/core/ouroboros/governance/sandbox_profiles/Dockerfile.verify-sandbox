@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# J.A.R.M.A.T.R.I.X. — Ephemeral VERIFY Sandbox (Slice 107)
+# =============================================================================
+# An ELITE multi-stage, multi-arch image for the OS-level runtime cage (§43 Arc 5).
+#
+#   * Multi-stage: deps are resolved in an isolated `builder` venv and copied into
+#     a clean `runtime` — no pip/build tooling in the final image.
+#   * Multi-arch: builds for linux/arm64 (M1 local) AND linux/amd64 (GCP Spot VMs)
+#     via `docker buildx --platform linux/arm64,linux/amd64`.
+#   * Cold-boots fast: the PROJECT CODE is NOT baked in — the L3 worktree is mounted
+#     read-only at /work at run time. This image carries ONLY the pytest stack, so
+#     the `requirements-sandbox.txt` layer caches aggressively and the image is tiny.
+#   * Hardened-friendly: runs as a non-root user (defense-in-depth alongside the
+#     run-time `--cap-drop ALL` / `--network none` / `--read-only` profile); writes
+#     only to the run-time tmpfs (`/tmp`) and the writable worktree-output mount.
+#
+# Build (multi-arch, from repo root):
+#   docker buildx build --platform linux/arm64,linux/amd64 \
+#     -f backend/core/ouroboros/governance/sandbox_profiles/Dockerfile.verify-sandbox \
+#     -t jarvis-verify-sandbox:latest \
+#     backend/core/ouroboros/governance/sandbox_profiles
+# =============================================================================
+
+ARG PYTHON_VERSION=3.11-slim
+
+# ---- Stage 1: builder — resolve deps into an isolated venv (cached layer) ----
+FROM python:${PYTHON_VERSION} AS builder
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+WORKDIR /build
+# The requirements layer is copied ALONE first so it caches independently of any
+# future Dockerfile churn — cold rebuilds only when the test-dep set changes.
+COPY requirements-sandbox.txt .
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir -r requirements-sandbox.txt
+
+# ---- Stage 2: runtime — slim, non-root, no build tooling ----
+FROM python:${PYTHON_VERSION} AS runtime
+LABEL org.jarvis.image="jarvis-verify-sandbox" \
+      org.jarvis.purpose="ephemeral OS-level VERIFY containment (Slice 107 / §43 Arc 5)"
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+# A non-root identity for defense-in-depth. The run-time profile additionally
+# drops ALL capabilities + no-new-privileges, so even uid 0 would be defanged —
+# this is belt-and-suspenders.
+RUN useradd --uid 65532 --create-home --shell /usr/sbin/nologin sandbox || true
+# /work = the read-only worktree mount (the project code) at run time.
+WORKDIR /work
+USER 65532
+# Default entrypoint is pytest; callers pass scoped test targets + flags. Cache is
+# disabled / redirected to the run-time tmpfs because the rootfs + /work are read-only.
+ENTRYPOINT ["python", "-m", "pytest"]
+CMD ["--version"]

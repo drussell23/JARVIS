@@ -35,6 +35,7 @@ import logging
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -281,6 +282,146 @@ async def run_payload_contained(
             stdout="", stderr=str(exc), duration_s=0.0, platform="linux-container",
             guarantees=_CONTAINER_GUARANTEES, diagnostic=f"wire error (fell back): {exc}",
         )
+
+
+def _parse_pytest_summary(stdout: str) -> Tuple[int, int, int, int, Tuple[str, ...]]:
+    """General pytest-summary parser → (passed, failed, errors, total, failed_names).
+    Pure, NEVER raises. Reads the canonical ``N passed, M failed, K errors`` summary
+    line + the ``FAILED <id>`` lines (NOT the SWE-bench expected-id parser, which is
+    keyed to held-out test IDs)."""
+    import re as _re
+    try:
+        text = stdout or ""
+        def _count(word: str) -> int:
+            m = _re.findall(r"(\d+)\s+" + word, text)
+            return int(m[-1]) if m else 0
+        passed = _count("passed")
+        failed = _count("failed")
+        errors = _count("error(?:s)?")
+        skipped = _count("skipped")
+        failed_names = tuple(_re.findall(r"^FAILED\s+(\S+)", text, _re.MULTILINE))[:64]
+        total = passed + failed + errors + skipped
+        return passed, failed, errors, total, failed_names
+    except Exception:  # noqa: BLE001
+        return 0, 0, 0, 0, ()
+
+
+@dataclass(frozen=True)
+class PytestContainerResult:
+    """Structured pass/fail telemetry from a containerized pytest run."""
+    ok: bool
+    breach: ContainmentBreach
+    passed: int
+    failed: int
+    total: int
+    failed_names: Tuple[str, ...]
+    returncode: Optional[int]
+    duration_s: float
+    diagnostic: str
+
+
+def build_pytest_container_argv(
+    test_targets: List[str],
+    *,
+    worktree: str,
+    image: Optional[str] = None,
+    policy: Optional[ContainmentPolicy] = None,
+    seccomp_profile: Optional[str] = None,
+) -> List[str]:
+    """PURE: the hardened ``docker run`` argv that mounts the worktree READ-ONLY
+    and runs the project's pytest suite inside the locked-down image (whose
+    ENTRYPOINT is ``python -m pytest``). Cache is disabled + bytecode suppressed
+    because the rootfs + /work are read-only. NEVER raises."""
+    pol = policy or ContainmentPolicy()
+    img = image or os.environ.get("JARVIS_RUNTIME_SANDBOX_VERIFY_IMAGE", "jarvis-verify-sandbox:latest")
+    try:
+        from backend.core.ouroboros.governance.swe_bench_pro.container_engine import (
+            build_hardened_security_argv,
+            docker_bin,
+        )
+        dbin = docker_bin()
+        hardening = build_hardened_security_argv(allow_tmp=True)
+    except Exception:  # noqa: BLE001
+        dbin = "docker"
+        hardening = ["--network", "none", "--cap-drop", "ALL",
+                     "--security-opt", "no-new-privileges", "--read-only",
+                     "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"]
+    # NOTE: no forced --platform. The verify-sandbox image is NATIVE arch
+    # (arm64 on the M1 dev host, amd64 on GCP Spot VMs) or multi-arch — Docker
+    # selects the matching arch. (container_engine.host_platform_flag() is amd64-
+    # biased for the SWE-bench images and would mismatch a locally-built arm64 image.)
+    argv: List[str] = [dbin, "run", "--rm"]
+    argv += hardening
+    argv += ["--memory", str(int(pol.as_bytes)), "--cpus", "1"]
+    prof = seccomp_profile if seccomp_profile is not None else os.environ.get(_ENV_SECCOMP, "").strip()
+    if prof:
+        argv += ["--security-opt", f"seccomp={prof}"]
+    # Worktree mounted READ-ONLY (the code is immutable during VERIFY); cwd /work.
+    argv += ["-v", f"{worktree}:/work:ro", "-w", "/work", "-e", "PYTHONDONTWRITEBYTECODE=1"]
+    argv += [img]
+    # pytest args (the image entrypoint is `python -m pytest`); cache off, clean config.
+    argv += list(test_targets) + ["-p", "no:cacheprovider", "-o", "addopts=", "-q"]
+    return argv
+
+
+async def run_pytest_in_container(
+    test_targets: List[str],
+    *,
+    worktree: Any,
+    image: Optional[str] = None,
+    policy: Optional[ContainmentPolicy] = None,
+    docker_run: Any = None,
+) -> PytestContainerResult:
+    """Run the project's pytest suite against the read-only worktree mount inside
+    the hardened container; parse structured pass/fail telemetry from stdout
+    (composes ``container_engine.parse_pytest_text``). NEVER raises. Returns a
+    DISABLED breach result when the runtime-sandbox master is off."""
+    import time as _t
+    pol = policy or ContainmentPolicy()
+    started = _t.monotonic()
+    if not runtime_sandbox_enabled():
+        return PytestContainerResult(
+            ok=False, breach=ContainmentBreach.DISABLED, passed=0, failed=0, total=0,
+            failed_names=(), returncode=None, duration_s=0.0,
+            diagnostic="disabled via JARVIS_RUNTIME_SANDBOX_ENABLED=false",
+        )
+    if docker_run is None:
+        try:
+            from backend.core.ouroboros.governance.swe_bench_pro.container_engine import (
+                _real_docker_run,
+            )
+            docker_run = _real_docker_run
+        except Exception as exc:  # noqa: BLE001
+            return PytestContainerResult(
+                ok=False, breach=ContainmentBreach.SPAWN_FAILED, passed=0, failed=0,
+                total=0, failed_names=(), returncode=None, duration_s=0.0,
+                diagnostic=f"docker runner unavailable: {exc}",
+            )
+    argv = build_pytest_container_argv(test_targets, worktree=str(worktree), image=image, policy=pol)
+    try:
+        rc, out, err = await docker_run(argv, float(pol.timeout_s))
+    except Exception as exc:  # noqa: BLE001
+        return PytestContainerResult(
+            ok=False, breach=ContainmentBreach.SPAWN_FAILED, passed=0, failed=0, total=0,
+            failed_names=(), returncode=None, duration_s=_t.monotonic() - started,
+            diagnostic=f"docker spawn failed: {exc}",
+        )
+    dur = _t.monotonic() - started
+    if rc == 124:
+        return PytestContainerResult(
+            ok=False, breach=ContainmentBreach.TIMEOUT, passed=0, failed=0, total=0,
+            failed_names=(), returncode=124, duration_s=dur,
+            diagnostic=f"CONTAINMENT BREACH: pytest container timeout after {pol.timeout_s}s",
+        )
+    # Parse structured pass/fail telemetry from the pytest summary line.
+    passed, failed, errors, total, failed_names = _parse_pytest_summary(out or "")
+    ok = (rc == 0)
+    return PytestContainerResult(
+        ok=ok, breach=ContainmentBreach.NONE if ok else ContainmentBreach.NONZERO_EXIT,
+        passed=passed, failed=failed, total=total, failed_names=failed_names,
+        returncode=rc, duration_s=dur,
+        diagnostic=f"pytest container rc={rc} passed={passed} failed={failed} total={total}",
+    )
 
 
 def record_containment_breach_belief(op_id: str, result: ContainmentResult, target_files: Any) -> None:

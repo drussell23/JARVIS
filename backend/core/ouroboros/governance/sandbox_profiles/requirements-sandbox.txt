@@ -1,0 +1,17 @@
+# J.A.R.M.A.T.R.I.X. VERIFY sandbox — MINIMAL test runtime (Slice 107).
+#
+# DESIGN: this image carries ONLY the pytest stack. The project code + the heavy
+# ML deps (torch / whisper / transformers — 308-line requirements.txt, multi-GB)
+# are NOT baked in: the L3 worktree is mounted read-only at /work at run time, and
+# the governance/architecture test layer imports its heavy deps LAZILY (inside
+# functions), so collection + the pure-Python governance suite run without them.
+# Result: a tiny image that cold-boots fast and is rebuilt ONLY when this test-dep
+# set changes (the provisioning daemon hashes this file + the Dockerfile).
+#
+# Pins mirror the host test env (pytest 9.0.3 / asyncio 1.3.0 / timeout 2.4.0 /
+# anyio 4.12.0 / json-report 1.5.0) so in-container results match local results.
+pytest==9.0.3
+pytest-asyncio==1.3.0
+pytest-timeout==2.4.0
+pytest-json-report==1.5.0
+anyio==4.12.0
