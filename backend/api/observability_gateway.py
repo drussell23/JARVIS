@@ -551,6 +551,48 @@ def build_router() -> Any:
             "armed": False,  # never auto-applied; operator signs to graduate
         }
 
+    @router.get("/layer4-roadmap-draft")
+    async def layer4_roadmap_draft() -> Dict[str, Any]:
+        """Slice 122 — READ-ONLY surface for the Layer-4 Authority tab. Exposes
+        the unsigned drafted roadmap + signing STATUS. It deliberately does NOT
+        expose a signing action: per this gateway's own invariant, a browser
+        endpoint that minted authority would be a sovereignty leak past the
+        Zero-Order Doll. Signing is a deliberate LOCAL operator CLI act
+        (`python3 -m backend.core.ouroboros.governance.sovereign_keys sign`),
+        which requires the passphrase the loop never has."""
+        import os as _os
+
+        import yaml as _yaml
+
+        draft = None
+        draft_path = _os.getenv("JARVIS_ROADMAP_DRAFT_PATH", ".jarvis/roadmap.draft.yaml")
+        try:
+            if _os.path.exists(draft_path):
+                draft = _yaml.safe_load(open(draft_path, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            draft = None
+        provisioned = signed = False
+        try:
+            from backend.core.ouroboros.governance.sovereign_keys import is_provisioned
+            provisioned = is_provisioned()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            signed = _os.path.exists(_os.getenv("JARVIS_LAYER4_ROADMAP_PATH", ".jarvis/roadmap.signed.yaml"))
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "draft": draft,
+            "key_provisioned": provisioned,
+            "signed_roadmap_present": signed,
+            "signing_surface": "local_cli_only",  # NOT a web button — by design
+            "sign_command": "python3 -m backend.core.ouroboros.governance.sovereign_keys sign",
+            "note": ("Signing mints unattended authority and is therefore NOT a web "
+                     "action (read-only invariant). Sign locally with the operator "
+                     "passphrase; the un-signable floor still protects safety ops."),
+            "armed": False,
+        }
+
     @router.post("/voice/{action}")
     async def voice_control(action: str, request: Request) -> Dict[str, Any]:
         """COSMETIC-ONLY write surface: mute/unmute Karen's voice. Routed through

@@ -186,6 +186,38 @@ def verify_signed_roadmap(body: Optional[Dict[str, Any]], *, now: int) -> Roadma
     if not isinstance(body, dict) or not body:
         return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.INVALID_FORMAT, detail="empty/non-dict body")
 
+    # Slice 122: asymmetric Ed25519 path (preferred — the loop holds only the
+    # public key and CANNOT forge). Routed before the symmetric HMAC fallback so
+    # an ed25519 roadmap needs no HMAC secret. The asymmetric verifier signs the
+    # canonical body, so a passing signature already proves no tamper.
+    if body.get("signature_alg") == "ed25519":
+        try:
+            from backend.core.ouroboros.governance import sovereign_keys as _SK
+
+            if not isinstance(body.get("signature"), str) or not body["signature"]:
+                return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.INVALID_FORMAT, detail="missing ed25519 signature")
+            if _SK.load_public_key() is None:
+                return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.MISSING, detail="no operator public key configured")
+            if not _SK.verify_roadmap_signature(body):
+                return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.INVALID_SIGNATURE, detail="ed25519 verify failed")
+            expires_at = body.get("expires_at")
+            if isinstance(expires_at, int) and now >= expires_at:
+                return dataclasses.replace(
+                    _INVALID, kind=RoadmapVerdictKind.EXPIRED, expires_at=expires_at,
+                    detail=f"now={now} >= exp={expires_at}",
+                )
+            scopes = body.get("authorized_scopes") or []
+            return RoadmapAuthorization(
+                kind=RoadmapVerdictKind.VALID,
+                scopes=frozenset(str(s) for s in scopes if isinstance(s, str)),
+                max_budget_usd=_coerce_float(body.get("max_budget_usd"), 0.0),
+                max_recursion_depth=_coerce_int(body.get("max_recursion_depth"), 0),
+                expires_at=int(expires_at) if isinstance(expires_at, int) else 0,
+                detail="ok(ed25519)",
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed on any asymmetric defect
+            return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.INVALID_FORMAT, detail=f"ed25519:{exc}")
+
     key = _operator_key()
     if key is None:
         return dataclasses.replace(_INVALID, kind=RoadmapVerdictKind.MISSING, detail="no operator key configured")
