@@ -69,33 +69,6 @@ from typing import (
     Union,
 )
 
-_ORACLE_TRUTHY = ("1", "true", "yes", "on")
-
-
-def _oracle_threaded_cache_load() -> bool:
-    """Slice 111 — should the (≈1.1 GB) graph-cache ``pickle.loads`` run OFF the
-    event loop (``asyncio.to_thread``)?  The load is synchronous-on-loop by
-    legacy design to avoid concurrent C-extension heap allocation with
-    ChromaDB/torch/numpy → libmalloc corruption on **macOS ARM64** (a hard-won
-    crash fix). But on the loop it blocks boot for the full deserialize (~158 s
-    observed), defeating the deferred-init path. Resolution:
-
-    * Explicit ``JARVIS_ORACLE_CACHE_THREADED_LOAD`` wins (``1``/``0``).
-    * Default **TRUE on non-Darwin** (Linux/GCP — the 12–18 mo deployment
-      target, where the ARM64 libmalloc hazard does not apply) so the engine +
-      gateway boot concurrently while the graph hydrates in a worker thread.
-    * Default **FALSE on Darwin** (the dev box) — keep the safe synchronous
-      path; opt in explicitly to test the threaded load locally.
-
-    NEVER raises."""
-    try:
-        raw = os.environ.get("JARVIS_ORACLE_CACHE_THREADED_LOAD")
-        if raw is not None:
-            return raw.strip().lower() in _ORACLE_TRUTHY
-        return sys.platform != "darwin"
-    except Exception:  # noqa: BLE001
-        return False
-
 try:
     import networkx as nx
     NETWORKX_AVAILABLE = True
@@ -1939,10 +1912,11 @@ class TheOracle:
             # has completed (and its readiness signaled above). Loading the
             # graph cache and spinning up ChromaDB's C-extension heap
             # concurrently triggered libmalloc corruption on macOS ARM64 — so
-            # graph load and semantic-backend init must never overlap. Slice 111
-            # preserves this: the threaded graph-cache load stays OFF by default
-            # on Darwin (see _oracle_threaded_cache_load), and semantic init is
-            # still gated behind mark_graph_ready() here.
+            # graph load and semantic-backend init must never overlap. This
+            # ordering is preserved by the synchronous graph load + the
+            # mark_graph_ready() gate here. (Slice 112 additionally isolates
+            # the whole Oracle into its own process, so the graph load never
+            # touches the engine's event loop at all.)
             # Phase 3 — Slice 10: Construct the OracleSemanticIndex
             # WITHOUT loading ChromaDB. The constructor is now
             # lightweight (config stash only); the actual ChromaDB
@@ -2676,30 +2650,21 @@ class TheOracle:
 
         return sandbox_fallback(OracleConfig.GRAPH_CACHE_FILE)
 
-    @staticmethod
-    def _read_and_unpickle_cache(cache_path: Path) -> Dict[str, Any]:
-        """Read + deserialize the graph cache. Pure blocking work — safe to run
-        either on the loop (Darwin default) or in a worker thread (non-Darwin
-        default, Slice 111) per :func:`_oracle_threaded_cache_load`.
-
-        ``pickle`` is used for the INTERNAL cache only (never untrusted data) —
-        the file is written by this same process in ``_write_cache_blocking``.
-        """
-        raw = cache_path.read_bytes()
-        return pickle.loads(raw)  # noqa: S301 — trusted internal cache
-
     async def _load_cache(self) -> bool:
         """Load cached graph from disk.
 
-        The ≈1.1 GB ``pickle.loads`` is the dominant boot cost (~158 s observed).
-        Slice 111: when :func:`_oracle_threaded_cache_load` is true (default on
-        non-Darwin / production Linux) the deserialize runs in a worker thread
-        via ``asyncio.to_thread`` so it does NOT block the event loop — the
-        engine + co-booted gateway boot concurrently while the graph hydrates,
-        finally honoring the deferred-init path. On macOS ARM64 the default
-        stays synchronous-on-loop to avoid concurrent C-extension heap
-        allocation with ChromaDB/torch/numpy (libmalloc corruption — a hard-won
-        crash fix); opt in with JARVIS_ORACLE_CACHE_THREADED_LOAD=1 to test.
+        Loads synchronously (not asyncio.to_thread) to prevent concurrent
+        C-extension heap allocation with ChromaDB/torch/numpy.  At boot
+        time nothing else needs the event loop — blocking for 2-5s is
+        acceptable to avoid libmalloc memory corruption on macOS ARM64.
+
+        NOTE (Slice 111 negative result, retired in Slice 112): threading
+        this load via ``asyncio.to_thread`` does NOT unblock the event loop —
+        ``pickle.loads`` is GIL-bound, so the worker thread starves the loop
+        identically to an inline load (empirically: 165 s of total loop
+        silence). The real fix is process isolation (Slice 112): this method
+        runs in the Oracle's OWN OS process, so the deserialize never touches
+        the engine's event loop at all.
 
         Note: pickle is used here for internal cache only (never untrusted
         data) — the cache file is written by this same process.
@@ -2707,12 +2672,9 @@ class TheOracle:
         try:
             cache_path = self._resolved_graph_cache_path()
             if cache_path.exists():
-                if _oracle_threaded_cache_load():
-                    data = await asyncio.to_thread(
-                        self._read_and_unpickle_cache, cache_path,
-                    )
-                else:
-                    data = self._read_and_unpickle_cache(cache_path)
+                _raw = cache_path.read_bytes()
+                data = pickle.loads(_raw)  # noqa: S301 — trusted internal cache
+                del _raw  # free the raw bytes immediately
 
                 self._graph._graph = data["graph"]
                 self._graph._node_index = data["node_index"]
