@@ -141,6 +141,9 @@ def _hermetic(monkeypatch, tmp_path):
     # Graduation machinery
     monkeypatch.setenv("JARVIS_AUTONOMOUS_GRADUATION_ENGINE_ENABLED", "true")
     monkeypatch.setenv("JARVIS_GRADUATION_OVERRIDE_APPLY_ENABLED", "true")
+    # Slice 103: this soak proves the ACTUATION path, so explicitly un-shadow.
+    # (Production now defaults to shadow-mode TRUE — see test_slice103_shadow_mode.)
+    monkeypatch.setenv("JARVIS_GRADUATION_SHADOW_MODE", "false")
     monkeypatch.setenv("JARVIS_GRADUATION_OVERRIDE_LEDGER_PATH", str(tmp_path / "overrides.jsonl"))
     monkeypatch.setenv("JARVIS_GRADUATION_ADVISORY_LEDGER_PATH", str(tmp_path / "advisories.jsonl"))
     monkeypatch.setenv("JARVIS_GRADUATION_LEDGER_PATH", str(tmp_path / "grad_ledger.jsonl"))

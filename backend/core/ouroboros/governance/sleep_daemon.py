@@ -191,6 +191,31 @@ def run_sleep_cycle_once(
     except Exception as exc:  # noqa: BLE001
         logger.debug("[SleepDaemon] meta-prior refresh failed: %s", exc)
 
+    # 4) Graduation shadow-evaluation — Slice 103 off-hot-path production evidence
+    # pass. When the operator has turned ON the graduation engine, run a REAL
+    # evaluation (composing the live cadence ledger + FlagRegistry + AST validator)
+    # and execute it. In SHADOW MODE (fail-closed default) this writes receipts to
+    # the shadow ledger + SAFETY advisories but NEVER an override → no OS-level
+    # flip; the human stays the sole actuator. Gated on the engine master so
+    # nothing runs unless the operator opted in. NEVER raises.
+    try:
+        from backend.core.ouroboros.governance.autonomous_graduation_engine import (
+            autonomous_graduation_engine_enabled,
+            evaluate_graduations,
+            execute_graduations,
+        )
+        if autonomous_graduation_engine_enabled():
+            _grad = evaluate_graduations()  # real ledger/registry/validator
+            execute_graduations(_grad)
+            if getattr(_grad, "auto_flipped", ()) or getattr(_grad, "advisories", ()):
+                logger.info(
+                    "[SleepDaemon] graduation shadow-eval — ready=%d advisories=%d "
+                    "(receipts in shadow ledger; no OS flip unless un-shadowed)",
+                    len(_grad.auto_flipped), len(_grad.advisories),
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[SleepDaemon] graduation shadow-eval failed: %s", exc)
+
     elapsed = max(0.0, time.time() - started)
     diagnostic = (
         f"consolidation={consolidation_verdict} "
