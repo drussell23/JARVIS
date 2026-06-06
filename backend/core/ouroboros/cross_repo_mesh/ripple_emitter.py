@@ -76,6 +76,22 @@ def _ledger_path() -> Path:
     return Path(os.getenv("JARVIS_CROSS_REPO_RIPPLE_LEDGER", _DEFAULT_LEDGER))
 
 
+def _note_emit_failure(detail: str) -> None:
+    """Best-effort EMIT-SIDE handshake-failure signal into the Slice-99
+    Ambiguity Sensor Mesh. Fire-and-forget honored — observed from the
+    LOCAL emit failure only (no request/response heartbeat). A sensor
+    failure must NEVER affect the emit result, so this is lazy-imported
+    and fully wrapped. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.ambiguity_sensor_mesh import (
+            note_cross_repo_emit_failure,
+        )
+
+        note_cross_repo_emit_failure(detail)
+    except Exception:  # noqa: BLE001 — sensor is best-effort, hot-path safe
+        return
+
+
 # ---------------------------------------------------------------------------
 # Result type.
 # ---------------------------------------------------------------------------
@@ -241,9 +257,13 @@ async def emit_ripple(
         token = sign_ripple(payload, psk)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("ripple sign failed: %s", exc)
+        _note_emit_failure(f"sign_error:{exc}")
         return EmitResult(verdict=VerifyVerdict.DISABLED, detail=f"sign_error:{exc}")
 
     ledger_written = _write_receipt(token, payload)
+    if not ledger_written:
+        # EMIT-SIDE write failure — handshake-health signal (best-effort).
+        _note_emit_failure("ledger_write_failed")
 
     bus_published = False
     if publish_bus:

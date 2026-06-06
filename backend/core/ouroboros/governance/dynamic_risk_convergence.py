@@ -192,10 +192,13 @@ def _weight_for(signal: Any) -> float:
 # ===========================================================================
 
 
-# Module-level bounded deque of (signal, timestamp_unix, weight). The
-# ONLY mutable authoritative state — and it only ever decays in relevance
-# as time advances (pure-function-of-window recovery).
-_SIGNALS: Deque[Tuple[Any, float, float]] = deque(
+# Module-level bounded deque of (signal, timestamp_unix, weight,
+# decay_s). The ONLY mutable authoritative state — and it only ever
+# decays in relevance as time advances (pure-function-of-window
+# recovery). ``decay_s`` is the signal's OWN decay horizon (``None`` →
+# fall back to the global window); per-signal age-vs-decay still has NO
+# latch, so the recovery invariant is preserved.
+_SIGNALS: Deque[Tuple[Any, float, float, Optional[float]]] = deque(
     maxlen=_DEFAULT_MAX_SIGNALS,
 )
 _LOCK = threading.Lock()
@@ -225,12 +228,21 @@ def record_ambiguity(
     *,
     now_unix: Optional[float] = None,
     weight: float = 1.0,
+    decay_s: Optional[float] = None,
 ) -> None:
     """Append an ambiguity signal stamped with the current time.
 
     Bounded (deque maxlen). NEVER raises — garbage inputs are stored
     as-is and simply contribute the default weight at scoring time
     (or are skipped if they can't be timestamped).
+
+    ``decay_s`` (Phase 3 "structured signal + decay-timer") is an
+    OPTIONAL per-signal decay horizon (seconds). When set, this signal
+    counts toward the score iff its age ``< decay_s`` — INDEPENDENTLY of
+    the global ``JARVIS_CONVERGENCE_WINDOW_S``. When ``None`` (the
+    legacy default), the signal falls back to the global window, so
+    existing callers behave byte-identically. Per-signal age-vs-decay
+    has NO latch — recovery stays a pure function of the window.
     """
     try:
         ts = float(now_unix) if now_unix is not None else time.time()
@@ -240,9 +252,19 @@ def record_ambiguity(
         w = float(weight)
     except (TypeError, ValueError):
         w = 1.0
+    d: Optional[float]
+    if decay_s is None:
+        d = None
+    else:
+        try:
+            d = float(decay_s)
+            if d <= 0:
+                d = None
+        except (TypeError, ValueError):
+            d = None
     with _LOCK:
         _ensure_capacity()
-        _SIGNALS.append((signal, ts, w))
+        _SIGNALS.append((signal, ts, w, d))
 
 
 def reset_signals() -> None:
@@ -279,7 +301,7 @@ def convergence_score(now_unix: Optional[float] = None) -> float:
     total = 0.0
     with _LOCK:
         snapshot = list(_SIGNALS)
-    for signal, ts, stored_weight in snapshot:
+    for signal, ts, stored_weight, decay_s in snapshot:
         try:
             age = now - float(ts)
         except (TypeError, ValueError):
@@ -287,7 +309,12 @@ def convergence_score(now_unix: Optional[float] = None) -> float:
         if age < 0:
             # Future-stamped signal — count it (clock skew tolerance).
             age = 0.0
-        if age < window:
+        # Per-signal decay (Phase 3): a signal with its OWN decay_s
+        # counts iff age < decay_s; else fall back to the global window.
+        # Still a pure function of age — NO latch — so recovery is
+        # preserved per-signal.
+        effective_window = decay_s if decay_s is not None else window
+        if age < effective_window:
             try:
                 total += _weight_for(signal) * float(stored_weight)
             except (TypeError, ValueError):
@@ -305,14 +332,15 @@ def _signal_counts(now_unix: Optional[float] = None) -> Dict[str, int]:
     counts: Dict[str, int] = {s.value: 0 for s in AmbiguitySignal}
     with _LOCK:
         snapshot = list(_SIGNALS)
-    for signal, ts, _w in snapshot:
+    for signal, ts, _w, decay_s in snapshot:
         try:
             age = now - float(ts)
         except (TypeError, ValueError):
             continue
         if age < 0:
             age = 0.0
-        if age < window and isinstance(signal, AmbiguitySignal):
+        effective_window = decay_s if decay_s is not None else window
+        if age < effective_window and isinstance(signal, AmbiguitySignal):
             counts[signal.value] = counts.get(signal.value, 0) + 1
     return counts
 
