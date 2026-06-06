@@ -447,6 +447,9 @@ class BattleTestHarness:
         self._governed_loop_service: Any = None
         # Slice 110 follow-up — co-boot command-center gateway server task.
         self._gateway_task: Optional[asyncio.Task] = None
+        # Slice 114 — decoupled gateway process + its cross-process telemetry queue.
+        self._gateway_proc: Any = None
+        self._telemetry_queue: Any = None
         self._predictive_engine: Any = None
         self._branch_manager: Any = None
         self._branch_name: Optional[str] = None
@@ -2135,7 +2138,38 @@ class BattleTestHarness:
                     gateway_port,
                     serve_gateway,
                 )
-                if command_center_gateway_enabled():
+                from backend.core.ouroboros.governance.telemetry_broker import (
+                    gateway_decoupled_enabled,
+                )
+                if command_center_gateway_enabled() and gateway_decoupled_enabled():
+                    # Slice 114: run the gateway in its OWN OS process — immune to
+                    # EVERY engine-loop freeze (vector loads, GIL-heavy ops).
+                    # Telemetry crosses via a bounded non-blocking queue; the FSM
+                    # never blocks on the UI, and the UI never blinks when the FSM
+                    # does. (The in-process bridge from GLS boot still registers
+                    # but no-ops — 0 local WS clients in decoupled mode.)
+                    from backend.core.ouroboros.governance.telemetry_broker import (
+                        build_queue_publishing_subscriber,
+                        make_telemetry_queue,
+                        spawn_gateway_process,
+                    )
+                    from backend.core.ouroboros.governance.cognitive_bus import (
+                        register_cognitive_subscribers,
+                    )
+                    self._telemetry_queue = make_telemetry_queue()
+                    self._gateway_proc = spawn_gateway_process(
+                        self._telemetry_queue, gateway_host(), gateway_port(),
+                    )
+                    _qsub = build_queue_publishing_subscriber(self._telemetry_queue)
+                    if _qsub is not None:
+                        await register_cognitive_subscribers([_qsub])
+                    logger.info(
+                        "[CommandCenter] DECOUPLED gateway spawned in its OWN "
+                        "process on http://%s:%d (Slice 114) — UI immune to "
+                        "engine-loop freezes",
+                        gateway_host(), gateway_port(),
+                    )
+                elif command_center_gateway_enabled():
                     self._gateway_task = asyncio.create_task(serve_gateway())
                     logger.info(
                         "[CommandCenter] observability gateway co-booting on "
@@ -2143,7 +2177,7 @@ class BattleTestHarness:
                         gateway_host(), gateway_port(),
                     )
             except Exception as exc:  # noqa: BLE001 — never fatal to the soak
-                logger.debug("[CommandCenter] gateway co-boot skipped: %s", exc)
+                logger.debug("[CommandCenter] gateway boot skipped: %s", exc)
 
             # ── Glanceable operator status line (Priority 2B) ─────────
             # Aggregates cost / idle / phase / op / route data from the
@@ -6447,6 +6481,20 @@ class BattleTestHarness:
                     await self._gateway_task
                 except asyncio.CancelledError:
                     pass
+        except Exception:
+            pass
+
+        # 0-cc2. Slice 114 — decoupled gateway PROCESS: stop its drain (sentinel)
+        # then terminate the process. Best-effort; never blocks teardown.
+        try:
+            if getattr(self, "_telemetry_queue", None) is not None:
+                from backend.core.ouroboros.governance.telemetry_broker import (
+                    stop_gateway_queue,
+                )
+                stop_gateway_queue(self._telemetry_queue)
+            proc = getattr(self, "_gateway_proc", None)
+            if proc is not None and proc.is_alive():
+                proc.terminate()
         except Exception:
             pass
 

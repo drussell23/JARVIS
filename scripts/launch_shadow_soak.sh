@@ -115,6 +115,10 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
   # overridable; default ON for the command-center soak.
   export JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED="${JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED:-1}"
   export JARVIS_ORACLE_GRAPH_PRUNE_ENABLED="${JARVIS_ORACLE_GRAPH_PRUNE_ENABLED:-1}"
+  # Slice 114: run the gateway in its OWN process (cross-process telemetry
+  # queue) so the command center is immune to EVERY engine-loop freeze —
+  # ChromaDB / embeddings / Oracle / any GIL-heavy op. The UI never blinks.
+  export JARVIS_GATEWAY_DECOUPLED_ENABLED="${JARVIS_GATEWAY_DECOUPLED_ENABLED:-1}"
   export JARVIS_BACKEND_PORT FRONTEND_PORT JARVIS_FRONTEND_PORT="$FRONTEND_PORT"
   CC_PIDS=()
   cleanup_cc() {
