@@ -83,6 +83,8 @@ class SleepCycleReport:
     fused_cluster_count: int
     meta_dominant_count: int
     meta_declining_count: int
+    autobiography_finding: str
+    autobiography_escape_count: int
     diagnostic: str
     elapsed_s: float
     schema_version: str = SLEEP_CYCLE_SCHEMA_VERSION
@@ -96,6 +98,8 @@ def _disabled_report(started: float) -> SleepCycleReport:
         fused_cluster_count=0,
         meta_dominant_count=0,
         meta_declining_count=0,
+        autobiography_finding="corpus_disabled",
+        autobiography_escape_count=0,
         diagnostic=f"sleep daemon disabled via {_ENV_ENABLED}=false",
         elapsed_s=0.0,
     )
@@ -142,6 +146,38 @@ def run_sleep_cycle_once(
     except Exception as exc:  # noqa: BLE001
         logger.debug("[SleepDaemon] fusion count failed: %s", exc)
 
+    # 2b) Adversarial autobiography self-audit — Slice 101 Phase 7. The organism
+    # reads its OWN recent commit history (git log + git show, scoped to O+V-
+    # signed commits) and probes each diff against the canonical adversarial
+    # corpus: did a shipped autonomous commit smuggle a cage-bypass pattern? This
+    # is the right home for an expensive git self-audit — off the hot path, on
+    # the idle sleep cadence. The audit self-publishes SSE + ledger. A
+    # CORPUS_ESCAPE is a loud SAFETY alarm (we surface it, we do NOT auto-
+    # remediate — un-gameable observability is the correct posture for a self-
+    # integrity detector). Self-gates on JARVIS_ADVERSARIAL_AUTOBIOGRAPHY_ENABLED
+    # (returns CORPUS_DISABLED cheaply, before any git, when off).
+    autobiography_finding = "corpus_disabled"
+    autobiography_escape_count = 0
+    try:
+        from backend.core.ouroboros.governance.adversarial_autobiography import (
+            audit_autobiography,
+        )
+        audit = audit_autobiography(force_refresh=True)
+        autobiography_finding = str(
+            getattr(audit.finding, "value", audit.finding)
+        )
+        autobiography_escape_count = int(getattr(audit, "escape_count", 0) or 0)
+        if autobiography_finding == "corpus_escape":
+            logger.warning(
+                "[SleepDaemon] SELF-AUDIT CAGE ESCAPE — %d O+V commit(s) "
+                "shipped an adversarial-corpus pattern (cage_health=%.3f). "
+                "Operator review required.",
+                autobiography_escape_count,
+                float(getattr(audit, "cage_health_ratio", 0.0) or 0.0),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[SleepDaemon] autobiography audit failed: %s", exc)
+
     # 3) Meta-prior calibration refresh — complementary stream, also persists.
     meta_dominant = 0
     meta_declining = 0
@@ -160,11 +196,13 @@ def run_sleep_cycle_once(
         f"consolidation={consolidation_verdict} "
         f"candidates={consolidation_candidates} "
         f"fused={fused_cluster_count} "
-        f"meta_dom={meta_dominant} meta_decl={meta_declining}"
+        f"meta_dom={meta_dominant} meta_decl={meta_declining} "
+        f"autobiography={autobiography_finding}"
     )
     if (
         consolidation_verdict in ("consolidated", "dreaming")
         or fused_cluster_count > 0
+        or autobiography_escape_count > 0
     ):
         logger.info("[SleepDaemon] cycle complete — %s", diagnostic)
     return SleepCycleReport(
@@ -174,6 +212,8 @@ def run_sleep_cycle_once(
         fused_cluster_count=fused_cluster_count,
         meta_dominant_count=meta_dominant,
         meta_declining_count=meta_declining,
+        autobiography_finding=autobiography_finding,
+        autobiography_escape_count=autobiography_escape_count,
         diagnostic=diagnostic,
         elapsed_s=elapsed,
     )

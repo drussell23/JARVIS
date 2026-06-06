@@ -113,6 +113,52 @@ def ov_signature_substring() -> str:
     return _OV_SIGNATURE
 
 
+def _run_post_commit_self_audit(op_id: str, commit_hash: str) -> None:
+    """Runs in a thread executor — the sync, git-heavy adversarial-autobiography
+    self-audit. NEVER raises. The audit self-publishes SSE + a JSONL ledger; a
+    CORPUS_ESCAPE (a shipped autonomous commit smuggled a cage-bypass pattern)
+    is logged loud for operator review. We do NOT auto-remediate."""
+    try:
+        from backend.core.ouroboros.governance.adversarial_autobiography import (
+            audit_autobiography,
+        )
+        report = audit_autobiography(force_refresh=True)
+        finding = str(getattr(report.finding, "value", report.finding))
+        if finding == "corpus_escape":
+            logger.warning(
+                "[AutoCommitter] SELF-AUDIT CAGE ESCAPE after commit %s "
+                "(op=%s): %d adversarial-corpus pattern(s) in O+V history — "
+                "operator review required.",
+                (commit_hash or "")[:8], op_id,
+                int(getattr(report, "escape_count", 0) or 0),
+            )
+    except Exception:  # noqa: BLE001 — self-audit must never affect anything
+        pass
+
+
+def _schedule_post_commit_self_audit(op_id: str, commit_hash: str) -> None:
+    """Slice 101 Phase 7 — after an O+V commit lands, schedule a NON-BLOCKING
+    adversarial-autobiography self-audit so a cage-bypass that shipped is caught
+    promptly (not only on the 30-min sleep cadence). The audit is sync + git-
+    heavy, so it runs in a thread executor (Zero-Block Invariant) — fire-and-
+    forget; the commit path NEVER waits on it. Self-gates on the autobiography
+    master so nothing is spawned when off. NEVER raises into the commit path.
+    """
+    try:
+        from backend.core.ouroboros.governance.adversarial_autobiography import (
+            master_enabled as _autobiography_enabled,
+        )
+        if not _autobiography_enabled():
+            return
+        loop = asyncio.get_running_loop()
+        # Fire-and-forget: do NOT await. _run_post_commit_self_audit never raises.
+        loop.run_in_executor(
+            None, _run_post_commit_self_audit, op_id, commit_hash,
+        )
+    except Exception:  # noqa: BLE001 — scheduling must never touch the commit
+        pass
+
+
 def ov_coauthor_line() -> str:
     """Canonical ``Co-Authored-By:`` trailer line for O+V commits."""
     return _OV_COAUTHOR
@@ -598,6 +644,10 @@ class AutoCommitter:
 
             # §24.6.2 — Store intent token in git notes post-commit.
             await self._store_intent_token(intent_token, commit_hash)
+
+            # Slice 101 Phase 7 — fire-and-forget self-audit (non-blocking,
+            # master-gated, never touches the commit path).
+            _schedule_post_commit_self_audit(op_id, commit_hash)
 
             result = CommitResult(
                 committed=True,
