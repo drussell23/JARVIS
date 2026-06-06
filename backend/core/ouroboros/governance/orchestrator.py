@@ -9667,7 +9667,13 @@ class GovernedOrchestrator:
 
         for raw_path in target_files[:3]:  # Cap at 3 files to stay within budget
             try:
-                ctx_info = oracle.get_context_for_improvement(raw_path, max_depth=2)
+                # Slice 113: this builder is SYNC, so reach the underlying
+                # in-process Oracle directly via the adapter's ``.raw`` (avoids
+                # an async cascade through every caller). In-process → identical
+                # behavior; under process isolation the graph is in another
+                # process so this sync path simply degrades (caught below).
+                _raw_oracle = getattr(oracle, "raw", oracle)
+                ctx_info = _raw_oracle.get_context_for_improvement(raw_path, max_depth=2)
             except Exception:
                 continue
 

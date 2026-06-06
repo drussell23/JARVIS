@@ -108,6 +108,13 @@ if [ "${COMMAND_CENTER:-0}" = "1" ]; then
   CC_IDLE="${SHADOW_IDLE_TIMEOUT:-600}"
   CC_WALL="${SHADOW_MAX_WALL_SECONDS:-0}"      # 0 = INFINITE (12–18 mo deployment); set SHADOW_MAX_WALL_SECONDS for a bounded watch
   export JARVIS_COMMAND_CENTER_GATEWAY=1        # co-boot the gateway inside the engine loop
+  # Slice 112/113: run the Oracle in its OWN process so the 1.1 GB / 166 s graph
+  # load happens on a separate GIL and NEVER freezes the engine loop — this is
+  # what keeps the gateway responsive THROUGH the hydration window (the soak's
+  # proof). Plus isolated-node graph hygiene to shrink the cache. Both
+  # overridable; default ON for the command-center soak.
+  export JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED="${JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED:-1}"
+  export JARVIS_ORACLE_GRAPH_PRUNE_ENABLED="${JARVIS_ORACLE_GRAPH_PRUNE_ENABLED:-1}"
   export JARVIS_BACKEND_PORT FRONTEND_PORT JARVIS_FRONTEND_PORT="$FRONTEND_PORT"
   CC_PIDS=()
   cleanup_cc() {
