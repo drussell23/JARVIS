@@ -8546,6 +8546,56 @@ class GovernedOrchestrator:
                 except Exception:
                     pass
 
+                # ---- Slice 106 — Runtime containment gate (gated, additive, fail-safe) ----
+                # When the OS-level Docker sandbox is enabled AND a containment
+                # probe is configured, run the candidate's runtime validation inside
+                # the locked-down Linux container (network none / read-only rootfs /
+                # cap-drop ALL / pids-limit). A ContainmentBreach (the candidate tried
+                # to hang, crash, exfiltrate, or escape the FS at runtime) is a hard
+                # VERIFY failure: mark verify failed (reusing the EXISTING failure →
+                # L2/GENERATE_RETRY routing below) + record a FALSIFYING quarantine
+                # belief so the learning loop steers away. The sandbox breach NEVER
+                # crashes the FSM. Gated default-FALSE (JARVIS_RUNTIME_SANDBOX_ENABLED)
+                # → byte-identical legacy. The probe + project image are operator-
+                # configured for the production (Linux/Docker) deployment.
+                try:
+                    from backend.core.ouroboros.governance.container_sandbox import (  # noqa: E501
+                        containerized_sandbox_enabled,
+                        record_containment_breach_belief,
+                        run_payload_contained,
+                    )
+                    from backend.core.ouroboros.governance.runtime_sandbox import (  # noqa: E501
+                        ContainmentBreach as _CB106,
+                    )
+                    _probe106 = os.environ.get(
+                        "JARVIS_RUNTIME_SANDBOX_VERIFY_PROBE", "",
+                    ).strip()
+                    if containerized_sandbox_enabled() and _probe106:
+                        _cres106 = await run_payload_contained(
+                            _probe106, worktree=str(self._config.project_root),
+                        )
+                        if (
+                            _cres106 is not None and not _cres106.ok
+                            and _cres106.breach in (
+                                _CB106.TIMEOUT, _CB106.SIGNAL_KILLED, _CB106.NONZERO_EXIT,
+                            )
+                        ):
+                            logger.warning(
+                                "[Orchestrator] CONTAINMENT BREACH at VERIFY op=%s "
+                                "breach=%s — quarantining candidate (→ GENERATE_RETRY)",
+                                ctx.op_id, _cres106.breach.value,
+                            )
+                            _verify_test_passed = False
+                            _verify_test_failures += 1
+                            record_containment_breach_belief(
+                                ctx.op_id, _cres106, ctx.target_files,
+                            )
+                except Exception:  # noqa: BLE001 — containment gate must NEVER crash VERIFY
+                    logger.debug(
+                        "[Orchestrator] containment gate skipped (non-fatal)",
+                        exc_info=True,
+                    )
+
                 # OpsDigestObserver v1.1a — VERIFY milestone. Plan tightening
                 # #1: ``scoped_to_applied_op=True`` because this branch only
                 # runs when ``ctx.target_files`` was applied (it's the scoped
