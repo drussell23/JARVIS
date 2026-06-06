@@ -145,6 +145,7 @@ bcrypt==5.0.0
 build==1.3.0
 cachetools==6.2.2
 certifi==2025.11.12
+cryptography>=42.0.0  # Slice 122: Ed25519 operator-signed Layer-4 roadmap authority
 cffi==2.0.0
 charset-normalizer==3.4.4
 chromadb==1.3.6
