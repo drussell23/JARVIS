@@ -76,6 +76,35 @@ _EVENT_TEMPLATES: Dict[str, Tuple[str, str]] = {
         "vital",
         "Boot check: {warning_count} issues detected.",
     ),
+    # --- Slice 109: cognitive-bus lifecycle narration -------------------
+    # High-severity cognitive events bound to the bus via
+    # cognitive_observability. Dynamically formatted from the lifecycle
+    # payload; the voice gate (JARVIS_KAREN_VOICE_ENABLED) + mute state
+    # are enforced UPSTREAM before on_event is ever called.
+    "cognitive.containment_breach": (
+        "cognitive_breach",
+        "Containment breach detected on operation {op_id}. The candidate "
+        "was quarantined; no code escaped the cage.",
+    ),
+    "cognitive.graduation_threshold_met": (
+        "cognitive_graduation",
+        "A graduation threshold was met for {flag}. Receipt accrued in "
+        "shadow mode; the flag was not flipped. Your decision.",
+    ),
+    "cognitive.load_shedding_active": (
+        "cognitive_loadshed",
+        "Load shedding is active. Cognitive fan-out throttled to protect "
+        "the host.",
+    ),
+    "cognitive.post_failure": (
+        "cognitive_failure",
+        "Operation {op_id} failed at {phase}. Belief revised; the lesson "
+        "was recorded.",
+    ),
+    "cognitive.post_apply": (
+        "cognitive_apply",
+        "Applied {op_id} with confidence {confidence}.",
+    ),
 }
 
 
