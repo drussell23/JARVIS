@@ -312,6 +312,7 @@ def test_snapshot_shape():
     expected_keys = {
         "state",
         "consecutive_transport_failures",
+        "consecutive_economic_failures",  # Slice 127
         "tripped_at_monotonic",
         "failure_threshold",
         "recovery_window_s",

@@ -5695,6 +5695,29 @@ class CandidateGenerator:
                             failure_message=str(inner_exc),
                             economic_reclassify=_s127_econ_on,
                         )
+                        # Slice 127 Phase 2 — per-provider economic breaker.
+                        # The fallback IS the Claude/Anthropic lane; when this
+                        # failure is an economic block ("credit balance too
+                        # low" / 402), trip the per-lane self-healing breaker so
+                        # FUTURE ops route around the broke lane (existing
+                        # should_allow_request gate) and it recovers after the
+                        # window — no sticky session brick. Gated + defensive;
+                        # detail is the redacted economic code, never a secret.
+                        try:
+                            if _s127_econ_on:
+                                from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
+                                    is_hard_economic_block as _s127_is_econ,
+                                )
+                                _s127_block = _s127_is_econ(str(inner_exc))
+                                if _s127_block is not None:
+                                    from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
+                                        get_claude_circuit_breaker as _s127_get_ccb,
+                                    )
+                                    _s127_get_ccb().record_economic_exhaustion(
+                                        f"claude_lane_economic:{_s127_block}",
+                                    )
+                        except Exception:  # noqa: BLE001 — never block cascade
+                            pass
                         # Telemetry — every classification is logged,
                         # regardless of breaker state. Best-effort.
                         _slice7e_publish_classified(

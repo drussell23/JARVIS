@@ -102,6 +102,33 @@ def is_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def claude_economic_breaker_enabled() -> bool:
+    """Slice 127 — master for ECONOMIC trips on the Claude lane breaker.
+
+    Default **FALSE** per §33.1. When OFF, ``record_economic_exhaustion`` is a
+    no-op (byte-identical to the pre-Slice-127 transport-only breaker). When
+    ON, a Claude "credit balance too low" economic block trips the lane OPEN so
+    future ops route around it, and the existing recovery-window self-heals it.
+    NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _economic_threshold() -> int:
+    """Consecutive economic exhaustions that trip the lane. Default 1 — an
+    economic refusal ("credit balance too low" / 402) is a definitive,
+    immediately-actionable "this lane can't serve now" signal, unlike a
+    transport flap. Operator-tunable; floored at 1."""
+    try:
+        return max(1, int(
+            os.environ.get("JARVIS_CLAUDE_ECONOMIC_BREAKER_THRESHOLD", "1")
+        ))
+    except ValueError:
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # Transport-class detection — string-based to avoid hard httpx dependency
 # ---------------------------------------------------------------------------
@@ -180,6 +207,9 @@ class ClaudeCircuitBreaker:
     ) -> None:
         self._state: CircuitState = CircuitState.CLOSED
         self._consecutive_transport_failures: int = 0
+        # Slice 127 — economic-exhaustion counter, kept DISTINCT from the
+        # transport counter so the two health signals don't cross-contaminate.
+        self._consecutive_economic_failures: int = 0
         self._tripped_at_monotonic: Optional[float] = None
         self._failure_threshold: int = (
             failure_threshold
@@ -266,15 +296,62 @@ class ClaudeCircuitBreaker:
                     self._recovery_window_s,
                 )
 
+    def record_economic_exhaustion(
+        self, detail: str = "unknown",
+    ) -> None:
+        """Slice 127 — record one ECONOMIC block on the Claude lane (a
+        "credit balance too low" / 402 refusal the CALLER already classified
+        as economic; this module stays stdlib-only and does NOT sniff the
+        message). Trips the lane OPEN at the (low) economic threshold so
+        ``should_allow_request()`` routes future ops around the broke lane;
+        the existing recovery-window → HALF_OPEN → ``record_success`` path
+        self-heals it once the lane is funded again.
+
+        No-op when ``JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED`` is OFF (default)
+        → byte-identical to the pre-Slice-127 transport-only breaker. NEVER
+        raises. ``detail`` is an audit hint only (never a secret — the caller
+        passes a redacted economic marker, not the raw key)."""
+        if not claude_economic_breaker_enabled():
+            return
+        with self._lock:
+            if self._state is CircuitState.HALF_OPEN:
+                # Probe hit the SAME economic wall — re-open, reset the clock.
+                self._state = CircuitState.OPEN
+                self._tripped_at_monotonic = time.monotonic()
+                self._total_trips += 1
+                logger.warning(
+                    "[ClaudeCircuitBreaker] HALF_OPEN economic probe failed "
+                    "(%s) — re-tripping to OPEN",
+                    detail,
+                )
+                return
+            self._consecutive_economic_failures += 1
+            if (
+                self._state is CircuitState.CLOSED
+                and self._consecutive_economic_failures
+                >= _economic_threshold()
+            ):
+                self._state = CircuitState.OPEN
+                self._tripped_at_monotonic = time.monotonic()
+                self._total_trips += 1
+                logger.warning(
+                    "[ClaudeCircuitBreaker] ECONOMIC TRIP (CLOSED -> OPEN) "
+                    "after %d economic exhaustion(s) (%s) — Claude requests "
+                    "route to the other lane for next %.0fs (self-heals)",
+                    self._consecutive_economic_failures, detail,
+                    self._recovery_window_s,
+                )
+
     def record_success(self) -> None:
         """Record a successful Claude call. Resets consecutive-failure
-        counter and, if HALF_OPEN, transitions back to CLOSED.
+        counters and, if HALF_OPEN, transitions back to CLOSED.
 
         Called by ``ClaudeProvider.generate`` on the success path.
         Idempotent — multiple successes in a row don't accumulate."""
         with self._lock:
             self._total_successes += 1
             self._consecutive_transport_failures = 0
+            self._consecutive_economic_failures = 0
             if self._state is not CircuitState.CLOSED:
                 logger.info(
                     "[ClaudeCircuitBreaker] %s -> CLOSED (probe "
@@ -332,6 +409,7 @@ class ClaudeCircuitBreaker:
         with self._lock:
             self._state = CircuitState.CLOSED
             self._consecutive_transport_failures = 0
+            self._consecutive_economic_failures = 0
             self._tripped_at_monotonic = None
 
     def snapshot(self) -> dict:
@@ -341,6 +419,8 @@ class ClaudeCircuitBreaker:
                 "state": self._state.value,
                 "consecutive_transport_failures":
                     self._consecutive_transport_failures,
+                "consecutive_economic_failures":
+                    self._consecutive_economic_failures,
                 "tripped_at_monotonic": self._tripped_at_monotonic,
                 "failure_threshold": self._failure_threshold,
                 "recovery_window_s": self._recovery_window_s,
@@ -384,6 +464,7 @@ __all__ = [
     "ClaudeCircuitBreaker",
     "get_claude_circuit_breaker",
     "is_enabled",
+    "claude_economic_breaker_enabled",
     "is_transport_class_exception",
     "reset_singleton_for_tests",
 ]
