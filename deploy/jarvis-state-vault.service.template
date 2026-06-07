@@ -1,0 +1,30 @@
+# JARVIS State Vault — autonomous .jarvis/ backup daemon (Slice 138)
+# Rendered by scripts/arm_and_launch.sh. Continuously mirrors the organism's
+# memory + tamper-evident evidence chain to a remote target so they survive
+# host-death. Fail-soft (a backup failure never affects the soak).
+
+[Unit]
+Description=JARVIS State Vault — autonomous evidence/memory backup
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+# Backend creds (e.g. AWS_* for s3, or ssh-agent for rsync) come from @REPO_ROOT@/.env.
+EnvironmentFile=-@REPO_ROOT@/.env
+Environment=JARVIS_STATE_BACKUP_ENABLED=1
+Environment=JARVIS_BACKUP_BACKEND=@BACKUP_BACKEND@
+Environment=JARVIS_BACKUP_TARGET=@BACKUP_TARGET@
+Environment=JARVIS_BACKUP_INTERVAL_S=@BACKUP_INTERVAL_S@
+ExecStart=/usr/bin/env python3 -m backend.core.ouroboros.governance.state_persistence_daemon
+Restart=always
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+StandardOutput=append:@REPO_ROOT@/.jarvis/state_vault.out
+StandardError=append:@REPO_ROOT@/.jarvis/state_vault.out
+
+[Install]
+WantedBy=default.target
