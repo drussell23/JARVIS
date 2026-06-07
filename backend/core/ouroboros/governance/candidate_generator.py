@@ -940,6 +940,18 @@ def _note_dw_candidate_success() -> None:
         get_dual_lane_breaker().record_success()
     except Exception:  # noqa: BLE001
         pass
+    # Slice 127 P3 — a DW completion succeeded → reset the dynamic-recovery
+    # episode counter to 0 instantly so the next transient blip recovers at
+    # ``base`` (gated, best-effort; never perturbs the success path).
+    try:
+        from backend.core.ouroboros.governance.dw_transport_recovery import (
+            dw_dynamic_recovery_enabled as _s127_dyn_on,
+            get_dw_transport_recovery as _s127_dwr,
+        )
+        if _s127_dyn_on():
+            _s127_dwr().note_recovered()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
@@ -969,6 +981,19 @@ def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
             SurfaceVerdict.TRANSPORT_DEGRADED,
             diagnostic=(diagnostic or "live_transport")[:120],
         )
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
+        pass
+    # Slice 127 P3 — register a dynamic-recovery rupture episode (debounced by
+    # ``base`` so a burst inside one outage = ONE episode). The dynamic window
+    # grows the next probe interval exponentially for a chronically-rupturing
+    # lane (gated, best-effort; never perturbs the dispatch error path).
+    try:
+        from backend.core.ouroboros.governance.dw_transport_recovery import (
+            dw_dynamic_recovery_enabled as _s127_dyn_on,
+            get_dw_transport_recovery as _s127_dwr,
+        )
+        if _s127_dyn_on():
+            _s127_dwr().note_degraded()
     except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
 
@@ -1024,7 +1049,25 @@ def dw_transport_degraded_preflight() -> bool:
         if rec is None or rec.verdict is not SurfaceVerdict.TRANSPORT_DEGRADED:
             return False
         age_s = time.time() - float(rec.last_probe_unix or 0.0)
-        return 0.0 <= age_s <= _dw_preflight_freshness_s()
+        # Slice 127 P3 — the freshness window is how long the DW lane stays
+        # severed before the next probe. When the dynamic-recovery master is ON,
+        # use the full-jitter EXPONENTIAL window (widens for a chronically-
+        # rupturing lane, resets on DW success) instead of the static default.
+        # OFF → byte-identical to the pre-P3 fixed window. Fail-safe: a 0/invalid
+        # dynamic window falls back to the static one (never starve DW).
+        _window_s = _dw_preflight_freshness_s()
+        try:
+            from backend.core.ouroboros.governance.dw_transport_recovery import (
+                dw_dynamic_recovery_enabled as _s127_dyn_on,
+                get_dw_transport_recovery as _s127_dwr,
+            )
+            if _s127_dyn_on():
+                _dyn = _s127_dwr().dynamic_recovery_window_s()
+                if _dyn and _dyn > 0:
+                    _window_s = _dyn
+        except Exception:  # noqa: BLE001 — fail-open to the static window
+            pass
+        return 0.0 <= age_s <= _window_s
     except Exception:  # noqa: BLE001 — never block dispatch on a gate error
         return False
 
