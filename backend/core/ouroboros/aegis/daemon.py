@@ -168,6 +168,29 @@ def build_app(
         upstream_map = _upstream_snapshot()
         app[_K_UPSTREAM_MAP] = upstream_map
 
+        # Slice 126.5 — cryptographic state telemetry at the env-LOAD point. Log
+        # the REDACTED fingerprint (sha256[:8], never the raw key) of each
+        # distinct upstream credential as the daemon sees it in its own env at
+        # boot. Paired with the injection-point fingerprint in forwarding.py,
+        # this makes any load→inject value-mutation directly observable.
+        try:
+            import logging as _logging
+            from backend.core.ouroboros.aegis.credential_env_loader import fingerprint as _fp
+
+            _seen = set()
+            for _ep in upstream_map.values():
+                _name = _ep.credential_env_var
+                if _name in _seen:
+                    continue
+                _seen.add(_name)
+                _val = os.environ.get(_name, "").strip()
+                _logging.getLogger("aegis-daemon").info(
+                    "[AegisDaemon] env-load credential: env_var=%s key=%s present=%s",
+                    _name, _fp(_val), bool(_val),
+                )
+        except Exception:  # noqa: BLE001 - telemetry must never block boot
+            pass
+
         # Register one handler per (path, method) pair. Two kinds:
         #   - LLM_COMPLETION → _handle_forward (lease-gated, reconciled)
         #   - PASSTHROUGH    → _handle_passthrough (session-gated, transparent)
