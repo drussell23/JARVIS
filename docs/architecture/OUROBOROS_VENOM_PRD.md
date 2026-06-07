@@ -12007,7 +12007,9 @@ Two further design corrections, also confident: **(1) read-only siege, not 50 li
 
 ### §51.11.27 — Slice 127 BUILT (Economic Sovereign Matrix) — the verify-first correction of §51.11.D
 
-**Status: P1 + P2 + P3 BUILT, tested, committed. Only P4 (the operator-funded ignition soak) remains.**
+**Status: P1 + P2 + P3 + P2.1 BUILT, tested, committed. The first bounded ignition soak (bt-2026-06-07) PROVED P1+P2 live (0 `terminal_config` bricks; Claude credit-400 → recoverable `terminal_quota`; `ECONOMIC TRIP` isolated the Claude lane + self-heals) and surfaced P2.1. Only P4 (a re-run soak on a lane that actually completes) remains.**
+
+**P2.1 — fallback-skip gate (IMMEDIATE → DW failover).** The live soak exposed a routing blind spot: `_generate_immediate` does "Claude direct, skip DW", and the existing `should_allow_request` gate only covers Claude-as-*primary* — so IMMEDIATE ops kept grinding against the depleted Claude lane (`terminal_quota` ×N, no completion) instead of failing over to the funded DW lane. Fix: the Claude-direct path now consults the Claude lane breaker via a pure decision helper (`immediate_reroute_to_dw`); when the breaker is OPEN (economic/transport) it reroutes the op to the DW primary (`_call_primary`), while a HALF_OPEN probe still keeps Claude-direct so the lane self-heals. Master `JARVIS_FALLBACK_SKIP_GATE_ENABLED` (default-FALSE §33.1). 8 tests + wiring pin; 170 green.
 
 **The blueprint was misdiagnosed (verify-first, ground truth from `bt-2026-06-07-040933` `debug.log`).** §51.11.D claimed a `/v1/models` **401** health-probe trips a **GLOBAL** breaker sticky `OPEN_TERMINAL`, bricking all lanes. The canonical log (line 1592) proves otherwise:
 

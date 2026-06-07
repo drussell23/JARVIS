@@ -1071,6 +1071,50 @@ def dw_transport_degraded_preflight() -> bool:
     except Exception:  # noqa: BLE001 — never block dispatch on a gate error
         return False
 
+
+# ---------------------------------------------------------------------------
+# Slice 127 P2.1 — fallback-skip gate (IMMEDIATE reroute to DW)
+# ---------------------------------------------------------------------------
+#
+# The live soak proved P1+P2 (no terminal_config brick; economic reclassify +
+# ECONOMIC TRIP). But `_generate_immediate` does "Claude direct, skip DW", so an
+# IMMEDIATE op keeps grinding against a depleted Claude lane and exhausts instead
+# of failing over to the funded DW lane — the existing should_allow_request gate
+# only covers Claude-as-PRIMARY. This gate makes the Claude-direct path consult
+# the Claude lane breaker first and reroute to the DW primary when it's OPEN.
+
+
+def fallback_skip_gate_enabled() -> bool:
+    """Slice 127 P2.1 master. Default **FALSE** per §33.1 — when OFF, the
+    IMMEDIATE path stays byte-identical Claude-direct. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_FALLBACK_SKIP_GATE_ENABLED", "false",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def immediate_reroute_to_dw(
+    *,
+    dw_is_primary: bool,
+    gate_enabled: bool,
+    claude_breaker_enabled: bool,
+    claude_allows_request: bool,
+) -> bool:
+    """Pure decision: should an IMMEDIATE op reroute from Claude-direct to the
+    DW primary? True iff DW is the primary lane, the gate is on, the Claude lane
+    breaker is enabled, and the breaker is NOT allowing requests (OPEN within
+    its window). When the breaker allows (CLOSED, or a HALF_OPEN probe), we keep
+    Claude-direct so the lane self-heals. Pure — no I/O, no side effects."""
+    return bool(
+        dw_is_primary
+        and gate_enabled
+        and claude_breaker_enabled
+        and not claude_allows_request
+    )
+
+
 # ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
@@ -3631,6 +3675,36 @@ class CandidateGenerator:
         # If DW IS the primary, go straight to Claude (the fallback).
         _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
         if _dw_is_primary:
+            # Slice 127 P2.1 — fallback-skip gate. Claude-direct would just
+            # grind an IMMEDIATE op against a depleted Claude lane (the live
+            # soak: terminal_quota x N, no completion). When the Claude lane
+            # breaker is OPEN (economic/transport), reroute to the funded DW
+            # primary instead. should_allow_request() returns True for a
+            # HALF_OPEN probe → we keep Claude-direct that one time so the lane
+            # self-heals. Gated default-FALSE → OFF is unchanged Claude-direct.
+            if fallback_skip_gate_enabled():
+                try:
+                    from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
+                        get_claude_circuit_breaker as _p21_ccb,
+                        is_enabled as _p21_ccb_enabled,
+                    )
+                    _p21_allows = _p21_ccb().should_allow_request()
+                    if immediate_reroute_to_dw(
+                        dw_is_primary=True,
+                        gate_enabled=True,
+                        claude_breaker_enabled=_p21_ccb_enabled(),
+                        claude_allows_request=_p21_allows,
+                    ):
+                        logger.warning(
+                            "[CandidateGenerator] IMMEDIATE reroute → DW: "
+                            "Claude lane breaker OPEN (economic/transport) — "
+                            "bypassing depleted Claude, routing to funded DW "
+                            "primary (op=%s)",
+                            getattr(context, "op_id", "?"),
+                        )
+                        return await self._call_primary(context, deadline)
+                except Exception:  # noqa: BLE001 — never block dispatch
+                    pass
             return await self._call_fallback(context, deadline)
 
         # Otherwise try primary (Claude/J-Prime), then fallback.
