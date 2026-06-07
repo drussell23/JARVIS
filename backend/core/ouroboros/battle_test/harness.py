@@ -128,7 +128,9 @@ class HarnessConfig:
     cost_cap_usd:
         Maximum API spend for the session.
     idle_timeout_s:
-        Seconds of inactivity before the session is stopped.
+        Seconds of inactivity before the session is stopped. ``<=0`` disables
+        the idle stop entirely (the --production-soak profile uses 0 for an
+        unattended long-term run; liveness then rests on cost_cap + wall cap).
     max_wall_seconds_s:
         Hard wall-clock ceiling on total session duration. ``None`` or
         ``<=0`` disables the cap (legacy behavior — only ``idle_timeout_s``
