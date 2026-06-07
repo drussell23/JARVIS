@@ -478,6 +478,19 @@ async def forward_request(
 
     # 3. Credential injection — never logged ---------------------------------
     upstream_credential = os.environ.get(endpoint.credential_env_var, "").strip()
+    # Slice 126.5 — cryptographic state telemetry. Log the REDACTED fingerprint
+    # (sha256[:8], never the raw key) of the credential at the exact injection
+    # microsecond, so a runtime value-mutation between daemon-load and injection
+    # is observable without ever leaking the secret.
+    try:
+        from backend.core.ouroboros.aegis.credential_env_loader import fingerprint as _fp
+        logger.info(
+            "[AegisForward] credential injection: path=%s env_var=%s key=%s scheme=%s",
+            endpoint.aegis_path, endpoint.credential_env_var,
+            _fp(upstream_credential), getattr(endpoint.auth_scheme, "value", endpoint.auth_scheme),
+        )
+    except Exception:  # noqa: BLE001 - telemetry must never break forwarding
+        pass
     if not upstream_credential:
         # Aegis daemon was started without credentials in its env — this
         # is operator error (the harness should have passed them at fork).

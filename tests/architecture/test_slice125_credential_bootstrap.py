@@ -114,3 +114,27 @@ class TestProbeClassification:
         assert is_fatal(V.OPERATOR_CREDENTIAL_PROBLEM) is True
         assert is_fatal(V.OK) is False
         assert is_fatal(V.TRANSPORT_PROBLEM) is False  # transient — don't hard-fail
+
+
+class TestConflictDetection:
+    """Slice 126.5 — a stale env credential differing from the funded .env must
+    be surfaced LOUDLY (the ghost that cost five soaks), with NO secret leak."""
+
+    def test_conflict_surfaced_redacted(self, tmp_path):
+        dotenv = tmp_path / ".env"
+        dotenv.write_text("DOUBLEWORD_API_KEY=sk-FUNDED-correct\n")
+        env = {"DOUBLEWORD_API_KEY": "sk-STALE-ghost"}  # a sibling-.env shadow
+        rep = L.load_provider_credentials(dotenv_path=str(dotenv), env=env)
+        assert "DOUBLEWORD_API_KEY" in rep.conflicts
+        line = L.format_report(rep)
+        assert "CONFLICT" in line
+        assert "sk-FUNDED" not in line and "sk-STALE" not in line  # redacted
+        # Explicit env still wins (we don't silently overwrite) — we WARN.
+        assert env["DOUBLEWORD_API_KEY"] == "sk-STALE-ghost"
+
+    def test_no_conflict_when_values_match(self, tmp_path):
+        dotenv = tmp_path / ".env"
+        dotenv.write_text("DOUBLEWORD_API_KEY=sk-SAME\n")
+        env = {"DOUBLEWORD_API_KEY": "sk-SAME"}
+        rep = L.load_provider_credentials(dotenv_path=str(dotenv), env=env)
+        assert rep.conflicts == {}

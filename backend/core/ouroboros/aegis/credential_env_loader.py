@@ -59,6 +59,7 @@ class CredentialLoadReport:
     already_present: List[str]        # names left untouched (explicit env wins)
     dotenv_present: bool
     error: str = ""                   # secret-free diagnostic, "" if clean
+    conflicts: Dict[str, str] = dataclasses.field(default_factory=dict)  # name → redacted env-vs-.env mismatch
 
     @property
     def ok(self) -> bool:
@@ -125,15 +126,26 @@ def load_provider_credentials(
             error=f"dotenv_parse_error: {exc.__class__.__name__}",
         )
 
+    conflicts: Dict[str, str] = {}
     for name in allowlist:
         if name in already:
-            continue  # explicit env wins
+            # Explicit env wins (operator override). But if the operator-approved
+            # .env carries a DIFFERENT value, that is the ghost that cost us five
+            # soaks (a stale sibling .env auto-loaded ahead of us): surface it
+            # LOUDLY with redacted fingerprints so it can never hide again.
+            env_val = (target.get(name) or "").strip()
+            dot_val = (parsed.get(name) or "").strip()
+            if dot_val and env_val and dot_val != env_val:
+                conflicts[name] = f"env={fingerprint(env_val)} .env={fingerprint(dot_val)}"
+            continue
         val = parsed.get(name)
         if val:
             target[name] = val
             loaded[name] = fingerprint(val)
 
-    return CredentialLoadReport(loaded=loaded, already_present=already, dotenv_present=True)
+    return CredentialLoadReport(
+        loaded=loaded, already_present=already, dotenv_present=True, conflicts=conflicts,
+    )
 
 
 def format_report(report: CredentialLoadReport) -> str:
@@ -144,10 +156,17 @@ def format_report(report: CredentialLoadReport) -> str:
         return f"[CredentialBootstrap] {report.error} — relying on exported env"
     loaded = ", ".join(f"{n}={fp}" for n, fp in sorted(report.loaded.items())) or "<none>"
     kept = ", ".join(sorted(report.already_present)) or "<none>"
-    return (
+    base = (
         f"[CredentialBootstrap] loaded-from-.env: {loaded} | "
         f"explicit-env-kept: {kept}"
     )
+    if report.conflicts:
+        clauses = "; ".join(f"{n} ({fps})" for n, fps in sorted(report.conflicts.items()))
+        base += (
+            f" | ⚠️ CONFLICT — env value differs from operator .env for: {clauses} "
+            f"(a stale value is shadowing the funded key — fix the source .env)"
+        )
+    return base
 
 
 __all__ = [
