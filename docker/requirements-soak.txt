@@ -41,5 +41,8 @@ uuid6
 # Unpinned so pip resolves a self-consistent onnxruntime / huggingface-hub / tokenizers.
 fastembed
 
-# Formal-proof engine (optional; import-guarded + fail-closed when absent)
-z3-solver>=4.16.0
+# NOTE: z3-solver is intentionally OMITTED. It has no prebuilt wheel for
+# linux/arm64 → pip builds it from source and fails in the slim container, and
+# the SMT prover (smt_invariant_prover) is import-guarded + fail-closed +
+# default-FALSE, so its absence is a clean no-op for the soak. To run formal
+# proofs on an x86_64 host (where a manylinux wheel exists), add:  z3-solver>=4.16.0
