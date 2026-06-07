@@ -36,6 +36,17 @@ for _a in "$@"; do
       # expired roadmap fails CLOSED → per-PR human review (legacy behavior).
       export JARVIS_LAYER4_ROADMAP_ENABLED=1
       ;;
+    --production-soak)
+      # Slice 123 fix: the wrapper (not just the python harness) must honor the
+      # production profile, since this script builds its own python invocation.
+      # Enable the process-isolated Oracle + boot-recovery quarantine here, and
+      # mark PRODUCTION_SOAK so the cap defaults below scale up. Each respects an
+      # existing env value so the operator can still override individually.
+      PRODUCTION_SOAK=1
+      export JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED="${JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED:-1}"
+      export JARVIS_BOOT_RECOVERY_QUARANTINE_ENABLED="${JARVIS_BOOT_RECOVERY_QUARANTINE_ENABLED:-1}"
+      PROD_FLAG="--production-soak"
+      ;;
     *) SIEGE_ARGS+=("$_a") ;;
   esac
 done
@@ -201,6 +212,16 @@ COST_CAP="${SHADOW_COST_CAP:-0.50}"
 IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-600}"
 MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-0}"
 
+# Slice 123 fix: --production-soak scales the caps up for a real T5 evidence run.
+# Re-resolves against SHADOW_* so an explicit operator override still wins; only
+# the DEFAULT changes (0.50→25.00 budget, 600→0 idle = no idle stop).
+if [ "${PRODUCTION_SOAK:-0}" = "1" ]; then
+  COST_CAP="${SHADOW_COST_CAP:-25.00}"
+  IDLE_TIMEOUT="${SHADOW_IDLE_TIMEOUT:-0}"
+  MAX_WALL="${SHADOW_MAX_WALL_SECONDS:-0}"
+  log "production-soak profile ACTIVE: cost-cap=\$$COST_CAP idle=$IDLE_TIMEOUT wall=$MAX_WALL oracle_isolation=on quarantine=on"
+fi
+
 # SHADOW_INTERACTIVE=1 drops --headless so the operator watches the live Rich
 # TUI (token stream + diff overlays + status line) and the SerpentFlow REPL on
 # a real terminal — the "let Karen narrate the boot" ignition session. The
@@ -215,4 +236,4 @@ fi
 log "launching O+V shadow soak (cost-cap=\$$COST_CAP idle=$IDLE_TIMEOUT wall=$MAX_WALL ${HEADLESS_FLAG})..."
 exec python3 scripts/ouroboros_battle_test.py \
   --cost-cap "$COST_CAP" --idle-timeout "$IDLE_TIMEOUT" --max-wall-seconds "$MAX_WALL" \
-  "$HEADLESS_FLAG" -v
+  ${PROD_FLAG:-} "$HEADLESS_FLAG" -v
