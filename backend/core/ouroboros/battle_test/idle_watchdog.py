@@ -182,6 +182,15 @@ class IdleWatchdog:
     async def _watch(self) -> None:
         """Internal loop: check elapsed time, sleep, fire event when idle."""
         try:
+            # timeout_s <= 0 means DISABLED — never fire (matches the production
+            # intent that `--idle-timeout 0` removes the idle stop, same as
+            # max_wall_seconds <=0). Without this guard, timeout_s=0 makes
+            # `remaining = 0 - elapsed` immediately negative → the watchdog fires
+            # idle on its first tick and a long unattended soak dies the moment
+            # it goes quiet. Honored here so the --production-soak profile's
+            # idle=0 is robust across the soak's inevitable restarts.
+            if self._timeout_s <= 0:
+                return
             while True:
                 # HIBERNATION_MODE: while frozen the clock does not advance.
                 # Poll at 100ms so unfreeze() is observed within a tick — the
