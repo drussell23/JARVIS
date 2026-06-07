@@ -136,11 +136,12 @@ def _cache_path() -> Path:
 
 
 class CacheLookupOutcome(str, enum.Enum):
-    """Closed taxonomy. ``SEMANTIC_HIT`` is RESERVED for the S1.x
-    semantic tier and is never produced in v1 (exact-only)."""
+    """Closed taxonomy. ``SEMANTIC_HIT`` is produced by the Slice 131 Phase 3
+    semantic tier (``semantic_cache``) — a strict-cosine near-match served on
+    exact-key MISS, gated by ``JARVIS_SEMANTIC_CACHE_ENABLED`` (default-FALSE)."""
 
     EXACT_HIT = "exact_hit"
-    SEMANTIC_HIT = "semantic_hit"            # reserved (S1.x)
+    SEMANTIC_HIT = "semantic_hit"            # Slice 131 P3 — near-match tier
     MISS = "miss"
     DISABLED = "disabled"
     INVALIDATED_REPO_CHANGE = "invalidated_repo_change"
@@ -583,6 +584,32 @@ async def cached_or_generate(
     except Exception as exc:  # noqa: BLE001 — fail-open
         logger.debug("[PRC] gate fault (fail-open): %s", exc)
         return await produce(), CacheLookupOutcome.FAULT_FAIL_OPEN
+
+    # Slice 131 P3 — semantic near-match interception (composes this substrate).
+    # On exact-key MISS, a strict-cosine near-match returns the cached response
+    # BEFORE paying for generation. Gated (JARVIS_SEMANTIC_CACHE_ENABLED,
+    # default-FALSE) + fail-closed (any fault → fall through to produce()).
+    # Skipped under exact-cache shadow mode (passthrough integrity) and on
+    # SHADOW_HIT_PASSTHROUGH (entry already exists at the exact key).
+    if not shadow and outcome is not CacheLookupOutcome.SHADOW_HIT_PASSTHROUGH:
+        try:
+            from backend.core.ouroboros.governance.semantic_cache import (
+                semantic_cache_enabled as _sem_enabled,
+                semantic_cache_lookup as _sem_lookup,
+            )
+            if _sem_enabled():
+                _sem_traj = await _sem_lookup(str(prompt), repo_root)
+                if _sem_traj is not None:
+                    _sem_gr = reconstruct_generation_result(_sem_traj)
+                    if _sem_gr is not None:
+                        logger.info(
+                            "[PRC] SEMANTIC_HIT — provider skipped, $0.00 "
+                            "(model=%s route=%s)", model, route,
+                        )
+                        return _sem_gr, CacheLookupOutcome.SEMANTIC_HIT
+        except Exception as exc:  # noqa: BLE001 — fail-closed → produce()
+            logger.debug("[PRC] semantic gate fault (fail-open): %s", exc)
+
     # Miss / invalidated / reconstruction-failed / SHADOW_HIT_PASSTHROUGH
     # → real generation, then best-effort store (store-omission is
     # fail-safe). On SHADOW_HIT_PASSTHROUGH the entry already exists at
@@ -598,6 +625,18 @@ async def cached_or_generate(
         ):
             t = _trajectory_from_generation_result(full, pref, gr)
             get_default_cache().store(t)
+            # Slice 131 P3 — write-through into the semantic cache so the next
+            # cycle can near-match this novel generation. Gated + fail-soft
+            # (store-omission never blocks the return).
+            try:
+                from backend.core.ouroboros.governance.semantic_cache import (
+                    semantic_cache_enabled as _sem_enabled2,
+                    semantic_cache_store as _sem_store,
+                )
+                if t is not None and _sem_enabled2():
+                    await _sem_store(str(prompt), t, repo_root)
+            except Exception as exc:  # noqa: BLE001 — write-through never blocks
+                logger.debug("[PRC] semantic write-through skipped: %s", exc)
     except Exception as exc:  # noqa: BLE001 — store never blocks
         logger.debug("[PRC] post-store skipped: %s", exc)
     return gr, outcome

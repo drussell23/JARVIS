@@ -49,10 +49,15 @@ def _gr(content="print(1)", noop=False):
 # -- flags / knobs ---------------------------------------------------------
 
 
+# Slice 131 P1 GRADUATED this master to default-TRUE (the cache is
+# correctness-fail-closed: any git diff re-keys, so default-on can only
+# eliminate redundant identical-context calls). Only explicit off-values
+# disable; unset/empty/garbage now resolve TRUE.
 @pytest.mark.parametrize("raw,exp", [
-    (None, False), ("", False), ("1", True), ("true", True),
-    ("YES", True), ("0", False), ("garbage", False)])
-def test_master_default_false_asymmetric(monkeypatch, raw, exp):
+    (None, True), ("", True), ("1", True), ("true", True),
+    ("YES", True), ("0", False), ("false", False), ("off", False),
+    ("garbage", True)])
+def test_master_default_true_asymmetric_slice131(monkeypatch, raw, exp):
     if raw is None:
         monkeypatch.delenv(
             "JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED", raising=False)
