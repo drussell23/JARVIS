@@ -62,7 +62,8 @@ pytest.ini
 
 # Config files not needed in container
 terraform/
-scripts/
+# NOTE (Slice 140): scripts/ is NOT excluded — the soak container ENTRYPOINT is
+# scripts/launch_shadow_soak.sh, so scripts/ must stay in the build context.
 .claude/
 *.tfvars
 *.tfstate*
