@@ -94,3 +94,11 @@ credentials/
 # Cache directories
 .cache/
 .huggingface/
+
+# ── Slice 140: secrets + crypto must NEVER be baked into an image layer ──
+# They mount at RUNTIME (docker-compose.soak.yml: env_file .env + ./.jarvis volume).
+.env
+.env.*
+\!.env.example
+.jarvis/
+.claude/worktrees/
