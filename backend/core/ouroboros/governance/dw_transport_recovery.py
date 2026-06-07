@@ -47,9 +47,10 @@ _DEFAULT_CAP_S = 600.0
 
 
 def dw_dynamic_recovery_enabled() -> bool:
-    """Master gate. Default **FALSE** per §33.1. NEVER raises."""
+    """Master gate. Slice 146: graduated default-TRUE (DW transport self-healing
+    on by default — live-proven). NEVER raises."""
     try:
-        return os.getenv(_ENV_MASTER, "false").strip().lower() in (
+        return os.getenv(_ENV_MASTER, "true").strip().lower() in (
             "1", "true", "yes", "on",
         )
     except Exception:  # noqa: BLE001

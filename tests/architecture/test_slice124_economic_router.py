@@ -50,9 +50,10 @@ class TestErrorClassification:
 
 
 class TestEconomicReclassifyMaster:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_graduated(self, monkeypatch):
+        # Slice 146: graduated default-TRUE — DW-sovereign (live-proven).
         monkeypatch.delenv("JARVIS_ECONOMIC_RECLASSIFY_ENABLED", raising=False)
-        assert ER.economic_reclassify_enabled() is False
+        assert ER.economic_reclassify_enabled() is True
 
     def test_enabled_truthy(self, monkeypatch):
         for v in ("1", "true", "yes", "on", "TRUE"):

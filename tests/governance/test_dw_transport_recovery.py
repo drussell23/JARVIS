@@ -38,9 +38,10 @@ class _ZeroRng:
 
 
 class TestMaster(unittest.TestCase):
-    def test_default_false(self) -> None:
+    def test_default_true_graduated(self) -> None:
+        # Slice 146: graduated default-TRUE (DW transport self-healing on by default).
         os.environ.pop("JARVIS_DW_DYNAMIC_RECOVERY_ENABLED", None)
-        self.assertFalse(dw_dynamic_recovery_enabled())
+        self.assertTrue(dw_dynamic_recovery_enabled())
 
     def test_enabled_truthy(self) -> None:
         for v in ("1", "true", "yes", "on"):

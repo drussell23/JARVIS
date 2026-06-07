@@ -86,9 +86,11 @@ class TestClaudeEconomicBreaker(unittest.TestCase):
         finally:
             os.environ.pop("JARVIS_CLAUDE_ECONOMIC_BREAKER_THRESHOLD", None)
 
-    def test_master_default_false(self) -> None:
+    def test_master_default_true_graduated(self) -> None:
+        # Slice 146: graduated default-TRUE — economic trips quarantine the Claude
+        # lane by default so future ops route to DW (live-proven).
         os.environ.pop("JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED", None)
-        self.assertFalse(claude_economic_breaker_enabled())
+        self.assertTrue(claude_economic_breaker_enabled())
 
 
 class TestEconomicBreakerWiringPin(unittest.TestCase):

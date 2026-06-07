@@ -1085,11 +1085,12 @@ def dw_transport_degraded_preflight() -> bool:
 
 
 def fallback_skip_gate_enabled() -> bool:
-    """Slice 127 P2.1 master. Default **FALSE** per §33.1 — when OFF, the
-    IMMEDIATE path stays byte-identical Claude-direct. NEVER raises."""
+    """Slice 127 P2.1 master. Slice 146: graduated default-TRUE — when the Claude
+    lane breaker is OPEN, IMMEDIATE ops skip the depleted fallback and reroute to
+    funded DW (live-proven). Operator can still force-off with =0. NEVER raises."""
     try:
         return os.environ.get(
-            "JARVIS_FALLBACK_SKIP_GATE_ENABLED", "false",
+            "JARVIS_FALLBACK_SKIP_GATE_ENABLED", "true",
         ).strip().lower() in ("1", "true", "yes", "on")
     except Exception:  # noqa: BLE001
         return False
