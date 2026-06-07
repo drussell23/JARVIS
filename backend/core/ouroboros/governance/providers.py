@@ -1710,6 +1710,46 @@ def _build_communication_mode_block(ctx: "OperationContext") -> Optional[str]:
     )
 
 
+def _prompt_prefix_cache_enabled() -> bool:
+    """Slice 131 P2a — gate the tool-catalog prefix-cache inversion. Default-FALSE
+    → OFF byte-identical (the stable tool catalog + output schema stay in the
+    volatile per-op user prompt). When ON, they are diverted into the cached
+    SYSTEM prefix so they ride the ~90%-cheaper cache instead of being re-billed
+    every op. NEVER raises."""
+    return os.getenv(
+        "JARVIS_PROMPT_PREFIX_CACHE_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _route_stable_tail(
+    parts: List[str],
+    stable_out: Optional[List[str]],
+    tool_section: str,
+    schema_section: str,
+    *,
+    enabled: bool,
+) -> None:
+    """ONE source of truth for where the STABLE tool catalog + output schema go.
+
+    OFF (or no sink) → append to the user-prompt ``parts`` (byte-identical
+    legacy: tool section then schema). ON + sink → divert both into
+    ``stable_out`` so the caller folds them into the cached system prefix,
+    eliminating the per-op re-bill. An empty tool section (VENOM_SKIP routes)
+    contributes nothing — only the schema is routed. NEVER raises."""
+    if enabled and stable_out is not None:
+        # ON: divert into the cached system prefix; skip an empty tool section
+        # (VENOM_SKIP routes) — no value in caching whitespace.
+        if tool_section:
+            stable_out.append(tool_section)
+        stable_out.append(schema_section)
+    else:
+        # OFF (or no sink): BYTE-IDENTICAL legacy — append the tool section
+        # (even when "") then the schema, exactly as the two prior parts.append
+        # calls did, so disabled behavior is bit-for-bit unchanged.
+        parts.append(tool_section)
+        parts.append(schema_section)
+
+
 def _build_tool_section(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -2188,8 +2228,15 @@ def _build_lean_codegen_prompt(
     force_full_content: bool = False,
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     preloaded_out: Optional[List[str]] = None,
+    stable_prefix_out: Optional[List[str]] = None,
 ) -> str:
     """Build a lean, tool-first generation prompt (~3-6K tokens).
+
+    Slice 131 P2a: when ``stable_prefix_out`` is provided AND
+    ``JARVIS_PROMPT_PREFIX_CACHE_ENABLED`` is on, the STABLE tool catalog +
+    output schema are diverted into ``stable_prefix_out`` (for the caller to fold
+    into the cached system prefix) instead of the volatile user prompt. Default
+    (no sink / flag off) is byte-identical legacy behavior.
 
     Unlike ``_build_codegen_prompt`` which front-loads full file contents,
     import context, test context, and expanded context into a single
@@ -2328,12 +2375,12 @@ def _build_lean_codegen_prompt(
     # _should_use_lean_prompt should already return False for those
     # routes, so this path shouldn't be reached for them, but plumb
     # the route anyway in case of caller drift).
-    parts.append(
-        _build_tool_section(
-            mcp_tools=mcp_tools,
-            voice_plain_language=voice_plain_language,
-            provider_route=str(getattr(ctx, "provider_route", "") or ""),
-        )
+    # Slice 131 P2a — compute the stable tool catalog once; routing (volatile
+    # user prompt vs cached system prefix) is decided after the schema is built.
+    _tool_section = _build_tool_section(
+        mcp_tools=mcp_tools,
+        voice_plain_language=voice_plain_language,
+        provider_route=str(getattr(ctx, "provider_route", "") or ""),
     )
 
     # ── 8. Output schema ────────────────────────────────────────────────
@@ -2375,7 +2422,13 @@ Rules:
 - Python files must be syntactically valid (`ast.parse()`-clean).
 - If the change is already implemented, return `{{"schema_version": "2b.1-noop", "reason": "<why>"}}`.
 - NEVER wrap the JSON in ```json ... ``` fences. NEVER emit prose before the opening `{{`. Your first character is `{{`."""
-    parts.append(schema_instruction)
+    # Slice 131 P2a — route the STABLE tool catalog + schema: into the cached
+    # system prefix (sink) when enabled, else the volatile user prompt
+    # (byte-identical legacy: tool section then schema).
+    _route_stable_tail(
+        parts, stable_prefix_out, _tool_section, schema_instruction,
+        enabled=_prompt_prefix_cache_enabled(),
+    )
 
     # ── 8a. Slice 20 Phase 3 — DW zero-candidate prohibition ────────────
     # Addresses v15 soak bt-2026-05-26-184355 "model judgment flaw":
