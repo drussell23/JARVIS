@@ -261,6 +261,44 @@ async def record_transition(
     )
 
 
+_pending_tasks: set = set()
+
+
+def note_transition_nowait(
+    *, op_id: str, phase_from: str, phase_to: str,
+    summary: str = "", context: Optional[dict] = None,
+) -> None:
+    """FIRE-AND-FORGET, NON-BLOCKING FSM synapse for the hot orchestrator path.
+
+    Schedules ``record_transition`` as a background task on the running event loop
+    and returns IMMEDIATELY — it never awaits, so it cannot block or starve the
+    main loop. Gated (no-op when disabled) and fully fail-soft (never raises). In
+    a sync context with no running loop (tests/CLI) it best-effort runs the record
+    inline. The strong task reference is held until completion to prevent GC."""
+    if not episodic_core_enabled():
+        return
+    try:
+        import asyncio
+        coro = record_transition(
+            op_id=str(op_id) if op_id is not None else "",
+            phase_from=str(phase_from) if phase_from is not None else "",
+            phase_to=str(phase_to) if phase_to is not None else "",
+            summary=summary, context=context,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            task = loop.create_task(coro)
+            _pending_tasks.add(task)
+            task.add_done_callback(_pending_tasks.discard)
+        else:
+            asyncio.run(coro)  # sync context (tests) — bounded, append-only
+    except Exception:  # noqa: BLE001 — a synapse must never perturb the FSM
+        pass
+
+
 def render_episodic_context(n: int = 0) -> str:
     """Gated render of the recent window for passive prompt injection. "" when
     disabled/empty. NEVER raises."""
@@ -279,5 +317,6 @@ __all__ = [
     "get_episodic_ledger",
     "reset_episodic_ledger",
     "record_transition",
+    "note_transition_nowait",
     "render_episodic_context",
 ]

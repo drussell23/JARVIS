@@ -150,6 +150,40 @@ def _slice12q_record_terminal(
     extracts the smallest correct payload from ctx + state + data,
     delegates idempotency + classification to SessionRecorder.
     NEVER raises."""
+    # Slice 134 — FSM synapse (write-side). Fire-and-forget episodic record of
+    # this terminal transition (START -> <terminal state>) with a context
+    # snapshot — captures COMPLETE / BLOCKED / failed (incl. IRON_GATE +
+    # REFUSED_SAFETY via reason_code) + the route the op took. Self-contained +
+    # recorder-INDEPENDENT (episodic memory must work in production without a
+    # battle-test SessionRecorder). Gated JARVIS_EPISODIC_CORE_ENABLED,
+    # non-blocking (scheduled, never awaited), fail-soft.
+    try:
+        from backend.core.ouroboros.governance.episodic_core import (
+            note_transition_nowait as _note_episode,
+        )
+        _state_value = getattr(state, "value", str(state)) or ""
+        _reason = (
+            getattr(ctx, "terminal_reason_code", "")
+            or (isinstance(data, dict) and (data.get("reason", "") or data.get("error", "")))
+            or ""
+        )
+        _op_id = str(getattr(ctx, "op_id", "") or "")
+        if _op_id:
+            _route = (
+                getattr(ctx, "provider_route", "")
+                or (isinstance(data, dict) and data.get("route", "")) or ""
+            )
+            _note_episode(
+                op_id=_op_id, phase_from="START", phase_to=str(_state_value),
+                summary=("op terminal " + str(_state_value)
+                         + (f" [{_reason}]" if _reason else "")),
+                context={
+                    "terminal_reason_code": str(_reason),
+                    "route": str(_route),
+                },
+            )
+    except Exception:  # noqa: BLE001 — synapse never perturbs the FSM
+        pass
     try:
         from backend.core.ouroboros.battle_test.session_recorder import (
             get_active_recorder,
