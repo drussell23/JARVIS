@@ -145,6 +145,27 @@ class RouteDecisionService:
                     decision.tier, decision.model or "-",
                     decision.escalated, decision.reason,
                 )
+                # Slice 135 — mid-cycle cognitive synapse: record the CAI routing
+                # decision as a coalesced episode (fire-and-forget, gated,
+                # non-blocking, fail-soft). Captures tier/difficulty/confidence so
+                # the organism remembers HOW it routed, not just the outcome.
+                try:
+                    from backend.core.ouroboros.governance.episodic_core import (
+                        note_route_nowait as _note_route,
+                    )
+                    _note_route(
+                        op_id=str(getattr(self, "_last_op_id", "") or "cai"),
+                        router="cai",
+                        summary=f"CAI → {decision.tier} (diff={decision.difficulty})",
+                        context={
+                            "tier": decision.tier,
+                            "difficulty": decision.difficulty,
+                            "confidence": decision.confidence,
+                            "escalated": decision.escalated,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — synapse never perturbs routing
+                    pass
             return decision
         except Exception as exc:  # noqa: BLE001 — fail-closed
             logger.debug("[CAIRouter] shadow consult skipped: %s", exc)
