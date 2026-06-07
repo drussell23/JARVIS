@@ -297,6 +297,17 @@ gates:
     persist_path: "~/.jarvis/ouroboros/cost_state.json"
 
 # ---------------------------------------------------------------------------
+# Cost Optimization (Slice 131 — Cost Sovereign Matrix)
+# Canonical, no-hardcode source for cost-routing model tiers. The economic
+# router's cheap-tier failover (economic_router.economic_failover_model) reads
+# claude_low_cost_model here; JARVIS_ECONOMIC_FAILOVER_MODEL env still overrides.
+# Keep this an ACTIVE model id (per shared model catalog) — claude-3-5-haiku is
+# retired; the current cheapest Anthropic tier is claude-haiku-4-5 ($1/$5 per M).
+# ---------------------------------------------------------------------------
+cost_optimization:
+  claude_low_cost_model: "claude-haiku-4-5"
+
+# ---------------------------------------------------------------------------
 # Provider Topology — Hard-segmented DW model mapping (Manifesto §5)
 # ---------------------------------------------------------------------------
 #

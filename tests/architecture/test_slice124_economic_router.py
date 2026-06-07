@@ -11,11 +11,13 @@ from backend.core.ouroboros.governance import economic_router as ER
 from backend.core.ouroboros.governance.economic_router import EconomicAction as A
 
 
-def test_master_default_false(monkeypatch):
+def test_master_default_true_graduated_slice131(monkeypatch):
+    # Slice 131 graduated this to default-TRUE (router only acts on the
+    # provider-failure path, so default-on cannot raise happy-path spend).
     monkeypatch.delenv("JARVIS_ECONOMIC_ROUTER_ENABLED", raising=False)
-    assert ER.economic_router_enabled() is False
-    monkeypatch.setenv("JARVIS_ECONOMIC_ROUTER_ENABLED", "1")
     assert ER.economic_router_enabled() is True
+    monkeypatch.setenv("JARVIS_ECONOMIC_ROUTER_ENABLED", "false")
+    assert ER.economic_router_enabled() is False
 
 
 class TestErrorClassification:
@@ -71,10 +73,14 @@ class TestTokenEstimate:
 
 class TestNoHardcodedModel:
     def test_cheap_model_resolved_from_env(self, monkeypatch):
-        monkeypatch.delenv("JARVIS_ECONOMIC_FAILOVER_MODEL", raising=False)
-        assert ER.economic_failover_model() == ""  # unset → empty (caller defaults)
         monkeypatch.setenv("JARVIS_ECONOMIC_FAILOVER_MODEL", "claude-haiku-4-5-20251001")
         assert ER.economic_failover_model() == "claude-haiku-4-5-20251001"
+
+    def test_cheap_model_resolves_from_policy_when_env_unset(self, monkeypatch):
+        # Slice 131: env-unset now resolves from brain_selection_policy.yaml
+        # (cost_optimization.claude_low_cost_model), not "" — no hardcode in code.
+        monkeypatch.delenv("JARVIS_ECONOMIC_FAILOVER_MODEL", raising=False)
+        assert ER.economic_failover_model()  # non-empty, from policy config
 
 
 class TestDecision:
@@ -85,7 +91,7 @@ class TestDecision:
         monkeypatch.delenv("JARVIS_BACKGROUND_ALLOW_FALLBACK", raising=False)
 
     def test_disabled_is_noop(self, monkeypatch):
-        monkeypatch.delenv("JARVIS_ECONOMIC_ROUTER_ENABLED", raising=False)
+        monkeypatch.setenv("JARVIS_ECONOMIC_ROUTER_ENABLED", "false")  # Slice 131: default is now TRUE
         d = ER.decide(route="background", error_text="http_402", prompt_chars=400, is_read_only=True)
         assert d.action is A.NO_OP
 
@@ -123,9 +129,11 @@ class TestDecision:
         d = ER.decide(route="standard", error_text="http_402", prompt_chars=400, is_read_only=True)
         assert d.action is A.NO_OP  # STANDARD already cascades by policy
 
-    def test_cheap_model_empty_when_env_unset(self, monkeypatch):
+    def test_cheap_model_from_policy_when_env_unset(self, monkeypatch):
+        # Slice 131: env-unset now resolves the cheap tier from the policy YAML
+        # (non-empty), so the cascade carries a concrete cheap model.
         monkeypatch.setenv("JARVIS_ECONOMIC_ROUTER_ENABLED", "1")
         monkeypatch.delenv("JARVIS_ECONOMIC_FAILOVER_MODEL", raising=False)
         d = ER.decide(route="background", error_text="http_402", prompt_chars=400, is_read_only=True)
         assert d.action is A.CASCADE_CHEAP
-        assert d.model == ""  # caller composes the default fallback provider
+        assert d.model  # resolved from brain_selection_policy.yaml (non-empty)
