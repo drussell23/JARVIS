@@ -1,7 +1,40 @@
-# Slice 138 — The Sovereign Infrastructure Matrix
+# Slice 138/139 — The Sovereign Infrastructure & Migration Matrix
 
 Reboot-surviving, self-backing-up deployment for the T5 unattended soak. One
-command arms the crypto gate and launches the organism as systemd services.
+command arms the crypto gate and launches the organism as systemd services — and
+one command migrates the whole organism from your workstation to a cloud host.
+
+## Autonomous cloud migration (Slice 139) — workstation → industrial host
+
+From the **main checkout** (where `.jarvis/` holds the real keys + signed roadmap):
+
+```bash
+# Package, ship, provision, and ignite on a fresh Linux host — one command:
+./scripts/migrate_to_host.sh ops@gcp-jprime /opt/jarvis --launch
+```
+
+It runs three composable pieces (each usable alone):
+- **`scripts/pack_sovereign_release.sh`** → a lean `.tar.gz`: excludes `.venv`,
+  `.git`, caches, and the 600M+ of regenerable `.jarvis` state; **preserves** the
+  Ed25519 pubkey + salt + meta + **signed roadmap** + the tamper-evident evidence
+  chain + episodic memory (allowlist) so the organism wakes up authorized and
+  remembering; **`.env` is NEVER in the artifact**.
+- **`deploy/provision_host.sh`** (IaC bootstrap) → installs Python 3.11+, the
+  build toolchain (numpy/fastembed), git/rsync, makes the venv, `pip install -r
+  requirements.txt`, and import-sanity-checks the deps. apt + dnf.
+- **The handshake** → `scp`s the artifact, ships `.env` **out-of-band** over the
+  same authenticated SSH (never in the tarball), extracts, provisions, and (with
+  `--launch`) runs `arm_and_launch.sh`. Because the signed roadmap travels in the
+  artifact, the host ignition is **non-interactive** (no passphrase prompt;
+  `arm_and_launch.sh` skips re-signing when a signed roadmap is present).
+
+Omit `--launch` to stage + provision only, then verify `.env` and ignite manually.
+
+---
+
+## One-command ignition (Linux + systemd)
+
+```bash
 
 ## One-command ignition (Linux + systemd)
 

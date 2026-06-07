@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pack_sovereign_release.sh — Slice 139: The Sovereign Artifact Packager
+# Bundles the JARVIS-AI-Agent repo into a lean, deployable .tar.gz for migration
+# to the industrial Linux host.
+#
+#   EXCLUDES the bulk + the dangerous: .venv, .git, __pycache__, *.pyc,
+#            .pytest_cache, node_modules, .claude/worktrees, AND the 600M+ of
+#            regenerable .jarvis caches/ledgers.
+#   EXCLUDES secrets: .env is NEVER baked into the artifact (transferred
+#            out-of-band by migrate_to_host.sh).
+#   PRESERVES the load-bearing .jarvis crypto + signatures + evidence/memory via
+#            an explicit allowlist (Ed25519 pubkey + salt + meta + signed roadmap
+#            + the tamper-evident evidence chain + episodic memory + warm vector
+#            index) so the organism wakes up authorized and remembering.
+#
+# Usage:  ./scripts/pack_sovereign_release.sh [output.tgz]
+# Output: dist/jarvis-sovereign-<gitsha>.tgz  (default)
+# =============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+SHA="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+OUT="${1:-$REPO_ROOT/dist/jarvis-sovereign-$SHA.tgz}"
+mkdir -p "$(dirname "$OUT")"
+
+log() { printf '\033[36m[pack]\033[0m %s\n' "$*"; }
+
+command -v rsync >/dev/null 2>&1 || { echo "[pack] FATAL: rsync required"; exit 1; }
+
+# The ONLY .jarvis entries that travel — crypto, signatures, evidence, memory.
+# Everything else under .jarvis is regenerable local state and is left behind.
+_JARVIS_ALLOWLIST=(
+  layer4_operator.pub
+  layer4_key.salt
+  layer4_key.meta.json
+  roadmap.signed.yaml
+  roadmap.draft.yaml
+  dissertation_evidence.jsonl
+  episodic_memory.jsonl
+  semantic_index.npz
+)
+
+STAGE_PARENT="$(mktemp -d)"
+STAGE="$STAGE_PARENT/jarvis-sovereign"
+trap 'rm -rf "$STAGE_PARENT"' EXIT
+mkdir -p "$STAGE"
+
+log "Staging clean tree (excluding .venv / .git / .env / caches / .jarvis bulk)…"
+rsync -a \
+  --exclude='.venv' \
+  --exclude='.git' \
+  --exclude='.env' \
+  --exclude='.env.*' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.pytest_cache' \
+  --exclude='.mypy_cache' \
+  --exclude='node_modules' \
+  --exclude='.claude/worktrees' \
+  --exclude='dist' \
+  --exclude='.jarvis' \
+  ./ "$STAGE/"
+
+log "Preserving load-bearing .jarvis crypto + signatures + evidence (allowlist)…"
+mkdir -p "$STAGE/.jarvis"
+_preserved=0
+for f in "${_JARVIS_ALLOWLIST[@]}"; do
+  if [ -f "$REPO_ROOT/.jarvis/$f" ]; then
+    cp -p "$REPO_ROOT/.jarvis/$f" "$STAGE/.jarvis/$f"
+    log "  + .jarvis/$f"
+    _preserved=$((_preserved + 1))
+  fi
+done
+[ "$_preserved" -gt 0 ] || log "WARNING: no .jarvis crypto/sig files found — provision + sign before packaging."
+
+# Hard guarantee: no secret ever rode along.
+if [ -f "$STAGE/.env" ]; then echo "[pack] FATAL: .env leaked into stage"; exit 2; fi
+
+log "Compressing → $OUT"
+tar czf "$OUT" -C "$STAGE_PARENT" "jarvis-sovereign"
+SIZE="$(du -h "$OUT" | cut -f1)"
+log "═══════════════════════════════════════════════════════════════"
+log "ARTIFACT READY: $OUT ($SIZE, git=$SHA)"
+log "  .jarvis crypto/sig/evidence preserved: $_preserved file(s)"
+log "  .env + .venv + .git + caches: EXCLUDED"
+log "  Next: ./scripts/migrate_to_host.sh user@host:/opt/jarvis $OUT"
+log "═══════════════════════════════════════════════════════════════"
