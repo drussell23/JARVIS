@@ -42,32 +42,25 @@ _LINKED = "recursion_depth_gate"
 
 
 def recursion_bound_spec() -> SmtSpec:
-    """Build the SmtSpec for the recursion-bound inductive-safety theorem from
-    the LIVE gate parameters. PROVED iff Z3 returns ``unsat``."""
-    lo = int(_MIN_MAX_DEPTH)
-    hi = int(_MAX_MAX_DEPTH)
-    live_mx = int(max_recursion_depth())
-    smt2 = (
-        ";; RRD recursion-depth bound — inductive safety (negation; unsat=PROVED)\n"
-        "(declare-const depth Int)\n"
-        "(declare-const mx Int)\n"
-        f"(assert (>= mx {lo}))\n"
-        f"(assert (<= mx {hi}))\n"
-        "(assert (>= depth 0))\n"
-        "(assert (<= depth mx))\n"            # invariant holds before
-        "(assert (<= (+ depth 1) mx))\n"      # gate ALLOWS (effective <= mx)
-        "(assert (> (+ depth 1) mx))\n"       # post-state breaks invariant
-        "(check-sat)\n"
+    """Canonical recursion-bound theorem spec.
+
+    **Slice 130**: this now DELEGATES to the deterministic AST extractor
+    (``ast_to_smt_extractor.recursion_bound_spec_from_source``) — the SMT is
+    compiled from the LIVE ``recursion_depth_gate.py`` AST, NOT a hand-written
+    formula. The live ceiling is appended to the description for the certificate.
+    Fail-closed: if extraction fails the delegate returns a non-provable spec.
+    """
+    from backend.core.ouroboros.governance.ast_to_smt_extractor import (
+        recursion_bound_spec_from_source,
     )
+    spec = recursion_bound_spec_from_source(None)  # None → live source
+    # Stamp the live ceiling into the description (certificate continuity).
     return SmtSpec(
-        name="rrd_recursion_bound_inductive",
-        smt2=smt2,
-        description=(
-            f"RRD recursion-depth bound is un-escapable for all ceilings in "
-            f"[{lo},{hi}] (live mx={live_mx}); allowed op never exceeds mx."
-        ),
-        linked_invariant_name=_LINKED,
-        timeout_ms=10000,
+        name=spec.name,
+        smt2=spec.smt2,
+        description=f"{spec.description} (live mx={int(max_recursion_depth())})",
+        linked_invariant_name=spec.linked_invariant_name,
+        timeout_ms=spec.timeout_ms,
     )
 
 
