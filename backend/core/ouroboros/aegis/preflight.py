@@ -229,6 +229,24 @@ async def aegis_preflight(
             detail="JARVIS_AEGIS_ENABLED is false (Slice 1 default)",
         )
 
+    # Slice 125 — ROOT INVARIANT: the funded provider keys from the operator-
+    # approved .env must be in the env BEFORE we snapshot. Otherwise the daemon
+    # is spawned with an absent key, injects nothing, and the upstream bills the
+    # request against its free ($0) tier → a misleading 402 "balance too low"
+    # that masquerades as out-of-credits but is really a credential-injection
+    # gap. The loader is allowlist-only, never overwrites an explicit export,
+    # never source-execs .env, and logs only redacted fingerprints.
+    try:
+        from backend.core.ouroboros.aegis.credential_env_loader import (
+            format_report,
+            load_provider_credentials,
+        )
+
+        _cred_report = load_provider_credentials(env=target_env)
+        logger.info("%s", format_report(_cred_report))
+    except Exception as exc:  # noqa: BLE001 - never block boot on the loader
+        logger.debug("[AegisPreflight] credential bootstrap skipped: %s", exc.__class__.__name__)
+
     # Snapshot credentials — we need them to hand to the subprocess
     # BEFORE we strip them from our env.
     creds = {

@@ -1521,6 +1521,34 @@ def main() -> None:
             f"[Aegis] daemon ready at {_aegis_result.aegis_url} "
             f"(pid={_aegis_result.subprocess_pid})"
         )
+        # Slice 125 — credential health probe. Prove the daemon injects a VALID
+        # credential of the funded class BEFORE a multi-hour soak spends time.
+        # Two arms (direct funded key vs Aegis-routed); a 402 through Aegis while
+        # the direct key is 200 is an INJECTION FAILURE — fail loud rather than
+        # silently 402 for hours and burn Claude. Gated; redacted logging only.
+        try:
+            from backend.core.ouroboros.aegis.credential_probe import (
+                credential_probe_enabled as _probe_enabled,
+                is_fatal as _probe_fatal,
+                probe_dw_credential_health as _probe_health,
+            )
+
+            if _probe_enabled():
+                _verdict = asyncio.run(_probe_health())
+                print(f"[Aegis] credential probe: {_verdict.value}")
+                if _probe_fatal(_verdict):
+                    print(
+                        f"[Aegis] FATAL: {_verdict.value} — the Aegis daemon is "
+                        f"not injecting the funded provider credential. Refusing "
+                        f"to start a long soak that would silently 402 / burn "
+                        f"fallback credits. Fix the credential path and retry.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+        except SystemExit:
+            raise
+        except Exception as _probe_exc:  # noqa: BLE001 - probe must not block boot on its own bug
+            print(f"[Aegis] credential probe skipped ({_probe_exc.__class__.__name__})")
 
     # ------------------------------------------------------------------
     # Build config + harness
