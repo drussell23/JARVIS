@@ -5360,6 +5360,12 @@ class CandidateGenerator:
                 from backend.core.ouroboros.governance.provider_retry_classifier import (  # noqa: E501
                     classify as _slice7e_classify,
                 )
+                # Slice 127 — economic reclassification gate (default-FALSE,
+                # §33.1). Lives in economic_router so the PURE-DATA classifier
+                # stays env-free (AST-pinned).
+                from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
+                    economic_reclassify_enabled as _s127_econ_reclassify_enabled,
+                )
                 from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
                     publish_provider_failure_classified as _slice7e_publish_classified,
                     publish_circuit_breaker_state_change as _slice7e_publish_state_change,
@@ -5673,9 +5679,21 @@ class CandidateGenerator:
                         # eligibility check below remain as additional
                         # gates (defense in depth — no breaker bypass
                         # of the pre-existing semantics).
+                        # Slice 127 — pass the raw message + economic gate so a
+                        # "credit balance too low" 400 (class BadRequestError)
+                        # reclassifies to recoverable TERMINAL_QUOTA instead of
+                        # sticky TERMINAL_CONFIG. Gate default-FALSE → OFF is
+                        # byte-identical to pre-127. (bt-2026-06-07-040933 root
+                        # cause: 16 sticky terminal_config trips.)
+                        try:
+                            _s127_econ_on = _s127_econ_reclassify_enabled()
+                        except Exception:  # noqa: BLE001 — failure-soft
+                            _s127_econ_on = False
                         _slice7e_decision = _slice7e_classify(
                             failure_class=type(inner_exc).__name__,
                             failure_mode=_inner_mode.name,
+                            failure_message=str(inner_exc),
+                            economic_reclassify=_s127_econ_on,
                         )
                         # Telemetry — every classification is logged,
                         # regardless of breaker state. Best-effort.

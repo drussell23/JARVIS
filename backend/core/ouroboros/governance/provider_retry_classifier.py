@@ -212,6 +212,46 @@ _FAILURE_MODE_DEFAULT: dict = {
 
 
 # ============================================================================
+# Slice 127 — economic reclassification (gated, §33.1 default-FALSE)
+# ============================================================================
+#
+# Root cause (bt-2026-06-07-040933, verify-first): a Claude HTTP 400
+# "Your credit balance is too low to access the Anthropic API" surfaces as
+# exception class ``BadRequestError`` — which is in ``_TERMINAL_CONFIG_CLASSES``
+# — so it was classified ``TERMINAL_CONFIG`` and the per-op Circuit Breaker
+# tripped sticky ``OPEN_TERMINAL`` on the FIRST hit, bricking 16 ops. But a
+# "credit balance too low" 400 is an ECONOMIC refusal (recoverable once the
+# operator funds the lane / after a window), NOT a permanent config fault.
+#
+# When the caller passes ``economic_reclassify=True`` (it reads the
+# ``JARVIS_ECONOMIC_RECLASSIFY_ENABLED`` master from ``economic_router`` — the
+# env read stays OUT of this PURE-DATA module, AST-pinned) and the failure
+# carries an error MESSAGE recognised as a hard economic block, ``classify``
+# returns the recoverable ``TERMINAL_QUOTA`` (the existing closed-taxonomy
+# member for an economic/quota refusal) instead of ``TERMINAL_CONFIG``. This
+# stays a 4-value closed taxonomy — no new RetryDecision member.
+#
+# The economic-marker detection COMPOSES ``economic_router.is_hard_economic_block``
+# (lazy import — no module cycle, no duplicate marker table). NEVER raises.
+
+
+def _is_economic_block_message(failure_message: Optional[str]) -> bool:
+    """True iff ``failure_message`` is a hard economic block. Composes the
+    canonical detector in ``economic_router`` (single source of truth for the
+    "balance too low" / "insufficient" / 402 markers). Lazy import keeps the
+    classifier free of any governance cycle. NEVER raises."""
+    if not failure_message:
+        return False
+    try:
+        from backend.core.ouroboros.governance.economic_router import (
+            is_hard_economic_block,
+        )
+        return is_hard_economic_block(failure_message) is not None
+    except Exception:  # noqa: BLE001 — failure-soft, defer to legacy path
+        return False
+
+
+# ============================================================================
 # Public API — classify()
 # ============================================================================
 
@@ -221,11 +261,19 @@ def classify(
     failure_mode: Optional[str] = None,
     *,
     http_status: Optional[int] = None,
+    failure_message: Optional[str] = None,
+    economic_reclassify: bool = False,
 ) -> RetryDecision:
     """Classify a provider failure into a closed RetryDecision.
 
     Priority (highest → lowest, first match wins):
 
+      0. **Economic block (Slice 127, gated).** When
+         ``economic_reclassify`` is True and ``failure_message`` is a
+         hard economic block ("credit balance too low" / "insufficient"
+         / 402), return the recoverable ``TERMINAL_QUOTA`` — never the
+         sticky ``TERMINAL_CONFIG`` a ``BadRequestError`` would
+         otherwise yield. False (default) → this priority is skipped.
       1. ``failure_class`` matches a known TERMINAL_* registry —
          the class string is dispositive (e.g.
          ``SessionBudgetPreflightRefused`` is always
@@ -253,6 +301,18 @@ def classify(
         HTTP status code from the provider response, when
         available. Optional — used only when neither class nor
         mode is dispositive.
+    failure_message:
+        The raw exception message (``str(exc)``), when available.
+        Optional — used only by the Slice 127 economic-block
+        priority-0 check, and only when ``economic_reclassify`` is
+        True. Inspected for public economic markers ("credit balance
+        too low" etc.) only — never for secrets.
+    economic_reclassify:
+        Slice 127 gate. When True (the caller sources it from
+        ``economic_router.economic_reclassify_enabled()``, default
+        FALSE per §33.1), an economic ``failure_message`` routes to
+        the recoverable ``TERMINAL_QUOTA`` instead of the sticky
+        ``TERMINAL_CONFIG``. False → byte-identical to pre-Slice-127.
 
     Returns
     -------
@@ -276,6 +336,14 @@ def classify(
     >>> classify("UnknownErrorClass")
     <RetryDecision.RETRY_TRANSIENT: 'retry_transient'>
     """
+    # Priority 0 (Slice 127, gated): economic block recognition. A
+    # provider "credit balance too low" / "insufficient funds" refusal is
+    # recoverable (operator funds the lane / quota window) — NOT a permanent
+    # config fault. The caller passes ``economic_reclassify`` from the
+    # ``economic_router`` master so OFF is byte-identical to pre-Slice-127.
+    if economic_reclassify and _is_economic_block_message(failure_message):
+        return RetryDecision.TERMINAL_QUOTA
+
     # Priority 1: failure_class registries (most specific).
     if failure_class:
         if failure_class in _TERMINAL_STRUCTURAL_CLASSES:
