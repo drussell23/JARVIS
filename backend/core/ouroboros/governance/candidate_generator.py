@@ -3474,6 +3474,45 @@ class CandidateGenerator:
                 self._fallback is not None
                 and (_is_read_only or _allow_mutating_fallback)
             )
+            # Slice 124 — Autonomous Economic Router. On a HARD economic block
+            # (DW http_402 balance / 429 rate-limit), a small read-only (or
+            # opt-in) BACKGROUND op should not dead-queue: cascade it to the
+            # cheap Claude tier to preserve momentum, while MASSIVE ops stay
+            # queued (don't pay Claude prices for a big background op). This
+            # EXTENDS the read-only cascade with an economic size-gate; the
+            # cheap model is resolved from JARVIS_ECONOMIC_FAILOVER_MODEL (no
+            # hardcode). Gated + fail-open; default-off → byte-identical.
+            try:
+                from backend.core.ouroboros.governance import economic_router as _ER
+
+                if _ER.economic_router_enabled() and self._fallback is not None:
+                    _prompt_chars = len(str(getattr(context, "prompt", "") or "")) \
+                        or len(str(getattr(context, "description", "") or ""))
+                    _econ = _ER.decide(
+                        route=provider_route,
+                        error_text=last_failure or "",
+                        prompt_chars=_prompt_chars,
+                        is_read_only=_is_read_only,
+                    )
+                    if _econ.action is _ER.EconomicAction.CASCADE_CHEAP:
+                        _can_cascade = True
+                        logger.info(
+                            "[CandidateGenerator] EconomicRouter: %s → cascade to "
+                            "cheap tier '%s' (op=%s, %s)",
+                            _econ.reason, _econ.model or "(default fallback)",
+                            op_id_short, provider_route,
+                        )
+                    elif _econ.action is _ER.EconomicAction.QUEUE:
+                        # Massive/unsafe op on a hard block — keep it queued
+                        # (overrides a would-be read-only cascade for cost).
+                        _can_cascade = False
+                        logger.info(
+                            "[CandidateGenerator] EconomicRouter: %s → staying "
+                            "queued for cheap provider (op=%s)",
+                            _econ.reason, op_id_short,
+                        )
+            except Exception:  # noqa: BLE001 - economic routing is best-effort
+                logger.debug("[CandidateGenerator] EconomicRouter consult skipped", exc_info=True)
             if _can_cascade:
                 _cascade_reason = (
                     "read_only_cost_safe"

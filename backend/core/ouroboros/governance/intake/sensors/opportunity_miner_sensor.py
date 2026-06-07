@@ -618,6 +618,14 @@ class OpportunityMinerSensor:
                 )
                 continue
             async for py_file in cooperative_yield_every_n_async(py_files):
+                # Slice 124 Phase 3 — guaranteed per-file yield. The
+                # cooperative_yield only fires every N, and the
+                # `_is_production_code → continue` skip-path below awaits
+                # nothing, so a long run of skipped files spins the loop with
+                # no scheduling slot for the FSM/ControlPlaneWatchdog (observed
+                # ControlPlaneStarvation lag_ms~3200). sleep(0) is ~free and
+                # forces a yield every iteration, capping FSM lag.
+                await asyncio.sleep(0)
                 rel = str(py_file.relative_to(self._repo_root))
 
                 if not self._is_production_code(py_file, root):
