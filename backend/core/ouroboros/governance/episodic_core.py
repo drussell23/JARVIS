@@ -68,6 +68,7 @@ class Episode:
     op_id: str
     summary: str
     context: dict = dataclasses.field(default_factory=dict)
+    coalesce_key: str = ""  # Slice 135 — non-empty groups mid-cycle spam (e.g. routing)
 
     def render(self) -> str:
         return f"- [{self.kind}] op={self.op_id}: {self.summary}"
@@ -151,15 +152,33 @@ class EpisodicLedger:
     # ── record / recall ─────────────────────────────────────────────────────
     async def record(
         self, *, kind: str, op_id: str, summary: str,
-        context: Optional[dict] = None,
+        context: Optional[dict] = None, coalesce_key: str = "",
     ) -> Optional[Episode]:
         """Append an episode: durable hash-chained receipt + short-term window;
         the episode evicted from the window is embedded into long-term recall.
-        Fail-soft — returns the Episode (or None on hard failure), never raises."""
+
+        **Slice 135 spam-guard:** when ``coalesce_key`` is non-empty and an
+        episode with the same key is already in the window, that episode is
+        UPDATED IN PLACE (latest summary + merged context + ``coalesced_count``)
+        instead of appending a new one — so a flurry of mid-cycle micro-routing
+        decisions collapses to one high-signal episode and cannot flush the
+        terminal episodes out of the window (no append → no eviction → no extra
+        durable I/O). Fail-soft — never raises."""
         try:
             with self._lock:
+                if coalesce_key:
+                    for existing in self._window:
+                        if existing.coalesce_key == coalesce_key:
+                            existing.summary = str(summary or "")
+                            existing.ts = time.time()
+                            existing.context.update(dict(context or {}))
+                            existing.context["coalesced_count"] = (
+                                existing.context.get("coalesced_count", 1) + 1
+                            )
+                            return existing  # coalesced — no append, no eviction
                 ep = Episode(self._seq, time.time(), str(kind), str(op_id),
-                             str(summary or ""), dict(context or {}))
+                             str(summary or ""), dict(context or {}),
+                             str(coalesce_key or ""))
                 self._seq += 1
                 evicted: Optional[Episode] = None
                 if len(self._window) == self._window.maxlen:
@@ -261,30 +280,30 @@ async def record_transition(
     )
 
 
+async def record_route(
+    *, op_id: str, router: str, summary: str = "", context: Optional[dict] = None,
+) -> Optional[Episode]:
+    """Record a routing decision (kind=route), COALESCED per op so mid-cycle
+    micro-decisions collapse to one high-signal episode. Gated + fail-soft."""
+    if not episodic_core_enabled():
+        return None
+    ctx = dict(context or {})
+    ctx["router"] = str(router)
+    return await get_episodic_ledger().record(
+        kind="route", op_id=str(op_id),
+        summary=summary or f"{router} routing decision",
+        context=ctx, coalesce_key=f"route:{op_id}",
+    )
+
+
 _pending_tasks: set = set()
 
 
-def note_transition_nowait(
-    *, op_id: str, phase_from: str, phase_to: str,
-    summary: str = "", context: Optional[dict] = None,
-) -> None:
-    """FIRE-AND-FORGET, NON-BLOCKING FSM synapse for the hot orchestrator path.
-
-    Schedules ``record_transition`` as a background task on the running event loop
-    and returns IMMEDIATELY — it never awaits, so it cannot block or starve the
-    main loop. Gated (no-op when disabled) and fully fail-soft (never raises). In
-    a sync context with no running loop (tests/CLI) it best-effort runs the record
-    inline. The strong task reference is held until completion to prevent GC."""
-    if not episodic_core_enabled():
-        return
+def _fire_nowait(coro) -> None:
+    """Schedule ``coro`` fire-and-forget on the running loop (or run inline in a
+    sync context). Non-blocking, fail-soft; holds a strong task ref (no GC)."""
+    import asyncio
     try:
-        import asyncio
-        coro = record_transition(
-            op_id=str(op_id) if op_id is not None else "",
-            phase_from=str(phase_from) if phase_from is not None else "",
-            phase_to=str(phase_to) if phase_to is not None else "",
-            summary=summary, context=context,
-        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -294,9 +313,42 @@ def note_transition_nowait(
             _pending_tasks.add(task)
             task.add_done_callback(_pending_tasks.discard)
         else:
-            asyncio.run(coro)  # sync context (tests) — bounded, append-only
+            asyncio.run(coro)  # sync context (tests/CLI) — bounded
     except Exception:  # noqa: BLE001 — a synapse must never perturb the FSM
-        pass
+        try:
+            coro.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def note_transition_nowait(
+    *, op_id: str, phase_from: str, phase_to: str,
+    summary: str = "", context: Optional[dict] = None,
+) -> None:
+    """FIRE-AND-FORGET, NON-BLOCKING FSM synapse for the hot orchestrator path —
+    schedules ``record_transition`` and returns immediately. Gated + fail-soft."""
+    if not episodic_core_enabled():
+        return
+    _fire_nowait(record_transition(
+        op_id=str(op_id) if op_id is not None else "",
+        phase_from=str(phase_from) if phase_from is not None else "",
+        phase_to=str(phase_to) if phase_to is not None else "",
+        summary=summary, context=context,
+    ))
+
+
+def note_route_nowait(
+    *, op_id: str, router: str, summary: str = "", context: Optional[dict] = None,
+) -> None:
+    """FIRE-AND-FORGET, NON-BLOCKING mid-cycle ROUTING synapse — schedules
+    ``record_route`` (coalesced per op) and returns immediately. Gated +
+    fail-soft. Safe to call from the hot routing path."""
+    if not episodic_core_enabled():
+        return
+    _fire_nowait(record_route(
+        op_id=str(op_id) if op_id is not None else "",
+        router=str(router), summary=summary, context=context,
+    ))
 
 
 def render_episodic_context(n: int = 0) -> str:
@@ -317,6 +369,8 @@ __all__ = [
     "get_episodic_ledger",
     "reset_episodic_ledger",
     "record_transition",
+    "record_route",
     "note_transition_nowait",
+    "note_route_nowait",
     "render_episodic_context",
 ]
