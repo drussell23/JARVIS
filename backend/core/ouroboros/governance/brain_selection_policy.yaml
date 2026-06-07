@@ -306,6 +306,11 @@ gates:
 # ---------------------------------------------------------------------------
 cost_optimization:
   claude_low_cost_model: "claude-haiku-4-5"
+  # Slice 131 Phase 4 — the CAI Autonomous Router cheapest->heaviest provider
+  # ladder. Tier NAMES are structural identifiers (cai_router resolves each:
+  # doubleword->DW topology, claude_low_cost->claude_low_cost_model above,
+  # claude_heavy->provider default). Reorder/extend here, never in code.
+  cascade_tiers: ["doubleword", "claude_low_cost", "claude_heavy"]
 
 # ---------------------------------------------------------------------------
 # Provider Topology — Hard-segmented DW model mapping (Manifesto §5)
