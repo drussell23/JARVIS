@@ -71,6 +71,7 @@ class RouteDecisionService:
         self._brain_selector = brain_selector or BrainSelector()
         self._selector: Optional[Any] = None  # lazy-init IntelligentModelSelector
         self._sai: Optional[Any] = None       # lazy-init SelfAwareIntelligence
+        self._last_cai_tier: Optional[Any] = None  # Slice 131 P4 — last CAI tier (observability)
 
     def _get_selector(self) -> Optional[Any]:
         """Lazy-init IntelligentModelSelector to avoid circular imports at module load."""
@@ -117,6 +118,38 @@ class RouteDecisionService:
             logger.debug("[RouteDecision] SAI health check skipped: %s", exc)
         return False
 
+    async def cai_tier_advisory(
+        self, description: str, complexity_hint: str = "",
+    ) -> Optional[Any]:
+        """Slice 131 Phase 4 — gated SHADOW consult of the CAI Autonomous Router.
+
+        Composes the cheapest-capable provider-tier cascade (CAI difficulty +
+        confidence, SAI situational cost-guard, policy-driven tier ladder, with
+        economic_router owning failover downstream). **Advisory only** — it does
+        NOT override brain selection yet; enforce is the documented follow-on
+        once shadow telemetry validates the tier choices. Stored on
+        ``self._last_cai_tier`` for observability. Gated
+        ``JARVIS_CAI_ROUTER_ENABLED`` default-FALSE → OFF is byte-identical (not
+        even invoked). Fail-closed: any error → ``None``. NEVER raises."""
+        self._last_cai_tier = None
+        try:
+            from backend.core.ouroboros.governance import cai_router
+            if not cai_router.cai_router_enabled():
+                return None
+            ctx = type("_CAICtx", (), {"task_complexity": str(complexity_hint or "")})()
+            decision = await cai_router.decide(description or "", ctx)
+            self._last_cai_tier = decision
+            if decision is not None:
+                logger.info(
+                    "[CAIRouter] shadow tier=%s model=%s escalated=%s | %s",
+                    decision.tier, decision.model or "-",
+                    decision.escalated, decision.reason,
+                )
+            return decision
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            logger.debug("[CAIRouter] shadow consult skipped: %s", exc)
+            return None
+
     async def select(
         self,
         description: str,
@@ -136,6 +169,13 @@ class RouteDecisionService:
         logger.debug(
             "[RouteDecision] intent=%s complexity=%s brain_override=%s",
             intent, complexity.value if complexity else None, brain_override,
+        )
+
+        # Slice 131 P4 — gated SHADOW consult of the CAI Autonomous Router.
+        # Advisory/observable only (does not alter the selection below); OFF
+        # (default) is byte-identical — the method early-returns before any work.
+        await self.cai_tier_advisory(
+            description, complexity.value if complexity else "",
         )
 
         # If intent classified successfully, override Layer-1 result
