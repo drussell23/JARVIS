@@ -54,6 +54,37 @@ set -- "${SIEGE_ARGS[@]:-}"
 
 log() { printf '\033[36m[shadow-soak]\033[0m %s\n' "$*"; }
 
+# ---- 0. Slice 125 — safe provider-credential bootstrap (pre-Aegis-snapshot) ----
+# Load ONLY allowlisted provider-credential names from .env into this shell's env
+# BEFORE any python subprocess / Aegis snapshot. This is bash-native parsing (NO
+# `source .env` — a garbled/hostile .env cannot exec shell), explicit exports win
+# (we only fill a name that is currently empty), and NO secret value is ever
+# printed. The harness ALSO loads these pre-snapshot (defense in depth); this
+# launcher arm guarantees the env is correct even before the first python call.
+_CRED_ALLOWLIST="DOUBLEWORD_API_KEY ANTHROPIC_API_KEY HF_TOKEN HUGGINGFACE_TOKEN"
+if [ -f .env ]; then
+  _loaded_names=""
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    _line="${_line#export }"
+    case "$_line" in *'='*) : ;; *) continue ;; esac
+    _k="${_line%%=*}"; _v="${_line#*=}"
+    # strip one matched pair of surrounding quotes (no shell semantics)
+    case "$_v" in \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;; \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;; esac
+    case " $_CRED_ALLOWLIST " in
+      *" $_k "*)
+        if [ -z "$(eval "printf '%s' \"\${$_k:-}\"")" ]; then
+          export "$_k=$_v"
+          _loaded_names="$_loaded_names $_k"
+        fi
+        ;;
+    esac
+  done < .env
+  # Report NAMES only — never values.
+  log "credential bootstrap: filled-from-.env={${_loaded_names:-<none>} } (explicit env preserved)"
+  unset _line _k _v _loaded_names
+fi
+
 # ---- 1. Docker daemon ----
 log "verifying Docker daemon..."
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
