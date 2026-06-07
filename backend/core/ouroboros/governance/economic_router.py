@@ -79,7 +79,7 @@ def economic_reclassify_enabled() -> bool:
     the recoverable ``TERMINAL_QUOTA`` instead of the sticky ``TERMINAL_CONFIG``
     that would otherwise sticky-brick the op. Lives here (next to the canonical
     economic detector) so the PURE-DATA classifier stays env-free. NEVER raises."""
-    return os.getenv(_ENV_RECLASSIFY, "false").strip().lower() in ("1", "true", "yes", "on")
+    return os.getenv(_ENV_RECLASSIFY, "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 def micro_op_token_limit() -> int:

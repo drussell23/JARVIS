@@ -26,9 +26,11 @@ from backend.core.ouroboros.governance.candidate_generator import (
 
 
 class TestFallbackSkipGateMaster(unittest.TestCase):
-    def test_default_false(self) -> None:
+    def test_default_true_graduated(self) -> None:
+        # Slice 146: graduated default-TRUE — when the Claude lane breaker is OPEN,
+        # IMMEDIATE ops skip the depleted fallback and reroute to funded DW (live-proven).
         os.environ.pop("JARVIS_FALLBACK_SKIP_GATE_ENABLED", None)
-        self.assertFalse(fallback_skip_gate_enabled())
+        self.assertTrue(fallback_skip_gate_enabled())
 
     def test_enabled_truthy(self) -> None:
         for v in ("1", "true", "yes", "on"):

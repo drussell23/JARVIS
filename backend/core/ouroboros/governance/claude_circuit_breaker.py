@@ -111,7 +111,7 @@ def claude_economic_breaker_enabled() -> bool:
     future ops route around it, and the existing recovery-window self-heals it.
     NEVER raises."""
     raw = os.environ.get(
-        "JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED", "",
+        "JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED", "true",  # Slice 146: graduated default-TRUE
     ).strip().lower()
     return raw in ("1", "true", "yes", "on")
 
