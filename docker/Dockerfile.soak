@@ -30,8 +30,14 @@ WORKDIR /app
 
 # Dependency layer first (cached across code changes).
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip wheel setuptools && \
-    pip install -r requirements.txt
+# The governance soak does NOT need the torch/ML training stack — fastembed
+# (semantic + episodic memory) runs on onnxruntime, and no governance/harness
+# module imports torch. Those pins (torch==2.12.0 / torchaudio==2.12.0) also do
+# not exist on PyPI for linux (max 2.11.0; the Mac has them via a private index).
+# Filter the torch family out for a lean, buildable, soak-only image.
+RUN grep -ivE '^torch(audio|vision)?==' requirements.txt > /tmp/requirements-soak.txt && \
+    pip install --upgrade pip wheel setuptools && \
+    pip install -r /tmp/requirements-soak.txt
 
 # Application code (.dockerignore keeps .venv / .git / .env / .jarvis out).
 COPY . /app
