@@ -259,9 +259,9 @@ async def run_bridge_against_broker(*, stop: Any = None) -> None:
         return
     try:
         from backend.core.ouroboros.governance.ide_observability_stream import (
-            get_stream_broker,
+            get_default_broker,
         )
-        broker = get_stream_broker()
+        broker = get_default_broker()
         sub = broker.subscribe()
         if sub is None:
             logger.warning("[DiscordBridge] broker subscriber cap reached — not bridging")
