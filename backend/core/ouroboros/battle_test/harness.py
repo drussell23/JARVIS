@@ -2183,6 +2183,27 @@ class BattleTestHarness:
             except Exception as exc:  # noqa: BLE001 — never fatal to the soak
                 logger.debug("[CommandCenter] gateway boot skipped: %s", exc)
 
+            # ── Slice 142/143 — Discord Observability Bridge ──
+            # If armed, subscribe to the StreamEventBroker in-process and stream
+            # batched events to the operator's Discord channels (#ops/#subagents/
+            # #cost-safety/#commits/#heartbeat/#routing). Off-hot-path, gated
+            # default-FALSE, fully fail-soft — a dead webhook never perturbs the soak.
+            try:
+                from backend.core.ouroboros.governance.discord_observability_bridge import (
+                    discord_bridge_enabled,
+                    run_bridge_against_broker,
+                )
+                if discord_bridge_enabled():
+                    self._discord_bridge_task = asyncio.create_task(
+                        run_bridge_against_broker(stop=self._shutdown_event)
+                    )
+                    logger.info(
+                        "[DiscordBridge] live organism feed armed (Slice 142/143) — "
+                        "streaming broker events to Discord"
+                    )
+            except Exception as exc:  # noqa: BLE001 — never fatal to the soak
+                logger.debug("[DiscordBridge] bridge boot skipped: %s", exc)
+
             # ── Slice 115 — Blue/Red Adversarial Falsification Matrix ──
             # GLS (the cage) is up. In --siege-mode, fire the Red surfaces at the
             # cage + recursion-depth bound as a fire-and-forget background task,

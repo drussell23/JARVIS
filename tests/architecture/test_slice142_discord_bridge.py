@@ -42,6 +42,8 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(DB.channel_for("circuit_breaker_tripped"), "cost_safety")
         self.assertEqual(DB.channel_for("commit_authority_decision_recorded"), "commits")
         self.assertEqual(DB.channel_for("posture_changed"), "heartbeat")
+        self.assertEqual(DB.channel_for("route_proposal"), "routing")  # Slice 143
+        self.assertEqual(DB.channel_for("model_confidence_drop"), "routing")
 
     def test_channel_for_unknown_is_none(self):
         self.assertIsNone(DB.channel_for("dashboard_rendered"))  # noise → dropped
