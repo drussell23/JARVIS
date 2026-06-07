@@ -48,6 +48,11 @@ _CHANNEL_MAP: Dict[str, str] = {
     "governor_emergency_brake": "cost_safety", "circuit_breaker_tripped": "cost_safety",
     "circuit_breaker_state_change": "cost_safety", "circuit_breaker_approaching": "cost_safety",
     "provider_failure_classified": "cost_safety", "intervention_banner_raised": "cost_safety",
+    # ── #routing — which provider/model/tier, and confidence (Slice 143) ──
+    "route_proposal": "routing",
+    "model_confidence_drop": "routing",
+    "model_confidence_approaching": "routing",
+    "model_sustained_low_confidence": "routing",
     # ── #commits ──
     "commit_authority_decision_recorded": "commits",
     # ── #heartbeat — the organism pulse ──
@@ -93,7 +98,7 @@ class BridgeEvent:
 
 _EMOJI = {
     "ops": "⚙️", "subagents": "🕸️", "cost_safety": "💰",
-    "commits": "📝", "heartbeat": "💓",
+    "commits": "📝", "heartbeat": "💓", "routing": "🧭",
 }
 
 
