@@ -32,23 +32,31 @@ fi
 
 # ── Phase 1: cryptographic provisioning + roadmap signing ────────────────────
 PUB="$JARVIS_DIR/layer4_operator.pub"
-if [ ! -f "$PUB" ] && [ -z "${JARVIS_LAYER4_OPERATOR_PUBKEY:-}" ]; then
-  log "No operator key found — provisioning (you'll be prompted for a passphrase; it is NEVER stored)."
-  python3 -m backend.core.ouroboros.governance.sovereign_keys provision
-else
-  log "Operator key already provisioned."
-fi
-
 DRAFT="$JARVIS_DIR/roadmap.draft.yaml"
 SIGNED="$JARVIS_DIR/roadmap.signed.yaml"
-if [ ! -f "$DRAFT" ]; then
-  die "No roadmap draft at $DRAFT. Author your SAFE authorized scopes there first \
+
+if [ -f "$SIGNED" ] && [ "${ARM_RESIGN:-0}" != "1" ]; then
+  # Slice 139: a migrated artifact carries the already-signed roadmap → ignite
+  # NON-INTERACTIVELY (no passphrase prompt on the headless cloud host). The
+  # loop still verifies the signature at runtime, fail-closed. Force a re-sign
+  # with ARM_RESIGN=1.
+  log "Signed roadmap present ($SIGNED) — skipping provision+sign (idempotent/migrated). ARM_RESIGN=1 to re-sign."
+else
+  if [ ! -f "$PUB" ] && [ -z "${JARVIS_LAYER4_OPERATOR_PUBKEY:-}" ]; then
+    log "No operator key found — provisioning (you'll be prompted for a passphrase; it is NEVER stored)."
+    python3 -m backend.core.ouroboros.governance.sovereign_keys provision
+  else
+    log "Operator key already provisioned."
+  fi
+  if [ ! -f "$DRAFT" ]; then
+    die "No roadmap draft at $DRAFT. Author your SAFE authorized scopes there first \
 (an unsigned, authority-free draft), then re-run. The un-signable floor still holds: \
 Order-2/M10, recursion, governance, and APPROVAL_REQUIRED/BLOCKED always escalate to you."
+  fi
+  log "Signing roadmap: $DRAFT → $SIGNED (passphrase prompt)."
+  python3 -m backend.core.ouroboros.governance.sovereign_keys sign --draft "$DRAFT" --out "$SIGNED"
+  [ -f "$SIGNED" ] || die "Signing did not produce $SIGNED."
 fi
-log "Signing roadmap: $DRAFT → $SIGNED (passphrase prompt)."
-python3 -m backend.core.ouroboros.governance.sovereign_keys sign --draft "$DRAFT" --out "$SIGNED"
-[ -f "$SIGNED" ] || die "Signing did not produce $SIGNED."
 
 # ── Phase 2: operator parameters (sane defaults) ─────────────────────────────
 COST_CAP="${JARVIS_T5_COST_CAP:-500}"
