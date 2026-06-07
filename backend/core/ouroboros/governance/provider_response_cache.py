@@ -79,10 +79,13 @@ _MAX_REPLAY_LINES = 50_000
 
 
 def response_cache_enabled() -> bool:
-    """Master switch, default-FALSE (PRD §7). Re-read each call so a
-    flip hot-reverts. NEVER raises."""
-    return os.environ.get(_ENV_MASTER, "false").strip().lower() in (
-        "1", "true", "yes", "on",
+    """Master switch. **Graduated to default-TRUE (Slice 131)** — the cache is
+    correctness-fail-closed (any git diff re-keys the entry, so a stale repo
+    state can never serve a wrong response) and availability-fail-open, so
+    default-on only ever ELIMINATES redundant identical-context calls. Re-read
+    each call so a flip hot-reverts. NEVER raises."""
+    return os.environ.get(_ENV_MASTER, "true").strip().lower() not in (
+        "0", "false", "no", "off",
     )
 
 

@@ -31,7 +31,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
-from typing import Optional
+import pathlib
+from typing import Any, Optional
 
 _ENV_MASTER = "JARVIS_ECONOMIC_ROUTER_ENABLED"
 _ENV_MICRO_TOKENS = "JARVIS_ECONOMIC_MICRO_OP_TOKENS"
@@ -44,7 +45,31 @@ _CHARS_PER_TOKEN = 4  # standard rough estimate
 
 
 def economic_router_enabled() -> bool:
-    return os.getenv(_ENV_MASTER, "false").strip().lower() in ("1", "true", "yes", "on")
+    """Master gate. **Graduated to default-TRUE (Slice 131)** — the router only
+    acts on the provider-FAILURE path (DW 402/429), so default-on cannot raise
+    spend on the happy path; it only adds a cheap-tier failover instead of a
+    hard stall. Hot-revert: ``=false``."""
+    return os.getenv(_ENV_MASTER, "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+# Canonical no-hardcode source for the cheap-tier failover model.
+_POLICY_PATH = pathlib.Path(__file__).parent / "brain_selection_policy.yaml"
+
+
+def _low_cost_model_from_policy(policy_path: Optional[pathlib.Path] = None) -> str:
+    """Resolve the cheap Claude tier from ``brain_selection_policy.yaml``
+    (``cost_optimization.claude_low_cost_model``). NO hardcoded model string in
+    this module (CLAUDE.md mandate) — the default lives in the YAML config.
+    NEVER raises; returns "" on any read/parse failure."""
+    path = policy_path or _POLICY_PATH
+    try:
+        import yaml  # lazy — keep module import-light + yaml-optional
+        with open(path, "r", encoding="utf-8") as fh:
+            data: Any = yaml.safe_load(fh) or {}
+        val = (data.get("cost_optimization", {}) or {}).get("claude_low_cost_model", "")
+        return str(val or "").strip()
+    except Exception:  # noqa: BLE001 — failure-soft
+        return ""
 
 
 def economic_reclassify_enabled() -> bool:
@@ -64,10 +89,17 @@ def micro_op_token_limit() -> int:
         return _DEFAULT_MICRO_OP_TOKENS
 
 
-def economic_failover_model() -> str:
-    """The cheapest Claude tier for micro-op failover — resolved from env, never
-    hardcoded. Empty when unset (caller uses the default fallback provider)."""
-    return (os.getenv(_ENV_FAILOVER_MODEL, "") or "").strip()
+def economic_failover_model(policy_path: Optional[pathlib.Path] = None) -> str:
+    """The cheapest Claude tier for micro-op failover. Resolution order
+    (CLAUDE.md no-hardcode mandate):
+      1. ``JARVIS_ECONOMIC_FAILOVER_MODEL`` env override (operator wins).
+      2. ``brain_selection_policy.yaml`` → ``cost_optimization.claude_low_cost_model``.
+      3. "" (caller composes the default fallback provider).
+    NEVER raises."""
+    env = (os.getenv(_ENV_FAILOVER_MODEL, "") or "").strip()
+    if env:
+        return env
+    return _low_cost_model_from_policy(policy_path)
 
 
 def _allow_mutating_fallback() -> bool:
