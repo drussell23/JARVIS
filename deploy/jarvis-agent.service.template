@@ -1,0 +1,45 @@
+# JARVIS Sovereign Organism — T5 Unattended Soak (Slice 137/138)
+# Rendered by scripts/arm_and_launch.sh (@PLACEHOLDERS@ are substituted with the
+# absolute repo path + chosen cost cap). Installed as a systemd unit so the soak
+# survives reboots and crashes — Restart=always with exponential backoff.
+#
+# Linux only (systemd). A macOS dev host has no systemd — run the soak on a
+# dedicated Linux server (see deploy/README.md for the launchd/nohup fallback).
+
+[Unit]
+Description=JARVIS Sovereign Organism — T5 Unattended Soak
+After=network-online.target
+Wants=network-online.target
+# Never stop trying to restart over a 12-month run (disable the start-rate limit).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+# Funded provider creds (DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY / HF_TOKEN) live
+# in @REPO_ROOT@/.env and are loaded by launch_shadow_soak.sh's Slice-125
+# credential bootstrap — NOT via systemd EnvironmentFile (which mis-parses
+# quoted/secret values). Only feature flags are set here.
+Environment=JARVIS_SOVEREIGN_KEYS_ENABLED=1
+Environment=JARVIS_LAYER4_ROADMAP_ENABLED=1
+Environment=JARVIS_EPISODIC_CORE_ENABLED=1
+Environment=JARVIS_SEMANTIC_CACHE_ENABLED=1
+Environment=JARVIS_CAI_ROUTER_ENABLED=1
+# Prefix-cache stays OFF: its activation seam isn't wired (inert until then).
+Environment=JARVIS_PROMPT_PREFIX_CACHE_ENABLED=0
+Environment=JARVIS_KAREN_VOICE_ENABLED=0
+ExecStart=/usr/bin/env bash @REPO_ROOT@/scripts/launch_shadow_soak.sh --production-soak --layer4-autonomous --headless --cost-cap @COST_CAP@ --idle-timeout 0 --max-wall-seconds 0
+# Resilience: always restart; 10s base, exponential to 5 min (systemd >= 254).
+# On older systemd, RestartSteps/RestartMaxDelaySec are ignored → fixed 10s.
+Restart=always
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+# Persistent, append-only logs in the evidence dir (backed up by the state vault).
+StandardOutput=append:@REPO_ROOT@/.jarvis/t5_soak.out
+StandardError=append:@REPO_ROOT@/.jarvis/t5_soak.out
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
