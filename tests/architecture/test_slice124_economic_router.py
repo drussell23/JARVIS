@@ -32,6 +32,36 @@ class TestErrorClassification:
         for t in ["live_transport:RuntimeError", "TransferEncodingError", "", None, "parse error"]:
             assert ER.is_hard_economic_block(t) is None
 
+    def test_anthropic_credit_balance_phrasing(self):
+        # Slice 127: the EXACT bt-2026-06-07-040933 Claude 400 message. The
+        # pre-Slice-127 detector missed it ("balance IS too low", not "balance
+        # too low") — that miss let it fall through to TERMINAL_CONFIG and
+        # sticky-brick 16 ops.
+        for t in [
+            "Error code: 400 - 'Your credit balance is too low to access "
+            "the Anthropic API. Please go to Plans & Billing to upgrade or "
+            "purchase credits.'",
+            "your credit balance is too low",
+            "please upgrade or purchase credits",
+        ]:
+            assert ER.is_hard_economic_block(t) == "402"
+
+
+class TestEconomicReclassifyMaster:
+    def test_default_false(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_ECONOMIC_RECLASSIFY_ENABLED", raising=False)
+        assert ER.economic_reclassify_enabled() is False
+
+    def test_enabled_truthy(self, monkeypatch):
+        for v in ("1", "true", "yes", "on", "TRUE"):
+            monkeypatch.setenv("JARVIS_ECONOMIC_RECLASSIFY_ENABLED", v)
+            assert ER.economic_reclassify_enabled() is True
+
+    def test_disabled_falsy(self, monkeypatch):
+        for v in ("0", "false", "no", "off", ""):
+            monkeypatch.setenv("JARVIS_ECONOMIC_RECLASSIFY_ENABLED", v)
+            assert ER.economic_reclassify_enabled() is False
+
 
 class TestTokenEstimate:
     def test_chars_to_tokens(self):

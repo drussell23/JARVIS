@@ -37,6 +37,7 @@ _ENV_MASTER = "JARVIS_ECONOMIC_ROUTER_ENABLED"
 _ENV_MICRO_TOKENS = "JARVIS_ECONOMIC_MICRO_OP_TOKENS"
 _ENV_FAILOVER_MODEL = "JARVIS_ECONOMIC_FAILOVER_MODEL"
 _ENV_ALLOW_MUTATING = "JARVIS_BACKGROUND_ALLOW_FALLBACK"  # reuse the existing knob
+_ENV_RECLASSIFY = "JARVIS_ECONOMIC_RECLASSIFY_ENABLED"  # Slice 127
 
 _DEFAULT_MICRO_OP_TOKENS = 1500
 _CHARS_PER_TOKEN = 4  # standard rough estimate
@@ -44,6 +45,16 @@ _CHARS_PER_TOKEN = 4  # standard rough estimate
 
 def economic_router_enabled() -> bool:
     return os.getenv(_ENV_MASTER, "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def economic_reclassify_enabled() -> bool:
+    """Slice 127 master gate for ECONOMIC RECLASSIFICATION in the provider
+    retry classifier. Default **FALSE** per §33.1. When ON, a provider
+    "credit balance too low" / "insufficient funds" failure is classified as
+    the recoverable ``TERMINAL_QUOTA`` instead of the sticky ``TERMINAL_CONFIG``
+    that would otherwise sticky-brick the op. Lives here (next to the canonical
+    economic detector) so the PURE-DATA classifier stays env-free. NEVER raises."""
+    return os.getenv(_ENV_RECLASSIFY, "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def micro_op_token_limit() -> int:
@@ -71,7 +82,17 @@ def is_hard_economic_block(error_text: Optional[str]) -> Optional[str]:
     if not error_text:
         return None
     t = str(error_text).lower()
-    if "402" in t or "balance too low" in t or "add credits" in t or "insufficient" in t or "payment" in t:
+    # Slice 127: Anthropic phrases it "credit balance IS too low", which the
+    # original "balance too low" marker missed — that miss let the
+    # bt-2026-06-07-040933 failure fall through to TERMINAL_CONFIG and
+    # sticky-brick 16 ops. Markers cover DW ("402"/"balance too low") AND
+    # Anthropic ("credit balance"/"purchase credit"/"upgrade or purchase").
+    _markers_402 = (
+        "402", "balance too low", "balance is too low", "credit balance",
+        "add credits", "purchase credit", "upgrade or purchase",
+        "insufficient", "payment",
+    )
+    if any(m in t for m in _markers_402):
         return "402"
     if "429" in t or "rate limit" in t or "too many requests" in t or "ratelimit" in t:
         return "429"
@@ -145,6 +166,7 @@ def decide(
 
 __all__ = [
     "economic_router_enabled",
+    "economic_reclassify_enabled",
     "micro_op_token_limit",
     "economic_failover_model",
     "is_hard_economic_block",
