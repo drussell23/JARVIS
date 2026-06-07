@@ -36,8 +36,9 @@ logger = logging.getLogger(__name__)
 
 _ENV_MASTER = "JARVIS_GRADUATION_ORCHESTRATOR_ENABLED"
 
-# The ONLY flags this harness may autonomously flip — the Slice-131 cost tiers
-# (all ROUTING/TUNING class, never SAFETY). Everything else is fail-closed.
+# The ONLY flags this harness may autonomously flip — explicitly-vetted
+# non-SAFETY substrates (Slice-131 cost tiers, all ROUTING/TUNING class, plus the
+# Slice-133 episodic memory core). Everything else is fail-closed (refused).
 _COST_CANDIDATES = frozenset({
     "JARVIS_SEMANTIC_CACHE_ENABLED",
     "JARVIS_CAI_ROUTER_ENABLED",
@@ -45,6 +46,7 @@ _COST_CANDIDATES = frozenset({
     "JARVIS_PROMPT_PREFIX_CACHE_ENABLED",
     "JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED",
     "JARVIS_ECONOMIC_ROUTER_ENABLED",
+    "JARVIS_EPISODIC_CORE_ENABLED",   # Slice 136 — the central nervous system
 })
 
 # Substrings that mark a key as credential-shaped — NEVER persisted by this harness.
@@ -153,6 +155,45 @@ async def _default_assertion(flag: str) -> AssertionResult:
             await c.store("q", object(), None, repo_digest="R")
             hit = await c.lookup("q", None, repo_digest="R")
             return AssertionResult(flag, hit is not None, "semantic write-through+near-match")
+        if flag == "JARVIS_EPISODIC_CORE_ENABLED":
+            import asyncio as _aio
+            from backend.core.ouroboros.governance import episodic_core as _EC
+            os.environ["JARVIS_EPISODIC_CORE_ENABLED"] = "1"
+            _EC.reset_episodic_ledger()
+            _probe = "episodic-graduation-probe-7f3a"
+            # Write an episode through the async nowait synapse, then wait for it
+            # to clear (proves the non-blocking write-through path).
+            _EC.note_transition_nowait(
+                op_id="grad-probe", phase_from="START", phase_to="COMPLETE",
+                summary=_probe,
+            )
+            await _aio.sleep(0.1)
+            # Assert it renders into the VOLATILE prompt tail. Primary: the exact
+            # content the builder appends (render_episodic_context); bonus: the
+            # full _build_lean_codegen_prompt path when a ctx can be constructed.
+            rendered = _EC.render_episodic_context()
+            in_render = _probe in rendered
+            in_builder = False
+            try:
+                import types as _types
+                from backend.core.ouroboros.governance.providers import (
+                    _build_lean_codegen_prompt as _blcp,
+                )
+                _ctx = _types.SimpleNamespace(
+                    op_id="grad-probe", description="probe", target_files=(),
+                    human_instructions="", implementation_plan="",
+                    session_lessons="", dependency_summary="", provider_route="",
+                )
+                _prompt = _blcp(_ctx)
+                in_builder = _probe in _prompt
+            except Exception:  # noqa: BLE001 — builder ctx best-effort
+                in_builder = False
+            passed = in_render or in_builder
+            return AssertionResult(
+                flag, passed,
+                f"episode rendered into volatile tail (render={in_render}, "
+                f"builder={in_builder})",
+            )
         if flag == "JARVIS_CAI_ROUTER_ENABLED":
             from backend.core.ouroboros.governance import cai_router as CR
             os.environ["JARVIS_CAI_ROUTER_ENABLED"] = "1"

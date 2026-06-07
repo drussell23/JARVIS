@@ -3598,6 +3598,29 @@ class CandidateGenerator:
                             "queued for cheap provider (op=%s)",
                             _econ.reason, op_id_short,
                         )
+                    # Slice 136 — economic-router cognitive synapse. Fired from
+                    # OUTSIDE the pure decide() (the AST-pinned classifier has no
+                    # side effects), so the organism remembers its economic
+                    # failover decisions. Coalesced per op; gated + non-blocking +
+                    # fail-soft.
+                    try:
+                        from backend.core.ouroboros.governance.episodic_core import (
+                            note_route_nowait as _note_route,
+                        )
+                        _note_route(
+                            op_id=str(op_id_short or ""),
+                            router="economic",
+                            summary=(f"economic {_econ.action.value} → "
+                                     f"{_econ.model or 'cheap-default'}"),
+                            context={
+                                "action": _econ.action.value,
+                                "tier": _econ.model or "cheap_default",
+                                "route": str(provider_route),
+                                "reason": _econ.reason,
+                            },
+                        )
+                    except Exception:  # noqa: BLE001 — synapse never perturbs routing
+                        pass
             except Exception:  # noqa: BLE001 - economic routing is best-effort
                 logger.debug("[CandidateGenerator] EconomicRouter consult skipped", exc_info=True)
             if _can_cascade:
