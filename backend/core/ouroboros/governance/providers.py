@@ -2308,6 +2308,20 @@ def _build_lean_codegen_prompt(
             "## Session Lessons\n\n" + _session_lessons.strip()
         )
 
+    # ── 5a. Episodic memory (Slice 133) — passive recall of the immediate
+    # past. Appended to `parts` (the VOLATILE user-prompt tail) ONLY — episodes
+    # change every loop, so they must NEVER enter the P2a cached system prefix
+    # (`stable_prefix_out`). Gated JARVIS_EPISODIC_CORE_ENABLED; "" when off.
+    try:
+        from backend.core.ouroboros.governance.episodic_core import (
+            render_episodic_context as _render_episodes,
+        )
+        _episodes_block = _render_episodes()
+        if _episodes_block:
+            parts.append(_episodes_block)
+    except Exception:  # noqa: BLE001 — memory never blocks generation
+        pass
+
     # ── 5b. Dependency impact from Oracle graph ─────────────────────────
     _dep_summary = getattr(ctx, "dependency_summary", "")
     if isinstance(_dep_summary, str) and _dep_summary.strip():
