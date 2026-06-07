@@ -263,6 +263,29 @@ def _resolve_pool_max_workers() -> int:
         return _DEFAULT_POOL_MAX_WORKERS
 
 
+_INPROCESS_ENV: str = "JARVIS_AST_HELPER_INPROCESS_ENABLED"
+
+
+def ast_helper_inprocess_enabled() -> bool:
+    """Slice 128 — run the heavy AST analyze IN-PROCESS (no ``ProcessPoolExecutor``)
+    when set. Default **FALSE** (§33.1) → the main process keeps the spawn pool,
+    byte-identical to pre-Slice-128.
+
+    Load-bearing for the process-isolated Oracle (``oracle_ipc``): that worker is
+    spawned ``daemon=True`` and a daemonic process cannot have children, so a
+    nested pool crashes ("daemonic processes are not allowed to have children").
+    The Oracle is ALREADY off the main loop (its own subprocess), so running the
+    analyze in-process there is correct — the redundant nested pool is what
+    failed. ``oracle_ipc._oracle_worker_main`` enables this before building the
+    Oracle. NEVER raises."""
+    try:
+        return os.environ.get(_INPROCESS_ENV, "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ============================================================================
 # Process-pool worker — module-level so spawn can locate the symbol
 # ============================================================================
@@ -1528,14 +1551,27 @@ async def _process_pool_analyze_for_oracle(
     result. Asyncio main thread keeps ticking during the await — the
     GIL contention that wedged v25 is now in the child process."""
     loop = asyncio.get_running_loop()
-    pool = _get_pool()
+    # Slice 128 — when in-process mode is on (the isolated Oracle subprocess,
+    # where a nested ProcessPoolExecutor would crash daemonic), dispatch the
+    # worker on a thread instead of the spawn pool. The worker is CPU-bound but
+    # we are already off the MAIN loop (this runs in the Oracle's own process);
+    # the thread keeps THIS subprocess's IPC loop responsive during the parse.
+    # Default off → the spawn pool path is byte-identical to pre-Slice-128.
+    if ast_helper_inprocess_enabled():
+        _dispatch = asyncio.to_thread(
+            _worker_analyze_for_oracle_in_process,
+            source, filename, repo_name, relative_path,
+        )
+    else:
+        pool = _get_pool()
+        _dispatch = loop.run_in_executor(
+            pool, _worker_analyze_for_oracle_in_process,
+            source, filename, repo_name, relative_path,
+        )
 
     try:
         worker_tuple = await asyncio.wait_for(
-            loop.run_in_executor(
-                pool, _worker_analyze_for_oracle_in_process,
-                source, filename, repo_name, relative_path,
-            ),
+            _dispatch,
             timeout=timeout_s,
         )
     except asyncio.TimeoutError:

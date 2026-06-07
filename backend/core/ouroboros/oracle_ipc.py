@@ -118,6 +118,13 @@ def _oracle_worker_main(conn: Any) -> None:
     loop), signals readiness, then serves requests until shutdown/EOF. NEVER
     lets an exception escape uncaught — a dying worker closes the pipe, which the
     parent proxy detects as a crash."""
+    # Slice 128 — THIS worker is spawned daemon=True; a daemonic process cannot
+    # have children, so the Oracle's inner ast_compile_helper ProcessPoolExecutor
+    # would crash ("daemonic processes are not allowed to have children", ×4789
+    # in soak bt-2026-06-07) and starve the loop. We are ALREADY off the engine
+    # loop (our own process), so the nested pool is redundant: force in-process
+    # AST analyze here. Set before TheOracle is built so its first index uses it.
+    os.environ.setdefault("JARVIS_AST_HELPER_INPROCESS_ENABLED", "1")
     try:
         asyncio.run(_oracle_worker_async(conn))
     except Exception as exc:  # noqa: BLE001 — last-resort; pipe close signals parent
