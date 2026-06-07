@@ -114,9 +114,12 @@ export JARVIS_OP_LIFECYCLE_SSE_ENABLED=1            # operation_terminal SSE wak
 
 # Karen's voice (macOS `say` — needs an audio device, NOT a TTY → works in the
 # headless soak too). Unmuted by default; say "Karen mute" any time to silence.
-export JARVIS_KAREN_VOICE_ENABLED=1                 # autonomous cognitive narration channel
-export OUROBOROS_NARRATOR_ENABLED=1                 # Karen master (unmuted)
-export JARVIS_KAREN_TOOL_VOICE_ENABLED=1            # tool/phase sub-voice (unmuted)
+# Slice 123: each flag now respects an existing env value, so the operator can
+# silence the whole voice channel for a run with `JARVIS_KAREN_VOICE_ENABLED=0
+# ./scripts/launch_shadow_soak.sh ...` (temporary, no code edit).
+export JARVIS_KAREN_VOICE_ENABLED="${JARVIS_KAREN_VOICE_ENABLED:-1}"   # autonomous cognitive narration channel
+export OUROBOROS_NARRATOR_ENABLED="${OUROBOROS_NARRATOR_ENABLED:-1}"   # Karen master
+export JARVIS_KAREN_TOOL_VOICE_ENABLED="${JARVIS_KAREN_TOOL_VOICE_ENABLED:-1}"  # tool/phase sub-voice
 export JARVIS_KAREN_VOICE="${JARVIS_KAREN_VOICE:-Karen}"
 
 # ---- 3c. Slice 110 — Native Command Center (live engine + gateway + React UI) ----
