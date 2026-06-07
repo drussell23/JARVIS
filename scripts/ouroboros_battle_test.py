@@ -930,6 +930,20 @@ def main() -> None:
             "retry storms defeat --idle-timeout. Env: OUROBOROS_BATTLE_MAX_WALL_SECONDS."
         ),
     )
+    parser.add_argument(
+        "--production-soak",
+        action="store_true",
+        default=os.environ.get("OUROBOROS_PRODUCTION_SOAK", "").strip().lower() in ("1", "true", "yes", "on"),
+        help=(
+            "Slice 123 Phase 3: production T5-evidence profile. Overrides the "
+            "battle-test defaults to scale up + remove leashes — cost-cap=25.00, "
+            "idle-timeout=0 (no idle stop), max-wall-seconds=0 (no wall cap) — and "
+            "enables process-isolated Oracle load (JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED) "
+            "+ boot-recovery quarantine (JARVIS_BOOT_RECOVERY_QUARANTINE_ENABLED). "
+            "Explicit --cost-cap/--idle-timeout/--max-wall-seconds still win if also passed. "
+            "Env: OUROBOROS_PRODUCTION_SOAK."
+        ),
+    )
     # Ticket C (2026-04-23): tri-state --headless. argparse doesn't
     # natively distinguish "flag absent" from "--no-headless" across
     # a single option — use a mutually-exclusive group so absence maps
@@ -1093,6 +1107,33 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Slice 123 Phase 3 — --production-soak profile.
+    # Scales the battle-test defaults up to a real long-term T5 evidence run
+    # and enables the process-isolated Oracle load + boot-recovery quarantine.
+    # Explicit flags still win: we only override a limit the operator did NOT
+    # pass on the command line (detected via sys.argv, not the parsed value).
+    # ------------------------------------------------------------------
+    if getattr(args, "production_soak", False):
+        import sys as _sys
+
+        _passed = set(_sys.argv[1:])
+        if "--cost-cap" not in _passed:
+            args.cost_cap = 25.00
+        if "--idle-timeout" not in _passed:
+            args.idle_timeout = 0.0
+        if "--max-wall-seconds" not in _passed:
+            args.max_wall_seconds = 0.0
+        # Enable the existing (Slice 112/113) process-isolated Oracle + the
+        # Slice 123 quarantine — only if the operator hasn't set them otherwise.
+        os.environ.setdefault("JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED", "1")
+        os.environ.setdefault("JARVIS_BOOT_RECOVERY_QUARANTINE_ENABLED", "1")
+        print(
+            "[production-soak] cost_cap=%.2f idle_timeout=%s max_wall=%s "
+            "oracle_isolation=on quarantine=on"
+            % (args.cost_cap, args.idle_timeout, args.max_wall_seconds)
+        )
 
     # ------------------------------------------------------------------
     # Phase 1 Slice 1.4 — deterministic re-execution (--rerun)

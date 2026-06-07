@@ -5429,11 +5429,26 @@ class GovernedLoopService:
             rollback_hash = latest.data.get("rollback_hash")  # pre-apply hash (set by ChangeEngine)
 
             if not target_path_str or not rollback_hash:
-                # Insufficient provenance — cannot assess rollback, escalate
+                # Insufficient provenance — cannot assess rollback, escalate.
+                # Slice 123 Phase 1: ALSO sequester the unvouched payload to
+                # .jarvis/quarantine/ so it stops re-clogging the boot intake on
+                # every restart (escalation below is unchanged — auditability
+                # preserved). Gated + best-effort; never breaks recovery.
+                try:
+                    from backend.core.ouroboros.governance.boot_recovery_quarantine import quarantine_op as _quarantine_op
+
+                    _quarantine_op(
+                        op_id,
+                        {**latest.data, "recovery_attempt_id": recovery_id},
+                        "boot_recovery_missing_provenance",
+                    )
+                except Exception:  # noqa: BLE001 - quarantine is best-effort
+                    pass
                 await ledger.append(LedgerEntry(
                     op_id=op_id, state=OperationState.FAILED,
                     data={"reason": "boot_recovery_missing_provenance",
-                          "recovery_attempt_id": recovery_id},
+                          "recovery_attempt_id": recovery_id,
+                          "quarantined": True},
                 ))
                 await self._stack.comm.emit_decision(
                     op_id=op_id, outcome="manual_intervention_required",
