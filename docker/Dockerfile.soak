@@ -1,0 +1,48 @@
+# JARVIS Sovereign Organism — T5 Unattended Soak (Slice 140)
+# =============================================================================
+# A self-contained soak container. Run detached under dockerd (`up -d`) → it
+# survives this session ending AND host reboot (compose restart: always), and
+# runs in its OWN process namespace — decoupled from any agent event loop, so the
+# S123/S127 control-plane starvation (nested-under-agent) cannot occur.
+#
+# SECURITY: secrets + crypto are NEVER baked into the image. The funded .env and
+# the .jarvis/ (Ed25519 keys + signed roadmap + persistent evidence/memory) mount
+# at RUNTIME via docker-compose.soak.yml. .dockerignore excludes both from the
+# build context.
+#
+#   docker build -f docker/Dockerfile.soak -t jarvis-sovereign-soak:latest .
+# =============================================================================
+FROM python:3.11-slim-bookworm
+
+LABEL org.opencontainers.image.title="jarvis-sovereign-soak"
+LABEL org.opencontainers.image.description="JARVIS T5 unattended soak organism"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Native build deps for numpy / fastembed (onnxruntime) + state-vault transports.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git rsync curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Dependency layer first (cached across code changes). The soak installs a CURATED
+# requirements set — NOT the full monorepo requirements.txt, which carries the
+# vision/voice/training stack (torch / transformers / faster-whisper / speechbrain)
+# that (a) the governance loop never imports and (b) does not resolve in a clean
+# Linux container (torch==2.12.0 is private-index-only; transformers vs pinned
+# huggingface-hub is ResolutionImpossible). See docker/requirements-soak.txt.
+COPY docker/requirements-soak.txt /app/requirements-soak.txt
+RUN pip install --upgrade pip wheel setuptools && \
+    pip install -r /app/requirements-soak.txt
+
+# Application code (.dockerignore keeps .venv / .git / .env / .jarvis out).
+COPY . /app
+
+# .env (funded creds) + .jarvis (crypto + signed roadmap + persistence) are
+# supplied at runtime by compose — not present in the image.
+ENTRYPOINT ["bash", "scripts/launch_shadow_soak.sh"]
+CMD ["--production-soak", "--layer4-autonomous", "--headless", \
+     "--cost-cap", "500", "--idle-timeout", "0", "--max-wall-seconds", "0"]

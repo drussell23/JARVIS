@@ -62,7 +62,8 @@ pytest.ini
 
 # Config files not needed in container
 terraform/
-scripts/
+# NOTE (Slice 140): scripts/ is NOT excluded — the soak container ENTRYPOINT is
+# scripts/launch_shadow_soak.sh, so scripts/ must stay in the build context.
 .claude/
 *.tfvars
 *.tfstate*
@@ -94,3 +95,11 @@ credentials/
 # Cache directories
 .cache/
 .huggingface/
+
+# ── Slice 140: secrets + crypto must NEVER be baked into an image layer ──
+# They mount at RUNTIME (docker-compose.soak.yml: env_file .env + ./.jarvis volume).
+.env
+.env.*
+\!.env.example
+.jarvis/
+.claude/worktrees/

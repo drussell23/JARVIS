@@ -1,0 +1,52 @@
+# JARVIS Sovereign Organism — T5 Unattended Soak (Slice 140)
+# =============================================================================
+# Detached, reboot-surviving soak via Docker — the container IS the supervisor.
+#
+#   ./scripts/launch_docker_soak.sh         # build + up -d + tail logs
+#   docker compose -f docker-compose.soak.yml logs -f jarvis-soak
+#   docker compose -f docker-compose.soak.yml down
+#
+# restart: always  → survives crashes AND host reboot (if dockerd starts on boot:
+#                    `sudo systemctl enable docker`). This replaces systemd's
+#                    Restart=always for the containerized path.
+# ./.jarvis volume → the Ed25519 keys + signed roadmap are READ from the host,
+#                    and the evidence chain + episodic memory are WRITTEN back to
+#                    the host disk → survive container death (the persistence vault).
+# env_file .env    → funded DOUBLEWORD/ANTHROPIC creds injected at runtime only.
+# =============================================================================
+services:
+  jarvis-soak:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.soak
+    image: jarvis-sovereign-soak:latest
+    container_name: jarvis-sovereign-soak
+    working_dir: /app
+    restart: always
+    stop_grace_period: 30s
+    # Funded provider creds — loaded at runtime, never in the image. Marked
+    # non-required so `compose config` validates anywhere; launch_docker_soak.sh's
+    # preflight hard-fails if .env is actually missing at ignition.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      JARVIS_SOVEREIGN_KEYS_ENABLED: "1"
+      JARVIS_LAYER4_ROADMAP_ENABLED: "1"
+      JARVIS_EPISODIC_CORE_ENABLED: "1"
+      JARVIS_SEMANTIC_CACHE_ENABLED: "1"
+      JARVIS_CAI_ROUTER_ENABLED: "1"
+      # Inert until its activation seam lands — keep OFF.
+      JARVIS_PROMPT_PREFIX_CACHE_ENABLED: "0"
+      JARVIS_KAREN_VOICE_ENABLED: "0"
+      # The container is the supervisor; the Oracle runs in-process-isolated already.
+      JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED: "1"
+    volumes:
+      # Crypto + signed roadmap (read) + evidence/memory (write) persist on host.
+      - ./.jarvis:/app/.jarvis
+    # Decouple the soak's CPU from the host so nothing starves it (tune to host).
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8g

@@ -1,0 +1,48 @@
+# JARVIS Sovereign Soak — curated runtime dependencies (Slice 140)
+# =============================================================================
+# The FULL requirements.txt is the whole monorepo (vision/voice/training: torch,
+# transformers, faster-whisper, speechbrain, ...) — it does not resolve in a clean
+# Linux container (torch==2.12.0 is private-index-only; transformers vs pinned
+# huggingface-hub is ResolutionImpossible) AND the governance soak imports none
+# of it. This is the minimal, conflict-free set the Ouroboros governance loop +
+# battle-test harness actually need.
+#
+# Hard top-level imports (verified across backend/core/ouroboros): aiohttp,
+# cryptography, psutil, rich, uuid6. Lazy/fail-soft runtime imports: anthropic,
+# PyYAML, numpy, httpx, fastembed (semantic + episodic memory; pulls onnxruntime
+# / huggingface-hub / tokenizers compatibly), z3-solver (optional, import-guarded).
+# =============================================================================
+
+# Providers + async transport
+anthropic==0.75.0
+aiohttp==3.13.2
+aiohttp_cors==0.8.1
+httpx==0.28.1
+
+# Layer-4 Ed25519 sovereign keys
+cryptography>=42.0.0
+
+# Semantic index numerics
+numpy>=1.26.4,<2.5
+
+# Config / roadmap / policy / env
+PyYAML==6.0.3
+python-dotenv>=1.0.0
+
+# Resource + memory pressure
+psutil==7.1.3
+
+# Boot-surface + REPL (imported even under --headless)
+rich
+prompt_toolkit
+uuid6
+
+# Semantic cache + episodic memory (onnxruntime backend, NOT torch).
+# Unpinned so pip resolves a self-consistent onnxruntime / huggingface-hub / tokenizers.
+fastembed
+
+# NOTE: z3-solver is intentionally OMITTED. It has no prebuilt wheel for
+# linux/arm64 → pip builds it from source and fails in the slim container, and
+# the SMT prover (smt_invariant_prover) is import-guarded + fail-closed +
+# default-FALSE, so its absence is a clean no-op for the soak. To run formal
+# proofs on an x86_64 host (where a manylinux wheel exists), add:  z3-solver>=4.16.0
