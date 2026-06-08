@@ -927,6 +927,12 @@ class OperationContext:
     context_hash: str
     previous_hash: Optional[str]
     target_files: Tuple[str, ...]
+    # Slice 167 — IMMUTABLE targets declared at inception (intake/create). The
+    # generation phase may overwrite ``target_files`` with the candidate's files; this
+    # preserves the originally-declared targets so the governance floor can never be
+    # blinded by a mid-pipeline overwrite. Set once in create(); carried by every
+    # ``with_*`` (dataclasses.replace preserves it) and never re-derived.
+    declared_targets: Tuple[str, ...] = ()
     risk_tier: Optional[RiskTier] = None
     description: str = ""
     routing: Optional[RoutingDecision] = None
@@ -1159,6 +1165,7 @@ class OperationContext:
             "phase_entered_at": now,
             "previous_hash": None,
             "target_files": target_files,
+            "declared_targets": target_files,  # Slice 167 — immutable inception targets
             "risk_tier": None,
             "description": description,
             "routing": None,
@@ -1221,6 +1228,7 @@ class OperationContext:
             context_hash=context_hash,
             previous_hash=None,
             target_files=target_files,
+            declared_targets=target_files,  # Slice 167 — immutable inception targets
             risk_tier=None,
             description=description,
             routing=None,
@@ -1351,6 +1359,20 @@ class OperationContext:
 
         # Final instance with correct hash
         return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def effective_targets(self) -> Tuple[str, ...]:
+        """Slice 167 — the UNION of the immutable declared targets (set at inception)
+        and the current ``target_files`` (which the generation phase may have
+        overwritten with the candidate's files), order-preserving + deduped.
+
+        The governance floor evaluates THIS so a generated candidate can never mask a
+        declared cage target to slip past the approval gate — declared-then-overwritten
+        targets still reach the boundary check. NEVER raises."""
+        try:
+            merged = (*(self.declared_targets or ()), *(self.target_files or ()))
+            return tuple(dict.fromkeys(str(t) for t in merged if str(t).strip()))
+        except Exception:  # noqa: BLE001
+            return tuple(self.target_files or ())
 
     def with_expanded_files(self, files: Tuple[str, ...]) -> "OperationContext":
         """Return a new context with expanded_context_files set (no phase change).
