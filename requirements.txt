@@ -308,3 +308,5 @@ google-cloud-monitoring>=2.0.0
 # Python 3.9.x is EOL (2025-10). Python 3.11.x is EOL (2026-10). Minimum supported version is now 3.12.
 # Upgrade your interpreter to Python 3.12 or 3.13 before installing.
 # Requires-Python: >=3.12
+
+discord.py>=2.3  # Slice 156 — interactive Discord control gateway (bot)

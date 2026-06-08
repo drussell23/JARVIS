@@ -46,3 +46,7 @@ fastembed
 # the SMT prover (smt_invariant_prover) is import-guarded + fail-closed +
 # default-FALSE, so its absence is a clean no-op for the soak. To run formal
 # proofs on an x86_64 host (where a manylinux wheel exists), add:  z3-solver>=4.16.0
+
+# Slice 156 — interactive Discord control gateway (bot). Light (pure-python + aiohttp
+# already present). Gated JARVIS_DISCORD_GATEWAY_ENABLED default-FALSE.
+discord.py>=2.3
