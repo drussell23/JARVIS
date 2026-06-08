@@ -4,6 +4,22 @@ Reboot-surviving, self-backing-up deployment for the T5 unattended soak. One
 command arms the crypto gate and launches the organism as systemd services — and
 one command migrates the whole organism from your workstation to a cloud host.
 
+## Two environments (deliberate) — full host is canonical for the 12-month soak
+
+| Environment | Deps | Oracle | Use |
+|---|---|---|---|
+| **Full host** (`migrate_to_host.sh` → `provision_host.sh` installs `requirements.txt`) | complete graph (incl. `networkx`/`tree_sitter`/`scipy`/`sklearn`) | **runs** (codebase graph live) | **Canonical 12-month production soak** |
+| **Lean Docker** (`docker/requirements-soak.txt`) | minimal governance-loop set only | **DEGRADED by design** (context-free) | Cost/governance + Discord-observability soak; quick local runs |
+
+**Do not bloat `docker/requirements-soak.txt`** to make the lean image run the
+Oracle — that muddies the architecture. The lean image is *meant* to run
+context-free. **Slice 149-P4 guardrail:** `oracle_ipc` now **preflights its hard
+deps before spawning** (single source: `_ORACLE_REQUIRED_DEPS`, backed by
+`oracle.py`'s explicit `networkx is required` raise). In a lean environment the
+Oracle **DEGRADES once** with a clear diagnostic — no 3× respawn storm — and the
+engine continues context-free; a transient crash on a full host still uses the
+bounded respawn. The canonical 12-month soak runs on a **full host**.
+
 ## Autonomous cloud migration (Slice 139) — workstation → industrial host
 
 From the **main checkout** (where `.jarvis/` holds the real keys + signed roadmap):
