@@ -622,6 +622,42 @@ def apply_floor_to_name(
     return (floor, floor)
 
 
+def apply_floor_to_risk_tier(
+    risk_tier: Any, *,
+    signal_source: str = "",
+    op_id: Optional[str] = None,
+    target_files: Optional[Sequence[Any]] = None,
+) -> Any:
+    """Slice 165 — apply the governance floor to a ``RiskTier`` ENUM (composing
+    :func:`apply_floor_to_name` + the name<->RiskTier mapping that was previously
+    duplicated across gate sites). Returns the floored tier, or the input unchanged
+    when no floor applies / the floor is not stricter.
+
+    This is the single, authoritative tier-level floor: call it at ANY decision
+    boundary (e.g. the APPROVE auto-apply-vs-approve gate) so no classification path
+    can route around the operator's MIN_RISK_TIER posture. Fail-closed via
+    apply_floor_to_name (Slice 163). NEVER raises — returns the input on any error."""
+    try:
+        from backend.core.ouroboros.governance.risk_engine import RiskTier
+        effective, applied = apply_floor_to_name(
+            risk_tier.name.lower(),
+            signal_source=signal_source, op_id=op_id, target_files=target_files,
+        )
+        if applied is None:
+            return risk_tier
+        tgt = {
+            "safe_auto": RiskTier.SAFE_AUTO,
+            "notify_apply": RiskTier.NOTIFY_APPLY,
+            "approval_required": RiskTier.APPROVAL_REQUIRED,
+            "blocked": RiskTier.BLOCKED,
+        }.get(effective)
+        if tgt is not None and risk_tier.value < tgt.value:
+            return tgt
+        return risk_tier
+    except Exception:  # noqa: BLE001 — fail-soft; never break the gate
+        return risk_tier
+
+
 def floor_reason(
     now: Optional[datetime] = None,
     *,

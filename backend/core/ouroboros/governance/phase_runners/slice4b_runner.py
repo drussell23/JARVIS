@@ -142,6 +142,31 @@ class Slice4bRunner(PhaseRunner):
         best_candidate = self._best_candidate
         risk_tier = self._risk_tier
 
+        # ---- Slice 165: universal governance floor at the AUTHORITATIVE boundary ----
+        # The MIN_RISK_TIER floor is applied in the GATE phase, but a trivial/IMMEDIATE
+        # op can reach this auto-apply-vs-approve decision with an un-floored tier (the
+        # live soak: SAFE_AUTO auto-applies, routing around the operator's approval
+        # posture). Re-assert the single-source floor here so NO classification path can
+        # bypass it. Byte-identical when no floor is configured; fail-soft.
+        try:
+            from backend.core.ouroboros.governance.risk_tier_floor import (
+                apply_floor_to_risk_tier,
+            )
+            _u_floored = apply_floor_to_risk_tier(
+                risk_tier,
+                signal_source=str(getattr(ctx, "signal_source", "") or ""),
+                op_id=ctx.op_id,
+                target_files=tuple(getattr(ctx, "target_files", ()) or ()),
+            )
+            if _u_floored is not risk_tier:
+                logger.warning(
+                    "[Slice4b] universal governance floor → %s→%s op=%s",
+                    risk_tier.name, _u_floored.name, ctx.op_id,
+                )
+                risk_tier = _u_floored
+        except Exception:  # noqa: BLE001 — never break the gate
+            pass
+
         # t_apply captured at APPLY start (used by COMPLETERunner for canary latency)
         _t_apply: float = 0.0
 
