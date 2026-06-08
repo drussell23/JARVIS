@@ -1352,6 +1352,22 @@ class OracleSemanticBackendStatus(str, enum.Enum):
 BackendStatus = OracleSemanticBackendStatus
 
 
+def _stdlib_backend_available() -> bool:
+    """Slice 155 — True if the STDLIB in-memory vector backend may take over when
+    chromadb is unavailable. Gated ``JARVIS_ORACLE_STDLIB_BACKEND_ENABLED``
+    (default TRUE — failure-path-only graceful degradation, can't affect the CHROMA
+    happy path; set =0 to force DEGRADED). Requires numpy (the cosine substrate).
+    NEVER raises."""
+    try:
+        if os.getenv("JARVIS_ORACLE_STDLIB_BACKEND_ENABLED", "true").strip().lower() \
+                not in ("1", "true", "yes", "on"):
+            return False
+        import importlib.util
+        return importlib.util.find_spec("numpy") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class OracleSemanticIndex:
     """Manages ChromaDB embeddings for code symbols (functions, methods, classes).
 
@@ -1427,6 +1443,11 @@ class OracleSemanticIndex:
         # but not yet inside an event loop).
         self._init_lock: Optional[asyncio.Lock] = None
         self._init_attempted: bool = False
+        # Slice 155 — STDLIB in-memory vector backend (numpy cosine), used when
+        # chromadb is unavailable so semantic search still works (non-persistent)
+        # instead of DEGRADED-empty. id -> (embedding floats, metadata). NO chromadb
+        # import here (AST pin honored) — pure numpy.
+        self._stdlib_store: Dict[str, Tuple[List[float], Dict[str, Any]]] = {}
 
     # ---- Slice 10 status surface ----
 
@@ -1534,13 +1555,27 @@ class OracleSemanticIndex:
                     timeout_s,
                 )
             except Exception as exc:  # noqa: BLE001 — fault isolation
-                self._status = OracleSemanticBackendStatus.DEGRADED
-                logger.warning(
-                    "[OracleSemanticIndex] backend=degraded — init "
-                    "raised %s: %s; queries return empty; graph "
-                    "readiness is unaffected",
-                    type(exc).__name__, exc,
-                )
+                # Slice 155 — chromadb unavailable (e.g. ModuleNotFoundError in an
+                # Oracle-capable image without the vector store). Fall back to the
+                # STDLIB in-memory numpy backend so semantic search still WORKS
+                # (non-persistent) instead of DEGRADED-empty. Last resort = DEGRADED.
+                if _stdlib_backend_available():
+                    self._status = OracleSemanticBackendStatus.STDLIB
+                    self._available = True
+                    logger.warning(
+                        "[OracleSemanticIndex] backend=stdlib (in-memory numpy) — "
+                        "chromadb unavailable (%s: %s); semantic search works "
+                        "in-memory (non-persistent); graph readiness is unaffected",
+                        type(exc).__name__, exc,
+                    )
+                else:
+                    self._status = OracleSemanticBackendStatus.DEGRADED
+                    logger.warning(
+                        "[OracleSemanticIndex] backend=degraded — init "
+                        "raised %s: %s; queries return empty; graph "
+                        "readiness is unaffected",
+                        type(exc).__name__, exc,
+                    )
             self._init_attempted = True
             return self._status
 
@@ -1639,11 +1674,12 @@ class OracleSemanticIndex:
         Never raises.
         """
         await self._ensure_initialized()
-        if (
-            self._status != OracleSemanticBackendStatus.CHROMA
-            or self._collection is None
-            or self._embedder is None
-        ):
+        # Slice 155 — CHROMA (persistent) OR STDLIB (in-memory) both embed.
+        _chroma = self._status == OracleSemanticBackendStatus.CHROMA
+        _stdlib = self._status == OracleSemanticBackendStatus.STDLIB
+        if (not (_chroma or _stdlib)) or self._embedder is None:
+            return
+        if _chroma and self._collection is None:
             return
 
         try:
@@ -1672,11 +1708,16 @@ class OracleSemanticIndex:
                     for n in batch
                 ]
 
-                self._collection.upsert(
-                    ids=ids,
-                    embeddings=[e.tolist() for e in embeddings],
-                    metadatas=metadatas,
-                )
+                if _stdlib:
+                    for _eid, _emb, _meta in zip(ids, embeddings, metadatas):
+                        _vec = _emb.tolist() if hasattr(_emb, "tolist") else list(_emb)
+                        self._stdlib_store[_eid] = ([float(x) for x in _vec], _meta)
+                else:
+                    self._collection.upsert(
+                        ids=ids,
+                        embeddings=[e.tolist() for e in embeddings],
+                        metadatas=metadatas,
+                    )
 
             logger.debug("[OracleSemanticIndex] Embedded %d nodes", len(embeddable))
         except Exception as exc:
@@ -1697,11 +1738,12 @@ class OracleSemanticIndex:
         STDLIB) or on any error.
         """
         await self._ensure_initialized()
-        if (
-            self._status != OracleSemanticBackendStatus.CHROMA
-            or self._collection is None
-            or self._embedder is None
-        ):
+        # Slice 155 — CHROMA (persistent) OR STDLIB (in-memory) both search.
+        _chroma = self._status == OracleSemanticBackendStatus.CHROMA
+        _stdlib = self._status == OracleSemanticBackendStatus.STDLIB
+        if (not (_chroma or _stdlib)) or self._embedder is None:
+            return []
+        if _chroma and self._collection is None:
             return []
 
         try:
@@ -1713,6 +1755,9 @@ class OracleSemanticIndex:
                 # "not available" fast-path above instead of raising into
                 # the outer except (which would log a misleading WARNING).
                 return []
+
+            if _stdlib:
+                return self._semantic_search_stdlib(query_embedding, k)
 
             results = self._collection.query(
                 query_embeddings=[query_embedding.tolist()],
@@ -1737,6 +1782,28 @@ class OracleSemanticIndex:
 
         except Exception as exc:
             logger.warning("[OracleSemanticIndex] semantic_search failed: %s", exc)
+            return []
+
+    def _semantic_search_stdlib(
+        self, query_embedding: Any, k: int = 5,
+    ) -> List[Tuple[str, float]]:
+        """Slice 155 — in-memory cosine search over the STDLIB store (no chromadb).
+        Mirrors the CHROMA path's file-level dedup + top-k contract. NEVER raises."""
+        try:
+            import numpy as np
+            q = np.asarray(query_embedding, dtype="float32")
+            qn = float(np.linalg.norm(q)) or 1.0
+            best: Dict[str, float] = {}
+            for _id, (emb, meta) in self._stdlib_store.items():
+                v = np.asarray(emb, dtype="float32")
+                vn = float(np.linalg.norm(v)) or 1.0
+                sim = max(0.0, min(1.0, float(np.dot(q, v) / (qn * vn))))
+                file_key = f"{meta['repo']}:{meta['file_path']}"
+                if file_key not in best or sim > best[file_key]:
+                    best[file_key] = sim
+            return sorted(best.items(), key=lambda x: x[1], reverse=True)[:k]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[OracleSemanticIndex] stdlib search failed: %s", exc)
             return []
 
 

@@ -18,3 +18,8 @@ tree_sitter
 
 # Event Spine (event-driven sensors instead of polling fallback)
 aiofiles
+
+# Oracle semantic vector store (Slice 155). arm64 wheels; the SOLE chromadb import
+# is oracle.py:_load_chromadb_sync (AST-pinned). When absent, the STDLIB in-memory
+# backend (Slice 155) takes over — chromadb is the canonical/persistent option.
+chromadb
