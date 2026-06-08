@@ -954,7 +954,7 @@ def _note_dw_candidate_success() -> None:
         pass
 
 
-def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
+def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -> None:
     """Slice 77 — the millisecond a LIVE dispatch hits a transport break
     (``live_transport:RuntimeError`` / socket drop), stamp the
     ``dw_surface_health`` ledger ``DIRECT_STREAMING → TRANSPORT_DEGRADED`` so
@@ -1005,7 +1005,7 @@ def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor as _s172_pred,
         )
-        _s172_pred().record_rupture()
+        _s172_pred().record_rupture(model_id=model_id)  # Slice 175 — per-model ring
     except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
 
@@ -3483,6 +3483,7 @@ class CandidateGenerator:
                 if failure_source is FailureSource.LIVE_TRANSPORT:
                     _note_dw_live_transport_degraded(
                         f"{model_id}:{type(exc).__name__}",
+                        model_id=model_id,  # Slice 175 — attribute the rupture to THIS model
                     )
                     _consecutive_lt += 1
                 else:

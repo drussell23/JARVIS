@@ -102,21 +102,23 @@ def _threshold_ceiling() -> float:
     return max(0.0, min(1.0, _envf(_ENV_THRESHOLD_CEILING, _DEFAULT_THRESHOLD_CEILING)))
 
 
-def _calibration_persist_path() -> str:
-    explicit = os.environ.get(_ENV_CALIBRATION_PERSIST_PATH, "").strip()
-    if explicit:
-        return explicit
-    base = os.environ.get("JARVIS_STATE_DIR", "").strip() or ".jarvis"
-    return os.path.join(base, "dw_threshold_calibration.json")
+def _calibration_persist_path(model_id: Any = "") -> str:
+    """Slice 175 — PER-MODEL calibration state file under .jarvis (or the env-overridden
+    base dir). Each model learns + persists its own threshold independently. NEVER raises."""
+    base = os.environ.get(_ENV_CALIBRATION_PERSIST_PATH, "").strip() \
+        or os.environ.get("JARVIS_STATE_DIR", "").strip() or ".jarvis"
+    key = _normalize_model(model_id) or "global"
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in key)
+    return os.path.join(base, f"dw_threshold_calibration_{safe}.json")
 
 
-def rupture_risk_threshold() -> float:
-    """The LIVE preemptive threshold. Slice 174 — when self-calibration is enabled this is
-    the calibrator's self-tuned, persisted value; otherwise the static env baseline (Slice
-    172, byte-identical). NEVER raises."""
+def rupture_risk_threshold(model_id: Any = "") -> float:
+    """The LIVE preemptive threshold for ``model_id``. Slice 174/175 — when self-calibration
+    is enabled this is that model's self-tuned, persisted value; otherwise the static env
+    baseline (Slice 172, byte-identical). NEVER raises."""
     if calibration_enabled():
         try:
-            return get_threshold_calibrator().threshold()
+            return get_threshold_calibrator(model_id).threshold()
         except Exception:  # noqa: BLE001 — fall back to the static baseline
             pass
     return _static_risk_threshold()
@@ -130,24 +132,42 @@ def _ring_size() -> int:
         return _DEFAULT_RING_SIZE
 
 
-class DWFailurePredictor:
-    """Recency-weighted Poisson estimator over a bounded ring of rupture timestamps.
+def _normalize_model(model_id: Any) -> str:
+    """Slice 175 — canonical per-model bucket key. Case-insensitive; "" is the valid
+    "unknown / unattributed" bucket (kept ISOLATED from every named model). NEVER raises."""
+    try:
+        return str(model_id or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
 
-    Thread-safe; record + probability are O(ring) with the ring bounded (default 256), so
-    the hot-path cost is a lock-guarded append (no I/O). NEVER raises."""
+
+class DWFailurePredictor:
+    """Slice 175 — PER-MODEL recency-weighted Poisson estimator. Maintains an INDEPENDENT
+    bounded rupture-timestamp ring per DW model, so a volatile model's ruptures never raise a
+    stable model's forecast (Blindspot B). Thread-safe; record + probability are O(ring) with
+    each ring bounded (default 256). NEVER raises."""
 
     def __init__(self, *, max_ring: Optional[int] = None) -> None:
         self._lock = threading.Lock()
-        self._ring: Deque[float] = collections.deque(maxlen=max_ring or _ring_size())
-        self._last_pred_ts: Optional[float] = None  # Slice 174 — calibration debounce
+        self._max_ring = max_ring or _ring_size()
+        self._rings: dict = {}            # model_key -> Deque[float]
+        self._last_pred_ts: dict = {}     # model_key -> float (Slice 174 debounce, per model)
 
-    def record_rupture(self, now: Optional[float] = None) -> None:
-        """Stamp a rupture event. Fed at the live-transport-degraded detection point.
-        Lock-guarded append only. NEVER raises."""
+    def _ring_locked(self, key: str) -> Deque[float]:
+        r = self._rings.get(key)
+        if r is None:
+            r = collections.deque(maxlen=self._max_ring)
+            self._rings[key] = r
+        return r
+
+    def record_rupture(self, now: Optional[float] = None, model_id: Any = "") -> None:
+        """Stamp a rupture event for ``model_id``'s ring. Fed at the live-transport-degraded
+        detection point. Lock-guarded append only. NEVER raises."""
         try:
             ts = time.monotonic() if now is None else float(now)
+            key = _normalize_model(model_id)
             with self._lock:
-                self._ring.append(ts)
+                self._ring_locked(key).append(ts)
         except Exception:  # noqa: BLE001
             pass
 
@@ -155,19 +175,23 @@ class DWFailurePredictor:
         self,
         now: Optional[float] = None,
         *,
+        model_id: Any = "",
         horizon_s: Optional[float] = None,
         lookback_s: Optional[float] = None,
         halflife_s: Optional[float] = None,
     ) -> float:
-        """P(≥1 rupture within ``horizon_s``) from the recency-weighted Poisson rate of
-        recent ruptures. Returns 0.0 when no recent ruptures. NEVER raises; result ∈ [0,1]."""
+        """P(≥1 rupture within ``horizon_s``) for ``model_id`` from its OWN ring's
+        recency-weighted Poisson rate. Returns 0.0 when that model has no recent ruptures
+        (so a pristine model is never penalized). NEVER raises; result ∈ [0,1]."""
         try:
             now = time.monotonic() if now is None else float(now)
             horizon = horizon_s if horizon_s is not None else rupture_horizon_s()
             lookback = lookback_s if lookback_s is not None else rupture_lookback_s()
             halflife = halflife_s if halflife_s is not None else rupture_halflife_s()
+            key = _normalize_model(model_id)
             with self._lock:
-                recent = [ts for ts in self._ring if 0.0 <= (now - ts) <= lookback]
+                ring = self._rings.get(key)
+                recent = [ts for ts in ring if 0.0 <= (now - ts) <= lookback] if ring else []
             if not recent:
                 return 0.0
             weighted = 0.0
@@ -180,29 +204,47 @@ class DWFailurePredictor:
         except Exception:  # noqa: BLE001
             return 0.0
 
-    def risk_exceeds_threshold(self, now: Optional[float] = None) -> bool:
-        """Slice 172/174 — is the live forecast at/above the (possibly self-calibrated)
-        threshold? When calibration is ON this ALSO drives the feedback loop: evaluate due
-        predictions against the rupture ring (FP/FN → tune), then record this prediction
-        (debounced to ~one per horizon so correlated same-window decisions don't over-tune).
-        When OFF it's the Slice 172 static comparison. NEVER raises."""
+    def risk_exceeds_threshold(self, now: Optional[float] = None, model_id: Any = "") -> bool:
+        """Slice 172/174/175 — is ``model_id``'s live forecast at/above ITS (possibly
+        self-calibrated) threshold? When calibration is ON this drives that model's feedback
+        loop (evaluate its due predictions against its ring, then record this prediction,
+        debounced per model). When OFF it's the static comparison. NEVER raises."""
         try:
             now = time.monotonic() if now is None else float(now)
-            prob = self.rupture_probability(now)
+            key = _normalize_model(model_id)
+            prob = self.rupture_probability(now, model_id=key)
             if not calibration_enabled():
                 return prob >= _static_risk_threshold()
-            cal = get_threshold_calibrator()
+            cal = get_threshold_calibrator(key)
             with self._lock:
-                ring = list(self._ring)
-                last = self._last_pred_ts
+                ring = list(self._rings.get(key) or ())
+                last = self._last_pred_ts.get(key)
             cal.evaluate(now, ring, horizon=rupture_horizon_s())
             if last is None or (now - last) >= rupture_horizon_s():
                 cal.record_prediction(now, prob)
                 with self._lock:
-                    self._last_pred_ts = now
+                    self._last_pred_ts[key] = now
             return prob >= cal.threshold()
         except Exception:  # noqa: BLE001
             return False
+
+    def highest_risk_model(self, now: Optional[float] = None) -> tuple:
+        """Slice 175 — the (model_key, probability) of the model with the highest current
+        rupture forecast — the most likely to be batched. Used by the Discord spine so the
+        operator sees the *riskiest model*, not a misleading global average. ("", 0.0) when
+        no model has recent ruptures. NEVER raises."""
+        try:
+            now = time.monotonic() if now is None else float(now)
+            with self._lock:
+                keys = list(self._rings.keys())
+            best_key, best = "", 0.0
+            for k in keys:
+                pr = self.rupture_probability(now, model_id=k)
+                if pr > best:
+                    best, best_key = pr, k
+            return best_key, best
+        except Exception:  # noqa: BLE001
+            return "", 0.0
 
 
 class ThresholdCalibrator:
@@ -324,18 +366,22 @@ class ThresholdCalibrator:
             return None
 
 
-_calibrator_singleton: Optional["ThresholdCalibrator"] = None
-_calibrator_lock = threading.Lock()
+_calibrators: dict = {}                  # Slice 175 — model_key -> ThresholdCalibrator
+_calibrators_lock = threading.Lock()
 
 
-def get_threshold_calibrator() -> "ThresholdCalibrator":
-    """Process-wide singleton (double-checked lock). NEVER raises."""
-    global _calibrator_singleton
-    if _calibrator_singleton is None:
-        with _calibrator_lock:
-            if _calibrator_singleton is None:
-                _calibrator_singleton = ThresholdCalibrator()
-    return _calibrator_singleton
+def get_threshold_calibrator(model_id: Any = "") -> "ThresholdCalibrator":
+    """Slice 175 — the per-model self-tuning calibrator (one independent learner + persist
+    file per DW model; double-checked lock). NEVER raises."""
+    key = _normalize_model(model_id)
+    cal = _calibrators.get(key)
+    if cal is None:
+        with _calibrators_lock:
+            cal = _calibrators.get(key)
+            if cal is None:
+                cal = ThresholdCalibrator(persist_path=_calibration_persist_path(key))
+                _calibrators[key] = cal
+    return cal
 
 
 _singleton: Optional[DWFailurePredictor] = None
@@ -352,11 +398,17 @@ def get_dw_failure_predictor() -> DWFailurePredictor:
     return _singleton
 
 
-def render_rupture_risk(prob: float) -> str:
-    """One-line render of the forecast for the Discord spine. NEVER raises."""
+def render_rupture_risk(prob: float, threshold: Optional[float] = None, model_id: str = "") -> str:
+    """One-line render of the forecast for the Discord spine. Slice 175 — shows the model's
+    OWN threshold (and name when given), not a global average. NEVER raises."""
     try:
         pct = max(0.0, min(1.0, float(prob))) * 100.0
-        bar = "🟢" if pct < 40 else ("🟡" if pct < rupture_risk_threshold() * 100 else "🔴")
-        return f"{bar} DW rupture risk: {pct:.0f}% (next {int(rupture_horizon_s() // 60)}m)"
+        thr = float(threshold) if threshold is not None else rupture_risk_threshold(model_id)
+        bar = "🟢" if pct < 40 else ("🟡" if pct < thr * 100 else "🔴")
+        tag = f" · {model_id}" if model_id else ""
+        return (
+            f"{bar} DW rupture risk: {pct:.0f}% (thr {thr * 100:.0f}%, "
+            f"next {int(rupture_horizon_s() // 60)}m){tag}"
+        )
     except Exception:  # noqa: BLE001
         return "🟢 DW rupture risk: 0% (next 5m)"

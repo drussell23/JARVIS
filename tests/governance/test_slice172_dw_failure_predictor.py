@@ -69,7 +69,7 @@ class TestPoissonModel(unittest.TestCase):
         p = DWFailurePredictor(max_ring=16)
         for i in range(100):
             p.record_rupture(now=float(i))
-        self.assertLessEqual(len(p._ring), 16)
+        self.assertLessEqual(len(p._rings[""]), 16)
 
     def test_thread_safe(self):
         p = DWFailurePredictor(max_ring=10000)
@@ -83,7 +83,7 @@ class TestPoissonModel(unittest.TestCase):
             t.start()
         for t in ts:
             t.join()
-        self.assertEqual(len(p._ring), 4000)
+        self.assertEqual(len(p._rings[""]), 4000)
 
     def test_never_raises_on_garbage(self):
         p = DWFailurePredictor()
@@ -118,17 +118,17 @@ class TestPreemptiveRouting(unittest.TestCase):
 
     def test_high_risk_preempts_to_batch_when_enabled(self):
         self._os.environ["JARVIS_DW_PREDICTIVE_ROUTING_ENABLED"] = "1"
-        DW._dw_rupture_risk_high = lambda: True  # type: ignore
+        DW._dw_rupture_risk_high = lambda *a, **k: True  # type: ignore
         self.assertTrue(DW._slice36_should_force_batch(_Ctx("standard")))
 
     def test_disabled_by_default_no_preempt(self):
         self._os.environ.pop("JARVIS_DW_PREDICTIVE_ROUTING_ENABLED", None)
-        DW._dw_rupture_risk_high = lambda: True  # type: ignore
+        DW._dw_rupture_risk_high = lambda *a, **k: True  # type: ignore
         self.assertFalse(DW._slice36_should_force_batch(_Ctx("standard")))
 
     def test_low_risk_no_preempt(self):
         self._os.environ["JARVIS_DW_PREDICTIVE_ROUTING_ENABLED"] = "1"
-        DW._dw_rupture_risk_high = lambda: False  # type: ignore
+        DW._dw_rupture_risk_high = lambda *a, **k: False  # type: ignore
         self.assertFalse(DW._slice36_should_force_batch(_Ctx("standard")))
 
 
