@@ -111,3 +111,32 @@ credentials/
 .ouroboros/**
 *.debug.log
 **/sessions/**
+
+# ── Untracked BULK that ballooned the build-context transfer to ~20GB when built
+# from a working checkout (the git-TRACKED source is only ~49MB). All of this is
+# gitignored data / build artifacts / model weights the soak image never needs —
+# we exclude the BULK while keeping the tracked .py source (vision/ has 119 tracked
+# source files the governance loop imports, buried in GB of artifacts). ──
+model_checkpoints/
+**/model_checkpoints/
+venv/
+**/venv/
+**/logs/
+**/target/                # rust/cargo build output (vision/jarvis-rust-core ≈ 4.3GB)
+**/.build/                # swift build output
+**/build/
+**/dist/
+**/.pytest_cache/
+**/.mypy_cache/
+# model weights / large binaries — never source
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+*.rlib
+*.rmeta
+*.dylib
+*.a
+*.mlmodel
+*.mlmodelc
