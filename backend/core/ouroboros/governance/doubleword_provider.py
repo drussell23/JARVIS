@@ -179,12 +179,32 @@ def _dw_model_min_effort_map() -> Dict[str, str]:
     return out
 
 
+# Slice 169 — test hook; when set, replaces the dynamic catalog resolver.
+_catalog_min_reasoning_effort_override = None
+
+
 def _dw_model_min_effort(model_id: str) -> str:
-    """Minimum reasoning_effort the target model accepts. Generic substring match
-    against the env-driven map; "none" (no floor) when nothing matches. NEVER raises."""
+    """Minimum reasoning_effort the target model accepts. Slice 169 — DYNAMIC first:
+    resolve from DW's live /v1/models capability metadata (via the catalog) so this
+    self-updates as DW adds models / exposes the field. Slice 168 — static env-map
+    fallback when the dynamic source has no answer. "none" (no floor) when neither
+    matches. NEVER raises."""
     if not model_id:
         return "none"
     mid = str(model_id).strip().lower()
+    # Slice 169 — dynamic capability resolution (no hardcode when DW exposes it).
+    try:
+        _resolver = _catalog_min_reasoning_effort_override
+        if _resolver is None:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                catalog_min_reasoning_effort as _resolver,
+            )
+        _dyn = _resolver(mid)
+        if _dyn:
+            return _dyn
+    except Exception:  # noqa: BLE001 — fall through to the static floor
+        pass
+    # Slice 168 — static env-map fallback.
     for substr, floor in _dw_model_min_effort_map().items():
         if substr in mid:
             return floor
