@@ -930,7 +930,9 @@ class CLASSIFYRunner(PhaseRunner):
                     _engine = GoalInferenceEngine(
                         repo_root=orch._config.project_root,
                     )
-                _inf_result = _engine.build()
+                # Slice 149 Phase 2 — off-loop build (LoopSink caught the sync
+                # build stalling the loop ~8.8s in the CLASSIFY phase).
+                _inf_result = await _engine.build_offloaded()
                 _inf_text = render_prompt_section(_inf_result)
                 if _inf_text:
                     _existing = getattr(

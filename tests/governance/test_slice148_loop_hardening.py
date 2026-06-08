@@ -25,8 +25,13 @@ class TestGoalInferenceBuildOffloaded(unittest.TestCase):
         self.src = _ORCH.read_text(encoding="utf-8")
 
     def test_build_runs_off_loop_via_to_thread(self):
-        # The heavy build must be offloaded.
-        self.assertIn("asyncio.to_thread(_engine.build", self.src)
+        # The heavy build must be offloaded. Slice 149 Phase 2 converged the
+        # orchestrator + CLASSIFY call sites onto GoalInferenceEngine.build_offloaded()
+        # (which wraps asyncio.to_thread) — either form keeps it off the loop.
+        self.assertTrue(
+            "await _engine.build_offloaded()" in self.src
+            or "asyncio.to_thread(_engine.build" in self.src
+        )
 
     def test_no_bare_sync_build_on_loop(self):
         # The bare synchronous on-loop call must be gone.
