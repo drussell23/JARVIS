@@ -479,10 +479,26 @@ class GATERunner(PhaseRunner):
                     )
                     risk_tier = _tgt
         except Exception:
-            logger.debug(
-                "[Orchestrator] MIN_RISK_TIER floor skipped",
-                exc_info=True,
+            # Slice 163 — FAIL-CLOSED last resort. If the floor block itself errors
+            # (import / mapping / recommendation), the operator's configured
+            # MIN_RISK_TIER must STILL apply — a governance floor that a stray
+            # exception can silently bypass is not a floor.
+            logger.warning(
+                "[Orchestrator] MIN_RISK_TIER floor block errored — applying "
+                "fail-closed floor", exc_info=True,
             )
+            try:
+                _fc = (os.environ.get("JARVIS_MIN_RISK_TIER", "") or "").strip().lower()
+                _fc_tgt = {
+                    "safe_auto": RiskTier.SAFE_AUTO,
+                    "notify_apply": RiskTier.NOTIFY_APPLY,
+                    "approval_required": RiskTier.APPROVAL_REQUIRED,
+                    "blocked": RiskTier.BLOCKED,
+                }.get(_fc)
+                if _fc_tgt is not None and risk_tier.value < _fc_tgt.value:
+                    risk_tier = _fc_tgt
+            except Exception:  # noqa: BLE001
+                pass
 
         # ---- RR Pass B Slice 2b: ORDER_2_GOVERNANCE floor ----
         # Runs AFTER the MIN_RISK_TIER floor so paranoia/quiet-hours
