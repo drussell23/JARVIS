@@ -79,10 +79,14 @@ class GatewayCommandRouter:
         approval_provider: Any,
         conversation_bridge: Any = None,
         on_refused: Optional[_RefusedHook] = None,
+        on_decision: Optional[Callable[..., None]] = None,
     ) -> None:
         self._provider = approval_provider
         self._bridge = conversation_bridge
         self._on_refused = on_refused
+        # on_decision(action=, op_id=, user_id=) — fired ONLY after an AUTHORIZED
+        # decision resolves (so REJECTED_BY_OPERATOR can be logged to a channel).
+        self._on_decision = on_decision
 
     async def handle(
         self, action: str, op_id: str, user_id: Any, text: Optional[str] = None,
@@ -105,10 +109,12 @@ class GatewayCommandRouter:
             if act == "approve":
                 res = await self._provider.approve(op_id, approver)
                 logger.info("[DiscordGateway] APPROVE op=%s by=%s", op_id, approver)
+                self._fire_decision(action="approve", op_id=op_id, user_id=str(user_id))
                 return {"ok": True, "action": "approve", "result": res}
             if act == "reject":
                 res = await self._provider.reject(op_id, approver, text or "rejected via Discord")
-                logger.info("[DiscordGateway] REJECT op=%s by=%s", op_id, approver)
+                logger.info("[DiscordGateway] REJECTED_BY_OPERATOR op=%s by=%s", op_id, approver)
+                self._fire_decision(action="reject", op_id=op_id, user_id=str(user_id))
                 return {"ok": True, "action": "reject", "result": res}
             if act == "steer":
                 # Feed the steer text into the FSM input spine (next-cycle constraint),
@@ -121,6 +127,7 @@ class GatewayCommandRouter:
                         logger.warning("[DiscordGateway] steer bridge note failed: %s", exc)
                 await self._provider.reject(op_id, approver, f"steered via Discord: {constraint}")
                 logger.info("[DiscordGateway] STEER op=%s by=%s", op_id, approver)
+                self._fire_decision(action="steer", op_id=op_id, user_id=str(user_id))
                 return {"ok": True, "action": "steer", "constraint": constraint}
             logger.warning("[DiscordGateway] unknown action=%r op=%s — ignored", action, op_id)
             return {"ok": False, "reason": f"unknown action: {action}"}
@@ -136,8 +143,54 @@ class GatewayCommandRouter:
         except Exception:  # noqa: BLE001
             pass
 
+    def _fire_decision(self, **kw: Any) -> None:
+        if self._on_decision is None:
+            return
+        try:
+            self._on_decision(**kw)
+        except Exception:  # noqa: BLE001
+            pass
 
-def build_router_from_gls(gls: Any, *, on_refused: Optional[_RefusedHook] = None) -> "GatewayCommandRouter":
+
+# Slice 157 — live-fire injection source tag (a genuine, non-github/ci channel source
+# → _classify_event's generic branch renders the op description from the event_type).
+LIVEFIRE_SOURCE = "livefire"
+
+
+def build_livefire_payload(task: str) -> Dict[str, Any]:
+    """Build the /webhook/generic JSON body for a GENUINE live-fire op. The task text
+    rides in ``type`` because EventChannel._classify_event renders the op description
+    as '<source> event: <type>' for non-github/ci sources. Includes a dedup signature."""
+    return {
+        "type": task,
+        "source": LIVEFIRE_SOURCE,
+        "signature": f"livefire:{task}",
+    }
+
+
+def summarize_pending(req: Dict[str, Any]) -> str:
+    """Embed text for a pending approval. Fixes the field mismatch: list_pending()
+    returns ``description``/``target_files`` (the gateway previously read only
+    summary/reason → a bare op_id). Prefers the real op description + targets."""
+    op_id = str(req.get("op_id") or req.get("request_id") or "")
+    desc = str(req.get("summary") or req.get("reason") or req.get("description") or "").strip()
+    targets = req.get("target_files") or ()
+    if not desc:
+        return op_id
+    if targets:
+        try:
+            tf = ", ".join(str(t) for t in targets)
+        except Exception:  # noqa: BLE001
+            tf = str(targets)
+        return f"{desc}\n\n**Targets:** {tf}"
+    return desc
+
+
+def build_router_from_gls(
+    gls: Any, *,
+    on_refused: Optional[_RefusedHook] = None,
+    on_decision: Optional[Callable[..., None]] = None,
+) -> "GatewayCommandRouter":
     """Compose a router from a live GovernedLoopService (its _approval_provider +
     the ConversationBridge TUI sink). Best-effort — missing pieces degrade gracefully."""
     provider = getattr(gls, "_approval_provider", None)
@@ -154,7 +207,8 @@ def build_router_from_gls(gls: Any, *, on_refused: Optional[_RefusedHook] = None
     except Exception:  # noqa: BLE001
         bridge = None
     return GatewayCommandRouter(
-        approval_provider=provider, conversation_bridge=bridge, on_refused=on_refused,
+        approval_provider=provider, conversation_bridge=bridge,
+        on_refused=on_refused, on_decision=on_decision,
     )
 
 
@@ -181,10 +235,35 @@ async def run_gateway_daemon(gls: Any, *, stop: Any = None) -> None:
         logger.warning("[DiscordGateway] discord.py unavailable (%s) — gateway disabled", exc)
         return
 
-    router = build_router_from_gls(gls)
-
     intents = discord.Intents.default()
     client = discord.Client(intents=intents)
+
+    # ── Decision broadcast: post the operator's verdict (esp. REJECTED_BY_OPERATOR)
+    # to a governance-gates channel. Off the FSM loop; fail-soft; optional channel.
+    _gates_channel_id = (os.getenv("JARVIS_DISCORD_GATES_CHANNEL_ID", "") or "").strip()
+
+    async def _post_decision(action: str, op_id: str, user_id: str) -> None:
+        if not _gates_channel_id:
+            return
+        try:
+            ch = client.get_channel(int(_gates_channel_id)) \
+                or await client.fetch_channel(int(_gates_channel_id))
+            verb = {"approve": "✅ APPROVED_BY_OPERATOR",
+                    "reject": "🛑 REJECTED_BY_OPERATOR",
+                    "steer": "🧭 STEERED_BY_OPERATOR"}.get(action, action.upper())
+            await ch.send(embed=discord.Embed(
+                title=verb, description=f"op `{op_id}` · operator `{user_id}`",
+                color=0xE74C3C if action == "reject" else 0x2ECC71))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[DiscordGateway] gates-channel post failed: %s", exc)
+
+    def _on_decision(action: str = "", op_id: str = "", user_id: str = "") -> None:
+        try:
+            client.loop.create_task(_post_decision(action, op_id, user_id))
+        except Exception:  # noqa: BLE001
+            pass
+
+    router = build_router_from_gls(gls, on_decision=_on_decision)
 
     def _make_view(op_id: str) -> Any:
         class _ArbitrationView(discord.ui.View):
@@ -250,7 +329,7 @@ async def run_gateway_daemon(gls: Any, *, stop: Any = None) -> None:
                     _seen.add(op_id)
                     embed = discord.Embed(
                         title="🚧 APPROVAL_REQUIRED — O+V awaiting arbitration",
-                        description=str(req.get("summary") or req.get("reason") or op_id)[:4000],
+                        description=summarize_pending(req)[:4000],
                         color=0xE67E22,
                     )
                     embed.add_field(name="op", value=op_id[:64], inline=False)
