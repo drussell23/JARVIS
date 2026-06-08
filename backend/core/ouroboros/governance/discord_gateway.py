@@ -228,6 +228,20 @@ def economic_telemetry_line() -> str:
         return "💸 Intra-DW failovers: 0 · Capital saved ~$0.00"
 
 
+def rupture_risk_line() -> str:
+    """Slice 172 — live DW rupture-risk forecast for the Discord spine, so the predictive
+    cortex is mathematically visible to the remote operator. Reads the predictor off the
+    hot path. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            get_dw_failure_predictor,
+            render_rupture_risk,
+        )
+        return render_rupture_risk(get_dw_failure_predictor().rupture_probability())
+    except Exception:  # noqa: BLE001
+        return "🟢 DW rupture risk: 0% (next 5m)"
+
+
 def build_router_from_gls(
     gls: Any, *,
     on_refused: Optional[_RefusedHook] = None,
@@ -392,6 +406,10 @@ async def run_gateway_daemon(gls: Any, *, stop: Any = None) -> None:
                         # every gate (the operator's live spine view).
                         embed.add_field(
                             name="💸 sovereignty", value=economic_telemetry_line(), inline=False,
+                        )
+                        # Slice 172 — live predictive-cortex forecast on the spine.
+                        embed.add_field(
+                            name="🔮 forecast", value=rupture_risk_line(), inline=False,
                         )
                         embed.set_footer(text=f"only operator {authorized_operator_id()} may decide")
                         await channel.send(embed=embed, view=_make_view(op_id))

@@ -996,6 +996,18 @@ def _note_dw_live_transport_degraded(diagnostic: str = "") -> None:
             _s127_dwr().note_degraded()
     except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
+    # Slice 172 — feed the predictive cortex the SAME rupture event (its own bounded
+    # timestamp ring drives the recency-weighted Poisson forecast). Fire-and-forget,
+    # lock-guarded append; never perturbs the dispatch error path. Record is
+    # UNCONDITIONAL (the master flag gates *routing*, not data collection — so the
+    # forecast is already warm the moment predictive routing is switched on).
+    try:
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            get_dw_failure_predictor as _s172_pred,
+        )
+        _s172_pred().record_rupture()
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
+        pass
 
 
 def dw_preflight_gate_enabled() -> bool:
