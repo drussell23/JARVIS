@@ -152,6 +152,33 @@ class GatewayCommandRouter:
             pass
 
 
+# Slice 158 — channel dispatch (DMs are a fragile governance surface; route approvals
+# to a shared #governance-gates text channel instead). The interaction.user.id guard
+# in the View callbacks stays intact, so only the operator's clicks are honored.
+def gates_channel_name() -> str:
+    """Target channel name for approval dispatch (env-tunable). Default
+    'governance-gates'. NEVER raises."""
+    return (os.getenv("JARVIS_DISCORD_GATES_CHANNEL", "") or "").strip() or "governance-gates"
+
+
+def gates_channel_id() -> str:
+    """Optional explicit channel-id override (numeric string), or '' to resolve by name."""
+    return (os.getenv("JARVIS_DISCORD_GATES_CHANNEL_ID", "") or "").strip()
+
+
+def pick_gates_channel(channels: Any, *, channel_id: str = "", channel_name: str = "governance-gates") -> Any:
+    """Resolve the gates channel from the bot's visible channels: explicit id wins;
+    a missing/unknown id falls back to name; returns None if neither matches."""
+    if channel_id:
+        for ch in channels:
+            if str(getattr(ch, "id", "")) == str(channel_id):
+                return ch
+    for ch in channels:
+        if getattr(ch, "name", None) == channel_name:
+            return ch
+    return None
+
+
 # Slice 157 — live-fire injection source tag (a genuine, non-github/ci channel source
 # → _classify_event's generic branch renders the op description from the event_type).
 LIVEFIRE_SOURCE = "livefire"
@@ -304,36 +331,50 @@ async def run_gateway_daemon(gls: Any, *, stop: Any = None) -> None:
 
     client._jarvis_make_view = _make_view  # type: ignore[attr-defined]
 
-    # ── Outbound dispatch: DM the operator a Rich embed + arbitration View for each
-    # NEW Orange APPROVAL_REQUIRED. Polls the EXISTING list_pending() — no hooking of
-    # provider internals (decoupled). Off the FSM loop (the bot's own event loop).
+    # ── Outbound dispatch (Slice 158): post a Rich embed + arbitration View for each
+    # NEW Orange APPROVAL_REQUIRED to the #governance-gates CHANNEL (not DMs — the
+    # account-limit proved DMs are fragile). Polls the EXISTING list_pending()
+    # (decoupled). Off the FSM loop. The interaction.user.id guard in the View stays
+    # intact, so only the operator's clicks in the shared channel are honored.
     import asyncio as _aio
     _interval = _env_float("JARVIS_DISCORD_GATEWAY_POLL_S", 3.0)
     _seen: set = set()
+    _warned_no_channel = {"v": False}
 
     async def _dispatch_pending() -> None:
         await client.wait_until_ready()
-        try:
-            operator = await client.fetch_user(int(authorized_operator_id()))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[DiscordGateway] cannot resolve operator DM (%s) — no dispatch", exc)
-            return
         provider = getattr(gls, "_approval_provider", None)
         while not (stop is not None and getattr(stop, "is_set", lambda: False)()):
             try:
-                pending = await provider.list_pending() if provider is not None else []
-                for req in pending or []:
-                    op_id = str(req.get("op_id") or req.get("request_id") or "")
-                    if not op_id or op_id in _seen:
-                        continue
-                    _seen.add(op_id)
-                    embed = discord.Embed(
-                        title="🚧 APPROVAL_REQUIRED — O+V awaiting arbitration",
-                        description=summarize_pending(req)[:4000],
-                        color=0xE67E22,
-                    )
-                    embed.add_field(name="op", value=op_id[:64], inline=False)
-                    await operator.send(embed=embed, view=_make_view(op_id))
+                channel = pick_gates_channel(
+                    list(client.get_all_channels()),
+                    channel_id=gates_channel_id(),
+                    channel_name=gates_channel_name(),
+                )
+                if channel is None:
+                    if not _warned_no_channel["v"]:
+                        logger.warning(
+                            "[DiscordGateway] gates channel #%s not found (create it + "
+                            "invite O+V, or set JARVIS_DISCORD_GATES_CHANNEL_ID) — "
+                            "approvals cannot be dispatched", gates_channel_name(),
+                        )
+                        _warned_no_channel["v"] = True
+                else:
+                    _warned_no_channel["v"] = False
+                    pending = await provider.list_pending() if provider is not None else []
+                    for req in pending or []:
+                        op_id = str(req.get("op_id") or req.get("request_id") or "")
+                        if not op_id or op_id in _seen:
+                            continue
+                        _seen.add(op_id)
+                        embed = discord.Embed(
+                            title="🚧 APPROVAL_REQUIRED — O+V awaiting arbitration",
+                            description=summarize_pending(req)[:4000],
+                            color=0xE67E22,
+                        )
+                        embed.add_field(name="op", value=op_id[:64], inline=False)
+                        embed.set_footer(text=f"only operator {authorized_operator_id()} may decide")
+                        await channel.send(embed=embed, view=_make_view(op_id))
             except Exception as exc:  # noqa: BLE001 — never crash the gateway
                 logger.debug("[DiscordGateway] dispatch poll error: %s", exc)
             await _aio.sleep(_interval)
