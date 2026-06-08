@@ -449,6 +449,21 @@ def _dw_rupture_risk_high() -> bool:
         return False
 
 
+def _dw_batch_lane_healthy() -> bool:
+    """Slice 173 — True iff DW's BATCH_STORAGE surface is HEALTHY, reusing the EXISTING
+    surface-health ledger check (``preflight_probe._batch_surface_healthy`` — no duplicate
+    health logic). Fails CLOSED (False on any error / flag-off). The Slice 172 predictive
+    detour MUST consult this: a forecast must never route an op INTO a degraded batch lane.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.preflight_probe import (
+            _batch_surface_healthy,
+        )
+        return _batch_surface_healthy()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slice36_should_force_batch(context: Any) -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -495,7 +510,19 @@ def _slice36_should_force_batch(context: Any) -> bool:
         # (reactive, on a CONFIRMED degraded stream): this fires on a FORECAST while the
         # stream may still look healthy. Opt-in (§33.1 — acts on a prediction); default
         # FALSE. Route-gated (standard/complex) like every other batch path.
-        if _route_ok and _slice172_predictive_routing_enabled() and _dw_rupture_risk_high():
+        #
+        # Slice 173 — MULTI-SURFACE SAFETY GUARD (closes Blindspot A). The detour fires
+        # ONLY if the batch lane is itself HEALTHY: a predictive cortex must never route an
+        # op INTO a degraded batch lane. If the forecast is high BUT batch is also degraded,
+        # abort the detour and stay on RT — a subsequent rupture then correctly cascades to
+        # Claude (both DW surfaces are compromised). Reuses _dw_batch_lane_healthy (the
+        # existing ledger check), not a duplicate.
+        if (
+            _route_ok
+            and _slice172_predictive_routing_enabled()
+            and _dw_rupture_risk_high()
+            and _dw_batch_lane_healthy()
+        ):
             return True
 
         # Legacy pure-DW batch optimization: requires Claude unavailable. With Claude
