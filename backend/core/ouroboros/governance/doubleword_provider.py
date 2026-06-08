@@ -151,22 +151,76 @@ def _clamp_reasoning_effort(eff: str) -> str:
     return eff
 
 
-def _reasoning_effort_for(complexity: str = "") -> str:
-    """Slice 55/84 — resolve reasoning_effort. Explicit
-    ``JARVIS_DW_REASONING_EFFORT`` wins (operator override / kill-switch,
-    UNCLAMPED); otherwise derive from the op's ``task_complexity`` (unknown →
-    ``none``) and clamp to the DW-serveable ceiling (Slice 84 — ``high``
-    ruptures DW's chunked stream)."""
+# Slice 168 — per-MODEL reasoning_effort FLOOR. Root cause (Seb @ Doubleword,
+# 2026-06-08, "Cancelled DeepSeek-v4-pro batch"): some DW models REJECT
+# reasoning_effort="none" and the batch is cancelled. We derive "none" for
+# trivial/simple ops, so a trivial op routed to such a model gets cancelled. Floor the
+# effort UP to the model's minimum supported value. Env-driven map (generic
+# substring→effort matching — no hardcoded model in the algorithm); the default carries
+# the one model DW has told us rejects "none". Override/extend via
+# JARVIS_DW_MODEL_MIN_EFFORT="substr:effort,substr:effort". Ideally resolved from DW's
+# /v1/models capability metadata once exposed (open question to DW).
+_DEFAULT_DW_MODEL_MIN_EFFORT: str = "deepseek-v4-pro:low"
+
+
+def _dw_model_min_effort_map() -> Dict[str, str]:
+    """Parse the env-driven model→min-effort map. NEVER raises."""
+    raw = os.environ.get("JARVIS_DW_MODEL_MIN_EFFORT", _DEFAULT_DW_MODEL_MIN_EFFORT)
+    out: Dict[str, str] = {}
+    try:
+        for pair in str(raw).split(","):
+            key, sep, val = pair.partition(":")
+            key = key.strip().lower()
+            val = val.strip().lower()
+            if sep and key and val in _EFFORT_ORDER:
+                out[key] = val
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _dw_model_min_effort(model_id: str) -> str:
+    """Minimum reasoning_effort the target model accepts. Generic substring match
+    against the env-driven map; "none" (no floor) when nothing matches. NEVER raises."""
+    if not model_id:
+        return "none"
+    mid = str(model_id).strip().lower()
+    for substr, floor in _dw_model_min_effort_map().items():
+        if substr in mid:
+            return floor
+    return "none"
+
+
+def _clamp_up_to_min(eff: str, floor: str) -> str:
+    """Clamp ``eff`` UP to ``floor`` (never lowers). Symmetric to
+    _clamp_reasoning_effort. Unknown strings pass through. Pure."""
+    try:
+        if _EFFORT_ORDER.index(eff) < _EFFORT_ORDER.index(floor):
+            return floor
+    except ValueError:
+        pass
+    return eff
+
+
+def _reasoning_effort_for(complexity: str = "", model: str = "") -> str:
+    """Slice 55/84/168 — resolve reasoning_effort. Explicit
+    ``JARVIS_DW_REASONING_EFFORT`` wins (operator override); otherwise derive from the
+    op's ``task_complexity`` and clamp to the DW-serveable ceiling (Slice 84 — ``high``
+    ruptures DW's chunked stream). Slice 168 — finally floor UP to the target model's
+    minimum supported effort so we never send a value the model rejects (e.g.
+    deepseek-v4-pro rejects ``none``)."""
     env = os.environ.get("JARVIS_DW_REASONING_EFFORT", "").strip().lower()
     if env:
-        return env
-    derived = _COMPLEXITY_REASONING_EFFORT.get(
-        (complexity or "").strip().lower(), "none",
-    )
-    return _clamp_reasoning_effort(derived)
+        base = env
+    else:
+        derived = _COMPLEXITY_REASONING_EFFORT.get(
+            (complexity or "").strip().lower(), "none",
+        )
+        base = _clamp_reasoning_effort(derived)
+    return _clamp_up_to_min(base, _dw_model_min_effort(model))
 
 
-def _reasoning_request_params(effort: str = "", *, complexity: str = "") -> dict:
+def _reasoning_request_params(effort: str = "", *, complexity: str = "", model: str = "") -> dict:
     """Slice 54/55 — DoubleWord reasoning-control request params.
 
     Qwen3.5 are reasoning models that burn the token budget on chain-of-thought
@@ -184,7 +238,10 @@ def _reasoning_request_params(effort: str = "", *, complexity: str = "") -> dict
     still wins. When effort resolves to ``none`` the (DW-ignored but harmless)
     enable_thinking flag is also sent for intent clarity.
     """
-    eff = (effort or _reasoning_effort_for(complexity) or "none").strip().lower()
+    eff = (effort or _reasoning_effort_for(complexity, model=model) or "none").strip().lower()
+    # Slice 168 — apply the per-model floor even to an explicit effort (a model that
+    # rejects "none" rejects it however it was chosen).
+    eff = _clamp_up_to_min(eff, _dw_model_min_effort(model))
     params: dict = {"reasoning_effort": eff}
     if eff == "none":
         # Belt-and-braces: harmless (DW ignores it) but keeps intent explicit
@@ -1133,6 +1190,7 @@ class DoublewordProvider:
                 # "none" (fast/cheap), high-impact core gets a CoT buffer.
                 **_reasoning_request_params(
                     complexity=getattr(ctx, "task_complexity", "") or "",
+                    model=_effective_model,
                 ),
             },
         })
@@ -2235,7 +2293,7 @@ class DoublewordProvider:
                 "temperature": _DW_TEMPERATURE,
                 # Slice 54/55 — reasoning control, effort derived from
                 # task_complexity (see _reasoning_request_params).
-                **_reasoning_request_params(complexity=_complexity or ""),
+                **_reasoning_request_params(complexity=_complexity or "", model=_effective_model),
             }
 
             if _stream_callback is not None:
@@ -3881,7 +3939,7 @@ class DoublewordProvider:
             "max_tokens": effective_max_tokens,
             "temperature": _DW_TEMPERATURE,
             # Slice 54 — reasoning control (see _reasoning_request_params).
-            **_reasoning_request_params(),
+            **_reasoning_request_params(model=effective_model),
         }
         if response_format is not None:
             body["response_format"] = response_format
