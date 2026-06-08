@@ -239,8 +239,12 @@ def rupture_risk_line() -> str:
             rupture_risk_threshold,
         )
         # Slice 175 — surface the RISKIEST model + its own threshold, not a global average.
-        model, prob = get_dw_failure_predictor().highest_risk_model()
-        return render_rupture_risk(prob, rupture_risk_threshold(model), model)
+        # Slice 176 — and the DOMINANT failure vector driving that level (holistic threat).
+        pred = get_dw_failure_predictor()
+        model, prob = pred.highest_risk_model()
+        line = render_rupture_risk(prob, rupture_risk_threshold(model), model)
+        vector = pred.dominant_signal(model_id=model) if model else ""
+        return line + (f" · via {vector}" if vector else "")
     except Exception:  # noqa: BLE001
         return "🟢 DW rupture risk: 0% (next 5m)"
 

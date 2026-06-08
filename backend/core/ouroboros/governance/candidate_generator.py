@@ -1010,6 +1010,30 @@ def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -
         pass
 
 
+def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
+    """Slice 176 — fuse a classified NON-transport DW FailureSource into the predictive
+    cortex as a weighted failure vector (economic 429 / upstream 5xx+parse / stall), per
+    model. Transport ruptures are already fed via _note_dw_live_transport_degraded; this
+    covers the rest of the spectrum (Blindspot D). Fire-and-forget, never perturbs the
+    dispatch error path. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.topology_sentinel import FailureSource
+        _kind = {
+            FailureSource.LIVE_HTTP_429: "economic",   # quota / rate-limit — imminent lockdown
+            FailureSource.LIVE_HTTP_5XX: "upstream",    # server error — localized
+            FailureSource.LIVE_PARSE_ERROR: "upstream",  # malformed/empty completion
+            FailureSource.LIVE_STREAM_STALL: "transport",  # stalled stream — transport class
+        }.get(failure_source)
+        if _kind is None:
+            return
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            get_dw_failure_predictor as _s176_pred,
+        )
+        _s176_pred().record_failure(model_id=model_id, kind=_kind)
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
+        pass
+
+
 def dw_preflight_gate_enabled() -> bool:
     """Slice 76 Phase 2 master flag — default TRUE. When off, dispatch is
     byte-identical to the pre-Slice-76 path (no pre-flight short-circuit)."""
@@ -3492,6 +3516,9 @@ class CandidateGenerator:
                     # transport breaks were per-model, not lane-wide. Reset the
                     # streak: a genuine blackout is N transport breaks in a row.
                     _consecutive_lt = 0
+                    # Slice 176 — fuse the non-transport vector into the predictor
+                    # (economic 429 / upstream 5xx+parse / stall), per-model + weighted.
+                    _record_dw_failure_signal(model_id, failure_source)
                 # Slice 73 + Slice 83 Phase 2 — structural transport short-circuit,
                 # now streak-gated. A LIVE_TRANSPORT break MIGHT mean the whole DW
                 # endpoint is down — but with the Slice 82/83 heterogeneous coder
