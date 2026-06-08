@@ -8499,38 +8499,54 @@ class GovernedOrchestrator:
                     op_id=ctx.op_id,
                 )
                 if infra_results and not self._infra_applicator.all_succeeded(infra_results):
-                    # Infrastructure operation failed — the file change is correct
-                    # but the environment didn't accept it. Roll back the file change
-                    # and mark FAILED so Ouroboros can retry with corrected deps.
                     _failed = [r for r in infra_results if not r.success]
-                    logger.error(
-                        "[Orchestrator] Infrastructure hook failed for %s: %s",
-                        ctx.op_id,
-                        "; ".join(f"{r.file_trigger}: exit={r.exit_code}" for r in _failed),
+                    from backend.core.ouroboros.governance.infrastructure_applicator import (
+                        infra_fail_soft_enabled,
+                        summarize_infra_failures,
                     )
-                    ctx = ctx.advance(
-                        OperationPhase.POSTMORTEM,
-                        terminal_reason_code="infrastructure_failed",
+                    if not infra_fail_soft_enabled():
+                        # Legacy terminal FAILED (operator opt-out via fail-soft=0): the
+                        # file change is correct but the environment didn't accept it.
+                        logger.error(
+                            "[Orchestrator] Infrastructure hook failed for %s: %s",
+                            ctx.op_id,
+                            "; ".join(f"{r.file_trigger}: exit={r.exit_code}" for r in _failed),
+                        )
+                        ctx = ctx.advance(
+                            OperationPhase.POSTMORTEM,
+                            terminal_reason_code="infrastructure_failed",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": "infrastructure_failed",
+                                "infra_results": [
+                                    {
+                                        "file": r.file_trigger,
+                                        "command": r.command,
+                                        "exit_code": r.exit_code,
+                                        "stderr": r.stderr_tail[:500],
+                                    }
+                                    for r in _failed
+                                ],
+                            },
+                        )
+                        self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+                        await self._publish_outcome(ctx, OperationState.FAILED, "infrastructure_failed")
+                        return ctx
+                    # Slice 160 fail-soft: infra failure is NOT fatal — flag
+                    # INFRA_WARNING + continue to VERIFY/COMPLETE (op survives; the
+                    # operator sees the warning via telemetry / Discord).
+                    _warn = summarize_infra_failures(_failed)
+                    logger.warning(
+                        "[Orchestrator] INFRA_WARNING (fail-soft) op=%s — continuing: %s",
+                        ctx.op_id, _warn,
                     )
-                    await self._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {
-                            "reason": "infrastructure_failed",
-                            "infra_results": [
-                                {
-                                    "file": r.file_trigger,
-                                    "command": r.command,
-                                    "exit_code": r.exit_code,
-                                    "stderr": r.stderr_tail[:500],
-                                }
-                                for r in _failed
-                            ],
-                        },
-                    )
-                    self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
-                    await self._publish_outcome(ctx, OperationState.FAILED, "infrastructure_failed")
-                    return ctx
+                    try:
+                        ctx = ctx.with_infra_warning(_warn)
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 # Log successful infra operations for observability
                 for r in infra_results:
