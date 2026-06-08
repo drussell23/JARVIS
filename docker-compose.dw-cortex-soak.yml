@@ -61,10 +61,21 @@ services:
       - ./.jarvis:/app/.jarvis
     # The battle-test loop IS the supervisor (headless, no wall cap; restart:always
     # gives longevity). Cost cap is the only ceiling — DW is cheap, so $25 lasts.
-    command: >-
-      python3 scripts/ouroboros_battle_test.py
-      --production-soak --headless
-      --cost-cap 25 --idle-timeout 0 --max-wall-seconds 0
+    # entrypoint OVERRIDE: the image's default ENTRYPOINT is launch_shadow_soak.sh
+    # (which verifies Docker — wrong for an in-container cortex run); run the
+    # battle-test directly via python3, matching the working `--entrypoint python3`
+    # manual launches.
+    entrypoint: ["python3"]
+    command:
+      - scripts/ouroboros_battle_test.py
+      - --production-soak
+      - --headless
+      - --cost-cap
+      - "25"
+      - --idle-timeout
+      - "0"
+      - --max-wall-seconds
+      - "0"
     deploy:
       resources:
         limits:

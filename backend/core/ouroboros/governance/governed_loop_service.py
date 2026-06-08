@@ -1563,6 +1563,47 @@ class GovernedLoopService:
                     "swallowed: %r", _cr_exc,
                 )
 
+            # Slice 177 — autonomous workspace hygiene. Fire a DEFERRED, once-per-boot
+            # artifact sweep (compress aging logs, prune ancient artifacts) on a WORKER
+            # THREAD via asyncio.to_thread, so the blocking file I/O never touches the
+            # event loop or contends the GIL on the hot path. Gated default-FALSE
+            # (§33.1 — it deletes files); the active session dir is explicitly protected
+            # (and the age-gate already shields recent/live files). NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.artifact_janitor import (  # noqa: E501
+                    artifact_janitor_enabled,
+                    ArtifactJanitor,
+                )
+                if artifact_janitor_enabled():
+                    import asyncio as _aio_jan
+                    _protect = []
+                    _sess = getattr(self, "_session_dir", None) \
+                        or os.environ.get("JARVIS_OUROBOROS_SESSION_DIR", "").strip()
+                    if _sess:
+                        _protect.append(str(_sess))
+
+                    async def _janitor_boot_sweep() -> None:
+                        try:
+                            _rep = await _aio_jan.to_thread(
+                                ArtifactJanitor(protect_paths=_protect).sweep
+                            )
+                            logger.info(
+                                "[GovernedLoop] artifact janitor: compressed=%s "
+                                "deleted=%s freed=%.1fMB errors=%s",
+                                _rep.get("compressed"), _rep.get("deleted"),
+                                _rep.get("freed_bytes", 0) / 1e6, _rep.get("errors"),
+                            )
+                        except Exception as _je:  # noqa: BLE001
+                            logger.debug("[GovernedLoop] janitor sweep swallowed: %r", _je)
+
+                    self._janitor_task = _aio_jan.create_task(_janitor_boot_sweep())
+                    logger.info(
+                        "[GovernedLoop] artifact janitor: deferred boot sweep scheduled "
+                        "(off-thread; active session protected)",
+                    )
+            except Exception as _jx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] artifact janitor boot swallowed: %r", _jx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
