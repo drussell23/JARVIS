@@ -349,6 +349,21 @@ def _force_batch_on_breaker_enabled() -> bool:
         not in ("0", "false", "no", "off")
 
 
+_INTRA_DW_FAILOVER_ENV: str = "JARVIS_DW_INTRA_TRANSPORT_FAILOVER_ENABLED"
+
+
+def _slice170_intra_dw_failover_enabled() -> bool:
+    """Master for the Slice 170 intra-DW transport failover. Default **TRUE**
+    (failure-path-only: only fires when the surface-health ledger reports the DW
+    streaming wire degraded AND the batch lane healthy — it cannot affect the
+    stream-healthy happy path). When ON, a DW transport rupture fails over to DW-batch
+    instead of cascading to the expensive Claude fallback, keeping the FUNDED primary
+    primary. =0 reverts to the legacy cascade-to-Claude-when-available behaviour.
+    NEVER raises."""
+    return os.environ.get(_INTRA_DW_FAILOVER_ENV, "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 def _claude_breaker_open(getter: Any = None) -> bool:
     """Slice 161 — True iff the Claude breaker is NOT CLOSED (OPEN or HALF_OPEN), i.e.
     Claude is unreliable as a fallback, so STANDARD/COMPLEX ops must force the DW batch
@@ -392,10 +407,30 @@ def _slice36_should_force_batch(context: Any) -> bool:
     failure (returns False = preserve legacy RT behavior).
     """
     try:
-        # Claude must be disabled — Slice 36 is the "pure-DW
-        # production" path optimization. With Claude available, RT
-        # failures cascade to Claude fallback and the empirical
-        # cost-benefit shifts.
+        # Route gate — only STANDARD + COMPLEX get the batch path (IMMEDIATE / BG /
+        # SPECULATIVE keep RT: small prompts + Venom value).
+        _route = (
+            getattr(context, "provider_route", "") or ""
+        ).strip().lower()
+        _route_ok = _route in ("standard", "complex")
+
+        # Slice 170 — intra-DW transport failover PRECEDES the cross-provider cascade.
+        # The economic leak: a DW streaming rupture (mislabeled live_transport) cascades
+        # to the expensive Claude fallback whenever Claude has credit — so DW, the FUNDED
+        # primary, only stays primary when Claude is broke. But a rupture is transport-
+        # specific: DW's batch lane serves the identical request stream-free. When the
+        # surface-health ledger shows the streaming wire degraded AND batch healthy (the
+        # Slice 41 signal), force DW-batch REGARDLESS of Claude availability — the rupture
+        # fails over WITHIN DW, not to Claude. Claude remains the fallback for genuine
+        # DW-WIDE outages (both surfaces degraded), not transport blips. Failure-path-only
+        # (fires solely on a degraded stream) → default-ON, §33.1.
+        if _route_ok and _slice170_intra_dw_failover_enabled() and _slice41_ledger_force_batch():
+            return True
+
+        # Legacy pure-DW batch optimization: requires Claude unavailable. With Claude
+        # available + a HEALTHY stream, RT failures cascade to Claude fallback and the
+        # empirical cost-benefit shifts (the Slice 170 block above is the exception — a
+        # DEGRADED stream fails over to DW-batch first).
         _claude_disabled = os.environ.get(
             "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -409,11 +444,7 @@ def _slice36_should_force_batch(context: Any) -> bool:
         )
         if not _claude_unavailable:
             return False
-        # Route gate — only STANDARD + COMPLEX get the batch path
-        _route = (
-            getattr(context, "provider_route", "") or ""
-        ).strip().lower()
-        if _route not in ("standard", "complex"):
+        if not _route_ok:
             return False
         # Slice 36 static opt-out (default ON per operator authorization).
         _raw = os.environ.get(_SLICE36_FORCE_BATCH_ENV, "1").strip().lower()
