@@ -444,7 +444,11 @@ def _dw_rupture_risk_high(model_id: str = "") -> bool:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor,
         )
-        return get_dw_failure_predictor().risk_exceeds_threshold(model_id=model_id)
+        if get_dw_failure_predictor().risk_exceeds_threshold(model_id=model_id):
+            return True
+        # Slice 179 — warm-boot: a CONFIRMED-degraded stream (persisted ledger) arms the
+        # forecast at T=0, before the per-model ring has warmed.
+        return _dw_streaming_warm_degraded()
     except Exception:  # noqa: BLE001
         return False
 
@@ -460,6 +464,42 @@ def _dw_batch_lane_healthy() -> bool:
             _batch_surface_healthy,
         )
         return _batch_surface_healthy()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_WARM_BOOT_ENV: str = "JARVIS_DW_WARM_BOOT_ENABLED"
+
+
+def _slice179_warm_boot_enabled() -> bool:
+    """Slice 179 — master for warm-boot armor. Default **TRUE** (failure-path-only: only
+    fires when the PERSISTED ledger shows the stream already degraded, so it cannot affect a
+    healthy-stream boot). NEVER raises."""
+    return os.environ.get(_WARM_BOOT_ENV, "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _dw_streaming_warm_degraded() -> bool:
+    """Slice 179 — does the PERSISTED surface-health ledger show DIRECT_STREAMING degraded
+    RIGHT NOW (RAW verdict — NOT freshness-gated like the Slice-170 path)? On a container
+    restart the ledger inherits the prior session's verdict, so this arms the cortex at T=0:
+    the very first ops (incl. the sentinel model-selection probe) batch instead of exhausting
+    on a rupturing RT stream. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.preflight_probe import (
+            is_surface_health_enabled,
+        )
+        if not is_surface_health_enabled():
+            return False
+        from backend.core.ouroboros.governance.dw_surface_health import (
+            SurfaceHealthLedger,
+            SurfaceKind,
+            SurfaceVerdict,
+        )
+        rec = SurfaceHealthLedger().verdict_for(SurfaceKind.DIRECT_STREAMING)
+        return rec is not None and rec.verdict in (
+            SurfaceVerdict.TRANSPORT_DEGRADED,
+            SurfaceVerdict.UPSTREAM_DEGRADED,
+        )
     except Exception:  # noqa: BLE001
         return False
 
@@ -530,6 +570,26 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
             logger.info(
                 "[Cortex] forecast preempt: model=%s rupture-risk≥threshold → DW-batch "
                 "(dodging the rupture before it throws)", model_id or "?",
+            )
+            return True
+
+        # Slice 179 — WARM-BOOT armor (cold-start eradication). Independent of the predictor's
+        # forecast warmth AND the predictive-routing flag: if the PERSISTED surface-health
+        # ledger shows DIRECT_STREAMING degraded, DW's stream is confirmed broken from
+        # millisecond zero (a restart inherits the prior verdict; the Slice-170 path can lapse
+        # it as stale). Force batch immediately — so the very first ops, INCLUDING the sentinel
+        # model-selection probe, never exhaust on a rupturing RT stream. Batch-health-gated
+        # (never detour into a broken batch lane). Failure-path-only → default-ON.
+        if (
+            _route_ok
+            and _slice179_warm_boot_enabled()
+            and _dw_streaming_warm_degraded()
+            and _dw_batch_lane_healthy()
+        ):
+            logger.info(
+                "[Cortex] WARM-BOOT armor: persisted ledger shows DIRECT_STREAMING degraded "
+                "→ DW-batch from T=0 (model=%s; cold-start exhaustion eradicated)",
+                model_id or "?",
             )
             return True
 
