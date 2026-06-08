@@ -424,6 +424,31 @@ def _claude_breaker_open(getter: Any = None) -> bool:
         return False
 
 
+def _slice172_predictive_routing_enabled() -> bool:
+    """Slice 172 — master for predictive preemptive routing (default FALSE, §33.1: acts
+    on a forecast, not a confirmed failure). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            predictive_routing_enabled,
+        )
+        return predictive_routing_enabled()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dw_rupture_risk_high() -> bool:
+    """Slice 172 — is the FORECAST rupture risk at/above the preemptive threshold? Reads
+    the predictive cortex (recency-weighted Poisson over recent ruptures). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            get_dw_failure_predictor,
+            rupture_risk_threshold,
+        )
+        return get_dw_failure_predictor().rupture_probability() >= rupture_risk_threshold()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slice36_should_force_batch(context: Any) -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -462,6 +487,15 @@ def _slice36_should_force_batch(context: Any) -> bool:
         # DW-WIDE outages (both surfaces degraded), not transport blips. Failure-path-only
         # (fires solely on a degraded stream) → default-ON, §33.1.
         if _route_ok and _slice170_intra_dw_failover_enabled() and _slice41_ledger_force_batch():
+            return True
+
+        # Slice 172 — PREDICTIVE preemptive routing (the cortex). The forecast says a
+        # rupture is likely within the horizon → route to batch BEFORE the stream breaks,
+        # so it never throws, never panics, never wakes Claude. Distinct from Slice 170
+        # (reactive, on a CONFIRMED degraded stream): this fires on a FORECAST while the
+        # stream may still look healthy. Opt-in (§33.1 — acts on a prediction); default
+        # FALSE. Route-gated (standard/complex) like every other batch path.
+        if _route_ok and _slice172_predictive_routing_enabled() and _dw_rupture_risk_high():
             return True
 
         # Legacy pure-DW batch optimization: requires Claude unavailable. With Claude
