@@ -50,6 +50,40 @@ _DEFAULT_THRESHOLD_FLOOR = 0.30    # never auto-tune below this
 _DEFAULT_THRESHOLD_CEILING = 0.95  # never auto-tune above this
 _DEFAULT_CALIBRATION_PENDING_MAX = 512
 
+# Slice 176 — multi-signal failure vectors + their predictive WEIGHTS. The risk score is a
+# weighted Poisson rate Σ weight(kind)·decay(age): a quota lockdown is far more predictive of
+# imminent total failure than a localized empty completion. Env-tunable per kind
+# (JARVIS_DW_SIGNAL_WEIGHT_<KIND>); unknown kind → 1.0. transport=1.0 keeps the Slice-172
+# transport-only ring byte-identical (unweighted == weight-1.0).
+_DEFAULT_SIGNAL_WEIGHTS = {
+    "transport": 1.0,   # SSE rupture / stream stall — baseline
+    "economic": 2.0,    # 402/429 quota / balance — HIGH (imminent total vendor lockdown)
+    "upstream": 0.4,    # empty/malformed completion, 5xx, parse — localized, low predictive
+    "cancel": 0.6,      # batch param-rejection (Slice 168 class) — correctable, moderate
+}
+
+
+def _normalize_kind(kind: Any) -> str:
+    """Canonical failure-vector key. NEVER raises; defaults to "transport"."""
+    try:
+        return str(kind or "transport").strip().lower() or "transport"
+    except Exception:  # noqa: BLE001
+        return "transport"
+
+
+def _signal_weight(kind: Any) -> float:
+    """Predictive weight for a failure vector (env-tunable; unknown → 1.0). NEVER raises."""
+    k = _normalize_kind(kind)
+    try:
+        raw = os.environ.get(f"JARVIS_DW_SIGNAL_WEIGHT_{k.upper()}", "").strip()
+        if raw:
+            v = float(raw)
+            if v >= 0:
+                return v
+    except Exception:  # noqa: BLE001
+        pass
+    return _DEFAULT_SIGNAL_WEIGHTS.get(k, 1.0)
+
 
 def _envf(name: str, default: float) -> float:
     try:
@@ -150,26 +184,36 @@ class DWFailurePredictor:
     def __init__(self, *, max_ring: Optional[int] = None) -> None:
         self._lock = threading.Lock()
         self._max_ring = max_ring or _ring_size()
-        self._rings: dict = {}            # model_key -> Deque[float]
+        self._rings: dict = {}            # model_key -> Deque[(ts, kind)]  (Slice 176)
         self._last_pred_ts: dict = {}     # model_key -> float (Slice 174 debounce, per model)
 
-    def _ring_locked(self, key: str) -> Deque[float]:
+    def _ring_locked(self, key: str) -> Deque:
         r = self._rings.get(key)
         if r is None:
             r = collections.deque(maxlen=self._max_ring)
             self._rings[key] = r
         return r
 
-    def record_rupture(self, now: Optional[float] = None, model_id: Any = "") -> None:
-        """Stamp a rupture event for ``model_id``'s ring. Fed at the live-transport-degraded
-        detection point. Lock-guarded append only. NEVER raises."""
+    def record_failure(
+        self, now: Optional[float] = None, model_id: Any = "", kind: Any = "transport",
+    ) -> None:
+        """Slice 176 — stamp a KIND-tagged failure event for ``model_id``'s ring (transport
+        rupture / economic 402-429 / upstream empty-or-5xx / cancel batch-rejection). The kind
+        determines its predictive weight in the fused risk score. Lock-guarded append only.
+        NEVER raises."""
         try:
             ts = time.monotonic() if now is None else float(now)
             key = _normalize_model(model_id)
+            k = _normalize_kind(kind)
             with self._lock:
-                self._ring_locked(key).append(ts)
+                self._ring_locked(key).append((ts, k))
         except Exception:  # noqa: BLE001
             pass
+
+    def record_rupture(self, now: Optional[float] = None, model_id: Any = "") -> None:
+        """Slice 172 compat — a transport rupture is one failure vector. Delegates to
+        record_failure(kind="transport"). NEVER raises."""
+        self.record_failure(now, model_id, "transport")
 
     def rupture_probability(
         self,
@@ -180,9 +224,10 @@ class DWFailurePredictor:
         lookback_s: Optional[float] = None,
         halflife_s: Optional[float] = None,
     ) -> float:
-        """P(≥1 rupture within ``horizon_s``) for ``model_id`` from its OWN ring's
-        recency-weighted Poisson rate. Returns 0.0 when that model has no recent ruptures
-        (so a pristine model is never penalized). NEVER raises; result ∈ [0,1]."""
+        """Slice 176 — fused failure risk for ``model_id``: P(≥1 failure within ``horizon_s``)
+        from its OWN ring's recency- AND severity-weighted Poisson rate (Σ weight(kind)·decay).
+        0.0 when that model has no recent failures. Transport-only rings (weight 1.0) are
+        byte-identical to Slice 172. NEVER raises; result ∈ [0,1]."""
         try:
             now = time.monotonic() if now is None else float(now)
             horizon = horizon_s if horizon_s is not None else rupture_horizon_s()
@@ -191,14 +236,15 @@ class DWFailurePredictor:
             key = _normalize_model(model_id)
             with self._lock:
                 ring = self._rings.get(key)
-                recent = [ts for ts in ring if 0.0 <= (now - ts) <= lookback] if ring else []
+                recent = [(ts, kd) for (ts, kd) in ring if 0.0 <= (now - ts) <= lookback] if ring else []
             if not recent:
                 return 0.0
             weighted = 0.0
-            for ts in recent:
+            for ts, kd in recent:
                 age = now - ts
-                weighted += (0.5 ** (age / halflife)) if halflife > 0 else 1.0
-            lam = weighted / lookback  # weighted episodes per second
+                decay = (0.5 ** (age / halflife)) if halflife > 0 else 1.0
+                weighted += _signal_weight(kd) * decay
+            lam = weighted / lookback  # severity-weighted episodes per second
             p = 1.0 - math.exp(-lam * horizon)
             return max(0.0, min(1.0, p))
         except Exception:  # noqa: BLE001
@@ -217,7 +263,10 @@ class DWFailurePredictor:
                 return prob >= _static_risk_threshold()
             cal = get_threshold_calibrator(key)
             with self._lock:
-                ring = list(self._rings.get(key) or ())
+                # Slice 176 — the calibrator evaluates against failure OCCURRENCE times
+                # (any vector counts as a positive outcome); extract timestamps from the
+                # (ts, kind) ring.
+                ring = [ts for (ts, _kd) in (self._rings.get(key) or ())]
                 last = self._last_pred_ts.get(key)
             cal.evaluate(now, ring, horizon=rupture_horizon_s())
             if last is None or (now - last) >= rupture_horizon_s():
@@ -245,6 +294,31 @@ class DWFailurePredictor:
             return best_key, best
         except Exception:  # noqa: BLE001
             return "", 0.0
+
+    def dominant_signal(
+        self, now: Optional[float] = None, model_id: Any = "",
+        *, lookback_s: Optional[float] = None, halflife_s: Optional[float] = None,
+    ) -> str:
+        """Slice 176 — the failure VECTOR contributing the most weighted mass to ``model_id``'s
+        current risk (so the operator sees *what kind* of threat is driving the level, e.g.
+        "economic"). "" when no recent failures. NEVER raises."""
+        try:
+            now = time.monotonic() if now is None else float(now)
+            lookback = lookback_s if lookback_s is not None else rupture_lookback_s()
+            halflife = halflife_s if halflife_s is not None else rupture_halflife_s()
+            key = _normalize_model(model_id)
+            with self._lock:
+                recent = [(ts, kd) for (ts, kd) in (self._rings.get(key) or ())
+                          if 0.0 <= (now - ts) <= lookback]
+            if not recent:
+                return ""
+            mass: dict = {}
+            for ts, kd in recent:
+                decay = (0.5 ** ((now - ts) / halflife)) if halflife > 0 else 1.0
+                mass[kd] = mass.get(kd, 0.0) + _signal_weight(kd) * decay
+            return max(mass.items(), key=lambda kv: kv[1])[0]
+        except Exception:  # noqa: BLE001
+            return ""
 
 
 class ThresholdCalibrator:
