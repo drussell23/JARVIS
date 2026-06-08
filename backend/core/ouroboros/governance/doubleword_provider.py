@@ -437,14 +437,14 @@ def _slice172_predictive_routing_enabled() -> bool:
 
 
 def _dw_rupture_risk_high() -> bool:
-    """Slice 172 — is the FORECAST rupture risk at/above the preemptive threshold? Reads
-    the predictive cortex (recency-weighted Poisson over recent ruptures). NEVER raises."""
+    """Slice 172/174 — is the FORECAST rupture risk at/above the (possibly self-calibrated)
+    threshold? Delegates to the predictor's risk_exceeds_threshold, which also drives the
+    Slice 174 calibration feedback loop when enabled. NEVER raises."""
     try:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor,
-            rupture_risk_threshold,
         )
-        return get_dw_failure_predictor().rupture_probability() >= rupture_risk_threshold()
+        return get_dw_failure_predictor().risk_exceeds_threshold()
     except Exception:  # noqa: BLE001
         return False
 
