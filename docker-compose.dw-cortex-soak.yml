@@ -47,6 +47,12 @@ services:
       # JARVIS_DW_RUPTURE_RISK_THRESHOLD: "0.7"   # 172 initial baseline (174 self-tunes)
       # JARVIS_DW_RUPTURE_HORIZON_S: "300"        # forecast window
       # JARVIS_DW_SIGNAL_WEIGHT_ECONOMIC: "2.0"   # 176 vector weights
+      # ── Slice 178: autonomous, VOLUME-AWARE workspace hygiene. ON from boot, but it
+      #    only evicts above the scarcity threshold (85%) — forensic logs are preserved
+      #    while disk is plentiful, so this is safe to run autonomously. ──
+      JARVIS_ARTIFACT_JANITOR_ENABLED: "1"
+      JARVIS_ARTIFACT_SCARCITY_THRESHOLD: "0.85"
+      # JARVIS_DISCORD_MAINTENANCE_WEBHOOK: "..."   # set in .env to push eviction events
       # ── Organism baseline ──
       JARVIS_EPISODIC_CORE_ENABLED: "1"
       JARVIS_CAI_ROUTER_ENABLED: "1"
