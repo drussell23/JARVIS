@@ -909,6 +909,29 @@ class BattleTestHarness:
                 await self.boot_governance_stack()
             with _BootPhase("boot_governed_loop_service"):
                 await self.boot_governed_loop_service()
+
+            # ── Slice 156 — interactive Discord control gateway ──
+            # GLS (+ its _approval_provider) is up → start the bidirectional bot as a
+            # decoupled background task: it DMs the operator [APPROVE]/[REJECT]/[STEER]
+            # for each Orange APPROVAL_REQUIRED and resolves it remotely. Gated
+            # default-FALSE + fail-soft (no token / no operator id → no-op); off the
+            # FSM loop. Authorization is enforced in the gateway (DISCORD_OPERATOR_ID).
+            try:
+                from backend.core.ouroboros.governance.discord_gateway import (
+                    discord_gateway_enabled,
+                    run_gateway_daemon,
+                )
+                if discord_gateway_enabled():
+                    self._discord_gateway_task = asyncio.create_task(
+                        run_gateway_daemon(
+                            self._governed_loop_service, stop=self._shutdown_event,
+                        )
+                    )
+                    logger.warning(
+                        "[DiscordGateway] interactive control gateway armed (Slice 156)"
+                    )
+            except Exception as exc:  # noqa: BLE001 — never fatal to the soak
+                logger.debug("[DiscordGateway] gateway boot skipped: %s", exc)
             # Provider-readiness gate (§33.1, default-FALSE). Fail-fast
             # *before* any op-emitting subsystem boots when Claude/DW
             # are unhealthy — closes the v18 27-min thrash failure mode
