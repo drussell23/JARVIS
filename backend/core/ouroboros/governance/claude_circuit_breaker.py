@@ -45,6 +45,7 @@ consult via ``get_claude_circuit_breaker()``. No reverse dependency.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import os
 import threading
@@ -150,6 +151,88 @@ def _economic_threshold() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Slice 164 — durable economic-trip state (kills the cold-start at boot)
+# ---------------------------------------------------------------------------
+# The breaker is an in-memory singleton; it resets to CLOSED every process boot,
+# so a credit-dead Claude is re-learned from scratch each relaunch and the first
+# ops exhaust before the Slice 161/162 DW-sovereignty protections engage. Persist
+# the economic-OPEN state (host-local .jarvis, gitignored) and restore it at boot
+# when RECENT (within a TTL) so protections are warm from op #1. The recovery
+# window restarts from boot, so a since-funded Claude still self-heals via the
+# normal HALF_OPEN probe — no permanent lock-out, no hardcoding.
+
+def _breaker_persist_enabled() -> bool:
+    """Master gate, default-FALSE per §33.1. NEVER raises."""
+    return os.environ.get("JARVIS_CLAUDE_BREAKER_PERSIST_ENABLED", "false") \
+        .strip().lower() in ("1", "true", "yes", "on")
+
+
+def _breaker_persist_path() -> str:
+    """Host-local state file (env-tunable; default .jarvis/). NEVER raises."""
+    explicit = (os.environ.get("JARVIS_CLAUDE_BREAKER_PERSIST_PATH", "") or "").strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get("JARVIS_STATE_DIR", "") or "").strip() or ".jarvis"
+    return os.path.join(base, "claude_breaker_state.json")
+
+
+def _breaker_persist_ttl_s() -> float:
+    """How long a persisted economic trip is honored before re-probing Claude.
+    Default 24h (a funded lane is re-checked daily). Floored at 0. NEVER raises."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_CLAUDE_BREAKER_PERSIST_TTL_S", "86400")))
+    except (TypeError, ValueError):
+        return 86400.0
+
+
+def _write_breaker_state(
+    state_name: str, economic_failures: int, *,
+    reason: str = "economic", path: Optional[str] = None, now_wall: Optional[float] = None,
+) -> None:
+    """Atomically persist the breaker state with a WALL-CLOCK timestamp (monotonic
+    doesn't survive a restart). NEVER raises — persistence is best-effort."""
+    try:
+        p = path or _breaker_persist_path()
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        payload = {
+            "state": str(state_name),
+            "economic_failures": int(economic_failures),
+            "tripped_at_wall": float(now_wall if now_wall is not None else time.time()),
+            "reason": str(reason),
+            "schema": 1,
+        }
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, p)  # atomic
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+
+
+def _read_breaker_state(
+    *, path: Optional[str] = None, now_wall: Optional[float] = None, ttl_s: Optional[float] = None,
+) -> Optional[int]:
+    """Read the persisted state. Returns the economic-failure count to restore IFF the
+    record is an OPEN economic trip within the TTL; otherwise None (no restore →
+    legacy cold start / re-probe). NEVER raises — fail-soft to None."""
+    try:
+        p = path or _breaker_persist_path()
+        with open(p, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if str(d.get("state", "")).lower() != "open":
+            return None
+        _ttl = ttl_s if ttl_s is not None else _breaker_persist_ttl_s()
+        _now = now_wall if now_wall is not None else time.time()
+        if (_now - float(d.get("tripped_at_wall", 0.0))) > _ttl:
+            return None  # stale → re-probe Claude (it may have been funded)
+        return max(1, int(d.get("economic_failures", 1)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Transport-class detection — string-based to avoid hard httpx dependency
 # ---------------------------------------------------------------------------
 
@@ -224,7 +307,9 @@ class ClaudeCircuitBreaker:
         self,
         failure_threshold: Optional[int] = None,
         recovery_window_s: Optional[float] = None,
+        persist_path: Optional[str] = None,
     ) -> None:
+        self._persist_path: Optional[str] = persist_path
         self._state: CircuitState = CircuitState.CLOSED
         self._consecutive_transport_failures: int = 0
         # Slice 127 — economic-exhaustion counter, kept DISTINCT from the
@@ -249,6 +334,35 @@ class ClaudeCircuitBreaker:
         self._total_trips: int = 0
         self._total_successes: int = 0
         self._lock = threading.RLock()
+        # Slice 164 — durable economic-trip restore. If a RECENT economic OPEN was
+        # persisted (within TTL), boot OPEN so the Slice 161/162 DW-sovereignty
+        # protections are warm from op #1 instead of paying the cold-start. The
+        # recovery window restarts from boot, so a since-funded lane self-heals.
+        if _breaker_persist_enabled():
+            _restored = _read_breaker_state(path=self._persist_path)
+            if _restored is not None:
+                self._state = CircuitState.OPEN
+                self._consecutive_economic_failures = _restored
+                self._tripped_at_monotonic = time.monotonic()
+                self._total_trips += 1
+                logger.warning(
+                    "[ClaudeCircuitBreaker] restored OPEN from persisted economic "
+                    "trip (failures=%d) — DW-sovereignty warm from boot (Slice 164)",
+                    _restored,
+                )
+
+    def _maybe_persist_open(self) -> None:
+        """Slice 164 — persist the economic-OPEN state (best-effort, caller holds lock)."""
+        if _breaker_persist_enabled():
+            _write_breaker_state(
+                "open", self._consecutive_economic_failures,
+                reason="economic", path=self._persist_path,
+            )
+
+    def _maybe_clear_persisted(self) -> None:
+        """Slice 164 — mark the lane recovered so the next boot starts CLOSED."""
+        if _breaker_persist_enabled():
+            _write_breaker_state("closed", 0, reason="recovered", path=self._persist_path)
 
     # -- Properties --------------------------------------------------------
 
@@ -354,6 +468,7 @@ class ClaudeCircuitBreaker:
                     "(%s) — re-tripping to OPEN (re-probe window now %.0fs)",
                     detail, self._effective_recovery_window_s(),
                 )
+                self._maybe_persist_open()  # Slice 164
                 return
             self._consecutive_economic_failures += 1
             if (
@@ -371,6 +486,7 @@ class ClaudeCircuitBreaker:
                     self._consecutive_economic_failures, detail,
                     self._recovery_window_s,
                 )
+                self._maybe_persist_open()  # Slice 164 — warm next boot
 
     def record_success(self) -> None:
         """Record a successful Claude call. Resets consecutive-failure
@@ -393,6 +509,7 @@ class ClaudeCircuitBreaker:
                 )
                 self._state = CircuitState.CLOSED
                 self._tripped_at_monotonic = None
+                self._maybe_clear_persisted()  # Slice 164 — recovered → cold-start next boot
 
     def record_non_transport_failure(self) -> None:
         """Record a non-transport failure (content failure, validation,
