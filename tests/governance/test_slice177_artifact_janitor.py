@@ -35,6 +35,9 @@ class TestRotationPolicy(unittest.TestCase):
         self.now = time.time()
 
     def _janitor(self, **kw):
+        # Slice 178 — force scarcity so these AGE-mechanics tests exercise eviction
+        # (the volume-aware gate is tested separately in test_slice178).
+        kw.setdefault("usage_probe", lambda: 0.99)
         return ArtifactJanitor(
             scan_dirs=[self.logs], compress_age_days=7, delete_age_days=30, **kw
         )

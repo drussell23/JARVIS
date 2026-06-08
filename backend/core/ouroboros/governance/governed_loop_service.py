@@ -1573,6 +1573,7 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.artifact_janitor import (  # noqa: E501
                     artifact_janitor_enabled,
                     ArtifactJanitor,
+                    emit_maintenance_eviction,
                 )
                 if artifact_janitor_enabled():
                     import asyncio as _aio_jan
@@ -1588,11 +1589,20 @@ class GovernedLoopService:
                                 ArtifactJanitor(protect_paths=_protect).sweep
                             )
                             logger.info(
-                                "[GovernedLoop] artifact janitor: compressed=%s "
-                                "deleted=%s freed=%.1fMB errors=%s",
+                                "[GovernedLoop] artifact janitor: usage=%.0f%% evicted=%s "
+                                "compressed=%s deleted=%s freed=%.1fMB errors=%s",
+                                _rep.get("usage_ratio", 0) * 100, _rep.get("evicted"),
                                 _rep.get("compressed"), _rep.get("deleted"),
                                 _rep.get("freed_bytes", 0) / 1e6, _rep.get("errors"),
                             )
+                            # Slice 178 — on an actual eviction, push MAINTENANCE_EVICTION
+                            # to the Discord spine (webhook; best-effort, off-thread).
+                            if _rep.get("evicted") and _rep.get("freed_bytes", 0) > 0:
+                                await _aio_jan.to_thread(
+                                    emit_maintenance_eviction,
+                                    _rep.get("usage_ratio", 0.0),
+                                    _rep.get("freed_bytes", 0),
+                                )
                         except Exception as _je:  # noqa: BLE001
                             logger.debug("[GovernedLoop] janitor sweep swallowed: %r", _je)
 
