@@ -364,6 +364,43 @@ def _slice170_intra_dw_failover_enabled() -> bool:
         not in ("0", "false", "no", "off")
 
 
+def _claude_unavailable_now() -> bool:
+    """Slice 171 — is Claude unavailable as a fallback right now (disabled OR breaker
+    OPEN)? Mirrors the _slice36 gate; used to ATTRIBUTE a force_batch decision: a
+    force_batch while Claude is AVAILABLE can only be the Slice 170 reroute (the legacy
+    batch path requires Claude unavailable). NEVER raises."""
+    try:
+        _disabled = os.environ.get(
+            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        return _disabled or (_force_batch_on_breaker_enabled() and _claude_breaker_open())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _record_intra_failover_telemetry(context: Any, force_batch: bool) -> bool:
+    """Slice 171 — record a Slice 170 intra-DW failover when one fired. A force_batch
+    decision while Claude is AVAILABLE ⟹ the intra-DW failover fired (a DW rupture
+    rerouted to batch), so we AVOIDED a Claude cascade = capital saved. Fire-and-forget:
+    a single lock-guarded counter increment, no I/O, no GIL contention. NEVER raises.
+    Returns True iff a failover was recorded (for telemetry/tests)."""
+    try:
+        if not force_batch:
+            return False
+        if _claude_unavailable_now():
+            return False  # Claude dead → batch is the legacy path, not a saved-vs-Claude event
+        from backend.core.ouroboros.governance.economic_telemetry import (
+            economic_telemetry_enabled,
+            get_economic_telemetry,
+        )
+        if not economic_telemetry_enabled():
+            return False
+        get_economic_telemetry().record_intra_failover()
+        return True
+    except Exception:  # noqa: BLE001 — telemetry must never break the adapter
+        return False
+
+
 def _claude_breaker_open(getter: Any = None) -> bool:
     """Slice 161 — True iff the Claude breaker is NOT CLOSED (OPEN or HALF_OPEN), i.e.
     Claude is unreliable as a fallback, so STANDARD/COMPLEX ops must force the DW batch
@@ -1820,6 +1857,9 @@ class DoublewordProvider:
         # config skip RT entirely and go straight to batch.
         _slice36_force_batch = _slice36_should_force_batch(context)
         if _slice36_force_batch:
+            # Slice 171 — surface the Slice 170 capital save (records iff Claude was
+            # available, i.e. a rupture-reroute we'd otherwise have cascaded to Claude).
+            _record_intra_failover_telemetry(context, True)
             logger.info(
                 "[DoublewordProvider] Slice 36 transport selector: "
                 "STANDARD/COMPLEX + Claude-disabled → BATCH path "

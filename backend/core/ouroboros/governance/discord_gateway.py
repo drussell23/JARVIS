@@ -213,6 +213,21 @@ def summarize_pending(req: Dict[str, Any]) -> str:
     return desc
 
 
+def economic_telemetry_line() -> str:
+    """Slice 171 — one-line economic-sovereignty metric for the Discord spine: the
+    running count of Slice 170 intra-DW failovers + estimated capital saved (DW ruptures
+    rerouted to batch instead of cascading to the expensive Claude fallback). Reads the
+    process-wide singleton snapshot off the hot path. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.economic_telemetry import (
+            get_economic_telemetry,
+            render_economic_telemetry,
+        )
+        return render_economic_telemetry(get_economic_telemetry().snapshot())
+    except Exception:  # noqa: BLE001
+        return "💸 Intra-DW failovers: 0 · Capital saved ~$0.00"
+
+
 def build_router_from_gls(
     gls: Any, *,
     on_refused: Optional[_RefusedHook] = None,
@@ -373,6 +388,11 @@ async def run_gateway_daemon(gls: Any, *, stop: Any = None) -> None:
                             color=0xE67E22,
                         )
                         embed.add_field(name="op", value=op_id[:64], inline=False)
+                        # Slice 171 — surface the running intra-DW failover savings on
+                        # every gate (the operator's live spine view).
+                        embed.add_field(
+                            name="💸 sovereignty", value=economic_telemetry_line(), inline=False,
+                        )
                         embed.set_footer(text=f"only operator {authorized_operator_id()} may decide")
                         await channel.send(embed=embed, view=_make_view(op_id))
             except Exception as exc:  # noqa: BLE001 — never crash the gateway
