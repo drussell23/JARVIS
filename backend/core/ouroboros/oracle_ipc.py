@@ -108,6 +108,45 @@ class OracleCrash:
 
 
 # ===========================================================================
+# Slice 149 P4 — dependency preflight (fail-fast vs respawn storm)
+# ===========================================================================
+# Single source of the Oracle's HARD deps. Backed by the Oracle's own explicit
+# declaration: oracle.py:818 `raise ImportError("networkx is required for
+# Oracle")`. The lean soak image deliberately omits these (it runs the governance
+# loop context-free); a full host (requirements.txt) has them. Preflighting here
+# turns a permanent missing-dep ImportError into a SINGLE clean DEGRADE instead of
+# a 3x respawn storm with exponential backoff.
+_ORACLE_REQUIRED_DEPS: Tuple[str, ...] = ("networkx",)
+
+
+def oracle_dependencies_available(
+    checker: Optional[Callable[[str], bool]] = None,
+) -> Tuple[bool, list]:
+    """Return ``(all_present, missing_list)`` for the Oracle's hard deps.
+
+    ``checker(name) -> bool`` is injectable for deterministic tests; the default
+    uses ``importlib.util.find_spec``. NEVER raises — a probe error treats the dep
+    as PRESENT (fail-open toward spawning, so a buggy probe never disables the
+    Oracle on a host that actually has its deps)."""
+    def _present(name: str) -> bool:
+        try:
+            import importlib.util
+            return importlib.util.find_spec(name) is not None
+        except Exception:  # noqa: BLE001 — probe error → assume present (fail-open)
+            return True
+    probe = checker or _present
+    missing = []
+    for dep in _ORACLE_REQUIRED_DEPS:
+        try:
+            present = probe(dep)
+        except Exception:  # noqa: BLE001
+            present = True  # fail-open
+        if not present:
+            missing.append(dep)
+    return (not missing, missing)
+
+
+# ===========================================================================
 # Child worker — runs INSIDE the isolated process (own GIL)
 # ===========================================================================
 
@@ -237,14 +276,44 @@ class AsyncOracleProxy:
         self._started_at = 0.0
         self._respawns = 0
         self._closing = False
+        # Slice 149 P4 — set by the start() preflight when hard deps are absent
+        # (lean environment); a permanent DEGRADE, NOT a transient respawn.
+        self._missing_deps: list = []
 
     # -- lifecycle ----------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(
+        self,
+        *,
+        dep_check: Optional[Callable[[], Tuple[bool, list]]] = None,
+    ) -> None:
         """Spawn the Oracle process + begin reading. Returns immediately — the
         Oracle hydrates in the background; queries return OracleNotReady until
-        the worker signals ready."""
+        the worker signals ready.
+
+        Slice 149 P4 — DEPENDENCY PREFLIGHT first: if the Oracle's hard deps are
+        absent (lean environment), DEGRADE ONCE with a clear diagnostic and do NOT
+        spawn — turning a permanent missing-dep ImportError into a single clean
+        degrade instead of a 3x respawn storm. Full host (deps present) → normal
+        spawn; a later transient crash still uses the bounded respawn.
+        ``dep_check`` injectable for tests; a preflight error fails OPEN (spawns)."""
         self._closing = False
+        check = dep_check or oracle_dependencies_available
+        try:
+            ok, missing = check()
+        except Exception:  # noqa: BLE001 — never block the Oracle on a buggy preflight
+            ok, missing = True, []
+        if not ok:
+            self._missing_deps = list(missing)
+            self._started_at = time.time()
+            logger.warning(
+                "[OracleIPC] DEGRADED — missing hard dep(s): %s. Lean environment; "
+                "Oracle stays context-free (engine unaffected). NO respawn attempted "
+                "(permanent ImportError). Run on a full host (requirements.txt) for "
+                "the Oracle.", ", ".join(missing),
+            )
+            return
+        self._missing_deps = []
         await self._spawn()
 
     async def _spawn(self) -> None:
@@ -293,6 +362,8 @@ class AsyncOracleProxy:
         return self._ready
 
     def _not_ready(self, reason: Optional[str] = None) -> OracleNotReady:
+        if self._missing_deps and reason is None:
+            reason = "missing_deps"  # Slice 149 P4 — permanent, lean-environment degrade
         r = reason or ("init_failed" if self._init_failed else "hydrating")
         return OracleNotReady(reason=r, elapsed_s=time.time() - self._started_at, respawns=self._respawns)
 
