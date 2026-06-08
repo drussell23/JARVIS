@@ -254,6 +254,38 @@ _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "12
 
 _SLICE36_FORCE_BATCH_ENV: str = "JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX"
 
+# Slice 159 — DW transport sovereignty. Slice 36 force-batch originally engaged ONLY
+# when Claude was explicitly DISABLED. But a *configured* yet *credit-dead* Claude
+# leaves _claude_disabled=False → RT streaming → DW SSE rupture (live_transport) →
+# cascade to a dead Claude → terminal_quota. The premise "Claude catches RT failures"
+# is false whenever Claude's circuit breaker is OPEN. Composes the Slice 146 breaker.
+_FORCE_BATCH_ON_BREAKER_ENV: str = "JARVIS_DW_FORCE_BATCH_ON_CLAUDE_BREAKER"
+
+
+def _force_batch_on_breaker_enabled() -> bool:
+    """Master for the Slice 159 breaker-aware force-batch trigger. Default **TRUE**
+    (failure-path-only: only fires while the Claude breaker is OPEN, so it can't
+    affect the Claude-healthy happy path; =0 reverts to legacy disabled-only). The
+    economic breaker (JARVIS_CLAUDE_ECONOMIC_BREAKER_ENABLED) still governs whether
+    the breaker opens at all. NEVER raises."""
+    return os.environ.get(_FORCE_BATCH_ON_BREAKER_ENV, "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _claude_breaker_open(getter: Any = None) -> bool:
+    """Slice 159 — True iff the Claude circuit breaker is currently REJECTING requests
+    (economic credit-death OR transport). In that state Claude cannot catch a DW RT
+    failure, so STANDARD/COMPLEX ops must force the DW batch transport. ``getter`` is
+    injectable for tests. NEVER raises — fail-closed to False (legacy RT)."""
+    try:
+        if getter is None:
+            from backend.core.ouroboros.governance.claude_circuit_breaker import (
+                get_claude_circuit_breaker as getter,  # type: ignore[assignment]
+            )
+        return not getter().should_allow_request()
+    except Exception:  # noqa: BLE001 — defensive; legacy RT on any failure
+        return False
+
 
 def _slice36_should_force_batch(context: Any) -> bool:
     """Slice 36 — adaptive transport selector decision.
@@ -282,7 +314,15 @@ def _slice36_should_force_batch(context: Any) -> bool:
         _claude_disabled = os.environ.get(
             "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
         ).strip().lower() in ("1", "true", "yes", "on")
-        if not _claude_disabled:
+        # Slice 159 — Claude is ALSO unavailable-as-fallback when its circuit breaker
+        # is OPEN (economic credit-death / transport). Then an RT failure cascades to a
+        # blocked Claude → terminal_quota exhaustion, so DW must carry via batch. This
+        # is what makes the organism sovereign on DW when Claude is credit-dead (not
+        # merely when explicitly disabled). Gated (default ON, failure-path-only).
+        _claude_unavailable = _claude_disabled or (
+            _force_batch_on_breaker_enabled() and _claude_breaker_open()
+        )
+        if not _claude_unavailable:
             return False
         # Route gate — only STANDARD + COMPLEX get the batch path
         _route = (
