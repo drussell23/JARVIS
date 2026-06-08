@@ -602,12 +602,19 @@ def apply_floor_to_name(
     _order = get_active_tier_order()
     if raw_in not in _order:
         return (tier_name, None)
-    floor = recommended_floor(
-        now,
-        signal_source=signal_source,
-        op_id=op_id,
-        target_files=target_files,
-    )
+    try:
+        floor = recommended_floor(
+            now,
+            signal_source=signal_source,
+            op_id=op_id,
+            target_files=target_files,
+        )
+    except Exception:  # noqa: BLE001
+        # Slice 163 — FAIL-CLOSED. A failure computing the recommendation must NOT
+        # silently bypass the operator's deliberate governance posture. Fall back to
+        # the explicit MIN_RISK_TIER floor so an erroring subsystem can never let an
+        # op auto-apply below the configured floor.
+        floor = _env_floor()
     if floor is None:
         return (tier_name, None)
     if _order[floor] <= _order[raw_in]:

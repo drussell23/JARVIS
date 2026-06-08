@@ -3703,16 +3703,22 @@ class CandidateGenerator:
             # grind an IMMEDIATE op against a depleted Claude lane (the live
             # soak: terminal_quota x N, no completion). When the Claude lane
             # breaker is OPEN (economic/transport), reroute to the funded DW
-            # primary instead. should_allow_request() returns True for a
-            # HALF_OPEN probe → we keep Claude-direct that one time so the lane
-            # self-heals. Gated default-FALSE → OFF is unchanged Claude-direct.
+            # primary instead. Slice 162 — read the breaker STATE (read-only) via the
+            # Slice 161 predicate, NOT should_allow_request(): the latter flickers True
+            # during a HALF_OPEN probe AND has a side effect (consumes the probe slot),
+            # so an IMMEDIATE op kept hammering a dead-but-probing Claude and exhausted
+            # before the gate. Now CLOSED → Claude-direct (self-heal); OPEN/HALF_OPEN →
+            # reroute to funded DW. Gated default-FALSE → OFF is unchanged Claude-direct.
             if fallback_skip_gate_enabled():
                 try:
                     from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
                         get_claude_circuit_breaker as _p21_ccb,
                         is_enabled as _p21_ccb_enabled,
                     )
-                    _p21_allows = _p21_ccb().should_allow_request()
+                    from backend.core.ouroboros.governance.doubleword_provider import (
+                        _claude_breaker_open as _p21_breaker_open,
+                    )
+                    _p21_allows = not _p21_breaker_open(getter=_p21_ccb)
                     if immediate_reroute_to_dw(
                         dw_is_primary=True,
                         gate_enabled=True,
