@@ -273,16 +273,24 @@ def _force_batch_on_breaker_enabled() -> bool:
 
 
 def _claude_breaker_open(getter: Any = None) -> bool:
-    """Slice 159 — True iff the Claude circuit breaker is currently REJECTING requests
-    (economic credit-death OR transport). In that state Claude cannot catch a DW RT
-    failure, so STANDARD/COMPLEX ops must force the DW batch transport. ``getter`` is
-    injectable for tests. NEVER raises — fail-closed to False (legacy RT)."""
+    """Slice 161 — True iff the Claude breaker is NOT CLOSED (OPEN or HALF_OPEN), i.e.
+    Claude is unreliable as a fallback, so STANDARD/COMPLEX ops must force the DW batch
+    transport.
+
+    Reads the breaker STATE directly (read-only). It deliberately does NOT call
+    ``should_allow_request()``, which (Slice 159 bug) has a SIDE EFFECT — it transitions
+    OPEN->HALF_OPEN and consumes the single probe slot — AND returns True during the
+    probe window, flickering force-batch OFF exactly when DW must carry the op (the
+    complex-op live_transport rupture observed in the soak). HALF_OPEN still counts as
+    unreliable: a probe is in flight, Claude is not yet proven healthy. ``getter``
+    injectable. NEVER raises — fail-closed to False (legacy RT)."""
     try:
         if getter is None:
             from backend.core.ouroboros.governance.claude_circuit_breaker import (
                 get_claude_circuit_breaker as getter,  # type: ignore[assignment]
             )
-        return not getter().should_allow_request()
+        from backend.core.ouroboros.governance.claude_circuit_breaker import CircuitState
+        return getter().state in (CircuitState.OPEN, CircuitState.HALF_OPEN)
     except Exception:  # noqa: BLE001 — defensive; legacy RT on any failure
         return False
 
