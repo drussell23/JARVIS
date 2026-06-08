@@ -1882,6 +1882,25 @@ class SemanticIndex:
             self._async_build_running = True
             self._async_builds_started += 1
 
+        # Slice 150 — process-isolated build (GIL-decoupled) when enabled + an
+        # event loop is running; else the legacy daemon thread (byte-identical OFF).
+        try:
+            from backend.core.ouroboros.governance.subprocess_compute import (
+                compute_isolation_enabled as _ci_enabled,
+            )
+            _iso = _ci_enabled()
+        except Exception:  # noqa: BLE001
+            _iso = False
+        if _iso:
+            try:
+                import asyncio as _aio
+                _loop = _aio.get_running_loop()
+            except RuntimeError:
+                _loop = None
+            if _loop is not None:
+                _loop.create_task(self._isolated_build())
+                return "started_isolated"
+
         def _worker() -> None:
             try:
                 ok = self.build(force=True)
@@ -1909,6 +1928,31 @@ class SemanticIndex:
             daemon=True,
         ).start()
         return "started"
+
+    async def _isolated_build(self, *, proxy=None) -> None:
+        """Slice 150 — run the heavy build in a SUBPROCESS (GIL-decoupled), then
+        reload the centroid from the .npz cache. Fail-closed: a not-ready / failed
+        worker keeps the current centroid. Always clears the single-flight flag so
+        the index can rebuild next cycle. NEVER raises out (it runs as a task)."""
+        ok = False
+        try:
+            from backend.core.ouroboros.governance.subprocess_compute import (
+                is_not_ready as _is_not_ready,
+            )
+            if proxy is None:
+                proxy = await _ensure_semantic_proxy()
+            res = await proxy.call("build", str(self._root))
+            if not _is_not_ready(res) and isinstance(res, dict) and res.get("built"):
+                ok = self._load_from_cache()
+        except Exception:  # noqa: BLE001
+            logger.debug("[SemanticIndex] isolated build failed", exc_info=True)
+        finally:
+            with self._lock:
+                if ok:
+                    self._async_builds_completed += 1
+                else:
+                    self._async_builds_failed += 1
+                self._async_build_running = False
 
     # ------------------------------------------------------------------
     # Slice 3a — cluster build helpers
@@ -2144,6 +2188,58 @@ class SemanticIndex:
             )
         except Exception:
             logger.debug("[SemanticIndex] cache write failed", exc_info=True)
+
+    def _load_from_cache(self) -> bool:
+        """Slice 150 — reload index state from .jarvis/semantic_index.npz (the
+        surface ``_persist_cache_safe`` writes). Symmetric to the writer; used by
+        the process-isolated build path (the worker builds + writes the cache, this
+        parent reloads — no centroid crosses the Pipe). FAIL-CLOSED: any error
+        (missing / corrupt npz, numpy absent, mid-write read) returns False and
+        leaves the current centroid untouched. Atomic swap under ``self._lock`` so
+        readers never observe a half-loaded index. NEVER raises."""
+        try:
+            import numpy as np
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            path = self._root / ".jarvis" / "semantic_index.npz"
+            if not path.exists():
+                return False
+            # SECURITY: allow_pickle is required only because _persist_cache_safe
+            # stores texts/sources as object-dtype string arrays. This .npz is a
+            # HOST-LOCAL, SELF-WRITTEN cache under the repo's own .jarvis/ (written
+            # exclusively by our spawned build worker) — NOT an untrusted external
+            # source. An attacker who could overwrite it would already hold local
+            # write/code-exec on the host, so this adds no new attack surface.
+            data = np.load(path, allow_pickle=True)
+            vectors = (
+                [[float(x) for x in row] for row in data["vectors"]]
+                if data["vectors"].size else []
+            )
+            centroid = (
+                [float(x) for x in data["centroid"]] if data["centroid"].size else []
+            )
+            texts = list(data["texts"])
+            sources = list(data["sources"])
+            tss = list(data["ts"])
+            halflives = list(data["halflives"])
+            built_at = float(data["built_at"][0]) if data["built_at"].size else 0.0
+            corpus = [
+                CorpusItem(
+                    text=str(texts[i]), source=str(sources[i]),
+                    ts=float(tss[i]), halflife_days=float(halflives[i]),
+                )
+                for i in range(len(texts))
+            ]
+            with self._lock:
+                self._corpus = corpus
+                self._vectors = vectors
+                self._centroid = centroid
+                self._built_at = built_at
+            return True
+        except Exception:  # noqa: BLE001 — fail-closed: keep the current centroid
+            logger.debug("[SemanticIndex] cache reload failed", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # Score
@@ -2782,6 +2878,47 @@ class SemanticIndex:
 # byte-identical behavior -- one signature -> one entry in the dict.
 _DEFAULT_INDICES: Dict[str, SemanticIndex] = {}
 _DEFAULT_INDEX_LOCK = threading.Lock()
+
+
+# ===========================================================================
+# Slice 150 — process-isolated build: worker entrypoint + reused proxy
+# (composes governance/subprocess_compute, which composes oracle_ipc)
+# ===========================================================================
+_semantic_proxy = None
+_semantic_proxy_lock = None
+
+
+def _semantic_build_handler(root_str: str) -> dict:
+    """Worker-side build (runs IN the subprocess): construct a SemanticIndex for
+    ``root_str``, build it (which writes the .npz cache), and return a tiny picklable
+    summary. No numpy crosses the Pipe — the heavy state is persisted to .npz for the
+    parent to reload via ``_load_from_cache``."""
+    idx = SemanticIndex(Path(root_str))
+    ok = idx.build(force=True)
+    return {"built": bool(ok), "n_docs": len(idx._corpus), "dim": len(idx._centroid)}
+
+
+def _semantic_build_worker_main(conn) -> None:
+    """Top-level (spawn-picklable) child entrypoint for the isolated semantic build."""
+    from backend.core.ouroboros.governance.subprocess_compute import run_worker_loop
+    run_worker_loop(conn, {"build": _semantic_build_handler})
+
+
+async def _ensure_semantic_proxy():
+    """Lazily create + start the SINGLE semantic-build subprocess proxy, reused
+    across builds (one worker process, not one-per-build). Composes
+    subprocess_compute.make_compute_proxy → oracle_ipc.AsyncOracleProxy."""
+    global _semantic_proxy, _semantic_proxy_lock
+    import asyncio
+    from backend.core.ouroboros.governance.subprocess_compute import make_compute_proxy
+    if _semantic_proxy_lock is None:
+        _semantic_proxy_lock = asyncio.Lock()
+    async with _semantic_proxy_lock:
+        if _semantic_proxy is None:
+            proxy = make_compute_proxy(_semantic_build_worker_main)
+            await proxy.start()
+            _semantic_proxy = proxy
+    return _semantic_proxy
 
 
 def get_default_index(project_root: Optional[Path] = None) -> SemanticIndex:
