@@ -229,8 +229,21 @@ def test_force_batch_ledger_overrides_static_optout(monkeypatch, tmp_path):
     assert _slice36_should_force_batch(_Ctx("immediate")) is False
 
 
-def test_force_batch_requires_claude_disabled(monkeypatch, tmp_path):
+def test_degraded_stream_forces_batch_even_with_claude_available(monkeypatch, tmp_path):
+    # Slice 170 — intra-DW transport failover. A degraded streaming wire + healthy batch
+    # lane now forces DW-batch EVEN when Claude is available, so a transport rupture fails
+    # over within DW instead of cascading to the expensive Claude fallback. (Pre-170 this
+    # asserted False — "force_batch requires Claude disabled" — which was the cost leak.)
     monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "false")
     _seed_ledger(monkeypatch, tmp_path,
                  stream=SurfaceVerdict.UPSTREAM_DEGRADED, batch=SurfaceVerdict.HEALTHY)
+    assert _slice36_should_force_batch(_Ctx("standard")) is True
+
+
+def test_healthy_stream_still_requires_claude_disabled(monkeypatch, tmp_path):
+    # The legacy invariant still holds for a HEALTHY stream: with Claude available and no
+    # degradation, RT failures may cascade to Claude (Slice 170 fires only on a rupture).
+    monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "false")
+    _seed_ledger(monkeypatch, tmp_path,
+                 stream=SurfaceVerdict.HEALTHY, batch=SurfaceVerdict.HEALTHY)
     assert _slice36_should_force_batch(_Ctx("standard")) is False
