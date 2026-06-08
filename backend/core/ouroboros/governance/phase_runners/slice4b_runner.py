@@ -677,38 +677,58 @@ class Slice4bRunner(PhaseRunner):
             )
             if infra_results and not orch._infra_applicator.all_succeeded(infra_results):
                 _failed = [r for r in infra_results if not r.success]
-                logger.error(
-                    "[Orchestrator] Infrastructure hook failed for %s: %s",
-                    ctx.op_id,
-                    "; ".join(f"{r.file_trigger}: exit={r.exit_code}" for r in _failed),
+                from backend.core.ouroboros.governance.infrastructure_applicator import (
+                    infra_fail_soft_enabled,
+                    summarize_infra_failures,
                 )
-                ctx = ctx.advance(
-                    OperationPhase.POSTMORTEM,
-                    terminal_reason_code="infrastructure_failed",
+                if not infra_fail_soft_enabled():
+                    # Legacy: terminal FAILED (operator opt-out via fail-soft=0).
+                    logger.error(
+                        "[Orchestrator] Infrastructure hook failed for %s: %s",
+                        ctx.op_id,
+                        "; ".join(f"{r.file_trigger}: exit={r.exit_code}" for r in _failed),
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code="infrastructure_failed",
+                    )
+                    await orch._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "infrastructure_failed",
+                            "infra_results": [
+                                {
+                                    "file": r.file_trigger,
+                                    "command": r.command,
+                                    "exit_code": r.exit_code,
+                                    "stderr": r.stderr_tail[:500],
+                                }
+                                for r in _failed
+                            ],
+                        },
+                    )
+                    orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+                    await orch._publish_outcome(ctx, OperationState.FAILED, "infrastructure_failed")
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason="infrastructure_failed",
+                        artifacts={"t_apply": _t_apply},
+                    )
+                # Slice 160 fail-soft: an infra-hook failure is NOT fatal. Flag
+                # INFRA_WARNING onto the context (surfaced to the operator via
+                # telemetry / Discord) and CONTINUE forward — the file change applied,
+                # only the deterministic consequence (pip/npm) didn't. The op proceeds
+                # to VERIFY/COMPLETE instead of dying before the governance floor.
+                _warn = summarize_infra_failures(_failed)
+                logger.warning(
+                    "[Orchestrator] INFRA_WARNING (fail-soft) op=%s — continuing: %s",
+                    ctx.op_id, _warn,
                 )
-                await orch._record_ledger(
-                    ctx,
-                    OperationState.FAILED,
-                    {
-                        "reason": "infrastructure_failed",
-                        "infra_results": [
-                            {
-                                "file": r.file_trigger,
-                                "command": r.command,
-                                "exit_code": r.exit_code,
-                                "stderr": r.stderr_tail[:500],
-                            }
-                            for r in _failed
-                        ],
-                    },
-                )
-                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
-                await orch._publish_outcome(ctx, OperationState.FAILED, "infrastructure_failed")
-                return PhaseResult(
-                    next_ctx=ctx, next_phase=None, status="fail",
-                    reason="infrastructure_failed",
-                    artifacts={"t_apply": _t_apply},
-                )
+                try:
+                    ctx = ctx.with_infra_warning(_warn)
+                except Exception:  # noqa: BLE001 — never let warning-stamping break the op
+                    pass
 
             for r in infra_results:
                 logger.info(

@@ -79,12 +79,75 @@ class InfraResult:
     file_trigger: str
 
 
+# Slice 160 — environment-aware manifest resolution. The agentic layer may write a
+# generic "requirements.txt", but the live environment's ACTIVE manifest can differ
+# (the soak container ships requirements-soak*.txt, not requirements.txt). Resolve the
+# manifest actually present in the repo root by priority instead of hardcoding one.
+_DEFAULT_MANIFEST_PRIORITY: Tuple[str, ...] = (
+    "requirements-soak-oracle.txt",  # Oracle-capable soak (most specific)
+    "requirements-soak.txt",          # lean soak
+    "requirements.txt",               # full host / standard
+)
+
+
+def _manifest_priority() -> Tuple[str, ...]:
+    """Manifest resolution priority (env-tunable, no hardcode in logic). Highest
+    priority first. Invalid/empty env → the default order. NEVER raises."""
+    raw = (os.environ.get("JARVIS_INFRA_MANIFEST_PRIORITY", "") or "").strip()
+    if raw:
+        parts = tuple(p.strip() for p in raw.split(",") if p.strip())
+        if parts:
+            return parts
+    return _DEFAULT_MANIFEST_PRIORITY
+
+
+def _resolve_pip_manifest(project_root: Path, requested_file: str) -> Optional[str]:
+    """Slice 160 — resolve the active pip manifest. The exact requested file wins if it
+    is actually present; otherwise the highest-priority manifest present in the repo
+    root; otherwise None (nothing to install → caller skips, never a hard fail).
+    Environment-aware, no hardcoded single-file assumption. NEVER raises."""
+    try:
+        if requested_file and (project_root / requested_file).is_file():
+            return requested_file
+        for cand in _manifest_priority():
+            if (project_root / cand).is_file():
+                return cand
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+    return None
+
+
 def _build_pip_argv(project_root: Path, file_path: str) -> List[str]:
-    """Build pip install argv using the project's venv Python."""
+    """Build pip install argv using the project's venv Python, targeting the
+    dynamically-resolved active manifest (Slice 160). Falls back to the requested
+    file when nothing resolvable is present (the fail-soft layer then catches it)."""
+    target = _resolve_pip_manifest(project_root, file_path) or file_path
     venv_pip = project_root / "venv" / "bin" / "pip"
     if venv_pip.exists():
-        return [str(venv_pip), "install", "-r", file_path]
-    return [sys.executable, "-m", "pip", "install", "-r", file_path]
+        return [str(venv_pip), "install", "-r", target]
+    return [sys.executable, "-m", "pip", "install", "-r", target]
+
+
+def infra_fail_soft_enabled() -> bool:
+    """Slice 160 — master for fail-soft infra. Default **TRUE** (failure-path-only: an
+    infra hook failure flags INFRA_WARNING and the op continues to the governance floor
+    instead of terminally dying; =0 reverts to legacy terminal-FAILED). NEVER raises."""
+    return os.environ.get("JARVIS_INFRA_FAIL_SOFT_ENABLED", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def summarize_infra_failures(results: List["InfraResult"]) -> str:
+    """Compact INFRA_WARNING text from failed infra results — surfaced in the op
+    context + the Discord #governance-gates embed so the operator can decide."""
+    parts = []
+    for r in results:
+        if not getattr(r, "success", True):
+            tail = (getattr(r, "stderr_tail", "") or "").strip().replace("\n", " ")
+            parts.append(
+                f"{getattr(r, 'file_trigger', '?')} (exit={getattr(r, 'exit_code', -1)}): "
+                f"{tail[:200]}"
+            )
+    return " | ".join(parts) if parts else ""
 
 
 def _build_npm_argv(project_root: Path, file_path: str) -> List[str]:

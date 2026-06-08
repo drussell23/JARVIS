@@ -961,6 +961,10 @@ class OperationContext:
     strategic_memory_prompt: str = ""
     strategic_memory_digest: str = ""
     terminal_reason_code: str = ""
+    # Slice 160 — non-fatal infrastructure-hook warning (e.g. pip install failed under
+    # fail-soft). Carried forward so the op reaches the governance floor / COMPLETE and
+    # the operator sees it (Discord embed / telemetry) rather than the op dying.
+    infra_warning: str = ""
     rollback_occurred: bool = False
     # P2-6: Runbook-grade observability — cross-operation correlation identifier.
     # For single-repo ops: defaults to op_id (self-referential).
@@ -1359,6 +1363,20 @@ class OperationContext:
             expanded_context_files=files,
             previous_hash=self.context_hash,
             context_hash="",  # placeholder — recomputed below
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_infra_warning(self, warning: str) -> "OperationContext":
+        """Slice 160 — return a new context carrying a non-fatal infra-hook warning
+        (no phase change). Set on fail-soft so the op continues to the governance
+        floor / COMPLETE and the operator sees it instead of the op dying."""
+        intermediate = dataclasses.replace(
+            self,
+            infra_warning=str(warning or "")[:2000],
+            previous_hash=self.context_hash,
+            context_hash="",
         )
         fields_for_hash = _context_to_hash_dict(intermediate)
         new_hash = _compute_hash(fields_for_hash)
