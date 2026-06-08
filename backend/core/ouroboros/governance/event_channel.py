@@ -70,6 +70,29 @@ class ChannelEvent:
     signature_valid: bool = True
 
 
+def _generic_classification(payload, source, event_type):
+    """Slice 166 — classify a generic (non-github/ci) channel event, honoring an
+    explicit ``target_files`` + ``description`` from the payload (injection fidelity).
+
+    An injected op can thus declare its REAL target, so the organism's own
+    governance_boundary_gate evaluates the true file set — e.g. an op touching the
+    governance cage (backend/core/ouroboros/governance/) is elevated to
+    APPROVAL_REQUIRED BY NATURE. Falls back to the broad ``("backend/",)`` default and
+    a synthesized description when unspecified. Pure + fail-soft. Returns
+    ``(urgency, description, target_files, repo)``."""
+    targets = payload.get("target_files") if isinstance(payload, dict) else None
+    if isinstance(targets, (list, tuple)) and targets:
+        resolved = tuple(str(t) for t in targets if str(t).strip())
+    else:
+        resolved = ()
+    desc = ""
+    if isinstance(payload, dict):
+        desc = str(payload.get("description") or "")
+    if not desc:
+        desc = f"{source} event: {event_type}"
+    return ("normal", desc, resolved or ("backend/",), "jarvis")
+
+
 @dataclass
 class ChannelStats:
     """Cumulative channel statistics."""
@@ -1552,13 +1575,8 @@ class EventChannelServer:
                 "jarvis",
             )
 
-        # Generic fallback
-        return (
-            "normal",
-            f"{event.source} event: {event.event_type}",
-            ("backend/",),
-            "jarvis",
-        )
+        # Generic fallback — Slice 166: honor explicit payload target_files / description
+        return _generic_classification(event.payload, event.source, event.event_type)
 
     @staticmethod
     def _repo_from_github(full_name: str) -> str:
