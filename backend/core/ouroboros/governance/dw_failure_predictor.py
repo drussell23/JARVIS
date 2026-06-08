@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import math
 import os
 import threading
 import time
 from typing import Any, Deque, Optional
+
+logger = logging.getLogger(__name__)
 
 _ENV_PREDICTIVE_ENABLED = "JARVIS_DW_PREDICTIVE_ROUTING_ENABLED"
 _ENV_HORIZON_S = "JARVIS_DW_RUPTURE_HORIZON_S"
@@ -333,8 +336,10 @@ class ThresholdCalibrator:
         self, *, initial: Optional[float] = None, step: Optional[float] = None,
         lo: Optional[float] = None, hi: Optional[float] = None,
         persist_path: Any = "__default__", max_pending: Optional[int] = None,
+        name: str = "",
     ) -> None:
         self._lock = threading.Lock()
+        self._name = name or "global"  # Slice 176 — for soak observability logging
         self._step = step if step is not None else _calibration_step()
         self._lo = lo if lo is not None else _threshold_floor()
         self._hi = hi if hi is not None else _threshold_ceiling()
@@ -398,8 +403,16 @@ class ThresholdCalibrator:
                             self._threshold = nt
                             changed = True
                 self._pending = keep
+                _new_thr = self._threshold
+                _fp, _fn, _bn = self._fp, self._fn, self._brier_n
+                _bs = self._brier_sum
             if changed:
                 self._persist()
+                # Slice 176 — soak observability: the cortex is learning its boundary.
+                logger.info(
+                    "[Cortex] calibrate model=%s threshold→%.3f (FP=%d FN=%d brier=%.3f n=%d)",
+                    self._name, _new_thr, _fp, _fn, (_bs / _bn) if _bn else 0.0, _bn,
+                )
             return evaluated
         except Exception:  # noqa: BLE001
             return 0
@@ -453,7 +466,9 @@ def get_threshold_calibrator(model_id: Any = "") -> "ThresholdCalibrator":
         with _calibrators_lock:
             cal = _calibrators.get(key)
             if cal is None:
-                cal = ThresholdCalibrator(persist_path=_calibration_persist_path(key))
+                cal = ThresholdCalibrator(
+                    persist_path=_calibration_persist_path(key), name=(key or "global"),
+                )
                 _calibrators[key] = cal
     return cal
 

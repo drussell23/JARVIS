@@ -1,0 +1,72 @@
+# JARVIS — DW Predictive-Cortex Soak (Slices 168–176)
+# =============================================================================
+# A DW-ONLY soak to validate the predictive cortex on live DoubleWord traffic.
+# Claude is DISABLED (JARVIS_PROVIDER_CLAUDE_DISABLED=true) — no cross-provider
+# cascade — so the organism runs on DW alone and the cortex accumulates its
+# intelligence (per-model rupture rings, multi-signal fusion, self-calibration)
+# from real DW failures.
+#
+#   ./scripts/launch_dw_cortex_soak.sh                 # build + up -d + tail
+#   docker compose -f docker-compose.dw-cortex-soak.yml logs -f | grep Cortex
+#   docker compose -f docker-compose.dw-cortex-soak.yml down
+#
+# NOTE on routing impact: with Claude disabled, Slice 36 already routes
+# standard/complex ops to batch, so the cortex's *preemptive reroute* is moot
+# (batch either way) — but its *learning* (forecasts, calibration, per-model,
+# multi-signal) runs fully and IS observable (see DW_CORTEX_SOAK.md). The
+# reroute's economic impact (avoided Claude cascades) is only meaningful with a
+# funded, available Claude — out of scope for a DW-only test by design.
+# =============================================================================
+services:
+  jarvis-dw-cortex-soak:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.soak
+      args:
+        SOAK_REQUIREMENTS: ${SOAK_REQUIREMENTS:-requirements-soak-oracle.txt}
+    image: jarvis-sovereign-soak:oracle
+    container_name: jarvis-dw-cortex-soak
+    working_dir: /app
+    restart: always
+    stop_grace_period: 30s
+    env_file:
+      - path: .env          # funded DOUBLEWORD_API_KEY — runtime only, never imaged
+        required: false
+    environment:
+      # ── DW-ONLY: no Claude, no cross-provider cascade ──
+      JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+      # ── The predictive cortex — the subject of this soak (172/174 are default-OFF) ──
+      JARVIS_DW_PREDICTIVE_ROUTING_ENABLED: "1"      # 172 — preemptive forecast routing
+      JARVIS_DW_CALIBRATION_ENABLED: "1"             # 174 — self-tuning Brier threshold
+      JARVIS_DW_DYNAMIC_RECOVERY_ENABLED: "1"        # 127 — dynamic exp recovery window
+      # ── Default-ON DW-arc protections (pinned explicit for the soak record) ──
+      JARVIS_DW_INTRA_TRANSPORT_FAILOVER_ENABLED: "1"  # 170
+      JARVIS_ECONOMIC_TELEMETRY_ENABLED: "1"            # 171
+      JARVIS_DW_SURFACE_HEALTH_ENABLED: "1"            # 39/40
+      # ── Cortex tuning (defaults; override to accelerate/observe in a short run) ──
+      # JARVIS_DW_RUPTURE_RISK_THRESHOLD: "0.7"   # 172 initial baseline (174 self-tunes)
+      # JARVIS_DW_RUPTURE_HORIZON_S: "300"        # forecast window
+      # JARVIS_DW_SIGNAL_WEIGHT_ECONOMIC: "2.0"   # 176 vector weights
+      # ── Organism baseline ──
+      JARVIS_EPISODIC_CORE_ENABLED: "1"
+      JARVIS_CAI_ROUTER_ENABLED: "1"
+      JARVIS_KAREN_VOICE_ENABLED: "0"
+      JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED: "1"
+      # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
+      # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
+      # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
+    volumes:
+      # Calibration state (dw_threshold_calibration_<model>.json) + episodic memory
+      # persist on the host → survive restart (no cortex amnesia).
+      - ./.jarvis:/app/.jarvis
+    # The battle-test loop IS the supervisor (headless, no wall cap; restart:always
+    # gives longevity). Cost cap is the only ceiling — DW is cheap, so $25 lasts.
+    command: >-
+      python3 scripts/ouroboros_battle_test.py
+      --production-soak --headless
+      --cost-cap 25 --idle-timeout 0 --max-wall-seconds 0
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8g
