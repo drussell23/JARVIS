@@ -116,6 +116,26 @@ def claude_economic_breaker_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def adaptive_reprobe_enabled() -> bool:
+    """Slice 147 — master for ADAPTIVE exponential economic re-probe backoff.
+    Default FALSE per §33.1. When OFF, the economic breaker keeps the fixed
+    recovery window (byte-identical to Slice 127). NEVER raises."""
+    return os.environ.get(
+        "JARVIS_CLAUDE_ECONOMIC_ADAPTIVE_REPROBE_ENABLED", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _max_reprobe_exponent() -> int:
+    """Cap on the economic re-probe exponent (window = base * 2**exp). Default 4
+    → max 16x the base window. Floored at 0. NEVER raises."""
+    try:
+        return max(0, int(
+            os.environ.get("JARVIS_CLAUDE_ECONOMIC_REPROBE_MAX_EXPONENT", "4")
+        ))
+    except (TypeError, ValueError):
+        return 4
+
+
 def _economic_threshold() -> int:
     """Consecutive economic exhaustions that trip the lane. Default 1 — an
     economic refusal ("credit balance too low" / 402) is a definitive,
@@ -210,6 +230,10 @@ class ClaudeCircuitBreaker:
         # Slice 127 — economic-exhaustion counter, kept DISTINCT from the
         # transport counter so the two health signals don't cross-contaminate.
         self._consecutive_economic_failures: int = 0
+        # Slice 147 — adaptive economic re-probe backoff. Grows by 1 on each
+        # failed economic HALF_OPEN probe (window = base * 2**exp), reset on
+        # success. Inert unless adaptive_reprobe_enabled().
+        self._economic_reprobe_exponent: int = 0
         self._tripped_at_monotonic: Optional[float] = None
         self._failure_threshold: int = (
             failure_threshold
@@ -316,13 +340,19 @@ class ClaudeCircuitBreaker:
         with self._lock:
             if self._state is CircuitState.HALF_OPEN:
                 # Probe hit the SAME economic wall — re-open, reset the clock.
+                # Slice 147: grow the adaptive re-probe exponent so a persistently
+                # broke lane is re-probed exponentially less often (DW runs clean).
                 self._state = CircuitState.OPEN
                 self._tripped_at_monotonic = time.monotonic()
                 self._total_trips += 1
+                if adaptive_reprobe_enabled():
+                    self._economic_reprobe_exponent = min(
+                        self._economic_reprobe_exponent + 1, _max_reprobe_exponent(),
+                    )
                 logger.warning(
                     "[ClaudeCircuitBreaker] HALF_OPEN economic probe failed "
-                    "(%s) — re-tripping to OPEN",
-                    detail,
+                    "(%s) — re-tripping to OPEN (re-probe window now %.0fs)",
+                    detail, self._effective_recovery_window_s(),
                 )
                 return
             self._consecutive_economic_failures += 1
@@ -352,6 +382,7 @@ class ClaudeCircuitBreaker:
             self._total_successes += 1
             self._consecutive_transport_failures = 0
             self._consecutive_economic_failures = 0
+            self._economic_reprobe_exponent = 0  # Slice 147: funding returned → reset backoff
             if self._state is not CircuitState.CLOSED:
                 logger.info(
                     "[ClaudeCircuitBreaker] %s -> CLOSED (probe "
@@ -372,6 +403,19 @@ class ClaudeCircuitBreaker:
         with self._lock:
             self._consecutive_transport_failures = 0
 
+    def _effective_recovery_window_s(self) -> float:
+        """Slice 147 — the recovery window in force. With adaptive re-probe ON,
+        an economically-quarantined lane backs off exponentially
+        (base * 2**exponent, exponent capped); OFF → the fixed base window
+        (byte-identical to Slice 127). NEVER raises."""
+        try:
+            if not adaptive_reprobe_enabled() or self._economic_reprobe_exponent <= 0:
+                return self._recovery_window_s
+            exp = min(self._economic_reprobe_exponent, _max_reprobe_exponent())
+            return self._recovery_window_s * float(2 ** exp)
+        except Exception:  # noqa: BLE001
+            return self._recovery_window_s
+
     def should_allow_request(self) -> bool:
         """Pre-call gate: True if a Claude request should be attempted.
 
@@ -389,13 +433,14 @@ class ClaudeCircuitBreaker:
                     self._state = CircuitState.HALF_OPEN
                     return True
                 elapsed = time.monotonic() - self._tripped_at_monotonic
-                if elapsed >= self._recovery_window_s:
+                _window = self._effective_recovery_window_s()
+                if elapsed >= _window:
                     self._state = CircuitState.HALF_OPEN
                     logger.info(
                         "[ClaudeCircuitBreaker] OPEN -> HALF_OPEN "
                         "(recovery window %.0fs elapsed) — allowing "
                         "one probe",
-                        self._recovery_window_s,
+                        _window,
                     )
                     return True
                 return False
@@ -410,6 +455,7 @@ class ClaudeCircuitBreaker:
             self._state = CircuitState.CLOSED
             self._consecutive_transport_failures = 0
             self._consecutive_economic_failures = 0
+            self._economic_reprobe_exponent = 0
             self._tripped_at_monotonic = None
 
     def snapshot(self) -> dict:
@@ -421,6 +467,9 @@ class ClaudeCircuitBreaker:
                     self._consecutive_transport_failures,
                 "consecutive_economic_failures":
                     self._consecutive_economic_failures,
+                "economic_reprobe_exponent": self._economic_reprobe_exponent,
+                "effective_recovery_window_s":
+                    self._effective_recovery_window_s(),
                 "tripped_at_monotonic": self._tripped_at_monotonic,
                 "failure_threshold": self._failure_threshold,
                 "recovery_window_s": self._recovery_window_s,
