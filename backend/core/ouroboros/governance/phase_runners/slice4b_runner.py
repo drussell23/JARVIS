@@ -152,11 +152,17 @@ class Slice4bRunner(PhaseRunner):
             from backend.core.ouroboros.governance.risk_tier_floor import (
                 apply_floor_to_risk_tier,
             )
+            # Slice 167 — evaluate the UNION of declared + generated targets so a
+            # candidate that overwrote target_files cannot mask a declared cage target.
+            try:
+                _u_targets = ctx.effective_targets()
+            except Exception:  # noqa: BLE001
+                _u_targets = tuple(getattr(ctx, "target_files", ()) or ())
             _u_floored = apply_floor_to_risk_tier(
                 risk_tier,
                 signal_source=str(getattr(ctx, "signal_source", "") or ""),
                 op_id=ctx.op_id,
-                target_files=tuple(getattr(ctx, "target_files", ()) or ()),
+                target_files=_u_targets,
             )
             if _u_floored is not risk_tier:
                 logger.warning(
