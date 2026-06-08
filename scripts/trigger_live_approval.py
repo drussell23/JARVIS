@@ -30,8 +30,12 @@ import os
 import sys
 import urllib.request
 
+# `docker exec python3 scripts/x.py` puts /app/scripts on sys.path, not /app — so the
+# `backend` package isn't importable. Bootstrap the repo root (parent of scripts/).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Reuse the canonical payload builder + source tag (single source of truth).
-from backend.core.ouroboros.governance.discord_gateway import (
+from backend.core.ouroboros.governance.discord_gateway import (  # noqa: E402
     build_livefire_payload,
     LIVEFIRE_SOURCE,
 )
