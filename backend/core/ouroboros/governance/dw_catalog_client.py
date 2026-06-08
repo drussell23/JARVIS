@@ -206,6 +206,75 @@ def parse_family(model_id: str) -> str:
     return model_id.split("/", 1)[0].strip().lower() or "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Slice 169 — dynamic reasoning_effort capability resolution from /v1/models
+# ---------------------------------------------------------------------------
+_REASONING_EFFORT_ORDER: Tuple[str, ...] = ("none", "low", "medium", "high")
+# Candidate metadata shapes (DW hasn't finalized the field name — we accept several).
+_REASONING_EFFORT_KEYS: Tuple[str, ...] = (
+    "supported_reasoning_efforts", "reasoning_efforts", "reasoning_effort_values",
+)
+
+
+def parse_supported_reasoning_efforts(raw: Mapping[str, Any]) -> Tuple[str, ...]:
+    """Slice 169 — extract the reasoning_effort values a model supports from its raw
+    ``/v1/models`` metadata. Checks top-level keys + a ``capabilities`` sub-dict
+    (multiple candidate shapes). Returns ``()`` when DW doesn't expose it — caller falls
+    back to the static floor. NEVER raises."""
+    try:
+        if not isinstance(raw, Mapping):
+            return ()
+        found = None
+        for k in _REASONING_EFFORT_KEYS:
+            v = raw.get(k)
+            if isinstance(v, (list, tuple)):
+                found = v
+                break
+        if found is None:
+            caps = raw.get("capabilities")
+            if isinstance(caps, Mapping):
+                for k in (*_REASONING_EFFORT_KEYS, "reasoning_effort"):
+                    v = caps.get(k)
+                    if isinstance(v, (list, tuple)):
+                        found = v
+                        break
+        if not found:
+            return ()
+        return tuple(str(x).strip().lower() for x in found if str(x).strip())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def catalog_min_reasoning_effort(model_id: str, *, snapshot: Any = None) -> Optional[str]:
+    """Slice 169 — the minimum reasoning_effort the model supports per DW's live
+    ``/v1/models`` capability metadata (via the cached catalog). Returns ``None`` when
+    discovery is off, the model or its metadata is absent → the caller falls back to the
+    static floor. ``snapshot`` injectable for tests; default = the disk-cached catalog
+    (no network). NEVER raises."""
+    try:
+        if snapshot is None:
+            if not discovery_enabled():
+                return None
+            snapshot = load_cached_snapshot(None)
+        if snapshot is None:
+            return None
+        mid = str(model_id).strip().lower()
+        for card in getattr(snapshot, "models", ()) or ():
+            cmid = str(getattr(card, "model_id", "")).strip().lower()
+            if cmid == mid or (mid and mid in cmid):
+                raw = json.loads(getattr(card, "raw_metadata_json", "") or "{}")
+                efforts = parse_supported_reasoning_efforts(raw)
+                if not efforts:
+                    return None
+                for e in _REASONING_EFFORT_ORDER:
+                    if e in efforts:
+                        return e
+                return None
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @dataclass(frozen=True)
 class ModelCard:
     """One model from DW's ``/models`` catalog.
