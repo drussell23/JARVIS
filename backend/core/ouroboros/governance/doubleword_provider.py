@@ -527,6 +527,10 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
             and _dw_rupture_risk_high(model_id)
             and _dw_batch_lane_healthy()
         ):
+            logger.info(
+                "[Cortex] forecast preempt: model=%s rupture-risk≥threshold → DW-batch "
+                "(dodging the rupture before it throws)", model_id or "?",
+            )
             return True
 
         # Legacy pure-DW batch optimization: requires Claude unavailable. With Claude
