@@ -436,15 +436,15 @@ def _slice172_predictive_routing_enabled() -> bool:
         return False
 
 
-def _dw_rupture_risk_high() -> bool:
-    """Slice 172/174 — is the FORECAST rupture risk at/above the (possibly self-calibrated)
-    threshold? Delegates to the predictor's risk_exceeds_threshold, which also drives the
-    Slice 174 calibration feedback loop when enabled. NEVER raises."""
+def _dw_rupture_risk_high(model_id: str = "") -> bool:
+    """Slice 172/174/175 — is the FORECAST rupture risk for THIS model at/above its (possibly
+    self-calibrated) threshold? Delegates to the predictor's per-model risk_exceeds_threshold,
+    which also drives that model's Slice 174 calibration loop when enabled. NEVER raises."""
     try:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor,
         )
-        return get_dw_failure_predictor().risk_exceeds_threshold()
+        return get_dw_failure_predictor().risk_exceeds_threshold(model_id=model_id)
     except Exception:  # noqa: BLE001
         return False
 
@@ -464,8 +464,12 @@ def _dw_batch_lane_healthy() -> bool:
         return False
 
 
-def _slice36_should_force_batch(context: Any) -> bool:
+def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     """Slice 36 — adaptive transport selector decision.
+
+    ``model_id`` (Slice 175): the resolved target DW model, so the predictive branch queries
+    that model's OWN rupture forecast (a volatile model batches while a stable one streams).
+    Empty → the shared "unknown" bucket (graceful for call sites that haven't resolved it).
 
     Returns True when the BATCH API path should be used in place of
     the RT streaming path for THIS specific op.
@@ -520,7 +524,7 @@ def _slice36_should_force_batch(context: Any) -> bool:
         if (
             _route_ok
             and _slice172_predictive_routing_enabled()
-            and _dw_rupture_risk_high()
+            and _dw_rupture_risk_high(model_id)
             and _dw_batch_lane_healthy()
         ):
             return True
@@ -1916,7 +1920,7 @@ class DoublewordProvider:
         # streaming TTFT p50 = 66.8s vs batch end-to-end 4-8s for
         # the same prompts. STANDARD/COMPLEX routes under pure-DW
         # config skip RT entirely and go straight to batch.
-        _slice36_force_batch = _slice36_should_force_batch(context)
+        _slice36_force_batch = _slice36_should_force_batch(context, model_id=_effective_model)
         if _slice36_force_batch:
             # Slice 171 — surface the Slice 170 capital save (records iff Claude was
             # available, i.e. a rupture-reroute we'd otherwise have cascaded to Claude).

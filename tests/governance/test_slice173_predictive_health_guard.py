@@ -38,7 +38,7 @@ def _high_risk_claude_available(monkeypatch):
     monkeypatch.delenv("JARVIS_PROVIDER_CLAUDE_DISABLED", raising=False)
     monkeypatch.setattr(DW, "_claude_breaker_open", lambda *a, **k: False)
     monkeypatch.setenv("JARVIS_DW_PREDICTIVE_ROUTING_ENABLED", "1")
-    monkeypatch.setattr(DW, "_dw_rupture_risk_high", lambda: True)
+    monkeypatch.setattr(DW, "_dw_rupture_risk_high", lambda *a, **k: True)
 
 
 def test_predictive_detour_fires_when_batch_healthy(monkeypatch, tmp_path):

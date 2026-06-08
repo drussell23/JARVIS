@@ -236,8 +236,11 @@ def rupture_risk_line() -> str:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor,
             render_rupture_risk,
+            rupture_risk_threshold,
         )
-        return render_rupture_risk(get_dw_failure_predictor().rupture_probability())
+        # Slice 175 — surface the RISKIEST model + its own threshold, not a global average.
+        model, prob = get_dw_failure_predictor().highest_risk_model()
+        return render_rupture_risk(prob, rupture_risk_threshold(model), model)
     except Exception:  # noqa: BLE001
         return "🟢 DW rupture risk: 0% (next 5m)"
 
