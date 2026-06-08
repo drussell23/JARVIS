@@ -105,9 +105,11 @@ class TestPreemptiveRouting(unittest.TestCase):
             "_claude_breaker_open": DW._claude_breaker_open,
             "_dw_rupture_risk_high": DW._dw_rupture_risk_high,
             "_slice41_ledger_force_batch": DW._slice41_ledger_force_batch,
+            "_dw_batch_lane_healthy": DW._dw_batch_lane_healthy,
         }
         DW._claude_breaker_open = lambda *a, **k: False  # type: ignore
         DW._slice41_ledger_force_batch = lambda: False  # no confirmed degradation
+        DW._dw_batch_lane_healthy = lambda: True  # Slice 173 guard: batch healthy by default
 
     def tearDown(self):
         self._os.environ.pop("JARVIS_DW_PREDICTIVE_ROUTING_ENABLED", None)
