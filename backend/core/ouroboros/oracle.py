@@ -1973,7 +1973,7 @@ class TheOracle:
             # timeout without hanging the asyncio loop.
             if self._semantic_index is None:
                 with _OraclePhase("oracle_semantic_index_init"):
-                    self._semantic_index = OracleSemanticIndex()
+                    self._ensure_semantic_index()
 
             self._readiness.mark_semantic_ready()
             self._running = True
@@ -2044,6 +2044,18 @@ class TheOracle:
         self._running = False
         logger.info("The Oracle shutdown complete")
 
+    def _ensure_semantic_index(self) -> "OracleSemanticIndex":
+        """Slice 154 — lazily construct the OracleSemanticIndex if it isn't up yet.
+
+        ``initialize_backend`` pre-warms ``self._semantic_index``, but full_index /
+        incremental_update can run before that semantic phase — leaving it None and
+        crashing ``embed_nodes`` with 'NoneType has no attribute embed_nodes'. This
+        guarantees a non-None index at every embed call site (single construction
+        point; OracleSemanticIndex.__init__ is lazy + never raises). NEVER returns None."""
+        if self._semantic_index is None:
+            self._semantic_index = OracleSemanticIndex()
+        return self._semantic_index
+
     async def full_index(self) -> None:
         """Perform a full index of all repositories."""
         logger.info("Starting full codebase index...")
@@ -2072,7 +2084,7 @@ class TheOracle:
         # Embed all nodes into semantic index (fault-isolated)
         try:
             all_nodes = self._graph.get_all_nodes()
-            await self._semantic_index.embed_nodes(all_nodes)
+            await self._ensure_semantic_index().embed_nodes(all_nodes)
         except Exception as exc:
             logger.warning("[Oracle] Semantic embedding after full_index failed: %s", exc)
 
@@ -2114,7 +2126,7 @@ class TheOracle:
                 ]
             else:
                 changed_nodes = self._graph.get_all_nodes()
-            await self._semantic_index.embed_nodes(changed_nodes)
+            await self._ensure_semantic_index().embed_nodes(changed_nodes)
         except Exception as exc:
             logger.warning("[Oracle] Semantic embedding after incremental_update failed: %s", exc)
 
