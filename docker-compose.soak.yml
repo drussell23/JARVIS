@@ -19,6 +19,10 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.soak
+      args:
+        # Slice 152 — lean (default) or Oracle-capable. launch_docker_soak.sh
+        # --oracle exports SOAK_REQUIREMENTS=requirements-soak-oracle.txt.
+        SOAK_REQUIREMENTS: ${SOAK_REQUIREMENTS:-requirements-soak.txt}
     image: jarvis-sovereign-soak:latest
     container_name: jarvis-sovereign-soak
     working_dir: /app
