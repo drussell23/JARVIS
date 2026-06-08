@@ -613,6 +613,19 @@ class GoalInferenceEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    async def build_offloaded(self, *, force: bool = False) -> InferenceResult:
+        """Slice 149 Phase 2 — async, off-loop build for boot/soak call sites.
+
+        The synchronous ``build()`` (→ ``SemanticIndex.build``, fastembed
+        inference + ``git log`` corpus assembly) can stall the event loop several
+        seconds (LoopSink caught ~8.8s). Running it via ``asyncio.to_thread``
+        keeps the governance loop responsive while other coroutines proceed. This
+        is the SINGLE off-loop entry point — orchestrator CONTEXT_EXPANSION and
+        the CLASSIFY phase runner both use it, so no caller scatters its own
+        ``to_thread`` wrapper. Returns the same ``InferenceResult`` as ``build``."""
+        import asyncio as _asyncio
+        return await _asyncio.to_thread(self.build, force=force)
+
     def build(self, *, force: bool = False) -> InferenceResult:
         if not inference_enabled():
             return InferenceResult(build_reason="disabled")

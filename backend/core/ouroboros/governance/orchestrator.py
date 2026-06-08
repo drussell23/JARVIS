@@ -2644,11 +2644,11 @@ class GovernedOrchestrator:
                         _engine = GoalInferenceEngine(
                             repo_root=self._config.project_root,
                         )
-                    # Slice 148 — the heavy GoalInferenceEngine.build (→
+                    # Slice 148/149 — the heavy GoalInferenceEngine.build (→
                     # SemanticIndex.build, fastembed inference) is synchronous and
-                    # was caught stalling the event loop ~8s (LoopSink). Offload it
-                    # so other coroutines keep running while it builds.
-                    _inf_result = await asyncio.to_thread(_engine.build)
+                    # stalls the event loop ~8s (LoopSink). Use the single off-loop
+                    # entry point so both boot call sites share one pattern.
+                    _inf_result = await _engine.build_offloaded()
                     _inf_text = render_prompt_section(_inf_result)
                     if _inf_text:
                         _existing = getattr(
