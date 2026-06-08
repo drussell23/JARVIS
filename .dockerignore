@@ -103,3 +103,11 @@ credentials/
 \!.env.example
 .jarvis/
 .claude/worktrees/
+
+# ── Battle-test / soak RUNTIME output — never needed in the image, and HUGE
+# (.ouroboros session debug.logs alone were 2.3GB, dwarfing the real context
+# and stalling `docker build` on context transfer). Pure runtime artifacts.
+.ouroboros/
+.ouroboros/**
+*.debug.log
+**/sessions/**
