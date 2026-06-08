@@ -737,21 +737,38 @@ class BattleTestHarness:
         # fail-soft. Placed here (not in the CommandCenter region, which the
         # production soak skips) so it ALWAYS arms when JARVIS_DISCORD_BRIDGE_ENABLED.
         # The broker is a lazy singleton; subscribing early just waits on its queue.
+        # Slice 149 Phase 1 — VISIBLE startup diagnostics. This block was silent
+        # in the soak (no armed/skip log) despite the flag being set; logging may
+        # not be fully configured this early in run(), so emit to stderr too
+        # (boot diagnostic, deterministic) and surface skips/errors at WARNING.
         try:
             from backend.core.ouroboros.governance.discord_observability_bridge import (
                 discord_bridge_enabled,
                 run_bridge_against_broker,
             )
-            if discord_bridge_enabled():
+            _bridge_on = discord_bridge_enabled()
+            print(
+                f"[DiscordBridge] boot: enabled={_bridge_on} "
+                f"(JARVIS_DISCORD_BRIDGE_ENABLED)",
+                file=sys.stderr, flush=True,
+            )
+            if _bridge_on:
                 self._discord_bridge_task = asyncio.create_task(
                     run_bridge_against_broker(stop=self._shutdown_event)
                 )
-                logger.info(
+                logger.warning(
                     "[DiscordBridge] live organism feed armed (Slice 142/143/145) — "
                     "streaming broker events to Discord"
                 )
+            else:
+                logger.warning(
+                    "[DiscordBridge] NOT armed — JARVIS_DISCORD_BRIDGE_ENABLED is off"
+                )
         except Exception as exc:  # noqa: BLE001 — never fatal to the soak
-            logger.debug("[DiscordBridge] bridge boot skipped: %s", exc)
+            print(f"[DiscordBridge] boot FAILED: {exc!r}", file=sys.stderr, flush=True)
+            logger.warning(
+                "[DiscordBridge] bridge boot FAILED: %r", exc, exc_info=True,
+            )
         # Ticket A Guard 2: wall-clock ceiling. Event fires when total session
         # wall time exceeds config.max_wall_seconds_s. Prevents provider retry
         # storms from hijacking both --idle-timeout (reset by retry activity)
