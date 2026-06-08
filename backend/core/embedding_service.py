@@ -71,6 +71,11 @@ class EmbeddingServiceConfig:
     # Model settings
     model_name: str = "all-MiniLM-L6-v2"
     device: str = "cpu"  # "cpu", "cuda", "mps"
+    # Slice 153 — fastembed fallback model (used when sentence-transformers is
+    # unavailable, e.g. the Oracle-capable soak image which ships fastembed not
+    # torch). 384-dim like all-MiniLM-L6-v2 → embedding-dim compatible. The model
+    # name is config-sourced (no hardcode in logic); matches semantic_index's default.
+    fastembed_model_name: str = "BAAI/bge-small-en-v1.5"
 
     # Performance settings
     batch_size: int = 32
@@ -104,7 +109,51 @@ class EmbeddingServiceConfig:
             pool_size=int(os.getenv("EMBEDDING_POOL_SIZE", "0")),
             enable_cache=os.getenv("EMBEDDING_CACHE", "true").lower() == "true",
             cache_maxsize=int(os.getenv("EMBEDDING_CACHE_SIZE", "10000")),
+            fastembed_model_name=os.getenv(
+                "EMBEDDING_FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5",
+            ),
         )
+
+
+# =============================================================================
+# Slice 153 — fastembed fallback adapter (SentenceTransformer.encode-compatible)
+# =============================================================================
+
+class _FastembedSTAdapter:
+    """A ``SentenceTransformer.encode``-compatible adapter over fastembed's
+    ``TextEmbedding``. Slice 153 — lets ``EmbeddingService.encode()`` (and every
+    one of its 14+ consumers, incl. the Oracle's ``embed_nodes``) work UNCHANGED on
+    fastembed when sentence-transformers is unavailable (the Oracle-capable soak
+    image ships fastembed, not torch). Exposes only the ``encode(...)`` subset
+    EmbeddingService calls; returns a normalized float32 ``(n, dim)`` array."""
+
+    def __init__(self, model_name: str, *, factory: Any = None) -> None:
+        self.model_name = model_name
+        if factory is not None:
+            self._te = factory(model_name)          # injectable for tests
+        else:
+            from fastembed import TextEmbedding      # deferred: no import unless used
+            self._te = TextEmbedding(model_name=model_name)
+
+    def encode(
+        self,
+        sentences: Any,
+        batch_size: Any = None,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+        convert_to_numpy: bool = True,
+        **_kw: Any,
+    ) -> np.ndarray:
+        items = [sentences] if isinstance(sentences, str) else list(sentences)
+        vecs = [np.asarray(v, dtype="float32") for v in self._te.embed(items)]
+        if not vecs:
+            return np.zeros((0, 0), dtype="float32")
+        arr = np.vstack(vecs).astype("float32")
+        if normalize_embeddings:
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            arr = arr / norms
+        return arr
 
 
 # =============================================================================
@@ -230,6 +279,11 @@ class EmbeddingService:
             logger.warning(f"[EmbeddingService] Memory check failed: {e}, proceeding anyway")
             return True
 
+    def _make_fastembed_model(self, factory: Any = None) -> "_FastembedSTAdapter":
+        """Slice 153 — build the SentenceTransformer.encode-compatible fastembed
+        adapter (config-sourced model name). ``factory`` injectable for tests."""
+        return _FastembedSTAdapter(self._config.fastembed_model_name, factory=factory)
+
     async def _load_model(self) -> bool:
         """
         Lazy load the SentenceTransformer model.
@@ -296,8 +350,28 @@ class EmbeddingService:
                 return True
 
             except ImportError as e:
-                logger.error(f"[EmbeddingService] ❌ sentence-transformers not installed: {e}")
-                return False
+                # Slice 153 — sentence-transformers absent (e.g. the Oracle-capable
+                # soak image: fastembed, not torch). Fall back to fastembed via a
+                # SentenceTransformer.encode-compatible adapter so encode() works
+                # unchanged — instead of returning None (which left the Oracle's
+                # embed_nodes producing no embeddings).
+                logger.warning(
+                    "[EmbeddingService] sentence-transformers unavailable (%s) — "
+                    "falling back to fastembed (model=%s)",
+                    e, self._config.fastembed_model_name,
+                )
+                try:
+                    self._model = self._make_fastembed_model()
+                    logger.info(
+                        "[EmbeddingService] ✅ fastembed fallback loaded: model=%s",
+                        self._config.fastembed_model_name,
+                    )
+                    return True
+                except Exception as fe:  # noqa: BLE001
+                    logger.error(
+                        "[EmbeddingService] ❌ fastembed fallback failed: %s", fe,
+                    )
+                    return False
             except Exception as e:
                 logger.error(f"[EmbeddingService] ❌ Failed to load model: {e}")
                 return False
