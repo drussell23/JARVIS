@@ -10,6 +10,14 @@ one command migrates the whole organism from your workstation to a cloud host.
 |---|---|---|---|
 | **Full host** (`migrate_to_host.sh` → `provision_host.sh` installs `requirements.txt`) | complete graph (incl. `networkx`/`tree_sitter`/`scipy`/`sklearn`) | **runs** (codebase graph live) | **Canonical 12-month production soak** |
 | **Lean Docker** (`docker/requirements-soak.txt`) | minimal governance-loop set only | **DEGRADED by design** (context-free) | Cost/governance + Discord-observability soak; quick local runs |
+| **Oracle-capable Docker** (`docker/requirements-soak-oracle.txt`, `launch_docker_soak.sh --oracle`) | lean + Oracle graph stack (`networkx`/`scipy`/`scikit-learn`/`tree_sitter`/`aiofiles`, arm64 wheels) | **runs** | **macOS soak with the Oracle live** — detached + decoupled, no separate Linux host |
+
+**On macOS (no separate Linux host):** `./scripts/launch_docker_soak.sh --oracle`
+builds the Oracle-capable image (the lean set + the Oracle graph deps via `-r`, NOT
+the full torch/transformers stack) and runs it **detached under dockerd** — surviving
+this session + reboot (with Docker Desktop auto-start), decoupled from any agent
+event loop, with the Oracle booting (preflight passes). This is the canonical-
+equivalent soak for a Mac without provisioning a cloud VM.
 
 **Do not bloat `docker/requirements-soak.txt`** to make the lean image run the
 Oracle — that muddies the architecture. The lean image is *meant* to run

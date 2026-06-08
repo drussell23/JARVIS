@@ -1,0 +1,20 @@
+# JARVIS Oracle-capable Soak — lean governance deps + the Oracle's codebase-graph deps.
+# =============================================================================
+# This is the Oracle-CAPABLE variant for macOS/Docker (no separate Linux host):
+# the lean governance set PLUS the Oracle's graph stack, so the Oracle dependency
+# preflight (Slice 149-P4) passes and the Oracle boots in-container.
+#
+# It does NOT bloat the lean requirements-soak.txt (composed via -r) and it does
+# NOT pull the full monorepo ML/voice/training stack (torch/transformers/etc. —
+# ResolutionImpossible on linux). The graph deps below all ship arm64 wheels.
+# =============================================================================
+-r requirements-soak.txt
+
+# Oracle codebase-graph stack (oracle.py: "networkx is required for Oracle")
+networkx>=3.0
+scipy
+scikit-learn
+tree_sitter
+
+# Event Spine (event-driven sensors instead of polling fallback)
+aiofiles

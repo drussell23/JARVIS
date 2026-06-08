@@ -17,6 +17,16 @@ die() { printf '\033[31m[docker-soak] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 docker info >/dev/null 2>&1 || die "docker daemon not reachable."
 
+# Slice 152 — --oracle builds the Oracle-CAPABLE image (lean + Oracle graph deps:
+# networkx/scipy/scikit-learn/tree_sitter/aiofiles) so the Oracle BOOTS in-container
+# on macOS/Docker (no separate Linux host). Default = lean (Oracle-degraded).
+for _arg in "$@"; do
+  if [ "$_arg" = "--oracle" ]; then
+    export SOAK_REQUIREMENTS="requirements-soak-oracle.txt"
+    log "ORACLE-CAPABLE build selected (SOAK_REQUIREMENTS=$SOAK_REQUIREMENTS)."
+  fi
+done
+
 # Preflight: the runtime-mounted secrets + crypto must exist on the host.
 [ -f "$REPO_ROOT/.env" ] || die "no .env at repo root (funded DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY required)."
 [ -f "$REPO_ROOT/.jarvis/roadmap.signed.yaml" ] || die "no .jarvis/roadmap.signed.yaml — provision + sign first (sovereign_keys), the Layer-4 gate is fail-closed."
@@ -38,7 +48,9 @@ log "  Stop:   ${DC[*]} -f $COMPOSE down"
 log "  Reboot-survival: sudo systemctl enable docker   (so dockerd starts on boot)"
 log "═══════════════════════════════════════════════════════════════"
 
-if [ "${1:-}" != "--no-logs" ]; then
+_no_logs=0
+for _arg in "$@"; do [ "$_arg" = "--no-logs" ] && _no_logs=1; done
+if [ "$_no_logs" -eq 0 ]; then
   log "Tailing logs (Ctrl-C detaches; the container keeps running)…"
   "${DC[@]}" -f "$COMPOSE" logs -f jarvis-soak
 fi

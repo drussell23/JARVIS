@@ -33,10 +33,17 @@ WORKDIR /app
 # vision/voice/training stack (torch / transformers / faster-whisper / speechbrain)
 # that (a) the governance loop never imports and (b) does not resolve in a clean
 # Linux container (torch==2.12.0 is private-index-only; transformers vs pinned
-# huggingface-hub is ResolutionImpossible). See docker/requirements-soak.txt.
-COPY docker/requirements-soak.txt /app/requirements-soak.txt
+# huggingface-hub is ResolutionImpossible).
+#
+# Slice 152 — SOAK_REQUIREMENTS build-arg picks the variant (both live in docker/):
+#   * requirements-soak.txt         (default) — lean, Oracle-DEGRADED (context-free)
+#   * requirements-soak-oracle.txt  — lean + Oracle graph deps (networkx/scipy/
+#       scikit-learn/tree_sitter/aiofiles, all arm64 wheels) → Oracle BOOTS.
+# The oracle file composes the lean one via -r, so both are copied.
+ARG SOAK_REQUIREMENTS=requirements-soak.txt
+COPY docker/requirements-soak.txt docker/requirements-soak-oracle.txt /app/docker/
 RUN pip install --upgrade pip wheel setuptools && \
-    pip install -r /app/requirements-soak.txt
+    pip install -r /app/docker/${SOAK_REQUIREMENTS}
 
 # Application code (.dockerignore keeps .venv / .git / .env / .jarvis out).
 COPY . /app
