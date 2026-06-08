@@ -12,4 +12,4 @@
 # Enables fast local vision detection (10-20x faster than Claude Vision)
 # Models: nano (3MB, 0.6GB RAM) to xlarge (68MB, 6GB RAM)
 # Install: pip install ultralytics
-ultralytics>=8.0.0
+ultralytics>=8.4.61
