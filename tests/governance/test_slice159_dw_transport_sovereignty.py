@@ -26,18 +26,22 @@ class _Ctx:
 
 
 class _FakeBreaker:
-    def __init__(self, allow):
-        self._allow = allow
-    def should_allow_request(self):
-        return self._allow
+    # Slice 161 — predicate reads .state (read-only), not should_allow_request.
+    def __init__(self, state):
+        self._state = state
+    @property
+    def state(self):
+        return self._state
 
 
 class TestBreakerOpenPredicate(unittest.TestCase):
     def test_open_when_breaker_rejects(self):
-        self.assertTrue(DW._claude_breaker_open(getter=lambda: _FakeBreaker(allow=False)))
+        from backend.core.ouroboros.governance.claude_circuit_breaker import CircuitState
+        self.assertTrue(DW._claude_breaker_open(getter=lambda: _FakeBreaker(CircuitState.OPEN)))
 
     def test_closed_when_breaker_allows(self):
-        self.assertFalse(DW._claude_breaker_open(getter=lambda: _FakeBreaker(allow=True)))
+        from backend.core.ouroboros.governance.claude_circuit_breaker import CircuitState
+        self.assertFalse(DW._claude_breaker_open(getter=lambda: _FakeBreaker(CircuitState.CLOSED)))
 
     def test_fail_closed_on_error(self):
         def _boom():
