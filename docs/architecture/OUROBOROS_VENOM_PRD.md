@@ -12103,6 +12103,52 @@ The §51.7 Tier-1→5 roadmap, re-scored against the live tree after Slices 101�
 
 ---
 
+### §51.11.32 — The DoubleWord Economic Sovereignty + Predictive Transport Arc (Slices 168–172, 2026-06-08)
+
+*Operator-driven: "DW is the funded primary — stop cascading to expensive Claude" + two real Seb/Meryem @ Doubleword emails (a cancelled deepseek-v4-pro batch; a Nemotron 3 launch). Standing constraint: "do not fund Claude … we do not patch structural gaps with financial workarounds." Verify-first throughout; every slice PR-squash-merged to `main`.*
+
+**The thesis.** O+V runs DoubleWord (DW) as its **funded, sovereign primary** (Tier 0) with Claude as the expensive Tier-1 fallback. The arc's animating defect: DW kept **cascading to Claude on its own failure modes**, silently overspending and defeating vendor sovereignty. Five slices close the loop from *quirk-tolerance* → *reactive failover* → *visible economics* → *predictive anticipation*.
+
+**The DW provider quirks (verified, load-bearing — `doubleword_provider.py`):**
+- **`reasoning_effort: "none"` is REJECTED by some models** (deepseek-v4-pro → DW *cancels the batch*, surfaced **asynchronously** so it reads as a transport failure, not a synchronous 400). We derive `none` for trivial/simple ops, so a trivial op routed there silently cancelled → cascade.
+- **High `reasoning_effort` RUPTURES the SSE chunked stream** (`ClientPayloadError: TransferEncodingError`); the dispatch *mislabels it `live_transport`*. `none/low/medium` stream cleanly. Streaming ceiling clamped to `medium` (`_dw_max_reasoning_effort`, env `JARVIS_DW_MAX_REASONING_EFFORT`).
+
+| Slice | Title | Layer | Core mechanism | Default |
+|---|---|---|---|---|
+| **168** | Per-model reasoning_effort floor | Quirk-tolerance | `_dw_model_min_effort(model)` clamps effort UP to a per-model minimum (env `JARVIS_DW_MODEL_MIN_EFFORT="substr:effort"`, generic substring match — no hardcoded model in the algorithm; default `deepseek-v4-pro:low`). `_clamp_up_to_min` is the symmetric partner to `_clamp_reasoning_effort`. Threaded `model=_effective_model` at all 3 request-build sites; floors even an explicit effort. | ON |
+| **169** | Dynamic capability resolver | Quirk-tolerance | `dw_catalog_client.parse_supported_reasoning_efforts` + `catalog_min_reasoning_effort` read per-model supported efforts from DW's `/v1/models` metadata (via the existing disk-cached catalog). `_dw_model_min_effort` resolves DYNAMIC-first → static-fallback (168) → `none`. Self-resolves with zero static map once DW exposes the field; byte-identical until then. | ON |
+| **170** | Intra-DW transport failover | **Reactive** | **THE cost-cascade fix.** Root cause: `_slice36_should_force_batch` had `if not _claude_unavailable: return False` — DW only failed over to its OWN batch transport when **Claude was DEAD**, so a DW *stream rupture* (transport-specific) cascaded to expensive Claude whenever Claude had credit. Fix: consult the existing `_slice41_ledger_force_batch()` signal (surface-health: `DIRECT_STREAMING` degraded ∧ `BATCH_STORAGE` healthy) **BEFORE** the Claude-availability gate → force DW-batch even when Claude is available; a rupture fails over WITHIN DW. Claude stays the fallback for genuine DW-*wide* outages. `JARVIS_DW_INTRA_TRANSPORT_FAILOVER_ENABLED`, failure-path-only. | ON |
+| **171** | Economic telemetry | **Observe** | `economic_telemetry.py`: thread-safe `EconomicTelemetry` singleton (intra_failover count + estimated capital saved; **832 ns/record**, lock+increment, no I/O/GIL stall). Attribution with ZERO re-eval: `force_batch=True` while Claude is AVAILABLE ⟹ the Slice 170 reroute fired (legacy batch path REQUIRES Claude unavailable) = a cascade avoided. `discord_gateway` renders a `💸 sovereignty` field on every gate embed. | ON |
+| **172** | DW failure-risk predictor | **Predictive** | `dw_failure_predictor.py`: pure-Python **recency-weighted Poisson interval estimator** (no torch/tf). Rupture events land in a bounded monotonic-timestamp ring (fed UNCONDITIONALLY at `_note_dw_live_transport_degraded` — the same stream the ledger ingests); half-life-decayed weights give rate `λ`, then `P(≥1 rupture in horizon) = 1 - exp(-λ·horizon)` ∈ [0,1]. `_slice36_should_force_batch` gains a PREDICTIVE branch AFTER the reactive one: forecast ≥ threshold → preempt to batch BEFORE the stream breaks. `🔮 forecast` Discord field. Proven: cold 0.0 → 4-rupture cluster 0.865 (preempt) → decayed 0.061. | **OFF** (§33.1 — acts on a forecast) |
+
+**The transport matrix — a complete sense → forecast → act → show loop:**
+```
+rupture event ─► _note_dw_live_transport_degraded
+                   ├─► surface-health ledger (reactive verdict)         [170]
+                   ├─► dw_transport_recovery (adaptive exp-backoff)       [127]
+                   └─► dw_failure_predictor.record_rupture()              [172]
+                                 │ Poisson forecast
+_slice36_should_force_batch():   ▼
+  1. stream CONFIRMED degraded?  → batch   (reactive, 170)
+  2. forecast ≥ threshold?       → batch   (PREEMPTIVE, 172)
+  3. Claude-availability fallthrough (legacy)
+                                 │ a preempt is still force_batch
+                                 ▼
+  Discord spine:  💸 capital saved (171)  +  🔮 rupture risk % (172)
+```
+
+**Honest reliability framing (the operator's verify-first standard).** This arc does **not** make DW *internally* more reliable — DW's streaming wire still ruptures. It makes O+V's *use* of DW more **resilient**: it tolerates DW's param quirks (168/169), routes around its known transport failure mode within DW instead of cascading (170), makes the savings auditable (171), and anticipates the failure to dodge it pre-emptively (172). DW becomes a more reliable *effective* primary through intelligent routing, not through any change to DW.
+
+**Known blindspots (explicitly deferred, not silently ignored):**
+- **(A) No batch-health guard on the predictive (172) branch** — Slice 170 only fails over when `BATCH_STORAGE` is healthy, but the 172 preemptive branch routes on a rupture forecast *without* checking the batch lane → it could preempt INTO a degraded batch lane. The strongest near-term fix candidate.
+- **(B) Global, not per-model, rupture rate** — one forecast for all DW models; Qwen3.5-397B / DeepSeek-V4-Pro / Nemotron-3 rupture at different rates. A per-model ring would route the rupture-prone model to batch while keeping a stable one on RT.
+- **(C) Open-loop** — no prediction-accuracy (Brier/calibration) feedback; the 0.7 threshold is fixed, not self-tuned against observed hit/miss.
+- **(D) Single-failure-mode coverage** — 172 forecasts *transport ruptures* only. Not modelled: batch-lane failures, `UPSTREAM_DEGRADED`/`done_before_content`, param-rejection batch-cancels (the 168 class), or economic/quota `402/429` (the circuit breaker's domain).
+
+**Nemotron 3 (Super-120B / Meryem's "Ultra") — candidate fit for O+V:** an agentic reasoning model (256K context, "5× throughput / 30% lower cost-to-task on SWE-bench" per DW) → fits the **COMPLEX/heavy_code route**, the **Venom multi-turn tool loop**, the **PLAN phase**, and **L3 subagents** (long-horizon agentic reasoning + large context). Integration is policy-driven (`brain_selection_policy.yaml` + dw_catalog — no hardcoded model), the 169 resolver handles its effort capabilities, and the 30%-cost claim is **directly A/B-testable on the SWE-Bench-Pro soak**. Precondition: confirm its `reasoning_effort: none` support (open question to Seb) so it doesn't re-trigger the 168 batch-cancel class.
+
+---
+
 ## Appendix D — Document History
 
 | Date | Version | Change | Author |
