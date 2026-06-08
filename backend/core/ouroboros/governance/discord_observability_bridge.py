@@ -191,6 +191,25 @@ class DiscordBridge:
                 self._last_post[ch] = now
         return posted
 
+    async def post_boot(self, detail: str = "organism igniting",
+                        *, poster: Optional[_Poster] = None) -> bool:
+        """Slice 151 — instant [boot] telemetry: post a single ping to #heartbeat
+        the moment the bridge arms, so the organism is observable within seconds of
+        startup regardless of background warm-up. Bypasses batching/throttling (one
+        message). Fail-soft: no heartbeat webhook or a dead poster → False, never
+        raises (a boot ping must never block startup)."""
+        try:
+            url = webhook_url_for("heartbeat")
+            if not url:
+                return False
+            content = f"{_EMOJI.get('heartbeat', '💓')} **[boot]** {detail}"
+            send = poster or _default_poster
+            rc = await send(url, content)
+            return 200 <= int(rc) < 300
+        except Exception as exc:  # noqa: BLE001 — a boot ping never blocks startup
+            logger.debug("[DiscordBridge] boot ping swallowed: %s", exc)
+            return False
+
     async def run(self, *, source: Any, poster: Optional[_Poster] = None,
                   stop: Any = None) -> None:
         """Drain ``source`` (an asyncio.Queue of BridgeEvent/StreamEvent) into
@@ -267,6 +286,9 @@ async def run_bridge_against_broker(*, stop: Any = None) -> None:
             logger.warning("[DiscordBridge] broker subscriber cap reached — not bridging")
             return
         bridge = DiscordBridge()
+        # Slice 151 — fire instant [boot] telemetry the moment we arm, so the
+        # organism is observable within seconds of startup (before any warm-up).
+        await bridge.post_boot()
         try:
             await bridge.run(source=sub.queue, stop=stop)
         finally:
