@@ -3243,16 +3243,35 @@ class CandidateGenerator:
                 _dw_rupture_risk_high as _s182_risk,
                 _dw_batch_lane_healthy as _s182_batch_ok,
             )
-            if provider_route in ("standard", "complex") and _s182_batch_ok() and (
-                _s182_warm() or _s182_risk("")
-            ):
-                _s182_force_batch = True
+            # Slice 183 — LIVE TELEMETRY PROBE. Capture the EXACT boolean state of every
+            # sub-gate AND the final computed decision, UNCONDITIONALLY (before the if), so the
+            # live soak shows precisely why force-batch is False. Each gate is evaluated into
+            # its own local — no short-circuit hiding which one fails.
+            _g_route_ok = provider_route in ("standard", "complex")
+            _g_batch = bool(_s182_batch_ok())
+            _g_warm = bool(_s182_warm())
+            _g_risk = bool(_s182_risk(""))
+            _s182_force_batch = _g_route_ok and _g_batch and (_g_warm or _g_risk)
+            logger.warning(
+                "[Slice183] dispatch-telemetry: op=%s route=%r route_ok=%s "
+                "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s → FORCE_BATCH=%s",
+                op_id_short, provider_route, _g_route_ok, _g_batch, _g_warm, _g_risk,
+                _s182_force_batch,
+            )
+            if _s182_force_batch:
                 logger.warning(
                     "[Cortex] SENTINEL batch-enforce: stream degraded / rupture-risk high → "
                     "ALL probes via BATCH at T=0 (route=%s, op=%s) — RT bypass eradicated",
                     provider_route, op_id_short,
                 )
         except Exception:  # noqa: BLE001 — enforcement is best-effort, never blocks dispatch
+            # Slice 183 — DO NOT silently swallow. Log the full traceback so a hidden
+            # ImportError / attribute error in the gate path is visible in the live soak.
+            import traceback as _s183_tb
+            logger.warning(
+                "[Slice183] dispatch-telemetry EXCEPTION (NOT swallowed silently): %s",
+                _s183_tb.format_exc(),
+            )
             _s182_force_batch = False
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
