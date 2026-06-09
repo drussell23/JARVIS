@@ -70,12 +70,26 @@ def _envf(name: str, default: float) -> float:
 
 
 def immortal_max_attempts() -> int:
-    """Bounded backstop on retries (the op deadline is the primary bound). NEVER raises."""
+    """Bounded backstop on retries (the immortal budget is the primary bound). NEVER raises."""
     try:
         v = int(_envf(_ENV_MAX_ATTEMPTS, _DEFAULT_MAX_ATTEMPTS))
         return v if v > 0 else _DEFAULT_MAX_ATTEMPTS
     except Exception:  # noqa: BLE001
         return _DEFAULT_MAX_ATTEMPTS
+
+
+def immortal_max_wait_s() -> float:
+    """Slice 182 Gap 3 — the immortal queue's budget, DETACHED from the op's 120s generation
+    deadline. A sustained DW outage must not expire the op; this is a separate, much longer
+    wall (default 1h) over which the queue keeps backing off and retrying. NEVER raises."""
+    return _envf("JARVIS_DW_IMMORTAL_MAX_WAIT_S", 3600.0)
+
+
+def immortal_per_attempt_window_s() -> float:
+    """Slice 182 Gap 3 — each immortal re-attempt gets a FRESH generation window (default 180s)
+    rather than inheriting the original op's already-elapsed deadline, so a retry actually has
+    time to complete once DW recovers. NEVER raises."""
+    return _envf("JARVIS_DW_IMMORTAL_ATTEMPT_WINDOW_S", 180.0)
 
 
 def immortal_backoff_s(attempt: int, *, base: Optional[float] = None, cap: Optional[float] = None) -> float:

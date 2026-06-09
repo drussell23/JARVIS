@@ -504,6 +504,25 @@ def _dw_streaming_warm_degraded() -> bool:
         return False
 
 
+_dw_sentinel_force_batch = __import__("contextvars").ContextVar(
+    "_dw_sentinel_force_batch", default=False,
+)
+
+
+def set_sentinel_force_batch(value: bool):
+    """Slice 182 — the sentinel COMMANDS DW-batch for the current async task's probes (async-
+    safe ContextVar; survives the frozen-context contract). Returns a token to reset with."""
+    return _dw_sentinel_force_batch.set(bool(value))
+
+
+def reset_sentinel_force_batch(token) -> None:
+    """Slice 182 — clear the sentinel force-batch command (call in a finally). NEVER raises."""
+    try:
+        _dw_sentinel_force_batch.reset(token)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -528,6 +547,13 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     failure (returns False = preserve legacy RT behavior).
     """
     try:
+        # Slice 182 — SENTINEL force-batch override (HIGHEST precedence). The sentinel, having
+        # natively queried the predictor/warm-boot, COMMANDS batch for this probe via an
+        # async-safe ContextVar. Load-bearing: in the sentinel path the per-model frozen
+        # context carries an EMPTY provider_route, so the route gate below cannot engage and
+        # every probe ruptured on RT (the v181 soak bleed). This override bypasses the gate.
+        if _dw_sentinel_force_batch.get():
+            return True
         # Route gate — only STANDARD + COMPLEX get the batch path (IMMEDIATE / BG /
         # SPECULATIVE keep RT: small prompts + Venom value).
         _route = (
