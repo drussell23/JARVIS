@@ -2129,10 +2129,39 @@ class DoublewordProvider:
                 getattr(context, "provider_route", "?"),
             )
 
+        # Slice 189 Phase 2 — STORM cost-optimizer. Before any RT attempt, consult the EXISTING
+        # predictive cortex (172-176). If a platform-wide rupture STORM is forecast, racing the
+        # RT path is pure waste (it will rupture) — force batch-only, saving the hedge spend.
+        if not _slice36_force_batch and self._s189_storm_forces_batch(context):
+            _slice36_force_batch = True
+
         # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
         # On 429/503, fall back to batch within DW (stay cheap) instead of
         # cascading to the 150x more expensive Claude fallback.
         if self._realtime_enabled and not _slice36_force_batch:
+            # Slice 189 Phase 1 — PROACTIVE TRANSPORT-HEDGE. Race RT (fast) vs batch (stable)
+            # concurrently; take the winner; an RT rupture is SWALLOWED so batch still wins —
+            # the op NEVER waits for the rupture. Reuses _generate_realtime + _generate_via_batch
+            # (no duplication). Gated; off → the legacy sequential RT-then-fallback below.
+            if self._s189_transport_hedge_active():
+                from backend.core.ouroboros.governance.dw_transport_hedge import hedged_race
+                from backend.core.ouroboros.governance.dw_immortal import (
+                    hedge_to_batch_on_rupture as _s189_is_rupture,
+                )
+                logger.info(
+                    "[Cortex] PROACTIVE hedge: racing RT vs BATCH concurrently — winner takes "
+                    "it, rupture can't be on the critical path (op=%s)",
+                    getattr(context, "op_id", "?")[:16],
+                )
+                return await hedged_race(
+                    lambda: self._generate_realtime(
+                        context, deadline, prompt_override=prompt_override,
+                        repair_context=repair_context,
+                    ),
+                    lambda: self._generate_via_batch(context, prompt_override),
+                    is_rupture=lambda e: isinstance(e, StreamRuptureError)
+                    or _s189_is_rupture(str(e)),
+                )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
                 return await self._generate_realtime(
@@ -2173,17 +2202,7 @@ class DoublewordProvider:
         t0 = time.monotonic()
         self._last_error_status = 0  # reset before attempt
 
-        pending = await self.submit_batch(context, prompt_override=prompt_override)
-        if pending is None:
-            raise DoublewordInfraError(
-                "Batch submission failed", status_code=self._last_error_status,
-            )
-
-        result = await self.poll_and_retrieve(pending, context)
-        if result is None:
-            raise DoublewordInfraError(
-                "Batch retrieval failed", status_code=self._last_error_status,
-            )
+        result = await self._generate_via_batch(context, prompt_override)
         # ── S2 — record op_outcome for MAD sample stream (PRD §11 B4) ─
         # Reached ONLY on real provider success (post-batch return).
         # Belt-and-suspenders: skip if provider_name carries the
@@ -2223,6 +2242,65 @@ class DoublewordProvider:
             )
         # ───────────────────────────────────────────────────────────
         return result
+
+    async def _generate_via_batch(self, context: Any, prompt_override: Optional[str] = None):
+        """Slice 189 — the STABLE transport as a single reusable coroutine: DW's stream-free
+        batch dispatch (submit → poll → retrieve), composing the EXISTING ``submit_batch`` +
+        ``poll_and_retrieve`` primitives. Used by BOTH the legacy batch fallback AND the
+        proactive transport-hedge — one orchestration, no duplication. Raises
+        ``DoublewordInfraError`` on submit/retrieve failure so the hedge can let the other
+        transport win if BATCH is the lane that breaks."""
+        pending = await self.submit_batch(context, prompt_override=prompt_override)
+        if pending is None:
+            raise DoublewordInfraError(
+                "Batch submission failed", status_code=self._last_error_status,
+            )
+        result = await self.poll_and_retrieve(pending, context)
+        if result is None:
+            raise DoublewordInfraError(
+                "Batch retrieval failed", status_code=self._last_error_status,
+            )
+        return result
+
+    def _s189_transport_hedge_active(self) -> bool:
+        """Slice 189 — is the proactive transport-hedge engaged for this op? NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_transport_hedge import (
+                transport_hedge_enabled,
+            )
+            return bool(transport_hedge_enabled() and self._realtime_enabled)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _s189_storm_forces_batch(self, context: Any) -> bool:
+        """Slice 189 Phase 2 — the cortex as cost-optimizer. Reuse the EXISTING predictive cortex
+        (172-176) as the storm signal: if the per-model rupture forecast exceeds the storm
+        threshold, the RT path is doomed → force batch-only (don't waste a hedge racing a path
+        that will rupture). Only consulted when the hedge is active. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_transport_hedge import (
+                transport_hedge_enabled,
+                should_skip_race_for_storm,
+            )
+            if not transport_hedge_enabled():
+                return False
+            from backend.core.ouroboros.governance.dw_failure_predictor import (
+                get_dw_failure_predictor,
+            )
+            import time as _t189
+            model = self._resolve_effective_model(context)
+            storm_p = get_dw_failure_predictor().rupture_probability(
+                _t189.time(), model_id=model,
+            )
+            if should_skip_race_for_storm(storm_p):
+                logger.info(
+                    "[Cortex] storm forecast %.2f ≥ threshold → BATCH-ONLY (skip the hedge, "
+                    "save the doomed-RT spend; model=%s)", storm_p, model,
+                )
+                return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # DW Heavy Non-Streaming Lane — composes complete_sync()
