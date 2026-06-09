@@ -53,10 +53,14 @@ services:
       JARVIS_ARTIFACT_JANITOR_ENABLED: "1"
       JARVIS_ARTIFACT_SCARCITY_THRESHOLD: "0.85"
       # JARVIS_DISCORD_MAINTENANCE_WEBHOOK: "..."   # set in .env to push eviction events
-      # ── Slice 185 Phase 4: wipe DW learned-state corrupted by the NameError phantom on this
-      #    ONE clean relaunch (the cortex calibrated against a ~2x-inflated rupture rate).
-      #    Remove this line after the first clean boot so the organism keeps learning. ──
-      JARVIS_DW_LEDGER_WIPE_ON_BOOT: "1"
+      # ── Slice 185 ledger-wipe RETIRED: the corrupted state was purged on the prior clean
+      #    boot; the cortex now LEARNS from clean signals (needed by the hedge cost-optimizer).
+      #    JARVIS_DW_LEDGER_WIPE_ON_BOOT intentionally absent (default-off → no wipe). ──
+      # ── Slice 189/190: PROACTIVE transport-hedge — race RT vs batch, take the winner, swallow
+      #    ruptures. The structural neutralization of DW instability. The cortex (172-176) is now
+      #    a cost-optimizer that skips the race during a forecast storm. Outcomes recorded into
+      #    the economic ledger (171): hedge_rt_wins / hedge_batch_wins / hedge_ruptures_swallowed. ──
+      JARVIS_DW_TRANSPORT_HEDGE_ENABLED: "1"
       # ── Organism baseline ──
       JARVIS_EPISODIC_CORE_ENABLED: "1"
       JARVIS_CAI_ROUTER_ENABLED: "1"

@@ -51,16 +51,32 @@ async def hedged_race(
     stable: Callable[[], Awaitable[Any]],
     *,
     is_rupture: Callable[[BaseException], bool] = lambda e: True,
+    fast_label: str = "rt",
+    stable_label: str = "batch",
+    on_outcome: Optional[Callable[[str, bool], None]] = None,
 ) -> Any:
     """Race ``fast`` (RT) against ``stable`` (batch). Return the FIRST successful result; cancel
     the loser aggressively. A ``fast`` failure that ``is_rupture`` returns True for is swallowed so
     ``stable`` can still win. If BOTH fail, the last exception is raised. Cancellation is awaited
-    so no orphaned tasks survive."""
+    so no orphaned tasks survive.
+
+    ``on_outcome(winner_label, rupture_swallowed)`` is invoked on the winning result so the caller
+    can record telemetry — which transport won, and whether an RT rupture was made INVISIBLE by
+    the stable path winning (a proactive capital-save). Best-effort: a sink error never breaks the
+    race."""
     loop = asyncio.get_event_loop()
     t_fast = loop.create_task(fast())
     t_stable = loop.create_task(stable())
     pending = {t_fast, t_stable}
     last_exc: Optional[BaseException] = None
+    fast_ruptured = False
+
+    def _report(winner_label: str) -> None:
+        if on_outcome is not None:
+            try:
+                on_outcome(winner_label, fast_ruptured)
+            except Exception:  # noqa: BLE001 — telemetry never breaks the race
+                pass
 
     try:
         while pending:
@@ -74,6 +90,7 @@ async def hedged_race(
                     last_exc = exc
                     # a fast-path rupture is non-fatal — let the stable path keep racing
                     if t is t_fast and is_rupture(exc):
+                        fast_ruptured = True
                         continue
                     # a non-rupture fast error or a stable error: if the other is still
                     # pending, keep waiting; else propagate below
@@ -84,6 +101,7 @@ async def hedged_race(
                         other.cancel()
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
+                    _report(fast_label if t is t_fast else stable_label)
                     return result
         # both finished without a success
         if last_exc is not None:

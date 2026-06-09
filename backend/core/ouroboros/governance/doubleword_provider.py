@@ -2153,6 +2153,23 @@ class DoublewordProvider:
                     "it, rupture can't be on the critical path (op=%s)",
                     getattr(context, "op_id", "?")[:16],
                 )
+                def _s190_hedge_outcome(winner: str, rupture_swallowed: bool) -> None:
+                    # Slice 190 — record the proactive win into the EXISTING economic ledger
+                    # (171): which transport won + whether an RT rupture was made INVISIBLE.
+                    logger.info(
+                        "[Cortex] hedge WON by %s%s (op=%s)",
+                        winner,
+                        " — RT rupture SWALLOWED, op never saw it" if rupture_swallowed else "",
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                    try:
+                        from backend.core.ouroboros.governance.economic_telemetry import (
+                            get_economic_telemetry,
+                        )
+                        get_economic_telemetry().record_hedge_outcome(winner, rupture_swallowed)
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 return await hedged_race(
                     lambda: self._generate_realtime(
                         context, deadline, prompt_override=prompt_override,
@@ -2161,6 +2178,9 @@ class DoublewordProvider:
                     lambda: self._generate_via_batch(context, prompt_override),
                     is_rupture=lambda e: isinstance(e, StreamRuptureError)
                     or _s189_is_rupture(str(e)),
+                    fast_label="rt",
+                    stable_label="batch",
+                    on_outcome=_s190_hedge_outcome,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
