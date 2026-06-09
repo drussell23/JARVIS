@@ -44,6 +44,10 @@ class EconomicTelemetry:
         self._lock = threading.Lock()
         self._intra_failovers = 0
         self._capital_saved_usd = 0.0
+        # Slice 190 — proactive transport-hedge outcomes
+        self._hedge_rt_wins = 0
+        self._hedge_batch_wins = 0
+        self._hedge_ruptures_swallowed = 0
 
     def record_intra_failover(self, saved_usd: Optional[float] = None) -> None:
         """Record one intra-DW failover (a Claude cascade we avoided). Lock-guarded
@@ -53,12 +57,33 @@ class EconomicTelemetry:
             self._intra_failovers += 1
             self._capital_saved_usd += delta
 
+    def record_hedge_outcome(
+        self, winner: str, rupture_swallowed: bool, saved_usd: Optional[float] = None,
+    ) -> None:
+        """Slice 190 — record a proactive transport-hedge result: which transport won the race
+        and whether an RT rupture was made INVISIBLE by batch winning. A swallowed rupture is a
+        proactive capital-save (batch served instead of cascading to Claude), so it also feeds
+        the intra-failover capital ledger. NEVER raises."""
+        delta = saved_usd if saved_usd is not None else _default_reroute_saved_usd()
+        with self._lock:
+            if str(winner).strip().lower() == "rt":
+                self._hedge_rt_wins += 1
+            else:
+                self._hedge_batch_wins += 1
+            if rupture_swallowed:
+                self._hedge_ruptures_swallowed += 1
+                self._intra_failovers += 1
+                self._capital_saved_usd += delta
+
     def snapshot(self) -> Dict[str, float]:
         """Current counters. NEVER raises."""
         with self._lock:
             return {
                 "intra_failovers": self._intra_failovers,
                 "capital_saved_usd": round(self._capital_saved_usd, 4),
+                "hedge_rt_wins": self._hedge_rt_wins,
+                "hedge_batch_wins": self._hedge_batch_wins,
+                "hedge_ruptures_swallowed": self._hedge_ruptures_swallowed,
             }
 
 
