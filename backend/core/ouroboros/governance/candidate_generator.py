@@ -3127,6 +3127,7 @@ class CandidateGenerator:
         provider_route: str,
         *,
         _immortal_attempt: int = 0,
+        _immortal_budget_deadline: Optional[float] = None,
     ) -> Optional[GenerationResult]:
         """Phase 10 P10.3 — sentinel-driven DW dispatch.
 
@@ -3230,6 +3231,29 @@ class CandidateGenerator:
         # blackout) severs. Reset by any success / non-transport failure.
         _consecutive_lt: int = 0
         _lt_sever_threshold: int = _live_transport_sever_threshold()
+        # Slice 182 — SENTINEL BATCH ENFORCEMENT (Gap 1). The per-model frozen context carries
+        # an EMPTY provider_route, so the downstream _slice36_should_force_batch route gate
+        # can't engage and every probe ruptured on RT (the v181 bleed). The sentinel KNOWS the
+        # route + the risk — so if the stream is degraded / rupture-risk is high AND batch is
+        # healthy, COMMAND every probe to batch at T=0 via the force-batch ContextVar.
+        _s182_force_batch = False
+        try:
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                _dw_streaming_warm_degraded as _s182_warm,
+                _dw_rupture_risk_high as _s182_risk,
+                _dw_batch_lane_healthy as _s182_batch_ok,
+            )
+            if provider_route in ("standard", "complex") and _s182_batch_ok() and (
+                _s182_warm() or _s182_risk("")
+            ):
+                _s182_force_batch = True
+                logger.warning(
+                    "[Cortex] SENTINEL batch-enforce: stream degraded / rupture-risk high → "
+                    "ALL probes via BATCH at T=0 (route=%s, op=%s) — RT bypass eradicated",
+                    provider_route, op_id_short,
+                )
+        except Exception:  # noqa: BLE001 — enforcement is best-effort, never blocks dispatch
+            _s182_force_batch = False
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
             # Phase 12 Slice H — TERMINAL_OPEN bypasses dispatch
@@ -3281,6 +3305,18 @@ class CandidateGenerator:
             # cascade-to-Claude after exhaustion doesn't carry a stale
             # override into the fallback provider.
             _override_token = _set_override(model_id)
+            # Slice 182 — alongside the model override, COMMAND batch for this probe when the
+            # sentinel determined degradation (Gap 1). Reset in the same finally as the model
+            # override, so neither leaks into the post-exhaustion cascade.
+            _s182_fb_token = None
+            if _s182_force_batch:
+                try:
+                    from backend.core.ouroboros.governance.doubleword_provider import (
+                        set_sentinel_force_batch as _s182_set_fb,
+                    )
+                    _s182_fb_token = _s182_set_fb(True)
+                except Exception:  # noqa: BLE001
+                    _s182_fb_token = None
             logger.info(
                 "[CandidateGenerator] Sentinel dispatch: route=%s "
                 "attempting model=%s (state=%s, op=%s)",
@@ -3324,6 +3360,15 @@ class CandidateGenerator:
                 # clean slate AND the post-loop cascade-to-Claude
                 # doesn't carry a stale override into the fallback.
                 _reset_override(_override_token)
+                # Slice 182 — clear the force-batch command too (never leak into cascade).
+                if _s182_fb_token is not None:
+                    try:
+                        from backend.core.ouroboros.governance.doubleword_provider import (
+                            reset_sentinel_force_batch as _s182_reset_fb,
+                        )
+                        _s182_reset_fb(_s182_fb_token)
+                    except Exception:  # noqa: BLE001
+                        pass
 
             if _attempt_result is not None:
                 # Success — let the sentinel know. Phase 10 P10.4
@@ -3512,6 +3557,25 @@ class CandidateGenerator:
                         model_id=model_id,  # Slice 175 — attribute the rupture to THIS model
                     )
                     _consecutive_lt += 1
+                    # Slice 182 Gap 2 — HEDGE AT THE RUPTURE BOUNDARY. The first rupture is the
+                    # absolute first line of defense: immediately COMMAND the remaining probes
+                    # in THIS dispatch onto batch, so a fresh-session rupture (before Gap 1's
+                    # persisted-degraded signal exists) doesn't walk all 6 models through RT.
+                    if not _s182_force_batch:
+                        try:
+                            from backend.core.ouroboros.governance.doubleword_provider import (
+                                dw_hedge_enabled as _s182_hedge_on,
+                                _dw_batch_lane_healthy as _s182_bok,
+                            )
+                            if _s182_hedge_on() and _s182_bok():
+                                _s182_force_batch = True
+                                logger.warning(
+                                    "[Immortal] rupture HEDGE at sentinel boundary: %s ruptured "
+                                    "→ remaining probes switched to BATCH (op=%s)",
+                                    model_id, op_id_short,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                 else:
                     # Slice 83 Phase 2 — a non-transport failure (429/5xx/parse)
                     # proves THIS model's transport is reachable, so the prior
@@ -3712,22 +3776,38 @@ class CandidateGenerator:
                     immortal_should_retry as _imm_should_retry,
                     immortal_backoff_s as _imm_backoff,
                     immortal_max_attempts as _imm_max,
+                    immortal_max_wait_s as _imm_max_wait,
+                    immortal_per_attempt_window_s as _imm_window,
                 )
                 import time as _imm_time
-                _imm_deadline = deadline.timestamp() if hasattr(deadline, "timestamp") else float(deadline)
+                from datetime import datetime as _imm_dt, timezone as _imm_tz, timedelta as _imm_td
+                _imm_now = _imm_time.time()
+                # Slice 182 Gap 3 — the immortal budget is DETACHED from the op's 120s generation
+                # deadline: a separate, much-longer wall (default 1h) computed ONCE and threaded
+                # across the retry recursion, so a sustained DW outage doesn't expire the op.
+                _imm_budget = (
+                    _immortal_budget_deadline if _immortal_budget_deadline is not None
+                    else (_imm_now + _imm_max_wait())
+                )
                 if _imm_should_retry(
-                    deadline=_imm_deadline, now=_imm_time.time(), claude_available=False,
+                    deadline=_imm_budget, now=_imm_now, claude_available=False,
                     attempt=_immortal_attempt, max_attempts=_imm_max(),
                 ):
                     _imm_delay = _imm_backoff(_immortal_attempt)
                     logger.warning(
-                        "[Immortal] DW exhausted + NO fallback → QUEUE_ONLY: backoff %.1fs then "
-                        "re-attempt #%d (op NEVER lost; op=%s, last=%s)",
-                        _imm_delay, _immortal_attempt + 1, op_id_short, (last_failure or "?")[:60],
+                        "[Immortal] DW exhausted + NO fallback → QUEUE_ONLY (deadline-detached): "
+                        "backoff %.1fs then re-attempt #%d, budget %.0fs remaining (op NEVER lost; "
+                        "op=%s, last=%s)",
+                        _imm_delay, _immortal_attempt + 1, max(0.0, _imm_budget - _imm_now),
+                        op_id_short, (last_failure or "?")[:60],
                     )
                     await asyncio.sleep(_imm_delay)
+                    # FRESH generation window for the retry (not the original op's elapsed deadline)
+                    _imm_fresh_deadline = _imm_dt.now(_imm_tz.utc) + _imm_td(seconds=_imm_window())
                     return await self._dispatch_via_sentinel(
-                        context, deadline, provider_route, _immortal_attempt=_immortal_attempt + 1,
+                        context, _imm_fresh_deadline, provider_route,
+                        _immortal_attempt=_immortal_attempt + 1,
+                        _immortal_budget_deadline=_imm_budget,
                     )
             except Exception as _imm_exc:  # noqa: BLE001 — the immortal layer must never itself break the op
                 logger.debug("[Immortal] queue-retry path swallowed: %r", _imm_exc)
