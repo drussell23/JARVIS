@@ -3242,6 +3242,7 @@ class CandidateGenerator:
                 _dw_streaming_warm_degraded as _s182_warm,
                 _dw_rupture_risk_high as _s182_risk,
                 _dw_batch_lane_healthy as _s182_batch_ok,
+                _dw_in_cold_start as _s184_cold,
             )
             # Slice 183 — LIVE TELEMETRY PROBE. Capture the EXACT boolean state of every
             # sub-gate AND the final computed decision, UNCONDITIONALLY (before the if), so the
@@ -3251,11 +3252,14 @@ class CandidateGenerator:
             _g_batch = bool(_s182_batch_ok())
             _g_warm = bool(_s182_warm())
             _g_risk = bool(_s182_risk(""))
-            _s182_force_batch = _g_route_ok and _g_batch and (_g_warm or _g_risk)
+            # Slice 184 — cold-start is a degradation TRIGGER: at fresh boot the stream is
+            # unproven, so the sentinel commands batch (fail-safe) even when warm/risk are blind.
+            _g_cold = bool(_s184_cold())
+            _s182_force_batch = _g_route_ok and _g_batch and (_g_warm or _g_risk or _g_cold)
             logger.warning(
                 "[Slice183] dispatch-telemetry: op=%s route=%r route_ok=%s "
-                "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s → FORCE_BATCH=%s",
-                op_id_short, provider_route, _g_route_ok, _g_batch, _g_warm, _g_risk,
+                "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s cold_start=%s → FORCE_BATCH=%s",
+                op_id_short, provider_route, _g_route_ok, _g_batch, _g_warm, _g_risk, _g_cold,
                 _s182_force_batch,
             )
             if _s182_force_batch:

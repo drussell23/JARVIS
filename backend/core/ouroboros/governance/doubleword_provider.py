@@ -523,6 +523,41 @@ def reset_sentinel_force_batch(token) -> None:
         pass
 
 
+# Slice 184 — COLD-START SEAL. Process-scoped boot time (module-load ≈ process start).
+_PROCESS_START = time.monotonic()
+
+
+def dw_cold_start_enabled() -> bool:
+    """Slice 184 — master for the cold-start seal. Default **TRUE** (failure-path-only: only
+    forces batch during the boot window). NEVER raises."""
+    return os.environ.get("JARVIS_DW_COLDSTART_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _dw_cold_start_window_s() -> float:
+    """Seconds after process start during which the stream is treated as UNPROVEN. NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_DW_COLDSTART_WINDOW_S", "").strip()
+        v = float(raw) if raw else 90.0
+        return v if v > 0 else 90.0
+    except Exception:  # noqa: BLE001
+        return 90.0
+
+
+def _dw_in_cold_start() -> bool:
+    """Slice 184 — True for the first window after a FRESH process boot, when the warm-boot +
+    predictor are structurally BLIND (Slice 183: no durable degradation signal survives a
+    restart). DETERMINISTIC, not predictive — you KNOW you just booted with no signal, so fail
+    SAFE. NEVER raises."""
+    try:
+        if not dw_cold_start_enabled():
+            return False
+        return (time.monotonic() - _PROCESS_START) < _dw_cold_start_window_s()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -615,6 +650,19 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
             logger.info(
                 "[Cortex] WARM-BOOT armor: persisted ledger shows DIRECT_STREAMING degraded "
                 "→ DW-batch from T=0 (model=%s; cold-start exhaustion eradicated)",
+                model_id or "?",
+            )
+            return True
+
+        # Slice 184 — COLD-START SEAL. The decisive fix: at fresh-process boot the warm-boot +
+        # predictor are structurally BLIND (Slice 183 telemetry: warm_degraded=False,
+        # rupture_risk=False — no durable degradation signal survives a restart). Rather than
+        # walk RT and rupture before the ledger learns, fail SAFE — force batch for the boot
+        # window so the FIRST ops can't rupture on an unproven stream. Batch-health-gated.
+        if _route_ok and _dw_in_cold_start() and _dw_batch_lane_healthy():
+            logger.info(
+                "[Cortex] COLD-START seal: fresh boot, stream UNPROVEN → DW-batch (fail-safe; "
+                "model=%s) until the ledger warms",
                 model_id or "?",
             )
             return True
