@@ -1252,6 +1252,23 @@ class GovernedLoopService:
 
         self._state = ServiceState.STARTING
         try:
+            # Slice 185 Phase 4 — purge DW learned-state corrupted by the NameError phantom
+            # (surface-health + calibration learned from internal faults mislabeled as vendor
+            # ruptures). Opt-in (JARVIS_DW_LEDGER_WIPE_ON_BOOT); NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.dw_ledger_wipe import (
+                    wipe_corrupted_dw_ledgers,
+                )
+                _wipe = wipe_corrupted_dw_ledgers()
+                if _wipe.get("wiped"):
+                    logger.warning(
+                        "[GovernedLoop] DW ledger wipe (Slice 185): purged %d corrupted "
+                        "learned-state file(s) — relearning from CLEAN signals: %s",
+                        len(_wipe["wiped"]), _wipe["wiped"],
+                    )
+            except Exception as _wipe_exc:  # noqa: BLE001
+                logger.debug("[GovernedLoop] DW ledger wipe swallowed: %r", _wipe_exc)
+
             await self._build_components()
 
             # Phase 4: initialize preemption FSM executor (ledger available after _build_components)

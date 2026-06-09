@@ -558,6 +558,45 @@ def _dw_in_cold_start() -> bool:
         return False
 
 
+def dw_latency_governor_enabled() -> bool:
+    """Slice 185 — master for the adaptive LATENCY governor. Default **TRUE**. NEVER raises."""
+    return os.environ.get("JARVIS_DW_LATENCY_GOVERNOR_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _dw_batch_ttft_estimate_s() -> float:
+    """Slice 185 — batch end-to-end TTFT estimate (env-tunable; v31 evidence: 4-8s). NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_DW_BATCH_TTFT_S", "").strip()
+        v = float(raw) if raw else 8.0
+        return v if v > 0 else 8.0
+    except Exception:  # noqa: BLE001
+        return 8.0
+
+
+def _dw_latency_favors_batch() -> bool:
+    """Slice 185 — the ADAPTIVE LATENCY GOVERNOR. No hardcoded transport preference: ingest the
+    LIVE rolling RT latency (DwLatencyTracker p95) and elect batch ONLY when RT's measured
+    latency mathematically CRUSHES batch's (RT p95 > batch_ttft × multiplier). If DW ever fixes
+    their RT latency, p95 drops and the organism NATURALLY routes back to RT — zero config
+    change. Returns False when there's no RT sample yet (let other gates decide). NEVER raises."""
+    try:
+        if not dw_latency_governor_enabled():
+            return False
+        from backend.core.ouroboros.governance.dw_latency_tracker import get_default_tracker
+        rt_p95 = get_default_tracker().p95()
+        if rt_p95 is None or rt_p95 <= 0:
+            return False  # no empirical RT signal yet — defer to the other gates
+        try:
+            mult = float(os.environ.get("JARVIS_DW_LATENCY_BATCH_MULT", "3.0") or 3.0)
+        except Exception:  # noqa: BLE001
+            mult = 3.0
+        return rt_p95 > (_dw_batch_ttft_estimate_s() * (mult if mult > 0 else 3.0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -663,6 +702,18 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
             logger.info(
                 "[Cortex] COLD-START seal: fresh boot, stream UNPROVEN → DW-batch (fail-safe; "
                 "model=%s) until the ledger warms",
+                model_id or "?",
+            )
+            return True
+
+        # Slice 185 — ADAPTIVE LATENCY GOVERNOR. No hardcoded transport preference: if the LIVE
+        # rolling RT p95 latency mathematically crushes batch's TTFT, elect batch on SPEED. This
+        # self-corrects — if DW fixes RT latency the p95 drops and the organism routes back to
+        # RT with zero config change. Batch-health-gated.
+        if _route_ok and _dw_latency_favors_batch() and _dw_batch_lane_healthy():
+            logger.info(
+                "[Cortex] LATENCY governor: RT p95 ≫ batch TTFT → DW-batch on speed (model=%s; "
+                "self-correcting — reverts to RT if DW's latency recovers)",
                 model_id or "?",
             )
             return True
@@ -2058,7 +2109,13 @@ class DoublewordProvider:
         # streaming TTFT p50 = 66.8s vs batch end-to-end 4-8s for
         # the same prompts. STANDARD/COMPLEX routes under pure-DW
         # config skip RT entirely and go straight to batch.
-        _slice36_force_batch = _slice36_should_force_batch(context, model_id=_effective_model)
+        # Slice 185 Phase 1 — eradicate the NameError phantom: `_effective_model` was undefined
+        # in this method's scope (defined only in submit_batch / _generate_realtime), so this
+        # threw NameError on every RT op since Slice 175 — caught + mislabeled as a vendor
+        # live_transport rupture. Resolve it natively in scope.
+        _slice36_force_batch = _slice36_should_force_batch(
+            context, model_id=self._resolve_effective_model(context),
+        )
         if _slice36_force_batch:
             # Slice 171 — surface the Slice 170 capital save (records iff Claude was
             # available, i.e. a rupture-reroute we'd otherwise have cascaded to Claude).

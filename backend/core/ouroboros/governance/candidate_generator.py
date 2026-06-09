@@ -3448,6 +3448,25 @@ class CandidateGenerator:
 
             if _attempt_exc is not None:
                 exc = _attempt_exc
+                # Slice 185 Phase 2 — STRICT-TYPE EXCEPTION SEGREGATION. A Python LOGICAL error
+                # (NameError/TypeError/AttributeError/…) is OUR codebase bug, NOT a vendor
+                # network rupture. It must bypass the vendor resilience path entirely: never be
+                # classified as live_transport, never recorded to the DW surface-health ledger
+                # (which corrupts the learned rupture rate), never silently degraded. Bubble it
+                # up as an INTERNAL_FAULT and crash LOUDLY so we fix OUR bug — the AI must never
+                # again blame the vendor for its own internal codebase flaws.
+                from backend.core.ouroboros.governance.dw_fault_taxonomy import (
+                    is_internal_fault as _s185_internal,
+                )
+                if _s185_internal(exc):
+                    logger.error(
+                        "[CandidateGenerator] INTERNAL_FAULT (%s) — NOT a vendor rupture; "
+                        "bubbling up + crashing loud, NOT touching the DW vendor ledger "
+                        "(op=%s, model=%s): %s",
+                        type(exc).__name__, op_id_short, model_id, exc,
+                        exc_info=True,
+                    )
+                    raise exc
                 err_str = str(exc)
                 err_lower = err_str.lower()
 
