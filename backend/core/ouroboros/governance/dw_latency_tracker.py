@@ -74,6 +74,21 @@ class DwLatencyTracker:
         self._lock = threading.Lock()
         self._last_update_ns = 0
         self._total_samples = 0
+        # Slice 188 Phase 3 — O(1) streaming p95 (P² algorithm) available as an OPT-IN
+        # alternative to the per-query sorted(). DEFAULT-OFF (verify-first): benchmarking showed
+        # P² UNDER-estimates p95 on the tracker's small, BIMODAL latency distribution (fast ~5s
+        # vs ruptured ~66s) — which would make the governor under-route to batch. For a ~100-
+        # element window the exact sort is microseconds AND correct, so exactness wins. Enable
+        # only if the window grows large enough that the sort is a real bottleneck. NEVER blocks.
+        self._p2 = None
+        try:
+            if os.environ.get(
+                "JARVIS_DW_P2_QUANTILE_ENABLED", "false",
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                from backend.core.ouroboros.governance.dw_streaming_stats import P2Quantile
+                self._p2 = P2Quantile(0.95)
+        except Exception:  # noqa: BLE001
+            self._p2 = None
 
     # ------------------------------------------------------------------
     # Recording
@@ -85,6 +100,8 @@ class DwLatencyTracker:
             return
         with self._lock:
             self._samples.append(float(elapsed_s))
+            if self._p2 is not None:
+                self._p2.update(float(elapsed_s))  # Slice 188: O(1) streaming p95
             self._consecutive_failures = 0
             self._last_update_ns = time.monotonic_ns()
             self._total_samples += 1
@@ -107,6 +124,11 @@ class DwLatencyTracker:
             return self._p95_locked()
 
     def _p95_locked(self) -> float:
+        # Slice 188 Phase 3 — O(1) P² estimate when warm; exact windowed sort as fallback.
+        if self._p2 is not None:
+            v = self._p2.value()
+            if v is not None:
+                return float(v)
         s = sorted(self._samples)
         idx = min(len(s) - 1, int(0.95 * len(s)))
         return s[idx]
