@@ -25,7 +25,7 @@ log() { printf '\033[36m[migrate]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[migrate] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 HOST="${1:-}"; REMOTE_DIR="${2:-}"; LAUNCH="${3:-}"
-[ -n "$HOST" ] && [ -n "$REMOTE_DIR" ] || die "usage: $0 <user@host> <remote_dir> [--launch]"
+[ -n "$HOST" ] && [ -n "$REMOTE_DIR" ] || die "usage: $0 <user@host> <remote_dir> [--launch|--cortex]"
 command -v ssh >/dev/null 2>&1 && command -v scp >/dev/null 2>&1 || die "ssh + scp required."
 
 # ── 1. Package ───────────────────────────────────────────────────────────────
@@ -61,8 +61,20 @@ if [ "$LAUNCH" = "--launch" ]; then
   log "ssh: igniting arm_and_launch.sh on $HOST (signed roadmap travels in the artifact → non-interactive)"
   ssh "$HOST" "cd '$REMOTE_DIR/jarvis-sovereign'; bash scripts/arm_and_launch.sh"
   log "═══════════════════════════════════════════════════════════════"
-  log "MIGRATION COMPLETE — organism igniting on $HOST."
+  log "MIGRATION COMPLETE — organism igniting on $HOST (Layer-4 systemd shadow-soak)."
   log "  Watch: ssh $HOST 'tail -f $REMOTE_DIR/jarvis-sovereign/.jarvis/t5_soak.out'"
+  log "═══════════════════════════════════════════════════════════════"
+elif [ "$LAUNCH" = "--cortex" ]; then
+  # Slice 191 — the PROACTIVE HEDGE soak via docker compose on the host's UNCONTENDED buildkit
+  # (the macOS daemon is retired). Reuses the existing launch_dw_cortex_soak.sh (the only
+  # launcher bound to docker-compose.dw-cortex-soak.yml with JARVIS_DW_TRANSPORT_HEDGE_ENABLED)
+  # — no duplication. --no-logs builds + up -d detached, then returns.
+  log "ssh: building + igniting the DW-cortex HEDGE soak on $HOST (docker compose, detached)…"
+  ssh "$HOST" "cd '$REMOTE_DIR/jarvis-sovereign'; chmod +x scripts/*.sh; SOAK_REQUIREMENTS=requirements-soak-oracle.txt ./scripts/launch_dw_cortex_soak.sh --no-logs"
+  log "═══════════════════════════════════════════════════════════════"
+  log "MIGRATION COMPLETE — PROACTIVE HEDGE soak building+running on $HOST."
+  log "  Hedge wins:  ssh $HOST \"docker logs jarvis-dw-cortex-soak 2>&1 | grep -E 'hedge WON|RT rupture SWALLOWED'\""
+  log "  Watch cortex: ssh $HOST 'docker logs -f jarvis-dw-cortex-soak'"
   log "═══════════════════════════════════════════════════════════════"
 else
   log "═══════════════════════════════════════════════════════════════"

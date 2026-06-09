@@ -61,6 +61,30 @@ rsync -a \
   --exclude='.claude/worktrees' \
   --exclude='dist' \
   --exclude='.jarvis' \
+  `# Slice 191 — mirror the .dockerignore bulk excludes so the payload is LEAN. These are` \
+  `# build artifacts + model weights + logs (NOT source); the remote host rebuilds deps and` \
+  `# compiled extensions for its OWN arch via docker compose build, so Mac arm64 binaries` \
+  `# must not travel anyway. Without these the rsync drags ~20GB of untracked bulk.` \
+  --exclude='.ouroboros' \
+  --exclude='.cache' \
+  --exclude='model_checkpoints' \
+  --exclude='logs' \
+  --exclude='venv' \
+  --exclude='target' \
+  --exclude='.build' \
+  --exclude='*.so' \
+  --exclude='*.dylib' \
+  --exclude='*.a' \
+  --exclude='*.rlib' \
+  --exclude='*.rmeta' \
+  --exclude='*.pt' \
+  --exclude='*.pth' \
+  --exclude='*.onnx' \
+  --exclude='*.safetensors' \
+  --exclude='*.gguf' \
+  --exclude='*.mlmodel' \
+  --exclude='*.mlmodelc' \
+  --exclude='*.log' \
   ./ "$STAGE/"
 
 log "Preserving load-bearing .jarvis crypto + signatures + evidence (allowlist)…"
