@@ -3243,6 +3243,7 @@ class CandidateGenerator:
                 _dw_rupture_risk_high as _s182_risk,
                 _dw_batch_lane_healthy as _s182_batch_ok,
                 _dw_in_cold_start as _s184_cold,
+                _dw_hedge_supersedes as _s192_supersedes,
             )
             # Slice 183 — LIVE TELEMETRY PROBE. Capture the EXACT boolean state of every
             # sub-gate AND the final computed decision, UNCONDITIONALLY (before the if), so the
@@ -3255,7 +3256,14 @@ class CandidateGenerator:
             # Slice 184 — cold-start is a degradation TRIGGER: at fresh boot the stream is
             # unproven, so the sentinel commands batch (fail-safe) even when warm/risk are blind.
             _g_cold = bool(_s184_cold())
-            _s182_force_batch = _g_route_ok and _g_batch and (_g_warm or _g_risk or _g_cold)
+            # Slice 192 — PROACTIVE HIERARCHY: the sentinel DEFERS to the hedge. When the hedge
+            # supersedes (active + no storm), do NOT force batch here — let the op RACE. The
+            # cold-start/warm-boot enforce only fires when the hedge is off or a storm is confirmed.
+            _g_hedge = bool(_s192_supersedes(context, model_id))
+            _s182_force_batch = (
+                (not _g_hedge)
+                and _g_route_ok and _g_batch and (_g_warm or _g_risk or _g_cold)
+            )
             logger.warning(
                 "[Slice183] dispatch-telemetry: op=%s route=%r route_ok=%s "
                 "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s cold_start=%s → FORCE_BATCH=%s",
