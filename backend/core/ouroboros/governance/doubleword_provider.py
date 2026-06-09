@@ -2760,6 +2760,12 @@ class DoublewordProvider:
                 # non-empty content chunk. monotonic() is jump-proof
                 # under wall-clock corrections.
                 _ttft_request_start_monotonic = time.monotonic()
+                # Slice 187 — precision TTFT: a perf_counter anchor for PURE network latency
+                # (separated from local async lag), recorded only if the loop wasn't starved.
+                from backend.core.ouroboros.governance.dw_precision_telemetry import (
+                    now_perf as _s187_now,
+                )
+                _ttft_request_start_perf = _s187_now()
                 _ttft_first_chunk_seen = False
 
                 # Slice 35 Phase 1 — STAGE_RT_AEGIS_AUTH timer.
@@ -3139,18 +3145,38 @@ class DoublewordProvider:
                                 if not _ttft_first_chunk_seen:
                                     _ttft_first_chunk_seen = True
                                     try:
-                                        _ttft_ms = int(
-                                            (self._last_chunk_at
-                                             - _ttft_request_start_monotonic)
-                                            * 1000.0
+                                        # Slice 187 — PURE network TTFT (perf_counter,
+                                        # request-sent → first-byte) separated from LOCAL ASYNC
+                                        # LAG. A loop-starved sample is EXCLUDED from the latency
+                                        # tracker so the routing governor never trains on a
+                                        # broken stopwatch.
+                                        from backend.core.ouroboros.governance.dw_precision_telemetry import (  # noqa: E501
+                                            network_ttft_ms as _s187_ttft,
+                                            measure_loop_lag_ms as _s187_lag,
+                                            ttft_sample_is_clean as _s187_clean,
+                                            now_perf as _s187_np,
                                         )
-                                        self._record_ttft_safely(
-                                            model_id=_effective_model,
-                                            ttft_ms=_ttft_ms,
-                                            op_id=getattr(
-                                                context, "op_id", "",
-                                            ) or "",
+                                        _pure_ttft_ms = _s187_ttft(
+                                            _ttft_request_start_perf, _s187_np(),
                                         )
+                                        _loop_lag_ms = await _s187_lag()
+                                        _ttft_clean = _s187_clean(_loop_lag_ms)
+                                        logger.info(
+                                            "[Slice187] TTFT pure_network=%.0fms loop_lag=%.0fms "
+                                            "clean=%s (model=%s) — %s",
+                                            _pure_ttft_ms, _loop_lag_ms, _ttft_clean,
+                                            _effective_model,
+                                            "RECORDED" if _ttft_clean
+                                            else "EXCLUDED (loop starved)",
+                                        )
+                                        if _ttft_clean:
+                                            self._record_ttft_safely(
+                                                model_id=_effective_model,
+                                                ttft_ms=int(_pure_ttft_ms),
+                                                op_id=getattr(
+                                                    context, "op_id", "",
+                                                ) or "",
+                                            )
                                         # Slice 35 Phase 1 — record
                                         # STAGE_RT_HTTP_POST at first-chunk
                                         # arrival (TTFT closes the HTTP
