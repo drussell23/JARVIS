@@ -136,6 +136,19 @@ class DriftType(str, Enum):
     A sibling model may be less prone to this judgment.
     """
 
+    DUAL_ARM_FAILURE = "dual_arm_failure"
+    """Slice 194 — a proactive hedge race where BOTH transport arms failed
+    on this model (e.g. an RT RuntimeError + a structural batch rejection).
+
+    Sourced from ``race_triage.record_dual_arm_blacklist`` after the
+    triage engine confirms a hard model/endpoint blockage (internal
+    faults and cancelled arms are carved out — Slice 185 doctrine).
+    Stored here so dual-arm events share the bounded per-op storage and
+    the /drift audit surface; the dispatch skip predicate for THIS kind
+    is ``race_triage.is_blacklisted_for_op`` (own master, default TRUE),
+    NOT ``has_drifted`` (whose rotation master defaults FALSE).
+    """
+
 
 @dataclass(frozen=True)
 class DriftEvent:

@@ -2281,6 +2281,49 @@ class DoublewordProvider:
                     except Exception:  # noqa: BLE001
                         pass
 
+                def _s194_on_abandoned(
+                    fast_exc: Optional[BaseException],
+                    stable_exc: Optional[BaseException],
+                ) -> None:
+                    # Slice 194 — the race died with NO winner. Count it
+                    # (explicit, no more derived-gap arithmetic), then triage:
+                    # a confirmed hard blockage blacklists THIS model for THIS
+                    # op so the sentinel walker rotates to the next ranked
+                    # candidate instead of re-walking the corpse every retry.
+                    try:
+                        from backend.core.ouroboros.governance.observability_registry import (
+                            record_hedge_abandoned as _s194_record_abandoned,
+                        )
+                        _s194_record_abandoned()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        from backend.core.ouroboros.governance.race_triage import (
+                            race_triage_enabled as _s194_enabled,
+                            record_dual_arm_blacklist as _s194_blacklist,
+                            triage_dual_failure,
+                        )
+                        if not _s194_enabled():
+                            return
+                        verdict = triage_dual_failure(fast_exc, stable_exc)
+                        _s194_op = getattr(context, "op_id", "") or ""
+                        _s194_model = ""
+                        try:
+                            _s194_model = self._resolve_effective_model(context) or ""
+                        except Exception:  # noqa: BLE001
+                            pass
+                        logger.warning(
+                            "[RaceTriage] hedge race ABANDONED op=%s model=%s "
+                            "fast=%s stable=%s hard_blockage=%s — %s",
+                            _s194_op[:16], _s194_model,
+                            verdict.fast_class.value, verdict.stable_class.value,
+                            verdict.hard_blockage, verdict.reason,
+                        )
+                        if verdict.hard_blockage:
+                            _s194_blacklist(_s194_op, _s194_model, verdict)
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 return await hedged_race(
                     lambda: self._generate_realtime(
                         context, deadline, prompt_override=prompt_override,
@@ -2292,6 +2335,7 @@ class DoublewordProvider:
                     fast_label="rt",
                     stable_label="batch",
                     on_outcome=_s190_hedge_outcome,
+                    on_abandoned=_s194_on_abandoned,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot

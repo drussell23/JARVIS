@@ -3328,6 +3328,28 @@ class CandidateGenerator:
                 # the tracker module is missing / unimportable / raises,
                 # fall through to normal attempt (legacy behavior).
                 pass
+            # Slice 194 — race-triage rotation. If BOTH hedge arms died on
+            # this model earlier in this same op (confirmed hard blockage),
+            # skip the corpse — the next iteration IS the next-highest-ranked
+            # catalog candidate. OWN master (JARVIS_RACE_TRIAGE_ENABLED,
+            # default TRUE, failure-path-only) — deliberately independent of
+            # the default-FALSE drift-rotation master above.
+            try:
+                from backend.core.ouroboros.governance.race_triage import (
+                    is_blacklisted_for_op as _s194_is_blacklisted,
+                )
+                _s194_op_id = getattr(context, "op_id", "") or ""
+                if _s194_is_blacklisted(_s194_op_id, model_id):
+                    logger.warning(
+                        "[RaceTriage] Sentinel dispatch: route=%s model=%s "
+                        "dual-arm-blacklisted on op — rotating to next ranked "
+                        "candidate (op=%s)",
+                        provider_route, model_id, op_id_short,
+                    )
+                    attempts.append(f"{model_id}:skipped_dual_arm")
+                    continue
+            except Exception:  # noqa: BLE001 — rotation is enhancement, not gate
+                pass
             attempts.append(f"{model_id}:attempted")
             # Stamp the per-attempt override via ContextVar (async-safe
             # per asyncio task, survives the frozen OperationContext

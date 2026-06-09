@@ -54,6 +54,9 @@ async def hedged_race(
     fast_label: str = "rt",
     stable_label: str = "batch",
     on_outcome: Optional[Callable[[str, bool], None]] = None,
+    on_abandoned: Optional[
+        Callable[[Optional[BaseException], Optional[BaseException]], None]
+    ] = None,
 ) -> Any:
     """Race ``fast`` (RT) against ``stable`` (batch). Return the FIRST successful result; cancel
     the loser aggressively. A ``fast`` failure that ``is_rupture`` returns True for is swallowed so
@@ -63,12 +66,20 @@ async def hedged_race(
     ``on_outcome(winner_label, rupture_swallowed)`` is invoked on the winning result so the caller
     can record telemetry — which transport won, and whether an RT rupture was made INVISIBLE by
     the stable path winning (a proactive capital-save). Best-effort: a sink error never breaks the
-    race."""
+    race.
+
+    ``on_abandoned(fast_exc, stable_exc)`` (Slice 194) fires when the race dies with NO winner —
+    both arms resolved, neither succeeded — passing each arm's captured exception (None for an
+    arm that was cancelled / never errored). The caller's triage engine classifies the pair to
+    confirm a hard model/endpoint blockage and rotate candidates. Best-effort: a sink error never
+    changes the raise behavior; the abandoned race still raises its last exception."""
     loop = asyncio.get_event_loop()
     t_fast = loop.create_task(fast())
     t_stable = loop.create_task(stable())
     pending = {t_fast, t_stable}
     last_exc: Optional[BaseException] = None
+    fast_exc: Optional[BaseException] = None
+    stable_exc: Optional[BaseException] = None
     fast_ruptured = False
 
     def _report(winner_label: str) -> None:
@@ -88,6 +99,11 @@ async def hedged_race(
                     continue
                 except BaseException as exc:  # noqa: BLE001
                     last_exc = exc
+                    # Slice 194 — capture per-arm so a dual failure can be triaged.
+                    if t is t_fast:
+                        fast_exc = exc
+                    else:
+                        stable_exc = exc
                     # a fast-path rupture is non-fatal — let the stable path keep racing
                     if t is t_fast and is_rupture(exc):
                         fast_ruptured = True
@@ -105,6 +121,15 @@ async def hedged_race(
                     return result
         # both finished without a success
         if last_exc is not None:
+            # Slice 194 — the race was ABANDONED (no winner). Hand both arms'
+            # exceptions to the caller's triage engine before raising. Only
+            # fires when at least one arm actually errored — a pure-cancellation
+            # unwind (outer shutdown) is not an abandoned race.
+            if on_abandoned is not None:
+                try:
+                    on_abandoned(fast_exc, stable_exc)
+                except Exception:  # noqa: BLE001 — triage never changes the raise
+                    pass
             raise last_exc
         raise RuntimeError("hedged_race: both transports resolved without a result")
     finally:
