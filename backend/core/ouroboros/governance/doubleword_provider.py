@@ -2245,6 +2245,16 @@ class DoublewordProvider:
                     "it, rupture can't be on the critical path (op=%s)",
                     getattr(context, "op_id", "?")[:16],
                 )
+                try:
+                    # Slice 193 — durable structured counter; the INFO line above
+                    # is invisible at the soak's WARNING threshold, the registry
+                    # is not (Manifesto §7).
+                    from backend.core.ouroboros.governance.observability_registry import (
+                        record_hedge_dispatch as _s193_record_hedge_dispatch,
+                    )
+                    _s193_record_hedge_dispatch()
+                except Exception:  # noqa: BLE001
+                    pass
                 def _s190_hedge_outcome(winner: str, rupture_swallowed: bool) -> None:
                     # Slice 190 — record the proactive win into the EXISTING economic ledger
                     # (171): which transport won + whether an RT rupture was made INVISIBLE.
@@ -2259,6 +2269,15 @@ class DoublewordProvider:
                             get_economic_telemetry,
                         )
                         get_economic_telemetry().record_hedge_outcome(winner, rupture_swallowed)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        # Slice 193 — the same outcome lands in the durable registry
+                        # so the long soak can audit victories across restarts.
+                        from backend.core.ouroboros.governance.observability_registry import (
+                            record_hedge_outcome as _s193_record_hedge_outcome,
+                        )
+                        _s193_record_hedge_outcome(winner, rupture_swallowed)
                     except Exception:  # noqa: BLE001
                         pass
 
