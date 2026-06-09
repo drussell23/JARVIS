@@ -53,6 +53,10 @@ services:
       JARVIS_ARTIFACT_JANITOR_ENABLED: "1"
       JARVIS_ARTIFACT_SCARCITY_THRESHOLD: "0.85"
       # JARVIS_DISCORD_MAINTENANCE_WEBHOOK: "..."   # set in .env to push eviction events
+      # ── Slice 185 Phase 4: wipe DW learned-state corrupted by the NameError phantom on this
+      #    ONE clean relaunch (the cortex calibrated against a ~2x-inflated rupture rate).
+      #    Remove this line after the first clean boot so the organism keeps learning. ──
+      JARVIS_DW_LEDGER_WIPE_ON_BOOT: "1"
       # ── Organism baseline ──
       JARVIS_EPISODIC_CORE_ENABLED: "1"
       JARVIS_CAI_ROUTER_ENABLED: "1"
