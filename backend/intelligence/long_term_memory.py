@@ -60,6 +60,35 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+
+def sanitize_embedding_vector(raw: Any) -> Optional[List[float]]:
+    """Slice 186 Phase 2 — strict, deterministic cast of ANY embedding shape to a FLAT list of
+    python floats, the ONLY form ChromaDB accepts. Handles numpy arrays / tensors (.tolist()),
+    2-D model output (shape [1, dim] → flatten), numpy scalar types (→ python float), and python
+    lists. Returns None on anything uncastable. NEVER raises — a malformed vector must skip
+    ingestion, not crash memory."""
+    try:
+        if raw is None:
+            return None
+        # numpy ndarray / torch tensor → python lists
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        if not isinstance(raw, (list, tuple)):
+            return None
+        # collapse a single-row 2-D vector (shape [1, dim]) to 1-D
+        if len(raw) == 1 and isinstance(raw[0], (list, tuple)):
+            raw = raw[0]
+        if not raw or not isinstance(raw, (list, tuple)):
+            return None
+        # reject if still nested (genuinely multi-row — not a single embedding)
+        if any(isinstance(x, (list, tuple)) for x in raw):
+            return None
+        out = [float(x) for x in raw]
+        return out if out else None
+    except Exception:  # noqa: BLE001 — uncastable vector → skip, never crash
+        return None
+
+
 T = TypeVar("T")
 
 
@@ -492,7 +521,9 @@ class LongTermMemoryManager:
 
         try:
             embedding = self._embedder.encode(text)
-            return embedding.tolist()
+            # Slice 186 Phase 2 — strict flat-float cast (was raw .tolist(), which left 2-D
+            # output as [[...]] and broke ChromaDB ingestion).
+            return sanitize_embedding_vector(embedding)
         except Exception as e:
             logger.warning(f"[LONG-TERM-MEMORY] Embedding failed: {e}")
             return None
@@ -520,7 +551,7 @@ class LongTermMemoryManager:
 
         # Store in ChromaDB
         if self._collections.get("episodes"):
-            embedding = self._generate_embedding(content)
+            embedding = await asyncio.to_thread(self._generate_embedding, content)  # Slice 186 P3: off-loop
 
             self._collections["episodes"].add(
                 ids=[memory_id],
@@ -571,7 +602,7 @@ class LongTermMemoryManager:
         content = f"{fact}: {json.dumps(value, default=str)}"
 
         if self._collections.get("facts"):
-            embedding = self._generate_embedding(content)
+            embedding = await asyncio.to_thread(self._generate_embedding, content)  # Slice 186 P3: off-loop
 
             self._collections["facts"].upsert(
                 ids=[memory_id],
@@ -625,7 +656,7 @@ class LongTermMemoryManager:
         content = f"{name}: " + " -> ".join(steps)
 
         if self._collections.get("procedures"):
-            embedding = self._generate_embedding(content)
+            embedding = await asyncio.to_thread(self._generate_embedding, content)  # Slice 186 P3: off-loop
 
             self._collections["procedures"].upsert(
                 ids=[memory_id],
@@ -669,7 +700,9 @@ class LongTermMemoryManager:
 
         collections_to_search = memory_types or ["episodes", "facts", "procedures"]
 
-        embedding = self._generate_embedding(query)
+        # Slice 186 Phase 3 — offload the SYNCHRONOUS embedder.encode() onto a worker thread so
+        # it can't strangle the control-plane event loop (the ControlPlaneStarvation lag).
+        embedding = await asyncio.to_thread(self._generate_embedding, query)
         if not embedding:
             return results
 
@@ -679,7 +712,9 @@ class LongTermMemoryManager:
                 continue
 
             try:
-                query_results = collection.query(
+                # Slice 186 Phase 3 — ChromaDB .query() is blocking I/O; run it off-loop.
+                query_results = await asyncio.to_thread(
+                    collection.query,
                     query_embeddings=[embedding],
                     n_results=limit,
                     include=["documents", "metadatas", "distances"],
@@ -812,7 +847,7 @@ class LongTermMemoryManager:
             if chain.steps:
                 content += f"\nThoughts: {' -> '.join(s.thought for s in chain.steps[:5])}"
 
-            embedding = self._generate_embedding(content)
+            embedding = await asyncio.to_thread(self._generate_embedding, content)  # Slice 186 P3: off-loop
 
             self._collections["reasoning"].add(
                 ids=[chain.chain_id],
