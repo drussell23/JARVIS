@@ -63,17 +63,21 @@ _SLOT_SIZE = _NAME_SIZE + 8
 _MAX_SLOTS = 256
 _FILE_SIZE = _HEADER_SIZE + _MAX_SLOTS * _SLOT_SIZE
 
-# The four long-window hedge metrics (Slice 193 charter).
+# The long-window hedge metrics (Slice 193 charter + Slice 194 abandoned races).
 HEDGE_CONCURRENCY_DISPATCHES = "hedge_concurrency_dispatches"
 HEDGE_RT_VICTORIES = "hedge_rt_victories"
 HEDGE_BATCH_VICTORIES = "hedge_batch_victories"
 HEDGE_RUPTURES_SWALLOWED = "hedge_ruptures_swallowed"
+# Slice 194 — a race where BOTH arms failed (no winner). Previously only
+# derivable as dispatches − victories; now explicit and self-describing.
+HEDGE_RACES_ABANDONED = "hedge_races_abandoned"
 
 _PREREGISTERED = (
     HEDGE_CONCURRENCY_DISPATCHES,
     HEDGE_RT_VICTORIES,
     HEDGE_BATCH_VICTORIES,
     HEDGE_RUPTURES_SWALLOWED,
+    HEDGE_RACES_ABANDONED,
 )
 
 
@@ -316,6 +320,14 @@ def record_hedge_dispatch() -> None:
     """One proactive hedge race launched (RT + batch in flight concurrently)."""
     try:
         get_observability_registry().incr(HEDGE_CONCURRENCY_DISPATCHES)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_hedge_abandoned() -> None:
+    """Slice 194 — one hedge race died with NO winner (both arms failed)."""
+    try:
+        get_observability_registry().incr(HEDGE_RACES_ABANDONED)
     except Exception:  # noqa: BLE001
         pass
 
