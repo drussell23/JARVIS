@@ -39,6 +39,27 @@ def immortal_queue_enabled() -> bool:
     return os.environ.get(_ENV_ENABLED, "true").strip().lower() not in ("0", "false", "no", "off")
 
 
+def dw_hedge_enabled() -> bool:
+    """Slice 181 — master for the intra-request RT→batch hedge. Default **TRUE**
+    (failure-path-only: only fires on a stream rupture). NEVER raises."""
+    return os.environ.get("JARVIS_DW_HEDGE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def dw_batch_retry_enabled() -> bool:
+    """Slice 181 — master for the Kevlar batch-creation retry. Default **TRUE**
+    (failure-path-only: only fires on a transient 5xx). NEVER raises."""
+    return os.environ.get("JARVIS_DW_BATCH_RETRY_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def dw_batch_max_retries() -> int:
+    """Slice 181 — bounded batch-creation re-submits. NEVER raises."""
+    try:
+        v = int(_envf("JARVIS_DW_BATCH_MAX_RETRIES", 3.0))
+        return v if v > 0 else 3
+    except Exception:  # noqa: BLE001
+        return 3
+
+
 def _envf(name: str, default: float) -> float:
     try:
         raw = os.environ.get(name, "").strip()

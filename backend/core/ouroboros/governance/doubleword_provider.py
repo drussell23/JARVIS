@@ -2009,6 +2009,25 @@ class DoublewordProvider:
                     prompt_override=prompt_override,
                     repair_context=repair_context,
                 )
+            except StreamRuptureError as _s181_rupture:
+                # Slice 181 — INTRA-REQUEST HEDGE. The RT SSE stream RUPTURED
+                # (ClientPayloadError: TransferEncodingError). Don't fail the model and
+                # bubble live_transport to the sentinel — re-submit the SAME payload over the
+                # stream-free BATCH lane within this same FSM tick. The op never sees the
+                # rupture; it just succeeds, more slowly. Gated; flag-off → legacy re-raise.
+                from backend.core.ouroboros.governance.dw_immortal import (
+                    dw_hedge_enabled as _s181_hedge_on,
+                    hedge_to_batch_on_rupture as _s181_hedge,
+                )
+                if _s181_hedge_on() and _s181_hedge(str(_s181_rupture) or "live_transport"):
+                    logger.warning(
+                        "[Immortal] RT stream RUPTURED → HEDGING to DW-batch within the same "
+                        "tick (op=%s) — the op never sees the rupture",
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                    # fall through to batch mode below (the hedge)
+                else:
+                    raise
             except DoublewordInfraError as exc:
                 if exc.status_code in (429, 503):
                     logger.info(
@@ -3661,11 +3680,12 @@ class DoublewordProvider:
                     )
 
     async def _create_batch(
-        self, input_file_id: str, *, op_id: str = "dw-batch-create",
+        self, input_file_id: str, *, op_id: str = "dw-batch-create", _s181_attempt: int = 0,
     ) -> Optional[str]:
         """Stage 2: Create batch job.
 
         Slice 2B-ii — ``op_id`` is threaded for per-call Aegis lease.
+        Slice 181 — ``_s181_attempt`` threads the Kevlar batch-retry recursion depth.
         """
         session = await self._get_session()
         _rl_t0 = time.monotonic()
@@ -3711,6 +3731,26 @@ class DoublewordProvider:
                         "[DoublewordProvider] Batch create failed: %s %s",
                         resp.status, body[:2000],
                     )
+                    # Slice 181 — KEVLAR batch net. The batch lane is NOT bulletproof. On a
+                    # TRANSIENT 5xx (DW overload), re-submit with exponential backoff instead
+                    # of bubbling None to the sentinel (which would exhaust the op). A 4xx
+                    # (the 168 param-rejection class) is NOT retried — re-submitting won't help.
+                    from backend.core.ouroboros.governance.dw_immortal import (
+                        dw_batch_retry_enabled as _s181_br_on,
+                        batch_should_retry as _s181_br,
+                        dw_batch_max_retries as _s181_br_max,
+                        immortal_backoff_s as _s181_br_backoff,
+                    )
+                    if _s181_br_on() and _s181_br(resp.status, _s181_attempt, max_retries=_s181_br_max()):
+                        logger.warning(
+                            "[Immortal] batch-create transient %d → backoff + re-submit #%d "
+                            "(op=%s; batch lane kept alive)",
+                            resp.status, _s181_attempt + 1, op_id,
+                        )
+                        await asyncio.sleep(_s181_br_backoff(_s181_attempt))
+                        return await self._create_batch(
+                            input_file_id, op_id=op_id, _s181_attempt=_s181_attempt + 1,
+                        )
                     return None
                 result = await resp.json()
                 batch_id = result.get("id")
