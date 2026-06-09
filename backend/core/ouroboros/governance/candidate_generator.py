@@ -3125,6 +3125,8 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
         provider_route: str,
+        *,
+        _immortal_attempt: int = 0,
     ) -> Optional[GenerationResult]:
         """Phase 10 P10.3 — sentinel-driven DW dispatch.
 
@@ -3698,6 +3700,37 @@ class CandidateGenerator:
             )
         # cascade_to_claude — Claude is the explicit cost contract.
         if self._fallback is None:
+            # Slice 180 — THE IMMORTAL EXECUTION LAYER. Raising here DELETES the op (the
+            # soak's all_providers_exhausted bleed). With NO fallback configured, exhausting
+            # is unacceptable. Instead → QUEUE_ONLY: exponential-backoff and RE-ATTEMPT the
+            # full DW dispatch until the vendor recovers, bounded by the op's own deadline +
+            # a capped attempt count. A transient TOTAL DW outage is survived (the warm-boot
+            # + intra-DW failover route the recovered attempt to batch); a permanently-dead
+            # DW still fails — but only after exhausting the queue budget, never instantly.
+            try:
+                from backend.core.ouroboros.governance.dw_immortal import (
+                    immortal_should_retry as _imm_should_retry,
+                    immortal_backoff_s as _imm_backoff,
+                    immortal_max_attempts as _imm_max,
+                )
+                import time as _imm_time
+                _imm_deadline = deadline.timestamp() if hasattr(deadline, "timestamp") else float(deadline)
+                if _imm_should_retry(
+                    deadline=_imm_deadline, now=_imm_time.time(), claude_available=False,
+                    attempt=_immortal_attempt, max_attempts=_imm_max(),
+                ):
+                    _imm_delay = _imm_backoff(_immortal_attempt)
+                    logger.warning(
+                        "[Immortal] DW exhausted + NO fallback → QUEUE_ONLY: backoff %.1fs then "
+                        "re-attempt #%d (op NEVER lost; op=%s, last=%s)",
+                        _imm_delay, _immortal_attempt + 1, op_id_short, (last_failure or "?")[:60],
+                    )
+                    await asyncio.sleep(_imm_delay)
+                    return await self._dispatch_via_sentinel(
+                        context, deadline, provider_route, _immortal_attempt=_immortal_attempt + 1,
+                    )
+            except Exception as _imm_exc:  # noqa: BLE001 — the immortal layer must never itself break the op
+                logger.debug("[Immortal] queue-retry path swallowed: %r", _imm_exc)
             _note_dw_total_outage(last_failure or "")  # Slice 53
             raise RuntimeError(
                 f"sentinel_dispatch_no_fallback:"
