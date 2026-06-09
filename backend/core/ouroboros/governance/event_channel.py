@@ -304,6 +304,46 @@ class EventChannelServer:
                     metrics_exc,
                 )
 
+            # Slice 193 — sovereign telemetry registry surface.
+            # Mounts /observability/registry (durable mmap-backed hedge
+            # counters: dispatches / rt victories / batch victories /
+            # ruptures swallowed). Loopback + CORS invariants mirror the
+            # existing IDE router; authority invariant is grep-pinned in
+            # tests/governance/test_observability_registry.py.
+            registry_router_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter as _IDEObsRouterReg,
+                    assert_loopback_only as _assert_loopback_registry,
+                )
+                from backend.core.ouroboros.governance.observability_registry import (
+                    observability_registry_enabled as _registry_enabled,
+                    register_registry_routes,
+                )
+                if _registry_enabled():
+                    _assert_loopback_registry(self._host)
+                    _registry_helper = _IDEObsRouterReg()
+                    register_registry_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _registry_helper._check_rate_limit(
+                                _registry_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_registry_helper._cors_headers,
+                    )
+                    registry_router_mounted = True
+            except ValueError as registry_loopback_exc:
+                logger.warning(
+                    "[EventChannel] registry observability refused: %s",
+                    registry_loopback_exc,
+                )
+            except Exception as registry_exc:
+                logger.warning(
+                    "[EventChannel] registry observability wiring failed: %s",
+                    registry_exc,
+                )
+
             # P5 Slice 5 — adversarial reviewer observability surface.
             # Mounts /observability/adversarial{,/history,/stats,
             # /{op_id}}. Loopback + CORS invariants mirror the
