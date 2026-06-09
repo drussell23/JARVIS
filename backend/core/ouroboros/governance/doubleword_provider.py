@@ -240,6 +240,40 @@ def _reasoning_effort_for(complexity: str = "", model: str = "") -> str:
     return _clamp_up_to_min(base, _dw_model_min_effort(model))
 
 
+def _dw_disable_thinking_enabled() -> bool:
+    """Slice 192 Phase 2 — master for the extra_body enable_thinking suppression. Default TRUE
+    (it fixes the placement of an already-intended param; vendor-confirmed by Seb). NEVER raises."""
+    return os.environ.get("JARVIS_DW_DISABLE_THINKING_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _dw_supports_reasoning_control(model_id: str = "") -> bool:
+    """Slice 192 Phase 2 — does the DW catalog (Slice 169 /v1/models metadata) show this model
+    supports reasoning control? DYNAMIC — no hardcoded model names. NEVER raises (False = unknown
+    → caller uses the legacy harmless top-level flag)."""
+    try:
+        from backend.core.ouroboros.governance.dw_catalog_client import (
+            catalog_min_reasoning_effort,
+        )
+        return catalog_min_reasoning_effort(model_id or "") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dw_thinking_extra_body(model_id: str = "") -> dict:
+    """Slice 192 Phase 2 — Seb @ Doubleword (2026-06-09): enable_thinking is honored ONLY nested
+    in ``extra_body``, not top-level. Inject ``{"chat_template_kwargs": {"enable_thinking": False}}``
+    DYNAMICALLY when the catalog confirms the model supports reasoning control — cutting stream
+    length → fewer ruptures at the SOURCE. Returns {} (caller falls back) otherwise. NEVER raises."""
+    try:
+        if _dw_disable_thinking_enabled() and _dw_supports_reasoning_control(model_id):
+            return {"chat_template_kwargs": {"enable_thinking": False}}
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _reasoning_request_params(effort: str = "", *, complexity: str = "", model: str = "") -> dict:
     """Slice 54/55 — DoubleWord reasoning-control request params.
 
@@ -264,9 +298,15 @@ def _reasoning_request_params(effort: str = "", *, complexity: str = "", model: 
     eff = _clamp_up_to_min(eff, _dw_model_min_effort(model))
     params: dict = {"reasoning_effort": eff}
     if eff == "none":
-        # Belt-and-braces: harmless (DW ignores it) but keeps intent explicit
-        # for any future endpoint that honors the chat-template flag.
-        params["chat_template_kwargs"] = {"enable_thinking": False}
+        # Slice 192 Phase 2 — DW honors enable_thinking ONLY nested in extra_body (Seb @
+        # Doubleword). Inject it there DYNAMICALLY for catalog-confirmed reasoning models (no
+        # hardcoded names) to cut stream length → fewer ruptures at the source. When the catalog
+        # can't confirm, fall back to the legacy top-level flag (DW-ignored but harmless).
+        _eb = _dw_thinking_extra_body(model)
+        if _eb:
+            params["extra_body"] = _eb
+        else:
+            params["chat_template_kwargs"] = {"enable_thinking": False}
     return params
 
 
@@ -597,6 +637,50 @@ def _dw_latency_favors_batch() -> bool:
         return False
 
 
+def _dw_confirmed_storm(model_id: str = "") -> bool:
+    """Slice 192 — the ONLY thing that overrides the proactive hedge: a confirmed platform-wide
+    rupture STORM. Reuses the EXISTING predictive cortex (172-176 rupture_probability) + the
+    Slice-188 storm threshold. Above threshold → RT is doomed → batch-only saves the spend.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dw_transport_hedge import (
+            should_skip_race_for_storm,
+        )
+        from backend.core.ouroboros.governance.dw_failure_predictor import (
+            get_dw_failure_predictor,
+        )
+        import time as _t192
+        storm_p = get_dw_failure_predictor().rupture_probability(_t192.time(), model_id=model_id)
+        return should_skip_race_for_storm(storm_p)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dw_hedge_supersedes(context: Any, model_id: str = "") -> bool:
+    """Slice 192 — THE PROACTIVE HIERARCHY. When the transport-hedge is active it SUPERSEDES all
+    reactive force-batch (cold-start 184 / warm-boot 179 / intra-failover 170 / predictive 172):
+    racing RT vs batch is strictly better than forcing batch-only when RT MIGHT work — you get
+    RT's speed if it works, batch's reliability if it ruptures. So force-batch yields to the race
+    — EXCEPT a confirmed STORM (cost-optimizer) and a degraded batch lane (can't race into it).
+    Route-gated to standard/complex. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.dw_transport_hedge import (
+            transport_hedge_enabled,
+        )
+        if not transport_hedge_enabled():
+            return False
+        route = (getattr(context, "provider_route", "") or "").strip().lower()
+        if route not in ("standard", "complex"):
+            return False
+        if not _dw_batch_lane_healthy():
+            return False  # can't hedge into a broken batch lane → let force-batch logic handle it
+        if _dw_confirmed_storm(model_id):
+            return False  # storm overrides the hedge → batch-only
+        return True  # hedge active, route ok, batch healthy, no storm → RACE
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     """Slice 36 — adaptive transport selector decision.
 
@@ -621,8 +705,16 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     failure (returns False = preserve legacy RT behavior).
     """
     try:
-        # Slice 182 — SENTINEL force-batch override (HIGHEST precedence). The sentinel, having
-        # natively queried the predictor/warm-boot, COMMANDS batch for this probe via an
+        # Slice 192 — THE PROACTIVE HIERARCHY (supersedes ALL reactive force-batch). When the
+        # transport-hedge is active and no STORM is forecast, RACE instead of force-batching —
+        # this explicitly OVERRIDES the cold-start timer (184), the warm-boot ledger flags (179),
+        # the intra-DW failover (170), the predictive cortex (172), AND the sentinel command
+        # below. Racing RT vs batch is strictly better than batch-only when RT MIGHT work. The
+        # ONLY override is a confirmed storm (checked inside _dw_hedge_supersedes → cost-optimizer).
+        if _dw_hedge_supersedes(context, model_id):
+            return False
+        # Slice 182 — SENTINEL force-batch override (HIGHEST reactive precedence). The sentinel,
+        # having natively queried the predictor/warm-boot, COMMANDS batch for this probe via an
         # async-safe ContextVar. Load-bearing: in the sentinel path the per-model frozen
         # context carries an EMPTY provider_route, so the route gate below cannot engage and
         # every probe ruptured on RT (the v181 soak bleed). This override bypasses the gate.
