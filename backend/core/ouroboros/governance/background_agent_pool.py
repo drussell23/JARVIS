@@ -1040,6 +1040,45 @@ class BackgroundAgentPool:
                     _op_timeout_s, _ceiling_reason = max(
                         _candidates, key=lambda p: (p[0], p[1]),
                     )
+                    # Slice 195 — Adaptive Horizon Governor. Derive the ceiling
+                    # from the op's STATIC shape (context size, continuous
+                    # file-count vector, model catalog profile) instead of the
+                    # magic-number table. Raise-only above the legacy floor +
+                    # hard-clamped (JARVIS_HORIZON_MAX_S) — computed ONCE here
+                    # at pickup, never extended mid-run (Slice 47 watchdog
+                    # doctrine: no ledger/liveness coupling). OFF → the legacy
+                    # pair above passes through byte-identical.
+                    try:
+                        from backend.core.ouroboros.governance.adaptive_horizon import (
+                            compute_horizon as _s195_compute_horizon,
+                        )
+                        _s195_model_id = None
+                        try:
+                            from backend.core.ouroboros.governance.provider_topology import (
+                                get_topology as _s195_get_topology,
+                            )
+                            _s195_route = str(
+                                getattr(
+                                    getattr(op.context, "routing", None),
+                                    "provider_route", "",
+                                ) or "background"
+                            )
+                            _s195_model_id = _s195_get_topology().model_for_route(
+                                _s195_route,
+                            )
+                        except Exception:  # noqa: BLE001
+                            _s195_model_id = None
+                        _op_timeout_s, _ceiling_reason = _s195_compute_horizon(
+                            legacy_floor_s=_op_timeout_s,
+                            legacy_reason=_ceiling_reason,
+                            context_chars=len(
+                                getattr(op.context, "description", "") or ""
+                            ),
+                            target_file_count=_target_file_count,
+                            model_id=_s195_model_id,
+                        )
+                    except Exception:  # noqa: BLE001 — governor is enhancement,
+                        pass            # never blocks pickup; legacy pair stands
                     if _ceiling_reason != "base":
                         logger.info(
                             "Worker %d: %s ceiling=%.0fs reason=%s "
