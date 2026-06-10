@@ -5651,6 +5651,28 @@ _CLAUDE_HARD_POOL_EXC_NAMES = frozenset(
     ).split(",")
     if _raw.strip()
 )
+
+# Slice 216 — closed-client detection is MESSAGE-keyed, not class-keyed: the
+# anthropic SDK surfaces a dead shared client as a generic
+# ``RuntimeError("Cannot send a request, as the client has been closed")``
+# nested under APIConnectionError, and ``RuntimeError`` is far too broad for
+# _CLAUDE_HARD_POOL_EXC_NAMES. Retrying on a closed client can NEVER succeed --
+# only a recycle helps (observed live: first dual-engine soak, 2026-06-10,
+# backoff-retried gen=3 against a dead client).
+_CLOSED_CLIENT_MSG_FRAGMENTS = ("client has been closed", "client is closed")
+
+
+def _is_closed_client_error(chain) -> bool:
+    """True if any member of the exception cause-chain carries the
+    closed-client message signature. NEVER raises."""
+    try:
+        for e in chain or ():
+            msg = str(e).lower()
+            if any(frag in msg for frag in _CLOSED_CLIENT_MSG_FRAGMENTS):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 # Ring buffer cap for cascade telemetry — bounded so long-running sessions
 # don't accumulate unbounded memory.
 _CLAUDE_CASCADE_TELEMETRY_CAP = int(
@@ -6722,6 +6744,15 @@ class ClaudeProvider:
                 if _CLAUDE_RECYCLE_ON_POOL_TIMEOUT and _hard_pool_hit:
                     self._recycle_client(
                         reason=f"hard_pool_signal:{label}:{exc_class_display}"
+                    )
+
+                # Slice 216 — a CLOSED shared client is unrecoverable by
+                # backoff (every retry hits the same dead object). Recycle
+                # NOW so the next attempt gets a live client. Message-keyed
+                # (see _is_closed_client_error). Observed live 2026-06-10.
+                if _is_closed_client_error(_chain):
+                    self._recycle_client(
+                        reason=f"closed_client:{label}"
                     )
 
                 # Streaming progress check — can't retry once bytes are out.
