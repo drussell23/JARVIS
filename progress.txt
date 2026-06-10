@@ -31,3 +31,7 @@
   [ ] host          keep Mac awake (caffeinate) + Docker autostart, OR migrate to GCP when billing on
   [ ] direction     author + sign real strategic goals (.jarvis/roadmap.yaml via strategy_signer)
   [ ] starvation    the organism's own #1 self-identified priority: eliminate control-plane starvation
+  [x] slice-212  runtime attestation: image stamped (commit+dirty) at build; boot compares vs
+                 operator pin -> DEPLOYMENT_INTEGRITY_MISMATCH fail-closed on drift (stale rebuild /
+                 dirty tree / unstamped). Born from the LIVED 2026-06-10 failure: a dirty compose
+                 blocked ff-merge and the "211 rebuild" silently ran 208 code. UNPINNED=warn-only.

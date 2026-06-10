@@ -24,6 +24,10 @@ services:
       dockerfile: docker/Dockerfile.soak
       args:
         SOAK_REQUIREMENTS: ${SOAK_REQUIREMENTS:-requirements-soak-oracle.txt}
+        # Slice 212 — attestation stamp (launcher exports these; bare builds
+        # produce an UNSTAMPED image that strict attestation refuses to boot).
+        GIT_COMMIT: ${GIT_COMMIT:-unstamped}
+        GIT_DIRTY: ${GIT_DIRTY:-unknown}
     image: jarvis-sovereign-soak:oracle
     container_name: jarvis-dw-cortex-soak
     working_dir: /app
@@ -139,6 +143,14 @@ services:
       # organism's work queue. ──
       JARVIS_ROADMAP_ORCHESTRATOR_ENABLED: "1"
       JARVIS_PROGRESS_LEDGER_ENABLED: "1"
+      # ── Slice 212 — RUNTIME ATTESTATION GATE. At boot, the image's build
+      # stamp (commit+dirty) is compared against the operator pin below; a
+      # stale rebuild / dirty-tree build / unstamped image FAILS CLOSED with
+      # DEPLOYMENT_INTEGRITY_MISMATCH (state=FAILED, loop never runs). The pin
+      # is set at launch by launch_dw_cortex_soak.sh; restarts keep it, so
+      # later merges to main can't false-trip a healthy soak. ──
+      JARVIS_RUNTIME_ATTESTATION_ENABLED: "1"
+      JARVIS_ATTESTATION_EXPECTED_COMMIT: ${JARVIS_ATTESTATION_EXPECTED_COMMIT:-}
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."

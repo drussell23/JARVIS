@@ -61,6 +61,18 @@ RUN pip install --upgrade pip wheel setuptools && \
 # Application code (.dockerignore keeps .venv / .git / .env / .jarvis out).
 COPY . /app
 
+# Slice 212 — build-time attestation stamp. The launch path passes the exact
+# commit + dirty-tree flag of the build context; at boot, runtime_attestation
+# compares this stamp against the operator-pinned expected commit and
+# fail-closes on drift (the stale-rebuild failure class of 2026-06-10).
+# Placed AFTER `COPY . /app` so the stamp can never survive a code change via
+# layer cache. Defaults mean an un-wrapped `docker build` yields an UNSTAMPED
+# image (strict mode refuses to boot it; the message says to use the launcher).
+ARG GIT_COMMIT=unstamped
+ARG GIT_DIRTY=unknown
+RUN printf '{"commit":"%s","dirty":"%s"}\n' "$GIT_COMMIT" "$GIT_DIRTY" \
+    > /app/.build_attestation.json
+
 # .env (funded creds) + .jarvis (crypto + signed roadmap + persistence) are
 # supplied at runtime by compose — not present in the image.
 ENTRYPOINT ["bash", "scripts/launch_shadow_soak.sh"]
