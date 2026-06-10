@@ -51,3 +51,9 @@
                  L2 PROBE PROVED: goal->reader(valid)->decomposition(valid, 2 sub-goals)->
                  envelope INTO router. Remaining break: orchestration 'no_plan' = planning needs
                  reliable LLM capacity = exactly what this slice supplies.
+  [x] slice-216  concurrency kernel: JARVIS_MULTI_STEP_ORCHESTRATION_ENABLED on (the no_plan
+                 root cause = 4th cut wire); closed-client message-keyed recycle (_is_closed_client_error
+                 -> _recycle_client instead of doomed backoff); fallback concurrency -> cap 4 (D2/12F-B
+                 fast-fail confirmed live). KNOWN ISSUE deferred: tool_call_without_tool_loop on
+                 IMMEDIATE rescue (loop IS wired at construction; conditional branch needs careful
+                 repro — no rushed patch on the generation gatekeeper). PRD §51.11.32 documents the arc.
