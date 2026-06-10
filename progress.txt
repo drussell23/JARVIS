@@ -35,3 +35,9 @@
                  operator pin -> DEPLOYMENT_INTEGRITY_MISMATCH fail-closed on drift (stale rebuild /
                  dirty tree / unstamped). Born from the LIVED 2026-06-10 failure: a dirty compose
                  blocked ff-merge and the "211 rebuild" silently ran 208 code. UNPINNED=warn-only.
+  [x] slice-213  native orchestration kernel: bash launcher -> typed/tested/async Python
+                 (lifecycle_kernel.py, HOST-side). Post-launch attestation verification IS the
+                 launch contract (exit 0 only on ATTESTED_MATCH — phantom deploys can't exit 0).
+                 REFUSED: in-container self-cycling (docker-socket = host escape) + auto-reload
+                 on self-verified patches (S208 = friction not proof; operator merge stays the
+                 deploy boundary).

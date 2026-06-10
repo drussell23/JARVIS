@@ -24,36 +24,16 @@ grep -q "DOUBLEWORD_API_KEY" "$REPO_ROOT/.env" || die ".env has no DOUBLEWORD_AP
 DC=(docker compose); docker compose version >/dev/null 2>&1 || DC=(docker-compose)
 export SOAK_REQUIREMENTS="requirements-soak-oracle.txt"
 
-# Slice 212 — runtime attestation. Stamp the image with the EXACT commit +
-# dirty flag of this build context, and pin the same commit as the boot-time
-# expectation. A stale rebuild (checkout behind what you merged) or a
-# dirty-tree build then FAILS CLOSED at boot with DEPLOYMENT_INTEGRITY_MISMATCH
-# instead of silently running old code (the 2026-06-10 drift class).
-GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unstamped)"
-# Dirty = dirt that actually ENTERS the image. .jarvis (runtime state mutated
-# through the bind-mount, e.g. roadmap.draft.yaml) and __pycache__ are in
-# .dockerignore — they can never reach the image, so they must not dirty the
-# stamp (first live trip 2026-06-10 was exactly this false positive).
-GIT_DIRTY="$([ -n "$(git status --porcelain -- ':\!.jarvis' ':\!**/__pycache__' 2>/dev/null)" ] && echo true || echo false)"
-export GIT_COMMIT GIT_DIRTY
-export JARVIS_ATTESTATION_EXPECTED_COMMIT="$GIT_COMMIT"
-log "Attestation: stamping ${GIT_COMMIT:0:12} (dirty=$GIT_DIRTY) + pinning as boot expectation."
-# NB: '|| true' is load-bearing — under set -e, a false [ test ] in a bare
-# 'a && b' statement kills the whole script (this exact line aborted the
-# 2026-06-10 relaunch BEFORE the build, leaving the old dirty image running).
-if [ "$GIT_DIRTY" = "true" ]; then
-  log "WARNING: dirty tree — strict attestation will REFUSE this image at boot. Commit or stash first."
-fi
-
-if [ "${1:-}" = "--monitor" ]; then
-  exec "$REPO_ROOT/scripts/dw_cortex_monitor.sh"
-fi
-
-log "Building the cortex-soak image (oracle-capable)…"
-"${DC[@]}" -f "$COMPOSE" build
-log "Igniting DW-only cortex soak (Claude DISABLED; 172/174 ON; restart=always)…"
-"${DC[@]}" -f "$COMPOSE" up -d
-log "Live. The cortex learns from real DW failures (per-model rings, multi-signal, self-calibration)."
+# Slice 213 — the stamping/build/verify logic moved to the NATIVE PYTHON
+# lifecycle kernel (typed, tested, async; no set-e traps — the bash trap here
+# cost a deploy cycle on 2026-06-10). The kernel refuses dirty trees upfront,
+# stamps + pins the commit, builds, launches, and VERIFIES the running
+# container attests MATCH before reporting success (exit 0 only on
+# ATTESTED_MATCH — a phantom deploy can no longer exit 0).
+log "Handing off to the native lifecycle kernel (Slice 213)…"
+python3 -m backend.core.ouroboros.governance.lifecycle_kernel --compose "$COMPOSE" \
+  || die "lifecycle kernel refused or could not attest the launch (see log above)."
+log "Live + ATTESTED. The cortex learns from real DW failures."
 log "  Forecasts/calibration:  docker compose -f $COMPOSE logs -f | grep -E 'Cortex|reroute'"
 log "  Learned thresholds:     ./scripts/dw_cortex_monitor.sh"
 log "  Stop:                   docker compose -f $COMPOSE down"
