@@ -414,11 +414,24 @@ def register_registry_routes(
                     status=429, headers=_headers(request),
                 )
         reg = get_observability_registry()
+        # Slice 204 — surface the Chronos non-volatile uptime ledger alongside
+        # the counters so the operator can see operational continuity in one
+        # GET (best-effort; absent/disabled → omitted).
+        chronos = None
+        try:
+            from backend.core.ouroboros.governance.chronos_ledger import (
+                chronos_enabled as _chr_on, get_chronos_ledger as _chr_get,
+            )
+            if _chr_on():
+                chronos = _chr_get().snapshot()
+        except Exception:  # noqa: BLE001
+            chronos = None
         return web.json_response(
             {
                 "schema_version": REGISTRY_SCHEMA_VERSION,
                 "backend": reg.backend_kind,
                 "counters": reg.snapshot(),
+                "chronos": chronos,
                 "generated_at_unix": time.time(),
             },
             status=200, headers=_headers(request),

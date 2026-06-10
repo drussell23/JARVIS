@@ -1721,6 +1721,59 @@ class GovernedLoopService:
             except Exception as _sx:  # noqa: BLE001
                 logger.debug("[GovernedLoop] strategy sim wiring swallowed: %r", _sx)
 
+            # Slice 204 — Chronos Continuity Matrix. Decouples operational
+            # history from volatile container memory: re-chain the disk-backed
+            # ledger on boot (preserve evolutionary history; chain the strict
+            # unsupervised interval only across an UNSUPERVISED recovery — a
+            # supervised rebuild resets it), then a 60s heartbeat accrues true
+            # running time (sleep-frozen wall-clock excluded). Gated, fail-soft.
+            try:
+                from backend.core.ouroboros.governance.chronos_ledger import (
+                    chronos_enabled as _chronos_on,
+                    get_chronos_ledger as _chronos_get,
+                    heartbeat_interval_s as _chronos_hb_s,
+                )
+                if _chronos_on():
+                    import asyncio as _aio_chr
+                    import time as _t_chr
+                    _image = os.environ.get("JARVIS_SOAK_IMAGE_ID", "").strip() \
+                        or os.environ.get("HOSTNAME", "").strip() or "local"
+                    _chr_led = _chronos_get()
+                    _chr_snap = _chr_led.rechain_on_boot(
+                        now_unix=_t_chr.time(), image_id=_image,
+                    )
+                    logger.warning(
+                        "[GovernedLoop] Chronos re-chained: boot=%d event=%s "
+                        "total_days=%.3f unsupervised_days=%.3f",
+                        _chr_snap.get("boot_count"), _chr_snap.get("last_event"),
+                        _chr_snap.get("total_operational_days", 0.0),
+                        _chr_snap.get("unsupervised_interval_days", 0.0),
+                    )
+
+                    async def _chronos_heartbeat_loop() -> None:
+                        _iv = _chronos_hb_s()
+                        while True:
+                            try:
+                                await _aio_chr.sleep(_iv)
+                                _chr_led.heartbeat(
+                                    now_unix=_t_chr.time(),
+                                    now_monotonic=_t_chr.monotonic(),
+                                )
+                            except _aio_chr.CancelledError:
+                                break
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                    self._chronos_task = _aio_chr.create_task(
+                        _chronos_heartbeat_loop(),
+                    )
+                    logger.info(
+                        "[GovernedLoop] Chronos heartbeat scheduled (%.0fs; "
+                        "non-volatile uptime ledger active)", _chronos_hb_s(),
+                    )
+            except Exception as _cx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] chronos wiring swallowed: %r", _cx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
