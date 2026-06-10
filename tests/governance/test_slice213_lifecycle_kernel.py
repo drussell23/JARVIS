@@ -36,7 +36,7 @@ from backend.core.ouroboros.governance.lifecycle_kernel import (
 
 def test_dirty_false_on_clean_tree():
     def run(args):
-        assert ":!.jarvis" in args and ":!**/__pycache__" in args
+        assert args[:3] == ["git", "status", "--porcelain"]
         return 0, ""
     assert compute_dirty(run=run) == "false"
 
@@ -44,6 +44,28 @@ def test_dirty_false_on_clean_tree():
 def test_dirty_true_on_real_code_dirt():
     def run(args):
         return 0, " M backend/core/ouroboros/governance/orchestrator.py\n"
+    assert compute_dirty(run=run) == "true"
+
+
+def test_dirty_false_on_dockerignored_noise_only():
+    """The 213b lived bug: pycache/.jarvis noise must be filtered IN PYTHON
+    (the git exclude pathspec excluded in a shell but NOT via subprocess —
+    pathspec magic is environment-sensitive)."""
+    def run(args):
+        return 0, (
+            "?? tests/unit/backend/core/__pycache__/\n"
+            " M .jarvis/roadmap.draft.yaml\n"
+            "?? .pytest_cache/\n"
+        )
+    assert compute_dirty(run=run) == "false"
+
+
+def test_dirty_true_when_real_dirt_mixed_with_noise():
+    def run(args):
+        return 0, (
+            "?? tests/unit/core/__pycache__/\n"
+            " M scripts/launch_dw_cortex_soak.sh\n"
+        )
     assert compute_dirty(run=run) == "true"
 
 

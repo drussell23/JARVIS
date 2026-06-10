@@ -43,9 +43,6 @@ from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# dirt that can never enter the image (mirrors .dockerignore — .jarvis is
-# runtime state mutated through the bind-mount; __pycache__ is build noise)
-_DIRT_EXCLUDES = (":!.jarvis", ":!**/__pycache__")
 _DEFAULT_MARKER = "STRATEGIC IGNITION MESH"
 _DEFAULT_COMPOSE = "docker-compose.dw-cortex-soak.yml"
 
@@ -82,18 +79,39 @@ def _default_sync_run(args: list) -> Tuple[int, str]:
         return 127, ""
 
 
+def _is_image_relevant(porcelain_line: str) -> bool:
+    """True if this porcelain status line names dirt that can enter the image.
+    .jarvis/* (runtime state mutated through the bind-mount), __pycache__ and
+    .pytest_cache are all dockerignored — they can never ship."""
+    path = porcelain_line[3:].strip().strip('"')
+    if " -> " in path:  # renames: check the destination
+        path = path.split(" -> ", 1)[1].strip().strip('"')
+    if path.startswith(".jarvis/") or path == ".jarvis":
+        return False
+    parts = path.rstrip("/").split("/")
+    if "__pycache__" in parts or ".pytest_cache" in parts:
+        return False
+    return True
+
+
 def compute_dirty(*, run: Optional[_SyncRun] = None) -> str:
-    """'true'/'false'/'unknown' — dirt scoped to what actually ships
-    (excludes .jarvis runtime state + __pycache__, both dockerignored).
-    NEVER raises."""
+    """'true'/'false'/'unknown' — dirt scoped to what actually ships.
+
+    Filtering happens IN PYTHON over the plain porcelain output, NOT via git
+    exclude pathspecs: the 213b bug was the same ':!**/__pycache__' pathspec
+    string excluding correctly in a shell but NOT via subprocess (git pathspec
+    magic is environment-sensitive). Deterministic line filtering removes the
+    whole quirk class. NEVER raises."""
     run = run or _default_sync_run
     try:
-        rc, out = run(
-            ["git", "status", "--porcelain", "--", *_DIRT_EXCLUDES],
-        )
+        rc, out = run(["git", "status", "--porcelain"])
         if rc != 0:
             return "unknown"
-        return "true" if out.strip() else "false"
+        relevant = [
+            ln for ln in out.splitlines()
+            if ln.strip() and _is_image_relevant(ln)
+        ]
+        return "true" if relevant else "false"
     except Exception:  # noqa: BLE001
         return "unknown"
 
