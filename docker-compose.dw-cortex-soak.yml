@@ -37,8 +37,32 @@ services:
       - path: .env          # funded DOUBLEWORD_API_KEY — runtime only, never imaged
         required: false
     environment:
-      # ── DW-ONLY: no Claude, no cross-provider cascade ──
-      JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+      # ── Slice 215 — THE FrugalGPT PER-ROUND CASCADE (DW-only era ENDS). ──
+      # The DW-cortex validation purpose of this soak is long served; the soak's
+      # purpose is now AUTONOMY. Claude re-enabled as the per-round rescue tier:
+      # each Venom round runs DW-primary -> Claude rescues THAT round on failure
+      # (per-round survival ~99.7% vs 0.7^n chain death), so chains survive
+      # without paying Claude for whole chains.
+      #   CHARTER (provider_topology defaults already encode it):
+      #   - IMMEDIATE/COMPLEX: dw_allowed=false -> cascade_to_claude (the spine)
+      #   - STANDARD: DW-primary, Claude per-round rescue
+      #   - BACKGROUND/SPECULATIVE: skip_and_queue — NEVER Claude (cost shield)
+      JARVIS_PROVIDER_CLAUDE_DISABLED: "false"
+      # Rescue budgets (blindspot #2): the 60-120s fallback caps were tuned to
+      # protect DW from Claude-starvation; as RESCUE they truncated healthy
+      # mid-stream generations. Raised for generation, modest for PLAN.
+      JARVIS_FALLBACK_MAX_TIMEOUT_S: "180"
+      OUROBOROS_PLAN_FALLBACK_MAX_TIMEOUT_S: "120"
+      # COST CONTAINMENT (operator's #1 concern — Claude spend velocity):
+      #   - session cost-cap lowered 25 -> 10 in the command below: bounds the
+      #     restart:always per-session-reset loophole to $10/session worst-case
+      #   - telemetry sentinel armed: COST_CAP_90 fires the Discord webhook
+      #     (webhook already in .env) BEFORE the cap, not after
+      #   - IMMEDIATE extended thinking stays OFF; BACKGROUND/SPECULATIVE stay
+      #     DW-only by topology; provider response cache (S131) default-ON
+      #     dedupes repeat Claude calls
+      JARVIS_TELEMETRY_SENTINEL_ENABLED: "1"
+      JARVIS_THINKING_BUDGET_IMMEDIATE: "0"
       # ── The predictive cortex — the subject of this soak (172/174 are default-OFF) ──
       JARVIS_DW_PREDICTIVE_ROUTING_ENABLED: "1"      # 172 — preemptive forecast routing
       JARVIS_DW_CALIBRATION_ENABLED: "1"             # 174 — self-tuning Brier threshold
@@ -171,7 +195,7 @@ services:
       - --production-soak
       - --headless
       - --cost-cap
-      - "25"
+      - "10"
       - --idle-timeout
       - "0"
       - --max-wall-seconds

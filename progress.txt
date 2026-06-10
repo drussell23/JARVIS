@@ -41,3 +41,13 @@
                  REFUSED: in-container self-cycling (docker-socket = host escape) + auto-reload
                  on self-verified patches (S208 = friction not proof; operator merge stays the
                  deploy boundary).
+  [x] slice-215  FrugalGPT per-round cascade: Claude RE-ENABLED as per-round rescue tier
+                 (DW-primary rounds, Claude rescues the failed round -> ~99.7% round survival vs
+                 0.7^n chain death). Topology defaults already encode the charter (IMMEDIATE/
+                 COMPLEX cascade_to_claude; BACKGROUND/SPECULATIVE skip_and_queue = never Claude).
+                 Rescue budgets 180s/120s. COST: session cap 25->10 (bounds restart-reset
+                 loophole), sentinel COST_CAP_90 Discord alert armed, thinking IMMEDIATE=0,
+                 response cache dedupes. Bandit state reset for the new Claude arm (cold-start).
+                 L2 PROBE PROVED: goal->reader(valid)->decomposition(valid, 2 sub-goals)->
+                 envelope INTO router. Remaining break: orchestration 'no_plan' = planning needs
+                 reliable LLM capacity = exactly what this slice supplies.
