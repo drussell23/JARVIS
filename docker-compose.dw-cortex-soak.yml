@@ -82,6 +82,13 @@ services:
       # then writes a durable sentinel and dissolves. The sentinel persists in
       # the bind-mounted .jarvis, so restart:always can never spam PRs. ──
       JARVIS_GENESIS_PROPOSAL_ENABLED: "1"
+      # ── Slice 201: Contextual Bandit Routing Advisor. Advisory-only +
+      # structurally fail-closed (reorders WITHIN the policy active set; can
+      # never select an out-of-policy arm). Online Thompson Sampling learns
+      # per-model success rates from live dispatch outcomes. Enabled here so
+      # the soak accumulates real reward data; the deterministic router stays
+      # authoritative and any error keeps the deterministic order. ──
+      JARVIS_BANDIT_ROUTER_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
