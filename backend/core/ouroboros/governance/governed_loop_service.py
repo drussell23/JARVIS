@@ -1631,6 +1631,47 @@ class GovernedLoopService:
             except Exception as _jx:  # noqa: BLE001
                 logger.debug("[GovernedLoop] artifact janitor boot swallowed: %r", _jx)
 
+            # Slice 200 — Genesis Proposal. A SINGLE-USE, gated (default-FALSE),
+            # fail-soft boot trigger that deterministically proves the full
+            # code-shipping highway exactly once: build an honest architecture
+            # doc → taste-check → open ONE review PR (APPROVAL_REQUIRED /
+            # DO-NOT-AUTO-MERGE) → write a durable sentinel so it never fires
+            # again (the bind-mounted .jarvis carries the sentinel across every
+            # restart, so restart:always can't spam PRs). Deferred create_task,
+            # never blocks boot. Mirrors the janitor one-shot precedent above.
+            try:
+                from backend.core.ouroboros.governance.genesis_proposal import (
+                    genesis_enabled,
+                    genesis_already_shipped,
+                    run_genesis_proposal,
+                )
+                if genesis_enabled() and not genesis_already_shipped():
+                    import asyncio as _aio_gen
+
+                    async def _genesis_boot_trigger() -> None:
+                        try:
+                            _res = await run_genesis_proposal()
+                            if _res:
+                                logger.warning(
+                                    "[GovernedLoop] genesis milestone PR shipped: "
+                                    "%s — single-use trigger dissolved",
+                                    _res.get("pr_url"),
+                                )
+                        except Exception as _ge:  # noqa: BLE001
+                            logger.debug(
+                                "[GovernedLoop] genesis trigger swallowed: %r", _ge,
+                            )
+
+                    self._genesis_task = _aio_gen.create_task(
+                        _genesis_boot_trigger(),
+                    )
+                    logger.info(
+                        "[GovernedLoop] genesis proposal: single-use boot "
+                        "trigger scheduled (gated, deferred, fail-soft)",
+                    )
+            except Exception as _gx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] genesis wiring swallowed: %r", _gx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
