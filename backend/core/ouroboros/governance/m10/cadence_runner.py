@@ -65,13 +65,27 @@ M10_CADENCE_RUNNER_SCHEMA_VERSION: str = "m10_cadence_runner.1"
 
 
 def cadence_enabled() -> bool:
-    """``JARVIS_M10_CADENCE_ENABLED`` — Slice 3 sub-flag. Default
-    FALSE. Requires master AND sub-flag for any side-effect."""
+    """``JARVIS_M10_CADENCE_ENABLED`` — Slice 3 sub-flag. Requires master
+    AND sub-flag for any side-effect.
+
+    Slice 198 — Sovereign Ignition: the sub-flag is three-state. An explicit
+    value wins (``=0`` is the supreme kill switch); when UNSET the cadence
+    loop IGNITES with the autonomous graduation unlock
+    (``m10_cadence_ignited``) — a graduated proposer that nothing triggers is
+    a dead engine. Fail-soft: ignition module unavailable → legacy off."""
     if not _master_enabled():
         return False
     raw = os.environ.get(
         "JARVIS_M10_CADENCE_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        try:
+            from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+                m10_cadence_ignited,
+            )
+            return bool(m10_cadence_ignited())
+        except Exception:  # noqa: BLE001
+            return False
     return raw in ("1", "true", "yes", "on")
 
 
