@@ -130,7 +130,14 @@ services:
       # Sleep-frozen wall-clock is excluded. JARVIS_SOAK_IMAGE_ID lets the
       # ledger tell rebuilds (supervised) from recoveries (unsupervised). ──
       JARVIS_CHRONOS_LEDGER_ENABLED: "1"
-      JARVIS_SOAK_IMAGE_ID: "slice-206-warmup"
+      # Slice 215b — image identity DERIVED from the attestation stamp commit
+      # (kernel exports GIT_COMMIT at launch). The hardcoded "slice-206-warmup"
+      # went stale across SEVEN deploys, so Chronos classified supervised
+      # rebuilds as recovery_unsupervised — silently OVERCOUNTING the §41.6
+      # unsupervised-interval evidence (the continuity-laundering class S208
+      # polices in code, arriving via stale config). Now every attested launch
+      # carries its commit as the image id: rebuild => supervised reset, honest.
+      JARVIS_SOAK_IMAGE_ID: ${GIT_COMMIT:-dev-unstamped}
       # ── Slice 206: Boot-Warmup Lifecycle. One-time heavy-init lag is recorded
       # as warmup_lag (visible, benign) instead of polluting steady-state
       # control_plane_starvation_events; the heavy builds are pre-warmed off-loop
