@@ -1672,6 +1672,55 @@ class GovernedLoopService:
             except Exception as _gx:  # noqa: BLE001
                 logger.debug("[GovernedLoop] genesis wiring swallowed: %r", _gx)
 
+            # Slice 203 — Strategy Simulator. A gated (default-FALSE), fail-soft
+            # boot trigger: read the registry telemetry → synthesize fitness-
+            # ranked remediation goals → bundle into ONE operator-review PR
+            # ([Ouroboros Strategic Proposal], DO-NOT-AUTO-MERGE). Deduped by
+            # deficiency-set fingerprint (the bind-mounted marker persists), so
+            # restart:always opens a new PR only when the proposal actually
+            # changes. PROPOSE-don't-dispose: writes only the .draft file, never
+            # signs, never writes the active roadmap — the operator elevates via
+            # strategy_signer. Deferred create_task; never blocks boot.
+            try:
+                from backend.core.ouroboros.governance.strategy_simulator import (
+                    simulator_enabled as _sim_enabled,
+                    propose_via_pr as _sim_propose,
+                )
+                if _sim_enabled():
+                    import asyncio as _aio_sim
+
+                    async def _strategy_sim_boot_trigger() -> None:
+                        try:
+                            _snap = {}
+                            try:
+                                from backend.core.ouroboros.governance.observability_registry import (  # noqa: E501
+                                    get_observability_registry as _sim_reg,
+                                )
+                                _snap = _sim_reg().snapshot()
+                            except Exception:  # noqa: BLE001
+                                _snap = {}
+                            _res = await _sim_propose(snapshot=_snap)
+                            if _res:
+                                logger.warning(
+                                    "[GovernedLoop] strategy proposal PR opened "
+                                    "(%d goals): %s",
+                                    _res.get("goals"), _res.get("pr_url"),
+                                )
+                        except Exception as _se:  # noqa: BLE001
+                            logger.debug(
+                                "[GovernedLoop] strategy sim swallowed: %r", _se,
+                            )
+
+                    self._strategy_sim_task = _aio_sim.create_task(
+                        _strategy_sim_boot_trigger(),
+                    )
+                    logger.info(
+                        "[GovernedLoop] strategy simulator: telemetry-driven "
+                        "proposal trigger scheduled (gated, deferred, deduped)",
+                    )
+            except Exception as _sx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] strategy sim wiring swallowed: %r", _sx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
