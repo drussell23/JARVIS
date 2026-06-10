@@ -3188,6 +3188,23 @@ class CandidateGenerator:
             provider_route,
         )
 
+        # Slice 201 — Contextual Bandit Routing Advisor. ADVISORY-ONLY +
+        # structurally fail-closed: the advisor reorders WITHIN ranked_models
+        # (the brain_selection_policy active set for this route), so it can
+        # only change the ORDER the sentinel tries policy-permitted models —
+        # never select an out-of-policy arm. Gated (default OFF → no-op); any
+        # error keeps the deterministic order. The hand-rolled router stays
+        # authoritative.
+        try:
+            from backend.core.ouroboros.governance.bandit_router import (
+                get_bandit_router as _s201_bandit,
+            )
+            _s201_order = _s201_bandit().advise(ranked_models)
+            if _s201_order and set(_s201_order) == set(ranked_models):
+                ranked_models = _s201_order
+        except Exception:  # noqa: BLE001 — advisory, never blocks dispatch
+            pass
+
         # Empty dw_models → fall through to legacy dispatch. IMMEDIATE
         # has empty models by design (Claude-direct); other routes
         # would fall here only if yaml is misconfigured.
@@ -3445,6 +3462,14 @@ class CandidateGenerator:
                         "[CandidateGenerator] sentinel.report_success raised",
                         exc_info=True,
                     )
+                try:
+                    # Slice 201 — feed the bandit a SUCCESS reward for this arm.
+                    from backend.core.ouroboros.governance.bandit_router import (
+                        get_bandit_router as _s201_bandit_ok,
+                    )
+                    _s201_bandit_ok().record_outcome(model_id, success=True)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Slice 20C — zero-candidate drift detection. The
                 # parser succeeded (we're on the success branch) but
                 # may have returned an empty candidates tuple while
@@ -3625,6 +3650,15 @@ class CandidateGenerator:
                         type(exc).__name__, op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
+                try:
+                    # Slice 201 — feed the bandit a FAILURE reward for this arm
+                    # so its posterior learns which models actually deliver.
+                    from backend.core.ouroboros.governance.bandit_router import (
+                        get_bandit_router as _s201_bandit_fail,
+                    )
+                    _s201_bandit_fail().record_outcome(model_id, success=False)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Slice 77 — dynamic transport telemetry. The moment a LIVE
                 # generation confirms a transport break, feed it into the
                 # dw_surface_health ledger so the NEXT op's Slice 76 P2
