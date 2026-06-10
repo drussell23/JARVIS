@@ -19,6 +19,12 @@
   [x] slice-206  boot-warmup lifecycle + honest starvation reclassification (warmup_lag)
   [x] slice-207  class-level loop guard: SemanticIndex.build() self-offloads if called sync on the loop
                  (immunizes ANY caller, current/future — not a localized patch)
+                 NOTE: 206/207 MISDIAGNOSED — the 25s freeze is GIL contention (CPU build in a thread),
+                 not on-loop execution. Real fix = process-isolation (JARVIS_COMPUTE_ISOLATION_ENABLED);
+                 helped 23s->13.5s but NOT fully eliminated (a direct cold-start caller remains). Open.
+  [x] slice-208  epistemic-integrity: SemanticGuardian now detects metric-gaming DECEPTION (not just AST
+                 mutation) — self-signing, counter-suppression, chronos-laundering -> HARD/APPROVAL_REQUIRED.
+                 HONEST SCOPE: pattern detectors raise friction + flag; NOT "un-gameable" (obfuscation evades).
 
 ## NEXT TARGETS (operator-gated — the engine is built; these need runtime + judgment)
   [ ] runtime       leave the soak UNTOUCHED to accrue continuous unsupervised days

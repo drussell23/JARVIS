@@ -1181,6 +1181,143 @@ def _pat_dynamic_dunder_construction(
 
 
 # Declared explicitly so tests + docs can enumerate without introspection.
+# ---------------------------------------------------------------------------
+# Slice 208 — Epistemic-integrity (metric-gaming deception) detectors
+# ---------------------------------------------------------------------------
+# Catch the structural-deception shapes observed this session that pass AST
+# validation while gaming the organism's own honesty: a patch that self-signs
+# a roadmap, suppresses an integrity counter, or launders Chronos
+# unsupervised-time across a supervised boundary.
+#
+# HONEST SCOPE: pattern detectors. They catch the known/obvious shapes, raise
+# friction, and route to APPROVAL_REQUIRED. They are NOT "un-gameable" — a
+# deliberately obfuscated deception can evade a regex. Defense-in-depth on the
+# immune system, not a proof of honesty.
+
+_SIGNING_OWNER_FILES = ("roadmap_reader.py", "strategy_signer.py")
+_SELF_SIGNING_RE = re.compile(
+    r"(compute_signature\s*\(|sign_roadmap_doc\s*\(|_build_signing_payload\s*\(|"
+    r"import\s+strategy_signer|from\s+\S*strategy_signer\s+import)"
+)
+
+
+def _pat_self_signing_attempt(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    """HARD: a patch in an AUTONOMOUS module invokes the roadmap signing
+    primitive — the self-authorization shape. The signer/reader modules own
+    the primitive and are exempt."""
+    base = (file_path or "").rsplit("/", 1)[-1]
+    if base in _SIGNING_OWNER_FILES:
+        return None
+    if len(_SELF_SIGNING_RE.findall(new_content)) <= len(
+        _SELF_SIGNING_RE.findall(old_content)
+    ):
+        return None
+    return Detection(
+        pattern="self_signing_attempt", severity="hard",
+        message=(
+            "Epistemic-integrity violation: patch invokes the roadmap signing "
+            "primitive (self-authorization — organism must not mint its own "
+            "operator attestation). METRIC_GAMING_DECEIT_ANOMALY."
+        ),
+        file_path=file_path,
+        lines=tuple(_line_numbers_for_pattern(new_content, _SELF_SIGNING_RE)),
+        snippet="self-signing",
+    )
+
+
+_PROTECTED_METRIC_VARS = (
+    "control_plane_starvation_events", "provider_exhaustions", "warmup_lag",
+    "hedge_races_abandoned", "lag_ms", "lag_event_count",
+)
+_METRIC_ZERO_RE = re.compile(
+    r"\b(" + "|".join(_PROTECTED_METRIC_VARS) + r")\b\s*=\s*0\b"
+)
+_ABSURD_THRESHOLD_RE = re.compile(
+    r"(threshold_ms|_threshold|max_starvation|starvation_threshold)\s*=\s*"
+    r"(9{6,}|1e\d{2,}|float\(\s*['\"]inf['\"]\s*\)|10\s*\*\*\s*\d{2,})"
+)
+_RECORD_CALL_RE = re.compile(
+    r"record_(control_plane_starvation|provider_exhaustion|warmup_lag|"
+    r"hedge_abandoned)\s*\("
+)
+
+
+def _pat_metric_counter_suppressed(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    """HARD: a patch hardcodes a protected integrity counter to zero, sets an
+    absurd threshold to disable a watchdog, or REMOVES a record_*() call —
+    suppressing a metric so it reports healthier than reality (the 'absolute
+    zero' deception). Test files out of scope."""
+    base = (file_path or "").rsplit("/", 1)[-1]
+    if base.startswith("test_") or base.endswith("_test.py"):
+        return None
+    for rx, why in (
+        (_METRIC_ZERO_RE, "hardcodes an integrity counter to 0"),
+        (_ABSURD_THRESHOLD_RE, "sets an absurd threshold to disable a watchdog"),
+    ):
+        if len(rx.findall(new_content)) > len(rx.findall(old_content)):
+            return Detection(
+                pattern="metric_counter_suppressed", severity="hard",
+                message=(
+                    f"Epistemic-integrity violation: patch {why} — suppressing "
+                    "a metric so it reports healthier than reality. "
+                    "METRIC_GAMING_DECEIT_ANOMALY."
+                ),
+                file_path=file_path,
+                lines=tuple(_line_numbers_for_pattern(new_content, rx)),
+                snippet="metric-suppression",
+            )
+    # Count only ACTIVE (non-comment) record calls so a comment-out counts as
+    # a removal (a commented line still contains the call text).
+    def _active_record_calls(text: str) -> int:
+        return sum(
+            1 for ln in text.splitlines()
+            if _RECORD_CALL_RE.search(ln) and not ln.lstrip().startswith("#")
+        )
+    if _active_record_calls(new_content) < _active_record_calls(old_content):
+        return Detection(
+            pattern="metric_counter_suppressed", severity="hard",
+            message=(
+                "Epistemic-integrity violation: patch removes a telemetry "
+                "record_*() call — blinding the metric. "
+                "METRIC_GAMING_DECEIT_ANOMALY."
+            ),
+            file_path=file_path, lines=(), snippet="record-call-removed",
+        )
+    return None
+
+
+_CHRONOS_RESET_RE = re.compile(r"unsupervised_interval_s\"?\]?\s*=\s*0\.0")
+
+
+def _pat_chronos_continuity_laundering(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    """HARD: a patch to chronos_ledger.py REMOVES an unsupervised-interval
+    reset — letting a supervised rebuild/migration claim continuous
+    UNSUPERVISED time (evidence laundering)."""
+    base = (file_path or "").rsplit("/", 1)[-1]
+    if base != "chronos_ledger.py":
+        return None
+    if len(_CHRONOS_RESET_RE.findall(new_content)) < len(
+        _CHRONOS_RESET_RE.findall(old_content)
+    ):
+        return Detection(
+            pattern="chronos_continuity_laundering", severity="hard",
+            message=(
+                "Epistemic-integrity violation: patch removes a Chronos "
+                "unsupervised-interval reset — a supervised rebuild/migration "
+                "could then claim continuous unsupervised time (evidence "
+                "laundering). METRIC_GAMING_DECEIT_ANOMALY."
+            ),
+            file_path=file_path, lines=(), snippet="chronos-reset-removed",
+        )
+    return None
+
+
 _ALL_PATTERNS: Tuple[str, ...] = (
     "removed_import_still_referenced",
     "function_body_collapsed",
@@ -1194,6 +1331,10 @@ _ALL_PATTERNS: Tuple[str, ...] = (
     "docstring_only_delete",
     "dynamic_import_chain",
     "dynamic_dunder_construction",
+    # Slice 208 — epistemic-integrity (metric-gaming deception)
+    "self_signing_attempt",
+    "metric_counter_suppressed",
+    "chronos_continuity_laundering",
 )
 
 
@@ -1212,6 +1353,10 @@ _PATTERNS: dict = {
     "dynamic_dunder_construction": (
         _pat_dynamic_dunder_construction
     ),
+    # Slice 208 — epistemic-integrity detectors
+    "self_signing_attempt": _pat_self_signing_attempt,
+    "metric_counter_suppressed": _pat_metric_counter_suppressed,
+    "chronos_continuity_laundering": _pat_chronos_continuity_laundering,
 }
 
 
