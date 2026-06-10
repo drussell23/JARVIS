@@ -131,6 +131,14 @@ services:
       JARVIS_GOAL_DECOMPOSITION_ENABLED: "1"
       JARVIS_M10_CADENCE_ENABLED: "1"
       JARVIS_ORANGE_PR_ENABLED: "1"
+      # ── Slice 211 — STRATEGIC IGNITION MESH. The roadmap_orchestrator master
+      # (the driver that reads the signed roadmap + emits goals into intake) was
+      # the third cut wire — default-FALSE + zero callers. Enable it + the GLS
+      # daemon now drives it on an adaptive, stress-aware cadence (recovers to
+      # base when the vendor stabilizes). THIS is what makes GOAL-001 reach the
+      # organism's work queue. ──
+      JARVIS_ROADMAP_ORCHESTRATOR_ENABLED: "1"
+      JARVIS_PROGRESS_LEDGER_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."

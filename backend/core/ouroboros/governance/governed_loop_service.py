@@ -1843,6 +1843,79 @@ class GovernedLoopService:
             except Exception as _ilx:  # noqa: BLE001
                 logger.debug("[GovernedLoop] warmup lifecycle swallowed: %r", _ilx)
 
+            # Slice 211 — STRATEGIC IGNITION MESH. The roadmap_orchestrator
+            # (reads the operator-signed roadmap, emits goal envelopes into
+            # intake) had ZERO callers in the live loop — the disconnected wire
+            # found in the GOAL-001 autonomy test. Plug it into GLS as a
+            # deferred daemon that drives execute_roadmap in single-poll bursts
+            # on an ADAPTIVE, stress-aware cadence (recovers to base when the
+            # vendor stabilizes — corrected from the cumulative formula that
+            # never recovers). Every emitted goal still flows through the full
+            # gated pipeline (Iron Gate + SemanticGuardian + boundary gate ->
+            # APPROVAL_REQUIRED -> orange PR). Gated, fail-soft, never blocks
+            # boot. Wired into GLS (the LIVE loop), NOT legacy engine.py.
+            try:
+                from backend.core.ouroboros.governance.roadmap_orchestrator import (  # noqa: E501
+                    master_enabled as _rmo_enabled,
+                    execute_roadmap as _rmo_execute,
+                )
+                from backend.core.ouroboros.governance.roadmap_cadence import (
+                    AdaptiveRoadmapCadence as _RmCadence,
+                )
+                if _rmo_enabled():
+                    import asyncio as _aio_rm
+
+                    async def _roadmap_ignition_daemon() -> None:
+                        cad = _RmCadence()
+                        # brief settle so intake/router are attached
+                        await _aio_rm.sleep(20)
+                        while True:
+                            try:
+                                _router = getattr(self, "_intake_router", None)
+                                _rep = await _rmo_execute(
+                                    router=_router,
+                                    max_iterations_override=1,
+                                )
+                                try:
+                                    from backend.core.ouroboros.governance.progress_ledger import (  # noqa: E501
+                                        ledger_enabled as _pl_on,
+                                        update_progress as _pl_update,
+                                    )
+                                    if _pl_on() and _rep is not None:
+                                        _pl_update(
+                                            completed=[],
+                                            next_targets=[(
+                                                "GOAL-001",
+                                                "roadmap orchestrator polling "
+                                                "(strategic ignition mesh live)",
+                                            )],
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            except _aio_rm.CancelledError:
+                                break
+                            except Exception as _re:  # noqa: BLE001
+                                logger.debug(
+                                    "[GovernedLoop] roadmap poll swallowed: %r",
+                                    _re,
+                                )
+                            try:
+                                await _aio_rm.sleep(cad.next_interval_s())
+                            except _aio_rm.CancelledError:
+                                break
+
+                    self._roadmap_task = _aio_rm.create_task(
+                        _roadmap_ignition_daemon(),
+                    )
+                    logger.warning(
+                        "[GovernedLoop] STRATEGIC IGNITION MESH live — roadmap "
+                        "orchestrator wired into the control plane (adaptive "
+                        "stress-aware cadence); organism now feeds on "
+                        "operator-signed goals.",
+                    )
+            except Exception as _rmx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] roadmap mesh wiring swallowed: %r", _rmx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
