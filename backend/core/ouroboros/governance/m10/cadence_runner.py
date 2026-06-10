@@ -135,9 +135,14 @@ def _master_enabled() -> bool:
 
 
 def should_fire_at(op_count: object) -> bool:
-    """Pure: True iff cadence enabled AND
-    ``op_count % cadence_n_ops() == 0`` AND ``op_count >= 1``.
-    NEVER raises."""
+    """True iff cadence enabled AND ``op_count % effective-step == 0``
+    AND ``op_count >= 1``.
+
+    Slice 197 — the Adaptive Synthesis Governor modulates the step: the
+    base ``cadence_n_ops()`` is scaled by the recent hedge-dispatch delta
+    read from the durable registry (busy window → conserve capital, idle
+    window → compile aggressively). Fail-soft: governor unavailable →
+    legacy base step. NEVER raises."""
     if not cadence_enabled():
         return False
     try:
@@ -149,7 +154,43 @@ def should_fire_at(op_count: object) -> bool:
     step = cadence_n_ops()
     if step < 1:
         return False
+    try:
+        from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+            effective_cadence_n,
+        )
+        step = effective_cadence_n(
+            base_n=step, dispatch_delta=_recent_dispatch_delta(),
+        )
+    except Exception:  # noqa: BLE001 — pacing is enhancement, not gate
+        pass
     return (n % step) == 0
+
+
+_last_dispatch_reading: int = -1
+
+
+def _recent_dispatch_delta() -> int:
+    """Hedge dispatches since the previous cadence check — the governor's
+    traffic signal, read from the durable registry. The first observation
+    reports moderate traffic (delta=1) so a fresh boot neither sprints nor
+    stalls. NEVER raises."""
+    global _last_dispatch_reading
+    try:
+        from backend.core.ouroboros.governance.observability_registry import (
+            HEDGE_CONCURRENCY_DISPATCHES,
+            get_observability_registry,
+        )
+        current = get_observability_registry().get(
+            HEDGE_CONCURRENCY_DISPATCHES,
+        )
+        if _last_dispatch_reading < 0:
+            _last_dispatch_reading = current
+            return 1
+        delta = max(0, current - _last_dispatch_reading)
+        _last_dispatch_reading = current
+        return delta
+    except Exception:  # noqa: BLE001
+        return 1
 
 
 # ---------------------------------------------------------------------------

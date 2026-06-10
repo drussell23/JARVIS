@@ -71,6 +71,11 @@ HEDGE_RUPTURES_SWALLOWED = "hedge_ruptures_swallowed"
 # Slice 194 — a race where BOTH arms failed (no winner). Previously only
 # derivable as dispatches − victories; now explicit and self-describing.
 HEDGE_RACES_ABANDONED = "hedge_races_abandoned"
+# Slice 197 — organism-health criteria for the M10 autonomous graduation
+# contract. Previously log-line-only; charter counters make the graduation
+# evaluation a pure read of the .bin (no log parsing).
+PROVIDER_EXHAUSTIONS = "provider_exhaustions"
+CONTROL_PLANE_STARVATION_EVENTS = "control_plane_starvation_events"
 
 _PREREGISTERED = (
     HEDGE_CONCURRENCY_DISPATCHES,
@@ -78,6 +83,8 @@ _PREREGISTERED = (
     HEDGE_BATCH_VICTORIES,
     HEDGE_RUPTURES_SWALLOWED,
     HEDGE_RACES_ABANDONED,
+    PROVIDER_EXHAUSTIONS,
+    CONTROL_PLANE_STARVATION_EVENTS,
 )
 
 
@@ -320,6 +327,24 @@ def record_hedge_dispatch() -> None:
     """One proactive hedge race launched (RT + batch in flight concurrently)."""
     try:
         get_observability_registry().incr(HEDGE_CONCURRENCY_DISPATCHES)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_provider_exhaustion() -> None:
+    """Slice 197 — one op died with all_providers_exhausted (every provider
+    tier failed). The single strongest negative health signal."""
+    try:
+        get_observability_registry().incr(PROVIDER_EXHAUSTIONS)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_control_plane_starvation() -> None:
+    """Slice 197 — one ControlPlaneStarvation lag event (main asyncio loop
+    failed to tick within threshold)."""
+    try:
+        get_observability_registry().incr(CONTROL_PLANE_STARVATION_EVENTS)
     except Exception:  # noqa: BLE001
         pass
 

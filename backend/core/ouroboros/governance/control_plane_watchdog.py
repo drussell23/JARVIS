@@ -497,6 +497,15 @@ class ControlPlaneWatchdog:
                     pass
                 if lag_ms >= self._threshold_ms:
                     self._lag_event_count += 1
+                    try:
+                        # Slice 197 — durable charter counter for the M10
+                        # graduation contract's starvation criterion.
+                        from backend.core.ouroboros.governance.observability_registry import (  # noqa: E501
+                            record_control_plane_starvation as _s197_record_starvation,
+                        )
+                        _s197_record_starvation()
+                    except Exception:  # noqa: BLE001
+                        pass
                     logger.warning(
                         "[ControlPlaneStarvation] lag_ms=%.1f "
                         "(requested=%.1f observed=%.1f) "
