@@ -95,6 +95,14 @@ services:
       # dispose: writes only roadmap.draft.yaml, never signs, never writes the
       # active roadmap — the operator elevates approved goals via strategy_signer. ──
       JARVIS_STRATEGY_SIMULATOR_ENABLED: "1"
+      # ── Slice 204: Chronos Continuity Matrix. Non-volatile, hash-chained
+      # uptime ledger (.jarvis/chronos_coherence.json) — re-chains on boot so a
+      # rebuild preserves evolutionary history (total_operational) while the
+      # strict unsupervised interval resets only on a SUPERVISED image change.
+      # Sleep-frozen wall-clock is excluded. JARVIS_SOAK_IMAGE_ID lets the
+      # ledger tell rebuilds (supervised) from recoveries (unsupervised). ──
+      JARVIS_CHRONOS_LEDGER_ENABLED: "1"
+      JARVIS_SOAK_IMAGE_ID: "slice-204-chronos"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
