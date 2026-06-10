@@ -138,12 +138,18 @@ def test_sign_with_wrong_secret_fails_verification():
 
 
 def test_signer_has_no_boot_autoinvocation():
-    """The signer must never be wired into a boot path — only operator-run."""
+    """The signer must never be IMPORTED or CALLED from a boot path — only
+    operator-run. A prose mention in a comment is fine; an import/call is not."""
     for fname in ("governed_loop_service.py", "harness.py"):
         for d in (_GOV, _GOV.parent / "battle_test"):
             f = d / fname
             if f.exists():
-                assert "strategy_signer" not in f.read_text(encoding="utf-8")
+                src = f.read_text(encoding="utf-8")
+                assert "import strategy_signer" not in src
+                assert "from backend.core.ouroboros.governance.strategy_signer" \
+                    not in src
+                assert "sign_roadmap_doc(" not in src
+                assert "strategy_signer._main" not in src
 
 
 # ===========================================================================

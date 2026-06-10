@@ -89,6 +89,12 @@ services:
       # the soak accumulates real reward data; the deterministic router stays
       # authoritative and any error keeps the deterministic order. ──
       JARVIS_BANDIT_ROUTER_ENABLED: "1"
+      # ── Slice 203: Strategy Simulator. Telemetry-driven self-prioritization
+      # → ONE operator-review PR ([Ouroboros Strategic Proposal], DO-NOT-AUTO-
+      # MERGE), deduped by deficiency-set so restart can't spam. Propose-don't-
+      # dispose: writes only roadmap.draft.yaml, never signs, never writes the
+      # active roadmap — the operator elevates approved goals via strategy_signer. ──
+      JARVIS_STRATEGY_SIMULATOR_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
