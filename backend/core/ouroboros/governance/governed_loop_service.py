@@ -1251,6 +1251,35 @@ class GovernedLoopService:
             )
 
         self._state = ServiceState.STARTING
+
+        # Slice 212 — RUNTIME ATTESTATION GATE. Deliberately OUTSIDE the
+        # fail-soft boot block below: a strict deployment-integrity mismatch
+        # (image stamped with a different commit than the operator pinned,
+        # dirty-tree build, or unstamped image) must HALT the boot — state →
+        # FAILED, DeploymentIntegrityMismatch propagates — never be
+        # logged-and-continued. Gated default-FALSE; UNPINNED is warn-only.
+        # Guards against the 2026-06-10 drift class: a stale rebuild running
+        # Slice-208 code while believed to be Slice-211.
+        try:
+            from backend.core.ouroboros.governance.runtime_attestation import (
+                DeploymentIntegrityMismatch,
+                enforce as _attest_enforce,
+            )
+        except Exception:  # noqa: BLE001
+            DeploymentIntegrityMismatch = None  # type: ignore[assignment]
+            _attest_enforce = None
+        if _attest_enforce is not None:
+            try:
+                _attest_enforce()
+            except DeploymentIntegrityMismatch:
+                self._state = ServiceState.FAILED
+                self._failure_reason = "deployment_integrity_mismatch"
+                raise
+            except Exception as _ax:  # noqa: BLE001
+                # Only the explicit mismatch halts; infrastructure errors in
+                # the attestation path itself must not brick a legacy boot.
+                logger.debug("[GovernedLoop] attestation infra swallowed: %r", _ax)
+
         try:
             # Slice 185 Phase 4 — purge DW learned-state corrupted by the NameError phantom
             # (surface-health + calibration learned from internal faults mislabeled as vendor

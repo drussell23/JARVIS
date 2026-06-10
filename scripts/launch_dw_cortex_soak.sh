@@ -24,6 +24,18 @@ grep -q "DOUBLEWORD_API_KEY" "$REPO_ROOT/.env" || die ".env has no DOUBLEWORD_AP
 DC=(docker compose); docker compose version >/dev/null 2>&1 || DC=(docker-compose)
 export SOAK_REQUIREMENTS="requirements-soak-oracle.txt"
 
+# Slice 212 — runtime attestation. Stamp the image with the EXACT commit +
+# dirty flag of this build context, and pin the same commit as the boot-time
+# expectation. A stale rebuild (checkout behind what you merged) or a
+# dirty-tree build then FAILS CLOSED at boot with DEPLOYMENT_INTEGRITY_MISMATCH
+# instead of silently running old code (the 2026-06-10 drift class).
+GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unstamped)"
+GIT_DIRTY="$([ -n "$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)"
+export GIT_COMMIT GIT_DIRTY
+export JARVIS_ATTESTATION_EXPECTED_COMMIT="$GIT_COMMIT"
+log "Attestation: stamping ${GIT_COMMIT:0:12} (dirty=$GIT_DIRTY) + pinning as boot expectation."
+[ "$GIT_DIRTY" = "true" ] && log "WARNING: dirty tree — strict attestation will REFUSE this image at boot. Commit or stash first."
+
 if [ "${1:-}" = "--monitor" ]; then
   exec "$REPO_ROOT/scripts/dw_cortex_monitor.sh"
 fi
