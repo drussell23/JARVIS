@@ -294,6 +294,47 @@ def _git_work_tree_with_remote() -> bool:
         return False
 
 
+def hardened_git_env(base=None):
+    """Slice 199 — a non-interactive git/gh environment: any missing or
+    expired credential FAILS CLOSED (error) rather than HANGING on a hidden
+    CLI prompt. Inherits ``base`` (defaults to the process env). NEVER raises."""
+    try:
+        env = dict(base if base is not None else os.environ)
+        env["GIT_TERMINAL_PROMPT"] = "0"   # git never prompts on the terminal
+        env["GIT_ASKPASS"] = env.get("GIT_ASKPASS") or "/bin/true"  # no askpass
+        env["GCM_INTERACTIVE"] = "never"   # git-credential-manager non-interactive
+        return env
+    except Exception:  # noqa: BLE001
+        return {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true",
+                "GCM_INTERACTIVE": "never"}
+
+
+def _gh_auth_status_probe() -> bool:
+    """Real ``gh auth status`` check — non-interactive, hardened env, bounded
+    timeout. True only on a successful (authenticated) exit. NEVER raises."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True, text=True, timeout=15,
+            env=hardened_git_env(),
+        )
+        return proc.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def gh_auth_status_ok(_probe=None) -> bool:
+    """Slice 199 — confirm the gh GitHub identity is authenticated WITHOUT a
+    blocking prompt (Phase 3 multi-channel assertion). ``_probe`` is a test
+    seam. Fail-closed: any failure/raise → False. NEVER raises."""
+    try:
+        probe = _probe if _probe is not None else _gh_auth_status_probe
+        return bool(probe())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def orange_pr_assertion_passes(_gh_probe=None, _git_probe=None) -> bool:
     """Live preflight for the orange-PR protection gate: confirm the async
     PR submission line CAN resolve — ``gh`` binary present AND inside a git
@@ -322,10 +363,16 @@ def taste_layer_armed() -> bool:
 
 def orange_pr_armed() -> bool:
     """Orange-PR gate arms iff autonomously unlocked AND the gh+git preflight
-    passes. Consulted by ``orange_pr_reviewer.is_orange_pr_enabled`` when the
-    env is unset; explicit env wins (kill switch supreme). NEVER raises."""
+    passes AND the gh identity is authenticated (Slice 199 — the full
+    multi-channel, non-interactive preflight). Consulted by
+    ``orange_pr_reviewer.is_orange_pr_enabled`` when the env is unset; explicit
+    env wins (kill switch supreme). NEVER raises."""
     try:
-        return is_autonomously_unlocked() and orange_pr_assertion_passes()
+        return (
+            is_autonomously_unlocked()
+            and orange_pr_assertion_passes()
+            and gh_auth_status_ok()
+        )
     except Exception:  # noqa: BLE001
         return False
 
