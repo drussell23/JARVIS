@@ -2144,6 +2144,15 @@ class CandidateGenerator:
         and the orchestrator ``_INFRA_PATTERNS`` set) keeps working.
         """
         self._counters.exhaustion_events += 1
+        try:
+            # Slice 197 — durable charter counter: the graduation contract
+            # reads provider exhaustions from the registry, not from logs.
+            from backend.core.ouroboros.governance.observability_registry import (
+                record_provider_exhaustion as _s197_record_exhaustion,
+            )
+            _s197_record_exhaustion()
+        except Exception:  # noqa: BLE001
+            pass
 
         fm = self.fsm._failure_mode
         report: Dict[str, Any] = {

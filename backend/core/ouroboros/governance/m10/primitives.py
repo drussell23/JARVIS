@@ -62,19 +62,33 @@ M10_PRIMITIVES_SCHEMA_VERSION: str = "m10_primitives.1"
 
 
 def m10_arch_proposer_enabled() -> bool:
-    """``JARVIS_M10_ARCH_PROPOSER_ENABLED`` (default ``false``
-    per §30.5.2 operator binding — STAYS default-false post-
-    Slice-5 graduation until 30+ proposal-acceptance audit).
+    """``JARVIS_M10_ARCH_PROPOSER_ENABLED`` — three-state resolution
+    (Slice 197 supersedes the static §30.5.2 binding via the
+    operator-delegated autonomous graduation contract):
 
-    Asymmetric env semantics — empty/whitespace = unset =
-    current default (false); explicit ``1``/``true``/``yes``/
-    ``on`` flips on. Re-read on every call so flips hot-revert
-    without restart."""
+      1. explicit ``1``/``true``/``yes``/``on`` → True (operator-on)
+      2. any other explicit value (incl. ``0``/``false``) → False —
+         the operator KILL SWITCH, supreme over any autonomous state
+         (Slice 136 precedent: operator =0 precedence honored)
+      3. unset/empty → consult the autonomous graduation contract
+         (``m10_autonomous_graduation.is_autonomously_unlocked`` —
+         criteria proven against the durable mmap registry; sticky
+         once persisted; fail-soft → False)
+
+    Re-read on every call so operator flips hot-revert without
+    restart."""
     raw = os.environ.get(
         "JARVIS_M10_ARCH_PROPOSER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # operator-pinned default per §30.5.2
+        # Slice 197 — operator-delegated autonomous graduation.
+        try:
+            from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+                is_autonomously_unlocked,
+            )
+            return bool(is_autonomously_unlocked())
+        except Exception:  # noqa: BLE001 — contract unavailable → locked
+            return False
     return raw in ("1", "true", "yes", "on")
 
 
