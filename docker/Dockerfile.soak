@@ -23,7 +23,20 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Native build deps for numpy / fastembed (onnxruntime) + state-vault transports.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git rsync curl ca-certificates \
+        build-essential git openssh-client rsync curl ca-certificates gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Slice 199 — the official GitHub CLI (gh), installed non-interactively from
+# its apt repo so the container can open PRs over HTTPS using the GH_TOKEN
+# already present in the runtime env (NO host SSH keys mounted). Clean layers:
+# keyring + list added, gh installed, apt lists purged.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

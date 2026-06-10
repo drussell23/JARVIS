@@ -1043,11 +1043,22 @@ class AutoCommitter:
             )
             return False
 
+        # Slice 199 — the network/credential subprocess runs under the
+        # non-interactive hardened env so a missing/expired credential FAILS
+        # CLOSED (returncode != 0) instead of HANGING on a hidden CLI prompt.
+        try:
+            from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+                hardened_git_env as _s199_hardened_env,
+            )
+            _push_env = _s199_hardened_env()
+        except Exception:  # noqa: BLE001
+            _push_env = None
         proc = await asyncio.create_subprocess_exec(
             "git", "push", "-u", "origin", branch,
             cwd=str(self._effective_repo_root()),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_push_env,
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:

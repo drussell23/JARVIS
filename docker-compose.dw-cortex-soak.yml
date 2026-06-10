@@ -66,6 +66,16 @@ services:
       JARVIS_CAI_ROUTER_ENABLED: "1"
       JARVIS_KAREN_VOICE_ENABLED: "0"
       JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED: "1"
+      # ── Slice 199: Sovereign Tooling & Dual-Identity (HTTPS-token variant) ──
+      # The container ships PRs autonomously using the GH_TOKEN already in .env
+      # over HTTPS — NO host SSH keys / gh identity mounted (more isolated, not
+      # less). Non-interactive hardening: a missing/expired credential FAILS
+      # CLOSED rather than hanging on a hidden CLI prompt.
+      GIT_TERMINAL_PROMPT: "0"
+      GCM_INTERACTIVE: "never"
+      JARVIS_GIT_ORIGIN_SLUG: "drussell23/JARVIS"
+      JARVIS_GIT_AUTHOR_NAME: "Ouroboros+Venom"
+      JARVIS_GIT_AUTHOR_EMAIL: "ov-soak@users.noreply.github.com"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
@@ -75,11 +85,12 @@ services:
       - ./.jarvis:/app/.jarvis
     # The battle-test loop IS the supervisor (headless, no wall cap; restart:always
     # gives longevity). Cost cap is the only ceiling — DW is cheap, so $25 lasts.
-    # entrypoint OVERRIDE: the image's default ENTRYPOINT is launch_shadow_soak.sh
-    # (which verifies Docker — wrong for an in-container cortex run); run the
-    # battle-test directly via python3, matching the working `--entrypoint python3`
-    # manual launches.
-    entrypoint: ["python3"]
+    # entrypoint OVERRIDE: Slice 199 — soak_git_entrypoint.sh conditions the
+    # container for autonomous PR shipping (git identity + gh HTTPS credential
+    # helper + isolated git repo bootstrap, all fail-soft) then `exec python3
+    # "$@"` with the command args below. Replaces the bare `["python3"]`
+    # override; same battle-test invocation, now ship-capable.
+    entrypoint: ["bash", "docker/soak_git_entrypoint.sh"]
     command:
       - scripts/ouroboros_battle_test.py
       - --production-soak
