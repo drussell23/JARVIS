@@ -76,6 +76,12 @@ services:
       JARVIS_GIT_ORIGIN_SLUG: "drussell23/JARVIS"
       JARVIS_GIT_AUTHOR_NAME: "Ouroboros+Venom"
       JARVIS_GIT_AUTHOR_EMAIL: "ov-soak@users.noreply.github.com"
+      # ── Slice 200: Genesis Proposal — SINGLE-USE boot trigger. On the first
+      # boot of a fresh .jarvis it deterministically opens ONE milestone review
+      # PR (DO-NOT-AUTO-MERGE) to prove the code-shipping highway end-to-end,
+      # then writes a durable sentinel and dissolves. The sentinel persists in
+      # the bind-mounted .jarvis, so restart:always can never spam PRs. ──
+      JARVIS_GENESIS_PROPOSAL_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
