@@ -1,0 +1,48 @@
+version: 1
+operator_id: ov-strategy-simulator
+source: strategy_simulation_telemetry_driven
+authority: draft
+signed: false
+note: DRAFT proposal synthesized by the strategy simulator from live registry telemetry.
+  NOT authoritative and NOT signed. Review the bundled PR; run strategy_signer to
+  elevate the goals you approve into the signed roadmap.yaml.
+goals:
+- id: sim-control_plane_starvation
+  title: Eliminate control-plane starvation (event-loop wedges)
+  description: 'Recurring ControlPlaneStarvation lag events — the main asyncio loop
+    is being starved by sync CPU work. Goal: move the blocking work off-thread / chunk
+    it so the loop ticks within threshold.'
+  priority: high
+  success_criteria: control_plane_starvation_events < 5 / 24h
+  depends_on: []
+  fitness: 3.5294
+  evidence:
+    counter: control_plane_starvation_events
+    count: 50.0
+    severity: 10.0
+- id: sim-provider_exhaustion
+  title: Harden provider resilience (eliminate all_providers_exhausted)
+  description: 'Telemetry shows ops fully exhausting every provider tier. Goal: drive
+    provider_exhaustions to 0 via deeper failover / backoff / additional fallback
+    capacity.'
+  priority: high
+  success_criteria: provider_exhaustions == 0 across a 24h window
+  depends_on: []
+  fitness: 2.402
+  evidence:
+    counter: provider_exhaustions
+    count: 15.0
+    severity: 10.0
+- id: sim-vendor_instability
+  title: Reduce abandoned hedge races (dual-arm vendor failures)
+  description: 'Races dying with no winner indicate dual-arm vendor failures. Goal:
+    lower the abandoned-race rate via earlier rotation / a third transport arm / better
+    model-health prediction.'
+  priority: medium
+  success_criteria: abandoned-race ratio < 5% of dispatches
+  depends_on: []
+  fitness: 0.5441
+  evidence:
+    counter: hedge_races_abandoned
+    count: 3.0
+    severity: 2.5
