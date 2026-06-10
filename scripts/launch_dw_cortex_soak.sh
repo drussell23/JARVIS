@@ -30,7 +30,11 @@ export SOAK_REQUIREMENTS="requirements-soak-oracle.txt"
 # dirty-tree build then FAILS CLOSED at boot with DEPLOYMENT_INTEGRITY_MISMATCH
 # instead of silently running old code (the 2026-06-10 drift class).
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unstamped)"
-GIT_DIRTY="$([ -n "$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)"
+# Dirty = dirt that actually ENTERS the image. .jarvis (runtime state mutated
+# through the bind-mount, e.g. roadmap.draft.yaml) and __pycache__ are in
+# .dockerignore — they can never reach the image, so they must not dirty the
+# stamp (first live trip 2026-06-10 was exactly this false positive).
+GIT_DIRTY="$([ -n "$(git status --porcelain -- ':\!.jarvis' ':\!**/__pycache__' 2>/dev/null)" ] && echo true || echo false)"
 export GIT_COMMIT GIT_DIRTY
 export JARVIS_ATTESTATION_EXPECTED_COMMIT="$GIT_COMMIT"
 log "Attestation: stamping ${GIT_COMMIT:0:12} (dirty=$GIT_DIRTY) + pinning as boot expectation."
