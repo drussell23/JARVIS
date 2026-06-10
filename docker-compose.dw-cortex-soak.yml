@@ -115,6 +115,22 @@ services:
       # offloaded build_async (non-blocking, eventually-consistent) instead of
       # freezing the loop for ~25s — immunizes ANY caller, current or future. ──
       JARVIS_LOOP_GUARD_ENABLED: "1"
+      # ── Slice 208-config: the 25s freeze is GIL contention (CPU build in a
+      # daemon thread), not on-loop execution — only PROCESS isolation frees
+      # the loop. Enables the dormant, tested Slice-150 subprocess build path
+      # (helped 23s->13.5s; residual cold-start caller is GOAL-001 below). ──
+      JARVIS_COMPUTE_ISOLATION_ENABLED: "1"
+      # ── Slice 209 — SOVEREIGN AUTONOMY IGNITION. Operator authored + signed
+      # GOAL-001 (eradicate cold-start GIL starvation) into .jarvis/roadmap.yaml
+      # (HMAC secret in .env, gitignored). Reader verifies it -> goal
+      # decomposition -> M10 ProposalSynthesizer -> the organism attempts its
+      # OWN #1 fix. Every patch still passes Iron Gate + SemanticGuardian (incl.
+      # Slice-208 deceit detectors) + boundary gate (governance edits ->
+      # APPROVAL_REQUIRED -> orange PR for human review, never auto-merge). ──
+      JARVIS_ROADMAP_READER_ENABLED: "1"
+      JARVIS_GOAL_DECOMPOSITION_ENABLED: "1"
+      JARVIS_M10_CADENCE_ENABLED: "1"
+      JARVIS_ORANGE_PR_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
