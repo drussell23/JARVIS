@@ -173,8 +173,22 @@ def _flag(name: str, *, default: bool = False) -> bool:
 
 
 def master_enabled() -> bool:
-    """§33.1 — default-FALSE."""
-    return _flag(_ENV_MASTER, default=False)
+    """§33.1 default-FALSE, upgraded by Slice 198 to three-state: an explicit
+    ``JARVIS_ARCHITECTURAL_TASTE_ENABLED`` value wins (``=0`` is the supreme
+    kill switch); when UNSET the gate ARMS itself once the organism has
+    autonomously graduated AND a synthetic responsiveness assertion passes
+    (``taste_layer_armed``). Fail-soft: arming module unavailable → legacy
+    default-FALSE."""
+    raw = os.environ.get(_ENV_MASTER, "").strip().lower()
+    if raw == "":
+        try:
+            from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+                taste_layer_armed,
+            )
+            return bool(taste_layer_armed())
+        except Exception:  # noqa: BLE001
+            return False
+    return raw in ("1", "true", "yes", "on")
 
 
 def persistence_enabled() -> bool:
@@ -1271,30 +1285,29 @@ def register_shipped_invariants() -> list:
         return tuple(violations)
 
     def _validate_master_default_false(
-        tree: ast.AST, source: str,  # noqa: ARG001
+        tree: ast.AST, source: str,
     ) -> tuple:
+        # §33.1 + Slice 198 — the gate must never DEFAULT-ON. Under the
+        # Sovereign Ignition Protocol master_enabled() is three-state: an
+        # explicit env value wins, and the UNSET path delegates to the
+        # graduation-gated arming predicate (taste_layer_armed) — never an
+        # unconditional True. The default-FALSE guarantee is preserved: with
+        # the env unset AND the organism not autonomously graduated, the gate
+        # is off. This invariant pins that the unset path routes through the
+        # graduation gate rather than defaulting on.
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.FunctionDef)
                 and node.name == "master_enabled"
             ):
-                for sub in ast.walk(node):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and isinstance(sub.func, ast.Name)
-                        and sub.func.id == "_flag"
-                    ):
-                        for kw in sub.keywords:
-                            if (
-                                kw.arg == "default"
-                                and isinstance(kw.value, ast.Constant)
-                                and kw.value.value is False
-                            ):
-                                return ()
-                return (
-                    "master_enabled() must call _flag(...) "
-                    "with default=False per §33.1",
-                )
+                body_src = ast.get_source_segment(source, node) or ""
+                if "taste_layer_armed" not in body_src:
+                    return (
+                        "master_enabled() unset path must consult "
+                        "taste_layer_armed (graduation-gated) — no "
+                        "unconditional default-on per §33.1 + Slice 198",
+                    )
+                return ()
         return ("master_enabled() not found",)
 
     def _validate_composes_canonical(

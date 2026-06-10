@@ -49,7 +49,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,15 +59,6 @@ logger = logging.getLogger(__name__)
 _ENV_ENABLED = "JARVIS_M10_AUTONOMOUS_GRADUATION_ENABLED"
 _ENV_STATE_PATH = "JARVIS_M10_GRADUATION_STATE_PATH"
 _DEFAULT_STATE_PATH = ".jarvis/m10_graduation_state.json"
-
-# Lazy-evaluation cache: m10_arch_proposer_enabled() is consulted on hot
-# paths (cadence checks), so an un-graduated organism re-evaluates at most
-# once per TTL instead of reading the registry on every call.
-_EVAL_TTL_S = 30.0
-_cache_lock = threading.Lock()
-_cached_unlocked: Optional[bool] = None
-_cached_at: float = 0.0
-
 
 def autonomous_graduation_enabled() -> bool:
     """Master for the autonomous contract (default TRUE — the merged Slice
@@ -212,34 +202,132 @@ def _persisted_unlocked() -> bool:
 
 def is_autonomously_unlocked() -> bool:
     """The predicate ``m10.primitives.m10_arch_proposer_enabled`` consults
-    when the operator env is UNSET. Sticky: a persisted unlock holds (later
-    metric noise doesn't re-lock; revocation = operator =0). Un-graduated →
-    lazily re-evaluates at most once per TTL. NEVER raises."""
-    global _cached_unlocked, _cached_at
+    when the operator env is UNSET.
+
+    Sticky-True via the persisted file (``_persisted_unlocked`` short-circuits
+    once graduated — later metric noise never re-locks; revocation = operator
+    =0). Pre-graduation, re-evaluates fresh on each call (a microsecond mmap
+    snapshot read) so ignition fires the MILLISECOND the criteria go healthy —
+    no negative-cache lag. evaluate_graduation persists on pass, so the next
+    call short-circuits. NEVER raises."""
     try:
         if not autonomous_graduation_enabled():
             return False
         if _persisted_unlocked():
             return True
-        with _cache_lock:
-            now = time.monotonic()
-            if _cached_unlocked is not None and (now - _cached_at) < _EVAL_TTL_S:
-                return _cached_unlocked
-        decision = evaluate_graduation()
-        with _cache_lock:
-            _cached_unlocked = decision.unlocked
-            _cached_at = time.monotonic()
-        return decision.unlocked
+        return evaluate_graduation().unlocked
     except Exception:  # noqa: BLE001
         return False
 
 
 def _reset_for_tests() -> None:
-    """Drop the lazy-evaluation cache so tests re-evaluate immediately."""
-    global _cached_unlocked, _cached_at
-    with _cache_lock:
-        _cached_unlocked = None
-        _cached_at = 0.0
+    """Test seam — no persistent in-process state to clear now that the
+    negative cache is gone; retained for import compatibility and future
+    state. NEVER raises."""
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Slice 198 — Sovereign Ignition Protocol: cadence ignition + protection arming
+# ---------------------------------------------------------------------------
+
+def m10_cadence_ignited() -> bool:
+    """The cadence loop ignites WITH the autonomous unlock — a graduated
+    proposer that nothing triggers is a dead engine. Consulted by
+    ``cadence_runner.cadence_enabled`` when its sub-flag is unset. The
+    operator kill switch (``JARVIS_M10_CADENCE_ENABLED=0``) is handled by the
+    caller and remains supreme. NEVER raises."""
+    try:
+        return is_autonomously_unlocked()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def taste_layer_assertion_passes(_assess_probe=None) -> bool:
+    """Live assertion for the architectural-taste protection gate: run a
+    SYNTHETIC micro-proposal through the master-independent ``assess_file``
+    scorer and confirm it returns a real assessment — proving the
+    design-quality filter is responsive. Non-blocking, no git, no model.
+    Fail-closed: any None/raise → False. ``_assess_probe`` is a test seam."""
+    try:
+        def _default_probe():
+            from backend.core.ouroboros.governance.architectural_taste_layer import (  # noqa: E501
+                assess_file,
+            )
+            # A tiny, well-formed synthetic module — the scorer must produce
+            # a verdict for it without touching disk or git.
+            return assess_file(
+                "slice198_synthetic_probe.py",
+                source_override=(
+                    "def add(a, b):\n"
+                    "    \"\"\"Sum two numbers.\"\"\"\n"
+                    "    return a + b\n"
+                ),
+                siblings_count=1,
+            )
+        probe = _assess_probe if _assess_probe is not None else _default_probe
+        result = probe()
+        return result is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _gh_present() -> bool:
+    import shutil
+    return shutil.which("gh") is not None
+
+
+def _git_work_tree_with_remote() -> bool:
+    import subprocess
+    try:
+        in_tree = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if in_tree.returncode != 0 or in_tree.stdout.strip() != "true":
+            return False
+        remotes = subprocess.run(
+            ["git", "remote"], capture_output=True, text=True, timeout=5,
+        )
+        return remotes.returncode == 0 and bool(remotes.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def orange_pr_assertion_passes(_gh_probe=None, _git_probe=None) -> bool:
+    """Live preflight for the orange-PR protection gate: confirm the async
+    PR submission line CAN resolve — ``gh`` binary present AND inside a git
+    work tree with a remote — WITHOUT pushing and WITHOUT a blocking CLI
+    prompt. Fail-closed: a headless/gitless container correctly does NOT arm
+    (the honest finding: orange-PR needs a real git+gh host). Probes are test
+    seams. NEVER raises."""
+    try:
+        gh = _gh_probe if _gh_probe is not None else _gh_present
+        git = _git_probe if _git_probe is not None else _git_work_tree_with_remote
+        return bool(gh()) and bool(git())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def taste_layer_armed() -> bool:
+    """Architectural-taste gate arms iff the organism is autonomously
+    unlocked AND its synthetic responsiveness assertion passes. Consulted by
+    ``architectural_taste_layer.master_enabled`` when the env is unset;
+    explicit env wins there (kill switch supreme). NEVER raises."""
+    try:
+        return is_autonomously_unlocked() and taste_layer_assertion_passes()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def orange_pr_armed() -> bool:
+    """Orange-PR gate arms iff autonomously unlocked AND the gh+git preflight
+    passes. Consulted by ``orange_pr_reviewer.is_orange_pr_enabled`` when the
+    env is unset; explicit env wins (kill switch supreme). NEVER raises."""
+    try:
+        return is_autonomously_unlocked() and orange_pr_assertion_passes()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -49,10 +49,24 @@ class PRReviewResult:
 
 
 def is_orange_pr_enabled() -> bool:
-    """True when the Orange-tier async PR path is opted into via env var."""
-    return os.environ.get("JARVIS_ORANGE_PR_ENABLED", "false").lower() in (
-        "1", "true", "yes", "on",
-    )
+    """True when the Orange-tier async PR path is active.
+
+    Slice 198 — three-state: an explicit ``JARVIS_ORANGE_PR_ENABLED`` value
+    wins (``=0`` is the supreme kill switch); when UNSET the gate ARMS itself
+    once the organism has autonomously graduated AND a live gh+git preflight
+    passes (``orange_pr_armed`` — no push, no blocking CLI prompt). A
+    headless/gitless container correctly does NOT arm. Fail-soft: arming
+    module unavailable → legacy default-FALSE."""
+    raw = os.environ.get("JARVIS_ORANGE_PR_ENABLED", "").strip().lower()
+    if raw == "":
+        try:
+            from backend.core.ouroboros.governance.m10_autonomous_graduation import (  # noqa: E501
+                orange_pr_armed,
+            )
+            return bool(orange_pr_armed())
+        except Exception:  # noqa: BLE001
+            return False
+    return raw in ("1", "true", "yes", "on")
 
 
 def build_commit_message(
