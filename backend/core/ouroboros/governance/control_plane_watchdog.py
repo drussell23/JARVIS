@@ -497,15 +497,40 @@ class ControlPlaneWatchdog:
                     pass
                 if lag_ms >= self._threshold_ms:
                     self._lag_event_count += 1
+                    # Slice 206 — honest reclassification: lag during the
+                    # BOOT_WARMUP window is recorded as warmup_lag (visible,
+                    # benign one-time init), NOT as steady-state starvation.
+                    # The hard warmup deadline (init_lifecycle) prevents this
+                    # from ever masking real post-warmup starvation.
+                    _s206_warmup = False
                     try:
-                        # Slice 197 — durable charter counter for the M10
-                        # graduation contract's starvation criterion.
+                        from backend.core.ouroboros.governance.init_lifecycle import (  # noqa: E501
+                            in_warmup as _s206_in_warmup,
+                        )
+                        _s206_warmup = bool(_s206_in_warmup())
+                    except Exception:  # noqa: BLE001
+                        _s206_warmup = False
+                    try:
                         from backend.core.ouroboros.governance.observability_registry import (  # noqa: E501
                             record_control_plane_starvation as _s197_record_starvation,
+                            record_warmup_lag as _s206_record_warmup_lag,
                         )
-                        _s197_record_starvation()
+                        if _s206_warmup:
+                            _s206_record_warmup_lag()
+                        else:
+                            # Slice 197 — durable charter counter for the M10
+                            # graduation contract's starvation criterion.
+                            _s197_record_starvation()
                     except Exception:  # noqa: BLE001
                         pass
+                    if _s206_warmup:
+                        logger.info(
+                            "[ControlPlaneWarmup] lag_ms=%.1f during BOOT_WARMUP "
+                            "(benign one-time init; recorded as warmup_lag, not "
+                            "starvation) event_n=%d", lag_ms, self._lag_event_count,
+                        )
+                        # skip the steady-state WARNING + heavy 12K snapshot
+                        continue
                     logger.warning(
                         "[ControlPlaneStarvation] lag_ms=%.1f "
                         "(requested=%.1f observed=%.1f) "

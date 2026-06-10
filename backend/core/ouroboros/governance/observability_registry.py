@@ -76,6 +76,10 @@ HEDGE_RACES_ABANDONED = "hedge_races_abandoned"
 # evaluation a pure read of the .bin (no log parsing).
 PROVIDER_EXHAUSTIONS = "provider_exhaustions"
 CONTROL_PLANE_STARVATION_EVENTS = "control_plane_starvation_events"
+# Slice 206 — loop lag during the BOOT_WARMUP window, recorded SEPARATELY from
+# steady-state starvation so the starvation metric isn't polluted by benign
+# one-time init blocking (honest reclassification, not suppression).
+WARMUP_LAG = "warmup_lag"
 
 _PREREGISTERED = (
     HEDGE_CONCURRENCY_DISPATCHES,
@@ -85,6 +89,7 @@ _PREREGISTERED = (
     HEDGE_RACES_ABANDONED,
     PROVIDER_EXHAUSTIONS,
     CONTROL_PLANE_STARVATION_EVENTS,
+    WARMUP_LAG,
 )
 
 
@@ -341,10 +346,20 @@ def record_provider_exhaustion() -> None:
 
 
 def record_control_plane_starvation() -> None:
-    """Slice 197 — one ControlPlaneStarvation lag event (main asyncio loop
-    failed to tick within threshold)."""
+    """Slice 197 — one STEADY-STATE ControlPlaneStarvation lag event (main
+    asyncio loop failed to tick within threshold post-warmup)."""
     try:
         get_observability_registry().incr(CONTROL_PLANE_STARVATION_EVENTS)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_warmup_lag() -> None:
+    """Slice 206 — one loop-lag event during the BOOT_WARMUP window. Recorded
+    separately from steady-state starvation: visible, but not conflated with
+    the 'something is wrong' signal."""
+    try:
+        get_observability_registry().incr(WARMUP_LAG)
     except Exception:  # noqa: BLE001
         pass
 

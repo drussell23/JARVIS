@@ -102,7 +102,14 @@ services:
       # Sleep-frozen wall-clock is excluded. JARVIS_SOAK_IMAGE_ID lets the
       # ledger tell rebuilds (supervised) from recoveries (unsupervised). ──
       JARVIS_CHRONOS_LEDGER_ENABLED: "1"
-      JARVIS_SOAK_IMAGE_ID: "slice-204-chronos"
+      JARVIS_SOAK_IMAGE_ID: "slice-206-warmup"
+      # ── Slice 206: Boot-Warmup Lifecycle. One-time heavy-init lag is recorded
+      # as warmup_lag (visible, benign) instead of polluting steady-state
+      # control_plane_starvation_events; the heavy builds are pre-warmed off-loop
+      # via the existing offload paths. Hard deadline (180s) prevents warmup from
+      # ever masking real steady-state starvation. ──
+      JARVIS_INIT_LIFECYCLE_ENABLED: "1"
+      JARVIS_INIT_WARMUP_MAX_S: "180"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
