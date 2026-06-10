@@ -29,9 +29,19 @@ log() { printf '\033[36m[pack]\033[0m %s\n' "$*"; }
 
 command -v rsync >/dev/null 2>&1 || { echo "[pack] FATAL: rsync required"; exit 1; }
 
-# The ONLY .jarvis entries that travel — crypto, signatures, evidence, memory.
-# Everything else under .jarvis is regenerable local state and is left behind.
+# The ONLY .jarvis entries that travel — crypto, signatures, evidence, memory,
+# and (Slice 205) the load-bearing OPERATIONAL-STATE ledgers. Everything else
+# under .jarvis is regenerable local state and is left behind.
+#
+# Slice 205 — state portability: without the operational ledgers below, a
+# migration to a new host would leave the evolutionary history behind and
+# regenerate it from zero (the "wiped history" failure the cluster ask was
+# really about). Carrying them on the EXISTING offline migration path is the
+# correct mechanism — no live cluster, no hot-swap. Chronos records the
+# cross-host boundary honestly (new image_id = supervised migration →
+# total_operational chains, unsupervised_interval resets — no laundering).
 _JARVIS_ALLOWLIST=(
+  # crypto + signatures + dissertation + memory (pre-205)
   layer4_operator.pub
   layer4_key.salt
   layer4_key.meta.json
@@ -40,6 +50,14 @@ _JARVIS_ALLOWLIST=(
   dissertation_evidence.jsonl
   episodic_memory.jsonl
   semantic_index.npz
+  # operational-state ledgers (Slice 205) — evolutionary history travels
+  observability_registry.bin    # Slice 193 — hedge/registry counters
+  chronos_coherence.json        # Slice 204 — uptime continuity chain
+  m10_graduation_state.json     # Slice 197 — autonomous graduation state
+  bandit_router_state.json      # Slice 201 — learned model posteriors
+  # single-use markers — so the new host doesn't re-fire / re-propose
+  genesis_proposal.done         # Slice 200 — milestone PR single-use sentinel
+  .strategy_proposal_marker     # Slice 203 — strategic-proposal dedup marker
 )
 
 STAGE_PARENT="$(mktemp -d)"

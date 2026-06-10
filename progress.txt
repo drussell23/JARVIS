@@ -1,0 +1,24 @@
+# O+V Strategic Progress Ledger
+# Git-tracked operator-legible record (the Ralph pattern, Slice 202/205).
+# Advisory — authority stays with the gates + the operator. Not auto-signed.
+
+## COMPLETED (this arc — 192-205, all merged to main)
+  [x] slice-192  proactive transport-hedge hierarchy (RT vs batch race)
+  [x] slice-193  sovereign telemetry registry (durable mmap counters)
+  [x] slice-194  race-triage + cross-model rotation (dual-arm recovery)
+  [x] slice-195  adaptive horizon governor (end of the 360s magic number)
+  [x] slice-197  M10 autonomous graduation contract (operator-delegated)
+  [x] slice-198  sovereign ignition (cadence + protection arming)
+  [x] slice-199  sovereign tooling (gh + HTTPS-token PR shipping, no host SSH)
+  [x] slice-200  genesis proposal (deterministic end-to-end ship proof) -> PR #69440 MERGED
+  [x] slice-201  contextual bandit routing advisor (Thompson Sampling)
+  [x] slice-202  strategy bootstrapper + operator-signer (refused self-signing)
+  [x] slice-203  strategy simulator (telemetry-driven proposal) -> PR #69445 MERGED
+  [x] slice-204  chronos continuity matrix (non-volatile, honest uptime ledger)
+  [x] slice-205  state portability (operational ledgers travel on migration)
+
+## NEXT TARGETS (operator-gated — the engine is built; these need runtime + judgment)
+  [ ] runtime       leave the soak UNTOUCHED to accrue continuous unsupervised days
+  [ ] host          keep Mac awake (caffeinate) + Docker autostart, OR migrate to GCP when billing on
+  [ ] direction     author + sign real strategic goals (.jarvis/roadmap.yaml via strategy_signer)
+  [ ] starvation    the organism's own #1 self-identified priority: eliminate control-plane starvation
