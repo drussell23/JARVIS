@@ -16,6 +16,9 @@
   [x] slice-203  strategy simulator (telemetry-driven proposal) -> PR #69445 MERGED
   [x] slice-204  chronos continuity matrix (non-volatile, honest uptime ledger)
   [x] slice-205  state portability (operational ledgers travel on migration)
+  [x] slice-206  boot-warmup lifecycle + honest starvation reclassification (warmup_lag)
+  [x] slice-207  class-level loop guard: SemanticIndex.build() self-offloads if called sync on the loop
+                 (immunizes ANY caller, current/future — not a localized patch)
 
 ## NEXT TARGETS (operator-gated — the engine is built; these need runtime + judgment)
   [ ] runtime       leave the soak UNTOUCHED to accrue continuous unsupervised days

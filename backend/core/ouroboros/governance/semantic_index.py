@@ -91,6 +91,15 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+def loop_guard_enabled() -> bool:
+    """Slice 207 — master for the class-level event-loop guard on ``build()``.
+    Default FALSE (OFF = byte-identical legacy: build() always runs the sync
+    rebuild). ON = build() invoked synchronously on the running event loop
+    redirects to the thread-offloaded build_async (non-blocking,
+    eventually-consistent) instead of freezing the loop. NEVER raises."""
+    return _env_bool("JARVIS_LOOP_GUARD_ENABLED", False)
+
+
 def _is_enabled() -> bool:
     """Master switch (default ``true`` post Tier 0a flip 2026-05-03).
 
@@ -1664,6 +1673,41 @@ class SemanticIndex:
         Honors the refresh interval unless ``force=True``. Never raises —
         failures log at DEBUG and leave the prior index (if any) in place.
         """
+        # Slice 207 — class-level event-loop guard. If build() is invoked
+        # SYNCHRONOUSLY on the running event loop (any caller, current or
+        # future — a non-singleton index, a per-op consumer, etc.), do NOT
+        # freeze the loop with the multi-second rebuild. Redirect to the
+        # existing thread-offloaded build_async (single-flight) and return the
+        # current eventually-consistent built-state. The advisory index
+        # tolerates one cycle of staleness (score/boost operate against the
+        # currently-loaded centroid; empty on cold start — exactly what a sync
+        # build would also yield before the embedder is warm). In a worker
+        # thread get_running_loop() raises → the guard is inert → the real
+        # rebuild runs there (no recursion). Gated; OFF → byte-identical.
+        if loop_guard_enabled():
+            _on_loop = False
+            try:
+                import asyncio as _aio_lg
+                _aio_lg.get_running_loop()
+                _on_loop = True
+            except RuntimeError:
+                _on_loop = False
+            except Exception:  # noqa: BLE001
+                _on_loop = False
+            if _on_loop:
+                logger.warning(
+                    "[SemanticIndex] build() invoked synchronously on the event "
+                    "loop — redirecting to thread-offloaded build_async "
+                    "(non-blocking, eventually-consistent). Caller should use "
+                    "build_async()/build_offloaded() directly.",
+                )
+                try:
+                    self.build_async()
+                except Exception:  # noqa: BLE001
+                    pass
+                with self._lock:
+                    return self._built_at > 0
+
         # Slice 33 Arc 0 — diagnostic only. Heavy sync rebuild
         # (centroid + clusters); called from build_async via
         # threadpool but also potentially on main during cold start.

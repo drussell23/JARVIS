@@ -110,6 +110,11 @@ services:
       # ever masking real steady-state starvation. ──
       JARVIS_INIT_LIFECYCLE_ENABLED: "1"
       JARVIS_INIT_WARMUP_MAX_S: "180"
+      # ── Slice 207: class-level loop guard. SemanticIndex.build() invoked
+      # synchronously on the event loop redirects to the existing thread-
+      # offloaded build_async (non-blocking, eventually-consistent) instead of
+      # freezing the loop for ~25s — immunizes ANY caller, current or future. ──
+      JARVIS_LOOP_GUARD_ENABLED: "1"
       # ── Optional: live 🔮 forecast / 💸 sovereignty on the Discord spine ──
       # JARVIS_DISCORD_GATEWAY_ENABLED: "1"   # needs DISCORD_BOT_TOKEN in .env
       # JARVIS_DISCORD_GATES_CHANNEL_ID: "..."
