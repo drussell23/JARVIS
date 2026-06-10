@@ -1774,6 +1774,75 @@ class GovernedLoopService:
             except Exception as _cx:  # noqa: BLE001
                 logger.debug("[GovernedLoop] chronos wiring swallowed: %r", _cx)
 
+            # Slice 206 — Boot-Warmup Lifecycle + proactive off-loop warmup.
+            # Enter BOOT_WARMUP so the watchdog records the one-time heavy-init
+            # lag as warmup_lag (visible, benign) instead of polluting the
+            # steady-state starvation metric. Then PROACTIVELY pre-warm the
+            # heavy builds via their EXISTING thread-offloaded paths
+            # (build_offloaded / build_async) so they never block the loop on
+            # first lazy use. On completion → STEADY_STATE + WARMUP_COMPLETE.
+            # The init_lifecycle hard deadline guarantees warmup can't be
+            # claimed forever to mask real starvation. Gated, deferred, fail-soft.
+            try:
+                from backend.core.ouroboros.governance.init_lifecycle import (
+                    init_lifecycle_enabled as _il_on,
+                    start_warmup as _il_start,
+                    mark_warmup_complete as _il_done,
+                )
+                if _il_on():
+                    import asyncio as _aio_il
+                    _il_start()
+                    logger.info(
+                        "[InitializationGuard] BOOT_WARMUP entered — heavy init "
+                        "lag recorded as warmup_lag (not steady-state starvation)",
+                    )
+
+                    async def _warmup_lifecycle_boot() -> None:
+                        # Concurrently pre-warm via the pre-existing offloaded
+                        # builds (each best-effort; a missing/erroring warmer
+                        # never blocks the transition).
+                        async def _warm_semantic() -> None:
+                            try:
+                                from backend.core.ouroboros.governance.goal_inference import (  # noqa: E501
+                                    get_default_engine,
+                                )
+                                eng = get_default_engine()
+                                if eng is not None and hasattr(eng, "build_offloaded"):
+                                    await eng.build_offloaded(force=True)
+                            except Exception as _we:  # noqa: BLE001
+                                logger.debug("[InitGuard] semantic warm: %r", _we)
+
+                        async def _warm_index() -> None:
+                            try:
+                                from backend.core.ouroboros.governance.semantic_index import (  # noqa: E501
+                                    get_default_index,
+                                )
+                                idx = get_default_index()
+                                if idx is not None and hasattr(idx, "build_async"):
+                                    idx.build_async()  # schedules off-loop build
+                            except Exception as _we:  # noqa: BLE001
+                                logger.debug("[InitGuard] index warm: %r", _we)
+
+                        try:
+                            await _aio_il.gather(
+                                _warm_semantic(), _warm_index(),
+                                return_exceptions=True,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _il_done()
+                        logger.warning(
+                            "[InitializationGuard] WARMUP_COMPLETE — STEADY_STATE; "
+                            "heavy init pre-warmed off-loop, steady-state "
+                            "starvation now authoritative",
+                        )
+
+                    self._warmup_task = _aio_il.create_task(
+                        _warmup_lifecycle_boot(),
+                    )
+            except Exception as _ilx:  # noqa: BLE001
+                logger.debug("[GovernedLoop] warmup lifecycle swallowed: %r", _ilx)
+
         except Exception as exc:
             self._state = ServiceState.FAILED
             self._failure_reason = str(exc)
