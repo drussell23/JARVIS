@@ -38,7 +38,12 @@ GIT_DIRTY="$([ -n "$(git status --porcelain -- ':\!.jarvis' ':\!**/__pycache__' 
 export GIT_COMMIT GIT_DIRTY
 export JARVIS_ATTESTATION_EXPECTED_COMMIT="$GIT_COMMIT"
 log "Attestation: stamping ${GIT_COMMIT:0:12} (dirty=$GIT_DIRTY) + pinning as boot expectation."
-[ "$GIT_DIRTY" = "true" ] && log "WARNING: dirty tree — strict attestation will REFUSE this image at boot. Commit or stash first."
+# NB: '|| true' is load-bearing — under set -e, a false [ test ] in a bare
+# 'a && b' statement kills the whole script (this exact line aborted the
+# 2026-06-10 relaunch BEFORE the build, leaving the old dirty image running).
+if [ "$GIT_DIRTY" = "true" ]; then
+  log "WARNING: dirty tree — strict attestation will REFUSE this image at boot. Commit or stash first."
+fi
 
 if [ "${1:-}" = "--monitor" ]; then
   exec "$REPO_ROOT/scripts/dw_cortex_monitor.sh"
