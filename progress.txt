@@ -57,3 +57,11 @@
                  fast-fail confirmed live). KNOWN ISSUE deferred: tool_call_without_tool_loop on
                  IMMEDIATE rescue (loop IS wired at construction; conditional branch needs careful
                  repro — no rushed patch on the generation gatekeeper). PRD §51.11.32 documents the arc.
+  [x] slice-217  THE 5TH CUT WIRE FIXED (verify-first; declined the singleton-registry refactor):
+                 GLS._intake_router was NEVER assigned -> roadmap daemon got None -> multi_step emit
+                 was a DRY-RUN ("router not provided") -> GOAL-001 sub-goal envelopes evaporated, WAL
+                 frozen 4 days, zero dispatch. Fix = ONE guarded line in IntakeLayerService.start():
+                 publish the consumed router onto the GLS the daemon reads. DECLINED: process-safe
+                 singleton (incoherent cross-process; over-engineering for a missing assignment) +
+                 sleep-sync queue-bypass (Chronos sleep-detect already honest; real fix = non-sleeping
+                 host, not code). HOST NOTE: Mac slept overnight (chronos_sleep_event) -> laptop != soak host.
