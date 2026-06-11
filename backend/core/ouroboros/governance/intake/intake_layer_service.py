@@ -450,6 +450,19 @@ class IntakeLayerService:
             runtime_orchestrator=_rto,
         )
 
+        # Slice 217 — publish the authoritative router onto the GLS (the 5th
+        # cut wire). The Slice-211 roadmap daemon resolves its ingestion target
+        # via `getattr(gls, "_intake_router", None)`; until this line GLS never
+        # set that attribute, so the daemon got None and emitted sub-goals into
+        # the multi_step orchestrator's DRY-RUN path
+        # (`error="router not provided"`) — the envelope evaporated, the WAL
+        # stayed frozen, GOAL-001::file-00 never dispatched. Publishing the SAME
+        # router object the IntakeLayerService consumer drains closes the loop:
+        # the roadmap daemon now ingests into the live dispatch queue. Guarded
+        # so gls=None (some test/embedding paths) can't crash boot.
+        if self._gls is not None:
+            self._gls._intake_router = self._router
+
         # A-narrator: salience-gated preflight awareness
         if self._config.a_narrator_enabled and self._say_fn is not None:
             self._narrator = IntakeNarrator(
