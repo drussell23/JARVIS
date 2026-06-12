@@ -2324,6 +2324,35 @@ class DoublewordProvider:
                     except Exception:  # noqa: BLE001
                         pass
 
+                # Slice 227 — context-aware hedge governor. When the Iron Gate
+                # will demand exploration for this op (the SAME predicate that
+                # re-opens the tool loop in Slice 226), the batch arm (no tool
+                # loop) must not pre-empt the exploring RT arm — its un-explored
+                # candidate would fail the exploration floor (the live
+                # GOAL-001::file-00 layer-3 bug). One source of truth across the
+                # capability, security, and concurrency planes. Rupture fallback
+                # is fully preserved (batch is buffered, used iff RT ruptures).
+                from backend.core.ouroboros.governance.dw_transport_hedge import (
+                    hedge_gate_aware_enabled as _s227_governor_on,
+                )
+                _s227_prefer_fast = False
+                if _s227_governor_on():
+                    try:
+                        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                            exploration_gate_demands_tools as _s227_gate_demands,
+                        )
+                        _s227_prefer_fast = _s227_gate_demands(
+                            str(getattr(context, "task_complexity", "")),
+                        )
+                    except Exception:  # noqa: BLE001 — fail-open to legacy race
+                        _s227_prefer_fast = False
+                if _s227_prefer_fast:
+                    logger.warning(
+                        "[Cortex] ⚡ HEDGE GOVERNOR: op needs Iron-Gate "
+                        "exploration — batch arm held speculative, RT arm (tool "
+                        "loop) gets the slot unless it ruptures (op=%s)",
+                        (getattr(context, "op_id", "?") or "?")[:16],
+                    )
                 return await hedged_race(
                     lambda: self._generate_realtime(
                         context, deadline, prompt_override=prompt_override,
@@ -2336,6 +2365,7 @@ class DoublewordProvider:
                     stable_label="batch",
                     on_outcome=_s190_hedge_outcome,
                     on_abandoned=_s194_on_abandoned,
+                    prefer_fast=_s227_prefer_fast,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
