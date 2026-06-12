@@ -81,3 +81,16 @@
                  DESIGNED knob (client.py:14-17): JARVIS_AEGIS_SESSION_TOKEN_TTL_S=7776000 (90d, covers
                  §41.6 evidence window). DURABLE follow-on = build the /session/refresh endpoint
                  (Slice-3 TODO) for truly-infinite uptime beyond any TTL.
+  [x] slice-221  STRATEGIC TARGET TRACE (verify-first KILLED two phantom slices first: the
+                 'topology bypass' didn't exist — immediate dw_allowed=False loads correctly; and the
+                 failing IMMEDIATE ops were TestFailure sensor noise, NOT GOAL-001 which routes
+                 COMPLEX/BACKGROUND). ROOT CAUSE FOUND: GOAL-001::file-00 held hostage by STALE
+                 goal_decomposition_ledger.jsonl (Jun-10 dry-run era, pre-S217) recording
+                 status=proposed/'emitted' for an emission that never ingested -> _mark_emitted_via_
+                 goal_decomposition sees already-emitted -> never re-emits -> emit_outcomes=[] forever.
+                 FIX: archive BOTH stale ledgers (multi_step + goal_decomposition) + clean-slate rebuild.
+                 QoS BLUEPRINT (designed, not built): partition intake into QoS-0 (sensor/health noise,
+                 throttleable) vs QoS-1 (operator-signed roadmap targets, dedicated un-starvable slots)
+                 — intake_priority_queue already has priority buckets; the gap is per-CLASS worker
+                 reservation so an IMMEDIATE timeout storm can't consume all execution slots. Build
+                 trigger: IF post-cleanup file-00 dispatches but starves behind sensor ops.
