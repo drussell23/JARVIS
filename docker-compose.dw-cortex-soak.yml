@@ -97,6 +97,17 @@ services:
       # first fetch repopulates with the live catalog. ──
       JARVIS_DW_CATALOG_DISCOVERY_ENABLED: "1"
       JARVIS_DW_CATALOG_AUTHORITATIVE: "1"
+      # ── Slice 218 — arm the EXISTING multi-model runtime verification matrix
+      # (verify-first: NOT a new circuit — race_triage + schema_drift_tracker +
+      # PromotionLedger + cortex + bandit already implement it). The ONE missing
+      # flag: schema-drift rotation. With it on, a model that emits a
+      # schema_invalid payload (e.g. tool_call_without_tool_loop) is demoted +
+      # the op rotates to the next ranked candidate — zero loop disruption.
+      # JARVIS_RACE_TRIAGE_ENABLED (dual-arm rotation) + the Zero-Trust
+      # PromotionLedger (new models quarantined to SPECULATIVE until they prove
+      # 10 clean ops) are already default-ON — so an un-vetted model like
+      # Nemotron EARNS its way up; it does NOT jump into the COMPLEX main track. ──
+      JARVIS_SCHEMA_DRIFT_ROTATION_ENABLED: "1"
       # ── Organism baseline ──
       JARVIS_EPISODIC_CORE_ENABLED: "1"
       JARVIS_CAI_ROUTER_ENABLED: "1"

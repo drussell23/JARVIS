@@ -65,3 +65,11 @@
                  singleton (incoherent cross-process; over-engineering for a missing assignment) +
                  sleep-sync queue-bypass (Chronos sleep-detect already honest; real fix = non-sleeping
                  host, not code). HOST NOTE: Mac slept overnight (chronos_sleep_event) -> laptop != soak host.
+  [x] slice-218  arm the EXISTING multi-model verification matrix (verify-first: NOT a new
+                 circuit). One missing flag: JARVIS_SCHEMA_DRIFT_ROTATION_ENABLED -> schema_invalid
+                 (tool_call_without_tool_loop) demotes the model + rotates to next ranked. Declined
+                 the duplicate schema-guard/demotion-circuit build (race_triage + schema_drift_tracker
+                 + PromotionLedger Zero-Trust quarantine + cortex timeout + bandit ALREADY do it).
+                 PREMISE CORRECTED: Nemotron does NOT jump into COMPLEX — the prove-it PromotionLedger
+                 quarantines new models to SPECULATIVE until 10 clean ops; DeepSeek-V4-Pro/Qwen-397B
+                 (proven, ranked) carry COMPLEX while Nemotron earns trust.
