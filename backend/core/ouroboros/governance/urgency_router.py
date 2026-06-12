@@ -500,6 +500,40 @@ class UrgencyRouter:
             # NEVER let envelope inspection break the route — fall through.
             pass
 
+        # ── Priority 0.75: headless-soak sensor demotion (Slice 223) ──
+        # The Slice-10A pattern, generalized. §5 urgency routing was designed
+        # for the HUMAN-REFLEX case; in a headless soak NO HUMAN IS WAITING on
+        # a sensor alarm. Live evidence (2026-06-12): the TestFailure sensor's
+        # storm over 3 known pre-existing failures routed IMMEDIATE ->
+        # Claude-direct, saturating the worker pool + burning premium tokens
+        # on unfixable noise while the operator-signed GOAL-001 starved 40min
+        # in queue. Demote test_failure-source ops to STANDARD (DW primary,
+        # Claude per-round rescue preserved — the 10A choice) when BOTH:
+        #   * JARVIS_SOAK_SENSOR_DEMOTION_ENABLED (gate, default FALSE)
+        #   * OUROBOROS_BATTLE_HEADLESS truthy (no human present)
+        # Source-discriminated (signal_source, stamped by the sensor), NOT a
+        # priority label a generated patch could self-elevate (S208 concern).
+        # Interactive sessions byte-identical: a human watching a test fail
+        # mid-typing keeps the reflex lane.
+        try:
+            _demote_on = os.environ.get(
+                "JARVIS_SOAK_SENSOR_DEMOTION_ENABLED", "",
+            ).strip().lower() in ("1", "true", "yes", "on")
+            _headless = os.environ.get(
+                "OUROBOROS_BATTLE_HEADLESS", "",
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if (
+                _demote_on and _headless
+                and (getattr(ctx, "signal_source", "") or "") == "test_failure"
+            ):
+                return (
+                    ProviderRoute.STANDARD,
+                    "headless_soak_sensor_demotion:test_failure:"
+                    "no_human_waiting:dw_primary",
+                )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
         urgency = getattr(ctx, "signal_urgency", "") or "normal"
         source = getattr(ctx, "signal_source", "") or ""
         complexity = getattr(ctx, "task_complexity", "") or "moderate"

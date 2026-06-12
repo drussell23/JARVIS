@@ -99,3 +99,9 @@
                  (priority 4) starved 40min in queue. Soak config: poll 1/day + fs-events off.
                  NOT gaming (failures documented pre-existing; changes WHEN we look). QoS build
                  remains the durable fix if starvation persists.
+  [x] slice-223  headless sensor demotion (10A pattern generalized; verify-first DESCOPED the
+                 plan's two-lane pool + 'cryptographic firewall'): BG/SPEC already barred from Claude
+                 (topology skip_and_queue); the leak was test_failure->IMMEDIATE->Claude-direct. New
+                 Priority 0.75: headless + test_failure -> STANDARD (DW primary, rescue preserved).
+                 Source-discriminated (S208-safe: not a self-elevatable label). Two-lane QoS pool
+                 build stays gated on the b5nai4cms watch verdict (starvation with noise quieted?).
