@@ -150,6 +150,16 @@ services:
       # direct — premium tokens reserved for human-reflex + strategic work.
       # Source-discriminated; interactive sessions byte-identical. ──
       JARVIS_SOAK_SENSOR_DEMOTION_ENABLED: "1"
+      # ── Slice 224 — Token-Economic Accounting Fabric. ──
+      # P2a prompt-prefix cache: the Venom tool catalog + output schema (the
+      # biggest FIXED blocks, previously re-billed in full every op) now ride
+      # the cached system prefix (~90% cheaper on hits). Builder logic was
+      # proven by 7 pre-existing tests; Slice 224 closed the missing call-site
+      # wire. Verify live via get_cache_stats hit-rate.
+      JARVIS_PROMPT_PREFIX_CACHE_ENABLED: "1"
+      # Hourly burn-rate cap (the '$26 can never vanish in a day' rail) —
+      # Aegis budget state machine denies premium dispatch past this rate.
+      JARVIS_AEGIS_HOURLY_BURN_CAP_USD: "2.00"
       GCM_INTERACTIVE: "never"
       JARVIS_GIT_ORIGIN_SLUG: "drussell23/JARVIS"
       JARVIS_GIT_AUTHOR_NAME: "Ouroboros+Venom"

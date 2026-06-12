@@ -8144,11 +8144,19 @@ class ClaudeProvider:
 
         # Zero-Waste S1 (D2): MCP discovery + lean/full prompt build
         # extracted into _assemble_codegen_prompt (low-risk extract).
+        # Slice 224 — P2a call-site wire (closes the 'on_without_sink_falls_
+        # back' gap): collect the stable tool-catalog/schema blocks here and
+        # fold them into the CACHED system prefix below, so the biggest fixed
+        # prompt blocks ride Anthropic's ~90%-cheaper cache instead of being
+        # re-billed in the volatile user prompt every op. Local per-call list
+        # -> concurrency-safe. Empty unless JARVIS_PROMPT_PREFIX_CACHE_ENABLED.
+        _p2a_stable_prefix: List[str] = []
         prompt_text, _mcp_tools, _preloaded_files = (
             await self._assemble_codegen_prompt(
                 context=context,
                 repo_root=repo_root,
                 repair_context=repair_context,
+                stable_prefix_out=_p2a_stable_prefix,
             )
         )
         # Build messages array for multi-turn conversation
@@ -8316,8 +8324,14 @@ class ClaudeProvider:
             # Env-gated via JARVIS_CLAUDE_PROMPT_CACHE_ENABLED /
             # JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS. On a cache hit, cached
             # input tokens cost $0.30/M instead of $3.00/M (90% savings).
-            _system_with_cache = self._build_cached_system_blocks(
+            _p2a_sys_base = (
                 _CODEGEN_SYSTEM_PROMPT
+                if not _p2a_stable_prefix
+                else _CODEGEN_SYSTEM_PROMPT + "\n\n"
+                + "\n\n".join(_p2a_stable_prefix)
+            )
+            _system_with_cache = self._build_cached_system_blocks(
+                _p2a_sys_base
             )
 
             # Streaming: use stream() for token-by-token output via TUI callback.
@@ -9191,6 +9205,7 @@ class ClaudeProvider:
         context: "OperationContext",
         repo_root: Optional[Path],
         repair_context: Optional[Any],
+        stable_prefix_out: Optional[List[str]] = None,
     ) -> Tuple[str, Any, List[str]]:
         """Zero-Waste S1 (D2) extract — MCP tools discovery + lean/
         full prompt build. Pulled out of :meth:`generate` so the
@@ -9223,6 +9238,7 @@ class ClaudeProvider:
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
                 preloaded_out=_preloaded_files,
+                stable_prefix_out=stable_prefix_out,
             )
             logger.info(
                 "[ClaudeAPI] Using lean prompt "
