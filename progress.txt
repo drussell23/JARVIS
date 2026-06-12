@@ -113,3 +113,8 @@
                  day x provider(inferred) x route rollups over aegis spend WAL incl. backups.
                  (3) JARVIS_AEGIS_HOURLY_BURN_CAP_USD=2.00 pinned (rate rail). Honest: provider
                  attribution is op-id heuristic, LABELED inferred; consoles stay authoritative.
+  [x] slice-225  PRD §51.11.34 (v3.27): the Soak Reliability + Token-Economic arc (217-224) +
+                 the next-slices roadmap. Five-layer onion documented; audited money verdict (~$1.90
+                 not $26 -> ~$24 outside audit trail); cost stack complete; BLUNT truth recorded
+                 (cost solved, file-00 still won't dispatch = NON-economic autonomy blocker).
+                 ROADMAP: A1 trace file-00 dispatch (milestone gate) is the #1 next action.
