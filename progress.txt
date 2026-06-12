@@ -73,3 +73,11 @@
                  PREMISE CORRECTED: Nemotron does NOT jump into COMPLEX — the prove-it PromotionLedger
                  quarantines new models to SPECULATIVE until 10 clean ops; DeepSeek-V4-Pro/Qwen-397B
                  (proven, ranked) carry COMPLEX while Nemotron earns trust.
+  [x] slice-220  Aegis session-TOKEN-expiry root cause (verify-first; declined the plan's
+                 session-factory/pool-reconnect as fixing a non-existent socket bug). The real bug:
+                 session token TTL default 3600=1h + single-use PSK + no /session/refresh -> after 1h
+                 every Claude call = 403 psk_already_consumed -> fallback_failed -> EXHAUSTION (NOT
+                 sleep, NOT sockets; HTTP session already self-heals via _ensure_http). Fix = the
+                 DESIGNED knob (client.py:14-17): JARVIS_AEGIS_SESSION_TOKEN_TTL_S=7776000 (90d, covers
+                 §41.6 evidence window). DURABLE follow-on = build the /session/refresh endpoint
+                 (Slice-3 TODO) for truly-infinite uptime beyond any TTL.
