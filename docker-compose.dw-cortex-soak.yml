@@ -89,6 +89,14 @@ services:
       #    a cost-optimizer that skips the race during a forecast storm. Outcomes recorded into
       #    the economic ledger (171): hedge_rt_wins / hedge_batch_wins / hedge_ruptures_swallowed. ──
       JARVIS_DW_TRANSPORT_HEDGE_ENABLED: "1"
+      # ── Slice 219 — make DW dynamic catalog-discovery EXPLICIT so the new
+      # funded key live-fetches DW's /v1/models and ranks per-route by params.
+      # This auto-discovers nvidia/NVIDIA-Nemotron-3-Ultra-550B (ranks #1 for
+      # COMPLEX at 550B > Qwen-397B) + Super-120B — NO hardcoded model id; the
+      # classifier owns ranking. The stale May-24 cache was archived so the
+      # first fetch repopulates with the live catalog. ──
+      JARVIS_DW_CATALOG_DISCOVERY_ENABLED: "1"
+      JARVIS_DW_CATALOG_AUTHORITATIVE: "1"
       # ── Organism baseline ──
       JARVIS_EPISODIC_CORE_ENABLED: "1"
       JARVIS_CAI_ROUTER_ENABLED: "1"
