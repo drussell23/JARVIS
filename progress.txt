@@ -118,3 +118,7 @@
                  not $26 -> ~$24 outside audit trail); cost stack complete; BLUNT truth recorded
                  (cost solved, file-00 still won't dispatch = NON-economic autonomy blocker).
                  ROADMAP: A1 trace file-00 dispatch (milestone gate) is the #1 next action.
+  [x] slice-226  PRD split (the 2.2MB doc exceeded GitHub's ~1MB render cap). 4 byte-conserved
+                 files (only +2109b of cross-links, zero content lost): PRD.md (lean §1-§23+TOC, 322KB,
+                 renders) + PRD_SPEC_DETAIL.md (§24-50) + NORTH_STAR.md (§51 + §51.11.x + active roadmap)
+                 + PRD_HISTORY.md (version headers + §40/41 banners). All <770KB.
