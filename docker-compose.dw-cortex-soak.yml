@@ -241,6 +241,11 @@ services:
       # upstream works (reader valid -> decomposition valid, 2 sub-goals ->
       # envelope into router); THIS flag is what lets sub-goals emit. ──
       JARVIS_MULTI_STEP_ORCHESTRATION_ENABLED: "1"
+      # §51.11.34-ROADMAP A1 — sub-goal completion writeback (the severed
+      # feedback wire). Default-TRUE; pinned explicit here for soak auditability.
+      # Closes the loop multi_step EMIT (PROPOSED) -> terminal op (COMPLETED) so
+      # done_count advances and GOAL-001::file-00 stops being a hostage.
+      JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED: "1"
       # Fallback-sem relief (landmine A): D2/12F-B sem-exhausted fast-fail
       # confirmed live; raise rescue concurrency to the cap so boot-time op
       # stacks queue less (observed 135s sem_wait on concurrency=3).
