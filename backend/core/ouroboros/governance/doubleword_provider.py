@@ -2324,6 +2324,35 @@ class DoublewordProvider:
                     except Exception:  # noqa: BLE001
                         pass
 
+                # Slice 227 — context-aware hedge governor. When the Iron Gate
+                # will demand exploration for this op (the SAME predicate that
+                # re-opens the tool loop in Slice 226), the batch arm (no tool
+                # loop) must not pre-empt the exploring RT arm — its un-explored
+                # candidate would fail the exploration floor (the live
+                # GOAL-001::file-00 layer-3 bug). One source of truth across the
+                # capability, security, and concurrency planes. Rupture fallback
+                # is fully preserved (batch is buffered, used iff RT ruptures).
+                from backend.core.ouroboros.governance.dw_transport_hedge import (
+                    hedge_gate_aware_enabled as _s227_governor_on,
+                )
+                _s227_prefer_fast = False
+                if _s227_governor_on():
+                    try:
+                        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                            exploration_gate_demands_tools as _s227_gate_demands,
+                        )
+                        _s227_prefer_fast = _s227_gate_demands(
+                            str(getattr(context, "task_complexity", "")),
+                        )
+                    except Exception:  # noqa: BLE001 — fail-open to legacy race
+                        _s227_prefer_fast = False
+                if _s227_prefer_fast:
+                    logger.warning(
+                        "[Cortex] ⚡ HEDGE GOVERNOR: op needs Iron-Gate "
+                        "exploration — batch arm held speculative, RT arm (tool "
+                        "loop) gets the slot unless it ruptures (op=%s)",
+                        (getattr(context, "op_id", "?") or "?")[:16],
+                    )
                 return await hedged_race(
                     lambda: self._generate_realtime(
                         context, deadline, prompt_override=prompt_override,
@@ -2336,6 +2365,7 @@ class DoublewordProvider:
                     stable_label="batch",
                     on_outcome=_s190_hedge_outcome,
                     on_abandoned=_s194_on_abandoned,
+                    prefer_fast=_s227_prefer_fast,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
@@ -2754,12 +2784,46 @@ class DoublewordProvider:
         # (the simple-background half of the v40b deadlock would otherwise
         # remain: loop runs, tools suppressed). Env-gated + BACKGROUND-only
         # -> byte-identical legacy when Claude is enabled / flag off.
-        if background_is_terminal_worker(str(_route)):
-            _will_skip_tools = (_complexity == "trivial")
-        else:
-            _will_skip_tools = (
-                _complexity in ("trivial", "simple")
-                or should_skip_venom_for_route(str(_route))
+        # Slice 226 — Iron Gate / provider capability alignment. The base
+        # tool-skip decision (BG-terminal-worker vs complexity/route skip) is
+        # now computed by the shared exploration_engine predicate so the
+        # capability plane (tools available) can never contradict the security
+        # plane (exploration floor). When the Iron Gate will demand exploration
+        # for a ``simple`` op on a venom-eligible route, the loop stays ON —
+        # closing the live GOAL-001::file-00 catch-22 (simple -> tools skipped
+        # -> exploration_insufficient -> guaranteed rejection). trivial stays
+        # exempt; BACKGROUND/SPECULATIVE keep their preload-credit skip.
+        from backend.core.ouroboros.governance.exploration_engine import (
+            compute_tool_loop_suppressed as _s226_compute_skip,
+            exploration_gate_demands_tools as _s226_gate_demands,
+        )
+        _s226_is_bg_tw = background_is_terminal_worker(str(_route))
+        _s226_route_skip = should_skip_venom_for_route(str(_route))
+        _base_skip = _s226_compute_skip(
+            complexity=str(_complexity),
+            route=str(_route),
+            is_bg_terminal_worker=_s226_is_bg_tw,
+            has_repair_context=False,
+        )
+        _will_skip_tools = _base_skip
+        # Slice 226 observability (operator pref: escalate capability anomalies
+        # LOUD, never silent re-route). When the alignment override re-opened
+        # the loop for a complexity that the cost heuristic would have stripped
+        # (simple, venom-eligible route, not BG-terminal-worker), flash it.
+        if (
+            not _base_skip
+            and not _s226_is_bg_tw
+            and not _s226_route_skip
+            and str(_complexity).strip().lower() == "simple"
+            and _s226_gate_demands(str(_complexity))
+        ):
+            logger.warning(
+                "[DoublewordProvider] ⚡ CAPABILITY ALIGNMENT: Iron Gate floor "
+                "demands exploration for a 'simple' op — re-opened the Venom "
+                "tool loop (read_file/search_code) the cost heuristic would "
+                "have withheld. route=%s op=%s",
+                _route,
+                (getattr(context, "op_id", "?") or "?")[:16],
             )
         # ──────────────────────────────────────────────────────────────
         # Slice 9 — L2 single-shot fast path (DW mirror)
