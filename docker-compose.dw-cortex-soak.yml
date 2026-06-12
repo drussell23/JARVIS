@@ -119,6 +119,18 @@ services:
       # less). Non-interactive hardening: a missing/expired credential FAILS
       # CLOSED rather than hanging on a hidden CLI prompt.
       GIT_TERMINAL_PROMPT: "0"
+      # ── Slice 220 — THE AegisClientError ROOT CAUSE (verify-first; NOT a socket/
+      # pool bug). The Aegis session TOKEN expires after JARVIS_AEGIS_SESSION_
+      # TOKEN_TTL_S (default 3600=1h). The bootstrap PSK is single-use + there is
+      # no /session/refresh endpoint yet, so after 1h every Claude call fails
+      # "403 psk_already_consumed" -> fallback_failed -> EXHAUSTION (sleep- AND
+      # socket-independent; the HTTP session already self-heals via _ensure_http).
+      # client.py:14-17 prescribes the fix: "set JARVIS_AEGIS_SESSION_TOKEN_TTL_S
+      # to cover the whole intended session duration." 90 days covers the full
+      # §41.6 Tier-D unsupervised-evidence window in one continuous run; a restart
+      # re-mints anyway. DECLINED the plan's session-factory/pool-reconnect: it
+      # would fix a non-existent socket bug while the 403 kept failing. ──
+      JARVIS_AEGIS_SESSION_TOKEN_TTL_S: "7776000"
       GCM_INTERACTIVE: "never"
       JARVIS_GIT_ORIGIN_SLUG: "drussell23/JARVIS"
       JARVIS_GIT_AUTHOR_NAME: "Ouroboros+Venom"
