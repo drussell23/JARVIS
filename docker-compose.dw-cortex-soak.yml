@@ -144,6 +144,12 @@ services:
       # the durable fix if starvation persists with the noise quieted. ──
       JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S: "86400"
       JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED: "0"
+      # ── Slice 223 — headless sensor demotion (the durable layer under 222's
+      # timer). Even if ANY sensor storms again, test_failure-source ops in a
+      # headless soak route STANDARD (DW primary), never IMMEDIATE/Claude-
+      # direct — premium tokens reserved for human-reflex + strategic work.
+      # Source-discriminated; interactive sessions byte-identical. ──
+      JARVIS_SOAK_SENSOR_DEMOTION_ENABLED: "1"
       GCM_INTERACTIVE: "never"
       JARVIS_GIT_ORIGIN_SLUG: "drussell23/JARVIS"
       JARVIS_GIT_AUTHOR_NAME: "Ouroboros+Venom"
