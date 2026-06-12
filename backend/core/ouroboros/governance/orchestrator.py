@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -141,6 +142,75 @@ _SLICE12Q_LEDGER_TO_STATUS: Dict[str, str] = {
 }
 
 
+_ENV_SUBGOAL_WRITEBACK = "JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED"
+
+
+def _slice_a1_subgoal_completion_writeback(ctx: Any, state: Any) -> None:
+    """§51.11.34-ROADMAP A1 — close the sub-goal completion feedback loop.
+
+    The multi_step orchestrator emits sub-goal envelopes (stamping
+    ``sub_goal_id`` + ``parent_goal_id`` into the envelope evidence) and writes
+    a ``PROPOSED`` row to the canonical goal_decomposition completion ledger at
+    EMIT time — but historically NOTHING wrote the terminal
+    ``COMPLETED``/``FAILED`` transition back. ``done_count`` (which counts
+    ``completed`` rows) was therefore structurally pinned at 0: a roadmap
+    sub-goal could dispatch and succeed any number of times and the roadmap
+    would never advance.
+
+    This writeback fires from the orchestrator terminal hook — the same
+    fail-soft, recorder-independent seam the Slice-134 episodic synapse uses.
+    When the terminal op carries roadmap sub-goal provenance via
+    ``ctx.intake_evidence_json``, the terminal state is mapped to a
+    CompletionStatus (``applied`` -> COMPLETED; any other terminal -> FAILED)
+    and appended to the completion ledger, so the multi_step orchestrator's
+    ``done_count`` advances and the roadmap can progress.
+
+    Gated ``JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED`` (default TRUE — this
+    closes a structural gap; OFF is byte-identical to the legacy severed loop).
+    NEVER raises.
+    """
+    try:
+        raw = os.environ.get(_ENV_SUBGOAL_WRITEBACK, "true").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return
+        # Cheap substring pre-check avoids a json.loads on the vast majority of
+        # ops (sensor signals) that carry no sub_goal provenance.
+        evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
+        if not evidence_json or "sub_goal_id" not in evidence_json:
+            return
+        try:
+            evidence = json.loads(evidence_json)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(evidence, dict):
+            return
+        sub_goal_id = str(evidence.get("sub_goal_id") or "").strip()
+        parent_goal_id = str(evidence.get("parent_goal_id") or "").strip()
+        if not sub_goal_id or not parent_goal_id:
+            return
+        state_value = getattr(state, "value", str(state)) or ""
+        from backend.core.ouroboros.governance.goal_decomposition_planner import (  # noqa: E501
+            CompletionStatus,
+            mark_sub_goal_status,
+        )
+        status = (
+            CompletionStatus.COMPLETED
+            if state_value == "applied"
+            else CompletionStatus.FAILED
+        )
+        mark_sub_goal_status(
+            sub_goal_id=sub_goal_id,
+            parent_goal_id=parent_goal_id,
+            status=status,
+            note=(
+                "terminal:" + str(state_value) + " via orchestrator op "
+                + str(getattr(ctx, "op_id", ""))
+            )[:512],
+        )
+    except Exception:  # noqa: BLE001 — writeback never perturbs the FSM
+        return
+
+
 def _slice12q_record_terminal(
     ctx: Any, state: Any, data: Dict[str, Any],
 ) -> None:
@@ -184,6 +254,10 @@ def _slice12q_record_terminal(
             )
     except Exception:  # noqa: BLE001 — synapse never perturbs the FSM
         pass
+    # §51.11.34-ROADMAP A1 — sub-goal completion writeback (the severed feedback
+    # wire). Recorder-independent + fail-soft, exactly like the episodic synapse
+    # above. Closes the roadmap progress loop: terminal op -> completion ledger.
+    _slice_a1_subgoal_completion_writeback(ctx, state)
     try:
         from backend.core.ouroboros.battle_test.session_recorder import (
             get_active_recorder,
