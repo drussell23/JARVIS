@@ -94,3 +94,8 @@
                  — intake_priority_queue already has priority buckets; the gap is per-CLASS worker
                  reservation so an IMMEDIATE timeout storm can't consume all execution slots. Build
                  trigger: IF post-cleanup file-00 dispatches but starves behind sensor ops.
+  [x] slice-222  quiet the self-DDoS: TestFailure sensor thrashing on 3 KNOWN pre-existing
+                 failing tests -> constant IMMEDIATE ops -> all 3 workers saturated -> GOAL-001
+                 (priority 4) starved 40min in queue. Soak config: poll 1/day + fs-events off.
+                 NOT gaming (failures documented pre-existing; changes WHEN we look). QoS build
+                 remains the durable fix if starvation persists.
