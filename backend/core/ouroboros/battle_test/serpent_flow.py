@@ -4868,6 +4868,20 @@ class SerpentREPL:
                     if line in ("cost", "/cost"):
                         self._print_cost()
                         continue
+                    if line in ("spend", "/spend"):
+                        # Slice 224 — day x provider x route attribution over
+                        # the Aegis spend WAL (read-only; never raises).
+                        try:
+                            from backend.core.ouroboros.governance.accounting_ledger import (  # noqa: E501
+                                format_spend_report, rollup_spend,
+                            )
+                            self._console.print(
+                                format_spend_report(rollup_spend()),
+                                highlight=False,
+                            )
+                        except Exception as _se:  # noqa: BLE001
+                            self._console.print(f"  spend report error: {_se}")
+                        continue
                     if line in ("posture", "/posture"):
                         self._print_posture()
                         continue

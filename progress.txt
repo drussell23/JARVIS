@@ -105,3 +105,11 @@
                  Priority 0.75: headless + test_failure -> STANDARD (DW primary, rescue preserved).
                  Source-discriminated (S208-safe: not a self-elevatable label). Two-lane QoS pool
                  build stays gated on the b5nai4cms watch verdict (starvation with noise quieted?).
+  [x] slice-224  token-economic accounting fabric: (1) P2a prompt-prefix cache COMPLETED —
+                 builder logic pre-existed (7 tests green) but NO call-site passed the sink
+                 ('on_without_sink_falls_back'); wired generate() -> _assemble_codegen_prompt ->
+                 fold into cached system blocks (concurrency-safe local). Tool catalog + schema
+                 now ~90% cheaper on cache hits. (2) accounting_ledger.py + /spend verb + CLI:
+                 day x provider(inferred) x route rollups over aegis spend WAL incl. backups.
+                 (3) JARVIS_AEGIS_HOURLY_BURN_CAP_USD=2.00 pinned (rate rail). Honest: provider
+                 attribution is op-id heuristic, LABELED inferred; consoles stay authoritative.
