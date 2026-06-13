@@ -211,6 +211,38 @@ def _slice_a1_subgoal_completion_writeback(ctx: Any, state: Any) -> None:
         return
 
 
+def _slice230_record_exploration_drift(op_id: Any, model_id: Any) -> None:
+    """Slice 230 — feed an Iron-Gate exploration rejection back into model
+    rotation. Records ``DriftType.EXPLORATION_INSUFFICIENT`` for
+    (op_id, model_id) in the Slice-20C drift tracker, so the GENERATE_RETRY
+    sentinel walk skips the model that just emitted a no-tool patch and
+    rotates to the next ranked candidate (the agentic elites, per Slices
+    228/229). Without this wire, a weak model that "succeeds" at transport
+    level keeps winning the walk and the op dies 0/1 forever. Loud by
+    operator preference. NEVER raises — the gate path must not be perturbed."""
+    try:
+        op = str(op_id or "").strip()
+        model = str(model_id or "").strip()
+        if not op or not model:
+            return
+        from backend.core.ouroboros.governance.schema_drift_tracker import (
+            DriftType,
+            get_default_tracker,
+        )
+        get_default_tracker().record(
+            op_id=op, model_id=model,
+            drift_type=DriftType.EXPLORATION_INSUFFICIENT,
+        )
+        logger.warning(
+            "[Orchestrator] ⚡ GATE→ROTATION: model=%s emitted a no-tool patch "
+            "(exploration_insufficient) — drift-marked for op=%s; the retry "
+            "walk will rotate to the next ranked (agentic) candidate",
+            model, op[:16],
+        )
+    except Exception:  # noqa: BLE001 — feedback never perturbs the gate
+        return
+
+
 def _slice12q_record_terminal(
     ctx: Any, state: Any, data: Dict[str, Any],
 ) -> None:
@@ -5039,6 +5071,14 @@ class GovernedOrchestrator:
                                 "%d/%d (attempt=%d cumulative, preloaded=%d) for op=%s",
                                 _op_explore_credit, _min_explore, attempt + 1,
                                 _preloaded_credit, ctx.op_id[:12],
+                            )
+                            # Slice 230 — feed the rejection back into model
+                            # rotation: drift-mark the model that produced this
+                            # no-tool candidate so the GENERATE_RETRY walk skips
+                            # it and rotates to the next ranked (agentic) model.
+                            _slice230_record_exploration_drift(
+                                ctx.op_id,
+                                getattr(generation, "model_id", ""),
                             )
                             generation = None
                             raise RuntimeError(_explore_err)
