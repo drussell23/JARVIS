@@ -186,3 +186,15 @@
                  unresolvable-fail-loud / empty-env / from_env-integration). 15 existing harness
                  tests green. gen_timeout-lift wiring (S231 lever masked by autarky) deferred to a
                  separate follow-up slice per operator.
+  [x] slice-234b RE-SOAK after S234 proved it NECESSARY but not sufficient: GOAL-001 again routed
+                 IMMEDIATE w/ DW-primary 180s (breaker_open_economic_persisted), generated,
+                 REVIEW=APPROVE, reached APPLY — then STILL "[Errno 2] /Users/.../semantic_index.py".
+                 2nd source: JARVIS_REPO_PATH is STILL the host path in the container (env_file: .env
+                 leaks it) and ~8 modules read it DIRECTLY (auto_action_router.py:1193 et al), joining
+                 absolute APPLY targets against it — bypassing the S234 harness resolver. FIX (config,
+                 not code): docker-compose.dw-cortex-soak.yml `environment:` now sets JARVIS_REPO_PATH=
+                 /app (+ sibling reactor/prime=/app), winning over env_file, so the container reflects
+                 its real /app layout. roadmap.signed.yaml carries ZERO host paths (ruled out).
+                 FOLLOW-UP (tracked, separate slice): promote _resolve_runtime_repo_root (S234) to a
+                 SHARED governance resolver + route all ~8 direct JARVIS_REPO_PATH reads through it
+                 (validate vs runtime FS, fail loud) — context-independent of the env. NOT done here.
