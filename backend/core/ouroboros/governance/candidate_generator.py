@@ -1132,6 +1132,22 @@ def fallback_skip_gate_enabled() -> bool:
         return False
 
 
+def _dw_autarky_enabled() -> bool:
+    """Slice 225 Phase 2 master. Default-TRUE — when the Claude fallback breaker
+    is OPEN/HALF_OPEN (terminal_quota / out-of-credits / transport), STANDARD and
+    COMPLEX ops keep the DW primary on the full op budget instead of severing it
+    at the 30s/75s reflex cap into a dead lane (the live GOAL-001::file-00
+    generation_failed wedge). Sibling to the P2.1 IMMEDIATE-route gate above, for
+    the STANDARD/COMPLEX primary-budget path. Operator force-off with =0. NEVER
+    raises — fail-closed to legacy cascade."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_AUTARKY_ENABLED", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def immediate_reroute_to_dw(
     *,
     dw_is_primary: bool,
@@ -3188,6 +3204,45 @@ class CandidateGenerator:
             provider_route,
         )
 
+        # Slice 229 — exploration-floor driven route elevation. When this op
+        # must satisfy the Iron Gate exploration floor (the SAME Slice-226
+        # predicate that opens the tool loop + steers the hedge), prepend the
+        # COMPLEX route's agentic-elite pool (active-param-ranked, family-
+        # weighted) so tool-loop work is never starved onto low-active models
+        # that cannot drive it. The live layer-5 wedge: Kimi/DeepSeek-V4-Pro/
+        # GLM-5.1 all promoted=True yet UNREACHABLE from STANDARD — file-00's
+        # 'simple' label kept it in a pool whose only capable member drifts.
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                exploration_gate_demands_tools as _s229_gate_demands,
+            )
+            from backend.core.ouroboros.governance.provider_topology import (
+                elevate_pool_for_exploration as _s229_elevate,
+            )
+            _s229_demands = (
+                provider_route not in ("background", "speculative")
+                and _s229_gate_demands(
+                    str(getattr(context, "task_complexity", "")),
+                )
+            )
+            if _s229_demands and provider_route != "complex":
+                _s229_elite = topology.dw_models_for_route("complex")
+                _s229_pool = _s229_elevate(
+                    tuple(ranked_models), tuple(_s229_elite),
+                    demands_tools=True,
+                )
+                if tuple(_s229_pool) != tuple(ranked_models):
+                    logger.warning(
+                        "[CandidateGenerator] ⚡ ROUTE ELEVATION: op needs "
+                        "Iron-Gate exploration — agentic-elite (COMPLEX) pool "
+                        "prepended for route=%s: %s (op=%s)",
+                        provider_route, list(_s229_pool)[:4],
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                    ranked_models = list(_s229_pool)
+        except Exception:  # noqa: BLE001 — elevation is enhancement, never blocks
+            pass
+
         # Slice 201 — Contextual Bandit Routing Advisor. ADVISORY-ONLY +
         # structurally fail-closed: the advisor reorders WITHIN ranked_models
         # (the brain_selection_policy active set for this route), so it can
@@ -4945,9 +5000,36 @@ class CandidateGenerator:
                 _force_batch = _slice36_should_force_batch(context)
             except Exception:  # noqa: BLE001 — defensive, legacy budget
                 _force_batch = False
+            # Slice 225 Phase 2 — Sovereign DW Autarky. Read the Claude fallback
+            # breaker (read-only, no probe side effect — same _claude_breaker_open
+            # predicate the Slice 127 P2.1 IMMEDIATE reroute uses). When the
+            # fallback lane is OPEN/HALF_OPEN (incl. terminal_quota / out-of-
+            # credits), there's no live lane to sever DW into — give DW the full
+            # runway instead of the 30s/75s reflex cap. Gated default-TRUE;
+            # OFF (or breaker CLOSED) is the byte-identical legacy cascade.
+            _fallback_dead = False
+            if _dw_autarky_enabled():
+                try:
+                    from backend.core.ouroboros.governance.doubleword_provider import (
+                        _claude_breaker_open as _autarky_breaker_open,
+                    )
+                    _fallback_dead = _autarky_breaker_open()
+                except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
+                    _fallback_dead = False
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id, force_batch=_force_batch,
+                fallback_dead=_fallback_dead,
             )
+            if _fallback_dead and primary_budget > _PRIMARY_MAX_TIMEOUT_S:
+                logger.warning(
+                    "[CandidateGenerator] ⚡ DW AUTARKY ENGAGED: Claude fallback "
+                    "breaker OPEN — granting DW the full %.1fs budget (vs %.1fs "
+                    "reflex cap), no dead-lane handoff. route=%s op=%s model=%s",
+                    primary_budget, _PRIMARY_MAX_TIMEOUT_S,
+                    getattr(context, "provider_route", "?"),
+                    getattr(context, "op_id", "?")[:16],
+                    model_id or "(unspecified)",
+                )
             # Slice 34 Phase 2 — dispatch profiler (default OFF; zero
             # overhead when disabled). Records the sem-wait + budget
             # stages into the per-op summary; STAGE_PROVIDER_GENERATE
@@ -6486,6 +6568,7 @@ class CandidateGenerator:
         *,
         model_id: str = "",
         force_batch: bool = False,
+        fallback_dead: bool = False,
     ) -> float:
         """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
 
@@ -6540,6 +6623,24 @@ class CandidateGenerator:
         if force_batch:
             batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
             return max(min(total_s, batch_cap), 0.0)
+
+        # Slice 225 Phase 2 — Sovereign DW Autarky. When the Claude fallback
+        # lane is unreliable (breaker OPEN/HALF_OPEN — incl. the terminal_quota
+        # / out-of-credits economic refusal), there is NO live fallback to hand
+        # off to. Severing DW at the 30s/75s reflex cap only accelerates
+        # exhaustion into a dead lane — the live-soak GOAL-001::file-00 wedge:
+        # DW cut at 30s -> Claude 400 "credit balance too low" -> EXHAUSTION,
+        # generation_failed, no patch ever produced. Give DW the full remaining
+        # runway up to a cost-safety ceiling instead (default 180s = the COMPLEX
+        # generation window). Mirrors the force_batch precedent directly above
+        # ("Claude disabled -> no fallback to reserve -> full runway"). The
+        # caller stamps fallback_dead from the read-only _claude_breaker_open
+        # predicate; default False is byte-identical to the legacy cascade.
+        if fallback_dead:
+            autarky_cap = _envf_or_default(
+                "JARVIS_DW_AUTARKY_MAX_BUDGET_S", 180.0,
+            )
+            return max(min(total_s, autarky_cap), 0.0)
 
         fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
 

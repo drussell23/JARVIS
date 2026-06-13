@@ -118,6 +118,139 @@
                  not $26 -> ~$24 outside audit trail); cost stack complete; BLUNT truth recorded
                  (cost solved, file-00 still won't dispatch = NON-economic autonomy blocker).
                  ROADMAP: A1 trace file-00 dispatch (milestone gate) is the #1 next action.
+  [x] slice-231  Telemetry-Driven Budget Synthesizer (Dynamic Allocation Kernel). ROOT FIX for
+                 the file-00 dispatch blocker: the per-route generation deadline was a STATIC
+                 lookup blind to live provider state, so a priority:critical roadmap goal routed
+                 IMMEDIATE (120s reflex window) and, when Claude was out of credits, the DW reroute
+                 (Slice 127 P2.1) inherited a too-short deadline -> deadline_exhausted_pre_fallback
+                 x23 before reaching the hardened DW agentic path. FIX: provider_availability.py
+                 (read-only ProviderAvailabilitySnapshot collector over the EXISTING
+                 claude_circuit_breaker + dw_surface_health state, fail-soft, no probe consumption);
+                 urgency_router.synthesize_generation_timeout LIFTS an IMMEDIATE tool-loop op to the
+                 COMPLEX 240s window when Claude is down (the load-bearing dispatch lever) +
+                 synthesize_budget_profile / context_budget_profile for honest §7 telemetry. Wired
+                 at orchestrator.py GENERATE _gen_timeout + both emit_decision stamp sites. Master
+                 JARVIS_BUDGET_SYNTHESIS_ENABLED default-TRUE; OFF = byte-identical legacy (proven).
+                 45 TDD tests green; zero new regressions (urgency_router/slice208/antivenom clean).
+                 LIVE-SOAK VALIDATED (jarvis-dw-cortex-soak, attested a301c38941): synthesizer
+                 fires correctly (reads claude=breaker_open_economic + dw=transport_degraded
+                 read-only, DW-primary budgets). DW-only autonomy works (ops COMPLETE on DW w/
+                 Claude unfunded). FOUND: gen_timeout 240s lift fired 0x — cold-start TIMING gap
+                 (breaker boots CLOSED, trips mid-GENERATE; signal absent at pre-dispatch lift). → S232.
+  [x] slice-232  Cold-start provider-funding signal (RC1 of the soak findings). The collector now
+                 derives Claude funding from the AUTHORITATIVE persisted breaker state at op #1 —
+                 reusing claude_circuit_breaker._read_breaker_state (TTL-aware, fail-soft), INDEPENDENT
+                 of the persist ENABLE flag (provider_availability._persisted_claude_economic_down,
+                 cached/non-blocking, in-memory OPEN keeps precedence, missing/stale/corrupt → graceful
+                 available). AND the economic-funding RECORD write is now flag-independent too
+                 (_maybe_persist_open/_maybe_clear_persisted decoupled from the flag) so the signal
+                 stays fresh from cold boot — the §33.1 gate still guards the behavior-changing
+                 auto-boot-OPEN restore (test_no_restore_when_disabled preserved). Closes the S231
+                 timing gap: the 240s lift now fires for a GOAL-001-shaped op from op #1. 11 TDD tests
+                 (cold-boot-persisted-OPEN / no-state / trip-during-generate / fail-soft / record-
+                 maintenance); zero new regressions (test_snapshot_shape failure is pre-existing S147
+                 drift). RC2 (DW tool-loop non-convergence) tracked separately.
+  [x] slice-233  Parse-gate enforcement of convergence (RC2 of the soak findings). The soak proved
+                 the 3-axis convergence machinery (Slice 85 cumulative + Slice 3E nudge + grace round)
+                 FIRES but is ADVISORY — the model emits read-only nav on the grace round, the loop
+                 returns the patch-less raw, op fails. FINDING (premise-correction): this loop
+                 advertises tools as PROSE + parses tool_use from TEXT (generate_fn:(prompt)->str) —
+                 NO structured tools= array at the boundary to strip. So the absolute invariant is
+                 enforced at the PARSE gate: tool_executor._slice233_enforcement_action (pure) →
+                 once _final_nudge_issued, a PURE read-only round is REJECTED (reuses
+                 _READONLY_EXPLORATION_TOOLS — no new taxonomy), model gets a hard denial via the
+                 proven current_prompt-append+continue path, bounded by _enforcement_rounds_cap
+                 (env JARVIS_TOOL_LOOP_ENFORCEMENT_ROUNDS default 2) AND remaining budget vs
+                 final_write_reserve_s. Resilient: a valid patch (non-tool response) returns upstream
+                 at parse_fn=None BEFORE the gate (honored mid-enforcement); progress/mutation tools
+                 → FINALIZE (not suppressed); cap/budget spent → clean fail. 11 TDD tests
+                 (ENFORCE / NORMAL / cap-reached / no-budget / progress-present / env-cap / zero-cap
+                 opt-out + 3 wiring AST pins). slice3e+slice85 convergence regression green; the 3
+                 test_tool_loop_budget_plan failures are pre-existing (fail identically stashed).
+  [x] slice-234  Runtime-aware repo-root resolution (the final GOAL-001 blocker). RE-SOAK of
+                 231+232+233 PROVED the budget root cause SOLVED: GOAL-001 routed IMMEDIATE w/
+                 DW-primary {1.0,0,180s} (was {0,0,0}), Slice232 persisted signal fired
+                 (breaker_open_economic_persisted), DW generated the patch (outcome=ok x9),
+                 REVIEW=APPROVE, GATE→OrangePR, reached APPLY — then failed ONLY at APPLY:
+                 "[Errno 2] No such file: '/Users/.../semantic_index.py'" (host abs path inside a
+                 /app container). ORIGIN (diagnosed, not symptom-patched): harness.from_env sourced
+                 repo_path from JARVIS_REPO_PATH (host path injected via .env env_file)
+                 UNCONDITIONALLY → fed the op-envelope repo_root (harness.py:2403/2805/2918) →
+                 ChangeEngine priority-1 per-request write root → APPLY joined relative targets
+                 against the host path. FIX: harness._resolve_runtime_repo_root — honor
+                 JARVIS_REPO_PATH ONLY if it exists+plausible in THIS runtime (carries
+                 backend/core/ouroboros), else derive from the code's own on-disk location
+                 (container-safe, no .git needed), else .git walk-up, else FAIL LOUD. Same
+                 authoritative root fixes OrangePR git discovery. 7 TDD tests (host-valid-env /
+                 container-stale-env-rejected / env-not-a-repo / no-env-code-location /
+                 unresolvable-fail-loud / empty-env / from_env-integration). 15 existing harness
+                 tests green. gen_timeout-lift wiring (S231 lever masked by autarky) deferred to a
+                 separate follow-up slice per operator.
+  [x] slice-234b RE-SOAK after S234 proved it NECESSARY but not sufficient: GOAL-001 again routed
+                 IMMEDIATE w/ DW-primary 180s (breaker_open_economic_persisted), generated,
+                 REVIEW=APPROVE, reached APPLY — then STILL "[Errno 2] /Users/.../semantic_index.py".
+                 2nd source: JARVIS_REPO_PATH is STILL the host path in the container (env_file: .env
+                 leaks it) and ~8 modules read it DIRECTLY (auto_action_router.py:1193 et al), joining
+                 absolute APPLY targets against it — bypassing the S234 harness resolver. FIX (config,
+                 not code): docker-compose.dw-cortex-soak.yml `environment:` now sets JARVIS_REPO_PATH=
+                 /app (+ sibling reactor/prime=/app), winning over env_file, so the container reflects
+                 its real /app layout. roadmap.signed.yaml carries ZERO host paths (ruled out).
+                 FOLLOW-UP (tracked, separate slice): promote _resolve_runtime_repo_root (S234) to a
+                 SHARED governance resolver + route all ~8 direct JARVIS_REPO_PATH reads through it
+                 (validate vs runtime FS, fail loud) — context-independent of the env. NOT done here.
+  [x] slice-235  Adaptive diff (re-enable native 2b.1-diff) — LAYER-5 fix, FULLY WIRED.
+                 AUDIT: the full 2b.1-diff machinery already exists (providers.py _SCHEMA_VERSION_DIFF
+                 :219, _DIFF_CANDIDATE_KEYS :222, _apply_unified_diff :1488, validate_diff_context +
+                 StaleDiffError :1343/1373) and schema_capability plumbing is complete end-to-end
+                 (brain_selector cfg → GLS:2800 → routing_intent → provider:4884). ROOT CAUSE: the flag
+                 is DEAD-CODED — providers.py:4884-4893 computes _force_full from schema_capability then
+                 passes hardcoded force_full_content=True (:4912/:4926); doubleword_provider.py:1583
+                 forces True unconditionally → DW emits 60K full_content blob → JSONDecodeError.
+                 LANDED: pure keystone should_force_full_content() + _diff_schema_threshold_lines()
+                 (env JARVIS_DIFF_SCHEMA_THRESHOLD_LINES default 800) in providers.py — full UNLESS
+                 (schema_capability==full_content_and_diff AND file_lines>threshold). 7 TDD tests green.
+                 REMAINING (mapped, own focused build): (1) wire keystone into both providers (replace
+                 hardcoded True at providers.py:4912/4926 + doubleword_provider.py:1583; compute
+                 target_line_count fail-soft); (2) brain_selection_policy.yaml: schema_capability:
+                 full_content_and_diff for ELITE agentic brains (config, no hardcoded model in code);
+                 (3) fail-safe degradation at orchestrator:6245 (diff_apply_failed/StaleDiff → flag op
+                 force_full_content + retry full_content, never crash); (4) soak. OPEN: can elite models
+                 (Kimi/DeepSeek-V4-Pro/GLM) do verbatim diffs where the 397B couldn't — fail-safe makes
+                 it safe to test live. Branch perf/slice-235-adaptive-diff.
+  [x] slice-235b WIRING COMPLETE (gen-core, careful): keystone should_force_full_content +
+                 _diff_schema_threshold_lines (env JARVIS_DIFF_SCHEMA_THRESHOLD_LINES=800) + the
+                 decoupled seam resolve_force_full_content / resolve_diff_capability_for_model
+                 (env JARVIS_DW_DIFF_CAPABLE_FAMILIES default moonshotai,deepseek-ai,zai-org — the
+                 397B EXCLUDED; reuses dw_catalog_client.parse_family) / _max_target_line_count.
+                 WIRED: doubleword_provider.py:1583 (was unconditional True) + providers.py Claude
+                 block (the computed-but-IGNORED _force_full now USED — both lean+full prompt builds)
+                 → native 2b.1-diff emitted only when (diff-capable elite family AND file>threshold).
+                 FAIL-SAFE: op_context.force_full_content_override field (on OperationContext@881,
+                 carried by advance/replace) + orchestrator GENERATE_RETRY governor (diff_apply_failed/
+                 stale_diff/validate_diff → set override + 'emit full file' feedback → retry degrades
+                 to full_content, never crashes/loops). Elite DW models are CATALOG models (not yaml
+                 brains) → capability via env families, not brain_selection_policy.yaml. 19 TDD tests;
+                 slice208 + op_context replace green; pre-existing failures unrelated (urgency source-
+                 table drift, sandbox_loop missing module). NOT YET SOAK-VALIDATED — open empirical Q:
+                 do elite models clear the verbatim-diff wall (fail-safe makes it safe to test live).
+  [x] slice-235b SOAK-VALIDATED live (image cfa9e89fa1): elite models DO clear the verbatim-diff
+                 wall — `emitting 2b.1-diff` fired 14x on moonshotai/Kimi-K2.6 + deepseek-ai/
+                 DeepSeek-V4-Flash. The open empirical Q is answered YES. (see slice-236)
+  [x] slice-236  Capability-aware DW selection (the "sixth layer"). RC of the s235 soak: the
+                 IMMEDIATE->DW reroute escaped the sealed Claude-only route but fell to the
+                 UNCONDITIONAL self._model baseline (Qwen-397B, not diff-capable) -> gate forced
+                 full_content -> 63K blob -> JSONDecodeError -> exhaustion. Fix in the SELECTOR (not
+                 gate/allowlist): providers.py pure seams op_warrants_diff_capable_model (reuses the
+                 gate's _max_target_line_count + _diff_schema_threshold_lines -> no size-signal
+                 drift) + select_diff_capable_model (ranks injected catalog by diff-capable family +
+                 JARVIS_DW_FAMILY_PREFERENCE; no model names in code) + capability_aware_default_model;
+                 doubleword_provider._capability_aware_default wired into the self._model baseline
+                 fallback ONLY (sentinel/topology overrides untouched). JARVIS_DW_CAPABILITY_AWARE_
+                 SELECTION_ENABLED default-TRUE; OFF/small/no-elite/already-capable byte-identical.
+                 25 TDD tests, +0 regressions. LIVE-SOAK (16min,$0.34,0 Claude): selection log 45x,
+                 elites now dominate (Kimi 66 + deepseek-V4 45 vs Qwen 44), JSONDecodeError 1 (was 6).
+                 OPEN: a SEVENTH layer (tool_loop_deadline_exceeded on heavy multi-file GOALs = the
+                 Slice-233 convergence problem at scale) blocks clean large-GOAL state=applied -> next.
   [x] slice-226  PRD split (the 2.2MB doc exceeded GitHub's ~1MB render cap). 4 byte-conserved
                  files (only +2109b of cross-links, zero content lost): PRD.md (lean §1-§23+TOC, 322KB,
                  renders) + PRD_SPEC_DETAIL.md (§24-50) + NORTH_STAR.md (§51 + §51.11.x + active roadmap)

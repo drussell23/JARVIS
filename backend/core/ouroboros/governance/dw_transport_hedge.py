@@ -27,6 +27,16 @@ def transport_hedge_enabled() -> bool:
     )
 
 
+def hedge_gate_aware_enabled() -> bool:
+    """Slice 227 master — the context-aware hedge governor. Default **TRUE**:
+    when an op faces the Iron Gate exploration floor, the batch arm is held
+    speculative so the tool-using RT arm gets the slot (rupture fallback intact).
+    OFF restores the byte-identical legacy FIRST_COMPLETED race. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_HEDGE_GATE_AWARE_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _storm_threshold() -> float:
     try:
         raw = os.environ.get("JARVIS_DW_STORM_SKIP_THRESHOLD", "").strip()
@@ -57,6 +67,7 @@ async def hedged_race(
     on_abandoned: Optional[
         Callable[[Optional[BaseException], Optional[BaseException]], None]
     ] = None,
+    prefer_fast: bool = False,
 ) -> Any:
     """Race ``fast`` (RT) against ``stable`` (batch). Return the FIRST successful result; cancel
     the loser aggressively. A ``fast`` failure that ``is_rupture`` returns True for is swallowed so
@@ -72,7 +83,16 @@ async def hedged_race(
     both arms resolved, neither succeeded — passing each arm's captured exception (None for an
     arm that was cancelled / never errored). The caller's triage engine classifies the pair to
     confirm a hard model/endpoint blockage and rotate candidates. Best-effort: a sink error never
-    changes the raise behavior; the abandoned race still raises its last exception."""
+    changes the raise behavior; the abandoned race still raises its last exception.
+
+    Slice 227 — ``prefer_fast`` (the context-aware hedge governor). When True, a winning STABLE
+    (batch) result does NOT pre-empt the race: it is held in a speculative buffer and the race
+    keeps waiting for the FAST (RT) arm. This is the gate-aware mode — the RT arm runs the Venom
+    tool loop (exploration), the batch arm does not, so an un-explored batch candidate that
+    arrives first would fail the Iron Gate's exploration floor (the live GOAL-001::file-00 layer-3
+    bug). The buffered batch is used ONLY if the RT arm then ruptures / fails / yields no success,
+    so the hedge's rupture-protection guarantee is fully preserved. ``prefer_fast=False`` (default)
+    is byte-identical to the legacy FIRST_COMPLETED race."""
     loop = asyncio.get_event_loop()
     t_fast = loop.create_task(fast())
     t_stable = loop.create_task(stable())
@@ -81,6 +101,8 @@ async def hedged_race(
     fast_exc: Optional[BaseException] = None
     stable_exc: Optional[BaseException] = None
     fast_ruptured = False
+    _UNSET = object()
+    buffered_stable: Any = _UNSET  # Slice 227 speculative buffer (prefer_fast)
 
     def _report(winner_label: str) -> None:
         if on_outcome is not None:
@@ -89,10 +111,27 @@ async def hedged_race(
             except Exception:  # noqa: BLE001 — telemetry never breaks the race
                 pass
 
+    async def _claim(result: Any, winner_label: str) -> Any:
+        # Cancel any still-pending loser + await its unwind, then report + return.
+        for other in pending:
+            other.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        _report(winner_label)
+        return result
+
     try:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
+            # Slice 227 — in prefer_fast mode, process the FAST arm first within a
+            # batch where both completed, so a co-completed RT success is taken
+            # over a stable success. Legacy (prefer_fast=False) keeps the original
+            # arbitrary set iteration → byte-identical.
+            done_iter = (
+                sorted(done, key=lambda t: 0 if t is t_fast else 1)
+                if prefer_fast else done
+            )
+            for t in done_iter:
                 try:
                     result = t.result()
                 except asyncio.CancelledError:
@@ -102,23 +141,41 @@ async def hedged_race(
                     # Slice 194 — capture per-arm so a dual failure can be triaged.
                     if t is t_fast:
                         fast_exc = exc
+                        if is_rupture(exc):
+                            fast_ruptured = True
+                        # Slice 227 — the RT arm failed. If we're holding a
+                        # speculative batch result (prefer_fast), claim it now —
+                        # the rupture/failure fallback the hedge exists for.
+                        if buffered_stable is not _UNSET:
+                            return await _claim(buffered_stable, stable_label)
+                        # otherwise wait for the stable arm (still pending)
+                        continue
                     else:
                         stable_exc = exc
                     # a fast-path rupture is non-fatal — let the stable path keep racing
-                    if t is t_fast and is_rupture(exc):
-                        fast_ruptured = True
-                        continue
-                    # a non-rupture fast error or a stable error: if the other is still
-                    # pending, keep waiting; else propagate below
+                    # (legacy comment preserved); a stable error waits for the other arm.
                     continue
                 else:
-                    # FIRST SUCCESS — cancel the loser aggressively + await its unwind
-                    for other in pending:
-                        other.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-                    _report(fast_label if t is t_fast else stable_label)
-                    return result
+                    # SUCCESS.
+                    if (
+                        prefer_fast
+                        and t is t_stable
+                        and buffered_stable is _UNSET
+                        and t_fast in pending
+                    ):
+                        # Batch won the race, but this op needs the RT arm's
+                        # exploration to clear the Iron Gate. Hold batch in the
+                        # speculative buffer and keep waiting for RT — do NOT
+                        # cancel it. RT success supersedes; RT rupture falls back.
+                        buffered_stable = result
+                        continue
+                    # FIRST usable SUCCESS — cancel the loser + return.
+                    return await _claim(result, fast_label if t is t_fast else stable_label)
+        # Slice 227 — race drained with no live success. A buffered batch result
+        # (RT never produced a success) is still a valid candidate — use it.
+        if buffered_stable is not _UNSET:
+            _report(stable_label)
+            return buffered_stable
         # both finished without a success
         if last_exc is not None:
             # Slice 194 — the race was ABANDONED (no winner). Hand both arms'

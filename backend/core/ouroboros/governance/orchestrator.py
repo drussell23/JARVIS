@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -141,6 +142,107 @@ _SLICE12Q_LEDGER_TO_STATUS: Dict[str, str] = {
 }
 
 
+_ENV_SUBGOAL_WRITEBACK = "JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED"
+
+
+def _slice_a1_subgoal_completion_writeback(ctx: Any, state: Any) -> None:
+    """§51.11.34-ROADMAP A1 — close the sub-goal completion feedback loop.
+
+    The multi_step orchestrator emits sub-goal envelopes (stamping
+    ``sub_goal_id`` + ``parent_goal_id`` into the envelope evidence) and writes
+    a ``PROPOSED`` row to the canonical goal_decomposition completion ledger at
+    EMIT time — but historically NOTHING wrote the terminal
+    ``COMPLETED``/``FAILED`` transition back. ``done_count`` (which counts
+    ``completed`` rows) was therefore structurally pinned at 0: a roadmap
+    sub-goal could dispatch and succeed any number of times and the roadmap
+    would never advance.
+
+    This writeback fires from the orchestrator terminal hook — the same
+    fail-soft, recorder-independent seam the Slice-134 episodic synapse uses.
+    When the terminal op carries roadmap sub-goal provenance via
+    ``ctx.intake_evidence_json``, the terminal state is mapped to a
+    CompletionStatus (``applied`` -> COMPLETED; any other terminal -> FAILED)
+    and appended to the completion ledger, so the multi_step orchestrator's
+    ``done_count`` advances and the roadmap can progress.
+
+    Gated ``JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED`` (default TRUE — this
+    closes a structural gap; OFF is byte-identical to the legacy severed loop).
+    NEVER raises.
+    """
+    try:
+        raw = os.environ.get(_ENV_SUBGOAL_WRITEBACK, "true").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return
+        # Cheap substring pre-check avoids a json.loads on the vast majority of
+        # ops (sensor signals) that carry no sub_goal provenance.
+        evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
+        if not evidence_json or "sub_goal_id" not in evidence_json:
+            return
+        try:
+            evidence = json.loads(evidence_json)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(evidence, dict):
+            return
+        sub_goal_id = str(evidence.get("sub_goal_id") or "").strip()
+        parent_goal_id = str(evidence.get("parent_goal_id") or "").strip()
+        if not sub_goal_id or not parent_goal_id:
+            return
+        state_value = getattr(state, "value", str(state)) or ""
+        from backend.core.ouroboros.governance.goal_decomposition_planner import (  # noqa: E501
+            CompletionStatus,
+            mark_sub_goal_status,
+        )
+        status = (
+            CompletionStatus.COMPLETED
+            if state_value == "applied"
+            else CompletionStatus.FAILED
+        )
+        mark_sub_goal_status(
+            sub_goal_id=sub_goal_id,
+            parent_goal_id=parent_goal_id,
+            status=status,
+            note=(
+                "terminal:" + str(state_value) + " via orchestrator op "
+                + str(getattr(ctx, "op_id", ""))
+            )[:512],
+        )
+    except Exception:  # noqa: BLE001 — writeback never perturbs the FSM
+        return
+
+
+def _slice230_record_exploration_drift(op_id: Any, model_id: Any) -> None:
+    """Slice 230 — feed an Iron-Gate exploration rejection back into model
+    rotation. Records ``DriftType.EXPLORATION_INSUFFICIENT`` for
+    (op_id, model_id) in the Slice-20C drift tracker, so the GENERATE_RETRY
+    sentinel walk skips the model that just emitted a no-tool patch and
+    rotates to the next ranked candidate (the agentic elites, per Slices
+    228/229). Without this wire, a weak model that "succeeds" at transport
+    level keeps winning the walk and the op dies 0/1 forever. Loud by
+    operator preference. NEVER raises — the gate path must not be perturbed."""
+    try:
+        op = str(op_id or "").strip()
+        model = str(model_id or "").strip()
+        if not op or not model:
+            return
+        from backend.core.ouroboros.governance.schema_drift_tracker import (
+            DriftType,
+            get_default_tracker,
+        )
+        get_default_tracker().record(
+            op_id=op, model_id=model,
+            drift_type=DriftType.EXPLORATION_INSUFFICIENT,
+        )
+        logger.warning(
+            "[Orchestrator] ⚡ GATE→ROTATION: model=%s emitted a no-tool patch "
+            "(exploration_insufficient) — drift-marked for op=%s; the retry "
+            "walk will rotate to the next ranked (agentic) candidate",
+            model, op[:16],
+        )
+    except Exception:  # noqa: BLE001 — feedback never perturbs the gate
+        return
+
+
 def _slice12q_record_terminal(
     ctx: Any, state: Any, data: Dict[str, Any],
 ) -> None:
@@ -184,6 +286,10 @@ def _slice12q_record_terminal(
             )
     except Exception:  # noqa: BLE001 — synapse never perturbs the FSM
         pass
+    # §51.11.34-ROADMAP A1 — sub-goal completion writeback (the severed feedback
+    # wire). Recorder-independent + fail-soft, exactly like the episodic synapse
+    # above. Closes the roadmap progress loop: terminal op -> completion ledger.
+    _slice_a1_subgoal_completion_writeback(ctx, state)
     try:
         from backend.core.ouroboros.battle_test.session_recorder import (
             get_active_recorder,
@@ -3098,14 +3204,14 @@ class GovernedOrchestrator:
                             reason_code=f"urgency_route:{_route_reason}",
                             route=_provider_route.value,
                             route_reason=_route_reason,
-                            budget_profile=_UR.route_budget_profile(_provider_route),
+                            budget_profile=_UR.context_budget_profile(_provider_route, ctx),
                             details={
                                 "route": _provider_route.value,
                                 "route_description": _UR.describe_route(_provider_route),
                                 "signal_urgency": getattr(ctx, "signal_urgency", ""),
                                 "signal_source": getattr(ctx, "signal_source", ""),
                                 "task_complexity": getattr(ctx, "task_complexity", ""),
-                                "budget_profile": _UR.route_budget_profile(_provider_route),
+                                "budget_profile": _UR.context_budget_profile(_provider_route, ctx),
                             },
                         )
                     except Exception:
@@ -4328,6 +4434,47 @@ class GovernedOrchestrator:
                     _gen_timeout = _route_timeouts.get(
                         _route, self._config.generation_timeout_s
                     )
+                    # ── Slice 231: Telemetry-Driven Budget Synthesis ──────────
+                    # The per-route generation deadline is the REAL dispatch
+                    # lever (budget_profile is observability-only). When the
+                    # premium Claude fallback lane is economically down, an
+                    # IMMEDIATE op that must drive the Iron-Gate tool loop is
+                    # lifted from its reflex window (120s) to the COMPLEX-class
+                    # window (240s) so the DW reroute (Slice 127 P2.1) isn't
+                    # severed mid-tool-loop → kills deadline_exhausted_pre_fallback
+                    # at its source. Fail-soft: any sensing fault keeps the base.
+                    try:
+                        from backend.core.ouroboros.governance.urgency_router import (
+                            budget_synthesis_enabled as _bs_enabled,
+                            synthesize_generation_timeout as _bs_gen_timeout,
+                        )
+                        if _bs_enabled():
+                            from backend.core.ouroboros.governance.provider_availability import (
+                                collect_provider_availability as _bs_collect,
+                            )
+                            from backend.core.ouroboros.governance.exploration_engine import (
+                                exploration_gate_demands_tools as _bs_demands,
+                            )
+                            _bs_snap = _bs_collect()
+                            _bs_tld = _bs_demands(
+                                str(getattr(ctx, "task_complexity", "")),
+                            )
+                            _lifted = _bs_gen_timeout(
+                                _route, _gen_timeout, _bs_snap,
+                                tool_loop_demanded=_bs_tld,
+                                elevated_timeout_s=_route_timeouts.get("complex"),
+                            )
+                            if _lifted > _gen_timeout:
+                                logger.warning(
+                                    "[BudgetSynth] route=%s claude=down:%s "
+                                    "tool_loop=%s → gen_timeout lifted %.0fs→%.0fs "
+                                    "(DW reroute funded) op=%s",
+                                    _route, getattr(_bs_snap, "claude_reason", "?"),
+                                    _bs_tld, _gen_timeout, _lifted, ctx.op_id,
+                                )
+                                _gen_timeout = _lifted
+                    except Exception:  # noqa: BLE001 — never crash routing
+                        pass
                     # Read-only BG/SPEC subagent fan-out override (Session 6,
                     # Derek 2026-04-17). The outer asyncio.wait_for at line
                     # below enforces this timeout absolutely — when the op
@@ -4965,6 +5112,14 @@ class GovernedOrchestrator:
                                 "%d/%d (attempt=%d cumulative, preloaded=%d) for op=%s",
                                 _op_explore_credit, _min_explore, attempt + 1,
                                 _preloaded_credit, ctx.op_id[:12],
+                            )
+                            # Slice 230 — feed the rejection back into model
+                            # rotation: drift-mark the model that produced this
+                            # no-tool candidate so the GENERATE_RETRY walk skips
+                            # it and rotates to the next ranked (agentic) model.
+                            _slice230_record_exploration_drift(
+                                ctx.op_id,
+                                getattr(generation, "model_id", ""),
                             )
                             generation = None
                             raise RuntimeError(_explore_err)
@@ -6102,6 +6257,38 @@ class GovernedOrchestrator:
                             )
                         except Exception:
                             pass
+
+                    # ── Slice 235 fail-safe degradation governor ──────────────
+                    # A 2b.1-diff candidate failed to apply (stale context /
+                    # coordinate drift). Degrade THIS op's retry to full_content
+                    # so a botched diff doesn't re-emit a diff that fails again.
+                    # Set the per-op override the providers honor (op_context
+                    # .force_full_content_override) + tell the model to emit the
+                    # complete file. NEVER crash — this is recovery, not failure.
+                    _diff_failed = (
+                        "diff_apply_failed" in _err_str
+                        or "stale_diff" in _err_str
+                        or "StaleDiff" in _err_str
+                        or "validate_diff" in _err_str
+                    )
+                    if _diff_failed:
+                        _retry_ctx_kwargs["force_full_content_override"] = True
+                        _df_msg = (
+                            "\n\n[SYSTEM] Your unified-diff patch failed to apply "
+                            "(stale/ambiguous context). For this retry, emit the "
+                            "COMPLETE file content (full_content schema 2b.1), not "
+                            "a diff."
+                        )
+                        _df_existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "") or ""
+                        _retry_ctx_kwargs["strategic_memory_prompt"] = (
+                            f"{_df_existing}{_df_msg}" if _df_existing else _df_msg.strip()
+                        )
+                        logger.warning(
+                            "[Orchestrator] Slice235 fail-safe: diff apply failed "
+                            "(%s) → degrading op=%s retry to full_content",
+                            _err_str[:80],
+                            getattr(ctx, "op_id", "?"),
+                        )
 
                     # Inject re-plan if available (appends to error feedback)
                     if _replan_text:

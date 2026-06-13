@@ -253,14 +253,14 @@ class ROUTERunner(PhaseRunner):
                         reason_code=f"urgency_route:{_route_reason}",
                         route=_provider_route.value,
                         route_reason=_route_reason,
-                        budget_profile=_UR.route_budget_profile(_provider_route),
+                        budget_profile=_UR.context_budget_profile(_provider_route, ctx),
                         details={
                             "route": _provider_route.value,
                             "route_description": _UR.describe_route(_provider_route),
                             "signal_urgency": getattr(ctx, "signal_urgency", ""),
                             "signal_source": getattr(ctx, "signal_source", ""),
                             "task_complexity": getattr(ctx, "task_complexity", ""),
-                            "budget_profile": _UR.route_budget_profile(_provider_route),
+                            "budget_profile": _UR.context_budget_profile(_provider_route, ctx),
                         },
                     )
                 except Exception:

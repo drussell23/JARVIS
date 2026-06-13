@@ -196,6 +196,19 @@ def _family_preference() -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
+def active_param_scoring_enabled() -> bool:
+    """Slice 228 master. Default **TRUE** — score model capability on ACTIVE
+    (not total) parameters, the correct metric for MoE models (a 35B-total/
+    3B-active model behaves like a 3B model and chokes on tool loops). OFF
+    restores byte-identical legacy total-param scoring. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_ACTIVE_PARAM_SCORING_ENABLED", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _score(card: ModelCard,
            weights: Mapping[str, float],
            family_bonus: Mapping[str, float],
@@ -208,14 +221,25 @@ def _score(card: ModelCard,
     handled via ``prefer_cheap`` — pricing weight already negative,
     so the absolute-cheap routes get a bonus on low pricing).
 
+    Slice 228 — the capability axis scores ACTIVE parameters (not total) when
+    JARVIS_DW_ACTIVE_PARAM_SCORING_ENABLED (default-TRUE), so a 35B-total/3B-
+    active MoE is rated by its true 3B capability and correctly demoted on
+    capability routes — the live GOAL-001::file-00 mis-route. Falls back to total
+    when active is absent. OFF = byte-identical legacy.
+
     Tied scores broken by alphabetical model_id at the call site.
     """
     score = 0.0
-    if card.parameter_count_b is not None:
+    _cap_b = card.parameter_count_b
+    if active_param_scoring_enabled():
+        _active = getattr(card, "active_parameter_count_b", None)
+        if _active is not None:
+            _cap_b = _active
+    if _cap_b is not None:
         # On cheap-routes, large param count is a *negative* signal
         # (we don't want a 397B model in BG even if it's cheap-ish)
         sign = -1.0 if prefer_cheap else 1.0
-        score += sign * weights["params"] * card.parameter_count_b / 10.0
+        score += sign * weights["params"] * _cap_b / 10.0
     if card.pricing_out_per_m_usd is not None:
         score += weights["pricing_out"] * card.pricing_out_per_m_usd
     if card.context_window is not None:

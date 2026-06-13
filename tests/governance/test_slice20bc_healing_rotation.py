@@ -81,13 +81,18 @@ def test_ast_pin_heal_system_prompt_is_immutable_operator_string() -> None:
     )
 
 
-def test_ast_pin_drift_type_taxonomy_is_closed_at_3_values() -> None:
-    """DriftType must be exactly the 3 v15 failure shapes.
+def test_ast_pin_drift_type_taxonomy_is_closed_at_5_values() -> None:
+    """DriftType must be exactly the 5 deliberate-slice failure shapes.
 
     Closing the taxonomy prevents drift recording from becoming a
-    catch-all bucket. Adding a 4th drift kind requires updating
+    catch-all bucket. Adding a new drift kind requires updating
     this pin + the dispatcher's skip predicate + this file's
     spine tests — that friction is intentional.
+
+    History: 3 v15 shapes -> +DUAL_ARM_FAILURE (Slice 194 — the pin was
+    NOT updated then; pre-existing breakage repaired here) ->
+    +EXPLORATION_INSUFFICIENT (Slice 230 — Iron-Gate rejection feeds model
+    rotation so a no-tool weak model can't monopolize GENERATE_RETRY).
     """
     src = SDT_FILE.read_text()
     tree = ast.parse(src, filename=str(SDT_FILE))
@@ -103,6 +108,8 @@ def test_ast_pin_drift_type_taxonomy_is_closed_at_3_values() -> None:
         "JSON_PARSE_ERROR_AFTER_HEAL",
         "SCHEMA_ID_HALLUCINATION",
         "ZERO_CANDIDATE_RETURN",
+        "DUAL_ARM_FAILURE",
+        "EXPLORATION_INSUFFICIENT",
     }
     assert set(found_values) == expected, (
         f"DriftType taxonomy drifted: got {found_values!r}, expected {expected!r}"

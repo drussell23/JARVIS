@@ -341,6 +341,137 @@ def _apply_immediate_tier_decay(
 
 
 # ---------------------------------------------------------------------------
+# Slice 231 — Telemetry-Driven Budget Synthesizer (Dynamic Allocation Kernel)
+# ---------------------------------------------------------------------------
+#
+# The route→budget map was a STATIC lookup that allocated the funded DW primary
+# ``max_dw_wait_s: 0.0`` on IMMEDIATE — so when the premium Claude fallback lane
+# was out of credits the op died at budget allocation
+# (``deadline_exhausted_pre_fallback``) before reaching the hardened DW agentic
+# path. The synthesizer makes the budget a deterministic function of a live
+# provider-availability snapshot, decided at the ROUTE phase before dispatch.
+#
+# Env-tunable (no hardcoded magic): the DW execution windows granted when Claude
+# is unavailable are sized to the documented timeout classes (CLAUDE.md).
+
+BUDGET_SYNTHESIS_ENABLED_ENV_VAR = "JARVIS_BUDGET_SYNTHESIS_ENABLED"
+_TOOL_LOOP_CEILING_ENV_VAR = "JARVIS_BUDGET_SYNTH_TOOL_LOOP_CEILING_S"
+_REFLEX_CEILING_ENV_VAR = "JARVIS_BUDGET_SYNTH_REFLEX_CEILING_S"
+_DEGRADED_FLOOR_ENV_VAR = "JARVIS_BUDGET_SYNTH_DEGRADED_FLOOR_S"
+
+_DEFAULT_TOOL_LOOP_CEILING_S = 180.0  # COMPLEX window — agentic tool-loop work
+_DEFAULT_REFLEX_CEILING_S = 60.0      # IMMEDIATE reflex window — no tool loop
+_DEFAULT_DEGRADED_FLOOR_S = 60.0      # DW degraded but the only funded lane
+
+
+def budget_synthesis_enabled() -> bool:
+    """Slice 231 master flag — re-read each call. Default-TRUE.
+
+    OFF → callers pass ``snapshot=None`` semantics and every budget profile is
+    byte-identical to the pre-Slice-231 static table (clean, instant rollback).
+    """
+    raw = os.environ.get(BUDGET_SYNTHESIS_ENABLED_ENV_VAR, "").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_float(var: str, default: float) -> float:
+    try:
+        raw = os.environ.get(var, "").strip()
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def synthesize_budget_profile(
+    route: "ProviderRoute",
+    snapshot,
+    legacy: Dict[str, float],
+    *,
+    tool_loop_demanded: bool = False,
+) -> Dict[str, float]:
+    """Deterministic budget allocation given live provider availability.
+
+    Pure, side-effect-free, sub-millisecond. ``legacy`` is the static profile
+    for *route* (the byte-identical fallback). The kernel only DEVIATES from
+    *legacy* when the premium Claude fallback lane is unavailable — otherwise it
+    returns *legacy* unchanged, so a funded Claude self-heals to the historical
+    fast-reflex behavior.
+
+    When Claude is unavailable:
+      * IMMEDIATE → DW-primary with a window sized to the work class
+        (tool-loop ⇒ COMPLEX 180s; else reflex 60s); DW degraded ⇒ clamped floor.
+      * STANDARD / COMPLEX → fold the now-useless Claude reserve into the DW cap.
+      * BACKGROUND / SPECULATIVE / WIRING_VALIDATION → unchanged (DW-only/fixture).
+    """
+    # Self-heal: Claude funded → nothing to adapt.
+    if getattr(snapshot, "claude_available", True):
+        return legacy
+
+    if route is ProviderRoute.IMMEDIATE:
+        if not getattr(snapshot, "dw_healthy", True):
+            # DW is our only funded lane but degraded — DW-primary, clamped.
+            window = _env_float(_DEGRADED_FLOOR_ENV_VAR, _DEFAULT_DEGRADED_FLOOR_S)
+        elif tool_loop_demanded:
+            window = _env_float(_TOOL_LOOP_CEILING_ENV_VAR, _DEFAULT_TOOL_LOOP_CEILING_S)
+        else:
+            window = _env_float(_REFLEX_CEILING_ENV_VAR, _DEFAULT_REFLEX_CEILING_S)
+        return {
+            "tier0_fraction": 1.0,
+            "tier1_reserve_s": 0.0,
+            "max_dw_wait_s": window,
+        }
+
+    if route in (ProviderRoute.STANDARD, ProviderRoute.COMPLEX):
+        # Reserving seconds for a dead Claude lane just starves DW — fold them in.
+        return {
+            "tier0_fraction": 1.0,
+            "tier1_reserve_s": 0.0,
+            "max_dw_wait_s": float(legacy.get("max_dw_wait_s", 0.0))
+            + float(legacy.get("tier1_reserve_s", 0.0)),
+        }
+
+    # DW-only / fixture routes have no Claude reserve to reclaim.
+    return legacy
+
+
+def synthesize_generation_timeout(
+    route,
+    base_timeout_s: float,
+    snapshot,
+    *,
+    tool_loop_demanded: bool = False,
+    elevated_timeout_s=None,
+) -> float:
+    """Load-bearing dispatch lever: the per-route generation deadline.
+
+    The ``budget_profile`` (max_dw_wait_s) is advisory/observability only — the
+    cascade's real deadline is the orchestrator's per-route generation timeout.
+    When the premium Claude fallback lane is down, an IMMEDIATE op that must
+    drive the agentic tool loop (Iron-Gate exploration floor) is lifted from its
+    reflex window to the elevated COMPLEX-class window so the DW reroute
+    (Slice 127 P2.1) isn't severed mid-tool-loop → no
+    ``deadline_exhausted_pre_fallback``.
+
+    Pure and monotonic: NEVER shrinks a base that already exceeds the elevated
+    target; only lifts. Returns ``base_timeout_s`` unchanged when Claude is
+    available, the route isn't IMMEDIATE, no tool loop is demanded, or no
+    elevated target is supplied.
+    """
+    if getattr(snapshot, "claude_available", True):
+        return base_timeout_s
+    route_str = getattr(route, "value", route)
+    if (
+        route_str == ProviderRoute.IMMEDIATE.value
+        and tool_loop_demanded
+        and elevated_timeout_s
+    ):
+        return max(float(base_timeout_s), float(elevated_timeout_s))
+    return base_timeout_s
+
+
+# ---------------------------------------------------------------------------
 # UrgencyRouter — the deterministic classifier
 # ---------------------------------------------------------------------------
 
@@ -603,17 +734,84 @@ class UrgencyRouter:
         return ProviderRoute.STANDARD, reason
 
     @staticmethod
-    def route_budget_profile(route: ProviderRoute) -> Dict[str, float]:
+    def route_budget_profile(
+        route: ProviderRoute,
+        snapshot=None,
+        *,
+        tool_loop_demanded: bool = False,
+    ) -> Dict[str, float]:
         """Return budget allocation hints for a given route.
 
-        These are advisory — CandidateGenerator uses them to tune
-        timeout allocation between DW and Claude.
+        These are advisory — CandidateGenerator uses them to tune timeout
+        allocation between DW and Claude.
+
+        Backward compatible: with ``snapshot=None`` (or the Slice 231 master
+        flag off) the return is byte-identical to the historical static table.
+        When a :class:`provider_availability.ProviderAvailabilitySnapshot` is
+        supplied and ``budget_synthesis_enabled()``, the profile is synthesized
+        from live provider availability so the funded DW primary is never
+        allocated a zero execution window while the Claude fallback is down.
 
         Returns dict with:
             tier0_fraction: fraction of total budget for DW (0.0-1.0)
             tier1_reserve_s: minimum seconds reserved for Claude
             max_dw_wait_s: hard cap on DW wait time
         """
+        legacy = UrgencyRouter._legacy_budget_profile(route)
+        if snapshot is None or not budget_synthesis_enabled():
+            return legacy
+        synthesized = synthesize_budget_profile(
+            route, snapshot, legacy, tool_loop_demanded=tool_loop_demanded,
+        )
+        if synthesized != legacy:
+            # §7 observability — make the dynamic allocation visible without grep.
+            logger.warning(
+                "[BudgetSynth] route=%s claude=unavailable:%s dw=%s tool_loop=%s "
+                "→ dw_wait=%.1fs tier0=%.2f reserve=%.1f",
+                getattr(route, "value", route),
+                getattr(snapshot, "claude_reason", "?"),
+                getattr(snapshot, "dw_reason", "?"),
+                tool_loop_demanded,
+                synthesized.get("max_dw_wait_s", 0.0),
+                synthesized.get("tier0_fraction", 0.0),
+                synthesized.get("tier1_reserve_s", 0.0),
+            )
+        return synthesized
+
+    @staticmethod
+    def context_budget_profile(
+        route: ProviderRoute, context,
+    ) -> Dict[str, float]:
+        """Slice 231 ROUTE-phase seam — synthesize the budget for *context*.
+
+        Builds a live provider-availability snapshot and derives the tool-loop
+        predicate from the op's complexity (the same Iron-Gate exploration floor
+        used by Slice 229 elevation), then delegates to
+        :meth:`route_budget_profile`. Fail-soft: any wiring error → the legacy
+        static profile, so routing can never crash on a sensing fault.
+        """
+        if not budget_synthesis_enabled():
+            return UrgencyRouter._legacy_budget_profile(route)
+        try:
+            from backend.core.ouroboros.governance.provider_availability import (
+                collect_provider_availability,
+            )
+            from backend.core.ouroboros.governance.exploration_engine import (
+                exploration_gate_demands_tools,
+            )
+            snapshot = collect_provider_availability()
+            tool_loop = exploration_gate_demands_tools(
+                str(getattr(context, "task_complexity", "")),
+            )
+        except Exception:  # noqa: BLE001 — never crash routing on a sensing fault
+            return UrgencyRouter._legacy_budget_profile(route)
+        return UrgencyRouter.route_budget_profile(
+            route, snapshot, tool_loop_demanded=tool_loop,
+        )
+
+    @staticmethod
+    def _legacy_budget_profile(route: ProviderRoute) -> Dict[str, float]:
+        """Pre-Slice-231 static route→budget table (byte-identical fallback)."""
         if route is ProviderRoute.IMMEDIATE:
             return {
                 "tier0_fraction": 0.0,

@@ -1,0 +1,35 @@
+# Slice 235 BOUNDED validation overlay (compose override).
+# Layer-5 validation is a short, hard-bounded run — NOT an open-ended soak.
+# Three credit/time guards compose (strictest wins):
+#   * --cost-cap 5            session $ ceiling (tighter than the soak's $10)
+#   * --max-wall-seconds 2400 HARD 40-min wall (the run-away guard the base
+#                             compose left at 0 = open-ended); harness fires
+#                             stop_reason=wall_clock_cap, blind to op-ledger.
+#   * JARVIS_AEGIS_HOURLY_BURN_CAP_USD=2.00 (inherited) rate rail.
+#
+# Provider posture — the FOURTH guard, credit-protective AND test-essential:
+#   * JARVIS_CLAUDE_BREAKER_PERSIST_ENABLED=true restores the valid economic-OPEN
+#     breaker record (.jarvis/claude_breaker_state.json) at boot, recreating the
+#     real "DW-sovereign / Claude out of credits" production scenario the slice
+#     targets. Effect: GOAL-001 generation routes through the DoubleWord elite
+#     pool (exercising the Slice 235 2b.1-diff seam) and Claude is never called
+#     (zero Claude credit burn). Without this flag the breaker resets CLOSED at
+#     every process boot and a healthy Claude would both burn credits and bypass
+#     the diff path we are here to validate.
+# Usage:
+#   docker compose -f docker-compose.dw-cortex-soak.yml \
+#                  -f docker-compose.slice235-validation.yml up -d --build
+services:
+  jarvis-dw-cortex-soak:
+    environment:
+      JARVIS_CLAUDE_BREAKER_PERSIST_ENABLED: "true"
+    command:
+      - scripts/ouroboros_battle_test.py
+      - --production-soak
+      - --headless
+      - --cost-cap
+      - "5"
+      - --idle-timeout
+      - "0"
+      - --max-wall-seconds
+      - "2400"

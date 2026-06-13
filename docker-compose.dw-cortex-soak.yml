@@ -37,6 +37,22 @@ services:
       - path: .env          # funded DOUBLEWORD_API_KEY — runtime only, never imaged
         required: false
     environment:
+      # ── Slice 234b — container repo-root truth (deployment config, not a code
+      # workaround). The host .env carries JARVIS_REPO_PATH=/Users/.../JARVIS-AI-Agent
+      # and is env_file'd in above; inside the container the repo genuinely lives at
+      # /app (working_dir + COPY . /app). Without this override the ~8 modules that
+      # read JARVIS_REPO_PATH directly join APPLY target paths against the host path
+      # that does not exist in the container → "[Errno 2] No such file" at APPLY.
+      # Telling the container its real layout is config doing its job. (The durable
+      # code fix — routing every reader through _resolve_runtime_repo_root, per
+      # Slice 234 — is a separate tracked follow-up so the code is context-independent
+      # of the env.) These env keys win because they are evaluated AFTER env_file.
+      JARVIS_REPO_PATH: "/app"
+      # Sibling repos are NOT present in this JARVIS-only soak; point them at /app so a
+      # stray cross-repo read resolves to a real dir, not a nonexistent host path
+      # (cross-repo orchestration is inactive in this soak regardless).
+      JARVIS_REACTOR_REPO_PATH: "/app"
+      JARVIS_PRIME_REPO_PATH: "/app"
       # ── Slice 215 — THE FrugalGPT PER-ROUND CASCADE (DW-only era ENDS). ──
       # The DW-cortex validation purpose of this soak is long served; the soak's
       # purpose is now AUTONOMY. Claude re-enabled as the per-round rescue tier:
@@ -241,6 +257,28 @@ services:
       # upstream works (reader valid -> decomposition valid, 2 sub-goals ->
       # envelope into router); THIS flag is what lets sub-goals emit. ──
       JARVIS_MULTI_STEP_ORCHESTRATION_ENABLED: "1"
+      # §51.11.34-ROADMAP A1 — sub-goal completion writeback (the severed
+      # feedback wire). Default-TRUE; pinned explicit here for soak auditability.
+      # Closes the loop multi_step EMIT (PROPOSED) -> terminal op (COMPLETED) so
+      # done_count advances and GOAL-001::file-00 stops being a hostage.
+      JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED: "1"
+      # TEMP A1.5 diagnostic — surface GENERATE/provider INFO on stdout to
+      # capture WHY file-00's op fast-fails (generation_failed in 17s). REVERT
+      # after diagnosis (default WARNING+ keeps stdout quiet).
+      JARVIS_SILENT_BOOT_TERMINAL_LEVEL: "INFO"
+      # Slice 225 Phase 2 — Sovereign DW Autarky. When Claude's breaker is
+      # OPEN (out-of-credits/terminal_quota), keep the DW primary on the full
+      # budget (180s) instead of severing at 30s into a dead lane. Default-TRUE;
+      # pinned explicit for soak auditability. THIS is what lets file-00
+      # complete on DW alone with Claude unfunded.
+      JARVIS_DW_AUTARKY_ENABLED: "1"
+      JARVIS_DW_AUTARKY_MAX_BUDGET_S: "180"
+      # Slice 228 — agentic family preference (CONFIG, not hardcoded code). With
+      # active-param scoring (default-TRUE) demoting low-active MoEs, this boosts
+      # the 2026 agentic-tier FAMILIES so gated/tool-loop ops land on a
+      # tool-capable titan (Kimi-K2.6 / DeepSeek-V4-Pro / Devstral / GLM-5.1 /
+      # Qwen-397B) instead of the 3B-active Qwen-35B. No model NAMES in code.
+      JARVIS_DW_FAMILY_PREFERENCE: "moonshotai:1.0,deepseek-ai:0.9,mistralai:0.8,zai-org:0.7,Qwen:0.5"
       # Fallback-sem relief (landmine A): D2/12F-B sem-exhausted fast-fail
       # confirmed live; raise rescue concurrency to the cap so boot-time op
       # stacks queue less (observed 135s sem_wait on concurrency=3).

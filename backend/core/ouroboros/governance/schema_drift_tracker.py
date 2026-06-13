@@ -136,6 +136,19 @@ class DriftType(str, Enum):
     A sibling model may be less prone to this judgment.
     """
 
+    EXPLORATION_INSUFFICIENT = "exploration_insufficient"
+    """Slice 230 — the Iron Gate rejected this model's candidate for making
+    ZERO exploration tool calls when the floor demanded >= 1.
+
+    Sourced from the orchestrator's exploration-gate rejection path. A model
+    that emits a direct patch without driving the Venom tool loop is a
+    transport-level "success" the sentinel walk stops at — so without this
+    drift record, GENERATE_RETRY re-picks the same weak model forever while
+    the elite agentic pool (ranked first by Slices 228/229) sits unreached.
+    Recording it makes ``has_drifted`` rotate the retry to a sibling that
+    actually explores.
+    """
+
     DUAL_ARM_FAILURE = "dual_arm_failure"
     """Slice 194 — a proactive hedge race where BOTH transport arms failed
     on this model (e.g. an RT RuntimeError + a structural batch rejection).

@@ -1278,19 +1278,70 @@ class DoublewordProvider:
         # (2) v1 route → model mapping.
         route = getattr(ctx, "provider_route", "") or ""
         if not route:
-            return self._model
+            return self._capability_aware_default(ctx, self._model)
         try:
             from backend.core.ouroboros.governance.provider_topology import (
                 get_topology,
             )
         except Exception:
-            return self._model
+            return self._capability_aware_default(ctx, self._model)
         # Phase 10 Slice 5a — unified deletion-side helper. Branches
         # on JARVIS_TOPOLOGY_SENTINEL_ENABLED internally; v2 path
         # returns first element of dw_models_for_route (catalog-first
         # → yaml fallback); v1 path is byte-identical to model_for_route.
         override = get_topology().model_for_route_unified(route)
-        return override or self._model
+        # (3) Baseline default. Slice 236 — an explicit per-route/sentinel
+        # override above is a DELIBERATE choice (respected verbatim); only the
+        # generic ``self._model`` baseline (the non-diff-capable Qwen-397B the
+        # IMMEDIATE→DW reroute falls onto) gets capability-aware treatment.
+        return override or self._capability_aware_default(ctx, self._model)
+
+    def _capability_aware_default(self, ctx: Any, base_model: str) -> str:
+        """Slice 236 — when DW route resolution falls through to the generic
+        baseline default (``self._model``, typically the non-diff-capable
+        Qwen-397B that the IMMEDIATE→DW reroute lands on) AND the op warrants a
+        large-file patch, prefer an entitled diff-capable elite family so the
+        Slice-235 2b.1-diff seam can actually engage. Thin wrapper: gathers the
+        live catalog + preference + capable-family set and delegates the decision
+        to the pure ``providers.capability_aware_default_model`` seam (the size
+        signal is the SAME one the gate reads — no drift). Gated; fail-soft → base.
+        OFF / small-file / no-entitled-elite / already-capable-base → byte-identical.
+        NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.providers import (
+                capability_aware_selection_enabled,
+                capability_aware_default_model,
+                _diff_capable_families,
+            )
+            if not capability_aware_selection_enabled():
+                return base_model
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                load_cached_snapshot,
+            )
+            from backend.core.ouroboros.governance.dw_catalog_classifier import (
+                _family_preference,
+            )
+            snap = load_cached_snapshot()
+            available = list(snap.model_ids()) if snap is not None else []
+            chosen = capability_aware_default_model(
+                base_model=base_model,
+                target_files=getattr(ctx, "target_files", ()) or (),
+                repo_root=self._repo_root,
+                available_models=available,
+                family_preference=_family_preference(),
+                diff_capable_families=_diff_capable_families(),
+                enabled=True,
+            )
+            if chosen != base_model:
+                logger.warning(
+                    "[DoublewordProvider] Slice236 capability-aware selection: "
+                    "large-file patch op (route=%s) → diff-capable %s "
+                    "(was baseline %s) — enabling the 2b.1-diff seam",
+                    getattr(ctx, "provider_route", "?"), chosen, base_model,
+                )
+            return chosen
+        except Exception:  # noqa: BLE001 — never break model resolution
+            return base_model
 
     # ------------------------------------------------------------------
     # Hoisted state accessors (Phase 1 Step 3B)
@@ -1579,18 +1630,38 @@ class DoublewordProvider:
             return None
         self._check_budget()
 
-        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
-        # Always use full_content schema (2b.1) — the 397B can't reliably
-        # produce verbatim context lines for unified diffs (2b.1-diff).
+        from backend.core.ouroboros.governance.providers import (
+            _build_codegen_prompt,
+            resolve_diff_capability_for_model,
+            resolve_force_full_content,
+        )
+        operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
+        _effective_model = self._resolve_effective_model(ctx)
+        # Slice 235 — adaptive diff. Was unconditional full_content because the
+        # 397B can't produce verbatim diff context. Now gated: a diff-capable
+        # ELITE family (Kimi/DeepSeek-V4-Pro/GLM — NOT the 397B) on a LARGE file
+        # emits the native 2b.1-diff (bounded output → no 60K-blob JSONDecodeError);
+        # everything else stays full_content. Fail-soft to full_content; the
+        # orchestrator degrades a stale/failed diff back to full_content.
+        _force_full = bool(getattr(ctx, "force_full_content_override", False)) or \
+            resolve_force_full_content(
+                schema_capability=resolve_diff_capability_for_model(_effective_model),
+                target_files=getattr(ctx, "target_files", ()) or (),
+                repo_root=self._repo_root,
+            )
+        if not _force_full:
+            logger.info(
+                "[DoublewordProvider] Slice235 adaptive-diff: emitting 2b.1-diff "
+                "schema (model=%s diff-capable, large target) op=%s",
+                _effective_model, operation_id,
+            )
         prompt = prompt_override or _build_codegen_prompt(
             ctx,
             repo_root=self._repo_root,
             repo_roots=self._repo_roots or None,
-            force_full_content=True,
+            force_full_content=_force_full,
             provider_route=getattr(ctx, "provider_route", "") or "",
         )
-        operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
-        _effective_model = self._resolve_effective_model(ctx)
 
         # Slice 38 — canonical JSONL composition via single helper.
         # Replaces raw ``json.dumps(...)`` which omitted the trailing
@@ -2324,6 +2395,35 @@ class DoublewordProvider:
                     except Exception:  # noqa: BLE001
                         pass
 
+                # Slice 227 — context-aware hedge governor. When the Iron Gate
+                # will demand exploration for this op (the SAME predicate that
+                # re-opens the tool loop in Slice 226), the batch arm (no tool
+                # loop) must not pre-empt the exploring RT arm — its un-explored
+                # candidate would fail the exploration floor (the live
+                # GOAL-001::file-00 layer-3 bug). One source of truth across the
+                # capability, security, and concurrency planes. Rupture fallback
+                # is fully preserved (batch is buffered, used iff RT ruptures).
+                from backend.core.ouroboros.governance.dw_transport_hedge import (
+                    hedge_gate_aware_enabled as _s227_governor_on,
+                )
+                _s227_prefer_fast = False
+                if _s227_governor_on():
+                    try:
+                        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                            exploration_gate_demands_tools as _s227_gate_demands,
+                        )
+                        _s227_prefer_fast = _s227_gate_demands(
+                            str(getattr(context, "task_complexity", "")),
+                        )
+                    except Exception:  # noqa: BLE001 — fail-open to legacy race
+                        _s227_prefer_fast = False
+                if _s227_prefer_fast:
+                    logger.warning(
+                        "[Cortex] ⚡ HEDGE GOVERNOR: op needs Iron-Gate "
+                        "exploration — batch arm held speculative, RT arm (tool "
+                        "loop) gets the slot unless it ruptures (op=%s)",
+                        (getattr(context, "op_id", "?") or "?")[:16],
+                    )
                 return await hedged_race(
                     lambda: self._generate_realtime(
                         context, deadline, prompt_override=prompt_override,
@@ -2336,6 +2436,7 @@ class DoublewordProvider:
                     stable_label="batch",
                     on_outcome=_s190_hedge_outcome,
                     on_abandoned=_s194_on_abandoned,
+                    prefer_fast=_s227_prefer_fast,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
@@ -2754,12 +2855,46 @@ class DoublewordProvider:
         # (the simple-background half of the v40b deadlock would otherwise
         # remain: loop runs, tools suppressed). Env-gated + BACKGROUND-only
         # -> byte-identical legacy when Claude is enabled / flag off.
-        if background_is_terminal_worker(str(_route)):
-            _will_skip_tools = (_complexity == "trivial")
-        else:
-            _will_skip_tools = (
-                _complexity in ("trivial", "simple")
-                or should_skip_venom_for_route(str(_route))
+        # Slice 226 — Iron Gate / provider capability alignment. The base
+        # tool-skip decision (BG-terminal-worker vs complexity/route skip) is
+        # now computed by the shared exploration_engine predicate so the
+        # capability plane (tools available) can never contradict the security
+        # plane (exploration floor). When the Iron Gate will demand exploration
+        # for a ``simple`` op on a venom-eligible route, the loop stays ON —
+        # closing the live GOAL-001::file-00 catch-22 (simple -> tools skipped
+        # -> exploration_insufficient -> guaranteed rejection). trivial stays
+        # exempt; BACKGROUND/SPECULATIVE keep their preload-credit skip.
+        from backend.core.ouroboros.governance.exploration_engine import (
+            compute_tool_loop_suppressed as _s226_compute_skip,
+            exploration_gate_demands_tools as _s226_gate_demands,
+        )
+        _s226_is_bg_tw = background_is_terminal_worker(str(_route))
+        _s226_route_skip = should_skip_venom_for_route(str(_route))
+        _base_skip = _s226_compute_skip(
+            complexity=str(_complexity),
+            route=str(_route),
+            is_bg_terminal_worker=_s226_is_bg_tw,
+            has_repair_context=False,
+        )
+        _will_skip_tools = _base_skip
+        # Slice 226 observability (operator pref: escalate capability anomalies
+        # LOUD, never silent re-route). When the alignment override re-opened
+        # the loop for a complexity that the cost heuristic would have stripped
+        # (simple, venom-eligible route, not BG-terminal-worker), flash it.
+        if (
+            not _base_skip
+            and not _s226_is_bg_tw
+            and not _s226_route_skip
+            and str(_complexity).strip().lower() == "simple"
+            and _s226_gate_demands(str(_complexity))
+        ):
+            logger.warning(
+                "[DoublewordProvider] ⚡ CAPABILITY ALIGNMENT: Iron Gate floor "
+                "demands exploration for a 'simple' op — re-opened the Venom "
+                "tool loop (read_file/search_code) the cost heuristic would "
+                "have withheld. route=%s op=%s",
+                _route,
+                (getattr(context, "op_id", "?") or "?")[:16],
             )
         # ──────────────────────────────────────────────────────────────
         # Slice 9 — L2 single-shot fast path (DW mirror)
@@ -3793,6 +3928,21 @@ class DoublewordProvider:
         # exploration_insufficient even after a full 7-tool-call loop.
         if tool_records:
             result = result.with_tool_records(tool_records)
+
+        # Slice 230b — stamp the EFFECTIVE model onto the result (same bug
+        # class as the Slice-84 record drop above: the parser can't know the
+        # model, so model_id stayed ""). Without this the Slice-230 gate→
+        # rotation drift-mark silently no-ops (empty model_id) and a no-tool
+        # weak model keeps monopolizing GENERATE_RETRY.
+        if not result.model_id:
+            # _effective_model = the per-attempt topology/sentinel override
+            # (the model that ACTUALLY served this call); _s35_model is the
+            # static default ('(unspecified)' fallback) — strictly secondary.
+            _s230b_model = str(_effective_model or "").strip()
+            if not _s230b_model or _s230b_model == "(unspecified)":
+                _s230b_model = str(_s35_model or "").strip()
+            if _s230b_model and _s230b_model != "(unspecified)":
+                result = dataclasses.replace(result, model_id=_s230b_model)
 
         # Attach Venom mutation audit (empty when no mutating tools fired).
         if venom_edits:

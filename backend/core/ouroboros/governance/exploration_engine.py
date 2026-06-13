@@ -451,6 +451,114 @@ def _read_int_env(name: str, default: int) -> int:
         return int(default)
 
 
+# ---------------------------------------------------------------------------
+# Slice 226 — Iron Gate / provider capability alignment
+# ---------------------------------------------------------------------------
+#
+# The exploration gate (orchestrator.py) enforces a per-complexity floor of
+# >=1 exploration call ("read the target file") for every NON-trivial op when
+# JARVIS_EXPLORATION_GATE is on. Independently, the DW/Prime providers skip the
+# Venom tool loop for ``complexity in {trivial, simple}`` as a cost optimization
+# — denying the model the read_file/search_code channels it needs to satisfy
+# that floor. A ``simple`` op on a venom-eligible route (the live
+# GOAL-001::file-00) is thus an unwinnable catch-22: no tools, then rejected for
+# not using them (``exploration_insufficient: 0/1``). The intended escape hatch
+# (preloaded-prompt credit) silently fails when the target file is too large to
+# inline (semantic_index.py = 3246 lines).
+#
+# These two predicates are the single source of truth both providers consult so
+# the capability plane (tools available) and the security plane (exploration
+# required) can never contradict.
+
+_ENV_GATE_ALIGNMENT = "JARVIS_GATE_ALIGNMENT_ENABLED"
+
+
+def gate_alignment_enabled() -> bool:
+    """Slice 226 master. Default-TRUE; OFF restores the byte-identical legacy
+    complexity-based tool-skip (simple -> skip). NEVER raises."""
+    try:
+        return os.environ.get(_ENV_GATE_ALIGNMENT, "true").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def exploration_gate_demands_tools(
+    complexity: str, *, gate_enabled: object = None,
+) -> bool:
+    """True iff the Iron Gate exploration floor will demand >=1 exploration
+    call for an op of this complexity — so a provider MUST keep the Venom tool
+    loop available rather than skipping it on a complexity heuristic.
+
+    Mirrors the orchestrator's gate-enable condition: ``JARVIS_EXPLORATION_GATE``
+    on AND complexity != 'trivial' (trivial is exempt; simple+ carry the >=1
+    "read the target file" floor). ``gate_enabled`` may be passed explicitly to
+    avoid the env read (testing / callers that already resolved it). NEVER
+    raises — fail-closed to False (legacy, no tools forced)."""
+    try:
+        if gate_enabled is None:
+            gate_enabled = (
+                os.environ.get("JARVIS_EXPLORATION_GATE", "true")
+                .strip().lower() == "true"
+            )
+        if not gate_enabled:
+            return False
+        return str(complexity or "").strip().lower() not in ("trivial", "")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def compute_tool_loop_suppressed(
+    *,
+    complexity: str,
+    route: str,
+    is_bg_terminal_worker: bool,
+    has_repair_context: bool,
+    gate_enabled: object = None,
+) -> bool:
+    """Unified Venom-tool-loop suppression decision (Slice 226).
+
+    Faithfully mirrors the historical DW-provider logic
+    (doubleword_provider ``_generate_realtime``):
+
+      * BG terminal-worker (Claude disabled): skip only ``trivial``.
+      * Otherwise: skip ``trivial``/``simple`` OR a venom-skip route
+        (BACKGROUND/SPECULATIVE — these pass the gate via preloaded-prompt
+        credit, not tools).
+      * L2 repair single-shot fast path (Slice 9): always skip.
+
+    PLUS the Slice-226 alignment override: when the gate will demand
+    exploration for this complexity, the COMPLEXITY-based skip is lifted (the
+    ROUTE-based skip is preserved — BACKGROUND keeps its preload-credit path).
+    Gated by ``gate_alignment_enabled()``; OFF = byte-identical legacy.
+    NEVER raises — fail-closed to the legacy decision on any error."""
+    try:
+        from backend.core.ouroboros.governance.route_predicates import (
+            should_skip_venom_for_route,
+        )
+        c = str(complexity or "").strip().lower()
+        r = str(route or "").strip().lower()
+        if is_bg_terminal_worker:
+            suppressed = (c == "trivial")
+        else:
+            route_skip = should_skip_venom_for_route(r)
+            suppressed = (c in ("trivial", "simple")) or route_skip
+            if (
+                gate_alignment_enabled()
+                and suppressed
+                and not route_skip
+                and exploration_gate_demands_tools(c, gate_enabled=gate_enabled)
+            ):
+                suppressed = False
+        if has_repair_context and not suppressed:
+            suppressed = True
+        return suppressed
+    except Exception:  # noqa: BLE001 — fail-closed to legacy complexity skip
+        c = str(complexity or "").strip().lower()
+        return c in ("trivial", "simple")
+
+
 @dataclass(frozen=True)
 class ExplorationFloors:
     """Per-complexity exploration thresholds.

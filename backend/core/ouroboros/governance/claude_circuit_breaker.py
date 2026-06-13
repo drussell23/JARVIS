@@ -352,17 +352,31 @@ class ClaudeCircuitBreaker:
                 )
 
     def _maybe_persist_open(self) -> None:
-        """Slice 164 — persist the economic-OPEN state (best-effort, caller holds lock)."""
-        if _breaker_persist_enabled():
-            _write_breaker_state(
-                "open", self._consecutive_economic_failures,
-                reason="economic", path=self._persist_path,
-            )
+        """Persist the economic-OPEN funding record (best-effort, caller holds lock).
+
+        Slice 232 — the WRITE is now flag-INDEPENDENT. The economic-funding state
+        ("Claude is out of credits") is cross-session knowledge the cold-start
+        provider-availability collector reads at op #1; if it were only written
+        when ``JARVIS_CLAUDE_BREAKER_PERSIST_ENABLED`` were set, the record would
+        go stale and the signal would never populate (the 90h-stale-file failure
+        the live soak surfaced). The persist ENABLE flag still governs the
+        behavior-changing part — auto-booting the breaker OPEN at __init__ (the
+        §33.1 safety concern) — which remains gated above. Recording data on disk
+        is benign; auto-restoring availability state is not.
+        """
+        _write_breaker_state(
+            "open", self._consecutive_economic_failures,
+            reason="economic", path=self._persist_path,
+        )
 
     def _maybe_clear_persisted(self) -> None:
-        """Slice 164 — mark the lane recovered so the next boot starts CLOSED."""
-        if _breaker_persist_enabled():
-            _write_breaker_state("closed", 0, reason="recovered", path=self._persist_path)
+        """Clear the funding record on recovery (flag-independent, Slice 232).
+
+        A since-funded lane must clear the record so the collector stops
+        reporting Claude down — also flag-independent, else a stale economic-OPEN
+        lingers until TTL after Claude is refunded.
+        """
+        _write_breaker_state("closed", 0, reason="recovered", path=self._persist_path)
 
     # -- Properties --------------------------------------------------------
 

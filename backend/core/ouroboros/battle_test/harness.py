@@ -113,6 +113,74 @@ def _memory_border_for_type(type_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Slice 234 — runtime-aware repo-root resolution
+# ---------------------------------------------------------------------------
+
+
+def _repo_root_plausible(p: Path) -> bool:
+    """A path is a plausible JARVIS repo root iff it carries the canonical
+    source tree. NEVER raises."""
+    try:
+        return (p / "backend" / "core" / "ouroboros").is_dir()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_runtime_repo_root(
+    *, env_value: Optional[str] = None, start: Optional[Path] = None,
+) -> Path:
+    """Resolve the repo root for the CURRENT runtime (host OR container).
+
+    The Slice 231/232 soak proved a host-absolute ``JARVIS_REPO_PATH`` baked into
+    ``.env`` and env_file'd into the container made APPLY join patches against a
+    path that does not exist at ``/app`` — the env was trusted as authority when
+    it is only a hint. Resolution priority:
+
+      1. ``JARVIS_REPO_PATH`` — ONLY if it exists in this runtime AND looks like
+         the repo. A stale host path inside a container is rejected here.
+      2. The repo root inferred from the code's own on-disk location — the code
+         is authoritative about where it lives, and this works in a container
+         even when ``.git`` was not bootstrapped.
+      3. A ``.git`` anchor walked up from the code location.
+
+    Fail loud (``RuntimeError``) if none resolve to a real repo, rather than
+    silently returning a root that APPLY would write into.
+    """
+    _env = (env_value if env_value is not None
+            else os.environ.get("JARVIS_REPO_PATH", "")).strip()
+    if _env:
+        try:
+            cand = Path(_env).expanduser()
+            if cand.is_dir() and _repo_root_plausible(cand):
+                return cand.resolve()
+            logger.warning(
+                "[RepoRoot] JARVIS_REPO_PATH=%r not valid in this runtime "
+                "(exists=%s) — deriving root from the code location instead",
+                _env, cand.exists(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    here = (start if start is not None else Path(__file__)).resolve()
+    # 2. code-location: nearest ancestor carrying backend/core/ouroboros.
+    for anc in here.parents:
+        if _repo_root_plausible(anc):
+            return anc
+    # 3. .git anchor walk-up (last resort).
+    for anc in (here, *here.parents):
+        try:
+            if (anc / ".git").exists():
+                return anc
+        except Exception:  # noqa: BLE001
+            continue
+    raise RuntimeError(
+        "cannot resolve repo root in this runtime: JARVIS_REPO_PATH="
+        f"{_env!r} is not a valid repo and no backend/core/ouroboros "
+        f"ancestor or .git anchor was found from {here}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # HarnessConfig
 # ---------------------------------------------------------------------------
 
@@ -204,7 +272,7 @@ class HarnessConfig:
         else:
             _headless = None
         return cls(
-            repo_path=Path(os.environ.get("JARVIS_REPO_PATH", ".")),
+            repo_path=_resolve_runtime_repo_root(),
             cost_cap_usd=float(os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")),
             idle_timeout_s=float(os.environ.get("OUROBOROS_BATTLE_IDLE_TIMEOUT", "600.0")),
             max_wall_seconds_s=_wall if _wall > 0 else None,

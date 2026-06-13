@@ -7,19 +7,6 @@ note: DRAFT proposal synthesized by the strategy simulator from live registry te
   NOT authoritative and NOT signed. Review the bundled PR; run strategy_signer to
   elevate the goals you approve into the signed roadmap.yaml.
 goals:
-- id: sim-control_plane_starvation
-  title: Eliminate control-plane starvation (event-loop wedges)
-  description: 'Recurring ControlPlaneStarvation lag events — the main asyncio loop
-    is being starved by sync CPU work. Goal: move the blocking work off-thread / chunk
-    it so the loop ticks within threshold.'
-  priority: high
-  success_criteria: control_plane_starvation_events < 5 / 24h
-  depends_on: []
-  fitness: 3.5294
-  evidence:
-    counter: control_plane_starvation_events
-    count: 50.0
-    severity: 10.0
 - id: sim-provider_exhaustion
   title: Harden provider resilience (eliminate all_providers_exhausted)
   description: 'Telemetry shows ops fully exhausting every provider tier. Goal: drive
@@ -28,10 +15,23 @@ goals:
   priority: high
   success_criteria: provider_exhaustions == 0 across a 24h window
   depends_on: []
-  fitness: 2.402
+  fitness: 4.3338
   evidence:
     counter: provider_exhaustions
-    count: 15.0
+    count: 1069.0
+    severity: 10.0
+- id: sim-control_plane_starvation
+  title: Eliminate control-plane starvation (event-loop wedges)
+  description: 'Recurring ControlPlaneStarvation lag events — the main asyncio loop
+    is being starved by sync CPU work. Goal: move the blocking work off-thread / chunk
+    it so the loop ticks within threshold.'
+  priority: high
+  success_criteria: control_plane_starvation_events < 5 / 24h
+  depends_on: []
+  fitness: 2.8186
+  evidence:
+    counter: control_plane_starvation_events
+    count: 650.0
     severity: 10.0
 - id: sim-vendor_instability
   title: Reduce abandoned hedge races (dual-arm vendor failures)
@@ -41,8 +41,8 @@ goals:
   priority: medium
   success_criteria: abandoned-race ratio < 5% of dispatches
   depends_on: []
-  fitness: 0.5441
+  fitness: 2.1856
   evidence:
     counter: hedge_races_abandoned
-    count: 3.0
-    severity: 2.5
+    count: 62.0
+    severity: 10.0

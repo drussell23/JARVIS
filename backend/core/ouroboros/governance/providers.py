@@ -229,6 +229,267 @@ _MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
 
 
 # ---------------------------------------------------------------------------
+# Slice 235 — adaptive diff: capability + size gated force_full_content
+# ---------------------------------------------------------------------------
+# Layer-5 root cause: providers COMPUTE _force_full from the brain's
+# schema_capability but then pass hardcoded force_full_content=True (the diff
+# path is dead-coded off), and DW forces True unconditionally — so DW emits the
+# whole 60K-char file as one full_content blob → JSONDecodeError. This re-enables
+# the EXISTING native 2b.1-diff path conditionally, reusing _apply_unified_diff +
+# validate_diff_context. Verbatim-diff reliability is model-specific (the 397B
+# couldn't); the orchestrator fail-safe degrades a failed diff to full_content.
+_DIFF_SCHEMA_THRESHOLD_ENV = "JARVIS_DIFF_SCHEMA_THRESHOLD_LINES"
+_DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES = 800
+
+
+def _diff_schema_threshold_lines() -> int:
+    """Min target-file line count above which a CAPABLE model emits a unified
+    diff instead of full_content. Small files stay full_content (a diff adds no
+    value and the blob/JSON problem only hits large files). Env-tunable; invalid
+    / non-positive → default. NEVER raises."""
+    raw = (os.environ.get(_DIFF_SCHEMA_THRESHOLD_ENV, "") or "").strip()
+    if not raw:
+        return _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+    try:
+        v = int(raw)
+        return v if v > 0 else _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+    except ValueError:
+        return _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+
+
+def should_force_full_content(
+    *,
+    schema_capability: str,
+    target_line_count: "Optional[int]",
+    threshold_lines: int,
+) -> bool:
+    """Decide whether to FORCE full_content (vs allow the native 2b.1-diff).
+
+    Force full_content UNLESS the model can reliably emit verbatim diffs
+    (``schema_capability == 'full_content_and_diff'``) AND the target file is
+    large enough (> ``threshold_lines``) to warrant a bounded diff. Conservative
+    by construction: unknown capability or unknown/small line count → force full.
+    Pure; never raises."""
+    if schema_capability != "full_content_and_diff":
+        return True
+    if not isinstance(target_line_count, int) or target_line_count <= int(threshold_lines):
+        return True
+    return False
+
+
+# Elite agentic families verified to emit verbatim unified-diff context (the
+# Qwen-397B workhorse is deliberately EXCLUDED — it's the model that couldn't,
+# per doubleword_provider.py:1583). Env-overridable; model NAMES never live in
+# code (only families), honoring brain_selection_policy.yaml as the source of
+# model truth.
+_DIFF_CAPABLE_FAMILIES_ENV = "JARVIS_DW_DIFF_CAPABLE_FAMILIES"
+_DEFAULT_DIFF_CAPABLE_FAMILIES = "moonshotai,deepseek-ai,zai-org"
+
+
+def _diff_capable_families() -> frozenset:
+    raw = (os.environ.get(_DIFF_CAPABLE_FAMILIES_ENV, "") or "").strip()
+    src = raw if raw else _DEFAULT_DIFF_CAPABLE_FAMILIES
+    return frozenset(
+        f.strip().lower() for f in src.split(",") if f.strip()
+    )
+
+
+def resolve_diff_capability_for_model(model_id: str) -> str:
+    """Map a DW catalog model id → schema_capability via its FAMILY (the vendor
+    prefix, e.g. ``moonshotai/Kimi-K2.6`` → ``moonshotai``). Reuses
+    provider_topology.parse_family when available, else the ``vendor/`` split.
+    Returns ``full_content_and_diff`` only for verified diff-capable families.
+    NEVER raises — unknown/empty → ``full_content_only`` (conservative)."""
+    try:
+        mid = (model_id or "").strip()
+        if not mid:
+            return "full_content_only"
+        family = ""
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                parse_family as _parse_family,
+            )
+            family = (_parse_family(mid) or "").strip().lower()
+        except Exception:  # noqa: BLE001 — fall back to the vendor-prefix split
+            family = ""
+        if not family:
+            family = mid.split("/", 1)[0].strip().lower() if "/" in mid else mid.strip().lower()
+        return (
+            "full_content_and_diff"
+            if family in _diff_capable_families()
+            else "full_content_only"
+        )
+    except Exception:  # noqa: BLE001
+        return "full_content_only"
+
+
+def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
+    """Largest line count across *target_files* (relative to *repo_root*).
+    Missing/unreadable files are skipped; all-missing/empty → ``None``. The diff
+    decision uses the MAX so any large file in a multi-file op can warrant a diff.
+    NEVER raises."""
+    try:
+        from pathlib import Path as _Path
+        if not target_files or repo_root is None:
+            return None
+        root = _Path(repo_root)
+        best = None
+        for rel in target_files:
+            try:
+                p = root / str(rel)
+                if not p.is_file():
+                    continue
+                n = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+                best = n if best is None else max(best, n)
+            except Exception:  # noqa: BLE001 — skip unreadable, never raise
+                continue
+        return best
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_force_full_content(
+    *, schema_capability: str, target_files, repo_root,
+) -> bool:
+    """Decoupled seam (no inline conditionals in the provider hot loops): decide
+    force_full_content from the model's diff capability + the largest target
+    file's line count. Fail-soft → ``True`` (conservative full_content) on any
+    error, so a bad read can never push an op into an un-emittable diff."""
+    try:
+        lines = _max_target_line_count(target_files, repo_root)
+        return should_force_full_content(
+            schema_capability=schema_capability,
+            target_line_count=lines,
+            threshold_lines=_diff_schema_threshold_lines(),
+        )
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Slice 236 — capability-aware DW baseline selection (the "sixth layer" fix)
+#
+# The Slice-235 gate decides full_content-vs-diff for the model that is ALREADY
+# selected; it cannot fix a selector that only ever offers the non-diff-capable
+# Qwen-397B baseline. These pure seams let the DW provider PREFER an entitled
+# diff-capable elite for large-file patch ops — reusing the SAME size primitive
+# the gate reads so the "needs a diff" signal can never drift from the gate's
+# "force full" signal, and the SAME family-capability set so capability is read
+# from one source of truth. No model NAMES live in code: selection is data-driven
+# from the injected catalog + JARVIS_DW_FAMILY_PREFERENCE + diff-capable families.
+# ---------------------------------------------------------------------------
+_CAPABILITY_AWARE_SELECTION_ENV = "JARVIS_DW_CAPABILITY_AWARE_SELECTION_ENABLED"
+
+
+def capability_aware_selection_enabled() -> bool:
+    """Master switch for capability-aware DW baseline selection. Default TRUE —
+    it is a root-cause fix whose OFF path, small-file path, no-elite-reachable
+    path, and already-capable-baseline path are all byte-identical to the legacy
+    baseline default; the kill switch exists purely for rollback. NEVER raises."""
+    raw = (os.environ.get(_CAPABILITY_AWARE_SELECTION_ENV, "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def op_warrants_diff_capable_model(*, target_files, repo_root) -> bool:
+    """True iff the op's largest target file exceeds the diff threshold — i.e. a
+    diff-capable model COULD emit a bounded 2b.1-diff instead of a full_content
+    blob. Reuses the SAME primitives the gate (``resolve_force_full_content``)
+    reads — ``_max_target_line_count`` + ``_diff_schema_threshold_lines`` — so the
+    selector's "needs a diff-capable model" decision and the gate's size decision
+    cannot drift apart. Fail-soft → ``False`` (no special routing) on any error."""
+    try:
+        lines = _max_target_line_count(target_files, repo_root)
+        return isinstance(lines, int) and lines > _diff_schema_threshold_lines()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _model_family(model_id: str) -> str:
+    """Family (vendor prefix) of a DW catalog model id, lower-cased. Reuses
+    ``dw_catalog_client.parse_family`` when importable, else the ``vendor/`` split.
+    Empty/unknown → ``""``. NEVER raises."""
+    try:
+        mid = (model_id or "").strip()
+        if not mid:
+            return ""
+        fam = ""
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                parse_family as _parse_family,
+            )
+            fam = (_parse_family(mid) or "").strip().lower()
+        except Exception:  # noqa: BLE001 — fall back to the vendor-prefix split
+            fam = ""
+        if not fam or fam == "unknown":
+            fam = mid.split("/", 1)[0].strip().lower() if "/" in mid else mid.strip().lower()
+        return fam
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def select_diff_capable_model(
+    *, available_models, family_preference, diff_capable_families,
+) -> "Optional[str]":
+    """From the entitled catalog *available_models*, pick the model whose FAMILY
+    is diff-capable and ranks highest in *family_preference*. Pure — no env /
+    catalog / IO reads (the caller injects all three) so it is deterministic and
+    unit-testable. Ranking: descending family preference (absent family → 0.0),
+    then ascending model id (a stable, deterministic tie-break). Returns ``None``
+    when no available model belongs to a diff-capable family. NEVER raises."""
+    try:
+        capable = {str(f).strip().lower() for f in (diff_capable_families or ())}
+        pref = {
+            str(k).strip().lower(): float(v)
+            for k, v in dict(family_preference or {}).items()
+        }
+        candidates = []
+        for mid in (available_models or ()):
+            if not isinstance(mid, str) or not mid.strip():
+                continue
+            fam = _model_family(mid)
+            if fam and fam in capable:
+                candidates.append((pref.get(fam, 0.0), mid))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: (-t[0], t[1]))
+        return candidates[0][1]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def capability_aware_default_model(
+    *, base_model, target_files, repo_root,
+    available_models, family_preference, diff_capable_families, enabled,
+) -> str:
+    """Pure orchestration seam: given the baseline default model + the op's size
+    signal + the entitled catalog + preference + diff-capable families, return the
+    model the DW provider should actually use. Prefers an entitled diff-capable
+    elite ONLY when ALL hold: *enabled*; the baseline is not already diff-capable;
+    the op warrants a large-file patch (gate-shared size signal); such an elite is
+    available. Otherwise returns *base_model* unchanged. No env / catalog / IO
+    reads — all injected → deterministic + unit-testable. Fail-soft → base_model,
+    so model resolution can never be broken by this seam."""
+    try:
+        if not enabled:
+            return base_model
+        capable = {str(f).strip().lower() for f in (diff_capable_families or ())}
+        if _model_family(base_model) in capable:
+            return base_model  # baseline default is itself diff-capable — no switch
+        if not op_warrants_diff_capable_model(
+            target_files=target_files, repo_root=repo_root,
+        ):
+            return base_model  # small / unknown file — baseline is correct
+        chosen = select_diff_capable_model(
+            available_models=available_models,
+            family_preference=family_preference,
+            diff_capable_families=diff_capable_families,
+        )
+        return chosen or base_model  # no entitled elite → graceful full_content
+    except Exception:  # noqa: BLE001
+        return base_model
+
+
+# ---------------------------------------------------------------------------
 # Attachment Serialization (Task 7 of VisionSensor + Visual VERIFY arc)
 # ---------------------------------------------------------------------------
 #
@@ -4890,7 +5151,17 @@ class PrimeProvider:
             _schema_cap = getattr(
                 context.telemetry.routing_intent, "schema_capability", "full_content_only"
             )
-        _force_full = _schema_cap != "full_content_and_diff"
+        # Slice 235 — the computed _force_full was previously IGNORED (the prompt
+        # builders hardcoded True), so the native 2b.1-diff path was dead-coded
+        # off. Now gate it through the decoupled seam: a diff-capable brain emits
+        # 2b.1-diff only for LARGE files; small files / weak brains stay
+        # full_content. Fail-soft to full_content; orchestrator degrades on stale.
+        _force_full = bool(getattr(context, "force_full_content_override", False)) or \
+            resolve_force_full_content(
+                schema_capability=_schema_cap,
+                target_files=getattr(context, "target_files", ()) or (),
+                repo_root=repo_root,
+            )
 
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
@@ -4909,7 +5180,7 @@ class PrimeProvider:
                 context,
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
-                force_full_content=True,
+                force_full_content=_force_full,
                 mcp_tools=_mcp_tools,
                 preloaded_out=_preloaded_files,
             )
@@ -4923,7 +5194,7 @@ class PrimeProvider:
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
-                force_full_content=True,
+                force_full_content=_force_full,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",
