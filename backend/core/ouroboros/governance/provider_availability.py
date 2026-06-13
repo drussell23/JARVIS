@@ -27,13 +27,16 @@ change — it is unused by the v1 deterministic kernel.
 from __future__ import annotations
 
 import os
+import threading
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from backend.core.ouroboros.governance.claude_circuit_breaker import (
     CircuitState,
     get_claude_circuit_breaker,
     is_enabled as claude_breaker_is_enabled,
+    _read_breaker_state,  # authoritative persisted-funding reader (TTL-aware, fail-soft)
 )
 from backend.core.ouroboros.governance.dw_surface_health import (
     SurfaceHealthLedger,
@@ -44,6 +47,14 @@ from backend.core.ouroboros.governance.dw_surface_health import (
 # Mirror Slice 19a/22's structural-disable contract verbatim.
 _CLAUDE_DISABLED_ENV_VAR = "JARVIS_PROVIDER_CLAUDE_DISABLED"
 _TRUE_TOKENS = {"1", "true", "yes", "on"}
+
+# Slice 232 — cold-start funding signal. The persisted breaker state is read at
+# most once per this window so the hot route path is zero-I/O in steady state
+# (non-blocking) while still picking up state changes within a few seconds.
+_PERSIST_CACHE_ENV_VAR = "JARVIS_PROVIDER_AVAILABILITY_PERSIST_CACHE_S"
+_DEFAULT_PERSIST_CACHE_S = 5.0
+_persist_cache_lock = threading.Lock()
+_persist_cache = {"ts": -1.0e9, "down": False}
 
 
 @dataclass(frozen=True)
@@ -68,8 +79,55 @@ def _env_true(var: str) -> bool:
     return os.environ.get(var, "").strip().lower() in _TRUE_TOKENS
 
 
+def _persist_cache_ttl_s() -> float:
+    try:
+        raw = os.environ.get(_PERSIST_CACHE_ENV_VAR, "").strip()
+        return max(0.0, float(raw)) if raw else _DEFAULT_PERSIST_CACHE_S
+    except (TypeError, ValueError):
+        return _DEFAULT_PERSIST_CACHE_S
+
+
+def _persisted_claude_economic_down(
+    reader: Optional[Callable[[], Optional[int]]] = None,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """True iff the AUTHORITATIVE persisted breaker state shows a FRESH economic OPEN.
+
+    Reuses ``claude_circuit_breaker._read_breaker_state`` (the single source of
+    truth — already TTL-aware and fail-soft) so the Claude-funding verdict is
+    populated from cold boot (op #1), INDEPENDENT of the persist ENABLE flag (the
+    reader does not gate on it). This closes the Slice-231 timing gap where the
+    in-memory breaker boots CLOSED and only trips OPEN mid-GENERATE — too late
+    for the pre-dispatch budget lift.
+
+    Fail-soft: any error → ``False`` (no signal; the live breaker still trips on
+    the first 402 — graceful degradation, never a crash). When *reader* is
+    injected the cache is bypassed for deterministic testing; the default path
+    caches briefly so the hot route path is zero-I/O in steady state.
+    """
+    if reader is not None:
+        try:
+            return reader() is not None
+        except Exception:  # noqa: BLE001 — fail-soft, never poison the snapshot
+            return False
+    _now = now if now is not None else time.monotonic()
+    ttl = _persist_cache_ttl_s()
+    with _persist_cache_lock:
+        if (_now - _persist_cache["ts"]) <= ttl:
+            return bool(_persist_cache["down"])
+        try:
+            down = _read_breaker_state() is not None
+        except Exception:  # noqa: BLE001
+            down = False
+        _persist_cache["ts"] = _now
+        _persist_cache["down"] = down
+        return down
+
+
 def _resolve_claude(
     *, breaker, breaker_enabled: bool, claude_disabled: bool,
+    persisted_reader: Optional[Callable[[], Optional[int]]] = None,
 ) -> tuple[bool, str]:
     """Read-only Claude-lane availability + forensic reason."""
     if claude_disabled:
@@ -80,6 +138,12 @@ def _resolve_claude(
 
     state = breaker.state  # read-only property
     if state is CircuitState.CLOSED:
+        # Slice 232 — cold-start funding signal. The in-memory breaker boots
+        # CLOSED, but the persisted source of truth may already record a fresh
+        # economic OPEN (out-of-credits surviving a restart). Honor it so the
+        # pre-dispatch lift fires from op #1 rather than after the first 402.
+        if _persisted_claude_economic_down(persisted_reader):
+            return False, "breaker_open_economic_persisted"
         return True, "closed"
     if state is CircuitState.HALF_OPEN:
         # Probing, not available. Committing an IMMEDIATE op to a half-open lane
@@ -115,13 +179,16 @@ def collect_provider_availability(
     ledger=None,
     claude_disabled: Optional[bool] = None,
     breaker_enabled: Optional[bool] = None,
+    persisted_reader: Optional[Callable[[], Optional[int]]] = None,
 ) -> ProviderAvailabilitySnapshot:
     """Build a :class:`ProviderAvailabilitySnapshot` from live health state.
 
     All dependencies are injectable (defaulting to the process singletons /
     env) so callers and tests can drive deterministic states without touching
-    global state. NEVER raises — on any sensing failure returns conservative
-    legacy-safe defaults (both providers available).
+    global state. ``persisted_reader`` overrides the cold-start funding reader
+    (defaults to the cached real persisted-breaker reader). NEVER raises — on
+    any sensing failure returns conservative legacy-safe defaults (both
+    providers available).
     """
     try:
         _breaker = breaker if breaker is not None else get_claude_circuit_breaker()
@@ -138,6 +205,7 @@ def collect_provider_availability(
         )
         claude_ok, claude_reason = _resolve_claude(
             breaker=_breaker, breaker_enabled=_benabled, claude_disabled=_disabled,
+            persisted_reader=persisted_reader,
         )
         dw_ok, dw_reason = _resolve_dw(ledger=_ledger)
         return ProviderAvailabilitySnapshot(

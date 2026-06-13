@@ -132,3 +132,21 @@
                  at orchestrator.py GENERATE _gen_timeout + both emit_decision stamp sites. Master
                  JARVIS_BUDGET_SYNTHESIS_ENABLED default-TRUE; OFF = byte-identical legacy (proven).
                  45 TDD tests green; zero new regressions (urgency_router/slice208/antivenom clean).
+                 LIVE-SOAK VALIDATED (jarvis-dw-cortex-soak, attested a301c38941): synthesizer
+                 fires correctly (reads claude=breaker_open_economic + dw=transport_degraded
+                 read-only, DW-primary budgets). DW-only autonomy works (ops COMPLETE on DW w/
+                 Claude unfunded). FOUND: gen_timeout 240s lift fired 0x — cold-start TIMING gap
+                 (breaker boots CLOSED, trips mid-GENERATE; signal absent at pre-dispatch lift). → S232.
+  [x] slice-232  Cold-start provider-funding signal (RC1 of the soak findings). The collector now
+                 derives Claude funding from the AUTHORITATIVE persisted breaker state at op #1 —
+                 reusing claude_circuit_breaker._read_breaker_state (TTL-aware, fail-soft), INDEPENDENT
+                 of the persist ENABLE flag (provider_availability._persisted_claude_economic_down,
+                 cached/non-blocking, in-memory OPEN keeps precedence, missing/stale/corrupt → graceful
+                 available). AND the economic-funding RECORD write is now flag-independent too
+                 (_maybe_persist_open/_maybe_clear_persisted decoupled from the flag) so the signal
+                 stays fresh from cold boot — the §33.1 gate still guards the behavior-changing
+                 auto-boot-OPEN restore (test_no_restore_when_disabled preserved). Closes the S231
+                 timing gap: the 240s lift now fires for a GOAL-001-shaped op from op #1. 11 TDD tests
+                 (cold-boot-persisted-OPEN / no-state / trip-during-generate / fail-soft / record-
+                 maintenance); zero new regressions (test_snapshot_shape failure is pre-existing S147
+                 drift). RC2 (DW tool-loop non-convergence) tracked separately.
