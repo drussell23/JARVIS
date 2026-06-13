@@ -3858,6 +3858,21 @@ class DoublewordProvider:
         if tool_records:
             result = result.with_tool_records(tool_records)
 
+        # Slice 230b — stamp the EFFECTIVE model onto the result (same bug
+        # class as the Slice-84 record drop above: the parser can't know the
+        # model, so model_id stayed ""). Without this the Slice-230 gate→
+        # rotation drift-mark silently no-ops (empty model_id) and a no-tool
+        # weak model keeps monopolizing GENERATE_RETRY.
+        if not result.model_id:
+            # _effective_model = the per-attempt topology/sentinel override
+            # (the model that ACTUALLY served this call); _s35_model is the
+            # static default ('(unspecified)' fallback) — strictly secondary.
+            _s230b_model = str(_effective_model or "").strip()
+            if not _s230b_model or _s230b_model == "(unspecified)":
+                _s230b_model = str(_s35_model or "").strip()
+            if _s230b_model and _s230b_model != "(unspecified)":
+                result = dataclasses.replace(result, model_id=_s230b_model)
+
         # Attach Venom mutation audit (empty when no mutating tools fired).
         if venom_edits:
             result = result.with_venom_edits(venom_edits)
