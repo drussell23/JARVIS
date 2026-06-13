@@ -4624,6 +4624,76 @@ def _should_force_convergence(
     return cumulative_explore_calls >= threshold
 
 
+# ── Slice 233 — parse-gate enforcement of convergence ──
+# The Slice 3E nudge is ADVISORY: it tells the model "tool calls will be
+# IGNORED" but nothing stops it from emitting read-only navigation on the grace
+# round, after which the loop returns the raw (patch-less) response and the op
+# fails (the live-soak GOAL-001 failure). This loop advertises tools as PROSE
+# and parses tool_use from TEXT — there is no structured ``tools=`` array at the
+# ``generate_fn`` boundary to strip — so the absolute invariant is enforced at
+# the PARSE gate: once convergence is forced, a PURE read-only navigation round
+# is structurally REJECTED (not executed), the model gets a hard denial directing
+# it to emit the patch, bounded by a cap AND remaining budget. Progress
+# (mutation) tools and a valid non-tool patch are never suppressed.
+
+
+class _ConvergenceEnforcement(enum.Enum):
+    """What the loop does with a tool-call round once convergence is forced."""
+
+    NORMAL = "normal"        # convergence not forced — proceed normally
+    ENFORCE = "enforce"      # pure read-only exploration — deny + re-prompt
+    FINALIZE = "finalize"    # bound/budget reached or progress present — return raw
+
+
+def _enforcement_rounds_cap() -> int:
+    """Slice 233 — max bounded enforcement re-prompts after convergence is forced.
+
+    Mirrors the env-knob pattern of ``_convergence_explore_call_threshold``.
+    Default 2 (one denial to redirect, one to comply, then a clean fail). ``0``
+    opts out entirely (legacy advisory behavior). Invalid / negative → default.
+    Env-tunable; never raises."""
+    raw = os.environ.get("JARVIS_TOOL_LOOP_ENFORCEMENT_ROUNDS", "").strip()
+    if not raw:
+        return 2
+    try:
+        v = int(raw)
+        return v if v >= 0 else 2
+    except ValueError:
+        return 2
+
+
+def _slice233_enforcement_action(
+    *,
+    convergence_forced: bool,
+    tool_call_names,
+    readonly_set,
+    enforcement_rounds_used: int,
+    enforcement_cap: int,
+    remaining_s: float,
+    final_write_reserve_s: float,
+) -> "_ConvergenceEnforcement":
+    """Pure decision for post-convergence tool enforcement (never raises).
+
+    ENFORCE only when convergence is forced AND the round is PURE read-only
+    navigation AND there is enforcement budget (under the cap) AND enough wall
+    budget left to still emit the final write. Otherwise FINALIZE (return the raw
+    response — downstream honors any patch it carries, else clean fail). A round
+    touching a non-read-only (progress) tool is never enforced here — the gate
+    stops exploration, not progress.
+    """
+    if not convergence_forced:
+        return _ConvergenceEnforcement.NORMAL
+    names = set(tool_call_names or ())
+    if names - set(readonly_set):
+        # progress / mutation tool present → not pure exploration
+        return _ConvergenceEnforcement.FINALIZE
+    if enforcement_rounds_used >= max(0, int(enforcement_cap)):
+        return _ConvergenceEnforcement.FINALIZE
+    if remaining_s <= final_write_reserve_s:
+        return _ConvergenceEnforcement.FINALIZE
+    return _ConvergenceEnforcement.ENFORCE
+
+
 # ---------------------------------------------------------------------------
 # BudgetPlan — structural per-round timeout derivation
 # ---------------------------------------------------------------------------
@@ -5489,6 +5559,7 @@ class ToolLoopCoordinator:
         # ROUNDS at ~232s remaining of 358s budget, far above the 10s
         # reserve threshold).
         _final_nudge_issued: bool = False
+        _enforcement_rounds_used: int = 0  # Slice 233 — bounded parse-gate denials
         raw: str = ""
         while True:
             round_index += 1
@@ -5636,22 +5707,56 @@ class ToolLoopCoordinator:
                 self._finalize_run(op_id)
                 return raw, records   # Final non-tool response
 
-            # Slice 3E — grace round outcome. When ``_final_nudge_issued``
-            # is True we promised the model "any further tool calls will
-            # be IGNORED". If it still emitted tool calls (i.e. did not
-            # converge to a final answer despite the imperative nudge),
-            # return the raw response anyway so downstream parsers and
-            # Iron Gate can inspect it — maybe the response also includes
-            # a parseable patch JSON alongside the tool calls, maybe not,
-            # but either way executing the tool calls and prolonging the
-            # loop violates the contract we just set with the model.
+            # Slice 233 — parse-gate enforcement of convergence. Once the
+            # final-write nudge has fired we promised the model "further tool
+            # calls will be IGNORED". The legacy behavior returned the raw
+            # (often patch-less) response and failed — the advisory contract
+            # the live soak proved insufficient. Now: a PURE read-only
+            # navigation round is structurally REJECTED (not executed) and the
+            # model is re-prompted with a hard denial directing it to emit the
+            # patch — bounded by an enforcement cap AND the remaining budget.
+            # A valid patch (non-tool response) already returned above; a round
+            # touching a progress tool, or once the bound/budget is spent,
+            # FINALIZEs to the legacy raw return (downstream honors any patch).
             if _final_nudge_issued:
+                _remaining_now = deadline - time.monotonic()
+                _enforce = _slice233_enforcement_action(
+                    convergence_forced=True,
+                    tool_call_names=[tc.name for tc in tool_calls],
+                    readonly_set=_READONLY_EXPLORATION_TOOLS,
+                    enforcement_rounds_used=_enforcement_rounds_used,
+                    enforcement_cap=_enforcement_rounds_cap(),
+                    remaining_s=_remaining_now,
+                    final_write_reserve_s=plan.final_write_reserve_s,
+                )
+                if _enforce is _ConvergenceEnforcement.ENFORCE:
+                    _enforcement_rounds_used += 1
+                    _denied = ", ".join(sorted({tc.name for tc in tool_calls}))
+                    # Reuse the proven nudge feedback path: append to the prompt
+                    # + ``continue`` so the denial reaches the model next round.
+                    current_prompt += (
+                        "\n\n[SYSTEM] Read-only navigation tools (" + _denied
+                        + ") are DISABLED — exploration budget exhausted. Your "
+                        "tool call(s) were REJECTED and NOT executed. Do NOT "
+                        "call them again. Emit the final patch JSON now, "
+                        "synthesizing the tool results you already gathered.\n"
+                    )
+                    logger.warning(
+                        "[ToolLoop] op=%s Slice233 read-only DENIED "
+                        "(n=%d, enforce=%d/%d, remaining=%.1fs) — re-prompting "
+                        "for the patch",
+                        op_id[:12] if op_id else "?", len(tool_calls),
+                        _enforcement_rounds_used, _enforcement_rounds_cap(),
+                        _remaining_now,
+                    )
+                    continue
                 logger.warning(
                     "[ToolLoop] op=%s GRACE round used; model emitted "
                     "%d tool call(s) after FINAL ROUND nudge instead of a "
-                    "final answer — returning raw response unprocessed; "
-                    "downstream parsers will determine validity",
+                    "final answer (enforce_used=%d) — returning raw response "
+                    "unprocessed; downstream parsers will determine validity",
                     op_id[:12] if op_id else "?", len(tool_calls),
+                    _enforcement_rounds_used,
                 )
                 self._last_records = list(records)
                 self._last_salient_args = list(salient_args)  # Slice 89

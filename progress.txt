@@ -150,3 +150,20 @@
                  (cold-boot-persisted-OPEN / no-state / trip-during-generate / fail-soft / record-
                  maintenance); zero new regressions (test_snapshot_shape failure is pre-existing S147
                  drift). RC2 (DW tool-loop non-convergence) tracked separately.
+  [x] slice-233  Parse-gate enforcement of convergence (RC2 of the soak findings). The soak proved
+                 the 3-axis convergence machinery (Slice 85 cumulative + Slice 3E nudge + grace round)
+                 FIRES but is ADVISORY — the model emits read-only nav on the grace round, the loop
+                 returns the patch-less raw, op fails. FINDING (premise-correction): this loop
+                 advertises tools as PROSE + parses tool_use from TEXT (generate_fn:(prompt)->str) —
+                 NO structured tools= array at the boundary to strip. So the absolute invariant is
+                 enforced at the PARSE gate: tool_executor._slice233_enforcement_action (pure) →
+                 once _final_nudge_issued, a PURE read-only round is REJECTED (reuses
+                 _READONLY_EXPLORATION_TOOLS — no new taxonomy), model gets a hard denial via the
+                 proven current_prompt-append+continue path, bounded by _enforcement_rounds_cap
+                 (env JARVIS_TOOL_LOOP_ENFORCEMENT_ROUNDS default 2) AND remaining budget vs
+                 final_write_reserve_s. Resilient: a valid patch (non-tool response) returns upstream
+                 at parse_fn=None BEFORE the gate (honored mid-enforcement); progress/mutation tools
+                 → FINALIZE (not suppressed); cap/budget spent → clean fail. 11 TDD tests
+                 (ENFORCE / NORMAL / cap-reached / no-budget / progress-present / env-cap / zero-cap
+                 opt-out + 3 wiring AST pins). slice3e+slice85 convergence regression green; the 3
+                 test_tool_loop_budget_plan failures are pre-existing (fail identically stashed).
