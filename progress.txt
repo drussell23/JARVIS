@@ -118,3 +118,17 @@
                  not $26 -> ~$24 outside audit trail); cost stack complete; BLUNT truth recorded
                  (cost solved, file-00 still won't dispatch = NON-economic autonomy blocker).
                  ROADMAP: A1 trace file-00 dispatch (milestone gate) is the #1 next action.
+  [x] slice-231  Telemetry-Driven Budget Synthesizer (Dynamic Allocation Kernel). ROOT FIX for
+                 the file-00 dispatch blocker: the per-route generation deadline was a STATIC
+                 lookup blind to live provider state, so a priority:critical roadmap goal routed
+                 IMMEDIATE (120s reflex window) and, when Claude was out of credits, the DW reroute
+                 (Slice 127 P2.1) inherited a too-short deadline -> deadline_exhausted_pre_fallback
+                 x23 before reaching the hardened DW agentic path. FIX: provider_availability.py
+                 (read-only ProviderAvailabilitySnapshot collector over the EXISTING
+                 claude_circuit_breaker + dw_surface_health state, fail-soft, no probe consumption);
+                 urgency_router.synthesize_generation_timeout LIFTS an IMMEDIATE tool-loop op to the
+                 COMPLEX 240s window when Claude is down (the load-bearing dispatch lever) +
+                 synthesize_budget_profile / context_budget_profile for honest §7 telemetry. Wired
+                 at orchestrator.py GENERATE _gen_timeout + both emit_decision stamp sites. Master
+                 JARVIS_BUDGET_SYNTHESIS_ENABLED default-TRUE; OFF = byte-identical legacy (proven).
+                 45 TDD tests green; zero new regressions (urgency_router/slice208/antivenom clean).

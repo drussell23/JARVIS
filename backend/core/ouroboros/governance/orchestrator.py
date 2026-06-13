@@ -3204,14 +3204,14 @@ class GovernedOrchestrator:
                             reason_code=f"urgency_route:{_route_reason}",
                             route=_provider_route.value,
                             route_reason=_route_reason,
-                            budget_profile=_UR.route_budget_profile(_provider_route),
+                            budget_profile=_UR.context_budget_profile(_provider_route, ctx),
                             details={
                                 "route": _provider_route.value,
                                 "route_description": _UR.describe_route(_provider_route),
                                 "signal_urgency": getattr(ctx, "signal_urgency", ""),
                                 "signal_source": getattr(ctx, "signal_source", ""),
                                 "task_complexity": getattr(ctx, "task_complexity", ""),
-                                "budget_profile": _UR.route_budget_profile(_provider_route),
+                                "budget_profile": _UR.context_budget_profile(_provider_route, ctx),
                             },
                         )
                     except Exception:
@@ -4434,6 +4434,47 @@ class GovernedOrchestrator:
                     _gen_timeout = _route_timeouts.get(
                         _route, self._config.generation_timeout_s
                     )
+                    # ── Slice 231: Telemetry-Driven Budget Synthesis ──────────
+                    # The per-route generation deadline is the REAL dispatch
+                    # lever (budget_profile is observability-only). When the
+                    # premium Claude fallback lane is economically down, an
+                    # IMMEDIATE op that must drive the Iron-Gate tool loop is
+                    # lifted from its reflex window (120s) to the COMPLEX-class
+                    # window (240s) so the DW reroute (Slice 127 P2.1) isn't
+                    # severed mid-tool-loop → kills deadline_exhausted_pre_fallback
+                    # at its source. Fail-soft: any sensing fault keeps the base.
+                    try:
+                        from backend.core.ouroboros.governance.urgency_router import (
+                            budget_synthesis_enabled as _bs_enabled,
+                            synthesize_generation_timeout as _bs_gen_timeout,
+                        )
+                        if _bs_enabled():
+                            from backend.core.ouroboros.governance.provider_availability import (
+                                collect_provider_availability as _bs_collect,
+                            )
+                            from backend.core.ouroboros.governance.exploration_engine import (
+                                exploration_gate_demands_tools as _bs_demands,
+                            )
+                            _bs_snap = _bs_collect()
+                            _bs_tld = _bs_demands(
+                                str(getattr(ctx, "task_complexity", "")),
+                            )
+                            _lifted = _bs_gen_timeout(
+                                _route, _gen_timeout, _bs_snap,
+                                tool_loop_demanded=_bs_tld,
+                                elevated_timeout_s=_route_timeouts.get("complex"),
+                            )
+                            if _lifted > _gen_timeout:
+                                logger.warning(
+                                    "[BudgetSynth] route=%s claude=down:%s "
+                                    "tool_loop=%s → gen_timeout lifted %.0fs→%.0fs "
+                                    "(DW reroute funded) op=%s",
+                                    _route, getattr(_bs_snap, "claude_reason", "?"),
+                                    _bs_tld, _gen_timeout, _lifted, ctx.op_id,
+                                )
+                                _gen_timeout = _lifted
+                    except Exception:  # noqa: BLE001 — never crash routing
+                        pass
                     # Read-only BG/SPEC subagent fan-out override (Session 6,
                     # Derek 2026-04-17). The outer asyncio.wait_for at line
                     # below enforces this timeout absolutely — when the op
