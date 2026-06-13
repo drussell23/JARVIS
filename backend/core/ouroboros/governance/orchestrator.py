@@ -6258,6 +6258,38 @@ class GovernedOrchestrator:
                         except Exception:
                             pass
 
+                    # ── Slice 235 fail-safe degradation governor ──────────────
+                    # A 2b.1-diff candidate failed to apply (stale context /
+                    # coordinate drift). Degrade THIS op's retry to full_content
+                    # so a botched diff doesn't re-emit a diff that fails again.
+                    # Set the per-op override the providers honor (op_context
+                    # .force_full_content_override) + tell the model to emit the
+                    # complete file. NEVER crash — this is recovery, not failure.
+                    _diff_failed = (
+                        "diff_apply_failed" in _err_str
+                        or "stale_diff" in _err_str
+                        or "StaleDiff" in _err_str
+                        or "validate_diff" in _err_str
+                    )
+                    if _diff_failed:
+                        _retry_ctx_kwargs["force_full_content_override"] = True
+                        _df_msg = (
+                            "\n\n[SYSTEM] Your unified-diff patch failed to apply "
+                            "(stale/ambiguous context). For this retry, emit the "
+                            "COMPLETE file content (full_content schema 2b.1), not "
+                            "a diff."
+                        )
+                        _df_existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "") or ""
+                        _retry_ctx_kwargs["strategic_memory_prompt"] = (
+                            f"{_df_existing}{_df_msg}" if _df_existing else _df_msg.strip()
+                        )
+                        logger.warning(
+                            "[Orchestrator] Slice235 fail-safe: diff apply failed "
+                            "(%s) → degrading op=%s retry to full_content",
+                            _err_str[:80],
+                            getattr(ctx, "op_id", "?"),
+                        )
+
                     # Inject re-plan if available (appends to error feedback)
                     if _replan_text:
                         _existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "")

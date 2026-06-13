@@ -277,6 +277,95 @@ def should_force_full_content(
     return False
 
 
+# Elite agentic families verified to emit verbatim unified-diff context (the
+# Qwen-397B workhorse is deliberately EXCLUDED — it's the model that couldn't,
+# per doubleword_provider.py:1583). Env-overridable; model NAMES never live in
+# code (only families), honoring brain_selection_policy.yaml as the source of
+# model truth.
+_DIFF_CAPABLE_FAMILIES_ENV = "JARVIS_DW_DIFF_CAPABLE_FAMILIES"
+_DEFAULT_DIFF_CAPABLE_FAMILIES = "moonshotai,deepseek-ai,zai-org"
+
+
+def _diff_capable_families() -> frozenset:
+    raw = (os.environ.get(_DIFF_CAPABLE_FAMILIES_ENV, "") or "").strip()
+    src = raw if raw else _DEFAULT_DIFF_CAPABLE_FAMILIES
+    return frozenset(
+        f.strip().lower() for f in src.split(",") if f.strip()
+    )
+
+
+def resolve_diff_capability_for_model(model_id: str) -> str:
+    """Map a DW catalog model id → schema_capability via its FAMILY (the vendor
+    prefix, e.g. ``moonshotai/Kimi-K2.6`` → ``moonshotai``). Reuses
+    provider_topology.parse_family when available, else the ``vendor/`` split.
+    Returns ``full_content_and_diff`` only for verified diff-capable families.
+    NEVER raises — unknown/empty → ``full_content_only`` (conservative)."""
+    try:
+        mid = (model_id or "").strip()
+        if not mid:
+            return "full_content_only"
+        family = ""
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                parse_family as _parse_family,
+            )
+            family = (_parse_family(mid) or "").strip().lower()
+        except Exception:  # noqa: BLE001 — fall back to the vendor-prefix split
+            family = ""
+        if not family:
+            family = mid.split("/", 1)[0].strip().lower() if "/" in mid else mid.strip().lower()
+        return (
+            "full_content_and_diff"
+            if family in _diff_capable_families()
+            else "full_content_only"
+        )
+    except Exception:  # noqa: BLE001
+        return "full_content_only"
+
+
+def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
+    """Largest line count across *target_files* (relative to *repo_root*).
+    Missing/unreadable files are skipped; all-missing/empty → ``None``. The diff
+    decision uses the MAX so any large file in a multi-file op can warrant a diff.
+    NEVER raises."""
+    try:
+        from pathlib import Path as _Path
+        if not target_files or repo_root is None:
+            return None
+        root = _Path(repo_root)
+        best = None
+        for rel in target_files:
+            try:
+                p = root / str(rel)
+                if not p.is_file():
+                    continue
+                n = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+                best = n if best is None else max(best, n)
+            except Exception:  # noqa: BLE001 — skip unreadable, never raise
+                continue
+        return best
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_force_full_content(
+    *, schema_capability: str, target_files, repo_root,
+) -> bool:
+    """Decoupled seam (no inline conditionals in the provider hot loops): decide
+    force_full_content from the model's diff capability + the largest target
+    file's line count. Fail-soft → ``True`` (conservative full_content) on any
+    error, so a bad read can never push an op into an un-emittable diff."""
+    try:
+        lines = _max_target_line_count(target_files, repo_root)
+        return should_force_full_content(
+            schema_capability=schema_capability,
+            target_line_count=lines,
+            threshold_lines=_diff_schema_threshold_lines(),
+        )
+    except Exception:  # noqa: BLE001
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Attachment Serialization (Task 7 of VisionSensor + Visual VERIFY arc)
 # ---------------------------------------------------------------------------
@@ -4939,7 +5028,17 @@ class PrimeProvider:
             _schema_cap = getattr(
                 context.telemetry.routing_intent, "schema_capability", "full_content_only"
             )
-        _force_full = _schema_cap != "full_content_and_diff"
+        # Slice 235 — the computed _force_full was previously IGNORED (the prompt
+        # builders hardcoded True), so the native 2b.1-diff path was dead-coded
+        # off. Now gate it through the decoupled seam: a diff-capable brain emits
+        # 2b.1-diff only for LARGE files; small files / weak brains stay
+        # full_content. Fail-soft to full_content; orchestrator degrades on stale.
+        _force_full = bool(getattr(context, "force_full_content_override", False)) or \
+            resolve_force_full_content(
+                schema_capability=_schema_cap,
+                target_files=getattr(context, "target_files", ()) or (),
+                repo_root=repo_root,
+            )
 
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
@@ -4958,7 +5057,7 @@ class PrimeProvider:
                 context,
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
-                force_full_content=True,
+                force_full_content=_force_full,
                 mcp_tools=_mcp_tools,
                 preloaded_out=_preloaded_files,
             )
@@ -4972,7 +5071,7 @@ class PrimeProvider:
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
-                force_full_content=True,
+                force_full_content=_force_full,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",

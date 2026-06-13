@@ -17,6 +17,9 @@ import pytest
 
 from backend.core.ouroboros.governance.providers import (
     _diff_schema_threshold_lines,
+    _max_target_line_count,
+    resolve_diff_capability_for_model,
+    resolve_force_full_content,
     should_force_full_content,
 )
 
@@ -64,3 +67,81 @@ class TestShouldForceFullContent:
         assert _diff_schema_threshold_lines() == 1500
         monkeypatch.setenv("JARVIS_DIFF_SCHEMA_THRESHOLD_LINES", "-5")
         assert _diff_schema_threshold_lines() == d  # invalid → default
+
+
+class TestDiffCapabilityByFamily:
+    def test_elite_families_are_diff_capable(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_DW_DIFF_CAPABLE_FAMILIES", raising=False)
+        assert resolve_diff_capability_for_model("moonshotai/Kimi-K2.6") == "full_content_and_diff"
+        assert resolve_diff_capability_for_model("deepseek-ai/DeepSeek-V4-Pro") == "full_content_and_diff"
+        assert resolve_diff_capability_for_model("zai-org/GLM-5.1-FP8") == "full_content_and_diff"
+
+    def test_qwen_397b_workhorse_is_not_diff_capable(self, monkeypatch):
+        # The 397B is exactly the model that couldn't do verbatim diffs (the
+        # reason 2b.1-diff was disabled) — must stay full_content_only.
+        monkeypatch.delenv("JARVIS_DW_DIFF_CAPABLE_FAMILIES", raising=False)
+        assert resolve_diff_capability_for_model("Qwen/Qwen-397B") == "full_content_only"
+
+    def test_unknown_or_empty_model_full_only(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_DW_DIFF_CAPABLE_FAMILIES", raising=False)
+        assert resolve_diff_capability_for_model("") == "full_content_only"
+        assert resolve_diff_capability_for_model("randovendor/foo") == "full_content_only"
+
+    def test_env_override_families(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_DW_DIFF_CAPABLE_FAMILIES", "acme,Qwen")
+        assert resolve_diff_capability_for_model("Qwen/Qwen-397B") == "full_content_and_diff"
+        assert resolve_diff_capability_for_model("moonshotai/Kimi-K2.6") == "full_content_only"
+
+
+class TestMaxTargetLineCount:
+    def test_max_across_targets(self, tmp_path):
+        (tmp_path / "small.py").write_text("a\nb\n")
+        (tmp_path / "big.py").write_text("\n".join(str(i) for i in range(500)))
+        n = _max_target_line_count(["small.py", "big.py"], tmp_path)
+        assert n == 500
+
+    def test_missing_files_skipped(self, tmp_path):
+        (tmp_path / "real.py").write_text("x\ny\nz\n")
+        n = _max_target_line_count(["real.py", "ghost.py"], tmp_path)
+        assert n == 3
+
+    def test_all_missing_is_none(self, tmp_path):
+        assert _max_target_line_count(["ghost.py"], tmp_path) is None
+
+    def test_empty_targets_is_none(self, tmp_path):
+        assert _max_target_line_count([], tmp_path) is None
+
+
+class TestResolveForceFullContentSeam:
+    def test_capable_large_uses_diff(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("JARVIS_DIFF_SCHEMA_THRESHOLD_LINES", raising=False)
+        (tmp_path / "big.py").write_text("\n".join(str(i) for i in range(2000)))
+        out = resolve_force_full_content(
+            schema_capability="full_content_and_diff",
+            target_files=["big.py"], repo_root=tmp_path,
+        )
+        assert out is False
+
+    def test_weak_model_forces_full(self, tmp_path):
+        (tmp_path / "big.py").write_text("\n".join(str(i) for i in range(2000)))
+        out = resolve_force_full_content(
+            schema_capability="full_content_only",
+            target_files=["big.py"], repo_root=tmp_path,
+        )
+        assert out is True
+
+    def test_capable_small_forces_full(self, tmp_path):
+        (tmp_path / "small.py").write_text("a\nb\nc\n")
+        out = resolve_force_full_content(
+            schema_capability="full_content_and_diff",
+            target_files=["small.py"], repo_root=tmp_path,
+        )
+        assert out is True
+
+    def test_fail_soft_true_on_bad_input(self):
+        # Unreadable / None repo_root → conservative full_content, never raise.
+        out = resolve_force_full_content(
+            schema_capability="full_content_and_diff",
+            target_files=["x.py"], repo_root=None,
+        )
+        assert out is True

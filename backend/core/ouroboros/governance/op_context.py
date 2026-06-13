@@ -935,6 +935,12 @@ class OperationContext:
     declared_targets: Tuple[str, ...] = ()
     risk_tier: Optional[RiskTier] = None
     description: str = ""
+    # Slice 235 — per-op force-full override. Set by the orchestrator fail-safe
+    # on a GENERATE_RETRY after a 2b.1-diff candidate failed to apply (stale /
+    # ambiguous context): the retry forces full_content regardless of model
+    # capability / file size, so a botched diff degrades cleanly instead of
+    # re-emitting a diff that fails again. Default False = adaptive (Slice 235).
+    force_full_content_override: bool = False
     routing: Optional[RoutingDecision] = None
     approval: Optional[ApprovalDecision] = None
     shadow: Optional[ShadowResult] = None

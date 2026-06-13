@@ -198,9 +198,7 @@
                  FOLLOW-UP (tracked, separate slice): promote _resolve_runtime_repo_root (S234) to a
                  SHARED governance resolver + route all ~8 direct JARVIS_REPO_PATH reads through it
                  (validate vs runtime FS, fail loud) — context-independent of the env. NOT done here.
-  [~] slice-235  Adaptive diff (re-enable native 2b.1-diff) — LAYER-5 fix. AUDIT COMPLETE + keystone
-                 landed; generation-core wiring mapped, NOT yet wired (quality checkpoint — providers
-                 are THE generation path, a bug breaks all gen; deferred careful wiring + soak).
+  [x] slice-235  Adaptive diff (re-enable native 2b.1-diff) — LAYER-5 fix, FULLY WIRED.
                  AUDIT: the full 2b.1-diff machinery already exists (providers.py _SCHEMA_VERSION_DIFF
                  :219, _DIFF_CANDIDATE_KEYS :222, _apply_unified_diff :1488, validate_diff_context +
                  StaleDiffError :1343/1373) and schema_capability plumbing is complete end-to-end
@@ -219,3 +217,19 @@
                  force_full_content + retry full_content, never crash); (4) soak. OPEN: can elite models
                  (Kimi/DeepSeek-V4-Pro/GLM) do verbatim diffs where the 397B couldn't — fail-safe makes
                  it safe to test live. Branch perf/slice-235-adaptive-diff.
+  [x] slice-235b WIRING COMPLETE (gen-core, careful): keystone should_force_full_content +
+                 _diff_schema_threshold_lines (env JARVIS_DIFF_SCHEMA_THRESHOLD_LINES=800) + the
+                 decoupled seam resolve_force_full_content / resolve_diff_capability_for_model
+                 (env JARVIS_DW_DIFF_CAPABLE_FAMILIES default moonshotai,deepseek-ai,zai-org — the
+                 397B EXCLUDED; reuses dw_catalog_client.parse_family) / _max_target_line_count.
+                 WIRED: doubleword_provider.py:1583 (was unconditional True) + providers.py Claude
+                 block (the computed-but-IGNORED _force_full now USED — both lean+full prompt builds)
+                 → native 2b.1-diff emitted only when (diff-capable elite family AND file>threshold).
+                 FAIL-SAFE: op_context.force_full_content_override field (on OperationContext@881,
+                 carried by advance/replace) + orchestrator GENERATE_RETRY governor (diff_apply_failed/
+                 stale_diff/validate_diff → set override + 'emit full file' feedback → retry degrades
+                 to full_content, never crashes/loops). Elite DW models are CATALOG models (not yaml
+                 brains) → capability via env families, not brain_selection_policy.yaml. 19 TDD tests;
+                 slice208 + op_context replace green; pre-existing failures unrelated (urgency source-
+                 table drift, sandbox_loop missing module). NOT YET SOAK-VALIDATED — open empirical Q:
+                 do elite models clear the verbatim-diff wall (fail-safe makes it safe to test live).

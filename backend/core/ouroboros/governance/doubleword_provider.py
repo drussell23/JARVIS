@@ -1579,18 +1579,38 @@ class DoublewordProvider:
             return None
         self._check_budget()
 
-        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
-        # Always use full_content schema (2b.1) — the 397B can't reliably
-        # produce verbatim context lines for unified diffs (2b.1-diff).
+        from backend.core.ouroboros.governance.providers import (
+            _build_codegen_prompt,
+            resolve_diff_capability_for_model,
+            resolve_force_full_content,
+        )
+        operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
+        _effective_model = self._resolve_effective_model(ctx)
+        # Slice 235 — adaptive diff. Was unconditional full_content because the
+        # 397B can't produce verbatim diff context. Now gated: a diff-capable
+        # ELITE family (Kimi/DeepSeek-V4-Pro/GLM — NOT the 397B) on a LARGE file
+        # emits the native 2b.1-diff (bounded output → no 60K-blob JSONDecodeError);
+        # everything else stays full_content. Fail-soft to full_content; the
+        # orchestrator degrades a stale/failed diff back to full_content.
+        _force_full = bool(getattr(ctx, "force_full_content_override", False)) or \
+            resolve_force_full_content(
+                schema_capability=resolve_diff_capability_for_model(_effective_model),
+                target_files=getattr(ctx, "target_files", ()) or (),
+                repo_root=self._repo_root,
+            )
+        if not _force_full:
+            logger.info(
+                "[DoublewordProvider] Slice235 adaptive-diff: emitting 2b.1-diff "
+                "schema (model=%s diff-capable, large target) op=%s",
+                _effective_model, operation_id,
+            )
         prompt = prompt_override or _build_codegen_prompt(
             ctx,
             repo_root=self._repo_root,
             repo_roots=self._repo_roots or None,
-            force_full_content=True,
+            force_full_content=_force_full,
             provider_route=getattr(ctx, "provider_route", "") or "",
         )
-        operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
-        _effective_model = self._resolve_effective_model(ctx)
 
         # Slice 38 — canonical JSONL composition via single helper.
         # Replaces raw ``json.dumps(...)`` which omitted the trailing
