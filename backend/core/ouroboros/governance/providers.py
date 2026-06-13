@@ -367,6 +367,129 @@ def resolve_force_full_content(
 
 
 # ---------------------------------------------------------------------------
+# Slice 236 — capability-aware DW baseline selection (the "sixth layer" fix)
+#
+# The Slice-235 gate decides full_content-vs-diff for the model that is ALREADY
+# selected; it cannot fix a selector that only ever offers the non-diff-capable
+# Qwen-397B baseline. These pure seams let the DW provider PREFER an entitled
+# diff-capable elite for large-file patch ops — reusing the SAME size primitive
+# the gate reads so the "needs a diff" signal can never drift from the gate's
+# "force full" signal, and the SAME family-capability set so capability is read
+# from one source of truth. No model NAMES live in code: selection is data-driven
+# from the injected catalog + JARVIS_DW_FAMILY_PREFERENCE + diff-capable families.
+# ---------------------------------------------------------------------------
+_CAPABILITY_AWARE_SELECTION_ENV = "JARVIS_DW_CAPABILITY_AWARE_SELECTION_ENABLED"
+
+
+def capability_aware_selection_enabled() -> bool:
+    """Master switch for capability-aware DW baseline selection. Default TRUE —
+    it is a root-cause fix whose OFF path, small-file path, no-elite-reachable
+    path, and already-capable-baseline path are all byte-identical to the legacy
+    baseline default; the kill switch exists purely for rollback. NEVER raises."""
+    raw = (os.environ.get(_CAPABILITY_AWARE_SELECTION_ENV, "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def op_warrants_diff_capable_model(*, target_files, repo_root) -> bool:
+    """True iff the op's largest target file exceeds the diff threshold — i.e. a
+    diff-capable model COULD emit a bounded 2b.1-diff instead of a full_content
+    blob. Reuses the SAME primitives the gate (``resolve_force_full_content``)
+    reads — ``_max_target_line_count`` + ``_diff_schema_threshold_lines`` — so the
+    selector's "needs a diff-capable model" decision and the gate's size decision
+    cannot drift apart. Fail-soft → ``False`` (no special routing) on any error."""
+    try:
+        lines = _max_target_line_count(target_files, repo_root)
+        return isinstance(lines, int) and lines > _diff_schema_threshold_lines()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _model_family(model_id: str) -> str:
+    """Family (vendor prefix) of a DW catalog model id, lower-cased. Reuses
+    ``dw_catalog_client.parse_family`` when importable, else the ``vendor/`` split.
+    Empty/unknown → ``""``. NEVER raises."""
+    try:
+        mid = (model_id or "").strip()
+        if not mid:
+            return ""
+        fam = ""
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                parse_family as _parse_family,
+            )
+            fam = (_parse_family(mid) or "").strip().lower()
+        except Exception:  # noqa: BLE001 — fall back to the vendor-prefix split
+            fam = ""
+        if not fam or fam == "unknown":
+            fam = mid.split("/", 1)[0].strip().lower() if "/" in mid else mid.strip().lower()
+        return fam
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def select_diff_capable_model(
+    *, available_models, family_preference, diff_capable_families,
+) -> "Optional[str]":
+    """From the entitled catalog *available_models*, pick the model whose FAMILY
+    is diff-capable and ranks highest in *family_preference*. Pure — no env /
+    catalog / IO reads (the caller injects all three) so it is deterministic and
+    unit-testable. Ranking: descending family preference (absent family → 0.0),
+    then ascending model id (a stable, deterministic tie-break). Returns ``None``
+    when no available model belongs to a diff-capable family. NEVER raises."""
+    try:
+        capable = {str(f).strip().lower() for f in (diff_capable_families or ())}
+        pref = {
+            str(k).strip().lower(): float(v)
+            for k, v in dict(family_preference or {}).items()
+        }
+        candidates = []
+        for mid in (available_models or ()):
+            if not isinstance(mid, str) or not mid.strip():
+                continue
+            fam = _model_family(mid)
+            if fam and fam in capable:
+                candidates.append((pref.get(fam, 0.0), mid))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: (-t[0], t[1]))
+        return candidates[0][1]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def capability_aware_default_model(
+    *, base_model, target_files, repo_root,
+    available_models, family_preference, diff_capable_families, enabled,
+) -> str:
+    """Pure orchestration seam: given the baseline default model + the op's size
+    signal + the entitled catalog + preference + diff-capable families, return the
+    model the DW provider should actually use. Prefers an entitled diff-capable
+    elite ONLY when ALL hold: *enabled*; the baseline is not already diff-capable;
+    the op warrants a large-file patch (gate-shared size signal); such an elite is
+    available. Otherwise returns *base_model* unchanged. No env / catalog / IO
+    reads — all injected → deterministic + unit-testable. Fail-soft → base_model,
+    so model resolution can never be broken by this seam."""
+    try:
+        if not enabled:
+            return base_model
+        capable = {str(f).strip().lower() for f in (diff_capable_families or ())}
+        if _model_family(base_model) in capable:
+            return base_model  # baseline default is itself diff-capable — no switch
+        if not op_warrants_diff_capable_model(
+            target_files=target_files, repo_root=repo_root,
+        ):
+            return base_model  # small / unknown file — baseline is correct
+        chosen = select_diff_capable_model(
+            available_models=available_models,
+            family_preference=family_preference,
+            diff_capable_families=diff_capable_families,
+        )
+        return chosen or base_model  # no entitled elite → graceful full_content
+    except Exception:  # noqa: BLE001
+        return base_model
+
+
+# ---------------------------------------------------------------------------
 # Attachment Serialization (Task 7 of VisionSensor + Visual VERIFY arc)
 # ---------------------------------------------------------------------------
 #

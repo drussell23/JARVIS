@@ -143,6 +143,13 @@ def test_resolver_reads_contextvar_first(
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
         )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
+        )
 
     p = _StubProvider()
     ctx = _FakeCtx("background")
@@ -166,6 +173,13 @@ def test_resolver_falls_back_when_contextvar_unset(
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
         )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
+        )
 
     p = _StubProvider()
     ctx = _FakeCtx("")  # no route → returns self._model
@@ -188,6 +202,13 @@ def test_resolver_empty_string_override_falls_through() -> None:
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
         )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
+        )
 
     p = _StubProvider()
     ctx = _FakeCtx("")
@@ -209,6 +230,13 @@ def test_resolver_ctx_without_dw_model_override_attr_no_raise() -> None:
         _model = "default-model-id"
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
+        )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
         )
 
     p = _StubProvider()
@@ -317,6 +345,13 @@ async def test_e2e_dispatcher_resolver_round_trip() -> None:
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
         )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
+        )
 
     provider = _StubProvider()
     ctx = _FakeCtx("background")
@@ -343,6 +378,13 @@ async def test_e2e_two_concurrent_attempts_isolated() -> None:
         _model = "default"
         _resolve_effective_model = (
             dwp.DoublewordProvider._resolve_effective_model
+        )
+        # Slice 236 — the resolver's baseline fallback now delegates to this
+        # sibling; a faithful stub of the resolver must borrow it too. With no
+        # ``_repo_root`` on the stub it fail-softs back to ``self._model``,
+        # preserving the legacy fallthrough these tests assert.
+        _capability_aware_default = (
+            dwp.DoublewordProvider._capability_aware_default
         )
 
     provider = _StubProvider()

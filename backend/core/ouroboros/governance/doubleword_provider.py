@@ -1278,19 +1278,70 @@ class DoublewordProvider:
         # (2) v1 route → model mapping.
         route = getattr(ctx, "provider_route", "") or ""
         if not route:
-            return self._model
+            return self._capability_aware_default(ctx, self._model)
         try:
             from backend.core.ouroboros.governance.provider_topology import (
                 get_topology,
             )
         except Exception:
-            return self._model
+            return self._capability_aware_default(ctx, self._model)
         # Phase 10 Slice 5a — unified deletion-side helper. Branches
         # on JARVIS_TOPOLOGY_SENTINEL_ENABLED internally; v2 path
         # returns first element of dw_models_for_route (catalog-first
         # → yaml fallback); v1 path is byte-identical to model_for_route.
         override = get_topology().model_for_route_unified(route)
-        return override or self._model
+        # (3) Baseline default. Slice 236 — an explicit per-route/sentinel
+        # override above is a DELIBERATE choice (respected verbatim); only the
+        # generic ``self._model`` baseline (the non-diff-capable Qwen-397B the
+        # IMMEDIATE→DW reroute falls onto) gets capability-aware treatment.
+        return override or self._capability_aware_default(ctx, self._model)
+
+    def _capability_aware_default(self, ctx: Any, base_model: str) -> str:
+        """Slice 236 — when DW route resolution falls through to the generic
+        baseline default (``self._model``, typically the non-diff-capable
+        Qwen-397B that the IMMEDIATE→DW reroute lands on) AND the op warrants a
+        large-file patch, prefer an entitled diff-capable elite family so the
+        Slice-235 2b.1-diff seam can actually engage. Thin wrapper: gathers the
+        live catalog + preference + capable-family set and delegates the decision
+        to the pure ``providers.capability_aware_default_model`` seam (the size
+        signal is the SAME one the gate reads — no drift). Gated; fail-soft → base.
+        OFF / small-file / no-entitled-elite / already-capable-base → byte-identical.
+        NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.providers import (
+                capability_aware_selection_enabled,
+                capability_aware_default_model,
+                _diff_capable_families,
+            )
+            if not capability_aware_selection_enabled():
+                return base_model
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                load_cached_snapshot,
+            )
+            from backend.core.ouroboros.governance.dw_catalog_classifier import (
+                _family_preference,
+            )
+            snap = load_cached_snapshot()
+            available = list(snap.model_ids()) if snap is not None else []
+            chosen = capability_aware_default_model(
+                base_model=base_model,
+                target_files=getattr(ctx, "target_files", ()) or (),
+                repo_root=self._repo_root,
+                available_models=available,
+                family_preference=_family_preference(),
+                diff_capable_families=_diff_capable_families(),
+                enabled=True,
+            )
+            if chosen != base_model:
+                logger.warning(
+                    "[DoublewordProvider] Slice236 capability-aware selection: "
+                    "large-file patch op (route=%s) → diff-capable %s "
+                    "(was baseline %s) — enabling the 2b.1-diff seam",
+                    getattr(ctx, "provider_route", "?"), chosen, base_model,
+                )
+            return chosen
+        except Exception:  # noqa: BLE001 — never break model resolution
+            return base_model
 
     # ------------------------------------------------------------------
     # Hoisted state accessors (Phase 1 Step 3B)
