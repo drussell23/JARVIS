@@ -386,6 +386,65 @@ async def authenticate_with_intelligent_service(
 # API Endpoints
 # ============================================================================
 
+@router.get("/diagnostics")
+async def get_voice_unlock_diagnostics():
+    """
+    Get comprehensive diagnostic information for voice unlock system.
+    
+    Returns detailed diagnostics including:
+    - Component health (ECAPA, PAVA, VIBA)
+    - Root cause analysis
+    - Recommended actions
+    - Integration status
+    """
+    try:
+        from voice_unlock.intelligent_diagnostic_system import get_diagnostic_system
+        
+        system = get_diagnostic_system()
+        diagnostic = await system.run_full_diagnostic()
+        
+        # Convert to JSON-serializable format
+        result = {
+            "overall_status": diagnostic.overall_status.value,
+            "overall_confidence": diagnostic.overall_confidence,
+            "timestamp": datetime.now().isoformat(),
+            "components": {},
+            "root_causes": diagnostic.root_causes,
+            "recommended_actions": [
+                {
+                    "priority": action.get("priority", "medium"),
+                    "action": action.get("action", ""),
+                    "auto_remediable": action.get("auto_remediable", False)
+                }
+                for action in diagnostic.recommended_actions
+            ],
+            "integration_status": diagnostic.integration_status
+        }
+        
+        # Convert component diagnostics
+        for name, component in diagnostic.components.items():
+            result["components"][name] = {
+                "status": component.status.value,
+                "severity": component.severity.value if hasattr(component.severity, 'value') else str(component.severity),
+                "message": component.message,
+                "details": component.details,
+                "auto_remediable": getattr(component, 'auto_remediable', False)
+            }
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"Diagnostic check failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Diagnostic check failed",
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+
 @router.get("/status")
 async def get_voice_unlock_status():
     """
