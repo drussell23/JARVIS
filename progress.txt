@@ -167,3 +167,22 @@
                  (ENFORCE / NORMAL / cap-reached / no-budget / progress-present / env-cap / zero-cap
                  opt-out + 3 wiring AST pins). slice3e+slice85 convergence regression green; the 3
                  test_tool_loop_budget_plan failures are pre-existing (fail identically stashed).
+  [x] slice-234  Runtime-aware repo-root resolution (the final GOAL-001 blocker). RE-SOAK of
+                 231+232+233 PROVED the budget root cause SOLVED: GOAL-001 routed IMMEDIATE w/
+                 DW-primary {1.0,0,180s} (was {0,0,0}), Slice232 persisted signal fired
+                 (breaker_open_economic_persisted), DW generated the patch (outcome=ok x9),
+                 REVIEW=APPROVE, GATE→OrangePR, reached APPLY — then failed ONLY at APPLY:
+                 "[Errno 2] No such file: '/Users/.../semantic_index.py'" (host abs path inside a
+                 /app container). ORIGIN (diagnosed, not symptom-patched): harness.from_env sourced
+                 repo_path from JARVIS_REPO_PATH (host path injected via .env env_file)
+                 UNCONDITIONALLY → fed the op-envelope repo_root (harness.py:2403/2805/2918) →
+                 ChangeEngine priority-1 per-request write root → APPLY joined relative targets
+                 against the host path. FIX: harness._resolve_runtime_repo_root — honor
+                 JARVIS_REPO_PATH ONLY if it exists+plausible in THIS runtime (carries
+                 backend/core/ouroboros), else derive from the code's own on-disk location
+                 (container-safe, no .git needed), else .git walk-up, else FAIL LOUD. Same
+                 authoritative root fixes OrangePR git discovery. 7 TDD tests (host-valid-env /
+                 container-stale-env-rejected / env-not-a-repo / no-env-code-location /
+                 unresolvable-fail-loud / empty-env / from_env-integration). 15 existing harness
+                 tests green. gen_timeout-lift wiring (S231 lever masked by autarky) deferred to a
+                 separate follow-up slice per operator.
