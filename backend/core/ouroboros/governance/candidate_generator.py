@@ -3204,6 +3204,45 @@ class CandidateGenerator:
             provider_route,
         )
 
+        # Slice 229 — exploration-floor driven route elevation. When this op
+        # must satisfy the Iron Gate exploration floor (the SAME Slice-226
+        # predicate that opens the tool loop + steers the hedge), prepend the
+        # COMPLEX route's agentic-elite pool (active-param-ranked, family-
+        # weighted) so tool-loop work is never starved onto low-active models
+        # that cannot drive it. The live layer-5 wedge: Kimi/DeepSeek-V4-Pro/
+        # GLM-5.1 all promoted=True yet UNREACHABLE from STANDARD — file-00's
+        # 'simple' label kept it in a pool whose only capable member drifts.
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                exploration_gate_demands_tools as _s229_gate_demands,
+            )
+            from backend.core.ouroboros.governance.provider_topology import (
+                elevate_pool_for_exploration as _s229_elevate,
+            )
+            _s229_demands = (
+                provider_route not in ("background", "speculative")
+                and _s229_gate_demands(
+                    str(getattr(context, "task_complexity", "")),
+                )
+            )
+            if _s229_demands and provider_route != "complex":
+                _s229_elite = topology.dw_models_for_route("complex")
+                _s229_pool = _s229_elevate(
+                    tuple(ranked_models), tuple(_s229_elite),
+                    demands_tools=True,
+                )
+                if tuple(_s229_pool) != tuple(ranked_models):
+                    logger.warning(
+                        "[CandidateGenerator] ⚡ ROUTE ELEVATION: op needs "
+                        "Iron-Gate exploration — agentic-elite (COMPLEX) pool "
+                        "prepended for route=%s: %s (op=%s)",
+                        provider_route, list(_s229_pool)[:4],
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                    ranked_models = list(_s229_pool)
+        except Exception:  # noqa: BLE001 — elevation is enhancement, never blocks
+            pass
+
         # Slice 201 — Contextual Bandit Routing Advisor. ADVISORY-ONLY +
         # structurally fail-closed: the advisor reorders WITHIN ranked_models
         # (the brain_selection_policy active set for this route), so it can

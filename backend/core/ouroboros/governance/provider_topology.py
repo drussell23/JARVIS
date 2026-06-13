@@ -606,6 +606,56 @@ class ProviderTopology:
 _EMPTY_TOPOLOGY = ProviderTopology(enabled=False)
 
 
+def route_elevation_enabled() -> bool:
+    """Slice 229 master — exploration-floor driven route elevation. Default
+    **TRUE**: an op that must satisfy the Iron Gate exploration floor gets the
+    COMPLEX route's (agentic-elite, active-param-ranked) model pool prepended to
+    its own, so tool-loop work is never starved onto low-active models that
+    cannot drive it (the live GOAL-001::file-00 layer-5 wedge: elites all
+    promoted but unreachable from STANDARD). OFF = byte-identical legacy pool.
+    NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_ROUTE_ELEVATION_ENABLED", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def elevate_pool_for_exploration(
+    ranked_models: Tuple[str, ...],
+    elite_models: Tuple[str, ...],
+    *,
+    demands_tools: bool,
+) -> Tuple[str, ...]:
+    """Slice 229 — pure pool-expansion invariant.
+
+    When ``demands_tools`` (the Slice-226 ``exploration_gate_demands_tools``
+    predicate, resolved by the caller) and the master is on, return
+    ``elite_models + (ranked_models - elite_models)``: the COMPLEX pool —
+    already ranked agentic-first by active-param scoring + family preference —
+    leads, the route's own models follow, deduped, order-stable. Elites-first is
+    deliberate: a gated op on a weak model burns its GENERATE attempts and fails
+    anyway, so one capable run is both cheaper and the point. No model names in
+    code — the elite pool is whatever the classifier ranked into COMPLEX.
+    Identity when the demand is absent / master off / elite pool empty.
+    NEVER raises — falls back to the unmodified pool."""
+    try:
+        base = tuple(ranked_models or ())
+        if not demands_tools or not route_elevation_enabled():
+            return base
+        elites = tuple(elite_models or ())
+        if not elites:
+            return base
+        elite_set = set(elites)
+        return elites + tuple(m for m in base if m not in elite_set)
+    except Exception:  # noqa: BLE001 — defensive: never perturb dispatch
+        try:
+            return tuple(ranked_models or ())
+        except Exception:  # noqa: BLE001
+            return ()
+
+
 def _locate_policy_yaml() -> Optional[Path]:
     """Return the path to ``brain_selection_policy.yaml`` or None.
 
