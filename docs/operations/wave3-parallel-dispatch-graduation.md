@@ -137,26 +137,43 @@ Per the W2(5) protocol carried forward into W3(6):
    overrides.
 7. **On clean post-flip**: Wave 3 (6) → **FINAL**.
 
-### Live reachability blocker (current state)
+### Live reachability blocker (current state — promoted 2026-04-25)
 
-Per the graduation matrix's S1+S2+S3 cadence: **0 of 3 sessions
-produced live `[ParallelDispatch]` markers**, all blocked by
-`intake_priority_inversion` (BG sensor flood starves the
-forced-reachability seed in `UnifiedIntakeRouter`'s class-partitioned
-FIFO queue).
+**Block class history**:
+- W3(6) S1+S2+S3 cadence (2026-04-23/24): `live_reachability=blocked_by_intake_starvation` — BG sensor flood starved the forced-reachability seed in `UnifiedIntakeRouter`'s class-partitioned FIFO queue.
+- F1 Slice 4 cadence S1b (2026-04-25): `live_reachability=blocked_by_provider_exhaustion` — **intake starvation FIXED**, but seed exhausts at GENERATE via DW primary failure → Claude fallback `CancelledError` after 72.8s sem_wait × 3 retries (`anthropic_transport`-class infra waiver, not runner-attributed).
 
-**Unblock path**: F1 — Intake priority scheduling
-(`memory/project_followup_f1_intake_governor_enforcement.md`). F1
-Slices 1–3 shipped per memory; F1 Slice 4 (live cadence) gated on
-merge + CI on main.
+**S1b proved F1+F2 plumbing end-to-end on production traffic** — first
+ever live battle-test where `[IntakePriority] primary dequeue` markers
+fired (8 in session) AND `envelope_routing_override` markers fired (3
+in session) AND the F2-stamped seed routed STANDARD via the priority-0.5
+clause (was IMMEDIATE in S1a without F2). Extended blocklist clean (0
+traceback frames in `parallel_dispatch.py`/`worktree_manager.py`/
+`phase_runners/`/`phase_dispatcher.py`).
 
-**Not in Slice 5a's scope to fix.** Slice 5a delivers everything
-gradutation-ready except the 3 live sessions; Slice 5b cannot fire
-until F1 unblocks live reachability OR operator narrowly waives the
-live-reachability bar in favor of test-harness supplements (8
-hermetic supplements covering eligibility / shadow / enforce /
-hot-revert / Iron Gate composition / worktree integration ship in
-Slice 5a — see `tests/governance/test_parallel_dispatch_reachability_supplement.py`).
+**The structural intake failure mode is resolved.** What remains is a
+downstream provider transport reliability issue, classified as
+infra-noise per the W2(5) graduation matrix's `anthropic_transport`
+waiver convention.
+
+**Unblock paths** (operator-deferred 2026-04-25):
+- Provider transport reliability fix (DW endpoint stability OR Claude
+  fallback timeout/retry-budget tuning) — outside W3(6)+F1+F2 scope.
+- Organic accumulation: under steady-state operation, any sensor
+  producing a multi-file generation will exercise the now-graduated-
+  shape F1+F2 path and the post-GENERATE seam will fire.
+
+**Explicitly REJECTED unblock paths** (per operator binding):
+- Modifying the seed to a smaller workload to dodge the provider
+  timeout — would mask the issue, not fix it.
+- Inflating timeout boundaries via env — same masking concern.
+
+**Cadence record** (full evidence in
+`memory/project_wave3_item6_graduation_matrix.md` §"F1 Slice 4
+cadence S1b — `live_reachability=blocked_by_provider_exhaustion`"):
+session `bt-2026-04-25-054256`, MERGE_HEAD_SHA `b068c8a083`,
+1/3 cadence sessions recorded, PAUSED — Slice 5b default flip remains
+blocked, Slice 4 default flip remains blocked.
 
 ---
 
@@ -215,8 +232,9 @@ Exit 0 on PASS; non-zero with failed-check summary on FAIL.
 | Operations runbook | ✓ this document |
 | Structural pin tests | ✓ `tests/governance/test_w3_6_slice5a_structural_pins.py` |
 | Live-fire smoke | ✓ `scripts/livefire_w3_6_parallel_dispatch.py` |
-| 3 clean live sessions | ⚠ blocked by F1 (intake priority scheduling) |
-| Slice 5b default flip | ⏸ pending operator authorization after F1 unblocks |
+| F1+F2 plumbing live-PROVEN | ✓ S1b session `bt-2026-04-25-054256` (8 F1 markers, 3 F2 markers, seed routed STANDARD) |
+| 3 clean live sessions | ⚠ 1/3 recorded; cadence PAUSED on `live_reachability=blocked_by_provider_exhaustion` (`anthropic_transport` infra waiver) |
+| Slice 5b default flip | ⏸ pending provider-transport unblock OR organic multi-file generation accumulation |
 
 ---
 
