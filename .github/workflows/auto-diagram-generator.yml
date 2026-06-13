@@ -222,9 +222,13 @@ jobs:
           fi
           echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
 
-          # Safely convert changed_files array to JSON, handling empty arrays
+          # Safely convert changed_files array to JSON, handling empty arrays.
+          # NOTE: -c flag (compact) is required — $GITHUB_OUTPUT only accepts
+          # single-line `name=value` writes; jq's default pretty-print emits
+          # multi-line JSON which the actions runner rejects with
+          # "Invalid format" and fails the job.
           if [[ "${#changed_files[@]}" -gt 0 ]]; then
-            changed_files_json=$(printf '%s\n' "${changed_files[@]}" | jq -Rs 'split("\n") | map(select(length > 0))')
+            changed_files_json=$(printf '%s\n' "${changed_files[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
           else
             changed_files_json='[]'
           fi
