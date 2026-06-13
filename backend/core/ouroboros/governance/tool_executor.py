@@ -4624,6 +4624,85 @@ def _should_force_convergence(
     return cumulative_explore_calls >= threshold
 
 
+# ---------------------------------------------------------------------------
+# Slice 237 — op-weight-scaled convergence (the "seventh layer" fix).
+#
+# The Slice-85 cumulative threshold above is STATIC. Heavy multi-file GOAL ops
+# burn 25-45s of the deadline per round (large context → high TTFT + generation
+# + tool-exec), so the loop completes only 1-3 rounds and the wall-clock deadline
+# fires before the static threshold accrues — the convergence trigger engages too
+# late and the op dies with tool_loop_deadline_exceeded. The fix REUSES the same
+# trigger: it scales the threshold DOWN in proportion to op weight (the largest
+# target file's line count — the SAME signal the Slice-235 gate reads), so the
+# existing _should_force_convergence fires EARLIER on heavy ops while light /
+# unknown ops keep the full budget (byte-identical). Not a deadline bump.
+# ---------------------------------------------------------------------------
+
+
+def _convergence_heavy_lines() -> int:
+    """Target-file line count above which an op is "heavy" and its cumulative
+    exploration budget is scaled DOWN toward earlier convergence. Default 800
+    (mirrors the diff-schema large-file boundary). Env
+    ``JARVIS_TOOL_LOOP_CONVERGENCE_HEAVY_LINES``. Invalid / non-positive →
+    default. NEVER raises."""
+    raw = os.environ.get("JARVIS_TOOL_LOOP_CONVERGENCE_HEAVY_LINES", "").strip()
+    if not raw:
+        return 800
+    try:
+        v = int(raw)
+        return v if v > 0 else 800
+    except ValueError:
+        return 800
+
+
+def _convergence_min_calls() -> int:
+    """Floor for the op-weight-scaled convergence threshold — even the heaviest
+    op gets at least this many read-only calls to localize before convergence is
+    forced. Default 4. Env ``JARVIS_TOOL_LOOP_CONVERGENCE_MIN_CALLS``. Invalid /
+    non-positive → default. NEVER raises."""
+    raw = os.environ.get("JARVIS_TOOL_LOOP_CONVERGENCE_MIN_CALLS", "").strip()
+    if not raw:
+        return 4
+    try:
+        v = int(raw)
+        return v if v > 0 else 4
+    except ValueError:
+        return 4
+
+
+def scale_convergence_threshold(
+    *, base_threshold, target_line_count, heavy_lines=None, min_calls=None,
+) -> int:
+    """Scale the cumulative-explore convergence ``base_threshold`` to op weight so
+    the EXISTING ``_should_force_convergence`` axis engages EARLIER on heavy
+    multi-file ops (whose high per-round latency would otherwise blow the deadline
+    before a static threshold is reached). Scales inversely to weight
+    (``target_line_count / heavy_lines``), floored at ``min_calls`` and capped at
+    ``base_threshold`` (scaling only ever REDUCES). Light / unknown ops (≤ the
+    heavy boundary or no line count) keep the full base threshold — byte-identical.
+    ``base_threshold <= 0`` (operator opted out of the axis) is respected verbatim.
+    Pure; NEVER raises → fail-soft to ``base_threshold``."""
+    try:
+        base = int(base_threshold)
+        if base <= 0:
+            return base  # axis disabled — respect the opt-out
+        hl = int(heavy_lines) if heavy_lines is not None else _convergence_heavy_lines()
+        mc = int(min_calls) if min_calls is not None else _convergence_min_calls()
+        if hl <= 0:
+            return base
+        if not isinstance(target_line_count, int) or target_line_count <= hl:
+            return base  # light / unknown → unchanged
+        ratio = target_line_count / float(hl)  # > 1 for a heavy op
+        scaled = int(base / ratio)
+        floor = mc if mc > 0 else 1
+        return max(floor, min(base, scaled))
+    except Exception:  # noqa: BLE001 — fail-soft
+        try:
+            return int(base_threshold)
+        except Exception:  # noqa: BLE001
+            return 0
+
+
 # ── Slice 233 — parse-gate enforcement of convergence ──
 # The Slice 3E nudge is ADVISORY: it tells the model "tool calls will be
 # IGNORED" but nothing stops it from emitting read-only navigation on the grace
@@ -5459,6 +5538,13 @@ class ToolLoopCoordinator:
         # fix composes the same path-validation contract the Advisor
         # already uses — no parallel resolver, no shared-state mutation.
         # Default ``None`` preserves byte-identical legacy behavior.
+        op_weight_lines: Optional[int] = None,
+        # Slice 237 — op weight (largest target-file line count, the SAME signal
+        # the Slice-235 gate reads). Scales the cumulative-convergence threshold
+        # DOWN for heavy multi-file ops so convergence engages before the per-round
+        # latency blows the deadline. ``None`` / light ops → byte-identical (the
+        # static Slice-85 threshold). The caller computes it via the existing
+        # ``providers._max_target_line_count``; no parallel weight calc here.
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -5543,7 +5629,14 @@ class ToolLoopCoordinator:
         # Slice 85 Phase 3 — cumulative read-only-call counter (evasion-proof
         # convergence axis; mixed-tool wandering still accrues here).
         _cumulative_explore_calls = 0
-        _convergence_call_threshold = _convergence_explore_call_threshold()
+        # Slice 237 — scale the static Slice-85 threshold DOWN by op weight so a
+        # heavy multi-file op forces convergence EARLIER (before its per-round
+        # latency burns the deadline). op_weight_lines=None / light ops → the
+        # base threshold verbatim (byte-identical).
+        _convergence_call_threshold = scale_convergence_threshold(
+            base_threshold=_convergence_explore_call_threshold(),
+            target_line_count=op_weight_lines,
+        )
         _soft_overflow_warned = False
         # ── Slice 3E — convergence-force final-write nudge ──
         # ``_final_nudge_issued`` flips True when the final-write nudge

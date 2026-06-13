@@ -3797,6 +3797,24 @@ class DoublewordProvider:
                 )
             except Exception:  # noqa: BLE001 — defensive
                 _eb_observer = None
+            # ── Slice 237 — op weight for convergence scaling ──
+            # The DW provider is the path heavy multi-file GOAL ops take when DW is
+            # sovereign (Claude breaker OPEN) — exactly where tool_loop_deadline_
+            # exceeded fired. Reuse the SAME op-weight signal the Slice-235 gate
+            # reads (resolve_force_full_content at :1647): providers._max_target_
+            # line_count over the SAME target_files + self._repo_root, so
+            # convergence scaling cannot drift from the gate. None on any miss →
+            # the tool loop's static threshold (byte-identical).
+            _op_weight_lines: Optional[int] = None
+            try:
+                from backend.core.ouroboros.governance.providers import (
+                    _max_target_line_count as _dw_max_lines,
+                )
+                _op_weight_lines = _dw_max_lines(
+                    getattr(context, "target_files", ()) or (), self._repo_root,
+                )
+            except Exception:  # noqa: BLE001 — never block the tool loop
+                _op_weight_lines = None
             try:
                 raw, tool_records_list = await self._tool_loop.run(
                     prompt=prompt,
@@ -3808,6 +3826,7 @@ class DoublewordProvider:
                     risk_tier=getattr(context, "risk_tier", None),
                     is_read_only=bool(getattr(context, "is_read_only", False)),
                     per_round_observer=_eb_observer,
+                    op_weight_lines=_op_weight_lines,
                 )
             finally:
                 try:
