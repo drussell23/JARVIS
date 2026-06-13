@@ -175,6 +175,66 @@ def _known_param_count(model_id: str) -> Optional[float]:
     return None
 
 
+# Slice 228 — MoE ACTIVE-parameter token. Modern MoE ids carry an ``A<N>B``
+# active-parameter signature: ``Qwen3.5-397B-A17B`` → 17 active; ``Qwen3.5-35B-A3B``
+# → 3 active; ``Nemotron-550B-A55B`` → 55 active. ACTIVE params — NOT total —
+# predict agentic tool-use capability: a 35B-total/3B-active MoE behaves like a 3B
+# model and chokes on multi-round tool loops. Metadata-derived (parse the standard
+# token), NOT hardcoded routing.
+_ACTIVE_PARAM_RE = re.compile(r"-A(\d+(?:\.\d+)?)B(?:[-_/]|$)", re.IGNORECASE)
+
+# Curated ACTIVE counts (billions) for strong agentic coders whose id carries no
+# ``A<N>B`` token (Kimi-K2, DeepSeek-V4, GLM-5 are MoEs but don't expose active in
+# the id). Accurate model METADATA mirroring _KNOWN_MODEL_PARAMS_B, env-extensible
+# via ``JARVIS_DW_KNOWN_MODEL_ACTIVE_PARAMS``. Absent here, the active count falls
+# back to TOTAL (fine — they're elite; ranking high is desired — but the curated
+# value keeps the capability axis honest vs a 1T-total fallback).
+_KNOWN_MODEL_ACTIVE_PARAMS_B: Tuple[Tuple[str, float], ...] = (
+    ("deepseek-v4-flash", 10.0),
+    ("deepseek-v4-pro", 37.0),
+    ("deepseek-v4", 37.0),
+    ("kimi-k2", 32.0),
+    ("glm-5", 32.0),
+)
+
+
+def _known_active_param_count(model_id: str) -> Optional[float]:
+    """Slice 228 — curated ACTIVE count for a model whose id has no ``A<N>B``
+    token, else None. Env override (``JARVIS_DW_KNOWN_MODEL_ACTIVE_PARAMS``)
+    merged first. NEVER raises."""
+    low = (model_id or "").lower()
+    pairs = list(_KNOWN_MODEL_ACTIVE_PARAMS_B)
+    try:
+        raw = os.environ.get("JARVIS_DW_KNOWN_MODEL_ACTIVE_PARAMS", "").strip()
+        if raw:
+            extra = []
+            for item in raw.split(","):
+                if ":" in item:
+                    sub, val = item.rsplit(":", 1)
+                    extra.append((sub.strip().lower(), float(val)))
+            pairs = extra + pairs  # operator entries win
+    except Exception:  # noqa: BLE001 — defensive, ignore malformed override
+        pass
+    for sub, params in pairs:
+        if sub in low:
+            return params
+    return None
+
+
+def parse_active_parameter_count(model_id: str) -> Optional[float]:
+    """Slice 228 — extract the MoE ACTIVE parameter count (billions): the
+    standard ``A<N>B`` token first, then the curated active map, else None
+    (dense / unknown → caller falls back to total params). Metadata-derived,
+    no hardcoded routing. NEVER raises."""
+    m = _ACTIVE_PARAM_RE.search(model_id or "")
+    if m is not None:
+        try:
+            return float(m.group(1))
+        except (ValueError, TypeError):
+            return None
+    return _known_active_param_count(model_id)
+
+
 def parse_parameter_count(model_id: str) -> Optional[float]:
     """Heuristic: extract the parameter count (in billions) from a
     model id when the API doesn't expose it as metadata.
@@ -293,6 +353,10 @@ class ModelCard:
     pricing_out_per_m_usd: Optional[float]
     supports_streaming: bool
     raw_metadata_json: str  # JSON-serialized raw dict; preserved for downstream
+    # Slice 228 — MoE ACTIVE parameter count (billions). Defaults to the total
+    # count for dense / no-token models so the field is always populated. Kept
+    # last with a default so existing positional constructors stay valid.
+    active_parameter_count_b: Optional[float] = None
 
     @classmethod
     def from_api_dict(cls, raw: Mapping[str, Any]) -> Optional["ModelCard"]:
@@ -312,6 +376,19 @@ class ModelCard:
             param_b = float(api_params)
         else:
             param_b = parse_parameter_count(model_id)
+
+        # Slice 228 — ACTIVE param count. Prefer API metadata, then the A<N>B /
+        # curated parse, then fall back to total (dense / unknown → active==total).
+        active_b: Optional[float] = None
+        api_active = raw.get("active_parameter_count_b") or raw.get(
+            "active_parameters_b",
+        )
+        if isinstance(api_active, (int, float)) and api_active > 0:
+            active_b = float(api_active)
+        else:
+            active_b = parse_active_parameter_count(model_id)
+        if active_b is None:
+            active_b = param_b  # dense / unknown → active mirrors total
 
         # context_window: optional, must be int when present
         ctx: Optional[int] = None
@@ -382,6 +459,7 @@ class ModelCard:
             pricing_out_per_m_usd=price_out,
             supports_streaming=streaming,
             raw_metadata_json=raw_json,
+            active_parameter_count_b=active_b,
         )
 
     def has_ambiguous_metadata(self) -> bool:

@@ -257,6 +257,12 @@ services:
       # complete on DW alone with Claude unfunded.
       JARVIS_DW_AUTARKY_ENABLED: "1"
       JARVIS_DW_AUTARKY_MAX_BUDGET_S: "180"
+      # Slice 228 — agentic family preference (CONFIG, not hardcoded code). With
+      # active-param scoring (default-TRUE) demoting low-active MoEs, this boosts
+      # the 2026 agentic-tier FAMILIES so gated/tool-loop ops land on a
+      # tool-capable titan (Kimi-K2.6 / DeepSeek-V4-Pro / Devstral / GLM-5.1 /
+      # Qwen-397B) instead of the 3B-active Qwen-35B. No model NAMES in code.
+      JARVIS_DW_FAMILY_PREFERENCE: "moonshotai:1.0,deepseek-ai:0.9,mistralai:0.8,zai-org:0.7,Qwen:0.5"
       # Fallback-sem relief (landmine A): D2/12F-B sem-exhausted fast-fail
       # confirmed live; raise rescue concurrency to the cap so boot-time op
       # stacks queue less (observed 135s sem_wait on concurrency=3).
