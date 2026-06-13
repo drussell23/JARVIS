@@ -198,3 +198,24 @@
                  FOLLOW-UP (tracked, separate slice): promote _resolve_runtime_repo_root (S234) to a
                  SHARED governance resolver + route all ~8 direct JARVIS_REPO_PATH reads through it
                  (validate vs runtime FS, fail loud) — context-independent of the env. NOT done here.
+  [~] slice-235  Adaptive diff (re-enable native 2b.1-diff) — LAYER-5 fix. AUDIT COMPLETE + keystone
+                 landed; generation-core wiring mapped, NOT yet wired (quality checkpoint — providers
+                 are THE generation path, a bug breaks all gen; deferred careful wiring + soak).
+                 AUDIT: the full 2b.1-diff machinery already exists (providers.py _SCHEMA_VERSION_DIFF
+                 :219, _DIFF_CANDIDATE_KEYS :222, _apply_unified_diff :1488, validate_diff_context +
+                 StaleDiffError :1343/1373) and schema_capability plumbing is complete end-to-end
+                 (brain_selector cfg → GLS:2800 → routing_intent → provider:4884). ROOT CAUSE: the flag
+                 is DEAD-CODED — providers.py:4884-4893 computes _force_full from schema_capability then
+                 passes hardcoded force_full_content=True (:4912/:4926); doubleword_provider.py:1583
+                 forces True unconditionally → DW emits 60K full_content blob → JSONDecodeError.
+                 LANDED: pure keystone should_force_full_content() + _diff_schema_threshold_lines()
+                 (env JARVIS_DIFF_SCHEMA_THRESHOLD_LINES default 800) in providers.py — full UNLESS
+                 (schema_capability==full_content_and_diff AND file_lines>threshold). 7 TDD tests green.
+                 REMAINING (mapped, own focused build): (1) wire keystone into both providers (replace
+                 hardcoded True at providers.py:4912/4926 + doubleword_provider.py:1583; compute
+                 target_line_count fail-soft); (2) brain_selection_policy.yaml: schema_capability:
+                 full_content_and_diff for ELITE agentic brains (config, no hardcoded model in code);
+                 (3) fail-safe degradation at orchestrator:6245 (diff_apply_failed/StaleDiff → flag op
+                 force_full_content + retry full_content, never crash); (4) soak. OPEN: can elite models
+                 (Kimi/DeepSeek-V4-Pro/GLM) do verbatim diffs where the 397B couldn't — fail-safe makes
+                 it safe to test live. Branch perf/slice-235-adaptive-diff.

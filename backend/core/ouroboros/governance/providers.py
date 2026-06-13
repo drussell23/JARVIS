@@ -229,6 +229,55 @@ _MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
 
 
 # ---------------------------------------------------------------------------
+# Slice 235 — adaptive diff: capability + size gated force_full_content
+# ---------------------------------------------------------------------------
+# Layer-5 root cause: providers COMPUTE _force_full from the brain's
+# schema_capability but then pass hardcoded force_full_content=True (the diff
+# path is dead-coded off), and DW forces True unconditionally — so DW emits the
+# whole 60K-char file as one full_content blob → JSONDecodeError. This re-enables
+# the EXISTING native 2b.1-diff path conditionally, reusing _apply_unified_diff +
+# validate_diff_context. Verbatim-diff reliability is model-specific (the 397B
+# couldn't); the orchestrator fail-safe degrades a failed diff to full_content.
+_DIFF_SCHEMA_THRESHOLD_ENV = "JARVIS_DIFF_SCHEMA_THRESHOLD_LINES"
+_DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES = 800
+
+
+def _diff_schema_threshold_lines() -> int:
+    """Min target-file line count above which a CAPABLE model emits a unified
+    diff instead of full_content. Small files stay full_content (a diff adds no
+    value and the blob/JSON problem only hits large files). Env-tunable; invalid
+    / non-positive → default. NEVER raises."""
+    raw = (os.environ.get(_DIFF_SCHEMA_THRESHOLD_ENV, "") or "").strip()
+    if not raw:
+        return _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+    try:
+        v = int(raw)
+        return v if v > 0 else _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+    except ValueError:
+        return _DEFAULT_DIFF_SCHEMA_THRESHOLD_LINES
+
+
+def should_force_full_content(
+    *,
+    schema_capability: str,
+    target_line_count: "Optional[int]",
+    threshold_lines: int,
+) -> bool:
+    """Decide whether to FORCE full_content (vs allow the native 2b.1-diff).
+
+    Force full_content UNLESS the model can reliably emit verbatim diffs
+    (``schema_capability == 'full_content_and_diff'``) AND the target file is
+    large enough (> ``threshold_lines``) to warrant a bounded diff. Conservative
+    by construction: unknown capability or unknown/small line count → force full.
+    Pure; never raises."""
+    if schema_capability != "full_content_and_diff":
+        return True
+    if not isinstance(target_line_count, int) or target_line_count <= int(threshold_lines):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Attachment Serialization (Task 7 of VisionSensor + Visual VERIFY arc)
 # ---------------------------------------------------------------------------
 #
