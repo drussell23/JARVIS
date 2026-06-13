@@ -233,3 +233,25 @@
                  slice208 + op_context replace green; pre-existing failures unrelated (urgency source-
                  table drift, sandbox_loop missing module). NOT YET SOAK-VALIDATED — open empirical Q:
                  do elite models clear the verbatim-diff wall (fail-safe makes it safe to test live).
+  [x] slice-235b SOAK-VALIDATED live (image cfa9e89fa1): elite models DO clear the verbatim-diff
+                 wall — `emitting 2b.1-diff` fired 14x on moonshotai/Kimi-K2.6 + deepseek-ai/
+                 DeepSeek-V4-Flash. The open empirical Q is answered YES. (see slice-236)
+  [x] slice-236  Capability-aware DW selection (the "sixth layer"). RC of the s235 soak: the
+                 IMMEDIATE->DW reroute escaped the sealed Claude-only route but fell to the
+                 UNCONDITIONAL self._model baseline (Qwen-397B, not diff-capable) -> gate forced
+                 full_content -> 63K blob -> JSONDecodeError -> exhaustion. Fix in the SELECTOR (not
+                 gate/allowlist): providers.py pure seams op_warrants_diff_capable_model (reuses the
+                 gate's _max_target_line_count + _diff_schema_threshold_lines -> no size-signal
+                 drift) + select_diff_capable_model (ranks injected catalog by diff-capable family +
+                 JARVIS_DW_FAMILY_PREFERENCE; no model names in code) + capability_aware_default_model;
+                 doubleword_provider._capability_aware_default wired into the self._model baseline
+                 fallback ONLY (sentinel/topology overrides untouched). JARVIS_DW_CAPABILITY_AWARE_
+                 SELECTION_ENABLED default-TRUE; OFF/small/no-elite/already-capable byte-identical.
+                 25 TDD tests, +0 regressions. LIVE-SOAK (16min,$0.34,0 Claude): selection log 45x,
+                 elites now dominate (Kimi 66 + deepseek-V4 45 vs Qwen 44), JSONDecodeError 1 (was 6).
+                 OPEN: a SEVENTH layer (tool_loop_deadline_exceeded on heavy multi-file GOALs = the
+                 Slice-233 convergence problem at scale) blocks clean large-GOAL state=applied -> next.
+  [x] slice-226  PRD split (the 2.2MB doc exceeded GitHub's ~1MB render cap). 4 byte-conserved
+                 files (only +2109b of cross-links, zero content lost): PRD.md (lean §1-§23+TOC, 322KB,
+                 renders) + PRD_SPEC_DETAIL.md (§24-50) + NORTH_STAR.md (§51 + §51.11.x + active roadmap)
+                 + PRD_HISTORY.md (version headers + §40/41 banners). All <770KB.
