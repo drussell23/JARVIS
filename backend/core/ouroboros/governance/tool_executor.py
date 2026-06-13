@@ -4703,6 +4703,60 @@ def scale_convergence_threshold(
             return 0
 
 
+def _final_write_reserve_max_fraction() -> float:
+    """Max fraction of the total tool-loop budget the op-weight-scaled final-write
+    reserve may claim. Heavy ops reserve MORE for the (large) forced write, but
+    never so much that exploration is starved entirely. Default 0.5. Env
+    ``JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_MAX_FRACTION``. Out-of-range / invalid →
+    default. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_MAX_FRACTION", "",
+    ).strip()
+    if not raw:
+        return 0.5
+    try:
+        v = float(raw)
+        return v if 0.0 < v <= 1.0 else 0.5
+    except ValueError:
+        return 0.5
+
+
+def scale_final_write_reserve(
+    *, base_reserve, total_budget_s, target_line_count,
+    heavy_lines=None, max_fraction=None,
+) -> float:
+    """Scale the final-write RESERVE UP for heavy ops so the forced final write
+    has budget to emit a large multi-file diff — the COMPLEMENT to
+    ``scale_convergence_threshold`` (firing convergence earlier is useless if only
+    ~10s is held back for the write). Scales with weight
+    (``target_line_count / heavy_lines``), never below ``base_reserve`` and capped
+    at ``max_fraction`` of ``total_budget_s`` (so exploration is never fully
+    starved). This is a REALLOCATION within the existing budget, NOT a deadline
+    bump. Light / unknown ops → ``base_reserve`` (byte-identical). Pure; NEVER
+    raises → fail-soft to ``base_reserve``."""
+    try:
+        base = float(base_reserve)
+        tot = float(total_budget_s)
+        if tot <= 0.0 or base < 0.0:
+            return base
+        hl = int(heavy_lines) if heavy_lines is not None else _convergence_heavy_lines()
+        mf = (
+            float(max_fraction) if max_fraction is not None
+            else _final_write_reserve_max_fraction()
+        )
+        if hl <= 0 or not isinstance(target_line_count, int) or target_line_count <= hl:
+            return base  # light / unknown → unchanged
+        ratio = target_line_count / float(hl)  # > 1 for a heavy op
+        scaled = base * ratio
+        cap = tot * mf
+        return max(base, min(scaled, cap))
+    except Exception:  # noqa: BLE001 — fail-soft
+        try:
+            return float(base_reserve)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+
 # ── Slice 233 — parse-gate enforcement of convergence ──
 # The Slice 3E nudge is ADVISORY: it tells the model "tool calls will be
 # IGNORED" but nothing stops it from emitting read-only navigation on the grace
@@ -5405,20 +5459,37 @@ class ToolLoopCoordinator:
         """
         return list(self._last_edit_history)
 
-    def _build_budget_plan(self, deadline: float) -> BudgetPlan:
+    def _build_budget_plan(
+        self, deadline: float, op_weight_lines: Optional[int] = None,
+    ) -> BudgetPlan:
         """Construct a ``BudgetPlan`` for this ``run()`` invocation.
 
         Reads ``deadline - time.monotonic()`` at call time so the plan
         reflects the **actual** budget available when the tool loop starts
         (not when the coordinator was constructed).
+
+        Slice 237 — scales the final-write reserve UP by op weight so a heavy
+        multi-file op holds back enough budget to actually emit its (large)
+        forced final write. Reallocation within the budget, not a deadline bump;
+        ``op_weight_lines=None`` / light ops → byte-identical legacy reserve.
         """
         total_budget_s = max(0.0, deadline - time.monotonic())
+        # Mirror BudgetPlan.build's default so op-weight scaling has a base to
+        # grow from (build() would otherwise compute this internally).
+        _base_reserve = self._final_write_reserve_s
+        if _base_reserve is None:
+            _base_reserve = min(_DEFAULT_FINAL_WRITE_RESERVE_S, total_budget_s * 0.25)
+        _reserve = scale_final_write_reserve(
+            base_reserve=_base_reserve,
+            total_budget_s=total_budget_s,
+            target_line_count=op_weight_lines,
+        )
         return BudgetPlan.build(
             total_budget_s=total_budget_s,
             hard_max_rounds=self._max_rounds,
             max_per_round_s=self._tool_timeout_s,
             min_per_round_s=self._min_per_round_s,
-            final_write_reserve_s=self._final_write_reserve_s,
+            final_write_reserve_s=_reserve,
         )
 
     async def _maybe_inline_permission_check(
@@ -5582,7 +5653,7 @@ class ToolLoopCoordinator:
         # ── Structural budget plan ──
         # Built once per run() so all timing decisions are derived from
         # the same consistent snapshot of the deadline.
-        plan = self._build_budget_plan(deadline)
+        plan = self._build_budget_plan(deadline, op_weight_lines=op_weight_lines)
         self._last_budget_plan = plan
         effective_max_rounds = plan.effective_max_rounds
 

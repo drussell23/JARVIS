@@ -93,6 +93,75 @@ class TestScaleConvergenceThreshold:
         assert isinstance(out, int) and 0 < out < 14
 
 
+class TestScaleFinalWriteReserve:
+    """The complement to threshold scaling: scale the final-write RESERVE UP for
+    heavy ops so the forced final write has budget to emit a large multi-file diff
+    (firing convergence earlier is useless if only ~10s is held back for the
+    write). Reallocation WITHIN the budget — not a deadline bump."""
+
+    def test_light_op_keeps_base_reserve(self):
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s=600.0, target_line_count=300,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert out == 10.0
+
+    def test_unknown_keeps_base_reserve(self):
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s=600.0, target_line_count=None,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert out == 10.0
+
+    def test_heavy_op_scales_reserve_up(self):
+        # 3246 lines / 800 ≈ 4.06 → 10 * 4.06 ≈ 40.6 (well under the 300s cap)
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s=600.0, target_line_count=3246,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert 40.0 <= out <= 41.5
+        assert out > 10.0  # heavy write gets MORE budget than the static 10s
+
+    def test_never_below_base(self):
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s=600.0, target_line_count=1000,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert out >= 10.0
+
+    def test_capped_at_max_fraction_of_budget(self):
+        # an enormous op must not starve all exploration — reserve capped
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s=120.0, target_line_count=100000,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert out == 60.0  # 0.5 * 120
+
+    def test_fail_soft_returns_base(self):
+        out = te.scale_final_write_reserve(
+            base_reserve=10.0, total_budget_s="bad", target_line_count=3246,
+            heavy_lines=800, max_fraction=0.5,
+        )
+        assert out == 10.0
+
+    def test_max_fraction_env_default_and_override(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_MAX_FRACTION", raising=False)
+        d = te._final_write_reserve_max_fraction()
+        assert isinstance(d, float) and 0.0 < d <= 1.0
+        monkeypatch.setenv("JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_MAX_FRACTION", "0.4")
+        assert te._final_write_reserve_max_fraction() == 0.4
+
+
+class TestBudgetPlanScalesReserveByOpWeight:
+    def test_build_budget_plan_threads_and_scales_reserve(self):
+        src = inspect.getsource(te.ToolLoopCoordinator._build_budget_plan)
+        assert "scale_final_write_reserve(" in src, "budget plan must scale the reserve by op weight"
+        assert "op_weight_lines" in src
+        # and run() must pass op_weight_lines into _build_budget_plan
+        run_src = inspect.getsource(te.ToolLoopCoordinator.run)
+        assert "_build_budget_plan(" in run_src and "op_weight_lines" in run_src
+
+
 class TestConvergenceWeightEnvKnobs:
     def test_heavy_lines_default_and_env(self, monkeypatch):
         monkeypatch.delenv("JARVIS_TOOL_LOOP_CONVERGENCE_HEAVY_LINES", raising=False)
