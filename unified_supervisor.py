@@ -29433,6 +29433,7 @@ class SelfHealingOrchestrator:
             success = await _shadow_guard_async(
                 f"execute remediation '{strategy.value}' on component '{component}'",
                 lambda: handler(component),
+                organ="SelfHealingOrchestrator",
             )
             if success is _SHADOW_TRAPPED:
                 self._stats["remediations_failed"] += 1
@@ -40862,10 +40863,15 @@ class LoadSheddingController(SystemService):
             # the request through (run the normal handler) instead.
             from backend.core.cybernetic_reanimation import (
                 resilience_shadow_mode_enabled as _resilience_shadow_mode_enabled,
+                emit_shadow_trap as _emit_shadow_trap,
             )
             if _resilience_shadow_mode_enabled():
                 logging.getLogger("unified_supervisor.reanimation").warning(
                     "[SHADOW MODE] Would have shed (rejected) request: %s", action,
+                )
+                # Slice 252 — structured real-time audit of the trapped shed.
+                _emit_shadow_trap(
+                    "LoadSheddingController", f"shed (reject) request: {action}",
                 )
             else:
                 raise RuntimeError(f"Request rejected: {action}")
