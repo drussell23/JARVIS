@@ -436,6 +436,43 @@ class GENERATERunner(PhaseRunner):
             except Exception:
                 logger.debug("[Orchestrator] Consciousness injection failed", exc_info=True)
 
+        # ── Slice 247 — State-Drift Reconciliation (RE-ALIGNMENT micro-phase) ──
+        # If this op already carries file hashes from a PRIOR generation (a
+        # resumed / resurrected op re-entering GENERATE after preemption — Slices
+        # 245/246), compare that PRESERVED baseline against the current disk
+        # BEFORE the re-snapshot below erases it. On drift (a human override
+        # patched a target during the suspension window), inject a re-alignment
+        # instruction so the model re-reads the drifted files and regenerates
+        # against the NEW state — never blind-patching a stale target. Zero-LLM,
+        # gated, fail-soft; reuses the strategic_memory_prompt injection channel.
+        try:
+            from backend.core.ouroboros.governance.state_drift import (
+                detect_drift as _detect_drift,
+                build_realignment_feedback as _build_realignment_feedback,
+                state_drift_reconcile_enabled as _drift_reconcile_enabled,
+                STATE_CONTEXT_DRIFTED as _STATE_CONTEXT_DRIFTED,
+            )
+            if ctx.generate_file_hashes and _drift_reconcile_enabled():
+                _drifted = _detect_drift(
+                    ctx.generate_file_hashes, orch._config.project_root,
+                )
+                if _drifted:
+                    _realign = _build_realignment_feedback(_drifted)
+                    _existing_mem = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = dataclasses.replace(
+                        ctx,
+                        strategic_memory_prompt=(
+                            f"{_existing_mem}\n\n{_realign}" if _existing_mem else _realign
+                        ),
+                    )
+                    logger.warning(
+                        "[Orchestrator] STATE=%s op=%s files=%s — injecting "
+                        "re-alignment (re-read forced before patch)",
+                        _STATE_CONTEXT_DRIFTED, ctx.op_id[:12], _drifted[:3],
+                    )
+        except Exception:  # noqa: BLE001 — drift reconcile must never crash GENERATE
+            logger.debug("[Orchestrator] state-drift reconcile skipped", exc_info=True)
+
         # ── Stale-exploration guard: snapshot file hashes at GENERATE time ──
         _gen_hashes: list = []
         for _tf in ctx.target_files:

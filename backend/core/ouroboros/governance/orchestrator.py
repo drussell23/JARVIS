@@ -8548,16 +8548,14 @@ class GovernedOrchestrator:
             # but the ledger records the staleness for future convergence analysis.
             _stale_files: list = []
             if ctx.generate_file_hashes:
-                for _ghf, _ghash in ctx.generate_file_hashes:
-                    if not _ghash:
-                        continue  # new file at GENERATE time, skip
-                    _ghf_path = self._config.project_root / _ghf
-                    try:
-                        _now_hash = hashlib.sha256(_ghf_path.read_bytes()).hexdigest()
-                    except (OSError, IOError):
-                        continue  # file deleted — different problem
-                    if _now_hash != _ghash:
-                        _stale_files.append(_ghf)
+                # Slice 247 — reuse the shared zero-LLM drift detector (single
+                # source of truth with the GENERATE-entry re-alignment guard).
+                from backend.core.ouroboros.governance.state_drift import (
+                    detect_drift as _detect_drift_apply,
+                )
+                _stale_files = _detect_drift_apply(
+                    ctx.generate_file_hashes, self._config.project_root,
+                )
                 if _stale_files:
                     logger.warning(
                         "[Orchestrator] Stale-exploration: %d file(s) changed between GENERATE and APPLY: %s [%s]",
