@@ -6503,6 +6503,7 @@ class ToolLoopCoordinator:
                         live_steering_enabled as _live_steering_enabled,
                         consume_guidance as _consume_guidance,
                         format_guidance_block as _format_guidance_block,
+                        propagate_directive as _propagate_directive,
                     )
                     if _live_steering_enabled():
                         _guidance = _consume_guidance(op_id)
@@ -6524,6 +6525,26 @@ class ToolLoopCoordinator:
                                 _pub_guidance(op_id=op_id, chars=len(_guidance))
                             except Exception:  # noqa: BLE001
                                 pass
+                            # Slice 251 — durability. OUT-OF-BAND classify + (if
+                            # GLOBAL) persist into UserPreferenceMemory so all
+                            # future agents boot with the directive. Fire-and-
+                            # forget create_task — the local fold above already
+                            # took effect; this never blocks the round loop.
+                            try:
+                                import asyncio as _asyncio
+                                _task = _asyncio.create_task(
+                                    _propagate_directive(op_id, _guidance)
+                                )
+                                # strong ref so the task isn't GC'd mid-flight
+                                self._steering_prop_tasks = getattr(
+                                    self, "_steering_prop_tasks", set(),
+                                )
+                                self._steering_prop_tasks.add(_task)
+                                _task.add_done_callback(
+                                    self._steering_prop_tasks.discard
+                                )
+                            except RuntimeError:
+                                pass  # no running loop (sync ctx) — skip durability
                 except Exception:  # noqa: BLE001 — steering must never crash the loop
                     logger.debug(
                         "[ToolLoop] live-steering absorption skipped at op=%s",

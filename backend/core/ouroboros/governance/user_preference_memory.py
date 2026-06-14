@@ -843,6 +843,50 @@ class UserPreferenceStore:
             )
             return None
 
+    def record_live_steering_directive(
+        self,
+        *,
+        op_id: str,
+        directive: str,
+    ) -> Optional["UserMemory"]:
+        """Slice 251 — persist a GLOBAL live-steering directive as a durable STYLE
+        memory so it is injected into EVERY future agent's generation prompt (via
+        StrategicDirection), curing multi-agent session-amnesia.
+
+        Mirrors the auto-extraction hooks (record_approval_rejection etc.): a
+        human directive injected mid-flight (e.g. "always use async SQLAlchemy
+        sessions") becomes a standing architectural preference. Dedupes by
+        directive shape (upsert). Returns the persisted memory, or ``None`` when
+        the directive is too sparse to encode. NEVER raises on sparse input."""
+        cleaned = (directive or "").strip()
+        if not cleaned:
+            return None
+        name = f"steering_{_slug(cleaned, max_len=40)}"
+        if not name.strip("_"):
+            name = f"steering_{op_id}"
+        try:
+            return self.add(
+                memory_type=MemoryType.STYLE,
+                name=name,
+                description=cleaned[:200],
+                content=(
+                    "This standing directive was injected live by the Sovereign "
+                    "Host mid-operation and classified as a GLOBAL architectural "
+                    "constraint. Apply it to all future work as a baseline "
+                    "preference, not a one-off correction."
+                ),
+                why="Live human steering elevated to a durable global directive.",
+                how_to_apply=cleaned[:400],
+                source=f"live_steering:{op_id}",
+                tags=("steering", "directive", "global"),
+            )
+        except ValueError:
+            logger.debug(
+                "[UserPreferenceStore] Skipped steering directive for op %s — "
+                "inputs too sparse", op_id,
+            )
+            return None
+
     def record_rollback(
         self,
         *,
