@@ -90,8 +90,21 @@ _VALID_SOURCES = frozenset({
     # Routes BACKGROUND via routing_override (low-cost; never burns Claude
     # budget); the resulting op still flows the full Iron Gate pipeline.
     "test_coverage",
+    # Added 2026-06-14 for Slice 246 (Preemptive Interrupt Matrix). Direct
+    # human-origin override channels — distinct from voice_human so a typed
+    # emergency / programmatic operator override is attributable separately.
+    # Members of SOVEREIGN_SOURCES → ranked BELOW resurrection (Human >
+    # Resurrected > Normal) and trigger preemption of a running resurrected op.
+    "cli_emergency",
+    "human_override",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
+
+# Slice 246 — human-origin sources that hold SOVEREIGN primacy: they outrank even
+# a resurrected hibernation survivor (which itself outranks all normal work). The
+# host always keeps ultimate control. Lives here (a leaf module) so both the
+# IntakeRouter and the BackgroundAgentPool import it without a cycle.
+SOVEREIGN_SOURCES = frozenset({"voice_human", "cli_emergency", "human_override"})
 
 # F2 Slice 2 — allowed values for the optional ``routing_override``
 # envelope field. Empty string is the "no override" sentinel (default).

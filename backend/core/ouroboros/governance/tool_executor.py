@@ -6475,6 +6475,20 @@ class ToolLoopCoordinator:
                         records,
                     )
 
+            # ── Slice 246 — cooperative human-override preemption checkpoint ──
+            # At the natural round boundary (coherent state: a round completed,
+            # context compacted), check whether a live human intent has requested
+            # this op yield. check_preemption raises OperationPreemptedError
+            # (BaseException → slips past broad Exception handlers to the pool
+            # worker, which re-ingests the op — micro-hibernation). Gated inside
+            # check_preemption; a no-op when no preemption pending. NOT a hard
+            # kill — the OperationContext (completed phases) is intact.
+            if op_id:
+                from backend.core.ouroboros.governance.preemption import (
+                    check_preemption as _check_preemption,
+                )
+                _check_preemption(op_id)
+
             # ── Upgrade 1 (PRD §31.2) per-round budget observer ──
             # Fires AFTER round body + compaction + force-truncate guard,
             # at the natural round-boundary just before the loop iterates.
