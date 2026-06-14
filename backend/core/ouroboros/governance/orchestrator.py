@@ -8548,12 +8548,16 @@ class GovernedOrchestrator:
             # but the ledger records the staleness for future convergence analysis.
             _stale_files: list = []
             if ctx.generate_file_hashes:
-                # Slice 247 — reuse the shared zero-LLM drift detector (single
-                # source of truth with the GENERATE-entry re-alignment guard).
+                # Slice 247/248 — verification pass. Re-hash the targets and
+                # decide whether to BLOCK: a candidate whose GENERATE baseline no
+                # longer matches disk is provably stale, and applying it corrupts
+                # the file (full-content overwrite = data loss; diff = line drift).
+                # Single source of truth with the GENERATE-entry re-alignment.
                 from backend.core.ouroboros.governance.state_drift import (
-                    detect_drift as _detect_drift_apply,
+                    should_block_apply as _should_block_apply,
+                    STATE_DRIFT_UNRECONCILED as _STATE_DRIFT_UNRECONCILED,
                 )
-                _stale_files = _detect_drift_apply(
+                _block_apply, _stale_files = _should_block_apply(
                     ctx.generate_file_hashes, self._config.project_root,
                 )
                 if _stale_files:
@@ -8565,6 +8569,31 @@ class GovernedOrchestrator:
                         "event": "stale_exploration_detected",
                         "stale_files": _stale_files,
                     })
+                if _block_apply:
+                    # Slice 248 — VERIFICATION FAILED. The GENERATE-entry
+                    # re-alignment (Slice 247) did not resolve the drift (the
+                    # model ignored the re-read, or the disk drifted again during
+                    # regeneration). Refuse the apply — fail safe to POSTMORTEM
+                    # rather than corrupt the file. The op re-runs fresh on its
+                    # next sensor trigger, regenerating against current disk (an
+                    # eventual re-alignment). Mirrors the LiveWorkSensor abort.
+                    logger.warning(
+                        "[Orchestrator] STATE DRIFT UNRECONCILED — blocking APPLY "
+                        "of stale candidate on %s — failing safe (no corruption) "
+                        "[%s]", _stale_files[:3], ctx.op_id[:12],
+                    )
+                    await self._record_ledger(ctx, OperationState.FAILED, {
+                        "reason": _STATE_DRIFT_UNRECONCILED,
+                        "stale_files": _stale_files,
+                    })
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code=_STATE_DRIFT_UNRECONCILED,
+                    )
+                    await self._publish_outcome(
+                        ctx, OperationState.FAILED, _STATE_DRIFT_UNRECONCILED,
+                    )
+                    return ctx
 
             # ── LiveWorkSensor: don't stomp on human-active files ──
             # If the human is actively editing a target file, defer the autonomous
