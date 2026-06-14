@@ -20,9 +20,18 @@ from typing import Any, Awaitable, Callable, Optional
 
 
 def transport_hedge_enabled() -> bool:
-    """Master for the proactive hedge. Default **FALSE** (§33.1 — new default-path behavior that
-    can double-spend; opt-in per deployment). NEVER raises."""
-    return os.environ.get("JARVIS_DW_TRANSPORT_HEDGE_ENABLED", "").strip().lower() in (
+    """Master for the proactive RT-vs-batch hedge.
+
+    Slice 241 T2 — GRADUATED to default **TRUE**: race the RT stream against the
+    stable batch path and take the first success, so a partial RT rupture is made
+    INVISIBLE (the batch arm wins, the op never sees the failure). This is the only
+    code lever for DW transport volatility (it cannot save a WHOLESALE DW outage
+    where both arms fail). The §33.1 double-spend concern is bounded: the loser is
+    cancelled aggressively on the first success, so steady-state cost ≈ RT (the
+    batch submit is cancelled before completion whenever RT wins). Kill switch:
+    ``JARVIS_DW_TRANSPORT_HEDGE_ENABLED=0`` (or false/no/off) reverts to the legacy
+    single-stream path. NEVER raises."""
+    return os.environ.get("JARVIS_DW_TRANSPORT_HEDGE_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 

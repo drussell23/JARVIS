@@ -87,9 +87,19 @@ class TestGenerateViaBatch(unittest.IsolatedAsyncioTestCase):
             await p._generate_via_batch(object(), None)
 
     def test_hedge_inactive_when_flag_off(self):
+        # Slice 241 T2 — the hedge is GRADUATED to default-ON, so verifying the
+        # flag-off path now requires explicitly setting the kill switch (=0)
+        # rather than relying on the default.
         import os
-        os.environ.pop("JARVIS_DW_TRANSPORT_HEDGE_ENABLED", None)
-        self.assertFalse(_MockProvider()._s189_transport_hedge_active())
+        _prev = os.environ.get("JARVIS_DW_TRANSPORT_HEDGE_ENABLED")
+        os.environ["JARVIS_DW_TRANSPORT_HEDGE_ENABLED"] = "0"
+        try:
+            self.assertFalse(_MockProvider()._s189_transport_hedge_active())
+        finally:
+            if _prev is None:
+                os.environ.pop("JARVIS_DW_TRANSPORT_HEDGE_ENABLED", None)
+            else:
+                os.environ["JARVIS_DW_TRANSPORT_HEDGE_ENABLED"] = _prev
 
 
 if __name__ == "__main__":
