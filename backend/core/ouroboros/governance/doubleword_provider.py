@@ -5120,6 +5120,79 @@ class DoublewordProvider:
         except Exception:
             return False
 
+    async def stream_health_probe(self) -> bool:
+        """Slice 243 — micro-streaming load test (the Stability Confidence Gate).
+
+        A 200-OK ``/models`` ping only proves the grid is *reachable*; DW's
+        primary failure mode is a *flapping* grid whose stateless streaming
+        socket drops mid-flight. Before the HibernationProber wakes the heavy
+        PLAN-EXPLOIT DAG, prove the grid can carry a real stream: request a tiny
+        deterministic multi-token completion over SSE (``/chat/completions``,
+        ``stream=true``, capped ``max_tokens``) and verify tokens arrive and the
+        socket closes cleanly. A mid-flight rupture, non-200, or too-few-tokens
+        → ``False`` (FLAPPING). Reuses the same session / Aegis-auth / lease /
+        SSE-read machinery as ``health_probe`` and the realtime path — no
+        duplicate transport. Lightweight (~$0), NEVER raises into the caller."""
+        if not self.is_available:
+            return False
+        try:
+            min_tokens = int(float(
+                os.getenv("JARVIS_GRID_STABILITY_MIN_TOKENS", "").strip() or 2
+            ))
+            if min_tokens < 1:
+                min_tokens = 1
+        except (TypeError, ValueError):
+            min_tokens = 2
+        try:
+            session = await self._get_session()
+            _call_auth = await _aegis_dw_session_auth_header()
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id="dw-stream-health-probe",
+                route="background",
+                estimated_cost_usd=0.0,
+            )
+            body = {
+                "model": self._model,
+                "messages": [
+                    {"role": "user", "content": "Reply with exactly: ok ok ok"},
+                ],
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "stream": True,
+            }
+            tokens = 0
+            async with session.post(
+                f"{self._base_url}/chat/completions",
+                json=body,
+                headers=_aegis_merge_lease_headers(_call_auth, _aegis_lease),
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status != 200:
+                    self._last_error_status = resp.status
+                    return False
+                # Mirror the realtime SSE read — a rupture here raises and is
+                # caught below as a flap.
+                while True:
+                    line = await resp.content.readline()
+                    if not line:
+                        break
+                    line_str = line.decode("utf-8", errors="replace").strip()
+                    if not line_str or not line_str.startswith("data: "):
+                        continue
+                    data_str = line_str[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if delta.get("content"):
+                            tokens += 1
+                    except Exception:  # noqa: BLE001 — skip malformed chunk
+                        continue
+            return tokens >= min_tokens
+        except Exception:  # noqa: BLE001 — any rupture / timeout == not stable
+            return False
+
     def get_stats(self) -> Dict[str, Any]:
         """Return cumulative stats for observability."""
         return {
