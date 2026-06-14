@@ -5267,7 +5267,7 @@ class GovernedLoopService:
                             "[GLS] idle_watchdog.freeze failed under hibernation"
                         )
 
-            def _wake_bridge(*, reason: str) -> None:
+            async def _wake_bridge(*, reason: str) -> None:
                 # Unfreeze first so the watchdog resets its clock before
                 # the pool starts dequeuing — avoids a spurious stale-fire
                 # immediately on wake against stale _last_poke.
@@ -5285,6 +5285,30 @@ class GovernedLoopService:
                         logger.exception(
                             "[GLS] bg_pool.resume failed under wake"
                         )
+                    # Slice 245 — Absolute-Primacy Re-Ingest. Healthy QUEUED ops
+                    # resumed in place above; the SURVIVORS (ops that failed with
+                    # provider-exhaustion while the grid was dark) are terminal
+                    # and must be re-ingested with Absolute-Max Primacy so they
+                    # supersede everything that accumulated during the dark
+                    # window. Re-submits the EXACT preserved OperationContext
+                    # (no completed work re-computed). Gated + fail-soft.
+                    if os.environ.get(
+                        "JARVIS_RESURRECTION_REINGEST_ENABLED", "true",
+                    ).strip().lower() in ("1", "true", "yes", "on"):
+                        try:
+                            survivors = _bg_ref.drain_exhaustion_failures()
+                            for _ctx in survivors:
+                                await _bg_ref.resubmit_resurrected(_ctx)
+                            if survivors:
+                                logger.info(
+                                    "[GLS] wake re-ingested %d hibernation "
+                                    "survivor(s) with absolute primacy",
+                                    len(survivors),
+                                )
+                        except Exception:  # noqa: BLE001 — never break wake
+                            logger.exception(
+                                "[GLS] resurrection re-ingest failed under wake"
+                            )
 
             try:
                 _ctrl_for_hooks.register_hibernation_hooks(
