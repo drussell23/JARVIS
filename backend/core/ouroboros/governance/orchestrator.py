@@ -3983,6 +3983,8 @@ class GovernedOrchestrator:
                     should_decouple_test_gen,
                     build_test_coverage_envelope,
                     test_sharding_enabled,
+                    estimate_test_gen_tokens,
+                    _shard_velocity_tok_s,
                 )
                 _coverage_enforcer = TestCoverageEnforcer(self._config.project_root)
                 _uncovered = _coverage_enforcer.detect_uncovered(ctx.target_files)
@@ -3997,12 +3999,17 @@ class GovernedOrchestrator:
                             ).total_seconds()
                     except Exception:  # noqa: BLE001
                         _remaining_s = float("inf")
+                    # Slice 240 — dynamic cost-vs-bandwidth shard trigger (no
+                    # hardcoded file-count gate): decouple iff the estimated tokens
+                    # to generate the tests exceed velocity × remaining budget.
+                    _est_test_tokens = estimate_test_gen_tokens(
+                        uncovered_files=_uncovered,
+                        repo_root=self._config.project_root,
+                    )
                     if test_sharding_enabled() and should_decouple_test_gen(
-                        provider_route=getattr(ctx, "provider_route", "") or "standard",
+                        est_test_tokens=_est_test_tokens,
+                        velocity_tok_s=_shard_velocity_tok_s(),
                         remaining_s=_remaining_s,
-                        uncovered_count=len(_uncovered),
-                        target_file_count=len(ctx.target_files or ()),
-                        complexity=str(getattr(ctx, "task_complexity", "") or ""),
                         enabled=True,
                     ):
                         _gls = getattr(self._stack, "governed_loop_service", None)

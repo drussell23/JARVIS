@@ -58,74 +58,112 @@ class TestDetectUncovered:
         assert instr and "test coverage" in instr.lower()
 
 
+class TestEstimateTestGenTokens:
+    """Cost side (LHS) — derived from ACTUAL file sizes, not a hardcoded constant."""
+
+    def test_scales_with_file_size(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("JARVIS_TEST_SHARD_TOKENS_PER_LINE", raising=False)
+        monkeypatch.delenv("JARVIS_TEST_SHARD_TEST_MULTIPLIER", raising=False)
+        (tmp_path / "small.py").write_text("\n".join(str(i) for i in range(10)))
+        (tmp_path / "big.py").write_text("\n".join(str(i) for i in range(1000)))
+        small = ih.estimate_test_gen_tokens(uncovered_files=["small.py"], repo_root=tmp_path)
+        big = ih.estimate_test_gen_tokens(uncovered_files=["big.py"], repo_root=tmp_path)
+        assert big > small * 50  # ~100x the lines → ~100x the cost (data-driven)
+
+    def test_sums_across_files(self, tmp_path):
+        (tmp_path / "a.py").write_text("\n".join(str(i) for i in range(100)))
+        (tmp_path / "b.py").write_text("\n".join(str(i) for i in range(100)))
+        one = ih.estimate_test_gen_tokens(uncovered_files=["a.py"], repo_root=tmp_path)
+        two = ih.estimate_test_gen_tokens(uncovered_files=["a.py", "b.py"], repo_root=tmp_path)
+        assert abs(two - 2 * one) < 1.0
+
+    def test_unreadable_file_costs_conservative_default(self, tmp_path):
+        out = ih.estimate_test_gen_tokens(uncovered_files=["ghost.py"], repo_root=tmp_path)
+        assert out > 0.0  # never free
+
+    def test_env_tunable_conversion(self, tmp_path, monkeypatch):
+        (tmp_path / "f.py").write_text("\n".join(str(i) for i in range(100)))
+        monkeypatch.setenv("JARVIS_TEST_SHARD_TOKENS_PER_LINE", "20")
+        monkeypatch.setenv("JARVIS_TEST_SHARD_TEST_MULTIPLIER", "2")
+        out = ih.estimate_test_gen_tokens(uncovered_files=["f.py"], repo_root=tmp_path)
+        assert abs(out - 100 * 20 * 2) < 1.0  # 4000
+
+    def test_fail_soft_zero(self):
+        assert ih.estimate_test_gen_tokens(uncovered_files=None, repo_root=None) == 0.0
+
+
 class TestShouldDecoupleTestGen:
-    """The adaptive decision — INVARIANT 1: tight budget + >2 uncovered → decouple."""
+    """Slice 240 — the DYNAMIC cost-vs-bandwidth trigger (no hardcoded file gate):
+    decouple iff est_test_tokens > velocity_tok_s × remaining_s."""
 
-    def test_invariant1_tight_budget_many_uncovered_decouples(self):
-        # the headline: standard route, tight budget, 3 (>2) uncovered → decouple
+    def test_cost_exceeds_bandwidth_decouples(self):
+        # 10000 tokens of tests, 40 tok/s, 60s window → 2400 capacity < 10000 → shard
         assert ih.should_decouple_test_gen(
-            provider_route="standard", remaining_s=20.0, uncovered_count=3,
-            target_file_count=3, complexity="heavy_code", enabled=True,
+            est_test_tokens=10000.0, velocity_tok_s=40.0, remaining_s=60.0, enabled=True,
         ) is True
 
-    def test_ample_budget_keeps_inline(self):
-        # plenty of time → inject inline (legacy), even with many uncovered
+    def test_cost_fits_bandwidth_inlines(self):
+        # 1000 tokens, 40 tok/s, 60s → 2400 capacity > 1000 → fits inline
         assert ih.should_decouple_test_gen(
-            provider_route="standard", remaining_s=600.0, uncovered_count=5,
-            target_file_count=5, complexity="standard", enabled=True,
+            est_test_tokens=1000.0, velocity_tok_s=40.0, remaining_s=60.0, enabled=True,
         ) is False
 
-    def test_two_or_fewer_uncovered_never_decouples(self):
-        # ">2 uncovered" gate — 2 is not enough to warrant a separate op
+    def test_boundary_strictly_greater(self):
+        # exactly at capacity (2400 == 40×60) → NOT strictly greater → inline
         assert ih.should_decouple_test_gen(
-            provider_route="immediate", remaining_s=1.0, uncovered_count=2,
-            target_file_count=2, complexity="heavy_code", enabled=True,
+            est_test_tokens=2400.0, velocity_tok_s=40.0, remaining_s=60.0, enabled=True,
         ) is False
-
-    def test_heavy_complexity_moderate_budget_decouples(self):
         assert ih.should_decouple_test_gen(
-            provider_route="complex", remaining_s=100.0, uncovered_count=4,
-            target_file_count=4, complexity="heavy_code", enabled=True,
+            est_test_tokens=2400.1, velocity_tok_s=40.0, remaining_s=60.0, enabled=True,
         ) is True
+
+    def test_ample_budget_inlines_even_large_tests(self):
+        # huge window swamps the cost → inline
+        assert ih.should_decouple_test_gen(
+            est_test_tokens=50000.0, velocity_tok_s=40.0, remaining_s=3600.0, enabled=True,
+        ) is False
+
+    def test_unbounded_budget_never_shards(self):
+        assert ih.should_decouple_test_gen(
+            est_test_tokens=99999.0, velocity_tok_s=40.0, remaining_s=float("inf"), enabled=True,
+        ) is False
+
+    def test_depleted_budget_shards(self):
+        # no budget left + real cost → cannot fit inline → decouple
+        assert ih.should_decouple_test_gen(
+            est_test_tokens=500.0, velocity_tok_s=40.0, remaining_s=0.0, enabled=True,
+        ) is True
+
+    def test_zero_cost_inlines(self):
+        assert ih.should_decouple_test_gen(
+            est_test_tokens=0.0, velocity_tok_s=40.0, remaining_s=1.0, enabled=True,
+        ) is False
 
     def test_disabled_never_decouples(self):
         assert ih.should_decouple_test_gen(
-            provider_route="standard", remaining_s=1.0, uncovered_count=9,
-            target_file_count=9, complexity="complex", enabled=False,
+            est_test_tokens=99999.0, velocity_tok_s=1.0, remaining_s=1.0, enabled=False,
         ) is False
 
-    def test_adaptive_route_scaled_floor(self):
-        # immediate route has a tighter floor than complex — same remaining_s,
-        # immediate decouples while complex (more headroom) may not
-        imm = ih.should_decouple_test_gen(
-            provider_route="immediate", remaining_s=50.0, uncovered_count=3,
-            target_file_count=3, complexity="standard", enabled=True,
-        )
-        cplx = ih.should_decouple_test_gen(
-            provider_route="complex", remaining_s=300.0, uncovered_count=3,
-            target_file_count=3, complexity="standard", enabled=True,
-        )
-        assert imm is False  # 50s is above the immediate floor (~45s) and not heavy
-        assert cplx is False  # 300s ample for complex
-        # but a tight immediate budget decouples
-        assert ih.should_decouple_test_gen(
-            provider_route="immediate", remaining_s=30.0, uncovered_count=3,
-            target_file_count=3, complexity="standard", enabled=True,
-        ) is True
-
-    def test_min_uncovered_env_tunable(self, monkeypatch):
-        monkeypatch.setenv("JARVIS_TEST_SHARD_MIN_UNCOVERED", "5")
-        # now 3 uncovered is below the (raised) floor → no decouple
-        assert ih.should_decouple_test_gen(
-            provider_route="standard", remaining_s=10.0, uncovered_count=3,
-            target_file_count=3, complexity="heavy_code", enabled=True,
-        ) is False
+    def test_no_hardcoded_file_count_gate_in_source(self):
+        # the >2 integer gate must be gone — the decision is purely the inequality
+        src = inspect.getsource(ih.should_decouple_test_gen)
+        assert "uncovered_count" not in src
+        assert "_test_shard_min_uncovered" not in src
+        assert "velocity_tok_s" in src and "est_test_tokens" in src
 
     def test_fail_soft_false_on_bad_input(self):
         assert ih.should_decouple_test_gen(
-            provider_route="standard", remaining_s="bad", uncovered_count=3,
-            target_file_count=3, complexity="x", enabled=True,
+            est_test_tokens="bad", velocity_tok_s=40.0, remaining_s=10.0, enabled=True,
         ) is False
+
+
+class TestVelocityEnvKnob:
+    def test_velocity_default_and_env(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_TEST_SHARD_VELOCITY_TOK_S", raising=False)
+        d = ih._shard_velocity_tok_s()
+        assert isinstance(d, float) and d > 0
+        monkeypatch.setenv("JARVIS_TEST_SHARD_VELOCITY_TOK_S", "75")
+        assert ih._shard_velocity_tok_s() == 75.0
 
 
 class TestShardingFlag:
