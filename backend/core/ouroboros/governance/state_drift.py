@@ -20,21 +20,56 @@ import os
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
-# Telemetry state token (Manifesto §7 — every autonomous decision is visible).
+# Telemetry state tokens (Manifesto §7 — every autonomous decision is visible).
 STATE_CONTEXT_DRIFTED = "CONTEXT_DRIFTED"
+# Slice 248 — terminal_reason_code when the APPLY-time verification pass blocks a
+# provably-stale candidate (drift the GENERATE-entry re-alignment did not resolve).
+STATE_DRIFT_UNRECONCILED = "state_drift_unreconciled"
 
 _ENV_ENABLED = "JARVIS_STATE_DRIFT_RECONCILE_ENABLED"
+_ENV_VERIFY = "JARVIS_STATE_DRIFT_VERIFY_ENABLED"
 
 
 def state_drift_reconcile_enabled() -> bool:
-    """Master gate (default-TRUE). When OFF, the legacy log-only / blind-apply
-    behaviour stands (byte-identical). NEVER raises."""
+    """Master gate for the GENERATE-entry re-alignment (Slice 247, default-TRUE).
+    When OFF, the legacy log-only / blind-apply behaviour stands (byte-identical).
+    NEVER raises."""
     try:
         return os.getenv(_ENV_ENABLED, "true").strip().lower() in (
             "1", "true", "yes", "on",
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+def state_drift_verify_enabled() -> bool:
+    """Slice 248 — master gate for the APPLY-time verification pass (default-TRUE).
+    When OFF, drift is still detected + logged but the apply is NOT blocked
+    (byte-identical to the pre-248 log-and-apply behaviour). NEVER raises."""
+    try:
+        return os.getenv(_ENV_VERIFY, "true").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def should_block_apply(
+    prior_hashes: Optional[Sequence[Tuple[str, str]]],
+    project_root: Optional[Any],
+) -> Tuple[bool, List[str]]:
+    """Slice 248 — the APPLY-time verification decision (pure, zero-LLM).
+
+    Returns ``(block, drifted_files)``: ``drifted_files`` is the current set of
+    targets whose on-disk content no longer matches the candidate's GENERATE
+    baseline; ``block`` is True iff there IS drift AND the verify gate is on.
+    A stale candidate applied to drifted disk corrupts the file (full-content
+    overwrite = data loss; diff/anchor = line drift), so a True ``block`` means
+    "refuse the apply, fail safe." NEVER raises — on any error returns
+    ``(False, [])`` (degrade to the legacy apply rather than crash)."""
+    drifted = detect_drift(prior_hashes, project_root)
+    block = bool(drifted) and state_drift_verify_enabled()
+    return block, drifted
 
 
 def detect_drift(

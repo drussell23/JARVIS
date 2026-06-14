@@ -103,7 +103,12 @@ class TestWiring:
     def test_orchestrator_apply_seam_reuses_detector(self):
         from backend.core.ouroboros.governance import orchestrator as orch
         src = inspect.getsource(orch)
-        assert "detect_drift" in src, "the APPLY stale-guard should reuse the shared detector"
+        # Slice 248 refactored the APPLY seam to call should_block_apply (the
+        # verification wrapper that COMPOSES detect_drift) — either proves reuse
+        # of the shared zero-LLM detector rather than an inline hashlib loop.
+        assert "should_block_apply" in src or "detect_drift" in src, (
+            "the APPLY stale-guard should reuse the shared state_drift detector"
+        )
 
 
 class TestPhase4Integration:
