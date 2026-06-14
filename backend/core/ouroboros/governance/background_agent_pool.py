@@ -32,8 +32,11 @@ system resources.
 
 Boundary Principle
 ------------------
-Queue management is **deterministic** -- bounded size, FIFO ordering,
-back-pressure via ``QueueFullError``.  The actual operation execution
+Queue management is **deterministic** -- bounded size, route-based
+**priority ordering** (``asyncio.PriorityQueue``: lower route-priority number
+runs first -- immediate=1, standard/complex=3, background=5, speculative=7, with
+``submission_order`` as the FIFO tie-break within a priority), back-pressure via
+``QueueFullError``.  The actual operation execution
 inside each worker is **agentic** -- delegated entirely to the
 ``GovernedOrchestrator.run()`` pipeline.
 
