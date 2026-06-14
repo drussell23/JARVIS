@@ -6,3 +6,21 @@ repos:
         args: ['--severity-level', 'medium', '--confidence-level', 'medium', '-q']
         exclude: ^(_deprecated_|tests/|backend/tests/|temporarily_|check_chirp|setup_tts|test_connector|test_password)
         types: [python]
+
+  # Durable, team-wide guard against committing compiled Python artifacts.
+  # Root-cause prevention (companion to the .gitignore at lines 3-5): 355 tracked
+  # *.pyc files had to be untracked because they were committed historically
+  # despite being gitignored (gitignore is inert for already-tracked files).
+  # This local hook (no external dependency) hard-fails any staged *.pyc or
+  # __pycache__/ path so the artifacts can never re-enter the index — even via
+  # an accidental `git add -f`.
+  - repo: local
+    hooks:
+      - id: forbid-committed-pyc
+        name: forbid committed .pyc / __pycache__ artifacts
+        entry: >-
+          Compiled Python artifacts (*.pyc / __pycache__/) must never be
+          committed -- they are gitignored build output. Untrack with:
+          git rm --cached <file>
+        language: fail
+        files: '(\.pyc$|(^|/)__pycache__/)'
