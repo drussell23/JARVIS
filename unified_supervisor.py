@@ -13764,6 +13764,13 @@ class ServiceDescriptor:
     activation_count: int = 0
     last_health_check: float = 0.0
 
+    # --- Cybernetic Reanimation (Phase C) ---
+    # Optional event-driven activation contract. Default None → byte-identical
+    # for every existing descriptor. When present (set by the ReanimationLayer),
+    # iter_event_driven()/EventActivationDispatcher use trigger_events to lazy-
+    # activate this dormant organ on a matching SupervisorEventType.
+    activation_contract: Optional["ActivationContract"] = None
+
 
 # =========================================================================
 # GOVERNANCE DATACLASSES (Enterprise Organ Activation Program v1.0)
