@@ -751,26 +751,80 @@ class PLANRunner(PhaseRunner):
             logger.debug("[Orchestrator] Adaptive learning injection failed", exc_info=True)
 
         # ── P0: Test Coverage Enforcer (pre-GENERATE) ──
+        # Slice 239 (adaptive test-sharding, layer 9): this is the LIVE seam (the
+        # phase-runner refactor moved the enforcer here from orchestrator._run_
+        # pipeline). When budget is tight and >2 target files are uncovered,
+        # DECOUPLE the "generate tests" requirement into a SEPARATE background
+        # intake op (UnifiedIntakeRouter WAL queue) so the PRIMARY patch graduates
+        # the Iron Gate cleanly; else inline-inject (legacy). Fail-soft: no router
+        # / emit failure / ample budget → inline injection.
         try:
             from backend.core.ouroboros.governance.intelligence_hooks import (
                 TestCoverageEnforcer,
+                should_decouple_test_gen,
+                build_test_coverage_envelope,
+                test_sharding_enabled,
             )
             _coverage_enforcer = TestCoverageEnforcer(orch._config.project_root)
-            _coverage_instruction = _coverage_enforcer.check_and_inject(
-                ctx.target_files, ctx.description,
-            )
-            if _coverage_instruction:
-                _existing_human = getattr(ctx, "human_instructions", "") or ""
-                ctx = dataclasses.replace(
-                    ctx,
-                    human_instructions=_existing_human + _coverage_instruction,
-                    previous_hash=ctx.context_hash,
-                )
-                logger.info(
-                    "[Orchestrator] TestCoverageEnforcer: injected test generation "
-                    "instruction for %d uncovered files (op=%s)",
-                    _coverage_instruction.count("`"), ctx.op_id,
-                )
+            _uncovered = _coverage_enforcer.detect_uncovered(ctx.target_files)
+            _decoupled = False
+            if _uncovered:
+                _remaining_s = float("inf")
+                try:
+                    _dl = getattr(ctx, "pipeline_deadline", None)
+                    if _dl is not None:
+                        _remaining_s = (
+                            _dl - datetime.now(tz=timezone.utc)
+                        ).total_seconds()
+                except Exception:  # noqa: BLE001
+                    _remaining_s = float("inf")
+                if test_sharding_enabled() and should_decouple_test_gen(
+                    provider_route=getattr(ctx, "provider_route", "") or "standard",
+                    remaining_s=_remaining_s,
+                    uncovered_count=len(_uncovered),
+                    target_file_count=len(ctx.target_files or ()),
+                    complexity=str(getattr(ctx, "task_complexity", "") or ""),
+                    enabled=True,
+                ):
+                    _gls = getattr(orch._stack, "governed_loop_service", None)
+                    _router = getattr(_gls, "_intake_router", None) if _gls else None
+                    if _router is not None:
+                        try:
+                            _env = build_test_coverage_envelope(
+                                uncovered_files=_uncovered,
+                                parent_op_id=getattr(ctx, "op_id", "") or "",
+                                repo=getattr(ctx, "repo", "") or "jarvis",
+                            )
+                            _ing = await _router.ingest(_env)
+                            _decoupled = True
+                            logger.info(
+                                "[Orchestrator] Slice239 test-sharding: DECOUPLED "
+                                "test-gen for %d uncovered file(s) → intake (%s); "
+                                "primary patch graduates clean (op=%s)",
+                                len(_uncovered), _ing, ctx.op_id,
+                            )
+                        except Exception:  # noqa: BLE001 — never break the primary op
+                            logger.debug(
+                                "[Orchestrator] Slice239 decouple emit failed — "
+                                "falling back to inline inject", exc_info=True,
+                            )
+                            _decoupled = False
+                if not _decoupled:
+                    _coverage_instruction = _coverage_enforcer.check_and_inject(
+                        ctx.target_files, ctx.description,
+                    )
+                    if _coverage_instruction:
+                        _existing_human = getattr(ctx, "human_instructions", "") or ""
+                        ctx = dataclasses.replace(
+                            ctx,
+                            human_instructions=_existing_human + _coverage_instruction,
+                            previous_hash=ctx.context_hash,
+                        )
+                        logger.info(
+                            "[Orchestrator] TestCoverageEnforcer: injected test "
+                            "generation instruction for %d uncovered file(s) (op=%s)",
+                            len(_uncovered), ctx.op_id,
+                        )
         except ImportError:
             pass
         except Exception:
