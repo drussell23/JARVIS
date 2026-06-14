@@ -85,6 +85,34 @@ def _recovery_prior_enabled() -> bool:
         return False
 
 
+# Slice 243 — Adaptive Grid Stability Matrix. A 200-OK ping is insufficient to
+# prove a flapping grid can carry a heavy PLAN-EXPLOIT stream; the gate runs a
+# micro-streaming load test before waking. =0 → byte-identical wake-on-ping.
+_ENV_STABILITY_GATE = "JARVIS_GRID_STABILITY_GATE_ENABLED"
+_ENV_STABILITY_CHECKS = "JARVIS_GRID_STABILITY_STREAM_CHECKS"
+_DEFAULT_STABILITY_CHECKS = 1
+
+
+def _stability_gate_enabled() -> bool:
+    """Master gate for micro-streaming stability verification. NEVER raises."""
+    try:
+        return os.getenv(_ENV_STABILITY_GATE, "true").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stability_stream_checks() -> int:
+    """Consecutive clean micro-streams required to declare the grid stable.
+    Dynamic confidence knob. NEVER raises (floors at 1)."""
+    try:
+        v = int(float(os.getenv(_ENV_STABILITY_CHECKS, "").strip() or _DEFAULT_STABILITY_CHECKS))
+        return v if v >= 1 else _DEFAULT_STABILITY_CHECKS
+    except (TypeError, ValueError):
+        return _DEFAULT_STABILITY_CHECKS
+
+
 def _resolve_float(env: str, default: float, explicit: Optional[float]) -> float:
     """Prefer explicit > env > default, falling back on parse errors."""
     if explicit is not None:
@@ -162,6 +190,9 @@ class HibernationProber:
         self._probe_attempts: int = 0
         self._wake_count: int = 0
         self._last_result: Optional[str] = None
+        # Slice 243 — the provider the last ping found healthy, so the stability
+        # gate can run its micro-streaming load test against the same endpoint.
+        self._last_healthy_provider: Optional[Any] = None
 
         logger.info(
             "HibernationProber initialised — providers=%d initial=%.1fs "
@@ -332,19 +363,29 @@ class HibernationProber:
 
                 healthy_name = await self._probe_any()
                 if healthy_name is not None:
-                    self._last_result = f"woken_by:{healthy_name}"
-                    self._wake_count += 1
-                    # Slice 242: the dark window just ended — feed its observed
-                    # duration into the prior so the NEXT outage's first probe
-                    # is timed from history, not a static guess.
-                    self._record_outage_duration(elapsed)
-                    logger.info(
-                        "[HibernationProber] %s healthy after %d probes "
-                        "in %.1fs — waking controller",
-                        healthy_name, self._probe_attempts, elapsed,
+                    # Slice 243 — a ping is not enough: prove the grid can carry
+                    # a heavy stream before waking the DAG. A flapping grid fails
+                    # here and we fall through to the backoff loop untouched.
+                    stable = await self._verify_grid_stability(
+                        self._last_healthy_provider, healthy_name,
                     )
-                    await self._wake(healthy_name)
-                    return
+                    if stable:
+                        self._last_result = f"woken_by:{healthy_name}"
+                        self._wake_count += 1
+                        # Slice 242: the dark window just ended — feed its
+                        # observed duration into the prior so the NEXT outage's
+                        # first probe is timed from history, not a static guess.
+                        # Only a STABLE resurrection banks the duration — a flap
+                        # is not the end of the outage.
+                        self._record_outage_duration(elapsed)
+                        logger.info(
+                            "[HibernationProber] %s healthy + stream-stable "
+                            "after %d probes in %.1fs — waking controller",
+                            healthy_name, self._probe_attempts, elapsed,
+                        )
+                        await self._wake(healthy_name)
+                        return
+                    self._last_result = "flapping_grid"
 
                 delay = min(delay * 2.0, self._max_delay_s)
                 logger.debug(
@@ -388,8 +429,56 @@ class HibernationProber:
                 name, "UP" if result else "DOWN",
             )
             if result:
+                self._last_healthy_provider = provider
                 return name
         return None
+
+    async def _verify_grid_stability(self, provider: Any, name: str) -> bool:
+        """Slice 243 — the Stability Confidence Gate.
+
+        A 200-OK ping only proves the grid is *reachable*, not that it can carry
+        a heavy PLAN-EXPLOIT stream — DW's primary failure mode is a stateless
+        socket that drops mid-stream (a *flapping* grid). Before waking, run a
+        Micro-Streaming Load Test: request a lightweight multi-token stream and
+        require ``_stability_stream_checks()`` consecutive clean completions.
+        A mid-flight rupture (raise) or incomplete stream (falsy) →
+        FLAPPING_GRID_DETECTED, abort the wake, return to the backoff loop —
+        the hibernated WAL intent is never disturbed.
+
+        Providers without a ``stream_health_probe`` (Prime/Claude) cannot be
+        stream-tested → trust the ping (legacy wake-on-ping). NEVER raises."""
+        if not _stability_gate_enabled():
+            return True
+        stream_probe = getattr(provider, "stream_health_probe", None)
+        if stream_probe is None:
+            return True  # legacy contract — no micro-stream available
+        checks = _stability_stream_checks()
+        logger.info(
+            "[HibernationProber] %s VERIFYING_STABILITY — micro-streaming load "
+            "test (%d clean stream(s) required)", name, checks,
+        )
+        for i in range(checks):
+            try:
+                ok = await stream_probe()
+            except Exception as exc:  # noqa: BLE001 — rupture == flap
+                logger.warning(
+                    "[HibernationProber] FLAPPING_GRID_DETECTED — %s stream "
+                    "ruptured mid-flight on check %d/%d (%s) — aborting wake, "
+                    "returning to backoff", name, i + 1, checks, exc,
+                )
+                return False
+            if not ok:
+                logger.warning(
+                    "[HibernationProber] FLAPPING_GRID_DETECTED — %s stream "
+                    "incomplete on check %d/%d — aborting wake, returning to "
+                    "backoff", name, i + 1, checks,
+                )
+                return False
+        logger.info(
+            "[HibernationProber] %s stream-stable (%d/%d clean) — grid ready "
+            "for heavy work", name, checks, checks,
+        )
+        return True
 
     async def _wake(self, healthy_name: str) -> None:
         """Call ``controller.wake_from_hibernation`` and swallow errors.
