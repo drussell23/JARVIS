@@ -1019,6 +1019,17 @@ class OperationContext:
     provider_route: str = ""   # "immediate" | "standard" | "complex" | "background" | "speculative"
     provider_route_reason: str = ""  # human-readable reason for telemetry
 
+    # ---- Slice 245 — hibernation resurrection flag ----
+    # Set (via with_resurrection()) when an op that failed with provider
+    # exhaustion during a dark window is re-ingested after the Grid Sentinel
+    # confirms recovery. Consumed by _compute_priority (intake) and
+    # BackgroundAgentPool.submit() (pool) to grant Absolute-Max Primacy so the
+    # survivor supersedes everything that accumulated while the grid was dark.
+    # The flag travels ON the preserved context — durable partial state (phase,
+    # already-generated candidates, plan) rides along; no completed work is
+    # re-computed.
+    resurrected_from_hibernation: bool = False
+
     # ---- Dependency intelligence from Oracle graph (injected at CONTEXT_EXPANSION) ----
     # ~200-token summary: direct dependents, transitive importers, blast radius.
     # Prevents breaking downstream consumers that import the target files.
@@ -1389,6 +1400,22 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             expanded_context_files=files,
+            previous_hash=self.context_hash,
+            context_hash="",  # placeholder — recomputed below
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_resurrection(self) -> "OperationContext":
+        """Slice 245 — return a new context flagged as a hibernation survivor
+        (no phase change). Preserves all durable partial state (phase,
+        generation candidates, plan, route) via the same hash-chain mechanics as
+        with_expanded_files(). Consumed by the priority layers for Absolute-Max
+        Primacy on re-ingest after grid recovery."""
+        intermediate = dataclasses.replace(
+            self,
+            resurrected_from_hibernation=True,
             previous_hash=self.context_hash,
             context_hash="",  # placeholder — recomputed below
         )

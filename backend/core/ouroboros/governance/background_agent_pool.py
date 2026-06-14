@@ -231,6 +231,38 @@ class BackgroundOp:
 # ---------------------------------------------------------------------------
 
 
+# Slice 245 — route priorities the pool ranks by (mirrors submit()). Lower runs
+# first: immediate=1, standard/complex=3, background=5, speculative=7.
+_ROUTE_PRIORITY: Dict[str, int] = {
+    "immediate": 1, "standard": 3, "complex": 3, "background": 5, "speculative": 7,
+}
+# Error substrings that mark an op as a hibernation SURVIVOR — it died because
+# the grid went dark, not because the work was bad. These get re-ingested with
+# Absolute-Max Primacy on wake.
+_RESURRECTABLE_ERROR_MARKERS: Tuple[str, ...] = (
+    "all_providers_exhausted", "providers_exhausted",
+    "deadline_exhausted", "live_transport",
+)
+
+
+def _resurrection_primacy_margin() -> int:
+    """Margin below the highest normal pool priority for a resurrected op.
+    Shares the JARVIS_RESURRECTION_PRIMACY_MARGIN knob with the intake layer.
+    NEVER raises (floors at 1)."""
+    try:
+        v = int(float(os.environ.get("JARVIS_RESURRECTION_PRIMACY_MARGIN", "").strip() or 100))
+        return v if v >= 1 else 100
+    except (TypeError, ValueError):
+        return 100
+
+
+def _resurrection_pool_priority() -> int:
+    """Absolute-max pool priority — dynamically below the highest normal route
+    priority (NOT a hardcoded 0/1). Derived from _ROUTE_PRIORITY so it stays
+    correct if the route tiers change."""
+    return min(_ROUTE_PRIORITY.values()) - _resurrection_primacy_margin()
+
+
 def _read_env_int(key: str, default: int) -> int:
     """Read an integer from the environment with a safe fallback."""
     raw = os.environ.get(key, "")
@@ -553,11 +585,13 @@ class BackgroundAgentPool:
 
         # Route-based priority for PriorityQueue (lower = runs first).
         _route = getattr(op_context, "provider_route", "") or "standard"
-        _route_priority = {
-            "immediate": 1, "standard": 3, "complex": 3,
-            "background": 5, "speculative": 7,
-        }
-        _priority = _route_priority.get(_route, 3)
+        # Slice 245 — a hibernation survivor jumps ahead of EVERY normal route
+        # (dynamic absolute-max, not hardcoded), so the work that accumulated
+        # during the dark window cannot starve the resurrected primary.
+        if getattr(op_context, "resurrected_from_hibernation", False):
+            _priority = _resurrection_pool_priority()
+        else:
+            _priority = _ROUTE_PRIORITY.get(_route, 3)
         self._submit_counter += 1
 
         try:
@@ -652,6 +686,50 @@ class BackgroundAgentPool:
             ctx_op_id, op_id, attempt_seq,
         )
         return op_id
+
+    async def resubmit_resurrected(self, op_context: "OperationContext") -> str:
+        """Slice 245 — re-ingest a hibernation survivor with Absolute-Max Primacy.
+
+        Re-submits the op's EXACT OperationContext (preserving durable partial
+        state — phase, already-generated candidates, plan; no completed work is
+        re-computed) flagged via ``with_resurrection()``. ``submit()`` then reads
+        the flag and assigns ``_resurrection_pool_priority()`` so the survivor
+        dequeues ahead of everything that accumulated during the dark window.
+        Reuses the canonical submit path — no parallel enqueue logic."""
+        resurrected = op_context
+        with_fn = getattr(op_context, "with_resurrection", None)
+        if callable(with_fn):
+            resurrected = with_fn()
+        op_id = await self.submit(resurrected)
+        logger.info(
+            "resubmit_resurrected: ctx_op_id=%s pool_op_id=%s — ABSOLUTE PRIMACY",
+            str(getattr(op_context, "op_id", "") or ""), op_id,
+        )
+        return op_id
+
+    def drain_exhaustion_failures(self) -> List["OperationContext"]:
+        """Slice 245 — collect + clear ops that FAILED due to provider
+        exhaustion during a dark window (the survivors). Returns their preserved
+        OperationContexts for re-ingest on wake. Cleared from ``_ops`` so a
+        subsequent wake cannot double-resurrect the same op. NEVER raises."""
+        survivors: List["OperationContext"] = []
+        try:
+            dead_ids = []
+            for op_id, op in list(self._ops.items()):
+                if op.status != "failed":
+                    continue
+                err = str(op.error or "")
+                if not any(m in err for m in _RESURRECTABLE_ERROR_MARKERS):
+                    continue
+                ctx = getattr(op, "context", None)
+                if ctx is not None:
+                    survivors.append(ctx)
+                    dead_ids.append(op_id)
+            for op_id in dead_ids:
+                self._ops.pop(op_id, None)
+        except Exception:  # noqa: BLE001 — wake path, never raise
+            logger.exception("[BGPool] drain_exhaustion_failures failed")
+        return survivors
 
     def is_resumed_dispatch(self, ctx_op_id: str) -> bool:
         """Return True iff a resumed dispatch is pending or in-flight

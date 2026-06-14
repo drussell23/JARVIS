@@ -308,11 +308,33 @@ def _is_test_generation_intent(envelope: "IntentEnvelope") -> bool:
     )
 
 
+def _resurrection_primacy_margin() -> int:
+    """Slice 245 — margin below the highest normal primacy for a resurrected op.
+    Env-tunable, NEVER raises (floors at 1)."""
+    try:
+        v = int(float(os.getenv("JARVIS_RESURRECTION_PRIMACY_MARGIN", "").strip() or 100))
+        return v if v >= 1 else 100
+    except (TypeError, ValueError):
+        return 100
+
+
+def _resurrection_intake_priority() -> int:
+    """Absolute-max intake primacy — dynamically below the highest normal source
+    (NOT a hardcoded 0). Derived from the live _PRIORITY_MAP so it stays correct
+    if the tiers change."""
+    try:
+        floor = min(_PRIORITY_MAP.values())
+    except (ValueError, TypeError):
+        floor = 0
+    return floor - _resurrection_primacy_margin()
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
     *,
     repo_root: "Optional[Path]" = None,
+    resurrected: bool = False,
 ) -> Tuple[int, Optional[Any]]:
     """Compute cost-aware priority score + rich goal alignment for an envelope.
 
@@ -340,6 +362,12 @@ def _compute_priority(
     endpoint rather than wondering why prioritization looks flat.
     """
     global _goal_alignment_failures, _goal_alignment_warned
+
+    # Slice 245 — a hibernation survivor gets Absolute-Max Primacy, short-
+    # circuiting all normal factors so nothing can demote it below the work that
+    # accumulated during the dark window. Dynamic floor (not a hardcoded 0).
+    if resurrected:
+        return _resurrection_intake_priority(), None
 
     base = _PRIORITY_MAP.get(envelope.source, 99)
     urgency = _URGENCY_BOOST.get(envelope.urgency, 0)
