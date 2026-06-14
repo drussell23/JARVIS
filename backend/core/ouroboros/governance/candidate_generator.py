@@ -85,6 +85,46 @@ _TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION",
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
 _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25"))
 
+
+# ---------------------------------------------------------------------------
+# Slice 238 — cascade-to-dead-Claude guard (layer 8).
+#
+# The sentinel's ``fallback_tolerance=cascade_to_claude`` path invoked
+# ``_call_fallback`` (the Claude lane) with NO breaker consult — so a DW
+# transient hiccup poisoned the op via the credit-dead Claude lane
+# (terminal_quota). The PRIMARY Claude lane already gates on the economic
+# breaker; this makes the cascade read the SAME source-of-truth (the read-only
+# ``doubleword_provider._claude_breaker_open`` predicate, no probe side-effect)
+# so when Claude is economically/transport OPEN the cascade is suppressed and the
+# op routes to the existing immortal DW-retry / clean-degrade branch instead.
+# ---------------------------------------------------------------------------
+
+
+def cascade_breaker_consult_enabled() -> bool:
+    """Master switch for the Slice-238 cascade breaker consult. Default TRUE —
+    failure-path-only (only changes behavior when the Claude breaker is OPEN,
+    which is exactly when cascading to it is wrong); breaker-CLOSED is byte-
+    identical to the legacy cascade. Kill switch is pure rollback. NEVER raises."""
+    raw = (os.environ.get("JARVIS_CASCADE_BREAKER_CONSULT_ENABLED", "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def should_cascade_to_claude(
+    *, has_fallback: bool, claude_breaker_open: bool, enabled: bool,
+) -> bool:
+    """Pure decision: should the sentinel actually cascade to the Claude fallback
+    after DW exhaustion? Cascade ONLY when a fallback is configured AND it is not
+    suppressed by an OPEN economic breaker. When *enabled* and the breaker is OPEN
+    (Claude known-dead), suppress the cascade (→ caller routes to the immortal
+    DW-retry / degrade branch). When *enabled* is False (kill switch), legacy
+    behavior: cascade iff a fallback exists. No env / breaker reads here — the
+    caller injects both — so this stays deterministic + unit-testable. Pure."""
+    if not has_fallback:
+        return False
+    if enabled and claude_breaker_open:
+        return False  # Claude lane is dead — do not poison the op via it
+    return True
+
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
 _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
@@ -3932,8 +3972,37 @@ class CandidateGenerator:
                 f"dw_severed_queued:"
                 f"{(last_failure or 'all_models_open')[:120]}"
             )
+        # cascade_to_claude — Claude is the explicit cost contract, BUT only when
+        # the Claude lane is actually alive. Slice 238: consult the SAME economic
+        # breaker the primary lane respects (read-only ``_claude_breaker_open`` —
+        # no probe side-effect) before cascading. When it is OPEN (Claude
+        # economically/transport dead) the cascade is suppressed and the op routes
+        # to the immortal DW-retry / clean-degrade branch below instead of
+        # poisoning the op via a known-dead lane (terminal_quota). Breaker CLOSED
+        # → byte-identical legacy cascade (a funded Claude is used normally).
+        _claude_lane_open = False
+        try:
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                _claude_breaker_open as _cascade_breaker_open,
+            )
+            _claude_lane_open = _cascade_breaker_open()
+        except Exception:  # noqa: BLE001 — advisory; never block dispatch
+            _claude_lane_open = False
+        _do_cascade = should_cascade_to_claude(
+            has_fallback=self._fallback is not None,
+            claude_breaker_open=_claude_lane_open,
+            enabled=cascade_breaker_consult_enabled(),
+        )
+        if not _do_cascade and self._fallback is not None and _claude_lane_open:
+            logger.warning(
+                "[CandidateGenerator] Slice238 cascade-to-claude SUPPRESSED: "
+                "Claude breaker OPEN (economic/transport) — not poisoning op via "
+                "the known-dead lane (terminal_quota); routing to immortal "
+                "DW-retry/degrade (op=%s, last=%s)",
+                op_id_short, (last_failure or "?")[:60],
+            )
         # cascade_to_claude — Claude is the explicit cost contract.
-        if self._fallback is None:
+        if not _do_cascade:
             # Slice 180 — THE IMMORTAL EXECUTION LAYER. Raising here DELETES the op (the
             # soak's all_providers_exhausted bleed). With NO fallback configured, exhausting
             # is unacceptable. Instead → QUEUE_ONLY: exponential-backoff and RE-ATTEMPT the
@@ -5278,6 +5347,20 @@ class CandidateGenerator:
         os.environ.get("JARVIS_BG_READONLY_SYNTHESIS_RESERVE_S", "180.0")
     )
 
+    def _fallback_is_claude(self) -> bool:
+        """Slice 238 — True iff the configured fallback is the Claude lane (so the
+        Claude economic breaker is the right health signal to gate it). Reads the
+        fallback's ``provider_name`` (e.g. ``claude-api``); a non-Claude fallback
+        (e.g. Prime) returns False so the Claude breaker never suppresses it.
+        NEVER raises → fail-soft to False (legacy: don't suppress)."""
+        try:
+            if self._fallback is None:
+                return False
+            name = (getattr(self._fallback, "provider_name", "") or "").strip().lower()
+            return "claude" in name
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _call_fallback(
         self,
         context: OperationContext,
@@ -5353,6 +5436,41 @@ class CandidateGenerator:
                 deadline=deadline,
                 disabled_routes=os.environ.get(_DISABLE_FALLBACK_ROUTES_ENV, ""),
             )
+
+        # Slice 238 — cascade breaker consult (CENTRAL seam). The s237 soak proved
+        # the cascade-to-dead-Claude poison (BadRequestError 400 → terminal_quota →
+        # cooldown cycle) reaches Claude from EVERY _call_fallback caller, not just
+        # the sentinel cascade_to_claude path. Guard it here, where all callers
+        # converge: when the fallback IS the Claude lane AND the economic breaker
+        # is OPEN (read-only _claude_breaker_open — same source-of-truth the
+        # primary lane respects, no probe side-effect), do NOT call the known-dead
+        # lane. Raise the EXISTING fallback_skipped sentinel (Slice 19b — NOT
+        # counted toward ExhaustionWatcher hibernation) so the op degrades cleanly
+        # instead of burning a 400 and poisoning the consecutive-failure counter.
+        # Breaker CLOSED → byte-identical (a funded Claude fallback is used).
+        if cascade_breaker_consult_enabled() and self._fallback_is_claude():
+            _claude_lane_open = False
+            try:
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    _claude_breaker_open as _cf_breaker_open,
+                )
+                _claude_lane_open = _cf_breaker_open()
+            except Exception:  # noqa: BLE001 — advisory; never block dispatch
+                _claude_lane_open = False
+            if _claude_lane_open:
+                logger.warning(
+                    "[CandidateGenerator] Slice238 fallback SUPPRESSED (central): "
+                    "Claude lane breaker OPEN (economic/transport) — skipping the "
+                    "known-dead Claude fallback (no terminal_quota poison); "
+                    "raising fallback_skipped so the op degrades cleanly "
+                    "(route=%s)", _op_route or "?",
+                )
+                self._raise_exhausted(
+                    "fallback_skipped:claude_breaker_open",
+                    context=context,
+                    deadline=deadline,
+                    fallback_state="economic_open",
+                )
 
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
