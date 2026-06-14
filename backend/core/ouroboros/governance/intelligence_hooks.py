@@ -18,6 +18,7 @@ Boundary Principle:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -47,6 +48,145 @@ _REVIEW_ALWAYS_PATHS: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Slice 239 — Adaptive Test-Sharding & Asynchronous Enforcement (layer 9).
+#
+# When a heavy multi-file GOAL has >2 uncovered files AND the remaining budget is
+# tight, injecting "also generate N test files" into the PRIMARY op's prompt
+# balloons it past its deadline. Instead, compile an ISOLATED test-coverage
+# payload and emit it as a SEPARATE background signal into the existing
+# UnifiedIntakeRouter WAL queue (reuse make_envelope + router.ingest + the
+# intake→op pipeline) so the primary patch graduates cleanly and a later
+# independent op fulfils coverage. Adaptive (route/budget/complexity-scaled, no
+# hardcoded cap), env-tunable, gated, fail-soft (no router → legacy inline inject).
+# ---------------------------------------------------------------------------
+
+# Route-scaled budget floor: decouple when remaining_s drops below the route's
+# floor. base × per-route fraction (tighter routes decouple earlier). The base is
+# env-tunable; the fractions mirror the route cost/deadline tiers (CLAUDE.md §5).
+_TEST_SHARD_ROUTE_FRACTIONS: Dict[str, float] = {
+    "immediate": 0.5,     # ~45s of the 90s base — very tight reflex window
+    "standard": 0.67,     # ~60s
+    "complex": 1.0,       # ~90s
+    "background": 1.33,   # ~120s
+    "speculative": 2.0,   # ~180s
+}
+
+
+def test_sharding_enabled() -> bool:
+    """Master switch for adaptive test-sharding (layer 9). Default TRUE — gated +
+    fail-soft (no router → legacy inline inject) + only fires when budget is tight
+    AND >2 files are uncovered, so light/ample ops are byte-identical. NEVER raises."""
+    raw = (os.environ.get("JARVIS_TEST_SHARDING_ENABLED", "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _test_shard_min_uncovered() -> int:
+    """Minimum uncovered-file count to warrant a SEPARATE test-coverage op (the
+    ">2 files" gate). Below this, inline injection is cheap enough. Default 3.
+    Env JARVIS_TEST_SHARD_MIN_UNCOVERED. Invalid/non-positive → default."""
+    raw = (os.environ.get("JARVIS_TEST_SHARD_MIN_UNCOVERED", "") or "").strip()
+    if not raw:
+        return 3
+    try:
+        v = int(raw)
+        return v if v > 0 else 3
+    except ValueError:
+        return 3
+
+
+def _test_shard_budget_base_s() -> float:
+    """Base budget floor (seconds) for the decouple decision, scaled per route.
+    Default 90. Env JARVIS_TEST_SHARD_BUDGET_BASE_S. Invalid/non-positive → default."""
+    raw = (os.environ.get("JARVIS_TEST_SHARD_BUDGET_BASE_S", "") or "").strip()
+    if not raw:
+        return 90.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 90.0
+    except ValueError:
+        return 90.0
+
+
+def _test_shard_budget_floor_s(provider_route: str) -> float:
+    """The route-scaled remaining-budget floor below which test-gen is decoupled."""
+    frac = _TEST_SHARD_ROUTE_FRACTIONS.get(
+        (provider_route or "standard").strip().lower(), 0.67,
+    )
+    return _test_shard_budget_base_s() * frac
+
+
+def should_decouple_test_gen(
+    *, provider_route: str, remaining_s, uncovered_count: int,
+    target_file_count: int = 1, complexity: str = "", enabled: bool = True,
+) -> bool:
+    """Pure adaptive decision: emit a SEPARATE background test-coverage op instead
+    of inlining the test-gen instruction into the primary op? Decouple ONLY when
+    enabled AND there are >2 uncovered files AND the budget can't sustain the load
+    — the budget floor scales to the route, and heavy/multi-file ops decouple with
+    more headroom. Light / ample ops → False (legacy inline inject, byte-identical).
+    No env / IO reads of the breaker here — all inputs injected → deterministic +
+    unit-testable. Pure; NEVER raises → fail-soft to False (inline)."""
+    try:
+        if not enabled:
+            return False
+        if int(uncovered_count) < _test_shard_min_uncovered():
+            return False  # ≤2 uncovered → inline is cheap enough
+        rem = float(remaining_s)
+        floor = _test_shard_budget_floor_s(provider_route)
+        if rem < floor:
+            return True
+        # Heavy / multi-file ops decouple with 1.5× headroom — their per-round
+        # latency makes an inlined N-file test-gen especially deadline-risky.
+        heavy = (complexity or "").strip().lower() in ("heavy_code", "complex")
+        multifile = int(target_file_count) >= 5
+        if (heavy or multifile) and rem < floor * 1.5:
+            return True
+        return False
+    except Exception:  # noqa: BLE001 — fail-soft to inline
+        return False
+
+
+def build_test_coverage_envelope(
+    *, uncovered_files, parent_op_id: str, repo: str = "jarvis",
+    description: str = "",
+):
+    """Compile the ISOLATED, dedup-stable test-coverage payload as an
+    IntentEnvelope (source=test_coverage, urgency=low, routing_override=background)
+    via the existing ``make_envelope``. The dedup signature is the sorted
+    uncovered set, so the SAME requirement re-emitted across parent retries
+    collapses to one background op. NEVER raises here is NOT promised — the caller
+    wraps the emit fail-soft (a bad envelope must not break the primary op)."""
+    from backend.core.ouroboros.governance.intake.intent_envelope import (
+        make_envelope as _make_envelope,
+    )
+    files = tuple(sorted({str(f) for f in (uncovered_files or ()) if str(f).strip()}))
+    sig = "test_coverage:" + hashlib.sha256(
+        "|".join(files).encode("utf-8"),
+    ).hexdigest()[:16]
+    desc = description or (
+        f"Generate test coverage for {len(files)} uncovered file(s) decoupled from "
+        f"patch op {str(parent_op_id)[:16]}: "
+        f"{', '.join(files[:3])}{'…' if len(files) > 3 else ''}"
+    )
+    return _make_envelope(
+        source="test_coverage",
+        description=desc,
+        target_files=files,
+        repo=repo or "jarvis",
+        confidence=0.9,
+        urgency="low",
+        evidence={
+            "signature": sig,
+            "uncovered_files": list(files),
+            "parent_op_id": str(parent_op_id),
+            "enforcer_reason": "budget_constraint",
+        },
+        requires_human_ack=False,
+        routing_override="background",
+    )
+
+
+# ---------------------------------------------------------------------------
 # 1. Test Coverage Enforcer (Pre-GENERATE)
 # ---------------------------------------------------------------------------
 
@@ -62,6 +202,28 @@ class TestCoverageEnforcer:
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
 
+    def detect_uncovered(self, target_files: Tuple[str, ...]) -> List[str]:
+        """Pure detection (Slice 239): the source-of-truth list of target files
+        that lack test coverage. Skips test files, non-Python files, and
+        ``__init__``/``conftest``. Both the legacy inline injection
+        (``check_and_inject``) and the decoupled sharding path read THIS, so the
+        "which files need tests" decision can never drift. NEVER raises → []."""
+        uncovered: List[str] = []
+        try:
+            for rel_path in target_files or ():
+                if "test_" in rel_path or rel_path.endswith("_test.py"):
+                    continue
+                if not rel_path.endswith(".py"):
+                    continue
+                basename = Path(rel_path).stem
+                if basename in ("__init__", "conftest"):
+                    continue
+                if not self._find_test_file(rel_path):
+                    uncovered.append(rel_path)
+        except Exception:  # noqa: BLE001 — detection must never break the pipeline
+            return []
+        return uncovered
+
     def check_and_inject(
         self,
         target_files: Tuple[str, ...],
@@ -73,23 +235,7 @@ class TestCoverageEnforcer:
         if any target files lack test coverage. Returns None if all files
         are covered or if target files are themselves tests.
         """
-        uncovered: List[str] = []
-
-        for rel_path in target_files:
-            # Skip test files and non-Python files
-            if "test_" in rel_path or rel_path.endswith("_test.py"):
-                continue
-            if not rel_path.endswith(".py"):
-                continue
-            # Skip __init__.py and config files
-            basename = Path(rel_path).stem
-            if basename in ("__init__", "conftest"):
-                continue
-
-            # Look for corresponding test files
-            test_exists = self._find_test_file(rel_path)
-            if not test_exists:
-                uncovered.append(rel_path)
+        uncovered = self.detect_uncovered(target_files)
 
         if not uncovered:
             return None
