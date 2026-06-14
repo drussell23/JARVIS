@@ -28,6 +28,7 @@ symbiote must be entirely visible.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import re
 import subprocess
@@ -396,6 +397,117 @@ def _headless_auto_approve_reason() -> Optional[str]:
         # as headless rather than letting the isatty() call raise.
         return "no-tty:stdin-invalid"
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Slice 253 — Shadow-Endorsement decision core (the "steering wheel")
+#
+# Pure + injectable so the /endorse decision logic is unit-testable WITHOUT
+# prompt_toolkit, a real TTY, or the 102K-line kernel. The REPL handler
+# (:meth:`SerpentREPL._handle_endorse`) wires the real backend callables +
+# prompt_toolkit prompt into these; the tests inject mocks.
+# ══════════════════════════════════════════════════════════════════════
+
+def classify_endorsement_choice(raw: Optional[str]) -> str:
+    """Normalize a raw human answer to the strict binary ``"y"`` / ``"n"``.
+
+    The endorsement gate is a STRICT binary ``[Endorse execution? y/N]`` — the
+    default (empty input, garbage, ``None``) is the SAFE ``"n"`` (decline). Only
+    an explicit ``y`` / ``yes`` (case-insensitive, whitespace-trimmed) endorses.
+    """
+    if raw is None:
+        return "n"
+    return "y" if str(raw).strip().lower() in ("y", "yes") else "n"
+
+
+async def resolve_endorsement(
+    action_id: str,
+    *,
+    choice: Optional[str] = None,
+    prompt_fn: "Callable[[Dict[str, Any]], Any]",
+    handle_choice: "Callable[[str, str], Any]",
+    payload: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """The injectable endorsement decision core.
+
+    Routes a single trapped-action endorsement decision through the backend:
+
+    * If ``choice`` is provided (``"y"``/``"n"`` or any string), it is used
+      directly — NO prompt is shown (the non-interactive ``/endorse <id> y|n``
+      scripting path + the headless path).
+    * If ``choice`` is ``None``, ``prompt_fn(payload)`` is awaited to obtain the
+      human's answer (the interactive ``[Endorse execution? y/N]`` prompt).
+    * The resolved answer is routed to ``handle_choice(action_id, answer)``
+      (the backend's ``handle_endorsement_choice``) which returns an
+      ``EndorsementResult``-shaped object (``.status`` / ``.action_id`` / etc.).
+
+    FAIL-SOFT by construction — a backend exception yields a synthetic
+    ``error`` result and an EOF/cancelled prompt is treated as a decline.
+    NEVER raises into the REPL loop. ``prompt_fn`` / ``handle_choice`` may be
+    sync or async (awaited iff awaitable).
+    """
+    answer: str
+    if choice is not None:
+        answer = str(choice)
+    else:
+        try:
+            out = prompt_fn(payload or {"action_id": action_id})
+            if inspect.isawaitable(out):
+                out = await out
+            answer = str(out)
+        except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
+            answer = "n"  # cancelled prompt == decline (safe default)
+        except Exception:  # noqa: BLE001 — a broken prompt must never crash
+            answer = "n"
+
+    try:
+        res = handle_choice(action_id, answer)
+        if inspect.isawaitable(res):
+            res = await res
+        return res
+    except Exception as exc:  # noqa: BLE001 — endorsement must never crash Host
+        return _EndorsementErrorShim(action_id=action_id, error=str(exc)[:256])
+
+
+class _EndorsementErrorShim:
+    """Minimal ``EndorsementResult``-shaped fail-soft result for the case where
+    the backend call itself raised (so :func:`render_endorsement_outcome` and
+    the REPL renderer have a uniform ``.status`` surface)."""
+
+    __slots__ = ("status", "action_id", "organ", "intended_action", "error")
+
+    def __init__(self, *, action_id: str = "", error: str = "") -> None:
+        self.status = "error"
+        self.action_id = action_id
+        self.organ = ""
+        self.intended_action = ""
+        self.error = error
+
+
+def render_endorsement_outcome(result: Any) -> str:
+    """Map an ``EndorsementResult`` to a calm, restrained one-line display
+    string (plain text — the REPL handler wraps it in Rich color markup).
+
+    Green-for-outcomes aesthetic: only ``executed`` is a positive outcome; the
+    rest are muted/caution. Pure + total — unknown statuses degrade gracefully.
+    """
+    status = str(getattr(result, "status", "") or "?")
+    aid = str(getattr(result, "action_id", "") or "?")
+    organ = str(getattr(result, "organ", "") or "")
+    organ_tag = f" {organ}" if organ else ""
+    if status == "executed":
+        return f"✓ endorsed → executed{organ_tag} (id={aid})"
+    if status == "declined":
+        return f"✗ declined{organ_tag} (id={aid}) — still pending until TTL"
+    if status == "not_found":
+        return f"action not found (id={aid}) — already endorsed or evicted"
+    if status == "expired":
+        return f"expired (id={aid}) — a stale kill must not fire late"
+    if status == "error":
+        err = str(getattr(result, "error", "") or "").strip()
+        suffix = f": {err}" if err else ""
+        return f"endorsement error (id={aid}){suffix}"
+    return f"endorsement outcome={status} (id={aid})"
 
 
 def _prov(provider: str) -> str:
@@ -4334,6 +4446,8 @@ class SerpentREPL:
         self._running = False
         self._task: Optional[asyncio.Task[None]] = None
         self._gls = gls  # GovernedLoopService reference for /cancel
+        # Slice 253 — live shadow-trap breadcrumb listener task.
+        self._shadow_breadcrumb_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
         """Start the REPL loop as a background task."""
@@ -4341,10 +4455,81 @@ class SerpentREPL:
             return
         self._running = True
         self._task = asyncio.ensure_future(self._loop())
+        # Slice 253 — start the live shadow-trap breadcrumb listener
+        # (best-effort, in-process; never blocks REPL boot).
+        try:
+            self._shadow_breadcrumb_task = asyncio.ensure_future(
+                self._shadow_breadcrumb_listener()
+            )
+        except Exception:  # noqa: BLE001 — breadcrumb is best-effort
+            self._shadow_breadcrumb_task = None
+
+    async def _shadow_breadcrumb_listener(self) -> None:
+        """Slice 253 — surface a calm, non-blocking breadcrumb when a Shadow
+        Mode action is trapped, so the Host knows to run ``/endorse``.
+
+        Subscribes IN-PROCESS to the existing :class:`StreamEventBroker` (the
+        same broker the read-only ``/observability/stream`` SSE uses — which is
+        left fully intact) and prints a one-line breadcrumb on each
+        ``SHADOW_ACTION_TRAPPED`` event. Deliberately does NOT hijack the prompt
+        mid-input (auto-stealing the input line under prompt_toolkit is fragile);
+        a breadcrumb + the ``/endorse`` pull-verb is the robust, elegant UX.
+
+        Best-effort + fail-soft: any error (broker disabled, subscriber cap
+        reached, import failure) silently disables the breadcrumb — the
+        ``/endorse`` verb remains fully functional regardless."""
+        sub = None
+        broker = None
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                EVENT_TYPE_SHADOW_ACTION_TRAPPED,
+                get_default_broker,
+            )
+
+            broker = get_default_broker()
+            sub = broker.subscribe()
+            if sub is None:
+                return  # subscriber cap reached — degrade silently
+            async for event in broker.stream_iter(sub, heartbeat_s=0):
+                if getattr(event, "event_type", "") != EVENT_TYPE_SHADOW_ACTION_TRAPPED:
+                    continue
+                try:
+                    payload = dict(getattr(event, "payload", {}) or {})
+                    organ = str(payload.get("organ_name", "") or "?")
+                    action = str(payload.get("intended_action", "") or "?")
+                    aid = str(payload.get("action_id", "") or "?")
+                    self._flow.console.print(
+                        f"  [{_C['heal']}]⚠ shadow action trapped[/{_C['heal']}]  "
+                        f"[{_C['neural']}]{organ}[/{_C['neural']}] wants to "
+                        f"[bold]{action}[/bold] "
+                        f"[{_C['dim']}](id={aid}) — /endorse to review[/{_C['dim']}]",
+                        highlight=False,
+                    )
+                except Exception:  # noqa: BLE001 — one bad event never kills the loop
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — breadcrumb is strictly best-effort
+            return
+        finally:
+            try:
+                if broker is not None and sub is not None:
+                    broker.unsubscribe(sub)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def stop(self) -> None:
         """Gracefully shut down the REPL."""
         self._running = False
+        # Slice 253 — tear down the breadcrumb listener.
+        _bc = getattr(self, "_shadow_breadcrumb_task", None)
+        if _bc is not None:
+            _bc.cancel()
+            try:
+                await _bc
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._shadow_breadcrumb_task = None
         # Stop the spinner invalidator first so its task doesn't
         # outlive the REPL session.
         try:
@@ -5006,6 +5191,16 @@ class SerpentREPL:
                         or line.startswith("review ")
                     ):
                         self._handle_review(line)
+                        continue
+
+                    # Slice 253 — Shadow-Endorsement interceptor (HITL steering
+                    # wheel for trapped Cybernetic Reanimation actions).
+                    if (
+                        line in ("/endorse", "endorse")
+                        or line.startswith("/endorse ")
+                        or line.startswith("endorse ")
+                    ):
+                        await self._handle_endorse(line)
                         continue
 
                     # Gap #3 Slice 3 — unified /expand <ref> verb
@@ -6888,6 +7083,213 @@ class SerpentREPL:
             f"  [{_C['dim']}]/accept <op-id> · /reject <op-id>[/{_C['dim']}]",
             highlight=False,
         )
+
+    # ── Slice 253 — Shadow-Endorsement interceptor (HITL steering wheel) ──
+
+    def _shadow_payload_for(self, action_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a trapped action's payload (organ_name / intended_action /
+        triggering_signal / action_id) by ``action_id`` for prompt rendering.
+
+        The backend exposes the pending store via its ``_PENDING`` registry's
+        ``entries`` OrderedDict (read-only here — we never pop; endorsement
+        pops one-shot through the backend API). Returns ``None`` when the id is
+        unknown. Fail-soft: any error yields ``None``."""
+        try:
+            from backend.core import cybernetic_reanimation as _cyber
+
+            entry = _cyber._PENDING.entries.get(action_id)
+            if entry is None:
+                return None
+            return {
+                "action_id": entry.action_id,
+                "organ_name": entry.organ,
+                "intended_action": entry.action_desc,
+                "triggering_signal": entry.signal_repr,
+            }
+        except Exception:  # noqa: BLE001 — read-side helper must never crash
+            return None
+
+    async def _endorse_prompt_fn(self, payload: Dict[str, Any]) -> str:
+        """The interactive ``[Endorse execution? y/N]`` prompt — reuses the EXACT
+        prompt_toolkit + ``patch_stdout`` mechanism the Plan Gate / review
+        approval prompt uses, with the same headless / no-TTY fallback.
+
+        Headless (no controlling TTY, or ``JARVIS_APPROVAL_AUTO_APPROVE``) is a
+        DECLINE here, NOT an auto-approve: endorsing a trapped kill is an
+        authority action — the safe default when no human is present is to leave
+        the global shadow shield UP. Returns the raw human answer string."""
+        c = self._flow.console
+        from backend.core.cybernetic_reanimation import endorsement_prompt_for
+
+        # Render the trapped action context (organ / action / signal).
+        try:
+            prompt_text = endorsement_prompt_for(payload)
+        except Exception:  # noqa: BLE001
+            prompt_text = f"[SHADOW] endorse {payload.get('action_id', '?')}?"
+        organ = str(payload.get("organ_name", "") or "?")
+        action = str(payload.get("intended_action", "") or "?")
+        signal = str(payload.get("triggering_signal", "") or "")
+        c.print()
+        c.print(
+            f"  [{_C['heal']}]⚠ shadow action trapped[/{_C['heal']}]  "
+            f"[{_C['dim']}]{prompt_text}[/{_C['dim']}]",
+            highlight=False,
+        )
+        c.print(
+            f"    organ: [{_C['neural']}]{organ}[/{_C['neural']}]  "
+            f"action: [bold]{action}[/bold]"
+            + (f"  signal: [{_C['dim']}]{signal}[/{_C['dim']}]" if signal else ""),
+            highlight=False,
+        )
+
+        # Headless / no-TTY → decline (do NOT execute a kill unattended).
+        if _headless_auto_approve_reason() is not None:
+            c.print(
+                f"  [{_C['dim']}](headless — declining endorsement; the global "
+                f"shadow shield stays up)[/{_C['dim']}]",
+                highlight=False,
+            )
+            return "n"
+
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.patch_stdout import patch_stdout
+
+            session = PromptSession()
+            with patch_stdout(raw=True):
+                answer = await session.prompt_async(
+                    HTML("<b>  Endorse execution? [y/N] </b>"),
+                )
+            return answer
+        except ImportError:
+            c.print(
+                f"  [{_C['dim']}](prompt_toolkit unavailable — declining)"
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+            return "n"
+        except (EOFError, KeyboardInterrupt):
+            return "n"
+
+    async def _endorse_one(
+        self, action_id: str, choice: Optional[str] = None,
+    ) -> None:
+        """Resolve + render a single endorsement decision for ``action_id``.
+
+        Wires the real backend (``handle_endorsement_choice``) + the
+        prompt_toolkit prompt into the injectable :func:`resolve_endorsement`
+        core, then prints the outcome in the green-for-outcomes aesthetic.
+        Fail-soft throughout."""
+        c = self._flow.console
+        try:
+            from backend.core.cybernetic_reanimation import (
+                handle_endorsement_choice,
+            )
+        except Exception as exc:  # noqa: BLE001
+            c.print(
+                f"  [{_C['death']}]/endorse error: backend unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        payload = self._shadow_payload_for(action_id) or {"action_id": action_id}
+        result = await resolve_endorsement(
+            action_id,
+            choice=choice,
+            prompt_fn=self._endorse_prompt_fn,
+            handle_choice=handle_endorsement_choice,
+            payload=payload,
+        )
+        line = render_endorsement_outcome(result)
+        status = str(getattr(result, "status", "") or "")
+        color = _C["life"] if status == "executed" else (
+            _C["death"] if status == "error" else _C["heal"]
+        )
+        c.print(f"  [{color}]{line}[/{color}]", highlight=False)
+
+    async def _handle_endorse(self, line: str) -> None:
+        """``/endorse`` — the human-in-the-loop "steering wheel" for trapped
+        Shadow Mode actions (Slice 253).
+
+        Forms::
+
+            /endorse                  — review the pending trapped action(s)
+                                        interactively ([y/N] per action)
+            /endorse <action_id>      — endorse/decline a specific id (prompts)
+            /endorse <action_id> y|n  — non-interactive (scripting / headless)
+
+        Endorsement re-hydrates + executes ONE trapped action in-process for a
+        single run (the global ``JARVIS_RESILIENCE_SHADOW_MODE`` shield stays
+        UP). Read-only SSE telemetry (``/observability/stream``) is unchanged.
+        ALL fail-soft — a backend error never crashes the REPL."""
+        c = self._flow.console
+        try:
+            from backend.core.cybernetic_reanimation import (
+                pending_shadow_action_count,
+                pending_shadow_action_ids,
+            )
+        except Exception as exc:  # noqa: BLE001
+            c.print(
+                f"  [{_C['death']}]/endorse error: backend unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Parse args: optional <action_id> and optional trailing y|n.
+        parts = line.replace("/endorse", "endorse", 1).split()
+        args = parts[1:]  # drop the verb
+        explicit_choice: Optional[str] = None
+        target_id: Optional[str] = None
+        if args:
+            if args[-1].strip().lower() in ("y", "n", "yes", "no"):
+                explicit_choice = args[-1].strip().lower()
+                args = args[:-1]
+            if args:
+                target_id = args[0].strip()
+
+        # Specific action_id path.
+        if target_id is not None:
+            try:
+                await self._endorse_one(target_id, choice=explicit_choice)
+            except Exception as exc:  # noqa: BLE001
+                c.print(
+                    f"  [{_C['death']}]/endorse error: {exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+            return
+
+        # No id given — operate on the pending queue.
+        try:
+            count = pending_shadow_action_count()
+        except Exception:  # noqa: BLE001
+            count = 0
+        if count == 0:
+            c.print(
+                f"  [{_C['dim']}]No trapped actions awaiting endorsement."
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+
+        try:
+            ids = list(pending_shadow_action_ids())
+        except Exception:  # noqa: BLE001
+            ids = []
+        # Most-recent first (the registry is oldest-first) — the freshest trap
+        # is the one the Host most likely wants to act on.
+        for action_id in reversed(ids):
+            # An explicit trailing y|n applies to ALL in the batch (scripting).
+            try:
+                await self._endorse_one(action_id, choice=explicit_choice)
+            except Exception as exc:  # noqa: BLE001
+                c.print(
+                    f"  [{_C['death']}]/endorse {action_id} error: "
+                    f"{exc}[/{_C['death']}]",
+                    highlight=False,
+                )
 
     # ── Runtime configuration commands ──────────────────────────
 
