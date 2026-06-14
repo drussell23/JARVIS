@@ -1423,6 +1423,30 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_steering_guidance(self, guidance: str) -> "OperationContext":
+        """Slice 249 — fold live human steering into the context (durable/auditable
+        path), appending to ``strategic_memory_prompt`` and advancing the
+        hash-chain via the same mechanics as with_expanded_files(). This is the
+        HASH-CHAIN-SAFE context update: it recomputes ``context_hash`` cleanly and
+        NEVER touches ``generate_file_hashes`` — so the Slice 248 file-drift
+        guillotine (which compares disk-file hashes, not the context hash) cannot
+        mistake a steering command for malicious file drift. NEVER raises into the
+        caller path (degrades to self on error)."""
+        try:
+            _existing = self.strategic_memory_prompt or ""
+            _merged = f"{_existing}\n\n{guidance}" if _existing else str(guidance)
+            intermediate = dataclasses.replace(
+                self,
+                strategic_memory_prompt=_merged,
+                previous_hash=self.context_hash,
+                context_hash="",  # placeholder — recomputed below
+            )
+            fields_for_hash = _context_to_hash_dict(intermediate)
+            new_hash = _compute_hash(fields_for_hash)
+            return dataclasses.replace(intermediate, context_hash=new_hash)
+        except Exception:  # noqa: BLE001
+            return self
+
     def with_infra_warning(self, warning: str) -> "OperationContext":
         """Slice 160 — return a new context carrying a non-fatal infra-hook warning
         (no phase change). Set on fail-soft so the op continues to the governance
