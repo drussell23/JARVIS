@@ -98,6 +98,7 @@ def _memory_type_emoji(type_name: str) -> str:
         "reference": "🔗",
         "forbidden_path": "🚫",
         "style": "🎨",
+        "forbidden_app": "📵",
     }.get(type_name.lower(), "•")
 
 
@@ -109,6 +110,7 @@ def _memory_border_for_type(type_name: str) -> str:
         "reference": "magenta",
         "forbidden_path": "red",
         "style": "green",
+        "forbidden_app": "bright_red",
     }.get(type_name.lower(), "white")
 
 
