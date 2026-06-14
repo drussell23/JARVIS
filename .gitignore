@@ -387,3 +387,23 @@ terraform/terraform.tfvars
 .jarvis/vision_frames/
 .jarvis/vision_cost_ledger.json
 .jarvis/vision_sensor_fp_ledger.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPILED-ARTIFACT INVARIANT — must remain the LAST word in this file.
+# ─────────────────────────────────────────────────────────────────────────────
+# gitignore is last-match-wins. The broad source re-includes above
+# (`!tests/core/**/*`, `!tests/unit/core/**/*`, `!docs/core/**/*`,
+# `!backend/context_intelligence/core/**/*`, `!backend/voice_unlock/core/**/*`)
+# exist to TRACK the .py source under those dirs-named-`core` (which the line-204
+# core-dump rule would otherwise exclude). But `**/*` also re-includes compiled
+# bytecode + caches under them — that is exactly how 355 .pyc files became
+# tracked (untracked in #69490). `backend/core` was hand-patched against this
+# (lines ~236-242); the test/doc trees were not. Rather than patch each tree,
+# re-assert the artifact excludes ONCE here, after every negation, so NO
+# re-include — present or future — can ever pull a build artifact back into
+# tracking. A directory exclude (`**/__pycache__/`) also blocks `**/*` re-entry
+# because git never descends into an excluded directory.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
