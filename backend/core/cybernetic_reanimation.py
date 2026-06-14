@@ -160,6 +160,27 @@ async def shadow_guard_async(
 
 
 # ---------------------------------------------------------------------------
+# Pure sampler predicate — extracted for unit testing the producer's logic
+# ---------------------------------------------------------------------------
+
+def _pressure_active(
+    mem: float,
+    cpu: float,
+    mem_thr: float,
+    cpu_thr: float,
+) -> bool:
+    """Return True when EITHER normalized resource (0.0-1.0) is at-or-above its
+    threshold. The pure predicate the live pressure sampler feeds into
+    :meth:`PressureSignalEmitter.observe` — extracted so the producer's
+    threshold/edge logic is unit-testable without the 102K-line kernel. NEVER
+    raises (non-numeric inputs coerce to the safe ``False`` floor)."""
+    try:
+        return (float(mem) >= float(mem_thr)) or (float(cpu) >= float(cpu_thr))
+    except Exception:  # noqa: BLE001 — sampler must never throw into the loop
+        return False
+
+
+# ---------------------------------------------------------------------------
 # PressureSignalEmitter — level observations -> edge-triggered signals
 # ---------------------------------------------------------------------------
 

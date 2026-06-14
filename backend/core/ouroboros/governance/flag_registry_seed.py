@@ -4889,6 +4889,85 @@ SEED_SPECS: list = [
         since="Slice 46 (monotonic heartbeat alignment, 2026-05-29)",
         posture_relevance=_HARDEN_CRITICAL,
     ),
+    # ====================================================================
+    # Sovereign Fusion — Cybernetic Reanimation ignition (Spec 2) — 5 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_RESILIENCE_REANIMATION_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master gate for the Cybernetic Reanimation ignition. When "
+            "true, the kernel instantiates the 7 resilience organs, wires "
+            "build_resilience_dispatcher, and starts the live pressure "
+            "sampler (PRODUCER) that drives them via edge-triggered "
+            "signals. Default false → ignition early-returns (boot is "
+            "byte-identical). Dangerous organ actions stay Shadow-guarded."
+        ),
+        category=Category.SAFETY,
+        source_file="unified_supervisor.py",
+        example="false",
+        since="Sovereign Fusion (resilience ignition, 2026-06-14)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_RESILIENCE_SHADOW_MODE",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Fail-safe for reanimated resilience organs (default TRUE). "
+            "While on, every DANGEROUS action (process kill, load shed, "
+            "remediation) is trapped at its source by shadow_guard — the "
+            "organ logs '[SHADOW MODE] Would have ...' and yields the "
+            "trapped sentinel instead of executing. Clear it only when the "
+            "matrix has earned trust to act on the world."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/cybernetic_reanimation.py",
+        example="true",
+        since="Spec 2 (Cybernetic Reanimation foundation)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_SAMPLE_INTERVAL_S",
+        type=FlagType.FLOAT, default=15.0,
+        description=(
+            "Cadence (seconds) of the resilience pressure sampler loop — "
+            "how often memory% and cpu% are read and fed to the edge-"
+            "triggered PressureSignalEmitter. Only active when reanimation "
+            "is ignited."
+        ),
+        category=Category.TIMING,
+        source_file="unified_supervisor.py",
+        example="15.0",
+        since="Sovereign Fusion (resilience ignition, 2026-06-14)",
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_MEM_THRESHOLD",
+        type=FlagType.FLOAT, default=0.9,
+        description=(
+            "Normalized memory-usage threshold (0.0-1.0) at/above which the "
+            "pressure sampler treats RESOURCE_PRESSURE as active, raising a "
+            "rising-edge signal to the resilience organs."
+        ),
+        category=Category.TUNING,
+        source_file="unified_supervisor.py",
+        example="0.9",
+        since="Sovereign Fusion (resilience ignition, 2026-06-14)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_CPU_THRESHOLD",
+        type=FlagType.FLOAT, default=0.9,
+        description=(
+            "Normalized cpu-utilization threshold (0.0-1.0) at/above which "
+            "the pressure sampler treats RESOURCE_PRESSURE as active, "
+            "raising a rising-edge signal to the resilience organs."
+        ),
+        category=Category.TUNING,
+        source_file="unified_supervisor.py",
+        example="0.9",
+        since="Sovereign Fusion (resilience ignition, 2026-06-14)",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
 ]
 
 
