@@ -29422,7 +29422,26 @@ class SelfHealingOrchestrator:
             }
 
         try:
-            success = await handler(component)
+            # Spec 2 Cybernetic Reanimation — Shadow Mode chokepoint. The
+            # reanimated orchestrator CALCULATES the remediation above, but in
+            # shadow mode it must not ACT on the world (kill / restart). The
+            # guard traps the handler call and logs the intended action.
+            from backend.core.cybernetic_reanimation import (
+                shadow_guard_async as _shadow_guard_async,
+                SHADOW_TRAPPED as _SHADOW_TRAPPED,
+            )
+            success = await _shadow_guard_async(
+                f"execute remediation '{strategy.value}' on component '{component}'",
+                lambda: handler(component),
+            )
+            if success is _SHADOW_TRAPPED:
+                self._stats["remediations_failed"] += 1
+                return {
+                    "success": False,
+                    "strategy": strategy.value,
+                    "component": component,
+                    "shadow_trapped": True,
+                }
 
             if success:
                 self._stats["remediations_successful"] += 1
@@ -29451,6 +29470,63 @@ class SelfHealingOrchestrator:
             "recent_remediations": self._history[-5:],
             "stats": self._stats,
         }
+
+def build_resilience_dispatcher(organs: "Dict[str, Any]") -> "Any":
+    """Spec 2 Cybernetic Reanimation — wire the 7 surviving resilience organs
+    into an :class:`EventActivationDispatcher` keyed to typed pressure signals.
+
+    ``organs`` maps class-name -> instance. Each organ wakes on the signal types
+    matching its mission. The dangerous actions are already routed through the
+    Shadow Mode guard at their SOURCE (``SelfHealingOrchestrator._execute_remediation``
+    and ``LoadSheddingController.with_shedding``), so reanimation is safe by
+    construction: organs reason on every signal but cannot act on the world while
+    ``JARVIS_RESILIENCE_SHADOW_MODE`` is on. Dispatch is async + fail-soft. NEVER
+    raises."""
+    from backend.core.cybernetic_reanimation import (
+        EventActivationDispatcher, PressureSignalType as _PT,
+    )
+    d = EventActivationDispatcher()
+
+    def _wire(name: str, signal_types, call) -> None:
+        organ = organs.get(name)
+        if organ is None:
+            return
+        async def _handler(sig, _o=organ, _c=call):
+            return await _c(_o, sig)
+        d.register_organ(name, _handler, signal_types)
+
+    # SelfHealing — heals on anomaly/degradation; its remediation is Shadow-guarded.
+    async def _heal(o, sig):
+        # a pressure signal means the component is unhealthy -> drive remediation
+        return await o.check_and_remediate(sig.source, 10.0, 0.9)
+    _wire("SelfHealingOrchestrator", [_PT.ANOMALY_DETECTED, _PT.COMPONENT_DEGRADED], _heal)
+
+    # LoadShedding — recompute shed state under resource pressure (shed is guarded).
+    async def _shed(o, sig):
+        fn = getattr(o, "_update_shedding_state", None)
+        if callable(fn):
+            fn()
+    _wire("LoadSheddingController", [_PT.RESOURCE_PRESSURE], _shed)
+
+    # Remaining organs — registered + woken; their response runs their existing
+    # logic via a recognized hook if present, else activation is logged (fail-soft).
+    async def _wake(o, sig):
+        for _m in ("on_pressure_signal", "handle_pressure", "evaluate"):
+            fn = getattr(o, _m, None)
+            if callable(fn):
+                res = fn(sig)
+                if hasattr(res, "__await__"):
+                    await res
+                return
+        logger.debug("[Reanimation] %s woken by %s (no signal hook)",
+                     type(o).__name__, sig.type)
+    _wire("GracefulDegradationManager", [_PT.COMPONENT_DEGRADED, _PT.RESOURCE_PRESSURE], _wake)
+    _wire("AutoScalingController", [_PT.RESOURCE_PRESSURE], _wake)
+    _wire("AnomalyDetector", [_PT.ANOMALY_DETECTED], _wake)
+    _wire("ProcessHealthPredictor", [_PT.ANOMALY_DETECTED, _PT.COMPONENT_DEGRADED], _wake)
+    _wire("AdvancedCircuitBreaker", [_PT.COMPONENT_DEGRADED], _wake)
+    return d
+
 
 class DistributedStateCoordinator:
     """
@@ -40780,7 +40856,19 @@ class LoadSheddingController(SystemService):
         accept, action = self.should_accept(priority)
 
         if not accept:
-            raise RuntimeError(f"Request rejected: {action}")
+            # Spec 2 Cybernetic Reanimation — Shadow Mode chokepoint. The
+            # reanimated controller DECIDES to shed above, but in shadow mode it
+            # must not actually reject the request. Log the intended shed and let
+            # the request through (run the normal handler) instead.
+            from backend.core.cybernetic_reanimation import (
+                resilience_shadow_mode_enabled as _resilience_shadow_mode_enabled,
+            )
+            if _resilience_shadow_mode_enabled():
+                logging.getLogger("unified_supervisor.reanimation").warning(
+                    "[SHADOW MODE] Would have shed (rejected) request: %s", action,
+                )
+            else:
+                raise RuntimeError(f"Request rejected: {action}")
 
         if action.startswith("delay:"):
             await asyncio.sleep(delay_ms / 1000)
