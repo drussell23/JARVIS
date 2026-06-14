@@ -158,6 +158,16 @@ EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED = "provider_failure_classified"
 EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE = "circuit_breaker_state_change"
 EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
 
+# Slice 249 (Async Observability + Live Steering) — three op-lifecycle events the
+# Sovereign Host streams to keep total situational awareness over autonomous
+# background processing. DRIFT_DETECTED fires when the Slice 247/248 validator
+# sees a target drift; TOOL_EXPLORATION_START fires at each tool-round boundary;
+# GUIDANCE_ABSORBED fires when a running op folds live human steering into its
+# prompt. All keyed by op_id, published via the existing non-blocking broker.
+EVENT_TYPE_DRIFT_DETECTED = "drift_detected"
+EVENT_TYPE_TOOL_EXPLORATION_START = "tool_exploration_start"
+EVENT_TYPE_GUIDANCE_ABSORBED = "guidance_absorbed"
+
 # Slice 12D (Graceful Shutdown on Global Breaker Trip) — single
 # event type covering the global-session structural-refusal
 # transition CLOSED → OPEN_TERMINAL. Carries trip_count + window_s
@@ -1497,6 +1507,11 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED,           # Slice 7e (OPEN_TERMINAL trip — carries the
                                                   # terminal_reason_code; consumers may collapse
                                                   # early instead of waiting on operation_terminal)
+    EVENT_TYPE_DRIFT_DETECTED,                    # Slice 249 (state-drift validator saw a target
+                                                  # drift — 247 re-align / 248 guillotine signal)
+    EVENT_TYPE_TOOL_EXPLORATION_START,            # Slice 249 (tool-round boundary — live progress)
+    EVENT_TYPE_GUIDANCE_ABSORBED,                 # Slice 249 (running op folded live human steering
+                                                  # into its prompt without suspending the lane)
     EVENT_TYPE_SESSION_EXHAUSTED,                 # Slice 12D (global breaker session-wide trip
                                                   # — fires once at CLOSED → OPEN_TERMINAL with
                                                   # trip_count + window_s + threshold; the
@@ -2996,6 +3011,73 @@ def publish_circuit_breaker_tripped(
             "[Stream] publish_circuit_breaker_tripped exception",
             exc_info=True,
         )
+        return None
+
+
+def publish_drift_detected(
+    *,
+    op_id: str = "",
+    drifted_files: Optional[Any] = None,
+) -> Optional[str]:
+    """Slice 249 — publish a ``drift_detected`` event when the state-drift
+    validator (247 re-align / 248 guillotine) sees a target drift. Non-blocking,
+    NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        _files = [str(f)[:200] for f in (drifted_files or [])][:20]
+        return get_default_broker().publish(
+            EVENT_TYPE_DRIFT_DETECTED,
+            op_id or "drift_detected",
+            {"op_id": str(op_id)[:64], "drifted_files": _files,
+             "drift_count": len(_files)},
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] publish_drift_detected exception", exc_info=True)
+        return None
+
+
+def publish_tool_exploration_start(
+    *,
+    op_id: str = "",
+    round_index: int = 0,
+) -> Optional[str]:
+    """Slice 249 — publish a ``tool_exploration_start`` event at each tool-round
+    boundary so the host sees live exploration progress. Non-blocking, NEVER
+    raises."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_TOOL_EXPLORATION_START,
+            op_id or "tool_exploration_start",
+            {"op_id": str(op_id)[:64], "round_index": int(round_index)},
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_tool_exploration_start exception", exc_info=True,
+        )
+        return None
+
+
+def publish_guidance_absorbed(
+    *,
+    op_id: str = "",
+    chars: int = 0,
+) -> Optional[str]:
+    """Slice 249 — publish a ``guidance_absorbed`` event when a running op folds
+    live human steering into its prompt (without suspending the lane).
+    Non-blocking, NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_GUIDANCE_ABSORBED,
+            op_id or "guidance_absorbed",
+            {"op_id": str(op_id)[:64], "chars": max(0, int(chars))},
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] publish_guidance_absorbed exception", exc_info=True)
         return None
 
 

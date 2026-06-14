@@ -6489,6 +6489,47 @@ class ToolLoopCoordinator:
                 )
                 _check_preemption(op_id)
 
+            # ── Slice 249 — live human-steering absorption ──
+            # At the same coherent round boundary, drain any guidance the
+            # Sovereign Host injected for this op and fold it into the live
+            # prompt for the NEXT round — WITHOUT suspending the lane (contrast
+            # Slice 246 preemption, which yields). The prompt is the model's
+            # active memory context; this is the in-place course-correction.
+            # Gated + fail-soft. Emits a guidance_absorbed telemetry event so the
+            # host sees the steering land.
+            if op_id:
+                try:
+                    from backend.core.ouroboros.governance.steering import (
+                        live_steering_enabled as _live_steering_enabled,
+                        consume_guidance as _consume_guidance,
+                        format_guidance_block as _format_guidance_block,
+                    )
+                    if _live_steering_enabled():
+                        _guidance = _consume_guidance(op_id)
+                        if _guidance:
+                            current_prompt = (
+                                current_prompt + "\n\n"
+                                + _format_guidance_block(_guidance)
+                            )
+                            logger.info(
+                                "[ToolLoop] LIVE STEERING absorbed for op=%s "
+                                "round=%d (%d chars) — folded into prompt, lane "
+                                "NOT suspended", op_id[:12], round_index,
+                                len(_guidance),
+                            )
+                            try:
+                                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                                    publish_guidance_absorbed as _pub_guidance,
+                                )
+                                _pub_guidance(op_id=op_id, chars=len(_guidance))
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception:  # noqa: BLE001 — steering must never crash the loop
+                    logger.debug(
+                        "[ToolLoop] live-steering absorption skipped at op=%s",
+                        op_id[:12] if op_id else "?", exc_info=True,
+                    )
+
             # ── Upgrade 1 (PRD §31.2) per-round budget observer ──
             # Fires AFTER round body + compaction + force-truncate guard,
             # at the natural round-boundary just before the loop iterates.
