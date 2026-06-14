@@ -192,3 +192,53 @@ class TestSlice253ShadowEndorsementKernel:
         await d.dispatch(PressureSignal(PT.ANOMALY_DETECTED, "victim-2", SignalEdge.RISING))
         assert killed == ["victim-1"], "the new action must be trapped, not auto-executed"
         assert cr.pending_shadow_action_count() == 1
+
+
+class TestSlice254DiagnosticSwarmKernel:
+    async def test_trap_spawns_ephemeral_agent_and_enriches_prompt(self, monkeypatch):
+        """Phase 4 (Slice 254): a real ANOMALY_DETECTED wakes the real
+        SelfHealingOrchestrator; the shadow_guard traps the kill and the
+        SubAgentOrchestrator (subscribed to the trap) spawns an ephemeral
+        read-only DiagnosticSubAgent WITHOUT blocking the dispatch. The agent's
+        root-cause analysis is then piped back into the endorsement prompt — the
+        Host's [Y/N] is intelligence-backed, not blind."""
+        monkeypatch.setenv("JARVIS_RESILIENCE_SHADOW_MODE", "true")
+        monkeypatch.setenv("JARVIS_DIAGNOSTIC_SWARM_ENABLED", "true")
+        from backend.core import cybernetic_reanimation as cr
+        from backend.core import diagnostic_swarm as ds
+        cr.reset_pending_shadow_actions()
+        cr.reset_trap_observers()
+
+        # inject a deterministic read-only probe (no psutil dependence in CI)
+        class _Probe:
+            async def investigate(self, context):
+                return {"top_process": "python(pid=999) cpu=97%", "mem_pct": 91}
+
+        orch = ds.SubAgentOrchestrator(agent_factory=lambda: ds.DiagnosticSubAgent(probe=_Probe()))
+        orch.attach_to_trap_stream()
+        try:
+            from unified_supervisor import build_resilience_dispatcher
+            sho, killed = _sho_with_fake_kill()
+            d = build_resilience_dispatcher({"SelfHealingOrchestrator": sho})
+
+            # dispatch returns even though a diagnostic was spawned (non-blocking)
+            await d.dispatch(
+                PressureSignal(PT.ANOMALY_DETECTED, "proc-victim", SignalEdge.RISING)
+            )
+            assert killed == [], "kill trapped by shadow shield"
+            action_id = cr.pending_shadow_action_ids()[-1]
+
+            payload = {
+                "organ_name": "SelfHealingOrchestrator",
+                "intended_action": "execute remediation 'restart' on 'proc-victim'",
+                "triggering_signal": "anomaly_detected:proc-victim:rising",
+                "action_id": action_id,
+            }
+            prompt = await ds.endorsement_prompt_with_diagnosis(orch, payload, wait_s=3.0)
+
+            assert "python(pid=999)" in prompt, "ephemeral agent's root-cause surfaced"
+            assert action_id in prompt and "[Y/N]" in prompt, "contextualized endorsement"
+            # and the trapped action is still endorsable (Slice 253 intact)
+            assert action_id in cr.pending_shadow_action_ids()
+        finally:
+            orch.detach()
