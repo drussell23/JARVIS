@@ -255,3 +255,50 @@
                  files (only +2109b of cross-links, zero content lost): PRD.md (lean §1-§23+TOC, 322KB,
                  renders) + PRD_SPEC_DETAIL.md (§24-50) + NORTH_STAR.md (§51 + §51.11.x + active roadmap)
                  + PRD_HISTORY.md (version headers + §40/41 banners). All <770KB.
+  [x] slice-237  Op-weight-scaled convergence (the seventh layer). scale_convergence_threshold +
+                 scale_final_write_reserve: heavy multi-file GOALs force convergence earlier AND hold
+                 a bigger final-write reserve, both scaled to target-file line count (no hardcoded
+                 round count). Reuses the Slice-85/233 machinery. 27 TDD. MERGED #69476.
+  [x] slice-238  Cascade consults the economic breaker (the eighth layer). DW transient hiccup no
+                 longer cascades into the credit-dead Claude lane (terminal_quota poison). should_
+                 cascade_to_claude + central _call_fallback guard reuse the read-only _claude_breaker
+                 _open. SOAK: terminal_quota 60->0, BadRequestError 23->0. 13 TDD. MERGED #69477.
+  [x] slice-239  Adaptive test-sharding (the ninth layer). TestCoverageEnforcer decouples "generate
+                 tests for N files" into a SEPARATE background intake op (UnifiedIntakeRouter WAL)
+                 instead of ballooning the primary patch. 239b wired the LIVE plan_runner seam (the
+                 orchestrator copy was dormant). 22+1 TDD. MERGED #69478/#69479.
+  [x] slice-240  Dynamic cost-vs-bandwidth shard trigger (Phase 2). Stripped the hardcoded >2-file
+                 gate -> (Files x Est_Tokens_per_file) > (Velocity x Budget_Remaining); tokens from
+                 ACTUAL file sizes, ratios env-tunable. Phase 1 (byte-offset stream healer) REFUSED:
+                 architecturally impossible vs a stateless SSE endpoint. 31 TDD. MERGED #69480.
+  [x] slice-241  T1: GENERATION_TIMEOUT classification (stop blaming DW for OUR budget). tool_loop_
+                 deadline_exceeded was mislabeled LIVE_TRANSPORT -> falsely degraded DW health +
+                 severed the lane. New non-transport FailureSource (weight 0.0); the ==LIVE_TRANSPORT
+                 degrade/sever consumers auto-skip it. 11 TDD. MERGED #69481.
+                 T2: graduated the RT-vs-batch transport hedge to default-ON (dual-stream arbitrage).
+                 Race RT(fast) vs batch(stable), first-success wins + loser cancelled; RT rupture
+                 swallowed -> batch returned seamlessly (rupture-pivot); prefer_fast holds batch
+                 speculative so RT exploration clears the Iron Gate. Honest limit: cannot save a
+                 WHOLESALE DW outage (both arms fail). 63 TDD. MERGED #69482.
+
+  ==========================================================================================
+  ||  O+V SOVEREIGN PIPELINE -- FLAG PLANTED (2026-06-14). Slices 235->241, 18 PRs merged.
+  ||  ------------------------------------------------------------------------------------
+  ||  Objective: make DoubleWord the reliable PRIMARY for Ouroboros+Venom (Claude is
+  ||  economically dead AND more expensive) -- O+V completes real autonomous work on DW
+  ||  alone. Every poison metric driven to ZERO and held across soaks:
+  ||      tool_loop_deadline_exceeded -> 0   deadline_exhausted -> 0
+  ||      terminal_quota -> 0                dead-Claude BadRequestError -> 0
+  ||      anthropic API calls -> 0           $ spend under outage -> $0.00
+  ||  Capabilities sealed: bounded 2b.1-diff emission; op-weight convergence + reserve;
+  ||  cascade respects the economic breaker; cost-driven async test-sharding to the WAL
+  ||  intake; honest GENERATION_TIMEOUT vs transport labels; dual-stream RT/batch hedge.
+  ||  Final soak (cf2513b407): total DW outage (46 DoublewordInfraError, both transports);
+  ||  hedge raced 14x + cleanly abandoned all 14; 0 poison, 0 Claude, $0.00 -- clean
+  ||  degradation under total external failure.
+  ||  The governance layer is structurally complete. The remaining gap to a heavy-GOAL
+  ||  state=applied is DW's OWN external generation reliability (infra), NOT governance
+  ||  code -- when DW was healthy (s237b window) elites served + diffs emitted + ops
+  ||  progressed. Capstone observation is gated on a healthy DW window, not on more
+  ||  slices. ZERO further governance slices required. O+V SOVEREIGN INFRA OPERATIONAL.
+  ==========================================================================================
