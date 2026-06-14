@@ -98,3 +98,31 @@ class TestAllSevenOrgansRegister:
         from unified_supervisor import build_resilience_dispatcher
         d = build_resilience_dispatcher({"SelfHealingOrchestrator": object()})
         assert d.organ_count() == 1
+
+
+class TestSlice252ShadowTelemetryKernel:
+    async def test_anomaly_trap_publishes_to_stream_broker(self, monkeypatch):
+        """Phase 3 (Slice 252): a synthesized ANOMALY_DETECTED wakes the real
+        SelfHealingOrchestrator via build_resilience_dispatcher, the shadow_guard
+        traps the kill, AND the StreamEventBroker registers a structured
+        SHADOW_ACTION_TRAPPED event — non-blocking, no log-grep needed."""
+        monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
+        from backend.core.ouroboros.governance import ide_observability_stream as ios
+        ios.reset_default_broker()
+        from unified_supervisor import build_resilience_dispatcher
+        sho, killed = _sho_with_fake_kill()
+        d = build_resilience_dispatcher({"SelfHealingOrchestrator": sho})
+
+        n = await d.dispatch(
+            PressureSignal(PT.ANOMALY_DETECTED, "proc-victim", SignalEdge.RISING)
+        )
+        assert n == 1
+        assert killed == [], "Shadow Mode must trap the kill"
+
+        evs = [e for e in ios.get_default_broker().recent_history(limit=100)
+               if e.event_type == ios.EVENT_TYPE_SHADOW_ACTION_TRAPPED]
+        assert len(evs) >= 1, "broker must register the SHADOW_ACTION_TRAPPED event"
+        p = evs[0].payload
+        assert p["organ_name"] == "SelfHealingOrchestrator"
+        assert "anomaly_detected:proc-victim" in p["triggering_signal"]
+        assert "execute remediation" in p["intended_action"]

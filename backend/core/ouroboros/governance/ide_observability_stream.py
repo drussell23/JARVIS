@@ -168,6 +168,12 @@ EVENT_TYPE_DRIFT_DETECTED = "drift_detected"
 EVENT_TYPE_TOOL_EXPLORATION_START = "tool_exploration_start"
 EVENT_TYPE_GUIDANCE_ABSORBED = "guidance_absorbed"
 
+# Slice 252 (Shadow-Telemetry) — fires when the Cybernetic Reanimation Shadow
+# Mode chokepoint (shadow_guard) traps a dangerous resilience action (kill / shed
+# / restart). Real-time, structured audit of the reanimated muscle's INTENT (no
+# log-grepping). Payload: organ_name + intended_action + triggering_signal.
+EVENT_TYPE_SHADOW_ACTION_TRAPPED = "shadow_action_trapped"
+
 # Slice 12D (Graceful Shutdown on Global Breaker Trip) — single
 # event type covering the global-session structural-refusal
 # transition CLOSED → OPEN_TERMINAL. Carries trip_count + window_s
@@ -1512,6 +1518,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TOOL_EXPLORATION_START,            # Slice 249 (tool-round boundary — live progress)
     EVENT_TYPE_GUIDANCE_ABSORBED,                 # Slice 249 (running op folded live human steering
                                                   # into its prompt without suspending the lane)
+    EVENT_TYPE_SHADOW_ACTION_TRAPPED,             # Slice 252 (Shadow Mode trapped a dangerous
+                                                  # resilience action — kill/shed/restart)
     EVENT_TYPE_SESSION_EXHAUSTED,                 # Slice 12D (global breaker session-wide trip
                                                   # — fires once at CLOSED → OPEN_TERMINAL with
                                                   # trip_count + window_s + threshold; the
@@ -3078,6 +3086,38 @@ def publish_guidance_absorbed(
         )
     except Exception:  # noqa: BLE001
         logger.debug("[Stream] publish_guidance_absorbed exception", exc_info=True)
+        return None
+
+
+def publish_shadow_action_trapped(
+    *,
+    organ_name: str = "",
+    intended_action: str = "",
+    triggering_signal: str = "",
+    op_id: str = "",
+) -> Optional[str]:
+    """Slice 252 — publish a ``shadow_action_trapped`` event when the Cybernetic
+    Reanimation Shadow Mode chokepoint traps a dangerous resilience action. The
+    structured payload (organ_name + intended_action + triggering_signal) gives
+    the Sovereign Host real-time audit of the reanimated muscle's intent.
+    Non-blocking, NEVER raises (returns None when the stream is disabled)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_SHADOW_ACTION_TRAPPED,
+            op_id or organ_name or "shadow_action_trapped",
+            {
+                "organ_name": str(organ_name)[:128],
+                "intended_action": str(intended_action)[:512],
+                "triggering_signal": str(triggering_signal)[:128],
+                "op_id": str(op_id)[:64],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_shadow_action_trapped exception", exc_info=True,
+        )
         return None
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -33,6 +34,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger("jarvis.cybernetic_reanimation")
 
 _ENV_SHADOW = "JARVIS_RESILIENCE_SHADOW_MODE"
+
+# Slice 252 — the pressure signal currently being dispatched to an organ. The
+# dispatcher sets it before invoking a handler so shadow_guard (called deep
+# inside the organ, with no signal in scope) can attribute a trap to its
+# triggering signal WITHOUT threading the signal through every kernel method.
+# Async-safe (ContextVar is per-task).
+_current_signal_var: "ContextVar[Optional[Any]]" = ContextVar(
+    "jarvis_reanimation_current_signal", default=None,
+)
 
 
 class PressureSignalType(str, Enum):
@@ -82,19 +92,53 @@ def resilience_shadow_mode_enabled() -> bool:
         return True  # fail SAFE — default to shadow on error
 
 
+def emit_shadow_trap(
+    organ_name: str,
+    intended_action: str,
+    triggering_signal: Any = None,
+) -> None:
+    """Slice 252 — publish a SHADOW_ACTION_TRAPPED telemetry event to the
+    StreamEventBroker when a dangerous action is trapped, giving the Sovereign
+    Host real-time structured audit (organ + action + signal) instead of a text
+    log. ``triggering_signal`` defaults to the dispatcher-set ContextVar so the
+    deep guard call-site needs no signal in scope. Out-of-band + fail-soft + lazy
+    import (keeps this module decoupled from the broker). NEVER raises."""
+    try:
+        sig = triggering_signal if triggering_signal is not None else _current_signal_var.get()
+        sig_repr = ""
+        if sig is not None:
+            try:
+                sig_repr = f"{sig.type.value}:{sig.source}:{sig.edge.value}"
+            except Exception:  # noqa: BLE001
+                sig_repr = str(sig)[:128]
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_shadow_action_trapped as _publish,
+        )
+        _publish(
+            organ_name=str(organ_name),
+            intended_action=str(intended_action),
+            triggering_signal=sig_repr,
+        )
+    except Exception:  # noqa: BLE001 — telemetry is best-effort, never the gate
+        logger.debug("[Reanimation] shadow-trap telemetry emit skipped", exc_info=True)
+
+
 def shadow_guard(
     action_desc: str,
     execute: Callable[[], Any],
     *,
+    organ: str = "",
     log: Optional[logging.Logger] = None,
 ) -> Any:
     """Gate a DANGEROUS action behind shadow mode. In shadow mode: log
-    ``[SHADOW MODE] Would have <action_desc>`` and return ``SHADOW_TRAPPED``
-    WITHOUT calling ``execute``. Otherwise: return ``execute()``. The single
-    chokepoint every reanimated organ routes its kill/shed/restart through."""
+    ``[SHADOW MODE] Would have <action_desc>``, publish a SHADOW_ACTION_TRAPPED
+    telemetry event, and return ``SHADOW_TRAPPED`` WITHOUT calling ``execute``.
+    Otherwise: return ``execute()``. The single chokepoint every reanimated organ
+    routes its kill/shed/restart through."""
     _log = log or logger
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
+        emit_shadow_trap(organ, action_desc)
         return SHADOW_TRAPPED
     return execute()
 
@@ -103,12 +147,14 @@ async def shadow_guard_async(
     action_desc: str,
     execute: Callable[[], Awaitable[Any]],
     *,
+    organ: str = "",
     log: Optional[logging.Logger] = None,
 ) -> Any:
     """Async variant of :func:`shadow_guard` for coroutine actions."""
     _log = log or logger
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
+        emit_shadow_trap(organ, action_desc)
         return SHADOW_TRAPPED
     return await execute()
 
@@ -201,11 +247,17 @@ class EventActivationDispatcher:
         handlers = list(self._organs.get(signal.type, ()))
         delivered = 0
         for name, handler in handlers:
+            # Slice 252 — expose the triggering signal to shadow_guard (deep in
+            # the organ) via the ContextVar, so a trapped action is attributed to
+            # the signal that woke it. Reset after each handler (per-organ scope).
+            _token = _current_signal_var.set(signal)
             try:
                 await handler(signal)
                 delivered += 1
             except Exception:  # noqa: BLE001 — one organ never breaks the bus
                 logger.exception("[Reanimation] organ %s raised on %s", name, signal.type)
+            finally:
+                _current_signal_var.reset(_token)
         return delivered
 
     def attach_to_bus(self, bus: Any, *, extract: Callable[[Any], Optional[PressureSignal]]) -> None:
