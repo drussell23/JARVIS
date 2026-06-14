@@ -217,3 +217,16 @@ class TestOrchestratorWiring:
         from backend.core.ouroboros.governance import orchestrator as o
         src = inspect.getsource(o)
         assert "check_and_inject(" in src
+
+    def test_live_plan_runner_seam_is_wired(self):
+        # The phase-runner refactor moved the LIVE test-coverage enforcement into
+        # plan_runner.py — the capstone soak proved THIS is the executing seam (the
+        # orchestrator copy was dormant). It MUST carry the decouple wiring too, or
+        # sharding silently never fires. Regression pin against that exact drift.
+        from backend.core.ouroboros.governance.phase_runners import plan_runner as pr
+        src = inspect.getsource(pr)
+        assert "should_decouple_test_gen(" in src
+        assert "build_test_coverage_envelope(" in src
+        assert "ingest(" in src
+        # the old backtick-count log must be gone (proof the old path was replaced)
+        assert "uncovered files (op" not in src
