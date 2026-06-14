@@ -168,6 +168,184 @@ def reset_dw_transport_recovery() -> None:
     get_dw_transport_recovery().reset()
 
 
+# ---------------------------------------------------------------------------
+# Slice 242 — adaptive statistical recovery-duration prior.
+#
+# The hibernation_prober already probes a dark DW grid on exponential backoff
+# and auto-wakes on recovery, but its FIRST probe interval was a STATIC default
+# (5s) — wasteful when outages historically last minutes (you ping a dark grid
+# for nothing, and DW won't return any sooner). This is an online, training-free
+# estimator (NOT an ML predictor — DW's recovery is an exogenous vendor event
+# with no observable features): record observed outage durations
+# (enter_hibernation → wake) into a bounded ring, then set the first re-probe
+# near a low quantile (p25) of history so we don't ping before the grid
+# plausibly recovers. It times WHEN to start probing — it never claims to know
+# WHEN DW returns. Falls back to the static default below ``min_samples``.
+# Pure, env-driven, thread-safe, NEVER raises (sits on the recovery path).
+# ---------------------------------------------------------------------------
+
+_ENV_PRIOR_WINDOW = "JARVIS_RECOVERY_PRIOR_WINDOW"
+_ENV_PRIOR_QUANTILE = "JARVIS_RECOVERY_PRIOR_QUANTILE"
+_ENV_PRIOR_MIN_SAMPLES = "JARVIS_RECOVERY_PRIOR_MIN_SAMPLES"
+_ENV_PRIOR_FLOOR_S = "JARVIS_RECOVERY_PRIOR_FLOOR_S"
+
+_DEFAULT_PRIOR_WINDOW = 20
+_DEFAULT_PRIOR_QUANTILE = 0.25
+_DEFAULT_PRIOR_MIN_SAMPLES = 3
+_DEFAULT_PRIOR_FLOOR_S = 1.0
+
+
+def _recovery_prior_window() -> int:
+    try:
+        v = int(float(os.getenv(_ENV_PRIOR_WINDOW, "").strip() or _DEFAULT_PRIOR_WINDOW))
+        return v if v > 0 else _DEFAULT_PRIOR_WINDOW
+    except (TypeError, ValueError):
+        return _DEFAULT_PRIOR_WINDOW
+
+
+def _recovery_prior_quantile() -> float:
+    try:
+        v = float(os.getenv(_ENV_PRIOR_QUANTILE, "").strip() or _DEFAULT_PRIOR_QUANTILE)
+        return v if 0.0 < v < 1.0 else _DEFAULT_PRIOR_QUANTILE
+    except (TypeError, ValueError):
+        return _DEFAULT_PRIOR_QUANTILE
+
+
+def _recovery_prior_min_samples() -> int:
+    try:
+        v = int(float(os.getenv(_ENV_PRIOR_MIN_SAMPLES, "").strip() or _DEFAULT_PRIOR_MIN_SAMPLES))
+        return v if v > 0 else _DEFAULT_PRIOR_MIN_SAMPLES
+    except (TypeError, ValueError):
+        return _DEFAULT_PRIOR_MIN_SAMPLES
+
+
+def _recovery_prior_floor_s() -> float:
+    try:
+        v = float(os.getenv(_ENV_PRIOR_FLOOR_S, "").strip() or _DEFAULT_PRIOR_FLOOR_S)
+        return v if v > 0 else _DEFAULT_PRIOR_FLOOR_S
+    except (TypeError, ValueError):
+        return _DEFAULT_PRIOR_FLOOR_S
+
+
+class RecoveryDurationPrior:
+    """Bounded ring of observed grid-outage durations → quantile-derived first
+    probe interval. Online, training-free, thread-safe, NEVER raises."""
+
+    def __init__(self) -> None:
+        from collections import deque
+
+        self._lock = threading.Lock()
+        self._samples: "deque[float]" = deque(maxlen=_recovery_prior_window())
+
+    def record(self, duration_s: Any) -> None:
+        """Append an observed outage duration (seconds). Non-numeric or
+        non-positive values are ignored. NEVER raises."""
+        try:
+            d = float(duration_s)
+        except (TypeError, ValueError):
+            return
+        if not (d > 0.0) or d != d:  # reject <=0 and NaN
+            return
+        try:
+            with self._lock:
+                # honour a live env change to the window size
+                want = _recovery_prior_window()
+                if self._samples.maxlen != want:
+                    from collections import deque
+
+                    self._samples = deque(self._samples, maxlen=want)
+                self._samples.append(d)
+        except Exception:  # noqa: BLE001 — recovery path, never raise
+            pass
+
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    def quantile(self, q: float) -> float:
+        """Linear-interpolated quantile of the retained durations. 0.0 if empty.
+        NEVER raises."""
+        try:
+            with self._lock:
+                data = sorted(self._samples)
+            if not data:
+                return 0.0
+            if len(data) == 1:
+                return data[0]
+            qq = min(1.0, max(0.0, float(q)))
+            pos = qq * (len(data) - 1)
+            lo = int(pos)
+            frac = pos - lo
+            if lo + 1 >= len(data):
+                return data[-1]
+            return data[lo] + (data[lo + 1] - data[lo]) * frac
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def first_probe_interval(
+        self,
+        *,
+        default_s: float,
+        max_s: float,
+        min_samples: Optional[int] = None,
+        quantile: Optional[float] = None,
+        floor_s: Optional[float] = None,
+    ) -> float:
+        """The interval before the FIRST health probe of a dark grid.
+
+        Below ``min_samples`` of history → fall back to the STATIC ``default_s``
+        (no trust yet). With enough history → the chosen low ``quantile`` (p25)
+        of observed durations, clamped to ``[floor_s, max_s]``. NEVER raises —
+        degrades to ``default_s`` on any error."""
+        try:
+            need = _recovery_prior_min_samples() if min_samples is None else int(min_samples)
+            if self.sample_count() < need:
+                return float(default_s)
+            q = _recovery_prior_quantile() if quantile is None else float(quantile)
+            floor = _recovery_prior_floor_s() if floor_s is None else float(floor_s)
+            est = self.quantile(q)
+            return min(float(max_s), max(float(floor), est))
+        except Exception:  # noqa: BLE001
+            return float(default_s)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            data = list(self._samples)
+        return {
+            "sample_count": len(data),
+            "window": _recovery_prior_window(),
+            "quantile": _recovery_prior_quantile(),
+            "min_samples": _recovery_prior_min_samples(),
+            "floor_s": _recovery_prior_floor_s(),
+        }
+
+    def reset(self) -> None:
+        from collections import deque
+
+        with self._lock:
+            self._samples = deque(maxlen=_recovery_prior_window())
+
+
+_PRIOR_SINGLETON: "RecoveryDurationPrior | None" = None
+_PRIOR_SINGLETON_LOCK = threading.Lock()
+
+
+def get_recovery_prior() -> RecoveryDurationPrior:
+    """Process-wide singleton — outage history accumulates across hibernation
+    cycles within a session (and across the prober's restarts)."""
+    global _PRIOR_SINGLETON
+    if _PRIOR_SINGLETON is None:
+        with _PRIOR_SINGLETON_LOCK:
+            if _PRIOR_SINGLETON is None:
+                _PRIOR_SINGLETON = RecoveryDurationPrior()
+    return _PRIOR_SINGLETON
+
+
+def reset_recovery_prior() -> None:
+    """Test isolation — clear the accumulated outage history."""
+    get_recovery_prior().reset()
+
+
 __all__ = [
     "DWTransportRecovery",
     "dw_dynamic_recovery_enabled",

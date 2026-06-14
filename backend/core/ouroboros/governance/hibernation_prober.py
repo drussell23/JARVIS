@@ -66,10 +66,23 @@ logger = logging.getLogger("Ouroboros.HibernationProber")
 _ENV_INITIAL_S = "JARVIS_HIBERNATION_PROBE_INITIAL_S"
 _ENV_MAX_S = "JARVIS_HIBERNATION_PROBE_MAX_S"
 _ENV_DURATION_S = "JARVIS_HIBERNATION_MAX_DURATION_S"
+# Slice 242 — adaptive statistical recovery-duration prior gate (graduated-on,
+# mirrors JARVIS_DW_DYNAMIC_RECOVERY_ENABLED). =0 → byte-identical static-5s path.
+_ENV_PRIOR_ENABLED = "JARVIS_RECOVERY_PRIOR_ENABLED"
 
 _DEFAULT_INITIAL_S = 5.0
 _DEFAULT_MAX_S = 300.0
 _DEFAULT_DURATION_S = 3600.0
+
+
+def _recovery_prior_enabled() -> bool:
+    """Master gate for the adaptive first-probe interval. NEVER raises."""
+    try:
+        return os.getenv(_ENV_PRIOR_ENABLED, "true").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _resolve_float(env: str, default: float, explicit: Optional[float]) -> float:
@@ -256,9 +269,52 @@ class HibernationProber:
     # Internal
     # ------------------------------------------------------------------
 
+    def _first_probe_delay(self) -> float:
+        """The interval before the FIRST probe of a dark grid.
+
+        Slice 242: when the recovery-prior is enabled and has enough outage
+        history, derive it from a low quantile (p25) of past dark-window
+        durations — don't ping before the grid plausibly recovers. Below
+        ``min_samples`` (or gate off) → the static ``initial_delay_s``. Fully
+        fail-soft: any error falls back to the static default."""
+        if not _recovery_prior_enabled():
+            return self._initial_delay_s
+        try:
+            from backend.core.ouroboros.governance.dw_transport_recovery import (
+                get_recovery_prior,
+            )
+
+            derived = get_recovery_prior().first_probe_interval(
+                default_s=self._initial_delay_s,
+                max_s=self._max_delay_s,
+            )
+            if derived != self._initial_delay_s:
+                logger.info(
+                    "[HibernationProber] adaptive first-probe delay=%.1fs "
+                    "(static default=%.1fs) — derived from outage history",
+                    derived, self._initial_delay_s,
+                )
+            return derived
+        except Exception:  # noqa: BLE001 — never starve probing on a prior error
+            return self._initial_delay_s
+
+    def _record_outage_duration(self, elapsed_s: float) -> None:
+        """Record the just-ended dark-window duration so the NEXT outage's
+        first probe is timed from history. NEVER raises."""
+        if not _recovery_prior_enabled():
+            return
+        try:
+            from backend.core.ouroboros.governance.dw_transport_recovery import (
+                get_recovery_prior,
+            )
+
+            get_recovery_prior().record(elapsed_s)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _probe_loop(self) -> None:
         """Exponential-backoff probe loop running in its own Task."""
-        delay = self._initial_delay_s
+        delay = self._first_probe_delay()
         try:
             while True:
                 await asyncio.sleep(delay)
@@ -278,6 +334,10 @@ class HibernationProber:
                 if healthy_name is not None:
                     self._last_result = f"woken_by:{healthy_name}"
                     self._wake_count += 1
+                    # Slice 242: the dark window just ended — feed its observed
+                    # duration into the prior so the NEXT outage's first probe
+                    # is timed from history, not a static guess.
+                    self._record_outage_duration(elapsed)
                     logger.info(
                         "[HibernationProber] %s healthy after %d probes "
                         "in %.1fs — waking controller",
