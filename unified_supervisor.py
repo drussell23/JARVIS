@@ -29528,6 +29528,201 @@ def build_resilience_dispatcher(organs: "Dict[str, Any]") -> "Any":
     return d
 
 
+# ---------------------------------------------------------------------------
+# Sovereign Fusion — IGNITE the resilience matrix (Spec 2 completion)
+#
+# ``build_resilience_dispatcher`` (above) wires the 7 organs to typed pressure
+# signals but was never CALLED, no organs were ever instantiated, and nothing
+# produced pressure signals. The three helpers below close that loop:
+#   * ``_instantiate_resilience_organs`` — best-effort construct each organ.
+#   * ``_ignite_resilience_reanimation`` — flag-guarded ignition: build the
+#     dispatcher, wire a ``PressureSignalEmitter``, and start the live PRODUCER
+#     (a background sampler that turns psutil resource readings into edge-
+#     triggered signals). Dangerous organ actions remain trapped at their
+#     SOURCE chokepoints by ``shadow_guard`` (default shadow-ON), so igniting
+#     the matrix wakes the organs to reason but cannot act on the world.
+#
+# Default OFF (``JARVIS_RESILIENCE_REANIMATION_ENABLED``) → early return →
+# byte-identical to the un-ignited kernel. ALL boot calls are fail-soft.
+# ---------------------------------------------------------------------------
+
+def _instantiate_resilience_organs() -> "Dict[str, Any]":
+    """Best-effort construct each of the 7 resilience organs. Each construction
+    is isolated in its own try/except — a single organ that needs an
+    unavailable arg is SKIPPED, never aborting the others. Returns a
+    ``{ClassName: instance}`` dict for the organs that built cleanly. NEVER
+    raises."""
+    organs: "Dict[str, Any]" = {}
+
+    # Organs with all-defaulted constructors.
+    for _name, _ctor in (
+        ("GracefulDegradationManager", lambda: GracefulDegradationManager()),
+        ("LoadSheddingController", lambda: LoadSheddingController()),
+        ("AutoScalingController", lambda: AutoScalingController()),
+        ("ProcessHealthPredictor", lambda: ProcessHealthPredictor()),
+        ("SelfHealingOrchestrator", lambda: SelfHealingOrchestrator()),
+        # AdvancedCircuitBreaker requires a name.
+        ("AdvancedCircuitBreaker", lambda: AdvancedCircuitBreaker(name="reanimation")),
+    ):
+        try:
+            organs[_name] = _ctor()
+        except Exception as _e:  # noqa: BLE001
+            logger.debug("[Reanimation] skip organ %s: %s", _name, _e)
+
+    # AnomalyDetector needs a SystemKernelConfig — derive from environment.
+    try:
+        _cfg = SystemKernelConfig.from_environment()
+        organs["AnomalyDetector"] = AnomalyDetector(_cfg)
+    except Exception as _e:  # noqa: BLE001
+        logger.debug("[Reanimation] skip organ AnomalyDetector: %s", _e)
+
+    logger.info(
+        "[Reanimation] instantiated %d/7 resilience organs: %s",
+        len(organs), sorted(organs),
+    )
+    return organs
+
+
+def _resilience_reanimation_enabled() -> bool:
+    """Master gate for the Sovereign Fusion ignition (default FALSE → OFF path
+    is byte-identical). NEVER raises."""
+    try:
+        return os.getenv(
+            "JARVIS_RESILIENCE_REANIMATION_ENABLED", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _resilience_pressure_sampler(
+    emitter: "Any",
+    *,
+    interval_s: float,
+    mem_thr: float,
+    cpu_thr: float,
+) -> None:
+    """The live PRODUCER. Loops forever (until cancelled) sampling memory% and
+    cpu% and feeding the edge-triggered :class:`PressureSignalEmitter`. Prefers
+    ``psutil``; falls back to a ``DynamicRAMMonitor`` reading for memory if
+    psutil is unavailable. Fail-soft per tick — a bad probe skips one cycle, it
+    never breaks the loop. Returns only on cancellation."""
+    from backend.core.cybernetic_reanimation import (
+        PressureSignalType as _PT, _pressure_active,
+    )
+
+    _ram_monitor = None  # lazy fallback for memory only
+
+    while True:
+        try:
+            mem = 0.0
+            cpu = 0.0
+            try:
+                mem = float(psutil.virtual_memory().percent) / 100.0
+            except Exception:  # noqa: BLE001 — fall back to DynamicRAMMonitor
+                try:
+                    if _ram_monitor is None:
+                        _ram_monitor = DynamicRAMMonitor()
+                    mem = float(getattr(_ram_monitor, "current_usage", 0.0) or 0.0)
+                except Exception:  # noqa: BLE001
+                    mem = 0.0
+            try:
+                cpu = float(psutil.cpu_percent(interval=None)) / 100.0
+            except Exception:  # noqa: BLE001
+                cpu = 0.0
+
+            emitter.observe(
+                _PT.RESOURCE_PRESSURE,
+                "system",
+                active=_pressure_active(mem, cpu, mem_thr, cpu_thr),
+                detail={"mem": mem, "cpu": cpu},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one bad tick never breaks the loop
+            logger.debug("[Reanimation] pressure sampler tick failed", exc_info=True)
+
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
+
+
+def _ignite_resilience_reanimation(kernel: "Any") -> bool:
+    """Ignite the Cybernetic Reanimation matrix on the live kernel. ONLY active
+    when ``JARVIS_RESILIENCE_REANIMATION_ENABLED`` is true (default FALSE →
+    early return, byte-identical OFF path). Fully fail-soft — NEVER breaks boot.
+
+    Wiring: instantiate organs → ``build_resilience_dispatcher`` → a
+    ``PressureSignalEmitter`` whose ``emit_fn`` schedules ``dispatcher.dispatch``
+    on the running loop → a background sampler task (the PRODUCER) registered in
+    the kernel's background-task registry. Returns True if ignition started.
+
+    Must be called from an async boot stage where the event loop is running and
+    the service registry exists. Dangerous organ actions stay Shadow-guarded at
+    their source."""
+    if not _resilience_reanimation_enabled():
+        return False
+    try:
+        organs = _instantiate_resilience_organs()
+        dispatcher = build_resilience_dispatcher(organs)
+
+        from backend.core.cybernetic_reanimation import (
+            PressureSignalEmitter, resilience_shadow_mode_enabled,
+        )
+
+        def _schedule_dispatch(sig: "Any") -> None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # no loop — nothing to schedule onto
+            loop.create_task(dispatcher.dispatch(sig))
+
+        emitter = PressureSignalEmitter(emit_fn=_schedule_dispatch)
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)))
+            except Exception:  # noqa: BLE001
+                return default
+
+        interval_s = _env_float("JARVIS_PRESSURE_SAMPLE_INTERVAL_S", 15.0)
+        mem_thr = _env_float("JARVIS_PRESSURE_MEM_THRESHOLD", 0.9)
+        cpu_thr = _env_float("JARVIS_PRESSURE_CPU_THRESHOLD", 0.9)
+
+        task = create_safe_task(
+            _resilience_pressure_sampler(
+                emitter,
+                interval_s=interval_s,
+                mem_thr=mem_thr,
+                cpu_thr=cpu_thr,
+            ),
+            name="resilience-pressure-sampler",
+        )
+        try:
+            kernel._background_tasks.append(task)
+        except Exception:  # noqa: BLE001 — registry is best-effort; task already live
+            logger.debug("[Reanimation] could not register sampler task", exc_info=True)
+
+        # Stash references on the kernel so they outlive this frame (no GC).
+        try:
+            kernel._resilience_dispatcher = dispatcher
+            kernel._resilience_emitter = emitter
+            kernel._resilience_sampler_task = task
+        except Exception:  # noqa: BLE001
+            pass
+
+        logger.info(
+            "[Reanimation] IGNITED — %d organs, sampler interval=%.1fs "
+            "mem_thr=%.2f cpu_thr=%.2f (shadow_mode=%s)",
+            dispatcher.organ_count(), interval_s, mem_thr, cpu_thr,
+            resilience_shadow_mode_enabled(),
+        )
+        return True
+    except Exception as _e:  # noqa: BLE001 — ignition NEVER breaks boot
+        logger.warning("[Reanimation] ignition failed (non-fatal): %s", _e)
+        return False
+
+
 class DistributedStateCoordinator:
     """
     Cross-repo state synchronization using file-based coordination.
@@ -72796,6 +72991,19 @@ class JarvisSystemKernel:
                         "[Startup] trace hook: %s: %s",
                         type(_exc).__name__, _exc,
                     )
+
+            # Sovereign Fusion — ignite the Cybernetic Reanimation matrix.
+            # Flag-guarded (JARVIS_RESILIENCE_REANIMATION_ENABLED, default OFF →
+            # early return → byte-identical) + fully fail-soft. The loop is
+            # running and the service registry + bus are up at this point, so
+            # this is the correct async stage for the live pressure producer.
+            try:
+                _ignite_resilience_reanimation(self)
+            except Exception as _reanim_err:  # noqa: BLE001 — never break boot
+                self.logger.debug(
+                    "[Startup] resilience reanimation ignition skipped: %s",
+                    _reanim_err,
+                )
 
             return 0
 
