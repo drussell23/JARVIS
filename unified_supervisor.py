@@ -64500,6 +64500,181 @@ class JarvisSystemKernel:
                 self.logger.warning(
                     f"[Reanimation] disabled (init failed): {_e!r}"
                 )
+            # ── C.4: live ReanimationLayer + PressureSignalEmitter ─────────
+            # Best-effort: construct only the organs that build cleanly, wire
+            # the layer (subscribe + register contracts — no event loop needed),
+            # and launch the edge-triggered pressure sampler as a kernel
+            # background task. Entirely inside the master `if` + a dedicated
+            # try/except → OFF path is byte-identical and any failure here only
+            # warns (reanimation must NEVER break boot).
+            try:
+                self._wire_reanimation_layer()
+            except Exception as _e:  # noqa: BLE001 — fail-soft; never break boot
+                self.logger.warning(
+                    f"[Reanimation] layer wiring skipped (init failed): {_e!r}"
+                )
+
+    def _wire_reanimation_layer(self) -> None:
+        """C.4 kernel wiring — construct the live resilience-organ matrix.
+
+        Conservative + fail-soft by construction:
+          * Each organ is constructed in its own try/except; an organ that
+            cannot be built cleanly is simply skipped (the layer tolerates a
+            partial organ dict). No fragile organ is force-instantiated.
+          * ``ReanimationLayer.wire()`` only subscribes to the bus and
+            registers ActivationContracts — no running loop required, so this
+            is safe to call from the synchronous ``__init__`` boot path.
+          * The PressureSignalEmitter is launched as a background task ONLY if
+            an event loop is already running; otherwise it is stashed on
+            ``self._reanimation_emitter`` for a later async boot stage to start
+            (never blocks / crashes boot).
+        Gated entirely by the master flag (caller checks ``_reanimation_enabled``).
+        """
+        from backend.core.ouroboros.governance.resilience_reanimation import (
+            ReanimationLayer,
+            PressureSignalEmitter,
+        )
+
+        # 1. Best-effort organ construction — skip any that don't build cleanly.
+        organs: Dict[str, Any] = {}
+
+        def _try(key: str, ctor: Callable[[], Any]) -> None:
+            try:
+                organs[key] = ctor()
+            except Exception as _e:  # noqa: BLE001 — skip fragile organ
+                self.logger.warning(
+                    f"[Reanimation] organ {key} skipped (construct failed): {_e!r}"
+                )
+
+        _try("graceful_degradation", lambda: GracefulDegradationManager())
+        _try("load_shedding", lambda: LoadSheddingController())
+        _try("auto_scaling", lambda: AutoScalingController())
+        _try(
+            "anomaly_detector",
+            lambda: AnomalyDetector(SystemKernelConfig.from_environment()),
+        )
+        _try("health_predictor", lambda: ProcessHealthPredictor())
+        _try("self_healing", lambda: SelfHealingOrchestrator())
+        _try(
+            "circuit_breaker",
+            lambda: AdvancedCircuitBreaker(name="reanimation"),
+        )
+
+        if not organs:
+            self.logger.warning(
+                "[Reanimation] no organs constructed cleanly; layer not wired"
+            )
+            return
+
+        bus = get_event_bus()
+
+        # 2. Closed-loop feedback emit — publish a typed SupervisorEvent.
+        def _emit(event_type_value: str, payload: dict) -> None:
+            try:
+                etype = SupervisorEventType(event_type_value)
+            except Exception:  # noqa: BLE001 — unknown type, drop
+                return
+            try:
+                bus.emit(SupervisorEvent(
+                    event_type=etype,
+                    timestamp=time.time(),
+                    message=f"[Reanimation] {event_type_value}",
+                    metadata=tuple(payload.items()),
+                ))
+            except Exception as _e:  # noqa: BLE001 — fail-soft
+                self.logger.warning(f"[Reanimation] feedback emit failed: {_e!r}")
+
+        # 3. Wire the layer with the REAL ServiceDescriptor / ActivationContract.
+        def _desc_factory(name: str, contract: Any) -> ServiceDescriptor:
+            return ServiceDescriptor(
+                name=f"reanimate_{name}",
+                service=organs[name],
+                phase=8, tier="optional",
+                activation_mode="event_driven",
+                criticality="optional",
+                boot_policy="non_blocking",
+                activation_contract=contract,
+            )
+
+        def _contract_factory(*, trigger_events, dependency_gate):
+            return ActivationContract(
+                trigger_events=list(trigger_events),
+                dependency_gate=list(dependency_gate),
+            )
+
+        self._reanimation_layer = ReanimationLayer(
+            bus, self._service_registry, organs,
+            descriptor_factory=_desc_factory,
+            contract_factory=_contract_factory,
+            emit=_emit,
+        )
+        self._reanimation_layer.wire()
+
+        # 4. Edge-triggered pressure sampler → resource_pressure events.
+        def _sampler() -> Dict[str, float]:
+            try:
+                import psutil
+                mem = float(psutil.virtual_memory().percent) / 100.0
+                cpu = float(psutil.cpu_percent(interval=None)) / 100.0
+                return {"mem": mem, "cpu": cpu}
+            except Exception:  # noqa: BLE001 — probe down → no sample
+                return {}
+
+        mem_thr = float(os.getenv("JARVIS_PRESSURE_MEM_THRESHOLD", "0.9"))
+        cpu_thr = float(os.getenv("JARVIS_PRESSURE_CPU_THRESHOLD", "0.9"))
+        emitter = PressureSignalEmitter(
+            sampler=_sampler,
+            emit=_emit,
+            thresholds={"mem": mem_thr, "cpu": cpu_thr},
+            signal_event={
+                "mem": SupervisorEventType.RESOURCE_PRESSURE.value,
+                "cpu": SupervisorEventType.RESOURCE_PRESSURE.value,
+            },
+        )
+        self._reanimation_emitter = emitter
+        self._reanimation_emitter_started = False
+
+        # Launch the sampler ONLY when a loop is already running. In the
+        # synchronous boot path no loop exists yet → stash for deferred start
+        # by ``_start_reanimation_emitter`` from the async event-infra stage.
+        try:
+            asyncio.get_running_loop()
+            self._start_reanimation_emitter()
+            self.logger.info(
+                "[Reanimation] layer wired; pressure emitter launched "
+                f"(organs={sorted(organs)})"
+            )
+        except RuntimeError:
+            self.logger.info(
+                "[Reanimation] layer wired; pressure emitter deferred "
+                f"(no running loop; organs={sorted(organs)})"
+            )
+
+    def _start_reanimation_emitter(self) -> None:
+        """Launch the stashed PressureSignalEmitter as a kernel background task.
+
+        Idempotent + fail-soft. Called from ``_wire_reanimation_layer`` when a
+        loop is already running, else from the async ``_initialize_event_
+        infrastructure`` stage (deferred start). No-op if the emitter was never
+        constructed (master flag off / no organs) or is already running.
+        """
+        emitter = getattr(self, "_reanimation_emitter", None)
+        if emitter is None or getattr(self, "_reanimation_emitter_started", False):
+            return
+        interval_s = float(
+            os.getenv("JARVIS_PRESSURE_SAMPLE_INTERVAL_S", "5.0")
+        )
+
+        async def _pressure_loop() -> None:
+            while True:
+                await emitter.tick()
+                await asyncio.sleep(interval_s)
+
+        task = create_safe_task(
+            _pressure_loop(), name="reanimation-pressure-emitter"
+        )
+        self._background_tasks.append(task)
+        self._reanimation_emitter_started = True
 
     async def _on_supervisor_rollback_outcome(self, outcome: Dict[str, Any]) -> None:
         """Bridge supervisor/manual rollback outcomes into the governed event stream."""
@@ -75679,6 +75854,18 @@ class JarvisSystemKernel:
                 self.logger.debug("[Kernel] v243.1: Event bus health checks registered")
         except Exception as e:
             self.logger.debug(f"[Kernel] v243.1: Health registration error: {e}")
+
+        # Cybernetic Reanimation (Phase C, C.4): deferred pressure-emitter start.
+        # The layer + emitter were wired synchronously in __init__ (no loop yet),
+        # so launch the sampler now that a running loop exists. Master-flag-gated
+        # (emitter is None when off) + fail-soft → never breaks event-infra boot.
+        if _reanimation_enabled():
+            try:
+                self._start_reanimation_emitter()
+            except Exception as _re:  # noqa: BLE001 — fail-soft
+                self.logger.warning(
+                    f"[Reanimation] deferred emitter start failed: {_re!r}"
+                )
 
     async def _check_event_bus_health(self) -> Tuple[bool, str, Dict[str, Any]]:
         """Health check for TrinityEventBus.

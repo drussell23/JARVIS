@@ -389,3 +389,188 @@ async def test_layer_component_degraded_drives_heal_tier():
     assert "record_metrics" in organs["health_predictor"].names()
     assert "check_and_remediate" in organs["self_healing"].names()
     assert "record_failure" in organs["circuit_breaker"].names()
+
+
+# ---------------------------------------------------------------------------
+# C.4 — feedback emitters (closed loop)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anomaly_adapter_emits_anomaly_detected_on_detection():
+    """When the organ's record_observation returns a truthy AnomalyScore, the
+    adapter re-broadcasts an anomaly_detected event via the injected emit."""
+    emitted = []
+    # MockOrgan returns a truthy 'score' for record_observation → anomaly seen
+    organ = MockOrgan(record_observation={"is_anomaly": True, "score": 9.9})
+    ad = AnomalyDetectorAdapter(
+        organ, emit=lambda etype, payload: emitted.append((etype, payload))
+    )
+    await ad.on_event({"category": "latency", "features": {"p99": 9999.0}})
+    assert organ.names() == ["record_observation"]
+    assert len(emitted) == 1
+    etype, payload = emitted[0]
+    assert etype == "anomaly_detected"
+    assert payload.get("category") == "latency"
+    assert payload.get("score") == 9.9
+
+
+@pytest.mark.asyncio
+async def test_anomaly_adapter_no_emit_when_not_anomalous():
+    """record_observation returns None (no anomaly) → no feedback emit."""
+    emitted = []
+    organ = MockOrgan()  # record_observation returns None
+    ad = AnomalyDetectorAdapter(
+        organ, emit=lambda etype, payload: emitted.append(etype)
+    )
+    await ad.on_event({"category": "latency", "features": {"p99": 1.0}})
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_anomaly_adapter_backward_compat_without_emit():
+    """Adapter with no emit callback behaves exactly as before (no error)."""
+    organ = MockOrgan(record_observation={"is_anomaly": True})
+    ad = AnomalyDetectorAdapter(organ)  # no emit
+    await ad.on_event({"category": "latency", "features": {"p99": 9.0}})
+    assert organ.names() == ["record_observation"]
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_adapter_emits_component_degraded_on_open():
+    """On a degraded component the breaker records a failure AND re-broadcasts
+    component_degraded so the heal-tier organs can react."""
+    emitted = []
+    organ = MockOrgan()
+    ad = CircuitBreakerAdapter(
+        organ, emit=lambda etype, payload: emitted.append((etype, payload))
+    )
+    await ad.on_event({"component": "w1", "degraded": True})
+    assert organ.names() == ["record_failure"]
+    assert len(emitted) == 1
+    etype, payload = emitted[0]
+    assert etype == "component_degraded"
+    assert payload.get("component") == "w1"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_adapter_no_emit_when_not_degraded():
+    """A recovery (degraded=False) records success and does NOT emit a
+    degraded feedback event."""
+    emitted = []
+    organ = MockOrgan()
+    ad = CircuitBreakerAdapter(
+        organ, emit=lambda etype, payload: emitted.append(etype)
+    )
+    await ad.on_event({"component": "w1", "degraded": False})
+    assert organ.names() == ["record_success"]
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_adapter_backward_compat_without_emit():
+    organ = MockOrgan()
+    ad = CircuitBreakerAdapter(organ)  # no emit
+    await ad.on_event({"component": "w1", "degraded": True})
+    assert organ.names() == ["record_failure"]
+
+
+@pytest.mark.asyncio
+async def test_feedback_emit_failure_is_failsoft():
+    """If the injected emit callback raises, the adapter logs + continues — the
+    organ call still happened and no exception propagates."""
+    organ = MockOrgan(record_observation={"is_anomaly": True})
+
+    def boom_emit(etype, payload):
+        raise RuntimeError("bus down")
+
+    ad = AnomalyDetectorAdapter(organ, emit=boom_emit)
+    await ad.on_event({"category": "x", "features": {}})  # must not raise
+    assert organ.names() == ["record_observation"]
+
+
+# ---------------------------------------------------------------------------
+# C.4 — integration proof: async-delivering bus + ON/OFF factory gate
+# ---------------------------------------------------------------------------
+from backend.core.ouroboros.governance.resilience_reanimation import (
+    build_reanimation_layer,
+)
+
+
+class AsyncDeliveringBus:
+    """A FakeBus that schedules subscriber delivery on the event loop so the
+    integration test exercises the real async fan-out path (not inline)."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def subscribe(self, handler):
+        self.handlers.append(handler)
+
+    async def fire(self, event):
+        # Deliver via the loop (await each handler) — faithful async path.
+        for h in self.handlers:
+            await asyncio.sleep(0)  # yield to the loop first
+            r = h(event)
+            if asyncio.iscoroutine(r):
+                await r
+
+
+@pytest.mark.asyncio
+async def test_integration_resource_pressure_activates_three_pressure_organs():
+    bus = AsyncDeliveringBus()
+    reg = RecordingRegistry()
+    organs = _seven_mock_organs()
+    layer = ReanimationLayer(bus, reg, organs)
+    layer.wire()
+    assert len(reg.registered) == 7  # all 7 contracts registered
+
+    await bus.fire(FakeEventWithMeta(
+        "resource_pressure",
+        {"signal": "cpu", "level": 0.92, "memory": 0.81}))
+
+    # The 3 pressure-tier organs all reacted to the single synthetic event.
+    assert "_check_resources" in organs["graceful_degradation"].names()
+    assert "record_load" in organs["load_shedding"].names()
+    assert "evaluate" in organs["auto_scaling"].names()
+    # Non-pressure organs stayed dormant.
+    assert organs["anomaly_detector"].names() == []
+    assert organs["self_healing"].names() == []
+
+
+@pytest.mark.asyncio
+async def test_build_reanimation_layer_on_wires(monkeypatch):
+    monkeypatch.setenv("JARVIS_RESILIENCE_REANIMATION_ENABLED", "true")
+    bus = FakeBus()
+    reg = RecordingRegistry()
+    organs = _seven_mock_organs()
+    layer = build_reanimation_layer(bus, reg, organs)
+    assert layer is not None
+    # ON → wired: bus subscribed + contracts registered.
+    assert bus.handlers
+    assert len(reg.registered) == 7
+
+
+@pytest.mark.asyncio
+async def test_build_reanimation_layer_off_is_noop(monkeypatch):
+    monkeypatch.setenv("JARVIS_RESILIENCE_REANIMATION_ENABLED", "false")
+    bus = FakeBus()
+    reg = RecordingRegistry()
+    organs = _seven_mock_organs()
+    layer = build_reanimation_layer(bus, reg, organs)
+    # OFF → no-op: no layer, no subscription, no registration.
+    assert layer is None
+    assert bus.handlers == []
+    assert reg.registered == []
+
+
+@pytest.mark.asyncio
+async def test_build_reanimation_layer_off_default_is_noop(monkeypatch):
+    """Master flag unset → default OFF → no-op (byte-identical boot)."""
+    monkeypatch.delenv("JARVIS_RESILIENCE_REANIMATION_ENABLED", raising=False)
+    bus = FakeBus()
+    reg = RecordingRegistry()
+    layer = build_reanimation_layer(bus, reg, _seven_mock_organs())
+    assert layer is None
+    assert bus.handlers == []
+    assert reg.registered == []

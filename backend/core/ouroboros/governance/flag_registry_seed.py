@@ -45,7 +45,114 @@ _HARDEN_AND_CONSOLIDATE = {
 }
 
 
+_REANIMATION_SRC = (
+    "backend/core/ouroboros/governance/resilience_reanimation.py"
+)
+
+
+def _reanimate_organ_spec(organ_key: str, organ_label: str) -> "FlagSpec":
+    """One per-organ kill switch ``JARVIS_REANIMATE_<ORGAN>_ENABLED`` (default
+    true; gated under the master). Kept DRY across the 7 resilience organs."""
+    return FlagSpec(
+        name=f"JARVIS_REANIMATE_{organ_key.upper()}_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            f"Per-organ sub-gate for the {organ_label} adapter in the "
+            "Cybernetic Reanimation matrix. Default true, but only takes "
+            "effect when the master JARVIS_RESILIENCE_REANIMATION_ENABLED "
+            "is on. When false the organ is neither registered nor wired."
+        ),
+        category=Category.SAFETY,
+        source_file=_REANIMATION_SRC,
+        example="true",
+        since="v1.0",
+    )
+
+
+# The 7 reanimated resilience organs (adapter key -> human label).
+_REANIMATION_ORGANS = [
+    ("graceful_degradation", "GracefulDegradationManager"),
+    ("load_shedding", "LoadSheddingController"),
+    ("auto_scaling", "AutoScalingController"),
+    ("anomaly_detector", "AnomalyDetector"),
+    ("health_predictor", "ProcessHealthPredictor"),
+    ("self_healing", "SelfHealingOrchestrator"),
+    ("circuit_breaker", "AdvancedCircuitBreaker"),
+]
+
+
 SEED_SPECS: list = [
+    # ====================================================================
+    # Cybernetic Reanimation (Phase C) — event-driven resilience matrix
+    #   master + 7 per-organ gates + sampler interval + 3 thresholds
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_RESILIENCE_REANIMATION_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for the Cybernetic Reanimation matrix — the "
+            "bus->activation dispatcher, the edge-triggered PressureSignalEmitter, "
+            "and the 7 resilience-organ adapters. Default OFF: when false the "
+            "kernel constructs nothing and the boot path is byte-identical."
+        ),
+        category=Category.SAFETY,
+        source_file=_REANIMATION_SRC,
+        example="false",
+        since="v1.0",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    # Per-organ gates (pattern: JARVIS_REANIMATE_<ORGAN>_ENABLED, default true)
+    *[_reanimate_organ_spec(k, label) for k, label in _REANIMATION_ORGANS],
+    FlagSpec(
+        name="JARVIS_PRESSURE_SAMPLE_INTERVAL_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Seconds between PressureSignalEmitter sampling ticks (the "
+            "background task that probes memory/CPU pressure and fires "
+            "edge-triggered resource_pressure events)."
+        ),
+        category=Category.TIMING,
+        source_file=_REANIMATION_SRC,
+        example="5.0",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_MEM_THRESHOLD",
+        type=FlagType.FLOAT, default=0.9,
+        description=(
+            "Memory-pressure fraction (0..1) above which the "
+            "PressureSignalEmitter edge-fires a resource_pressure event."
+        ),
+        category=Category.TUNING,
+        source_file=_REANIMATION_SRC,
+        example="0.9",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_CPU_THRESHOLD",
+        type=FlagType.FLOAT, default=0.9,
+        description=(
+            "CPU-pressure fraction (0..1) above which the "
+            "PressureSignalEmitter edge-fires a resource_pressure event."
+        ),
+        category=Category.TUNING,
+        source_file=_REANIMATION_SRC,
+        example="0.9",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_PRESSURE_DEGRADED_THRESHOLD",
+        type=FlagType.FLOAT, default=0.5,
+        description=(
+            "Component health-score fraction (0..1) at or below which a "
+            "component is treated as degraded, edge-firing a "
+            "component_degraded event into the reanimation matrix."
+        ),
+        category=Category.TUNING,
+        source_file=_REANIMATION_SRC,
+        example="0.5",
+        since="v1.0",
+    ),
     # ====================================================================
     # DirectionInferrer / StrategicPosture (Wave 1 #1) — 9 flags
     # ====================================================================

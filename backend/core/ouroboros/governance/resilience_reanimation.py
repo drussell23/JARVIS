@@ -22,6 +22,21 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _coerce_score(score: Any) -> Any:
+    """Best-effort numeric extraction from an AnomalyScore-like value.
+
+    The real organ returns an ``AnomalyScore`` dataclass with a ``.score``
+    attribute; tests pass a dict. Fail-soft — return None if neither shape
+    matches so the feedback payload stays well-formed.
+    """
+    val = getattr(score, "score", None)
+    if val is not None:
+        return val
+    if isinstance(score, dict):
+        return score.get("score")
+    return None
+
+
 class EventActivationDispatcher:
     """Subscribes to the supervisor event bus and activates registry services
     whose ActivationContract.trigger_events match the emitted event type.
@@ -126,14 +141,35 @@ class PressureSignalEmitter:
 
 
 class _OrganAdapter:
-    """Common fail-soft scaffold for organ adapters."""
+    """Common fail-soft scaffold for organ adapters.
+
+    ``emit`` is an OPTIONAL feedback callback ``emit(event_type_value, payload)``
+    that closes the reactive loop — an adapter that observes a meaningful organ
+    outcome (anomaly detected, breaker opened) re-broadcasts a typed event so
+    the rest of the matrix can react. Absent the callback an adapter behaves
+    exactly as before (backward-compatible). Emit failures are fail-soft.
+    """
 
     name: str = "organ"
     #: event_type.value strings this adapter reacts to.
     trigger_events: tuple = ()
 
-    def __init__(self, organ: Any) -> None:
+    def __init__(
+        self, organ: Any, *, emit: Optional[Callable[[str, dict], None]] = None
+    ) -> None:
         self._organ = organ
+        self._emit = emit
+
+    def _feedback(self, event_type_value: str, payload: dict) -> None:
+        """Fire the optional feedback emit, fail-soft. No-op without a callback."""
+        if self._emit is None:
+            return
+        try:
+            self._emit(event_type_value, payload)
+        except Exception as err:  # noqa: BLE001 — feedback must never wedge
+            logger.warning(
+                "[Reanimation] %s feedback emit failed: %r", self.name, err
+            )
 
     async def _safe(self, coro_or_value: Any) -> Any:
         """Await a value if it is awaitable; swallow + log on failure."""
@@ -224,7 +260,20 @@ class AnomalyDetectorAdapter(_OrganAdapter):
         try:
             category = payload.get("category", "unknown")
             features = payload.get("features") or {}
-            await self._safe(self._organ.record_observation(category, features))
+            score = await self._safe(
+                self._organ.record_observation(category, features)
+            )
+            # Closed loop: a truthy AnomalyScore means an anomaly was detected →
+            # re-broadcast so the matrix (e.g. self-healing) can react.
+            if score:
+                self._feedback(
+                    "anomaly_detected",
+                    {
+                        "category": category,
+                        "score": _coerce_score(score),
+                        "features": features,
+                    },
+                )
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
@@ -282,6 +331,19 @@ class CircuitBreakerAdapter(_OrganAdapter):
         try:
             if payload.get("degraded", True):
                 await self._safe(self._organ.record_failure())
+                # Closed loop: a degraded component is an OPEN/degraded signal →
+                # re-broadcast component_degraded for the heal-tier organs.
+                self._feedback(
+                    "component_degraded",
+                    {
+                        "component": payload.get("component", "unknown"),
+                        "health_score": payload.get("health_score", 0.0),
+                        "failure_probability": payload.get(
+                            "failure_probability", 1.0
+                        ),
+                        "degraded": True,
+                    },
+                )
             else:
                 await self._safe(self._organ.record_success())
         except asyncio.CancelledError:
@@ -345,6 +407,13 @@ class ReanimationLayer:
     ``descriptor_factory`` / ``contract_factory`` are optional injection seams
     so the kernel can pass the real ``ServiceDescriptor`` / ``ActivationContract``
     constructors; absent them the layer uses duck-typed stand-ins (sandbox-safe).
+
+    ``emit`` is the OPTIONAL closed-loop feedback callback
+    ``emit(event_type_value, payload)``. When provided it is handed to the
+    feedback-capable adapters (AnomalyDetector, CircuitBreaker) so a detected
+    anomaly / opened breaker re-broadcasts a typed event onto the bus. The
+    kernel supplies an ``emit`` that constructs + publishes a SupervisorEvent;
+    absent it the loop is open (legacy behaviour).
     """
 
     def __init__(
@@ -356,6 +425,7 @@ class ReanimationLayer:
         enabled_flags: Optional[Dict[str, bool]] = None,
         descriptor_factory: Optional[Callable[..., Any]] = None,
         contract_factory: Optional[Callable[..., Any]] = None,
+        emit: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self._bus = event_bus
         self._registry = service_registry
@@ -363,6 +433,7 @@ class ReanimationLayer:
         self._enabled_flags = dict(enabled_flags or {})
         self._descriptor_factory = descriptor_factory
         self._contract_factory = contract_factory
+        self._emit = emit
         self._adapters: Dict[str, _OrganAdapter] = {}
         self._wired = False
 
@@ -383,7 +454,7 @@ class ReanimationLayer:
             if not self._organ_enabled(key):
                 logger.info("[Reanimation] organ %s disabled by flag", key)
                 continue
-            adapter = factory(organ)
+            adapter = factory(organ, emit=self._emit)
             self._adapters[key] = adapter
             self._register_contract(key, list(adapter.trigger_events))
         if self._adapters:
@@ -413,6 +484,12 @@ class ReanimationLayer:
 
     @staticmethod
     def _extract_payload(event: Any) -> dict:
+        # Real SupervisorEvent stores metadata as a tuple of (k, v) pairs and
+        # exposes a ``metadata_dict`` accessor; tests pass a plain dict. Prefer
+        # the dict accessor, then a dict metadata/payload, else empty.
+        md = getattr(event, "metadata_dict", None)
+        if isinstance(md, dict) and md:
+            return md
         meta = getattr(event, "metadata", None)
         if isinstance(meta, dict):
             return meta
@@ -439,3 +516,55 @@ class ReanimationLayer:
                     "[Reanimation] adapter %s dispatch failed: %r",
                     adapter.name, err,
                 )
+
+
+# ===========================================================================
+# C.4 — master-flag-guarded factory (OFF no-op proof)
+# ===========================================================================
+
+
+def reanimation_enabled() -> bool:
+    """Master kill switch — ``JARVIS_RESILIENCE_REANIMATION_ENABLED``.
+
+    Default OFF: absent / falsy → the layer is never wired. Mirrors the
+    kernel's ``_reanimation_enabled()`` so the standalone factory and the
+    kernel hook agree on the gate.
+    """
+    return _env_flag("JARVIS_RESILIENCE_REANIMATION_ENABLED", False)
+
+
+def build_reanimation_layer(
+    event_bus: Any,
+    service_registry: Any,
+    organs: Dict[str, Any],
+    *,
+    enabled_flags: Optional[Dict[str, bool]] = None,
+    descriptor_factory: Optional[Callable[..., Any]] = None,
+    contract_factory: Optional[Callable[..., Any]] = None,
+    emit: Optional[Callable[[str, dict], None]] = None,
+) -> Optional["ReanimationLayer"]:
+    """Construct + ``wire()`` a ``ReanimationLayer`` IFF the master flag is on.
+
+    When ``JARVIS_RESILIENCE_REANIMATION_ENABLED`` is false (the default) this
+    is a strict no-op: it returns ``None`` and touches neither the bus
+    (no subscribe) nor the registry (no register) — proving the OFF path is
+    byte-identical. Fail-soft: if construction/wiring raises, it logs and
+    returns ``None`` (reanimation must never break boot).
+    """
+    if not reanimation_enabled():
+        return None
+    try:
+        layer = ReanimationLayer(
+            event_bus,
+            service_registry,
+            organs,
+            enabled_flags=enabled_flags,
+            descriptor_factory=descriptor_factory,
+            contract_factory=contract_factory,
+            emit=emit,
+        )
+        layer.wire()
+        return layer
+    except Exception as err:  # noqa: BLE001 — never break boot
+        logger.warning("[Reanimation] build_reanimation_layer failed: %r", err)
+        return None
