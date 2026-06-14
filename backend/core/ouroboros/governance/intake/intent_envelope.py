@@ -81,6 +81,15 @@ _VALID_SOURCES = frozenset({
     # — drift between that constant and this frozenset is caught by an
     # AST pin in the B.2.1 spine.
     "swe_bench_pro",
+    # Added 2026-06-13 for Slice 239 (Adaptive Test-Sharding). The
+    # TestCoverageEnforcer decouples a heavy GOAL's "generate tests for N
+    # uncovered files" requirement into a SEPARATE background op instead of
+    # inlining it into the primary patch prompt (which blew the deadline —
+    # layer 9 of the s235 capstone arc). Honest-source token: decoupled
+    # test-coverage work MUST NOT masquerade as `test_failure` / `backlog`.
+    # Routes BACKGROUND via routing_override (low-cost; never burns Claude
+    # budget); the resulting op still flows the full Iron Gate pipeline.
+    "test_coverage",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 

@@ -106,6 +106,7 @@ _PRIORITY_MAP_DEFERRED: frozenset = frozenset({
     "meta_dormancy_alarm",
     "performance_regression",
     "security_advisory",
+    "test_coverage",  # Slice 239 — decoupled background test-gen (deferred tier)
     "todo_scanner",
     "vision_sensor",
     "web_intelligence",
