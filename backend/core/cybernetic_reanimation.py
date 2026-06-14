@@ -230,6 +230,47 @@ def pending_shadow_action_ids() -> List[str]:
     return list(_PENDING.entries.keys())
 
 
+# ---------------------------------------------------------------------------
+# Slice 254 — trap observers: the in-process subscription to SHADOW_ACTION_TRAPPED
+#
+# A consumer (e.g. the diagnostic swarm) registers a callback that fires — fully
+# fail-soft — every time shadow_guard traps an action, receiving the same payload
+# shape as the telemetry event. This is the decoupled, kernel-free equivalent of
+# subscribing to the event on the SupervisorEventBus: the trap chokepoint is the
+# single source of truth, so observers see exactly what the broker sees, in-proc.
+# Observers MUST be non-blocking (return immediately, schedule any real work).
+# ---------------------------------------------------------------------------
+
+_TRAP_OBSERVERS: "List[Callable[[Dict[str, Any]], Any]]" = []
+
+
+def register_trap_observer(callback: Callable[[Dict[str, Any]], Any]) -> None:
+    """Subscribe a callback to SHADOW_ACTION_TRAPPED. Idempotent per callable."""
+    if callback not in _TRAP_OBSERVERS:
+        _TRAP_OBSERVERS.append(callback)
+
+
+def unregister_trap_observer(callback: Callable[[Dict[str, Any]], Any]) -> None:
+    try:
+        _TRAP_OBSERVERS.remove(callback)
+    except ValueError:
+        pass
+
+
+def reset_trap_observers() -> None:
+    _TRAP_OBSERVERS.clear()
+
+
+def _notify_trap_observers(payload: Dict[str, Any]) -> None:
+    """Fan a trap out to every observer. NEVER raises; one bad observer never
+    blocks the trap path or the others."""
+    for cb in list(_TRAP_OBSERVERS):
+        try:
+            cb(payload)
+        except Exception:  # noqa: BLE001 — an observer must never break the trap
+            logger.debug("[Reanimation] trap observer raised", exc_info=True)
+
+
 async def endorse_shadow_action(action_id: str) -> EndorsementResult:
     """Re-hydrate and execute ONE trapped action for the given ``action_id`` —
     bypassing the shadow block for this single run WITHOUT touching the global
@@ -359,11 +400,16 @@ def shadow_guard(
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
         # Slice 253 — stash the live callable so the Host can later endorse it.
+        sig_repr = _current_signal_repr()
         action_id = _PENDING.register(
             organ=organ, action_desc=action_desc, execute=execute, is_coro=False,
-            signal_repr=_current_signal_repr(),
+            signal_repr=sig_repr,
         )
         emit_shadow_trap(organ, action_desc, action_id=action_id)
+        _notify_trap_observers({
+            "organ_name": organ, "intended_action": action_desc,
+            "triggering_signal": sig_repr, "action_id": action_id, "op_id": "",
+        })
         return SHADOW_TRAPPED
     return execute()
 
@@ -380,11 +426,16 @@ async def shadow_guard_async(
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
         # Slice 253 — stash the live coroutine factory for endorsement.
+        sig_repr = _current_signal_repr()
         action_id = _PENDING.register(
             organ=organ, action_desc=action_desc, execute=execute, is_coro=True,
-            signal_repr=_current_signal_repr(),
+            signal_repr=sig_repr,
         )
         emit_shadow_trap(organ, action_desc, action_id=action_id)
+        _notify_trap_observers({
+            "organ_name": organ, "intended_action": action_desc,
+            "triggering_signal": sig_repr, "action_id": action_id, "op_id": "",
+        })
         return SHADOW_TRAPPED
     return await execute()
 
