@@ -5346,6 +5346,20 @@ class PrimeProvider:
                 )
             except Exception:  # noqa: BLE001 — never block tool loop
                 _evidence_override = None
+            # ── Slice 237 — op weight for convergence scaling ──
+            # The largest target-file line count is the SAME op-weight signal the
+            # Slice-235 gate reads (resolve_force_full_content), computed via the
+            # SAME helper + the SAME repo_root — so the tool loop's "force
+            # convergence earlier on heavy ops" decision cannot drift from the
+            # gate's "this is a large-file op" decision. None on any miss → the
+            # tool loop falls back to its static threshold (byte-identical).
+            _op_weight_lines: Optional[int] = None
+            try:
+                _op_weight_lines = _max_target_line_count(
+                    getattr(context, "target_files", ()) or (), self._repo_root,
+                )
+            except Exception:  # noqa: BLE001 — never block the tool loop
+                _op_weight_lines = None
             try:
                 raw, tool_records_list = await self._tool_loop.run(
                     prompt=prompt,
@@ -5358,6 +5372,7 @@ class PrimeProvider:
                     is_read_only=_is_read_only,
                     per_round_observer=_eb_observer,
                     repo_root_override=_evidence_override,
+                    op_weight_lines=_op_weight_lines,
                 )
             finally:
                 # Idempotent close — no-op when master flag off.
@@ -9331,6 +9346,15 @@ class ClaudeProvider:
                 )
             except Exception:  # noqa: BLE001 — never block tool loop
                 _evidence_override = None
+            # ── Slice 237 — op weight for convergence scaling (see DW/Prime
+            # sites). Same op-weight signal the gate reads; None → byte-identical.
+            _op_weight_lines: Optional[int] = None
+            try:
+                _op_weight_lines = _max_target_line_count(
+                    getattr(context, "target_files", ()) or (), self._repo_root,
+                )
+            except Exception:  # noqa: BLE001 — never block the tool loop
+                _op_weight_lines = None
             raw, tool_records_list = await self._tool_loop.run(
                 prompt=prompt_text,
                 generate_fn=_generate_raw,
@@ -9341,6 +9365,7 @@ class ClaudeProvider:
                 risk_tier=getattr(context, "risk_tier", None),
                 is_read_only=bool(getattr(context, "is_read_only", False)),
                 repo_root_override=_evidence_override,
+                op_weight_lines=_op_weight_lines,
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
