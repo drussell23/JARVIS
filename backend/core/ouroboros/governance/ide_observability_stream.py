@@ -174,6 +174,13 @@ EVENT_TYPE_GUIDANCE_ABSORBED = "guidance_absorbed"
 # log-grepping). Payload: organ_name + intended_action + triggering_signal.
 EVENT_TYPE_SHADOW_ACTION_TRAPPED = "shadow_action_trapped"
 
+# Slice 253 (Active Shadow Endorsement & HITL Gateway) — the RETURN channel:
+# fires when the Sovereign Host endorses a previously-trapped shadow action,
+# re-hydrating + executing that ONE action_id (bypassing the shadow block for a
+# single run) WITHOUT dropping the global JARVIS_RESILIENCE_SHADOW_MODE shield.
+# Payload: action_id + organ_name + intended_action + outcome.
+EVENT_TYPE_ENDORSE_SHADOW_ACTION = "endorse_shadow_action"
+
 # Slice 12D (Graceful Shutdown on Global Breaker Trip) — single
 # event type covering the global-session structural-refusal
 # transition CLOSED → OPEN_TERMINAL. Carries trip_count + window_s
@@ -1520,6 +1527,8 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # into its prompt without suspending the lane)
     EVENT_TYPE_SHADOW_ACTION_TRAPPED,             # Slice 252 (Shadow Mode trapped a dangerous
                                                   # resilience action — kill/shed/restart)
+    EVENT_TYPE_ENDORSE_SHADOW_ACTION,             # Slice 253 (Host endorsed a trapped action —
+                                                  # one-shot re-hydrate+execute, shield intact)
     EVENT_TYPE_SESSION_EXHAUSTED,                 # Slice 12D (global breaker session-wide trip
                                                   # — fires once at CLOSED → OPEN_TERMINAL with
                                                   # trip_count + window_s + threshold; the
@@ -3094,13 +3103,16 @@ def publish_shadow_action_trapped(
     organ_name: str = "",
     intended_action: str = "",
     triggering_signal: str = "",
+    action_id: str = "",
     op_id: str = "",
 ) -> Optional[str]:
     """Slice 252 — publish a ``shadow_action_trapped`` event when the Cybernetic
     Reanimation Shadow Mode chokepoint traps a dangerous resilience action. The
     structured payload (organ_name + intended_action + triggering_signal) gives
     the Sovereign Host real-time audit of the reanimated muscle's intent.
-    Non-blocking, NEVER raises (returns None when the stream is disabled)."""
+    ``action_id`` (Slice 253) lets the Host reference THIS specific trapped action
+    when endorsing it through the return channel. Non-blocking, NEVER raises
+    (returns None when the stream is disabled)."""
     if not stream_enabled():
         return None
     try:
@@ -3111,12 +3123,49 @@ def publish_shadow_action_trapped(
                 "organ_name": str(organ_name)[:128],
                 "intended_action": str(intended_action)[:512],
                 "triggering_signal": str(triggering_signal)[:128],
+                "action_id": str(action_id)[:64],
                 "op_id": str(op_id)[:64],
             },
         )
     except Exception:  # noqa: BLE001
         logger.debug(
             "[Stream] publish_shadow_action_trapped exception", exc_info=True,
+        )
+        return None
+
+
+def publish_endorse_shadow_action(
+    *,
+    action_id: str = "",
+    organ_name: str = "",
+    intended_action: str = "",
+    outcome: str = "",
+    op_id: str = "",
+) -> Optional[str]:
+    """Slice 253 — publish an ``endorse_shadow_action`` event when the Sovereign
+    Host endorses a previously-trapped action: it is re-hydrated and executed for
+    that ONE ``action_id`` (the shadow block bypassed for a single run) while the
+    global JARVIS_RESILIENCE_SHADOW_MODE shield stays UP. ``outcome`` is the
+    terminal status (executed / expired / not_found / error / declined). The audit
+    trail closes the bidirectional loop: trap -> endorse -> execute, all visible.
+    Non-blocking, NEVER raises (returns None when the stream is disabled)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_ENDORSE_SHADOW_ACTION,
+            op_id or action_id or organ_name or "endorse_shadow_action",
+            {
+                "action_id": str(action_id)[:64],
+                "organ_name": str(organ_name)[:128],
+                "intended_action": str(intended_action)[:512],
+                "outcome": str(outcome)[:64],
+                "op_id": str(op_id)[:64],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_endorse_shadow_action exception", exc_info=True,
         )
         return None
 

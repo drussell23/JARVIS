@@ -24,8 +24,11 @@ Pure/async, env-driven, NEVER raises on the dispatch hot path.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
+import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -92,10 +95,226 @@ def resilience_shadow_mode_enabled() -> bool:
         return True  # fail SAFE — default to shadow on error
 
 
+# ---------------------------------------------------------------------------
+# Slice 253 — Active Shadow Endorsement & HITL Gateway (the return channel)
+#
+# Passive telemetry (Slice 252) tells the Host what the muscle WOULD have done.
+# This is the bidirectional half: when shadow_guard traps a dangerous action it
+# STASHES the original callable (a live in-process closure) keyed by a unique
+# action_id. The Host can later ENDORSE that one action_id — the closure is
+# re-hydrated and executed for a single run, bypassing the shadow block for THAT
+# action only, while the global JARVIS_RESILIENCE_SHADOW_MODE shield stays UP.
+#
+# Bounded + TTL'd: a pending action that is never endorsed expires (a stale kill
+# must NOT fire late) and the registry is capacity-capped (oldest evicted). The
+# stash is in-process only — closures are not serializable, so an un-endorsed
+# action does not survive a process restart (by design: a restart is a clean
+# slate, not a queue of pending world-mutations).
+# ---------------------------------------------------------------------------
+
+_ENV_PENDING_MAX = "JARVIS_SHADOW_PENDING_MAX"
+_ENV_PENDING_TTL_S = "JARVIS_SHADOW_PENDING_TTL_S"
+_DEFAULT_PENDING_MAX = 64
+_DEFAULT_PENDING_TTL_S = 300.0
+
+
+def _pending_max() -> int:
+    try:
+        return max(1, int(os.getenv(_ENV_PENDING_MAX, str(_DEFAULT_PENDING_MAX))))
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_PENDING_MAX
+
+
+def _pending_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.getenv(_ENV_PENDING_TTL_S, str(_DEFAULT_PENDING_TTL_S))))
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_PENDING_TTL_S
+
+
+def _current_signal_repr() -> str:
+    """Compact repr of the dispatcher-set triggering signal (ContextVar), for
+    stashing alongside a pending action. NEVER raises."""
+    try:
+        sig = _current_signal_var.get()
+        if sig is None:
+            return ""
+        return f"{sig.type.value}:{sig.source}:{sig.edge.value}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@dataclass
+class PendingShadowAction:
+    """A trapped dangerous action awaiting endorsement. Holds the live in-process
+    callable so it can be re-hydrated and executed for one run."""
+    action_id: str
+    organ: str
+    action_desc: str
+    execute: Callable[[], Any]
+    is_coro: bool
+    signal_repr: str
+    created_monotonic: float
+
+
+@dataclass(frozen=True)
+class EndorsementResult:
+    """Terminal outcome of an endorsement attempt. ``status`` is one of:
+    executed | declined | not_found | expired | error."""
+    status: str
+    action_id: str
+    organ: str = ""
+    intended_action: str = ""
+    result: Any = None
+    error: str = ""
+
+
+class PendingShadowActionRegistry:
+    """Bounded, TTL-aware store of trapped actions awaiting endorsement. Pure +
+    in-process; NEVER raises on the register/pop hot path."""
+
+    def __init__(self) -> None:
+        self.entries: "OrderedDict[str, PendingShadowAction]" = OrderedDict()
+        self._seq = 0
+
+    def register(
+        self,
+        *,
+        organ: str,
+        action_desc: str,
+        execute: Callable[[], Any],
+        is_coro: bool,
+        signal_repr: str = "",
+    ) -> str:
+        """Stash a trapped action; returns its unique action_id. Evicts the
+        oldest entry when the capacity cap is exceeded."""
+        self._seq += 1
+        action_id = f"shadow-{self._seq:06d}"
+        self.entries[action_id] = PendingShadowAction(
+            action_id=action_id,
+            organ=str(organ),
+            action_desc=str(action_desc),
+            execute=execute,
+            is_coro=bool(is_coro),
+            signal_repr=str(signal_repr),
+            created_monotonic=time.monotonic(),
+        )
+        # Bound the registry — drop oldest beyond the cap (FIFO).
+        cap = _pending_max()
+        while len(self.entries) > cap:
+            self.entries.popitem(last=False)
+        return action_id
+
+    def pop(self, action_id: str) -> Optional[PendingShadowAction]:
+        return self.entries.pop(action_id, None)
+
+    def reset(self) -> None:
+        self.entries.clear()
+        self._seq = 0
+
+
+_PENDING = PendingShadowActionRegistry()
+
+
+def reset_pending_shadow_actions() -> None:
+    """Clear all pending trapped actions (test seam + clean-slate on boot)."""
+    _PENDING.reset()
+
+
+def pending_shadow_action_count() -> int:
+    return len(_PENDING.entries)
+
+
+def pending_shadow_action_ids() -> List[str]:
+    """The action_ids currently awaiting endorsement (oldest first)."""
+    return list(_PENDING.entries.keys())
+
+
+async def endorse_shadow_action(action_id: str) -> EndorsementResult:
+    """Re-hydrate and execute ONE trapped action for the given ``action_id`` —
+    bypassing the shadow block for this single run WITHOUT touching the global
+    JARVIS_RESILIENCE_SHADOW_MODE shield. One-shot (the entry is popped, so it
+    cannot double-fire). Rejects unknown ids and expired (TTL'd) entries — a
+    stale kill must never fire late. Fail-soft: an exception in the underlying
+    action yields status="error", never propagates. Publishes an audit event."""
+    entry = _PENDING.pop(action_id)
+    if entry is None:
+        return EndorsementResult(status="not_found", action_id=action_id)
+
+    ttl = _pending_ttl_s()
+    if ttl > 0 and (time.monotonic() - entry.created_monotonic) > ttl:
+        _emit_endorsement(entry, "expired")
+        return EndorsementResult(
+            status="expired", action_id=action_id, organ=entry.organ,
+            intended_action=entry.action_desc,
+        )
+
+    try:
+        out = entry.execute()
+        if entry.is_coro or inspect.isawaitable(out):
+            out = await out
+        _emit_endorsement(entry, "executed")
+        return EndorsementResult(
+            status="executed", action_id=action_id, organ=entry.organ,
+            intended_action=entry.action_desc, result=out,
+        )
+    except Exception as exc:  # noqa: BLE001 — endorsement must never crash the Host
+        logger.exception(
+            "[Reanimation] endorsed action %s (%s) raised", action_id, entry.organ,
+        )
+        _emit_endorsement(entry, "error")
+        return EndorsementResult(
+            status="error", action_id=action_id, organ=entry.organ,
+            intended_action=entry.action_desc, error=str(exc)[:256],
+        )
+
+
+def _emit_endorsement(entry: PendingShadowAction, outcome: str) -> None:
+    """Publish the endorsement audit event. Fail-soft, lazy import, NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_endorse_shadow_action as _publish,
+        )
+        _publish(
+            action_id=entry.action_id,
+            organ_name=entry.organ,
+            intended_action=entry.action_desc,
+            outcome=outcome,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Reanimation] endorsement telemetry emit skipped", exc_info=True)
+
+
+def endorsement_prompt_for(payload: Dict[str, Any]) -> str:
+    """Render the non-blocking HITL prompt the CLI/TUI shows the Host when a
+    SHADOW_ACTION_TRAPPED event arrives. Pure (TTY-free, testable)."""
+    organ = str(payload.get("organ_name", "") or "?")
+    action = str(payload.get("intended_action", "") or "?")
+    aid = str(payload.get("action_id", "") or "?")
+    return f"[SHADOW] {organ} would {action} (id={aid}). Endorse Execution? [Y/N]"
+
+
+async def handle_endorsement_choice(action_id: str, choice: str) -> EndorsementResult:
+    """Apply the Host's CLI/TUI decision. 'y'/'yes' endorses (re-hydrate+execute);
+    anything else declines (the action stays pending until its TTL lapses, so the
+    Host can still endorse it later). The IN-PROCESS dispatch target a REPL verb
+    or trusted command channel calls — deliberately NOT the read-only
+    /observability surface (executing a kill is an authority action)."""
+    if str(choice).strip().lower() in ("y", "yes"):
+        return await endorse_shadow_action(action_id)
+    entry = _PENDING.entries.get(action_id)
+    return EndorsementResult(
+        status="declined", action_id=action_id,
+        organ=entry.organ if entry else "",
+        intended_action=entry.action_desc if entry else "",
+    )
+
+
 def emit_shadow_trap(
     organ_name: str,
     intended_action: str,
     triggering_signal: Any = None,
+    action_id: str = "",
 ) -> None:
     """Slice 252 — publish a SHADOW_ACTION_TRAPPED telemetry event to the
     StreamEventBroker when a dangerous action is trapped, giving the Sovereign
@@ -118,6 +337,7 @@ def emit_shadow_trap(
             organ_name=str(organ_name),
             intended_action=str(intended_action),
             triggering_signal=sig_repr,
+            action_id=str(action_id),
         )
     except Exception:  # noqa: BLE001 — telemetry is best-effort, never the gate
         logger.debug("[Reanimation] shadow-trap telemetry emit skipped", exc_info=True)
@@ -138,7 +358,12 @@ def shadow_guard(
     _log = log or logger
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
-        emit_shadow_trap(organ, action_desc)
+        # Slice 253 — stash the live callable so the Host can later endorse it.
+        action_id = _PENDING.register(
+            organ=organ, action_desc=action_desc, execute=execute, is_coro=False,
+            signal_repr=_current_signal_repr(),
+        )
+        emit_shadow_trap(organ, action_desc, action_id=action_id)
         return SHADOW_TRAPPED
     return execute()
 
@@ -154,7 +379,12 @@ async def shadow_guard_async(
     _log = log or logger
     if resilience_shadow_mode_enabled():
         _log.warning("[SHADOW MODE] Would have %s", action_desc)
-        emit_shadow_trap(organ, action_desc)
+        # Slice 253 — stash the live coroutine factory for endorsement.
+        action_id = _PENDING.register(
+            organ=organ, action_desc=action_desc, execute=execute, is_coro=True,
+            signal_repr=_current_signal_repr(),
+        )
+        emit_shadow_trap(organ, action_desc, action_id=action_id)
         return SHADOW_TRAPPED
     return await execute()
 
