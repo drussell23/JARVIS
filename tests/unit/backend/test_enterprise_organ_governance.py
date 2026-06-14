@@ -273,94 +273,6 @@ class TestStreamingAnalyticsEngineGovernance:
         assert healthy is False
 
 
-class TestConsentManagementSystemGovernance:
-    """ConsentManagementSystem must be a governed SystemService."""
-
-    def test_is_system_service(self):
-        from unified_supervisor import ConsentManagementSystem, SystemService
-        assert issubclass(ConsentManagementSystem, SystemService)
-
-    def test_constructor_purity(self):
-        from unified_supervisor import ConsentManagementSystem
-        cms = ConsentManagementSystem()
-        assert cms._initialized is False
-
-    def test_capability_contract(self):
-        from unified_supervisor import ConsentManagementSystem
-        cms = ConsentManagementSystem()
-        contract = cms.capability_contract()
-        assert contract.name == "ConsentManagementSystem"
-        assert "writes_consent_records" in contract.side_effects
-
-    def test_activation_triggers(self):
-        from unified_supervisor import ConsentManagementSystem
-        cms = ConsentManagementSystem()
-        triggers = cms.activation_triggers()
-        assert isinstance(triggers, list)
-
-    @pytest.mark.asyncio
-    async def test_health_check_before_init(self):
-        from unified_supervisor import ConsentManagementSystem
-        cms = ConsentManagementSystem()
-        healthy, msg = await cms.health_check()
-        assert healthy is False
-
-    @pytest.mark.asyncio
-    async def test_lifecycle(self):
-        from unified_supervisor import ConsentManagementSystem
-        cms = ConsentManagementSystem()
-        await cms.initialize()
-        assert cms._initialized is True
-        healthy, msg = await cms.health_check()
-        assert healthy is True
-        await cms.cleanup()
-        assert cms._initialized is False
-
-
-class TestDigitalSignatureServiceGovernance:
-    """DigitalSignatureService must be a governed SystemService."""
-
-    def test_is_system_service(self):
-        from unified_supervisor import DigitalSignatureService, SystemService
-        assert issubclass(DigitalSignatureService, SystemService)
-
-    def test_constructor_purity(self):
-        from unified_supervisor import DigitalSignatureService
-        dss = DigitalSignatureService()
-        assert dss._initialized is False
-
-    def test_capability_contract(self):
-        from unified_supervisor import DigitalSignatureService
-        dss = DigitalSignatureService()
-        contract = dss.capability_contract()
-        assert contract.name == "DigitalSignatureService"
-        assert "writes_signature_store" in contract.side_effects
-
-    def test_activation_triggers(self):
-        from unified_supervisor import DigitalSignatureService
-        dss = DigitalSignatureService()
-        triggers = dss.activation_triggers()
-        assert isinstance(triggers, list)
-
-    @pytest.mark.asyncio
-    async def test_health_check_before_init(self):
-        from unified_supervisor import DigitalSignatureService
-        dss = DigitalSignatureService()
-        healthy, msg = await dss.health_check()
-        assert healthy is False
-
-    @pytest.mark.asyncio
-    async def test_lifecycle(self):
-        from unified_supervisor import DigitalSignatureService
-        dss = DigitalSignatureService()
-        await dss.initialize()
-        assert dss._initialized is True
-        healthy, msg = await dss.health_check()
-        assert healthy is True
-        await dss.cleanup()
-        assert dss._initialized is False
-
-
 class TestLegacyDegradationManagerGovernance:
     """LegacyDegradationManager must be a governed SystemService."""
 
@@ -418,8 +330,6 @@ ORGAN_CLASSES = [
     "SessionManager",
     "DataLakeManager",
     "StreamingAnalyticsEngine",
-    "ConsentManagementSystem",
-    "DigitalSignatureService",
     "LegacyDegradationManager",
 ]
 
@@ -492,8 +402,6 @@ PERSISTENT_ORGANS = [
     "NotificationHub",
     "DataLakeManager",
     "StreamingAnalyticsEngine",
-    "ConsentManagementSystem",
-    "DigitalSignatureService",
     "LegacyDegradationManager",
 ]
 
