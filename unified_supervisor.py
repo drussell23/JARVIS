@@ -1876,6 +1876,17 @@ def _use_modular_crash_recovery() -> bool:
         return False
     return not _get_env_bool("JARVIS_FORCE_INLINE_CRASH_RECOVERY", False)
 
+def _reanimation_enabled() -> bool:
+    """Cybernetic Reanimation (Phase C) master flag — default OFF.
+
+    When false, the bus→activation dispatcher is never constructed and the
+    boot path is byte-identical to legacy behaviour.
+    """
+    import os
+    return os.getenv(
+        "JARVIS_RESILIENCE_REANIMATION_ENABLED", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
 # Log modular integration status at startup
 _integration_logger = logging.getLogger("unified_supervisor.integration")
 _integration_status = []
@@ -14114,6 +14125,23 @@ class SystemServiceRegistry:
             desc.healthy = False
             logger.warning("[SSR] On-demand start failed for %s: %s", name, e)
             return False
+
+    def iter_event_driven(self) -> List["ServiceDescriptor"]:
+        """Read-only: yield registered descriptors that are event-driven.
+
+        Returns the descriptors whose ``activation_mode == "event_driven"`` or
+        that carry an ``activation_contract`` (the Cybernetic Reanimation
+        ActivationContract attached in a later phase). Pure projection — no
+        state mutation, no activation. The EventActivationDispatcher consumes
+        this to bridge bus events to ``activate_service`` calls; the registry's
+        gates remain authoritative.
+        """
+        out: List["ServiceDescriptor"] = []
+        for desc in self._services.values():
+            if getattr(desc, "activation_mode", None) == "event_driven" or \
+                    getattr(desc, "activation_contract", None) is not None:
+                out.append(desc)
+        return out
 
     # ── health ──────────────────────────────────────────────────────────
 
@@ -64442,6 +64470,26 @@ class JarvisSystemKernel:
         ))
 
         logger.info("[Kernel] Service registry: 76 services registered across phases 1-8")
+
+        # ── Cybernetic Reanimation (Phase C) ─ bus→activation bridge ──────
+        # Default OFF. When enabled, wires the SupervisorEventBus to the
+        # registry's event-driven services so they activate on emitted
+        # pressure/health events. The registry's gates remain authoritative.
+        # Fail-soft: reanimation must never break boot. OFF path is the `if`
+        # simply not taken → byte-identical legacy behaviour.
+        if _reanimation_enabled():
+            try:
+                from backend.core.ouroboros.governance.resilience_reanimation import (
+                    EventActivationDispatcher,
+                )
+                self._reanimation_dispatcher = EventActivationDispatcher(
+                    get_event_bus(), self._service_registry,
+                )
+                self._reanimation_dispatcher.start()
+            except Exception as _e:  # noqa: BLE001 — fail-soft; never break boot
+                self.logger.warning(
+                    f"[Reanimation] disabled (init failed): {_e!r}"
+                )
 
     async def _on_supervisor_rollback_outcome(self, outcome: Dict[str, Any]) -> None:
         """Bridge supervisor/manual rollback outcomes into the governed event stream."""
