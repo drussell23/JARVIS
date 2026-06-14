@@ -60,88 +60,124 @@ _REVIEW_ALWAYS_PATHS: Tuple[str, ...] = (
 # hardcoded cap), env-tunable, gated, fail-soft (no router → legacy inline inject).
 # ---------------------------------------------------------------------------
 
-# Route-scaled budget floor: decouple when remaining_s drops below the route's
-# floor. base × per-route fraction (tighter routes decouple earlier). The base is
-# env-tunable; the fractions mirror the route cost/deadline tiers (CLAUDE.md §5).
-_TEST_SHARD_ROUTE_FRACTIONS: Dict[str, float] = {
-    "immediate": 0.5,     # ~45s of the 90s base — very tight reflex window
-    "standard": 0.67,     # ~60s
-    "complex": 1.0,       # ~90s
-    "background": 1.33,   # ~120s
-    "speculative": 2.0,   # ~180s
-}
+# Slice 240 — the decouple decision is now a DYNAMIC COST-vs-BANDWIDTH inequality
+# (no hardcoded file-count gate). Shard the test-gen to a background op iff the
+# mathematical cost of generating the tests EXCEEDS the live bandwidth of the
+# primary task window:
+#
+#     (Files_uncovered × Est_Tokens_per_file)  >  (Velocity_live × Budget_Remaining)
+#
+# The LHS (est_test_tokens) is derived from each uncovered file's ACTUAL line count
+# — data-driven, never a magic integer. The conversion ratios + the live velocity
+# baseline are env-tunable (no hardcoded thresholds). Light ops whose tests fit the
+# window stay inline (byte-identical); only ops whose test load can't fit decouple.
 
 
 def test_sharding_enabled() -> bool:
     """Master switch for adaptive test-sharding (layer 9). Default TRUE — gated +
-    fail-soft (no router → legacy inline inject) + only fires when budget is tight
-    AND >2 files are uncovered, so light/ample ops are byte-identical. NEVER raises."""
+    fail-soft (no router → legacy inline inject); only fires when the cost model
+    says the test load can't fit the primary window, so light/ample ops are
+    byte-identical. NEVER raises."""
     raw = (os.environ.get("JARVIS_TEST_SHARDING_ENABLED", "true") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def _test_shard_min_uncovered() -> int:
-    """Minimum uncovered-file count to warrant a SEPARATE test-coverage op (the
-    ">2 files" gate). Below this, inline injection is cheap enough. Default 3.
-    Env JARVIS_TEST_SHARD_MIN_UNCOVERED. Invalid/non-positive → default."""
-    raw = (os.environ.get("JARVIS_TEST_SHARD_MIN_UNCOVERED", "") or "").strip()
+def _env_float(name: str, default: float) -> float:
+    """Positive-float env reader (no hardcoded literals at the call sites). Invalid
+    / non-positive → default. NEVER raises."""
+    raw = (os.environ.get(name, "") or "").strip()
     if not raw:
-        return 3
-    try:
-        v = int(raw)
-        return v if v > 0 else 3
-    except ValueError:
-        return 3
-
-
-def _test_shard_budget_base_s() -> float:
-    """Base budget floor (seconds) for the decouple decision, scaled per route.
-    Default 90. Env JARVIS_TEST_SHARD_BUDGET_BASE_S. Invalid/non-positive → default."""
-    raw = (os.environ.get("JARVIS_TEST_SHARD_BUDGET_BASE_S", "") or "").strip()
-    if not raw:
-        return 90.0
+        return default
     try:
         v = float(raw)
-        return v if v > 0 else 90.0
+        return v if v > 0 else default
     except ValueError:
-        return 90.0
+        return default
 
 
-def _test_shard_budget_floor_s(provider_route: str) -> float:
-    """The route-scaled remaining-budget floor below which test-gen is decoupled."""
-    frac = _TEST_SHARD_ROUTE_FRACTIONS.get(
-        (provider_route or "standard").strip().lower(), 0.67,
-    )
-    return _test_shard_budget_base_s() * frac
+def _shard_tokens_per_line() -> float:
+    """Est tokens per source line (the lines→tokens conversion for the cost model).
+    Env JARVIS_TEST_SHARD_TOKENS_PER_LINE. Default 12.0 (empirical Python avg)."""
+    return _env_float("JARVIS_TEST_SHARD_TOKENS_PER_LINE", 12.0)
+
+
+def _shard_test_multiplier() -> float:
+    """Ratio of generated-test size to source size (a test file ≈ its module).
+    Env JARVIS_TEST_SHARD_TEST_MULTIPLIER. Default 1.0."""
+    return _env_float("JARVIS_TEST_SHARD_TEST_MULTIPLIER", 1.0)
+
+
+def _shard_velocity_tok_s() -> float:
+    """Live generation bandwidth baseline (tokens/sec) — Velocity_live in the cost
+    model. No per-op live throughput signal exists in the provider yet, so this is
+    an env-tunable baseline (the DW elite-pool steady-state). Env
+    JARVIS_TEST_SHARD_VELOCITY_TOK_S. Default 40.0."""
+    return _env_float("JARVIS_TEST_SHARD_VELOCITY_TOK_S", 40.0)
+
+
+def _shard_default_file_lines() -> float:
+    """Conservative line-count for an uncovered file that can't be read (so an
+    unresolvable path still contributes a real cost, never 0). Env
+    JARVIS_TEST_SHARD_DEFAULT_FILE_LINES. Default 200."""
+    return _env_float("JARVIS_TEST_SHARD_DEFAULT_FILE_LINES", 200.0)
+
+
+def estimate_test_gen_tokens(
+    *, uncovered_files, repo_root, tokens_per_line=None, test_multiplier=None,
+) -> float:
+    """Cost side (LHS) of the shard-trigger inequality: estimated tokens to GENERATE
+    tests for *uncovered_files*, derived from each file's ACTUAL line count
+    (× tokens/line × test-multiplier) — data-driven, NOT a hardcoded per-file
+    constant. An unreadable path contributes a conservative default so it is never
+    free. Pure (only reads file sizes); NEVER raises → 0.0 on total failure."""
+    try:
+        tpl = float(tokens_per_line) if tokens_per_line is not None else _shard_tokens_per_line()
+        mult = float(test_multiplier) if test_multiplier is not None else _shard_test_multiplier()
+        root = Path(repo_root) if repo_root is not None else None
+        total = 0.0
+        for rel in (uncovered_files or ()):
+            lines = 0
+            try:
+                if root is not None:
+                    p = root / str(rel)
+                    if p.is_file():
+                        lines = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+            except Exception:  # noqa: BLE001 — unreadable file → conservative default
+                lines = 0
+            if lines <= 0:
+                lines = int(_shard_default_file_lines())
+            total += float(lines) * tpl * mult
+        return max(0.0, total)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def should_decouple_test_gen(
-    *, provider_route: str, remaining_s, uncovered_count: int,
-    target_file_count: int = 1, complexity: str = "", enabled: bool = True,
+    *, est_test_tokens, velocity_tok_s, remaining_s, enabled: bool = True,
 ) -> bool:
-    """Pure adaptive decision: emit a SEPARATE background test-coverage op instead
-    of inlining the test-gen instruction into the primary op? Decouple ONLY when
-    enabled AND there are >2 uncovered files AND the budget can't sustain the load
-    — the budget floor scales to the route, and heavy/multi-file ops decouple with
-    more headroom. Light / ample ops → False (legacy inline inject, byte-identical).
-    No env / IO reads of the breaker here — all inputs injected → deterministic +
-    unit-testable. Pure; NEVER raises → fail-soft to False (inline)."""
+    """Dynamic shard-trigger (Slice 240) — NO hardcoded file-count gate. Decouple
+    test-gen to a background op iff the mathematical cost of generating the tests
+    exceeds the live bandwidth of the primary task window:
+
+        est_test_tokens  >  velocity_tok_s × remaining_s
+
+    i.e. ``(Files × Est_Tokens_per_file) > (Velocity_live × Budget_Remaining)``.
+    An unbounded budget (remaining_s == inf) never shards; a depleted budget
+    (remaining_s ≤ 0) with real cost always shards (it can't possibly fit inline).
+    All inputs injected → deterministic + unit-testable. Pure; fail-soft → False."""
     try:
         if not enabled:
             return False
-        if int(uncovered_count) < _test_shard_min_uncovered():
-            return False  # ≤2 uncovered → inline is cheap enough
+        cost = float(est_test_tokens)
+        if cost <= 0.0:
+            return False  # nothing to generate → inline (no-op)
         rem = float(remaining_s)
-        floor = _test_shard_budget_floor_s(provider_route)
-        if rem < floor:
-            return True
-        # Heavy / multi-file ops decouple with 1.5× headroom — their per-round
-        # latency makes an inlined N-file test-gen especially deadline-risky.
-        heavy = (complexity or "").strip().lower() in ("heavy_code", "complex")
-        multifile = int(target_file_count) >= 5
-        if (heavy or multifile) and rem < floor * 1.5:
-            return True
-        return False
+        if rem == float("inf"):
+            return False  # no deadline pressure → keep inline
+        if rem <= 0.0:
+            return True   # no budget left → cannot fit inline, decouple
+        vel = float(velocity_tok_s)
+        return cost > vel * rem
     except Exception:  # noqa: BLE001 — fail-soft to inline
         return False
 
