@@ -80,3 +80,50 @@ async def test_one_failing_activation_does_not_block_others():
     EventActivationDispatcher(bus, reg).start()
     await bus.fire(FakeEvent("resource_pressure"))
     assert reg.activated == ["good"]  # bad failed, good still ran
+
+
+# ---------------------------------------------------------------------------
+# C.2 — PressureSignalEmitter tests
+# ---------------------------------------------------------------------------
+from backend.core.ouroboros.governance.resilience_reanimation import PressureSignalEmitter
+
+
+@pytest.mark.asyncio
+async def test_emitter_edge_triggers_once_on_crossing():
+    emitted = []
+    levels = {"mem": [0.5, 0.95, 0.96, 0.4]}   # below, cross, stay, drop
+    seq = iter(levels["mem"])
+    def sampler(): return {"mem": next(seq)}
+    em = PressureSignalEmitter(
+        sampler=sampler,
+        emit=lambda etype, payload: emitted.append((etype, payload)),
+        thresholds={"mem": 0.9},
+        signal_event={"mem": "resource_pressure"},
+    )
+    for _ in range(4):
+        await em.tick()
+    # crossing 0.5->0.95 emits once; 0.95->0.96 (stay above) no emit; drop resets
+    assert [e[0] for e in emitted] == ["resource_pressure"]
+
+
+@pytest.mark.asyncio
+async def test_emitter_reemits_after_drop_then_recross():
+    emitted = []
+    seq = iter([0.95, 0.4, 0.95])
+    em = PressureSignalEmitter(
+        sampler=lambda: {"mem": next(seq)},
+        emit=lambda etype, payload: emitted.append(etype),
+        thresholds={"mem": 0.9},
+        signal_event={"mem": "resource_pressure"},
+    )
+    for _ in range(3):
+        await em.tick()
+    assert emitted == ["resource_pressure", "resource_pressure"]
+
+
+@pytest.mark.asyncio
+async def test_emitter_failsoft_on_sampler_error():
+    def sampler(): raise RuntimeError("probe down")
+    em = PressureSignalEmitter(sampler=sampler, emit=lambda *a: None,
+                               thresholds={"mem": 0.9}, signal_event={"mem": "resource_pressure"})
+    await em.tick()  # must not raise

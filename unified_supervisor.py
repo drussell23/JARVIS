@@ -8787,6 +8787,9 @@ class SupervisorEventType(Enum):
     SHUTDOWN_START = "shutdown_start"
     SHUTDOWN_END = "shutdown_end"
     LOG = "log"
+    RESOURCE_PRESSURE = "resource_pressure"
+    ANOMALY_DETECTED = "anomaly_detected"
+    COMPONENT_DEGRADED = "component_degraded"
 
 
 # =========================================================================

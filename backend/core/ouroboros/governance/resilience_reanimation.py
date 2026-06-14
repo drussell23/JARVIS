@@ -63,3 +63,37 @@ class EventActivationDispatcher:
             logger.info(
                 "[Reanimation] event=%s activated=%s", etype, activated
             )
+
+
+class PressureSignalEmitter:
+    """Edge-triggered pressure sampler. Emits a typed event only when a signal
+    transitions from below to above its threshold (never every tick). Fail-soft.
+    """
+
+    def __init__(self, sampler, emit, thresholds, signal_event):
+        self._sampler = sampler          # () -> {signal: level}
+        self._emit = emit                # (event_type_value, payload) -> None
+        self._thresholds = dict(thresholds)
+        self._signal_event = dict(signal_event)
+        self._above = {}                 # signal -> bool (last state)
+
+    async def tick(self) -> None:
+        try:
+            sample = self._sampler() or {}
+        except Exception as err:  # noqa: BLE001 — fail-soft
+            logger.warning("[Reanimation] pressure sample failed: %r", err)
+            return
+        for signal, level in sample.items():
+            thr = self._thresholds.get(signal)
+            if thr is None:
+                continue
+            now_above = level >= thr
+            was_above = self._above.get(signal, False)
+            if now_above and not was_above:
+                etype = self._signal_event.get(signal)
+                if etype:
+                    try:
+                        self._emit(etype, {"signal": signal, "level": level})
+                    except Exception as err:  # noqa: BLE001
+                        logger.warning("[Reanimation] emit failed: %r", err)
+            self._above[signal] = now_above
