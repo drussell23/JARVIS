@@ -5347,6 +5347,20 @@ class CandidateGenerator:
         os.environ.get("JARVIS_BG_READONLY_SYNTHESIS_RESERVE_S", "180.0")
     )
 
+    def _fallback_is_claude(self) -> bool:
+        """Slice 238 — True iff the configured fallback is the Claude lane (so the
+        Claude economic breaker is the right health signal to gate it). Reads the
+        fallback's ``provider_name`` (e.g. ``claude-api``); a non-Claude fallback
+        (e.g. Prime) returns False so the Claude breaker never suppresses it.
+        NEVER raises → fail-soft to False (legacy: don't suppress)."""
+        try:
+            if self._fallback is None:
+                return False
+            name = (getattr(self._fallback, "provider_name", "") or "").strip().lower()
+            return "claude" in name
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _call_fallback(
         self,
         context: OperationContext,
@@ -5422,6 +5436,41 @@ class CandidateGenerator:
                 deadline=deadline,
                 disabled_routes=os.environ.get(_DISABLE_FALLBACK_ROUTES_ENV, ""),
             )
+
+        # Slice 238 — cascade breaker consult (CENTRAL seam). The s237 soak proved
+        # the cascade-to-dead-Claude poison (BadRequestError 400 → terminal_quota →
+        # cooldown cycle) reaches Claude from EVERY _call_fallback caller, not just
+        # the sentinel cascade_to_claude path. Guard it here, where all callers
+        # converge: when the fallback IS the Claude lane AND the economic breaker
+        # is OPEN (read-only _claude_breaker_open — same source-of-truth the
+        # primary lane respects, no probe side-effect), do NOT call the known-dead
+        # lane. Raise the EXISTING fallback_skipped sentinel (Slice 19b — NOT
+        # counted toward ExhaustionWatcher hibernation) so the op degrades cleanly
+        # instead of burning a 400 and poisoning the consecutive-failure counter.
+        # Breaker CLOSED → byte-identical (a funded Claude fallback is used).
+        if cascade_breaker_consult_enabled() and self._fallback_is_claude():
+            _claude_lane_open = False
+            try:
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    _claude_breaker_open as _cf_breaker_open,
+                )
+                _claude_lane_open = _cf_breaker_open()
+            except Exception:  # noqa: BLE001 — advisory; never block dispatch
+                _claude_lane_open = False
+            if _claude_lane_open:
+                logger.warning(
+                    "[CandidateGenerator] Slice238 fallback SUPPRESSED (central): "
+                    "Claude lane breaker OPEN (economic/transport) — skipping the "
+                    "known-dead Claude fallback (no terminal_quota poison); "
+                    "raising fallback_skipped so the op degrades cleanly "
+                    "(route=%s)", _op_route or "?",
+                )
+                self._raise_exhausted(
+                    "fallback_skipped:claude_breaker_open",
+                    context=context,
+                    deadline=deadline,
+                    fallback_state="economic_open",
+                )
 
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()

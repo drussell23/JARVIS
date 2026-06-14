@@ -92,3 +92,41 @@ class TestDispatchWiresBreakerConsult:
         # branch (Slice 180), not invent a new degrade path
         src = inspect.getsource(cg.CandidateGenerator._dispatch_via_sentinel)
         assert "immortal" in src.lower()
+
+
+class TestFallbackIsClaude:
+    """The Claude breaker only gates the Claude lane — a non-Claude fallback
+    (e.g. Prime) must never be suppressed by it."""
+
+    def _stub(self, provider_name):
+        from types import SimpleNamespace
+        stub = SimpleNamespace(_fallback=SimpleNamespace(provider_name=provider_name))
+        return cg.CandidateGenerator._fallback_is_claude(stub)
+
+    def test_claude_fallback_detected(self):
+        assert self._stub("claude-api") is True
+        assert self._stub("Claude") is True
+
+    def test_non_claude_fallback_not_detected(self):
+        assert self._stub("doubleword-397b") is False
+        assert self._stub("j-prime") is False
+
+    def test_none_fallback_not_claude(self):
+        from types import SimpleNamespace
+        assert cg.CandidateGenerator._fallback_is_claude(
+            SimpleNamespace(_fallback=None)
+        ) is False
+
+
+class TestCentralFallbackGuard:
+    """The CENTRAL seam: _call_fallback must suppress the dead Claude lane for
+    EVERY caller (not just the sentinel cascade — the s237 soak proved
+    BadRequestError 400 reached Claude from other _call_fallback callers too)."""
+
+    def test_call_fallback_consults_breaker_centrally(self):
+        src = inspect.getsource(cg.CandidateGenerator._call_fallback)
+        assert "_claude_breaker_open" in src, "central _call_fallback must consult the breaker"
+        assert "_fallback_is_claude" in src, "only suppress when the fallback IS Claude"
+        # reuses the existing non-hibernation fallback_skipped sentinel (Slice 19b)
+        assert "fallback_skipped:claude_breaker_open" in src
+        assert "cascade_breaker_consult_enabled" in src
