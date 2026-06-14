@@ -3616,6 +3616,7 @@ class CandidateGenerator:
                 # again blame the vendor for its own internal codebase flaws.
                 from backend.core.ouroboros.governance.dw_fault_taxonomy import (
                     is_internal_fault as _s185_internal,
+                    is_generation_timeout as _s241_gen_timeout,
                 )
                 if _s185_internal(exc):
                     logger.error(
@@ -3646,7 +3647,15 @@ class CandidateGenerator:
                     getattr(exc, "is_terminal_auth_error", lambda: False)()
                 )
 
-                if _is_modality or _is_auth_terminal:
+                if _s241_gen_timeout(exc):
+                    # Slice 241 — OUR op-level tool-loop budget exhaustion
+                    # (tool_loop_deadline / max_rounds / starved), NOT a DW
+                    # transport rupture. Classify GENERATION_TIMEOUT so the
+                    # ==LIVE_TRANSPORT degrade/sever consumers ignore it and the
+                    # topology breaker (weight 0.0) never trips on OUR budget.
+                    # Stops blaming DoubleWord's network for our generation budget.
+                    failure_source = FailureSource.GENERATION_TIMEOUT
+                elif _is_modality or _is_auth_terminal:
                     # Slice H — terminal failure class. Even though we
                     # report it as LIVE_HTTP_5XX semantics here for
                     # back-compat, the breaker (Slice H wiring) will

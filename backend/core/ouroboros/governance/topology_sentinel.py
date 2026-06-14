@@ -224,6 +224,7 @@ _SENTINEL_PROPAGATED_VARS: Tuple[str, ...] = (
     "JARVIS_TOPOLOGY_WEIGHT_HEAVY_PROBE_FAIL",
     "JARVIS_TOPOLOGY_WEIGHT_LIGHT_PROBE_FAIL",
     "JARVIS_TOPOLOGY_WEIGHT_LIGHT_PROBE_TIMEOUT",
+    "JARVIS_TOPOLOGY_WEIGHT_GENERATION_TIMEOUT",  # Slice 241
 )
 
 
@@ -437,6 +438,11 @@ class FailureSource(str, enum.Enum):
     HEAVY_PROBE_FAIL = "heavy_probe_fail"          # 1.5
     LIGHT_PROBE_FAIL = "light_probe_fail"          # 1.0
     LIGHT_PROBE_TIMEOUT = "light_probe_timeout"    # 1.0
+    # Slice 241 — OUR op-level generation/tool-loop budget exhaustion (NOT a DW
+    # transport rupture). Weight 0.0: recorded for telemetry but NEVER contributes
+    # to the weighted-streak that trips the DW model/topology breaker, and (being
+    # != LIVE_TRANSPORT) the degrade/sever consumers ignore it automatically.
+    GENERATION_TIMEOUT = "generation_timeout"      # 0.0
 
 
 _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
@@ -448,6 +454,7 @@ _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
     FailureSource.HEAVY_PROBE_FAIL: 1.5,
     FailureSource.LIGHT_PROBE_FAIL: 1.0,
     FailureSource.LIGHT_PROBE_TIMEOUT: 1.0,
+    FailureSource.GENERATION_TIMEOUT: 0.0,
 }
 
 
