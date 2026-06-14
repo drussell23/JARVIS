@@ -58,6 +58,14 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
+# Slice 246 — leaf imports (no cycle: intent_envelope + preemption import neither
+# this module nor the orchestrator).
+from backend.core.ouroboros.governance.intake.intent_envelope import (
+    SOVEREIGN_SOURCES as _SOVEREIGN_SOURCES,
+)
+from backend.core.ouroboros.governance import preemption as _preemption
+from backend.core.ouroboros.governance.preemption import OperationPreemptedError
+
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.orchestrator import GovernedOrchestrator
     from backend.core.ouroboros.governance.op_context import OperationContext
@@ -261,6 +269,23 @@ def _resurrection_pool_priority() -> int:
     priority (NOT a hardcoded 0/1). Derived from _ROUTE_PRIORITY so it stays
     correct if the route tiers change."""
     return min(_ROUTE_PRIORITY.values()) - _resurrection_primacy_margin()
+
+
+def _sovereign_primacy_margin() -> int:
+    """Slice 246 — margin by which a human-origin intent outranks resurrection in
+    the pool. Shares the JARVIS_SOVEREIGN_PRIMACY_MARGIN knob with the intake
+    layer. NEVER raises (floors at 1)."""
+    try:
+        v = int(float(os.environ.get("JARVIS_SOVEREIGN_PRIMACY_MARGIN", "").strip() or 100))
+        return v if v >= 1 else 100
+    except (TypeError, ValueError):
+        return 100
+
+
+def _sovereign_pool_priority() -> int:
+    """Sovereign human pool priority — strictly below resurrection (Human >
+    Resurrected > Normal). The host always wins the worker lane."""
+    return _resurrection_pool_priority() - _sovereign_primacy_margin()
 
 
 def _read_env_int(key: str, default: int) -> int:
@@ -585,10 +610,14 @@ class BackgroundAgentPool:
 
         # Route-based priority for PriorityQueue (lower = runs first).
         _route = getattr(op_context, "provider_route", "") or "standard"
+        _signal_src = getattr(op_context, "signal_source", "") or ""
+        # Slice 246 — sovereign human primacy: a direct human-origin intent
+        # outranks EVERYTHING (including a resurrected survivor). Checked first.
         # Slice 245 — a hibernation survivor jumps ahead of EVERY normal route
-        # (dynamic absolute-max, not hardcoded), so the work that accumulated
-        # during the dark window cannot starve the resurrected primary.
-        if getattr(op_context, "resurrected_from_hibernation", False):
+        # (dynamic absolute-max), so dark-window backlog can't starve it.
+        if _signal_src in _SOVEREIGN_SOURCES:
+            _priority = _sovereign_pool_priority()
+        elif getattr(op_context, "resurrected_from_hibernation", False):
             _priority = _resurrection_pool_priority()
         else:
             _priority = _ROUTE_PRIORITY.get(_route, 3)
@@ -614,7 +643,41 @@ class BackgroundAgentPool:
             self._queue.qsize(),
             self._queue_size,
         )
+        # Slice 246 — Preemption Sentinel. A live human intent just landed; if a
+        # resurrected survivor is actively occupying a worker, fire a non-blocking
+        # preemption so it gracefully yields at its next round boundary (the
+        # worker re-ingests it — micro-hibernation). Queue ordering alone can't
+        # preempt an already-running op. Gated + fail-soft.
+        if _signal_src in _SOVEREIGN_SOURCES and _preemption.human_preemption_enabled():
+            try:
+                for _running_id in self.running_resurrected_op_ids():
+                    _preemption.request_preemption(_running_id)
+                    logger.info(
+                        "[BGPool] PREEMPTION requested for running resurrected "
+                        "op=%s — yielding to human override (source=%s)",
+                        _running_id, _signal_src,
+                    )
+            except Exception:  # noqa: BLE001 — sentinel must never block submit
+                logger.exception("[BGPool] preemption sentinel failed")
         return op_id
+
+    def running_resurrected_op_ids(self) -> List[str]:
+        """Slice 246 — ctx.op_id of every currently-RUNNING resurrected survivor.
+        These are the only ops a human override needs to preempt (queued ones are
+        already out-ranked by sovereign priority). NEVER raises."""
+        out: List[str] = []
+        try:
+            for op in self._ops.values():
+                if op.status != "running":
+                    continue
+                ctx = getattr(op, "context", None)
+                if ctx is not None and getattr(ctx, "resurrected_from_hibernation", False):
+                    cid = str(getattr(ctx, "op_id", "") or "")
+                    if cid:
+                        out.append(cid)
+        except Exception:  # noqa: BLE001
+            logger.exception("[BGPool] running_resurrected_op_ids failed")
+        return out
 
     def get_result(self, op_id: str) -> Optional[BackgroundOp]:
         """Return the :class:`BackgroundOp` for the given ID, or None.
@@ -1240,6 +1303,28 @@ class BackgroundAgentPool:
                         park_exc.signal.descriptor.kind,
                         op.elapsed_s or 0.0,
                     )
+                except OperationPreemptedError:
+                    # Slice 246 — graceful human-override preemption (NOT a hard
+                    # kill, NOT terminal). The op yielded at a round boundary; its
+                    # OperationContext (completed phases) is intact. Re-ingest it
+                    # via Slice 245's resurrection path (micro-hibernation) so it
+                    # re-enters the VIP lane BELOW the human and resumes from its
+                    # last durable phase. "preempted" is non-terminal.
+                    _ctx_op_id = str(getattr(op.context, "op_id", "") or "")
+                    _preemption.clear_preemption(_ctx_op_id)
+                    op.status = "preempted"
+                    try:
+                        await self.resubmit_resurrected(op.context)
+                        logger.info(
+                            "Worker %d: operation %s PREEMPTED by human override "
+                            "— re-ingested with VIP primacy (micro-hibernation)",
+                            worker_id, op.op_id,
+                        )
+                    except Exception:  # noqa: BLE001 — never lose the payload
+                        logger.exception(
+                            "Worker %d: preempt re-ingest failed for %s",
+                            worker_id, op.op_id,
+                        )
                 except Exception as exc:
                     op.error = f"{type(exc).__name__}: {exc}"
                     op.status = "failed"

@@ -29,6 +29,7 @@ from .intake_priority_queue import (
     _intake_priority_scheduler_enabled,
 )
 from .intent_envelope import IntentEnvelope
+from .intent_envelope import SOVEREIGN_SOURCES as _SOVEREIGN_SOURCES
 from .wal import WAL, WALEntry
 
 logger = logging.getLogger(__name__)
@@ -329,6 +330,23 @@ def _resurrection_intake_priority() -> int:
     return floor - _resurrection_primacy_margin()
 
 
+def _sovereign_primacy_margin() -> int:
+    """Slice 246 — margin by which a human-origin intent outranks resurrection.
+    Env-tunable, NEVER raises (floors at 1)."""
+    try:
+        v = int(float(os.getenv("JARVIS_SOVEREIGN_PRIMACY_MARGIN", "").strip() or 100))
+        return v if v >= 1 else 100
+    except (TypeError, ValueError):
+        return 100
+
+
+def _sovereign_human_priority() -> int:
+    """Sovereign human primacy — strictly below resurrection (Human > Resurrected
+    > Normal), so a live human intent can never be starved by an autonomous
+    survivor. Dynamic; the host always keeps ultimate control."""
+    return _resurrection_intake_priority() - _sovereign_primacy_margin()
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
@@ -362,6 +380,12 @@ def _compute_priority(
     endpoint rather than wondering why prioritization looks flat.
     """
     global _goal_alignment_failures, _goal_alignment_warned
+
+    # Slice 246 — sovereign human primacy. A direct human-origin intent outranks
+    # EVERYTHING, including a resurrected survivor, so the autonomous organism can
+    # never starve a live human. Checked first; the host keeps ultimate control.
+    if getattr(envelope, "source", "") in _SOVEREIGN_SOURCES:
+        return _sovereign_human_priority(), None
 
     # Slice 245 — a hibernation survivor gets Absolute-Max Primacy, short-
     # circuiting all normal factors so nothing can demote it below the work that

@@ -69,10 +69,13 @@ class TestResurrectionContextFlag:
 
 class TestIntakeResurrectionPrimacy:
     def test_resurrected_beats_highest_normal_source(self):
-        # voice_human is the highest normal primacy (priority 0)
-        voice_p, _ = uir._compute_priority(_env("voice_human", urgency="critical"))
+        # Slice 246 made human-origin sources SOVEREIGN (above resurrection), so
+        # the "highest normal" example here is the top NON-sovereign source
+        # (test_failure=1). Resurrected still supersedes all normal/autonomous
+        # work — it just yields to a live human (proven in the Slice 246 suite).
+        top_normal_p, _ = uir._compute_priority(_env("test_failure", urgency="critical"))
         res_p, _ = uir._compute_priority(_env("backlog"), resurrected=True)
-        assert res_p < voice_p, "resurrected must supersede even voice_human"
+        assert res_p < top_normal_p, "resurrected must supersede the top normal source"
 
     def test_is_dynamic_not_hardcoded_zero(self, monkeypatch):
         monkeypatch.setenv("JARVIS_RESURRECTION_PRIMACY_MARGIN", "50")
