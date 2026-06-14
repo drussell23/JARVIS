@@ -30,10 +30,8 @@ import pytest
 
 _USP_PATH = Path(__file__).resolve().parents[3] / "unified_supervisor.py"
 
-# The 32 higher functions classes
+# The 27 higher functions classes (5 enterprise organs purged in Slice 250 Phase B)
 _HIGHER_CLASSES = (
-    "BlueGreenDeployer",
-    "CanaryReleaseManager",
     "RollbackCoordinator",
     "DataPipelineManager",
     "InfrastructureProvisionerManager",
@@ -42,13 +40,10 @@ _HIGHER_CLASSES = (
     "GraphDatabaseManager",
     "SearchEngineManager",
     "IntegrationBusManager",
-    "TenantManager",
     "EncryptionServiceManager",
     "TemplateEngine",
     "ReportGenerator",
     "PluginManager",
-    "LocalizationManager",
-    "ABTestingFramework",
     "FeatureFlagManager",
     "ExternalServiceRegistry",
     "CalendarService",
@@ -139,13 +134,10 @@ _CONFIG_REQUIRED = frozenset({
     "GraphDatabaseManager",
     "SearchEngineManager",
     "IntegrationBusManager",
-    "TenantManager",
     "EncryptionServiceManager",
     "TemplateEngine",
     "ReportGenerator",
     "PluginManager",
-    "LocalizationManager",
-    "ABTestingFramework",
     "FeatureFlagManager",
     "ExternalServiceRegistry",
     "CalendarService",
