@@ -123,17 +123,124 @@ class LiveKernelValidator:
             for f in changed_files
         )
 
-    def _build_probe_script(self, affected_symbols: List[str]) -> str:
-        """Render the ephemeral probe: import unified_supervisor + construct/call the
-        affected symbols, with network/FS/db patched (unittest.mock) so the boot is
-        side-effect-free. (TDD: assemble the exact mock surface + symbol exercise.)"""
-        raise NotImplementedError("C.2 — render mocked live-fire probe script")
+    _MARKER = "LIVEFIRE_RESULT:"
+
+    def _build_probe_script(
+        self, module: str, affected_symbols: List[str], path_insert: Optional[str]
+    ) -> str:
+        """Render the ephemeral probe. SCOPED, high-signal exercise (no blind mock-arg
+        fabrication): import the module (catches import/decorator/class-body errors),
+        construct affected default-constructible classes, and call affected NO-ARG
+        module-level functions (catches the Slice-255 NameError class). Functions that
+        REQUIRE args are flagged (``needs_args``), never force-called with fake args."""
+        return (
+            "import sys, json, traceback, inspect\n"
+            f"_PI = {path_insert!r}\n"
+            "if _PI:\n    sys.path.insert(0, _PI)\n"
+            'RES = {"ok": True, "exercised": [], "needs_args": [], '
+            '"exception_type": "", "traceback": ""}\n'
+            "def _exercise(obj):\n"
+            "    if isinstance(obj, type):\n"
+            "        try:\n"
+            "            obj()\n"
+            "        except TypeError:\n"
+            "            return 'needs_args'\n"
+            "        return 'ok'\n"
+            "    if callable(obj):\n"
+            "        sig = inspect.signature(obj)\n"
+            "        req = [p for p in sig.parameters.values() if p.default is p.empty "
+            "and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]\n"
+            "        if req:\n            return 'needs_args'\n"
+            "        r = obj()\n"
+            "        if inspect.iscoroutine(r):\n"
+            "            import asyncio; asyncio.run(r)\n"
+            "        return 'ok'\n"
+            "    return 'ok'\n"
+            "try:\n"
+            f"    mod = __import__({module!r})\n"
+            f"    for sym in {list(affected_symbols)!r}:\n"
+            "        obj = getattr(mod, sym, None)\n"
+            "        if obj is None:\n            continue\n"
+            "        outcome = _exercise(obj)\n"
+            "        (RES['needs_args'] if outcome == 'needs_args' else RES['exercised']).append(sym)\n"
+            "except Exception:\n"
+            "    RES['ok'] = False\n"
+            "    RES['exception_type'] = type(sys.exc_info()[1]).__name__\n"
+            "    RES['traceback'] = traceback.format_exc()\n"
+            f'print("{self._MARKER}" + json.dumps(RES))\n'
+        )
+
+    async def _default_runner(self, script: str, timeout_s: float):
+        """Spawn an ephemeral, TTL-bounded subprocess. Returns (rc, stdout, stderr)."""
+        import asyncio
+        import sys as _sys
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, "-c", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
     async def validate_patch(
-        self, *, changed_files: List[str], affected_symbols: List[str]
+        self,
+        *,
+        changed_files: List[str],
+        affected_symbols: List[str],
+        module: str = "unified_supervisor",
+        path_insert: Optional[str] = None,
     ) -> LiveFireResult:
-        """Run the ephemeral live-fire probe; FAIL on any unhandled exception/timeout."""
-        raise NotImplementedError("C.2 — spawn TTL/mem-bounded subprocess, parse result")
+        """Run the ephemeral live-fire probe; FAIL on any unhandled exception/timeout.
+        Skips (ok=True) when the patch doesn't touch the guarded kernel surface."""
+        import asyncio
+        import time
+
+        if module == "unified_supervisor" and not self.affects_kernel(changed_files):
+            return LiveFireResult(ok=True, exercised=[])
+
+        script = self._build_probe_script(module, affected_symbols, path_insert)
+        runner = self._run or self._default_runner
+        t0 = time.monotonic()
+        try:
+            rc, out, err = await asyncio.wait_for(
+                runner(script, self._timeout_s), timeout=self._timeout_s + 5
+            )
+        except asyncio.TimeoutError:
+            return LiveFireResult(
+                ok=False, timed_out=True, exception_type="LiveFireTimeout",
+                traceback=f"live-fire exceeded {self._timeout_s}s",
+                duration_s=time.monotonic() - t0,
+            )
+        dur = time.monotonic() - t0
+
+        marker_idx = out.rfind(self._MARKER)
+        if marker_idx < 0:
+            return LiveFireResult(
+                ok=False, exception_type="ProbeProtocolError",
+                traceback=(err or out or "no probe result").strip()[-4000:],
+                duration_s=dur,
+            )
+        import json as _json
+        try:
+            payload = _json.loads(out[marker_idx + len(self._MARKER):].splitlines()[0])
+        except Exception as err2:  # noqa: BLE001
+            return LiveFireResult(
+                ok=False, exception_type="ProbeProtocolError",
+                traceback=f"unparseable probe result: {err2!r}", duration_s=dur,
+            )
+        return LiveFireResult(
+            ok=bool(payload.get("ok")),
+            traceback=payload.get("traceback", ""),
+            exception_type=payload.get("exception_type", ""),
+            exercised=list(payload.get("exercised", [])),
+            duration_s=dur,
+        )
 
 
 # ── Phase 3: cascade breaker + adaptive relief (SKELETON — TDD to fill) ──
