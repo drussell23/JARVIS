@@ -270,7 +270,80 @@ class CascadeFailureBreaker:
         """A task that did NOT escalate resets the consecutive counter."""
         self._consecutive = 0
 
-    async def on_trip(self) -> str:
-        """Suspend → soft relief → re-evaluate → resume or shadow-gated HARD_RESTART.
-        Returns one of: 'recovered' | 'awaiting_endorsement' | 'suspended'."""
-        raise NotImplementedError("C.3 — soft relief + MemoryPressureGate re-eval + shadow-gated reboot")
+    @staticmethod
+    def _is_recovered(level: Any) -> bool:
+        """True ONLY for an explicit safe level. Unknown/None/failed-probe → False
+        (fail-secure: assume still-degraded, proceed to the shadow-gated reboot)."""
+        if level is None:
+            return False
+        s = str(getattr(level, "value", level)).strip().lower()
+        return s in ("ok", "normal", "low", "nominal")
+
+    async def on_trip(
+        self,
+        *,
+        pressure_probe: Callable[[], Any],
+        shadow_guard: Callable[..., Any],
+        reboot_action: Callable[[], Any],
+        cache_clear: Optional[Callable[[], Any]] = None,
+        state_flush: Optional[Callable[[], Any]] = None,
+        emit: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    ) -> str:
+        """Deterministic suspend → non-destructive soft relief → re-evaluate → resume,
+        else best-effort serializable state flush + shadow-gated HARD_RESTART.
+
+        Returns 'recovered' | 'awaiting_endorsement' | 'suspended'. NEVER auto-reboots
+        and NEVER raises — every step is fail-soft. ``reboot_action`` is only ever
+        invoked *through* ``shadow_guard`` (trapped in shadow mode → /endorse).
+        """
+        import gc
+
+        async def _safe(label: str, fn: Optional[Callable[..., Any]], *args: Any) -> Any:
+            if fn is None:
+                return None
+            try:
+                return await _await_if_needed(fn(*args))
+            except Exception as err:  # noqa: BLE001 — relief/telemetry never escalate
+                _LOG.warning("[Cascade] %s failed (fail-soft): %r", label, err)
+                return None
+
+        # 1. NON-DESTRUCTIVE soft relief
+        try:
+            gc.collect()
+        except Exception:  # noqa: BLE001
+            pass
+        await _safe("cache_clear", cache_clear)
+
+        # 2. Re-evaluate the environment (MemoryPressureGate, injected)
+        level = await _safe("pressure_probe", pressure_probe)
+        if self._is_recovered(level):
+            self._tripped = False
+            self._consecutive = 0
+            await _safe("emit", emit, "ENVIRONMENT_RECOVERED", {"level": str(level)})
+            _LOG.info("[Cascade] soft relief recovered the environment (level=%s)", level)
+            return "recovered"
+
+        # 3. Still degraded → best-effort flush of SERIALIZABLE state (reuse WAL; closures
+        #    + live handles cannot survive — documented, not silently lost), then route the
+        #    HARD_RESTART through shadow_guard so the human endorses it. NEVER auto-reboot.
+        await _safe("state_flush", state_flush)
+        await _safe("emit", emit, "CRITICAL_SYSTEMIC_CASCADE", {"level": str(level)})
+        outcome = await _safe(
+            "shadow_guard", shadow_guard,
+            "HARD_RESTART the O+V loop (environment critical)", reboot_action,
+        )
+        # shadow_guard returns a SHADOW_TRAPPED sentinel in shadow mode (action withheld
+        # → pending /endorse). Anything else means it executed (shadow off + endorsed path).
+        if outcome is not None and repr(outcome).upper().find("SHADOW_TRAPPED") >= 0:
+            return "awaiting_endorsement"
+        return "suspended"
+
+
+async def _await_if_needed(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+import logging as _logging  # noqa: E402 — module logger for the cascade breaker
+_LOG = _logging.getLogger("live_kernel_validator")
