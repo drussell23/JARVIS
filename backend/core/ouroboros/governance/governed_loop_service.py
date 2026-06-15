@@ -1139,6 +1139,9 @@ class GovernedLoopService:
         self._graph_coalescer: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
         self._mcp_client: Optional[Any] = None  # Phase A: GovernanceMCPClient, wired in start()
+        # Evidence Rail (Unit A/C) — durable shadow-vs-legacy ledger.
+        # Initialized in _build_components when store_enabled(); None = inert.
+        self._shadow_store_ref: Optional[Any] = None
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
@@ -2088,6 +2091,15 @@ class GovernedLoopService:
                 await _evt_ch.stop()
             except Exception:
                 pass
+
+        # Evidence Rail — close the durable telemetry store
+        _ssr = getattr(self, "_shadow_store_ref", None)
+        if _ssr is not None:
+            try:
+                await _ssr.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+            self._shadow_store_ref = None
 
         # Detach from stack
         self._detach_from_stack()
@@ -4869,6 +4881,39 @@ class GovernedLoopService:
                 )
         except Exception as exc:
             logger.debug("[GLS] SubagentOrchestrator skipped: %s", exc)
+
+        # ---- Evidence Rail (Unit A/C) — shadow-vs-legacy telemetry store + graduation gate ----
+        # Inert + byte-identical when JARVIS_SHADOW_TELEMETRY_STORE_ENABLED=false:
+        # store_enabled() is False → no store constructed → set_shadow_rail never
+        # called → orchestrator's _shadow_store stays None → FSM byte-identical.
+        try:
+            from backend.core.ouroboros.governance.shadow_telemetry_store import (
+                ShadowTelemetryStore, store_enabled,
+            )
+            from backend.core.ouroboros.governance.shadow_graduation_gate import (
+                ShadowGraduationGate, build_rail_evaluator, gate_enabled,
+            )
+            if store_enabled():
+                _shadow_store = ShadowTelemetryStore(
+                    evaluator=build_rail_evaluator(),
+                )
+                await _shadow_store.start()
+                self._shadow_store_ref = _shadow_store
+                _shadow_gate = (
+                    ShadowGraduationGate(store=_shadow_store)
+                    if gate_enabled() else None
+                )
+                if self._orchestrator is not None and hasattr(
+                    self._orchestrator, "set_shadow_rail"
+                ):
+                    self._orchestrator.set_shadow_rail(
+                        _shadow_store, _shadow_gate,
+                    )
+        except Exception:  # noqa: BLE001 — rail attach must never break boot
+            logger.warning(
+                "[GovernedLoopService] shadow rail attach failed (non-fatal)",
+                exc_info=True,
+            )
 
         # ---- Wire Self-Critique Engine (Phase 3a — post-VERIFY quality signal) ----
         # Cheap DW critique over the applied diff against the original goal.

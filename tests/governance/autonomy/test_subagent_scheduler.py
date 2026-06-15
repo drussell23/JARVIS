@@ -6,6 +6,16 @@ import time
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_l3_memory_governor(monkeypatch):
+    # These tests exercise scheduling/concurrency LOGIC, not the L3 RAM
+    # governor. The governor (default-on) would otherwise clamp parallelism
+    # by live host RAM, making concurrency assertions host-dependent/flaky.
+    # The governor's own behavior is covered by
+    # tests/governance/autonomy/test_scheduler_memory_governor.py.
+    monkeypatch.setenv("JARVIS_L3_MEMORY_GOVERNOR_ENABLED", "false")
+
+
 def _make_graph(
     *,
     graph_id="graph-scheduler",

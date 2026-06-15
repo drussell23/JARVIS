@@ -1213,6 +1213,13 @@ class GovernedOrchestrator:
         # stable. None until governed_loop_service wires it.
         self._subagent_orchestrator: Any = None
 
+        # Evidence Rail (Unit A + C) — harness-attached via set_shadow_rail().
+        # Both default to None; when None the rail is fully inert and the FSM
+        # is byte-identical to its pre-rail state.
+        self._shadow_store: Any = None
+        self._shadow_gate: Any = None
+        self._shadow_gate_tasks: set = set()
+
         # ── Phase 1 Step 3C: reload-hostile state hoisted to _governance_state ──
         # Every field that would otherwise get re-allocated on
         # ``importlib.reload(orchestrator)`` now lives on an
@@ -1569,17 +1576,52 @@ class GovernedOrchestrator:
         """
         self._subagent_orchestrator = orch
 
-    async def _run_review_shadow(self, ctx: Any, best_candidate: Any) -> None:
-        """Phase B — post-VALIDATE REVIEW subagent in OBSERVER MODE.
+    def set_shadow_rail(self, store: Any, gate: Any) -> None:
+        """Attach the Evidence Rail store + graduation gate (Unit A/C).
+
+        Both default to None → rail is inert and the FSM is byte-identical
+        to the pre-rail state. Mirrors the ``set_subagent_orchestrator``
+        pattern so harness wiring stays uniform.
+        """
+        self._shadow_store = store
+        self._shadow_gate = gate
+
+    def _fire_shadow_gate(self, agent: str) -> None:
+        """Fire-and-forget graduation check after a comparison row lands.
+
+        Strong task ref prevents GC; fully guarded + fail-soft. No-ops
+        when ``_shadow_gate`` is None (the default) so the FSM is
+        byte-identical when the rail is not attached.
+        """
+        gate = getattr(self, "_shadow_gate", None)
+        if gate is None:
+            return
+        try:
+            import asyncio as _asyncio
+            _task = _asyncio.ensure_future(gate.maybe_promote(agent))
+            self._shadow_gate_tasks.add(_task)
+            _task.add_done_callback(self._shadow_gate_tasks.discard)
+        except Exception:  # noqa: BLE001 — observer contract
+            pass
+
+    async def _run_review_shadow(
+        self, ctx: Any, best_candidate: Any,
+    ) -> "Optional[RiskTier]":
+        """Phase B — post-VALIDATE REVIEW subagent (observer → authoritative).
 
         Gated by ``JARVIS_REVIEW_SUBAGENT_SHADOW`` (default **``true``**,
         graduated 2026-04-20). When on, dispatches a REVIEW subagent per
         candidate file and emits the verdict to telemetry. **The FSM
-        proceeds to GATE regardless of verdict** — no risk-tier change,
-        no retry routing, no state mutation. The contract stays
-        observer-only even post-graduation; promoting REVIEW into
-        authority-carrying gate logic is a separate slice with its own
-        graduation arc.
+        proceeds to GATE regardless of verdict** — no retry routing, no
+        state mutation beyond risk-tier escalation.
+
+        **Authoritative mode** (Unit C): when
+        ``JARVIS_REVIEW_SUBAGENT_AUTHORITATIVE=true`` (default ``false``),
+        a REJECT aggregate verdict escalates the risk tier to
+        APPROVAL_REQUIRED via the return value (strictest-wins: only
+        increases, never decreases). The call site captures the return
+        and applies it to the GATE-local ``risk_tier`` variable.
+        Defaults false → return None → byte-identical FSM behaviour.
 
         Graduation evidence (2026-04-20):
           * 28-test regression spine green (test_review_subagent.py +
@@ -1707,6 +1749,44 @@ class GovernedOrchestrator:
             # can build rollup counters (aggregate-verdict distribution,
             # approve/reject rates, per-session verdict sanity) across the
             # graduation arc. Matches the [SemanticGuard] log convention.
+
+            # Evidence Rail (Unit A) — record shadow + legacy outcomes.
+            # Fully guarded: inert + byte-identical when no rail is attached.
+            # NOTE: ctx.risk_tier is the pre-SemanticGuardian tier (guardian
+            # upgrade is stored in the outer local only, not back-propagated to
+            # ctx). This is the correct legacy signal: it reflects the vanilla
+            # VALIDATE-phase risk classification before any pattern-detector
+            # intervention, giving a stable like-for-like comparison baseline.
+            # semantic_guard_hard is NOT accessible here (held in outer scope);
+            # we leave it False (the conservative default) — the alignment
+            # evaluator treats this as a softer legacy block signal, which is
+            # correct for the pre-guardian tier.
+            if getattr(self, "_shadow_store", None) is not None:
+                try:
+                    self._shadow_store.record_shadow_nowait(
+                        op_id=getattr(ctx, "op_id", "?"),
+                        agent="review",
+                        ts=time.time(),
+                        shadow_outcome={"aggregate": _aggregate},
+                    )
+                    _rt = getattr(ctx, "risk_tier", None)
+                    self._shadow_store.record_legacy_nowait(
+                        op_id=getattr(ctx, "op_id", "?"),
+                        agent="review",
+                        ts=time.time(),
+                        legacy_outcome={
+                            "risk_tier": str(_rt.name if _rt is not None else ""),
+                            "semantic_guard_hard": False,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — observer contract
+                    pass
+                # Gate fires before the async writer commits THIS op's row, so
+                # the streak it reads reflects N-1 ops (eventual-consistency).
+                # This is intentionally conservative — graduation lands one op
+                # later than the bare threshold, never earlier.
+                self._fire_shadow_gate("review")
+
             logger.info(
                 "[REVIEW-SHADOW] op=%s aggregate=%s files_reviewed=%d "
                 "approved=%d reservations=%d rejected=%d failed=%d "
@@ -1720,12 +1800,32 @@ class GovernedOrchestrator:
                 _counts["failed"],
                 _duration_ms,
             )
+
+            # Authoritative REVIEW (Unit C, post-graduation): a REJECT
+            # verdict raises the risk tier to APPROVAL_REQUIRED.
+            # Composes strictest-wins with SemanticGuardian/Iron Gate —
+            # only ADDS friction, never removes it.
+            # Flag defaults false -> return None -> byte-identical until
+            # graduation.
+            if os.environ.get(
+                "JARVIS_REVIEW_SUBAGENT_AUTHORITATIVE", "false",
+            ).strip().lower() in ("true", "1", "yes") and _aggregate == "REJECT":
+                try:
+                    logger.info(
+                        "[AUTHORITATIVE] agent=review op=%s REJECT -> "
+                        "APPROVAL_REQUIRED",
+                        getattr(ctx, "op_id", "?"),
+                    )
+                    return RiskTier.APPROVAL_REQUIRED
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:
             # Observer contract: shadow must never break the FSM.
             logger.debug(
                 "[Orchestrator] REVIEW shadow dispatch skipped",
                 exc_info=True,
             )
+        return None
 
     async def _run_plan_shadow(self, ctx: Any) -> Any:
         """Phase B PLAN-shadow — AgenticPlanSubagent dispatch running
@@ -1823,6 +1923,149 @@ class GovernedOrchestrator:
                 if hasattr(_result.status, "value")
                 else str(_result.status)
             )
+
+            # Evidence Rail (Unit A) — record legacy + shadow for graduation soak.
+            # Fully guarded: inert + byte-identical when no rail is attached.
+            #
+            # Legacy flat: the target_files tuple is the canonical set of paths
+            # the operation was scoped to. It's stable, always present, and
+            # represents what the legacy flat-plan generator was asked to cover.
+            # Using ctx.implementation_plan's ordered_changes would be slightly
+            # more precise but risks a JSON parse failure on a skipped plan; the
+            # target_files path is simpler and correct for alignment purposes.
+            #
+            # Shadow DAG: coerce the tuple-of-tuples _execution_graph into the
+            # dict-of-dicts shape the evaluator expects. The inner unit tuples
+            # carry ("unit_id", ...), ("dependency_ids", ...), ("owned_paths", ...)
+            # which we remap to the evaluator's canonical keys ("id", "deps",
+            # "owned_paths") so shadow_evaluator._has_cycle + evaluate_plan work.
+            if getattr(self, "_shadow_store", None) is not None:
+                try:
+                    _legacy_flat = [
+                        p for p in (getattr(ctx, "target_files", ()) or ()) if p
+                    ]
+                    self._shadow_store.record_legacy_nowait(
+                        op_id=getattr(ctx, "op_id", "?"),
+                        agent="plan",
+                        ts=time.time(),
+                        legacy_outcome={"flat": _legacy_flat},
+                    )
+                    if _execution_graph is not None:
+                        try:
+                            _eg_dict = dict(_execution_graph)
+                            _units_payload = _eg_dict.get("units") or ()
+                            _shadow_units = [
+                                {
+                                    "id": str(dict(_ut).get("unit_id", "")),
+                                    "deps": list(
+                                        dict(_ut).get("dependency_ids", ()) or ()
+                                    ),
+                                    "owned_paths": list(
+                                        dict(_ut).get("owned_paths", ()) or ()
+                                    ),
+                                }
+                                for _ut in _units_payload
+                            ]
+                        except Exception:  # noqa: BLE001
+                            _shadow_units = []
+                        self._shadow_store.record_shadow_nowait(
+                            op_id=getattr(ctx, "op_id", "?"),
+                            agent="plan",
+                            ts=time.time(),
+                            shadow_outcome={"units": _shadow_units},
+                        )
+                except Exception:  # noqa: BLE001 — observer contract
+                    pass
+                # Gate fires before the async writer commits THIS op's row, so
+                # the streak it reads reflects N-1 ops (eventual-consistency).
+                # This is intentionally conservative — graduation lands one op
+                # later than the bare threshold, never earlier.
+                self._fire_shadow_gate("plan")
+
+            # Authoritative PLAN (Unit C, post-graduation): run the
+            # graceful-degradation breaker. On trip (cyclical/empty DAG
+            # or CRITICAL memory pressure), emit AGENT_DEGRADATION and
+            # KEEP legacy as the authoritative input.
+            # Flag defaults false -> byte-identical until graduation.
+            #
+            # NOTE on _shadow_units scoping: the producer block computes
+            # _shadow_units inside a nested if/try (guarded by
+            # _shadow_store + _execution_graph). Rather than referencing
+            # a possibly-unbound local, we independently rebuild the
+            # units list from _execution_graph here — same transform,
+            # no dependency on the producer's inner scope.
+            #
+            # NOTE on downstream DAG consumption: ctx.execution_graph
+            # (stashed above) is currently OBSERVER-ONLY — it is stashed
+            # on ctx, not on best_candidate, so _materialize_execution_
+            # graph_candidate (line ~10523) which gates on
+            # "execution_graph" in best_candidate never sees it.
+            # Making the shadow DAG drive actual execution is a
+            # follow-up slice. When AUTHORITATIVE=true, the breaker-trip
+            # path correctly leaves legacy authoritative (it already is,
+            # since the DAG is observer-only). The endorsed path logs an
+            # INFO and proceeds — no execution change yet.
+            if os.environ.get(
+                "JARVIS_PLAN_SUBAGENT_AUTHORITATIVE", "false",
+            ).strip().lower() in ("true", "1", "yes"):
+                try:
+                    from backend.core.ouroboros.governance.shadow_graduation_gate import (
+                        PlanBreaker,
+                    )
+                    # Rebuild units from _execution_graph independent of
+                    # producer scope (safe even if _shadow_store is None).
+                    _breaker_units: list = []
+                    if _execution_graph is not None:
+                        try:
+                            _beg_dict = dict(_execution_graph)
+                            _beg_payload = _beg_dict.get("units") or ()
+                            _breaker_units = [
+                                {
+                                    "id": str(dict(_bu).get("unit_id", "")),
+                                    "deps": list(
+                                        dict(_bu).get("dependency_ids", ()) or ()
+                                    ),
+                                    "owned_paths": list(
+                                        dict(_bu).get("owned_paths", ()) or ()
+                                    ),
+                                }
+                                for _bu in _beg_payload
+                            ]
+                        except Exception:  # noqa: BLE001
+                            _breaker_units = []
+                    _decision = PlanBreaker().should_use_legacy(
+                        dag={"units": _breaker_units},
+                    )
+                    if _decision.trip:
+                        logger.warning(
+                            "[BREAKER] agent=plan op=%s trip=%s pressure=%s"
+                            " -> legacy (authoritative path retained)",
+                            getattr(ctx, "op_id", "?"),
+                            _decision.reason,
+                            _decision.pressure_level,
+                        )
+                        try:
+                            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                                get_default_broker as _get_broker,
+                                publish_agent_degradation_event,
+                            )
+                            publish_agent_degradation_event(
+                                broker=_get_broker(),
+                                agent="plan",
+                                op_id=getattr(ctx, "op_id", "?"),
+                                trip_reason=_decision.reason,
+                                pressure_level=_decision.pressure_level,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        logger.info(
+                            "[AUTHORITATIVE] agent=plan op=%s DAG endorsed"
+                            " (execution follow-up slice pending)",
+                            getattr(ctx, "op_id", "?"),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
 
             logger.info(
                 "[PLAN-SHADOW] op=%s status=%s dag_units=%d edges=%d "
@@ -7736,10 +7979,18 @@ class GovernedOrchestrator:
                         exc_info=True,
                     )
 
-            # ---- REVIEW subagent (Slice 1a — SHADOW MODE observer only) ----
-            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry
-            # only; FSM proceeds to GATE unchanged. See _run_review_shadow.
-            await self._run_review_shadow(ctx, best_candidate)
+            # ---- REVIEW subagent (Slice 1a — observer; Unit C — authoritative) ----
+            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry.
+            # When JARVIS_REVIEW_SUBAGENT_AUTHORITATIVE=true (default false),
+            # a REJECT aggregate returns RiskTier.APPROVAL_REQUIRED here and
+            # is applied strictest-wins to the GATE-local risk_tier. Inert
+            # (returns None) until graduation. See _run_review_shadow.
+            _review_escalated_tier = await self._run_review_shadow(ctx, best_candidate)
+            if _review_escalated_tier is not None and (
+                risk_tier is None
+                or risk_tier.value < _review_escalated_tier.value
+            ):
+                risk_tier = _review_escalated_tier
 
             # ---- MutationGate: APPLY-phase execution boundary (cached) ----
             #

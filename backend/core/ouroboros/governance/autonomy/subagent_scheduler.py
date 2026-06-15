@@ -35,6 +35,11 @@ from backend.core.ouroboros.governance.op_context import OperationContext
 from backend.core.ouroboros.governance.saga.merge_coordinator import MergeCoordinator
 from backend.core.ouroboros.governance.saga.saga_types import FileOp, PatchedFile, RepoPatch
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
+# Module-level (not lazy like _consult_memory_gate's in-method import) so
+# tests can monkeypatch this symbol as a seam; the governor path below uses it.
+from backend.core.ouroboros.governance.memory_pressure_gate import (
+    get_default_gate,
+)
 
 logger = logging.getLogger("Ouroboros.SubagentScheduler")
 
@@ -497,6 +502,9 @@ class SubagentScheduler:
                 # Zero work loss. Gate-disabled → pass-through (no clamp). Every
                 # decision is logged + SSE-published (allow / clamp / disabled /
                 # probe_fail) so operators have a §8 audit trail.
+                # Bound before the guard so the Unit D block below can safely
+                # read it even if a future edit repopulates `selected`.
+                decision = None
                 if selected:
                     decision = self._consult_memory_gate(
                         len(selected), graph_id=graph_id,
@@ -504,6 +512,23 @@ class SubagentScheduler:
                     if decision is not None and decision.n_allowed < len(selected):
                         overflow = list(selected[decision.n_allowed:])
                         selected = list(selected[:decision.n_allowed])
+                        deferred = sorted(list(deferred) + overflow)
+
+                # Unit D — worktree-RAM-budget governor composes on top of
+                # the fan-out gate (strictest-wins). Same zero-work-loss
+                # defer-overflow mechanism; disabled/probe-fail -> no clamp.
+                if selected:
+                    level_cap = (
+                        decision.n_allowed
+                        if decision is not None
+                        else len(selected)
+                    )
+                    gov = self._consult_memory_governor(
+                        len(selected), graph_id=graph_id, level_cap=level_cap,
+                    )
+                    if gov is not None and gov.n_allowed < len(selected):
+                        overflow = list(selected[gov.n_allowed:])
+                        selected = list(selected[:gov.n_allowed])
                         deferred = sorted(list(deferred) + overflow)
 
                 if not selected:
@@ -753,6 +778,60 @@ class SubagentScheduler:
                 exc_info=True,
             )
 
+        return decision
+
+    def _consult_memory_governor(
+        self,
+        n_requested: int,
+        *,
+        graph_id: str,
+        level_cap: int,
+    ) -> Optional[Any]:
+        """Unit D — worktree-RAM-budget clamp composed on top of the
+        Slice 5 Arc B fan-out gate.
+
+        Returns a ``GovernorDecision`` (or ``None`` when disabled / on
+        any probe failure — the scheduler must never break on the
+        governor). ``level_cap`` is the allowance already granted by
+        the free-%-based fan-out gate; the governor takes the strictest
+        of that and the absolute RAM budget.
+        """
+        from backend.core.ouroboros.governance.autonomy.l3_memory_governor import (
+            compute_worktree_cap,
+            governor_enabled,
+            worktree_ram_budget_mb,
+        )
+
+        if not governor_enabled():
+            return None
+        try:
+            gate = get_default_gate()
+            probe = gate.probe()
+            avail_mb = float(probe.available_bytes) / (1024.0 * 1024.0)
+        except Exception:  # noqa: BLE001 — governor must not break scheduler
+            logger.debug(
+                "[SubagentScheduler] memory governor probe failed "
+                "(non-fatal)", exc_info=True,
+            )
+            return None
+
+        decision = compute_worktree_cap(
+            requested=n_requested,
+            avail_mb=avail_mb,
+            budget_mb=worktree_ram_budget_mb(),
+            level_cap=level_cap,
+        )
+        log_fn = (
+            logger.warning if decision.disposition == "clamp" else logger.info
+        )
+        log_fn(
+            "[SubagentScheduler] ram_governor: graph=%s disposition=%s "
+            "requested=%d allowed=%d ram_cap=%d level_cap=%d avail_mb=%.0f "
+            "budget_mb=%d",
+            graph_id, decision.disposition, decision.requested,
+            decision.n_allowed, decision.ram_cap, decision.level_cap,
+            decision.avail_mb, decision.budget_mb,
+        )
         return decision
 
     def _select_ready_batch(

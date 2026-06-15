@@ -197,6 +197,11 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# Evidence Rail Unit C — emitted by the circuit breaker when an authoritative
+# subagent trips back to legacy (degradation event). Payload carries agent +
+# trip_reason + pressure_level so IDE consumers can render a "degraded" banner.
+EVENT_TYPE_AGENT_DEGRADATION = "agent_degradation"
+
 # Dynamic Risk-State Convergence Engine (Slice 98 Phase 2) — emitted
 # ONLY on a convergence-band TRANSITION (NORMAL/ELEVATED/PARANOIA).
 # Payload carries the ConvergenceVerdict.to_dict() snapshot. Keyed by
@@ -1535,6 +1540,9 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # in-process on_trip callback drives harness
                                                   # graceful shutdown, this SSE is the IDE
                                                   # observability surface)
+    EVENT_TYPE_AGENT_DEGRADATION,                 # Evidence Rail Unit C — authoritative
+                                                  # subagent tripped back to legacy; payload:
+                                                  # agent + trip_reason + pressure_level.
 })
 
 
@@ -4439,6 +4447,26 @@ def publish_review_branch_event(
             exc_info=True,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Evidence Rail Unit C — AGENT_DEGRADATION SSE publisher
+# ---------------------------------------------------------------------------
+
+
+def publish_agent_degradation_event(
+    *, broker: Any, agent: str, op_id: str, trip_reason: str,
+    pressure_level: str,
+) -> None:
+    """Best-effort AGENT_DEGRADATION frame. Never raises/blocks."""
+    try:
+        broker.publish(
+            EVENT_TYPE_AGENT_DEGRADATION, op_id,
+            {"agent": agent, "trip_reason": trip_reason,
+             "pressure_level": pressure_level},
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
