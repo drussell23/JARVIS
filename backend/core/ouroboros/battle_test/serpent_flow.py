@@ -5203,6 +5203,16 @@ class SerpentREPL:
                         await self._handle_endorse(line)
                         continue
 
+                    # Live-fire validation — flag-gated synthetic pressure injector
+                    # (debug tooling; inert unless JARVIS_REANIMATION_DEBUG_INJECT_ENABLED).
+                    if (
+                        line in ("/inject-pressure", "inject-pressure")
+                        or line.startswith("/inject-pressure ")
+                        or line.startswith("inject-pressure ")
+                    ):
+                        await self._handle_inject_pressure(line)
+                        continue
+
                     # Gap #3 Slice 3 — unified /expand <ref> verb
                     # dispatches by ref prefix:
                     #   t-N → tool result body (Gap #2 BoundedBodyStore)
@@ -7208,6 +7218,90 @@ class SerpentREPL:
             _C["death"] if status == "error" else _C["heal"]
         )
         c.print(f"  [{color}]{line}[/{color}]", highlight=False)
+
+    async def _handle_inject_pressure(self, line: str) -> None:
+        """``/inject-pressure [signal] [source]`` — DEBUG / live-fire validation.
+
+        Flag-gated (``JARVIS_REANIMATION_DEBUG_INJECT_ENABLED``, default off).
+        Synthesizes ONE precise pressure signal into the LIVE in-process
+        Cybernetic Reanimation dispatcher — **no host degradation** — to force
+        the full chain (dispatcher → organ → ``shadow_guard`` trap →
+        ``SHADOW_ACTION_TRAPPED`` telemetry → ``/endorse`` [y/N]) under
+        controlled input.
+
+        Forms::
+
+            /inject-pressure                    — component_degraded / jarvis-prime
+            /inject-pressure <signal>           — component_degraded | anomaly_detected
+                                                  | resource_pressure
+            /inject-pressure <signal> <source>  — e.g. component_degraded reactor-core
+
+        After a component_degraded/anomaly injection in shadow mode, run
+        ``/endorse`` to see the [y/N] prompt. ALL fail-soft."""
+        import os
+
+        c = self._flow.console
+        if os.getenv(
+            "JARVIS_REANIMATION_DEBUG_INJECT_ENABLED", "false"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            c.print(
+                f"  [{_C['dim']}]/inject-pressure is disabled — boot with "
+                f"JARVIS_REANIMATION_DEBUG_INJECT_ENABLED=true to use it."
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+
+        parts = line.replace("/inject-pressure", "inject-pressure", 1).split()
+        signal = parts[1] if len(parts) > 1 else "component_degraded"
+        source = parts[2] if len(parts) > 2 else "jarvis-prime"
+
+        try:
+            from backend.kernel import get_kernel_instance
+            from tests.battle_test.synthetic_pressure_injector import (
+                inject_pressure,
+            )
+        except Exception as exc:  # noqa: BLE001
+            c.print(
+                f"  [{_C['death']}]/inject-pressure: tooling unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        try:
+            kernel = get_kernel_instance()
+            reached = await inject_pressure(
+                signal=signal, source=source, kernel=kernel
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-soft, never crash the REPL
+            c.print(
+                f"  [{_C['death']}]/inject-pressure failed: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        if reached is None:
+            c.print(
+                f"  [{_C['death']}]/inject-pressure: not injectable (see log — no "
+                f"live kernel, or reanimation not ignited via "
+                f"JARVIS_RESILIENCE_REANIMATION_ENABLED=true).[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        c.print(
+            f"  [{_C['life']}]⚡ injected synthetic {signal}[/{_C['life']}] "
+            f"[{_C['dim']}](source={source}) → {reached} organ(s) reached"
+            f"[/{_C['dim']}]",
+            highlight=False,
+        )
+        if signal in ("component_degraded", "anomaly_detected"):
+            c.print(
+                f"  [{_C['dim']}]if shadow mode is up, a trap is now pending — "
+                f"run /endorse to review the [y/N] prompt.[/{_C['dim']}]",
+                highlight=False,
+            )
 
     async def _handle_endorse(self, line: str) -> None:
         """``/endorse`` — the human-in-the-loop "steering wheel" for trapped
