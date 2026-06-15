@@ -100,3 +100,34 @@ def test_close_block_borderless_no_footer(monkeypatch):
     flow._active_ops.add(op)
     flow._close_op_block(op)
     assert not any(c in buf.getvalue() for c in _BOX_CHARS)
+
+
+# --------------------------------------------------------------------------- grayscale
+def test_clean_markup_demotes_secondary_colors():
+    from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+    out = SerpentFlow._clean_markup("[cyan]synth[/cyan] [magenta]DW[/magenta] [yellow]m[/yellow]")
+    assert "cyan" not in out and "magenta" not in out and "yellow" not in out
+    assert "[dim]" in out
+
+
+def test_clean_markup_preserves_outcome_colors():
+    from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+    out = SerpentFlow._clean_markup("[green]ok[/green] [red]bad[/red]")
+    assert "[green]" in out and "[red]" in out
+
+
+def test_clean_markup_strips_phase_emoji():
+    from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+    out = SerpentFlow._clean_markup("🔬 sensed")
+    assert "🔬" not in out and "sensed" in out
+
+
+def test_op_line_borderless_strips_emoji_and_color(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_OPBLOCK_BORDERLESS_ENABLED", "true")
+    flow, buf = _flow()
+    op = "op-emoji"
+    flow._active_ops.add(op)
+    flow._op_line(op, "[cyan]🔬 sensed[/cyan]  mygoal")
+    out = buf.getvalue()
+    assert "🔬" not in out and "mygoal" in out

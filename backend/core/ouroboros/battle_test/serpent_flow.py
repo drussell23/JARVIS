@@ -1131,13 +1131,36 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             return False
 
+    # Secondary Rich styles demoted to dim in borderless mode (color is
+    # reserved for outcomes — green/red are intentionally NOT listed here).
+    _SECONDARY_STYLES = ("cyan", "magenta", "yellow", "blue underline", "blue")
+    # Per-phase decoration emojis stripped in borderless mode (signature
+    # emojis live at boot only).
+    _PHASE_EMOJI = ("🔬", "🧬", "⚙️", "🛡️", "👤", "🔍", "🔭", "▸")
+
+    @staticmethod
+    def _clean_markup(markup: str) -> str:
+        """Grayscale + emoji normalization for borderless lines: demote secondary
+        color styles to dim, strip per-phase emojis. Preserves green/red so
+        outcome signals stay legible. Fail-soft (returns input on any error)."""
+        try:
+            out = str(markup)
+            for style in SerpentFlow._SECONDARY_STYLES:
+                out = out.replace("[" + style + "]", "[dim]")
+                out = out.replace("[/" + style + "]", "[/dim]")
+            for emoji in SerpentFlow._PHASE_EMOJI:
+                out = out.replace(emoji + " ", "").replace(emoji, "")
+            return out
+        except Exception:  # noqa: BLE001
+            return markup
+
     def _emit_fit(self, markup: str) -> None:
-        """Print one borderless line through overflow-safe print_fit."""
+        """Print one borderless line: grayscale-normalized + overflow-safe."""
         try:
             from backend.core.ouroboros.battle_test.presentation_restraint import (
                 print_fit,
             )
-            print_fit(self.console, markup)
+            print_fit(self.console, self._clean_markup(markup))
         except Exception:  # noqa: BLE001
             self.console.print(markup, highlight=False)
 
