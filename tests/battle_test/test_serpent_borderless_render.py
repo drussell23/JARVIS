@@ -138,39 +138,66 @@ import asyncio  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 
-def test_synth_pulse_uses_status_when_enabled(monkeypatch):
+def test_synth_pulse_drives_existing_spinner(monkeypatch):
+    # Leverages the EXISTING _spinner_state mechanism, not a console.status overlay.
     monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
     monkeypatch.setenv("JARVIS_TUI_PULSE_ENABLED", "true")
-    monkeypatch.setattr(PR, "real_stdout_isatty", lambda: True)
     flow, _ = _flow()
-    status = MagicMock()
-    flow.console = MagicMock()
-    flow.console.status.return_value = status
+    mid = {}
 
     async def go():
         async with flow._synth_pulse("op-p", "doubleword"):
-            pass
+            mid["active"] = flow._spinner_state.active
+            mid["msg"] = flow._spinner_state.message
 
     asyncio.run(go())
-    status.start.assert_called_once()
-    status.stop.assert_called_once()
-    flow.console.show_cursor.assert_called_with(True)
+    assert mid["active"] is True                         # spinner armed during await
+    assert "synthesizing" in mid["msg"]
+    assert flow._spinner_state.active is False           # cleared after
+
+
+def test_synth_pulse_clears_spinner_on_exception(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TUI_PULSE_ENABLED", "true")
+    flow, _ = _flow()
+
+    async def go():
+        async with flow._synth_pulse("op-p", "doubleword"):
+            raise ValueError("boom")
+
+    try:
+        asyncio.run(go())
+    except ValueError:
+        pass
+    assert flow._spinner_state.active is False           # cleared despite exception
 
 
 def test_synth_pulse_noop_when_disabled(monkeypatch):
     monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
     monkeypatch.setenv("JARVIS_TUI_PULSE_ENABLED", "false")
     flow, _ = _flow()
-    flow.console = MagicMock()
     ran = {}
 
     async def go():
         async with flow._synth_pulse("op-p", "doubleword"):
             ran["body"] = True
+            ran["active"] = flow._spinner_state.active
 
     asyncio.run(go())
     assert ran["body"] is True
-    flow.console.status.assert_not_called()
+    assert ran["active"] is False                        # never armed when disabled
+
+
+def test_start_status_borderless_cleans_message(monkeypatch):
+    # The EXISTING execution spinner (validate/verify/tool) shows grayscale-clean
+    # messages in borderless mode: no box prefix, no per-phase emoji.
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_OPBLOCK_BORDERLESS_ENABLED", "true")
+    flow, _ = _flow()
+    flow._start_status("  │  🛡️ immune check │ running tests…")
+    msg = flow._spinner_state.message
+    assert "│" not in msg and "🛡️" not in msg
+    assert "immune check" in msg and "running tests" in msg
 
 
 # --------------------------------------------------------------------------- lifecycle

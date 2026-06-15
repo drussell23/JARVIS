@@ -1150,6 +1150,8 @@ class SerpentFlow:
                 out = out.replace("[/" + style + "]", "[/dim]")
             for emoji in SerpentFlow._PHASE_EMOJI:
                 out = out.replace(emoji + " ", "").replace(emoji, "")
+            for box in ("┌", "│", "└", "─"):       # stray box chars never belong borderless
+                out = out.replace(box, "")
             return out
         except Exception:  # noqa: BLE001
             return markup
@@ -1165,31 +1167,38 @@ class SerpentFlow:
             self.console.print(markup, highlight=False)
 
     def _synth_pulse(self, op_id: str, provider: str):
-        """Return an async context that pulses a spinner on the active
-        'synthesizing' line while an awaited generation/validation runs:
+        """Async context that masks an awaited generation with the EXISTING
+        execution spinner (``_start_status``/``_stop_status`` → ``_spinner_state``
+        → bottom-toolbar ouroboros glyph) — NOT a second ``console.status``
+        overlay (that would be a duplicate, competing spinner). Use as:
 
             async with self._synth_pulse(op_id, provider):
                 result = await provider.generate(...)
 
-        No-op (still runs the body) when pulse is disabled or headless. The
-        cursor-armor + TTY-gating live in presentation_restraint.pulse."""
-        try:
+        No-op (body still runs) when pulse is disabled. The ``try/finally``
+        guarantees the spinner state is cleared on ANY exception boundary."""
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _ctx():
             from backend.core.ouroboros.battle_test.presentation_restraint import (
-                pulse, pulse_enabled, glyphs,
+                pulse_enabled, glyphs,
             )
-            if not pulse_enabled():
-                raise RuntimeError("pulse disabled")  # fall through to no-op
-            prov = _PROV.get(provider, provider)
-            line = f"{glyphs()['action']} synthesizing [{_C['dim']}]{prov}[/{_C['dim']}]"
-            return pulse(self.console, line)
-        except Exception:  # noqa: BLE001
-            from contextlib import asynccontextmanager
-
-            @asynccontextmanager
-            async def _noop():
+            armed = False
+            try:
+                if pulse_enabled():
+                    prov = _PROV.get(provider, provider)
+                    self._start_status(
+                        f"{glyphs()['action']} synthesizing {prov}",
+                        spinner=_active_spinner_name(),
+                    )
+                    armed = True
                 yield
+            finally:
+                if armed:
+                    self._stop_status()
 
-            return _noop()
+        return _ctx()
 
     @staticmethod
     def _action_glyph() -> str:
@@ -1650,6 +1659,11 @@ class SerpentFlow:
         marker so operators still see the status was set (no
         animation possible without an active prompt session).
         """
+        # Borderless mode: clean the spinner message to the grayscale glyph
+        # vocabulary (drop box prefixes + per-phase emojis) so the EXISTING
+        # bottom-toolbar spinner matches the Claude-Code-clean op-block render.
+        if self._borderless():
+            message = self._clean_markup(message).strip()
         self._spinner_state.active = True
         self._spinner_state.message = message
         self._spinner_state.token_count = 0
