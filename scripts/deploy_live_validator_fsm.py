@@ -11,9 +11,10 @@ Design honesty (the same discipline the validator enforces):
     import fails, we auto-revert from the .bak.
   * The injected hook is FLAG-GATED (JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED, default OFF)
     and FAIL-SOFT (wrapped in try/except) so a subtly-wrong hook cannot crash VALIDATE
-    — worst case it logs and no-ops. It reuses the EXISTING retry machinery by flipping
-    validation.passed→False (and logs LOUDLY "gate INERT" if validation is frozen — the
-    one detail only the dogfood boot can confirm).
+    — worst case it logs and no-ops. It reuses the EXISTING retry machinery by REBINDING
+    validation via dataclasses.replace(passed=False) — VERIFIED-correct because
+    op_context.ValidationResult is @dataclass(frozen=True), so a plain attribute set would
+    raise FrozenInstanceError.
 
 Run sandbox-off on a main+.env checkout:  python3 scripts/deploy_live_validator_fsm.py
 Idempotent: refuses if the marker is already present.
@@ -58,12 +59,22 @@ WIRING = (
     "                                if not _lf_res.ok:\n"
     "                                    logger.warning('[LiveFire] candidate FAILED live-fire boot: %s: %s',\n"
     "                                                   _lf_res.exception_type, (_lf_res.traceback or '')[-500:])\n"
-    "                                    try:\n"
-    "                                        validation.passed = False\n"
-    "                                        validation.failure_class = 'live_fire_boot_failure'\n"
-    "                                    except Exception:\n"
-    "                                        logger.error('[LiveFire] could not mark validation failed (frozen?) — GATE INERT; '\n"
-    "                                                     'wire a mutable validation signal here.')\n"
+    "                                    # VERIFIED: op_context.ValidationResult is @dataclass(frozen=True) —\n"
+    "                                    # a plain `validation.passed = False` raises FrozenInstanceError. We\n"
+    "                                    # REBIND the loop var via dataclasses.replace so downstream\n"
+    "                                    # (`best_validation = validation`, the `if validation.passed` branch,\n"
+    "                                    # ledger) sees the failed result and the EXISTING retry/escalation\n"
+    "                                    # machinery handles route-back. failure_class='build' (the patch does\n"
+    "                                    # not even import) routes it like a build break; tune if desired.\n"
+    "                                    import dataclasses as _lf_dc\n"
+    "                                    validation = _lf_dc.replace(\n"
+    "                                        validation,\n"
+    "                                        passed=False,\n"
+    "                                        failure_class='build',\n"
+    "                                        error='live-fire boot failure: ' + str(_lf_res.exception_type),\n"
+    "                                        short_summary=('live-fire boot failure: ' + str(_lf_res.exception_type)\n"
+    "                                                       + ': ' + (_lf_res.traceback or ''))[:300],\n"
+    "                                    )\n"
     "                    except Exception as _lf_err:\n"
     "                        logger.warning('[LiveFire] gate error (fail-soft, skipped): %r', _lf_err)\n"
     "                    # --- end Slice 256 ---\n"
@@ -113,9 +124,11 @@ def deploy(*, orch: Path = ORCH, boot_check=_default_boot_check) -> int:
         return 4
 
     print("BOOT CHECK PASSED (orchestrator imports clean). Wiring deployed.\n"
-          "NOTE: functional proof = the dogfood boot. If logs show "
-          "'[LiveFire] ... GATE INERT', `validation` is frozen — that's the one detail "
-          "the boot surfaces; fix with a mutable validation signal at the anchor.")
+          "NOTE: functional proof = the dogfood boot. The wiring is frozen-dataclass-safe "
+          "(rebinds via dataclasses.replace). With JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED=true, "
+          "a kernel-touching candidate that fails its live-fire import will log "
+          "'[LiveFire] candidate FAILED live-fire boot' and route back through the existing "
+          "retry machinery (failure_class=build).")
     return 0
 
 
