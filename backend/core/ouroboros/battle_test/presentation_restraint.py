@@ -1066,6 +1066,27 @@ def spinner_name() -> str:
     return "dots" if _stdout_supports_utf8() else "line"
 
 
+def print_fit(console, markup: str) -> None:
+    """Print one op-block line, truncated to the live console width with an
+    ellipsis -- never wraps (so the glyph column never moves). Width is read
+    from the console per call (SIGWINCH-adaptive; Rich defaults to 80
+    off-terminal). Fail-soft: on any Rich error, falls back to a plain crop
+    print, and if that fails too, swallows the error rather than crash the
+    render path."""
+    try:
+        from rich.text import Text
+        console.print(
+            Text.from_markup(markup),
+            no_wrap=True, overflow="ellipsis", crop=True, soft_wrap=False,
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            width = getattr(console, "width", 80) or 80
+            console.print(str(markup)[: max(8, int(width) - 1)], highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def format_idle_breadcrumb(
     *,
     branch: str = "",

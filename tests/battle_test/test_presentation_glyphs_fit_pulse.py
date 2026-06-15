@@ -43,3 +43,41 @@ def test_glyphs_none_encoding_is_safe(monkeypatch):
 def test_glyphs_missing_stdout_is_safe(monkeypatch):
     monkeypatch.setattr(sys, "stdout", object())  # no .encoding attr at all
     assert PR.glyphs()["action"] == "*"          # fail-safe to ASCII
+
+
+# --------------------------------------------------------------------------- print_fit
+from io import StringIO  # noqa: E402
+from rich.console import Console  # noqa: E402
+
+
+def _con(width):
+    return Console(file=StringIO(), width=width, force_terminal=False, color_system=None)
+
+
+def test_print_fit_truncates_to_width():
+    con = _con(40)
+    PR.print_fit(con, "  ⎿ " + ("x/" * 80))            # far wider than 40
+    out = con.file.getvalue().rstrip("\n")
+    assert len(out) <= 40                               # never exceeds width
+    assert out.endswith("…") or out.endswith("...")     # ellipsis applied
+
+
+def test_print_fit_short_line_unchanged():
+    con = _con(80)
+    PR.print_fit(con, "⏺ applied")
+    out = con.file.getvalue()
+    assert "applied" in out and "…" not in out
+
+
+def test_print_fit_never_wraps_multiline():
+    con = _con(20)
+    PR.print_fit(con, "⏺ " + ("verylongtokenwithoutspaces" * 4))
+    assert con.file.getvalue().count("\n") == 1        # exactly one line, no wrap
+
+
+def test_print_fit_failsoft_on_bad_console():
+    class _Boom:
+        width = 30
+        def print(self, *a, **k):
+            raise RuntimeError("nope")
+    PR.print_fit(_Boom(), "anything")                  # must not raise
