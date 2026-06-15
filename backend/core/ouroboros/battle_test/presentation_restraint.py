@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
@@ -1036,6 +1037,33 @@ def real_stdout_isatty() -> bool:
         return bool(sys.stdout.isatty())
     except Exception:  # noqa: BLE001
         return False
+
+
+# ---------------------------------------------------------------------------
+# Encoding-aware glyph vocabulary (ASCII fallback for non-UTF-8 terminals)
+# ---------------------------------------------------------------------------
+
+_GLYPHS_UTF8 = {"action": "\u23fa", "result": "\u23bf"}
+_GLYPHS_ASCII = {"action": "*", "result": ">"}
+
+
+def _stdout_supports_utf8() -> bool:
+    """True only when stdout can encode our glyphs. Fail-safe to False."""
+    try:
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+        return "utf" in enc
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def glyphs() -> dict:
+    """Glyph vocabulary, degraded to ASCII on non-UTF-8 stdout."""
+    return dict(_GLYPHS_UTF8 if _stdout_supports_utf8() else _GLYPHS_ASCII)
+
+
+def spinner_name() -> str:
+    """Rich spinner name: braille 'dots' on UTF-8, ASCII 'line' otherwise."""
+    return "dots" if _stdout_supports_utf8() else "line"
 
 
 def format_idle_breadcrumb(
