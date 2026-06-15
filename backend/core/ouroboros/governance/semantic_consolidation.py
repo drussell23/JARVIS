@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
@@ -280,3 +281,42 @@ class SemanticConsolidationMatrix:
                 occurrences=occurrences,
             )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Process-wide lazy singleton (the call site the Tier-2 deployer injects)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MATRIX: Optional["SemanticConsolidationMatrix"] = None
+_DEFAULT_MATRIX_LOCK = threading.Lock()
+
+
+def get_default_matrix(project_root: Optional[Any] = None) -> "SemanticConsolidationMatrix":
+    """Return a process-wide :class:`SemanticConsolidationMatrix` wired to the default
+    UserPreferenceStore. Lets orchestrator hooks reach the matrix without threading it
+    through every constructor (mirrors ``get_default_store``). Fail-soft: if the store can't
+    be built, the matrix runs store-less (clusters in memory, persists nothing) — never
+    raising into the hot lesson path. Gating is still per-call via the env master switch."""
+    global _DEFAULT_MATRIX
+    with _DEFAULT_MATRIX_LOCK:
+        if _DEFAULT_MATRIX is None:
+            store = None
+            try:
+                from backend.core.ouroboros.governance.user_preference_memory import (
+                    get_default_store,
+                )
+                store = get_default_store(project_root)
+            except Exception:  # noqa: BLE001
+                logger.debug("[Consolidation] default store unavailable — store-less matrix",
+                             exc_info=True)
+            # purge intentionally None: episodic-purge wiring is a separate, explicit
+            # follow-up — the directive still persists; we just don't auto-evict episodes yet.
+            _DEFAULT_MATRIX = SemanticConsolidationMatrix(store=store, purge=None)
+        return _DEFAULT_MATRIX
+
+
+def reset_default_matrix() -> None:
+    """Clear the process-wide singleton. Primarily for tests."""
+    global _DEFAULT_MATRIX
+    with _DEFAULT_MATRIX_LOCK:
+        _DEFAULT_MATRIX = None

@@ -172,5 +172,29 @@ def test_style_memory_type_used():
     assert getattr(mt, "value", mt) == "style"
 
 
+def test_get_default_matrix_singleton():
+    from backend.core.ouroboros.governance import semantic_consolidation as sc
+    sc.reset_default_matrix()
+    a = sc.get_default_matrix("/tmp/x")
+    b = sc.get_default_matrix()
+    assert a is b
+    sc.reset_default_matrix()
+    c = sc.get_default_matrix()
+    assert c is not a
+
+
+def test_get_default_matrix_storeless_safe(monkeypatch):
+    # if the store factory blows up, the matrix must still build (store-less) and record safely
+    from backend.core.ouroboros.governance import semantic_consolidation as sc
+    import backend.core.ouroboros.governance.user_preference_memory as upm
+    sc.reset_default_matrix()
+    monkeypatch.setattr(upm, "get_default_store",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no disk")))
+    m = sc.get_default_matrix()        # must not raise
+    assert m is not None
+    assert m.record(Lesson(signature="boom")) is None  # store-less + off → safe no-op
+    sc.reset_default_matrix()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
