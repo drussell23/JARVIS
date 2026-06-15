@@ -87,7 +87,7 @@ webrtcvad>=2.0.10  # Voice activity detection
 pvporcupine>=3.0.0  # Wake word detection (requires PICOVOICE_ACCESS_KEY)
 
 # Schema Validation
-jsonschema>=4.20.0  # JSON schema validation for config and API
+jsonschema>=4.26.0  # JSON schema validation for config and API
 
 # Weather and location services
 geocoder>=1.38.0  # For IP-based location detection
