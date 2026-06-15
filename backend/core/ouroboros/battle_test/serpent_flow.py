@@ -1118,12 +1118,45 @@ class SerpentFlow:
             f"  {events}"
         )
 
-    def _open_op_block(self, op_id: str, sensor: str) -> None:
-        """Print the top border of an op block and register it as active.
+    # ── Sovereign Terminal UI: borderless render helpers ─────────
+    @staticmethod
+    def _borderless() -> bool:
+        """True when the Claude-Code-clean borderless render is active
+        (master-gated). Fail-soft to False → legacy boxed path."""
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                borderless_enabled,
+            )
+            return borderless_enabled()
+        except Exception:  # noqa: BLE001
+            return False
 
-        Refactored 2026-05-03: snapshot is recorded for the swarm
-        digest unconditionally; the visible header only prints when
-        the lens is focused on this op.
+    def _emit_fit(self, markup: str) -> None:
+        """Print one borderless line through overflow-safe print_fit."""
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                print_fit,
+            )
+            print_fit(self.console, markup)
+        except Exception:  # noqa: BLE001
+            self.console.print(markup, highlight=False)
+
+    @staticmethod
+    def _action_glyph() -> str:
+        from backend.core.ouroboros.battle_test.presentation_restraint import glyphs
+        return glyphs()["action"]
+
+    @staticmethod
+    def _result_glyph() -> str:
+        from backend.core.ouroboros.battle_test.presentation_restraint import glyphs
+        return glyphs()["result"]
+
+    def _open_op_block(self, op_id: str, sensor: str) -> None:
+        """Print the op-block header and register it as active.
+
+        Borderless mode: a single ``glyph sensor  short`` action line (no box).
+        Legacy mode: the top border. Snapshot is recorded for the swarm digest
+        unconditionally; the visible header only prints when the lens is focused.
         """
         self._active_ops.add(op_id)
         self._op_sensors[op_id] = sensor
@@ -1135,6 +1168,11 @@ class SerpentFlow:
         if not self._is_focused(op_id):
             return
         short = _short_id(op_id)
+        if self._borderless():
+            self._emit_fit(
+                f"{self._action_glyph()} {sensor}  [{_C['dim']}]{short}[/{_C['dim']}]"
+            )
+            return
         w = self._block_w()
         label = f" {short} ── {sensor} "
         pad = max(2, w - len(label) - 2)
@@ -1264,6 +1302,11 @@ class SerpentFlow:
         self._streaming_started_ops.discard(op_id)
         if not was_focused:
             return
+        if self._borderless():
+            # No footer border — the receipt line already carried the outcome;
+            # one blank line provides the vertical rhythm between op groups.
+            self.console.print()
+            return
         short = _short_id(op_id)
         w = self._block_w()
         stats = (
@@ -1303,10 +1346,15 @@ class SerpentFlow:
         if op_id and op_id in self._active_ops:
             if not self._is_focused(op_id):
                 return
-            self.console.print(
-                f"  [{_C['border']}]│[/{_C['border']}]  {text}",
-                highlight=False,
-            )
+            if self._borderless():
+                self._emit_fit(
+                    f"  [{_C['dim']}]{self._result_glyph()}[/{_C['dim']}] {text}"
+                )
+            else:
+                self.console.print(
+                    f"  [{_C['border']}]│[/{_C['border']}]  {text}",
+                    highlight=False,
+                )
         else:
             # Out-of-band lines (system messages, banners) — always render
             self.console.print(f"  {text}", highlight=False)
@@ -1477,8 +1525,9 @@ class SerpentFlow:
             pass  # no event loop / sync context — skip silently
 
     def _op_blank(self, op_id: str) -> None:
-        """Print a blank line with the op border (visual breathing room)."""
-        if op_id and op_id in self._active_ops:
+        """Print a blank line for visual breathing room (borderless: plain blank;
+        legacy: a bordered ``│`` spacer)."""
+        if op_id and op_id in self._active_ops and not self._borderless():
             self.console.print(
                 f"  [{_C['border']}]│[/{_C['border']}]",
                 highlight=False,
@@ -1490,6 +1539,10 @@ class SerpentFlow:
 
     def _open_nested(self, op_id: str, header: str) -> None:
         """Open a nested block within an op (tool call, diff, etc.)."""
+        if self._borderless():
+            # nested header as a dim result sub-line (no box frame)
+            self._op_line(op_id, f"[{_C['dim']}]{header}[/{_C['dim']}]")
+            return
         w = self._block_w() - 6  # indent for op border
         pad = max(2, w - _visible_len(header) - 4)
         border = f"[{_C['border']}]┌─ {header} {'─' * pad}[/{_C['border']}]"
@@ -1498,7 +1551,10 @@ class SerpentFlow:
     def _nested_line(self, op_id: str, text: str) -> None:
         """Print a line inside a nested block."""
         if op_id and op_id in self._active_ops:
-            if len(self._active_ops) > 1:
+            if self._borderless():
+                # deeper indent, no box rails
+                self._emit_fit(f"      {text}")
+            elif len(self._active_ops) > 1:
                 short = _short_id(op_id)
                 self.console.print(
                     f"  [{_C['border']}]│ {short} │[/{_C['border']}]  {text}",
@@ -1514,6 +1570,8 @@ class SerpentFlow:
 
     def _close_nested(self, op_id: str) -> None:
         """Close a nested block."""
+        if self._borderless():
+            return                      # no footer rail in borderless mode
         w = self._block_w() - 6
         border = f"[{_C['border']}]└{'─' * w}[/{_C['border']}]"
         self._op_line(op_id, border)
