@@ -1087,6 +1087,44 @@ def print_fit(console, markup: str) -> None:
             pass
 
 
+from contextlib import asynccontextmanager  # noqa: E402
+
+
+@asynccontextmanager
+async def pulse(console, line: str, *, spinner: str = ""):
+    """Non-blocking spinner on the active action line during awaited work.
+
+    TTY-gated -- a no-op headless/CI/piped (no spinner art leaks into logs; the
+    awaited body still runs). Cursor armor: a try/finally GUARANTEES the cursor
+    is restored and the buffer flushed on ANY exception boundary (fatal LLM /
+    network error mid-spin must never leave the operator's terminal with a
+    hidden cursor). Leverages Rich ``console.status`` (background-thread spinner
+    + cursor management); raw ``\\033[?25h`` is only the last-resort fallback."""
+    if not real_stdout_isatty():
+        yield
+        return
+    spin = spinner or spinner_name()
+    status = None
+    try:
+        status = console.status(line, spinner=spin)
+        status.start()
+        yield
+    finally:
+        try:
+            if status is not None:
+                status.stop()          # clears spinner region, restores cursor
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            console.show_cursor(True)  # Rich-native cursor restore
+        except Exception:  # noqa: BLE001
+            try:
+                sys.stdout.write("\033[?25h")   # last-resort raw ANSI show-cursor
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def format_idle_breadcrumb(
     *,
     branch: str = "",

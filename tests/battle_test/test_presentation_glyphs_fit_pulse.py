@@ -81,3 +81,61 @@ def test_print_fit_failsoft_on_bad_console():
         def print(self, *a, **k):
             raise RuntimeError("nope")
     PR.print_fit(_Boom(), "anything")                  # must not raise
+
+
+# --------------------------------------------------------------------------- pulse
+import asyncio  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def test_pulse_noop_when_not_tty(monkeypatch):
+    monkeypatch.setattr(PR, "real_stdout_isatty", lambda: False)
+    con = MagicMock()
+    ran = {}
+
+    async def go():
+        async with PR.pulse(con, "⏺ synthesizing"):
+            ran["body"] = True
+
+    asyncio.run(go())
+    assert ran["body"] is True
+    con.status.assert_not_called()             # no spinner in headless
+
+
+def test_pulse_starts_stops_and_restores_cursor(monkeypatch):
+    monkeypatch.setattr(PR, "real_stdout_isatty", lambda: True)
+    con = MagicMock()
+    status = MagicMock()
+    con.status.return_value = status
+
+    async def go():
+        async with PR.pulse(con, "⏺ synthesizing"):
+            pass
+
+    asyncio.run(go())
+    status.start.assert_called_once()
+    status.stop.assert_called_once()
+    con.show_cursor.assert_called_with(True)   # cursor armor
+
+
+def test_pulse_restores_cursor_on_exception(monkeypatch):
+    monkeypatch.setattr(PR, "real_stdout_isatty", lambda: True)
+    con = MagicMock()
+    status = MagicMock()
+    con.status.return_value = status
+
+    async def go():
+        async with PR.pulse(con, "⏺ x"):
+            raise ValueError("boom")
+
+    with pytest_raises(ValueError):
+        asyncio.run(go())
+    status.stop.assert_called_once()           # stopped despite exception
+    con.show_cursor.assert_called_with(True)
+
+
+import pytest as _pytest  # noqa: E402
+
+
+def pytest_raises(exc):
+    return _pytest.raises(exc)
