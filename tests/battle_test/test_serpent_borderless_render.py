@@ -171,3 +171,34 @@ def test_synth_pulse_noop_when_disabled(monkeypatch):
     asyncio.run(go())
     assert ran["body"] is True
     flow.console.status.assert_not_called()
+
+
+# --------------------------------------------------------------------------- lifecycle
+def test_full_lifecycle_borderless_clean(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_OPBLOCK_BORDERLESS_ENABLED", "true")
+    flow, buf = _flow()
+    op = "op-life"
+    flow._open_op_block(op, "TestFailure")
+    flow._op_line(op, "[cyan]🔬 sensed[/cyan]  fix the thing")
+    flow._op_line(op, "[magenta]synthesizing[/magenta]  doubleword")
+    flow._op_line(op, "[green]applied[/green]  $0.004")
+    flow._op_blank(op)
+    flow._close_op_block(op)
+    out = buf.getvalue()
+    assert not any(c in out for c in _BOX_CHARS)          # borderless throughout
+    assert ("⏺" in out) or ("*" in out)                   # action glyph
+    assert "fix the thing" in out and "TestFailure" in out
+    assert "🔬" not in out                                 # emoji demoted
+    assert "\n\n" in out                                   # vertical rhythm
+
+
+def test_off_parity_legacy_boxes_intact(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "false")
+    flow, buf = _flow()
+    op = "op-legacy"
+    flow._open_op_block(op, "TestFailure")
+    flow._op_line(op, "x")
+    flow._close_op_block(op)
+    out = buf.getvalue()
+    assert "┌" in out and "│" in out and "└" in out       # legacy boxed render intact
