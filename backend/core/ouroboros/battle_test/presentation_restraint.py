@@ -727,6 +727,41 @@ def register_flags(registry) -> int:
             example="~/.jarvis/repl_history",
             since="Gap #7 Slice 5 (2026-05-04)",
         ),
+        # ── Sovereign Terminal UI: borderless render + pulse ──────
+        FlagSpec(
+            name="JARVIS_OPBLOCK_BORDERLESS_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Borderless Claude-Code-clean op-block render: glyph "
+                "action/result hierarchy (no box-drawing borders), "
+                "grayscale chrome, vertical rhythm. Gated by the "
+                "presentation-restraint master; when that master is off "
+                "the legacy boxed renderer is byte-identical. Default TRUE."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            example="true",
+            since="Sovereign Terminal UI (2026-06-15)",
+        ),
+        FlagSpec(
+            name="JARVIS_TUI_PULSE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Async pulse spinner on the active action line during "
+                "synthesizing/validating awaits. TTY-gated (no-op "
+                "headless/CI). Default TRUE under the restraint master."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            example="true",
+            since="Sovereign Terminal UI (2026-06-15)",
+        ),
         # ── Slice 4: input polish ─────────────────────────────────
         FlagSpec(
             name="JARVIS_REPL_INPUT_POLISH_ENABLED",
@@ -1059,6 +1094,23 @@ def _stdout_supports_utf8() -> bool:
 def glyphs() -> dict:
     """Glyph vocabulary, degraded to ASCII on non-UTF-8 stdout."""
     return dict(_GLYPHS_UTF8 if _stdout_supports_utf8() else _GLYPHS_ASCII)
+
+
+def borderless_enabled() -> bool:
+    """Borderless glyph op-block render. Default TRUE under the restraint master;
+    the master gates it so master-off is byte-identical legacy boxed rendering."""
+    if not is_restraint_enabled():
+        return False
+    raw = os.environ.get("JARVIS_OPBLOCK_BORDERLESS_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def pulse_enabled() -> bool:
+    """Async pulse spinner. Default TRUE under the restraint master."""
+    if not is_restraint_enabled():
+        return False
+    raw = os.environ.get("JARVIS_TUI_PULSE_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def spinner_name() -> str:
