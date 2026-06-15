@@ -347,3 +347,75 @@ async def _await_if_needed(value: Any) -> Any:
 
 import logging as _logging  # noqa: E402 — module logger for the cascade breaker
 _LOG = _logging.getLogger("live_kernel_validator")
+
+
+# ── Phase 4: the VALIDATE-phase gate (the orchestrator integration LOGIC) ──
+
+def _retry_feedback(result: "LiveFireResult") -> str:
+    """Targeted GENERATE-retry feedback from a live-fire failure (Iron Gate style)."""
+    if result.timed_out:
+        return ("Live-fire boot TIMED OUT — your patch likely hangs at import or on a "
+                "patched symbol. Remove blocking/infinite work from module/boot scope.")
+    return (
+        "Your patch FAILED a live-fire boot (real subprocess import + symbol exercise), "
+        f"not just pytest. Fix this before resubmitting:\n{result.exception_type}: "
+        f"{result.traceback.strip()[-1500:]}"
+    )
+
+
+async def livefire_validate_gate(
+    *,
+    changed_files: List[str],
+    affected_symbols: List[str],
+    attempt: int,
+    validator: "LiveKernelValidator",
+    breaker: "CascadeFailureBreaker",
+    escalate: Callable[[Dict[str, Any]], Any],
+    generation_context: Optional[Dict[str, Any]] = None,
+    module: str = "unified_supervisor",
+) -> Dict[str, Any]:
+    """One VALIDATE-phase live-fire decision. The orchestrator calls this when a
+    candidate is ready to validate. Returns a verdict dict:
+
+      {'verdict': 'pass'}                              → proceed to GATE
+      {'verdict': 'retry', 'feedback': str}           → route back to GENERATE (within budget)
+      {'verdict': 'escalated'}                         → budget exhausted; async PR filed; loop continues
+      {'verdict': 'suspended', 'cascade_tripped': True}→ escalation tripped the cascade breaker
+
+    Pure policy + injected deps (validator/breaker/escalate) → fully unit-testable
+    without the orchestrator. Fail-soft: an escalation error still returns a verdict.
+    """
+    if not validator.affects_kernel(changed_files):
+        return {"verdict": "pass", "reason": "non_kernel_skip"}
+
+    result = await validator.validate_patch(
+        changed_files=changed_files, affected_symbols=affected_symbols, module=module
+    )
+    if result.ok:
+        breaker.record_clean_task()
+        return {"verdict": "pass", "exercised": result.exercised}
+
+    budget = livefire_retry_budget(len(changed_files))
+    if attempt < budget:
+        return {"verdict": "retry", "feedback": _retry_feedback(result), "attempt": attempt, "budget": budget}
+
+    # Budget exhausted on a kernel patch → risk-tiered async escalation (OrangePRReviewer).
+    dump = sanitize_state_dump({
+        "generation_context": generation_context or {},
+        "livefire": {
+            "exception_type": result.exception_type,
+            "traceback": result.traceback,
+            "timed_out": result.timed_out,
+            "changed_files": changed_files,
+            "affected_symbols": affected_symbols,
+            "budget": budget,
+        },
+    })
+    try:
+        await _await_if_needed(escalate(dump))
+    except Exception as err:  # noqa: BLE001 — escalation failure must not crash VALIDATE
+        _LOG.warning("[LiveFire] escalation failed (fail-soft): %r", err)
+    tripped = breaker.record_escalation()
+    _LOG.warning("[LiveFire] kernel patch failed live-fire after %d attempts → escalated "
+                 "(cascade_tripped=%s)", budget, tripped)
+    return {"verdict": "suspended" if tripped else "escalated", "cascade_tripped": tripped}
