@@ -91,10 +91,10 @@ def deploy(*, orch: Path = ORCH, boot_check=_default_boot_check) -> int:
         return 4
 
     print("BOOT CHECK PASSED (orchestrator imports clean). Tier-2 wiring deployed.\n"
-          "With JARVIS_SEMANTIC_CONSOLIDATION_ENABLED=true, recurring failure lessons now "
-          "cluster and distill into CORE_DIRECTIVE STYLE memories. NOTE: episodic-purge is a "
-          "separate follow-up (matrix runs purge=None for now — directives persist, episodes "
-          "are not auto-evicted yet).")
+          "With JARVIS_SEMANTIC_CONSOLIDATION_ENABLED=true, recurring failure lessons cluster "
+          "and distill into CORE_DIRECTIVE STYLE memories; on commit, the matrix retires the "
+          "superseded episodes via the integrity-preserving episodic prune (RAM eviction + "
+          "append-only supersession tombstone — the durable hash chain is never erased).")
     return 0
 
 
