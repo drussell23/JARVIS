@@ -88,15 +88,20 @@ def test_consolidates_once_then_quiet():
     assert len(store.added) == 1
 
 
-def test_purge_called_with_episode_ids():
+def test_purge_called_with_fingerprint():
     store = _FakeStore()
-    purged = []
-    m = SemanticConsolidationMatrix(store=store, purge=lambda ids: purged.extend(ids),
-                                    threshold=3, enabled=True)
-    for i in range(3):
-        m.record(_lf("ImportError: cannot import name x", ep=f"ep-{i}"))
-    assert sorted(purged) == ["ep-0", "ep-1", "ep-2"]
-    res = m.record  # noqa: just ensure no crash on extra
+    seen = {}
+
+    def _purge(fp):
+        seen["fp"] = fp
+        return 3                      # pretend 3 episodes retired
+
+    m = SemanticConsolidationMatrix(store=store, purge=_purge, threshold=3, enabled=True)
+    res = None
+    for _ in range(3):
+        res = m.record(_lf("ImportError: cannot import name 'x'"))
+    assert seen.get("fp") == fingerprint("ImportError: cannot import name 'x'")
+    assert res is not None and res.episodes_purged == 3
     assert len(store.added) == 1
 
 
@@ -104,13 +109,14 @@ def test_purge_skipped_if_store_fails():
     class _BadStore:
         def add(self, **kw):
             raise RuntimeError("disk full")
-    purged = []
-    m = SemanticConsolidationMatrix(store=_BadStore(), purge=lambda ids: purged.extend(ids),
+    calls = []
+    m = SemanticConsolidationMatrix(store=_BadStore(),
+                                    purge=lambda fp: calls.append(fp) or 0,
                                     threshold=2, enabled=True)
-    # store.add fails → not persisted → purge must NOT run (don't lose episodes on failure)
-    assert m.record(_lf("TypeError", ep="a")) is None
-    assert m.record(_lf("TypeError", ep="b")) is None
-    assert purged == []
+    # store.add fails → not persisted → purge must NOT run (don't retire episodes on failure)
+    assert m.record(_lf("TypeError")) is None
+    assert m.record(_lf("TypeError")) is None
+    assert calls == []
 
 
 def test_principle_selection_by_family():
@@ -194,6 +200,71 @@ def test_get_default_matrix_storeless_safe(monkeypatch):
     assert m is not None
     assert m.record(Lesson(signature="boom")) is None  # store-less + off → safe no-op
     sc.reset_default_matrix()
+
+
+# --------------------------------------------------------------------------- episodic prune
+class _FakeBlue:
+    def __init__(self):
+        self.records = []
+
+    def record(self, **kw):
+        self.records.append(kw)
+
+
+def _seed(led, summary, kind="error", op="op"):
+    from backend.core.ouroboros.governance.episodic_core import Episode
+    led._window.append(Episode(len(led._window), 0.0, kind, op, summary))
+
+
+def test_episodic_prune_evicts_matching_and_appends_tombstone():
+    from backend.core.ouroboros.governance.episodic_core import EpisodicLedger
+    blue = _FakeBlue()
+    led = EpisodicLedger(window=8, longterm_max=10, blue_ledger=blue, embedder=None)
+    _seed(led, "FrozenInstanceError: cannot assign to field 'passed'")
+    _seed(led, "all good — complete", kind="complete")
+    removed = led.prune(lambda ep: "frozeninstanceerror" in ep.summary.lower(),
+                        tombstone_label="fp")
+    assert removed == 1
+    assert all("frozeninstanceerror" not in ep.summary.lower() for ep in led._window)
+    # append-only supersession tombstone written; original receipts NOT deleted
+    assert any(r.get("verdict") == "superseded" for r in blue.records)
+
+
+def test_episodic_prune_bad_predicate_keeps_all():
+    from backend.core.ouroboros.governance.episodic_core import EpisodicLedger
+    led = EpisodicLedger(window=4, blue_ledger=_FakeBlue(), embedder=None)
+    _seed(led, "keep me")
+    removed = led.prune(lambda ep: (_ for _ in ()).throw(ValueError("boom")))
+    assert removed == 0 and len(led._window) == 1   # a throwing matcher never nukes the cache
+
+
+def test_episodic_prune_no_match_no_tombstone():
+    from backend.core.ouroboros.governance.episodic_core import EpisodicLedger
+    blue = _FakeBlue()
+    led = EpisodicLedger(window=4, blue_ledger=blue, embedder=None)
+    _seed(led, "unrelated")
+    assert led.prune(lambda ep: False) == 0
+    assert blue.records == []   # nothing removed → no tombstone churn
+
+
+def test_default_purge_wires_to_episodic(monkeypatch):
+    monkeypatch.setenv("JARVIS_EPISODIC_CORE_ENABLED", "1")
+    from backend.core.ouroboros.governance import episodic_core as ec
+    from backend.core.ouroboros.governance import semantic_consolidation as sc
+    ec.reset_episodic_ledger()
+    led = ec.get_episodic_ledger()
+    led._blue = _FakeBlue()          # avoid touching the real .jarvis ledger
+    led._blue_resolved = True
+    _seed(led, "FrozenInstanceError: cannot assign to field 'x'")
+    fp = sc.fingerprint("FrozenInstanceError: cannot assign to field 'x'")
+    assert sc._default_purge(fp) == 1
+    ec.reset_episodic_ledger()
+
+
+def test_prune_episodes_helper_off_when_disabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_EPISODIC_CORE_ENABLED", "0")
+    from backend.core.ouroboros.governance import episodic_core as ec
+    assert ec.prune_episodes(lambda ep: True) == 0   # disabled → no-op
 
 
 if __name__ == "__main__":

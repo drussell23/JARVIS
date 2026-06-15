@@ -13,7 +13,8 @@ student writes the lesson down once and forgets the noise.
 
 Design discipline (matches the rest of the engine):
   * Decoupled + duck-typed: ``store`` needs only ``.add(memory_type, name, description, ...)``;
-    ``purge`` is any ``Callable[[List[str]], None]``. No hard import of the heavy store, so it
+    ``purge`` is any ``Callable[[str], int]`` taking the consolidated cluster fingerprint and
+    returning how many backing episodes it retired. No hard import of the heavy store, so it
     is unit-testable with fakes and OFF-inert.
   * Default OFF (``JARVIS_SEMANTIC_CONSOLIDATION_ENABLED``). Fail-soft — ``record`` never
     raises into its caller.
@@ -151,7 +152,7 @@ class SemanticConsolidationMatrix:
         self,
         *,
         store: Optional[Any] = None,
-        purge: Optional[Callable[[List[str]], None]] = None,
+        purge: Optional[Callable[[str], int]] = None,
         threshold: Optional[int] = None,
         max_clusters: Optional[int] = None,
         enabled: Optional[bool] = None,
@@ -235,7 +236,6 @@ class SemanticConsolidationMatrix:
         principle = _principle_for(cluster.fingerprint, raw_sample)
         occurrences = len(cluster.lessons)
         files = tuple(sorted({l.file_path for l in cluster.lessons if l.file_path}))
-        episode_ids = [l.episode_id for l in cluster.lessons if l.episode_id]
         short = cluster.fingerprint[:60].strip() or "recurring-failure"
         name = f"core-directive: {short}"
         description = f"Distilled from {occurrences} similar failures — {principle[:120]}"
@@ -263,10 +263,9 @@ class SemanticConsolidationMatrix:
                 logger.debug("[Consolidation] store.add failed (fail-soft)", exc_info=True)
 
         purged = 0
-        if persisted and self._purge is not None and episode_ids:
+        if persisted and self._purge is not None:
             try:
-                self._purge(episode_ids)
-                purged = len(episode_ids)
+                purged = int(self._purge(cluster.fingerprint) or 0)
             except Exception:  # noqa: BLE001
                 logger.debug("[Consolidation] purge failed (fail-soft)", exc_info=True)
 
@@ -309,10 +308,23 @@ def get_default_matrix(project_root: Optional[Any] = None) -> "SemanticConsolida
             except Exception:  # noqa: BLE001
                 logger.debug("[Consolidation] default store unavailable — store-less matrix",
                              exc_info=True)
-            # purge intentionally None: episodic-purge wiring is a separate, explicit
-            # follow-up — the directive still persists; we just don't auto-evict episodes yet.
-            _DEFAULT_MATRIX = SemanticConsolidationMatrix(store=store, purge=None)
+            _DEFAULT_MATRIX = SemanticConsolidationMatrix(store=store, purge=_default_purge)
         return _DEFAULT_MATRIX
+
+
+def _default_purge(fp: str) -> int:
+    """Integrity-preserving purge: retire episodic recall entries whose summary shares the
+    consolidated cluster's fingerprint (RAM cache eviction + append-only supersession
+    tombstone — NEVER deletes the tamper-evident chain). Fail-soft → 0."""
+    try:
+        from backend.core.ouroboros.governance.episodic_core import prune_episodes
+        return prune_episodes(
+            lambda ep: fingerprint(getattr(ep, "summary", "")) == fp,
+            tombstone_label=fp[:60],
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Consolidation] episodic prune unavailable", exc_info=True)
+        return 0
 
 
 def reset_default_matrix() -> None:

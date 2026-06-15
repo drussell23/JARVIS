@@ -32,7 +32,7 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, List, Optional, Sequence, Tuple
 
 _ENV_MASTER = "JARVIS_EPISODIC_CORE_ENABLED"
 _ENV_WINDOW = "JARVIS_EPISODIC_WINDOW"
@@ -207,6 +207,50 @@ class EpisodicLedger:
         with self._lock:
             self._longterm.append((vec, ep))
 
+    def prune(self, match: Callable[["Episode"], bool], *, tombstone_label: str = "") -> int:
+        """Integrity-preserving retirement of superseded episodes.
+
+        Evicts episodes for which ``match(ep)`` is True from the in-RAM long-term recall
+        cache AND the short-term window — freeing RAM immediately and stopping a
+        consolidated failure pattern from resurfacing in ``recall``. It then APPENDS a
+        tombstone receipt to the tamper-evident ledger recording the supersession.
+
+        It NEVER deletes from the append-only durable ledger: erasing a hash-chained
+        receipt would break tamper-evidence (Manifesto §8 audit-immutability + the
+        dissertation-evidence purity this module guarantees). The audit-correct way to
+        retire a record is to append a supersession marker, not erase the original.
+
+        Returns the number of in-memory episodes evicted. Fail-soft → 0. A predicate that
+        raises is treated as "no match" (keep) so a bad matcher can never nuke the cache.
+        """
+        def _hit(ep: "Episode") -> bool:
+            try:
+                return bool(match(ep))
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            with self._lock:
+                kept_lt = [(v, ep) for (v, ep) in self._longterm if not _hit(ep)]
+                kept_w = [ep for ep in self._window if not _hit(ep)]
+                removed = (len(self._longterm) - len(kept_lt)) + (len(self._window) - len(kept_w))
+                if removed:
+                    self._longterm = deque(kept_lt, maxlen=self._longterm.maxlen)
+                    self._window = deque(kept_w, maxlen=self._window.maxlen)
+            if removed:
+                try:
+                    bl = self._blue_ledger()
+                    if bl is not None:
+                        bl.record(
+                            attack_class="episodic_superseded",
+                            payload=f"superseded {removed} episodes: {tombstone_label}"[:300],
+                            verdict="superseded", blocked=False,
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+            return removed
+        except Exception:  # noqa: BLE001
+            return 0
+
     def recent(self, n: int) -> List[Episode]:
         """The immediate short-term window (most recent last). NEVER raises."""
         try:
@@ -263,6 +307,14 @@ def reset_episodic_ledger() -> None:
     global _singleton
     with _singleton_lock:
         _singleton = None
+
+
+def prune_episodes(match: Callable[["Episode"], bool], *, tombstone_label: str = "") -> int:
+    """Module helper: retire superseded episodes on the default ledger (integrity-preserving;
+    see :meth:`EpisodicLedger.prune`). No-op (0) when episodic core is disabled."""
+    if not episodic_core_enabled():
+        return 0
+    return get_episodic_ledger().prune(match, tombstone_label=tombstone_label)
 
 
 async def record_transition(
