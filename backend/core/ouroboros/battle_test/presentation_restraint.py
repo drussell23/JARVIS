@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
@@ -726,6 +727,41 @@ def register_flags(registry) -> int:
             example="~/.jarvis/repl_history",
             since="Gap #7 Slice 5 (2026-05-04)",
         ),
+        # ── Sovereign Terminal UI: borderless render + pulse ──────
+        FlagSpec(
+            name="JARVIS_OPBLOCK_BORDERLESS_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Borderless Claude-Code-clean op-block render: glyph "
+                "action/result hierarchy (no box-drawing borders), "
+                "grayscale chrome, vertical rhythm. Gated by the "
+                "presentation-restraint master; when that master is off "
+                "the legacy boxed renderer is byte-identical. Default TRUE."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            example="true",
+            since="Sovereign Terminal UI (2026-06-15)",
+        ),
+        FlagSpec(
+            name="JARVIS_TUI_PULSE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Async pulse spinner on the active action line during "
+                "synthesizing/validating awaits. TTY-gated (no-op "
+                "headless/CI). Default TRUE under the restraint master."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            example="true",
+            since="Sovereign Terminal UI (2026-06-15)",
+        ),
         # ── Slice 4: input polish ─────────────────────────────────
         FlagSpec(
             name="JARVIS_REPL_INPUT_POLISH_ENABLED",
@@ -1036,6 +1072,109 @@ def real_stdout_isatty() -> bool:
         return bool(sys.stdout.isatty())
     except Exception:  # noqa: BLE001
         return False
+
+
+# ---------------------------------------------------------------------------
+# Encoding-aware glyph vocabulary (ASCII fallback for non-UTF-8 terminals)
+# ---------------------------------------------------------------------------
+
+_GLYPHS_UTF8 = {"action": "\u23fa", "result": "\u23bf"}
+_GLYPHS_ASCII = {"action": "*", "result": ">"}
+
+
+def _stdout_supports_utf8() -> bool:
+    """True only when stdout can encode our glyphs. Fail-safe to False."""
+    try:
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+        return "utf" in enc
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def glyphs() -> dict:
+    """Glyph vocabulary, degraded to ASCII on non-UTF-8 stdout."""
+    return dict(_GLYPHS_UTF8 if _stdout_supports_utf8() else _GLYPHS_ASCII)
+
+
+def borderless_enabled() -> bool:
+    """Borderless glyph op-block render. Default TRUE under the restraint master;
+    the master gates it so master-off is byte-identical legacy boxed rendering."""
+    if not is_restraint_enabled():
+        return False
+    raw = os.environ.get("JARVIS_OPBLOCK_BORDERLESS_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def pulse_enabled() -> bool:
+    """Async pulse spinner. Default TRUE under the restraint master."""
+    if not is_restraint_enabled():
+        return False
+    raw = os.environ.get("JARVIS_TUI_PULSE_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def spinner_name() -> str:
+    """Rich spinner name: braille 'dots' on UTF-8, ASCII 'line' otherwise."""
+    return "dots" if _stdout_supports_utf8() else "line"
+
+
+def print_fit(console, markup: str) -> None:
+    """Print one op-block line, truncated to the live console width with an
+    ellipsis -- never wraps (so the glyph column never moves). Width is read
+    from the console per call (SIGWINCH-adaptive; Rich defaults to 80
+    off-terminal). Fail-soft: on any Rich error, falls back to a plain crop
+    print, and if that fails too, swallows the error rather than crash the
+    render path."""
+    try:
+        from rich.text import Text
+        console.print(
+            Text.from_markup(markup),
+            no_wrap=True, overflow="ellipsis", crop=True, soft_wrap=False,
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            width = getattr(console, "width", 80) or 80
+            console.print(str(markup)[: max(8, int(width) - 1)], highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+from contextlib import asynccontextmanager  # noqa: E402
+
+
+@asynccontextmanager
+async def pulse(console, line: str, *, spinner: str = ""):
+    """Non-blocking spinner on the active action line during awaited work.
+
+    TTY-gated -- a no-op headless/CI/piped (no spinner art leaks into logs; the
+    awaited body still runs). Cursor armor: a try/finally GUARANTEES the cursor
+    is restored and the buffer flushed on ANY exception boundary (fatal LLM /
+    network error mid-spin must never leave the operator's terminal with a
+    hidden cursor). Leverages Rich ``console.status`` (background-thread spinner
+    + cursor management); raw ``\\033[?25h`` is only the last-resort fallback."""
+    if not real_stdout_isatty():
+        yield
+        return
+    spin = spinner or spinner_name()
+    status = None
+    try:
+        status = console.status(line, spinner=spin)
+        status.start()
+        yield
+    finally:
+        try:
+            if status is not None:
+                status.stop()          # clears spinner region, restores cursor
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            console.show_cursor(True)  # Rich-native cursor restore
+        except Exception:  # noqa: BLE001
+            try:
+                sys.stdout.write("\033[?25h")   # last-resort raw ANSI show-cursor
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def format_idle_breadcrumb(
