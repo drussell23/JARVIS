@@ -131,3 +131,43 @@ def test_op_line_borderless_strips_emoji_and_color(monkeypatch):
     flow._op_line(op, "[cyan]🔬 sensed[/cyan]  mygoal")
     out = buf.getvalue()
     assert "🔬" not in out and "mygoal" in out
+
+
+# --------------------------------------------------------------------------- pulse wiring
+import asyncio  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def test_synth_pulse_uses_status_when_enabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TUI_PULSE_ENABLED", "true")
+    monkeypatch.setattr(PR, "real_stdout_isatty", lambda: True)
+    flow, _ = _flow()
+    status = MagicMock()
+    flow.console = MagicMock()
+    flow.console.status.return_value = status
+
+    async def go():
+        async with flow._synth_pulse("op-p", "doubleword"):
+            pass
+
+    asyncio.run(go())
+    status.start.assert_called_once()
+    status.stop.assert_called_once()
+    flow.console.show_cursor.assert_called_with(True)
+
+
+def test_synth_pulse_noop_when_disabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_PRESENTATION_RESTRAINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TUI_PULSE_ENABLED", "false")
+    flow, _ = _flow()
+    flow.console = MagicMock()
+    ran = {}
+
+    async def go():
+        async with flow._synth_pulse("op-p", "doubleword"):
+            ran["body"] = True
+
+    asyncio.run(go())
+    assert ran["body"] is True
+    flow.console.status.assert_not_called()

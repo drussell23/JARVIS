@@ -1164,6 +1164,33 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             self.console.print(markup, highlight=False)
 
+    def _synth_pulse(self, op_id: str, provider: str):
+        """Return an async context that pulses a spinner on the active
+        'synthesizing' line while an awaited generation/validation runs:
+
+            async with self._synth_pulse(op_id, provider):
+                result = await provider.generate(...)
+
+        No-op (still runs the body) when pulse is disabled or headless. The
+        cursor-armor + TTY-gating live in presentation_restraint.pulse."""
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                pulse, pulse_enabled, glyphs,
+            )
+            if not pulse_enabled():
+                raise RuntimeError("pulse disabled")  # fall through to no-op
+            prov = _PROV.get(provider, provider)
+            line = f"{glyphs()['action']} synthesizing [{_C['dim']}]{prov}[/{_C['dim']}]"
+            return pulse(self.console, line)
+        except Exception:  # noqa: BLE001
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def _noop():
+                yield
+
+            return _noop()
+
     @staticmethod
     def _action_glyph() -> str:
         from backend.core.ouroboros.battle_test.presentation_restraint import glyphs
