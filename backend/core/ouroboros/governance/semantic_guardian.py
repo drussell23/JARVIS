@@ -1361,6 +1361,28 @@ _PATTERNS: dict = {
 
 
 # ---------------------------------------------------------------------------
+# Tier 0 — Anticipatory Edge-Case Armor (blindspot detectors)
+# ---------------------------------------------------------------------------
+#
+# Static detectors for the bug classes that survive ast.parse and bite at runtime
+# (frozen-instance mutation, unguarded Optional deref, no-op loop rebinds) — the gap the
+# LiveKernelValidator catches dynamically. Additive + per-pattern kill switches
+# (JARVIS_SEMGUARD_<NAME>_ENABLED), identical inspect()/Detection contract. Living in a
+# separate module keeps the CFG/immutability analysis isolated; import is fail-soft so a
+# load error can never disable the existing guardian.
+try:  # pragma: no cover - import guard
+    from backend.core.ouroboros.governance.semantic_guardian_blindspots import (
+        BLINDSPOT_PATTERNS as _BLINDSPOT_PATTERNS,
+    )
+    for _bs_name, _bs_detector in _BLINDSPOT_PATTERNS.items():
+        if _bs_name not in _PATTERNS:                     # never shadow a hand-written pattern
+            _PATTERNS[_bs_name] = _bs_detector
+            _ALL_PATTERNS = tuple(_ALL_PATTERNS) + (_bs_name,)
+except Exception:  # noqa: BLE001
+    logger.debug("[SemanticGuard] blindspot detectors unavailable — skipping", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Phase 7.1 — adapted-pattern boot-time merge
 # ---------------------------------------------------------------------------
 #

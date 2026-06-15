@@ -94,8 +94,10 @@ def test_all_pattern_names_is_exhaustive():
     assert set(all_pattern_names()) == set(_PATTERNS.keys())
     # Pattern count: 12 structural + 3 Slice-208 epistemic-integrity
     # (self_signing_attempt / metric_counter_suppressed /
-    # chronos_continuity_laundering — metric-gaming deception detectors).
-    assert len(all_pattern_names()) == 15
+    # chronos_continuity_laundering) + 5 Tier-0 Anticipatory Edge-Case Armor
+    # blindspot detectors (frozen_dataclass_mutation / namedtuple_attr_assignment /
+    # pydantic_immutable_set / type_coercion_blindspot / loop_var_rebind_lost).
+    assert len(all_pattern_names()) == 20
 
 
 # ---------------------------------------------------------------------------
