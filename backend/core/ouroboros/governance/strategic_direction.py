@@ -130,7 +130,12 @@ class StrategicDirectionService:
         # — synthetic soul: the organism remembers what it has been working
         # on). Conventional-commit parsing, zero model inference.
         if _GIT_HISTORY_ENABLED:
-            self._git_themes = self._extract_git_themes(
+            # Slice 258 — await the off-loop async path. The sync
+            # ``_extract_git_themes`` ran ``git log`` (subprocess) on the
+            # asyncio thread (LoopSink: blocked_ms≈197); the async variant
+            # routes through ``git_momentum``'s thread-offloaded git-read pool
+            # so the git fork never blocks the loop.
+            self._git_themes = await self._extract_git_themes_async(
                 self._root, max_commits=_GIT_HISTORY_MAX_COMMITS,
             )
             momentum_section = self._format_git_themes(self._git_themes)
@@ -931,7 +936,9 @@ class StrategicDirectionService:
         )
         # Slice 33 Arc 0 — diagnostic only. Subprocess git log + parse
         # for 50 commits runs synchronously on the asyncio thread when
-        # this is called from any async caller.
+        # this is called from any async caller. Retained for back-compat
+        # (direct test callers); production ``load()`` uses the off-loop
+        # ``_extract_git_themes_async`` below (Slice 258).
         from backend.core.ouroboros.telemetry.loop_sink import (
             sink_sync as _ls_sink_sync,
         )
@@ -941,6 +948,31 @@ class StrategicDirectionService:
                 max_commits=int(max_commits),
             )
             return format_themes(snapshot)
+
+    @staticmethod
+    async def _extract_git_themes_async(
+        project_root: Path,
+        max_commits: int = 50,
+    ) -> List[str]:
+        """Off-loop twin of :meth:`_extract_git_themes` (Slice 258).
+
+        Delegates to ``git_momentum.compute_recent_momentum_async``, which runs
+        the bounded ``git log`` in the dedicated git-read thread pool — the git
+        fork happens on a worker thread, never the event loop. Byte-identical
+        ``List[str]`` output to the sync wrapper. NEVER raises.
+        """
+        from backend.core.ouroboros.governance.git_momentum import (
+            compute_recent_momentum_async,
+            format_themes,
+        )
+        try:
+            snapshot = await compute_recent_momentum_async(
+                project_root=project_root,
+                max_commits=int(max_commits),
+            )
+        except Exception:  # noqa: BLE001 — digest momentum is best-effort
+            return []
+        return format_themes(snapshot)
 
     @staticmethod
     def _format_git_themes(themes: List[str]) -> str:
