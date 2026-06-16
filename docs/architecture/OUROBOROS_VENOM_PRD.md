@@ -1,6 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.28 (2026-06-15 — **§3.8 added — Slice 257 Battle-Test Loop-Starvation Hardening** (first clean `session_outcome=complete` after a wave of `heartbeat_stale` SIGKILLs: four event-loop / shutdown / telemetry wedges fixed — Oracle over-indexing `.claude/worktrees` (29.5k duplicate `.py`), posture `commit_ratios` forking git ON the loop thread (108s block), Oracle shutdown cache-write wedge, harvester false-positive OOM; 41 regression tests green; merged to main). — see §3.7 below)
+**Version**: 3.29 (2026-06-16 — **§3.9 added — Slice 259 Adaptive Model Tiering Engine (Sovereign Adaptive Memory Matrix)** (EmbeddingService tiers instead of failing under memory pressure: HIGH PyTorch ~800MB ⇄ LITE fastembed/ONNX-CoreML ~200MB; denial-triggered demotion + headroom-triggered promotion with hysteresis + atomic model swap; fastembed added to primary requirements.txt; 11 engine tests; live-validated on M1. ARM64 asm = compute not memory; Rust int8 quant deferred). — see §3.9 below)
+>
+> 3.28 (2026-06-15 — **§3.8 added — Slice 257 Battle-Test Loop-Starvation Hardening** (first clean `session_outcome=complete` after a wave of `heartbeat_stale` SIGKILLs: four event-loop / shutdown / telemetry wedges fixed — Oracle over-indexing `.claude/worktrees` (29.5k duplicate `.py`), posture `commit_ratios` forking git ON the loop thread (108s block), Oracle shutdown cache-write wedge, harvester false-positive OOM; 41 regression tests green; merged to main). — see §3.7 below)
 >
 > 3.27 (2026-06-12 — **§51.11.34 added — Soak Reliability + Token-Economic Arc (Slices 217-224)** (five-layer onion: funding->sleep->Aegis-token-1h-expiry->stale-ledger-hostage->sensor-self-DDoS; audited soak spend ~$1.90 not $26; P2a cache + /spend + $2/h rail COMPLETE; BLUNT: cost solved, file-00 still won't dispatch -> autonomy blocker is non-economic; roadmap A1 trace-dispatch > A2 QoS > B1 Claude-Batch > B2 compression > B3 UCCI-calibration > C1 /session/refresh > C2 non-sleeping-host). — full version history in OUROBOROS_VENOM_PRD_HISTORY.md)
 
@@ -908,6 +910,20 @@ See §9 Phase 10 for the full slice-by-slice plan.
 - The autonomous organism resets the shared checkout to `origin/main` mid-run — **commit fixes to a branch (or isolate in a worktree) before running the battle test**; running *from* the fix branch keeps it active (the harness branches `ouroboros/battle-test/<ts>` from current HEAD).
 - The battle test needs unsandboxed socket bind (Aegis IPC daemon) + provider network.
 - Claude (Tier-1 fallback) being out of credit is the 3-tier failback case; leave it **enabled** — `JARVIS_PROVIDER_CLAUDE_DISABLED=true` removes the fallback DW model-dispatch needs (`sentinel_dispatch_no_fallback` churn). DW (Tier-0 primary) carries the load; the Claude economic breaker trips fast and demotes IMMEDIATE→STANDARD→DW.
+
+---
+
+### 3.9 Slice 259 — Adaptive Model Tiering Engine (Sovereign Adaptive Memory Matrix) *(NEW 2026-06-16)*
+
+**The EmbeddingService no longer fails under memory pressure — it tiers.** A soak on the M1 host showed `[EmbeddingService] ❌ Insufficient memory to load model` when the `ProactiveResourceGuard` denied the ~800MB PyTorch SentenceTransformer (host at 77% used / ~4GB free). The physics: the memory lever is the **model's footprint** (quantization / a leaner runtime), not the memory *monitor* and not ARM64 assembly (assembly is a *compute* lever — NEON `arm64_dot_product`/`l2_norm`/`matvec` speed up vector math but don't shrink RAM; the Rust `RustMemoryMonitor` only measures and isn't even built). The right lever already lives in the repo: **fastembed** (ONNX Runtime + CoreML/ARM64, `BAAI/bge-small-en-v1.5`, ~200MB, 384-dim — dimension-compatible with `all-MiniLM-L6-v2`), exposed via the Slice 153 `_FastembedSTAdapter`. ONNX Runtime ships optimized ARM64/CoreML kernels, so the LITE tier gets assembly-grade speed for free.
+
+Rather than a brittle static fallback, the service runs a two-tier adaptive FSM (`backend/core/embedding_service.py`):
+
+- **Phase 1 — parity.** `fastembed>=0.3.0` added to the primary `requirements.txt` (it was only in `requirements-semantic.txt`) and installed on the M1 — the `ModuleNotFoundError` blocker is closed.
+- **Phase 2 — adaptive demotion.** `EmbeddingTier` (`HIGH`=PyTorch / `LITE`=fastembed / `NONE`). `_load_model` tries the HIGH tier (broker- or guard-gated at `pytorch_estimate_mb`); on **denial or torch-absence** it pivots to `_try_load_fastembed_tier` (gated at `fastembed_estimate_mb` + `lite_floor_gb`) instead of degrading to no embeddings. Validated live: HIGH-denied → real fastembed LITE loaded in ~1.2s → working 384-dim encodes.
+- **Phase 3 — heuristic promotion (blindspot armor).** A background poller (`_promotion_loop`, `promotion_poll_s`, default 60s) calls `maybe_promote_tier()` while on LITE: when `_pytorch_headroom_available()` holds for `promotion_stable_checks` consecutive observations (hysteresis, default 2) **and** the gate re-grants at commit time, it loads PyTorch and **atomically swaps the model under the lock** (in-flight `encode()` never sees a half-loaded model), then frees the LITE handle. The system *climbs back* to full fidelity when the host recovers — it never degrades permanently.
+
+All thresholds are env-tunable (`JARVIS_EMBEDDING_ADAPTIVE_TIERING` / `_ADAPTIVE_PROMOTION`, `EMBEDDING_{PYTORCH,FASTEMBED}_ESTIMATE_MB`, `EMBEDDING_PROMOTION_{POLL_S,STABLE_CHECKS,HEADROOM_GB}`, `EMBEDDING_LITE_FLOOR_GB`) — no hardcoded numbers in the logic. Observability via `active_tier` / `tier_status()` / `get_stats()["active_tier"]`. 11 engine tests + 14 existing embedding/broker/fallback tests green. *(Footnote: the Rust int8 quantization path — `quantized_inference.rs`'s own "4× memory reduction" — is the bigger torch-free native route, deferred: it needs the crate built + a full transformer runtime, where fastembed/ONNX already delivers the win.)*
 
 ---
 
