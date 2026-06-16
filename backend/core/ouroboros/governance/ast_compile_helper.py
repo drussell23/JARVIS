@@ -511,19 +511,81 @@ def _get_pool() -> ProcessPoolExecutor:
     return _pool
 
 
-def shutdown_pool() -> None:
-    """Shut down the process pool (for tests + clean exit).
-    NEVER raises."""
+def _proc_alive(p: Any) -> bool:
+    """is_alive() that never raises (a torn-down handle may throw)."""
+    try:
+        return bool(p.is_alive())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def shutdown_pool(*, deadline_s: float = 5.0) -> str:
+    """Deterministically tear down the AST process pool. NEVER raises.
+
+    Returns the teardown verdict: ``"idle"`` (no pool), ``"graceful"`` (workers
+    drained within ``deadline_s``), or ``"escalated"`` (workers force-terminated).
+
+    Three layers — because ``ProcessPoolExecutor.shutdown(cancel_futures=True)``
+    only drops QUEUED futures; it cannot interrupt a worker already running an AST
+    parse. That is the v25 / bt-2026-06-16 ``Shutting down The Oracle...`` wedge:
+    an in-flight index left running workers that no public API could stop, so the
+    process never exited cleanly (and ``session_outcome`` never reached ``complete``).
+
+      1. ``shutdown(wait=False, cancel_futures=True)`` — drop the queue, don't block.
+      2. bounded ``join(timeout)`` per worker — let in-flight parses finish gracefully.
+      3. escalation — ``terminate()`` (then ``kill()``) any worker still alive past
+         the deadline. The pool can't interrupt running workers; the OS can.
+    """
     global _pool
     with _pool_lock:
-        if _pool is None:
-            return
+        pool = _pool
+        _pool = None
+    if pool is None:
+        return "idle"
+    # Snapshot the worker handles FIRST — ProcessPoolExecutor.shutdown() nulls
+    # ``_processes``, so capturing after Layer 1 loses them.
+    procs = list((getattr(pool, "_processes", None) or {}).values())
+    # Layer 1 — drop queued futures, return immediately (no join-hang).
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:                       # cancel_futures is 3.9+; degrade safely
         try:
-            _pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=False)
         except Exception:  # noqa: BLE001
             pass
-        finally:
-            _pool = None
+    except Exception:  # noqa: BLE001
+        pass
+    # Layer 2 — bounded graceful drain of running workers.
+    deadline = time.monotonic() + max(0.0, float(deadline_s))
+    for p in procs:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            p.join(timeout=remaining)
+        except Exception:  # noqa: BLE001
+            pass
+    # Layer 3 — escalate: force-terminate stragglers the pool can't interrupt.
+    stuck = [p for p in procs if _proc_alive(p)]
+    if not stuck:
+        return "graceful"
+    for p in stuck:
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(0.2)
+    for p in stuck:
+        if _proc_alive(p):
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    logger.warning(
+        "[AstCompileHelper] ORACLE_TEARDOWN_ESCALATION: force-terminated %d stuck "
+        "worker(s) past %.1fs deadline", len(stuck), float(deadline_s),
+    )
+    return "escalated"
 
 
 # ============================================================================

@@ -1890,6 +1890,26 @@ def _oracle_shutdown_deadline_s() -> float:
         return _ORACLE_SHUTDOWN_DEADLINE_DEFAULT_S
 
 
+_ORACLE_POOL_TEARDOWN_DEADLINE_ENV = "JARVIS_ORACLE_POOL_TEARDOWN_DEADLINE_S"
+_ORACLE_POOL_TEARDOWN_DEADLINE_DEFAULT_S = 5.0
+
+
+def _oracle_pool_teardown_deadline_s() -> float:
+    """``JARVIS_ORACLE_POOL_TEARDOWN_DEADLINE_S`` — bound on the AST process-pool
+    teardown at shutdown. Default 5s: workers get this long to finish in-flight
+    parses gracefully before they are force-terminated. Set ``0`` to skip the
+    graceful drain and force-terminate immediately. Keep under the
+    BoundedShutdownWatchdog 30s budget (shared with the cache-save deadline)."""
+    raw = os.environ.get(
+        _ORACLE_POOL_TEARDOWN_DEADLINE_ENV,
+        str(_ORACLE_POOL_TEARDOWN_DEADLINE_DEFAULT_S),
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _ORACLE_POOL_TEARDOWN_DEADLINE_DEFAULT_S
+
+
 # =============================================================================
 # THE ORACLE - MAIN INDEXER
 # =============================================================================
@@ -1907,6 +1927,7 @@ class TheOracle:
         self._file_hashes: Dict[str, str] = {}  # file_path -> content hash
         self._lock = asyncio.Lock()
         self._running = False
+        self._shutting_down = False  # cancellation token: stops the indexer mid-build on shutdown
         self._last_indexed_monotonic_ns: int = 0  # set after each full index build
 
         # Repository configurations
@@ -2132,6 +2153,9 @@ class TheOracle:
         Set to ``0`` to skip ``_save_cache`` entirely on shutdown.
         """
         logger.info("Shutting down The Oracle...")
+        # Cancellation token FIRST: stop the indexer from submitting new batches so
+        # the AST pool can drain instead of fighting fresh work during teardown.
+        self._shutting_down = True
         deadline_s = _oracle_shutdown_deadline_s()
         if deadline_s <= 0.0:
             logger.info(
@@ -2152,6 +2176,32 @@ class TheOracle:
                     "or =0 to skip saves on shutdown entirely.",
                     deadline_s,
                 )
+        # Tear down the AST-indexing ProcessPoolExecutor deterministically.
+        # Closes the bt-2026-06-16 "Shutting down The Oracle..." wedge: an in-flight
+        # index left pool workers running, which blocked clean exit so
+        # session_outcome never reached "complete". Bounded drain + force-terminate
+        # (see ast_compile_helper.shutdown_pool). Runs in a thread because the
+        # graceful join is blocking; the event loop keeps ticking. NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.ast_compile_helper import (
+                shutdown_pool as _shutdown_ast_pool,
+            )
+            verdict = await asyncio.to_thread(
+                _shutdown_ast_pool,
+                deadline_s=_oracle_pool_teardown_deadline_s(),
+            )
+            if verdict == "escalated":
+                logger.warning(
+                    "[Oracle.shutdown] ORACLE_TEARDOWN_ESCALATION — AST pool "
+                    "force-terminated to guarantee bounded shutdown",
+                )
+            else:
+                logger.info("[Oracle.shutdown] AST pool teardown: %s", verdict)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[Oracle.shutdown] AST pool teardown best-effort failed",
+                exc_info=True,
+            )
         self._running = False
         logger.info("The Oracle shutdown complete")
 
@@ -2293,6 +2343,15 @@ class TheOracle:
         except Exception:  # noqa: BLE001
             _await_quiescence = None  # type: ignore[assignment]
         for i in range(0, total_files, batch_size):
+            # Cancellation token: abort the build if shutdown was requested, so the
+            # AST pool can drain + teardown instead of being abandoned mid-index
+            # (the bt-2026-06-16 "Shutting down The Oracle..." wedge).
+            if self._shutting_down:
+                logger.info(
+                    "[Oracle] index of %s cancelled — shutdown requested "
+                    "(%d/%d files submitted)", repo_name, i, total_files,
+                )
+                break
             # Park at 0% CPU here if a Claude SDK stream is in flight —
             # deterministic containment, not best-effort sleep(0).
             if _await_quiescence is not None:
