@@ -2231,8 +2231,23 @@ class BattleTestHarness:
                 GovernedLoopService,
             )
 
+            # Sovereign Execution Boundary Stage B — dynamic project_root
+            # injection. When JARVIS_FILE_ISOLATION_ENABLED is on AND the
+            # session is autonomous, the loop's project_root resolves to an
+            # isolated worktree; every mutation delegate (ChangeEngine /
+            # BranchManager / TestRunner / ToolExecutor) inherits project_root,
+            # so this single redirect quarantines all file/git/test mutation
+            # out of the operator's primary checkout. No os.chdir, no global
+            # cwd state. Off (default) → repo_path → byte-identical boot.
+            from backend.core.ouroboros.governance.autonomous_workspace import (
+                resolve_loop_project_root,
+            )
+            _loop_root = await resolve_loop_project_root(
+                self._config.repo_path,
+                session_id=str(self._session_id),
+            )
             gls_config = GovernedLoopConfig.from_env(
-                project_root=self._config.repo_path,
+                project_root=_loop_root,
             )
             # Widen canary slices for battle test — allow all files.
             # Production default is ("tests/", "docs/") which blocks
@@ -2787,6 +2802,18 @@ class BattleTestHarness:
 
         if not master_enabled():
             return  # §33.1 master-FALSE byte-identical path
+
+        # Stage B unification: if file-isolation already created + exported
+        # the unified worktree earlier (at GLS-config construction, before
+        # this phase), reuse it instead of double-creating a second worktree.
+        _existing_ws = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE", "")
+        if _existing_ws and Path(_existing_ws).is_dir():
+            self._auto_commit_workspace = Path(_existing_ws)
+            logger.info(
+                "[ledger_sovereignty] reusing file-isolation worktree "
+                "%s (Stage B already created it)", _existing_ws,
+            )
+            return
 
         # Session id MUST be exported BEFORE WorktreeManager.create
         # so the marker payload carries the correct value.
