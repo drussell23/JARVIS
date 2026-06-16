@@ -67,8 +67,27 @@ def test_gate_inert_is_anomaly():
 
 
 def test_oom_is_anomaly():
-    cert = _c(_HEALED_LOG + "\nstop_reason=process_memory_cap")
-    assert cert.verdict == H.ANOMALY and "OOM" in cert.headline.upper() or "memory" in cert.headline.lower()
+    # Real ProcessMemoryWatchdog FIRE log line ("Session X stopping: ...").
+    cert = _c(_HEALED_LOG + "\nSession bt-x stopping: process_memory_cap — RSS exceeded")
+    assert cert.verdict == H.ANOMALY and ("OOM" in cert.headline.upper() or "memory" in cert.headline.lower())
+
+
+def test_oom_via_summary_stop_reason_is_anomaly():
+    # Authoritative path: the watchdog stamps summary.stop_reason on a graceful stop.
+    summary = {**_COMPLETE, "stop_reason": "process_memory_cap"}
+    cert = H.certify(H.parse_metrics(_HEALED_LOG, summary, ""))
+    assert cert.verdict == H.ANOMALY and "memory" in cert.headline.lower()
+
+
+def test_armed_watchdog_is_NOT_oom():
+    # Slice 257 regression: the ProcessMemoryWatchdog *arming* line merely
+    # describes the cap (it contains "process_memory_cap" and "OOM-kill") — it
+    # must NOT be read as an OOM event. A clean wall_clock_cap run that armed
+    # the watchdog but never tripped (rss far below cap) must stay non-anomalous.
+    arming = ("[ProcessMemoryWatchdog] armed: warn=10445MB cap=12288MB interval=15s "
+              "— graceful stop_reason=process_memory_cap before OS OOM-kill.")
+    m = H.parse_metrics(_HEALED_LOG + "\n" + arming, _COMPLETE, "")
+    assert m.oom is False
 
 
 def test_boot_check_failed_is_anomaly():

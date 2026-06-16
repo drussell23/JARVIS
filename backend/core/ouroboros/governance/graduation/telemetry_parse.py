@@ -41,8 +41,16 @@ _RE_RETRY = re.compile(r"GENERATE_RETRY|VALIDATE_RETRY")
 _RE_RECOVERED = re.compile(r"state=applied|state=complete|phase=COMPLETE")
 _RE_GATE_INERT = re.compile(r"GATE INERT")
 _RE_TIMEOUT = re.compile(r"LiveFireTimeout|live-fire exceeded")
+# Genuine memory-cap FIRE only. Slice 257 — the previous pattern matched bare
+# ``process_memory_cap`` / ``OOM``, which also matched the ProcessMemoryWatchdog
+# *arming* line ("armed: warn=…MB cap=…MB — graceful stop_reason=
+# process_memory_cap before OS OOM-kill"). That line merely DESCRIBES the cap;
+# arming is not firing. bt-2026-06-16-063106 completed cleanly at rss=555MB
+# (cap 12288MB) via wall_clock_cap yet was mis-verdicted ANOMALY/OOM. The
+# watchdog logs "Session X stopping: process_memory_cap" only when it actually
+# trips, and stamps summary.stop_reason=process_memory_cap — both authoritative.
 _RE_OOM = re.compile(
-    r"process_memory_cap|MemoryError|\bOOM\b|emergency_brake|"
+    r"stopping: process_memory_cap|MemoryError|emergency_brake|"
     r"memory_pressure_changed.*(critical|emergency)",
 )
 
@@ -108,6 +116,10 @@ def parse_metrics(
         m.stop_reason = str(summary.get("stop_reason", ""))
         m.cost_total = summary.get("cost_total")
         m.duration_s = summary.get("duration_s")
+    # Authoritative memory-cap signal: when the ProcessMemoryWatchdog actually
+    # fires it produces a graceful summary with stop_reason=process_memory_cap.
+    # (The log-regex above catches the same fire + MemoryError / pressure.)
+    m.oom = m.oom or m.stop_reason == "process_memory_cap"
     return m
 
 
