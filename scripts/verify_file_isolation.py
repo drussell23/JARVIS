@@ -273,12 +273,19 @@ def _read_summary(session: Path) -> Optional[Dict]:
 
 async def watch_and_verify(
     *, sessions_dir: Path, primary_root: Path, since_ts: float,
-    timeout_s: float, poll_s: float,
+    timeout_s: float, poll_s: float, pin_session: str = "",
 ) -> int:
     deadline = time.monotonic() + timeout_s
-    print(f"[verifier] watching {sessions_dir}/ for a soak session …",
-          flush=True)
     session: Optional[Path] = None
+    if pin_session:
+        # Deterministic bind to a known session dir — immune to the
+        # autonomous loop spawning a newer bt-* mid-soak.
+        session = sessions_dir / pin_session
+        print(f"[verifier] pinned to {session} — awaiting termination …",
+              flush=True)
+    else:
+        print(f"[verifier] watching {sessions_dir}/ for a soak session …",
+              flush=True)
     while session is None:
         session = _find_latest_session(sessions_dir, since_ts)
         if session is None:
@@ -324,12 +331,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--primary-root", default=str(_PROJECT_ROOT))
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--poll", type=float, default=3.0)
+    ap.add_argument("--session", default="",
+                    help="Pin to a specific session dir name (e.g. bt-…).")
     args = ap.parse_args(argv)
     return asyncio.run(watch_and_verify(
         sessions_dir=Path(args.sessions_dir),
         primary_root=Path(args.primary_root),
         since_ts=time.time(),
         timeout_s=args.timeout, poll_s=args.poll,
+        pin_session=args.session,
     ))
 
 
