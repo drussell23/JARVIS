@@ -1894,6 +1894,66 @@ _ORACLE_POOL_TEARDOWN_DEADLINE_ENV = "JARVIS_ORACLE_POOL_TEARDOWN_DEADLINE_S"
 _ORACLE_POOL_TEARDOWN_DEADLINE_DEFAULT_S = 5.0
 
 
+def _oracle_backpressure_enabled() -> bool:
+    """``JARVIS_ORACLE_BACKPRESSURE_ENABLED`` (default true) — AIMD throttle on the
+    index batch loop so cold indexing yields to the FSM control plane instead of
+    starving it (the ControlPlaneStarvation cold-boot wedge). Kill switch ``=0``
+    restores the fixed-batch firehose."""
+    raw = os.environ.get("JARVIS_ORACLE_BACKPRESSURE_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_backpressure_lag_ms() -> float:
+    """``JARVIS_ORACLE_BACKPRESSURE_LAG_MS`` — event-loop lag (ms) above which the
+    index throttles its concurrency. Default 50ms (control-plane comfort band)."""
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_ORACLE_BACKPRESSURE_LAG_MS", "50")))
+    except (TypeError, ValueError):
+        return 50.0
+
+
+def _oracle_backpressure_min_batch() -> int:
+    """``JARVIS_ORACLE_BACKPRESSURE_MIN_BATCH`` — floor for the throttled batch so
+    progress never fully stalls. Default 4."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_BACKPRESSURE_MIN_BATCH", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+class _AdaptiveIndexThrottle:
+    """AIMD backpressure for the Oracle index batch loop.
+
+    Multiplicative-DECREASE the batch size (= per-cycle ProcessPool concurrency) when
+    measured event-loop lag exceeds the threshold; additive-INCREASE back toward the
+    ceiling when the loop is responsive. The classic congestion-control shape:
+    background indexing gracefully yields cores to the primary FSM, then reclaims them
+    once the control plane has breathing room. Pure decision logic — no I/O, testable.
+    """
+
+    def __init__(self, *, max_batch: int, min_batch: int = 4, lag_threshold_ms: float = 50.0):
+        self.max_batch = max(1, int(max_batch))
+        self.min_batch = max(1, min(int(min_batch), self.max_batch))
+        self.lag_threshold_ms = max(1.0, float(lag_threshold_ms))
+        self.batch = self.max_batch
+        self._increment = max(1, self.max_batch // 8)
+
+    def update(self, lag_ms: float) -> int:
+        """Fold one lag observation into the batch size; return the new size."""
+        if lag_ms > self.lag_threshold_ms:
+            self.batch = max(self.min_batch, self.batch // 2)               # MD
+        else:
+            self.batch = min(self.max_batch, self.batch + self._increment)  # AI
+        return self.batch
+
+    def backoff_s(self, lag_ms: float) -> float:
+        """Seconds to yield the loop when lagging — proportional to the overshoot,
+        capped so one bad reading can't park indexing for long."""
+        if lag_ms <= self.lag_threshold_ms:
+            return 0.0
+        return min(0.5, (lag_ms - self.lag_threshold_ms) / 1000.0)
+
+
 def _oracle_pool_teardown_deadline_s() -> float:
     """``JARVIS_ORACLE_POOL_TEARDOWN_DEADLINE_S`` — bound on the AST process-pool
     teardown at shutdown. Default 5s: workers get this long to finish in-flight
@@ -2294,6 +2354,16 @@ class TheOracle:
         elapsed = time.time() - start_time
         logger.info(f"Incremental update complete in {elapsed:.2f}s")
 
+    async def _measure_loop_lag_ms(self, probe_s: float = 0.02) -> float:
+        """Cheap event-loop lag probe: how far a short ``asyncio.sleep`` overshoots
+        is how backed-up the loop is right now. Pure timing; never raises."""
+        try:
+            t0 = time.monotonic()
+            await asyncio.sleep(probe_s)
+            return max(0.0, (time.monotonic() - t0 - probe_s) * 1000.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     async def _index_repository(self, repo_name: str, repo_path: Path) -> None:
         """Index all Python files in a repository."""
         logger.info(f"Indexing repository: {repo_name} at {repo_path}")
@@ -2342,7 +2412,22 @@ class TheOracle:
             )
         except Exception:  # noqa: BLE001
             _await_quiescence = None  # type: ignore[assignment]
-        for i in range(0, total_files, batch_size):
+        # Adaptive backpressure (Phase 1): AIMD throttle so cold indexing yields to the
+        # FSM control plane instead of starving it (ControlPlaneStarvation cold-boot
+        # wedge). When disabled, ``effective`` stays pinned at the full batch_size — the
+        # legacy fixed-batch firehose, behaviorally unchanged.
+        _throttle = (
+            _AdaptiveIndexThrottle(
+                max_batch=batch_size,
+                min_batch=_oracle_backpressure_min_batch(),
+                lag_threshold_ms=_oracle_backpressure_lag_ms(),
+            )
+            if _oracle_backpressure_enabled()
+            else None
+        )
+        i = 0
+        _batch_no = 0
+        while i < total_files:
             # Cancellation token: abort the build if shutdown was requested, so the
             # AST pool can drain + teardown instead of being abandoned mid-index
             # (the bt-2026-06-16 "Shutting down The Oracle..." wedge).
@@ -2359,20 +2444,20 @@ class TheOracle:
                     await _await_quiescence(label="oracle_index_repository")
                 except Exception:  # noqa: BLE001 — never break the index
                     pass
-            batch = python_files[i:i + batch_size]
+            effective = _throttle.batch if _throttle is not None else batch_size
+            batch = python_files[i:i + effective]
             tasks = [
                 self._index_file(repo_name, repo_path, file_path)
                 for file_path in batch
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+            i += len(batch)
+            _batch_no += 1
+            _is_last_batch = i >= total_files
             # Durable partial checkpoint (see cadence note above).  Never
             # let a checkpoint failure break the index — durability is a
             # best-effort enhancement, not a correctness dependency.
-            _batch_idx = i // batch_size
-            _is_last_batch = (i + batch_size) >= total_files
-            if _ck_every_n > 0 and (
-                _is_last_batch or (_batch_idx > 0 and _batch_idx % _ck_every_n == 0)
-            ):
+            if _ck_every_n > 0 and (_is_last_batch or _batch_no % _ck_every_n == 0):
                 try:
                     await self._save_cache()
                 except Exception:  # noqa: BLE001 — never break the index
@@ -2380,18 +2465,26 @@ class TheOracle:
             # Emit progress at most every 5s OR on the last batch — bounds
             # log volume on fast SSDs while still surfacing forward motion.
             _now = time.monotonic()
-            files_done = min(i + batch_size, total_files)
-            is_last = files_done >= total_files
-            if is_last or (_now - _last_progress_log) >= 5.0:
+            files_done = min(i, total_files)
+            if _is_last_batch or (_now - _last_progress_log) >= 5.0:
                 rate = files_done / max(_now - _t_batch_start, 0.001)
                 pct = 100.0 * files_done / max(total_files, 1)
+                _bp_note = f" batch={effective}" if _throttle is not None else ""
                 logger.info(
                     "[Oracle.index] %s: %d/%d files (%.1f%%) "
-                    "rate=%.0f files/s elapsed=%.1fs",
+                    "rate=%.0f files/s elapsed=%.1fs%s",
                     repo_name, files_done, total_files, pct,
-                    rate, _now - _t_batch_start,
+                    rate, _now - _t_batch_start, _bp_note,
                 )
                 _last_progress_log = _now
+            # Adaptive backpressure: measure loop lag, throttle next-batch concurrency,
+            # and yield the loop proportional to the overshoot so the FSM can breathe.
+            if _throttle is not None and not _is_last_batch:
+                lag_ms = await self._measure_loop_lag_ms()
+                _throttle.update(lag_ms)
+                _backoff = _throttle.backoff_s(lag_ms)
+                if _backoff > 0.0:
+                    await asyncio.sleep(_backoff)
 
         self._graph._metrics["files_indexed"] = total_files
 
