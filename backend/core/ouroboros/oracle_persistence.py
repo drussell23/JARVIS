@@ -61,8 +61,20 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 
 def sqlite_persistence_enabled() -> bool:
-    """Master switch. Default OFF — flip to graduate after a real-graph soak (ADD §9 caveat)."""
-    return _env_truthy("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", False)
+    """Master switch. **Default ON** (graduated 2026-06-16): SQLite is the canonical Oracle memory
+    layer. The Sovereign Memory Armor (AIMD memory-pressure throttle + streaming warm-load) makes a
+    fresh cold index 16GB-safe by construction — it contracts and, at CRITICAL, suspends-durably
+    rather than OOM. Kill switch ``=0`` restores the legacy monolithic-pickle path."""
+    return _env_truthy("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", True)
+
+
+def sqlite_migrate_pkl_enabled() -> bool:
+    """**Default OFF** — the legacy ``.pkl`` → SQLite auto-migration is DEPRECATED. Materializing a
+    large accreted pickle into a live DiGraph is the ~10GB memory monster this whole layer replaces;
+    on a constrained host it OOMs. Default-ON persistence therefore cold-indexes FRESH, never auto-
+    loads the pickle. This opt-in is for a provisioned host with headroom that explicitly wants the
+    one-time ingest (``JARVIS_ORACLE_SQLITE_MIGRATE_PKL=1``)."""
+    return _env_truthy("JARVIS_ORACLE_SQLITE_MIGRATE_PKL", False)
 
 
 def sqlite_busy_timeout_ms() -> int:
