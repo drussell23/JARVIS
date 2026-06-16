@@ -3218,9 +3218,13 @@ class TheOracle:
         return self._persistence
 
     async def _load_cache_via_provider(self) -> bool:
-        """Provider-backed load. On a fresh DB with a legacy pickle present, performs the one-time
-        seamless migration (ingest → archive) first, then loads. Fail-soft → ``False`` triggers a
-        Phase-1-throttled cold index (never a wedge)."""
+        """Provider-backed load. DB present → load it. DB absent → return ``False`` so the FSM
+        cold-indexes FRESH (Phase-1-throttled + memory-armored), never a wedge.
+
+        The legacy ``.pkl`` auto-migration is DEPRECATED and gated behind an explicit opt-in
+        (``JARVIS_ORACLE_SQLITE_MIGRATE_PKL``, default off) — materializing a large accreted pickle
+        into a live DiGraph is the ~10GB memory monster this layer replaces and would OOM a
+        constrained host. Default-ON persistence cold-indexes fresh instead."""
         from backend.core.ouroboros import oracle_persistence as _op
 
         prov = self._persistence_provider()
@@ -3228,7 +3232,10 @@ class TheOracle:
             return False
         try:
             if not await prov.exists():
-                await _op.migrate_pickle_to_sqlite(self._resolved_graph_cache_path(), prov)
+                if _op.sqlite_migrate_pkl_enabled():
+                    await _op.migrate_pickle_to_sqlite(self._resolved_graph_cache_path(), prov)
+                else:
+                    return False  # no db + migration deprecated → cold index fresh
             state = await prov.load()
         except Exception as exc:  # noqa: BLE001 — load must never crash boot
             logger.warning("[Oracle] sqlite load failed (cold index will rebuild): %s", exc)

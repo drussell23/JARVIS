@@ -270,24 +270,32 @@ def test_corrupt_db_is_quarantined_and_returns_none(tmp_path):
 
 # --------------------------------------------------------------------------- factory + flags
 def test_factory_off_returns_none(monkeypatch, tmp_path):
-    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "0")  # explicit kill switch
     assert P.build_provider(db_path=tmp_path / "o.db", pickle_path=tmp_path / "o.pkl") is None
 
 
-def test_factory_on_returns_sqlite(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
+def test_factory_on_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", raising=False)  # graduated default-ON
     prov = P.build_provider(db_path=tmp_path / "o.db", pickle_path=tmp_path / "o.pkl")
     assert isinstance(prov, P.AioSqliteProvider)
 
 
-def test_flag_default_off(monkeypatch):
+def test_flag_default_on(monkeypatch):
     monkeypatch.delenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", raising=False)
-    assert P.sqlite_persistence_enabled() is False
+    assert P.sqlite_persistence_enabled() is True   # graduated 2026-06-16
 
 
 def test_flag_kill_switch(monkeypatch):
-    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
-    assert P.sqlite_persistence_enabled() is True
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "0")
+    assert P.sqlite_persistence_enabled() is False
+
+
+def test_migrate_pkl_default_off(monkeypatch):
+    """The legacy .pkl auto-migration is DEPRECATED — default OFF (opt-in only)."""
+    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_MIGRATE_PKL", raising=False)
+    assert P.sqlite_migrate_pkl_enabled() is False
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_MIGRATE_PKL", "1")
+    assert P.sqlite_migrate_pkl_enabled() is True
 
 
 def test_busy_timeout_env_override(monkeypatch):
@@ -315,8 +323,8 @@ def _populate(oracle, n=3):
 
 
 def test_oracle_off_uses_legacy_pickle(monkeypatch, tmp_path):
-    """Master OFF → the .pkl is written, the provider is never even built (byte-identical path)."""
-    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", raising=False)
+    """Kill switch =0 → the .pkl is written, the provider is never even built (legacy path)."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "0")
 
     async def run():
         o = _fresh_oracle(monkeypatch, tmp_path)
@@ -350,12 +358,12 @@ def test_oracle_on_roundtrips_through_sqlite(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
-def test_oracle_on_migrates_legacy_pickle_on_first_load(monkeypatch, tmp_path):
-    """Master ON + a legacy .pkl present + no db → first load migrates (ingest + archive)."""
+def test_oracle_on_migrates_legacy_pickle_only_with_optin(monkeypatch, tmp_path):
+    """Master ON + legacy .pkl + no db + MIGRATE opt-in → first load migrates (ingest + archive)."""
     monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_MIGRATE_PKL", "1")  # explicit opt-in
 
     async def run():
-        # seed a legacy pickle via the legacy (OFF) save path
         seed = _fresh_oracle(monkeypatch, tmp_path)
         g = _populate(seed)
         nn = g._graph.number_of_nodes()
@@ -367,10 +375,32 @@ def test_oracle_on_migrates_legacy_pickle_on_first_load(monkeypatch, tmp_path):
         await o._persistence.close()
         assert ok is True
         assert o._graph._graph.number_of_nodes() == nn
-        # migrated: db created, pickle archived
         assert (tmp_path / "oracle.db").exists()
         assert not (tmp_path / "codebase_graph.pkl").exists()
         assert (tmp_path / "codebase_graph.pkl.migrated").exists()
+    asyncio.run(run())
+
+
+def test_oracle_default_on_does_NOT_auto_load_legacy_pickle(monkeypatch, tmp_path):
+    """THE TRAP ERADICATION: master ON (default) + a legacy .pkl present + no db + migration NOT
+    opted-in → the Oracle must NOT touch the pickle (no ~10GB load). _load_cache returns False so
+    the FSM cold-indexes fresh, and the .pkl is left untouched."""
+    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", raising=False)  # default ON
+    monkeypatch.delenv("JARVIS_ORACLE_SQLITE_MIGRATE_PKL", raising=False)          # default OFF
+
+    async def run():
+        seed = _fresh_oracle(monkeypatch, tmp_path)
+        g = _populate(seed)
+        await P.PickleProvider(tmp_path / "codebase_graph.pkl").save(_state_from_graph(g))
+        assert (tmp_path / "codebase_graph.pkl").exists()
+
+        o = _fresh_oracle(monkeypatch, tmp_path)
+        ok = await o._load_cache()           # db absent + migration off → cold-index signal
+        if o._persistence is not None:
+            await o._persistence.close()
+        assert ok is False                                       # no load → fresh cold index
+        assert (tmp_path / "codebase_graph.pkl").exists()        # pickle untouched (NOT migrated)
+        assert not (tmp_path / "codebase_graph.pkl.migrated").exists()
     asyncio.run(run())
 
 
