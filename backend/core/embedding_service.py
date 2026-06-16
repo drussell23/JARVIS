@@ -54,11 +54,36 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Adaptive Model Tiering — the Sovereign Adaptive Memory Matrix (Slice 259)
+# =============================================================================
+class EmbeddingTier(IntEnum):
+    """Fidelity-ordered embedding tiers (higher value = higher fidelity).
+
+    The service runs on exactly one tier at a time and adapts to host memory:
+
+      * ``HIGH``  — the ~800MB PyTorch SentenceTransformer (best quality).
+      * ``LITE``  — the ~200MB fastembed (ONNX/CoreML, ARM64-optimized) model,
+                    embedding-dimension-compatible (384-dim bge-small ≈
+                    all-MiniLM-L6-v2). The tier the service *demotes* to when
+                    the HIGH allocation is denied under memory pressure.
+      * ``NONE``  — no model loaded yet (or fully degraded).
+
+    Ordering matters: ``maybe_promote_tier`` only ever moves *up* (LITE→HIGH),
+    and the watchdog never demotes a working HIGH tier.
+    """
+
+    NONE = 0
+    LITE = 1
+    HIGH = 2
 
 # =============================================================================
 # CONFIGURATION
@@ -97,9 +122,35 @@ class EmbeddingServiceConfig:
     encode_timeout: float = 30.0
     shutdown_timeout: float = 10.0
 
+    # ── Adaptive Model Tiering (Slice 259) ──────────────────────────────
+    # Master switch for the demote-on-pressure / promote-on-headroom engine.
+    adaptive_tiering_enabled: bool = True
+    # Memory the two tiers are expected to cost (MB). Drives the budget gate +
+    # the promotion-headroom check. Env-tunable — no hardcoded thresholds in
+    # the logic.
+    pytorch_estimate_mb: int = 800
+    fastembed_estimate_mb: int = 200
+    # Background promotion poller (LITE→HIGH).
+    promotion_enabled: bool = True
+    promotion_poll_s: float = 60.0
+    # Hysteresis: require this many *consecutive* headroom observations before
+    # committing to an 800MB promotion (stops flapping when memory hovers near
+    # the line).
+    promotion_stable_checks: int = 2
+    # Extra free GB (beyond the model estimate) required before promoting —
+    # the floor the host must keep after the HIGH model loads.
+    promotion_headroom_gb: float = 2.0
+    # Free GB (beyond the LITE estimate) required to even attempt the LITE
+    # tier; below this the service degrades to no embeddings.
+    lite_floor_gb: float = 0.5
+
     @classmethod
     def from_env(cls) -> "EmbeddingServiceConfig":
         """Create config from environment variables."""
+        def _flag(name: str, default: bool) -> bool:
+            return os.getenv(name, str(default)).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
         return cls(
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             device=os.getenv("EMBEDDING_DEVICE", "cpu"),
@@ -112,6 +163,16 @@ class EmbeddingServiceConfig:
             fastembed_model_name=os.getenv(
                 "EMBEDDING_FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5",
             ),
+            adaptive_tiering_enabled=_flag("JARVIS_EMBEDDING_ADAPTIVE_TIERING", True),
+            pytorch_estimate_mb=int(os.getenv("EMBEDDING_PYTORCH_ESTIMATE_MB", "800")),
+            fastembed_estimate_mb=int(os.getenv("EMBEDDING_FASTEMBED_ESTIMATE_MB", "200")),
+            promotion_enabled=_flag("JARVIS_EMBEDDING_ADAPTIVE_PROMOTION", True),
+            promotion_poll_s=float(os.getenv("EMBEDDING_PROMOTION_POLL_S", "60")),
+            promotion_stable_checks=max(
+                1, int(os.getenv("EMBEDDING_PROMOTION_STABLE_CHECKS", "2"))
+            ),
+            promotion_headroom_gb=float(os.getenv("EMBEDDING_PROMOTION_HEADROOM_GB", "2.0")),
+            lite_floor_gb=float(os.getenv("EMBEDDING_LITE_FLOOR_GB", "0.5")),
         )
 
 
@@ -200,6 +261,12 @@ class EmbeddingService:
 
         self._active_grant = None  # Memory Control Plane grant, if loaded via broker
 
+        # ── Adaptive Model Tiering state (Slice 259) ────────────────────
+        self._active_tier: EmbeddingTier = EmbeddingTier.NONE
+        self._promotion_task: Optional[asyncio.Task] = None
+        self._promotion_stable_count: int = 0
+        self._tier_transitions: int = 0  # observability: total demote/promote events
+
         # Register cleanup
         atexit.register(self._sync_cleanup)
         self._register_with_shutdown_manager()
@@ -245,33 +312,49 @@ class EmbeddingService:
         except Exception as e:
             logger.debug(f"[EmbeddingService] Could not register with cross-repo cleanup: {e}")
 
-    async def _check_memory_budget(self) -> bool:
-        """Check if we have enough memory to load the model."""
+    async def _check_memory_budget(
+        self,
+        *,
+        component: str = "sentence_transformer",
+        estimated_mb: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Gate a tier load through the ProactiveResourceGuard.
+
+        Slice 259 — parameterised so each tier asks for its own footprint
+        (HIGH ~800MB / LITE ~200MB) and so the background promotion poller can
+        pass a short ``timeout`` (no 30s boot-style wait off the hot path).
+        Returns True (proceed) if the guard is unavailable — the guard is an
+        optimisation, not a hard dependency.
+        """
         try:
             from backend.core.proactive_resource_guard import (
                 get_proactive_resource_guard,
                 COMPONENT_MEMORY_ESTIMATES,
             )
-            
+
             guard = get_proactive_resource_guard()
-            estimated_mb = COMPONENT_MEMORY_ESTIMATES.get("sentence_transformer", 800)
-            
-            # Request memory budget with callback for emergency unload
-            granted = await guard.request_memory_budget(
-                component="sentence_transformer",
-                estimated_mb=estimated_mb,
-                priority=60,  # Medium-high priority (embeddings are important)
+            mb = estimated_mb if estimated_mb is not None else \
+                COMPONENT_MEMORY_ESTIMATES.get(component, 800)
+
+            kwargs: Dict[str, Any] = dict(
+                component=component,
+                estimated_mb=mb,
+                priority=60,  # Medium-high (embeddings matter)
                 can_unload=True,
                 unload_callback=self._sync_cleanup,
             )
-            
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            granted = await guard.request_memory_budget(**kwargs)
+
             if not granted:
                 logger.warning(
-                    f"[EmbeddingService] Memory budget denied for SentenceTransformer "
-                    f"(need ~{estimated_mb}MB)"
+                    "[EmbeddingService] Memory budget denied for %s (need ~%dMB)",
+                    component, mb,
                 )
             return granted
-            
+
         except ImportError:
             logger.debug("[EmbeddingService] ProactiveResourceGuard not available, skipping memory check")
             return True  # Proceed without guard
@@ -284,106 +367,294 @@ class EmbeddingService:
         adapter (config-sourced model name). ``factory`` injectable for tests."""
         return _FastembedSTAdapter(self._config.fastembed_model_name, factory=factory)
 
-    async def _load_model(self) -> bool:
-        """
-        Lazy load the SentenceTransformer model.
+    # ── Tier observability ──────────────────────────────────────────────
+    @property
+    def active_tier(self) -> EmbeddingTier:
+        """The embedding tier currently serving encode() (NONE if unloaded)."""
+        return self._active_tier
 
-        CRITICAL: This is the ONLY place SentenceTransformer should be instantiated.
-        
-        v2.0: Now checks memory budget via ProactiveResourceGuard before loading.
+    @property
+    def tier_name(self) -> str:
+        return self._active_tier.name
+
+    def tier_status(self) -> Dict[str, Any]:
+        """Snapshot for /observability — adaptive tiering state."""
+        return {
+            "active_tier": self._active_tier.name,
+            "model_loaded": self._model is not None,
+            "adaptive_tiering_enabled": self._config.adaptive_tiering_enabled,
+            "promotion_enabled": self._config.promotion_enabled,
+            "promotion_loop_running": (
+                self._promotion_task is not None and not self._promotion_task.done()
+            ),
+            "promotion_stable_count": self._promotion_stable_count,
+            "tier_transitions": self._tier_transitions,
+        }
+
+    # ── Model-construction seams (overridable for tests) ────────────────
+    def _load_sentence_transformer(self) -> Any:
+        """Construct the HIGH-tier PyTorch model. Isolated so tests can patch
+        it without a torch install. Raises ImportError if torch is absent."""
+        from sentence_transformers import SentenceTransformer  # deferred
+        return SentenceTransformer(self._config.model_name, device=self._config.device)
+
+    # ── Memory headroom probes (psutil via the guard, with fallback) ────
+    def _available_gb(self) -> Optional[float]:
+        """Best-effort system available memory in GB. Reuses the guard's
+        accounting (same psutil source) so the tiering and the guard never
+        disagree; falls back to psutil, then None (unknown)."""
+        try:
+            from backend.core.proactive_resource_guard import (
+                get_proactive_resource_guard,
+            )
+            _, available_gb, _ = get_proactive_resource_guard().get_memory_info()
+            return float(available_gb)
+        except Exception:
+            try:
+                import psutil
+                return psutil.virtual_memory().available / (1024 ** 3)
+            except Exception:
+                return None
+
+    def _pytorch_headroom_available(self) -> bool:
+        """True iff the host can hold the HIGH model AND keep the promotion
+        floor afterwards. Conservative: unknown memory → not enough."""
+        avail = self._available_gb()
+        if avail is None:
+            return False
+        need = (self._config.pytorch_estimate_mb / 1024.0) + self._config.promotion_headroom_gb
+        return avail >= need
+
+    def _lite_headroom_available(self) -> bool:
+        """True iff there's room for the LITE model + a small floor. Lenient:
+        unknown memory → allow (LITE is the whole point of degrading)."""
+        avail = self._available_gb()
+        if avail is None:
+            return True
+        need = (self._config.fastembed_estimate_mb / 1024.0) + self._config.lite_floor_gb
+        return avail >= need
+
+    async def _load_model(self) -> bool:
+        """Lazy-load an embedding tier, adapting to host memory.
+
+        Order: HIGH (PyTorch ~800MB) → on denial/absence, demote to LITE
+        (fastembed ~200MB, ONNX/CoreML) rather than running without embeddings.
+        Once on LITE, a background poller tries to climb back to HIGH when the
+        host recovers headroom. Returns True if any tier is serving.
         """
         if self._model is not None:
             return True
-
         if self._shutdown_requested:
             logger.warning("[EmbeddingService] Cannot load model during shutdown")
             return False
 
-        # Memory Control Plane: Try broker-mediated loading
+        # Tier 0 (HIGH): PyTorch SentenceTransformer.
+        if await self._try_load_pytorch_tier():
+            return True
+
+        # Adaptive demotion — pivot to the lighter ONNX/CoreML tier instead of
+        # degrading to no embeddings.
+        if self._config.adaptive_tiering_enabled:
+            if await self._try_load_fastembed_tier(reason="high_tier_unavailable"):
+                self._ensure_promotion_loop()
+                return True
+
+        logger.warning(
+            "[EmbeddingService] No embedding tier could load — long-term memory "
+            "runs without semantic embeddings until memory pressure eases."
+        )
+        return False
+
+    async def _try_load_pytorch_tier(self) -> bool:
+        """Load the HIGH (PyTorch) tier. Returns False (without erroring) when
+        the budget is denied or torch is absent, so the caller can demote."""
+        # Memory Control Plane: prefer the broker when present.
         try:
             from backend.core.memory_budget_broker import get_memory_budget_broker
-            from backend.core.budgeted_loaders import EmbeddingBudgetedLoader
-
             _broker = get_memory_budget_broker()
             if _broker is not None:
-                return await self._load_model_via_broker(_broker)
+                ok = await self._load_model_via_broker(_broker)
+                if ok:
+                    self._active_tier = EmbeddingTier.HIGH
+                return ok  # broker denial → False → caller demotes
         except ImportError:
             pass
         except Exception as e:
             logger.debug(f"[EmbeddingService] Broker unavailable, using legacy path: {e}")
 
-        # v2.0: Check memory budget BEFORE loading. A denial here is a
-        # *graceful degradation*, not a crash — the organism keeps running with
-        # long-term-memory embeddings disabled until memory frees up and a
-        # later load attempt succeeds. Logged at WARNING (not ERROR) so it
-        # reads as "operating in reduced mode under memory pressure" rather
-        # than a fault the operator must triage.
-        if not await self._check_memory_budget():
+        # Legacy guard gate.
+        if not await self._check_memory_budget(
+            component="sentence_transformer",
+            estimated_mb=self._config.pytorch_estimate_mb,
+        ):
             logger.warning(
-                "[EmbeddingService] Embedding model load deferred — insufficient "
-                "free memory for the ~800MB SentenceTransformer. Long-term "
-                "memory runs without semantic embeddings until pressure eases."
+                "[EmbeddingService] HIGH tier (PyTorch ~%dMB) denied under memory "
+                "pressure — attempting LITE tier.",
+                self._config.pytorch_estimate_mb,
             )
             return False
 
         async with self._model_lock:
-            # Double-check after acquiring lock
             if self._model is not None:
                 return True
-
             try:
-                logger.info(f"[EmbeddingService] Loading model: {self._config.model_name}")
+                logger.info(f"[EmbeddingService] Loading HIGH tier: {self._config.model_name}")
                 start = time.time()
-
-                # Import in function to defer loading
-                from sentence_transformers import SentenceTransformer
-
-                # Create model with explicit settings to avoid internal pool creation
-                self._model = SentenceTransformer(
-                    self._config.model_name,
-                    device=self._config.device,
-                )
-
-                # Explicitly disable internal multiprocessing pools
-                # SentenceTransformer can start pools for encode_multi_process()
-                # We never use that method, but ensure pools aren't started
-                if hasattr(self._model, '_target_device'):
-                    # Model loaded successfully
-                    pass
-
-                elapsed = time.time() - start
+                self._model = self._load_sentence_transformer()
+                self._active_tier = EmbeddingTier.HIGH
                 logger.info(
-                    f"[EmbeddingService] ✅ Model loaded in {elapsed:.2f}s "
-                    f"(device: {self._config.device})"
+                    "[EmbeddingService] ✅ HIGH tier loaded in %.2fs (device: %s)",
+                    time.time() - start, self._config.device,
                 )
                 return True
-
             except ImportError as e:
-                # Slice 153 — sentence-transformers absent (e.g. the Oracle-capable
-                # soak image: fastembed, not torch). Fall back to fastembed via a
-                # SentenceTransformer.encode-compatible adapter so encode() works
-                # unchanged — instead of returning None (which left the Oracle's
-                # embed_nodes producing no embeddings).
+                # torch absent — release the reservation we took and demote.
                 logger.warning(
                     "[EmbeddingService] sentence-transformers unavailable (%s) — "
-                    "falling back to fastembed (model=%s)",
-                    e, self._config.fastembed_model_name,
+                    "demoting to fastembed LITE tier.", e,
                 )
-                try:
-                    self._model = self._make_fastembed_model()
-                    logger.info(
-                        "[EmbeddingService] ✅ fastembed fallback loaded: model=%s",
-                        self._config.fastembed_model_name,
-                    )
-                    return True
-                except Exception as fe:  # noqa: BLE001
-                    logger.error(
-                        "[EmbeddingService] ❌ fastembed fallback failed: %s", fe,
-                    )
-                    return False
-            except Exception as e:
-                logger.error(f"[EmbeddingService] ❌ Failed to load model: {e}")
+                self._release_component("sentence_transformer")
                 return False
+            except Exception as e:
+                logger.error(f"[EmbeddingService] ❌ HIGH tier load failed: {e}")
+                self._release_component("sentence_transformer")
+                return False
+
+    async def _try_load_fastembed_tier(self, *, reason: str) -> bool:
+        """Load the LITE (fastembed / ONNX-CoreML) tier. Returns False only if
+        memory is too tight even for ~200MB or fastembed is unavailable."""
+        if not self._lite_headroom_available():
+            logger.warning(
+                "[EmbeddingService] Even the LITE tier (~%dMB) exceeds free "
+                "memory — running without embeddings.",
+                self._config.fastembed_estimate_mb,
+            )
+            return False
+        async with self._model_lock:
+            if self._model is not None:
+                return True
+            try:
+                start = time.time()
+                self._model = self._make_fastembed_model()
+                prev = self._active_tier
+                self._active_tier = EmbeddingTier.LITE
+                if prev != EmbeddingTier.LITE:
+                    self._tier_transitions += 1
+                logger.warning(
+                    "[EmbeddingService] ⬇️ Serving on LITE tier (fastembed=%s, "
+                    "~%dMB ONNX/CoreML) reason=%s — loaded in %.2fs. Will promote "
+                    "back to HIGH when headroom returns.",
+                    self._config.fastembed_model_name,
+                    self._config.fastembed_estimate_mb, reason, time.time() - start,
+                )
+                return True
+            except Exception as fe:  # noqa: BLE001 — fastembed missing / model fetch failed
+                logger.warning(
+                    "[EmbeddingService] LITE tier (fastembed) unavailable: %s", fe,
+                )
+                return False
+
+    def _release_component(self, component: str) -> None:
+        """Best-effort release of a guard budget reservation. NEVER raises."""
+        try:
+            from backend.core.proactive_resource_guard import (
+                get_proactive_resource_guard,
+            )
+            get_proactive_resource_guard().release_budget(component)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Heuristic Promotion Protocol (LITE → HIGH) ──────────────────────
+    async def maybe_promote_tier(self) -> bool:
+        """Attempt a single LITE→HIGH promotion. Returns True if promoted.
+
+        Guards: only from LITE, only when enabled, only after
+        ``promotion_stable_checks`` consecutive headroom observations
+        (hysteresis), and the HIGH load is gated again at commit time. Atomic:
+        the model handle is swapped under the lock so in-flight encode() never
+        sees a half-loaded model. NEVER raises.
+        """
+        if self._shutdown_requested:
+            return False
+        if self._active_tier != EmbeddingTier.LITE:
+            return False
+        if not (self._config.adaptive_tiering_enabled and self._config.promotion_enabled):
+            return False
+
+        if not self._pytorch_headroom_available():
+            self._promotion_stable_count = 0
+            return False
+        self._promotion_stable_count += 1
+        if self._promotion_stable_count < self._config.promotion_stable_checks:
+            return False
+
+        # Gate the actual reservation (short timeout — we already saw headroom).
+        if not await self._check_memory_budget(
+            component="sentence_transformer",
+            estimated_mb=self._config.pytorch_estimate_mb,
+            timeout=2.0,
+        ):
+            self._promotion_stable_count = 0
+            return False
+
+        async with self._model_lock:
+            if self._active_tier != EmbeddingTier.LITE:  # raced
+                self._release_component("sentence_transformer")
+                return False
+            old_model = self._model
+            try:
+                start = time.time()
+                new_model = self._load_sentence_transformer()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[EmbeddingService] Promotion HIGH load failed (%s) — staying on LITE.", e,
+                )
+                self._release_component("sentence_transformer")
+                self._promotion_stable_count = 0
+                return False
+            self._model = new_model
+            self._active_tier = EmbeddingTier.HIGH
+            self._promotion_stable_count = 0
+            self._tier_transitions += 1
+            logger.info(
+                "[EmbeddingService] ⬆️ Promoted LITE→HIGH (fastembed→PyTorch) in "
+                "%.2fs — memory headroom recovered.", time.time() - start,
+            )
+        # Free the LITE model outside the lock.
+        with suppress(Exception):
+            del old_model
+            gc.collect()
+        return True
+
+    def _ensure_promotion_loop(self) -> None:
+        """Start the background LITE→HIGH poller once, if enabled and a loop
+        is running. Best-effort — promotion is opportunistic, never required."""
+        if not (self._config.adaptive_tiering_enabled and self._config.promotion_enabled):
+            return
+        if self._promotion_task is not None and not self._promotion_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop — caller can retry on next load
+        self._promotion_task = loop.create_task(self._promotion_loop())
+
+    async def _promotion_loop(self) -> None:
+        """Poll for headroom while degraded; exit once promoted or on shutdown."""
+        try:
+            while not self._shutdown_requested and self._active_tier == EmbeddingTier.LITE:
+                await asyncio.sleep(self._config.promotion_poll_s)
+                if self._shutdown_requested:
+                    break
+                try:
+                    if await self.maybe_promote_tier():
+                        break
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("[EmbeddingService] promotion attempt error (ignored): %s", e)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._promotion_task = None
 
     async def _load_model_via_broker(self, broker) -> bool:
         """Load embedding model via Memory Control Plane broker."""
@@ -595,6 +866,15 @@ class EmbeddingService:
         self._shutdown_requested = True
         logger.info("[EmbeddingService] Starting cleanup...")
 
+        # Slice 259 — stop the background tier-promotion poller first.
+        _ptask = self._promotion_task
+        if _ptask is not None and not _ptask.done():
+            _ptask.cancel()
+            with suppress(Exception):
+                await _ptask
+        self._promotion_task = None
+        self._active_tier = EmbeddingTier.NONE
+
         try:
             # Stop any multiprocess pools that may have been started
             if self._model is not None:
@@ -632,6 +912,13 @@ class EmbeddingService:
         """
         self._shutdown_requested = True
 
+        # Slice 259 — signal the promotion poller to exit (it checks
+        # _shutdown_requested each tick); can't await from a sync context.
+        with suppress(Exception):
+            if self._promotion_task is not None and not self._promotion_task.done():
+                self._promotion_task.cancel()
+        self._active_tier = EmbeddingTier.NONE
+
         try:
             if self._model is not None:
                 if hasattr(self._model, 'stop_multi_process_pool'):
@@ -652,6 +939,8 @@ class EmbeddingService:
             "model_loaded": self._model is not None,
             "model_name": self._config.model_name,
             "device": self._config.device,
+            "active_tier": self._active_tier.name,
+            "tier_transitions": self._tier_transitions,
             "encode_count": self._encode_count,
             "cache_enabled": self._config.enable_cache,
             "cache_size": len(self._cache),

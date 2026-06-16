@@ -209,6 +209,13 @@ numpy>=1.26.4,<2.5
 oauthlib==3.3.1
 opencv-python==4.10.0.84
 onnxruntime==1.19.2
+# fastembed — the LITE embedding tier of the Adaptive Model Tiering Engine
+# (EmbeddingService). ONNX/CoreML-backed bge-small (~200MB) the service pivots
+# to when the ~800MB PyTorch SentenceTransformer is denied under memory
+# pressure, and promotes back from once headroom returns. Rides the pinned
+# onnxruntime==1.19.2 above (fastembed needs onnxruntime>=1.17). Mirrors the
+# pin already in requirements-semantic.txt so the primary env has parity.
+fastembed>=0.3.0
 faster-whisper==1.2.1
 openai-whisper==20250625
 opentelemetry-api==1.39.0
