@@ -32,9 +32,12 @@ fallback can't silently corrupt the operator's tree).
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 _TRUTHY = ("1", "true", "yes", "on")
 _ENV_FILE_ISOLATION = "JARVIS_FILE_ISOLATION_ENABLED"
@@ -93,6 +96,13 @@ async def resolve_loop_project_root(
     # established workspace-handoff env, NOT process-cwd mutation.
     os.environ[_ENV_COMMIT_WORKSPACE] = str(wt_path)
     os.environ.setdefault(_ENV_SESSION_ID, str(session_id))
+    # §7 absolute observability — emit a grep-stable marker so a soak can
+    # verify the redirect fired and identify the quarantine zone.
+    logger.info(
+        "[FileIsolation] routed project_root -> %s "
+        "(session=%s branch=%s)",
+        wt_path, session_id, workspace_branch(session_id),
+    )
     return wt_path
 
 
