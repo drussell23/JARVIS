@@ -38,14 +38,14 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Get PR Number
         id: pr_number
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request ||
@@ -499,7 +499,7 @@ jobs:
           PYTHON_SCRIPT
 
       - name: Post AI Analysis as Comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -551,7 +551,7 @@ jobs:
             }
 
       - name: Add Labels Based on AI Analysis
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -600,7 +600,7 @@ jobs:
 
       - name: Create Review with AI Feedback
         if: steps.ai_analysis.outputs.merge_ready == 'false'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
