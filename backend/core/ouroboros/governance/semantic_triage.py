@@ -55,6 +55,20 @@ _TRIAGE_MAX_FILE_CHARS = int(os.environ.get("OUROBOROS_TRIAGE_MAX_FILE_CHARS", "
 _TRIAGE_MAX_FILES = int(os.environ.get("OUROBOROS_TRIAGE_MAX_FILES", "3"))
 # Enable/disable triage (master switch)
 _TRIAGE_ENABLED = os.environ.get("OUROBOROS_TRIAGE_ENABLED", "true").lower() == "true"
+# verify_model() boot-race retry: the /v1/models probe can fire before the
+# Aegis credential proxy has injected the DW key, yielding a transient
+# 401/403. Retry a bounded number of times with short async backoff so the
+# triage model is genuinely verified once creds land — instead of logging a
+# spurious warning and proceeding unverified. Both knobs env-tunable.
+_TRIAGE_VERIFY_MAX_ATTEMPTS = max(
+    1, int(os.environ.get("OUROBOROS_TRIAGE_VERIFY_MAX_ATTEMPTS", "4"))
+)
+_TRIAGE_VERIFY_BACKOFF_S = max(
+    0.0, float(os.environ.get("OUROBOROS_TRIAGE_VERIFY_BACKOFF_S", "1.5"))
+)
+# HTTP statuses worth retrying — transient auth (proxy warming) + transient
+# upstream unavailability. A 404/400 is a real config error → no retry.
+_TRIAGE_VERIFY_RETRY_STATUSES = frozenset({401, 403, 429, 502, 503, 504})
 
 
 # ---------------------------------------------------------------------------
@@ -210,21 +224,48 @@ class SemanticTriageEngine:
                 self._model_verified = False
                 return False
 
-            async with session.get(
-                f"{base_url}/models",
-                timeout=self._dw._request_timeout(),
-            ) as resp:
-                if resp.status != 200:
+            # Bounded retry on transient auth / upstream blips — the probe can
+            # outrace the Aegis credential proxy at boot (401 before the key is
+            # injected, 200 moments later). Async backoff keeps the loop free.
+            body = None
+            for _attempt in range(1, _TRIAGE_VERIFY_MAX_ATTEMPTS + 1):
+                async with session.get(
+                    f"{base_url}/models",
+                    timeout=self._dw._request_timeout(),
+                ) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        break
+                    if (
+                        resp.status in _TRIAGE_VERIFY_RETRY_STATUSES
+                        and _attempt < _TRIAGE_VERIFY_MAX_ATTEMPTS
+                    ):
+                        logger.debug(
+                            "[SemanticTriage] /v1/models returned %d "
+                            "(attempt %d/%d) — credential proxy likely still "
+                            "warming; retrying in %.1fs",
+                            resp.status, _attempt,
+                            _TRIAGE_VERIFY_MAX_ATTEMPTS, _TRIAGE_VERIFY_BACKOFF_S,
+                        )
+                        if _TRIAGE_VERIFY_BACKOFF_S > 0:
+                            await asyncio.sleep(_TRIAGE_VERIFY_BACKOFF_S)
+                        continue
+                    # Non-retryable status, or retries exhausted — the model
+                    # may still work, so proceed optimistically (unverified).
                     logger.warning(
-                        "[SemanticTriage] /v1/models returned %d — "
-                        "cannot verify triage model availability",
-                        resp.status,
+                        "[SemanticTriage] /v1/models returned %d after %d "
+                        "attempt(s) — cannot verify triage model availability",
+                        resp.status, _attempt,
                     )
-                    # Proceed anyway — model might still work
                     self._model_verified = True
                     return True
 
-                body = await resp.json()
+            # Defensive: the loop always sets ``body`` (200) or returns, but if
+            # a non-dict/None somehow slipped through, proceed optimistically
+            # rather than crash the boot-time verification.
+            if not isinstance(body, (list, dict)):
+                self._model_verified = True
+                return True
 
             # DW models endpoint returns {"data": [{"id": "model-name", ...}, ...]}
             # or a flat list — handle both

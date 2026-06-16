@@ -29,11 +29,54 @@ Authority invariants (PRD §12.2 / Manifesto §1 Boundary):
 """
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# ── Off-loop git-read executor (Slice 258) ──────────────────────────────────
+# git_momentum is the single hub for "read recent git log" across the
+# organism (StrategicDirection digest + DirectionInferrer arc context). The
+# async path MUST NOT spawn git via ``asyncio.create_subprocess_exec`` —
+# that helper forks/execs the child ON the event-loop thread, and from the
+# large multi-threaded organism process the fork alone blocks the loop for
+# tens of seconds (the Slice 257 ``commit_ratios`` finding; ``git log`` itself
+# is sub-second — the cost is the fork, not the query). Instead we run the
+# bounded sync ``compute_recent_momentum`` (subprocess.run) in this dedicated
+# 2-worker pool, so a slow fork blocks a worker thread, never the loop. A
+# private pool (not the default executor) isolates git-fork latency from every
+# other ``to_thread`` caller.
+_git_read_executor: Optional[ThreadPoolExecutor] = None
+_git_read_executor_lock = threading.Lock()
+
+
+def _get_git_read_executor() -> ThreadPoolExecutor:
+    global _git_read_executor
+    if _git_read_executor is not None:
+        return _git_read_executor
+    with _git_read_executor_lock:
+        if _git_read_executor is None:
+            _git_read_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="git-momentum-read",
+            )
+    return _git_read_executor
+
+
+def shutdown_git_read_executor() -> None:
+    """Best-effort clean shutdown of the git-read pool. NEVER raises."""
+    global _git_read_executor
+    with _git_read_executor_lock:
+        ex = _git_read_executor
+        _git_read_executor = None
+    if ex is not None:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 — teardown must not raise
+            pass
 
 # Conventional Commits: ``type(scope)?: subject``. Scope is optional.
 # This regex is the single source of truth for both consumers
@@ -111,50 +154,32 @@ async def compute_recent_momentum_async(
     max_commits: int = _DEFAULT_MAX_COMMITS,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> Optional[MomentumSnapshot]:
-    """Slice 33 Arc 2 Phase 1 — async-native git momentum.
+    """Off-loop async git momentum.
 
-    Same return shape as :func:`compute_recent_momentum` but uses
-    ``asyncio.create_subprocess_exec`` so no thread-pool slot is
-    consumed during the git log scan. NEVER raises — every failure
-    path returns ``None``.
+    Same return shape as :func:`compute_recent_momentum`. Slice 258 replaces
+    the previous ``asyncio.create_subprocess_exec`` body — which forks the git
+    child ON the event-loop thread and blocked the loop tens of seconds from
+    the large organism process — with a thread-offloaded call to the bounded
+    sync path via the dedicated git-read pool. The fork now happens in a worker
+    thread; the loop stays free. ``timeout_s`` is enforced by the inner
+    ``subprocess.run``. NEVER raises — every failure path returns ``None``.
     """
     import asyncio as _asyncio_gm
-    n = max(1, int(max_commits))
+    loop = _asyncio_gm.get_running_loop()
     try:
-        proc = await _asyncio_gm.create_subprocess_exec(
-            "git", "log", f"-{n}", "--pretty=format:%H|%ct|%s",
-            cwd=str(project_root),
-            stdout=_asyncio_gm.subprocess.PIPE,
-            stderr=_asyncio_gm.subprocess.DEVNULL,
+        return await loop.run_in_executor(
+            _get_git_read_executor(),
+            functools.partial(
+                compute_recent_momentum,
+                project_root=project_root,
+                max_commits=max_commits,
+                timeout_s=timeout_s,
+            ),
         )
-    except (FileNotFoundError, OSError):
-        return None
-    try:
-        stdout_bytes, _ = await _asyncio_gm.wait_for(
-            proc.communicate(), timeout=float(timeout_s),
-        )
-    except _asyncio_gm.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:  # noqa: BLE001
-            pass
-        return None
     except _asyncio_gm.CancelledError:
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — async contract: never raise
         return None
-    if proc.returncode != 0:
-        return None
-    try:
-        text = stdout_bytes.decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        return None
-    return _parse_git_log_output(text)  # noqa: F821 — defined below
 
 
 def _parse_git_log_output(text: str) -> Optional[MomentumSnapshot]:
