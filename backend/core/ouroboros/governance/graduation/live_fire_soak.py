@@ -126,6 +126,52 @@ def is_paused() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+# Debug-log capture bound (Sovereign Telemetry Unification, 2026-06-15).
+# The self-heal trajectory the Arbiter parses can span the whole log, so the
+# captured slice must be larger than the legacy 8KB tail — but still bounded
+# for memory safety. Env-tunable, NO hardcoded magic in the read path.
+_MIN_DEBUG_LOG_CAPTURE_BYTES: int = 8192            # legacy tail floor
+_DEFAULT_DEBUG_LOG_CAPTURE_BYTES: int = 1_048_576   # 1 MiB
+_MAX_DEBUG_LOG_CAPTURE_BYTES: int = 16 * 1_048_576  # 16 MiB ceiling
+
+
+def _debug_log_capture_bytes() -> int:
+    """Resolve the debug.log capture window from
+    ``JARVIS_LIVE_FIRE_DEBUG_LOG_CAPTURE_BYTES``, clamped to
+    ``[8192, 16 MiB]``. Invalid/absent → 1 MiB default. NEVER raises."""
+    raw = os.environ.get("JARVIS_LIVE_FIRE_DEBUG_LOG_CAPTURE_BYTES", "")
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_DEBUG_LOG_CAPTURE_BYTES
+    return max(
+        _MIN_DEBUG_LOG_CAPTURE_BYTES,
+        min(val, _MAX_DEBUG_LOG_CAPTURE_BYTES),
+    )
+
+
+def _telemetry_arbiter_active() -> bool:
+    """True iff the Sovereign Arbiter should run: BOTH contract
+    consultation AND the telemetry-arbiter master flag are on. The
+    arbiter is a contract-layer refinement, so it requires contract
+    consultation to be enabled too. Defensive: import failure → False
+    (legacy path). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.graduation_contract import (  # noqa: E501
+            is_contract_consultation_enabled,
+            is_telemetry_arbiter_enabled,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(
+            is_contract_consultation_enabled()
+            and is_telemetry_arbiter_enabled()
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Dependency ordering: substrate flags graduate BEFORE surface flags
 # ---------------------------------------------------------------------------
@@ -274,6 +320,11 @@ class EvidenceRow:
     notes: str
     # Slice 6 — Optional[str]; serialized only when present.
     runner_attributed_kind: Optional[str] = None
+    # Sovereign Telemetry Unification (2026-06-15) — Unified Evidence Row.
+    # The harvester self-heal trajectory wrapping the legacy classification.
+    # Optional[Dict]; serialized only when the Arbiter ran (present iff
+    # JARVIS_LIVE_FIRE_TELEMETRY_ARBITER_ENABLED was on for this soak).
+    telemetry: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -297,6 +348,8 @@ class EvidenceRow:
         }
         if self.runner_attributed_kind is not None:
             out["runner_attributed_kind"] = self.runner_attributed_kind
+        if self.telemetry is not None:
+            out["telemetry"] = dict(self.telemetry)
         return out
 
 
@@ -900,20 +953,32 @@ class LiveFireSoakHarness:
         outcome_str, runner_attributed, class_notes = classify_outcome(
             summary, debug_log_tail=debug_tail or "",
         )
-        # Phase 9.2 — consult per-flag GraduationContract (opt-in via
-        # JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT). Contract can:
-        #   * Override clean predicate (e.g. require ≥1 hypothesis
-        #     for CuriosityEngine flag).
-        #   * Override failure-class blocklist (treat specific runner-
-        #     class failures as INFRA waivers for this flag).
-        # When master-off, contract consultation is a no-op — behavior
-        # is byte-identical to pre-9.2.
-        outcome_str, runner_attributed, class_notes = (
-            self._maybe_apply_contract(
-                chosen, summary,
+        # Sovereign Telemetry Unification (2026-06-15) — when the Arbiter
+        # is enabled (AND contract consultation is on), route the legacy
+        # classification + harvester Metrics through the GraduationContract
+        # Arbiter (recovery override / anomaly guard / Metrics-aware
+        # predicate / blocklist). Otherwise fall back to the Phase 9.2
+        # summary-only contract refinement — byte-identical legacy path.
+        telemetry_payload: Optional[Dict[str, Any]] = None
+        if _telemetry_arbiter_active():
+            (
+                outcome_str, runner_attributed, class_notes,
+                telemetry_payload,
+            ) = self._apply_telemetry_arbiter(
+                chosen, summary, debug_tail or "",
                 outcome_str, runner_attributed, class_notes,
             )
-        )
+        else:
+            # Phase 9.2 — consult per-flag GraduationContract (opt-in via
+            # JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT). When master-off,
+            # contract consultation is a no-op — behavior is byte-identical
+            # to pre-9.2.
+            outcome_str, runner_attributed, class_notes = (
+                self._maybe_apply_contract(
+                    chosen, summary,
+                    outcome_str, runner_attributed, class_notes,
+                )
+            )
         # Build evidence row.
         session_id = str(summary.get("session_id") or "unknown")
         cost_total = _safe_float(summary.get("cost_total"))
@@ -960,6 +1025,7 @@ class LiveFireSoakHarness:
             finished_at_epoch=finished_at_epoch,
             notes=class_notes[:MAX_NOTES_CHARS],
             runner_attributed_kind=runner_kind_value,
+            telemetry=telemetry_payload,
         )
         # Persist rich-evidence row.
         self._append_history_row(evidence)
@@ -1177,6 +1243,78 @@ class LiveFireSoakHarness:
                 class_notes + "|" + ",".join(notes_extra)
             )[:MAX_NOTES_CHARS]
         return (outcome_str, runner_attributed, class_notes)
+
+    def _apply_telemetry_arbiter(
+        self,
+        flag_name: str,
+        summary: Mapping[str, Any],
+        debug_text: str,
+        outcome_str: str,
+        runner_attributed: bool,
+        class_notes: str,
+    ) -> Tuple[str, bool, str, Optional[Dict[str, Any]]]:
+        """Sovereign Arbiter Protocol — fuse the legacy classify_outcome
+        stream with the harvester Metrics stream via the per-flag
+        GraduationContract, and synthesize the Unified Evidence Row
+        telemetry payload.
+
+        Composes the SHARED parse (``telemetry_parse.parse_metrics`` —
+        the exact parser the operator harvester uses, zero duplication)
+        and ``GraduationContract.arbitrate`` (recovery override / anomaly
+        guard / Metrics-aware predicate / blocklist). NEVER raises into
+        the run path — on any failure, returns the legacy tuple with a
+        ``None`` telemetry payload (degrades to pre-arbiter behavior)."""
+        try:
+            from backend.core.ouroboros.governance.graduation.telemetry_parse import (  # noqa: E501
+                parse_metrics,
+            )
+            from backend.core.ouroboros.governance.graduation.graduation_contract import (  # noqa: E501
+                get_contract,
+            )
+        except Exception:  # noqa: BLE001 — substrate unavailable
+            return (outcome_str, runner_attributed, class_notes, None)
+        try:
+            metrics = parse_metrics(
+                debug_text or "",
+                summary if isinstance(summary, dict) else None,
+            )
+        except Exception:  # noqa: BLE001
+            return (outcome_str, runner_attributed, class_notes, None)
+        legacy_outcome = outcome_str
+        try:
+            contract = get_contract(flag_name)
+            new_outcome, new_ra, new_notes = contract.arbitrate(
+                legacy_outcome=outcome_str,
+                runner_attributed=runner_attributed,
+                class_notes=class_notes,
+                summary=summary,
+                metrics=metrics,
+            )
+        except Exception:  # noqa: BLE001
+            new_outcome, new_ra, new_notes = (
+                outcome_str, runner_attributed, class_notes,
+            )
+        # Unified Evidence Row payload: legacy classification wrapped in
+        # the harvester trajectory context.
+        try:
+            fired = list(getattr(metrics, "livefire_fired", []) or [])[:16]
+            telemetry: Optional[Dict[str, Any]] = {
+                "livefire_fired": fired,
+                "routed_build": bool(getattr(metrics, "routed_build", False)),
+                "retried": bool(getattr(metrics, "retried", False)),
+                "recovered": bool(getattr(metrics, "recovered", False)),
+                "oom": bool(getattr(metrics, "oom", False)),
+                "gate_inert": bool(getattr(metrics, "gate_inert", False)),
+                "livefire_timeout": bool(
+                    getattr(metrics, "livefire_timeout", False),
+                ),
+                "legacy_outcome": legacy_outcome,
+                "arbiter_outcome": new_outcome,
+                "arbiter_changed_outcome": new_outcome != legacy_outcome,
+            }
+        except Exception:  # noqa: BLE001
+            telemetry = None
+        return (new_outcome, new_ra, new_notes, telemetry)
 
     def _truncate_failure_counts(
         self, raw: Mapping[str, Any],
@@ -1440,7 +1578,14 @@ def _read_most_recent_session(
                 text = debug_path.read_text(
                     encoding="utf-8", errors="replace",
                 )
-                debug_tail = text[-8192:]
+                # Sovereign Telemetry Unification (2026-06-15): the
+                # self-heal trajectory ([LiveFire] fail → failure_class
+                # =build → GENERATE_RETRY → state=applied) can span the
+                # whole log, so capture an env-tunable bounded slice
+                # rather than a hardcoded 8KB tail. The legacy
+                # classify_outcome only needs the tail; the Arbiter's
+                # parse_metrics needs the trajectory.
+                debug_tail = text[-_debug_log_capture_bytes():]
             except OSError:
                 debug_tail = ""
         if isinstance(summary, dict):

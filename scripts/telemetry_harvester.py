@@ -23,25 +23,31 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-SESSIONS_DIR = Path(".ouroboros/sessions")
+# Sovereign Telemetry Unification (2026-06-15): the pure parse now lives in
+# an importable backend module so the Live-Fire Graduation Soak substrate can
+# reuse THE SAME parse — zero duplication, zero drift. This script keeps its
+# own concerns (certify verdict, render, async watcher, CLI) and re-imports
+# the pure parse. CLI behavior is byte-identical.
+#
+# Path bootstrap: cron/operator invokes this script directly, so ensure the
+# repo root is importable before the backend import.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# ── grounded log patterns (verified against real debug.log + the deployed wiring) ────────
-_RE_PHASE = re.compile(r"phase=[A-Z_]+")
-_RE_LIVEFIRE_FAIL = re.compile(r"\[LiveFire\] candidate FAILED live-fire boot:\s*(\S+)")
-_RE_FAILCLASS_BUILD = re.compile(r"failure_class[=:][\"']?build\b")
-_RE_RETRY = re.compile(r"GENERATE_RETRY|VALIDATE_RETRY")
-_RE_RECOVERED = re.compile(r"state=applied|state=complete|phase=COMPLETE")
-_RE_GATE_INERT = re.compile(r"GATE INERT")
-_RE_TIMEOUT = re.compile(r"LiveFireTimeout|live-fire exceeded")
-_RE_OOM = re.compile(r"process_memory_cap|MemoryError|\bOOM\b|emergency_brake|memory_pressure_changed.*(critical|emergency)")
-_TERMINAL_OUTCOMES = {"complete", "incomplete_kill"}
+from backend.core.ouroboros.governance.graduation.telemetry_parse import (  # noqa: E402
+    Metrics,
+    _TERMINAL_OUTCOMES,
+    parse_metrics,
+)
+
+SESSIONS_DIR = Path(".ouroboros/sessions")
 
 # verdicts
 FIELD_CERTIFIED = "FIELD_CERTIFIED"
@@ -51,56 +57,10 @@ INCOMPLETE = "INCOMPLETE"
 
 
 @dataclass
-class Metrics:
-    # A — deployment integrity
-    booted: bool = False
-    boot_check_passed: int = 0           # from optional deployer stdout
-    boot_check_failed: bool = False
-    # B — live-fire trajectory
-    livefire_fired: List[str] = field(default_factory=list)   # exception types caught
-    routed_build: bool = False
-    retried: bool = False
-    recovered: bool = False
-    # C — hardware/state
-    gate_inert: bool = False
-    livefire_timeout: bool = False
-    oom: bool = False
-    # termination
-    session_outcome: str = ""
-    stop_reason: str = ""
-    cost_total: Optional[float] = None
-    duration_s: Optional[float] = None
-
-
-@dataclass
 class CertResult:
     verdict: str
     headline: str
     reasons: List[str]
-
-
-def parse_metrics(log_text: str, summary: Optional[Dict], deployer_stdout: str = "") -> Metrics:
-    """Pure parse — grounded in real emitted strings. No side effects."""
-    m = Metrics()
-    m.booted = bool(_RE_PHASE.search(log_text))
-    m.boot_check_passed = deployer_stdout.count("BOOT CHECK PASSED")
-    m.boot_check_failed = "BOOT CHECK FAILED" in deployer_stdout
-
-    m.livefire_fired = _RE_LIVEFIRE_FAIL.findall(log_text)
-    m.routed_build = bool(_RE_FAILCLASS_BUILD.search(log_text))
-    m.retried = bool(_RE_RETRY.search(log_text))
-    m.recovered = bool(_RE_RECOVERED.search(log_text))
-
-    m.gate_inert = bool(_RE_GATE_INERT.search(log_text))
-    m.livefire_timeout = bool(_RE_TIMEOUT.search(log_text))
-    m.oom = bool(_RE_OOM.search(log_text))
-
-    if summary:
-        m.session_outcome = str(summary.get("session_outcome", ""))
-        m.stop_reason = str(summary.get("stop_reason", ""))
-        m.cost_total = summary.get("cost_total")
-        m.duration_s = summary.get("duration_s")
-    return m
 
 
 def certify(m: Metrics) -> CertResult:

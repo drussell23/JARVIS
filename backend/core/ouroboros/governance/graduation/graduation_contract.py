@@ -51,9 +51,10 @@ opt in via ``JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true``.
 """
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional
+from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple
 
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -65,8 +66,12 @@ MIN_RE_ARM_SECONDS: int = 60
 MAX_RE_ARM_SECONDS: int = 24 * 3600  # 24h ceiling
 
 
-# Predicate signature: takes a summary dict, returns True iff CLEAN.
-CleanPredicate = Callable[[Mapping[str, Any]], bool]
+# Predicate signature: ``(summary) -> bool`` OR ``(summary, metrics) -> bool``.
+# Both arities are supported; :meth:`GraduationContract.is_clean` dispatches by
+# inspecting the callable's positional arity. ``metrics`` is duck-typed (the
+# telemetry_parse.Metrics object) so this module stays import-light + stdlib-
+# only (no telemetry_parse import, no cycle).
+CleanPredicate = Callable[..., bool]
 
 
 def is_contract_consultation_enabled() -> bool:
@@ -77,6 +82,86 @@ def is_contract_consultation_enabled() -> bool:
     return os.environ.get(
         "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT", "",
     ).strip().lower() in _TRUTHY
+
+
+def is_telemetry_arbiter_enabled() -> bool:
+    """Master flag — ``JARVIS_LIVE_FIRE_TELEMETRY_ARBITER_ENABLED``
+    (default ``false``). Gates the Sovereign Arbiter Protocol: when on
+    (AND contract consultation is on AND harvester Metrics are available),
+    the substrate routes outcome classification through
+    :meth:`GraduationContract.arbitrate` instead of the summary-only
+    contract refinement. Off ⇒ byte-identical legacy behavior."""
+    return os.environ.get(
+        "JARVIS_LIVE_FIRE_TELEMETRY_ARBITER_ENABLED", "",
+    ).strip().lower() in _TRUTHY
+
+
+def _predicate_is_metrics_aware(predicate: CleanPredicate) -> bool:
+    """True iff ``predicate`` can accept a second positional ``metrics``
+    argument. Defensive: callables without an introspectable signature
+    (builtins, some C-level callables) fall back to legacy 1-arg.
+    NEVER raises."""
+    try:
+        sig = inspect.signature(predicate)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for p in sig.parameters.values():
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+        elif p.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True  # *args swallows metrics
+    return positional >= 2
+
+
+def _metrics_shows_full_recovery(metrics: Any) -> bool:
+    """Deterministic 'the system autonomously caught + healed' signal.
+
+    Requires the COMPLETE self-heal trajectory: a live-fire failure
+    fired, was routed back as a build fault, the op retried, and a
+    subsequent recovery state was observed — AND no OOM anomaly. Pure;
+    duck-typed; NEVER raises."""
+    if metrics is None:
+        return False
+    try:
+        fired = bool(getattr(metrics, "livefire_fired", None))
+        return (
+            fired
+            and bool(getattr(metrics, "routed_build", False))
+            and bool(getattr(metrics, "retried", False))
+            and bool(getattr(metrics, "recovered", False))
+            and not bool(getattr(metrics, "oom", False))
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+def _is_positive_int_value(v: Any) -> bool:
+    """True iff ``v`` coerces to an int > 0. Pure; NEVER raises."""
+    try:
+        return int(v) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _metrics_anomaly(metrics: Any) -> Optional[str]:
+    """Return a structured anomaly tag iff a hard hardware/wiring
+    invariant was violated (``oom`` / ``gate_inert``), else None. These
+    DISQUALIFY a CLEAN classification (P1, highest priority). Pure;
+    NEVER raises."""
+    if metrics is None:
+        return None
+    try:
+        if bool(getattr(metrics, "oom", False)):
+            return "oom"
+        if bool(getattr(metrics, "gate_inert", False)):
+            return "gate_inert"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +291,45 @@ def predicate_requires_curiosity_hypothesis(
     return _session_ops_count(summary) >= 1
 
 
+def predicate_requires_live_kernel_validation(
+    summary: Mapping[str, Any],
+    metrics: Any = None,
+) -> bool:
+    """Capstone Dogfood predicate for ``JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED``.
+
+    The LiveKernelValidator's OWN graduation demands the highest evidence
+    bar — proof from the harvester telemetry that the validator actually
+    exercised its self-heal path on this session, not merely that the
+    session completed. Metrics-aware (2-arg) signature.
+
+    CLEAN iff ALL hold:
+      * default clean (``session_outcome=='complete'``, no runner faults)
+      * ``metrics.livefire_fired``  — a live-fire test executed (≥1 catch)
+      * NOT ``metrics.oom``         — zero OOM anomalies (16GB invariant)
+      * ``metrics.recovered``       — the candidate was successfully
+        processed (state=applied/complete observed)
+
+    When metrics are unavailable (arbiter off / no telemetry), falls back
+    to the default predicate so the contract degrades gracefully rather
+    than blocking graduation on missing instrumentation. Pure; NEVER
+    raises."""
+    if not default_clean_predicate(summary):
+        return False
+    if metrics is None:
+        # No telemetry stream — cannot prove self-heal; defer to default
+        # (deployment proven). The arbiter only routes here when Metrics
+        # exist, so production graduation still demands the full bar.
+        return True
+    try:
+        return (
+            bool(getattr(metrics, "livefire_fired", None))
+            and not bool(getattr(metrics, "oom", False))
+            and bool(getattr(metrics, "recovered", False))
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Contract dataclass
 # ---------------------------------------------------------------------------
@@ -237,15 +361,113 @@ class GraduationContract:
                 self, "re_arm_after_runner_seconds", clamped,
             )
 
-    def is_clean(self, summary: Mapping[str, Any]) -> bool:
+    def is_clean(
+        self,
+        summary: Mapping[str, Any],
+        metrics: Any = None,
+    ) -> bool:
         """Run the contract's clean predicate. Falls back to
-        ``default_clean_predicate`` when none registered. NEVER
+        ``default_clean_predicate`` when none registered.
+
+        Dual-signature dispatch: a ``(summary, metrics)`` predicate
+        receives the harvester Metrics; a legacy ``(summary)`` predicate
+        is called with summary only (metrics ignored safely). NEVER
         raises."""
         predicate = self.clean_predicate or default_clean_predicate
         try:
+            if _predicate_is_metrics_aware(predicate):
+                return bool(predicate(summary, metrics))
             return bool(predicate(summary))
         except Exception:  # noqa: BLE001 — defensive
             return False
+
+    def arbitrate(
+        self,
+        *,
+        legacy_outcome: str,
+        runner_attributed: bool,
+        class_notes: str,
+        summary: Mapping[str, Any],
+        metrics: Any,
+    ) -> Tuple[str, bool, str]:
+        """Sovereign Arbiter — resolve the legacy classify_outcome stream
+        against the harvester Metrics stream via a deterministic priority
+        matrix. Returns the synthesized ``(outcome, runner_attributed,
+        notes)``. Pure; NEVER raises into the caller.
+
+        Priority (a later rule can only TIGHTEN, never resurrect CLEAN
+        once an anomaly pulled it down):
+
+          P2 recovery override : legacy error + full self-heal -> CLEAN
+          P1 anomaly guard     : oom / gate_inert  -> CLEAN forbidden (INFRA)
+          P3 metrics predicate : CLEAN but contract predicate False -> RUNNER
+          P4 blocklist override: RUNNER -> INFRA waiver
+
+        ``metrics is None`` degrades gracefully to the legacy summary-only
+        contract refinement (recovery/anomaly steps skip)."""
+        outcome = str(legacy_outcome)
+        ra = bool(runner_attributed)
+        extra: list[str] = []
+        try:
+            # --- P2: autonomous-recovery override --------------------
+            # A legacy infra/runner verdict that the system PROVABLY
+            # caught + healed is actually a success. Recovery > static
+            # error.
+            if (
+                outcome in ("infra", "runner")
+                and _metrics_shows_full_recovery(metrics)
+            ):
+                outcome = "clean"
+                ra = False
+                extra.append("arbiter_recovery_override")
+
+            # --- P1: anomaly guard (dominates CLEAN) -----------------
+            # A hardware/wiring invariant violation can NEVER be CLEAN,
+            # even post-recovery-override. Downgrades to INFRA waiver
+            # (environmental fault, not feature fault).
+            if outcome == "clean":
+                anomaly = _metrics_anomaly(metrics)
+                if anomaly is not None:
+                    outcome = "infra"
+                    ra = False
+                    extra.append(f"arbiter_anomaly_{anomaly}")
+
+            # --- P3: metrics-aware predicate downgrade ---------------
+            # The contract gets the LAST word on whether a CLEAN session
+            # actually exercised the feature (now Metrics-aware).
+            if outcome == "clean" and self.clean_predicate is not None:
+                if not self.is_clean(summary, metrics):
+                    outcome = "runner"
+                    ra = True
+                    extra.append("contract_metrics_predicate_downgraded")
+
+            # --- P4: legacy blocklist override (RUNNER -> INFRA) ------
+            if outcome == "runner" and self.failure_class_blocklist_overrides:
+                failure_counts = {}
+                if isinstance(summary, Mapping):
+                    failure_counts = summary.get("failure_class_counts") or {}
+                if isinstance(failure_counts, dict):
+                    positive = {
+                        k for k, v in failure_counts.items()
+                        if _is_positive_int_value(v)
+                    }
+                    if positive and positive.issubset(
+                        self.failure_class_blocklist_overrides,
+                    ):
+                        outcome = "infra"
+                        ra = False
+                        extra.append(
+                            "contract_blocklist_upgraded_runner_to_infra",
+                        )
+        except Exception:  # noqa: BLE001 — arbiter NEVER raises
+            return (str(legacy_outcome), bool(runner_attributed), class_notes)
+
+        notes = class_notes
+        if extra:
+            notes = (notes + "|" + ",".join(extra)) if notes else "|".join(
+                extra,
+            )
+        return (outcome, ra, notes)
 
     def to_metadata_dict(self) -> Dict[str, Any]:
         """Serializable view (predicate not included — predicates
@@ -316,6 +538,23 @@ _BUILT_IN_CONTRACTS: Dict[str, GraduationContract] = {
             "as CLEAN — defends against engine-not-fired sessions."
         ),
     ),
+    # Capstone Dogfood Contract (Sovereign Telemetry Unification,
+    # 2026-06-15). The LiveKernelValidator is the live-fire boot check
+    # whose self-heal trajectory the telemetry harvester measures — so
+    # its graduation is gated on harvester-PROVEN evidence that it fired,
+    # did not OOM, and recovered. Metrics-aware predicate (2-arg). This
+    # closes the loop: the validator graduates only when the telemetry
+    # that watches it proves it works.
+    "JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED": GraduationContract(
+        flag_name="JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED",
+        clean_predicate=predicate_requires_live_kernel_validation,
+        description=(
+            "LiveKernelValidator may only graduate when harvester "
+            "telemetry proves a live-fire test executed, ZERO OOM "
+            "anomalies occurred, and the candidate was successfully "
+            "processed (self-heal recovered)."
+        ),
+    ),
 }
 
 
@@ -368,7 +607,9 @@ __all__ = [
     "get_contract",
     "has_custom_contract",
     "is_contract_consultation_enabled",
+    "is_telemetry_arbiter_enabled",
     "known_contract_flags",
     "predicate_requires_curiosity_hypothesis",
     "predicate_requires_decision_trace_rows",
+    "predicate_requires_live_kernel_validation",
 ]
