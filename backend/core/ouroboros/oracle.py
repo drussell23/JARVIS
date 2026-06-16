@@ -188,6 +188,15 @@ class OracleConfig:
         # dir (swe_bench checkouts, session telemetry, locks) — never source
         # to index. Substring ``.jarvis`` covers the entire subtree.
         ".jarvis",
+        # Slice 257 — Claude Code's agent worktrees live under
+        # ``.claude/worktrees/<name>`` (each a full 29k-file checkout). The
+        # ``.worktrees`` pattern above does NOT match ``.claude/worktrees``
+        # (slash, not dot), so the Oracle recursed into all of them and
+        # ast-parsed 6× the tree → process-pool saturation → loop
+        # starvation → stale heartbeat → ExternalWatchdog SIGKILL
+        # (bt-2026-06-16-042304, exit 137). ``.claude`` is tooling state,
+        # never source to index — substring covers the whole subtree.
+        ".claude",
     ]
 
     # File types to index
@@ -218,6 +227,41 @@ def _is_oracle_legacy_thread_mode() -> bool:
     / unset / unrecognized → False (new path active)."""
     raw = os.environ.get(_ORACLE_LEGACY_THREAD_MODE_ENV, "").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _is_linked_git_worktree(path: Path) -> bool:
+    """Return True iff ``path`` is the root of a *linked* git worktree.
+
+    Slice 257 — the static EXCLUDE_PATTERNS substring list can only catch
+    worktrees whose parent directory we already know to name (``.worktrees``,
+    ``.claude``, ``.jarvis/.../worktrees``). This is the general guard for any
+    future ``git worktree add`` location, with no hardcoded names.
+
+    The discriminator is exact, not heuristic: ``git worktree add`` creates a
+    ``.git`` **file** holding ``gitdir: <path>`` — never a directory. So:
+
+      * linked worktree  → ``<dir>/.git`` is a FILE   → skip (duplicate
+        checkout, 0 files tracked by the main repo)
+      * embedded clone /
+        first-class source → ``<dir>/.git`` is a DIR  → DO NOT skip
+        (e.g. ``backend/vision`` is a stray nested repo but its 229 ``.py``
+        files are tracked source the organism reasons about)
+      * the main repo root → ``.git`` is a DIR        → never skipped
+
+    Indexing 6× duplicate worktree checkouts is what saturated the process
+    pool, starved the asyncio loop, and tripped the ExternalWatchdog SIGKILL
+    in bt-2026-06-16-042304. Targeting *only* the file-``.git`` case removes
+    that load without dropping any real source from the index.
+
+    Fail-soft by construction: any OSError (permission, race, odd path) is
+    swallowed and treated as "not a worktree", so the guard can only ever
+    *add* exclusions for true linked worktrees — never crash the walk or skip
+    legitimate source.
+    """
+    try:
+        return (path / ".git").is_file()
+    except OSError:
+        return False
 
 
 # Slice 33 Arc 2 Phase 3 — async graph-write queue master switch.
@@ -2309,6 +2353,15 @@ class TheOracle:
                     if should_exclude(item):
                         continue
                     if item.is_dir():
+                        # Slice 257 — never descend into a linked git worktree
+                        # (a duplicate checkout whose files are not tracked
+                        # source). General, no-hardcoding guard that catches
+                        # any future `git worktree add` location the static
+                        # EXCLUDE_PATTERNS list does not yet name, while
+                        # preserving embedded clones that ARE real source
+                        # (e.g. backend/vision).
+                        if _is_linked_git_worktree(item):
+                            continue
                         scan_dir(item)
                     elif item.suffix in OracleConfig.SUPPORTED_EXTENSIONS:
                         python_files.append(item)

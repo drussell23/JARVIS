@@ -262,6 +262,27 @@ class SignalCollector:
             return []
         return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
 
+    def _git_head(self) -> str:
+        """Sync ``git rev-parse HEAD`` — the cheap cache anchor.
+
+        Slice 257 — paired with :meth:`_git_subjects` for the off-loop
+        ``commit_ratios_async`` path. Runs in the dedicated
+        ``fs_signal_executor`` thread, so even a slow fork (large
+        multi-threaded process) blocks a worker, never the event loop.
+        Returns "" on any failure so a stale value can't pin the cache.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self._root), capture_output=True, text=True,
+                timeout=2.0, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
     async def _git_subjects_async(self, n: int) -> List[str]:
         """Slice 33 Arc 2 Phase 1 — async git subprocess.
 
@@ -372,25 +393,34 @@ class SignalCollector:
         }
 
     async def commit_ratios_async(self) -> Dict[str, float]:
-        """Slice 33 Arc 2 Phase 1 — async-native commit ratios.
+        """Async commit ratios — git work offloaded to a worker thread.
 
-        Same semantics as sync :meth:`commit_ratios`, but the git log
-        runs via ``create_subprocess_exec`` — no thread-pool slot
-        consumed even during cold-cache 18 s scans.
+        Slice 257 (bt-2026-06-16-052242, 108.9s loop wedge → near-fatal
+        heartbeat-stale SIGKILL): the previous implementation resolved HEAD
+        and the 100-commit ``git log`` via ``asyncio.create_subprocess_exec``,
+        which forks/execs the child **on the event-loop thread**. From the
+        large, multi-threaded organism process — concurrent with the Oracle
+        process pool forking 16 cold-index workers — that fork blocked the
+        loop synchronously for 33–108s (the ``git log`` query itself is
+        0.14s; the cost is the fork, not the work). Because the block is
+        synchronous and yield-less, the 30s collector ``wait_for`` could not
+        cancel it and ``ControlPlaneStarvation`` stayed silent — the heartbeat
+        froze and the 120s external watchdog SIGKILLed the session.
 
-        Slice 52 Phase 2 — reactive cache: a cheap ``git rev-parse HEAD``
-        gate short-circuits the 100-commit ``git log`` whenever HEAD has
-        not advanced since the last computation (the common case at the
-        300s cadence — this is what was costing up to 9.8s/cycle in v46).
-        Recomputes when HEAD moves; never caches when HEAD is unresolvable
-        so a stale value can't pin the posture.
+        The fix runs the git calls in the dedicated ``fs_signal_executor``
+        (the pool the other fs-backed signals already use). A slow fork now
+        blocks a worker thread, never the loop, so the heartbeat keeps
+        beating. ``subprocess.run`` timeouts (2s HEAD / 5s log) still bound
+        the work; the Slice 52 HEAD-cache short-circuit is preserved.
         """
+        loop = asyncio.get_running_loop()
+        executor = _get_fs_signal_executor()
         window = commit_window()
-        head = await self._git_head_async()
+        head = await loop.run_in_executor(executor, self._git_head)
         cache = self._commit_ratios_cache
         if head and cache is not None and cache[0] == head and cache[1] == window:
             return dict(cache[2])
-        subjects = await self._git_subjects_async(window)
+        subjects = await loop.run_in_executor(executor, self._git_subjects, window)
         ratios = self._compute_commit_ratios(subjects)
         if head:
             self._commit_ratios_cache = (head, window, dict(ratios))

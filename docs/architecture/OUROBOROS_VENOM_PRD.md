@@ -1,6 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.27 (2026-06-12 — **§51.11.34 added — Soak Reliability + Token-Economic Arc (Slices 217-224)** (five-layer onion: funding->sleep->Aegis-token-1h-expiry->stale-ledger-hostage->sensor-self-DDoS; audited soak spend ~$1.90 not $26; P2a cache + /spend + $2/h rail COMPLETE; BLUNT: cost solved, file-00 still won't dispatch -> autonomy blocker is non-economic; roadmap A1 trace-dispatch > A2 QoS > B1 Claude-Batch > B2 compression > B3 UCCI-calibration > C1 /session/refresh > C2 non-sleeping-host). — full version history in OUROBOROS_VENOM_PRD_HISTORY.md)
+**Version**: 3.28 (2026-06-15 — **§3.8 added — Slice 257 Battle-Test Loop-Starvation Hardening** (first clean `session_outcome=complete` after a wave of `heartbeat_stale` SIGKILLs: four event-loop / shutdown / telemetry wedges fixed — Oracle over-indexing `.claude/worktrees` (29.5k duplicate `.py`), posture `commit_ratios` forking git ON the loop thread (108s block), Oracle shutdown cache-write wedge, harvester false-positive OOM; 41 regression tests green; merged to main). — see §3.7 below)
+>
+> 3.27 (2026-06-12 — **§51.11.34 added — Soak Reliability + Token-Economic Arc (Slices 217-224)** (five-layer onion: funding->sleep->Aegis-token-1h-expiry->stale-ledger-hostage->sensor-self-DDoS; audited soak spend ~$1.90 not $26; P2a cache + /spend + $2/h rail COMPLETE; BLUNT: cost solved, file-00 still won't dispatch -> autonomy blocker is non-economic; roadmap A1 trace-dispatch > A2 QoS > B1 Claude-Batch > B2 compression > B3 UCCI-calibration > C1 /session/refresh > C2 non-sleeping-host). — full version history in OUROBOROS_VENOM_PRD_HISTORY.md)
 
 > **📑 This PRD is split across four files (the single doc grew past GitHub's render limit).**
 > - **`OUROBOROS_VENOM_PRD.md`** (this file) — the core spec: §1–§23 + Table of Contents.
@@ -886,6 +888,26 @@ These five are in addition to the four primary picks (Kimi-K2.6, GLM-5.1, Qwen3.
 - **Slice 6**: 24h soak validation + flag-default flip + lock in cost-per-op trending downward.
 
 See §9 Phase 10 for the full slice-by-slice plan.
+
+---
+
+### 3.8 Slice 257 — Battle-Test Loop-Starvation Hardening *(NEW 2026-06-15)*
+
+**The first clean `session_outcome=complete` after a wave of `heartbeat_stale` SIGKILLs.** Battle-test sessions kept finalizing as `in_flight` instead of `complete` because the out-of-process `ExternalWatchdog` SIGKILLed the process (`exit 137`, `reason=heartbeat_stale`) whenever the main asyncio loop starved long enough (≥120s, `JARVIS_EXTERNAL_WATCHDOG_STALE_S`) to freeze the on-loop heartbeat tick — so `_generate_report` (the only path that stamps `session_outcome=complete`) never ran. Forensic root-cause work across `bt-2026-06-16-042304 / 050048 / 052242 / 060619` isolated **four distinct wedges**, each unmasking the next. The deterministic fixes (no brute-force, no retries):
+
+1. **Oracle over-indexed `.claude/worktrees`.** `oracle.py::_find_python_files.should_exclude()` substring-matches `OracleConfig.EXCLUDE_PATTERNS`; the existing `.worktrees` entry never matched `.claude/worktrees` (slash, not dot), so the Oracle recursed into all of Claude Code's agent worktrees — **29,558 duplicate `.py` (~6× the 6,051-file real tree)** — and ast-parsed them every cycle, saturating the process pool and blocking the loop ~73s.
+   - **Fix:** add `.claude` to `EXCLUDE_PATTERNS` *and* the miner's `_WALK_PRUNE_SEGMENTS`; plus a general, no-hardcoding guard `_is_linked_git_worktree(path)` — the walk skips any directory whose `.git` is a **file** (`git worktree add` creates a `gitdir:` pointer file), catching every future worktree location while preserving embedded clones whose `.git` is a **directory** and whose files are real tracked source (e.g. `backend/vision`'s 229 `.py`).
+2. **Posture `commit_ratios` forked git ON the event-loop thread.** `posture_observer.py::commit_ratios_async` resolved HEAD + the 100-commit `git log` via `asyncio.create_subprocess_exec`, which forks/execs the child on the loop thread. From the large multi-threaded organism process — concurrent with the Oracle cold-index forking 16 workers — that fork blocked the loop **33–108s** (`git log` itself is 0.14s; the cost is the *fork*, not the query). The block is synchronous and yield-less, so the 30s collector `wait_for` could not cancel it and `ControlPlaneStarvation` stayed silent; 108.9s came within ~11s of the SIGKILL.
+   - **Fix:** run the git calls in the dedicated `fs_signal_executor` (the pool the other fs-backed posture signals already use) so a slow fork blocks a worker thread, never the loop. The Slice 52 HEAD-cache short-circuit and `subprocess.run` timeouts are preserved. After: `ControlPlaneStarvation 0`, heartbeat fresh, no SIGKILL.
+3. **Shutdown wedged on the Oracle cache write.** `_shutdown_components` → Oracle `_write_cache_blocking` (`cache_path.write_bytes` of the graph cache) cannot be interrupted by its 5s deadline (blocking C-level write), exceeding the 30s `BoundedShutdownWatchdog` → `os._exit(75)` before `_generate_report`. Mitigated operationally for soaks via the **existing designed flag** `JARVIS_ORACLE_SHUTDOWN_DEADLINE_S=0` (skips the shutdown cache save; rebuilds next boot). *Follow-up: make the cache write bounded/interruptible.*
+4. **Harvester false-positive OOM.** `graduation/telemetry_parse.py::_RE_OOM` matched bare `process_memory_cap`/`OOM`, which also matched the `ProcessMemoryWatchdog` *arming* line ("armed: … stop_reason=process_memory_cap before OS OOM-kill") — so a clean `wall_clock_cap` stop at `rss=555MB` (cap 12288MB) was mis-verdicted ANOMALY/OOM. **Fix:** match the genuine *fire* (`stopping: process_memory_cap`) + `MemoryError`/`emergency_brake`/critical-pressure, plus OR the authoritative `summary.stop_reason == "process_memory_cap"`.
+
+**Evidence:** `bt-2026-06-16-063106` → `session_outcome=complete`, `stop_reason=wall_clock_cap`, `dur=759s`, **0 new infra-noise classes** (only `cancelled_shutdown`, a baseline class). `telemetry_harvester.py` report — Metric A `booted=True`; Metric B all-false (self-heal UNEXERCISED — no kernel-touching candidate reached the default-off live-fire gate); Metric C all-false (`gate_inert=False / livefire_timeout=False / oom=False`); verdict OPERATIONAL_UNEXERCISED. **41 regression tests green** (`test_slice257_claude_worktree_exclusion`, `test_slice257_posture_git_offloop`, `test_telemetry_harvester`, `test_slice49_scanner_exclusions`, `test_slice44_worktree_reaper`).
+
+**Operational notes (load-bearing for future soaks):**
+- The autonomous organism resets the shared checkout to `origin/main` mid-run — **commit fixes to a branch (or isolate in a worktree) before running the battle test**; running *from* the fix branch keeps it active (the harness branches `ouroboros/battle-test/<ts>` from current HEAD).
+- The battle test needs unsandboxed socket bind (Aegis IPC daemon) + provider network.
+- Claude (Tier-1 fallback) being out of credit is the 3-tier failback case; leave it **enabled** — `JARVIS_PROVIDER_CLAUDE_DISABLED=true` removes the fallback DW model-dispatch needs (`sentinel_dispatch_no_fallback` churn). DW (Tier-0 primary) carries the load; the Claude economic breaker trips fast and demotes IMMEDIATE→STANDARD→DW.
 
 ---
 
