@@ -374,5 +374,134 @@ def test_oracle_on_migrates_legacy_pickle_on_first_load(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+# --------------------------------------------------------------------------- Phase 2 hot path
+def test_write_txn_rolls_back_on_error(tmp_path):
+    """ACID guard: an exception inside `_write_txn` rolls the whole batch back to the last
+    clean commit — no partial/orphaned rows survive."""
+    async def run():
+        g = _build_graph(3)
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(_state_from_graph(g))
+        n0 = (await prov.load()).graph.number_of_nodes()
+        conn = await prov._conn_or_open()
+        with pytest.raises(RuntimeError):
+            async with prov._write_txn(conn):
+                await conn.execute("DELETE FROM nodes")   # destructive...
+                raise RuntimeError("boom mid-batch")        # ...then blow up
+        after = await prov.load()
+        await prov.close()
+        assert after.graph.number_of_nodes() == n0          # rolled back, nothing lost
+    asyncio.run(run())
+
+
+def test_upsert_files_is_repo_scoped(tmp_path):
+    """Two repos sharing a relative path must not clobber each other on per-file dirty replace."""
+    import networkx as nx
+
+    def one(repo, rel, name):
+        g = nx.DiGraph()
+        nid = NodeID(repo=repo, file_path=rel, name=name, node_type=NodeType.FUNCTION, line_number=1)
+        g.add_node(str(nid), **NodeData(node_id=nid).to_dict())
+        return g
+
+    async def run():
+        # seed: repo A and repo B both own "shared.py"
+        combined = nx.compose(one("A", "shared.py", "a_fn"), one("B", "shared.py", "b_fn"))
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(P.GraphState(graph=combined))
+        # re-index ONLY repo A's shared.py (replace a_fn -> a_fn2)
+        await prov.upsert_files({
+            "shared.py": {
+                "repo": "A",
+                "hash_key": "A:shared.py",
+                "source_hash": "newA",
+                "node_rows": list(P._iter_node_rows(one("A", "shared.py", "a_fn2"))),
+                "edge_rows": [],
+            }
+        })
+        loaded = await prov.load()
+        await prov.close()
+        keys = set(loaded.graph.nodes)
+        assert "B:shared.py:b_fn" in keys      # repo B untouched
+        assert "A:shared.py:a_fn2" in keys     # repo A replaced
+        assert "A:shared.py:a_fn" not in keys  # old A node gone
+    asyncio.run(run())
+
+
+def test_upsert_files_hash_key_distinct_from_file_path(tmp_path):
+    """file_hashes is keyed by the Oracle cache_key (repo:relative) while nodes.file_path is the
+    bare relative path — the upsert must honor both via `hash_key`."""
+    import networkx as nx
+
+    def one(repo, rel, name):
+        g = nx.DiGraph()
+        nid = NodeID(repo=repo, file_path=rel, name=name, node_type=NodeType.FUNCTION, line_number=1)
+        g.add_node(str(nid), **NodeData(node_id=nid).to_dict())
+        return g
+
+    async def run():
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.upsert_files({
+            "pkg/mod.py": {
+                "repo": "jarvis", "hash_key": "jarvis:pkg/mod.py", "source_hash": "h1",
+                "node_rows": list(P._iter_node_rows(one("jarvis", "pkg/mod.py", "f"))),
+                "edge_rows": [],
+            }
+        })
+        loaded = await prov.load()
+        await prov.close()
+        assert loaded.file_hashes == {"jarvis:pkg/mod.py": "h1"}   # cache_key form preserved
+    asyncio.run(run())
+
+
+def test_extraction_helpers(tmp_path):
+    g = _build_graph(2)._graph
+    keys = list(g.nodes)[:2]
+    nrows = P.node_rows_for_keys(g, keys)
+    erows = P.edge_rows_for_keys(g, keys)
+    assert len(nrows) == 2
+    assert all(r[0] in keys for r in nrows)
+    assert all(r[0] in keys for r in erows)  # only OUTGOING edges from the given keys
+
+
+def test_oracle_incremental_checkpoint_extracts_and_commits(monkeypatch, tmp_path):
+    """The Oracle's `_sqlite_incremental_checkpoint` extracts the batch's files from the live graph
+    and commits them incrementally (no full rewrite)."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
+    from backend.core.ouroboros.oracle import TheOracle
+
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path",
+                        staticmethod(lambda: tmp_path / "oracle.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path",
+                        staticmethod(lambda: tmp_path / "codebase_graph.pkl"))
+
+    async def run():
+        o = TheOracle()
+        # populate the live graph as if a batch had been indexed
+        g = _build_graph(3)
+        o._graph = g
+        o._file_hashes = {f"jarvis:backend/pkg/module_{f}.py": f"h{f}" for f in range(3)}
+        o._graph_write_queue = None  # queue disabled → drain is a no-op
+        batch = [tmp_path / "repo" / "backend/pkg/module_0.py",
+                 tmp_path / "repo" / "backend/pkg/module_1.py"]
+        commit_ms = await o._sqlite_incremental_checkpoint(batch, "jarvis", tmp_path / "repo")
+        assert commit_ms >= 0.0
+        prov = o._persistence_provider()
+        loaded = await prov.load()
+        await prov.close()
+        # only module_0 + module_1 committed (2 files x 2 nodes). module_2 is NOT a committed row
+        # — it only appears as an in-memory STUB (no node_id attr) auto-vivified from module_1's
+        # cross-file edge on load; it gains a real row only when module_2 is itself indexed.
+        assert loaded is not None
+        files = {
+            loaded.graph.nodes[k]["node_id"]["file_path"]
+            for k in loaded.graph.nodes if "node_id" in loaded.graph.nodes[k]
+        }
+        assert "backend/pkg/module_0.py" in files
+        assert "backend/pkg/module_1.py" in files
+        assert "backend/pkg/module_2.py" not in files  # not committed — only an edge-target stub
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

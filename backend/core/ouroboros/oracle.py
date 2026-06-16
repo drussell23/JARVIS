@@ -2315,7 +2315,14 @@ class TheOracle:
                    f"{self._graph._metrics['total_nodes']} nodes, "
                    f"{self._graph._metrics['total_edges']} edges")
 
-        await self._save_cache()
+        # Persist. When SQLite is on, every batch already committed its files incrementally, so a
+        # final whole-graph rewrite would be redundant (and re-introduce the monolithic write we
+        # eliminated) — flush only the metrics meta row. Legacy pickle path takes the full save.
+        from backend.core.ouroboros import oracle_persistence as _op_fi
+        if _op_fi.sqlite_persistence_enabled():
+            await self._sqlite_persist_metrics()
+        else:
+            await self._save_cache()
 
         # Embed all nodes into semantic index (fault-isolated)
         try:
@@ -2379,6 +2386,83 @@ class TheOracle:
         except Exception:  # noqa: BLE001
             return 0.0
 
+    async def _drain_graph_write_queue(self, timeout_s: float = 30.0) -> None:
+        """Bounded wait until the async graph-write consumer has APPLIED all enqueued writes, so a
+        subsequent read of the live graph reflects the just-submitted batch. No-op when the queue
+        is disabled (legacy inline-write path). Never raises."""
+        q = self._graph_write_queue
+        if q is None:
+            return
+        try:
+            await asyncio.wait_for(q.join(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Oracle] graph-write queue drain exceeded %.1fs — checkpoint may lag a batch",
+                timeout_s,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _sqlite_incremental_checkpoint(
+        self, batch_files: List[Path], repo_name: str, repo_path: Path,
+    ) -> float:
+        """Phase-2 incremental hot path. Drains the graph-write queue so the batch's nodes are
+        materialized, extracts per-file rows from the live graph, and commits ONLY this batch's
+        dirty files in one ACID transaction via ``upsert_files`` — *every commit is a checkpoint*,
+        replacing the monolithic per-batch rewrite that caused cold-index starvation.
+
+        Returns the commit wall-time in ms (fed into the AIMD throttle as a disk-I/O-latency
+        signal). Fail-soft: a checkpoint failure NEVER breaks the index."""
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        prov = self._persistence_provider()
+        if prov is None or not hasattr(prov, "upsert_files"):
+            return 0.0
+        try:
+            await self._drain_graph_write_queue()
+            records: Dict[str, Dict[str, Any]] = {}
+            for fp in batch_files:
+                try:
+                    rel = str(fp.relative_to(repo_path))
+                except ValueError:
+                    rel = str(fp)
+                cache_key = f"{repo_name}:{rel}"
+                # _file_index is keyed by bare relative path; filter to THIS repo's node keys
+                # (node_key == "repo:relative:name") so a relative path shared across repos
+                # doesn't cross-contaminate the per-file dirty replace.
+                keys = [
+                    k for k in self._graph._file_index.get(rel, ())
+                    if k.startswith(repo_name + ":")
+                ]
+                if not keys:
+                    continue
+                records[rel] = {
+                    "repo": repo_name,
+                    "hash_key": cache_key,
+                    "source_hash": self._file_hashes.get(cache_key, ""),
+                    "node_rows": _op.node_rows_for_keys(self._graph._graph, keys),
+                    "edge_rows": _op.edge_rows_for_keys(self._graph._graph, keys),
+                }
+            if not records:
+                return 0.0
+            t0 = time.monotonic()
+            await prov.upsert_files(records)
+            return (time.monotonic() - t0) * 1000.0
+        except Exception as exc:  # noqa: BLE001 — durability is best-effort, never break the index
+            logger.warning("[Oracle] sqlite incremental checkpoint failed (non-fatal): %s", exc)
+            return 0.0
+
+    async def _sqlite_persist_metrics(self) -> None:
+        """Flush ONLY the metrics meta row at end of a full index — the nodes/edges were already
+        persisted incrementally per batch, so this avoids a redundant whole-graph rewrite."""
+        prov = self._persistence_provider()
+        if prov is None or not hasattr(prov, "set_meta"):
+            return
+        try:
+            await prov.set_meta("metrics", json.dumps(self._graph._metrics or {}))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Oracle] sqlite metrics flush failed (non-fatal): %s", exc)
+
     async def _index_repository(self, repo_name: str, repo_path: Path) -> None:
         """Index all Python files in a repository."""
         logger.info(f"Indexing repository: {repo_name} at {repo_path}")
@@ -2440,6 +2524,11 @@ class TheOracle:
             if _oracle_backpressure_enabled()
             else None
         )
+        # Phase 2 — when SQLite persistence is on, the per-batch checkpoint becomes an INCREMENTAL
+        # upsert of just this batch's files (every commit is a checkpoint) instead of a monolithic
+        # whole-graph rewrite. The commit window IS the adaptive AIMD batch (no hardcoded interval).
+        from backend.core.ouroboros import oracle_persistence as _op_mod
+        _sqlite_on = _op_mod.sqlite_persistence_enabled()
         i = 0
         _batch_no = 0
         while i < total_files:
@@ -2472,11 +2561,19 @@ class TheOracle:
             # Durable partial checkpoint (see cadence note above).  Never
             # let a checkpoint failure break the index — durability is a
             # best-effort enhancement, not a correctness dependency.
+            _commit_ms = 0.0
             if _ck_every_n > 0 and (_is_last_batch or _batch_no % _ck_every_n == 0):
-                try:
-                    await self._save_cache()
-                except Exception:  # noqa: BLE001 — never break the index
-                    pass
+                if _sqlite_on:
+                    # Incremental ACID commit of THIS batch's dirty files only — no whole-graph
+                    # rewrite. Commit latency feeds the throttle below (I/O-adaptive batch window).
+                    _commit_ms = await self._sqlite_incremental_checkpoint(
+                        batch, repo_name, repo_path,
+                    )
+                else:
+                    try:
+                        await self._save_cache()
+                    except Exception:  # noqa: BLE001 — never break the index
+                        pass
             # Emit progress at most every 5s OR on the last batch — bounds
             # log volume on fast SSDs while still surfacing forward motion.
             _now = time.monotonic()
@@ -2496,8 +2593,13 @@ class TheOracle:
             # and yield the loop proportional to the overshoot so the FSM can breathe.
             if _throttle is not None and not _is_last_batch:
                 lag_ms = await self._measure_loop_lag_ms()
-                _throttle.update(lag_ms)
-                _backoff = _throttle.backoff_s(lag_ms)
+                # I/O-adaptive batch window: a slow incremental commit (disk write throttled)
+                # is folded into the effective lag so the next batch CONTRACTS under write
+                # pressure — and expands again when commits are fast. The commit window thus
+                # tracks both event-loop responsiveness AND disk I/O latency, no hardcoding.
+                eff_lag = max(lag_ms, _commit_ms)
+                _throttle.update(eff_lag)
+                _backoff = _throttle.backoff_s(eff_lag)
                 if _backoff > 0.0:
                     await asyncio.sleep(_backoff)
 
