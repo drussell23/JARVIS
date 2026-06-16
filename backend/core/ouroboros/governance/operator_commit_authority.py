@@ -114,6 +114,13 @@ _ENV_SECRET_PATH = "JARVIS_COMMIT_AUTHORITY_SECRET_PATH"
 _ENV_ENABLE_FILE = "JARVIS_COMMIT_AUTHORITY_ENABLE_FILE"
 _ENV_PRESENCE_FILE = "JARVIS_COMMIT_AUTHORITY_PRESENCE_FILE"
 _ENV_PRESENCE_TTL_S = "JARVIS_COMMIT_PRESENCE_TTL_S"
+# Sovereign Execution Boundary (Stage A) — dedicated default-OFF sub-flag.
+# Composes WITH the OCA master (the boundary only operates inside the OCA
+# pre-commit path), but is its own switch so enabling OCA is byte-identical
+# until the operator opts into the stricter "autonomous never commits in the
+# primary tree / on main" rule. Off → the autonomous channel keeps its
+# documented legacy contract unchanged.
+_ENV_EXECUTION_BOUNDARY = "JARVIS_EXECUTION_BOUNDARY_ENABLED"
 
 _DEFAULT_GRANTS_RELATIVE = ".jarvis/commit_authority/grants.jsonl"
 _DEFAULT_SECRET_RELATIVE = ("commit_authority", "secret")  # under ~/.jarvis
@@ -1295,6 +1302,57 @@ def _autonomous_verdict(
     )
 
 
+def _execution_boundary_verdict(
+    ctx: CommitAuthorityContext,
+    repo_root: Path,
+) -> Optional[CommitAuthorityVerdictResult]:
+    """Sovereign Execution Boundary (Stage A) — refuse an AUTONOMOUS commit
+    that targets the operator's PRIMARY checkout or the main/master branch.
+
+    Reached ONLY from the autonomous branch of :func:`verify_pre_commit`,
+    so autonomy is already cryptographically established (no valid operator
+    presence). This adds the *location* constraint that the bare sovereignty
+    marker does not: the loop must commit from an isolated worktree on a
+    feature branch, never the operator's primary tree — closing the
+    branch/file-mutation revert vector.
+
+    Deny-on-proof, never-on-doubt: composes
+    :func:`execution_context.is_primary_checkout` (which returns True only on
+    affirmative detection) so a transient git fault can never wedge a
+    legitimate worktree commit. Returns a DENY verdict or ``None`` (pass).
+    Reuses :attr:`CommitAuthorityVerdict.DENIED_SOVEREIGNTY` (the verdict
+    taxonomy is closed/pinned at 8). NEVER raises."""
+    # Dedicated default-OFF sub-flag — composes with the OCA master so
+    # enabling OCA alone stays byte-identical to the legacy autonomous
+    # contract. Off → the boundary is inert.
+    if not _flag(_ENV_EXECUTION_BOUNDARY, default=False):
+        return None
+    try:
+        from backend.core.ouroboros.governance import (
+            execution_context as _ec,
+        )
+        primary = bool(_ec.is_primary_checkout(repo_root))
+    except Exception:  # noqa: BLE001 — substrate unavailable → don't block
+        primary = False
+    norm_branch = str(getattr(ctx, "branch", "") or "").strip().lower()
+    on_protected = norm_branch in ("main", "master")
+    if not (primary or on_protected):
+        return None
+    where = (
+        "the operator PRIMARY checkout"
+        if primary
+        else f"protected branch '{norm_branch}'"
+    )
+    return _verdict(
+        CommitAuthorityVerdict.DENIED_SOVEREIGNTY,
+        ctx.channel,
+        "Sovereign Execution Boundary: autonomous commit into "
+        f"{where} refused — the loop must commit from an isolated "
+        "worktree on a feature branch, not the operator's primary "
+        f"tree. repo_root={repo_root}",
+    )
+
+
 def _governance_gate(
     ctx: CommitAuthorityContext,
     grant: Optional[CommitGrant],
@@ -1369,6 +1427,12 @@ def verify_pre_commit(
     # governance hash-cap still applies (autonomous ops touching
     # governance/ must match the signed manifest).
     if channel is CommitChannel.AUTONOMOUS:
+        # Sovereign Execution Boundary (Stage A): an autonomous commit must
+        # never land in the operator's primary checkout or on main/master —
+        # the loop commits from an isolated worktree on a feature branch.
+        boundary = _execution_boundary_verdict(ctx, repo_root)
+        if boundary is not None:
+            return boundary
         sov = _autonomous_verdict(ctx, repo_root)
         if not sov.authorized():
             return sov
