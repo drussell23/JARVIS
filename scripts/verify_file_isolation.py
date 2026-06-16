@@ -271,6 +271,45 @@ def _read_summary(session: Path) -> Optional[Dict]:
         return None
 
 
+def _session_candidate_dirs(session: Path, primary_root: Path) -> List[Path]:
+    """All dirs that may hold THIS session's artifacts. The harness splits
+    debug.log (repo_path-anchored → main) and summary.json (cwd-relative →
+    worktree) when the soak runs from a linked worktree, so search the bound
+    dir AND any worktree sibling session dir of the same name."""
+    cands = [session]
+    try:
+        cands.extend(sorted(primary_root.glob(
+            f".claude/worktrees/*/.ouroboros/sessions/{session.name}")))
+    except Exception:  # noqa: BLE001
+        pass
+    seen, out = set(), []
+    for c in cands:
+        if str(c) not in seen:
+            seen.add(str(c))
+            out.append(c)
+    return out
+
+
+def _read_summary_any(session: Path, primary_root: Path) -> Optional[Dict]:
+    for c in _session_candidate_dirs(session, primary_root):
+        s = _read_summary(c)
+        if s is not None:
+            return s
+    return None
+
+
+def _read_debug_any(session: Path, primary_root: Path) -> str:
+    best = ""
+    for c in _session_candidate_dirs(session, primary_root):
+        lp = c / "debug.log"
+        try:
+            if lp.is_file() and lp.stat().st_size > len(best):
+                best = lp.read_text(errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+    return best
+
+
 async def watch_and_verify(
     *, sessions_dir: Path, primary_root: Path, since_ts: float,
     timeout_s: float, poll_s: float, pin_session: str = "",
@@ -297,7 +336,7 @@ async def watch_and_verify(
     print(f"[verifier] bound to {session.name}; awaiting FSM termination …",
           flush=True)
     while True:
-        summary = _read_summary(session)
+        summary = _read_summary_any(session, primary_root)
         if summary and str(summary.get("session_outcome", "")) in _TERMINAL_OUTCOMES:
             break
         if time.monotonic() > deadline:
@@ -306,9 +345,8 @@ async def watch_and_verify(
             break
         await asyncio.sleep(poll_s)
 
-    log_path = session / "debug.log"
-    debug_log = log_path.read_text(errors="replace") if log_path.is_file() else ""
-    summary = _read_summary(session)
+    debug_log = _read_debug_any(session, primary_root)
+    summary = _read_summary_any(session, primary_root)
     # Health context via the SHARED harvester parse.
     metrics = parse_metrics(debug_log, summary)
     verdict = assess_isolation(
