@@ -374,5 +374,223 @@ def test_oracle_on_migrates_legacy_pickle_on_first_load(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+# --------------------------------------------------------------------------- Phase 2 hot path
+def test_write_txn_rolls_back_on_error(tmp_path):
+    """ACID guard: an exception inside `_write_txn` rolls the whole batch back to the last
+    clean commit — no partial/orphaned rows survive."""
+    async def run():
+        g = _build_graph(3)
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(_state_from_graph(g))
+        n0 = (await prov.load()).graph.number_of_nodes()
+        conn = await prov._conn_or_open()
+        with pytest.raises(RuntimeError):
+            async with prov._write_txn(conn):
+                await conn.execute("DELETE FROM nodes")   # destructive...
+                raise RuntimeError("boom mid-batch")        # ...then blow up
+        after = await prov.load()
+        await prov.close()
+        assert after.graph.number_of_nodes() == n0          # rolled back, nothing lost
+    asyncio.run(run())
+
+
+def test_upsert_files_is_repo_scoped(tmp_path):
+    """Two repos sharing a relative path must not clobber each other on per-file dirty replace."""
+    import networkx as nx
+
+    def one(repo, rel, name):
+        g = nx.DiGraph()
+        nid = NodeID(repo=repo, file_path=rel, name=name, node_type=NodeType.FUNCTION, line_number=1)
+        g.add_node(str(nid), **NodeData(node_id=nid).to_dict())
+        return g
+
+    async def run():
+        # seed: repo A and repo B both own "shared.py"
+        combined = nx.compose(one("A", "shared.py", "a_fn"), one("B", "shared.py", "b_fn"))
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(P.GraphState(graph=combined))
+        # re-index ONLY repo A's shared.py (replace a_fn -> a_fn2)
+        await prov.upsert_files({
+            "shared.py": {
+                "repo": "A",
+                "hash_key": "A:shared.py",
+                "source_hash": "newA",
+                "node_rows": list(P._iter_node_rows(one("A", "shared.py", "a_fn2"))),
+                "edge_rows": [],
+            }
+        })
+        loaded = await prov.load()
+        await prov.close()
+        keys = set(loaded.graph.nodes)
+        assert "B:shared.py:b_fn" in keys      # repo B untouched
+        assert "A:shared.py:a_fn2" in keys     # repo A replaced
+        assert "A:shared.py:a_fn" not in keys  # old A node gone
+    asyncio.run(run())
+
+
+def test_upsert_files_hash_key_distinct_from_file_path(tmp_path):
+    """file_hashes is keyed by the Oracle cache_key (repo:relative) while nodes.file_path is the
+    bare relative path — the upsert must honor both via `hash_key`."""
+    import networkx as nx
+
+    def one(repo, rel, name):
+        g = nx.DiGraph()
+        nid = NodeID(repo=repo, file_path=rel, name=name, node_type=NodeType.FUNCTION, line_number=1)
+        g.add_node(str(nid), **NodeData(node_id=nid).to_dict())
+        return g
+
+    async def run():
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.upsert_files({
+            "pkg/mod.py": {
+                "repo": "jarvis", "hash_key": "jarvis:pkg/mod.py", "source_hash": "h1",
+                "node_rows": list(P._iter_node_rows(one("jarvis", "pkg/mod.py", "f"))),
+                "edge_rows": [],
+            }
+        })
+        loaded = await prov.load()
+        await prov.close()
+        assert loaded.file_hashes == {"jarvis:pkg/mod.py": "h1"}   # cache_key form preserved
+    asyncio.run(run())
+
+
+def test_extraction_helpers():
+    g = _build_graph(2)._graph
+    keys = list(g.nodes)[:2]
+    nrows = P.node_rows_for_keys(g, keys)
+    erows = P.edge_rows_for_keys(g, keys)
+    assert len(nrows) == 2
+    assert all(r[0] in keys for r in nrows)
+    assert all(r[0] in keys for r in erows)  # only OUTGOING edges from the given keys
+
+
+def test_oracle_incremental_checkpoint_extracts_and_commits(monkeypatch, tmp_path):
+    """The Oracle's `_sqlite_incremental_checkpoint` extracts the batch's files from the live graph
+    and commits them incrementally (no full rewrite)."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
+    from backend.core.ouroboros.oracle import TheOracle
+
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path",
+                        staticmethod(lambda: tmp_path / "oracle.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path",
+                        staticmethod(lambda: tmp_path / "codebase_graph.pkl"))
+
+    async def run():
+        o = TheOracle()
+        # populate the live graph as if a batch had been indexed
+        g = _build_graph(3)
+        o._graph = g
+        o._file_hashes = {f"jarvis:backend/pkg/module_{f}.py": f"h{f}" for f in range(3)}
+        o._graph_write_queue = None  # queue disabled → drain is a no-op
+        batch = [tmp_path / "repo" / "backend/pkg/module_0.py",
+                 tmp_path / "repo" / "backend/pkg/module_1.py"]
+        commit_ms = await o._sqlite_incremental_checkpoint(batch, "jarvis", tmp_path / "repo")
+        assert commit_ms >= 0.0
+        prov = o._persistence_provider()
+        loaded = await prov.load()
+        await prov.close()
+        # only module_0 + module_1 committed (2 files x 2 nodes). module_2 is NOT a committed row
+        # — it only appears as an in-memory STUB (no node_id attr) auto-vivified from module_1's
+        # cross-file edge on load; it gains a real row only when module_2 is itself indexed.
+        assert loaded is not None
+        files = {
+            loaded.graph.nodes[k]["node_id"]["file_path"]
+            for k in loaded.graph.nodes if "node_id" in loaded.graph.nodes[k]
+        }
+        assert "backend/pkg/module_0.py" in files
+        assert "backend/pkg/module_1.py" in files
+        assert "backend/pkg/module_2.py" not in files  # not committed — only an edge-target stub
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- streaming warm-load
+def test_streaming_load_chunk_boundary(tmp_path, monkeypatch):
+    """Warm-load via fetchmany must reconstruct identically across chunk boundaries (chunk smaller
+    than the row count exercises the multi-fetch path)."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", "7")
+    async def run():
+        g = _build_graph(10)  # 20 nodes >> chunk of 7 → ≥3 fetchmany rounds
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(_state_from_graph(g))
+        loaded = await prov.load()
+        await prov.close()
+        assert loaded.graph.number_of_nodes() == g._graph.number_of_nodes()
+        assert loaded.graph.number_of_edges() == g._graph.number_of_edges()
+        assert set(loaded.node_index) == set(g._node_index)
+    asyncio.run(run())
+
+
+def test_load_chunk_env_default():
+    import os as _os
+    _os.environ.pop("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", None)
+    assert P.sqlite_load_chunk() == 2000
+
+
+# --------------------------------------------------------------------------- memory armor
+class _FakeGate:
+    """A MemoryPressureGate stand-in that returns a scripted sequence of pressure levels."""
+    def __init__(self, levels):
+        self._levels = list(levels)
+        self._i = 0
+
+    def pressure(self):
+        lvl = self._levels[min(self._i, len(self._levels) - 1)]
+        self._i += 1
+        return lvl
+
+
+def _oracle_with_gate(monkeypatch, tmp_path, levels):
+    from backend.core.ouroboros.oracle import TheOracle
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path", staticmethod(lambda: tmp_path / "o.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path", staticmethod(lambda: tmp_path / "c.pkl"))
+    o = TheOracle()
+    o._memory_gate_ref = _FakeGate(levels)   # pre-seed so _memory_gate() returns the fake
+    return o
+
+
+def test_armor_maps_levels(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    for lvl, expect in [(L.OK, "ok"), (L.WARN, "warn"), (L.HIGH, "high")]:
+        o = _oracle_with_gate(monkeypatch, tmp_path, [lvl])
+        assert asyncio.run(o._memory_armor_check()) == expect
+
+
+def test_armor_critical_persist_when_never_clears(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "2")
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.05")
+    o = _oracle_with_gate(monkeypatch, tmp_path, [L.CRITICAL] * 10)
+    assert asyncio.run(o._memory_armor_check()) == "critical_persist"
+    assert o._mem_armor_yields == 2  # forced GC+yield exactly max_yields times
+
+
+def test_armor_critical_then_clears(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "3")
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.05")
+    # first probe CRITICAL → enter yield loop; next probe OK → clears as "critical" (contract hard)
+    o = _oracle_with_gate(monkeypatch, tmp_path, [L.CRITICAL, L.OK])
+    assert asyncio.run(o._memory_armor_check()) == "critical"
+
+
+def test_armor_disabled_via_gate(monkeypatch, tmp_path):
+    from backend.core.ouroboros.oracle import TheOracle
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path", staticmethod(lambda: tmp_path / "o.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path", staticmethod(lambda: tmp_path / "c.pkl"))
+    o = TheOracle()
+    monkeypatch.setattr("backend.core.ouroboros.governance.memory_pressure_gate.is_enabled",
+                        lambda: False)
+    # _memory_gate() returns None → armor is a clean no-op
+    assert asyncio.run(o._memory_armor_check()) == "ok"
+
+
+def test_armor_flag_default_on(monkeypatch):
+    import backend.core.ouroboros.oracle as O
+    monkeypatch.delenv("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", raising=False)
+    assert O._oracle_memory_armor_enabled() is True
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", "0")
+    assert O._oracle_memory_armor_enabled() is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

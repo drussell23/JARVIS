@@ -1924,6 +1924,33 @@ def _oracle_backpressure_min_batch() -> int:
         return 4
 
 
+def _oracle_memory_armor_enabled() -> bool:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_ENABLED`` (default true) — second AIMD axis: fold host
+    memory pressure into the index throttle so the cold build defends a constrained RAM boundary
+    (16GB host). No-op unless memory actually elevates; the kill switch ``=0`` disables it."""
+    raw = os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_memory_armor_max_yields() -> int:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS`` — at CRITICAL pressure the index forces a
+    GC + loop-yield this many times waiting for pressure to clear before SUSPENDING the build
+    (durable — every SQLite commit is a checkpoint, so it resumes next boot). Default 3."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _oracle_memory_armor_yield_s() -> float:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S`` — seconds to yield to the GC/allocator per attempt
+    when CRITICAL. Default 0.5s."""
+    try:
+        return max(0.05, float(os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.5")))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 class _AdaptiveIndexThrottle:
     """AIMD backpressure for the Oracle index batch loop.
 
@@ -2036,6 +2063,12 @@ class TheOracle:
         # env flips after import still apply). ``None`` == legacy pickle path (byte-identical).
         self._persistence: Any = None
         self._persistence_built: bool = False
+
+        # Sovereign Memory Armor — observability counters (the index throttle's memory axis).
+        self._memory_gate_ref: Any = None
+        self._mem_armor_contractions: int = 0   # batches contracted under WARN/HIGH/CRITICAL
+        self._mem_armor_yields: int = 0          # GC+sleep yields performed at CRITICAL
+        self._mem_armor_suspended: bool = False  # index suspended because CRITICAL never cleared
 
         logger.info("The Oracle initialized")
 
@@ -2315,7 +2348,14 @@ class TheOracle:
                    f"{self._graph._metrics['total_nodes']} nodes, "
                    f"{self._graph._metrics['total_edges']} edges")
 
-        await self._save_cache()
+        # Persist. When SQLite is on, every batch already committed its files incrementally, so a
+        # final whole-graph rewrite would be redundant (and re-introduce the monolithic write we
+        # eliminated) — flush only the metrics meta row. Legacy pickle path takes the full save.
+        from backend.core.ouroboros import oracle_persistence as _op_fi
+        if _op_fi.sqlite_persistence_enabled():
+            await self._sqlite_persist_metrics()
+        else:
+            await self._save_cache()
 
         # Embed all nodes into semantic index (fault-isolated)
         try:
@@ -2379,6 +2419,130 @@ class TheOracle:
         except Exception:  # noqa: BLE001
             return 0.0
 
+    async def _drain_graph_write_queue(self, timeout_s: float = 30.0) -> None:
+        """Bounded wait until the async graph-write consumer has APPLIED all enqueued writes, so a
+        subsequent read of the live graph reflects the just-submitted batch. No-op when the queue
+        is disabled (legacy inline-write path). Never raises."""
+        q = self._graph_write_queue
+        if q is None:
+            return
+        try:
+            await asyncio.wait_for(q.join(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Oracle] graph-write queue drain exceeded %.1fs — checkpoint may lag a batch",
+                timeout_s,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _sqlite_incremental_checkpoint(
+        self, batch_files: List[Path], repo_name: str, repo_path: Path,
+    ) -> float:
+        """Phase-2 incremental hot path. Drains the graph-write queue so the batch's nodes are
+        materialized, extracts per-file rows from the live graph, and commits ONLY this batch's
+        dirty files in one ACID transaction via ``upsert_files`` — *every commit is a checkpoint*,
+        replacing the monolithic per-batch rewrite that caused cold-index starvation.
+
+        Returns the commit wall-time in ms (fed into the AIMD throttle as a disk-I/O-latency
+        signal). Fail-soft: a checkpoint failure NEVER breaks the index."""
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        prov = self._persistence_provider()
+        if prov is None or not hasattr(prov, "upsert_files"):
+            return 0.0
+        try:
+            await self._drain_graph_write_queue()
+            records: Dict[str, Dict[str, Any]] = {}
+            for fp in batch_files:
+                try:
+                    rel = str(fp.relative_to(repo_path))
+                except ValueError:
+                    rel = str(fp)
+                cache_key = f"{repo_name}:{rel}"
+                # _file_index is keyed by bare relative path; filter to THIS repo's node keys
+                # (node_key == "repo:relative:name") so a relative path shared across repos
+                # doesn't cross-contaminate the per-file dirty replace.
+                keys = [
+                    k for k in self._graph._file_index.get(rel, ())
+                    if k.startswith(repo_name + ":")
+                ]
+                if not keys:
+                    continue
+                records[rel] = {
+                    "repo": repo_name,
+                    "hash_key": cache_key,
+                    "source_hash": self._file_hashes.get(cache_key, ""),
+                    "node_rows": _op.node_rows_for_keys(self._graph._graph, keys),
+                    "edge_rows": _op.edge_rows_for_keys(self._graph._graph, keys),
+                }
+            if not records:
+                return 0.0
+            t0 = time.monotonic()
+            await prov.upsert_files(records)
+            return (time.monotonic() - t0) * 1000.0
+        except Exception as exc:  # noqa: BLE001 — durability is best-effort, never break the index
+            logger.warning("[Oracle] sqlite incremental checkpoint failed (non-fatal): %s", exc)
+            return 0.0
+
+    async def _sqlite_persist_metrics(self) -> None:
+        """Flush ONLY the metrics meta row at end of a full index — the nodes/edges were already
+        persisted incrementally per batch, so this avoids a redundant whole-graph rewrite."""
+        prov = self._persistence_provider()
+        if prov is None or not hasattr(prov, "set_meta"):
+            return
+        try:
+            await prov.set_meta("metrics", json.dumps(self._graph._metrics or {}))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Oracle] sqlite metrics flush failed (non-fatal): %s", exc)
+
+    def _memory_gate(self):
+        """Lazily resolve the shared MemoryPressureGate (the same advisory probe the SensorGovernor
+        uses — no duplication). Returns ``None`` if the gate is disabled or unavailable."""
+        if self._memory_gate_ref is None:
+            try:
+                from backend.core.ouroboros.governance.memory_pressure_gate import (
+                    get_default_gate, is_enabled,
+                )
+                if not is_enabled():
+                    return None
+                self._memory_gate_ref = get_default_gate()
+            except Exception:  # noqa: BLE001 — armor must never break the index
+                return None
+        return self._memory_gate_ref
+
+    async def _memory_armor_check(self) -> str:
+        """Phase-1 memory axis of the multi-axis throttle. Probes host RAM pressure; under
+        CRITICAL it actively DEFENDS the host boundary — forces ``gc.collect()`` + yields the loop
+        to the GC/allocator, re-probing up to ``_oracle_memory_armor_max_yields()`` times. Returns
+        one of ``ok|warn|high|critical|critical_persist``:
+          - ``warn|high|critical`` → caller contracts the next batch's concurrency footprint
+          - ``critical_persist``   → pressure would not clear → caller SUSPENDS the build (safe:
+            every SQLite commit is a checkpoint, so it resumes next boot via the file_hashes skip)
+        Never raises."""
+        gate = self._memory_gate()
+        if gate is None:
+            return "ok"
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+            lvl = gate.pressure()
+        except Exception:  # noqa: BLE001
+            return "ok"
+        if lvl != PressureLevel.CRITICAL:
+            return lvl.value  # ok / warn / high
+        # CRITICAL: proactive suspend-and-yield to reclaim transient memory before proceeding.
+        import gc
+        for _ in range(_oracle_memory_armor_max_yields()):
+            self._mem_armor_yields += 1
+            gc.collect()
+            await asyncio.sleep(_oracle_memory_armor_yield_s())
+            try:
+                if gate.pressure() != PressureLevel.CRITICAL:
+                    return "critical"   # cleared — but recently critical → still contract hard
+            except Exception:  # noqa: BLE001
+                return "critical"
+        return "critical_persist"
+
     async def _index_repository(self, repo_name: str, repo_path: Path) -> None:
         """Index all Python files in a repository."""
         logger.info(f"Indexing repository: {repo_name} at {repo_path}")
@@ -2440,6 +2604,19 @@ class TheOracle:
             if _oracle_backpressure_enabled()
             else None
         )
+        # Phase 2 — when SQLite persistence is on, the per-batch checkpoint becomes an INCREMENTAL
+        # upsert of just this batch's files (every commit is a checkpoint) instead of a monolithic
+        # whole-graph rewrite. The commit window IS the adaptive AIMD batch (no hardcoded interval).
+        from backend.core.ouroboros import oracle_persistence as _op_mod
+        _sqlite_on = _op_mod.sqlite_persistence_enabled()
+        # Sovereign Memory Armor — second throttle axis. Maps host RAM pressure onto the AIMD
+        # throttle's lag scale so an elevated memory level contracts the next batch's process-pool
+        # fan-out exactly as event-loop lag does (multiplier × the throttle's lag threshold).
+        _armor_on = _oracle_memory_armor_enabled()
+        # Multiplier × the throttle's lag threshold → synthetic "lag" fed to the AIMD. >1.0 so each
+        # elevated level actually breaches (the throttle halves on >threshold) and higher levels
+        # also yield the loop longer (backoff_s is proportional to the overshoot). Graded defense.
+        _MEM_LAG_MULT = {"ok": 0.0, "warn": 1.5, "high": 2.5, "critical": 4.0}
         i = 0
         _batch_no = 0
         while i < total_files:
@@ -2459,6 +2636,24 @@ class TheOracle:
                     await _await_quiescence(label="oracle_index_repository")
                 except Exception:  # noqa: BLE001 — never break the index
                     pass
+            # --- Sovereign Memory Armor (top-of-loop, multi-axis) ---
+            # Probe host RAM BEFORE submitting the batch. CRITICAL → defend the 16GB boundary:
+            # gc-yield, and if it won't clear, SUSPEND with a durable checkpoint (resumes next
+            # boot). WARN/HIGH → fold into the AIMD throttle so this batch contracts its fan-out.
+            if _armor_on and not self._shutting_down:
+                _mem_lvl = await self._memory_armor_check()
+                if _mem_lvl == "critical_persist":
+                    self._mem_armor_suspended = True
+                    logger.warning(
+                        "[Oracle.index] CRITICAL memory pressure persisted after GC yields — "
+                        "SUSPENDING %s index at %d/%d files. Partial graph is durable (every "
+                        "SQLite commit is a checkpoint); it resumes next boot via the file_hashes "
+                        "skip.", repo_name, i, total_files,
+                    )
+                    break
+                if _throttle is not None and _MEM_LAG_MULT.get(_mem_lvl, 0.0) > 0.0:
+                    self._mem_armor_contractions += 1
+                    _throttle.update(_MEM_LAG_MULT[_mem_lvl] * _throttle.lag_threshold_ms)
             effective = _throttle.batch if _throttle is not None else batch_size
             batch = python_files[i:i + effective]
             tasks = [
@@ -2472,11 +2667,19 @@ class TheOracle:
             # Durable partial checkpoint (see cadence note above).  Never
             # let a checkpoint failure break the index — durability is a
             # best-effort enhancement, not a correctness dependency.
+            _commit_ms = 0.0
             if _ck_every_n > 0 and (_is_last_batch or _batch_no % _ck_every_n == 0):
-                try:
-                    await self._save_cache()
-                except Exception:  # noqa: BLE001 — never break the index
-                    pass
+                if _sqlite_on:
+                    # Incremental ACID commit of THIS batch's dirty files only — no whole-graph
+                    # rewrite. Commit latency feeds the throttle below (I/O-adaptive batch window).
+                    _commit_ms = await self._sqlite_incremental_checkpoint(
+                        batch, repo_name, repo_path,
+                    )
+                else:
+                    try:
+                        await self._save_cache()
+                    except Exception:  # noqa: BLE001 — never break the index
+                        pass
             # Emit progress at most every 5s OR on the last batch — bounds
             # log volume on fast SSDs while still surfacing forward motion.
             _now = time.monotonic()
@@ -2496,8 +2699,13 @@ class TheOracle:
             # and yield the loop proportional to the overshoot so the FSM can breathe.
             if _throttle is not None and not _is_last_batch:
                 lag_ms = await self._measure_loop_lag_ms()
-                _throttle.update(lag_ms)
-                _backoff = _throttle.backoff_s(lag_ms)
+                # I/O-adaptive batch window: a slow incremental commit (disk write throttled)
+                # is folded into the effective lag so the next batch CONTRACTS under write
+                # pressure — and expands again when commits are fast. The commit window thus
+                # tracks both event-loop responsiveness AND disk I/O latency, no hardcoding.
+                eff_lag = max(lag_ms, _commit_ms)
+                _throttle.update(eff_lag)
+                _backoff = _throttle.backoff_s(eff_lag)
                 if _backoff > 0.0:
                     await asyncio.sleep(_backoff)
 

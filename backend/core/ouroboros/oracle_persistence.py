@@ -36,9 +36,10 @@ import pickle  # noqa: S403 — internal legacy cache migration only (trusted, s
 import shutil
 import time
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,17 @@ def sqlite_integrity_timeout_s() -> float:
         return max(0.0, float(os.environ.get("JARVIS_ORACLE_SQLITE_INTEGRITY_TIMEOUT_S", "10")))
     except (TypeError, ValueError):
         return 10.0
+
+
+def sqlite_load_chunk() -> int:
+    """``JARVIS_ORACLE_SQLITE_LOAD_CHUNK`` — warm-load streaming chunk size. The DiGraph is
+    rebuilt incrementally via ``fetchmany(chunk)`` so the transient footprint is graph + ONE chunk
+    of rows, never graph + the entire result set materialized as a Python list (the warm-boot
+    spike). Default 2000."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", "2000")))
+    except (TypeError, ValueError):
+        return 2000
 
 
 # ---------------------------------------------------------------------------- value object
@@ -282,6 +294,26 @@ class AioSqliteProvider(PersistenceProvider):
         await conn.commit()
         self._schema_ready = True
 
+    @asynccontextmanager
+    async def _write_txn(self, conn):
+        """ACID write boundary (Phase 2). Serializes writers (asyncio.Lock), ensures schema,
+        opens with ``BEGIN IMMEDIATE`` (grabs the write lock upfront so ``busy_timeout`` applies
+        cleanly), and guarantees a deterministic async ``ROLLBACK`` if the body raises — no
+        partial / orphaned rows ever survive an exception or mid-batch interrupt. The block that
+        last cleanly committed is the rollback target."""
+        async with self._lock():
+            await self._ensure_schema_once(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                try:
+                    await conn.rollback()
+                except Exception:  # noqa: BLE001 — rollback best-effort; original error wins
+                    logger.warning("[OraclePersist] rollback failed after txn error", exc_info=True)
+                raise
+
     async def close(self) -> None:
         if self._conn is not None:
             try:
@@ -362,52 +394,63 @@ class AioSqliteProvider(PersistenceProvider):
         except Exception:  # noqa: BLE001
             return None
 
+        # Phase-2 streaming warm-load: build the DiGraph incrementally via fetchmany(chunk) so the
+        # transient footprint is graph + ONE chunk, never graph + the entire result set as a list
+        # (the warm-boot RAM spike). Flat memory profile during reconstruction.
+        chunk = sqlite_load_chunk()
+        n_nodes = 0
         async with conn.execute(
             "SELECT node_key, repo, file_path, name, node_type, line_number, docstring, signature,"
             " decorators, base_classes, complexity, line_count, last_modified, source_hash FROM nodes"
         ) as cur:
-            node_rows = await cur.fetchall()
+            while True:
+                rows = await cur.fetchmany(chunk)
+                if not rows:
+                    break
+                for r in rows:
+                    (node_key, repo, file_path, name, node_type, line_number, docstring, signature,
+                     decorators, base_classes, complexity, line_count, last_modified, source_hash) = r
+                    # Rebuild the EXACT attr shape add_node stored (NodeData.to_dict()) so the rest
+                    # of the Oracle (get_node → dict(graph.nodes[k])) is byte-for-byte identical.
+                    attrs = {
+                        "node_id": {
+                            "repo": repo, "file_path": file_path, "name": name,
+                            "node_type": node_type, "line_number": line_number,
+                        },
+                        "docstring": docstring,
+                        "signature": signature,
+                        "decorators": json.loads(decorators) if decorators else [],
+                        "base_classes": json.loads(base_classes) if base_classes else [],
+                        "complexity": complexity,
+                        "line_count": line_count,
+                        "last_modified": last_modified,
+                        "source_hash": source_hash,
+                    }
+                    graph.add_node(node_key, **attrs)
+                    node_index[node_key] = NodeID(
+                        repo=repo, file_path=file_path, name=name,
+                        node_type=NodeType(node_type), line_number=line_number,
+                    )
+                    file_index[file_path].add(node_key)
+                    repo_index[repo].add(node_key)
+                    type_index[NodeType(node_type)].add(node_key)
+                    n_nodes += 1
 
-        if not node_rows:
+        if n_nodes == 0:
             return None  # empty store → cold index
-
-        for r in node_rows:
-            (node_key, repo, file_path, name, node_type, line_number, docstring, signature,
-             decorators, base_classes, complexity, line_count, last_modified, source_hash) = r
-            # Rebuild the EXACT attr shape add_node stored (NodeData.to_dict()), so the rest
-            # of the Oracle (get_node → dict(graph.nodes[k])) is byte-for-byte identical.
-            attrs = {
-                "node_id": {
-                    "repo": repo, "file_path": file_path, "name": name,
-                    "node_type": node_type, "line_number": line_number,
-                },
-                "docstring": docstring,
-                "signature": signature,
-                "decorators": json.loads(decorators) if decorators else [],
-                "base_classes": json.loads(base_classes) if base_classes else [],
-                "complexity": complexity,
-                "line_count": line_count,
-                "last_modified": last_modified,
-                "source_hash": source_hash,
-            }
-            graph.add_node(node_key, **attrs)
-            node_index[node_key] = NodeID(
-                repo=repo, file_path=file_path, name=name,
-                node_type=NodeType(node_type), line_number=line_number,
-            )
-            file_index[file_path].add(node_key)
-            repo_index[repo].add(node_key)
-            type_index[NodeType(node_type)].add(node_key)
 
         async with conn.execute(
             "SELECT src_key, dst_key, edge_type, line_number, context FROM edges"
         ) as cur:
-            edge_rows = await cur.fetchall()
-        for src_key, dst_key, edge_type, line_number, context in edge_rows:
-            graph.add_edge(
-                src_key, dst_key,
-                edge_type=edge_type, line_number=line_number, context=context,
-            )
+            while True:
+                rows = await cur.fetchmany(chunk)
+                if not rows:
+                    break
+                for src_key, dst_key, edge_type, line_number, context in rows:
+                    graph.add_edge(
+                        src_key, dst_key,
+                        edge_type=edge_type, line_number=line_number, context=context,
+                    )
 
         async with conn.execute("SELECT file_path, source_hash FROM file_hashes") as cur:
             fh_rows = await cur.fetchall()
@@ -450,40 +493,23 @@ class AioSqliteProvider(PersistenceProvider):
             for fp, sh in state.file_hashes.items()
         ]
         metrics_json = json.dumps(state.metrics or {})
-        async with self._lock():
-            await self._ensure_schema_once(conn)
-            try:
-                await conn.execute("BEGIN IMMEDIATE")  # grab the write lock upfront (busy_timeout applies)
-                await conn.execute("DELETE FROM nodes")
-                await conn.execute("DELETE FROM edges")
-                await conn.execute("DELETE FROM file_hashes")
-                if node_rows:
-                    await conn.executemany(
-                        "INSERT OR REPLACE INTO nodes (node_key, repo, file_path, name, node_type,"
-                        " line_number, docstring, signature, decorators, base_classes, complexity,"
-                        " line_count, last_modified, source_hash)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        node_rows,
-                    )
-                if edge_rows:
-                    await conn.executemany(
-                        "INSERT OR REPLACE INTO edges (src_key, dst_key, edge_type, line_number, context)"
-                        " VALUES (?,?,?,?,?)",
-                        edge_rows,
-                    )
-                if fh_rows:
-                    await conn.executemany(
-                        "INSERT OR REPLACE INTO file_hashes (file_path, source_hash, indexed_at)"
-                        " VALUES (?,?,?)",
-                        fh_rows,
-                    )
-                await conn.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES('metrics', ?)", (metrics_json,)
+        async with self._write_txn(conn):
+            await conn.execute("DELETE FROM nodes")
+            await conn.execute("DELETE FROM edges")
+            await conn.execute("DELETE FROM file_hashes")
+            if node_rows:
+                await conn.executemany(_INSERT_NODE_SQL, node_rows)
+            if edge_rows:
+                await conn.executemany(_INSERT_EDGE_SQL, edge_rows)
+            if fh_rows:
+                await conn.executemany(
+                    "INSERT OR REPLACE INTO file_hashes (file_path, source_hash, indexed_at)"
+                    " VALUES (?,?,?)",
+                    fh_rows,
                 )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
+            await conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES('metrics', ?)", (metrics_json,)
+            )
 
     async def upsert_files(
         self,
@@ -491,59 +517,55 @@ class AioSqliteProvider(PersistenceProvider):
         *,
         indexed_at: Optional[float] = None,
     ) -> None:
-        """Phase-2 incremental hot path (ADD §5): per-file dirty replace in ONE transaction —
-        *every commit is a checkpoint*, no monolithic rewrite. ``files`` maps file_path →
-        ``{"node_rows": [...], "edge_rows": [...], "source_hash": str}`` (rows in the same
-        column order as :func:`_iter_node_rows`/:func:`_iter_edge_rows`)."""
+        """Phase-2 incremental hot path (ADD §5): per-file dirty replace in ONE ACID transaction —
+        *every commit is a checkpoint*, no monolithic rewrite. The whole set commits or rolls back
+        atomically (``_write_txn``).
+
+        ``files`` maps the bare relative ``file_path`` (matches ``nodes.file_path``) → payload:
+          - ``node_rows`` / ``edge_rows``: rows in the column order of the INSERTs
+          - ``source_hash``: content hash for the file_hashes table
+          - ``repo`` (optional): when present, the dirty-replace is scoped by ``(repo, file_path)``
+            so two repos sharing a relative path don't clobber each other's nodes
+          - ``hash_key`` (optional): the file_hashes key (the Oracle's ``repo:relative`` cache_key);
+            defaults to ``file_path`` for the single-repo case
+        """
         if not files:
             return
         conn = await self._conn_or_open()
         ts = indexed_at if indexed_at is not None else time.time()
-        async with self._lock():
-            await self._ensure_schema_once(conn)
-            try:
-                await conn.execute("BEGIN IMMEDIATE")  # grab the write lock upfront (busy_timeout applies)
-                for file_path, payload in files.items():
-                    # Edges have no file_path column (ADD §4) — resolve the file's *current*
-                    # node keys, then purge every edge touching them (both directions). Deleting
-                    # by the OLD keys is load-bearing: a stale outgoing edge left behind would
-                    # resurrect its deleted source node as a bare stub on the next load.
-                    async with conn.execute(
-                        "SELECT node_key FROM nodes WHERE file_path = ?", (file_path,)
-                    ) as cur:
-                        old_keys = [r[0] for r in await cur.fetchall()]
-                    if old_keys:
-                        ph = ",".join("?" * len(old_keys))
-                        await conn.execute(
-                            f"DELETE FROM edges WHERE src_key IN ({ph}) OR dst_key IN ({ph})",
-                            old_keys + old_keys,
-                        )
-                    await conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
-                    node_rows = payload.get("node_rows") or []
-                    edge_rows = payload.get("edge_rows") or []
-                    if node_rows:
-                        await conn.executemany(
-                            "INSERT OR REPLACE INTO nodes (node_key, repo, file_path, name, node_type,"
-                            " line_number, docstring, signature, decorators, base_classes, complexity,"
-                            " line_count, last_modified, source_hash)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            node_rows,
-                        )
-                    if edge_rows:
-                        await conn.executemany(
-                            "INSERT OR REPLACE INTO edges (src_key, dst_key, edge_type, line_number, context)"
-                            " VALUES (?,?,?,?,?)",
-                            edge_rows,
-                        )
+        async with self._write_txn(conn):
+            for file_path, payload in files.items():
+                repo = payload.get("repo")
+                # Edges have no file_path column (ADD §4) — resolve the file's *current* node
+                # keys, then purge every edge touching them (both directions). Deleting by the OLD
+                # keys is load-bearing: a stale outgoing edge would resurrect its deleted source
+                # node as a bare stub on the next load. Scope by (repo, file_path) when repo given.
+                if repo is not None:
+                    sel = ("SELECT node_key FROM nodes WHERE file_path = ? AND repo = ?", (file_path, repo))
+                    deln = ("DELETE FROM nodes WHERE file_path = ? AND repo = ?", (file_path, repo))
+                else:
+                    sel = ("SELECT node_key FROM nodes WHERE file_path = ?", (file_path,))
+                    deln = ("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+                async with conn.execute(*sel) as cur:
+                    old_keys = [r[0] for r in await cur.fetchall()]
+                if old_keys:
+                    ph = ",".join("?" * len(old_keys))
                     await conn.execute(
-                        "INSERT OR REPLACE INTO file_hashes (file_path, source_hash, indexed_at)"
-                        " VALUES (?,?,?)",
-                        (file_path, payload.get("source_hash", ""), ts),
+                        f"DELETE FROM edges WHERE src_key IN ({ph}) OR dst_key IN ({ph})",
+                        old_keys + old_keys,
                     )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
+                await conn.execute(*deln)
+                node_rows = payload.get("node_rows") or []
+                edge_rows = payload.get("edge_rows") or []
+                if node_rows:
+                    await conn.executemany(_INSERT_NODE_SQL, node_rows)
+                if edge_rows:
+                    await conn.executemany(_INSERT_EDGE_SQL, edge_rows)
+                await conn.execute(
+                    "INSERT OR REPLACE INTO file_hashes (file_path, source_hash, indexed_at)"
+                    " VALUES (?,?,?)",
+                    (payload.get("hash_key", file_path), payload.get("source_hash", ""), ts),
+                )
 
     async def set_meta(self, key: str, value: str) -> None:
         conn = await self._conn_or_open()
@@ -560,38 +582,78 @@ class AioSqliteProvider(PersistenceProvider):
 
 
 # ---------------------------------------------------------------------------- row marshalling
+_INSERT_NODE_SQL = (
+    "INSERT OR REPLACE INTO nodes (node_key, repo, file_path, name, node_type, line_number,"
+    " docstring, signature, decorators, base_classes, complexity, line_count, last_modified,"
+    " source_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_INSERT_EDGE_SQL = (
+    "INSERT OR REPLACE INTO edges (src_key, dst_key, edge_type, line_number, context)"
+    " VALUES (?,?,?,?,?)"
+)
+
+
+def _node_row(node_key: str, attrs: Dict[str, Any]):
+    """One SQLite node row from a graph node's attr dict (column order matches _INSERT_NODE_SQL)."""
+    nid = attrs.get("node_id") or {}
+    return (
+        node_key,
+        nid.get("repo", ""),
+        nid.get("file_path", ""),
+        nid.get("name", ""),
+        nid.get("node_type", "function"),
+        int(nid.get("line_number", 0) or 0),
+        attrs.get("docstring"),
+        attrs.get("signature"),
+        json.dumps(attrs.get("decorators") or []),
+        json.dumps(attrs.get("base_classes") or []),
+        int(attrs.get("complexity", 0) or 0),
+        int(attrs.get("line_count", 0) or 0),
+        float(attrs.get("last_modified", 0.0) or 0.0),
+        attrs.get("source_hash", "") or "",
+    )
+
+
+def _edge_row(src: str, dst: str, attrs: Dict[str, Any]):
+    """One SQLite edge row (column order matches _INSERT_EDGE_SQL)."""
+    return (
+        src,
+        dst,
+        attrs.get("edge_type", "calls"),
+        int(attrs.get("line_number", 0) or 0),
+        attrs.get("context", "") or "",
+    )
+
+
 def _iter_node_rows(graph):
-    """Yield SQLite node rows from a live DiGraph (column order matches the INSERT)."""
+    """Yield SQLite node rows for every node in a live DiGraph."""
     for node_key, attrs in graph.nodes(data=True):
-        nid = attrs.get("node_id") or {}
-        yield (
-            node_key,
-            nid.get("repo", ""),
-            nid.get("file_path", ""),
-            nid.get("name", ""),
-            nid.get("node_type", "function"),
-            int(nid.get("line_number", 0) or 0),
-            attrs.get("docstring"),
-            attrs.get("signature"),
-            json.dumps(attrs.get("decorators") or []),
-            json.dumps(attrs.get("base_classes") or []),
-            int(attrs.get("complexity", 0) or 0),
-            int(attrs.get("line_count", 0) or 0),
-            float(attrs.get("last_modified", 0.0) or 0.0),
-            attrs.get("source_hash", "") or "",
-        )
+        yield _node_row(node_key, attrs)
 
 
 def _iter_edge_rows(graph):
-    """Yield SQLite edge rows from a live DiGraph (column order matches the INSERT)."""
+    """Yield SQLite edge rows for every edge in a live DiGraph."""
     for src, dst, attrs in graph.edges(data=True):
-        yield (
-            src,
-            dst,
-            attrs.get("edge_type", "calls"),
-            int(attrs.get("line_number", 0) or 0),
-            attrs.get("context", "") or "",
-        )
+        yield _edge_row(src, dst, attrs)
+
+
+def node_rows_for_keys(graph, keys: Iterable[str]) -> List[tuple]:
+    """SQLite node rows for a specific set of node keys (the incremental per-file extraction)."""
+    rows: List[tuple] = []
+    for k in keys:
+        if k in graph.nodes:
+            rows.append(_node_row(k, graph.nodes[k]))
+    return rows
+
+
+def edge_rows_for_keys(graph, keys: Iterable[str]) -> List[tuple]:
+    """SQLite edge rows OUTGOING from a set of node keys (a file owns its outgoing edges)."""
+    rows: List[tuple] = []
+    for k in keys:
+        if k in graph.nodes:
+            for dst in graph.successors(k):
+                rows.append(_edge_row(k, dst, graph.edges[k, dst]))
+    return rows
 
 
 # ---------------------------------------------------------------------------- migration
