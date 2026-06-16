@@ -145,6 +145,9 @@ class OracleConfig:
     ORACLE_CACHE_DIR = Path(os.getenv("ORACLE_CACHE_DIR", Path.home() / ".jarvis/oracle"))
     GRAPH_CACHE_FILE = ORACLE_CACHE_DIR / "codebase_graph.pkl"
     INDEX_CACHE_FILE = ORACLE_CACHE_DIR / "file_index.json"
+    # Phase 2 — incremental SQLite persistence (gated; see oracle_persistence.py). Sibling of
+    # the legacy pickle so sandbox_fallback resolves both to the same dir symmetrically.
+    SQLITE_DB_FILE = ORACLE_CACHE_DIR / "oracle.db"
 
     # Semantic index (ChromaDB)
     CHROMA_PERSIST_DIR: Path = Path(os.getenv(
@@ -2029,6 +2032,11 @@ class TheOracle:
         self._graph_writes_applied: int = 0
         self._graph_writes_dropped: int = 0
 
+        # Phase 2 — storage-agnostic persistence provider (lazy; built on first cache touch so
+        # env flips after import still apply). ``None`` == legacy pickle path (byte-identical).
+        self._persistence: Any = None
+        self._persistence_built: bool = False
+
         logger.info("The Oracle initialized")
 
     # ------------------------------------------------------------------
@@ -2262,6 +2270,13 @@ class TheOracle:
                 "[Oracle.shutdown] AST pool teardown best-effort failed",
                 exc_info=True,
             )
+        # Phase 2 — release the persistence connection (closes the aiosqlite worker thread).
+        # No-op when the legacy pickle path is active (provider is None). NEVER raises.
+        if self._persistence is not None:
+            try:
+                await self._persistence.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("[Oracle.shutdown] persistence close best-effort failed", exc_info=True)
         self._running = False
         logger.info("The Oracle shutdown complete")
 
@@ -2971,6 +2986,86 @@ class TheOracle:
 
         return sandbox_fallback(OracleConfig.GRAPH_CACHE_FILE)
 
+    @staticmethod
+    def _resolved_sqlite_path() -> Path:
+        """SQLite db location — resolved through the SAME ``sandbox_fallback`` as the pickle so
+        load/save/migrate never disagree under the Iron Gate (the symmetry that fixed the
+        cold-reindex-every-boot bug for the legacy cache)."""
+        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
+
+        return sandbox_fallback(OracleConfig.SQLITE_DB_FILE)
+
+    def _persistence_provider(self):
+        """Lazily build (once) the storage backend via the factory. Returns ``None`` when the
+        master switch is off OR aiosqlite is unavailable — callers then use the legacy pickle
+        path verbatim. No hardcoding: the Oracle asks the factory and adapts."""
+        if not self._persistence_built:
+            from backend.core.ouroboros import oracle_persistence as _op
+
+            self._persistence = _op.build_provider(
+                db_path=self._resolved_sqlite_path(),
+                pickle_path=self._resolved_graph_cache_path(),
+            )
+            self._persistence_built = True
+        return self._persistence
+
+    async def _load_cache_via_provider(self) -> bool:
+        """Provider-backed load. On a fresh DB with a legacy pickle present, performs the one-time
+        seamless migration (ingest → archive) first, then loads. Fail-soft → ``False`` triggers a
+        Phase-1-throttled cold index (never a wedge)."""
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        prov = self._persistence_provider()
+        if prov is None:
+            return False
+        try:
+            if not await prov.exists():
+                await _op.migrate_pickle_to_sqlite(self._resolved_graph_cache_path(), prov)
+            state = await prov.load()
+        except Exception as exc:  # noqa: BLE001 — load must never crash boot
+            logger.warning("[Oracle] sqlite load failed (cold index will rebuild): %s", exc)
+            return False
+        if state is None:
+            return False
+        self._graph._graph = state.graph
+        self._graph._node_index = state.node_index
+        self._graph._file_index = defaultdict(set, state.file_index)
+        self._graph._repo_index = defaultdict(set, state.repo_index)
+        self._graph._type_index = defaultdict(set, state.type_index)
+        self._graph._metrics = state.metrics
+        self._file_hashes = state.file_hashes
+        return True
+
+    async def _save_cache_via_provider(self) -> None:
+        """Provider-backed full-snapshot save (shutdown path). The incremental hot path is the
+        provider's ``upsert_files`` driven from the index loop; this keeps a correct full write."""
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        prov = self._persistence_provider()
+        if prov is None:
+            return
+        # Same gated graph hygiene as the legacy path.
+        try:
+            if os.environ.get("JARVIS_ORACLE_GRAPH_PRUNE_ENABLED", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ):
+                self._graph.prune_isolated_nodes()
+        except Exception:  # noqa: BLE001
+            pass
+        state = _op.GraphState(
+            graph=self._graph._graph,
+            node_index=self._graph._node_index,
+            file_index=dict(self._graph._file_index),
+            repo_index=dict(self._graph._repo_index),
+            type_index=dict(self._graph._type_index),
+            metrics=self._graph._metrics,
+            file_hashes=self._file_hashes,
+        )
+        try:
+            await prov.save(state)
+        except Exception as exc:  # noqa: BLE001 — never raise from save
+            logger.error("[Oracle] sqlite save failed: %s", exc)
+
     async def _load_cache(self) -> bool:
         """Load cached graph from disk.
 
@@ -2989,7 +3084,14 @@ class TheOracle:
 
         Note: pickle is used here for internal cache only (never untrusted
         data) — the cache file is written by this same process.
+
+        Phase 2: when ``JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED`` is on, this delegates to the
+        provider (with seamless one-time pickle migration). Off → legacy path verbatim.
         """
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        if _op.sqlite_persistence_enabled():
+            return await self._load_cache_via_provider()
         try:
             cache_path = self._resolved_graph_cache_path()
             if cache_path.exists():
@@ -3042,7 +3144,16 @@ class TheOracle:
         blocked by the sandbox; ``sandbox_fallback`` routes to
         ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering
         shields.
+
+        Phase 2: when ``JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED`` is on, this delegates to the
+        provider's transactional write. Off → legacy monolithic pickle path verbatim.
         """
+        from backend.core.ouroboros import oracle_persistence as _op
+
+        if _op.sqlite_persistence_enabled():
+            await self._save_cache_via_provider()
+            return
+
         # Slice 112 graph hygiene (gated, default-OFF): crush serialization
         # bloat by pruning isolated (degree-0) nodes BEFORE the snapshot. Pure
         # bloat removal — traversal results (shortest_path / simple_cycles) are
