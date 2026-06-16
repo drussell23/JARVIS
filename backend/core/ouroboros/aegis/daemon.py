@@ -139,7 +139,12 @@ def build_app(
     # handlers below.
     app[_K_HMAC_KEY] = secrets.token_bytes(32)
     app[_K_BOOTSTRAP_PSK] = bootstrap_psk
-    app[_K_PSK_CONSUMED] = False
+    # Mutable runtime flag held in a one-element box, not a bare bool. aiohttp
+    # freezes the Application mapping on startup, so *reassigning* ``app[key]``
+    # at request time ("app[_K_PSK_CONSUMED] = True" mid-handler) raised
+    # ``DeprecationWarning: Changing state of started or joined application``.
+    # Mutating the box's *contents* leaves the (frozen) mapping untouched.
+    app[_K_PSK_CONSUMED] = {"v": False}
     active_sessions: Dict[str, SessionToken] = {}
     app[_K_ACTIVE_SESSIONS] = active_sessions
     app[_K_NONCE_LEDGER] = NonceLedger(capacity=nonce_ledger_capacity)
@@ -270,7 +275,7 @@ async def _handle_health(request: web.Request) -> web.Response:
         "schema_version": AEGIS_SCHEMA_VERSION,
         "bind_host": app[_K_BIND_HOST],
         "bind_port": app[_K_BIND_PORT],
-        "psk_consumed": app[_K_PSK_CONSUMED],
+        "psk_consumed": app[_K_PSK_CONSUMED]["v"],
         "active_session_count": len(app[_K_ACTIVE_SESSIONS]),
         "nonce_ledger_size": app[_K_NONCE_LEDGER].size(),
         "boot_ts": app[_K_BOOT_TS],
@@ -294,7 +299,7 @@ async def _handle_session_establish(request: web.Request) -> web.Response:
             {"ok": False, "error": "missing_bearer"}, status=401,
         )
 
-    if app[_K_PSK_CONSUMED]:
+    if app[_K_PSK_CONSUMED]["v"]:
         # Single-use: any subsequent attempt is rejected without
         # disclosing whether the PSK matched.
         return web.json_response(
@@ -316,8 +321,9 @@ async def _handle_session_establish(request: web.Request) -> web.Response:
         )
 
     # Mint the session token. Mark PSK consumed FIRST so a concurrent
-    # second request gets the consumed-path response.
-    app[_K_PSK_CONSUMED] = True
+    # second request gets the consumed-path response. Mutate the box's
+    # contents (not the frozen app mapping) — see _make_app.
+    app[_K_PSK_CONSUMED]["v"] = True
     now = time.time()
     K: bytes = app[_K_HMAC_KEY]
     wire, payload = mint_session_token(

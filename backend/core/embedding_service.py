@@ -312,9 +312,18 @@ class EmbeddingService:
         except Exception as e:
             logger.debug(f"[EmbeddingService] Broker unavailable, using legacy path: {e}")
 
-        # v2.0: Check memory budget BEFORE loading
+        # v2.0: Check memory budget BEFORE loading. A denial here is a
+        # *graceful degradation*, not a crash — the organism keeps running with
+        # long-term-memory embeddings disabled until memory frees up and a
+        # later load attempt succeeds. Logged at WARNING (not ERROR) so it
+        # reads as "operating in reduced mode under memory pressure" rather
+        # than a fault the operator must triage.
         if not await self._check_memory_budget():
-            logger.error("[EmbeddingService] ❌ Insufficient memory to load model")
+            logger.warning(
+                "[EmbeddingService] Embedding model load deferred — insufficient "
+                "free memory for the ~800MB SentenceTransformer. Long-term "
+                "memory runs without semantic embeddings until pressure eases."
+            )
             return False
 
         async with self._model_lock:

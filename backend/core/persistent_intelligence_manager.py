@@ -489,10 +489,22 @@ class PersistentIntelligenceManager:
         logger.debug("[PERSISTENT-INTELLIGENCE] Local database initialized")
 
     async def _init_cloud_adapter(self) -> None:
-        """Initialize cloud database adapter."""
+        """Initialize cloud database adapter.
+
+        Routes through the canonical ``get_database_adapter()`` factory rather
+        than the non-existent ``CloudDatabaseAdapter.create()`` (which raised
+        ``AttributeError: type object 'CloudDatabaseAdapter' has no attribute
+        'create'`` and aborted persistent-intelligence cloud init every boot).
+        The factory is the single source of truth: it returns the global
+        singleton, honours the Cloud SQL ReadinessGate (instant SQLite fallback
+        when the proxy is known-down), and wraps initialization in a timeout so
+        this call can never block the boot chain.
+        """
         try:
-            from backend.intelligence.cloud_database_adapter import CloudDatabaseAdapter
-            self._cloud_adapter = await CloudDatabaseAdapter.create()
+            from backend.intelligence.cloud_database_adapter import (
+                get_database_adapter,
+            )
+            self._cloud_adapter = await get_database_adapter()
             logger.info("[PERSISTENT-INTELLIGENCE] Cloud adapter initialized")
         except ImportError:
             logger.warning("[PERSISTENT-INTELLIGENCE] Cloud adapter not available")

@@ -267,6 +267,11 @@ def _todo_fixme_count(source: str) -> int:
 # classification): this set is about NEVER TRAVERSING heavy/non-source trees.
 _WALK_PRUNE_SEGMENTS: frozenset = frozenset({
     ".jarvis", ".worktrees", ".ouroboros",
+    # Slice 257 — Claude Code agent worktrees (``.claude/worktrees/<name>``)
+    # are full duplicate checkouts; pruning ``.claude`` stops the miner walk
+    # from descending into them (the Oracle leak that SIGKILLed
+    # bt-2026-06-16-042304 — same root cause, sibling scanner).
+    ".claude",
     ".git", "node_modules", "__pycache__",
     ".venv", "venv", ".mypy_cache", ".pytest_cache",
     "build", "dist", ".eggs",
