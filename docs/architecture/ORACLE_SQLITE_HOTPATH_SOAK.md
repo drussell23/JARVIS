@@ -150,3 +150,35 @@ VERDICT: PASS
 
 The 16 GB-host boundary is actively defended on both the cold-index and warm-boot paths.
 
+## Capstone graduation crucible — default-ON, under REAL ambient pressure
+
+After flipping `JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED` to default-ON, the full `backend/` index
+was re-run with **no forcing** — the host was genuinely at HIGH pressure (~3 GB free), so the armor
+engaged on real signal:
+
+```
+PHASE A — cold index (default-ON, real ambient HIGH pressure)
+  files indexed (graph nodes)   :    214,854
+  edges                         :    402,321
+  cold index wall time          :      78.72 s   (vs 62 s unarmored — the armor slowed it to protect the host)
+  peak RSS after index          :        575 MB
+  max control-plane stall       :     831.2 ms
+  memory armor — contractions   :        621      <-- driven by REAL ambient pressure, not forced
+  memory armor — suspended?     :      False
+PHASE B — warm reboot (streaming load)
+  warm load nodes               :    214,854
+  warm load wall time           :       7.789 s   (10x faster than cold)
+  transient spike over steady   :      11.4 %     (streaming load; flattened vs a fetchall spike)
+VERDICT: PASS
+```
+
+621 natural contractions + clean completion + 10× warm boot, default-ON, no OOM, no kill switch.
+This is the canonical SQLite layer running on the constrained host under genuine memory pressure.
+
+### Honest boundary on the full 29k-file / Phase-9 graduation
+This crucible is `backend/` (214k nodes). A fresh full **3-repo** index (~29k files, ~2 M nodes,
+~4.8 GB steady) does not fit the host's current ~3 GB free — the armor would suspend-durably (it
+guarantees no-OOM, not infinite RAM), completing across resume passes or with more headroom.
+`session_outcome=complete` is produced by the **battle-test harness** (`ouroboros_battle_test.py`),
+not this index path — that Phase-9 graduation is a separate, heavier soak.
+
