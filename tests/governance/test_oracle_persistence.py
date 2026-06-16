@@ -454,7 +454,7 @@ def test_upsert_files_hash_key_distinct_from_file_path(tmp_path):
     asyncio.run(run())
 
 
-def test_extraction_helpers(tmp_path):
+def test_extraction_helpers():
     g = _build_graph(2)._graph
     keys = list(g.nodes)[:2]
     nrows = P.node_rows_for_keys(g, keys)
@@ -501,6 +501,95 @@ def test_oracle_incremental_checkpoint_extracts_and_commits(monkeypatch, tmp_pat
         assert "backend/pkg/module_1.py" in files
         assert "backend/pkg/module_2.py" not in files  # not committed — only an edge-target stub
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- streaming warm-load
+def test_streaming_load_chunk_boundary(tmp_path, monkeypatch):
+    """Warm-load via fetchmany must reconstruct identically across chunk boundaries (chunk smaller
+    than the row count exercises the multi-fetch path)."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", "7")
+    async def run():
+        g = _build_graph(10)  # 20 nodes >> chunk of 7 → ≥3 fetchmany rounds
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(_state_from_graph(g))
+        loaded = await prov.load()
+        await prov.close()
+        assert loaded.graph.number_of_nodes() == g._graph.number_of_nodes()
+        assert loaded.graph.number_of_edges() == g._graph.number_of_edges()
+        assert set(loaded.node_index) == set(g._node_index)
+    asyncio.run(run())
+
+
+def test_load_chunk_env_default():
+    import os as _os
+    _os.environ.pop("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", None)
+    assert P.sqlite_load_chunk() == 2000
+
+
+# --------------------------------------------------------------------------- memory armor
+class _FakeGate:
+    """A MemoryPressureGate stand-in that returns a scripted sequence of pressure levels."""
+    def __init__(self, levels):
+        self._levels = list(levels)
+        self._i = 0
+
+    def pressure(self):
+        lvl = self._levels[min(self._i, len(self._levels) - 1)]
+        self._i += 1
+        return lvl
+
+
+def _oracle_with_gate(monkeypatch, tmp_path, levels):
+    from backend.core.ouroboros.oracle import TheOracle
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path", staticmethod(lambda: tmp_path / "o.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path", staticmethod(lambda: tmp_path / "c.pkl"))
+    o = TheOracle()
+    o._memory_gate_ref = _FakeGate(levels)   # pre-seed so _memory_gate() returns the fake
+    return o
+
+
+def test_armor_maps_levels(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    for lvl, expect in [(L.OK, "ok"), (L.WARN, "warn"), (L.HIGH, "high")]:
+        o = _oracle_with_gate(monkeypatch, tmp_path, [lvl])
+        assert asyncio.run(o._memory_armor_check()) == expect
+
+
+def test_armor_critical_persist_when_never_clears(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "2")
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.05")
+    o = _oracle_with_gate(monkeypatch, tmp_path, [L.CRITICAL] * 10)
+    assert asyncio.run(o._memory_armor_check()) == "critical_persist"
+    assert o._mem_armor_yields == 2  # forced GC+yield exactly max_yields times
+
+
+def test_armor_critical_then_clears(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "3")
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.05")
+    # first probe CRITICAL → enter yield loop; next probe OK → clears as "critical" (contract hard)
+    o = _oracle_with_gate(monkeypatch, tmp_path, [L.CRITICAL, L.OK])
+    assert asyncio.run(o._memory_armor_check()) == "critical"
+
+
+def test_armor_disabled_via_gate(monkeypatch, tmp_path):
+    from backend.core.ouroboros.oracle import TheOracle
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path", staticmethod(lambda: tmp_path / "o.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path", staticmethod(lambda: tmp_path / "c.pkl"))
+    o = TheOracle()
+    monkeypatch.setattr("backend.core.ouroboros.governance.memory_pressure_gate.is_enabled",
+                        lambda: False)
+    # _memory_gate() returns None → armor is a clean no-op
+    assert asyncio.run(o._memory_armor_check()) == "ok"
+
+
+def test_armor_flag_default_on(monkeypatch):
+    import backend.core.ouroboros.oracle as O
+    monkeypatch.delenv("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", raising=False)
+    assert O._oracle_memory_armor_enabled() is True
+    monkeypatch.setenv("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", "0")
+    assert O._oracle_memory_armor_enabled() is False
 
 
 if __name__ == "__main__":

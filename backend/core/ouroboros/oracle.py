@@ -1924,6 +1924,33 @@ def _oracle_backpressure_min_batch() -> int:
         return 4
 
 
+def _oracle_memory_armor_enabled() -> bool:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_ENABLED`` (default true) — second AIMD axis: fold host
+    memory pressure into the index throttle so the cold build defends a constrained RAM boundary
+    (16GB host). No-op unless memory actually elevates; the kill switch ``=0`` disables it."""
+    raw = os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_memory_armor_max_yields() -> int:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS`` — at CRITICAL pressure the index forces a
+    GC + loop-yield this many times waiting for pressure to clear before SUSPENDING the build
+    (durable — every SQLite commit is a checkpoint, so it resumes next boot). Default 3."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_MAX_YIELDS", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _oracle_memory_armor_yield_s() -> float:
+    """``JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S`` — seconds to yield to the GC/allocator per attempt
+    when CRITICAL. Default 0.5s."""
+    try:
+        return max(0.05, float(os.environ.get("JARVIS_ORACLE_MEMORY_ARMOR_YIELD_S", "0.5")))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 class _AdaptiveIndexThrottle:
     """AIMD backpressure for the Oracle index batch loop.
 
@@ -2036,6 +2063,12 @@ class TheOracle:
         # env flips after import still apply). ``None`` == legacy pickle path (byte-identical).
         self._persistence: Any = None
         self._persistence_built: bool = False
+
+        # Sovereign Memory Armor — observability counters (the index throttle's memory axis).
+        self._memory_gate_ref: Any = None
+        self._mem_armor_contractions: int = 0   # batches contracted under WARN/HIGH/CRITICAL
+        self._mem_armor_yields: int = 0          # GC+sleep yields performed at CRITICAL
+        self._mem_armor_suspended: bool = False  # index suspended because CRITICAL never cleared
 
         logger.info("The Oracle initialized")
 
@@ -2463,6 +2496,53 @@ class TheOracle:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Oracle] sqlite metrics flush failed (non-fatal): %s", exc)
 
+    def _memory_gate(self):
+        """Lazily resolve the shared MemoryPressureGate (the same advisory probe the SensorGovernor
+        uses — no duplication). Returns ``None`` if the gate is disabled or unavailable."""
+        if self._memory_gate_ref is None:
+            try:
+                from backend.core.ouroboros.governance.memory_pressure_gate import (
+                    get_default_gate, is_enabled,
+                )
+                if not is_enabled():
+                    return None
+                self._memory_gate_ref = get_default_gate()
+            except Exception:  # noqa: BLE001 — armor must never break the index
+                return None
+        return self._memory_gate_ref
+
+    async def _memory_armor_check(self) -> str:
+        """Phase-1 memory axis of the multi-axis throttle. Probes host RAM pressure; under
+        CRITICAL it actively DEFENDS the host boundary — forces ``gc.collect()`` + yields the loop
+        to the GC/allocator, re-probing up to ``_oracle_memory_armor_max_yields()`` times. Returns
+        one of ``ok|warn|high|critical|critical_persist``:
+          - ``warn|high|critical`` → caller contracts the next batch's concurrency footprint
+          - ``critical_persist``   → pressure would not clear → caller SUSPENDS the build (safe:
+            every SQLite commit is a checkpoint, so it resumes next boot via the file_hashes skip)
+        Never raises."""
+        gate = self._memory_gate()
+        if gate is None:
+            return "ok"
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+            lvl = gate.pressure()
+        except Exception:  # noqa: BLE001
+            return "ok"
+        if lvl != PressureLevel.CRITICAL:
+            return lvl.value  # ok / warn / high
+        # CRITICAL: proactive suspend-and-yield to reclaim transient memory before proceeding.
+        import gc
+        for _ in range(_oracle_memory_armor_max_yields()):
+            self._mem_armor_yields += 1
+            gc.collect()
+            await asyncio.sleep(_oracle_memory_armor_yield_s())
+            try:
+                if gate.pressure() != PressureLevel.CRITICAL:
+                    return "critical"   # cleared — but recently critical → still contract hard
+            except Exception:  # noqa: BLE001
+                return "critical"
+        return "critical_persist"
+
     async def _index_repository(self, repo_name: str, repo_path: Path) -> None:
         """Index all Python files in a repository."""
         logger.info(f"Indexing repository: {repo_name} at {repo_path}")
@@ -2529,6 +2609,14 @@ class TheOracle:
         # whole-graph rewrite. The commit window IS the adaptive AIMD batch (no hardcoded interval).
         from backend.core.ouroboros import oracle_persistence as _op_mod
         _sqlite_on = _op_mod.sqlite_persistence_enabled()
+        # Sovereign Memory Armor — second throttle axis. Maps host RAM pressure onto the AIMD
+        # throttle's lag scale so an elevated memory level contracts the next batch's process-pool
+        # fan-out exactly as event-loop lag does (multiplier × the throttle's lag threshold).
+        _armor_on = _oracle_memory_armor_enabled()
+        # Multiplier × the throttle's lag threshold → synthetic "lag" fed to the AIMD. >1.0 so each
+        # elevated level actually breaches (the throttle halves on >threshold) and higher levels
+        # also yield the loop longer (backoff_s is proportional to the overshoot). Graded defense.
+        _MEM_LAG_MULT = {"ok": 0.0, "warn": 1.5, "high": 2.5, "critical": 4.0}
         i = 0
         _batch_no = 0
         while i < total_files:
@@ -2548,6 +2636,24 @@ class TheOracle:
                     await _await_quiescence(label="oracle_index_repository")
                 except Exception:  # noqa: BLE001 — never break the index
                     pass
+            # --- Sovereign Memory Armor (top-of-loop, multi-axis) ---
+            # Probe host RAM BEFORE submitting the batch. CRITICAL → defend the 16GB boundary:
+            # gc-yield, and if it won't clear, SUSPEND with a durable checkpoint (resumes next
+            # boot). WARN/HIGH → fold into the AIMD throttle so this batch contracts its fan-out.
+            if _armor_on and not self._shutting_down:
+                _mem_lvl = await self._memory_armor_check()
+                if _mem_lvl == "critical_persist":
+                    self._mem_armor_suspended = True
+                    logger.warning(
+                        "[Oracle.index] CRITICAL memory pressure persisted after GC yields — "
+                        "SUSPENDING %s index at %d/%d files. Partial graph is durable (every "
+                        "SQLite commit is a checkpoint); it resumes next boot via the file_hashes "
+                        "skip.", repo_name, i, total_files,
+                    )
+                    break
+                if _throttle is not None and _MEM_LAG_MULT.get(_mem_lvl, 0.0) > 0.0:
+                    self._mem_armor_contractions += 1
+                    _throttle.update(_MEM_LAG_MULT[_mem_lvl] * _throttle.lag_threshold_ms)
             effective = _throttle.batch if _throttle is not None else batch_size
             batch = python_files[i:i + effective]
             tasks = [

@@ -87,6 +87,17 @@ def sqlite_integrity_timeout_s() -> float:
         return 10.0
 
 
+def sqlite_load_chunk() -> int:
+    """``JARVIS_ORACLE_SQLITE_LOAD_CHUNK`` — warm-load streaming chunk size. The DiGraph is
+    rebuilt incrementally via ``fetchmany(chunk)`` so the transient footprint is graph + ONE chunk
+    of rows, never graph + the entire result set materialized as a Python list (the warm-boot
+    spike). Default 2000."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_SQLITE_LOAD_CHUNK", "2000")))
+    except (TypeError, ValueError):
+        return 2000
+
+
 # ---------------------------------------------------------------------------- value object
 @dataclass
 class GraphState:
@@ -383,52 +394,63 @@ class AioSqliteProvider(PersistenceProvider):
         except Exception:  # noqa: BLE001
             return None
 
+        # Phase-2 streaming warm-load: build the DiGraph incrementally via fetchmany(chunk) so the
+        # transient footprint is graph + ONE chunk, never graph + the entire result set as a list
+        # (the warm-boot RAM spike). Flat memory profile during reconstruction.
+        chunk = sqlite_load_chunk()
+        n_nodes = 0
         async with conn.execute(
             "SELECT node_key, repo, file_path, name, node_type, line_number, docstring, signature,"
             " decorators, base_classes, complexity, line_count, last_modified, source_hash FROM nodes"
         ) as cur:
-            node_rows = await cur.fetchall()
+            while True:
+                rows = await cur.fetchmany(chunk)
+                if not rows:
+                    break
+                for r in rows:
+                    (node_key, repo, file_path, name, node_type, line_number, docstring, signature,
+                     decorators, base_classes, complexity, line_count, last_modified, source_hash) = r
+                    # Rebuild the EXACT attr shape add_node stored (NodeData.to_dict()) so the rest
+                    # of the Oracle (get_node → dict(graph.nodes[k])) is byte-for-byte identical.
+                    attrs = {
+                        "node_id": {
+                            "repo": repo, "file_path": file_path, "name": name,
+                            "node_type": node_type, "line_number": line_number,
+                        },
+                        "docstring": docstring,
+                        "signature": signature,
+                        "decorators": json.loads(decorators) if decorators else [],
+                        "base_classes": json.loads(base_classes) if base_classes else [],
+                        "complexity": complexity,
+                        "line_count": line_count,
+                        "last_modified": last_modified,
+                        "source_hash": source_hash,
+                    }
+                    graph.add_node(node_key, **attrs)
+                    node_index[node_key] = NodeID(
+                        repo=repo, file_path=file_path, name=name,
+                        node_type=NodeType(node_type), line_number=line_number,
+                    )
+                    file_index[file_path].add(node_key)
+                    repo_index[repo].add(node_key)
+                    type_index[NodeType(node_type)].add(node_key)
+                    n_nodes += 1
 
-        if not node_rows:
+        if n_nodes == 0:
             return None  # empty store → cold index
-
-        for r in node_rows:
-            (node_key, repo, file_path, name, node_type, line_number, docstring, signature,
-             decorators, base_classes, complexity, line_count, last_modified, source_hash) = r
-            # Rebuild the EXACT attr shape add_node stored (NodeData.to_dict()), so the rest
-            # of the Oracle (get_node → dict(graph.nodes[k])) is byte-for-byte identical.
-            attrs = {
-                "node_id": {
-                    "repo": repo, "file_path": file_path, "name": name,
-                    "node_type": node_type, "line_number": line_number,
-                },
-                "docstring": docstring,
-                "signature": signature,
-                "decorators": json.loads(decorators) if decorators else [],
-                "base_classes": json.loads(base_classes) if base_classes else [],
-                "complexity": complexity,
-                "line_count": line_count,
-                "last_modified": last_modified,
-                "source_hash": source_hash,
-            }
-            graph.add_node(node_key, **attrs)
-            node_index[node_key] = NodeID(
-                repo=repo, file_path=file_path, name=name,
-                node_type=NodeType(node_type), line_number=line_number,
-            )
-            file_index[file_path].add(node_key)
-            repo_index[repo].add(node_key)
-            type_index[NodeType(node_type)].add(node_key)
 
         async with conn.execute(
             "SELECT src_key, dst_key, edge_type, line_number, context FROM edges"
         ) as cur:
-            edge_rows = await cur.fetchall()
-        for src_key, dst_key, edge_type, line_number, context in edge_rows:
-            graph.add_edge(
-                src_key, dst_key,
-                edge_type=edge_type, line_number=line_number, context=context,
-            )
+            while True:
+                rows = await cur.fetchmany(chunk)
+                if not rows:
+                    break
+                for src_key, dst_key, edge_type, line_number, context in rows:
+                    graph.add_edge(
+                        src_key, dst_key,
+                        edge_type=edge_type, line_number=line_number, context=context,
+                    )
 
         async with conn.execute("SELECT file_path, source_hash FROM file_hashes") as cur:
             fh_rows = await cur.fetchall()

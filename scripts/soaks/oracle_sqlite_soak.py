@@ -102,15 +102,42 @@ async def main() -> int:
     if o._persistence is not None:
         await o._persistence.close()
 
-    # ---- Phase B: warm reboot from SQLite ----
+    # ---- Phase B: warm reboot from SQLite, sampling RSS to prove the spike is flattened ----
+    try:
+        import psutil  # type: ignore
+        _proc = psutil.Process()
+
+        def _now_rss_mb() -> float:
+            return _proc.memory_info().rss / 1e6
+    except Exception:  # noqa: BLE001
+        _now_rss_mb = _rss_mb  # fallback (peak-only)
+
     o2 = TheOracle()
     o2._repos = {"jarvis": subtree}
+    rss_before_load = _now_rss_mb()
+    load_peak = {"v": rss_before_load}
+    load_stop = asyncio.Event()
+
+    async def _rss_sampler() -> None:
+        while not load_stop.is_set():
+            load_peak["v"] = max(load_peak["v"], _now_rss_mb())
+            try:
+                await asyncio.wait_for(load_stop.wait(), timeout=0.02)
+            except asyncio.TimeoutError:
+                pass
+
+    sampler = asyncio.create_task(_rss_sampler())
     t1 = time.monotonic()
     ok = await o2._load_cache()
     warm_s = time.monotonic() - t1
+    load_stop.set()
+    await sampler
+    rss_after_load = _now_rss_mb()
     warm_nodes = o2._graph._graph.number_of_nodes()
     if o2._persistence is not None:
         await o2._persistence.close()
+    # transient spike over the steady (graph-resident) footprint — low % == flat streaming load
+    spike_pct = 100.0 * (load_peak["v"] - rss_after_load) / max(rss_after_load, 1e-9)
 
     # ---- report ----
     print("\n" + "=" * 70)
@@ -123,11 +150,18 @@ async def main() -> int:
     print(f"  peak RSS after index          : {rss_after_index:>10.0f} MB")
     print(f"  *** max control-plane stall    : {hb_out.get('max_stall_ms', 0.0):>9.1f} ms "
           f"({hb_out.get('pings', 0)} pings)")
-    print(f"{'PHASE B — warm reboot (load from SQLite)':<45}")
+    print(f"  memory armor — contractions   : {o._mem_armor_contractions:>10,}")
+    print(f"  memory armor — GC yields      : {o._mem_armor_yields:>10,}")
+    print(f"  memory armor — suspended?     : {str(o._mem_armor_suspended):>10}")
+    print(f"{'PHASE B — warm reboot (streaming load from SQLite)':<45}")
     print(f"  warm load ok                  : {str(ok):>10}")
     print(f"  warm load nodes               : {warm_nodes:>10,}")
     print(f"  warm load wall time           : {warm_s:>10.3f} s")
     print(f"  speedup (cold/warm)           : {cold_s / max(warm_s, 1e-9):>10.0f}x")
+    print(f"  RSS before load               : {rss_before_load:>10.0f} MB")
+    print(f"  RSS steady after load (graph) : {rss_after_load:>10.0f} MB")
+    print(f"  *** peak RSS DURING load       : {load_peak['v']:>9.0f} MB")
+    print(f"  *** transient spike over steady: {spike_pct:>9.1f} %   (low == flat streaming load)")
     print("=" * 70)
 
     verdict_ok = ok and warm_nodes == nodes and nodes > 0
