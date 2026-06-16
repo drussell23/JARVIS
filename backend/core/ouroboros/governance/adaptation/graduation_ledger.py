@@ -416,6 +416,24 @@ CADENCE_POLICY: Tuple[CadencePolicyEntry, ...] = (
             "delta emission"
         ),
     ),
+    # ----------------------------------------------------------------
+    # Capstone Dogfood — LiveKernelValidator (Sovereign Telemetry
+    # Unification, 2026-06-15). Kernel-touching: the validator reroutes
+    # live-fire-failing candidates back through GENERATE_RETRY as
+    # failure_class=build. Its per-flag GraduationContract demands
+    # harvester-proven self-heal evidence (fired + no-OOM + recovered),
+    # so it carries the stricter Pass C bar (5 clean sessions).
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED",
+        required_clean_sessions=5,
+        cadence_class=CadenceClass.PASS_C,
+        description=(
+            "LiveKernelValidator — live-fire boot validation reroutes "
+            "kernel-touching candidates to self-heal (mutation-adjacent "
+            "gate — Pass C bar; Metrics-aware capstone contract)"
+        ),
+    ),
 )
 
 
