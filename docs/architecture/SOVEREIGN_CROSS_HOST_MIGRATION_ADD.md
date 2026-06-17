@@ -32,11 +32,22 @@ pipeline. Every new component is justified against "why can't an existing one do
 | State backup daemon | `governance/state_persistence_daemon.py` (rsync/s3/git of `.jarvis/`) | Reused as-is |
 | GPU-capable image | `docker/Dockerfile.gcp-inference` (CUDA/CPU autodetect, PyTorch/Transformers/llama-cpp) | Reused as base |
 
-### Cloud target assumption (please confirm at review)
-**GCP** is assumed primary (J-Prime is GCP-self-hosted; `Dockerfile.gcp-inference` + `Dockerfile.cloud`
-Cloud Run already exist). The transport/brain layers are **provider-agnostic** (plain `user@host`
-SSH, as `migrate_to_host.sh` already is); only §4 (accelerators) is GCP-specific and isolates the
-provider behind a profile file, so AWS/Azure is a profile swap, not a redesign.
+### Provider & host-sizing (operator-confirmed: DoubleWord is primary)
+**DoubleWord (DW 397B) is the primary LLM provider (Tier 0), with Claude as Tier-1 fallback** — both
+are **remote APIs** (`api.doubleword.ai`, `api.anthropic.com`). The decisive consequence for this
+design: **the migration host is an FSM *orchestration* host, not an LLM-serving host.** Generation
+happens remotely; the host only runs the governance loop + the Oracle brain + two small local models.
+
+- **The host is RAM-bound, not GPU-bound.** The reason to migrate is the **~5 GB Oracle graph** that
+  doesn't fit the local 3 GB-free boundary — *that* is the headroom we need. A modest **16–32 GB VM
+  with network egress to `api.doubleword.ai`** satisfies the core migration. No LLM-serving
+  accelerator is required for generation.
+- **Critical env-envelope payload:** `DOUBLEWORD_API_KEY` (Tier 0) + `ANTHROPIC_API_KEY` (Tier-1
+  fallback). `HF_TOKEN`/`HUGGINGFACE_TOKEN` are only needed if §5's local models pull weights from HF.
+- **Cloud target:** host can be **GCP** (assumed; J-Prime is GCP, the inference/Cloud-Run images
+  exist) or any VM with DW network reach — the transport/brain layers are provider-agnostic (`user@host`
+  SSH, as `migrate_to_host.sh` already is). Only §5's *optional* accelerator step is provider-specific,
+  isolated behind a profile file.
 
 ## 2. Goals / Non-goals
 **Goals:** (1) secrets encrypted at rest AND in transit, decryptable only by the operator passphrase;
@@ -118,14 +129,21 @@ daemon for steady-state — each tool for its job, no duplication.
 
 ---
 
-## 5. Pillar 3 — Component Staging for Tiny Prime (GPU/TPU)
+## 5. Pillar 3 — Component Staging for Tiny Prime (GPU/TPU) — OPTIONAL, off the critical path
+
+### Scope note (DW-primary)
+Because **generation is remote via DW (Tier 0)**, this host serves **no large LLM**. The only locally
+accelerated workloads are two *small* models: **Tiny Prime** (the upcoming compact intent classifier —
+today `intent_classifier.py` routes to remote J-Prime) and the **Voice Biometric** stack (ECAPA
+192-dim, onnxruntime, `backend/voice_unlock/`). Both fit a **single modest GPU (e.g. L4)** or run on
+**CPU** with the profile's `fallback`. **No A100/TPU is required**, and this pillar is **deferrable** —
+the core migration (Pillars 1–2 + a RAM-adequate host) stands alone and unblocks the Phase-9 Capstone
+without it. Build §5 only when the Tiny Prime / voice workloads actually land.
 
 ### Problem
 There is currently **no GPU/TPU allocation** anywhere (only macOS Metal via `metal_accelerator.rs`).
-Model weights are **excluded** from the lean artifact (`.onnx`/`.pt`/`.so`/`.dylib`). Tiny Prime (the
-upcoming small local intent classifier — today `intent_classifier.py` routes to remote J-Prime) and
-the Voice Biometric stack (ECAPA 192-dim, onnxruntime, under `backend/voice_unlock/`) both need
-accelerator placement and a weight-staging path.
+Model weights are **excluded** from the lean artifact (`.onnx`/`.pt`/`.so`/`.dylib`), so Tiny Prime and
+the ECAPA stack need a declarative device map + a weight-staging path when they do land.
 
 ### Design: a declarative accelerator profile + a weight-staging step
 1. **`deploy/accelerator_profile.yaml`** (NEW — the single source of truth, no hardcoding). Declares
@@ -218,13 +236,19 @@ credential allowlist, state-vault daemon, `Dockerfile.gcp-inference`, systemd te
 3. **Accelerator Staging** — `accelerator_profile.yaml` + `provision_host.sh` CUDA/TPU step +
    `stage_models.sh` + device-binding/fallback for Tiny Prime + ECAPA. Largest; provider-specific.
 
-> These three are independent and ordered by value+risk. Recommend Slice 1 → 2 → 3, each through the
-> normal spec → writing-plans → build cycle.
+> These three are independent and ordered by value+risk. **Slices 1 → 2 unblock the Phase-9 Capstone
+> on their own** (env + brain + RAM-adequate host, DW remote for generation). **Slice 3 is optional /
+> deferred** until the Tiny Prime + voice workloads actually land. Each goes through the normal
+> spec → writing-plans → build cycle.
 
 ## 11. Open questions for the operator
-1. **Cloud target** — GCP assumed (drives §5). Confirm, or name AWS/Azure (profile swap).
-2. **Accelerator** — GPU (L4/A100) vs TPU (v5e) for Tiny Prime? Determines `accelerator_profile.yaml`
-   defaults and the `provision_host.sh` driver path.
-3. **Weight sources** — HF Hub (have `HF_TOKEN`) vs a private GCS bucket for Tiny Prime + ECAPA?
-4. **Brain shipment** — ship `oracle.db` in the artifact (`--with-brain`, ~0.5–1 GB) vs seed it via a
+**Settled (operator-confirmed):** DW is the primary provider ⇒ host is RAM-bound orchestration (no
+LLM-serving GPU); critical secret is `DOUBLEWORD_API_KEY` (+ `ANTHROPIC_API_KEY` Tier-1). Pillar 3 is
+optional/deferrable.
+
+Remaining:
+1. **Host sizing/provider** — a 16–32 GB VM with egress to `api.doubleword.ai`. GCP assumed; confirm,
+   or name AWS/Azure/VPS (transport+brain are provider-agnostic; only optional §5 cares).
+2. **Brain shipment** — ship `oracle.db` in the artifact (`--with-brain`, ~0.5–1 GB) vs seed it via a
    one-shot state-vault pull on the host? (Artifact is simpler; vault-pull keeps the artifact lean.)
+3. *(Deferred until Tiny Prime/voice land)* accelerator type (L4 vs CPU) + weight source (HF vs GCS).
