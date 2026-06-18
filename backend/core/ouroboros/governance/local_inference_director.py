@@ -188,18 +188,22 @@ class LocalPrimeClient:
             )
         return self._session
 
-    async def complete(self, *, system: str, user: str, prompt_tokens: int) -> LocalCompletion:
+    async def complete(self, *, system: str, user: str, prompt_tokens: int,
+                       temperature: float = 0.2,
+                       max_tokens: "Optional[int]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
-        body = {
+        body: Dict[str, Any] = {
             "model": self._cfg.model_name,
             "keep_alive": self._cfg.keep_alive_seconds,
-            "temperature": 0.2,
+            "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         t0 = time.monotonic()
         async with sess.post(url, json=body) as resp:
             data = await resp.json()
@@ -210,11 +214,14 @@ class LocalPrimeClient:
         self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
         return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
 
-    async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int) -> LocalCompletion:
+    async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
+                               temperature: float = 0.2,
+                               max_tokens: "Optional[int]" = None) -> LocalCompletion:
         timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
         try:
             return await asyncio.wait_for(
-                self.complete(system=system, user=user, prompt_tokens=prompt_tokens),
+                self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
+                              temperature=temperature, max_tokens=max_tokens),
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
@@ -223,10 +230,54 @@ class LocalPrimeClient:
                 f"warm={self.profiler.is_warm()}"
             ) from e
 
+    async def generate(self, prompt: str, system_prompt: "Optional[str]" = None,
+                       context: "Optional[Any]" = None, max_tokens: int = 4096,
+                       temperature: float = 0.7, model_name: "Optional[str]" = None,
+                       task_profile: "Optional[Any]" = None, **kwargs: Any) -> Any:
+        """Drop-in PrimeClient.generate adapter -> PrimeResponse (source=local_prime).
+
+        context/task_profile are accepted for interface parity; the 3B path relies
+        on the structured prompt + files already in `prompt` (documented v1 limit).
+        """
+        import uuid
+        from backend.core.prime_client import PrimeResponse
+        sys_txt = system_prompt or ""
+        est_tokens = max(1, (len(prompt) + len(sys_txt)) // 4)
+        lc = await self.complete_guarded(
+            system=sys_txt, user=prompt, prompt_tokens=est_tokens,
+            temperature=temperature, max_tokens=max_tokens,
+        )
+        return PrimeResponse(
+            content=lc.text,
+            request_id=uuid.uuid4().hex,
+            model=model_name or self._cfg.model_name,
+            source="local_prime",
+            latency_ms=lc.total_ms,
+            tokens_used=lc.output_tokens,
+        )
+
+    async def _check_health(self) -> Any:
+        """Drop-in PrimeClient._check_health -> PrimeStatus (AVAILABLE iff Ollama reachable)."""
+        from backend.core.prime_client import PrimeStatus
+        try:
+            sess = await self._ensure_session()
+            url = self._cfg.base_url.rstrip("/") + "/api/tags"
+            async with sess.get(url) as resp:
+                return PrimeStatus.AVAILABLE if resp.status == 200 else PrimeStatus.UNAVAILABLE
+        except Exception:
+            return PrimeStatus.UNAVAILABLE
+
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+def build_local_prime_client() -> "Optional[LocalPrimeClient]":
+    """Factory honoring the master kill-switch. OFF -> None (legacy untouched)."""
+    if not local_prime_enabled():
+        return None
+    return LocalPrimeClient(LocalConfig.from_env())
 
 
 class LocalInferenceDirector:

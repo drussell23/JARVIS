@@ -213,3 +213,51 @@ async def test_critical_eviction_unloads_and_gc(monkeypatch):
     await d.enforce_memory(PressureLevel.CRITICAL)
     assert any(c.get("keep_alive") == 0 for c in evicted["calls"])  # forced unload
     assert gc_calls["n"] >= 2  # dual-stage gc.collect()
+
+
+@pytest.mark.asyncio
+async def test_generate_returns_primeresponse_with_content():
+    from backend.core.ouroboros.governance.local_inference_director import LocalPrimeClient, LocalConfig
+    fake = _FakeSession({"choices": [{"message": {"content": "GENERATED"}}],
+                         "usage": {"completion_tokens": 7}})
+    client = LocalPrimeClient(LocalConfig.from_env(), session=fake)
+    resp = await client.generate(prompt="do x", system_prompt="be terse", max_tokens=256, temperature=0.0)
+    assert resp.content == "GENERATED"
+    assert resp.source == "local_prime"
+    assert resp.request_id  # non-empty
+    # max_tokens forwarded to the Ollama body
+    _, kw = fake.posts[-1]
+    assert kw["json"].get("max_tokens") == 256
+
+
+@pytest.mark.asyncio
+async def test_check_health_available_on_200():
+    from backend.core.ouroboros.governance.local_inference_director import LocalPrimeClient, LocalConfig
+
+    class _HealthResp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class _HealthSession:
+        closed = False
+        def get(self, url, **kw): return _HealthResp()
+        def post(self, url, **kw): raise AssertionError("health must use GET")
+        async def close(self): self.closed = True
+
+    client = LocalPrimeClient(LocalConfig.from_env(), session=_HealthSession())
+    status = await client._check_health()
+    assert status.name == "AVAILABLE"
+
+
+def test_build_local_prime_client_off_returns_none(monkeypatch):
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")
+    from backend.core.ouroboros.governance.local_inference_director import build_local_prime_client
+    assert build_local_prime_client() is None
+
+
+def test_build_local_prime_client_on_returns_client(monkeypatch):
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    from backend.core.ouroboros.governance.local_inference_director import (
+        build_local_prime_client, LocalPrimeClient)
+    assert isinstance(build_local_prime_client(), LocalPrimeClient)

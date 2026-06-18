@@ -3901,6 +3901,24 @@ class GovernedLoopService:
 
         # Build PrimeProvider if PrimeClient available
         _primary_probe_ok = False  # track for FSM sync after generator build
+        # J-Prime local activation (Phase 3): when no GCP PrimeClient is configured
+        # and the local tier is enabled, inject the local Ollama-backed client so
+        # PrimeProvider has a real backend. OFF or GCP-present -> no-op (legacy).
+        if self._prime_client is None:
+            try:
+                from backend.core.ouroboros.governance.local_inference_director import (
+                    build_local_prime_client,
+                )
+                _local_prime = build_local_prime_client()
+                if _local_prime is not None:
+                    self._prime_client = _local_prime
+                    logger.info(
+                        "[GovernedLoop] J-Prime local tier: LocalPrimeClient injected (Ollama)"
+                    )
+            except Exception:
+                logger.debug(
+                    "[GovernedLoop] local prime injection skipped", exc_info=True
+                )
         if self._prime_client is not None:
             try:
                 from backend.core.ouroboros.governance.providers import (
