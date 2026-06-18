@@ -879,6 +879,17 @@ class CodebaseKnowledgeGraph:
             "last_incremental_update": 0.0,
         }
 
+        # Traversal seam (Slice 1) — all graph QUERIES route through this backend instead of hitting
+        # NetworkX directly, so the read layer is decoupled from the storage format. Default is the
+        # in-memory backend (byte-identical to the pre-seam path); Slice 2 swaps in a parity-checked
+        # SQLite lazy backend. Reads ``self`` dynamically, so wholesale ``_graph`` replacement on
+        # cache load is transparent. Never raises (fail-soft to direct nx if the seam can't build).
+        try:
+            from backend.core.ouroboros.oracle_graph_backend import build_graph_backend
+            self._backend = build_graph_backend(self)
+        except Exception:  # noqa: BLE001
+            self._backend = None  # type: ignore[assignment]
+
     def add_node(self, node_data: NodeData) -> None:
         """Add a node to the graph."""
         node_id = node_data.node_id
@@ -985,29 +996,33 @@ class CodebaseKnowledgeGraph:
             self._metrics["total_edges"] += 1
 
     def get_node(self, node_id: Union[NodeID, str]) -> Optional[Dict[str, Any]]:
-        """Get node data by ID."""
+        """Get node data by ID. Routes through the traversal seam (Slice 1)."""
         node_key = str(node_id)
+        if self._backend is not None:
+            return self._backend.get_node(node_key)
         if node_key in self._graph:
             return dict(self._graph.nodes[node_key])
         return None
 
     def get_edges_from(self, node_id: Union[NodeID, str]) -> List[Tuple[str, Dict[str, Any]]]:
-        """Get all outgoing edges from a node."""
+        """Get all outgoing edges from a node. Routes through the traversal seam (Slice 1)."""
         node_key = str(node_id)
+        if self._backend is not None:
+            return self._backend.successors(node_key)
         if node_key not in self._graph:
             return []
-
         return [
             (target, dict(self._graph.edges[node_key, target]))
             for target in self._graph.successors(node_key)
         ]
 
     def get_edges_to(self, node_id: Union[NodeID, str]) -> List[Tuple[str, Dict[str, Any]]]:
-        """Get all incoming edges to a node."""
+        """Get all incoming edges to a node. Routes through the traversal seam (Slice 1)."""
         node_key = str(node_id)
+        if self._backend is not None:
+            return self._backend.predecessors(node_key)
         if node_key not in self._graph:
             return []
-
         return [
             (source, dict(self._graph.edges[source, node_key]))
             for source in self._graph.predecessors(node_key)
@@ -1238,23 +1253,26 @@ class CodebaseKnowledgeGraph:
         if source_key not in self._graph or target_key not in self._graph:
             return None
 
+        # Route through the traversal seam (Slice 1) — InMemory overrides with nx.shortest_path;
+        # the SQLite backend (Slice 2) uses the primitive-based BFS. Identical results either way.
+        if self._backend is not None:
+            path = self._backend.shortest_path(source_key, target_key)
+            if path is None:
+                return None
+            return [self._node_index[key] for key in path if key in self._node_index]
         try:
-            # Use networkx shortest path
-            path = nx.shortest_path(
-                self._graph,
-                source_key,
-                target_key,
-            )
+            path = nx.shortest_path(self._graph, source_key, target_key)
             return [self._node_index[key] for key in path if key in self._node_index]
         except nx.NetworkXNoPath:
             return None
 
     def find_circular_dependencies(self) -> List[List[NodeID]]:
-        """Find all circular dependencies in the graph."""
+        """Find all circular dependencies in the graph (declared in-scope per §10 — routes through
+        the seam so it never falls into the partial-graph trap under the Scoper)."""
         cycles = []
-
         try:
-            for cycle in nx.simple_cycles(self._graph):
+            source = self._backend.simple_cycles() if self._backend is not None else nx.simple_cycles(self._graph)
+            for cycle in source:
                 if len(cycle) > 1:  # Ignore self-loops
                     cycle_nodes = [
                         self._node_index[key]
@@ -1310,10 +1328,19 @@ class CodebaseKnowledgeGraph:
             next_level: Set[str] = set()
 
             for node_key in current_level:
-                if direction in ("out", "both"):
-                    next_level.update(self._graph.successors(node_key))
-                if direction in ("in", "both"):
-                    next_level.update(self._graph.predecessors(node_key))
+                # Neighbor collection routes through the seam (Slice 1). The subgraph
+                # materialization below stays nx for the in-memory backend; the SQLite backend
+                # (Slice 2) builds the sub-graph from rows.
+                if self._backend is not None:
+                    if direction in ("out", "both"):
+                        next_level.update(self._backend.successor_keys(node_key))
+                    if direction in ("in", "both"):
+                        next_level.update(self._backend.predecessor_keys(node_key))
+                else:
+                    if direction in ("out", "both"):
+                        next_level.update(self._graph.successors(node_key))
+                    if direction in ("in", "both"):
+                        next_level.update(self._graph.predecessors(node_key))
 
             nodes_to_include.update(next_level)
             current_level = next_level
