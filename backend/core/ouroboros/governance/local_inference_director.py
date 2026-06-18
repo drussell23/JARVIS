@@ -7,6 +7,7 @@ byte-identical legacy).
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import threading
@@ -131,6 +132,15 @@ class LatencyProfiler:
         return elapsed_ms > (m + 3.0 * sd_eff)
 
 
+class LocalLatencyLockup(RuntimeError):
+    """Raised when local inference breaches the adaptive/ceiling timeout.
+
+    Consumed by candidate_generator's FailbackStateMachine to transition
+    J-Prime to PRIMARY_DEGRADED and cascade the op upstream.
+    """
+    failure_class = "terminal_lag_lockup"
+
+
 def render_structured_prompt(*, task: str, constraints: List[str], files: Dict[str, str]) -> str:
     """Structured-prompt discipline for the local 3B: rigid bounded tags, no loose NL."""
     parts = ["<task>", task, "</task>", "<constraints>"]
@@ -196,6 +206,19 @@ class LocalPrimeClient:
         ttft_ms = min(total_ms, 0.1 * total_ms)
         self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
         return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
+
+    async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int) -> LocalCompletion:
+        timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
+        try:
+            return await asyncio.wait_for(
+                self.complete(system=system, user=user, prompt_tokens=prompt_tokens),
+                timeout=timeout_ms / 1000.0,
+            )
+        except asyncio.TimeoutError as e:
+            raise LocalLatencyLockup(
+                f"local_inference timeout: budget={timeout_ms:.0f}ms "
+                f"warm={self.profiler.is_warm()}"
+            ) from e
 
     async def aclose(self) -> None:
         if self._session is not None:

@@ -132,3 +132,36 @@ def test_structured_prompt_uses_bounded_tags():
     s = render_structured_prompt(task="fix bug", constraints=["no new deps"], files={"a.py": "x=1"})
     assert "<task>" in s and "</task>" in s
     assert "<constraints>" in s and "<files>" in s
+
+
+@pytest.mark.asyncio
+async def test_breaker_trips_on_ceiling_breach(monkeypatch):
+    from backend.core.ouroboros.governance.local_inference_director import (
+        LocalPrimeClient, LocalConfig, LocalLatencyLockup)
+    monkeypatch.setenv("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", "50")  # tiny ceiling
+
+    class _SlowSession:
+        closed = False
+
+        def post(self, url, **kw):
+            class _R:
+                status = 200
+
+                async def __aenter__(self_):
+                    import asyncio
+                    await asyncio.sleep(0.2)  # 200ms > 50ms ceiling
+                    return self_
+
+                async def __aexit__(self_, *a):
+                    return False
+
+                async def json(self_):
+                    return {"choices": [{"message": {"content": "x"}}]}
+            return _R()
+
+        async def close(self):
+            self.closed = True
+
+    client = LocalPrimeClient(LocalConfig.from_env(), session=_SlowSession())
+    with pytest.raises(LocalLatencyLockup):
+        await client.complete_guarded(system="<s/>", user="<u/>", prompt_tokens=10)
