@@ -13,10 +13,21 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import os
 import time
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def _hedge_enabled_default() -> bool:
+    return os.environ.get("JARVIS_TIERED_HEDGE_ENABLED", "").strip().lower() in _TRUE
+
+
+def _hedge_window_default_s() -> float:
+    return float(os.environ.get("JARVIS_TIERED_HEDGE_WINDOW_MS", "800")) / 1000.0
 
 
 class HeavyState(str, enum.Enum):
@@ -61,6 +72,8 @@ class TieredPrimeClient:
         now_fn: Optional[Callable[[], float]] = None,
         failure_threshold: Optional[int] = None,
         cooldown_s: Optional[float] = None,
+        hedge_enabled: Optional[bool] = None,
+        hedge_window_s: Optional[float] = None,
     ) -> None:
         self._heavy = heavy
         self._light = light
@@ -75,6 +88,10 @@ class TieredPrimeClient:
         self._consecutive_failures: int = 0
         self._degraded_at: float = 0.0
         self._pending_recovery_probe: Optional[asyncio.Task] = None  # strong ref
+
+        # Hedging (Task 3)
+        self._hedge_enabled: bool = hedge_enabled if hedge_enabled is not None else _hedge_enabled_default()
+        self._hedge_window_s: float = hedge_window_s if hedge_window_s is not None else _hedge_window_default_s()
 
     @staticmethod
     def _resolve_recovery_params() -> tuple[int, float]:
@@ -171,6 +188,8 @@ class TieredPrimeClient:
         # Heavy tier only when HEALTHY. When DEGRADED, skip heavy entirely and,
         # once the cooldown has elapsed, schedule a non-blocking recovery probe.
         if self._heavy is not None and self._heavy_state is HeavyState.HEALTHY:
+            if self._hedge_enabled and self._light is not None:
+                return await self._generate_hedged(prompt, kw)
             try:
                 result = await self._heavy.generate(prompt, **kw)
                 self._record_heavy_success()
@@ -191,6 +210,54 @@ class TieredPrimeClient:
         if self._light is not None:
             return await self._light.generate(prompt, **kw)
         raise RuntimeError("tiered_prime_client: no tier available")
+
+    # ------------------------------------------------------------------
+    # Hedging helpers (Task 3)
+    # ------------------------------------------------------------------
+
+    async def _cancel_and_drain(self, task: "Optional[asyncio.Task]") -> None:
+        """Cancel a laggard task and await it so no task/FD/socket leaks."""
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _generate_hedged(self, prompt: str, kw: dict) -> Any:
+        """Start heavy; if it doesn't finish within the hedge window, race a local
+        hedge. Accept first success; cancel the laggard cleanly. Heavy too-slow or
+        failed -> record_heavy_failure (FSM signal); heavy win -> record_success."""
+        heavy_task: asyncio.Task = asyncio.ensure_future(self._heavy.generate(prompt, **kw))
+        done, _pending = await asyncio.wait({heavy_task}, timeout=self._hedge_window_s)
+        if heavy_task in done:
+            try:
+                result = heavy_task.result()
+                self._record_heavy_success()
+                return result
+            except Exception as exc:
+                self._record_heavy_failure()
+                logger.info("[Tiered] heavy failed within window (%s) -> light", exc)
+                return await self._light.generate(prompt, **kw)
+        # window elapsed: race a local hedge
+        light_task: asyncio.Task = asyncio.ensure_future(self._light.generate(prompt, **kw))
+        done, pending = await asyncio.wait(
+            {heavy_task, light_task}, return_when=asyncio.FIRST_COMPLETED)
+        # Prefer a heavy success; else take a light success.
+        if heavy_task in done and not heavy_task.cancelled() and heavy_task.exception() is None:
+            await self._cancel_and_drain(light_task)
+            self._record_heavy_success()
+            return heavy_task.result()
+        if light_task in done and not light_task.cancelled() and light_task.exception() is None:
+            await self._cancel_and_drain(heavy_task)
+            self._record_heavy_failure()  # heavy too slow / failed -> soft failure
+            return light_task.result()
+        # neither produced a clean success: drain both, then surface via fresh light
+        await self._cancel_and_drain(light_task)
+        await self._cancel_and_drain(heavy_task)
+        # final attempt on light (fresh) so the caller still gets a result if possible
+        return await self._light.generate(prompt, **kw)
 
     # ------------------------------------------------------------------
     # Health + lifecycle
