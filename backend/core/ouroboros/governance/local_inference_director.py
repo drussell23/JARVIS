@@ -184,6 +184,13 @@ class LocalPrimeClient:
         self._cfg = cfg
         self._session = session
         self.profiler = LatencyProfiler(cfg)
+        self._governor: Any = None
+
+    def attach_governor(self, governor: Any) -> None:
+        """Attach a LocalInferenceDirector so generate() consults memory_guard()
+        before each local inference (host-OOM protection). When unattached,
+        behavior is byte-identical to the ungoverned path."""
+        self._governor = governor
 
     async def _ensure_session(self) -> Any:
         if self._session is None:
@@ -249,6 +256,8 @@ class LocalPrimeClient:
         context/task_profile are accepted for interface parity; the 3B path relies
         on the structured prompt + files already in `prompt` (documented v1 limit).
         """
+        if self._governor is not None:
+            await self._governor.memory_guard()
         import uuid
         from backend.core.prime_client import PrimeResponse
         sys_txt = system_prompt or ""

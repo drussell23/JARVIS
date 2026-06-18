@@ -310,3 +310,93 @@ async def test_memory_guard_passthrough_when_gate_disabled(monkeypatch):
 
     d = LocalInferenceDirector(LocalConfig.from_env(), client=object(), gate=_FakeGate())
     await d.memory_guard()  # no raise because the gate master switch is OFF
+
+
+@pytest.mark.asyncio
+async def test_generate_consults_governor_and_refuses_at_critical():
+    from backend.core.ouroboros.governance.local_inference_director import (
+        LocalPrimeClient, LocalConfig, LocalMemoryCritical)
+
+    class _RecordSession:
+        closed = False
+        def __init__(self): self.posts = []
+        def post(self, url, **kw):
+            self.posts.append((url, kw))
+            class _R:
+                status = 200
+                async def __aenter__(self_): return self_
+                async def __aexit__(self_, *a): return False
+                async def json(self_): return {"choices": [{"message": {"content": "x"}}]}
+            return _R()
+        async def close(self): self.closed = True
+
+    class _CriticalGov:
+        async def memory_guard(self):
+            raise LocalMemoryCritical("host CRITICAL")
+
+    sess = _RecordSession()
+    client = LocalPrimeClient(LocalConfig.from_env(), session=sess)
+    client.attach_governor(_CriticalGov())
+    with pytest.raises(LocalMemoryCritical):
+        await client.generate(prompt="do x", system_prompt="s", max_tokens=64)
+    # refused BEFORE any inference call to Ollama
+    assert sess.posts == []
+
+
+@pytest.mark.asyncio
+async def test_generate_calls_guard_then_proceeds_when_ok():
+    from backend.core.ouroboros.governance.local_inference_director import (
+        LocalPrimeClient, LocalConfig)
+    calls = {"guard": 0}
+
+    class _OkGov:
+        async def memory_guard(self):
+            calls["guard"] += 1  # OK -> returns without raising
+
+    fake_payload = {"choices": [{"message": {"content": "OK"}}], "usage": {"completion_tokens": 3}}
+
+    class _FakeSession:
+        closed = False
+        def __init__(self): self.posts = []
+        def post(self, url, **kw):
+            self.posts.append((url, kw))
+            class _R:
+                status = 200
+                async def __aenter__(self_): return self_
+                async def __aexit__(self_, *a): return False
+                async def json(self_): return fake_payload
+            return _R()
+        async def close(self): self.closed = True
+
+    sess = _FakeSession()
+    client = LocalPrimeClient(LocalConfig.from_env(), session=sess)
+    client.attach_governor(_OkGov())
+    resp = await client.generate(prompt="hi", system_prompt="s", max_tokens=16)
+    assert resp.content == "OK"
+    assert calls["guard"] == 1            # guard consulted
+    assert len(sess.posts) == 1           # inference proceeded after guard passed
+
+
+@pytest.mark.asyncio
+async def test_generate_no_governor_is_phase3_behavior():
+    from backend.core.ouroboros.governance.local_inference_director import (
+        LocalPrimeClient, LocalConfig)
+    fake_payload = {"choices": [{"message": {"content": "Z"}}], "usage": {"completion_tokens": 2}}
+
+    class _FakeSession:
+        closed = False
+        def __init__(self): self.posts = []
+        def post(self, url, **kw):
+            self.posts.append((url, kw))
+            class _R:
+                status = 200
+                async def __aenter__(self_): return self_
+                async def __aexit__(self_, *a): return False
+                async def json(self_): return fake_payload
+            return _R()
+        async def close(self): self.closed = True
+
+    client = LocalPrimeClient(LocalConfig.from_env(), session=_FakeSession())
+    # no attach_governor -> governor is None -> unchanged Phase 3 behavior
+    resp = await client.generate(prompt="hi", system_prompt="s")
+    assert resp.content == "Z"
