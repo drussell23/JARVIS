@@ -8,6 +8,26 @@
 
 ---
 
+## 0. Do you need this yet? (YAGNI trigger gate)
+
+**Status: SHELVED — ready design, not scheduled for build (2026-06-17).**
+
+DW is the primary provider and is a **remote inference API**, not a compute host — it cannot run the
+governance FSM / Oracle / sensors. The local machine **already** calls DW for generation, so
+generation was never the constraint. The *only* thing a cloud host buys is **enough resident RAM to
+hold the full ~5 GB / 29k-node Oracle brain at once** for an uninterrupted Phase-9 Capstone soak.
+
+Since the **Memory Armor** now makes the Oracle 16 GB-safe by construction (contract → GC-yield →
+suspend-durable + `file_hashes` resume), the organism **runs locally with DW today** with no new
+infrastructure. Therefore this migration is **deferred**.
+
+**Build this ADD only when ALL of these hold:**
+1. You need the **full** 29k-node brain *resident in one pass* (not incremental/resumed), AND
+2. The local host genuinely can't provide that headroom (can't free RAM, can't scope the index), AND
+3. A clean Phase-9 `session_outcome=complete` is the active goal.
+
+Until then: operate locally + DW + the armor. The pipeline below is designed and waiting.
+
 ## 1. Context & framing
 
 The Oracle persistence arc concluded: SQLite is the canonical, memory-armored brain (default-ON).
