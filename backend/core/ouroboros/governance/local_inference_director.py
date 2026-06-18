@@ -8,6 +8,7 @@ byte-identical legacy).
 from __future__ import annotations
 
 import asyncio
+import gc
 import math
 import os
 import threading
@@ -15,6 +16,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
+
+from .memory_pressure_gate import PressureLevel
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -224,3 +227,37 @@ class LocalPrimeClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+class LocalInferenceDirector:
+    """Lifecycle + memory-aware governance for the local tier."""
+
+    def __init__(self, cfg: LocalConfig, client: Any) -> None:
+        self._cfg = cfg
+        self._client = client
+
+    def admit_concurrency(self, level: PressureLevel) -> int:
+        if level is PressureLevel.CRITICAL:
+            return 0
+        if level is PressureLevel.HIGH:
+            return 1
+        return self._cfg.max_concurrency
+
+    async def _evict_model(self) -> None:
+        """Force immediate unload from unified memory via keep_alive:0."""
+        try:
+            sess = await self._client._ensure_session()
+            url = self._cfg.base_url.rstrip("/") + "/api/generate"
+            async with sess.post(url, json={"model": self._cfg.model_name, "keep_alive": 0}):
+                pass
+        except Exception:
+            pass  # eviction is best-effort; never raise into the control path
+
+    async def enforce_memory(self, level: PressureLevel) -> None:
+        """At CRITICAL: un-bypassable atomic teardown."""
+        if level is not PressureLevel.CRITICAL:
+            return
+        await self._evict_model()   # 1) API unload
+        gc.collect()                # 2) dual-stage GC sweep
+        gc.collect()
+        await asyncio.sleep(0)      # 3) yield to host OS for RAM reclaim

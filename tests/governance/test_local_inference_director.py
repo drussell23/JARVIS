@@ -165,3 +165,51 @@ async def test_breaker_trips_on_ceiling_breach(monkeypatch):
     client = LocalPrimeClient(LocalConfig.from_env(), session=_SlowSession())
     with pytest.raises(LocalLatencyLockup):
         await client.complete_guarded(system="<s/>", user="<u/>", prompt_tokens=10)
+
+
+@pytest.mark.asyncio
+async def test_high_pressure_clamps_concurrency_to_one():
+    from backend.core.ouroboros.governance.local_inference_director import LocalInferenceDirector, LocalConfig
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+    d = LocalInferenceDirector(LocalConfig.from_env(), client=object())
+    assert d.admit_concurrency(PressureLevel.OK) == LocalConfig.from_env().max_concurrency
+    assert d.admit_concurrency(PressureLevel.HIGH) == 1
+    assert d.admit_concurrency(PressureLevel.CRITICAL) == 0
+
+
+@pytest.mark.asyncio
+async def test_critical_eviction_unloads_and_gc(monkeypatch):
+    from backend.core.ouroboros.governance.local_inference_director import (
+        LocalInferenceDirector, LocalConfig, LocalPrimeClient)
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+    evicted = {"calls": []}
+
+    class _EvictSession:
+        closed = False
+
+        def post(self, url, **kw):
+            evicted["calls"].append(kw.get("json", {}))
+
+            class _R:
+                status = 200
+
+                async def __aenter__(self_):
+                    return self_
+
+                async def __aexit__(self_, *a):
+                    return False
+
+                async def json(self_):
+                    return {"status": "ok"}
+            return _R()
+
+        async def close(self):
+            self.closed = True
+
+    client = LocalPrimeClient(LocalConfig.from_env(), session=_EvictSession())
+    d = LocalInferenceDirector(LocalConfig.from_env(), client=client)
+    gc_calls = {"n": 0}
+    monkeypatch.setattr("gc.collect", lambda *a, **k: gc_calls.__setitem__("n", gc_calls["n"] + 1) or 0)
+    await d.enforce_memory(PressureLevel.CRITICAL)
+    assert any(c.get("keep_alive") == 0 for c in evicted["calls"])  # forced unload
+    assert gc_calls["n"] >= 2  # dual-stage gc.collect()
