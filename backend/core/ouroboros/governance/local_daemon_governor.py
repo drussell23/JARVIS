@@ -74,8 +74,15 @@ class LocalDaemonGovernor:
             if client is None:
                 return False
             try:
-                status = await client._check_health()
+                # Bound the probe: the shared _check_health has no per-request
+                # timeout (aiohttp's 300s default), and the governor awaits this at
+                # boot — a stalled-but-open Ollama port could otherwise extend boot
+                # by ~300s before the poll deadline notices. Cap it (env-tunable).
+                _to = float(os.environ.get("JARVIS_LOCAL_HEALTH_TIMEOUT_S", "5"))
+                status = await asyncio.wait_for(client._check_health(), timeout=_to)
                 return getattr(status, "name", "") == "AVAILABLE"
+            except asyncio.TimeoutError:
+                return False
             finally:
                 await client.aclose()
         except Exception:
