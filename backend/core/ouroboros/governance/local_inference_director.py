@@ -40,8 +40,8 @@ class LocalConfig:
 
     @classmethod
     def from_env(cls) -> "LocalConfig":
-        def _i(n, d): return int(os.environ.get(n, d))
-        def _f(n, d): return float(os.environ.get(n, d))
+        def _i(n: str, d: int) -> int: return int(os.environ.get(n, str(d)))
+        def _f(n: str, d: float) -> float: return float(os.environ.get(n, str(d)))
         ceiling = _i("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", 120_000)
         return cls(
             base_url=os.environ.get("JARVIS_LOCAL_MODEL_BASE_URL", "http://127.0.0.1:11434"),

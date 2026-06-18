@@ -1,7 +1,6 @@
 # tests/governance/test_local_inference_director.py
 from __future__ import annotations
 import importlib
-import pytest
 
 MOD = "backend.core.ouroboros.governance.local_inference_director"
 
