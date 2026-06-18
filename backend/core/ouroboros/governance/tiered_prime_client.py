@@ -10,10 +10,18 @@ Task 1 = basic routing. Health hysteresis FSM (Task 2) and speculative hedging
 """
 from __future__ import annotations
 
+import asyncio
+import enum
 import logging
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class HeavyState(str, enum.Enum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
 
 
 def _is_available(status: Any) -> bool:
@@ -35,33 +43,158 @@ async def _close_any(client: Any) -> None:
 
 
 class TieredPrimeClient:
-    """Composite of heavy + light PrimeClient-compatible tiers."""
+    """Composite of heavy + light PrimeClient-compatible tiers.
 
-    def __init__(self, *, heavy: Any, light: Any) -> None:
+    Task 2 adds a health hysteresis FSM for the heavy tier:
+    - Consecutive failures >= failure_threshold -> DEGRADED (route to light).
+    - While DEGRADED within the cooldown window, heavy is completely bypassed.
+    - Once the cooldown elapses, a NON-BLOCKING background recovery probe is
+      scheduled (strong ref, cleared in finally). A clean probe re-promotes to
+      HEALTHY; a failing probe keeps the state DEGRADED.
+    """
+
+    def __init__(
+        self,
+        *,
+        heavy: Any,
+        light: Any,
+        now_fn: Optional[Callable[[], float]] = None,
+        failure_threshold: Optional[int] = None,
+        cooldown_s: Optional[float] = None,
+    ) -> None:
         self._heavy = heavy
         self._light = light
+        self._now = now_fn or time.monotonic
+
+        thr, cool = self._resolve_recovery_params()
+        self._failure_threshold: int = failure_threshold if failure_threshold is not None else thr
+        self._cooldown_s: float = cooldown_s if cooldown_s is not None else cool
+
+        # FSM state (Task 2)
+        self._heavy_state: HeavyState = HeavyState.HEALTHY
+        self._consecutive_failures: int = 0
+        self._degraded_at: float = 0.0
+        self._pending_recovery_probe: Optional[asyncio.Task] = None  # strong ref
+
+    @staticmethod
+    def _resolve_recovery_params() -> tuple[int, float]:
+        """Pull circuit-breaker params from recovery_policy; fall back to 3/30.0."""
+        try:
+            from backend.core.recovery_policy import get_recovery_params
+            rp = get_recovery_params("prime_router")
+            if rp is not None:
+                return int(rp.circuit_failure_threshold), float(rp.circuit_recovery_seconds)
+        except Exception:
+            pass
+        return 3, 30.0
 
     @property
     def provider_name(self) -> str:
         return "tiered-jprime"
 
-    async def generate(self, prompt: str, system_prompt: Optional[str] = None,
-                       context: Optional[Any] = None, max_tokens: int = 4096,
-                       temperature: float = 0.7, model_name: Optional[str] = None,
-                       task_profile: Optional[Any] = None, **kwargs: Any) -> Any:
-        kw = dict(system_prompt=system_prompt, context=context, max_tokens=max_tokens,
-                  temperature=temperature, model_name=model_name,
-                  task_profile=task_profile, **kwargs)
-        if self._heavy is not None:
+    # ------------------------------------------------------------------
+    # FSM helpers
+    # ------------------------------------------------------------------
+
+    def heavy_state(self) -> str:
+        return self._heavy_state.value
+
+    def _record_heavy_success(self) -> None:
+        self._consecutive_failures = 0
+        self._heavy_state = HeavyState.HEALTHY
+
+    def _record_heavy_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._failure_threshold:
+            if self._heavy_state is not HeavyState.DEGRADED:
+                self._heavy_state = HeavyState.DEGRADED
+                self._degraded_at = self._now()
+                logger.info(
+                    "[Tiered] heavy DEGRADED after %d consecutive failures (cooldown=%.1fs)",
+                    self._consecutive_failures,
+                    self._cooldown_s,
+                )
+
+    def _cooldown_elapsed(self) -> bool:
+        return (self._now() - self._degraded_at) >= self._cooldown_s
+
+    async def _recovery_probe(self) -> None:
+        """Non-blocking background probe: re-promote heavy only on a clean health check."""
+        try:
+            status = await self._heavy._check_health()
+            if _is_available(status):
+                self._record_heavy_success()
+                logger.info("[Tiered] heavy recovery probe OK -> re-promoted HEALTHY")
+            else:
+                logger.debug("[Tiered] heavy recovery probe returned UNAVAILABLE -> stays DEGRADED")
+        except Exception:
+            logger.debug("[Tiered] heavy recovery probe raised", exc_info=True)
+        finally:
+            self._pending_recovery_probe = None
+
+    def _maybe_schedule_recovery_probe(self) -> None:
+        """Schedule a background recovery probe if cooldown has elapsed and none is running."""
+        if (
+            self._heavy_state is HeavyState.DEGRADED
+            and self._cooldown_elapsed()
+            and self._pending_recovery_probe is None
+            and self._heavy is not None
+        ):
+            # ensure_future keeps a strong ref via self._pending_recovery_probe;
+            # the finally block in _recovery_probe clears it when done.
+            self._pending_recovery_probe = asyncio.ensure_future(self._recovery_probe())
+
+    # ------------------------------------------------------------------
+    # Core generate (Task 1 routing extended by Task 2 FSM)
+    # ------------------------------------------------------------------
+
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        context: Optional[Any] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        model_name: Optional[str] = None,
+        task_profile: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Any:
+        kw = dict(
+            system_prompt=system_prompt,
+            context=context,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model_name=model_name,
+            task_profile=task_profile,
+            **kwargs,
+        )
+        # Heavy tier only when HEALTHY. When DEGRADED, skip heavy entirely and,
+        # once the cooldown has elapsed, schedule a non-blocking recovery probe.
+        if self._heavy is not None and self._heavy_state is HeavyState.HEALTHY:
             try:
-                return await self._heavy.generate(prompt, **kw)
+                result = await self._heavy.generate(prompt, **kw)
+                self._record_heavy_success()
+                return result
             except Exception as exc:
-                logger.info("[Tiered] heavy generate failed (%s) -> light", exc)
+                self._record_heavy_failure()
+                logger.info(
+                    "[Tiered] heavy generate failed (%s) state=%s -> light",
+                    exc,
+                    self._heavy_state.value,
+                )
                 if self._light is None:
                     raise
+        else:
+            # DEGRADED path: maybe kick off a background probe
+            self._maybe_schedule_recovery_probe()
+
         if self._light is not None:
             return await self._light.generate(prompt, **kw)
         raise RuntimeError("tiered_prime_client: no tier available")
+
+    # ------------------------------------------------------------------
+    # Health + lifecycle
+    # ------------------------------------------------------------------
 
     async def _check_health(self) -> Any:
         from backend.core.prime_client import PrimeStatus
