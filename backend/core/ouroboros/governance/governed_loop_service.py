@@ -3929,11 +3929,16 @@ class GovernedLoopService:
                     self._prime_client = _local_prime
                     # Give the local tier a live home so shutdown releases its
                     # pooled aiohttp session (zero-FD teardown). The director also
-                    # hosts the CRITICAL memory-eviction valve for Phase 3.1 in-loop
-                    # wiring.
+                    # hosts the CRITICAL memory-eviction valve consulted on every
+                    # local generate.
                     self._local_inference_director = LocalInferenceDirector(
                         LocalConfig.from_env(), client=_local_prime
                     )
+                    # Phase 3.1: attach the director so every local generate()
+                    # consults memory_guard() (CRITICAL -> evict + refuse + cascade
+                    # upstream), protecting the host from OOM. Concurrency stays with
+                    # candidate_generator's existing _jprime_sem (no duplication).
+                    _local_prime.attach_governor(self._local_inference_director)
                     logger.info(
                         "[GovernedLoop] J-Prime local tier: LocalPrimeClient injected (Ollama)"
                     )

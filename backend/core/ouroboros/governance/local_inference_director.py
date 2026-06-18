@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
 
-from .memory_pressure_gate import PressureLevel
+from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -144,6 +144,16 @@ class LocalLatencyLockup(RuntimeError):
     failure_class = "terminal_lag_lockup"
 
 
+class LocalMemoryCritical(RuntimeError):
+    """Raised when host memory is CRITICAL at local-generate admission time.
+
+    The local tier evicts the model and refuses the op so the cascade routes
+    upstream to remote providers instead of OOM-ing the host. Consumed by
+    classify_local_failure -> PRIMARY_DEGRADED.
+    """
+    failure_class = "local_memory_critical"
+
+
 def render_structured_prompt(*, task: str, constraints: List[str], files: Dict[str, str]) -> str:
     """Structured-prompt discipline for the local 3B: rigid bounded tags, no loose NL."""
     parts = ["<task>", task, "</task>", "<constraints>"]
@@ -174,6 +184,13 @@ class LocalPrimeClient:
         self._cfg = cfg
         self._session = session
         self.profiler = LatencyProfiler(cfg)
+        self._governor: Any = None
+
+    def attach_governor(self, governor: Any) -> None:
+        """Attach a LocalInferenceDirector so generate() consults memory_guard()
+        before each local inference (host-OOM protection). When unattached,
+        behavior is byte-identical to the ungoverned path."""
+        self._governor = governor
 
     async def _ensure_session(self) -> Any:
         if self._session is None:
@@ -239,6 +256,8 @@ class LocalPrimeClient:
         context/task_profile are accepted for interface parity; the 3B path relies
         on the structured prompt + files already in `prompt` (documented v1 limit).
         """
+        if self._governor is not None:
+            await self._governor.memory_guard()
         import uuid
         from backend.core.prime_client import PrimeResponse
         sys_txt = system_prompt or ""
@@ -283,16 +302,10 @@ def build_local_prime_client() -> "Optional[LocalPrimeClient]":
 class LocalInferenceDirector:
     """Lifecycle + memory-aware governance for the local tier."""
 
-    def __init__(self, cfg: LocalConfig, client: Any) -> None:
+    def __init__(self, cfg: LocalConfig, client: Any, gate: Any = None) -> None:
         self._cfg = cfg
         self._client = client
-
-    def admit_concurrency(self, level: PressureLevel) -> int:
-        if level is PressureLevel.CRITICAL:
-            return 0
-        if level is PressureLevel.HIGH:
-            return 1
-        return self._cfg.max_concurrency
+        self._gate = gate if gate is not None else get_default_gate()
 
     async def _evict_model(self) -> None:
         """Force immediate unload from unified memory via keep_alive:0."""
@@ -312,6 +325,24 @@ class LocalInferenceDirector:
         gc.collect()                # 2) dual-stage GC sweep
         gc.collect()
         await asyncio.sleep(0)      # 3) yield to host OS for RAM reclaim
+
+    async def memory_guard(self) -> None:
+        """Reuse the shared MemoryPressureGate before local inference.
+
+        At CRITICAL host memory, evict the resident model and refuse the op by
+        raising LocalMemoryCritical so the cascade routes upstream to remote
+        providers instead of OOM-ing the host. Concurrency is NOT handled here
+        (candidate_generator's _jprime_sem already caps local inference at 1).
+        Pass-through when the gate master switch is OFF.
+        """
+        if not memory_gate_enabled():
+            return
+        level = self._gate.pressure()
+        if level is PressureLevel.CRITICAL:
+            await self.enforce_memory(level)  # evict + dual gc + yield (existing)
+            raise LocalMemoryCritical(
+                "host memory CRITICAL - local inference refused; cascading upstream"
+            )
 
     async def stop(self) -> None:
         """Clean teardown: release the pooled session (zero hanging FDs)."""
