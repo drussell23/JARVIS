@@ -99,3 +99,13 @@ async def test_end_to_end_client_with_real_director_refuses_at_critical(monkeypa
     # the ONLY post allowed is the eviction unload (keep_alive:0); NO chat/completions inference
     assert all("/v1/chat/completions" not in url for url, _ in sess.posts)
     assert any(kw.get("json", {}).get("keep_alive") == 0 for _, kw in sess.posts)
+
+
+@pytest.mark.asyncio
+async def test_killswitch_off_no_governor_no_guard(monkeypatch):
+    """With the local tier OFF, build_local_prime_client() is None, so nothing is
+    injected, no governor is attached, and memory_guard is never reachable --
+    byte-identical to pre-Phase-3.1 behavior."""
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")
+    from backend.core.ouroboros.governance.local_inference_director import build_local_prime_client
+    assert build_local_prime_client() is None
