@@ -210,12 +210,32 @@ def test_factory_returns_harness_when_flags_on(monkeypatch, tmp_path):
             b.shadow.close()
 
 
-def test_factory_inmemory_when_off(monkeypatch, tmp_path):
+def test_factory_inmemory_when_kill_switch(monkeypatch, tmp_path):
     g, _, _ = _graph_with_stub()
     db = _build_db(tmp_path, g)
-    monkeypatch.delenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "0")  # kill switch → legacy in-memory
     b = GB.build_graph_backend(g, db_path=db)
     assert isinstance(b, GB.InMemoryGraphBackend)
+
+
+def test_factory_lazy_by_default(monkeypatch, tmp_path):
+    g, _, _ = _graph_with_stub()
+    db = _build_db(tmp_path, g)
+    monkeypatch.delenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", raising=False)  # graduated default-ON
+    monkeypatch.delenv("JARVIS_ORACLE_PARITY_HARNESS_ENABLED", raising=False)
+    b = GB.build_graph_backend(g, db_path=db)
+    try:
+        assert isinstance(b, GB.SqliteLazyGraphBackend)   # lazy is the canonical read path now
+    finally:
+        b.close()
+
+
+def test_factory_fallback_inmemory_when_no_db(monkeypatch, tmp_path):
+    """Robustness: lazy default-ON but NO db (cold start) → falls back to in-memory, never broken."""
+    g, _, _ = _graph_with_stub()
+    monkeypatch.delenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", raising=False)
+    assert isinstance(GB.build_graph_backend(g, db_path=tmp_path / "absent.db"), GB.InMemoryGraphBackend)
+    assert isinstance(GB.build_graph_backend(g, db_path=None), GB.InMemoryGraphBackend)
 
 
 # --------------------------------------------------------------------------- Slice 3: live pressure governance
@@ -324,6 +344,86 @@ def test_harness_zero_divergence_under_pressure(monkeypatch, tmp_path):
         assert shadow.pressure_events > 0   # contraction happened during the verified run
     finally:
         shadow.close()
+
+
+# --------------------------------------------------------------------------- Slice 4/5: find_* + global streaming
+def test_sqlite_node_lookup_parity(tmp_path):
+    g, ids, stub = _graph_with_stub()
+    db = _build_db(tmp_path, g)
+    mem = GB.InMemoryGraphBackend(g)
+    sl = GB.SqliteLazyGraphBackend(db)
+    try:
+        assert set(sl.nodes_by_name("sym0")) == set(mem.nodes_by_name("sym0"))
+        assert set(sl.nodes_by_name("sym", fuzzy=True)) == set(mem.nodes_by_name("sym", fuzzy=True))
+        assert set(sl.nodes_by_type("function")) == set(mem.nodes_by_type("function"))
+        assert set(sl.nodes_in_file("pkg/m0.py")) == set(mem.nodes_in_file("pkg/m0.py"))
+        assert set(sl.nodes_in_repo("jarvis")) == set(mem.nodes_in_repo("jarvis"))
+        assert sl.node_id_for(str(ids[0])) == mem.node_id_for(str(ids[0]))
+        assert set(sl.stream_edges()) == set(mem.stream_edges())   # streamed cursor == graph edges
+    finally:
+        sl.close()
+
+
+def test_streamed_simple_cycles_matches_nx(tmp_path):
+    import networkx as nx
+    g, ids, _ = _graph_with_stub()
+    g.add_edge(ids[2], ids[0], EdgeData(EdgeType.CALLS))
+    db = _build_db(tmp_path, g)
+    nx_cycles = {frozenset(c) for c in nx.simple_cycles(g._graph)}
+    sl = GB.SqliteLazyGraphBackend(db)   # streamed adjacency → primitive DFS
+    try:
+        assert {frozenset(c) for c in sl.simple_cycles()} == nx_cycles
+    finally:
+        sl.close()
+
+
+def test_ckg_lazy_read_path_correct_with_empty_in_memory(monkeypatch, tmp_path):
+    """THE capstone correctness proof (ADD §0): with the in-memory graph EMPTIED (worst-case Scoper
+    eviction) + lazy ON, every query method must still return the correct full result via SQLite."""
+    monkeypatch.setenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "1")
+    import networkx as nx
+    from collections import defaultdict
+    g, ids, _ = _graph_with_stub()
+    g.add_edge(ids[2], ids[0], EdgeData(EdgeType.CALLS))   # a cycle for find_circular_dependencies
+    db = _build_db(tmp_path, g)
+
+    # reference answers from the FULL in-memory graph
+    ref_name = sorted(n.name for n in g.find_nodes_by_name("sym0"))
+    ref_file = sorted(n.name for n in g.find_nodes_in_file("pkg/m0.py"))
+    ref_type = len(g.find_nodes_by_type(NodeType.FUNCTION))
+    ref_chain = g.find_call_chain(ids[0], ids[3])
+    ref_cycles = {frozenset(str(n) for n in c) for c in g.find_circular_dependencies()}
+
+    # simulate full eviction: blow away the in-memory graph + indices, then attach the lazy backend
+    g._graph = nx.DiGraph(); g._node_index = {}
+    g._file_index = defaultdict(set); g._repo_index = defaultdict(set); g._type_index = defaultdict(set)
+    g.attach_lazy_backend(db)
+    assert isinstance(g._backend, GB.SqliteLazyGraphBackend)   # lazy ON → SQLite read path
+
+    try:
+        assert sorted(n.name for n in g.find_nodes_by_name("sym0")) == ref_name
+        assert sorted(n.name for n in g.find_nodes_in_file("pkg/m0.py")) == ref_file
+        assert len(g.find_nodes_by_type(NodeType.FUNCTION)) == ref_type
+        chain = g.find_call_chain(ids[0], ids[3])
+        assert chain is not None and len(chain) == len(ref_chain)
+        assert {frozenset(str(n) for n in c) for c in g.find_circular_dependencies()} == ref_cycles
+    finally:
+        g.close_backend()
+
+
+def test_ckg_attach_uses_harness_when_parity_on(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ORACLE_PARITY_HARNESS_ENABLED", "1")
+    g, ids, _ = _graph_with_stub()
+    db = _build_db(tmp_path, g)
+    g.attach_lazy_backend(db)
+    try:
+        assert isinstance(g._backend, GB.DualBackendParityHarness)
+        # queries run through the harness (primary in-mem + shadow sqlite) with zero divergence
+        g.find_nodes_by_name("sym0"); g.compute_blast_radius(str(ids[0]))
+        assert g._backend.stats()["divergences"] == 0
+    finally:
+        g.close_backend()
 
 
 if __name__ == "__main__":

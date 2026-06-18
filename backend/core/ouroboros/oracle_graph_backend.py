@@ -39,9 +39,14 @@ EdgeRow = Tuple[str, Dict[str, Any]]  # (neighbor_key, edge_attrs)
 
 # ---------------------------------------------------------------------------- config (§10)
 def lazy_traversal_enabled() -> bool:
-    """``JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED`` (default false) — route graph queries through the
-    SQLite-backed lazy backend instead of the resident in-memory DiGraph. OFF → InMemory (today)."""
-    return os.environ.get("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "false").strip().lower() in (
+    """``JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED`` — route graph queries through the SQLite-backed lazy
+    backend instead of the resident in-memory DiGraph.
+
+    **Graduated default-ON 2026-06-18** — the lazy read path is complete (primitives + find_* family
+    + global streaming queries) and parity-proven; in-memory remains the corruption/cold-start
+    FALLBACK (build_graph_backend returns it when no db is present). Kill switch ``=0`` restores the
+    resident-graph read path."""
+    return os.environ.get("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -163,19 +168,36 @@ class GraphBackend(ABC):
             depth += 1
         return seen
 
+    def stream_edges(self, chunk_size: int = 10000):  # noqa: D401
+        """Sliding-window cursor over ALL edges as ``(src_key, dst_key)`` — the global-sweep
+        primitive (Slice 4). Yields so a global algorithm builds a *key-only* adjacency by streaming
+        edges instead of materializing the whole DiGraph (no node attrs, no networkx overhead).
+        Default is built on ``all_keys`` + ``successors``; backends with a real cursor override it
+        (the SQLite backend streams the edges table via ``fetchmany``)."""
+        for k in self.all_keys():
+            for dst in self.successor_keys(k):
+                yield (k, dst)
+
     def simple_cycles(self, max_cycles: Optional[int] = None) -> List[List[str]]:
-        """Enumerate elementary cycles via primitive-only DFS (Johnson-style backtracking). A global
-        analysis — heavier than local traversals (ADD §6). Bounded by ``max_cycles`` when set."""
-        cycles: List[List[str]] = []
-        keys = list(self.all_keys())
+        """Enumerate elementary cycles (global analysis, ADD §6) — STREAMED (Slice 4). Builds a
+        key-only adjacency in ONE sliding-window sweep of the edges table (no per-node N+1, no node
+        attrs, no full DiGraph), then runs the proven primitive DFS over that adjacency. RAM is
+        O(V+E) keys (irreducible for cycle enumeration), NOT O(full graph with attrs). Both backends
+        share this impl → parity is exact and bounded. ``max_cycles`` caps enumeration."""
+        from collections import defaultdict
+        adj: Dict[str, List[str]] = defaultdict(list)
+        for src, dst in self.stream_edges():           # one cursor sweep, chunked
+            adj[src].append(dst)
+        keys = list(adj.keys())
         index = {k: i for i, k in enumerate(keys)}
+        cycles: List[List[str]] = []
 
         def dfs(start: str, node: str, stack: List[str], on_stack: Set[str]) -> None:
             if max_cycles is not None and len(cycles) >= max_cycles:
                 return
             stack.append(node)
             on_stack.add(node)
-            for nbr in self.successor_keys(node):
+            for nbr in adj.get(node, ()):  # key-only adjacency — no DB round-trip, no attrs
                 if index.get(nbr, -1) < index.get(start, 1 << 62):
                     continue  # only consider nodes >= start (avoid duplicate rotations)
                 if nbr == start:
@@ -192,6 +214,28 @@ class GraphBackend(ABC):
                 break
             dfs(k, k, [], set())
         return cycles
+
+    # --- node lookup primitives (back the find_* family; lazy-correct under Scoper eviction) ---
+    def node_id_for(self, key: str):
+        """Reconstruct a ``NodeID`` for a key (default: from ``get_node``; backends override for
+        speed)."""
+        from backend.core.ouroboros.oracle import NodeID
+        attrs = self.get_node(key)
+        if attrs and attrs.get("node_id"):
+            return NodeID.from_dict(attrs["node_id"])
+        return None
+
+    def nodes_by_name(self, name: str, fuzzy: bool = False) -> List[str]:
+        raise NotImplementedError
+
+    def nodes_by_type(self, node_type_value: str) -> List[str]:
+        raise NotImplementedError
+
+    def nodes_in_file(self, file_path: str) -> List[str]:
+        raise NotImplementedError
+
+    def nodes_in_repo(self, repo: str) -> List[str]:
+        raise NotImplementedError
 
     def all_keys(self) -> List[str]:
         """All node keys. Default raises — backends that support global scans override it."""
@@ -238,7 +282,37 @@ class InMemoryGraphBackend(GraphBackend):
     def all_keys(self) -> List[str]:
         return list(self._g.nodes)
 
-    # native NetworkX overrides (exact + fast)
+    def stream_edges(self, chunk_size: int = 10000):
+        for u, v in self._g.edges():
+            yield (u, v)
+
+    # node lookups (back the find_* family) — read the in-memory indices
+    def node_id_for(self, key: str):
+        return self._ckg._node_index.get(key)
+
+    def nodes_by_name(self, name: str, fuzzy: bool = False) -> List[str]:
+        nl = name.lower()
+        out = []
+        for k, nid in self._ckg._node_index.items():
+            if (nl in nid.name.lower()) if fuzzy else (nid.name == name or nid.name.endswith(f".{name}")):
+                out.append(k)
+        return out
+
+    def nodes_by_type(self, node_type_value: str) -> List[str]:
+        from backend.core.ouroboros.oracle import NodeType
+        try:
+            return list(self._ckg._type_index.get(NodeType(node_type_value), set()))
+        except ValueError:
+            return []
+
+    def nodes_in_file(self, file_path: str) -> List[str]:
+        return list(self._ckg._file_index.get(file_path, set()))
+
+    def nodes_in_repo(self, repo: str) -> List[str]:
+        return list(self._ckg._repo_index.get(repo, set()))
+
+    # native NetworkX override (exact + fast); simple_cycles uses the shared STREAMED impl so the
+    # in-memory and SQLite backends are parity-exact AND bounded.
     def shortest_path(self, source: str, target: str) -> Optional[List[str]]:
         import networkx as nx
         g = self._g
@@ -248,15 +322,6 @@ class InMemoryGraphBackend(GraphBackend):
             return nx.shortest_path(g, source, target)
         except nx.NetworkXNoPath:
             return None
-
-    def simple_cycles(self, max_cycles: Optional[int] = None) -> List[List[str]]:
-        import networkx as nx
-        out: List[List[str]] = []
-        for cyc in nx.simple_cycles(self._g):
-            out.append(cyc)
-            if max_cycles is not None and len(out) >= max_cycles:
-                break
-        return out
 
 
 # ---------------------------------------------------------------------------- live differential harness
@@ -356,6 +421,28 @@ class DualBackendParityHarness(GraphBackend):
 
     def all_keys(self) -> List[str]:
         return self.primary.all_keys()
+
+    def stream_edges(self, chunk_size: int = 10000):
+        return self.primary.stream_edges(chunk_size)
+
+    # node lookups — primary authoritative, shadow differentially checked (order-insensitive)
+    def node_id_for(self, key: str):
+        return self._diff("node_id_for", (key,), lambda: self.primary.node_id_for(key))
+
+    def nodes_by_name(self, name: str, fuzzy: bool = False) -> List[str]:
+        return self._diff("nodes_by_name", (name, fuzzy),
+                          lambda: self.primary.nodes_by_name(name, fuzzy))
+
+    def nodes_by_type(self, node_type_value: str) -> List[str]:
+        return self._diff("nodes_by_type", (node_type_value,),
+                          lambda: self.primary.nodes_by_type(node_type_value))
+
+    def nodes_in_file(self, file_path: str) -> List[str]:
+        return self._diff("nodes_in_file", (file_path,),
+                          lambda: self.primary.nodes_in_file(file_path))
+
+    def nodes_in_repo(self, repo: str) -> List[str]:
+        return self._diff("nodes_in_repo", (repo,), lambda: self.primary.nodes_in_repo(repo))
 
     # prefetch hints reach BOTH backends (the shadow's batched IN query is the whole point)
     def prefetch_successors(self, keys: List[str]) -> None:
@@ -710,6 +797,45 @@ class SqliteLazyGraphBackend(GraphBackend):
         for (s, d) in self._q("SELECT src_key, dst_key FROM edges"):
             seen.add(s); seen.add(d)
         return list(seen)
+
+    # -- global-sweep streaming (Slice 4): sliding-window cursor over the edges table --
+    def stream_edges(self, chunk_size: int = 10000):
+        with self._lock:
+            self.query_count += 1
+            cur = self._c().execute("SELECT src_key, dst_key FROM edges")
+            while True:
+                rows = cur.fetchmany(chunk_size)
+                if not rows:
+                    break
+                for src, dst in rows:
+                    yield (src, dst)
+
+    # -- node lookups (back the find_* family; lazy-correct — read SQL, not the partial in-mem index) --
+    def node_id_for(self, key: str):
+        from backend.core.ouroboros.oracle import NodeID
+        attrs = self.get_node(key)
+        if attrs and attrs.get("node_id"):
+            return NodeID.from_dict(attrs["node_id"])
+        return None
+
+    def nodes_by_name(self, name: str, fuzzy: bool = False) -> List[str]:
+        if fuzzy:
+            rows = self._q("SELECT node_key FROM nodes WHERE lower(name) LIKE ?", (f"%{name.lower()}%",))
+        else:
+            rows = self._q("SELECT node_key FROM nodes WHERE name = ? OR name LIKE ?",
+                           (name, f"%.{name}"))
+        return [r[0] for r in rows]
+
+    def nodes_by_type(self, node_type_value: str) -> List[str]:
+        return [r[0] for r in self._q(  # idx_nodes_type
+            "SELECT node_key FROM nodes WHERE node_type = ?", (node_type_value,))]
+
+    def nodes_in_file(self, file_path: str) -> List[str]:
+        return [r[0] for r in self._q(  # idx_nodes_file
+            "SELECT node_key FROM nodes WHERE file_path = ?", (file_path,))]
+
+    def nodes_in_repo(self, repo: str) -> List[str]:
+        return [r[0] for r in self._q("SELECT node_key FROM nodes WHERE repo = ?", (repo,))]
 
     # -- predictive batch prefetch (the N+1 armor) --
     def prefetch_successors(self, keys: List[str]) -> None:
