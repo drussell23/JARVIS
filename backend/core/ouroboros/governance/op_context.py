@@ -1509,6 +1509,34 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_cross_repo_promotion(
+        self,
+        *,
+        repo_scope: Tuple[str, ...],
+        dependency_edges: Tuple[Tuple[str, str], ...] = (),
+        apply_plan: Tuple[str, ...] = (),
+        risk_tier: Optional["RiskTier"] = None,
+    ) -> "OperationContext":
+        """Elevate this op to multi-repo scope (Cross-Repo Scope Promoter ignition).
+
+        Setting ``repo_scope`` to >1 repo re-derives ``cross_repo=True`` in ``__post_init__`` (via
+        ``dataclasses.replace``), routing APPLY through ``_execute_saga_apply``. Optionally forces the
+        risk tier (Orange-tier APPROVAL_REQUIRED for autonomous multi-repo mutation). No phase change;
+        hash chain preserved (mirrors the other ``with_*`` stampers)."""
+        updates: Dict[str, Any] = {
+            "repo_scope": tuple(repo_scope),
+            "dependency_edges": tuple(dependency_edges),
+            "apply_plan": tuple(apply_plan),
+            "previous_hash": self.context_hash,
+            "context_hash": "",
+        }
+        if risk_tier is not None:
+            updates["risk_tier"] = risk_tier
+        intermediate = dataclasses.replace(self, **updates)
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
     def with_strategic_memory_context(
         self,
         *,

@@ -3247,6 +3247,27 @@ class GovernedOrchestrator:
                 if _serpent: _serpent.update_phase("CONTEXT_EXPANSION")
                 ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
 
+                # ---- Cross-Repo Scope Promoter (ignition) ----
+                # Before GENERATE, consult the unified Oracle graph: if the fault cone crosses a repo
+                # boundary (jarvis→reactor/prime), elevate repo_scope to span both — igniting the
+                # native Saga apply path at APPLY — and force Orange-tier. Gated + fail-soft → no-op
+                # when off (single-repo pipeline byte-identical). Elevating here (pre-GENERATE) lets
+                # the 2c.1 multi-repo candidate schema produce the per-repo patch_map the saga needs.
+                try:
+                    from backend.core.ouroboros.governance.cross_repo_scope_promoter import (
+                        CrossRepoScopePromoter, promoter_enabled,
+                    )
+                    if promoter_enabled() and not ctx.cross_repo:
+                        _promoter = CrossRepoScopePromoter()
+                        ctx, _promo_report = await _promoter.maybe_promote(ctx)
+                        if _promo_report is not None and _promo_report.promoted:
+                            logger.info(
+                                "[CrossRepoPromoter] op=%s scope elevated → %s\n%s",
+                                ctx.op_id, _promo_report.elevated_scope, _promo_report.render(),
+                            )
+                except Exception:  # noqa: BLE001 — promoter is additive; never break the pipeline
+                    logger.debug("[CrossRepoPromoter] hook skipped", exc_info=True)
+
                 # ---- Phase 2b: CONTEXT_EXPANSION ----
                 try:
                     expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
