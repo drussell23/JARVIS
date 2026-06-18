@@ -1,3 +1,5 @@
+> **An autonomous, solo-built systems-engineering framework — ~4.29M tracked lines and 8,300+ solo-authored commits.**
+
 # JARVIS -- Just A Rather Very Intelligent System
 
 **The Body of the Trinity AGI OS**
@@ -5,6 +7,24 @@
 **Author:** [Derek J. Russell](https://github.com/drussell23) -- RSI/AGI Researcher & Trinity Architect
 
 JARVIS is the control plane and execution layer of a three-repository AGI ecosystem. It owns macOS integration, screen vision, voice biometric authentication, focus-preserving UI automation, and the 102K-line unified supervisor that boots and coordinates the entire stack with a single command. All model references are resolved at runtime from a shared YAML policy -- zero hardcoded model names remain anywhere in the interactive or governance pipelines.
+
+---
+
+## 📊 By the Numbers
+
+A solo-built system. Every figure is `git`-tracked and reproducible (`git ls-files -z | xargs -0 wc -l`):
+
+| Metric | Value |
+|---|---|
+| **Total lines (tracked)** | **~4.29M** (3.19M Python) |
+| **Ouroboros + Venom (O+V)** — autonomous self-development engine | **~1.45M lines** |
+| &nbsp;&nbsp;↳ O+V breakdown | 734K engine · 646K test spine · 64K scripts & docs |
+| Python files | 5,961 |
+| Languages | Python · Swift · TypeScript · Rust · Shell |
+| Commits | **8,352 — ~99.8% solo-authored** |
+| Cadence | ~27 commits/day, Aug 2025 → present (~10 months) |
+
+> O+V is roughly **half engine, half proof** — the 646K-line test spine exists to keep a self-modifying system honest.
 
 ---
 
