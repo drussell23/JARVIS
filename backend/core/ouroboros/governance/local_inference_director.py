@@ -7,8 +7,12 @@ byte-identical legacy).
 """
 from __future__ import annotations
 
+import math
 import os
+import threading
+from collections import deque
 from dataclasses import dataclass
+from typing import Deque
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -57,3 +61,70 @@ class LocalConfig:
             max_concurrency=_i("JARVIS_LOCAL_MODEL_MAX_CONCURRENCY", 2),
             pool_limit=_i("JARVIS_LOCAL_POOL_LIMIT", 8),
         )
+
+
+class LatencyProfiler:
+    """Thread-safe sliding window of (ttft_ms, per_token_ms) -> bounded adaptive timeout.
+
+    Cold start uses the seed; the adaptive value is always clamped to
+    [floor, ceiling]. The ceiling is the un-flexible hard cap that guarantees a
+    wedged model still trips the breaker (watchdog-isolation invariant).
+    """
+
+    def __init__(self, cfg: "LocalConfig") -> None:
+        self._cfg = cfg
+        self._lock = threading.Lock()
+        self._ttft: Deque[float] = deque(maxlen=cfg.window_size)
+        self._per_tok: Deque[float] = deque(maxlen=cfg.window_size)
+        self._total: Deque[float] = deque(maxlen=cfg.window_size)
+
+    def record(self, *, ttft_ms: float, total_ms: float, output_tokens: int) -> None:
+        per_tok = (total_ms - ttft_ms) / max(1, output_tokens)
+        with self._lock:
+            self._ttft.append(float(ttft_ms))
+            self._per_tok.append(max(0.0, per_tok))
+            self._total.append(float(total_ms))
+
+    def is_warm(self) -> bool:
+        with self._lock:
+            return len(self._total) >= self._cfg.min_samples
+
+    @staticmethod
+    def _mean(xs: Deque[float]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    @classmethod
+    def _stddev(cls, xs: Deque[float]) -> float:
+        if len(xs) < 2:
+            return 0.0
+        m = cls._mean(xs)
+        return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+    def adaptive_timeout_ms(self, *, prompt_tokens: int) -> float:
+        cfg = self._cfg
+        with self._lock:
+            warm = len(self._total) >= cfg.min_samples
+            ttft_m = self._mean(self._ttft)
+            tok_m = self._mean(self._per_tok)
+            tot_sd = self._stddev(self._total)
+        if not warm:
+            return float(min(cfg.timeout_seed_ms, cfg.timeout_ceiling_ms))
+        est_out = max(1.0, prompt_tokens * cfg.output_ratio)
+        expected = ttft_m + tok_m * est_out
+        flexed = expected + cfg.margin_sigma * tot_sd
+        return float(max(cfg.timeout_floor_ms, min(flexed, cfg.timeout_ceiling_ms)))
+
+    def is_terminal_lag(self, *, elapsed_ms: float) -> bool:
+        cfg = self._cfg
+        if elapsed_ms > cfg.timeout_ceiling_ms:
+            return True
+        with self._lock:
+            warm = len(self._total) >= cfg.min_samples
+            if not warm:
+                return False
+            m = self._mean(self._total)
+            sd = self._stddev(self._total)
+        # Use a minimum stddev floor of 10% of mean so that a perfectly uniform
+        # sample distribution still produces a meaningful 3-sigma band.
+        sd_eff = max(sd, m * 0.1)
+        return elapsed_ms > (m + 3.0 * sd_eff)

@@ -29,3 +29,44 @@ def test_config_defaults(monkeypatch):
     assert cfg.model_name == "qwen2.5-coder:3b"
     assert cfg.keep_alive_seconds == 300
     assert cfg.timeout_ceiling_ms == 120_000
+
+
+def test_profiler_cold_start_uses_seed():
+    from backend.core.ouroboros.governance.local_inference_director import LatencyProfiler, LocalConfig
+    cfg = LocalConfig.from_env()
+    p = LatencyProfiler(cfg)
+    assert p.adaptive_timeout_ms(prompt_tokens=1000) == min(cfg.timeout_seed_ms, cfg.timeout_ceiling_ms)
+    assert p.is_warm() is False
+
+
+def test_profiler_warms_and_scales_with_prompt_size():
+    from backend.core.ouroboros.governance.local_inference_director import LatencyProfiler, LocalConfig
+    cfg = LocalConfig.from_env()
+    p = LatencyProfiler(cfg)
+    for _ in range(6):
+        p.record(ttft_ms=200.0, total_ms=200.0 + 100 * 10.0, output_tokens=100)
+    assert p.is_warm() is True
+    t_big = p.adaptive_timeout_ms(prompt_tokens=2000)
+    t_small = p.adaptive_timeout_ms(prompt_tokens=200)
+    assert t_big > t_small
+    assert t_big <= cfg.timeout_ceiling_ms
+
+
+def test_profiler_never_exceeds_ceiling_even_with_huge_prompt():
+    from backend.core.ouroboros.governance.local_inference_director import LatencyProfiler, LocalConfig
+    cfg = LocalConfig.from_env()
+    p = LatencyProfiler(cfg)
+    for _ in range(6):
+        p.record(ttft_ms=500.0, total_ms=5000.0, output_tokens=100)
+    assert p.adaptive_timeout_ms(prompt_tokens=10_000_000) == cfg.timeout_ceiling_ms
+
+
+def test_profiler_three_sigma_terminal_lag():
+    from backend.core.ouroboros.governance.local_inference_director import LatencyProfiler, LocalConfig
+    cfg = LocalConfig.from_env()
+    p = LatencyProfiler(cfg)
+    for _ in range(6):
+        p.record(ttft_ms=200.0, total_ms=1000.0, output_tokens=100)
+    assert p.is_terminal_lag(elapsed_ms=1100.0) is False
+    assert p.is_terminal_lag(elapsed_ms=50_000.0) is True
+    assert p.is_terminal_lag(elapsed_ms=cfg.timeout_ceiling_ms + 1) is True
