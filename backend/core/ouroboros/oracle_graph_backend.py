@@ -91,6 +91,16 @@ class GraphBackend(ABC):
     @abstractmethod
     def edge_count(self) -> int: ...
 
+    # --- prefetch hooks (N+1 armor) ---
+    # The default algorithms below are LAYER-BY-LAYER BFS so a backend can batch-load an entire
+    # frontier in one disk sweep. These hooks are no-ops for the in-memory backend (RAM is already
+    # the cache) and a batched ``WHERE src_key IN (...)`` for the SQLite lazy backend.
+    def prefetch_successors(self, keys: List[str]) -> None:  # noqa: D401
+        """Hint: the caller is about to read ``successors`` for all of ``keys``."""
+
+    def prefetch_predecessors(self, keys: List[str]) -> None:  # noqa: D401
+        """Hint: the caller is about to read ``predecessors`` for all of ``keys``."""
+
     # --- algorithms over the primitives (overridable for native speed) ---
     def successor_keys(self, key: str) -> List[str]:
         return [dst for dst, _ in self.successors(key)]
@@ -99,35 +109,39 @@ class GraphBackend(ABC):
         return [src for src, _ in self.predecessors(key)]
 
     def shortest_path(self, source: str, target: str) -> Optional[List[str]]:
-        """Unweighted shortest path via BFS over ``successors`` (matches ``nx.shortest_path`` for an
-        unweighted DiGraph). Returns the node-key path inclusive of endpoints, or None."""
+        """Unweighted shortest path via LAYER BFS over ``successors`` (same length as
+        ``nx.shortest_path`` for an unweighted DiGraph). Prefetches each frontier (N+1 armor)."""
         if source == target:
             return [source] if self.contains(source) else None
         if not self.contains(source) or not self.contains(target):
             return None
         prev: Dict[str, Optional[str]] = {source: None}
-        q: deque = deque([source])
-        while q:
-            cur = q.popleft()
-            for nxt in self.successor_keys(cur):
-                if nxt in prev:
-                    continue
-                prev[nxt] = cur
-                if nxt == target:
-                    path = [nxt]
-                    while prev[path[-1]] is not None:
-                        path.append(prev[path[-1]])  # type: ignore[arg-type]
-                    path.reverse()
-                    return path
-                q.append(nxt)
+        frontier: List[str] = [source]
+        while frontier:
+            self.prefetch_successors(frontier)        # batch the whole layer in one sweep
+            nxt: List[str] = []
+            for cur in frontier:
+                for s in self.successor_keys(cur):
+                    if s in prev:
+                        continue
+                    prev[s] = cur
+                    if s == target:
+                        path = [s]
+                        while prev[path[-1]] is not None:
+                            path.append(prev[path[-1]])  # type: ignore[arg-type]
+                        path.reverse()
+                        return path
+                    nxt.append(s)
+            frontier = nxt
         return None
 
     def descendants(self, key: str, max_depth: Optional[int] = None) -> Set[str]:
-        """All nodes reachable from ``key`` (exclusive of ``key``), optional depth bound."""
+        """All nodes reachable from ``key`` (exclusive), optional depth bound. Layer BFS + prefetch."""
         seen: Set[str] = set()
         frontier: List[str] = [key]
         depth = 0
         while frontier and (max_depth is None or depth < max_depth):
+            self.prefetch_successors(frontier)        # batch the whole layer in one sweep
             nxt: List[str] = []
             for n in frontier:
                 for s in self.successor_keys(n):
@@ -256,21 +270,37 @@ class DualBackendParityHarness(GraphBackend):
         self.divergences = 0
         self.shadow_errors = 0
         self.records: deque = deque(maxlen=max(1, max_records))
+        # per-method latency accumulators (seconds) — the raw execution-delta payload (Phase 3)
+        self.latency: Dict[str, Dict[str, float]] = {}
+
+    def _account(self, method: str, primary_s: float, shadow_s: float) -> None:
+        m = self.latency.setdefault(method, {"primary_s": 0.0, "shadow_s": 0.0, "n": 0})
+        m["primary_s"] += primary_s
+        m["shadow_s"] += shadow_s
+        m["n"] += 1
 
     # -- the differential wrapper --
-    def _diff(self, method: str, args: tuple, primary_val: Any) -> Any:
-        """Run the shadow, compare to ``primary_val``, record + fall back on any mismatch/error.
-        Always returns ``primary_val`` (the trusted path)."""
+    def _diff(self, method: str, args: tuple, primary_thunk: Callable[[], Any]) -> Any:
+        """Time + run the primary (authoritative); if a shadow exists, time + run it, compare with a
+        method-aware comparator, and record + fall back on any mismatch/error. Always returns the
+        primary's value (the trusted path)."""
+        t0 = _now()
+        primary_val = primary_thunk()
+        primary_s = _now() - t0
         if self.shadow is None:
             return primary_val
         self.comparisons += 1
+        t1 = _now()
         try:
             shadow_val = getattr(self.shadow, method)(*args)
+            shadow_s = _now() - t1
         except Exception as exc:  # noqa: BLE001 — shadow must never break the query
             self.shadow_errors += 1
+            self._account(method, primary_s, _now() - t1)
             self._record(method, args, primary_val, f"<shadow raised: {exc!r}>", kind="shadow_error")
             return primary_val
-        if not _results_equal(primary_val, shadow_val):
+        self._account(method, primary_s, shadow_s)
+        if not _compare(method, primary_val, shadow_val):
             self.divergences += 1
             self._record(method, args, primary_val, shadow_val, kind="divergence")
         return primary_val
@@ -296,40 +326,85 @@ class DualBackendParityHarness(GraphBackend):
 
     # -- primitives (primary authoritative, shadow differentially checked) --
     def contains(self, key: str) -> bool:
-        return self._diff("contains", (key,), self.primary.contains(key))
+        return self._diff("contains", (key,), lambda: self.primary.contains(key))
 
     def get_node(self, key: str) -> Optional[Dict[str, Any]]:
-        return self._diff("get_node", (key,), self.primary.get_node(key))
+        return self._diff("get_node", (key,), lambda: self.primary.get_node(key))
 
     def successors(self, key: str) -> List[EdgeRow]:
-        return self._diff("successors", (key,), self.primary.successors(key))
+        return self._diff("successors", (key,), lambda: self.primary.successors(key))
 
     def predecessors(self, key: str) -> List[EdgeRow]:
-        return self._diff("predecessors", (key,), self.primary.predecessors(key))
+        return self._diff("predecessors", (key,), lambda: self.primary.predecessors(key))
 
     def node_count(self) -> int:
-        return self._diff("node_count", (), self.primary.node_count())
+        return self._diff("node_count", (), lambda: self.primary.node_count())
 
     def edge_count(self) -> int:
-        return self._diff("edge_count", (), self.primary.edge_count())
+        return self._diff("edge_count", (), lambda: self.primary.edge_count())
 
     def all_keys(self) -> List[str]:
         return self.primary.all_keys()
 
+    # prefetch hints reach BOTH backends (the shadow's batched IN query is the whole point)
+    def prefetch_successors(self, keys: List[str]) -> None:
+        self.primary.prefetch_successors(keys)
+        if self.shadow is not None:
+            try:
+                self.shadow.prefetch_successors(keys)
+            except Exception:  # noqa: BLE001
+                pass
+
     # algorithms: trust the primary's (overridden) impl, differentially check the shadow's
     def shortest_path(self, source: str, target: str) -> Optional[List[str]]:
-        return self._diff("shortest_path", (source, target), self.primary.shortest_path(source, target))
+        return self._diff("shortest_path", (source, target),
+                          lambda: self.primary.shortest_path(source, target))
 
     def simple_cycles(self, max_cycles: Optional[int] = None) -> List[List[str]]:
-        return self._diff("simple_cycles", (max_cycles,), self.primary.simple_cycles(max_cycles))
+        return self._diff("simple_cycles", (max_cycles,),
+                          lambda: self.primary.simple_cycles(max_cycles))
 
-    def stats(self) -> Dict[str, int]:
-        return {
+    def stats(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
             "comparisons": self.comparisons,
             "divergences": self.divergences,
             "shadow_errors": self.shadow_errors,
             "records": len(self.records),
         }
+        # raw latency deltas (Phase 3 payload): per-method primary vs shadow mean, in ms
+        lat = {}
+        for m, d in self.latency.items():
+            n = max(1, d["n"])
+            lat[m] = {
+                "n": d["n"],
+                "primary_ms": round(1000.0 * d["primary_s"] / n, 4),
+                "shadow_ms": round(1000.0 * d["shadow_s"] / n, 4),
+            }
+        out["latency"] = lat
+        return out
+
+
+def _now() -> float:
+    import time
+    return time.perf_counter()
+
+
+def _compare(method: str, a: Any, b: Any) -> bool:
+    """Method-aware equality. Most reads are exact (order-insensitive). Two cases are NOT
+    exact-comparable because more than one correct answer exists:
+      - ``shortest_path``: any path of the same length is equally optimal → compare LENGTH (or both None).
+      - ``simple_cycles``: enumeration order/rotation differs by algorithm → compare the SET of cycles
+        (each cycle as a frozenset of its nodes)."""
+    if method == "shortest_path":
+        if a is None or b is None:
+            return a is None and b is None
+        return len(a) == len(b)
+    if method == "simple_cycles":
+        try:
+            return {frozenset(c) for c in a} == {frozenset(c) for c in b}
+        except TypeError:
+            return a == b
+    return _results_equal(a, b)
 
 
 def _results_equal(a: Any, b: Any) -> bool:
@@ -421,10 +496,201 @@ class AdaptiveNodeCache:
         return len(self._d)
 
 
+# ---------------------------------------------------------------------------- SQLite lazy backend
+_NODE_COLS = (
+    "node_key, repo, file_path, name, node_type, line_number, docstring, signature, decorators,"
+    " base_classes, complexity, line_count, last_modified, source_hash"
+)
+
+
+def _row_to_node_attrs(r: tuple) -> Dict[str, Any]:
+    """Rebuild the EXACT attr dict shape ``NodeData.to_dict()`` produces (so it's byte-identical to
+    the in-memory ``dict(graph.nodes[k])``)."""
+    import json
+    (node_key, repo, file_path, name, node_type, line_number, docstring, signature,
+     decorators, base_classes, complexity, line_count, last_modified, source_hash) = r
+    return {
+        "node_id": {"repo": repo, "file_path": file_path, "name": name,
+                    "node_type": node_type, "line_number": line_number},
+        "docstring": docstring,
+        "signature": signature,
+        "decorators": json.loads(decorators) if decorators else [],
+        "base_classes": json.loads(base_classes) if base_classes else [],
+        "complexity": complexity,
+        "line_count": line_count,
+        "last_modified": last_modified,
+        "source_hash": source_hash,
+    }
+
+
+def _edge_attrs(edge_type: str, line_number: int, context: str) -> Dict[str, Any]:
+    return {"edge_type": edge_type, "line_number": line_number, "context": context}
+
+
+class SqliteLazyGraphBackend(GraphBackend):
+    """On-demand traversal over the canonical ``oracle.db`` — the query-time RAM-wall killer. Reads
+    via a sync, thread-safe, READ-ONLY ``sqlite3`` connection over the existing ``idx_edges_src`` /
+    ``idx_edges_dst`` / ``idx_nodes_*`` indexes; materializes nodes/edges on demand into adaptive
+    caches instead of holding the whole graph resident.
+
+    Predictive prefetch (the N+1 armor): ``prefetch_successors(frontier)`` pulls an ENTIRE BFS layer
+    in one ``WHERE src_key IN (...)`` sweep, so a deep recursion costs O(depth) disk round-trips
+    instead of O(nodes). Matches the in-memory backend exactly — including stub-node semantics (edge
+    endpoints with no ``nodes`` row), so the parity harness sees zero divergence.
+    """
+
+    _IN_CHUNK = 800  # under SQLite's ~999 bound-parameter limit
+
+    def __init__(self, db_path: Any, *, busy_timeout_ms: int = 5000,
+                 node_cache: Optional[AdaptiveNodeCache] = None):
+        import threading
+        self._db_path = str(db_path)
+        self._busy = busy_timeout_ms
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self._node_cache = node_cache or AdaptiveNodeCache()
+        self._succ_cache = AdaptiveNodeCache()   # src_key -> [(dst, edge_attrs)]
+        self._pred_cache = AdaptiveNodeCache()   # dst_key -> [(src, edge_attrs)]
+        self.query_count = 0                     # disk round-trips (prefetch N+1-armor telemetry)
+
+    # -- connection (sync, read-only, thread-safe) --
+    def _c(self):
+        if self._conn is None:
+            import sqlite3
+            self._conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro", uri=True, check_same_thread=False,
+            )
+            self._conn.execute(f"PRAGMA busy_timeout={self._busy}")
+            self._conn.execute("PRAGMA query_only=ON")
+        return self._conn
+
+    def _q(self, sql: str, params: tuple = ()) -> List[tuple]:
+        with self._lock:
+            self.query_count += 1
+            return list(self._c().execute(sql, params).fetchall())
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+
+    def apply_pressure(self, level: str) -> None:
+        for c in (self._node_cache, self._succ_cache, self._pred_cache):
+            c.apply_pressure(level)
+
+    # -- primitives (stub-aware for byte-identical parity with the in-memory graph) --
+    def _in_edges(self, key: str) -> bool:
+        if self._q("SELECT 1 FROM edges WHERE src_key=? LIMIT 1", (key,)):
+            return True
+        return bool(self._q("SELECT 1 FROM edges WHERE dst_key=? LIMIT 1", (key,)))
+
+    def contains(self, key: str) -> bool:
+        if self._succ_cache.get(key) or self._pred_cache.get(key) or self._node_cache.get(key):
+            return True
+        if self._q("SELECT 1 FROM nodes WHERE node_key=? LIMIT 1", (key,)):
+            return True
+        return self._in_edges(key)   # stub node (edge endpoint w/o a row) — matches in-memory
+
+    def get_node(self, key: str) -> Optional[Dict[str, Any]]:
+        cached = self._node_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        rows = self._q(f"SELECT {_NODE_COLS} FROM nodes WHERE node_key=?", (key,))
+        if rows:
+            attrs = _row_to_node_attrs(rows[0])
+            self._node_cache.put(key, attrs)
+            return dict(attrs)
+        # no row: in-memory returns {} for a stub endpoint, None for a truly-absent key
+        return {} if self._in_edges(key) else None
+
+    def successors(self, key: str) -> List[EdgeRow]:
+        v = self._succ_cache.get(key)
+        if v is not None:
+            return list(v)
+        rows = self._q(
+            "SELECT dst_key, edge_type, line_number, context FROM edges WHERE src_key=?", (key,))
+        out = [(dst, _edge_attrs(et, ln, ctx)) for dst, et, ln, ctx in rows]
+        self._succ_cache.put(key, out)
+        return list(out)
+
+    def predecessors(self, key: str) -> List[EdgeRow]:
+        v = self._pred_cache.get(key)
+        if v is not None:
+            return list(v)
+        rows = self._q(
+            "SELECT src_key, edge_type, line_number, context FROM edges WHERE dst_key=?", (key,))
+        out = [(src, _edge_attrs(et, ln, ctx)) for src, et, ln, ctx in rows]
+        self._pred_cache.put(key, out)
+        return list(out)
+
+    def node_count(self) -> int:
+        # distinct union of node rows + edge endpoints == in-memory graph.number_of_nodes() (w/ stubs)
+        rows = self._q(
+            "SELECT COUNT(*) FROM (SELECT node_key AS k FROM nodes "
+            "UNION SELECT src_key FROM edges UNION SELECT dst_key FROM edges)")
+        return int(rows[0][0]) if rows else 0
+
+    def edge_count(self) -> int:
+        rows = self._q("SELECT COUNT(*) FROM edges")
+        return int(rows[0][0]) if rows else 0
+
+    def all_keys(self) -> List[str]:
+        seen = set()
+        for (k,) in self._q("SELECT node_key FROM nodes"):
+            seen.add(k)
+        for (s, d) in self._q("SELECT src_key, dst_key FROM edges"):
+            seen.add(s); seen.add(d)
+        return list(seen)
+
+    # -- predictive batch prefetch (the N+1 armor) --
+    def prefetch_successors(self, keys: List[str]) -> None:
+        self._prefetch(keys, self._succ_cache, "src_key", "dst_key")
+
+    def prefetch_predecessors(self, keys: List[str]) -> None:
+        self._prefetch(keys, self._pred_cache, "dst_key", "src_key")
+
+    def _prefetch(self, keys: List[str], cache: AdaptiveNodeCache, by: str, other: str) -> None:
+        want = [k for k in dict.fromkeys(keys) if cache.get(k) is None]  # dedup + skip cached
+        if not want:
+            return
+        from collections import defaultdict
+        for i in range(0, len(want), self._IN_CHUNK):
+            chunk = want[i:i + self._IN_CHUNK]
+            ph = ",".join("?" * len(chunk))
+            rows = self._q(
+                f"SELECT {by}, {other}, edge_type, line_number, context FROM edges WHERE {by} IN ({ph})",
+                tuple(chunk),
+            )
+            grouped: Dict[str, List[EdgeRow]] = defaultdict(list)
+            for k, nbr, et, ln, ctx in rows:
+                grouped[k].append((nbr, _edge_attrs(et, ln, ctx)))
+            for k in chunk:
+                cache.put(k, grouped.get(k, []))   # cache known-empty too (prevents re-query)
+
+
 # ---------------------------------------------------------------------------- factory
-def build_graph_backend(ckg: Any) -> GraphBackend:
-    """Single decision point for the traversal backend. Slice 1: always returns
-    ``InMemoryGraphBackend`` (byte-identical to the pre-seam path). Slice 2 will return a
-    ``DualBackendParityHarness(primary=InMemory, shadow=SqliteLazy)`` when the lazy + parity flags
-    are on — so the Oracle's query layer never needs to change again."""
-    return InMemoryGraphBackend(ckg)
+def build_graph_backend(ckg: Any, *, db_path: Any = None) -> GraphBackend:
+    """Single decision point for the traversal backend.
+      - Lazy OFF (default): ``InMemoryGraphBackend`` — byte-identical to the pre-seam path.
+      - Lazy ON + parity ON + a readable ``db_path``: ``DualBackendParityHarness`` with the in-memory
+        primary (authoritative) differentially verifying the SQLite lazy shadow — the safe production
+        graduation path.
+      - Lazy ON + parity OFF + db: the SQLite backend directly (post-graduation).
+    Fail-soft: any SQLite-open problem falls back to in-memory."""
+    primary = InMemoryGraphBackend(ckg)
+    if not lazy_traversal_enabled() or db_path is None:
+        return primary
+    try:
+        import os as _os
+        if not _os.path.exists(str(db_path)):
+            return primary
+        shadow = SqliteLazyGraphBackend(db_path)
+        if parity_harness_enabled():
+            return DualBackendParityHarness(primary=primary, shadow=shadow)
+        return shadow
+    except Exception:  # noqa: BLE001 — never let the seam break Oracle construction
+        logger.warning("[OracleBackend] lazy backend unavailable — using in-memory", exc_info=True)
+        return primary
