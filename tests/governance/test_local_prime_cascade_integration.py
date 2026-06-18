@@ -46,3 +46,18 @@ async def test_director_stop_closes_session_no_leak(monkeypatch):
     await d.stop()
     assert client._session is None   # released
     assert fake.closed is True       # zero hanging FDs
+
+
+def test_memory_critical_maps_to_primary_degraded():
+    from backend.core.ouroboros.governance.local_inference_director import LocalMemoryCritical
+    from backend.core.ouroboros.governance.candidate_generator import classify_local_failure
+    verdict = classify_local_failure(LocalMemoryCritical("host CRITICAL"))
+    assert verdict.degrade is True
+    assert verdict.target_state == "PRIMARY_DEGRADED"
+    assert verdict.cascade_upstream is True
+
+
+def test_memory_critical_failure_class_attr():
+    from backend.core.ouroboros.governance.local_inference_director import LocalMemoryCritical
+    assert LocalMemoryCritical("x").failure_class == "local_memory_critical"
+    assert isinstance(LocalMemoryCritical("x"), RuntimeError)

@@ -144,6 +144,16 @@ class LocalLatencyLockup(RuntimeError):
     failure_class = "terminal_lag_lockup"
 
 
+class LocalMemoryCritical(RuntimeError):
+    """Raised when host memory is CRITICAL at local-generate admission time.
+
+    The local tier evicts the model and refuses the op so the cascade routes
+    upstream to remote providers instead of OOM-ing the host. Consumed by
+    classify_local_failure -> PRIMARY_DEGRADED.
+    """
+    failure_class = "local_memory_critical"
+
+
 def render_structured_prompt(*, task: str, constraints: List[str], files: Dict[str, str]) -> str:
     """Structured-prompt discipline for the local 3B: rigid bounded tags, no loose NL."""
     parts = ["<task>", task, "</task>", "<constraints>"]

@@ -1350,7 +1350,8 @@ def classify_local_failure(exc: BaseException) -> LocalFailureVerdict:
     op upstream (the FailbackStateMachine already passes context on cascade, so no
     L2 sandbox teardown). All other exceptions are ordinary provider failures.
     """
-    if getattr(exc, "failure_class", None) == "terminal_lag_lockup":
+    _LOCAL_DEGRADE_CLASSES = ("terminal_lag_lockup", "local_memory_critical")
+    if getattr(exc, "failure_class", None) in _LOCAL_DEGRADE_CLASSES:
         return LocalFailureVerdict(
             degrade=True, cascade_upstream=True, target_state="PRIMARY_DEGRADED"
         )
