@@ -64,6 +64,17 @@ def traversal_cache_max() -> int:
         return 5000
 
 
+def traversal_pressure_probe_interval_s() -> float:
+    """``JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S`` — minimum seconds between live
+    MemoryPressureGate probes during traversal (Slice 3). Throttles the probe so the sync hot path
+    stays fast while still contracting the cache within a couple seconds of host pressure. Default
+    2.0s; ``0`` probes every frontier (used by soaks to force immediate contraction)."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S", "2.0")))
+    except (TypeError, ValueError):
+        return 2.0
+
+
 # ---------------------------------------------------------------------------- the seam
 class GraphBackend(ABC):
     """The traversal seam. Concrete backends implement the primitives; the algorithms below are
@@ -542,7 +553,7 @@ class SqliteLazyGraphBackend(GraphBackend):
     _IN_CHUNK = 800  # under SQLite's ~999 bound-parameter limit
 
     def __init__(self, db_path: Any, *, busy_timeout_ms: int = 5000,
-                 node_cache: Optional[AdaptiveNodeCache] = None):
+                 node_cache: Optional[AdaptiveNodeCache] = None, memory_gate: Any = None):
         import threading
         self._db_path = str(db_path)
         self._busy = busy_timeout_ms
@@ -552,6 +563,14 @@ class SqliteLazyGraphBackend(GraphBackend):
         self._succ_cache = AdaptiveNodeCache()   # src_key -> [(dst, edge_attrs)]
         self._pred_cache = AdaptiveNodeCache()   # dst_key -> [(src, edge_attrs)]
         self.query_count = 0                     # disk round-trips (prefetch N+1-armor telemetry)
+        # Slice 3 — live memory-pressure governance of the working set. Reuses the shared
+        # MemoryPressureGate (same advisory the index armor + scoper use). ``memory_gate`` is
+        # injectable for tests; otherwise resolved lazily from the default gate.
+        self._gate = memory_gate
+        self._gate_resolved = memory_gate is not None
+        self._last_probe_t = 0.0
+        self.pressure_events = 0                  # times the cache contracted under live pressure
+        self.last_pressure = "ok"
 
     # -- connection (sync, read-only, thread-safe) --
     def _c(self):
@@ -577,9 +596,56 @@ class SqliteLazyGraphBackend(GraphBackend):
                 finally:
                     self._conn = None
 
-    def apply_pressure(self, level: str) -> None:
+    def apply_pressure(self, level: str) -> int:
+        """Contract all three working-set caches to the pressure ``level`` and, at CRITICAL, flush
+        freed dicts back to the OS via GC. Returns total entries evicted. Reusable from an external
+        cadence (e.g. the governor tick) as well as the internal throttled probe."""
+        evicted = 0
         for c in (self._node_cache, self._succ_cache, self._pred_cache):
-            c.apply_pressure(level)
+            evicted += c.apply_pressure(level)
+        if level == "critical":
+            import gc
+            gc.collect()
+        self.last_pressure = level
+        return evicted
+
+    # -- live memory-pressure governance (Slice 3) --
+    def _resolve_gate(self):
+        if not self._gate_resolved:
+            self._gate_resolved = True
+            try:
+                from backend.core.ouroboros.governance.memory_pressure_gate import (
+                    get_default_gate, is_enabled,
+                )
+                self._gate = get_default_gate() if is_enabled() else None
+            except Exception:  # noqa: BLE001 — governance is advisory; never break a query
+                self._gate = None
+        return self._gate
+
+    def _maybe_apply_pressure(self) -> None:
+        """Throttled probe (per traversal frontier, time-bounded) of the shared MemoryPressureGate;
+        contracts the caches when host RAM is elevated. Sync + cheap; keeps the hot read path fast
+        while making the resident working set DYNAMICALLY shrink under pressure instead of growing
+        unbounded during a deep recursion. No-op when the gate is disabled/unavailable."""
+        gate = self._resolve_gate()
+        if gate is None:
+            return
+        now = _now()
+        if now - self._last_probe_t < traversal_pressure_probe_interval_s():
+            return
+        self._last_probe_t = now
+        try:
+            level = gate.pressure().value
+        except Exception:  # noqa: BLE001
+            return
+        if level in ("warn", "high", "critical"):
+            evicted = self.apply_pressure(level)
+            if evicted > 0 or level == "critical":
+                self.pressure_events += 1
+        else:
+            # pressure cleared → restore baseline cache size (adaptive both ways)
+            if self.last_pressure != "ok":
+                self.apply_pressure("ok")
 
     # -- primitives (stub-aware for byte-identical parity with the in-memory graph) --
     def _in_edges(self, key: str) -> bool:
@@ -653,6 +719,9 @@ class SqliteLazyGraphBackend(GraphBackend):
         self._prefetch(keys, self._pred_cache, "dst_key", "src_key")
 
     def _prefetch(self, keys: List[str], cache: AdaptiveNodeCache, by: str, other: str) -> None:
+        # Live memory governance: one throttled gate probe per traversal frontier (the natural,
+        # bounded cadence) so a deep recursion contracts the working set instead of growing it.
+        self._maybe_apply_pressure()
         want = [k for k in dict.fromkeys(keys) if cache.get(k) is None]  # dedup + skip cached
         if not want:
             return
