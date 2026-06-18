@@ -218,5 +218,113 @@ def test_factory_inmemory_when_off(monkeypatch, tmp_path):
     assert isinstance(b, GB.InMemoryGraphBackend)
 
 
+# --------------------------------------------------------------------------- Slice 3: live pressure governance
+class _FakeGate:
+    """MemoryPressureGate stand-in returning a scripted level sequence; counts probe calls."""
+    def __init__(self, levels):
+        self._levels = list(levels)
+        self._i = 0
+        self.calls = 0
+
+    def pressure(self):
+        from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+        self.calls += 1
+        lvl = self._levels[min(self._i, len(self._levels) - 1)]
+        self._i += 1
+        return lvl
+
+
+def _chain_db(tmp_path, n=30):
+    g = CodebaseKnowledgeGraph()
+    ids = []
+    for i in range(n):
+        nid = NodeID(repo="jarvis", file_path=f"p/m{i}.py", name=f"s{i}", node_type=NodeType.FUNCTION)
+        g.add_node(NodeData(node_id=nid))
+        ids.append(nid)
+    for i in range(n - 1):
+        g.add_edge(ids[i], ids[i + 1], EdgeData(EdgeType.CALLS))
+    return _build_db(tmp_path, g), g, ids
+
+
+def test_deep_traversal_contracts_cache_under_critical(monkeypatch, tmp_path):
+    """A deep recursive traversal under sustained CRITICAL pressure must CONTRACT the working-set
+    cache (not grow it) — and still return the correct full result."""
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_CACHE_MAX", "20")   # small baseline → visible contraction
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S", "0")  # probe every frontier
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    db, g, ids = _chain_db(tmp_path, 30)
+    sl = GB.SqliteLazyGraphBackend(db, memory_gate=_FakeGate([L.CRITICAL]))
+    try:
+        desc = sl.descendants(str(ids[0]))                  # 29-layer recursion w/ per-layer prefetch
+        assert desc == set(str(i) for i in ids[1:])         # correctness preserved under pressure
+        assert sl.pressure_events > 0                        # the cache contracted on live pressure
+        assert sl._succ_cache.maxsize == int(20 * 0.1)       # CRITICAL ×0.1 → 2
+        assert len(sl._succ_cache) <= sl._succ_cache.maxsize  # resident working set bounded
+    finally:
+        sl.close()
+
+
+def test_pressure_probe_is_throttled(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    db, g, ids = _chain_db(tmp_path, 6)
+    # large interval → at most ONE probe across rapid prefetches
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S", "9999")
+    gate = _FakeGate([L.HIGH])
+    sl = GB.SqliteLazyGraphBackend(db, memory_gate=gate)
+    try:
+        sl.prefetch_successors([str(i) for i in ids])
+        sl.prefetch_predecessors([str(i) for i in ids])
+        assert gate.calls == 1   # throttled — only the first frontier probed within the window
+    finally:
+        sl.close()
+
+
+def test_pressure_clears_restores_baseline(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_CACHE_MAX", "50")
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S", "0")
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    db, g, ids = _chain_db(tmp_path, 8)
+    # CRITICAL first (contract), then OK (restore) — adaptive BOTH ways
+    sl = GB.SqliteLazyGraphBackend(db, memory_gate=_FakeGate([L.CRITICAL, L.OK]))
+    try:
+        sl.prefetch_successors([str(ids[0])])      # probe #1 → CRITICAL → maxsize 5
+        assert sl._succ_cache.maxsize == 5
+        sl.prefetch_successors([str(ids[1])])      # probe #2 → OK → restore baseline 50
+        assert sl._succ_cache.maxsize == 50
+    finally:
+        sl.close()
+
+
+def test_apply_pressure_returns_evicted_and_gc_on_critical(tmp_path):
+    db, g, ids = _chain_db(tmp_path, 12)
+    sl = GB.SqliteLazyGraphBackend(db)
+    try:
+        for i in ids:
+            sl.successors(str(i))
+        # critical contraction must evict + not raise (exercises the GC path)
+        evicted = sl.apply_pressure("critical")
+        assert evicted >= 0 and sl.last_pressure == "critical"
+    finally:
+        sl.close()
+
+
+def test_harness_zero_divergence_under_pressure(monkeypatch, tmp_path):
+    """Parity must hold WHILE the shadow's cache is being contracted under pressure."""
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_CACHE_MAX", "8")
+    monkeypatch.setenv("JARVIS_ORACLE_TRAVERSAL_PRESSURE_INTERVAL_S", "0")
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel as L
+    db, g, ids = _chain_db(tmp_path, 20)
+    shadow = GB.SqliteLazyGraphBackend(db, memory_gate=_FakeGate([L.CRITICAL]))
+    h = GB.DualBackendParityHarness(primary=GB.InMemoryGraphBackend(g), shadow=shadow)
+    try:
+        for i in ids:
+            h.successors(str(i)); h.get_node(str(i)); h.predecessors(str(i))
+        h.shortest_path(str(ids[0]), str(ids[19]))
+        assert h.stats()["divergences"] == 0 and h.stats()["shadow_errors"] == 0
+        assert shadow.pressure_events > 0   # contraction happened during the verified run
+    finally:
+        shadow.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
