@@ -890,6 +890,33 @@ class CodebaseKnowledgeGraph:
         except Exception:  # noqa: BLE001
             self._backend = None  # type: ignore[assignment]
 
+    def attach_lazy_backend(self, db_path: Any) -> None:
+        """(Slice 2) Rebuild the traversal backend with SQLite lazy reads once ``oracle.db`` exists.
+        When the lazy + parity flags are on, this swaps in a ``DualBackendParityHarness`` (in-memory
+        primary differentially verifying the SQLite shadow); otherwise stays in-memory. Fail-soft —
+        keeps the current backend on any error."""
+        try:
+            from backend.core.ouroboros.oracle_graph_backend import build_graph_backend
+            new_backend = build_graph_backend(self, db_path=db_path)
+            old = getattr(self, "_backend", None)
+            self._backend = new_backend
+            if old is not None and old is not new_backend and hasattr(old, "close"):
+                try:
+                    old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("[Oracle] attach_lazy_backend failed (keeping current backend)", exc_info=True)
+
+    def close_backend(self) -> None:
+        """Release any lazy-backend DB connection (shutdown). Fail-soft."""
+        b = getattr(self, "_backend", None)
+        if b is not None and hasattr(b, "close"):
+            try:
+                b.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def add_node(self, node_data: NodeData) -> None:
         """Add a node to the graph."""
         node_id = node_data.node_id
