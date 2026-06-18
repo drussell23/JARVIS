@@ -622,5 +622,131 @@ def test_armor_flag_default_on(monkeypatch):
     assert O._oracle_memory_armor_enabled() is False
 
 
+# --------------------------------------------------------------------------- Adaptive Subtree Scoper
+def test_cluster_by_package_respects_target_and_covers_all():
+    from pathlib import Path
+    import backend.core.ouroboros.oracle as O
+    repo = Path("/repo")
+    files = []
+    for pkg in ("a", "b", "c"):
+        for i in range(40):
+            files.append(repo / "backend" / pkg / f"m{i}.py")
+    parts = O._cluster_by_package(files, repo, target_files=50)
+    # every partition within target (these packages are 40 each, splittable into the 50 budget)
+    assert all(len(p) <= 50 for p in parts)
+    # lossless: union of partitions == input set
+    flat = [f for p in parts for f in p]
+    assert sorted(flat) == sorted(files)
+    assert len(parts) >= 2  # 120 files / 50 budget → multiple partitions
+
+
+def test_cluster_oversized_single_package_splits_deeper():
+    from pathlib import Path
+    import backend.core.ouroboros.oracle as O
+    repo = Path("/repo")
+    # one package, but with deeper sub-structure → must split on depth+1
+    files = [repo / "pkg" / sub / f"m{i}.py" for sub in ("x", "y", "z") for i in range(30)]
+    parts = O._cluster_by_package(files, repo, target_files=40)
+    assert all(len(p) <= 40 for p in parts)
+    assert sorted(f for p in parts for f in p) == sorted(files)
+
+
+def test_partition_subtrees_off_returns_single(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", raising=False)
+    o = _fresh_oracle(monkeypatch, tmp_path)
+    files = [tmp_path / f"m{i}.py" for i in range(1000)]
+    assert o._partition_subtrees(files, tmp_path) == [files]
+
+
+def test_partition_subtrees_on_splits(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ORACLE_SCOPER_MIN_PARTITION_FILES", "10")
+    # force a tiny budget so partitioning definitely triggers, regardless of host RAM
+    monkeypatch.setenv("JARVIS_ORACLE_SCOPER_SAFETY_FRAC", "0.05")
+    monkeypatch.setenv("JARVIS_ORACLE_SCOPER_PER_NODE_KB", "5000")  # huge per-node cost → tiny target
+    o = _fresh_oracle(monkeypatch, tmp_path)
+    files = [tmp_path / "pkg" / f"p{i % 6}" / f"m{i}.py" for i in range(600)]
+    parts = o._partition_subtrees(files, tmp_path)
+    assert len(parts) >= 2
+    assert sorted(f for p in parts for f in p) == sorted(files)
+
+
+def test_evict_partition_drops_nodes_keeps_file_hashes(monkeypatch, tmp_path):
+    o = _fresh_oracle(monkeypatch, tmp_path)
+    g = _build_graph(3)            # files backend/pkg/module_0..2.py, 2 nodes each
+    o._graph = g
+    o._file_hashes = {f"jarvis:backend/pkg/module_{i}.py": f"h{i}" for i in range(3)}
+    repo = tmp_path
+    f0 = repo / "backend/pkg/module_0.py"
+    n_before = g._graph.number_of_nodes()
+    evicted = o._evict_partition([f0], repo, "jarvis")
+    assert evicted == 2                                   # module_0 had 2 nodes
+    assert g._graph.number_of_nodes() == n_before - 2     # removed from in-memory graph
+    assert "backend/pkg/module_0.py" not in g._file_index # index bucket cleaned
+    assert o._file_hashes == {f"jarvis:backend/pkg/module_{i}.py": f"h{i}" for i in range(3)}  # PRESERVED
+
+
+def test_scoped_eviction_preserves_cross_partition_edge_in_sqlite(monkeypatch, tmp_path):
+    """THE correctness proof (Phase 3): index package A → commit → EVICT A → index package B with a
+    cross-edge B→A → commit. The full graph (A real node + B + B→A edge) must reconstruct from
+    SQLite byte-identically, proving eviction never loses durable cross-partition structure."""
+    monkeypatch.setenv("JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED", "1")
+    from backend.core.ouroboros.oracle import TheOracle
+    monkeypatch.setattr(TheOracle, "_resolved_sqlite_path", staticmethod(lambda: tmp_path / "oracle.db"))
+    monkeypatch.setattr(TheOracle, "_resolved_graph_cache_path", staticmethod(lambda: tmp_path / "c.pkl"))
+    repo = tmp_path
+
+    async def run():
+        o = TheOracle()
+        o._graph_write_queue = None
+        g = o._graph
+        a1 = NodeID(repo="jarvis", file_path="pkg_a/a.py", name="fa", node_type=NodeType.FUNCTION, line_number=1)
+        b1 = NodeID(repo="jarvis", file_path="pkg_b/b.py", name="fb", node_type=NodeType.FUNCTION, line_number=1)
+
+        # --- partition A: index + commit + EVICT ---
+        g.add_node(NodeData(node_id=a1, source_hash="ha"))
+        o._file_hashes["jarvis:pkg_a/a.py"] = "ha"
+        await o._sqlite_incremental_checkpoint([repo / "pkg_a/a.py"], "jarvis", repo)
+        assert o._evict_partition([repo / "pkg_a/a.py"], repo, "jarvis") == 1
+        assert str(a1) not in g._graph                        # A evicted from RAM
+
+        # --- partition B: index with a cross-edge B->A (A is currently a RAM stub) + commit ---
+        g.add_node(NodeData(node_id=b1, source_hash="hb"))
+        g.add_edge(b1, a1, EdgeData(EdgeType.CALLS, line_number=2, context="cross"))
+        o._file_hashes["jarvis:pkg_b/b.py"] = "hb"
+        await o._sqlite_incremental_checkpoint([repo / "pkg_b/b.py"], "jarvis", repo)
+
+        # --- reconstruct the FULL graph from SQLite ---
+        prov = o._persistence_provider()
+        loaded = await prov.load()
+        await prov.close()
+        keys = set(loaded.graph.nodes)
+        assert str(a1) in keys and str(b1) in keys               # both real nodes present
+        assert "node_id" in loaded.graph.nodes[str(a1)]          # A is a REAL node (not lost to eviction)
+        assert loaded.graph.has_edge(str(b1), str(a1))           # cross-partition edge survived
+        assert loaded.graph.number_of_nodes() == 2 and loaded.graph.number_of_edges() == 1
+    asyncio.run(run())
+
+
+def test_scoper_flag_default_off(monkeypatch):
+    import backend.core.ouroboros.oracle as O
+    monkeypatch.delenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", raising=False)
+    assert O._oracle_scoper_enabled() is False
+    monkeypatch.setenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "1")
+    assert O._oracle_scoper_enabled() is True
+
+
+def test_provider_checkpoint_wal_and_counts(tmp_path):
+    async def run():
+        g = _build_graph(3)
+        prov = P.AioSqliteProvider(tmp_path / "o.db")
+        await prov.save(_state_from_graph(g))
+        await prov.checkpoint_wal()                               # must not raise; folds WAL
+        n, e = await prov.count_nodes_edges()
+        await prov.close()
+        assert n == g._graph.number_of_nodes() and e == g._graph.number_of_edges()
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

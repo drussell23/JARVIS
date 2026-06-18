@@ -592,6 +592,28 @@ class AioSqliteProvider(PersistenceProvider):
             row = await cur.fetchone()
         return row[0] if row else None
 
+    async def checkpoint_wal(self) -> None:
+        """Structural checkpoint — fold the ``-wal`` back into the main db (``TRUNCATE`` mode). Used by
+        the Adaptive Scoper between subtree partitions so a partition is fully durable on disk and the
+        ``-wal`` can't grow unbounded across a long sequential build. Serialized by the write lock."""
+        conn = await self._conn_or_open()
+        async with self._lock():
+            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await conn.commit()
+
+    async def count_nodes_edges(self) -> Tuple[int, int]:
+        """Authoritative ``(nodes, edges)`` counts from the canonical store — refreshes the in-memory
+        metrics after a scoped+evicted build (where the resident counters are partial)."""
+        conn = await self._conn_or_open()
+        try:
+            async with conn.execute("SELECT count(*) FROM nodes") as cur:
+                n = (await cur.fetchone())[0]
+            async with conn.execute("SELECT count(*) FROM edges") as cur:
+                e = (await cur.fetchone())[0]
+            return int(n), int(e)
+        except Exception:  # noqa: BLE001 — no schema yet → zero
+            return 0, 0
+
 
 # ---------------------------------------------------------------------------- row marshalling
 _INSERT_NODE_SQL = (
