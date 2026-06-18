@@ -30,6 +30,12 @@ def _hedge_window_default_s() -> float:
     return float(os.environ.get("JARVIS_TIERED_HEDGE_WINDOW_MS", "800")) / 1000.0
 
 
+def tiered_enabled() -> bool:
+    """Master switch for composing the GCP-heavy + local-light tiered client.
+    Default OFF -> the heavy tier is wired but NOT activated."""
+    return os.environ.get("JARVIS_JPRIME_TIERED_ENABLED", "").strip().lower() in _TRUE
+
+
 class HeavyState(str, enum.Enum):
     HEALTHY = "HEALTHY"
     DEGRADED = "DEGRADED"

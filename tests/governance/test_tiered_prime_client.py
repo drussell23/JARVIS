@@ -75,3 +75,11 @@ def test_factory_both_returns_tiered_only_one_returns_that_one():
     assert build_tiered_prime_client(heavy=None, light=light) is light   # only light -> passthrough
     assert build_tiered_prime_client(heavy=heavy, light=None) is heavy   # only heavy -> passthrough
     assert build_tiered_prime_client(heavy=None, light=None) is None     # neither -> None (legacy)
+
+
+def test_tiered_enabled_default_off(monkeypatch):
+    monkeypatch.delenv("JARVIS_JPRIME_TIERED_ENABLED", raising=False)
+    from backend.core.ouroboros.governance.tiered_prime_client import tiered_enabled
+    assert tiered_enabled() is False
+    monkeypatch.setenv("JARVIS_JPRIME_TIERED_ENABLED", "true")
+    assert tiered_enabled() is True
