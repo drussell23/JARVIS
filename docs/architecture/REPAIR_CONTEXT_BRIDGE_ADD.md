@@ -54,6 +54,15 @@ overlaps resolve to the innermost span. Frames with no resolvable node (e.g. gen
 `node_key=None` and are skipped as targets. Fail-soft: if traceback parsing fails, the signal
 degrades to today's `error_text` (the loop still works, just graph-blind for that op).
 
+**Implemented (Slice 1):** pure mapper `governance/intent/repair_traceback.py`
+(`parse_pytest_tracebacks` → `_frames_for_test` correlation → `map_frames_to_nodes` innermost-span
+AST map → `build_traceback_map` deepest-first `fault_node_keys`); injectable `NodeResolver`
+(production = the Oracle's `_graph._backend`, lazily + fail-soft). Wired into
+`intent/test_watcher.py`: `TestFailure.traceback_evidence` (additive field) populated by the async
+`_enrich_failures` (mapping offloaded via `asyncio.to_thread` — zero block on the sensor poll loop),
+merged into `IntentSignal.evidence` in `process_failures`. Gated `JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`
+(default OFF → signal evidence byte-identical to pre-bridge). 32 tests (mapper + watcher wiring).
+
 ---
 
 ## 2. Phase 2 — Graph-Informed Cognitive Context (the steer)
@@ -105,8 +114,14 @@ flushed to disk or signed by `AutoCommitter`:
      pre-fix cone → reject (introduced circular dependency).
    - **New dead code:** a node that had callers/importers pre-fix has *none* post-delta → reject
      (the fix orphaned a referenced symbol).
-   - **Severed call-chain:** a call-chain present pre-fix between two cone nodes no longer resolves
-     post-delta → reject (structural break elsewhere in the blast radius).
+   - **Severed call-chain (reachability-gated — see §3.1):** a call-chain present pre-fix between two
+     cone nodes no longer resolves post-delta. This is **not** a binary rejection: it is a structural
+     break *only if* severing it disrupts reachability from a **system entry point** (an active test
+     suite, a `__main__`/loop entry, or any live external caller) to a still-**active** downstream
+     component. If the only paths it severs lead to **dead/orphaned subgraphs**, the severance is
+     **authorized as valid structural pruning** (the fix legitimately removed reachable-only-from-dead
+     code) → ACCEPT + emit non-blocking cleanup telemetry. The Dynamic Reachability Matrix (§3.1)
+     decides which case applies.
 4. **Verdict:** ACCEPT → candidate proceeds to the existing VERIFY/SemanticGuardian/AutoCommit path
    unchanged. REJECT → emit a **structural-divergence signature** (kind + offending node/edge, hashed
    via `failure_classifier.patch_signature_hash`) and **append it to the L2 failure context**, so the
@@ -124,6 +139,57 @@ feedback loop, and the failure-classifier — net new code is the simulator + th
   regression *outside* the cone is out of scope (and would be unrelated to this fix by definition).
 - It validates **structure**, not behavior — VERIFY (the scoped test run) remains the behavioral
   authority. This gate is friction *before* the test run, catching structural breaks tests miss.
+
+---
+
+## 3.1 The Dynamic Graph Reachability Matrix (severed-chain adjudication)
+
+**The principle (operator-ratified behavioral rule):** *a severed call-chain is a structural
+regression only when it disrupts reachability from a live system entry point to a still-active
+downstream component. A chain severed only within a dead or orphaned subgraph is valid structural
+pruning, not a break.* This replaces naïve "any removed edge = reject" with intent-aware
+adjudication, and is the canonical answer to §8 Q2.
+
+**Entry points (the reachability roots) — derived, never hardcoded:**
+- **Active test suites** — the test nodes the Oracle already indexes (files under the configured test
+  dirs); for the repairing op specifically, the *failing test node* is always a root.
+- **Runtime entries** — `__main__` guards, registered loop/daemon entrypoints, and any node with a
+  live external in-edge the Oracle records (e.g. CLI/handler registration).
+- These are read from the graph, not a static list — new entrypoints become roots automatically (§5
+  intelligence-driven, no hardcoded routing).
+
+**The matrix (computed on the *post-delta* cone, deterministic, zero-LLM):**
+For each call-chain `C` that existed pre-fix but no longer resolves post-delta, classify its severed
+endpoint(s) by reachability from the entry-point root set `R` over the post-delta graph:
+
+| Downstream endpoint reachable from `R` post-delta? | Endpoint still has *other* live callers? | Verdict |
+|---|---|---|
+| **Yes** (a live root still reaches it another way) | — | **ACCEPT** — chain rerouted, not broken; reachability preserved |
+| **No** | **Yes** (reachable via a different live chain) | **ACCEPT** — local re-wiring; component still active |
+| **No** | **No**, but endpoint *was* reachable from `R` **pre-delta** | **REJECT** — *this fix* orphaned a live component → divergence signature → L2 feedback |
+| **No** | **No**, and endpoint was **already** dead pre-delta | **ACCEPT (prune)** — severing dead-only code; emit `structural_prune` cleanup telemetry (non-blocking) |
+
+The decisive comparison is **pre-delta vs post-delta reachability of the endpoint from `R`**: REJECT
+iff the fix transitions an endpoint from *reachable-from-a-live-root* to *unreachable*. Everything
+else (already-dead, rerouted, or still-reachable) is authorized.
+
+**Implementation (reuses shipped primitives, no new traversal engine):**
+- Reachability = the GraphBackend's existing `descendants(root)` / `find_call_chain` over the
+  cone-scoped *what-if* subgraph (§3 step 2) — run once for the root set pre-delta and once
+  post-delta; the endpoint's membership flip in `reachable(R)` is the whole decision. Streamed,
+  cone-bounded, ~10 ms, lazy-backend memory profile (the proven 7 MB path).
+- `structural_prune` events are fire-and-forget telemetry on the existing observability/SSE surface —
+  they record *what dead code the fix legitimately removed* (so cleanup is auditable per §7
+  observability), and **never block** the candidate.
+
+**Honest bound:** "dead" here means *graph-unreachable from the live root set* — a component reached
+only via reflection / dynamic dispatch / external RPC the Oracle can't see could be misclassified as
+dead. Mitigations: (a) the matrix only *prunes* (ACCEPT) on dead-only severance, so a
+misclassification is a missed-friction event, never a false REJECT that blocks a good fix; (b) VERIFY
+(the behavioral authority) still runs; (c) `structural_prune` telemetry makes every authorized
+pruning visible for human audit. Like the other two checks, severed-chain starts **soft** (logged +
+fed back, non-blocking) and graduates to hard-REJECT-on-live-orphan only after the soak shows a low
+false-positive rate.
 
 ---
 
@@ -176,8 +242,11 @@ TestFailure (pytest)
 ## 8. Open questions for the operator
 1. **Cone size cap** — top-K nodes/files injected into the prompt (token budget). Starting guess: the
    direct blast-radius + 1-hop dependencies, capped ~50 symbols; tune after the soak.
-2. **Severed-call-chain strictness** — should removing *any* pre-existing call-chain in the cone
-   reject, or only chains the failing test transitively exercised? (Lean: the latter — fewer false
-   positives.)
+2. **Severed-call-chain strictness** — **RESOLVED (see §3.1, operator-ratified).** Not binary: the
+   Dynamic Graph Reachability Matrix rejects *only* when a fix flips a downstream component from
+   reachable-from-a-live-entry-point to unreachable; a chain severed only within a dead/orphaned
+   subgraph is authorized as valid structural pruning (ACCEPT + non-blocking `structural_prune`
+   cleanup telemetry). Entry-point roots (active test suites incl. the failing test, `__main__`/loop
+   entries, live external callers) are derived from the graph, never hardcoded.
 3. **"Vectorized" cone** — confirm the structured node/edge-set interpretation (recommended) vs an
    actual embedding vector (out of scope; the semantic index already embeds separately).
