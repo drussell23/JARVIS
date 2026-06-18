@@ -972,6 +972,118 @@ class Advisory:
     chronic_entropy: float     # Domain failure rate from LearningConsolidator
     risk_score: float          # Composite 0.0–1.0
     voice_message: str = ""    # What JARVIS would say
+    # Proactive Advisory Plane extensions (2026-06-18):
+    git_volatility: float = 0.0          # 0.0–1.0 churn hotspot score of the targets
+    memory_pressure: str = "ok"          # host RAM headroom level at evaluation time
+    safety_plan: List[str] = field(default_factory=list)  # Phase 3 prerequisite de-risk steps
+
+    def render_safety_plan(self) -> str:
+        """Render the prerequisite safety plan as an advisory clause for the prompt context."""
+        if not self.safety_plan:
+            return ""
+        lines = [
+            f"## PREREQUISITE SAFETY PLAN ({self.decision.value.upper()} — de-risk before mutating)",
+            "The advisor flagged this operation as fragile. Complete these prerequisites FIRST:",
+        ]
+        lines.extend(f"  {i + 1}. {step}" for i, step in enumerate(self.safety_plan))
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- Proactive axes
+def _advisor_git_volatility_enabled() -> bool:
+    """``JARVIS_ADVISOR_GIT_VOLATILITY_ENABLED`` (default ON) — git churn-hotspot risk axis."""
+    return os.environ.get("JARVIS_ADVISOR_GIT_VOLATILITY_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _advisor_memory_axis_enabled() -> bool:
+    """``JARVIS_ADVISOR_MEMORY_AXIS_ENABLED`` (default ON) — host RAM-headroom risk axis."""
+    return os.environ.get("JARVIS_ADVISOR_MEMORY_AXIS_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _advisor_safety_plan_enabled() -> bool:
+    """``JARVIS_ADVISOR_SAFETY_PLAN_ENABLED`` (default ON) — Phase 3 prerequisite-plan generation."""
+    return os.environ.get("JARVIS_ADVISOR_SAFETY_PLAN_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def compute_git_volatility(target_files, repo_root, *, runner=None):  # noqa: ANN001
+    """Git Volatility Telemetry axis: commit churn of the targets over a window → (score 0-1, hotspots).
+
+    High churn = a frequently-changing hot-spot (risky to mutate); the score feeds the fragility
+    vector. Pure (injectable ``runner`` for tests); fail-soft → (0.0, []) on any git error."""
+    import subprocess
+    try:
+        window = int(os.environ.get("JARVIS_ADVISOR_CHURN_WINDOW_DAYS", "90"))
+    except ValueError:
+        window = 90
+    try:
+        hotspot = max(1, int(os.environ.get("JARVIS_ADVISOR_CHURN_HOTSPOT_COMMITS", "20")))
+    except ValueError:
+        hotspot = 20
+    root = str(repo_root) if repo_root else "."
+
+    def _default_runner(path: str) -> int:
+        out = subprocess.run(
+            ["git", "-C", root, "log", f"--since={window}.days.ago", "--oneline", "--", path],
+            capture_output=True, text=True, timeout=10,
+        )
+        return len([ln for ln in out.stdout.splitlines() if ln.strip()])
+
+    run = runner or _default_runner
+    max_churn = 0
+    hotspots: List[str] = []
+    for f in (target_files or ()):
+        try:
+            n = int(run(f))
+        except Exception:  # noqa: BLE001 — git is best-effort
+            continue
+        if n > max_churn:
+            max_churn = n
+        if n >= hotspot:
+            hotspots.append(f"{f}({n})")
+    score = min(1.0, max_churn / float(hotspot)) if max_churn else 0.0
+    return round(score, 3), hotspots
+
+
+def memory_headroom_factor(*, gate=None):  # noqa: ANN001
+    """System Resource Headroom axis: MemoryPressureGate level → (risk factor 0-1, level name).
+    Fail-soft → (0.0, "ok")."""
+    _MAP = {"ok": 0.0, "warn": 0.3, "high": 0.6, "critical": 0.9}
+    try:
+        if gate is None:
+            from backend.core.ouroboros.governance.memory_pressure_gate import get_default_gate
+            gate = get_default_gate()
+        level = getattr(gate.pressure(), "value", "ok")
+        return _MAP.get(str(level).lower(), 0.0), str(level).lower()
+    except Exception:  # noqa: BLE001
+        return 0.0, "ok"
+
+
+def build_safety_plan(decision, blast_radius, test_coverage, target_files, hotspots):  # noqa: ANN001
+    """Phase 3: autonomous prerequisite safety pipeline for a CAUTION/BLOCK operation — concrete
+    de-risking steps (characterization test, forensic branch) to run BEFORE the feature mutation."""
+    steps: List[str] = []
+    tgt = ", ".join(list(target_files or ())[:3]) or "the target(s)"
+    if test_coverage <= 0.0:
+        steps.append(f"Write a characterization test asserting the CURRENT behavior of {tgt}, "
+                     "and run it green — establishing a regression baseline before any mutation.")
+    elif test_coverage < 0.5:
+        steps.append(f"Extend coverage of {tgt} (currently {test_coverage:.0%}) with a targeted test "
+                     "for the surface you intend to change, run it green first.")
+    if blast_radius >= 10:
+        steps.append(f"Establish an isolated forensic branch for the mutation (blast radius "
+                     f"{blast_radius} files) so the change can be reviewed/reverted as a unit.")
+    if hotspots:
+        steps.append(f"These targets are churn hot-spots ({', '.join(hotspots[:3])}); run the existing "
+                     "suite for them BEFORE mutating to capture the current green state.")
+    if decision == AdvisoryDecision.BLOCK and not steps:
+        steps.append("Add minimal test coverage for the targets and re-run the advisor before proceeding.")
+    return steps
 
 
 class OperationAdvisor:
@@ -1459,6 +1571,25 @@ class OperationAdvisor:
             )
             risk_factors.append(0.2)
 
+        # Signal 7: Git volatility (churn hot-spot telemetry) — frequently-changing targets are
+        # riskier to mutate. Proactive Advisory Plane axis (2026-06-18). Fail-soft.
+        git_volatility = 0.0
+        hotspots: List[str] = []
+        if _advisor_git_volatility_enabled() and not is_read_only:
+            git_volatility, hotspots = compute_git_volatility(target_files, repo_root)
+            if git_volatility >= 0.5:
+                reasons.append(f"High git volatility (churn hot-spot): {', '.join(hotspots[:3])}")
+                risk_factors.append(round(git_volatility * 0.4, 3))
+
+        # Signal 8: System resource headroom (MemoryPressureGate) — mutating under host memory
+        # pressure compounds risk. Proactive Advisory Plane axis. Fail-soft.
+        mem_factor, mem_level = (0.0, "ok")
+        if _advisor_memory_axis_enabled():
+            mem_factor, mem_level = memory_headroom_factor()
+            if mem_factor > 0.0:
+                reasons.append(f"Host memory pressure: {mem_level}")
+                risk_factors.append(round(mem_factor * 0.5, 3))
+
         # Compute composite risk score
         risk_score = sum(risk_factors) / max(1, len(risk_factors)) if risk_factors else 0.0
         risk_score = min(1.0, risk_score)
@@ -1482,6 +1613,18 @@ class OperationAdvisor:
             decision = AdvisoryDecision.BLOCK
             reasons.append("BLOCKED: Zero test coverage + extreme blast radius")
 
+        # Adaptive Armor (Proactive Advisory Plane): a highly-connected node with low coverage,
+        # mutated under HIGH/CRITICAL host memory pressure, is the worst-case fragility compound —
+        # escalate to at least CAUTION (BLOCK when coverage is zero). Reversible via the axis flags.
+        if (not is_read_only and blast_radius >= 10 and test_coverage < 0.5
+                and mem_level in ("high", "critical")):
+            if test_coverage <= 0.0 and decision != AdvisoryDecision.BLOCK:
+                decision = AdvisoryDecision.BLOCK
+                reasons.append("BLOCKED (Adaptive Armor): high blast + zero coverage + memory pressure")
+            elif decision in (AdvisoryDecision.RECOMMEND,):
+                decision = AdvisoryDecision.CAUTION
+                reasons.append("CAUTION (Adaptive Armor): high blast + low coverage + memory pressure")
+
         # Observability: surface the bypass as a positive reason so the
         # log line and prompt-context both show WHY a high-blast op passed.
         if is_read_only:
@@ -1490,6 +1633,16 @@ class OperationAdvisor:
                 f"Read-only op: blast_radius={blast_radius}, "
                 f"coverage={test_coverage:.0%} bypassed (no-mutation contract)",
             )
+
+        # Phase 3: autonomous prerequisite safety plan — on CAUTION/ADVISE_AGAINST/BLOCK the advisor
+        # does not flat-exit; it generates concrete de-risk prerequisites (characterization test /
+        # forensic branch) to run BEFORE the feature mutation. Fail-soft + reversible.
+        safety_plan: List[str] = []
+        if (_advisor_safety_plan_enabled() and not is_read_only
+                and decision in (AdvisoryDecision.CAUTION, AdvisoryDecision.ADVISE_AGAINST,
+                                 AdvisoryDecision.BLOCK)):
+            safety_plan = build_safety_plan(decision, blast_radius, test_coverage,
+                                            target_files, hotspots)
 
         # Build voice message
         voice = self._build_voice_message(decision, reasons, target_files)
@@ -1502,6 +1655,9 @@ class OperationAdvisor:
             chronic_entropy=chronic_entropy,
             risk_score=round(risk_score, 3),
             voice_message=voice,
+            git_volatility=git_volatility,
+            memory_pressure=mem_level,
+            safety_plan=safety_plan,
         )
 
         logger.info(
@@ -1533,6 +1689,10 @@ class OperationAdvisor:
             lines.append(
                 "\nBe careful with these files. Check for side effects."
             )
+        # Phase 3: surface the prerequisite safety plan (de-risk steps) into the prompt context.
+        plan = advisory.render_safety_plan()
+        if plan:
+            lines.append("\n" + plan)
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
