@@ -447,3 +447,223 @@ async def run_stateful_l2_soak(*, escape_enabled: bool) -> Dict[str, Any]:
     }
 
 
+# ===========================================================================
+# Hardware-integration helpers (Phase 3 / 3.1 / 3.3) — require live Ollama
+# ===========================================================================
+# These functions are pure async callables; they keep all heavy imports LOCAL
+# so importing this module remains cheap even without Ollama or the backend
+# installed.  Call them from skip-guarded pytest wrappers (see
+# tests/governance/test_local_prime_chaos_hardware.py).
+
+def ollama_available(base_url: str = "http://127.0.0.1:11434", timeout_s: float = 1.0) -> bool:
+    """Best-effort sync check: True iff the local Ollama /api/tags responds. Used by
+    hardware-integration tests to skip cleanly when no local engine is present."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/api/tags", timeout=timeout_s) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+async def run_local_prime_warm_standby_check() -> Dict[str, Any]:
+    """Phase 3/3.1 hardware check: cold+warm local generation timing, health probe,
+    and the CRITICAL memory_guard evict+refuse. Returns:
+      {"healthy": bool, "cold_ms": float, "warm_ms": float, "warm_faster": bool,
+       "memory_guard_refused": bool}
+    Requires live Ollama. Raises AssertionError on a hard failure."""
+    import time
+
+    os.environ.setdefault("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    os.environ.setdefault("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+
+    from backend.core.ouroboros.governance.local_inference_director import (
+        build_local_prime_client,
+        LocalConfig,
+        LocalInferenceDirector,
+        LocalMemoryCritical,
+    )
+    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+
+    client = build_local_prime_client()
+    assert client is not None, "kill-switch should be ON for the smoke test"
+
+    # Health probe
+    status = await client._check_health()
+    healthy = getattr(status, "name", "") == "AVAILABLE"
+
+    # Cold generate
+    t0 = time.monotonic()
+    resp = await client.generate(
+        prompt="Write a Python function fib(n) returning the nth Fibonacci number. Code only.",
+        system_prompt="You are a terse code generator. Output only Python code, no prose.",
+        max_tokens=200,
+        temperature=0.0,
+    )
+    cold_ms = (time.monotonic() - t0) * 1000.0
+
+    # Warm generate (weights resident -> should be faster TTFT)
+    t0 = time.monotonic()
+    await client.generate(
+        prompt="Write a one-line Python lambda that squares its argument. Code only.",
+        system_prompt="Output only code.",
+        max_tokens=64,
+        temperature=0.0,
+    )
+    warm_ms = (time.monotonic() - t0) * 1000.0
+
+    # Live memory guard: a CRITICAL gate must evict + refuse (cascade upstream),
+    # proving the Phase 3.1 valve fires against the real engine.
+    class _CriticalGate:
+        def pressure(self):
+            return PressureLevel.CRITICAL
+
+    director = LocalInferenceDirector(LocalConfig.from_env(), client=client, gate=_CriticalGate())
+    client.attach_governor(director)
+    memory_guard_refused = False
+    try:
+        await client.generate(prompt="this must be refused", system_prompt="x", max_tokens=16)
+    except LocalMemoryCritical:
+        memory_guard_refused = True
+    assert memory_guard_refused, "memory guard must refuse at CRITICAL"
+
+    # Detach and confirm normal generation resumes (model reloads on demand)
+    client.attach_governor(None)
+    await client.generate(prompt="print('hi')? Output only code.", system_prompt="x", max_tokens=32)
+
+    await client.aclose()
+
+    return {
+        "healthy": healthy,
+        "cold_ms": cold_ms,
+        "warm_ms": warm_ms,
+        "warm_faster": warm_ms < cold_ms,
+        "memory_guard_refused": memory_guard_refused,
+    }
+
+
+async def run_in_flight_exhaustion_handoff_check() -> Dict[str, Any]:
+    """Phase 3.3 hardware check: induced all_providers_exhausted -> execute_local_last_resort
+    with a fake graph backend (one central file, peripherals) -> live Ollama absorbs the
+    PRUNED payload -> EXHAUSTION_HANDOFF_TRIGGERED beacon lands in the real broker ->
+    unhealthy local re-raises the ORIGINAL exhaustion. Returns:
+      {"absorbed": bool, "content": str, "kept_central": bool, "pruned_peripheral": bool,
+       "beacon_count": int, "reraised_on_unhealthy": bool}
+    Requires live Ollama. Raises AssertionError on a hard failure."""
+    import dataclasses
+
+    os.environ.setdefault("JARVIS_JPRIME_LASTRESORT_ENABLED", "true")
+    os.environ.setdefault("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    os.environ.setdefault("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+
+    from backend.core.ouroboros.governance.exhaustion_interceptor import (
+        lastresort_enabled, should_intercept, execute_local_last_resort,
+    )
+    from backend.core.ouroboros.governance.local_inference_director import build_local_prime_client
+    from backend.core.ouroboros.governance.ide_observability_stream import get_default_broker
+
+    assert lastresort_enabled(), "lastresort kill-switch should be ON"
+
+    local = build_local_prime_client()
+    assert local is not None, "local tier must be enabled for the hardware check"
+
+    # Adapter: the interceptor calls jprime.generate(context, deadline) (PrimeProvider
+    # shape). Bridge that to the real LocalPrimeClient.generate(prompt, ...) so the
+    # LIVE Ollama 3B actually produces the pruned-payload response.
+    class _OllamaJprimeAdapter:
+        def __init__(self, client, *, healthy: bool = True) -> None:
+            self._c = client
+            self._healthy = healthy
+            self.seen_files: Optional[tuple] = None  # type: ignore[assignment]
+
+        async def health_probe(self) -> bool:
+            if not self._healthy:
+                return False
+            s = await self._c._check_health()
+            return getattr(s, "name", "") == "AVAILABLE"
+
+        async def generate(self, context: Any, deadline: Any) -> Any:
+            files = list(getattr(context, "target_files", ()))
+            self.seen_files = tuple(files)
+            prompt = (
+                f"You are handed these source files after a cloud-provider outage: {files}. "
+                f"Reply with a single one-line Python comment naming them. Comment only."
+            )
+            return await self._c.generate(
+                prompt=prompt, system_prompt="Output exactly one line.",
+                max_tokens=64, temperature=0.0,
+            )
+
+    @dataclasses.dataclass
+    class _Ctx:
+        op_id: str = "hardware-exhaustion"
+        target_files: tuple = ("core_hub.py", "peripheral_docs.py", "orphan_util.py")
+
+    # Fake topology: core_hub is highly central; the others are peripheral.
+    class _GraphBackend:
+        _nodes: Dict[str, list] = {
+            "core_hub.py": ["hub.fn"],
+            "peripheral_docs.py": ["doc.fn"],
+            "orphan_util.py": ["orph.fn"],
+        }
+
+        def nodes_in_file(self, f: str) -> list:
+            return self._nodes.get(f, [])
+
+        def successor_keys(self, k: str) -> list:
+            return ["a", "b", "c", "d"] if k == "hub.fn" else []
+
+        def predecessor_keys(self, k: str) -> list:
+            return ["e", "f", "g", "h"] if k == "hub.fn" else []
+
+    adapter = _OllamaJprimeAdapter(local)
+    broker = get_default_broker()
+    exc = RuntimeError("all_providers_exhausted:fallback_failed")
+
+    assert should_intercept(exc, jprime=adapter) is True
+    assert should_intercept(RuntimeError("some_other_error"), jprime=adapter) is False
+
+    # Force pruning: each file ~600 tok, ceiling 1000 -> peripheral/orphan discarded, hub kept.
+    file_tokens = {"core_hub.py": 600, "peripheral_docs.py": 600, "orphan_util.py": 600}
+    res = await execute_local_last_resort(
+        jprime=adapter, context=_Ctx(), deadline=None, graph_backend=_GraphBackend(),
+        broker=broker, file_tokens=file_tokens, ceiling_tokens=1000, original_exc=exc,
+    )
+
+    assert adapter.seen_files is not None, "adapter must have been called"
+    kept_central = "core_hub.py" in adapter.seen_files
+    pruned_peripheral = "orphan_util.py" not in adapter.seen_files
+    absorbed = bool(res.content.strip())
+
+    assert kept_central, "central node must be retained after pruning"
+    assert pruned_peripheral, "peripheral node must be pruned"
+    assert absorbed, "Ollama must return non-empty content"
+
+    # Telemetry beacon landed in the REAL broker history.
+    hist = broker.recent_history() if hasattr(broker, "recent_history") else []
+    beacons = [e for e in hist if "exhaustion_handoff" in str(e).lower()]
+    assert len(beacons) >= 1, "telemetry beacon must reach the real broker"
+
+    # Exhaustion contract: unhealthy local re-raises the ORIGINAL exhaustion.
+    bad = _OllamaJprimeAdapter(local, healthy=False)
+    reraised_on_unhealthy = False
+    try:
+        await execute_local_last_resort(
+            jprime=bad, context=_Ctx(), deadline=None, graph_backend=None,
+            broker=broker, file_tokens={}, original_exc=exc,
+        )
+    except RuntimeError as e:
+        reraised_on_unhealthy = "all_providers_exhausted" in str(e)
+    assert reraised_on_unhealthy, "must re-raise the original all_providers_exhausted"
+
+    await local.aclose()
+
+    return {
+        "absorbed": absorbed,
+        "content": res.content,
+        "kept_central": kept_central,
+        "pruned_peripheral": pruned_peripheral,
+        "beacon_count": len(beacons),
+        "reraised_on_unhealthy": reraised_on_unhealthy,
+    }
+
