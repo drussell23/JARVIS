@@ -69,15 +69,19 @@ class RepoRegistry:
                 canary_slices=("tests/",),
             ))
 
-        # Optional: reactor-core
-        # Canonical var takes priority; REACTOR_CORE_REPO_PATH accepted for backward compat
-        if "JARVIS_REACTOR_REPO_PATH" in os.environ:
-            reactor_path = os.environ.get("JARVIS_REACTOR_REPO_PATH")
-        else:
-            reactor_path = os.environ.get("REACTOR_CORE_REPO_PATH")
+        # Optional: reactor-core. Registered under the canonical key "reactor" — the SAME repo key
+        # the Oracle uses in NodeID (oracle.py self._repos = {"jarvis","prime","reactor"}) — so
+        # resolve_repo_roots("reactor") and the unified graph agree (single source of truth). Env
+        # precedence: JARVIS_REACTOR_REPO_PATH > REACTOR_CORE_REPO_PATH > REACTOR_CORE_PATH (the var
+        # the Oracle itself reads), so setting any one wires both the registry and the Oracle.
+        reactor_path = (
+            os.environ.get("JARVIS_REACTOR_REPO_PATH")
+            or os.environ.get("REACTOR_CORE_REPO_PATH")
+            or os.environ.get("REACTOR_CORE_PATH")
+        )
         if reactor_path:
             configs.append(RepoConfig(
-                name="reactor-core",
+                name="reactor",
                 local_path=Path(reactor_path),
                 canary_slices=("tests/",),
             ))
