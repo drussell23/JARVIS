@@ -156,6 +156,38 @@ feedback loop, and the failure-classifier — net new code is the simulator + th
 - It validates **structure**, not behavior — VERIFY (the scoped test run) remains the behavioral
   authority. This gate is friction *before* the test run, catching structural breaks tests miss.
 
+**Implemented (Slice 3):** `governance/structural_validation_gate.py` — `StructuralValidationGate`
+runs at the post-GENERATE / pre-sandbox seam in `repair_engine._run_inner` (before the test run, so a
+structural regression is fed back without burning a validation run). Three deterministic, zero-LLM
+proofs over an **isolated** what-if delta:
+- **Acyclicity Guard** (hard) — a cycle in the post-delta cone absent pre-delta (DFS back-edge);
+  coordinates carry the closed loop.
+- **Path Reachability Matrix** (§3.1) — a node that flips reachable-from-a-live-root → unreachable
+  (BFS over pre/post delta); dead-only severance → `StructuralPrune` (ACCEPT + non-blocking
+  telemetry), never a false reject.
+- **Boundary Invariant Verification** (soft) — a changed intra-file symbol signature whose un-modified
+  in-cone callers (incoming CALLS/IMPORTS edges) still rely on the old contract. (This is the
+  as-built third proof; standalone dead-code detection is subsumed by the reachability matrix's prune
+  path — a node orphaned by the fix is exactly a reachability flip.)
+
+**Blindspot Armor (isolation + thread-safety):** the candidate is parsed off-process via
+`analyze_python_source_for_oracle` (its own interpreter — never touches the live backend); the what-if
+graph is a per-invocation local `_DeltaGraph` built from a **read-only** cone snapshot
+(`OracleConeReader`), never written back to the `SqliteLazyGraphBackend`. Concurrent repair iterations
+cannot pollute each other's simulation or contend on shared mutable graph state.
+
+**Feedback (Phase 3):** a violation compiles a structured `DivergenceSignature` (kind + severity +
+exact AST coordinates: the closed loop / the severed edge path / the symbol + old→new signature),
+hashed via `failure_classifier.patch_signature_hash`, rendered to targeted correction guidance, and
+routed into the L2 loop as a `failure_class="structural"` `RepairContext` → the existing
+iterate-with-feedback loop self-corrects. Bounded: `JARVIS_REPAIR_STRUCTURAL_MAX_REJECTS` (default 3)
+consecutive structural rejections fall through to the sandbox (friction, not an absolute wall); each
+reject also consumes one `max_iterations` slot. Per-check severity env-tunable
+(`JARVIS_REPAIR_STRUCT_{CYCLE,REACH,BOUNDARY}_SEVERITY`; cycle/reach `hard`, boundary `soft`);
+`JARVIS_REPAIR_STRUCTURAL_SOFT_BLOCKS` graduates soft → blocking post-soak. Gated
+`JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED` (default OFF → L2 byte-identical); fail-soft → ACCEPT on any
+inability to simulate. 20 gate tests + 132 repair-engine regression green.
+
 ---
 
 ## 3.1 The Dynamic Graph Reachability Matrix (severed-chain adjudication)
