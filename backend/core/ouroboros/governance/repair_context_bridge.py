@@ -257,9 +257,13 @@ class RepairContextBridge:
         evidence_json: str = "",
         target_file: str = "",
         failing_tests: Tuple[str, ...] = (),
+        force: bool = False,
     ) -> Optional[RepairCone]:
-        """Build the cone off-loop (the lazy graph query API is synchronous). Fail-soft → None."""
-        if not bridge_enabled():
+        """Build the cone off-loop (the lazy graph query API is synchronous). Fail-soft → None.
+
+        ``force=True`` bypasses the steer-flag self-gate so the Slice 3 structural gate (which has its
+        own master flag) can obtain a cone even when the prompt-steer flag is off."""
+        if not force and not bridge_enabled():
             return None
         import asyncio
 

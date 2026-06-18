@@ -670,6 +670,15 @@ class RepairEngine:
         # provider chain hard-stops only after N back-to-back timeouts
         # (default 2) instead of starving the whole timebox on iter 1.
         consecutive_provider_timeouts = 0
+        # Slice 3 — failing tests from the most recent classification, used as the
+        # structural gate's reachability roots. Empty on iter 1 (roots then derive
+        # from the cone's call-chain only — fewer false rejects, never more).
+        last_failing_tests: Tuple[str, ...] = ()
+        # Slice 3 — bound consecutive structural rejections so a model that cannot
+        # satisfy the gate can't monopolize the timebox; falls through to the sandbox
+        # after the cap (the gate is friction, not an absolute wall). Rides the
+        # overall max_iterations budget too (each reject consumes one iteration).
+        structural_reject_streak = 0
         t_start = time.monotonic()
         records: list = []
         model_id: str = getattr(ctx.generation, "model_id", "")
@@ -819,11 +828,86 @@ class RepairEngine:
             elif not _has_full_content:
                 return _stopped("candidate_unusable:no_diff_or_full_content")
 
+            file_path = current_candidate.get("file_path", "")
+
+            # ----------------------------------------------------------------
+            # Slice 3 — PRE-FLIGHT STRUCTURAL VALIDATION GATE (the enforce).
+            # Runs BEFORE the sandbox so a structural regression (new cycle /
+            # severed live reachability / broken interface contract) is caught and
+            # fed back as a targeted DivergenceSignature WITHOUT burning a test run.
+            # Gated (JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED) + fail-soft → None = OFF.
+            # ----------------------------------------------------------------
+            _struct_verdict = await self._structural_validate(
+                ctx, file_path, full_content, diff, last_failing_tests,
+            )
+            if _struct_verdict is not None and not _struct_verdict.accepted:
+                structural_reject_streak += 1
+                _max_struct_rejects = int(
+                    os.environ.get("JARVIS_REPAIR_STRUCTURAL_MAX_REJECTS", "3")
+                )
+                _logger.info(
+                    "\U0001f6e1️ [L2 Repair] Iteration %d: structural gate REJECT "
+                    "(streak=%d/%d) — %s",
+                    iteration, structural_reject_streak, _max_struct_rejects,
+                    _struct_verdict.telemetry(),
+                )
+                if structural_reject_streak <= _max_struct_rejects:
+                    # Route the structured divergence feedback into the NEXT
+                    # generation as a mathematically targeted correction phase.
+                    from backend.core.ouroboros.governance.op_context import RepairContext
+                    _struct_feedback = _struct_verdict.feedback()
+                    _struct_sig = next(
+                        (d.signature_hash for d in _struct_verdict.blocking()), ""
+                    )
+                    repair_context = RepairContext(
+                        iteration=iteration,
+                        max_iterations=budget.max_iterations,
+                        failure_class="structural",
+                        failure_signature_hash=_struct_sig,
+                        failing_tests=last_failing_tests,
+                        failure_summary=_struct_feedback[:600],
+                        current_candidate_content=full_content,
+                        current_candidate_file_path=file_path,
+                        dependency_cone=_struct_feedback,
+                    )
+                    rec = RepairIterationRecord(
+                        op_id=ctx.op_id,
+                        iteration=iteration,
+                        repair_state=L2State.L2_BUILD_REPAIR_PROMPT.value,
+                        failure_class="structural",
+                        failure_signature_hash=_struct_sig,
+                        patch_signature_hash=_patch_sig(diff or full_content),
+                        diff_lines=0,
+                        files_changed=1,
+                        validation_duration_s=0.0,
+                        outcome="structural_reject",
+                        model_id=model_id,
+                        provider_name=provider_name,
+                    )
+                    self._emit_record(ctx.op_id, rec)
+                    records.append(rec)
+                    continue  # regenerate with targeted structural feedback
+                # Cap reached: stop blocking, fall through to the sandbox (friction,
+                # not an absolute wall) so a genuine fix still gets a behavioral run.
+                _logger.info(
+                    "[L2 Repair] structural reject cap reached (%d) — proceeding to sandbox",
+                    _max_struct_rejects,
+                )
+            elif _struct_verdict is not None and _struct_verdict.prunes:
+                # Authorized dead-only severance — non-blocking cleanup telemetry (§3.1).
+                _logger.info(
+                    "\U0001f9f9 [L2 Repair] structural prune authorized: %d dead-only edge(s)",
+                    len(_struct_verdict.prunes),
+                )
+
+            # Proceeding to the sandbox → reset the consecutive-structural-reject
+            # streak (it tracks back-to-back gate blocks, not lifetime rejects).
+            structural_reject_streak = 0
+
             # ----------------------------------------------------------------
             # RUN in sandbox
             # ----------------------------------------------------------------
             total_validation_runs += 1
-            file_path = current_candidate.get("file_path", "")
             sandbox_content = ""
             _patch_failed = False
             try:
@@ -945,6 +1029,9 @@ class RepairEngine:
             # CLASSIFY FAILURE
             # ----------------------------------------------------------------
             classification = self._classifier.classify(svr)
+            # Slice 3 — refresh the structural gate's reachability roots from the
+            # latest failing tests (used on the NEXT iteration's pre-flight check).
+            last_failing_tests = tuple(classification.failing_test_ids or ())
             # ── Slice 4A — L2-local hard-stop subtype narrowing ──
             # Closes the bt-2026-05-25-091657 L2-after-1-iter trap:
             # the failure_classifier flags ``missing_dependency`` and
@@ -1065,37 +1152,104 @@ class RepairEngine:
             self._emit_record(ctx.op_id, rec)
             records.append(rec)
 
+    def _ensure_context_bridge(self) -> Any:
+        """Lazily instantiate the shared RepairContextBridge (Slices 2+3 reuse one instance)."""
+        if self._context_bridge is None:
+            from backend.core.ouroboros.governance.repair_context_bridge import (
+                RepairContextBridge,
+            )
+            self._context_bridge = RepairContextBridge()
+        return self._context_bridge
+
+    async def _build_cone_object(
+        self,
+        ctx: Any,
+        file_path: str,
+        failing_tests: Tuple[str, ...],
+        *,
+        force: bool = False,
+    ) -> Any:
+        """Build the dependency-cone OBJECT (shared by Slice 2 render + Slice 3 gate). ``force``
+        bypasses the steer-flag self-gate so the structural gate gets a cone under its own flag.
+        Fail-soft → ``None``."""
+        try:
+            bridge = self._ensure_context_bridge()
+            evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
+            return await bridge.build(
+                evidence_json=evidence_json,
+                target_file=file_path,
+                failing_tests=tuple(failing_tests or ()),
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
+            _logger.debug("[RepairBridge] cone object unavailable (non-fatal): %s", exc)
+            return None
+
     async def _build_dependency_cone(
         self,
         ctx: Any,
         file_path: str,
         failing_tests: Tuple[str, ...],
     ) -> Optional[str]:
-        """Repair Context Bridge (Slice 2) — build + render the graph dependency cone.
+        """Repair Context Bridge (Slice 2) — build + render the graph dependency-cone clause.
 
-        Gated by ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (the bridge's ``build`` self-gates and
-        returns ``None`` when off). Lazily instantiates the bridge, sources the fault coordinates
-        adaptively (Slice 1 ``fault_node_keys`` from ``ctx.intake_evidence_json`` → file → tests),
-        and offloads the lazy-graph cone build to a worker thread. Fail-soft: any error → ``None``,
-        leaving the repair prompt byte-identical to pre-bridge behavior."""
+        Gated by ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (the bridge self-gates → ``None`` when off).
+        Fail-soft: any error → ``None``, leaving the repair prompt byte-identical to pre-bridge."""
         try:
-            if self._context_bridge is None:
-                from backend.core.ouroboros.governance.repair_context_bridge import (
-                    RepairContextBridge,
-                )
-                self._context_bridge = RepairContextBridge()
-            evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
-            cone = await self._context_bridge.build(
-                evidence_json=evidence_json,
-                target_file=file_path,
-                failing_tests=tuple(failing_tests or ()),
-            )
+            cone = await self._build_cone_object(ctx, file_path, failing_tests)
             if cone is None:
                 return None
-            clause = self._context_bridge.render_clause(cone)
+            clause = self._ensure_context_bridge().render_clause(cone)
             return clause or None
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
+            return None
+
+    async def _structural_validate(
+        self,
+        ctx: Any,
+        file_path: str,
+        full_content: str,
+        diff: str,
+        failing_tests: Tuple[str, ...],
+    ) -> Any:
+        """Repair Context Bridge (Slice 3) — pre-flight structural validation gate.
+
+        Returns a ``StructuralVerdict`` (``None`` when the gate is off / unavailable). Builds the
+        isolated cone-scoped what-if delta and runs the three structural proofs. Fail-soft: any error
+        → ``None`` (caller proceeds as today). The candidate is parsed off-process (Blindspot Armor);
+        the live ``SqliteLazyGraphBackend`` is only ever read, never written."""
+        try:
+            from backend.core.ouroboros.governance.structural_validation_gate import (
+                StructuralValidationGate,
+                OracleConeReader,
+                gate_enabled,
+            )
+            if not gate_enabled():
+                return None
+            if not full_content or not file_path:
+                return None  # diff-only / no full source → cannot simulate (fail-soft ACCEPT)
+            cone = await self._build_cone_object(ctx, file_path, failing_tests, force=True)
+            if cone is None:
+                return None
+            from backend.core.ouroboros.oracle import get_oracle
+
+            graph = getattr(get_oracle(), "_graph", None)
+            if graph is None:
+                return None
+            reader = OracleConeReader(graph, cone, tuple(failing_tests or ()))
+            repo_name = getattr(ctx, "primary_repo", "") or ""
+            gate = StructuralValidationGate()
+            verdict = await gate.validate(
+                candidate_source=full_content,
+                candidate_diff=diff,
+                file_path=file_path,
+                repo_name=repo_name,
+                reader=reader,
+            )
+            return verdict
+        except Exception as exc:  # noqa: BLE001 — gate must never break L2
+            _logger.debug("[StructuralGate] validate unavailable (non-fatal, ACCEPT): %s", exc)
             return None
 
     async def _generate_repair_candidate(
