@@ -312,3 +312,10 @@ class LocalInferenceDirector:
         gc.collect()                # 2) dual-stage GC sweep
         gc.collect()
         await asyncio.sleep(0)      # 3) yield to host OS for RAM reclaim
+
+    async def stop(self) -> None:
+        """Clean teardown: release the pooled session (zero hanging FDs)."""
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
