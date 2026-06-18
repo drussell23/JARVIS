@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -157,7 +157,7 @@ class LocalPrimeClient:
     TCPConnector + keep-alive eliminates per-call socket setup across L2 passes.
     """
 
-    def __init__(self, cfg: LocalConfig, session: Optional[object] = None) -> None:
+    def __init__(self, cfg: LocalConfig, session: Optional[Any] = None) -> None:
         self._cfg = cfg
         self._session = session
         self.profiler = LatencyProfiler(cfg)
