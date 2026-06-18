@@ -363,11 +363,16 @@ class RepairEngine:
         repo_root: Any,
         sandbox_factory: Any = None,
         ledger: Any = None,
+        context_bridge: Any = None,
     ) -> None:
         self._budget = budget
         self._prime = prime_provider
         self._repo_root = repo_root
         self._ledger = ledger
+        # Repair Context Bridge (Slice 2): graph-derived dependency-cone steer.
+        # Injectable for tests; lazily built on first use otherwise. Only consulted
+        # when JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED is on (else inert / cone=None).
+        self._context_bridge = context_bridge
         if sandbox_factory is None:
             from backend.core.ouroboros.governance.repair_sandbox import RepairSandbox
             self._sandbox_factory = RepairSandbox
@@ -1024,6 +1029,12 @@ class RepairEngine:
             # BUILD REPAIR PROMPT (set repair_context for next iteration)
             # ----------------------------------------------------------------
             from backend.core.ouroboros.governance.op_context import RepairContext
+            # Repair Context Bridge (Slice 2): graph-derived dependency-cone steer
+            # for the NEXT iteration's GENERATE. Gated + fail-soft → None when off,
+            # leaving the repair prompt byte-identical to pre-bridge behavior.
+            _dependency_cone = await self._build_dependency_cone(
+                ctx, file_path, classification.failing_test_ids,
+            )
             repair_context = RepairContext(
                 iteration=iteration,
                 max_iterations=budget.max_iterations,
@@ -1033,6 +1044,7 @@ class RepairEngine:
                 failure_summary=(svr.stdout + svr.stderr)[:300],
                 current_candidate_content=sandbox_content,
                 current_candidate_file_path=file_path,
+                dependency_cone=_dependency_cone,
             )
 
             outcome = "progress" if is_progress else "no_progress"
@@ -1052,6 +1064,39 @@ class RepairEngine:
             )
             self._emit_record(ctx.op_id, rec)
             records.append(rec)
+
+    async def _build_dependency_cone(
+        self,
+        ctx: Any,
+        file_path: str,
+        failing_tests: Tuple[str, ...],
+    ) -> Optional[str]:
+        """Repair Context Bridge (Slice 2) — build + render the graph dependency cone.
+
+        Gated by ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (the bridge's ``build`` self-gates and
+        returns ``None`` when off). Lazily instantiates the bridge, sources the fault coordinates
+        adaptively (Slice 1 ``fault_node_keys`` from ``ctx.intake_evidence_json`` → file → tests),
+        and offloads the lazy-graph cone build to a worker thread. Fail-soft: any error → ``None``,
+        leaving the repair prompt byte-identical to pre-bridge behavior."""
+        try:
+            if self._context_bridge is None:
+                from backend.core.ouroboros.governance.repair_context_bridge import (
+                    RepairContextBridge,
+                )
+                self._context_bridge = RepairContextBridge()
+            evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
+            cone = await self._context_bridge.build(
+                evidence_json=evidence_json,
+                target_file=file_path,
+                failing_tests=tuple(failing_tests or ()),
+            )
+            if cone is None:
+                return None
+            clause = self._context_bridge.render_clause(cone)
+            return clause or None
+        except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
+            _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
+            return None
 
     async def _generate_repair_candidate(
         self,

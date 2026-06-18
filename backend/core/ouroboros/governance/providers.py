@@ -3482,6 +3482,12 @@ Rules:
             f"Fix ONLY the failing lines. Do not regenerate the whole file.\n"
             f"The diff must apply cleanly to the content shown above."
         )
+        # Repair Context Bridge (Slice 2) — additive graph-derived dependency-cone
+        # boundary clause. Present only when the bridge populated it (gated); when
+        # absent the repair block is byte-identical to pre-bridge behavior.
+        _cone = getattr(_rc, "dependency_cone", None)
+        if _cone:
+            _repair_block = f"{_repair_block}\n\n{_cone}"
         parts.append(_repair_block)
 
     parts.append(schema_instruction)
