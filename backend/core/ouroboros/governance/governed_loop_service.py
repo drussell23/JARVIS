@@ -2089,6 +2089,19 @@ class GovernedLoopService:
             except Exception:
                 pass
 
+        # J-Prime local tier (Phase 3) — release the injected LocalPrimeClient's
+        # pooled aiohttp session so shutdown leaves zero hanging FDs. Best-effort;
+        # inert unless a local client was injected (flag ON + no GCP client).
+        _lid = getattr(self, "_local_inference_director", None)
+        if _lid is not None:
+            try:
+                await _lid.stop()
+            except Exception:
+                logger.debug(
+                    "[GovernedLoop] local inference director stop failed",
+                    exc_info=True,
+                )
+
         # Detach from stack
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
@@ -3901,6 +3914,33 @@ class GovernedLoopService:
 
         # Build PrimeProvider if PrimeClient available
         _primary_probe_ok = False  # track for FSM sync after generator build
+        # J-Prime local activation (Phase 3): when no GCP PrimeClient is configured
+        # and the local tier is enabled, inject the local Ollama-backed client so
+        # PrimeProvider has a real backend. OFF or GCP-present -> no-op (legacy).
+        if self._prime_client is None:
+            try:
+                from backend.core.ouroboros.governance.local_inference_director import (
+                    build_local_prime_client,
+                    LocalConfig,
+                    LocalInferenceDirector,
+                )
+                _local_prime = build_local_prime_client()
+                if _local_prime is not None:
+                    self._prime_client = _local_prime
+                    # Give the local tier a live home so shutdown releases its
+                    # pooled aiohttp session (zero-FD teardown). The director also
+                    # hosts the CRITICAL memory-eviction valve for Phase 3.1 in-loop
+                    # wiring.
+                    self._local_inference_director = LocalInferenceDirector(
+                        LocalConfig.from_env(), client=_local_prime
+                    )
+                    logger.info(
+                        "[GovernedLoop] J-Prime local tier: LocalPrimeClient injected (Ollama)"
+                    )
+            except Exception:
+                logger.debug(
+                    "[GovernedLoop] local prime injection skipped", exc_info=True
+                )
         if self._prime_client is not None:
             try:
                 from backend.core.ouroboros.governance.providers import (

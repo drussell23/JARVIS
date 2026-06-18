@@ -1332,6 +1332,32 @@ def _fmt_val(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local-tier failure classifier (Phase 3 Task 7)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalFailureVerdict:
+    degrade: bool
+    cascade_upstream: bool
+    target_state: Optional[str]
+
+
+def classify_local_failure(exc: BaseException) -> LocalFailureVerdict:
+    """Map a local-tier exception to an FSM transition verdict.
+
+    A terminal_lag_lockup degrades J-Prime to PRIMARY_DEGRADED and cascades the
+    op upstream (the FailbackStateMachine already passes context on cascade, so no
+    L2 sandbox teardown). All other exceptions are ordinary provider failures.
+    """
+    if getattr(exc, "failure_class", None) == "terminal_lag_lockup":
+        return LocalFailureVerdict(
+            degrade=True, cascade_upstream=True, target_state="PRIMARY_DEGRADED"
+        )
+    return LocalFailureVerdict(degrade=False, cascade_upstream=False, target_state=None)
+
+
+# ---------------------------------------------------------------------------
 # CandidateProvider Protocol
 # ---------------------------------------------------------------------------
 
