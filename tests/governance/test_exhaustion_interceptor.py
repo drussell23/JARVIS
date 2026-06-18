@@ -27,8 +27,11 @@ class _Jprime:
 
 
 class _Broker:
+    # Mirrors the REAL StreamEventBroker.publish(event_type, op_id, payload=None)
+    # signature exactly, so a kwarg drift in the production call can't pass silently.
     def __init__(self): self.events = []
-    def publish(self, **kw): self.events.append(kw)
+    def publish(self, event_type, op_id, payload=None):
+        self.events.append({"event_type": event_type, "op_id": op_id, "data": payload})
 
 
 def test_lastresort_enabled_default_off(monkeypatch):

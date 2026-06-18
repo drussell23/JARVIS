@@ -153,10 +153,13 @@ def _emit_handoff_beacon(
     if broker is None:
         return
     try:
+        # StreamEventBroker.publish(event_type, op_id, payload) — positional, as
+        # every real caller uses it. (The earlier data= kwarg silently TypeError'd
+        # into the best-effort guard, so the beacon never reached the broker.)
         broker.publish(
-            event_type="exhaustion_handoff_triggered",
-            op_id=str(getattr(context, "op_id", "") or "")[:48],
-            data={
+            "exhaustion_handoff_triggered",
+            str(getattr(context, "op_id", "") or "")[:48],
+            {
                 "cause": _exhaustion_cause(original_exc),
                 "tokens_before": prune.tokens_before,
                 "tokens_after": prune.tokens_after,
