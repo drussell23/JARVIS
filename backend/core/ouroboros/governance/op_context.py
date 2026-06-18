@@ -1799,6 +1799,12 @@ class RepairContext:
         last patch was applied. The model is asked to diff against this.
     current_candidate_file_path:
         Repo-relative path of the file being repaired.
+    dependency_cone:
+        Repair Context Bridge (Slice 2) — graph-derived dependency-cone boundary
+        clause (downstream dependents / upstream dependencies / causal call-chain
+        from the failing test) rendered for the REPAIR MODE prompt. ``None`` until
+        the bridge populates it (gated ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED``);
+        ``None`` leaves the repair prompt byte-identical to pre-bridge behavior.
     """
 
     iteration: int
@@ -1809,3 +1815,4 @@ class RepairContext:
     failure_summary: str
     current_candidate_content: str
     current_candidate_file_path: str
+    dependency_cone: Optional[str] = None

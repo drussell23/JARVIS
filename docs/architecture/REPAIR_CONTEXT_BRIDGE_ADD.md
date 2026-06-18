@@ -91,6 +91,22 @@ prompt is not immutable — only the gate is.
 already-proven 7 MB-vs-134 MB footprint) and reuses the `AdaptiveNodeCache` that contracts under
 `MemoryPressureGate` pressure.
 
+**Implemented (Slice 2):** `governance/repair_context_bridge.py` — `RepairCone` (structured,
+proximity-ordered node/edge set; *not* an embedding, per §8 Q3) + `RepairContextBridge`.
+**Adaptive fault-key resolution** (no hardcoding): Slice 1 `fault_node_keys` (from
+`ctx.intake_evidence_json`) → file being repaired (`find_nodes_in_file`) → failing-test functions
+(`find_nodes_by_name`) — sharper with Slice 1 on, still works standalone. Composes the shipped Oracle
+primitives `compute_blast_radius` (downstream dependents, proximity-ordered: direct then transitive),
+`get_dependencies` (upstream), `find_call_chain` (test→fault causal path) — **no new traversal**.
+`async build()` self-gates on the master flag and offloads the synchronous lazy-graph query path via
+`asyncio.to_thread` (zero block on the L2 loop). Caps env-tunable: `JARVIS_REPAIR_CONE_MAX_SYMBOLS`
+(default 50), `JARVIS_REPAIR_CONE_BLAST_DEPTH` (default 2); top-K-by-proximity truncation flagged in
+the clause. Injection: additive `RepairContext.dependency_cone` field (default `None` → prompt
+byte-identical); populated in `repair_engine._run_inner` via `_build_dependency_cone` (lazy
+bridge, fail-soft); rendered in `providers._build_codegen_prompt`'s REPAIR MODE block only when
+present. Gated `JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED` (shared master). 15 bridge tests + 112
+repair-engine regression green.
+
 ---
 
 ## 3. Phase 3 — Pre-Flight Structural Validation Gate (the Zero-Regression Shield)
