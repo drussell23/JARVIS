@@ -259,10 +259,17 @@ class TieredPrimeClient:
             await self._cancel_and_drain(heavy_task)
             self._record_heavy_failure()  # heavy too slow / failed -> soft failure
             return light_task.result()
-        # neither produced a clean success: drain both, then surface via fresh light
+        # neither produced a clean success: drain both (no-op on already-done tasks).
         await self._cancel_and_drain(light_task)
         await self._cancel_and_drain(heavy_task)
-        # final attempt on light (fresh) so the caller still gets a result if possible
+        # If the light hedge already finished with an exception (e.g. a deliberate
+        # LocalMemoryCritical valve refusal), surface it directly rather than firing
+        # a redundant third light call (which would duplicate the evict/refuse at
+        # CRITICAL memory). Only fall back to a fresh light attempt when the light
+        # hedge never produced a result (was still pending and got cancelled).
+        if (light_task.done() and not light_task.cancelled()
+                and light_task.exception() is not None):
+            raise light_task.exception()  # type: ignore[misc]
         return await self._light.generate(prompt, **kw)
 
     # ------------------------------------------------------------------
