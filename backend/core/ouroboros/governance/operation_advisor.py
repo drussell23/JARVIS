@@ -32,8 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_ENABLED = os.environ.get(
-    "JARVIS_ADVISOR_ENABLED", "true"
+# Master enable. JARVIS_OPERATION_ADVISOR_ENABLED is a unified passthrough ALIAS: when explicitly
+# set it takes precedence; otherwise the canonical JARVIS_ADVISOR_ENABLED applies (default ON).
+_ENABLED = (
+    os.environ.get("JARVIS_OPERATION_ADVISOR_ENABLED")
+    or os.environ.get("JARVIS_ADVISOR_ENABLED", "true")
 ).lower() in ("true", "1", "yes")
 _BLAST_RADIUS_WARN = int(os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_WARN", "10"))
 _FAILURE_STREAK_WARN = int(os.environ.get("JARVIS_ADVISOR_FAILURE_STREAK_WARN", "3"))
