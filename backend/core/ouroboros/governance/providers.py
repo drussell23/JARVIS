@@ -3482,6 +3482,11 @@ Rules:
             f"Fix ONLY the failing lines. Do not regenerate the whole file.\n"
             f"The diff must apply cleanly to the content shown above."
         )
+        # L2 completion (Phase 2) — stochastic strategy-escalation directive, injected
+        # FIRST (highest priority) when the loop diverged so the model switches paradigm.
+        _escalation = getattr(_rc, "escalation_directive", None)
+        if _escalation:
+            _repair_block = f"{_escalation}\n\n{_repair_block}"
         # Repair Context Bridge (Slice 2) — additive graph-derived dependency-cone
         # boundary clause. Present only when the bridge populated it (gated); when
         # absent the repair block is byte-identical to pre-bridge behavior.

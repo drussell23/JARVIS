@@ -298,3 +298,38 @@ TestFailure (pytest)
    entries, live external callers) are derived from the graph, never hardcoded.
 3. **"Vectorized" cone** — confirm the structured node/edge-set interpretation (recommended) vs an
    actual embedding vector (out of scope; the semantic index already embeds separately).
+
+---
+
+## 9. L2 Engine Completion — Coordinated Transactional & Stochastic Mutation Engine
+
+With the bridge (Slices 1-3) making L2 graph-aware, three remaining L2 limitations were closed so the
+self-healing loop is a dynamic, path-aware, resilient execution fabric (not flat early-stops).
+
+**Phase 1 — Topologically-ordered multi-file coordinated repair** (`repair_multifile.py`): L2 was
+single-file; multi-file `files: [...]` candidates (which GENERATE/orchestrator already emit with atomic
+batch-rollback) were silently dropped. Now `extract_candidate_files` + `topo_sort_files` (dependency →
+dependent, via the Oracle lazy graph; cycle-safe) order the batch, and `_run_inner` applies every file
+in the L2 sandbox — which is itself the atomic transaction boundary (any apply/test failure discards
+the throwaway sandbox → all-or-nothing). Tests scoped to all changed files. Gated
+`JARVIS_L2_MULTIFILE_ENABLED` (default OFF). *Honest bound:* the structural gate validates the primary
+(dependency-root) file; full multi-file delta simulation is a clean follow-up.
+
+**Phase 2 — Stochastic state-mutation escape gates** (`repair_progress.py`): the two flat early-stops
+(`oscillation_detected` = identical fail+patch pair; `no_progress_streak`) are local minima. When
+`JARVIS_L2_DIVERGE_ESCAPE_ENABLED` is on and the escalation budget (`JARVIS_L2_MAX_ESCALATIONS`,
+default 2) remains, instead of stopping the loop **mutates its own strategy**: a deterministic
+escalation ladder switches the generation paradigm (localized patch → full-method encapsulation rewrite
+→ module-level redesign, injected via `RepairContext.escalation_directive`) and widens the
+dependency-cone lookahead (`cone_depth_bump`) so the model gets more architectural telemetry. Budget-
+bounded → termination guaranteed; falls back to the legacy terminal stop when spent.
+
+**Phase 3 — Granular AST-relational progress tracking** (`repair_progress.py`): `RepairProgressTracker`
+adds the deferred condition 3 — a strictly-narrowing failing-signature **set** counts as progress even
+at constant count — plus an **Operational Velocity Score** over the repair timeline. When velocity is
+non-positive while failures persist (thrashing), the loop pre-emptively throttles the Oracle's
+`AdaptiveNodeCache` (`apply_pressure`) to head off a token/memory blow-up. Gated
+`JARVIS_L2_PROGRESS_V11_ENABLED` (default OFF).
+
+All three gated default-OFF → L2 byte-identical when off (147 repair-engine + 317 combined tests
+green). Graduation soak (with the bridge + gate flags) flips them on.

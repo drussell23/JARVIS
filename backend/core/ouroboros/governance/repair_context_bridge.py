@@ -166,6 +166,7 @@ class RepairContextBridge:
         evidence_json: str,
         target_file: str,
         failing_tests: Tuple[str, ...],
+        depth_override: int = 0,
     ) -> Optional[RepairCone]:
         g = self._get_graph()
         if g is None:
@@ -175,7 +176,9 @@ class RepairContextBridge:
             return None
 
         cap = self._max_symbols if self._max_symbols is not None else _cone_max_symbols()
-        depth = self._blast_depth if self._blast_depth is not None else _cone_blast_depth()
+        base_depth = self._blast_depth if self._blast_depth is not None else _cone_blast_depth()
+        # Phase 2 (L2 divergence escape): widen the lookahead radius when escalating.
+        depth = base_depth + max(0, int(depth_override or 0))
 
         files: List[str] = []
         symbols: List[str] = []
@@ -258,18 +261,21 @@ class RepairContextBridge:
         target_file: str = "",
         failing_tests: Tuple[str, ...] = (),
         force: bool = False,
+        depth_override: int = 0,
     ) -> Optional[RepairCone]:
         """Build the cone off-loop (the lazy graph query API is synchronous). Fail-soft → None.
 
         ``force=True`` bypasses the steer-flag self-gate so the Slice 3 structural gate (which has its
-        own master flag) can obtain a cone even when the prompt-steer flag is off."""
+        own master flag) can obtain a cone even when the prompt-steer flag is off. ``depth_override``
+        widens the blast-radius lookahead (L2 divergence escalation, Phase 2)."""
         if not force and not bridge_enabled():
             return None
         import asyncio
 
         try:
             return await asyncio.to_thread(
-                self._build_sync, evidence_json, target_file, tuple(failing_tests)
+                self._build_sync, evidence_json, target_file, tuple(failing_tests),
+                depth_override,
             )
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             logger.debug("[RepairBridge] cone build failed (non-fatal): %s", exc)
