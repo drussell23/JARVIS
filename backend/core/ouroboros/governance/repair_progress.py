@@ -32,17 +32,20 @@ __all__ = [
 
 # --------------------------------------------------------------------------- flags
 def diverge_escape_enabled() -> bool:
-    """``JARVIS_L2_DIVERGE_ESCAPE_ENABLED`` (default OFF) — convert flat oscillation/no-progress
-    stops into bounded stochastic strategy escalations."""
-    return os.environ.get("JARVIS_L2_DIVERGE_ESCAPE_ENABLED", "false").strip().lower() in (
+    """``JARVIS_L2_DIVERGE_ESCAPE_ENABLED`` (default ON — graduated 2026-06-18 on stateful-mock
+    behavioral proof: escape-ON converges through staged stagnation, escape-OFF stops) — convert flat
+    oscillation/no-progress stops into bounded stochastic strategy escalations. Kill-switch:
+    set the env to ``false`` to disable."""
+    return os.environ.get("JARVIS_L2_DIVERGE_ESCAPE_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
 
 def progress_v11_enabled() -> bool:
-    """``JARVIS_L2_PROGRESS_V11_ENABLED`` (default OFF) — sig-set-narrowing progress signal +
-    Operational Velocity Score + memory-throttle."""
-    return os.environ.get("JARVIS_L2_PROGRESS_V11_ENABLED", "false").strip().lower() in (
+    """``JARVIS_L2_PROGRESS_V11_ENABLED`` (default ON — graduated 2026-06-18) — sig-set-narrowing
+    progress signal + Operational Velocity Score + memory-throttle. Kill-switch: set the env to
+    ``false`` to disable."""
+    return os.environ.get("JARVIS_L2_PROGRESS_V11_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 

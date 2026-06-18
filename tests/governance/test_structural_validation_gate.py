@@ -225,7 +225,8 @@ class TestBoundaryInvariant:
 class TestGatingAndFailSoft:
     @pytest.mark.asyncio
     async def test_disabled_accepts(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED", raising=False)
+        # graduated default-ON → must explicitly set the kill-switch to exercise the disabled path
+        monkeypatch.setenv("JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED", "false")
         gate = StructuralValidationGate(analyzer=_analyzer([]))
         v = await gate.validate(candidate_source="x", file_path="f.py",
                                 repo_name="r", reader=_Reader([]))

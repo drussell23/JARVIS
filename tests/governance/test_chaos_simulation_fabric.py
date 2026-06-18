@@ -15,6 +15,7 @@ from tests.governance.chaos_simulation_fabric import (
     ChaosSimulationFabric,
     ChaosWorkspace,
     FaultSeeder,
+    run_stateful_l2_soak,
 )
 
 
@@ -91,3 +92,31 @@ class TestFabricConvergence:
             assert report.converged is True
         finally:
             fab.workspace.cleanup()
+
+
+class TestStatefulAdversarialSoak:
+    """Live-behavioral proof: a stateful mock provider drives the REAL RepairEngine._run_inner
+    through stagnation → escalation → velocity → convergence. The CONTRAST is the proof."""
+
+    @pytest.mark.asyncio
+    async def test_escape_on_converges_through_stagnation(self) -> None:
+        tel = await run_stateful_l2_soak(escape_enabled=True)
+        # escalation ladder carried the staged stagnation all the way to convergence
+        assert tel["terminal"] == "L2_CONVERGED"
+        assert tel["converged"] is True
+        assert tel["iterations"] >= 5
+
+    @pytest.mark.asyncio
+    async def test_escape_off_stops_at_no_progress(self) -> None:
+        tel = await run_stateful_l2_soak(escape_enabled=False)
+        # same staged stagnation, but without escape the flat early-stop fires
+        assert tel["terminal"] == "L2_STOPPED"
+        assert tel["stop_reason"] == "no_progress_streak"
+        assert tel["converged"] is False
+
+    @pytest.mark.asyncio
+    async def test_escape_is_the_decisive_factor(self) -> None:
+        on = await run_stateful_l2_soak(escape_enabled=True)
+        off = await run_stateful_l2_soak(escape_enabled=False)
+        # identical scenario; the ONLY difference is the flag → ON converges, OFF stops
+        assert on["converged"] is True and off["converged"] is False

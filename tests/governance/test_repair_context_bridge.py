@@ -181,7 +181,8 @@ class TestRender:
 class TestAsyncBuild:
     @pytest.mark.asyncio
     async def test_disabled_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", raising=False)
+        # graduated default-ON → set the kill-switch explicitly to exercise the OFF path
+        monkeypatch.setenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "false")
         b = RepairContextBridge(oracle_graph=_graph_full())
         cone = await b.build(evidence_json='{"fault_node_keys": ["%s"]}' % _FAULT,
                              target_file="src/calc.py")

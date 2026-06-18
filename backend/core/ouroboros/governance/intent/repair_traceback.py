@@ -27,9 +27,10 @@ _BLOCK_RE = re.compile(r"^_{3,}\s+(?P<name>[^_].*?)\s+_{3,}\s*$")
 
 
 def bridge_enabled() -> bool:
-    """``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (default OFF) — master switch for traceback
-    enrichment + (Slice 2) blast-radius cone. OFF → signals are byte-identical to today."""
-    return os.environ.get("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "false").strip().lower() in (
+    """``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (default ON — graduated 2026-06-18 on behavioral-mock
+    + chaos-fabric + real-soak no-regression evidence) — master switch for traceback enrichment +
+    (Slice 2) blast-radius cone. Kill-switch: set the env to ``false`` to disable."""
+    return os.environ.get("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
