@@ -2324,6 +2324,41 @@ class GovernedOrchestrator:
                             strategic_memory_digest=ctx.strategic_memory_digest,
                         )
 
+                    # Active Forensic Inoculation: on a CAUTION/BLOCK hot-spot, stamp a
+                    # non-destructive forensic ref + run a deterministic characterization baseline
+                    # (import/interface smoke). If the fragile component is already broken, LOCK the
+                    # gate + inject an un-bypassable structural constraint. Gated
+                    # (JARVIS_FORENSIC_INOCULATION_ENABLED, default OFF) + fail-soft.
+                    try:
+                        from backend.core.ouroboros.governance.forensic_inoculation import (
+                            ForensicInoculationEngine, inoculation_enabled,
+                        )
+                        if inoculation_enabled():
+                            _inoc_graph = None
+                            try:
+                                from backend.core.ouroboros.oracle import get_oracle
+                                _inoc_graph = getattr(get_oracle(), "_graph", None)
+                            except Exception:  # noqa: BLE001
+                                _inoc_graph = None
+                            _inoc = await ForensicInoculationEngine(
+                                self._config.project_root, graph=_inoc_graph,
+                            ).inoculate(_advisory, ctx.target_files, ctx.op_id)
+                            if _inoc.triggered and _inoc.locked and _inoc.constraint_clause:
+                                _existing2 = getattr(ctx, "strategic_memory_prompt", "") or ""
+                                ctx = ctx.with_strategic_memory_context(
+                                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                                    strategic_memory_prompt=_existing2 + "\n\n" + _inoc.constraint_clause,
+                                    strategic_memory_digest=ctx.strategic_memory_digest,
+                                )
+                                logger.warning(
+                                    "[Orchestrator] Forensic inoculation LOCKED op=%s branch=%s — "
+                                    "baseline failed; constraint injected", ctx.op_id,
+                                    _inoc.forensic_branch,
+                                )
+                    except Exception:  # noqa: BLE001 — inoculation must never break the pipeline
+                        logger.debug("[Orchestrator] forensic inoculation skipped", exc_info=True)
+
                     # Voice the warning
                     if _advisory.voice_message and self._reasoning_narrator is not None:
                         try:
