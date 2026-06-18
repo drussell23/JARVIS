@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
 
-from .memory_pressure_gate import PressureLevel
+from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -293,16 +293,10 @@ def build_local_prime_client() -> "Optional[LocalPrimeClient]":
 class LocalInferenceDirector:
     """Lifecycle + memory-aware governance for the local tier."""
 
-    def __init__(self, cfg: LocalConfig, client: Any) -> None:
+    def __init__(self, cfg: LocalConfig, client: Any, gate: Any = None) -> None:
         self._cfg = cfg
         self._client = client
-
-    def admit_concurrency(self, level: PressureLevel) -> int:
-        if level is PressureLevel.CRITICAL:
-            return 0
-        if level is PressureLevel.HIGH:
-            return 1
-        return self._cfg.max_concurrency
+        self._gate = gate if gate is not None else get_default_gate()
 
     async def _evict_model(self) -> None:
         """Force immediate unload from unified memory via keep_alive:0."""
@@ -322,6 +316,24 @@ class LocalInferenceDirector:
         gc.collect()                # 2) dual-stage GC sweep
         gc.collect()
         await asyncio.sleep(0)      # 3) yield to host OS for RAM reclaim
+
+    async def memory_guard(self) -> None:
+        """Reuse the shared MemoryPressureGate before local inference.
+
+        At CRITICAL host memory, evict the resident model and refuse the op by
+        raising LocalMemoryCritical so the cascade routes upstream to remote
+        providers instead of OOM-ing the host. Concurrency is NOT handled here
+        (candidate_generator's _jprime_sem already caps local inference at 1).
+        Pass-through when the gate master switch is OFF.
+        """
+        if not memory_gate_enabled():
+            return
+        level = self._gate.pressure()
+        if level is PressureLevel.CRITICAL:
+            await self.enforce_memory(level)  # evict + dual gc + yield (existing)
+            raise LocalMemoryCritical(
+                "host memory CRITICAL - local inference refused; cascading upstream"
+            )
 
     async def stop(self) -> None:
         """Clean teardown: release the pooled session (zero hanging FDs)."""
