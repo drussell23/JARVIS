@@ -2407,6 +2407,40 @@ class CandidateGenerator:
                         "re-raising original exhaustion",
                         exc_info=True,
                     )
+                # Phase 3.3 Task 2 — J-Prime last-resort local handoff.
+                # When JARVIS_JPRIME_LASTRESORT_ENABLED is true, route the op
+                # to the local 3B tier with a topologically-pruned payload
+                # instead of crashing the loop. Gate default OFF -> re-raise
+                # (byte-identical legacy). Never masks the original error on
+                # local failure or unhealthy probe.
+                try:
+                    from backend.core.ouroboros.governance.exhaustion_interceptor import (
+                        should_intercept,
+                        execute_local_last_resort,
+                    )
+                    if should_intercept(exc, jprime=self._jprime):
+                        _ft = self._estimate_target_file_tokens(context)
+                        _broker = self._resolve_sse_broker()
+                        return await execute_local_last_resort(
+                            jprime=self._jprime,
+                            context=context,
+                            deadline=deadline,
+                            graph_backend=getattr(self, "_graph_backend", None),
+                            broker=_broker,
+                            file_tokens=_ft,
+                            original_exc=exc,
+                        )
+                except RuntimeError:
+                    # execute_local_last_resort re-raises original_exc on any
+                    # local failure — let it propagate cleanly.
+                    raise
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[CandidateGenerator] jprime lastresort "
+                        "intercept failed (non-fatal); "
+                        "re-raising original exhaustion",
+                        exc_info=True,
+                    )
             raise
         else:
             if self._exhaustion_watcher is not None:
@@ -2436,6 +2470,44 @@ class CandidateGenerator:
                     exc_info=True,
                 )
             return result
+
+    def _estimate_target_file_tokens(self, context: Any) -> Dict[str, int]:
+        """Best-effort per-file token estimate for the exhaustion interceptor.
+
+        Reads each file in ``context.target_files`` relative to the repo root
+        (``self._repo_root`` when set, else cwd) and estimates token count as
+        ``len(text) // 4``. Missing or unreadable files contribute 0. Never
+        raises -- any error is swallowed so the interceptor path stays safe.
+        """
+        result: Dict[str, int] = {}
+        try:
+            files = list(getattr(context, "target_files", ()) or ())
+            repo_root = getattr(self, "_repo_root", None)
+            for f in files:
+                try:
+                    import os as _os
+                    path = (
+                        _os.path.join(repo_root, f)
+                        if repo_root and not _os.path.isabs(f)
+                        else f
+                    )
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        result[f] = len(fh.read()) // 4
+                except Exception:  # noqa: BLE001
+                    result[f] = 0
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+
+    def _resolve_sse_broker(self) -> Any:
+        """Return the default SSE broker for beacon publishing, or None on failure."""
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                get_default_broker,
+            )
+            return get_default_broker()
+        except Exception:  # noqa: BLE001
+            return None
 
     async def _apply_bg_spec_structural_filter(
         self,

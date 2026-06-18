@@ -1254,6 +1254,10 @@ EVENT_TYPE_TERMINATION_HOOK_DISPATCHED = "termination_hook_dispatched"
 # "saturation event" notifications + correlate to the structural
 # `pre_admission_shed` exhaustion at the orchestrator level.
 EVENT_TYPE_ADMISSION_DECISION_EMITTED = "admission_decision_emitted"
+# Phase 3.3 Task 2 — Exhaustion Interceptor. Fired when the last-resort
+# J-Prime local handoff activates (all_providers_exhausted intercepted,
+# payload pruned topologically, local tier absorbing the op).
+EVENT_TYPE_EXHAUSTION_HANDOFF_TRIGGERED = "exhaustion_handoff_triggered"
 # CodebaseCharacterDigest Slice 3 — emitted when ProactiveExploration
 # Sensor surfaces an under-touched semantic cluster as an IntentEnvelope.
 # Lets IDE/observability consumers correlate the cluster-coverage bias
@@ -1535,6 +1539,11 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # in-process on_trip callback drives harness
                                                   # graceful shutdown, this SSE is the IDE
                                                   # observability surface)
+    EVENT_TYPE_EXHAUSTION_HANDOFF_TRIGGERED,      # Phase 3.3 Task 2 (last-resort local handoff
+                                                  # — all_providers_exhausted intercepted,
+                                                  # topological prune applied, J-Prime local
+                                                  # tier absorbs the op; gated by
+                                                  # JARVIS_JPRIME_LASTRESORT_ENABLED)
 })
 
 
