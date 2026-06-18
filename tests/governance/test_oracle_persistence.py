@@ -728,12 +728,12 @@ def test_scoped_eviction_preserves_cross_partition_edge_in_sqlite(monkeypatch, t
     asyncio.run(run())
 
 
-def test_scoper_flag_default_off(monkeypatch):
+def test_scoper_flag_default_on(monkeypatch):
     import backend.core.ouroboros.oracle as O
     monkeypatch.delenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", raising=False)
-    assert O._oracle_scoper_enabled() is False
-    monkeypatch.setenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "1")
-    assert O._oracle_scoper_enabled() is True
+    assert O._oracle_scoper_enabled() is True        # graduated default-ON 2026-06-18
+    monkeypatch.setenv("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "0")
+    assert O._oracle_scoper_enabled() is False        # kill switch
 
 
 def test_provider_checkpoint_wal_and_counts(tmp_path):

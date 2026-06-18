@@ -177,11 +177,14 @@ def test_cache_default_baseline_is_5000(monkeypatch):
     assert GB.AdaptiveNodeCache().maxsize == 5000
 
 
-def test_flags_default_off(monkeypatch):
+def test_flag_defaults_after_graduation(monkeypatch):
     for f in ("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "JARVIS_ORACLE_PARITY_HARNESS_ENABLED"):
         monkeypatch.delenv(f, raising=False)
+    assert GB.lazy_traversal_enabled() is True       # graduated default-ON 2026-06-18
+    assert GB.parity_harness_enabled() is False      # verification tool — opt-in (holds in-mem resident)
+    # kill switch still works
+    monkeypatch.setenv("JARVIS_ORACLE_LAZY_TRAVERSAL_ENABLED", "0")
     assert GB.lazy_traversal_enabled() is False
-    assert GB.parity_harness_enabled() is False
 
 
 # --------------------------------------------------------------------------- seam preserves Oracle behavior

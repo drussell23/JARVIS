@@ -1055,34 +1055,44 @@ class CodebaseKnowledgeGraph:
             for source in self._graph.predecessors(node_key)
         ]
 
+    def _contains(self, node_key: str) -> bool:
+        """Membership via the traversal seam (lazy-correct — True even when the in-memory graph is
+        partial/empty under the Scoper, as long as SQLite has the node)."""
+        return self._backend.contains(node_key) if self._backend is not None else (node_key in self._graph)
+
+    def _ids_for_keys(self, keys: List[str]) -> List[NodeID]:
+        """Map backend node keys → NodeID via the seam (lazy-correct; the SQLite backend rebuilds
+        NodeIDs from rows, so this works even when the in-memory index is partial under the Scoper)."""
+        out: List[NodeID] = []
+        for k in keys:
+            nid = self._backend.node_id_for(k) if self._backend is not None else self._node_index.get(k)
+            if nid is not None:
+                out.append(nid)
+        return out
+
     def find_nodes_by_name(self, name: str, fuzzy: bool = False) -> List[NodeID]:
-        """Find nodes by name (exact or fuzzy match)."""
+        """Find nodes by name (exact or fuzzy match). Routes through the traversal seam (Slice 4)."""
+        if self._backend is not None:
+            return self._ids_for_keys(self._backend.nodes_by_name(name, fuzzy))
         results = []
         name_lower = name.lower()
-
         for node_key, node_id in self._node_index.items():
-            if fuzzy:
-                if name_lower in node_id.name.lower():
-                    results.append(node_id)
-            else:
-                if node_id.name == name or node_id.name.endswith(f".{name}"):
-                    results.append(node_id)
-
+            if (name_lower in node_id.name.lower()) if fuzzy else (
+                    node_id.name == name or node_id.name.endswith(f".{name}")):
+                results.append(node_id)
         return results
 
     def find_nodes_by_type(self, node_type: NodeType) -> List[NodeID]:
-        """Find all nodes of a specific type."""
-        return [
-            self._node_index[key]
-            for key in self._type_index[node_type]
-        ]
+        """Find all nodes of a specific type. Routes through the traversal seam (Slice 4)."""
+        if self._backend is not None:
+            return self._ids_for_keys(self._backend.nodes_by_type(node_type.value))
+        return [self._node_index[key] for key in self._type_index[node_type]]
 
     def find_nodes_in_file(self, file_path: str) -> List[NodeID]:
-        """Find all nodes in a specific file."""
-        return [
-            self._node_index[key]
-            for key in self._file_index[file_path]
-        ]
+        """Find all nodes in a specific file. Routes through the traversal seam (Slice 4)."""
+        if self._backend is not None:
+            return self._ids_for_keys(self._backend.nodes_in_file(file_path))
+        return [self._node_index[key] for key in self._file_index[file_path]]
 
     def get_all_nodes(self) -> List["NodeData"]:
         """Return all NodeData objects stored in the graph.
@@ -1106,11 +1116,10 @@ class CodebaseKnowledgeGraph:
         return result
 
     def find_nodes_in_repo(self, repo: str) -> List[NodeID]:
-        """Find all nodes in a specific repository."""
-        return [
-            self._node_index[key]
-            for key in self._repo_index[repo]
-        ]
+        """Find all nodes in a specific repository. Routes through the traversal seam (Slice 4)."""
+        if self._backend is not None:
+            return self._ids_for_keys(self._backend.nodes_in_repo(repo))
+        return [self._node_index[key] for key in self._repo_index[repo]]
 
     def get_callers(self, node_id: Union[NodeID, str]) -> List[NodeID]:
         """Get all nodes that call this node."""
@@ -1180,7 +1189,7 @@ class CodebaseKnowledgeGraph:
         This is THE killer feature - shows impact of changes.
         """
         node_key = str(node_id)
-        if node_key not in self._graph:
+        if not self._contains(node_key):
             if isinstance(node_id, str):
                 # Try to find by name
                 found = self.find_nodes_by_name(node_id)
@@ -1277,7 +1286,7 @@ class CodebaseKnowledgeGraph:
         source_key = str(source)
         target_key = str(target)
 
-        if source_key not in self._graph or target_key not in self._graph:
+        if not self._contains(source_key) or not self._contains(target_key):
             return None
 
         # Route through the traversal seam (Slice 1) — InMemory overrides with nx.shortest_path;
@@ -1286,7 +1295,7 @@ class CodebaseKnowledgeGraph:
             path = self._backend.shortest_path(source_key, target_key)
             if path is None:
                 return None
-            return [self._node_index[key] for key in path if key in self._node_index]
+            return self._ids_for_keys(path)   # seam-routed mapping (lazy-correct under eviction)
         try:
             path = nx.shortest_path(self._graph, source_key, target_key)
             return [self._node_index[key] for key in path if key in self._node_index]
@@ -1301,11 +1310,7 @@ class CodebaseKnowledgeGraph:
             source = self._backend.simple_cycles() if self._backend is not None else nx.simple_cycles(self._graph)
             for cycle in source:
                 if len(cycle) > 1:  # Ignore self-loops
-                    cycle_nodes = [
-                        self._node_index[key]
-                        for key in cycle
-                        if key in self._node_index
-                    ]
+                    cycle_nodes = self._ids_for_keys(cycle)   # seam-routed (lazy-correct)
                     if cycle_nodes:
                         cycles.append(cycle_nodes)
         except Exception as e:
@@ -1314,12 +1319,13 @@ class CodebaseKnowledgeGraph:
         return cycles
 
     def find_dead_code(self) -> List[NodeID]:
-        """Find potentially dead code (unreferenced functions/classes)."""
+        """Find potentially dead code (unreferenced functions/classes). Routes node enumeration
+        through the seam (Slice 4) so it streams from SQLite and is correct even when the in-memory
+        index is partial under the Scoper."""
         dead_code = []
 
-        for node_key in self._type_index[NodeType.FUNCTION] | self._type_index[NodeType.METHOD]:
-            node_id = self._node_index[node_key]
-
+        candidates = self.find_nodes_by_type(NodeType.FUNCTION) + self.find_nodes_by_type(NodeType.METHOD)
+        for node_id in candidates:
             # Skip special methods
             if node_id.name.startswith("__"):
                 continue
@@ -1344,7 +1350,7 @@ class CodebaseKnowledgeGraph:
     ) -> "CodebaseKnowledgeGraph":
         """Extract a subgraph centered on a node."""
         root_key = str(root)
-        if root_key not in self._graph:
+        if not self._contains(root_key):
             return CodebaseKnowledgeGraph()
 
         # Collect nodes within depth
@@ -2010,8 +2016,12 @@ def _oracle_scoper_enabled() -> bool:
     """``JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED`` (default false) — partition the cold index into
     decoupled package subtrees and traverse them sequentially with between-subtree RAM reclaim, so a
     full 29k-file brain BUILDS on a constrained host without ever holding the whole graph resident.
-    OFF → single un-partitioned pass (byte-identical to the pre-scoper path)."""
-    raw = os.environ.get("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "false")
+    OFF → single un-partitioned pass (byte-identical to the pre-scoper path).
+
+    **Graduated default-ON 2026-06-18** — safe now that the lazy read path (find_* + traversals +
+    global queries) routes through the SQLite backend, so the Scoper's between-subtree eviction no
+    longer leaves queries reading a partial in-memory graph (ADD §0 sequencing satisfied)."""
+    raw = os.environ.get("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "true")
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -2454,6 +2464,11 @@ class TheOracle:
                 await self._persistence.close()
             except Exception:  # noqa: BLE001
                 logger.debug("[Oracle.shutdown] persistence close best-effort failed", exc_info=True)
+        # Slice 5 — release the lazy traversal backend's read-only connection (no-op when in-memory).
+        try:
+            self._graph.close_backend()
+        except Exception:  # noqa: BLE001
+            logger.debug("[Oracle.shutdown] backend close best-effort failed", exc_info=True)
         self._running = False
         logger.info("The Oracle shutdown complete")
 
@@ -2498,6 +2513,10 @@ class TheOracle:
         from backend.core.ouroboros import oracle_persistence as _op_fi
         if _op_fi.sqlite_persistence_enabled():
             await self._sqlite_persist_metrics()
+            # Slice 5 — db is now built; activate the lazy read backend so post-index queries route
+            # through SQLite (bounded RAM, correct even after Scoper eviction left the in-mem graph
+            # partial). No-op unless the lazy flag is on.
+            self._graph.attach_lazy_backend(self._resolved_sqlite_path())
         else:
             await self._save_cache()
 
@@ -3523,6 +3542,9 @@ class TheOracle:
         self._graph._type_index = defaultdict(set, state.type_index)
         self._graph._metrics = state.metrics
         self._file_hashes = state.file_hashes
+        # Slice 5 — the db is present + current; activate the lazy/parity-verified read backend so
+        # queries route through SQLite (bounded RAM). No-op unless the lazy flag is on.
+        self._graph.attach_lazy_backend(self._resolved_sqlite_path())
         return True
 
     async def _save_cache_via_provider(self) -> None:
