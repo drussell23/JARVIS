@@ -3914,38 +3914,54 @@ class GovernedLoopService:
 
         # Build PrimeProvider if PrimeClient available
         _primary_probe_ok = False  # track for FSM sync after generator build
-        # J-Prime local activation (Phase 3): when no GCP PrimeClient is configured
-        # and the local tier is enabled, inject the local Ollama-backed client so
-        # PrimeProvider has a real backend. OFF or GCP-present -> no-op (legacy).
-        if self._prime_client is None:
-            try:
-                from backend.core.ouroboros.governance.local_inference_director import (
-                    build_local_prime_client,
-                    LocalConfig,
-                    LocalInferenceDirector,
+        # J-Prime tier wiring.
+        # Phase 3.2 (tiered, default OFF -> heavy GCP wired but NOT activated):
+        #   compose heavy (existing GCP prime_client) + light (governed local Ollama)
+        #   into a TieredPrimeClient. Phase 3.1 (default path): local-only injection
+        #   when no heavy client is configured. OFF for both -> byte-identical legacy.
+        try:
+            from backend.core.ouroboros.governance.local_inference_director import (
+                build_local_prime_client,
+                LocalConfig,
+                LocalInferenceDirector,
+            )
+            from backend.core.ouroboros.governance.tiered_prime_client import (
+                tiered_enabled,
+                build_tiered_prime_client,
+            )
+
+            def _build_governed_local():
+                _lp = build_local_prime_client()
+                if _lp is not None:
+                    _dir = LocalInferenceDirector(LocalConfig.from_env(), client=_lp)
+                    _lp.attach_governor(_dir)
+                    self._local_inference_director = _dir
+                return _lp
+
+            if tiered_enabled():
+                _light = _build_governed_local()
+                _composite = build_tiered_prime_client(
+                    heavy=self._prime_client, light=_light
                 )
-                _local_prime = build_local_prime_client()
+                if _composite is not None and _composite is not self._prime_client:
+                    self._prime_client = _composite
+                    logger.info(
+                        "[GovernedLoop] J-Prime tiered composite active "
+                        "(heavy=%s, light=%s)",
+                        self._prime_client is not None,
+                        _light is not None,
+                    )
+            elif self._prime_client is None:
+                _local_prime = _build_governed_local()
                 if _local_prime is not None:
                     self._prime_client = _local_prime
-                    # Give the local tier a live home so shutdown releases its
-                    # pooled aiohttp session (zero-FD teardown). The director also
-                    # hosts the CRITICAL memory-eviction valve consulted on every
-                    # local generate.
-                    self._local_inference_director = LocalInferenceDirector(
-                        LocalConfig.from_env(), client=_local_prime
-                    )
-                    # Phase 3.1: attach the director so every local generate()
-                    # consults memory_guard() (CRITICAL -> evict + refuse + cascade
-                    # upstream), protecting the host from OOM. Concurrency stays with
-                    # candidate_generator's existing _jprime_sem (no duplication).
-                    _local_prime.attach_governor(self._local_inference_director)
                     logger.info(
                         "[GovernedLoop] J-Prime local tier: LocalPrimeClient injected (Ollama)"
                     )
-            except Exception:
-                logger.debug(
-                    "[GovernedLoop] local prime injection skipped", exc_info=True
-                )
+        except Exception:
+            logger.debug(
+                "[GovernedLoop] J-Prime tier wiring skipped", exc_info=True
+            )
         if self._prime_client is not None:
             try:
                 from backend.core.ouroboros.governance.providers import (
