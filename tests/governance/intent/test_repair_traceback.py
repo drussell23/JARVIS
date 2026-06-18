@@ -157,9 +157,10 @@ class TestBuildTracebackMap:
 
 # --------------------------------------------------------------------------- flag
 class TestFlag:
-    def test_default_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_default_on_graduated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # graduated 2026-06-18 → default ON when env unset
         monkeypatch.delenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", raising=False)
-        assert bridge_enabled() is False
+        assert bridge_enabled() is True
 
     @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
     def test_truthy(self, monkeypatch: pytest.MonkeyPatch, val: str) -> None:

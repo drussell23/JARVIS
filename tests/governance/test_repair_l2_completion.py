@@ -165,10 +165,19 @@ class TestProgressV11:
 
 # --------------------------------------------------------------------------- flags
 class TestFlags:
-    def test_defaults_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_defaults_on_graduated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # graduated 2026-06-18 → default ON when env unset
         for v in ("JARVIS_L2_MULTIFILE_ENABLED", "JARVIS_L2_DIVERGE_ESCAPE_ENABLED",
                   "JARVIS_L2_PROGRESS_V11_ENABLED"):
             monkeypatch.delenv(v, raising=False)
+        assert l2_multifile_enabled() is True
+        assert diverge_escape_enabled() is True
+        assert progress_v11_enabled() is True
+
+    def test_kill_switch_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for v in ("JARVIS_L2_MULTIFILE_ENABLED", "JARVIS_L2_DIVERGE_ESCAPE_ENABLED",
+                  "JARVIS_L2_PROGRESS_V11_ENABLED"):
+            monkeypatch.setenv(v, "false")
         assert l2_multifile_enabled() is False
         assert diverge_escape_enabled() is False
         assert progress_v11_enabled() is False

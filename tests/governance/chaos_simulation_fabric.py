@@ -318,3 +318,132 @@ class ChaosSimulationFabric:
         report.converged = all(report.stages.values())
         return report
 
+
+# ===========================================================================
+# Stateful Adversarial Provider Simulation Plane (live-behavioral L2 proof)
+# ===========================================================================
+# The deterministic loop above proves the cross-repo PLUMBING. This plane drives the *real*
+# RepairEngine._run_inner through a multi-iteration stagnation→escalation→velocity→convergence
+# scenario with a stateful mock provider + mock sandbox — exercising the divergence-escape and
+# progress-v1.1 code paths behaviorally, with NO cloud dependency. The proof is the CONTRAST:
+# with JARVIS_L2_DIVERGE_ESCAPE_ENABLED the staged stagnation CONVERGES; without it the same
+# scenario STOPS at no_progress_streak. That contrast is genuine behavioral evidence.
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+
+class _MockGenResult:
+    def __init__(self, candidate: Dict[str, Any]) -> None:
+        self.candidates = [candidate]
+        self.model_id = "stateful-adversarial-mock"
+        self.provider_name = "mock"
+
+
+class StatefulAdversarialMockProvider:
+    """Stateful mock implementing the provider `generate()` interface. Returns a DISTINCT patch each
+    call (line-diff variation → distinct patch_sig) — the sandbox decides pass/fail to stage the
+    stagnation→progress→convergence arc."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @staticmethod
+    def iter_candidate(n: int) -> Dict[str, Any]:
+        # distinct content each iteration (line-diff variation)
+        return {"file_path": "mod.py", "full_content": f"# attempt {n}\ndef f():\n    return {n}\n"}
+
+    async def generate(self, ctx: Any, deadline: Any, repair_context: Any = None) -> _MockGenResult:
+        self.calls += 1
+        return _MockGenResult(self.iter_candidate(self.calls + 1))
+
+
+class _MockSandbox:
+    """Async-CM mock sandbox. run_tests() returns per-iteration results staging the arc:
+    iters 1-3 fail with the SAME two tests (stagnation → same fail_sig → no-progress),
+    iter 4 fails with ONE test (narrowed set → progress + velocity), iter 5 passes (converged)."""
+
+    _runs = 0  # class-level: shared across the per-iteration sandbox instances
+
+    def __init__(self, repo_root: Any, test_timeout_s: float) -> None:
+        self.sandbox_root = Path(repo_root)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def apply_patch(self, diff: str, file_path: str) -> None:
+        return None
+
+    async def apply_full_content(self, content: str, file_path: str) -> None:
+        return None
+
+    async def run_tests(self, targets, timeout_s):  # noqa: ANN001
+        from backend.core.ouroboros.governance.repair_sandbox import SandboxValidationResult
+        _MockSandbox._runs += 1
+        n = _MockSandbox._runs
+        if n <= 3:   # stagnation: identical failing set
+            stdout = ("FAILED tests/test_mod.py::test_a - AssertionError\n"
+                      "FAILED tests/test_mod.py::test_b - AssertionError\n"
+                      "2 failed in 0.1s\n")
+            return SandboxValidationResult(passed=False, stdout=stdout, stderr="", returncode=1, duration_s=0.1)
+        if n == 4:   # incremental improvement: narrowed failing set
+            stdout = "FAILED tests/test_mod.py::test_a - AssertionError\n1 failed in 0.1s\n"
+            return SandboxValidationResult(passed=False, stdout=stdout, stderr="", returncode=1, duration_s=0.1)
+        # n >= 5: converged
+        return SandboxValidationResult(passed=True, stdout="2 passed in 0.1s\n", stderr="", returncode=0, duration_s=0.1)
+
+
+class _NullBridge:
+    """Inert context bridge so the L2 loop stays hermetic (no real Oracle index in the sim)."""
+    async def build(self, **kwargs):  # noqa: ANN003
+        return None
+
+    def render_clause(self, cone):  # noqa: ANN001
+        return ""
+
+
+def _mock_ctx() -> Any:
+    gen = SimpleNamespace(
+        candidates=[StatefulAdversarialMockProvider.iter_candidate(1)],
+        model_id="stateful-adversarial-mock", provider_name="mock",
+    )
+    return SimpleNamespace(
+        op_id="chaos-soak-op", generation=gen, primary_repo="jarvis",
+        intake_evidence_json="", target_files=("mod.py",),
+    )
+
+
+async def run_stateful_l2_soak(*, escape_enabled: bool) -> Dict[str, Any]:
+    """Drive the REAL RepairEngine._run_inner through the staged arc. Returns harvested telemetry.
+    With escape_enabled the staged stagnation should CONVERGE; without it, STOP at no_progress."""
+    from backend.core.ouroboros.governance.repair_engine import RepairBudget, RepairEngine
+
+    os.environ["JARVIS_L2_PROGRESS_V11_ENABLED"] = "true"
+    os.environ["JARVIS_L2_DIVERGE_ESCAPE_ENABLED"] = "true" if escape_enabled else "false"
+    os.environ["JARVIS_L2_MAX_ESCALATIONS"] = "3"
+    _MockSandbox._runs = 0
+
+    budget = RepairBudget(
+        enabled=True, max_iterations=8, timebox_s=120.0, min_deadline_remaining_s=1.0,
+        per_iteration_test_timeout_s=10.0, max_diff_lines=500, max_files_changed=5,
+        max_total_validation_runs=12, no_progress_streak_kill=2,
+        max_class_retries={"test": 12, "syntax": 12, "env": 12, "flake": 12},
+    )
+    engine = RepairEngine(
+        budget=budget, prime_provider=StatefulAdversarialMockProvider(),
+        repo_root=Path(tempfile.gettempdir()), sandbox_factory=_MockSandbox,
+        context_bridge=_NullBridge(),
+    )
+    deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120)
+    result = await engine.run(_mock_ctx(), None, deadline)
+    return {
+        "terminal": result.terminal,
+        "stop_reason": result.stop_reason,
+        "iterations": len(result.iterations),
+        "converged": result.terminal == "L2_CONVERGED",
+    }
+
+

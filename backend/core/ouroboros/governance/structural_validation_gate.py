@@ -52,8 +52,9 @@ _SOFT = "soft"
 
 # --------------------------------------------------------------------------- flags
 def gate_enabled() -> bool:
-    """``JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED`` (default OFF) — master for the structural gate."""
-    return os.environ.get("JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED", "false").strip().lower() in (
+    """``JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED`` (default ON — graduated 2026-06-18) — master for the
+    structural gate. Kill-switch: set the env to ``false`` to disable."""
+    return os.environ.get("JARVIS_REPAIR_STRUCTURAL_GATE_ENABLED", "true").strip().lower() in (
         "1", "true", "yes", "on",
     )
 

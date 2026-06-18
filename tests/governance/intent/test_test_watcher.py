@@ -224,7 +224,8 @@ class TestBridgeOffByteIdentical:
     async def test_off_leaves_evidence_unenriched(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", raising=False)
+        # graduated default-ON → set the kill-switch explicitly to exercise the OFF path
+        monkeypatch.setenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "false")
         watcher = TestWatcher(repo="jarvis", node_resolver=_FakeResolver())
         f = _make_failure()
         await watcher._enrich_failures([f], _TB_OUTPUT)
