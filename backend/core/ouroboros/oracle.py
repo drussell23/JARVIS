@@ -1951,6 +1951,94 @@ def _oracle_memory_armor_yield_s() -> float:
         return 0.5
 
 
+# ---------------------------------------------------------------------------- Adaptive Local Subtree Scoper
+def _oracle_scoper_enabled() -> bool:
+    """``JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED`` (default false) — partition the cold index into
+    decoupled package subtrees and traverse them sequentially with between-subtree RAM reclaim, so a
+    full 29k-file brain BUILDS on a constrained host without ever holding the whole graph resident.
+    OFF → single un-partitioned pass (byte-identical to the pre-scoper path)."""
+    raw = os.environ.get("JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED", "false")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _oracle_scoper_safety_frac() -> float:
+    """``JARVIS_ORACLE_SCOPER_SAFETY_FRAC`` — fraction of *available* host RAM to budget per
+    partition (no hardcoded file cap; the cap is derived live from this × free RAM). Default 0.30."""
+    try:
+        return min(0.9, max(0.05, float(os.environ.get("JARVIS_ORACLE_SCOPER_SAFETY_FRAC", "0.30"))))
+    except (TypeError, ValueError):
+        return 0.30
+
+
+def _oracle_scoper_per_node_kb() -> float:
+    """``JARVIS_ORACLE_SCOPER_PER_NODE_KB`` — empirical resident cost per graph node (soak-measured
+    slope ≈ 2.34 MB / 1000 nodes). Used only to convert a RAM budget into a node/file target."""
+    try:
+        return max(0.1, float(os.environ.get("JARVIS_ORACLE_SCOPER_PER_NODE_KB", "2.4")))
+    except (TypeError, ValueError):
+        return 2.4
+
+
+def _oracle_scoper_nodes_per_file() -> float:
+    """``JARVIS_ORACLE_SCOPER_NODES_PER_FILE`` — empirical nodes produced per source file
+    (soak-measured ≈ 68). Converts the node target into a file target for partition sizing."""
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_ORACLE_SCOPER_NODES_PER_FILE", "68")))
+    except (TypeError, ValueError):
+        return 68.0
+
+
+def _oracle_scoper_min_partition_files() -> int:
+    """``JARVIS_ORACLE_SCOPER_MIN_PARTITION_FILES`` — floor on partition size so a tiny free-RAM
+    reading can't fragment the index into thousands of micro-partitions. Default 200."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_SCOPER_MIN_PARTITION_FILES", "200")))
+    except (TypeError, ValueError):
+        return 200
+
+
+def _cluster_by_package(files: "List[Path]", repo_path: Path, target_files: int) -> "List[List[Path]]":
+    """Cluster files into package-aligned partitions each ≤ ``target_files`` (Phase 1 — pure, no I/O,
+    testable). Logical-boundary analysis: group by directory (package) depth, recursively splitting a
+    package that alone exceeds the target into its sub-packages; then first-fit-decreasing bin-pack
+    the resulting groups so intra-package edges stay within a partition and only cross-package edges
+    become the (durable, by-key) inter-partition stubs."""
+    def _rel_parts(f: Path):
+        try:
+            return f.relative_to(repo_path).parts
+        except ValueError:
+            return (f.name,)
+
+    def _group(file_list, depth):
+        buckets: "Dict[str, List[Path]]" = {}
+        for f in file_list:
+            parts = _rel_parts(f)
+            key = "/".join(parts[:depth]) if len(parts) > depth else "/".join(parts[:-1]) or "."
+            buckets.setdefault(key, []).append(f)
+        out: "List[List[Path]]" = []
+        for grp in buckets.values():
+            # Recurse only if the group is over target AND there is deeper structure to split on.
+            if len(grp) > target_files and any(len(_rel_parts(f)) > depth + 1 for f in grp):
+                out.extend(_group(grp, depth + 1))
+            else:
+                out.append(grp)
+        return out
+
+    groups = _group(files, 1)
+    groups.sort(key=len, reverse=True)  # first-fit-decreasing
+    partitions: "List[List[Path]]" = []
+    for grp in groups:
+        placed = False
+        for p in partitions:
+            if len(p) + len(grp) <= target_files:
+                p.extend(grp)
+                placed = True
+                break
+        if not placed:
+            partitions.append(list(grp))
+    return partitions
+
+
 class _AdaptiveIndexThrottle:
     """AIMD backpressure for the Oracle index batch loop.
 
@@ -2069,6 +2157,8 @@ class TheOracle:
         self._mem_armor_contractions: int = 0   # batches contracted under WARN/HIGH/CRITICAL
         self._mem_armor_yields: int = 0          # GC+sleep yields performed at CRITICAL
         self._mem_armor_suspended: bool = False  # index suspended because CRITICAL never cleared
+        self._scoper_partitions: int = 0          # subtree partitions the last index ran over
+        self._scoper_evictions: int = 0           # between-subtree RAM-reclaim evictions performed
 
         logger.info("The Oracle initialized")
 
@@ -2543,14 +2633,144 @@ class TheOracle:
                 return "critical"
         return "critical_persist"
 
+    def _partition_subtrees(self, files: "List[Path]", repo_path: Path) -> "List[List[Path]]":
+        """Phase 1 — predictive topology partition. Returns a single partition (the whole list) when
+        the scoper is off or the work fits the RAM budget; otherwise package-aligned subtrees each
+        sized to a *live-derived* RAM budget (no hardcoded cap)."""
+        if not _oracle_scoper_enabled() or len(files) <= _oracle_scoper_min_partition_files():
+            return [files]
+        gate = self._memory_gate()
+        try:
+            avail_mb = (gate.probe().available_bytes / 1e6) if gate is not None else 4096.0
+        except Exception:  # noqa: BLE001
+            avail_mb = 4096.0
+        budget_mb = max(64.0, avail_mb * _oracle_scoper_safety_frac())
+        per_node_mb = _oracle_scoper_per_node_kb() / 1024.0
+        target_nodes = budget_mb / max(per_node_mb, 1e-6)
+        target_files = max(
+            _oracle_scoper_min_partition_files(),
+            int(target_nodes / max(_oracle_scoper_nodes_per_file(), 1.0)),
+        )
+        if len(files) <= target_files:
+            return [files]
+        parts = _cluster_by_package(files, repo_path, target_files)
+        return parts or [files]
+
+    def _evict_partition(self, partition_files: "List[Path]", repo_path: Path, repo_name: str) -> int:
+        """Phase 2 — reclaim a committed subtree's RAM. Removes its nodes from the in-memory DiGraph
+        + inverted indices (the durable copy is already in SQLite; cross-partition edges persist
+        by-key). NEVER touches ``_file_hashes`` (the skip-unchanged signal must survive for resume).
+        Returns the node count evicted."""
+        g = self._graph
+        rels = set()
+        keys = set()
+        for f in partition_files:
+            try:
+                rel = str(f.relative_to(repo_path))
+            except ValueError:
+                rel = str(f)
+            rels.add(rel)
+            keys.update(k for k in g._file_index.get(rel, ()) if k.startswith(repo_name + ":"))
+        keys = {k for k in keys if k in g._graph}
+        if not keys:
+            return 0
+        for k in keys:
+            nid = g._node_index.pop(k, None)
+            if nid is not None:
+                g._file_index.get(nid.file_path, set()).discard(k)
+                g._repo_index.get(nid.repo, set()).discard(k)
+                g._type_index.get(nid.node_type, set()).discard(k)
+        g._graph.remove_nodes_from(keys)  # in-memory only — drops incident edges from the cache
+        for fp in rels:
+            if fp in g._file_index and not g._file_index[fp]:
+                g._file_index.pop(fp, None)
+        return len(keys)
+
+    async def _refresh_metrics_from_sqlite(self) -> None:
+        """After a scoped+evicted index the in-memory counters are partial — pull the authoritative
+        node/edge totals from SQLite (the canonical store holds the full graph)."""
+        prov = self._persistence_provider()
+        if prov is None or not hasattr(prov, "count_nodes_edges"):
+            return
+        try:
+            n, e = await prov.count_nodes_edges()
+            self._graph._metrics["total_nodes"] = n
+            self._graph._metrics["total_edges"] = e
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Oracle.scoper] sqlite metric refresh failed (non-fatal): %s", exc)
+
     async def _index_repository(self, repo_name: str, repo_path: Path) -> None:
-        """Index all Python files in a repository."""
+        """Index all Python files in a repository.
+
+        Adaptive Local Subtree Scoper: when ``JARVIS_ORACLE_ADAPTIVE_SCOPER_ENABLED`` is on, the
+        repo's files are partitioned into decoupled package subtrees (Phase 1) and indexed
+        sequentially; between subtrees, if host RAM is pressured, the engine structurally checkpoints
+        SQLite, evicts the just-committed subtree from the in-memory DiGraph, and forces a GC before
+        the next partition (Phase 2). The full graph still lands in SQLite (byte-identical), so a
+        constrained host BUILDS the whole brain without ever holding it all resident. Scoper off →
+        a single partition = the pre-scoper path, byte-identical."""
         logger.info(f"Indexing repository: {repo_name} at {repo_path}")
 
-        # Find all Python files
         python_files = await self._find_python_files(repo_path)
         total_files = len(python_files)
         logger.info(f"Found {total_files} Python files in {repo_name}")
+
+        partitions = self._partition_subtrees(python_files, repo_path)
+        self._scoper_partitions = len(partitions)
+        from backend.core.ouroboros import oracle_persistence as _op_part
+        _sqlite_on_part = _op_part.sqlite_persistence_enabled()
+        if len(partitions) > 1:
+            logger.info(
+                "[Oracle.scoper] %s: %d files → %d package subtrees (RAM-bounded sequential build)",
+                repo_name, total_files, len(partitions),
+            )
+        gate = self._memory_gate() if _oracle_scoper_enabled() else None
+
+        for pidx, part in enumerate(partitions):
+            label = f"{pidx + 1}/{len(partitions)}" if len(partitions) > 1 else ""
+            suspended = await self._run_index_batches(part, repo_name, repo_path, label)
+            if suspended:
+                break
+            # Phase 2 — between-subtree RAM reclaim (only when partitioned + pressured + durable).
+            if len(partitions) > 1 and gate is not None and _sqlite_on_part and pidx < len(partitions) - 1:
+                try:
+                    from backend.core.ouroboros.governance.memory_pressure_gate import PressureLevel
+                    lvl = gate.pressure()
+                except Exception:  # noqa: BLE001
+                    lvl = None
+                if lvl in (PressureLevel.HIGH, PressureLevel.CRITICAL):
+                    prov = self._persistence_provider()
+                    if prov is not None and hasattr(prov, "checkpoint_wal"):
+                        try:
+                            await prov.checkpoint_wal()   # fold WAL → partition is durable, bound -wal
+                        except Exception:  # noqa: BLE001
+                            pass
+                    evicted = self._evict_partition(part, repo_path, repo_name)
+                    import gc
+                    gc.collect()
+                    self._scoper_evictions += 1
+                    logger.info(
+                        "[Oracle.scoper] subtree %s done — RAM %s → checkpoint + evicted %d nodes + GC",
+                        label, lvl.value, evicted,
+                    )
+
+        self._graph._metrics["files_indexed"] = total_files
+        if _sqlite_on_part and self._scoper_evictions > 0:
+            await self._refresh_metrics_from_sqlite()
+
+    async def _run_index_batches(
+        self, python_files: "List[Path]", repo_name: str, repo_path: Path, partition_label: str = "",
+    ) -> bool:
+        """Inner adaptive batch loop over ONE partition's files. Returns True if the build was
+        SUSPENDED (shutdown or CRITICAL-persist memory) so the caller stops; False if it completed.
+
+        This is the pre-scoper ``_index_repository`` body verbatim (AIMD throttle + Memory Armor +
+        incremental SQLite checkpoint), parameterized by ``python_files`` so the outer scoper can
+        drive it subtree-by-subtree."""
+        total_files = len(python_files)
+        if total_files == 0:
+            return False
+        _plabel = f" [subtree {partition_label}]" if partition_label else ""
 
         # Process files in parallel batches.  Per-batch progress logging
         # so operators have visibility into long-running indexing — the
@@ -2625,10 +2845,10 @@ class TheOracle:
             # (the bt-2026-06-16 "Shutting down The Oracle..." wedge).
             if self._shutting_down:
                 logger.info(
-                    "[Oracle] index of %s cancelled — shutdown requested "
-                    "(%d/%d files submitted)", repo_name, i, total_files,
+                    "[Oracle] index of %s%s cancelled — shutdown requested "
+                    "(%d/%d files submitted)", repo_name, _plabel, i, total_files,
                 )
-                break
+                return True
             # Park at 0% CPU here if a Claude SDK stream is in flight —
             # deterministic containment, not best-effort sleep(0).
             if _await_quiescence is not None:
@@ -2646,11 +2866,11 @@ class TheOracle:
                     self._mem_armor_suspended = True
                     logger.warning(
                         "[Oracle.index] CRITICAL memory pressure persisted after GC yields — "
-                        "SUSPENDING %s index at %d/%d files. Partial graph is durable (every "
+                        "SUSPENDING %s%s index at %d/%d files. Partial graph is durable (every "
                         "SQLite commit is a checkpoint); it resumes next boot via the file_hashes "
-                        "skip.", repo_name, i, total_files,
+                        "skip.", repo_name, _plabel, i, total_files,
                     )
-                    break
+                    return True
                 if _throttle is not None and _MEM_LAG_MULT.get(_mem_lvl, 0.0) > 0.0:
                     self._mem_armor_contractions += 1
                     _throttle.update(_MEM_LAG_MULT[_mem_lvl] * _throttle.lag_threshold_ms)
@@ -2689,9 +2909,9 @@ class TheOracle:
                 pct = 100.0 * files_done / max(total_files, 1)
                 _bp_note = f" batch={effective}" if _throttle is not None else ""
                 logger.info(
-                    "[Oracle.index] %s: %d/%d files (%.1f%%) "
+                    "[Oracle.index] %s%s: %d/%d files (%.1f%%) "
                     "rate=%.0f files/s elapsed=%.1fs%s",
-                    repo_name, files_done, total_files, pct,
+                    repo_name, _plabel, files_done, total_files, pct,
                     rate, _now - _t_batch_start, _bp_note,
                 )
                 _last_progress_log = _now
@@ -2709,7 +2929,7 @@ class TheOracle:
                 if _backoff > 0.0:
                     await asyncio.sleep(_backoff)
 
-        self._graph._metrics["files_indexed"] = total_files
+        return False  # partition completed (not suspended)
 
     async def _find_python_files(self, root: Path) -> List[Path]:
         """Find all Python files in a directory, excluding patterns."""
