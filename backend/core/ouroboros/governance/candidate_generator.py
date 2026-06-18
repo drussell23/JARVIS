@@ -4947,6 +4947,19 @@ class CandidateGenerator:
             return result
         except (Exception, asyncio.CancelledError) as exc:
             mode = FailbackStateMachine.classify_exception(exc)
+            # Phase 3.1 observability: surface local-tier degradations (memory /
+            # latency) distinctly in operator logs. Pure telemetry — the FSM
+            # transition above is authoritative; this never changes control flow.
+            try:
+                _lv = classify_local_failure(exc)
+                if _lv.degrade:
+                    logger.info(
+                        "[LocalTier] degrade class=%s -> %s (cascading upstream)",
+                        getattr(exc, "failure_class", "unknown"),
+                        _lv.target_state,
+                    )
+            except Exception:
+                pass
             logger.warning(
                 "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
                 "falling back",
