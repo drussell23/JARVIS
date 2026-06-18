@@ -679,6 +679,13 @@ class RepairEngine:
         # after the cap (the gate is friction, not an absolute wall). Rides the
         # overall max_iterations budget too (each reject consumes one iteration).
         structural_reject_streak = 0
+        # L2 completion — Phase 2/3 state. progress_tracker drives granular-progress +
+        # velocity; escalation_count bounds the stochastic strategy-escalation budget;
+        # pending_escalation carries the active paradigm switch into the next GENERATE.
+        from backend.core.ouroboros.governance.repair_progress import RepairProgressTracker
+        progress_tracker = RepairProgressTracker()
+        escalation_count = 0
+        pending_escalation: Any = None
         t_start = time.monotonic()
         records: list = []
         model_id: str = getattr(ctx.generation, "model_id", "")
@@ -820,15 +827,32 @@ class RepairEngine:
             _has_real_diff = "@@" in diff and ("+" in diff or "-" in diff)
             _has_full_content = bool(full_content)
 
+            # L2 completion (Phase 1) — topologically-ordered multi-file coordinated repair.
+            # Extract + dependency-order the candidate's files (None when off / single-file).
+            # The throwaway sandbox is the atomic transaction boundary: any apply/test failure
+            # discards the whole batch, so cross-file mutations are all-or-nothing.
+            _multi_files = await self._resolve_multifile_batch(current_candidate)
+            _is_multi = _multi_files is not None and len(_multi_files) > 1
+
             if _has_real_diff:
                 if _count_diff_lines(diff) > budget.max_diff_lines:
                     return _stopped("diff_expansion_rejected")
                 if _count_diff_files(diff) > budget.max_files_changed:
                     return _stopped("diff_files_rejected")
+            elif _is_multi:
+                if len(_multi_files) > budget.max_files_changed:
+                    return _stopped("diff_files_rejected")
             elif not _has_full_content:
                 return _stopped("candidate_unusable:no_diff_or_full_content")
 
-            file_path = current_candidate.get("file_path", "")
+            # Primary file = first in dependency order (used for the structural gate, cone,
+            # RepairContext echo, and as a test target). For multi-file, full_content is the
+            # primary's content so the single-file gate/cone path still has a coherent source.
+            if _is_multi:
+                file_path = _multi_files[0][0]
+                full_content = _multi_files[0][1]
+            else:
+                file_path = current_candidate.get("file_path", "")
 
             # ----------------------------------------------------------------
             # Slice 3 — PRE-FLIGHT STRUCTURAL VALIDATION GATE (the enforce).
@@ -917,11 +941,14 @@ class RepairEngine:
                     try:
                         if _has_real_diff:
                             await sb.apply_patch(diff, file_path)
+                        elif _is_multi:
+                            # Phase 1 — apply every file in dependency order as one batch.
+                            # The sandbox is the atomic boundary: if any apply raises, the
+                            # whole sandbox is discarded (all-or-nothing transaction).
+                            for _mf_path, _mf_content in _multi_files:
+                                await sb.apply_full_content(_mf_content, _mf_path)
                         else:
                             # full_content path: write the candidate verbatim.
-                            # NOTE: L2 is single-file; ``files: [...]`` multi-
-                            # file candidates are not yet handled inside the
-                            # sandbox apply path.
                             await sb.apply_full_content(full_content, file_path)
                     except RuntimeError as apply_exc:
                         # Apply failure — the diff is malformed, doesn't match
@@ -959,7 +986,14 @@ class RepairEngine:
                     if _patch_failed:
                         svr = None
                     else:
-                        test_targets: Tuple[str, ...] = (file_path,) if file_path else ()
+                        # Multi-file: scope tests to ALL changed files so the batch is
+                        # validated coherently; single-file keeps the original scoping.
+                        if _is_multi:
+                            test_targets: Tuple[str, ...] = tuple(
+                                p for p, _ in _multi_files
+                            )
+                        else:
+                            test_targets = (file_path,) if file_path else ()
                         svr = await sb.run_tests(
                             test_targets, budget.per_iteration_test_timeout_s
                         )
@@ -1067,13 +1101,9 @@ class RepairEngine:
             patch_sig = _patch_sig(diff if _has_real_diff else full_content)
 
             # ----------------------------------------------------------------
-            # EVALUATE PROGRESS
+            # EVALUATE PROGRESS (Phase 3 — granular v1.1 when enabled)
             # ----------------------------------------------------------------
-            # Two of three progress conditions from the design doc are checked:
-            #   1. Fewer failing tests than previous iteration.
-            #   2. Failure severity improved (syntax/env → test).
-            # Condition 3 (sig-hash set narrowing + diff_lines decrease) is
-            # deferred to v1.1 per the implementation plan.
+            # Base conditions (always): fewer failing tests, or severity improved.
             current_failing_count = len(classification.failing_test_ids)
             is_progress = (
                 prev_failing_count is None
@@ -1084,26 +1114,72 @@ class RepairEngine:
                     and prev_failure_class in ("syntax", "env")
                 )
             )
+            from backend.core.ouroboros.governance.repair_progress import (
+                progress_v11_enabled, diverge_escape_enabled, next_escalation,
+            )
+            # Phase 3 — record telemetry; a strictly-narrowing failing-signature SET
+            # counts as progress even at constant count (condition 3), and a non-positive
+            # Operational Velocity Score under persistent errors throttles the graph cache
+            # before a token/memory blow-up. Gated + fail-soft.
+            _diff_lines_now = (
+                _count_diff_lines(diff) if _has_real_diff
+                else len(full_content.splitlines())
+            )
+            progress_tracker.record(
+                fail_sig=fail_sig, patch_sig=patch_sig,
+                failing_sigs=frozenset(classification.failing_test_ids or ()),
+                diff_lines=_diff_lines_now,
+            )
+            if progress_v11_enabled():
+                if progress_tracker.sig_set_narrowed():
+                    is_progress = True
+                if progress_tracker.should_throttle_memory():
+                    _logger.info(
+                        "\U0001f4c9 [L2 Repair] velocity=%.3f (thrashing) → throttling graph cache",
+                        progress_tracker.velocity_score(),
+                    )
+                    self._throttle_graph_cache()
             prev_failing_count = current_failing_count
             prev_failure_class = fail_class
 
             # ----------------------------------------------------------------
-            # OSCILLATION check
+            # DIVERGENCE → stochastic strategy escalation (Phase 2) or terminal stop
             # ----------------------------------------------------------------
+            # The two flat early-stops (oscillation = identical fail+patch pair;
+            # no-progress streak = identical failure over sequential iters) are local
+            # minima. When escape is enabled and the escalation budget remains, instead
+            # of stopping we MUTATE the strategy: switch the generation paradigm
+            # (localized patch → full-method/module rewrite) and widen the cone — then
+            # let the loop regenerate. Budget-bounded so termination is guaranteed.
             pair = (fail_sig, patch_sig)
+            _diverged_reason: Optional[str] = None
             if pair in seen_pairs:
-                return _stopped("oscillation_detected")
+                _diverged_reason = "oscillation_detected"
             seen_pairs.add(pair)
-
-            # ----------------------------------------------------------------
-            # NO-PROGRESS streak
-            # ----------------------------------------------------------------
             if is_progress:
                 no_progress_streak = 0
             else:
                 no_progress_streak += 1
                 if no_progress_streak >= budget.no_progress_streak_kill:
-                    return _stopped("no_progress_streak")
+                    _diverged_reason = _diverged_reason or "no_progress_streak"
+
+            pending_escalation = None
+            if _diverged_reason is not None:
+                _esc = (
+                    next_escalation(escalation_count + 1)
+                    if diverge_escape_enabled() else None
+                )
+                if _esc is None:
+                    # Escape disabled or budget exhausted → terminal stop (legacy behavior).
+                    return _stopped(_diverged_reason)
+                escalation_count += 1
+                pending_escalation = _esc
+                no_progress_streak = 0  # changed strategy — give the new paradigm room
+                _logger.info(
+                    "\U0001f300 [L2 Repair] DIVERGED (%s) → escalation L%d "
+                    "(paradigm switch + cone depth +%d)",
+                    _diverged_reason, _esc.level, _esc.cone_depth_bump,
+                )
 
             # ----------------------------------------------------------------
             # PER-CLASS retry cap
@@ -1119,8 +1195,14 @@ class RepairEngine:
             # Repair Context Bridge (Slice 2): graph-derived dependency-cone steer
             # for the NEXT iteration's GENERATE. Gated + fail-soft → None when off,
             # leaving the repair prompt byte-identical to pre-bridge behavior.
+            # Phase 2: on divergence, widen the cone lookahead so the escalated
+            # paradigm gets additional architectural telemetry.
+            _cone_depth_override = (
+                pending_escalation.cone_depth_bump if pending_escalation else 0
+            )
             _dependency_cone = await self._build_dependency_cone(
                 ctx, file_path, classification.failing_test_ids,
+                cone_depth_override=_cone_depth_override,
             )
             repair_context = RepairContext(
                 iteration=iteration,
@@ -1132,6 +1214,9 @@ class RepairEngine:
                 current_candidate_content=sandbox_content,
                 current_candidate_file_path=file_path,
                 dependency_cone=_dependency_cone,
+                escalation_directive=(
+                    pending_escalation.paradigm if pending_escalation else None
+                ),
             )
 
             outcome = "progress" if is_progress else "no_progress"
@@ -1168,10 +1253,11 @@ class RepairEngine:
         failing_tests: Tuple[str, ...],
         *,
         force: bool = False,
+        depth_override: int = 0,
     ) -> Any:
         """Build the dependency-cone OBJECT (shared by Slice 2 render + Slice 3 gate). ``force``
         bypasses the steer-flag self-gate so the structural gate gets a cone under its own flag.
-        Fail-soft → ``None``."""
+        ``depth_override`` widens the lookahead (L2 divergence escalation). Fail-soft → ``None``."""
         try:
             bridge = self._ensure_context_bridge()
             evidence_json = getattr(ctx, "intake_evidence_json", "") or ""
@@ -1180,6 +1266,7 @@ class RepairEngine:
                 target_file=file_path,
                 failing_tests=tuple(failing_tests or ()),
                 force=force,
+                depth_override=depth_override,
             )
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] cone object unavailable (non-fatal): %s", exc)
@@ -1190,13 +1277,16 @@ class RepairEngine:
         ctx: Any,
         file_path: str,
         failing_tests: Tuple[str, ...],
+        cone_depth_override: int = 0,
     ) -> Optional[str]:
         """Repair Context Bridge (Slice 2) — build + render the graph dependency-cone clause.
 
         Gated by ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (the bridge self-gates → ``None`` when off).
         Fail-soft: any error → ``None``, leaving the repair prompt byte-identical to pre-bridge."""
         try:
-            cone = await self._build_cone_object(ctx, file_path, failing_tests)
+            cone = await self._build_cone_object(
+                ctx, file_path, failing_tests, depth_override=cone_depth_override,
+            )
             if cone is None:
                 return None
             clause = self._ensure_context_bridge().render_clause(cone)
@@ -1204,6 +1294,62 @@ class RepairEngine:
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
             return None
+
+    async def _resolve_multifile_batch(self, candidate: Any) -> Optional[list]:
+        """L2 completion (Phase 1) — extract + topologically order a candidate's files.
+
+        Returns a dependency-ordered ``[(file_path, full_content), ...]`` when
+        ``JARVIS_L2_MULTIFILE_ENABLED`` is on AND the candidate carries >1 usable file; otherwise
+        ``None`` (L2 stays single-file, byte-identical). Topo order uses the Oracle graph so a file
+        others depend on is applied first. Fail-soft: any error → ``None``."""
+        try:
+            from backend.core.ouroboros.governance.repair_multifile import (
+                l2_multifile_enabled, extract_candidate_files, topo_sort_files,
+            )
+            if not l2_multifile_enabled():
+                return None
+            files = extract_candidate_files(candidate)
+            if len(files) <= 1:
+                return None
+
+            # depends_on(a, b): does file a import/call file b? (via the Oracle graph, read-only)
+            graph = None
+            try:
+                from backend.core.ouroboros.oracle import get_oracle
+                graph = getattr(get_oracle(), "_graph", None)
+            except Exception:  # noqa: BLE001
+                graph = None
+
+            def _depends_on(a_path: str, b_path: str) -> bool:
+                if graph is None:
+                    return False
+                try:
+                    for n in (graph.find_nodes_in_file(a_path) or []):
+                        for dep in (graph.get_dependencies(n) or []):
+                            # NodeID str is "repo:file:name" → file segment.
+                            parts = str(dep).split(":")
+                            if len(parts) >= 3 and parts[1] == b_path:
+                                return True
+                except Exception:  # noqa: BLE001
+                    return False
+                return False
+
+            return topo_sort_files(files, _depends_on)
+        except Exception as exc:  # noqa: BLE001 — multi-file is additive; never break L2
+            _logger.debug("[L2 Repair] multi-file resolve failed (non-fatal): %s", exc)
+            return None
+
+    def _throttle_graph_cache(self) -> None:
+        """L2 completion (Phase 3) — contract the Oracle's adaptive node cache when the repair loop
+        is thrashing (negative velocity under persistent errors), to head off a token/memory blow-up
+        before it happens. Fail-soft + best-effort."""
+        try:
+            from backend.core.ouroboros.oracle import get_oracle
+            backend = getattr(getattr(get_oracle(), "_graph", None), "_backend", None)
+            if backend is not None and hasattr(backend, "apply_pressure"):
+                backend.apply_pressure("high")
+        except Exception as exc:  # noqa: BLE001 — advisory throttle; never break L2
+            _logger.debug("[L2 Repair] graph cache throttle unavailable (non-fatal): %s", exc)
 
     async def _structural_validate(
         self,

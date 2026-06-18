@@ -1816,3 +1816,7 @@ class RepairContext:
     current_candidate_content: str
     current_candidate_file_path: str
     dependency_cone: Optional[str] = None
+    # L2 completion (Phase 2): stochastic strategy-escalation directive injected when the repair loop
+    # diverges (local minimum). Switches the generation paradigm (localized patch → full-method /
+    # module-level rewrite). ``None`` outside a divergence → prompt byte-identical.
+    escalation_directive: Optional[str] = None
