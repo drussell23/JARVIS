@@ -1,6 +1,7 @@
 # tests/governance/test_local_inference_director.py
 from __future__ import annotations
 import importlib
+import pytest
 
 MOD = "backend.core.ouroboros.governance.local_inference_director"
 
@@ -70,3 +71,64 @@ def test_profiler_three_sigma_terminal_lag():
     assert p.is_terminal_lag(elapsed_ms=1100.0) is False
     assert p.is_terminal_lag(elapsed_ms=50_000.0) is True
     assert p.is_terminal_lag(elapsed_ms=cfg.timeout_ceiling_ms + 1) is True
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+        self.status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self):
+        return self._p
+
+
+class _FakeSession:
+    def __init__(self, payload):
+        self._p = payload
+        self.closed = False
+        self.posts = []
+
+    def post(self, url, **kw):
+        self.posts.append((url, kw))
+        return _FakeResp(self._p)
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_client_generate_posts_to_openai_compat_with_keep_alive():
+    from backend.core.ouroboros.governance.local_inference_director import LocalPrimeClient, LocalConfig
+    payload = {"choices": [{"message": {"content": "patched code"}}],
+               "usage": {"completion_tokens": 12}}
+    fake = _FakeSession(payload)
+    cfg = LocalConfig.from_env()
+    client = LocalPrimeClient(cfg, session=fake)
+    out = await client.complete(system="<sys/>", user="<task/>", prompt_tokens=100)
+    assert out.text == "patched code"
+    url, kw = fake.posts[-1]
+    assert url.endswith("/v1/chat/completions")
+    assert kw["json"]["keep_alive"] == cfg.keep_alive_seconds
+    assert kw["json"]["model"] == cfg.model_name
+
+
+@pytest.mark.asyncio
+async def test_client_close_releases_session():
+    from backend.core.ouroboros.governance.local_inference_director import LocalPrimeClient, LocalConfig
+    fake = _FakeSession({"choices": [{"message": {"content": "x"}}]})
+    client = LocalPrimeClient(LocalConfig.from_env(), session=fake)
+    await client.aclose()
+    assert fake.closed is True
+
+
+def test_structured_prompt_uses_bounded_tags():
+    from backend.core.ouroboros.governance.local_inference_director import render_structured_prompt
+    s = render_structured_prompt(task="fix bug", constraints=["no new deps"], files={"a.py": "x=1"})
+    assert "<task>" in s and "</task>" in s
+    assert "<constraints>" in s and "<files>" in s

@@ -10,9 +10,10 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque
+from typing import Deque, Dict, List, Optional
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -128,3 +129,75 @@ class LatencyProfiler:
         # sample distribution still produces a meaningful 3-sigma band.
         sd_eff = max(sd, m * 0.1)
         return elapsed_ms > (m + 3.0 * sd_eff)
+
+
+def render_structured_prompt(*, task: str, constraints: List[str], files: Dict[str, str]) -> str:
+    """Structured-prompt discipline for the local 3B: rigid bounded tags, no loose NL."""
+    parts = ["<task>", task, "</task>", "<constraints>"]
+    parts += [f"- {c}" for c in constraints]
+    parts += ["</constraints>", "<files>"]
+    for path, body in files.items():
+        parts += [f'<file path="{path}">', body, "</file>"]
+    parts += ["</files>", "<output_format>full_content</output_format>"]
+    return "\n".join(parts)
+
+
+@dataclass
+class LocalCompletion:
+    text: str
+    output_tokens: int
+    ttft_ms: float
+    total_ms: float
+
+
+class LocalPrimeClient:
+    """aiohttp connection-pooled client -> Ollama OpenAI-compat endpoint.
+
+    A persistent session (lazily built, or injected for tests) with a bounded
+    TCPConnector + keep-alive eliminates per-call socket setup across L2 passes.
+    """
+
+    def __init__(self, cfg: LocalConfig, session: Optional[object] = None) -> None:
+        self._cfg = cfg
+        self._session = session
+        self.profiler = LatencyProfiler(cfg)
+
+    async def _ensure_session(self) -> object:
+        if self._session is None:
+            import aiohttp  # local import keeps module import cheap when OFF
+            conn = aiohttp.TCPConnector(
+                limit=self._cfg.pool_limit,
+                limit_per_host=self._cfg.pool_limit,
+                keepalive_timeout=max(30, self._cfg.keep_alive_seconds),
+            )
+            self._session = aiohttp.ClientSession(
+                connector=conn, headers={"Connection": "keep-alive"},
+            )
+        return self._session
+
+    async def complete(self, *, system: str, user: str, prompt_tokens: int) -> LocalCompletion:
+        sess = await self._ensure_session()
+        url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
+        body = {
+            "model": self._cfg.model_name,
+            "keep_alive": self._cfg.keep_alive_seconds,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        t0 = time.monotonic()
+        async with sess.post(url, json=body) as resp:
+            data = await resp.json()
+        total_ms = (time.monotonic() - t0) * 1000.0
+        text = data["choices"][0]["message"]["content"]
+        out_toks = int(data.get("usage", {}).get("completion_tokens", 0)) or max(1, len(text) // 4)
+        ttft_ms = min(total_ms, 0.1 * total_ms)
+        self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
+        return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
+
+    async def aclose(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
