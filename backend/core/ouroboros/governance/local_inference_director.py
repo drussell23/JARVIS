@@ -162,7 +162,7 @@ class LocalPrimeClient:
         self._session = session
         self.profiler = LatencyProfiler(cfg)
 
-    async def _ensure_session(self) -> object:
+    async def _ensure_session(self) -> Any:
         if self._session is None:
             import aiohttp  # local import keeps module import cheap when OFF
             conn = aiohttp.TCPConnector(
