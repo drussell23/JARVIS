@@ -4338,6 +4338,21 @@ class GovernedLoopService:
             )
             self._exhaustion_watcher = _exhaustion_watcher
 
+            # Phase 3.3: give the CandidateGenerator the Oracle graph backend so the
+            # exhaustion interceptor can prune by topological centrality. None-safe:
+            # the pruner falls back to size-ordering when no backend is available.
+            # Oracle stores its SqliteLazyGraphBackend at self._oracle._backend.
+            try:
+                _gb = None
+                _oracle = getattr(self, "_oracle", None)
+                if _oracle is not None:
+                    _gb = (getattr(_oracle, "_backend", None)
+                           or getattr(_oracle, "graph_backend", None)
+                           or getattr(_oracle, "graph", None))
+                setattr(self._generator, "_graph_backend", _gb)
+            except Exception:
+                logger.debug("[GovernedLoop] graph backend wiring skipped", exc_info=True)
+
             # HIBERNATION_MODE step 6: construct a HibernationProber over the
             # real provider handles and attach it to the watcher so that
             # entering HIBERNATION automatically arms a wake loop. Sequencing:
