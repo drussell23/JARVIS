@@ -10552,6 +10552,20 @@ class GovernedOrchestrator:
             return ("fatal", ctx)
 
         if l2_result.terminal == "L2_CONVERGED" and l2_result.candidate is not None:
+            # Self-Correction & DPO Alignment Engine (Phase 1): emit the converged repair as a
+            # provider-labeled DPO trajectory (rejected=failing candidate, chosen=converged fix) to
+            # Reactor-Core for DW-stability training. Fire-and-forget, gated
+            # (JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED, default OFF), fail-soft — never affects APPLY.
+            try:
+                from backend.core.ouroboros.governance.repair_trajectory_emitter import (
+                    RepairTrajectoryEmitter, emitter_enabled, critic_learn_enabled,
+                )
+                if emitter_enabled() or critic_learn_enabled():
+                    # emit() routes: feed the local M1 online critic (learn) and/or stream to Reactor.
+                    RepairTrajectoryEmitter().emit(ctx, l2_result)
+            except Exception:  # noqa: BLE001 — emission must never break the pipeline
+                logger.debug("[Orchestrator] repair-trajectory emit skipped", exc_info=True)
+
             # Post-L2 canonical validation is architecturally broken for
             # Python candidates: test_runner.PythonAdapter.run hard-codes
             # sandbox_dir=None (see its docstring at run() line 228-237) so
