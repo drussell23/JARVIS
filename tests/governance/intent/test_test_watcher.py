@@ -173,3 +173,120 @@ class TestExtractsFilePathFromTestId:
             "tests/test_utils.py::TestClass::test_method"
         )
         assert result == "tests/test_utils.py"
+
+
+# ---------------------------------------------------------------------------
+# Repair Context Bridge (Slice 1) — traceback enrichment wiring
+# ---------------------------------------------------------------------------
+
+import textwrap as _textwrap  # noqa: E402
+
+_TB_OUTPUT = _textwrap.dedent("""\
+    =================================== FAILURES ===================================
+    _______________________________ test_parse ____________________________________
+    tests/test_core.py:12: in test_parse
+        assert parse("x") == 3
+    src/calc.py:42: in parse
+        raise ValueError("boom")
+    E   ValueError: boom
+    =========================== short test summary info ============================
+    FAILED tests/test_core.py::test_parse - ValueError: boom
+""")
+
+
+class _FakeResolver:
+    """GraphBackend-shaped fake: maps src/calc.py:42 -> a 'parse' node."""
+
+    def nodes_in_file(self, file_path):  # noqa: ANN001, ANN201
+        if file_path == "src/calc.py":
+            return ["src/calc.py::parse"]
+        return []
+
+    def get_node(self, key):  # noqa: ANN001, ANN201
+        if key == "src/calc.py::parse":
+            return {"node_id": {"line_number": 40}, "line_count": 10}
+        return None
+
+
+def _make_failure() -> TestFailure:
+    return TestFailure(
+        test_id="tests/test_core.py::test_parse",
+        file_path="tests/test_core.py",
+        error_text="ValueError: boom",
+    )
+
+
+class TestBridgeOffByteIdentical:
+    """With the bridge flag OFF, enrichment is a no-op and the signal evidence
+    is byte-identical to pre-bridge behavior (no traceback keys)."""
+
+    @pytest.mark.asyncio
+    async def test_off_leaves_evidence_unenriched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", raising=False)
+        watcher = TestWatcher(repo="jarvis", node_resolver=_FakeResolver())
+        f = _make_failure()
+        await watcher._enrich_failures([f], _TB_OUTPUT)
+        assert f.traceback_evidence is None  # untouched
+        # streak 2 → stable signal carries only the legacy evidence keys
+        watcher.process_failures([f])
+        signals = watcher.process_failures([_make_failure()])
+        ev = signals[0].evidence
+        assert set(ev) == {"signature", "test_id", "streak", "error_text"}
+
+
+class TestBridgeOnEnriches:
+    """With the bridge ON, the failure is enriched and the keys flow into the
+    emitted signal's evidence additively."""
+
+    @pytest.mark.asyncio
+    async def test_on_maps_traceback_to_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "true")
+        watcher = TestWatcher(repo="jarvis", node_resolver=_FakeResolver())
+        f = _make_failure()
+        await watcher._enrich_failures([f], _TB_OUTPUT)
+        assert f.traceback_evidence is not None
+        assert "src/calc.py::parse" in f.traceback_evidence["fault_node_keys"]
+
+    @pytest.mark.asyncio
+    async def test_enriched_keys_merge_into_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "true")
+        watcher = TestWatcher(repo="jarvis", node_resolver=_FakeResolver())
+        # streak 1 (not stable yet) — enrich the second-run failure
+        watcher.process_failures([_make_failure()])
+        f2 = _make_failure()
+        await watcher._enrich_failures([f2], _TB_OUTPUT)
+        signals = watcher.process_failures([f2])
+        assert len(signals) == 1
+        ev = signals[0].evidence
+        assert "fault_node_keys" in ev and "traceback_frames" in ev
+        assert ev["signature"] == "ValueError: boom:tests/test_core.py"  # legacy intact
+
+
+class TestBridgeFailSoft:
+    """Enrichment must never raise — a broken resolver degrades to None."""
+
+    @pytest.mark.asyncio
+    async def test_broken_resolver_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED", "true")
+
+        class _Boom:
+            def nodes_in_file(self, file_path):  # noqa: ANN001, ANN201
+                raise RuntimeError("backend down")
+
+            def get_node(self, key):  # noqa: ANN001, ANN201
+                raise RuntimeError("backend down")
+
+        watcher = TestWatcher(repo="jarvis", node_resolver=_Boom())
+        f = _make_failure()
+        await watcher._enrich_failures([f], _TB_OUTPUT)  # must not raise
+        # frames still parse + record (in_repo) even though node mapping failed
+        assert f.traceback_evidence is not None
+        assert f.traceback_evidence["fault_node_keys"] == []

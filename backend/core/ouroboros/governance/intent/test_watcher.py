@@ -27,8 +27,8 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .signals import IntentSignal
 
@@ -60,11 +60,18 @@ class TestFailure:
         The file portion of the test id, e.g. ``"tests/test_utils.py"``.
     error_text:
         The error summary text captured from the FAILED line.
+    traceback_evidence:
+        Repair Context Bridge (Slice 1) enrichment — additive evidence merged
+        into the emitted signal: ``{traceback_frames, fault_node_keys}`` mapping
+        the failing call stack to Oracle node keys. ``None`` until the bridge
+        enriches it (gated ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED``); ``None``
+        leaves the signal byte-identical to pre-bridge behavior.
     """
 
     test_id: str
     file_path: str
     error_text: str
+    traceback_evidence: Optional[Dict[str, Any]] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +107,15 @@ class TestWatcher:
         repo_path: Optional[str] = None,
         poll_interval_s: Optional[float] = None,
         pytest_timeout_s: float = 30.0,
+        node_resolver: Optional[Any] = None,
     ) -> None:
         self.repo = repo
         self.test_dir = os.environ.get("JARVIS_INTENT_TEST_DIR", test_dir)
         self.repo_path = repo_path or os.environ.get("JARVIS_REPO_PATH", ".")
+        # Repair Context Bridge (Slice 1): injectable Oracle line->node resolver.
+        # ``None`` → lazily resolved from the global Oracle backend at enrich time
+        # (fail-soft). Tests inject a fake. Only consulted when the bridge is on.
+        self._node_resolver = node_resolver
         self.poll_interval_s = (
             poll_interval_s
             if poll_interval_s is not None
@@ -242,6 +254,17 @@ class TestWatcher:
             # Stable = at least 2 consecutive failures
             if streak >= 2:
                 confidence = min(0.95, 0.7 + 0.1 * streak)
+                evidence: Dict[str, Any] = {
+                    "signature": f"{f.error_text}:{f.file_path}",
+                    "test_id": f.test_id,
+                    "streak": streak,
+                    "error_text": f.error_text,
+                }
+                # Repair Context Bridge (Slice 1): additive traceback enrichment.
+                # Only present when the bridge enriched this failure; merging
+                # ``None``/empty leaves the evidence byte-identical to before.
+                if f.traceback_evidence:
+                    evidence.update(f.traceback_evidence)
                 signal = IntentSignal(
                     source="intent:test_failure",
                     target_files=(f.file_path,),
@@ -250,12 +273,7 @@ class TestWatcher:
                         f"Stable test failure: {f.test_id} "
                         f"(streak={streak}): {f.error_text}"
                     ),
-                    evidence={
-                        "signature": f"{f.error_text}:{f.file_path}",
-                        "test_id": f.test_id,
-                        "streak": streak,
-                        "error_text": f.error_text,
-                    },
+                    evidence=evidence,
                     confidence=confidence,
                     stable=True,
                 )
@@ -284,6 +302,59 @@ class TestWatcher:
         return test_id.split("::")[0]
 
     # ------------------------------------------------------------------
+    # Repair Context Bridge (Slice 1) — deep semantic failure ingestion
+    # ------------------------------------------------------------------
+
+    def _get_node_resolver(self) -> Optional[Any]:
+        """Return the Oracle line->node resolver (``nodes_in_file`` + ``get_node``).
+
+        Uses the injected resolver if provided (tests); otherwise lazily reaches
+        the global Oracle's graph backend. Fail-soft: any error → ``None``, which
+        degrades enrichment to frame-only (no node mapping), never raising."""
+        if self._node_resolver is not None:
+            return self._node_resolver
+        try:
+            from backend.core.ouroboros.oracle import get_oracle
+
+            backend = getattr(get_oracle()._graph, "_backend", None)
+            if backend is not None and hasattr(backend, "nodes_in_file"):
+                self._node_resolver = backend
+                return backend
+        except Exception as exc:  # noqa: BLE001 — resolver is best-effort
+            logger.debug("[RepairBridge] node resolver unavailable: %s", exc)
+        return None
+
+    async def _enrich_failures(
+        self, failures: List[TestFailure], output: str
+    ) -> None:
+        """AST-map each failure's traceback to Oracle node keys (in place).
+
+        Gated by ``JARVIS_REPAIR_CONTEXT_BRIDGE_ENABLED`` (default OFF). The
+        parse + sqlite line->node mapping is offloaded to a worker thread
+        (``asyncio.to_thread``) so the sensor's primary poll loop never blocks on
+        graph I/O. Fail-soft: any error leaves ``traceback_evidence`` as ``None``
+        and the signal degrades to today's graph-blind behavior."""
+        try:
+            from .repair_traceback import bridge_enabled, build_traceback_map
+        except Exception:  # noqa: BLE001 — module import must never break the sensor
+            return
+        if not bridge_enabled() or not failures or not output:
+            return
+        resolver = self._get_node_resolver()
+        repo_roots = [str(self.repo_path)]
+
+        def _map_all() -> None:
+            for f in failures:
+                tb = build_traceback_map(output, f.test_id, repo_roots, resolver)
+                if tb.frames:
+                    f.traceback_evidence = tb.to_evidence()
+
+        try:
+            await asyncio.to_thread(_map_all)
+        except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
+            logger.debug("[RepairBridge] failure enrichment failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Poll loop
     # ------------------------------------------------------------------
 
@@ -302,6 +373,9 @@ class TestWatcher:
         if exit_code == -1:
             return []  # timeout -- skip cycle, preserve streaks
         failures = self.parse_pytest_output(output, exit_code)
+        # Repair Context Bridge (Slice 1): non-blocking AST traceback enrichment
+        # (gated, fail-soft) — populates f.traceback_evidence before signal build.
+        await self._enrich_failures(failures, output)
         return self.process_failures(failures)
 
     async def start(self) -> None:
