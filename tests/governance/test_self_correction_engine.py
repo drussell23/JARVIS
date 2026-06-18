@@ -148,3 +148,68 @@ class TestPreflightCritic:
         c = PreflightCritic(infer=_boom)
         v = await c.evaluate("x")
         assert v.failure_probability is None and v.short_circuit is False
+
+
+# --------------------------------------------------------------------------- M1-native online critic
+def _critic(tmp_path):
+    from backend.core.ouroboros.governance.preflight_critic import OnlineTopologicalCritic
+    return OnlineTopologicalCritic(path=str(tmp_path / "critic.npz"))
+
+
+class TestOnlineTopologicalCritic:
+    def test_featurize_produces_vector(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        from backend.core.ouroboros.governance.preflight_critic import featurize
+        v = featurize("def f(): return 1", file_path="m.py", graph=None)
+        assert v.shape[0] > 4  # code vector ⊕ 4 topology ⊕ bias
+
+    def test_cold_predict_is_none(self, tmp_path) -> None:
+        c = _critic(tmp_path)
+        assert c.predict_failure("def f(): pass") is None  # no learned signal
+
+    def test_online_learning_separates(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        c = _critic(tmp_path)
+        for i in range(120):
+            c.learn_pair(f"def b{i}(:\n SYNTAX_ERROR_TOKEN\n", f"def g{i}():\n return {i}\n",
+                         file_path="m.py", graph=None)
+        assert c.samples() == 240 and c.is_warm() is True
+        assert c.windowed_accuracy() >= 0.8
+        pf = c.predict_failure("def x(:\n SYNTAX_ERROR_TOKEN\n")
+        pp = c.predict_failure("def y():\n return 1\n")
+        assert pf is not None and pp is not None and pf > pp  # broken scored riskier than clean
+
+    def test_graduation_gate_requires_samples(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        monkeypatch.setenv("JARVIS_PREFLIGHT_CRITIC_GRAD_SAMPLES", "50")
+        monkeypatch.setenv("JARVIS_PREFLIGHT_CRITIC_GRAD_ACCURACY", "0.7")
+        c = _critic(tmp_path)
+        assert c.is_graduation_ready() is False  # cold
+        for i in range(40):
+            c.learn_pair(f"def b{i}(:\n ERR\n", f"def g{i}():\n return {i}\n")
+        assert c.is_graduation_ready() is True   # 80 samples ≥ 50, acc high
+
+    def test_persistence_round_trip(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        path = str(tmp_path / "p.npz")
+        from backend.core.ouroboros.governance.preflight_critic import OnlineTopologicalCritic
+        c1 = OnlineTopologicalCritic(path=path)
+        for i in range(20):
+            c1.learn_pair(f"def b{i}(:\n ERR\n", f"def g{i}():\n return {i}\n")
+        n = c1.samples()
+        c2 = OnlineTopologicalCritic(path=path)  # reload from disk
+        assert c2.samples() == n and c2.predict_failure("def z(): return 1") is not None
+
+    def test_topology_failsoft_no_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        from backend.core.ouroboros.governance.preflight_critic import _topology_features
+        feats = _topology_features("m.py", None)
+        assert feats.shape[0] == 4 and float(feats.sum()) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_async_learn_and_predict(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+        c = _critic(tmp_path)
+        for i in range(30):
+            await c.alearn_pair(f"def b{i}(:\n ERR\n", f"def g{i}():\n return {i}\n")
+        assert await c.apredict_failure("def y(): return 1") is not None

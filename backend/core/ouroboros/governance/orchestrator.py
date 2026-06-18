@@ -10558,9 +10558,10 @@ class GovernedOrchestrator:
             # (JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED, default OFF), fail-soft — never affects APPLY.
             try:
                 from backend.core.ouroboros.governance.repair_trajectory_emitter import (
-                    RepairTrajectoryEmitter, emitter_enabled,
+                    RepairTrajectoryEmitter, emitter_enabled, critic_learn_enabled,
                 )
-                if emitter_enabled():
+                if emitter_enabled() or critic_learn_enabled():
+                    # emit() routes: feed the local M1 online critic (learn) and/or stream to Reactor.
                     RepairTrajectoryEmitter().emit(ctx, l2_result)
             except Exception:  # noqa: BLE001 — emission must never break the pipeline
                 logger.debug("[Orchestrator] repair-trajectory emit skipped", exc_info=True)

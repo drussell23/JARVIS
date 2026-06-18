@@ -29,8 +29,17 @@ __all__ = ["RepairTrajectoryEmitter", "emitter_enabled", "build_dpo_trajectory"]
 
 def emitter_enabled() -> bool:
     """``JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED`` (default OFF) — opt-in; streams trajectory data to
-    Reactor-Core. OFF → no-op (the repair loop is byte-identical)."""
+    Reactor-Core. OFF → no remote stream (the repair loop is byte-identical)."""
     return os.environ.get("JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def critic_learn_enabled() -> bool:
+    """``JARVIS_PREFLIGHT_CRITIC_LEARN_ENABLED`` (default OFF) — feed converged trajectories to the
+    M1-native online critic so it ACCUMULATES on-device (decoupled from gating: learn first, then the
+    critic auto-graduates to gating once warm + accurate). Cheap + fail-soft."""
+    return os.environ.get("JARVIS_PREFLIGHT_CRITIC_LEARN_ENABLED", "false").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -161,28 +170,62 @@ class RepairTrajectoryEmitter:
                         pass
                     break
 
-    def emit(self, ctx: Any, result: Any) -> bool:
-        """Build + fire-and-forget the trajectory. Returns True if a task was scheduled (not that it
-        succeeded). Gated + fail-soft; safe to call from the repair loop's terminal path."""
-        if not emitter_enabled():
-            return False
+    def _learn_local(self, event: Dict[str, Any]) -> None:
+        """Feed the converged trajectory to the M1-native online critic (on-device, milliseconds).
+        Offloaded to a thread (Metal/CPU executor ring) so the control bus sees zero latency."""
         try:
-            event = build_dpo_trajectory(ctx, result)
-            if event is None:
-                return False
+            from backend.core.ouroboros.governance.preflight_critic import get_default_critic
+            critic = get_default_critic()
+            rejected = event.get("original_response", "") or ""
+            chosen = event.get("corrected_response", "") or ""
+            file_path = (event.get("metadata", {}) or {}).get("file_path", "") or ""
+            graph = None
+            try:
+                from backend.core.ouroboros.oracle import get_oracle
+                graph = getattr(get_oracle(), "_graph", None)
+            except Exception:  # noqa: BLE001
+                graph = None
             import asyncio
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = None
             if loop is not None:
-                task = loop.create_task(self._send(event))
-                # strong ref so the fire-and-forget task isn't GC'd mid-flight
-                _PENDING.add(task)
-                task.add_done_callback(_PENDING.discard)
+                t = loop.create_task(critic.alearn_pair(rejected, chosen, file_path, graph))
+                _PENDING.add(t); t.add_done_callback(_PENDING.discard)
             else:
-                asyncio.run(self._send(event))
-            return True
+                critic.learn_pair(rejected, chosen, file_path, graph)
+        except Exception as exc:  # noqa: BLE001 — learning is best-effort
+            logger.debug("[TrajectoryEmitter] local critic learn skipped: %s", exc)
+
+    def emit(self, ctx: Any, result: Any) -> bool:
+        """Build the trajectory once, then route it: (a) feed the local M1 online critic if learning is
+        on, (b) fire-and-forget stream to Reactor-Core if remote emit is on. Gated + fail-soft; safe
+        from the repair loop's terminal path. Returns True if either path ran."""
+        if not (emitter_enabled() or critic_learn_enabled()):
+            return False
+        try:
+            event = build_dpo_trajectory(ctx, result)
+            if event is None:
+                return False
+            did = False
+            if critic_learn_enabled():
+                self._learn_local(event)
+                did = True
+            if emitter_enabled():
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    task = loop.create_task(self._send(event))
+                    _PENDING.add(task)
+                    task.add_done_callback(_PENDING.discard)
+                else:
+                    asyncio.run(self._send(event))
+                did = True
+            return did
         except Exception as exc:  # noqa: BLE001 — emission must never break L2
             logger.debug("[TrajectoryEmitter] emit skipped (non-fatal): %s", exc)
             return False
