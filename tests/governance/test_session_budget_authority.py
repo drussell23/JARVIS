@@ -588,3 +588,69 @@ def test_dw_complete_sync_inherits_preflight_via_check_budget(tmp_path):
     assert session_calls == [], (
         "complete_sync must refuse via _check_budget BEFORE opening a session"
     )
+
+
+# ============================================================================
+# Sovereign Exec Engine (2026-06-19) — reservation TTL sweep (leak fix)
+# ============================================================================
+import time as _time
+from backend.core.ouroboros.governance import session_budget_authority as _sba
+from backend.core.ouroboros.governance.session_budget_authority import (
+    acquire_reservation,
+    get_reservations_snapshot,
+    sweep_stale_reservations,
+)
+
+
+def test_ttl_sweep_releases_stale_reservation(monkeypatch):
+    monkeypatch.setenv("JARVIS_SBA_RESERVATION_TTL_S", "600")
+    set_session_budget_provider(_FakeProvider(5.0))
+    assert acquire_reservation(op_id="op-a", signal_source="test_failure",
+                               estimated_total_usd=0.50) is True
+    assert len(get_reservations_snapshot()) == 1
+    # age the clock past the TTL -> swept
+    released = sweep_stale_reservations(now=_time.monotonic() + 700.0)
+    assert released == 1
+    assert get_reservations_snapshot() == ()
+
+
+def test_ttl_sweep_keeps_fresh_reservation(monkeypatch):
+    monkeypatch.setenv("JARVIS_SBA_RESERVATION_TTL_S", "600")
+    set_session_budget_provider(_FakeProvider(5.0))
+    acquire_reservation(op_id="op-b", signal_source="test_failure",
+                        estimated_total_usd=0.50)
+    released = sweep_stale_reservations(now=_time.monotonic() + 1.0)
+    assert released == 0
+    assert len(get_reservations_snapshot()) == 1
+
+
+def test_ttl_zero_disables_sweep(monkeypatch):
+    monkeypatch.setenv("JARVIS_SBA_RESERVATION_TTL_S", "0")
+    set_session_budget_provider(_FakeProvider(5.0))
+    acquire_reservation(op_id="op-c", signal_source="test_failure",
+                        estimated_total_usd=0.50)
+    assert sweep_stale_reservations(now=_time.monotonic() + 9999.0) == 0
+    assert len(get_reservations_snapshot()) == 1
+
+
+def test_lazy_sweep_in_acquire_reclaims_leaked_budget(monkeypatch):
+    """The bug: op-A reserves the whole cap, never releases (queued+drained);
+    op-B can never acquire. With the lazy TTL sweep, once A is stale, B's
+    acquire reclaims it and succeeds."""
+    monkeypatch.setenv("JARVIS_SBA_RESERVATION_TTL_S", "600")
+    set_session_budget_provider(_FakeProvider(0.50))   # tiny cap, like the soak
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(_sba.time, "monotonic", lambda: clock["t"])
+    # A reserves the ENTIRE $0.50 cap
+    assert acquire_reservation(op_id="op-A", signal_source="test_failure",
+                               estimated_total_usd=0.50) is True
+    # B cannot acquire — no liquidity (this is the live-soak lock)
+    assert acquire_reservation(op_id="op-B", signal_source="test_failure",
+                               estimated_total_usd=0.50) is False
+    # ...time passes; A is now a stale leak (queued+drained, never released)
+    clock["t"] = 1000.0 + 700.0
+    # B retries — the lazy sweep inside acquire reclaims A, so B succeeds
+    assert acquire_reservation(op_id="op-B", signal_source="test_failure",
+                               estimated_total_usd=0.50) is True
+    snap = {r.op_id for r in get_reservations_snapshot()}
+    assert snap == {"op-B"}      # A swept, B holds the reservation

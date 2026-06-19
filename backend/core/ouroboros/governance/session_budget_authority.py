@@ -227,6 +227,25 @@ def per_op_reservation_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _reservation_ttl_s() -> float:
+    """Max seconds a reservation may sit unspent before a lazy sweep
+    releases it (Sovereign Exec Engine, 2026-06-19). Default 600s.
+
+    Fixes the reservation LEAK: ops that are queued then drained at
+    background-pool shutdown (or otherwise never reach the orchestrator
+    terminal release hook) would otherwise hold their reservation
+    forever, permanently shrinking ``effective_remaining`` and starving
+    every subsequent preflight. The TTL is deliberately GENEROUS —
+    longer than any legitimate op wall-time (heavy tool-loops run
+    130s+) — so a live, still-generating op is never swept mid-flight
+    (which would let it spend past the cap). ``<=0`` disables the sweep.
+    NEVER raises."""
+    try:
+        return float(os.environ.get("JARVIS_SBA_RESERVATION_TTL_S", "600"))
+    except (TypeError, ValueError):
+        return 600.0
+
+
 @dataclass(frozen=True)
 class Reservation:
     """Slice 12AA per-op reservation entry. Immutable snapshot of
@@ -284,6 +303,10 @@ def acquire_reservation(
         return False
 
     with _reservations_lock:
+        # Lazy TTL sweep: reclaim leaked reservations before computing
+        # the contended pool, so a stalled/drained op can't permanently
+        # block a fresh acquire.
+        _sweep_stale_locked(time.monotonic(), _reservation_ttl_s())
         other_reserved = sum(
             r.reserved_usd
             for r in _reservations.values()
@@ -324,6 +347,48 @@ def get_reservations_snapshot() -> Tuple[Reservation, ...]:
             return tuple(_reservations.values())
     except Exception:  # noqa: BLE001
         return ()
+
+
+def _sweep_stale_locked(now: float, ttl_s: float) -> int:
+    """Release reservations older than ``ttl_s``. ASSUMES the caller
+    already holds ``_reservations_lock``. Returns count released.
+    NEVER raises. ``ttl_s <= 0`` is a no-op (sweep disabled)."""
+    if ttl_s <= 0.0:
+        return 0
+    stale = [
+        oid for oid, r in _reservations.items()
+        if (now - r.acquired_at_monotonic) > ttl_s
+    ]
+    for oid in stale:
+        r = _reservations.pop(oid, None)
+        if r is not None:
+            logger.info(
+                "[SBA] reservation TTL sweep: released op_id=%s "
+                "reserved=$%.4f age=%.1fs > ttl=%.1fs (leak reclaimed)",
+                oid, r.reserved_usd, now - r.acquired_at_monotonic, ttl_s,
+            )
+    return len(stale)
+
+
+def sweep_stale_reservations(now: Optional[float] = None) -> int:
+    """Public, lock-acquiring TTL sweep. Releases reservations whose
+    age exceeds ``JARVIS_SBA_RESERVATION_TTL_S``. Returns count
+    released. ``now`` is injectable for tests. NEVER raises.
+
+    Called lazily from :func:`acquire_reservation` and
+    :func:`check_preflight` so liquidity self-heals exactly when
+    budget is contended — no background task, so it adds ZERO
+    event-loop load (deliberate: a sweep coroutine would worsen the
+    on-loop starvation this engine exists to relieve)."""
+    try:
+        ttl = _reservation_ttl_s()
+        if ttl <= 0.0:
+            return 0
+        _now = float(now) if now is not None else time.monotonic()
+        with _reservations_lock:
+            return _sweep_stale_locked(_now, ttl)
+    except Exception:  # noqa: BLE001 — never break the budget path
+        return 0
 
 
 def _sum_other_reservations(op_id: Optional[str]) -> float:
@@ -567,6 +632,9 @@ def check_preflight(
     # owning op's OWN reservation is intentionally NOT subtracted
     # — the owning op spends FROM its reservation. When op_id is
     # None (legacy callers), other ops' reservations still apply.
+    # Sovereign Exec Engine — lazy TTL sweep first so leaked/stalled
+    # reservations don't perpetually refuse fresh preflights.
+    sweep_stale_reservations()
     other_reserved = _sum_other_reservations(op_id)
     effective_remaining = max(0.0, remaining - other_reserved)
 
@@ -646,6 +714,7 @@ __all__ = [
     "check_preflight",
     "get_background_spend_limit_pct",
     "get_reservations_snapshot",
+    "sweep_stale_reservations",
     "get_session_budget_provider",
     "get_session_remaining_usd",
     "get_session_total_cap_usd",

@@ -499,6 +499,22 @@ class BackgroundAgentPool:
                 op.completed_at = time.monotonic()
                 self._cancelled_count += 1
                 drained += 1
+                # Sovereign Exec Engine (2026-06-19) — release any budget
+                # reservation this queued op held. These ops never reach the
+                # orchestrator terminal release hook (they're cancelled here,
+                # not run()), so without this they LEAK their reservation and
+                # permanently shrink effective_remaining. The TTL sweep is the
+                # backstop; this is the precise, immediate release.
+                try:
+                    _ctx = getattr(op, "context", None)
+                    _oid = str(getattr(_ctx, "op_id", "") or "")
+                    if _oid:
+                        from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                            release_reservation as _sba_release,
+                        )
+                        _sba_release(_oid)
+                except Exception:  # noqa: BLE001 — release is best-effort
+                    pass
                 self._queue.task_done()
             except asyncio.QueueEmpty:
                 break
