@@ -110,6 +110,25 @@ def _default_model() -> str:
     return os.environ.get("DOUBLEWORD_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8")
 
 
+def _daily_usd_cap() -> float:
+    """Daily probe-spend ceiling; <=0 disables the cap."""
+    return _float_env("JARVIS_FLEET_DAILY_USD_CAP", 0.50)
+
+
+def _probe_usd_per_mtok() -> float:
+    """Estimated USD per 1M completion tokens for cost accounting (conservative
+    DW output-tier default). Used only for the daily-cap ledger, not billing."""
+    return _float_env("JARVIS_FLEET_PROBE_USD_PER_MTOK", 0.40)
+
+
+def _estimate_probe_usd(completion_tokens: int) -> float:
+    """Best-effort probe cost from completion tokens. Never raises."""
+    try:
+        return (max(0, int(completion_tokens)) / 1_000_000.0) * _probe_usd_per_mtok()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Default collaborators (all LATE-imported, fail-soft)
 # --------------------------------------------------------------------------- #
@@ -233,6 +252,13 @@ class FleetEvaluator:
                     now=self.clock(),
                 )
 
+                # Daily-cap ledger: record best-effort probe spend (both probes).
+                self.store.add_spend(
+                    _estimate_probe_usd(r.completion_tokens)
+                    + _estimate_probe_usd(c.completion_tokens),
+                    now=self.clock(),
+                )
+
                 sc = self.store.score(model_id)
                 if sc is not None:
                     logger.info(
@@ -243,6 +269,16 @@ class FleetEvaluator:
                         sc.label_adherence,
                         valid_tok_per_s(sc),
                         sc.sample_count,
+                    )
+                    self._emit(
+                        "fleet_calibrated",
+                        {
+                            "model_id": model_id,
+                            "ast_pass_rate": round(sc.ast_pass_rate, 4),
+                            "label_adherence": round(sc.label_adherence, 4),
+                            "valid_tok_per_s": round(valid_tok_per_s(sc), 2),
+                            "sample_count": sc.sample_count,
+                        },
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -263,6 +299,15 @@ class FleetEvaluator:
             if not fleet_evaluator_enabled():
                 return
             if not self.idle_check():
+                return
+            # Daily probe-spend ceiling — over cap → no-op this cycle.
+            cap = _daily_usd_cap()
+            if cap > 0.0 and self.store.spend_today(now) >= cap:
+                logger.info(
+                    "[FleetEvaluator] daily probe-spend cap reached "
+                    "($%.4f >= $%.2f) — skipping calibration cycle",
+                    self.store.spend_today(now), cap,
+                )
                 return
             models = list(self.snapshot_loader() or [])
             if not models:

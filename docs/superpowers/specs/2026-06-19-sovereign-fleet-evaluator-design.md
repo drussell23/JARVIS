@@ -265,7 +265,8 @@ green; the live calibration soak runs on a real host.
 | `JARVIS_FLEET_PROBE_MAX_TOKENS` | 512 | per-probe token cap |
 | `JARVIS_FLEET_PROBE_TIMEOUT_S` | 60 | per-probe HTTP timeout |
 | `JARVIS_FLEET_MAX_MODELS_PER_CYCLE` | 4 | models calibrated per idle cycle |
-| `JARVIS_FLEET_DAILY_USD_CAP` | 0.50 | daily probe spend ceiling |
+| `JARVIS_FLEET_DAILY_USD_CAP` | 0.50 | daily probe spend ceiling (UTC-day rolling; `<=0` disables); enforced in `maybe_calibrate` via the store spend-ledger |
+| `JARVIS_FLEET_PROBE_USD_PER_MTOK` | 0.40 | USD/1M completion tokens for the spend ledger (accounting, not billing) |
 | `JARVIS_FLEET_GRAD_MIN_SAMPLES` | 5 | min probes before a model can graduate |
 | `JARVIS_FLEET_GRAD_MIN_AST` | 0.8 | min code pass-rate to graduate |
 | `JARVIS_FLEET_GRAD_MARGIN` | 1.5 | × valid_tok_per_s the winner must beat the default |

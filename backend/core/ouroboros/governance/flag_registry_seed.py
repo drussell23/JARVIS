@@ -5056,12 +5056,25 @@ SEED_SPECS: list = [
         type=FlagType.FLOAT, default=0.50,
         description=(
             "Daily probe spend ceiling in USD. Once exceeded, the "
-            "evaluator pauses further probes until the rolling window "
-            "resets."
+            "evaluator pauses further probes until the rolling UTC-day "
+            "window resets. <=0 disables the cap."
         ),
         category=Category.CAPACITY,
         source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
         example="0.50",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_PROBE_USD_PER_MTOK",
+        type=FlagType.FLOAT, default=0.40,
+        description=(
+            "Estimated USD per 1M completion tokens used to account probe "
+            "cost against JARVIS_FLEET_DAILY_USD_CAP (conservative DW "
+            "output-tier default; for the spend ledger, not billing)."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="0.40",
         since="2026-06-19",
     ),
     FlagSpec(

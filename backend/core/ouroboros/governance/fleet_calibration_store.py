@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -194,6 +195,9 @@ class FleetCalibrationStore:
     def __init__(self, path: Optional[Path] = None) -> None:
         self._path = path  # resolved lazily so env can be patched
         self._scores: Dict[str, QualityScore] = {}
+        # Daily probe-spend ledger (UTC-day-bucketed). Auto-resets when the
+        # UTC date rolls over so the cap is a rolling daily ceiling.
+        self._spend: Dict[str, Any] = {"date": "", "usd": 0.0}
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -228,6 +232,15 @@ class FleetCalibrationStore:
             sc = QualityScore.from_json_dict(raw)
             if sc is not None:
                 self._scores[sc.model_id] = sc
+        spend_raw = payload.get("spend", {})
+        if isinstance(spend_raw, Mapping):
+            try:
+                self._spend = {
+                    "date": str(spend_raw.get("date", "")),
+                    "usd": float(spend_raw.get("usd", 0.0) or 0.0),
+                }
+            except (ValueError, TypeError):
+                self._spend = {"date": "", "usd": 0.0}
 
     def save(self) -> None:
         """Write current state to disk atomically. NEVER raises; logs."""
@@ -236,6 +249,7 @@ class FleetCalibrationStore:
                 mid: self._clamp_unseeded(sc).to_json_dict()
                 for mid, sc in self._scores.items()
             },
+            "spend": dict(self._spend),
         }
         try:
             _atomic_write(
@@ -327,6 +341,45 @@ class FleetCalibrationStore:
                 "[FleetCalibrationStore] record_probe failed for %s",
                 model_id, exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Daily probe-spend ledger (cost cap enforcement)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _utc_date(now: float) -> str:
+        """UTC calendar-day key (``YYYY-MM-DD``) for a unix timestamp."""
+        return datetime.fromtimestamp(float(now), tz=timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+
+    def spend_today(self, now: float) -> float:
+        """USD spent on probes in the current UTC day. NEVER raises.
+
+        Returns 0.0 when the stored ledger is from an earlier day (the cap
+        is a rolling daily ceiling — yesterday's spend does not count today).
+        """
+        try:
+            self._ensure_loaded()
+            if str(self._spend.get("date", "")) != self._utc_date(now):
+                return 0.0
+            return float(self._spend.get("usd", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def add_spend(self, usd: float, *, now: float) -> None:
+        """Add probe spend to today's ledger (resets on UTC date roll). NEVER raises."""
+        try:
+            self._ensure_loaded()
+            today = self._utc_date(now)
+            prior = (
+                float(self._spend.get("usd", 0.0) or 0.0)
+                if str(self._spend.get("date", "")) == today
+                else 0.0
+            )
+            self._spend = {"date": today, "usd": prior + max(0.0, float(usd))}
+        except Exception:  # noqa: BLE001
+            logger.debug("[FleetCalibrationStore] add_spend failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Queries (read-only)
