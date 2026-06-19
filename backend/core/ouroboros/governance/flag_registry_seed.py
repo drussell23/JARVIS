@@ -5017,7 +5017,7 @@ SEED_SPECS: list = [
     ),
     FlagSpec(
         name="JARVIS_FLEET_PROBE_MAX_TOKENS",
-        type=FlagType.INT, default=512,
+        type=FlagType.INT, default=2048,
         description=(
             "Per-probe generation token cap. Bounds the cost and latency "
             "of each calibration probe."

@@ -262,7 +262,7 @@ green; the live calibration soak runs on a real host.
 | `JARVIS_FLEET_EVALUATOR_ENABLED` | false | master: run calibration at all |
 | `JARVIS_FLEET_EVALUATOR_AUTHORITATIVE` | false | quality scores re-rank live routing (auto-flipped) |
 | `JARVIS_FLEET_EWMA_ALPHA` | 0.4 | EWMA smoothing factor |
-| `JARVIS_FLEET_PROBE_MAX_TOKENS` | 512 | per-probe token cap |
+| `JARVIS_FLEET_PROBE_MAX_TOKENS` | 2048 | per-probe token cap (codegen battery needs ~1400 to finish; 512 truncated valid coders to ast=0 on live soak) |
 | `JARVIS_FLEET_PROBE_TIMEOUT_S` | 60 | per-probe HTTP timeout |
 | `JARVIS_FLEET_MAX_MODELS_PER_CYCLE` | 4 | models calibrated per idle cycle |
 | `JARVIS_FLEET_DAILY_USD_CAP` | 0.50 | daily probe spend ceiling (UTC-day rolling; `<=0` disables); enforced in `maybe_calibrate` via the store spend-ledger |
