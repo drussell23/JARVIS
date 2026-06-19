@@ -219,7 +219,7 @@ class FleetCalibrationStore:
         scores_raw = payload.get("scores", {})
         if not isinstance(scores_raw, Mapping):
             return
-        for mid, raw in scores_raw.items():
+        for raw in scores_raw.values():
             if not isinstance(raw, Mapping):
                 continue
             sc = QualityScore.from_json_dict(raw)
@@ -338,13 +338,18 @@ class FleetCalibrationStore:
 
 
 def fleet_rerank(
-    route: str,
+    _route: str,
     ranked_models: Tuple[str, ...],
     scores: Mapping[str, QualityScore],
     *,
     route_kind: str,
 ) -> Tuple[str, ...]:
     """PURE quality-weighted re-rank. NEVER raises.
+
+    ``_route`` is accepted positionally for caller symmetry (the route
+    string callers already hold) but behavior is driven entirely by the
+    explicit keyword-only ``route_kind`` so the pure function stays
+    trivially testable; the raw route is intentionally unused here.
 
     Reorders ONLY the scored models among themselves (descending fitness,
     stable), keeping every UNSCORED model at its original index. Returns
