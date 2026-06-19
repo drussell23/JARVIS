@@ -96,8 +96,12 @@ from backend.core.ouroboros.governance.op_context import (
 )
 from backend.core.ouroboros.governance.stream_rupture import (
     StreamRuptureError,
+    lag_compensated_inter_chunk_timeout_s as _lag_compensated_inter_chunk_timeout_s,
     stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
     stream_rupture_timeout_s as _stream_rupture_timeout_s,
+)
+from backend.core.ouroboros.governance.control_plane_watchdog import (
+    recent_lag_ms as _recent_lag_ms,
 )
 
 try:
@@ -8055,7 +8059,13 @@ class ClaudeProvider:
             _rupture_ttft = _stream_rupture_timeout_s(
                 thinking_enabled=_thinking_active,
             )
-            _rupture_ic = _stream_inter_chunk_timeout_s()
+            # CD-1 — lag-aware inter-chunk timeout: credit back any
+            # accumulated event-loop lag so a starved loop cannot
+            # false-rupture a flowing Claude stream.
+            _rupture_ic = _lag_compensated_inter_chunk_timeout_s(
+                base_s=_stream_inter_chunk_timeout_s(),
+                lag_credit_s=_recent_lag_ms() / 1000.0,
+            )
             # Derive the truncated op_id for activity-pulse identity.
             _stream_op_id = str(
                 getattr(ctx.context, "op_id", "?")

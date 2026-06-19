@@ -23,6 +23,7 @@ provider imports permitted.
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +304,54 @@ class StreamBudgetTooShortError(RuntimeError):
             f"sem_wait={sem_wait_s:.1f}s:"
             f"route={route}"
         )
+
+
+# ---------------------------------------------------------------------------
+# CD-1 — Lag-aware inter-chunk timeout compensation
+# ---------------------------------------------------------------------------
+
+
+def stream_lag_compensation_enabled() -> bool:
+    """Master gate for CD-1 lag-credit compensation. Default OFF.
+
+    When OFF the ``lag_compensated_inter_chunk_timeout_s`` helper is
+    a transparent passthrough (returns ``base_s`` unchanged) so the
+    behaviour is byte-identical to the pre-CD-1 code path.
+    """
+    return os.environ.get(
+        "JARVIS_STREAM_LAG_COMPENSATION_ENABLED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _lag_credit_cap_s() -> float:
+    """Maximum seconds of lag that may be credited back (env-tunable).
+
+    Default 60s — chosen to be 2× the default inter-chunk timeout so
+    a single starved loop cycle never inflates the budget beyond 90s,
+    which remains well inside typical provider health thresholds.
+    """
+    return float(os.environ.get("JARVIS_STREAM_LAG_CREDIT_CAP_S", "60"))
+
+
+def lag_compensated_inter_chunk_timeout_s(
+    *,
+    base_s: float,
+    lag_credit_s: float,
+    max_credit_s: "Optional[float]" = None,
+) -> float:
+    """Inter-chunk timeout extended by credited loop-lag (capped).
+
+    When the event loop has been starved during the inter-chunk window
+    the delay is NOT real network silence — the provider was streaming
+    but the loop could not consume chunks in time. Crediting that lag
+    back widens the watchdog window by exactly the loop-busy time so
+    a flowing stream is never false-ruptured.
+
+    Returns ``base_s`` unchanged when lag-compensation is OFF or the
+    credit is zero/negative. Never raises.
+    """
+    if not stream_lag_compensation_enabled():
+        return float(base_s)
+    cap = max_credit_s if max_credit_s is not None else _lag_credit_cap_s()
+    credit = max(0.0, min(float(lag_credit_s), float(cap)))
+    return float(base_s) + credit

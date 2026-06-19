@@ -47,8 +47,12 @@ from backend.core.ouroboros.governance.stream_rupture import (
     CognitiveStallError,
     StreamRuptureError,
     cognitive_stall_timeout_s as _cognitive_stall_timeout_s,
+    lag_compensated_inter_chunk_timeout_s as _lag_compensated_inter_chunk_timeout_s,
     stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
     stream_rupture_timeout_s as _stream_rupture_timeout_s,
+)
+from backend.core.ouroboros.governance.control_plane_watchdog import (
+    recent_lag_ms as _recent_lag_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -3219,7 +3223,13 @@ class DoublewordProvider:
                     # Phase 1 (TTFT): generous timeout for first token.
                     # Phase 2 (Inter-Chunk): tight timeout once streaming.
                     _rupture_ttft = _stream_rupture_timeout_s()
-                    _rupture_ic = _stream_inter_chunk_timeout_s()
+                    # CD-1 — lag-aware inter-chunk timeout: credit back
+                    # any accumulated event-loop lag so a starved loop
+                    # cannot false-rupture a flowing network stream.
+                    _rupture_ic = _lag_compensated_inter_chunk_timeout_s(
+                        base_s=_stream_inter_chunk_timeout_s(),
+                        lag_credit_s=_recent_lag_ms() / 1000.0,
+                    )
                     _chunk_phase_timeout = _rupture_ttft  # Phase 1
                     _sse_has_tokens = False
                     # Phase-Aware Heartbeat — pulse the harness
