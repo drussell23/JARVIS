@@ -107,3 +107,35 @@ async def test_graduation_flips_after_stable_cycles(monkeypatch, tmp_path):
     assert flips == []
     ev._maybe_graduate(now=2.0)   # cycle 2 -> stable -> flip
     assert flips and flips[-1][0] == "JARVIS_FLEET_EVALUATOR_AUTHORITATIVE" and flips[-1][1] == "true"
+
+
+@pytest.mark.asyncio
+async def test_daily_cap_skips_calibration(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_FLEET_EVALUATOR_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FLEET_CALIBRATION_PATH", str(tmp_path / "c.json"))
+    monkeypatch.setenv("JARVIS_FLEET_DAILY_USD_CAP", "0.01")
+    store = s.FleetCalibrationStore()
+    store.add_spend(0.02, now=1.0)        # already over the $0.01 cap today
+    calls = []
+    async def spy(model_id, messages, *, max_tokens):
+        calls.append(model_id)
+        return fe.ProbeResult("", 0, 0, 0, False, "")
+    ev = fe.FleetEvaluator(model_caller=spy, store=store, idle_check=lambda: True,
+                           clock=lambda: 1.0, snapshot_loader=lambda: ["m"])
+    await ev.maybe_calibrate(now=1.0)
+    assert calls == []                    # over cap -> zero probes
+
+
+@pytest.mark.asyncio
+async def test_spend_accumulates_after_calibrate(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_FLEET_EVALUATOR_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FLEET_CALIBRATION_PATH", str(tmp_path / "c.json"))
+    monkeypatch.setenv("JARVIS_FLEET_PROBE_USD_PER_MTOK", "1.0")
+    store = s.FleetCalibrationStore()
+    ev = fe.FleetEvaluator(model_caller=_fake_caller("good"), store=store,
+                           idle_check=lambda: True, clock=lambda: 1.0)
+    await ev.calibrate_models(["deepseek"])
+    # 'good' caller returns 80 completion tokens per probe x 2 probes = 160 tok
+    # at $1.0/Mtok => 160/1e6 = 0.00016 USD
+    assert store.spend_today(1.0) > 0.0
+    assert abs(store.spend_today(1.0) - 160 / 1_000_000.0) < 1e-9

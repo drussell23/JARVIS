@@ -82,3 +82,22 @@ def test_apply_rerank_failsoft_returns_input_on_error(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_FLEET_CALIBRATION_PATH", str(tmp_path / "none.json"))
     # no store data -> input unchanged
     assert s.fleet_apply_rerank("standard", ("a", "b")) == ("a", "b")
+
+
+def test_spend_ledger_roundtrip_and_daily_reset(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_FLEET_CALIBRATION_PATH", str(tmp_path / "c.json"))
+    st = s.FleetCalibrationStore()
+    day1 = 1_700_000_000.0          # some fixed unix ts
+    day2 = day1 + 86_400.0          # +1 UTC day
+    assert st.spend_today(day1) == 0.0
+    st.add_spend(0.01, now=day1)
+    st.add_spend(0.02, now=day1)
+    assert abs(st.spend_today(day1) - 0.03) < 1e-9
+    st.save()
+    # reload persists the ledger
+    st2 = s.FleetCalibrationStore()
+    assert abs(st2.spend_today(day1) - 0.03) < 1e-9
+    # next UTC day -> rolling reset
+    assert st2.spend_today(day2) == 0.0
+    st2.add_spend(0.005, now=day2)
+    assert abs(st2.spend_today(day2) - 0.005) < 1e-9
