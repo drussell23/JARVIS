@@ -2395,6 +2395,15 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Advisor failed", exc_info=True)
 
+            # Quota Shield (Phases 1+2): proactively route trivial/localized ops
+            # to the zero-cost local tier (preserving DW quota), unless host memory
+            # is CRITICAL. Reuses the advisory just computed. Gated + fail-soft.
+            try:
+                from backend.core.ouroboros.governance.quota_shield import apply_quota_shield
+                ctx = await apply_quota_shield(ctx, advisory=_advisory)
+            except Exception:
+                logger.debug("[Orchestrator] quota shield skipped", exc_info=True)
+
             # ---- Phase 1: CLASSIFY ----
             profile = self._build_profile(ctx)
             classification = self._stack.risk_engine.classify(profile)

@@ -10,6 +10,9 @@ nothing itself.
 """
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -79,3 +82,93 @@ def decide(*, advisory: Any, pressure_level: Any, token_volume: int,
     if load < threshold:
         return ShieldDecision(True, False, load, f"low_cognitive_load:{load:.3f}<{threshold:.3f}")
     return ShieldDecision(False, False, load, f"high_cognitive_load:{load:.3f}>={threshold:.3f}")
+
+
+logger = logging.getLogger(__name__)
+
+# Strong refs so fire-and-forget pre-warm tasks are not GC'd mid-flight.
+_PREWARM_TASKS: set = set()
+
+
+def _default_token_estimator(ctx: Any) -> int:
+    """Best-effort token estimate from target file sizes (len//4). Never raises."""
+    import os as _os  # noqa: F401 — kept for clarity; _os not used but import validates
+    total = 0
+    for path in (getattr(ctx, "target_files", ()) or ()):
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                total += len(fh.read()) // 4
+        except Exception:
+            continue
+    return total
+
+
+async def apply_quota_shield(
+    ctx: Any,
+    *,
+    advisory: Any,
+    gate: Any = None,
+    governor: Any = None,
+    local_enabled: Any = None,
+    token_estimator: Any = None,
+) -> Any:
+    """Orchestrator-side application of the quota shield.
+
+    Returns ctx unchanged when disabled; otherwise returns a (possibly
+    prefer_local-stamped) ctx and fires a non-blocking JIT pre-warm of the
+    local daemon when routing local. Fail-soft: any error returns the original
+    ctx untouched.
+    """
+    if not quota_shield_enabled():
+        return ctx
+    try:
+        if local_enabled is None:
+            from backend.core.ouroboros.governance.local_inference_director import (
+                local_prime_enabled as _lpe,
+            )
+            local_enabled = _lpe()
+        if gate is None:
+            from backend.core.ouroboros.governance.memory_pressure_gate import get_default_gate
+            gate = get_default_gate()
+        est = token_estimator or _default_token_estimator
+        token_volume = int(est(ctx))
+        level = gate.pressure()
+        decision = decide(
+            advisory=advisory,
+            pressure_level=level,
+            token_volume=token_volume,
+            local_enabled=bool(local_enabled),
+        )
+        logger.info(
+            "[QuotaShield] op=%s load=%.3f route_local=%s mem_override=%s reason=%s",
+            getattr(ctx, "op_id", "?"),
+            decision.cognitive_load,
+            decision.route_local,
+            decision.memory_override,
+            decision.reason,
+        )
+        if not decision.route_local:
+            return ctx
+        # JIT pre-warm: fire-and-forget so daemon boot latency is masked.
+        _gov = governor
+        try:
+            if _gov is None:
+                from backend.core.ouroboros.governance.local_daemon_governor import (
+                    daemon_governor_enabled,
+                    LocalDaemonGovernor,
+                )
+                if daemon_governor_enabled():
+                    _gov = LocalDaemonGovernor()
+            if _gov is not None:
+                _t = asyncio.ensure_future(_gov.start_if_enabled())
+                _PREWARM_TASKS.add(_t)
+                _t.add_done_callback(_PREWARM_TASKS.discard)
+        except Exception:
+            logger.debug("[QuotaShield] JIT pre-warm skipped", exc_info=True)
+        try:
+            return dataclasses.replace(ctx, prefer_local=True)
+        except Exception:
+            return ctx  # ctx not a dataclass / immutable replace failed -> leave as-is
+    except Exception:
+        logger.debug("[QuotaShield] apply skipped (fail-soft)", exc_info=True)
+        return ctx
