@@ -3247,6 +3247,19 @@ class DoublewordProvider:
                     _content_seen = False
                     _first_progress_at = 0.0
                     _cognitive_stall_s = _cognitive_stall_timeout_s()
+                    # CD-2 — mark this SSE stream active so the load-shed latch
+                    # can engage SensorGovernor emergency-brake when event-loop
+                    # lag is critical. Wrapped defensively: a missing module or
+                    # broken import NEVER interrupts streaming. stream_end() is
+                    # called after the loop regardless of exit path.
+                    _cd2_ls = None
+                    try:
+                        from backend.core.ouroboros.governance import (
+                            control_plane_load_shed as _cd2_ls,
+                        )
+                        _cd2_ls.stream_begin()
+                    except Exception:  # noqa: BLE001
+                        _cd2_ls = None
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
                     while True:
                         try:
@@ -3546,6 +3559,15 @@ class DoublewordProvider:
                                         _activity_pulse(_stream_op_id)
                                     except Exception:  # noqa: BLE001
                                         pass
+                                    # CD-2 — evaluate lag every 8 chunks (same
+                                    # cadence as the heartbeat) and update the
+                                    # shed latch. Defensive: NEVER raises into
+                                    # the SSE loop.
+                                    try:
+                                        if _cd2_ls is not None:
+                                            _cd2_ls.evaluate(_recent_lag_ms())
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 # Phase 12.2 Slice C — record TTFT once
                                 # per request on first non-empty content
                                 # chunk. NEVER raises into the SSE loop:
@@ -3612,6 +3634,13 @@ class DoublewordProvider:
                                 output_tokens = _usage.get("completion_tokens", 0)
                         except json.JSONDecodeError:
                             continue
+                    # CD-2 — clear stream-active latch now that the SSE loop
+                    # has exited (normal completion, rupture, or stall).
+                    try:
+                        if _cd2_ls is not None:
+                            _cd2_ls.stream_end()
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 # Non-streaming path
                 # Slice 31 — Aegis session bearer (closes v24
