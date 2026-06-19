@@ -19,7 +19,6 @@ LATE-imported inside try/except so this module imports cleanly with no network o
 real-file side effects.
 """
 
-import asyncio  # noqa: F401  (used by the optional live caller path)
 import logging
 import os
 import time
@@ -36,6 +35,7 @@ from backend.core.ouroboros.governance.fleet_quality_battery import (
 from backend.core.ouroboros.governance.fleet_calibration_store import (
     FleetCalibrationStore,
     graduation_ready,
+    valid_tok_per_s,
 )
 
 logger = logging.getLogger(__name__)
@@ -241,7 +241,7 @@ class FleetEvaluator:
                         model_id,
                         sc.ast_pass_rate,
                         sc.label_adherence,
-                        tok_per_s,
+                        valid_tok_per_s(sc),
                         sc.sample_count,
                     )
             except Exception as exc:  # noqa: BLE001

@@ -1258,6 +1258,12 @@ EVENT_TYPE_ADMISSION_DECISION_EMITTED = "admission_decision_emitted"
 # J-Prime local handoff activates (all_providers_exhausted intercepted,
 # payload pruned topologically, local tier absorbing the op).
 EVENT_TYPE_EXHAUSTION_HANDOFF_TRIGGERED = "exhaustion_handoff_triggered"
+# Sovereign Fleet Evaluator (2026-06-19) — the autonomous quality-calibration
+# loop's two visible decisions: a per-model calibration result and the
+# auto-graduation that flips quality-aware routing authoritative. Manifesto §7
+# (every autonomous decision is visible). Both fire best-effort + fail-soft.
+EVENT_TYPE_FLEET_CALIBRATED = "fleet_calibrated"
+EVENT_TYPE_FLEET_GRADUATED = "fleet_graduated"
 # CodebaseCharacterDigest Slice 3 — emitted when ProactiveExploration
 # Sensor surfaces an under-touched semantic cluster as an IntentEnvelope.
 # Lets IDE/observability consumers correlate the cluster-coverage bias
@@ -1544,6 +1550,10 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # topological prune applied, J-Prime local
                                                   # tier absorbs the op; gated by
                                                   # JARVIS_JPRIME_LASTRESORT_ENABLED)
+    EVENT_TYPE_FLEET_CALIBRATED,                  # Sovereign Fleet Evaluator (2026-06-19 —
+                                                  # per-model quality calibration result)
+    EVENT_TYPE_FLEET_GRADUATED,                   # Sovereign Fleet Evaluator (2026-06-19 —
+                                                  # quality-aware routing flipped authoritative)
 })
 
 
