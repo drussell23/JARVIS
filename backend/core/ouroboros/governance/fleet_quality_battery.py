@@ -86,7 +86,7 @@ def is_ast_valid(text: str) -> bool:
 # --- Semantic placeholder detection ------------------------------------------
 
 
-def _is_ellipsis_expr(node: ast.stmt) -> bool:
+def _is_ellipsis_expr(node: ast.AST) -> bool:
     """True if node is a bare ``...`` expression statement."""
     return (
         isinstance(node, ast.Expr)
@@ -95,7 +95,7 @@ def _is_ellipsis_expr(node: ast.stmt) -> bool:
     )
 
 
-def _is_notimplemented_raise(node: ast.stmt) -> bool:
+def _is_notimplemented_raise(node: ast.AST) -> bool:
     """True for ``raise NotImplementedError`` or ``raise NotImplementedError(...)``."""
     if not isinstance(node, ast.Raise) or node.exc is None:
         return False
