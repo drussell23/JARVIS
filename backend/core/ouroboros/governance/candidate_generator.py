@@ -2884,6 +2884,19 @@ class CandidateGenerator:
             )
             return await self._generate_immediate(context, deadline)
 
+        # Quota Shield: a shield-selected (prefer_local) op tries the zero-cost local
+        # tier first via the existing primacy path, regardless of urgency route. On
+        # local decline (sem saturation / timeout / error) it returns None and falls
+        # through to the normal route below -> graceful, no behavior change when unset.
+        if (
+            getattr(context, "prefer_local", False)
+            and self._jprime is not None
+            and _provider_route not in ("background", "speculative")
+        ):
+            _ql = await self._try_jprime_primacy(context, deadline, "quota_shield")
+            if _ql is not None:
+                return _ql
+
         if _provider_route == "immediate":
             return await self._generate_immediate(context, deadline)
         if _provider_route == "background":
@@ -4281,7 +4294,9 @@ class CandidateGenerator:
         # time keeps the hot-path branch cheap when the flag is off.
         from ._governance_state import jprime_primacy_enabled
 
-        if not jprime_primacy_enabled():
+        # Quota Shield: prefer_local ops use the same local-first primacy path even
+        # when jprime_primacy is otherwise off for this route.
+        if not (jprime_primacy_enabled() or getattr(context, "prefer_local", False)):
             return None
         if self._jprime is None or not getattr(
             self._jprime, "provider_name", ""
