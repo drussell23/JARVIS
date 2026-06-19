@@ -121,7 +121,18 @@ class TestWatcher:
             if poll_interval_s is not None
             else float(os.environ.get("JARVIS_INTENT_TEST_INTERVAL_S", "300"))
         )
-        self.pytest_timeout_s = pytest_timeout_s
+        # Env-overridable (Sovereign Exec Engine, 2026-06-19): high-compute
+        # hosts raise this past the 30s default so a full-repo pytest sweep
+        # completes instead of being SIGKILLed mid-run (the local M1 foil that
+        # kept an isolated seed defect from ever being detected).
+        try:
+            self.pytest_timeout_s = float(
+                os.environ.get(
+                    "JARVIS_INTENT_PYTEST_TIMEOUT_S", str(pytest_timeout_s),
+                )
+            )
+        except (TypeError, ValueError):
+            self.pytest_timeout_s = pytest_timeout_s
 
         # Streak tracking: test_id -> consecutive failure count
         self._failure_streak: Dict[str, int] = {}
