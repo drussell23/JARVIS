@@ -1018,6 +1018,7 @@ class OperationContext:
     # Determines which provider strategy CandidateGenerator uses.
     provider_route: str = ""   # "immediate" | "standard" | "complex" | "background" | "speculative"
     provider_route_reason: str = ""  # human-readable reason for telemetry
+    prefer_local: bool = False    # Quota Shield: route this op to the local J-Prime tier
 
     # ---- Slice 245 — hibernation resurrection flag ----
     # Set (via with_resurrection()) when an op that failed with provider

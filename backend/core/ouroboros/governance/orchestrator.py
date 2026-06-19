@@ -3131,6 +3131,17 @@ class GovernedOrchestrator:
                 )
 
         # Wave 2 (5) Slice 3 - ROUTE+CTX+PLAN PhaseRunner delegation gate.
+        # Quota Shield (Phases 1+2): proactively route trivial/localized ops to the
+        # zero-cost local tier (preserving DW quota), unless host memory is CRITICAL.
+        # Placed AFTER the CLASSIFY if/else so it runs on BOTH the extracted-runner
+        # (default/production) and legacy inline paths (both set _advisory + ctx here).
+        # Gated (default OFF) + fail-soft + advisory-None-guarded.
+        try:
+            from backend.core.ouroboros.governance.quota_shield import apply_quota_shield
+            ctx = await apply_quota_shield(ctx, advisory=_advisory)
+        except Exception:
+            logger.debug("[Orchestrator] quota shield skipped", exc_info=True)
+
         # All three flags (JARVIS_PHASE_RUNNER_{ROUTE,CONTEXT_EXPANSION,PLAN}_EXTRACTED)
         # must be set to engage the runner chain. This all-or-nothing
         # gate simplifies wiring while the three phases remain
