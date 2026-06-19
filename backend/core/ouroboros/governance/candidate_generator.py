@@ -1188,6 +1188,34 @@ def _dw_autarky_enabled() -> bool:
         return False
 
 
+def _provider_quota_isolation_enabled() -> bool:
+    """Sovereign State Isolation (2026-06-19) master. Default-TRUE — a
+    provider's economic/quota death (e.g. Claude 402 'credit balance too
+    low') is recorded on THAT provider's own lane breaker only, and is NOT
+    allowed to trip the provider-NEUTRAL per-op circuit breaker into
+    OPEN_TERMINAL. Without this, Claude's credit-death poisons the whole op
+    so DW autarky can never carry it — the empirically-confirmed
+    cross-provider contamination (terminal_quota 5->0 once isolated).
+    Operator force-off with =0 -> byte-identical legacy. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_PROVIDER_QUOTA_ISOLATION_ENABLED", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def quota_isolation_skips_op_breaker(
+    *, is_provider_economic_block: bool, isolation_enabled: bool,
+) -> bool:
+    """PURE predicate: should the per-op breaker trip be SKIPPED for this
+    failure? True iff the failure is a provider economic block AND
+    isolation is enabled — the provider's OWN lane breaker already owns the
+    death, so tripping the op-neutral breaker would cross-contaminate the op
+    for every other (still-viable) provider. NEVER raises."""
+    return bool(is_provider_economic_block) and bool(isolation_enabled)
+
+
 def immediate_reroute_to_dw(
     *,
     dw_is_primary: bool,
@@ -6454,6 +6482,7 @@ class CandidateGenerator:
                         # should_allow_request gate) and it recovers after the
                         # window — no sticky session brick. Gated + defensive;
                         # detail is the redacted economic code, never a secret.
+                        _claude_econ_block = False
                         try:
                             if _s127_econ_on:
                                 from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
@@ -6461,6 +6490,7 @@ class CandidateGenerator:
                                 )
                                 _s127_block = _s127_is_econ(str(inner_exc))
                                 if _s127_block is not None:
+                                    _claude_econ_block = True
                                     from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
                                         get_claude_circuit_breaker as _s127_get_ccb,
                                     )
@@ -6478,6 +6508,31 @@ class CandidateGenerator:
                             provider="claude",
                             op_id=_slice7e_op_id,
                         )
+                        # Sovereign State Isolation (2026-06-19): a confirmed
+                        # Claude economic death is OWNED by Claude's lane breaker
+                        # (recorded above). Do NOT let it trip the provider-
+                        # NEUTRAL per-op breaker into the sticky OPEN_TERMINAL —
+                        # that poisons the op for DW too (empirically-confirmed
+                        # cross-provider contamination: terminal_quota 5->0 once
+                        # isolated). Downgrade ONLY the decision the OP breaker
+                        # sees to RETRY_TRANSIENT (non-poisoning) so the op stays
+                        # viable for DW autarky; the Claude lane is already marked
+                        # dead by its global breaker + the Slice238 suppression.
+                        # Telemetry above already published the TRUE decision.
+                        if quota_isolation_skips_op_breaker(
+                            is_provider_economic_block=_claude_econ_block,
+                            isolation_enabled=_provider_quota_isolation_enabled(),
+                        ):
+                            logger.warning(
+                                "[CandidateGenerator] QUOTA ISOLATION: Claude "
+                                "economic death contained to Claude lane breaker; "
+                                "per-op breaker NOT terminal-tripped (op stays "
+                                "viable for DW autarky) op=%s",
+                                _slice7e_op_id,
+                            )
+                            _slice7e_decision = type(
+                                _slice7e_decision
+                            ).RETRY_TRANSIENT
                         _slice7e_prior_state = _slice7e_breaker.state.value
                         _slice7e_verdict = _slice7e_breaker.evaluate(
                             _slice7e_decision,
