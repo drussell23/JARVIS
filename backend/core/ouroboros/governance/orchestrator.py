@@ -6352,6 +6352,35 @@ class GovernedOrchestrator:
                             "- Ensure the JSON is valid (no trailing commas, no unquoted keys)\n"
                             "- full_content must be the entire file, not a summary or placeholder\n"
                         )
+                    # Truncation-retry (gated): output truncation/elision ->
+                    # retry with a changed output shape (diff) + token headroom
+                    # instead of re-yelling. Reuses build_truncation_retry_directive.
+                    try:
+                        from backend.core.ouroboros.governance.truncation_retry import (
+                            truncation_retry_enabled, is_truncation_failure,
+                            build_truncation_retry_directive, stamp_retry_directive,
+                        )
+                        if truncation_retry_enabled() and is_truncation_failure(_err_msg):
+                            _diff_capable = False
+                            _ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+                            if _ri is not None:
+                                _diff_capable = getattr(_ri, "schema_capability", "") == "full_content_and_diff"
+                            _cur_max = int(getattr(ctx, "retry_max_tokens_override", 0) or 8192)
+                            _tr_directive = build_truncation_retry_directive(
+                                diff_capable=_diff_capable, current_max_tokens=_cur_max)
+                            ctx = stamp_retry_directive(ctx, _tr_directive)
+                            _error_feedback = (
+                                _error_feedback + "\n\n" + _tr_directive.feedback
+                                if _error_feedback else _tr_directive.feedback
+                            )
+                            logger.info(
+                                "[TruncationRetry] op=%s force_diff=%s max_tokens=%d -> GENERATE_RETRY",
+                                getattr(ctx, "op_id", "?"), _tr_directive.force_diff,
+                                _tr_directive.new_max_tokens,
+                            )
+                    except Exception:
+                        logger.debug("[TruncationRetry] skip", exc_info=True)
+
                     _retry_ctx_kwargs["strategic_memory_prompt"] = _error_feedback
 
                     # Record generation failure in episodic memory for downstream use

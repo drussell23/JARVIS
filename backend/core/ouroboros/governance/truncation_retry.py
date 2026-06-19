@@ -48,6 +48,23 @@ def _token_ceiling() -> int:
         return 16384
 
 
+def stamp_retry_directive(ctx: object, directive: RetryDirective) -> object:
+    """Return a copy of *ctx* with the directive applied (frozen-dataclass safe).
+
+    force_diff -> ctx.force_diff_on_retry=True; always sets retry_max_tokens_override.
+    Fail-soft: if ctx is not a dataclass (or replace raises), returns ctx unchanged.
+    """
+    import dataclasses as _dc
+    try:
+        return _dc.replace(
+            ctx,  # type: ignore[arg-type]
+            force_diff_on_retry=bool(directive.force_diff),
+            retry_max_tokens_override=int(directive.new_max_tokens),
+        )
+    except Exception:
+        return ctx
+
+
 def build_truncation_retry_directive(*, diff_capable: bool, current_max_tokens: int) -> RetryDirective:
     """Produce the retry directive for a truncation failure.
 

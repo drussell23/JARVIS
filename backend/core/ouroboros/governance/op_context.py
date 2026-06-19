@@ -1020,6 +1020,14 @@ class OperationContext:
     provider_route_reason: str = ""  # human-readable reason for telemetry
     prefer_local: bool = False    # Quota Shield: route this op to the local J-Prime tier
 
+    # ---- Truncation-retry shape flags (Task 2, feat/jprime-truncation-retry-diff-shape) ----
+    # Stamped by the orchestrator GENERATE_RETRY path when a truncation/elision
+    # failure is detected (JARVIS_TRUNCATION_RETRY_ENABLED=true). Consumed by
+    # the provider tier to change output shape on the next attempt instead of
+    # retrying with the same parameters.
+    force_diff_on_retry: bool = False        # Truncation-retry: force 2b.1-diff output on this retry
+    retry_max_tokens_override: int = 0        # Truncation-retry: >0 overrides provider max_tokens for this retry
+
     # ---- Slice 245 — hibernation resurrection flag ----
     # Set (via with_resurrection()) when an op that failed with provider
     # exhaustion during a dark window is re-ingested after the Grid Sentinel

@@ -43,3 +43,33 @@ def test_directive_token_bump_respects_ceiling(monkeypatch):
     monkeypatch.setenv("JARVIS_TRUNCATION_RETRY_TOKEN_CEILING", "16384")
     d = build_truncation_retry_directive(diff_capable=False, current_max_tokens=12000)
     assert d.new_max_tokens <= 16384         # min(2x, ceiling)
+
+
+def test_stamp_directive_sets_context_flags():
+    import dataclasses
+    from backend.core.ouroboros.governance.truncation_retry import (
+        stamp_retry_directive, RetryDirective)
+
+    @dataclasses.dataclass(frozen=True)
+    class _Ctx:
+        op_id: str = "o"
+        force_diff_on_retry: bool = False
+        retry_max_tokens_override: int = 0
+
+    out = stamp_retry_directive(_Ctx(), RetryDirective(force_diff=True, new_max_tokens=16384, feedback="x"))
+    assert out.force_diff_on_retry is True
+    assert out.retry_max_tokens_override == 16384
+
+
+def test_stamp_directive_failsoft_on_non_dataclass():
+    from backend.core.ouroboros.governance.truncation_retry import (
+        stamp_retry_directive, RetryDirective)
+    obj = object()
+    assert stamp_retry_directive(obj, RetryDirective(False, 1, "x")) is obj
+
+
+def test_real_operation_context_has_truncation_fields():
+    from backend.core.ouroboros.governance.op_context import OperationContext
+    f = OperationContext.__dataclass_fields__
+    assert "force_diff_on_retry" in f and f["force_diff_on_retry"].default is False
+    assert "retry_max_tokens_override" in f and f["retry_max_tokens_override"].default == 0
