@@ -819,6 +819,31 @@ _default_watchdog: Optional[ControlPlaneWatchdog] = None
 _default_lock = threading.Lock()
 
 
+def recent_lag_ms(window_s: float = 10.0) -> float:
+    """Sum of observed event-loop lag (ms) over the recent window.
+
+    Used by the stream-rupture inter-chunk watchdog (CD-1) to credit
+    accumulated loop-lag back to the timeout budget so a starved loop
+    cannot false-rupture a healthy flowing stream.
+
+    The function windows ``LagRecord`` entries by ``ts_monotonic`` so
+    only lag observed within the last ``window_s`` seconds contributes.
+    Best-effort: returns 0.0 on any error so callers are never broken.
+    """
+    try:
+        recs = get_default_watchdog().recent_lag_records()
+        if not recs:
+            return 0.0
+        cutoff = time.monotonic() - window_s
+        total = 0.0
+        for r in recs:
+            if r.ts_monotonic >= cutoff:
+                total += float(r.lag_ms or 0.0)
+        return total
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def get_default_watchdog() -> ControlPlaneWatchdog:
     """Process-singleton accessor. NEVER raises."""
     global _default_watchdog
@@ -846,6 +871,8 @@ __all__ = [
     "watchdog_enabled",
     "get_default_watchdog",
     "reset_default_watchdog",
+    # CD-1 — lag-aware inter-chunk stream timeout
+    "recent_lag_ms",
     # Slice 12K — starvation attribution surface
     "StarvationSnapshot",
     "ThreadFrameSnapshot",

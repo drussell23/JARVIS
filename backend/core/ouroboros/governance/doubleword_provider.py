@@ -47,8 +47,12 @@ from backend.core.ouroboros.governance.stream_rupture import (
     CognitiveStallError,
     StreamRuptureError,
     cognitive_stall_timeout_s as _cognitive_stall_timeout_s,
+    lag_compensated_inter_chunk_timeout_s as _lag_compensated_inter_chunk_timeout_s,
     stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
     stream_rupture_timeout_s as _stream_rupture_timeout_s,
+)
+from backend.core.ouroboros.governance.control_plane_watchdog import (
+    recent_lag_ms as _recent_lag_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -3219,7 +3223,13 @@ class DoublewordProvider:
                     # Phase 1 (TTFT): generous timeout for first token.
                     # Phase 2 (Inter-Chunk): tight timeout once streaming.
                     _rupture_ttft = _stream_rupture_timeout_s()
-                    _rupture_ic = _stream_inter_chunk_timeout_s()
+                    # CD-1 — lag-aware inter-chunk timeout: credit back
+                    # any accumulated event-loop lag so a starved loop
+                    # cannot false-rupture a flowing network stream.
+                    _rupture_ic = _lag_compensated_inter_chunk_timeout_s(
+                        base_s=_stream_inter_chunk_timeout_s(),
+                        lag_credit_s=_recent_lag_ms() / 1000.0,
+                    )
                     _chunk_phase_timeout = _rupture_ttft  # Phase 1
                     _sse_has_tokens = False
                     # Phase-Aware Heartbeat — pulse the harness
@@ -3237,6 +3247,19 @@ class DoublewordProvider:
                     _content_seen = False
                     _first_progress_at = 0.0
                     _cognitive_stall_s = _cognitive_stall_timeout_s()
+                    # CD-2 — mark this SSE stream active so the load-shed latch
+                    # can engage SensorGovernor emergency-brake when event-loop
+                    # lag is critical. Wrapped defensively: a missing module or
+                    # broken import NEVER interrupts streaming. stream_end() is
+                    # called after the loop regardless of exit path.
+                    _cd2_ls = None
+                    try:
+                        from backend.core.ouroboros.governance import (
+                            control_plane_load_shed as _cd2_ls,
+                        )
+                        _cd2_ls.stream_begin()
+                    except Exception:  # noqa: BLE001
+                        _cd2_ls = None
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
                     while True:
                         try:
@@ -3536,6 +3559,15 @@ class DoublewordProvider:
                                         _activity_pulse(_stream_op_id)
                                     except Exception:  # noqa: BLE001
                                         pass
+                                    # CD-2 — evaluate lag every 8 chunks (same
+                                    # cadence as the heartbeat) and update the
+                                    # shed latch. Defensive: NEVER raises into
+                                    # the SSE loop.
+                                    try:
+                                        if _cd2_ls is not None:
+                                            _cd2_ls.evaluate(_recent_lag_ms())
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 # Phase 12.2 Slice C — record TTFT once
                                 # per request on first non-empty content
                                 # chunk. NEVER raises into the SSE loop:
@@ -3602,6 +3634,13 @@ class DoublewordProvider:
                                 output_tokens = _usage.get("completion_tokens", 0)
                         except json.JSONDecodeError:
                             continue
+                    # CD-2 — clear stream-active latch now that the SSE loop
+                    # has exited (normal completion, rupture, or stall).
+                    try:
+                        if _cd2_ls is not None:
+                            _cd2_ls.stream_end()
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 # Non-streaming path
                 # Slice 31 — Aegis session bearer (closes v24

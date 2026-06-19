@@ -539,8 +539,24 @@ class SensorGovernor:
 
     def _emergency_brake_active(self) -> bool:
         """Reads the current signal bundle via the injected callable.
-        Returns True if cost_burn > threshold or postmortem_rate > threshold.
+        Returns True if cost_burn > threshold or postmortem_rate > threshold,
+        OR if the CD-2 control-plane load-shed latch is active (stream is
+        consuming the event loop under critical lag). CD-2 is gated by
+        JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED (default OFF) so this OR is
+        a no-op when the feature is disabled.
         Missing signals → False (brake disabled)."""
+        # CD-2 — load-shed latch: if a DW SSE stream is active AND event-loop
+        # lag exceeds JARVIS_LOAD_SHED_LAG_THRESHOLD_MS, shed low-priority
+        # background sensors to free the loop. Wrapped defensively so a
+        # missing/broken module never silences the existing brake logic.
+        try:
+            from backend.core.ouroboros.governance.control_plane_load_shed import (
+                is_shedding as _cd2_is_shedding,
+            )
+            if _cd2_is_shedding():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         try:
             bundle = self._signal_bundle_fn()
         except Exception:  # noqa: BLE001
