@@ -1643,12 +1643,23 @@ class DoublewordProvider:
         # emits the native 2b.1-diff (bounded output → no 60K-blob JSONDecodeError);
         # everything else stays full_content. Fail-soft to full_content; the
         # orchestrator degrades a stale/failed diff back to full_content.
+        _schema_cap = resolve_diff_capability_for_model(_effective_model)
         _force_full = bool(getattr(ctx, "force_full_content_override", False)) or \
             resolve_force_full_content(
-                schema_capability=resolve_diff_capability_for_model(_effective_model),
+                schema_capability=_schema_cap,
                 target_files=getattr(ctx, "target_files", ()) or (),
                 repo_root=self._repo_root,
             )
+        # Truncation-retry (gated): honor force_diff_on_retry + retry_max_tokens_override
+        # on a stamped retry. No-op when the flags are unset (byte-identical).
+        try:
+            from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+            _force_full, _retry_max_tokens = apply_retry_overrides(
+                ctx=ctx, schema_capability=_schema_cap,
+                force_full=_force_full, max_tokens=self._max_tokens,
+            )
+        except Exception:
+            _retry_max_tokens = self._max_tokens
         if not _force_full:
             logger.info(
                 "[DoublewordProvider] Slice235 adaptive-diff: emitting 2b.1-diff "
@@ -1687,7 +1698,7 @@ class DoublewordProvider:
                     )},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": self._max_tokens,
+                "max_tokens": _retry_max_tokens,
                 "temperature": _DW_TEMPERATURE,
                 # Slice 54/55 — Qwen3.5 reasoning control. reasoning_effort
                 # (DW-honored; the old enable_thinking flag was ignored) is
