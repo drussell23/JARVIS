@@ -48,3 +48,24 @@ def test_disabled_is_inert(monkeypatch):
     monkeypatch.setenv("JARVIS_TRUNCATION_RETRY_ENABLED", "false")
     from backend.core.ouroboros.governance.truncation_retry import truncation_retry_enabled
     assert truncation_retry_enabled() is False
+
+
+def test_real_operationcontext_advance_preserves_truncation_fields():
+    """Closes the recurring 'wiring verified only by inspection' gap: stamp the two
+    flags on a REAL OperationContext, advance to GENERATE_RETRY, and assert they
+    survive advance() (i.e. _retry_ctx_kwargs can't clobber them)."""
+    import dataclasses
+    from datetime import datetime, timezone
+    from backend.core.ouroboros.governance.op_context import (
+        OperationContext, OperationPhase)
+    now = datetime.now(timezone.utc)
+    ctx = OperationContext(
+        op_id="op-trunc-test", created_at=now, phase=OperationPhase.GENERATE,
+        phase_entered_at=now, context_hash="h0", previous_hash="",
+        target_files=("a.py",),
+    )
+    stamped = dataclasses.replace(
+        ctx, force_diff_on_retry=True, retry_max_tokens_override=16384)
+    advanced = stamped.advance(OperationPhase.GENERATE_RETRY)
+    assert advanced.force_diff_on_retry is True
+    assert advanced.retry_max_tokens_override == 16384
