@@ -2102,6 +2102,18 @@ class GovernedLoopService:
                     exc_info=True,
                 )
 
+        # Phase 3.4: hand the local daemon back to the host (flush weights; stop the
+        # daemon only if the governor started it). Gated + ownership-safe + fail-soft.
+        _gov = getattr(self, "_local_daemon_governor", None)
+        if _gov is not None:
+            try:
+                await _gov.stop_if_idle()
+            except Exception:
+                logger.debug(
+                    "[GovernedLoop] local daemon governor stop failed",
+                    exc_info=True,
+                )
+
         # Detach from stack
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
@@ -3914,6 +3926,19 @@ class GovernedLoopService:
 
         # Build PrimeProvider if PrimeClient available
         _primary_probe_ok = False  # track for FSM sync after generator build
+        # Phase 3.4: JIT-boot the local Ollama daemon before the local tier is wired,
+        # so its health probe sees a live engine. Gated (JARVIS_LOCAL_DAEMON_GOVERNOR_ENABLED
+        # default OFF) + fail-soft: a governor failure never blocks boot.
+        try:
+            from backend.core.ouroboros.governance.local_daemon_governor import (
+                daemon_governor_enabled, LocalDaemonGovernor,
+            )
+            if daemon_governor_enabled():
+                self._local_daemon_governor = LocalDaemonGovernor()
+                await self._local_daemon_governor.start_if_enabled()
+        except Exception:
+            logger.debug("[GovernedLoop] local daemon governor start skipped", exc_info=True)
+
         # J-Prime tier wiring.
         # Phase 3.2 (tiered, default OFF -> heavy GCP wired but NOT activated):
         #   compose heavy (existing GCP prime_client) + light (governed local Ollama)
