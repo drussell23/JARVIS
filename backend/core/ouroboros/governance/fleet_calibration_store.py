@@ -92,10 +92,13 @@ class QualityScore:
 def ewma_update(prev: Optional[float], new: float, alpha: float) -> float:
     """Exponentially-weighted moving average.
 
-    First sample (``prev is None``) returns the new value directly so the
-    series starts unbiased. Otherwise ``alpha*new + (1-alpha)*prev``.
+    First sample (``prev is None`` or an unseeded ``NaN`` carry) returns the
+    new value directly so the series starts unbiased. Otherwise
+    ``alpha*new + (1-alpha)*prev``.
     """
-    return float(new) if prev is None else alpha * new + (1.0 - alpha) * prev
+    if prev is None or prev != prev:  # None or NaN -> seed directly
+        return float(new)
+    return alpha * new + (1.0 - alpha) * prev
 
 
 def valid_tok_per_s(sc: QualityScore) -> float:
@@ -230,7 +233,8 @@ class FleetCalibrationStore:
         """Write current state to disk atomically. NEVER raises; logs."""
         payload = {
             "scores": {
-                mid: sc.to_json_dict() for mid, sc in self._scores.items()
+                mid: self._clamp_unseeded(sc).to_json_dict()
+                for mid, sc in self._scores.items()
             },
         }
         try:
@@ -277,8 +281,13 @@ class FleetCalibrationStore:
             alpha = _alpha()
             prev = self._scores.get(mid)
 
-            prev_ast = prev.ast_pass_rate if prev else 0.0
-            prev_label = prev.label_adherence if prev else 0.0
+            # An untouched field on a brand-new model is left UNSEEDED (NaN)
+            # so the first probe of the *other* kind seeds it directly instead
+            # of EWMA-blending against a poisoning 0.0. NaN is clamped to 0.0
+            # on every read/persist surface, so it never escapes the store.
+            _unseeded = float("nan")
+            prev_ast = prev.ast_pass_rate if prev else _unseeded
+            prev_label = prev.label_adherence if prev else _unseeded
             prev_ttft = prev.ttft_ms if prev else None
             prev_tps = prev.tok_per_s if prev else None
 
@@ -323,13 +332,32 @@ class FleetCalibrationStore:
     # Queries (read-only)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _clamp_unseeded(sc: QualityScore) -> QualityScore:
+        """Replace any UNSEEDED (NaN) field with 0.0 so NaN never escapes the
+        store to consumers (graduation gate, re-rank, persistence)."""
+        ast = sc.ast_pass_rate
+        lab = sc.label_adherence
+        if ast == ast and lab == lab:  # both already real (no NaN)
+            return sc
+        return QualityScore(
+            model_id=sc.model_id,
+            ast_pass_rate=ast if ast == ast else 0.0,
+            label_adherence=lab if lab == lab else 0.0,
+            ttft_ms=sc.ttft_ms,
+            tok_per_s=sc.tok_per_s,
+            sample_count=sc.sample_count,
+            updated_at=sc.updated_at,
+        )
+
     def score(self, model_id: str) -> Optional[QualityScore]:
         self._ensure_loaded()
-        return self._scores.get(model_id)
+        sc = self._scores.get(model_id)
+        return self._clamp_unseeded(sc) if sc is not None else None
 
     def all_scores(self) -> Dict[str, QualityScore]:
         self._ensure_loaded()
-        return dict(self._scores)
+        return {mid: self._clamp_unseeded(sc) for mid, sc in self._scores.items()}
 
 
 # ---------------------------------------------------------------------------
