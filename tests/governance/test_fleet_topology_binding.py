@@ -26,7 +26,7 @@ def test_rerank_applied_when_authoritative(monkeypatch, tmp_path):
     assert out[0] == "good"     # measured-valid coder rises above measured-invalid
 
 
-def test_guard_off_is_identity(monkeypatch, tmp_path):
+def test_guard_off_is_identity(monkeypatch):
     monkeypatch.delenv("JARVIS_FLEET_EVALUATOR_AUTHORITATIVE", raising=False)
     from backend.core.ouroboros.governance import provider_topology as pt
     # _fleet_guarded must be a pass-through when the gate is off
