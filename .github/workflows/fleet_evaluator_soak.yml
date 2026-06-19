@@ -39,10 +39,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Fleet unit tests (offline)
+      - name: Install governance import-chain deps (lean, no ML bloat)
+        # Importing any backend.core.ouroboros.governance.* leaf runs the
+        # package __init__ aggregator, which hard-imports this set. Enumerated
+        # from the live import graph (not requirements-soak.txt, which omits
+        # aiofiles/aiosqlite/networkx/redis/opentelemetry/xxhash). All pure-
+        # python or manylinux wheels → fast, no compilation, no DW secret.
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio
+          pip install \
+            aiohttp aiofiles aiosqlite attrs cryptography networkx \
+            opentelemetry-api opentelemetry-sdk psutil redis uuid6 \
+            PyYAML xxhash \
+            pytest pytest-asyncio
+
+      - name: Fleet unit tests (offline, 35)
+        run: |
           python -m pytest -q \
             tests/governance/test_fleet_quality_battery.py \
             tests/governance/test_fleet_calibration_store.py \
@@ -51,6 +63,7 @@ jobs:
 
       - name: Multi-cycle EWMA-stability soak
         id: soak
+        if: always()   # headline deliverable — run even if a unit test regressed
         run: |
           python3 scripts/fleet_soak_multicycle.py "$RUNNER_TEMP/fleet_soak_report.md"
 
