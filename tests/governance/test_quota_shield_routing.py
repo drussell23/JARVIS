@@ -35,6 +35,29 @@ async def test_end_to_end_shield_decision_to_prefer_local(monkeypatch):
     assert out.prefer_local is True
 
 
+import pytest as _pytest
+
+
+@_pytest.mark.asyncio
+async def test_apply_shield_none_advisory_is_noop(monkeypatch):
+    """Advisory None (e.g. extracted-classify path missing it) must NOT route local
+    on a blind 0-load read — the shield leaves ctx untouched."""
+    monkeypatch.setenv("JARVIS_QUOTA_SHIELD_ENABLED", "true")
+    import dataclasses
+    from backend.core.ouroboros.governance.quota_shield import apply_quota_shield
+
+    @dataclasses.dataclass(frozen=True)
+    class _Ctx:
+        op_id: str = "o"
+        target_files: tuple = ("x.py",)
+        prefer_local: bool = False
+
+    ctx = _Ctx()
+    out = await apply_quota_shield(ctx, advisory=None)
+    assert out is ctx                      # None advisory -> no hijack
+    assert out.prefer_local is False
+
+
 def test_primacy_gate_honors_prefer_local_source():
     """Static guard: the primacy gate fires on prefer_local OR jprime_primacy_enabled."""
     import backend.core.ouroboros.governance.candidate_generator as cg

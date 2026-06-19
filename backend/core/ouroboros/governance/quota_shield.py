@@ -92,7 +92,6 @@ _PREWARM_TASKS: set = set()
 
 def _default_token_estimator(ctx: Any) -> int:
     """Best-effort token estimate from target file sizes (len//4). Never raises."""
-    import os as _os  # noqa: F401 — kept for clarity; _os not used but import validates
     total = 0
     for path in (getattr(ctx, "target_files", ()) or ()):
         try:
@@ -120,6 +119,10 @@ async def apply_quota_shield(
     ctx untouched.
     """
     if not quota_shield_enabled():
+        return ctx
+    # No advisory -> we cannot assess cognitive load. Do NOT hijack routing on a
+    # blind 0-load read (which would route everything local). Leave ctx untouched.
+    if advisory is None:
         return ctx
     try:
         if local_enabled is None:
