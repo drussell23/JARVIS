@@ -1,0 +1,87 @@
+name: Fleet Evaluator — multi-cycle EWMA soak
+
+# Clean-room validation for the Sovereign Fleet Evaluator. Runs on a dedicated
+# ubuntu-latest runner (bare-metal event-loop fidelity, no macOS virtualization)
+# so the EWMA latency telemetry is uncorrupted. The soak is DETERMINISTIC (mocked
+# caller with injected latency spike + 502) — no DoubleWord secret, no cost, no
+# flake — it proves the EWMA absorbs transients without the routing rank flapping.
+
+on:
+  push:
+    branches: [fleet/sovereign-evaluator]
+    paths:
+      - "backend/core/ouroboros/governance/fleet_*.py"
+      - "scripts/fleet_soak_multicycle.py"
+      - ".github/workflows/fleet_evaluator_soak.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: fleet-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    env:
+      JARVIS_FLEET_EVALUATOR_ENABLED: "true"
+      JARVIS_FLEET_EWMA_ALPHA: "0.4"
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fleet unit tests (offline)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+          python -m pytest -q \
+            tests/governance/test_fleet_quality_battery.py \
+            tests/governance/test_fleet_calibration_store.py \
+            tests/governance/test_fleet_evaluator.py \
+            tests/governance/test_fleet_topology_binding.py
+
+      - name: Multi-cycle EWMA-stability soak
+        id: soak
+        run: |
+          python3 scripts/fleet_soak_multicycle.py "$RUNNER_TEMP/fleet_soak_report.md"
+
+      - name: Publish soak report to job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/fleet_soak_report.md" ]; then
+            cat "$RUNNER_TEMP/fleet_soak_report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "soak produced no report (early failure)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment soak result on PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR=$(gh pr list --head "${GITHUB_REF_NAME}" --state open \
+                 --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$PR" ]; then
+            echo "no open PR for ${GITHUB_REF_NAME}; skipping comment"
+            exit 0
+          fi
+          {
+            echo "<!-- fleet-soak -->"
+            if [ -f "$RUNNER_TEMP/fleet_soak_report.md" ]; then
+              cat "$RUNNER_TEMP/fleet_soak_report.md"
+            else
+              echo "## Fleet Evaluator soak: early failure (no report produced)"
+            fi
+            echo ""
+            echo "_Clean-room run [\`${GITHUB_RUN_ID}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) on \`ubuntu-latest\` — deterministic, no DW secret, no cost._"
+          } > "$RUNNER_TEMP/fleet_soak_comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/fleet_soak_comment.md"
