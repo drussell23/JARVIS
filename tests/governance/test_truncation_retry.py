@@ -73,3 +73,41 @@ def test_real_operation_context_has_truncation_fields():
     f = OperationContext.__dataclass_fields__
     assert "force_diff_on_retry" in f and f["force_diff_on_retry"].default is False
     assert "retry_max_tokens_override" in f and f["retry_max_tokens_override"].default == 0
+
+
+def _ctx(force_diff=False, override=0):
+    import dataclasses
+    @dataclasses.dataclass(frozen=True)
+    class _C:
+        force_diff_on_retry: bool = False
+        retry_max_tokens_override: int = 0
+    return _C(force_diff_on_retry=force_diff, retry_max_tokens_override=override)
+
+
+def test_apply_overrides_forces_diff_when_capable():
+    from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+    ff, mt = apply_retry_overrides(ctx=_ctx(force_diff=True), schema_capability="full_content_and_diff",
+                                   force_full=True, max_tokens=8192)
+    assert ff is False           # diff allowed
+    assert mt == 8192
+
+
+def test_apply_overrides_cannot_force_diff_on_full_only():
+    from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+    ff, mt = apply_retry_overrides(ctx=_ctx(force_diff=True), schema_capability="full_content_only",
+                                   force_full=True, max_tokens=8192)
+    assert ff is True            # full_content_only model can't emit a diff -> unchanged
+
+
+def test_apply_overrides_token_override():
+    from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+    ff, mt = apply_retry_overrides(ctx=_ctx(override=16384), schema_capability="full_content_only",
+                                   force_full=True, max_tokens=8192)
+    assert mt == 16384
+
+
+def test_apply_overrides_noop_when_unset():
+    from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+    ff, mt = apply_retry_overrides(ctx=_ctx(), schema_capability="full_content_and_diff",
+                                   force_full=True, max_tokens=8192)
+    assert ff is True and mt == 8192   # no flags -> unchanged

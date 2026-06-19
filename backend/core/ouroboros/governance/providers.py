@@ -5174,6 +5174,17 @@ class PrimeProvider:
                 repo_root=repo_root,
             )
 
+        # Truncation-retry (gated): on a retry stamped force_diff_on_retry, allow the
+        # native 2b.1-diff path for diff-capable models, and honor retry_max_tokens_override.
+        try:
+            from backend.core.ouroboros.governance.truncation_retry import apply_retry_overrides
+            _force_full, _retry_max_tokens = apply_retry_overrides(
+                ctx=context, schema_capability=_schema_cap,
+                force_full=_force_full, max_tokens=self._max_tokens,
+            )
+        except Exception:
+            _retry_max_tokens = self._max_tokens
+
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
         if self._mcp_client is not None and self._tools_enabled:
@@ -5240,7 +5251,7 @@ class PrimeProvider:
             resp = await self._client.generate(
                 prompt=p,
                 system_prompt=_CODEGEN_SYSTEM_PROMPT,
-                max_tokens=self._max_tokens,
+                max_tokens=_retry_max_tokens,
                 temperature=0.2,
                 model_name=_brain_model,
                 task_profile=_task_profile,
@@ -5422,7 +5433,7 @@ class PrimeProvider:
                 resp = await self._client.generate(
                     prompt=current_prompt,
                     system_prompt=_CODEGEN_SYSTEM_PROMPT,
-                    max_tokens=self._max_tokens,
+                    max_tokens=_retry_max_tokens,
                     temperature=0.2,
                     model_name=_brain_model,
                     task_profile=_task_profile,

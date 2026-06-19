@@ -65,6 +65,28 @@ def stamp_retry_directive(ctx: object, directive: RetryDirective) -> object:
         return ctx
 
 
+def apply_retry_overrides(*, ctx: object, schema_capability: str, force_full: bool, max_tokens: int):
+    """Apply truncation-retry context flags to a provider's (force_full, max_tokens).
+
+    Returns (force_full_out, max_tokens_out):
+      * force_diff_on_retry + diff-capable model -> force_full_out=False (allow 2b.1-diff).
+        (A full_content_only model cannot emit a diff, so force_full is left as-is.)
+      * retry_max_tokens_override > 0 -> max_tokens_out = the override.
+    Fail-soft: any error returns the inputs unchanged. No-op when flags unset.
+    """
+    try:
+        ff = bool(force_full)
+        mt = int(max_tokens)
+        if getattr(ctx, "force_diff_on_retry", False) and schema_capability == "full_content_and_diff":
+            ff = False
+        _ov = int(getattr(ctx, "retry_max_tokens_override", 0) or 0)
+        if _ov > 0:
+            mt = _ov
+        return ff, mt
+    except Exception:
+        return force_full, max_tokens
+
+
 def build_truncation_retry_directive(*, diff_capable: bool, current_max_tokens: int) -> RetryDirective:
     """Produce the retry directive for a truncation failure.
 
