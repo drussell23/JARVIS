@@ -91,7 +91,12 @@ def _max_models_per_cycle() -> int:
 
 
 def _probe_max_tokens() -> int:
-    return _int_env("JARVIS_FLEET_PROBE_MAX_TOKENS", 512)
+    # 2048, not 512: the codegen battery asks for a full two-function answer
+    # (~1400 completion tokens for a real coder). 512 truncates valid coders
+    # mid-function → unparseable → false ast=0. Confirmed on a live DW soak
+    # (DeepSeek-V4-Flash needs 1360 tok; at 512 it scored 0). The classify
+    # probe stops early so the larger cap doesn't inflate triage cost.
+    return _int_env("JARVIS_FLEET_PROBE_MAX_TOKENS", 2048)
 
 
 def _stable_cycles() -> int:
