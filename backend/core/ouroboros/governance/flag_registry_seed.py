@@ -4968,6 +4968,163 @@ SEED_SPECS: list = [
         since="Sovereign Fusion (resilience ignition, 2026-06-14)",
         posture_relevance=_HARDEN_CRITICAL,
     ),
+
+    # ====================================================================
+    # Sovereign Fleet Evaluator (Tasks 1-4, 2026-06-19) — 12 flags
+    # Measures DW model output quality, gated re-rank of live routing.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_FLEET_EVALUATOR_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master switch for the Sovereign Fleet Evaluator — when true, "
+            "idle-cycle quality calibration probes DW models and folds "
+            "results into the calibration store. Descriptive until "
+            "JARVIS_FLEET_EVALUATOR_AUTHORITATIVE flips."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="false",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_EVALUATOR_AUTHORITATIVE",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "When true, measured quality scores re-rank the live DW "
+            "model-selection path (provider_topology.dw_models_for_route). "
+            "Auto-flipped by the FleetEvaluator once a soak proves the "
+            "calibrated coder beats the static default. OFF is byte-"
+            "identical legacy routing."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="false",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_EWMA_ALPHA",
+        type=FlagType.FLOAT, default=0.4,
+        description=(
+            "EWMA smoothing factor applied when folding a new probe "
+            "result into a model's running quality score. Higher = "
+            "faster adaptation, lower = more stable."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/fleet_calibration_store.py",
+        example="0.4",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_PROBE_MAX_TOKENS",
+        type=FlagType.INT, default=512,
+        description=(
+            "Per-probe generation token cap. Bounds the cost and latency "
+            "of each calibration probe."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="512",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_PROBE_TIMEOUT_S",
+        type=FlagType.FLOAT, default=60.0,
+        description=(
+            "Per-probe HTTP timeout in seconds for a single calibration "
+            "probe request."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="60",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_MAX_MODELS_PER_CYCLE",
+        type=FlagType.INT, default=4,
+        description=(
+            "Maximum number of DW models calibrated per idle evaluation "
+            "cycle. Caps per-cycle probe fan-out."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="4",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_DAILY_USD_CAP",
+        type=FlagType.FLOAT, default=0.50,
+        description=(
+            "Daily probe spend ceiling in USD. Once exceeded, the "
+            "evaluator pauses further probes until the rolling window "
+            "resets."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="0.50",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_GRAD_MIN_SAMPLES",
+        type=FlagType.INT, default=5,
+        description=(
+            "Minimum number of probes a model must accumulate before it "
+            "is eligible to graduate into the authoritative re-rank."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="5",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_GRAD_MIN_AST",
+        type=FlagType.FLOAT, default=0.8,
+        description=(
+            "Minimum AST/code pass-rate (0.0-1.0) a model must hold "
+            "before it can graduate."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="0.8",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_GRAD_MARGIN",
+        type=FlagType.FLOAT, default=1.5,
+        description=(
+            "Multiplier on valid_tok_per_s the candidate winner must "
+            "beat the static default by before graduation. 1.5 = the "
+            "winner must be 50% faster-at-valid-output."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="1.5",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_GRAD_STABLE_CYCLES",
+        type=FlagType.INT, default=2,
+        description=(
+            "Consecutive winning evaluation cycles required before the "
+            "evaluator auto-flips JARVIS_FLEET_EVALUATOR_AUTHORITATIVE."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/fleet_evaluator.py",
+        example="2",
+        since="2026-06-19",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_CALIBRATION_PATH",
+        type=FlagType.STR, default=".jarvis/fleet_calibration.json",
+        description=(
+            "Filesystem path for the persistent fleet calibration store "
+            "(per-model EWMA quality scores)."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/fleet_calibration_store.py",
+        example=".jarvis/fleet_calibration.json",
+        since="2026-06-19",
+    ),
 ]
 
 

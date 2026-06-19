@@ -412,7 +412,7 @@ class ProviderTopology:
                 key = (route or "").strip().lower()
                 ranked = holder.assignments_by_route.get(key, ())
                 if ranked:
-                    return ranked
+                    return _fleet_guarded(route, ranked)
             # Fall through to YAML — cold-start, stale, route missing,
             # or route empty in catalog. YAML stays authoritative for
             # all four fallback conditions
@@ -422,7 +422,7 @@ class ProviderTopology:
             return ()
         effective = entry.effective_dw_models
         if effective:
-            return effective
+            return _fleet_guarded(route, effective)
         # ── Slice 10B-ii — trusted-seed runtime bypass ──
         # YAML + dynamic catalog both returned empty; consult
         # PromotionLedger for operator-attested trusted seeds that
@@ -430,7 +430,7 @@ class ProviderTopology:
         # :func:`_trusted_seed_dw_models_for_route` for the gate
         # composition (re-uses dw_catalog_classifier.gate_for_route
         # so the same param/price thresholds apply).
-        return _trusted_seed_dw_models_for_route(route)
+        return _fleet_guarded(route, _trusted_seed_dw_models_for_route(route))
 
     def fallback_tolerance_for_route(self, route: str) -> str:
         """Return the v2 ``fallback_tolerance`` for *route*.
@@ -654,6 +654,30 @@ def elevate_pool_for_exploration(
             return tuple(ranked_models or ())
         except Exception:  # noqa: BLE001
             return ()
+
+
+def _fleet_guarded(route: str, result: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Gated quality-aware re-rank (Sovereign Fleet Evaluator, 2026-06-19).
+
+    OFF by default → returns ``result`` byte-identically. When
+    ``JARVIS_FLEET_EVALUATOR_AUTHORITATIVE`` is set (auto-flipped by the
+    FleetEvaluator once a soak proves the calibrated coder beats the
+    static default), the already-resolved ranked tuple is reordered by
+    measured ``valid_tok_per_s`` / ``triage_fitness``. Pure + fail-soft:
+    any error returns the input unchanged.
+    """
+    try:
+        from backend.core.ouroboros.governance.fleet_evaluator import (
+            fleet_authoritative_enabled,
+        )
+        if fleet_authoritative_enabled():
+            from backend.core.ouroboros.governance.fleet_calibration_store import (
+                fleet_apply_rerank,
+            )
+            return fleet_apply_rerank(route, result)
+    except Exception:
+        pass
+    return result
 
 
 def _locate_policy_yaml() -> Optional[Path]:
