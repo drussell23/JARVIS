@@ -2893,7 +2893,7 @@ class CandidateGenerator:
             and self._jprime is not None
             and _provider_route not in ("background", "speculative")
         ):
-            _ql = await self._try_jprime_primacy(context, deadline, "quota_shield")
+            _ql = await self._try_jprime_primacy(context, deadline, route_label="quota_shield")
             if _ql is not None:
                 return _ql
 

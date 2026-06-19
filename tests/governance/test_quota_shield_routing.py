@@ -40,4 +40,5 @@ def test_primacy_gate_honors_prefer_local_source():
     import backend.core.ouroboros.governance.candidate_generator as cg
     src = open(cg.__file__).read()
     assert 'getattr(context, "prefer_local", False)' in src   # gate honors the flag
-    assert 'self._try_jprime_primacy(context, deadline, "quota_shield")' in src  # dispatch consult
+    # dispatch consult — route_label is keyword-only on _try_jprime_primacy
+    assert 'self._try_jprime_primacy(context, deadline, route_label="quota_shield")' in src
