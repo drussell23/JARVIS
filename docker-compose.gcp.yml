@@ -64,3 +64,9 @@ services:
       # be exercised; all other ops keep the strict heuristic gates.
       JARVIS_CALIBRATION_MODE_ENABLED: "true"
       JARVIS_CALIBRATION_TARGET_PATH: "tests/seed/test_seed_defect.py"
+      # Point the TestWatcher at ONLY the calibration seed so it gets a clean
+      # 1-test failure (TestFailure signal → seed op) instead of drowning it in
+      # collection errors from running the whole deps-incomplete tests/ tree.
+      JARVIS_INTENT_TEST_DIR: "tests/seed"
+      JARVIS_INTENT_TEST_INTERVAL_S: "60"
+
