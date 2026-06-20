@@ -1,0 +1,52 @@
+# =============================================================================
+# Sovereign Cognitive Crucible overlay — the Immortal Graduation Cadence.
+#
+# Layered ON TOP of docker-compose.prod.yml + docker-compose.gcp.yml to convert
+# a node from "perpetual battle-test" into a "graduation cadence" node:
+#
+#   docker compose -f docker-compose.prod.yml \
+#                  -f docker-compose.gcp.yml \
+#                  -f docker-compose.crucible.yml up -d --build
+#
+# What it changes vs the GCP soak node:
+#   - entrypoint → scripts/crucible_cadence.sh (one soak at a time → propose PR
+#     → GCS sync → sleep), instead of a single perpetual battle-test.
+#   - turns ON the 7 graduation master flags (Crucible armed).
+#   - keeps SHADOW MODE ON (PR-proposes; no autonomous .env auto-flip — the
+#     Order-2 cage's human/OCA merge gate is preserved).
+#   - wires GCS amnesia-proofing (Evidence Vault gcs backend target) + the JIT
+#     GH token passthrough (read from .env, written by the startup script from
+#     instance metadata / Secret Manager — never in git, never in the image).
+# =============================================================================
+services:
+  jarvis-prod:
+    entrypoint: ["bash", "scripts/crucible_cadence.sh"]
+    command: []
+    environment:
+      # --- The 7 Crucible master flags (ARM the autonomic graduation loop) ---
+      JARVIS_GRADUATION_LEDGER_ENABLED: "true"
+      JARVIS_AUTONOMOUS_GRADUATION_ENGINE_ENABLED: "true"
+      JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED: "true"
+      JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT: "true"
+      JARVIS_LIVE_FIRE_TELEMETRY_ARBITER_ENABLED: "true"
+      JARVIS_PHASE9_ORCHESTRATOR_ENABLED: "true"
+      JARVIS_CRUCIBLE_GRADUATION_PR_ENABLED: "true"
+      # Cage preserved: shadow mode ON → the override ledger never flips a flag
+      # in .env autonomously. The ONLY autonomous write surface is the
+      # source-of-truth [SOVEREIGN GRADUATION] PR (human/OCA merges it).
+      JARVIS_GRADUATION_SHADOW_MODE: "true"
+      # --- Amnesia-proofing: Evidence Vault → GCS (preemption resume) ---
+      JARVIS_STATE_BACKUP_ENABLED: "true"
+      JARVIS_BACKUP_BACKEND: "gcs"
+      JARVIS_BACKUP_TARGET: "gs://jarvis-473803-deployments/crucible-state/.jarvis"
+      JARVIS_BACKUP_SRC: "/app/.jarvis"
+      # --- TTFT/AST veto thresholds (env-tunable; defaults explicit) ---
+      JARVIS_CRUCIBLE_TTFT_CEILING_MS: "30000"
+      JARVIS_CRUCIBLE_TTFT_DEGRADE_RATIO: "1.5"
+      # --- Cadence tuning ---
+      JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
+      OUROBOROS_BATTLE_COST_CAP: "1.00"
+      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "2400"
+      # GH_TOKEN flows in via env_file: .env (startup script writes it from
+      # instance metadata `jarvis-gh-token`). Declared here for visibility;
+      # the real value never lives in this file.
