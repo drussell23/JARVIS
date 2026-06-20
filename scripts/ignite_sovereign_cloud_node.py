@@ -87,13 +87,29 @@ async def _ignite(args: argparse.Namespace) -> int:
         print("   --dry-run: config validated, NOT creating the VM.")
         return 0
 
+    md = {
+        "jarvis-dw-api-key": dw_key,
+        "jarvis-dw-primary-override": args.pin,
+    }
+    if args.crucible:
+        # Arm the autonomic graduation cadence (crucible overlay on the node).
+        md["jarvis-crucible-mode"] = "true"
+        print("   🧬 CRUCIBLE MODE — autonomic graduation cadence armed on boot")
+    # JIT GitHub auth: prefer Secret Manager `github-token` (the startup script
+    # reads it natively). Optionally pass a token through here as metadata
+    # fallback — NEVER printed, only length. A token is REQUIRED for the node to
+    # push [SOVEREIGN GRADUATION] PRs; without one the cadence soaks but cannot
+    # open PRs (it logs a clear warning).
+    gh_tok = os.environ.get("GH_TOKEN", "").strip()
+    if gh_tok:
+        md["jarvis-gh-token"] = gh_tok
+        print(f"   gh_token via metadata: {_mask(gh_tok)}")
+    else:
+        print("   gh_token: relying on Secret Manager `github-token` "
+              "(set GH_TOKEN env to pass via metadata instead)")
+
     mgr = GCPVMManager(cfg)
-    ok, result = await mgr.start_soak_vm(
-        extra_metadata={
-            "jarvis-dw-api-key": dw_key,
-            "jarvis-dw-primary-override": args.pin,
-        },
-    )
+    ok, result = await mgr.start_soak_vm(extra_metadata=md)
     if not ok:
         print(f"❌ ignition failed: {result}")
         return 1
@@ -115,6 +131,8 @@ def main() -> int:
     p.add_argument("--disk-gb", type=int, default=int(os.environ.get("GCP_BOOT_DISK_GB", "50")))
     p.add_argument("--max-hours", type=float, default=float(os.environ.get("GCP_MAX_VM_HOURS", "6")))
     p.add_argument("--dry-run", action="store_true", help="validate config, do not create the VM")
+    p.add_argument("--crucible", action="store_true",
+                   help="arm the autonomic Sovereign Cognitive Graduation Crucible cadence")
     args = p.parse_args()
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))

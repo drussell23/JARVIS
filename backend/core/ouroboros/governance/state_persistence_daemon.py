@@ -88,6 +88,13 @@ def build_backup_commands(backend: str, src: str, target: str) -> List[List[str]
         return [["rsync", "-az", "--delete", f"{src.rstrip('/')}/", target]]
     if b == "s3":
         return [["aws", "s3", "sync", src, target, "--delete"]]
+    if b == "gcs":
+        # Sovereign Cognitive Crucible amnesia-proofing (2026-06-20): mirror the
+        # state dir to a GCS bucket so a preempted Spot node resumes its
+        # graduation ledger + soak history on restart. ``-m`` parallel, ``-r``
+        # recursive, ``-d`` prune remote deletions (mirror semantics, matching
+        # rsync/s3). The Spot VM's default compute SA authenticates via ADC.
+        return [["gsutil", "-m", "rsync", "-r", "-d", src.rstrip("/"), target]]
     if b == "git":
         # A self-contained git repo INSIDE src pushing to a private remote.
         msg = f"state-vault snapshot {int(time.time())}"
