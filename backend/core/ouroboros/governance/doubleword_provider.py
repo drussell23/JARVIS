@@ -2449,7 +2449,10 @@ class DoublewordProvider:
                     except Exception:  # noqa: BLE001 — fail-open to legacy race
                         _s227_prefer_fast = False
                 if _s227_prefer_fast:
-                    logger.warning(
+                    # INFO: a routine, by-design per-op routing decision (the hedge
+                    # governor preferring the RT/tool-loop arm for an Iron-Gate
+                    # exploration op). Observable, not actionable — not a WARNING.
+                    logger.info(
                         "[Cortex] ⚡ HEDGE GOVERNOR: op needs Iron-Gate "
                         "exploration — batch arm held speculative, RT arm (tool "
                         "loop) gets the slot unless it ruptures (op=%s)",
@@ -2919,7 +2922,10 @@ class DoublewordProvider:
             and str(_complexity).strip().lower() == "simple"
             and _s226_gate_demands(str(_complexity))
         ):
-            logger.warning(
+            # INFO: routine, by-design Iron-Gate enforcement (re-opening the Venom
+            # tool loop so a 'simple' op still meets the exploration floor).
+            # Observable adaptive behavior, not an actionable warning.
+            logger.info(
                 "[DoublewordProvider] ⚡ CAPABILITY ALIGNMENT: Iron Gate floor "
                 "demands exploration for a 'simple' op — re-opened the Venom "
                 "tool loop (read_file/search_code) the cost heuristic would "
