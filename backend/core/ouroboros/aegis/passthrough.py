@@ -47,7 +47,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -58,7 +58,9 @@ from backend.core.ouroboros.aegis.lease import (
 )
 from backend.core.ouroboros.aegis.request_body import (
     BodyTooLarge,
+    content_length_hint,
     read_body_capped,
+    stream_body_capped,
 )
 from backend.core.ouroboros.aegis.upstream_registry import (
     AuthScheme,
@@ -134,14 +136,40 @@ def _bearer_session(request: web.Request) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+# Sovereign Aegis Batch-Passthrough Matrix (2026-06-20). Default raised from
+# 4 MiB → 64 MiB. The 4 MiB floor 413'd a MASSIVE multi-file architectural
+# refactor's batch JSONL (full file contents in the GENERATE prompt run to many
+# MiB) at the proxy boundary BEFORE it ever reached DW — the only real blocker
+# on routing huge ops through the batch lane. Safe to raise because the body is
+# now STREAMED (constant memory), so this cap bounds ACCEPTED bytes, not RAM.
+# INVARIANT: this MUST be >= the DW provider's upload preflight cap
+# (JARVIS_DW_UPLOAD_MAX_BYTES) so the provider's own guard rejects first with a
+# precise provider-side error rather than a bare aegis 413.
+_DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+
+
 def _max_request_body_bytes() -> int:
     raw = os.environ.get("JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES", "").strip()
     if not raw:
-        return 4 * 1024 * 1024
+        return _DEFAULT_MAX_REQUEST_BODY_BYTES
     try:
         return max(1024, int(raw))
     except (TypeError, ValueError):
-        return 4 * 1024 * 1024
+        return _DEFAULT_MAX_REQUEST_BODY_BYTES
+
+
+def _stream_passthrough_enabled() -> bool:
+    """Master for the streaming (constant-memory) passthrough body forwarder.
+    Default **TRUE** — the batch lane must not buffer massive JSONL uploads
+    twice. =0/false reverts to the legacy buffered ``read_body_capped`` path
+    (byte-identical) for instant rollback. NEVER raises."""
+    return os.environ.get("JARVIS_AEGIS_STREAM_PASSTHROUGH", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+# Methods that carry a request body Aegis must forward. GET/DELETE polls and
+# content retrievals have no body → outbound data stays None (legacy shape).
+_BODY_METHODS: Tuple[str, ...] = ("POST", "PUT", "PATCH")
 
 
 def _strip_inbound_headers(request: web.Request) -> Dict[str, str]:
@@ -235,40 +263,64 @@ async def forward_passthrough(
         )
 
     # --- 3. Request body (FULL read, cap-enforced; passthrough never parses) -
-    # Slice 42 — read the ENTIRE body via read_body_capped (chunk-accumulation
-    # loop). The prior single ``request.content.read(cap)`` truncated bodies
-    # that arrived across multiple TCP segments (e.g. an 18 KB multipart batch
-    # upload), forwarding a broken multipart upstream → DW HTTP 400. The DoS
-    # cap is preserved: over-cap → HTTP 413, no unbounded buffering.
-    try:
-        body_bytes = await read_body_capped(request, _max_request_body_bytes())
-    except BodyTooLarge as exc:
+    # Slice 42 — read the ENTIRE body (never a single truncating read).
+    # Sovereign Aegis Batch-Passthrough Matrix — the body is resolved into an
+    # outbound ``data`` source that is EITHER a constant-memory streaming
+    # generator (default) OR the legacy buffered bytes (kill switch). Both
+    # enforce the cap; streaming additionally rejects an over-cap upload from
+    # its declared Content-Length BEFORE reading a byte (the common case, since
+    # aiohttp always sets Content-Length for a bytes/FormData body).
+    _cap = _max_request_body_bytes()
+    _has_body = request.method.upper() in _BODY_METHODS
+    outbound_data: Any = None
+
+    def _too_large(detail: str):
         return (
             web.json_response(
                 {"ok": False, "error": "request_body_too_large",
-                 "detail": str(exc)}, status=413,
+                 "detail": detail}, status=413,
             ),
             PassthroughResult(
                 outcome=PassthroughOutcome.REQUEST_TOO_LARGE,
                 upstream_status=None,
                 response_bytes=0,
-                detail=str(exc),
+                detail=detail,
             ),
         )
-    except (asyncio.CancelledError, aiohttp.ClientError):
-        raise
-    except Exception as exc:  # noqa: BLE001
-        return (
-            web.json_response(
-                {"ok": False, "error": "request_body_read_failed"}, status=400,
-            ),
-            PassthroughResult(
-                outcome=PassthroughOutcome.CLIENT_DISCONNECTED,
-                upstream_status=None,
-                response_bytes=0,
-                detail=str(exc),
-            ),
-        )
+
+    if _has_body:
+        # Clean early 413 from the declared size — no read, no upstream open.
+        declared = content_length_hint(request)
+        if declared is not None and declared > _cap:
+            return _too_large(
+                f"declared Content-Length {declared} exceeds cap {_cap}"
+            )
+        if _stream_passthrough_enabled():
+            # Constant-memory: yields chunks straight to the outbound request,
+            # raising BodyTooLarge mid-stream (caught at the forward site) for
+            # chunked / no-Content-Length clients the early check can't see.
+            outbound_data = stream_body_capped(request, _cap)
+        else:
+            try:
+                _buf = await read_body_capped(request, _cap)
+            except BodyTooLarge as exc:
+                return _too_large(str(exc))
+            except (asyncio.CancelledError, aiohttp.ClientError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    web.json_response(
+                        {"ok": False, "error": "request_body_read_failed"},
+                        status=400,
+                    ),
+                    PassthroughResult(
+                        outcome=PassthroughOutcome.CLIENT_DISCONNECTED,
+                        upstream_status=None,
+                        response_bytes=0,
+                        detail=str(exc),
+                    ),
+                )
+            outbound_data = _buf if _buf else None
 
     # --- 4. Credential injection (never logged) -----------------------------
     upstream_credential = os.environ.get(endpoint.credential_env_var, "").strip()
@@ -319,8 +371,13 @@ async def forward_passthrough(
             upstream_resp = await session.request(
                 method=request.method,
                 url=upstream_url,
-                data=body_bytes if body_bytes else None,
+                data=outbound_data,
             )
+        except BodyTooLarge as exc:
+            # Streaming path: a chunked / no-Content-Length client exceeded the
+            # cap mid-send (the early declared-size check couldn't see it). The
+            # upstream send is aborted by aiohttp; surface the clean 413.
+            return _too_large(str(exc))
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return (
                 web.json_response({

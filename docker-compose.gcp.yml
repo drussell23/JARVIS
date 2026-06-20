@@ -32,18 +32,29 @@ services:
       JARVIS_SEMANTIC_INFERENCE_ENABLED: "false"
       # don't let the heavy 550B boot probe false-degrade the DW stream lane
       JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
-      # AEGIS VALIDATION RESULT (2026-06-20 soak): re-arming aegis REGRESSED the loop
-      # — every op fsm_exhausted, zero state=applied. PR #69590 fixed the upstream-
-      # response LEAK ("Unclosed connection") but the aegis DW-streaming path still
-      # breaks generation under live load (the rupture, not just the leak). Aegis
-      # stays OFF for the working cloud config; the deeper AegisForward DW-SSE rupture
-      # is a tracked follow-up (dedicated fix + its own validation soak required).
-      JARVIS_AEGIS_ENABLED: "false"
-      # DYNAMIC TRANSPORT ROUTER (item 3): replaces the force-RT hardcode. A per-op
-      # payload heuristic streams localized fixes (RT, fast) and batches large/
-      # multi-file refactors (DW batch, now that the webhook-vs-poll retrieve-hang
-      # is fixed in #69599). No all-or-nothing dichotomy.
+      # AEGIS SHIELDS UP + FULLY DYNAMIC (Sovereign Aegis Batch-Passthrough Matrix,
+      # 2026-06-20). Two isolation soaks proved BOTH proxied lanes healthy end to
+      # end with shields up:
+      #   - RT/SSE-through-aegis  → state=applied (op-019ee41b RT soak)
+      #   - BATCH-through-aegis   → files-upload + create + poll + content-retrieve
+      #     all upstream_status=200, zero 4xx/5xx, → state=applied (force-batch soak)
+      # The batch lane was never "ruptured"; its only real limit was payload SIZE:
+      # aiohttp's 1 MiB server default + the 4 MiB passthrough cap + the 5 MiB
+      # provider preflight all 413'd a MASSIVE multi-file refactor's batch JSONL.
+      # The Matrix fixes that structurally (streaming constant-memory passthrough +
+      # aligned 64 MiB caps + 65 MiB aiohttp ceiling) so the engine can route huge
+      # ops through batch under the proxy. No tourniquet: the dynamic router is
+      # ARMED and the force-batch pins are GONE — the engine evaluates each op's
+      # payload itself (RT for localized fixes, batch for large refactors).
+      JARVIS_AEGIS_ENABLED: "true"
       JARVIS_DW_DYNAMIC_TRANSPORT_ENABLED: "true"
+      # Massive-payload ceilings (Matrix). Aegis passthrough cap MUST be >= the DW
+      # provider upload preflight (both 64 MiB) so the provider rejects first with a
+      # precise cause; aiohttp's server ceiling sits 1 MiB above so the proxy's clean
+      # JSON 413 stays authoritative. Streaming forwarder ON (constant memory).
+      JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES: "67108864"
+      JARVIS_DW_UPLOAD_MAX_BYTES: "67108864"
+      JARVIS_AEGIS_STREAM_PASSTHROUGH: "true"
       # real cores → give DW generation full runway (no 90s reflex-cap timeouts)
       OUROBOROS_TIER0_MAX_WAIT_S: "600"
       JARVIS_GENERATION_TIMEOUT_S: "900"

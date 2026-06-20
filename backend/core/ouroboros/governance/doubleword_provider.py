@@ -4210,7 +4210,16 @@ class DoublewordProvider:
         # Slice 37 Phase 1 — pre-flight size guard. DW's /v1/files
         # endpoint returns opaque HTTP 500 on oversized payloads;
         # fail-fast with named cause before the round-trip.
-        _max_upload_bytes = 5 * 1024 * 1024  # 5 MB default
+        #
+        # Sovereign Aegis Batch-Passthrough Matrix (2026-06-20). Default raised
+        # 5 MiB → 64 MiB so a MASSIVE multi-file architectural refactor's batch
+        # JSONL clears the provider preflight and reaches the (now streaming,
+        # 65 MiB-ceilinged) Aegis passthrough. INVARIANT: this preflight cap MUST
+        # stay <= the Aegis passthrough cap (JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES,
+        # default 64 MiB) so an over-cap upload is rejected HERE with a precise
+        # provider-side cause, never as a bare proxy 413 mid-flight. Both default
+        # to 64 MiB; if an operator raises one, raise the other to match.
+        _max_upload_bytes = 64 * 1024 * 1024  # 64 MiB default (aligned w/ Aegis)
         try:
             _env_max = os.environ.get("JARVIS_DW_UPLOAD_MAX_BYTES", "").strip()
             if _env_max:

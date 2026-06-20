@@ -94,12 +94,15 @@ def test_ast_pin_slice37_error_body_capture_widened() -> None:
 
 
 def test_spine_env_knob_overrides_default_max_bytes() -> None:
-    """``JARVIS_DW_UPLOAD_MAX_BYTES`` env overrides the 5 MB
-    default. Operators can tighten or loosen the guard."""
+    """``JARVIS_DW_UPLOAD_MAX_BYTES`` env overrides the default upload guard.
+    Operators can tighten or loosen it. Sovereign Aegis Batch-Passthrough
+    Matrix (2026-06-20) raised the default 5 MiB -> 64 MiB so massive
+    multi-file refactor JSONL clears the preflight, aligned with the Aegis
+    passthrough cap (JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES)."""
     src = DW_FILE.read_text()
     # The env knob name + default value documented
     assert "JARVIS_DW_UPLOAD_MAX_BYTES" in src
-    assert "5 * 1024 * 1024" in src  # 5 MB default
+    assert "64 * 1024 * 1024" in src  # 64 MiB default (aligned with Aegis cap)
 
 
 def test_spine_payload_size_logged_with_model_and_custom_id() -> None:

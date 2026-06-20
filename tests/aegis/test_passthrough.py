@@ -60,8 +60,15 @@ class _Recorder:
 
 
 def _make_dw_passthrough_stub(recorder: _Recorder) -> web.Application:
-    """Stub upstream for the 5 allowlisted DW endpoints."""
-    app = web.Application()
+    """Stub upstream for the 5 allowlisted DW endpoints.
+
+    client_max_size raised to 128 MiB so the stub mirrors the REAL DW batch
+    API (which accepts large JSONL uploads). With aiohttp's 1 MiB default the
+    stub itself would 413 a massive upload, masking whether *Aegis* forwards
+    it — the Sovereign Aegis Batch-Passthrough Matrix tests must exercise the
+    proxy's own boundary, not the stub's.
+    """
+    app = web.Application(client_max_size=128 * 1024 * 1024)
 
     async def _record(request: web.Request) -> dict:
         # Read body raw (don't json-decode — multipart preservation test).
@@ -251,6 +258,83 @@ async def test_files_large_multipart_forwarded_byte_identical(stack, size):
     assert rec["body_len"] == len(body), (
         f"truncated forward: upstream saw {rec['body_len']} of {len(body)} bytes"
     )
+    assert rec["body_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Aegis Batch-Passthrough Matrix — massive payload streaming
+# ---------------------------------------------------------------------------
+
+
+async def test_files_massive_multipart_streamed_byte_identical(stack):
+    # A 2 MB upload — over the LEGACY 4 MB-ish band is not needed; this proves
+    # the streaming path forwards a multi-segment, multi-MB body byte-identical
+    # (constant memory). With JARVIS_AEGIS_STREAM_PASSTHROUGH default ON this
+    # exercises stream_body_capped end to end through the daemon.
+    client, recorder, _ = stack
+    session = await _session_token(client)
+    body = _large_multipart(2 * 1024 * 1024)
+    resp = await client.post(
+        "/v1/files",
+        headers={
+            "Authorization": f"Bearer {session}",
+            "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        },
+        data=body,
+    )
+    assert resp.status == 200
+    assert len(recorder.received) == 1
+    rec = recorder.received[0]
+    assert rec["body_len"] == len(body), (
+        f"truncated stream: upstream saw {rec['body_len']} of {len(body)} bytes"
+    )
+    assert rec["body_sha256"] == hashlib.sha256(body).hexdigest()
+    assert rec["auth_header"] == f"Bearer {_STUB_DW_KEY}"
+    assert "multipart/form-data" in rec["content_type"]
+
+
+async def test_files_over_cap_clean_413_before_upstream(stack, monkeypatch):
+    # An upload whose declared Content-Length exceeds the cap is rejected with a
+    # clean HTTP 413 BEFORE any body is read or the upstream is touched.
+    monkeypatch.setenv("JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES", str(1 * 1024 * 1024))
+    client, recorder, _ = stack
+    session = await _session_token(client)
+    body = _large_multipart(2 * 1024 * 1024)  # 2 MB > 1 MB cap
+    resp = await client.post(
+        "/v1/files",
+        headers={
+            "Authorization": f"Bearer {session}",
+            "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        },
+        data=body,
+    )
+    assert resp.status == 413
+    payload = await resp.json()
+    assert payload["error"] == "request_body_too_large"
+    # Upstream NEVER saw the request — rejected at the proxy boundary.
+    assert recorder.received == []
+
+
+async def test_files_streaming_disabled_buffered_fallback_byte_identical(
+    stack, monkeypatch,
+):
+    # Kill switch: JARVIS_AEGIS_STREAM_PASSTHROUGH=false reverts to the legacy
+    # buffered read_body_capped path — still byte-identical (instant rollback).
+    monkeypatch.setenv("JARVIS_AEGIS_STREAM_PASSTHROUGH", "false")
+    client, recorder, _ = stack
+    session = await _session_token(client)
+    body = _large_multipart(512 * 1024)
+    resp = await client.post(
+        "/v1/files",
+        headers={
+            "Authorization": f"Bearer {session}",
+            "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        },
+        data=body,
+    )
+    assert resp.status == 200
+    rec = recorder.received[0]
+    assert rec["body_len"] == len(body)
     assert rec["body_sha256"] == hashlib.sha256(body).hexdigest()
 
 
