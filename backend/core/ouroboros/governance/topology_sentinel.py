@@ -443,6 +443,12 @@ class FailureSource(str, enum.Enum):
     # to the weighted-streak that trips the DW model/topology breaker, and (being
     # != LIVE_TRANSPORT) the degrade/sever consumers ignore it automatically.
     GENERATION_TIMEOUT = "generation_timeout"      # 0.0
+    # Sovereign Exception Taxonomy (2026-06-20) — OUR-side FSM dispatch exhaustion
+    # (DW yielded no candidate AND no fallback configured under pure-DW autarky).
+    # NOT a vendor rupture. Weight 0.0: like GENERATION_TIMEOUT it is telemetry-only
+    # and (being != LIVE_TRANSPORT) the degrade/sever consumers ignore it — so one
+    # op's no-candidate can NEVER sever the DW lane or corrupt vendor surface-health.
+    FSM_EXHAUSTED = "fsm_exhausted"                # 0.0
 
 
 _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
@@ -455,6 +461,7 @@ _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
     FailureSource.LIGHT_PROBE_FAIL: 1.0,
     FailureSource.LIGHT_PROBE_TIMEOUT: 1.0,
     FailureSource.GENERATION_TIMEOUT: 0.0,
+    FailureSource.FSM_EXHAUSTED: 0.0,
 }
 
 

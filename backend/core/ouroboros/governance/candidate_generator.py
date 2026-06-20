@@ -3787,6 +3787,7 @@ class CandidateGenerator:
                 from backend.core.ouroboros.governance.dw_fault_taxonomy import (
                     is_internal_fault as _s185_internal,
                     is_generation_timeout as _s241_gen_timeout,
+                    is_fsm_exhaustion as _fsm_exhausted,
                 )
                 if _s185_internal(exc):
                     logger.error(
@@ -3825,6 +3826,18 @@ class CandidateGenerator:
                     # topology breaker (weight 0.0) never trips on OUR budget.
                     # Stops blaming DoubleWord's network for our generation budget.
                     failure_source = FailureSource.GENERATION_TIMEOUT
+                elif _fsm_exhausted(exc):
+                    # Sovereign Exception Taxonomy (2026-06-20) — OUR-side FSM
+                    # dispatch exhaustion (DW produced no candidate AND no Claude
+                    # fallback configured under pure-DW autarky). NOT a vendor
+                    # rupture: no socket failed, the vendor rejected nothing. The
+                    # cloud soak proved a single
+                    # ``all_providers_exhausted:fallback_skipped:no_fallback_configured``
+                    # was mislabeled LIVE_TRANSPORT on all 16 models, severing the
+                    # whole DW lane + corrupting surface-health. Classify
+                    # FSM_EXHAUSTED (weight 0.0) so it fails ONLY this op without
+                    # severing the lane or touching the vendor ledger.
+                    failure_source = FailureSource.FSM_EXHAUSTED
                 elif _is_modality or _is_auth_terminal:
                     # Slice H — terminal failure class. Even though we
                     # report it as LIVE_HTTP_5XX semantics here for
@@ -3921,7 +3934,13 @@ class CandidateGenerator:
                         "[CandidateGenerator] Sentinel dispatch: model=%s "
                         "FAILED (source=%s, exc=%s) — trying next (op=%s)",
                         model_id, failure_source.value,
-                        type(exc).__name__, op_id_short,
+                        # Observability (2026-06-20): un-swallow the message. The
+                        # prior log emitted only ``type(exc).__name__`` — which hid
+                        # that a "live_transport RuntimeError" was actually an
+                        # internal ``...:no_fallback_configured`` FSM exhaustion,
+                        # costing two long blind diagnosis passes. Include the
+                        # (bounded) message so the real cause is visible at WARNING.
+                        f"{type(exc).__name__}: {err_str[:300]!r}", op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
                 try:

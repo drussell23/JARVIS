@@ -77,3 +77,36 @@ def is_generation_timeout(exc: BaseException) -> bool:
         return any(m in msg for m in _GENERATION_TIMEOUT_MARKERS)
     except Exception:  # noqa: BLE001 — the taxonomy must never itself throw
         return False
+
+
+# Sovereign Exception Taxonomy (2026-06-20) — FSM-EXHAUSTION segregation. When the
+# DW primary yields no candidate AND the Claude fallback is not configured (pure-DW
+# autarky), the per-model sentinel dispatch wraps it as a RuntimeError whose message
+# is one of these OUR-side FSM-control markers. These are NOT vendor transport
+# ruptures — no socket failed, the vendor never even rejected anything. Cloud soak
+# 2026-06-20 proved every one of the 16 models got mislabeled ``LIVE_TRANSPORT`` from
+# a single ``all_providers_exhausted:fallback_skipped:no_fallback_configured``,
+# which then SEVERED the whole DW lane (Slice 73/83 fast-cascade) and corrupted the
+# surface-health ledger — turning one op's no-candidate into a lane-wide outage.
+_FSM_EXHAUSTION_MARKERS = (
+    "no_fallback_configured",
+    "all_providers_exhausted",
+    "fallback_skipped",
+    "sentinel_dispatch_no_fallback",
+    "background_dw_blocked_by_topology",
+    "speculative_deferred",
+)
+
+
+def is_fsm_exhaustion(exc: BaseException) -> bool:
+    """True iff ``exc`` is an OUR-side FSM dispatch exhaustion (DW produced no
+    candidate AND no fallback is configured), NOT a vendor transport rupture. Must
+    be classified ``FSM_EXHAUSTED`` — never ``LIVE_TRANSPORT`` — so it fails only
+    the specific op WITHOUT severing the DW lane or corrupting the vendor
+    surface-health ledger (the 2026-06-20 cloud-soak lane-wide-outage root cause).
+    Message-matched; a genuine transport error never matches. NEVER raises → False."""
+    try:
+        msg = str(exc).lower()
+        return any(m in msg for m in _FSM_EXHAUSTION_MARKERS)
+    except Exception:  # noqa: BLE001 — the taxonomy must never itself throw
+        return False
