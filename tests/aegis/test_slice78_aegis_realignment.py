@@ -65,3 +65,36 @@ def test_upstream_read_failure_maps_to_unreachable_outcome():
     assert src.index("upstream_read_failed = True") < src.rindex(
         "ForwardOutcome.UPSTREAM_UNREACHABLE"
     )
+
+
+# --- the upstream connection must be released on EVERY exit path -------------
+# Bug (2026-06-20 DW-stream soak): only the guillotine branch released the
+# upstream ClientResponse. The normal-completion, client-disconnect, and
+# upstream-read-failed paths left it unreleased, so when ``async with session``
+# closed, aiohttp logged "Unclosed connection" and orphaned the upstream socket.
+
+
+def test_upstream_response_released_in_finally_on_all_paths():
+    src = inspect.getsource(forwarding.forward_request)
+    # release must appear at least twice: the pre-existing guillotine branch
+    # AND the new all-paths release in the streaming finally.
+    assert src.count("upstream_resp.release()") >= 2, (
+        "upstream_resp must be released on every exit path, not just guillotine"
+    )
+    # the all-paths release must live inside the streaming finally (after the
+    # write_eof), so client-disconnect / upstream-read-failed breaks still hit it.
+    fin = src.index("finally:")
+    eof = src.index("write_eof", fin)
+    assert src.index("upstream_resp.release()", eof) > eof, (
+        "the all-paths release must be in the finally, after write_eof"
+    )
+
+
+def test_release_is_guarded_so_cleanup_never_fails_loud():
+    src = inspect.getsource(forwarding.forward_request)
+    rel = src.index("upstream_resp.release()", src.index("write_eof"))
+    # the all-paths release is wrapped so a cleanup error can't break the return
+    window = src[rel - 60:rel + 120]
+    assert "try:" in window and "except Exception" in window, (
+        "the all-paths release must be guarded (cleanup must never fail loud)"
+    )
