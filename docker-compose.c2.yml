@@ -1,0 +1,27 @@
+# JARVIS C2 Telemetry overlay (2026-06-20) — distributed observability.
+# =============================================================================
+# Compose OVERRIDE for the prod engine that makes its loopback-only SSE stream
+# (GET /observability/stream, started by GLS on 127.0.0.1:8099) reachable for a
+# secure SSH-forwarded C2 subscriber — WITHOUT weakening the engine's
+# loopback-only security invariant.
+#
+# network_mode: host → the container's loopback IS the host's loopback, so the
+# loopback-bound EventChannelServer listens on the HOST's 127.0.0.1:8099. An
+# SSH local-forward from the M1 (ssh -L 8099:localhost:8099 user@host) then
+# reaches it. No 0.0.0.0 bind, no auth bypass, no new internet-facing surface —
+# the stream stays loopback-only; SSH provides the encrypted transport.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.c2.yml up -d --build
+#
+# Then on the M1: see deploy/C2_TELEMETRY.md (one-line connect).
+# =============================================================================
+services:
+  jarvis-prod:
+    # Host networking: container loopback == host loopback. Port mappings are
+    # ignored under host mode (by design — the SSE stream stays on 127.0.0.1).
+    network_mode: host
+    environment:
+      # Ensure the observability HTTP listener + SSE stream are armed.
+      JARVIS_IDE_OBSERVABILITY_ENABLED: "true"
+      JARVIS_IDE_STREAM_ENABLED: "true"
+      JARVIS_CHANNEL_PORT: "8099"
