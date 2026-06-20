@@ -71,5 +71,37 @@ def test_fallback_dead_zero_remaining_is_zero():
     assert CandidateGenerator._compute_primary_budget(0.0, fallback_dead=True) == 0.0
 
 
+# ── config-disabled Claude is a DEAD fallback → autarky must engage ─────────
+# Gap: ``_claude_breaker_open()`` reads only the breaker STATE, so a
+# CONFIG-disabled Claude (``JARVIS_PROVIDER_CLAUDE_DISABLED=true``) — which is
+# never even constructed, the deadest possible fallback — leaves the breaker
+# CLOSED and the autarky full-runway grant never engaged, holding the sole-lane
+# DW to the reflex cap until it TIMED OUT. ``_claude_config_disabled()`` closes it.
+
+def test_claude_config_disabled_true_when_env_on(monkeypatch):
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _claude_config_disabled,
+    )
+    for val in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", val)
+        assert _claude_config_disabled() is True, f"{val!r} should disable Claude"
+
+
+def test_claude_config_disabled_false_when_unset(monkeypatch):
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _claude_config_disabled,
+    )
+    monkeypatch.delenv("JARVIS_PROVIDER_CLAUDE_DISABLED", raising=False)
+    assert _claude_config_disabled() is False
+
+
+def test_claude_config_disabled_false_when_explicit_false(monkeypatch):
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _claude_config_disabled,
+    )
+    monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "false")
+    assert _claude_config_disabled() is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
