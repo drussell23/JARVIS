@@ -46,6 +46,68 @@ class RewriteResult:
     detail: str
 
 
+# Bounded codebase search for the literal-site locator.
+_LOCATOR_ROOTS = ("backend", "scripts")
+_LOCATOR_MAX_FILE_BYTES = 2 * 1024 * 1024
+_LOCATOR_SKIP_DIRS = frozenset({
+    ".git", ".venv", "node_modules", "__pycache__", ".claude",
+    "tests", "test",
+})
+
+
+def locate_default_literal_file(
+    flag: str, repo_root: str, *, hint: Optional[str] = None,
+) -> Optional[str]:
+    """Find the single source file whose ``os.environ.get("<FLAG>", "<falsy>")``
+    default literal the crucible should flip.
+
+    ``FlagSpec.source_file`` points to the flag's DECLARATION/doc site, which is
+    frequently NOT where the default literal lives (audited: only ~6/96 align).
+    This locator searches the codebase for the actual literal site so the
+    crucible can graduate the real source-of-truth. Pure-ish (bounded file I/O),
+    fail-soft, NEVER raises.
+
+    Returns the repo-relative path IFF exactly one file contains exactly one
+    flippable falsy default for ``flag`` (the ``hint`` file is checked first and
+    wins if it qualifies). Returns ``None`` on zero or ambiguous (>1 file)
+    matches — abstain rather than guess."""
+    if not isinstance(flag, str) or not flag or not isinstance(repo_root, str):
+        return None
+    pat = _flag_default_pattern(flag)
+
+    def _qualifies(rel: str) -> bool:
+        try:
+            with open(os.path.join(repo_root, rel), "r", encoding="utf-8") as fh:
+                txt = fh.read(_LOCATOR_MAX_FILE_BYTES)
+        except OSError:
+            return False
+        ms = list(pat.finditer(txt))
+        if len(ms) != 1:
+            return False
+        return ms[0].group("lit").strip().lower() in _FALSY_LITERALS
+
+    # Hint (registry source_file) wins if it qualifies.
+    if hint and _qualifies(hint):
+        return hint
+
+    found: list = []
+    for root in _LOCATOR_ROOTS:
+        base = os.path.join(repo_root, root)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in _LOCATOR_SKIP_DIRS]
+            for fn in filenames:
+                if not fn.endswith(".py"):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, fn), repo_root)
+                if _qualifies(rel):
+                    found.append(rel)
+                    if len(found) > 1:
+                        return None  # ambiguous across files — abstain
+    return found[0] if len(found) == 1 else None
+
+
 def _flag_default_pattern(flag: str) -> re.Pattern:
     """Match ``os.environ.get("<FLAG>", "<literal>")`` capturing the quote +
     inner default literal. Tolerates single/double quotes + inner whitespace."""
@@ -169,9 +231,15 @@ async def propose_graduation_pr(
         except Exception as exc:  # noqa: BLE001
             return ProposalResult(False, flag, "", None, f"registry_unavailable:{exc}")
 
-    source_file = _resolve_source_file(flag, registry)
+    # Resolve the literal SITE: the registry source_file is a hint (it points to
+    # the declaration, not always the default literal), so the locator searches
+    # the codebase and returns the real single literal-site (hint wins if valid).
+    hint = _resolve_source_file(flag, registry)
+    source_file = locate_default_literal_file(flag, repo_root, hint=hint)
     if not source_file:
-        return ProposalResult(False, flag, "", None, "source_file_unknown")
+        return ProposalResult(
+            False, flag, hint or "", None, "literal_site_unresolved",
+        )
 
     abs_path = os.path.join(repo_root, source_file)
     try:

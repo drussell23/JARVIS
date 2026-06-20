@@ -9,8 +9,48 @@ from backend.core.ouroboros.governance.graduation.graduation_pr_proposer import 
     ProposalResult,
     flip_default_to_true,
     graduation_pr_enabled,
+    locate_default_literal_file,
     propose_graduation_pr,
 )
+
+
+# ── literal-site locator (Slice 5.5) ────────────────────────────────────────
+
+def _mk(tmp_path, rel, text):
+    p = tmp_path / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+
+
+def test_locator_finds_single_site(tmp_path):
+    _mk(tmp_path, "backend/m.py",
+        'x = os.environ.get("JARVIS_F", "false")\n')
+    assert locate_default_literal_file("JARVIS_F", str(tmp_path)) == "backend/m.py"
+
+
+def test_locator_abstains_on_multiple_files(tmp_path):
+    _mk(tmp_path, "backend/a.py", 'os.environ.get("JARVIS_F", "false")\n')
+    _mk(tmp_path, "backend/b.py", 'os.environ.get("JARVIS_F", "false")\n')
+    assert locate_default_literal_file("JARVIS_F", str(tmp_path)) is None
+
+
+def test_locator_hint_wins_when_valid(tmp_path):
+    _mk(tmp_path, "backend/decl.py", 'os.environ.get("JARVIS_F", "0")\n')
+    assert locate_default_literal_file(
+        "JARVIS_F", str(tmp_path), hint="backend/decl.py",
+    ) == "backend/decl.py"
+
+
+def test_locator_skips_tests_dir(tmp_path):
+    _mk(tmp_path, "backend/real.py", 'os.environ.get("JARVIS_F", "false")\n')
+    _mk(tmp_path, "backend/tests/t.py", 'os.environ.get("JARVIS_F", "false")\n')
+    # tests/ is pruned → only the real site counts (not ambiguous)
+    assert locate_default_literal_file("JARVIS_F", str(tmp_path)) == "backend/real.py"
+
+
+def test_locator_none_when_absent(tmp_path):
+    _mk(tmp_path, "backend/m.py", "x = 1\n")
+    assert locate_default_literal_file("JARVIS_MISSING", str(tmp_path)) is None
 
 
 # ── the pure rewriter (safety-critical) ─────────────────────────────────────
