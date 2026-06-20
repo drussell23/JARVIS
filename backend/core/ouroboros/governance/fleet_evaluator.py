@@ -211,6 +211,28 @@ class FleetEvaluator:
         self.flag_persister = flag_persister or _default_flag_persister
         self._consecutive_wins = 0
         self._last_winner: Optional[str] = None
+        self._repair_sentinel: Any = None  # lazily built when sentinel enabled
+
+    # -- autonomic repair sentinel (idle self-verification) ----------------- #
+    async def _maybe_run_repair_sentinel(self, *, now: float) -> None:
+        """Run the Autonomic Repair Sentinel on this idle tick. Independent of
+        the calibration master (it self-gates on JARVIS_FLEET_SENTINEL_ENABLED +
+        idle + cost). Late-imported to avoid a circular dep. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.fleet_repair_sentinel import (
+                RepairSentinel,
+                repair_sentinel_enabled,
+            )
+            if not repair_sentinel_enabled():
+                return
+            if self._repair_sentinel is None:
+                self._repair_sentinel = RepairSentinel(
+                    model_caller=self.model_caller, store=self.store,
+                    idle_check=self.idle_check, clock=self.clock,
+                )
+            await self._repair_sentinel.maybe_run_sentinel(now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FleetEvaluator] repair sentinel skipped: %s", exc)
 
     # -- single probe ------------------------------------------------------- #
     async def _probe_one(
@@ -301,6 +323,11 @@ class FleetEvaluator:
         """Idle-cycle entry. Short-circuits before any probe when the master
         switch is off or the system is not idle. Never raises."""
         try:
+            # Autonomic Repair Sentinel — runs FIRST + independent of the
+            # calibration master (self-gated on JARVIS_FLEET_SENTINEL_ENABLED +
+            # idle + cost), so DW O+V health self-verifies even when periodic
+            # model calibration is off.
+            await self._maybe_run_repair_sentinel(now=now)
             if not fleet_evaluator_enabled():
                 return
             if not self.idle_check():

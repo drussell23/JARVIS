@@ -5078,6 +5078,42 @@ SEED_SPECS: list = [
         since="2026-06-19",
     ),
     FlagSpec(
+        name="JARVIS_FLEET_SENTINEL_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master for the Autonomic Repair Sentinel: on idle cycles, run a "
+            "mutated slice of the O+V repair battery against the monitored DW "
+            "coder(s) and feed pass/fail into the FleetEvaluator EWMA so a "
+            "degrading model is auto-deprioritised before it fails a live op. "
+            "Default OFF (opt-in — spends real DW budget, cost-capped)."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/fleet_repair_sentinel.py",
+        example="true",
+        since="2026-06-20",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_SENTINEL_DEFECTS_PER_CYCLE",
+        type=FlagType.INT, default=3,
+        description=(
+            "Repair-battery defects probed per Sentinel idle cycle (bounds "
+            "cost; rotates across the battery + monitored models over cycles)."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_repair_sentinel.py",
+        example="3",
+        since="2026-06-20",
+    ),
+    FlagSpec(
+        name="JARVIS_FLEET_SENTINEL_MAX_TOKENS",
+        type=FlagType.INT, default=1024,
+        description="Per-repair max_tokens cap for Sentinel generation probes.",
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/fleet_repair_sentinel.py",
+        example="1024",
+        since="2026-06-20",
+    ),
+    FlagSpec(
         name="JARVIS_FLEET_GRAD_MIN_SAMPLES",
         type=FlagType.INT, default=5,
         description=(
