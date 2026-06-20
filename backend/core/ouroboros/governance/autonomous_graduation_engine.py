@@ -59,6 +59,7 @@ STANDARD→AUTO_FLIP, SAFETY→APPROVAL_ADVISORY. Master OFF → DISABLED.
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import json
@@ -662,6 +663,78 @@ def _disabled_report(
 # ---------------------------------------------------------------------------
 
 
+def _maybe_propose_source_pr(decision: GraduationDecision) -> bool:
+    """Sovereign Cognitive Crucible source-of-truth graduation (2026-06-20).
+
+    When ``JARVIS_CRUCIBLE_GRADUATION_PR_ENABLED`` is on, an AUTO_FLIP decision
+    ALSO fires the autonomous [SOVEREIGN GRADUATION] PR: it reads the flag's last
+    3 CLEAN soaks' crucible evidence and, IF they clear the TTFT/AST veto, opens
+    a cage-respecting PR that rewrites the source default literal (never merges).
+    The shadow-gated override-ledger receipt (the .env audit path) is unaffected.
+
+    Best-effort, fail-soft, gate-default-off. Returns True iff a PR proposal was
+    SCHEDULED. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.graduation_pr_proposer import (  # noqa: E501
+            graduation_pr_enabled,
+            propose_graduation_pr,
+        )
+        if not graduation_pr_enabled():
+            return False
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (
+            recent_clean_crucible_evidence,
+        )
+        from backend.core.ouroboros.governance.graduation.telemetry_manifest import (  # noqa: E501
+            manifest_recommends_merge,
+        )
+        from backend.core.ouroboros.governance.graduation import (
+            crucible_verdict as _cv,
+        )
+        flag = decision.flag_name
+        evidence = recent_clean_crucible_evidence(flag, limit=3)
+        required = 3
+        try:
+            from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: E501
+                CADENCE_POLICY,
+            )
+            for entry in CADENCE_POLICY:
+                if getattr(entry, "flag_name", None) == flag:
+                    required = int(getattr(entry, "required_clean_sessions", 3))
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if not manifest_recommends_merge(evidence, required_clean=required):
+            return False
+        ceiling = _cv._env_float(
+            _cv._TTFT_CEILING_ENV, _cv._DEFAULT_TTFT_CEILING_MS,
+        )
+        session_ids = [str(e.get("session_id", "")) for e in evidence]
+        repo_root = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE") or os.getcwd()
+
+        async def _go() -> None:
+            try:
+                await propose_graduation_pr(
+                    flag,
+                    soak_evidence=evidence,
+                    session_ids=session_ids,
+                    required_clean=required,
+                    ttft_ceiling_ms=ceiling,
+                    repo_root=repo_root,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[GraduationEngine] PR proposal failed: %s", exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_go())
+        except RuntimeError:
+            asyncio.run(_go())
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail-soft; never block graduation
+        logger.debug("[GraduationEngine] _maybe_propose_source_pr: %s", exc)
+        return False
+
+
 def execute_graduations(
     report: GraduationEngineReport,
     *,
@@ -693,6 +766,11 @@ def execute_graduations(
                     decision, now_unix=now_unix,
                 ):
                     recorded.append(decision.flag_name)
+                # Sovereign Cognitive Crucible: also fire the source-of-truth
+                # [SOVEREIGN GRADUATION] PR (gated, fail-soft, cage-respecting —
+                # proposes, never merges). Independent of the shadow-gated
+                # override receipt above.
+                _maybe_propose_source_pr(decision)
             elif (
                 decision.disposition
                 is GraduationDisposition.APPROVAL_ADVISORY

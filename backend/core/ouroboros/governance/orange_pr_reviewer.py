@@ -226,6 +226,8 @@ class OrangePRReviewer:
         files: List[Tuple[str, str]],
         evidence: Optional[Dict[str, Any]] = None,
         risk_tier_name: str = "APPROVAL_REQUIRED",
+        body_override: Optional[str] = None,
+        title_override: Optional[str] = None,
     ) -> Optional[PRReviewResult]:
         """Open an async-review PR for the given candidate.
 
@@ -305,9 +307,19 @@ class OrangePRReviewer:
                 )
                 return None
 
-            pr_title = f"[Ouroboros Review] {description[:72].strip()}"
-            pr_body = build_pr_body(
-                op_id, description, files, evidence, risk_tier_name
+            # body_override / title_override let an autonomous caller (e.g. the
+            # Sovereign Cognitive Crucible) supply a self-authored PR body — the
+            # Telemetry Manifest — and an exact title. Falls back to the
+            # templated review body when not supplied (byte-identical legacy).
+            pr_title = (
+                title_override.strip() if title_override
+                else f"[Ouroboros Review] {description[:72].strip()}"
+            )
+            pr_body = (
+                body_override if body_override
+                else build_pr_body(
+                    op_id, description, files, evidence, risk_tier_name
+                )
             )
             rc, out, err = await self._run_gh(
                 "pr", "create",

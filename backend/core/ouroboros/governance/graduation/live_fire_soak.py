@@ -374,6 +374,45 @@ def history_path() -> Path:
     return Path(".jarvis") / "live_fire_graduation_history.jsonl"
 
 
+def recent_clean_crucible_evidence(
+    flag_name: str, *, limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Sovereign Cognitive Crucible (2026-06-20) — read the last ``limit`` CLEAN
+    soaks for ``flag_name`` and return their crucible evidence bundles (the
+    TTFT/AST proof folded into each EvidenceRow.telemetry["crucible"]). Used by
+    the autonomous graduation engine to build the [SOVEREIGN GRADUATION] PR
+    manifest. Best-effort; NEVER raises; returns [] when unavailable."""
+    out: List[Dict[str, Any]] = []
+    try:
+        p = history_path()
+        if not p.exists():
+            return out
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    rows: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("flag_name") != flag_name:
+            continue
+        if str(obj.get("outcome", "")).lower() != "clean":
+            continue
+        tel = obj.get("telemetry")
+        cruc = tel.get("crucible") if isinstance(tel, dict) else None
+        if isinstance(cruc, dict):
+            rows.append({**cruc, "session_id": obj.get("session_id", "")})
+    # Most-recent ``limit`` (history is append-only chronological).
+    return rows[-limit:] if limit and len(rows) > limit else rows
+
+
 # ---------------------------------------------------------------------------
 # Outcome classification helpers
 # ---------------------------------------------------------------------------
@@ -1312,6 +1351,16 @@ class LiveFireSoakHarness:
                 "arbiter_outcome": new_outcome,
                 "arbiter_changed_outcome": new_outcome != legacy_outcome,
             }
+            # Sovereign Cognitive Crucible (2026-06-20) — fold in the TTFT/AST
+            # evidence bundle so this soak's EvidenceRow carries the proof the
+            # graduation PR manifest renders. Best-effort; never blocks.
+            try:
+                from backend.core.ouroboros.governance.graduation import (
+                    crucible_verdict as _cv,
+                )
+                telemetry["crucible"] = _cv.crucible_evidence(metrics)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             telemetry = None
         return (new_outcome, new_ra, new_notes, telemetry)
