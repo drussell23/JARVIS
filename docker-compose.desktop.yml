@@ -1,0 +1,55 @@
+# JARVIS Desktop (M1 / Docker Desktop) overlay — adaptive constrained-host run.
+# =============================================================================
+# Runs the REAL engine on a 16GB-class Mac via Docker Desktop. The container VM
+# is decoupled from the dev/agent process (the contention that starved the
+# nested host runs) but gets only a SUBSET of the Mac's RAM — so survival here
+# depends on the engine SELF-THROTTLING under pressure, not on raw headroom.
+#
+# Root-cause approach (reuse-first, adaptive, no hardcoding): arm the EXISTING
+# MemoryPressureGate + SensorGovernor aggressively so the 16-sensor swarm reads
+# real memory % and dynamically sheds op-emission + L3 fanout as the VM fills —
+# the same graduated subsystems, tuned tight for a constrained host. No sensor
+# is hardcoded off; the swarm scales itself to whatever RAM Docker Desktop gives.
+#
+# Overlay on prod (reuses Dockerfile.soak + entrypoint + secret/persistence):
+#   open -a Docker                                   # launch Docker Desktop, wait for it
+#   # then in Settings → Resources, give it as much RAM as you can spare (>=12GB)
+#   docker compose -f docker-compose.prod.yml -f docker-compose.desktop.yml up -d --build
+#   docker compose -f docker-compose.prod.yml -f docker-compose.desktop.yml logs -f jarvis-prod
+# =============================================================================
+services:
+  jarvis-prod:
+    # Hard memory ceiling so the container can't drag the Mac under; tune to your
+    # Docker Desktop allocation (leave the host ~4GB). The engine self-throttles
+    # well before this via the pressure gate below.
+    mem_limit: 11g
+    deploy:
+      resources:
+        limits:
+          memory: 11g
+    environment:
+      # --- adaptive pressure response (reused graduated subsystems, tight) ---
+      JARVIS_MEMORY_PRESSURE_GATE_ENABLED: "true"
+      JARVIS_MEMORY_PRESSURE_PROCESS_DIM_ENABLED: "true"
+      JARVIS_MEMORY_PRESSURE_WARN_PCT: "0.55"     # trip earlier than default
+      JARVIS_MEMORY_PRESSURE_HIGH_PCT: "0.70"
+      JARVIS_MEMORY_PRESSURE_CRITICAL_PCT: "0.82"
+      JARVIS_MEMORY_PRESSURE_WARN_FANOUT_CAP: "2"
+      JARVIS_MEMORY_PRESSURE_HIGH_FANOUT_CAP: "1"
+      JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP: "1"
+      JARVIS_SENSOR_GOVERNOR_ENABLED: "true"
+      JARVIS_SENSOR_GOVERNOR_GLOBAL_CAP_PER_HOUR: "40"   # vs 200 default — fewer on-loop intakes
+      JARVIS_SENSOR_GOVERNOR_EMERGENCY_COST_THRESHOLD: "0.7"
+      JARVIS_SENSOR_GOVERNOR_EMERGENCY_REDUCTION_PCT: "0.85"
+      # --- constrained pools (don't oversubscribe the small VM) ---
+      JARVIS_AST_HELPER_POOL_MAX_WORKERS: "2"
+      JARVIS_BG_POOL_SIZE: "2"
+      # --- pure DW autarky on the M1 (Claude credits out; J-Prime can't hold) ---
+      JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+      JARVIS_PROVIDER_QUOTA_ISOLATION_ENABLED: "true"
+      JARVIS_FLEET_EVALUATOR_ENABLED: "true"
+      JARVIS_FLEET_SENTINEL_ENABLED: "true"
+      # --- modest leashes for a desktop run ---
+      OUROBOROS_BATTLE_COST_CAP: "3.00"
+      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "1800"
+      JARVIS_INTENT_PYTEST_TIMEOUT_S: "180"
