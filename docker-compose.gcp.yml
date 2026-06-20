@@ -32,11 +32,14 @@ services:
       JARVIS_SEMANTIC_INFERENCE_ENABLED: "false"
       # don't let the heavy 550B boot probe false-degrade the DW stream lane
       JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
-      # SHIELDS UP (item 1): aegis re-armed to validate PR #69590 (the AegisForward
-      # upstream-response-release fix) holds the DW SSE stream under live load. The
-      # batch retrieve-hang (#69599) + dynamic router below make this safe to test —
-      # if aegis ruptures RT, the loop now routes/recovers cleanly instead of wedging.
-      JARVIS_AEGIS_ENABLED: "true"
+      # AEGIS VALIDATION RESULT (2026-06-20 soak): re-arming aegis REGRESSED the loop
+      # — every op fsm_exhausted, zero state=applied. PR #69590 fixed the upstream-
+      # response LEAK ("Unclosed connection") but the aegis DW-streaming path still
+      # breaks generation under live load (the rupture, not just the leak). So aegis
+      # stays OFF for the working cloud config; the deeper AegisForward DW-SSE rupture
+      # is a tracked follow-up (needs a dedicated fix + its own validation soak).
+      # The proven state=applied config is aegis-OFF + dynamic transport router.
+      JARVIS_AEGIS_ENABLED: "false"
       # DYNAMIC TRANSPORT ROUTER (item 3): replaces the force-RT hardcode. A per-op
       # payload heuristic streams localized fixes (RT, fast) and batches large/
       # multi-file refactors (DW batch, now that the webhook-vs-poll retrieve-hang
