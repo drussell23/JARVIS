@@ -1019,18 +1019,54 @@ def _serialize_attachments(
     return blocks
 
 
+def _abs_repo_root(candidate: "Optional[Path]") -> "Optional[Path]":
+    """Normalize a repo-root candidate to an ABSOLUTE, resolved path.
+
+    Returns ``None`` for an empty / whitespace / unusable candidate so the
+    caller can fall through to the next source. A relative candidate (``.``,
+    ``''``, ``foo``) is resolved against the CWD — this is the load-bearing
+    fix for the L2/batch codegen prompt: ``target_files`` arrive ABSOLUTE
+    (e.g. ``/app/tests/seed/test_seed_defect.py`` from pytest), so a relative
+    repo root makes ``Path.relative_to`` raise *"one path is relative and the
+    other is absolute"*. Resolving the root to an absolute path bridges that.
+    NEVER raises."""
+    if candidate is None:
+        return None
+    try:
+        s = str(candidate).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    if not s:
+        return None
+    try:
+        return Path(s).resolve()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _resolve_effective_repo_root(
     ctx: "OperationContext",
     repo_root: Optional[Path],
     repo_roots: Optional[Dict[str, Path]],
 ) -> Path:
-    """Resolve the filesystem root for the current operation context."""
-    base_root = repo_root or Path.cwd()
+    """Resolve the filesystem root for the current operation context.
+
+    INVARIANT: ALWAYS returns an ABSOLUTE, resolved path — never a relative or
+    empty one — so downstream ``relative_to`` / path-join over ABSOLUTE
+    ``target_files`` is well-defined. Resolution order (first usable wins):
+    per-op ``repo_roots[primary_repo]`` → passed ``repo_root`` → CWD. Each
+    candidate is normalized via :func:`_abs_repo_root`; an empty/relative
+    candidate is upgraded (resolved) rather than passed through. NEVER raises."""
     if repo_roots:
         primary_repo = getattr(ctx, "primary_repo", "")
         if primary_repo and primary_repo in repo_roots:
-            return Path(repo_roots[primary_repo])
-    return Path(base_root)
+            picked = _abs_repo_root(repo_roots[primary_repo])
+            if picked is not None:
+                return picked
+    picked = _abs_repo_root(repo_root)
+    if picked is not None:
+        return picked
+    return Path.cwd().resolve()
 
 # ── Tool-use interface ────────────────────────────────────────────────
 _TOOL_SCHEMA_VERSION = "2b.2-tool"
