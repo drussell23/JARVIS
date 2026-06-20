@@ -330,6 +330,49 @@ def predicate_requires_live_kernel_validation(
         return False
 
 
+def predicate_cognitive_graduation(
+    summary: Mapping[str, Any],
+    metrics: Any = None,
+) -> bool:
+    """Sovereign Cognitive Crucible universal veto (2026-06-20).
+
+    The default clean-predicate for any flag WITHOUT a more-specific built-in
+    contract. Composes the canonical :func:`default_clean_predicate` (which
+    already buckets FSM-exhaustion-class faults — ``phase_runner_error`` /
+    ``candidate_validate_error`` / ``fsm_state_corruption`` — as runner faults)
+    with the two latency/structural vetoes the autonomic crucible demands:
+
+      * TTFT degradation (``crucible_verdict.ttft_degraded``)
+      * AST corruption    (``crucible_verdict.ast_corrupted``)
+
+    Metrics-aware (2-arg), **VETO-ONLY** by construction: it returns ``False``
+    ONLY on positive evidence of TTFT/AST harm, and ``True`` otherwise. This is
+    deliberate — ``default_clean`` is already enforced upstream (the legacy
+    ``classify_outcome`` the arbiter composes), and the arbiter's metrics-
+    predicate step only ever *downgrades* a CLEAN outcome. A veto-only predicate
+    therefore adds the latency/structural gate WITHOUT undoing the arbiter's
+    recovery-override (P2): a session a legacy error + full self-heal promoted to
+    CLEAN stays CLEAN unless it ALSO degraded TTFT or corrupted AST.
+
+    **Fail-OPEN on absent telemetry** — ``metrics`` None (arbiter off / no
+    parse) → no objection (cannot prove harm). Pure; NEVER raises.
+
+    The ``crucible_verdict`` import is lazy to preserve this module's AST-pinned
+    stdlib-only top-level import posture (``crucible_verdict`` is itself pure +
+    stdlib-only, so there is no real coupling — only the pin to respect)."""
+    if metrics is None:
+        return True
+    try:
+        from backend.core.ouroboros.governance.graduation import (
+            crucible_verdict as _cv,
+        )
+        ttft_bad, _ = _cv.ttft_degraded(metrics)
+        ast_bad, _ = _cv.ast_corrupted(metrics)
+        return (not ttft_bad) and (not ast_bad)
+    except Exception:  # noqa: BLE001 — defensive; no objection on error
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Contract dataclass
 # ---------------------------------------------------------------------------
@@ -572,7 +615,14 @@ def get_contract(flag_name: str) -> GraduationContract:
     builtin = _BUILT_IN_CONTRACTS.get(flag_name)
     if builtin is not None:
         return builtin
-    return GraduationContract(flag_name=flag_name)
+    # Sovereign Cognitive Crucible: flags without a specific built-in contract
+    # graduate under the universal TTFT/AST math-veto (composed on default-clean,
+    # fail-open on absent telemetry). No hardcoded per-flag list — every
+    # crucible-discovered candidate is auto-vetoed.
+    return GraduationContract(
+        flag_name=flag_name,
+        clean_predicate=predicate_cognitive_graduation,
+    )
 
 
 def has_custom_contract(flag_name: str) -> bool:

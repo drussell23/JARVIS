@@ -53,6 +53,24 @@ _RE_OOM = re.compile(
     r"stopping: process_memory_cap|MemoryError|emergency_brake|"
     r"memory_pressure_changed.*(critical|emergency)",
 )
+# Sovereign Cognitive Crucible (2026-06-20) — TTFT + AST veto signals.
+# TTFT samples: HeavyProbe + candidate_generator emit ``ttft_ms=<int>``.
+# 0 is the timeout/failure sentinel (dw_heavy_probe sets ttft_ms=0 on
+# failure) — kept in the raw list but the verdict math uses non-zero
+# samples only (a 0 means "no first token", handled by the FSM/recovery
+# signals, not the latency gate).
+_RE_TTFT = re.compile(r"ttft_ms=(\d+)")
+# Explicit candidate AST/syntax corruption — distinct from the failure_class
+# runner-bucket (already caught by default_clean via phase_runner_error /
+# candidate_validate_error). These markers prove the *cognitive feature under
+# test* emitted structurally-broken code during a soak.
+_RE_AST_CORRUPT = re.compile(
+    r"PhaseRunnerASTValidationError"
+    r"|failure_class[=:][\"']?(?:ast_\w+|syntax_\w+)"
+    r"|candidate[^\n]*invalid syntax"
+    r"|placeholder_detected"
+    r"|ast_validation_failed",
+)
 
 # Session outcomes the harness writes when the FSM finalized a summary.
 _TERMINAL_OUTCOMES = {"complete", "incomplete_kill"}
@@ -81,6 +99,9 @@ class Metrics:
     stop_reason: str = ""
     cost_total: Optional[float] = None
     duration_s: Optional[float] = None
+    # Sovereign Cognitive Crucible — latency + structural-integrity signals
+    ttft_samples_ms: List[int] = field(default_factory=list)  # all ttft_ms=N
+    ast_corruption_signals: int = 0   # explicit candidate AST/syntax breakage
 
 
 def parse_metrics(
@@ -110,6 +131,16 @@ def parse_metrics(
     m.gate_inert = bool(_RE_GATE_INERT.search(log_text))
     m.livefire_timeout = bool(_RE_TIMEOUT.search(log_text))
     m.oom = bool(_RE_OOM.search(log_text))
+
+    # Cognitive Crucible — TTFT samples + explicit AST-corruption count.
+    ttft_hits: List[int] = []
+    for raw in _RE_TTFT.findall(log_text):
+        try:
+            ttft_hits.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    m.ttft_samples_ms = ttft_hits
+    m.ast_corruption_signals = len(_RE_AST_CORRUPT.findall(log_text))
 
     if isinstance(summary, dict):
         m.session_outcome = str(summary.get("session_outcome", ""))

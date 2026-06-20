@@ -284,10 +284,20 @@ def test_curiosity_predicate_falls_back_to_ops_when_field_absent():
 
 
 def test_get_contract_unknown_flag_returns_default():
+    # Sovereign Cognitive Crucible (2026-06-20): flags without a specific
+    # built-in now carry the universal TTFT/AST veto predicate
+    # (predicate_cognitive_graduation) instead of None. It is VETO-ONLY +
+    # fail-open: with no metrics it returns True (no objection), so the
+    # default behavior is byte-identical until positive TTFT/AST harm exists.
+    from backend.core.ouroboros.governance.graduation.graduation_contract import (
+        predicate_cognitive_graduation,
+    )
     c = get_contract("JARVIS_DOES_NOT_EXIST")
     assert c.flag_name == "JARVIS_DOES_NOT_EXIST"
-    assert c.clean_predicate is None
+    assert c.clean_predicate is predicate_cognitive_graduation
     assert c.failure_class_blocklist_overrides == frozenset()
+    # Fail-open contract: no metrics → no objection (default-clean preserved).
+    assert c.clean_predicate({"session_outcome": "complete"}, None) is True
 
 
 def test_get_contract_known_flag_returns_custom():
