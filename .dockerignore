@@ -58,6 +58,11 @@ test_*/
 *_test.py
 test_*.py
 pytest.ini
+# Calibration seed — a blast-radius-1 system-test target the soak image MUST carry
+# so the OperationAdvisor's CALIBRATION_OVERRIDE has a real on-disk target to greenlight.
+# Re-included after the broad tests/ + test_*.py excludes above (later rules win).
+!tests/seed/
+!tests/seed/test_seed_defect.py
 .pytest_cache/
 
 # Config files not needed in container

@@ -47,6 +47,9 @@ services:
       # timings per op. If STAGE_HTTP_DISPATCH never appears, the abort is pre-HTTP
       # (the short-circuit); if it does, the abort is in parse. Structured, not print().
       JARVIS_DISPATCH_PROFILER_ENABLED: "true"
+      # INFO so the profiler's op_summary / STAGE_ trace is actually emitted (the
+      # container root defaults to WARNING via a basicConfig no-op, which silences it).
+      JARVIS_LOG_LEVEL: "INFO"
       # Formal Calibration Bypass: the OperationAdvisor natively greenlights ONLY the
       # blast-radius-1 seed (tests/seed/test_seed_defect.py) so the dispatch path can
       # be exercised; all other ops keep the strict heuristic gates.
