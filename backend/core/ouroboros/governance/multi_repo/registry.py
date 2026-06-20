@@ -52,11 +52,19 @@ class RepoRegistry:
         """Build registry from environment variables."""
         configs: List[RepoConfig] = []
 
-        # Always include jarvis
-        jarvis_path = os.environ.get("JARVIS_REPO_PATH", ".")
+        # Always include jarvis. Normalize the env path to an ABSOLUTE, resolved
+        # root: a set-but-empty / whitespace var must NOT become ``Path("")``, and
+        # even ``.`` must be resolved — downstream codegen joins + relative_to over
+        # ABSOLUTE target_files require an absolute root (mirrors the strip+resolve
+        # pattern in session_archive / cursor_rule_guard). NEVER raises.
+        jarvis_path = (os.environ.get("JARVIS_REPO_PATH") or "").strip() or "."
+        try:
+            jarvis_local = Path(jarvis_path).resolve()
+        except Exception:  # noqa: BLE001
+            jarvis_local = Path.cwd().resolve()
         configs.append(RepoConfig(
             name="jarvis",
-            local_path=Path(jarvis_path),
+            local_path=jarvis_local,
             canary_slices=("tests/",),
         ))
 
