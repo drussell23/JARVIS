@@ -1,11 +1,17 @@
-"""Slice 42 — Aegis full-body capped reader (multi-segment truncation fix)."""
+"""Slice 42 — Aegis full-body capped reader (multi-segment truncation fix).
+
+Sovereign Aegis Batch-Passthrough Matrix (2026-06-20) — adds the streaming,
+constant-memory body forwarder for massive batch JSONL uploads.
+"""
 from __future__ import annotations
 
 import pytest
 
 from backend.core.ouroboros.aegis.request_body import (
     BodyTooLarge,
+    content_length_hint,
     read_body_capped,
+    stream_body_capped,
 )
 
 
@@ -29,8 +35,9 @@ class _FragmentedContent:
 
 
 class _FakeReq:
-    def __init__(self, content):
+    def __init__(self, content, headers=None):
         self.content = content
+        self.headers = headers or {}
 
 
 async def test_reads_full_body_across_fragments():
@@ -83,3 +90,64 @@ async def test_exactly_at_cap_succeeds():
     req = _FakeReq(_FragmentedContent(body, fragment_size=4096))
     out = await read_body_capped(req, cap=cap)
     assert len(out) == cap
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Aegis Batch-Passthrough Matrix — streaming, constant-memory body
+# ---------------------------------------------------------------------------
+
+
+async def _drain(agen) -> bytes:
+    out = bytearray()
+    async for chunk in agen:
+        out.extend(chunk)
+    return bytes(out)
+
+
+async def test_stream_yields_full_body_across_fragments():
+    # A 256 KB body delivered in 1500-byte segments — streamed, not buffered.
+    body = bytes((i % 256) for i in range(256 * 1024))
+    req = _FakeReq(_FragmentedContent(body, fragment_size=1500))
+    out = await _drain(stream_body_capped(req, cap=64 * 1024 * 1024))
+    assert out == body  # byte-identical full body via the streaming path
+
+
+async def test_stream_never_holds_more_than_one_chunk():
+    # The generator must yield as it reads — a body far larger than one chunk
+    # is delivered in many yields (proves constant-memory streaming, not buffer).
+    body = b"Z" * (300 * 1024)
+    req = _FakeReq(_FragmentedContent(body, fragment_size=64 * 1024))
+    chunks = []
+    async for chunk in stream_body_capped(req, cap=64 * 1024 * 1024):
+        chunks.append(len(chunk))
+    assert len(chunks) >= 4  # >=4 separate yields, not one giant buffer
+    assert sum(chunks) == len(body)
+
+
+async def test_stream_raises_too_large_over_cap_midstream():
+    cap = 8192
+    body = b"A" * (cap + 4096)
+    req = _FakeReq(_FragmentedContent(body, fragment_size=4096))
+    with pytest.raises(BodyTooLarge) as ei:
+        await _drain(stream_body_capped(req, cap=cap))
+    assert ei.value.cap == cap
+
+
+async def test_stream_empty_body():
+    req = _FakeReq(_FragmentedContent(b"", fragment_size=4096))
+    assert await _drain(stream_body_capped(req, cap=4096)) == b""
+
+
+def test_content_length_hint_present():
+    req = _FakeReq(None, headers={"Content-Length": "12345"})
+    assert content_length_hint(req) == 12345
+
+
+def test_content_length_hint_absent():
+    req = _FakeReq(None, headers={})
+    assert content_length_hint(req) is None
+
+
+def test_content_length_hint_malformed():
+    req = _FakeReq(None, headers={"Content-Length": "not-a-number"})
+    assert content_length_hint(req) is None

@@ -103,6 +103,27 @@ _K_UPSTREAM_MAP = "_upstream_map"
 # ---------------------------------------------------------------------------
 
 
+def _client_max_size() -> int:
+    """aiohttp server-level body ceiling for the Aegis app.
+
+    Sovereign Aegis Batch-Passthrough Matrix (2026-06-20). aiohttp's
+    ``web.Application`` defaults ``client_max_size`` to 1 MiB and enforces it in
+    the payload reader — so a MASSIVE batch JSONL upload was 413'd by aiohttp
+    itself BEFORE the passthrough handler (or its 64 MiB cap) ever ran. This is
+    the true outermost ceiling. Set it just ABOVE the passthrough body cap (cap
+    + 1 MiB headroom for the multipart envelope) so the passthrough's own clean
+    JSON 413 + telemetry remains authoritative for over-cap uploads, while
+    aiohttp's bare 413 only ever fires for pathological excess. Tracks the same
+    ``JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES`` env so the two never drift. NEVER raises.
+    """
+    raw = os.environ.get("JARVIS_AEGIS_MAX_REQUEST_BODY_BYTES", "").strip()
+    try:
+        cap = max(1024, int(raw)) if raw else 64 * 1024 * 1024
+    except (TypeError, ValueError):
+        cap = 64 * 1024 * 1024
+    return cap + 1024 * 1024
+
+
 def build_app(
     *,
     budget: ImmutableBudgetStateMachine,
@@ -132,7 +153,7 @@ def build_app(
     surface. Default False preserves the Slice 1 dark-substrate
     posture for any caller that constructs the app directly.
     """
-    app = web.Application()
+    app = web.Application(client_max_size=_client_max_size())
 
     # K is generated INSIDE the factory, never returned, never logged.
     # AST pin confirms K is referenced only via app[_K_HMAC_KEY] in the
