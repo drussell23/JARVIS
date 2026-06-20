@@ -32,18 +32,29 @@ services:
       JARVIS_SEMANTIC_INFERENCE_ENABLED: "false"
       # don't let the heavy 550B boot probe false-degrade the DW stream lane
       JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
-      # AEGIS VALIDATION RESULT (2026-06-20 soak): re-arming aegis REGRESSED the loop
-      # — every op fsm_exhausted, zero state=applied. PR #69590 fixed the upstream-
-      # response LEAK ("Unclosed connection") but the aegis DW-streaming path still
-      # breaks generation under live load (the rupture, not just the leak). Aegis
-      # stays OFF for the working cloud config; the deeper AegisForward DW-SSE rupture
-      # is a tracked follow-up (dedicated fix + its own validation soak required).
-      JARVIS_AEGIS_ENABLED: "false"
-      # DYNAMIC TRANSPORT ROUTER (item 3): replaces the force-RT hardcode. A per-op
-      # payload heuristic streams localized fixes (RT, fast) and batches large/
-      # multi-file refactors (DW batch, now that the webhook-vs-poll retrieve-hang
-      # is fixed in #69599). No all-or-nothing dichotomy.
-      JARVIS_DW_DYNAMIC_TRANSPORT_ENABLED: "true"
+      # AEGIS SHIELDS UP — CORRECTED DIAGNOSIS (2026-06-20 isolation soak).
+      # The earlier "aegis regressed" reading was MISATTRIBUTED to the SSE path. An
+      # isolated soak (aegis ON + RT transport, batch off) proves the RT/SSE-through-
+      # aegis path is HEALTHY end to end:
+      #   - [AegisForward] credential injection on /v1/chat/completions (key sha256:90f571d4)
+      #   - upstream_status=200 (zero 4xx / zero 5xx at the aegis→DW boundary)
+      #   - zero "Unclosed connection" (the #69590 leak fix holds)
+      #   - rupture_risk=False throughout — NO SSE rupture
+      #   - op-019ee41b-700c: GENERATE outcome=ok → LEDGER_TERMINAL state=applied
+      # i.e. state=applied WITH THE SECURITY PROXY ACTIVELY DEFENDING. The boot-time
+      # /v1/models 401s are transient "credential proxy warming" that self-heal to 200
+      # within ~3 min — fail-soft, not a generation failure.
+      # What actually regressed the prior DUAL soak was the BATCH-through-aegis-
+      # passthrough path (dynamic router sending heavy ops to DW /v1/batches), NOT the
+      # RT SSE path. So: shields ARMED, and transport PINNED TO RT until the
+      # batch-through-aegis-passthrough path gets its own dedicated fix + soak
+      # (tracked follow-up). No SSE rewrite needed — the stream pipeline works.
+      JARVIS_AEGIS_ENABLED: "true"
+      # RT transport pinned: the RT/SSE-through-aegis path is the proven shields-up
+      # lane (state=applied above). Dynamic routing stays OFF here only because its
+      # batch arm rides the unproven batch-through-aegis-passthrough path; re-enable
+      # once that path is validated under aegis.
+      JARVIS_DW_DYNAMIC_TRANSPORT_ENABLED: "false"
       # real cores → give DW generation full runway (no 90s reflex-cap timeouts)
       OUROBOROS_TIER0_MAX_WAIT_S: "600"
       JARVIS_GENERATION_TIMEOUT_S: "900"
