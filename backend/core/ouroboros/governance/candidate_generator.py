@@ -777,6 +777,27 @@ _CLAUDE_DISABLED_ENV = "JARVIS_PROVIDER_CLAUDE_DISABLED"
 _SLICE23_MIN_PROMOTED_FOR_AUTO = 2
 
 
+def _claude_config_disabled() -> bool:
+    """True when the Claude fallback tier is STRUCTURALLY disabled via
+    ``JARVIS_PROVIDER_CLAUDE_DISABLED`` — the deadest possible fallback (the
+    provider is never even constructed), distinct from a tripped circuit breaker.
+
+    DW-autarky's full-runway grant (Slice 225) keys off ``_claude_breaker_open``,
+    which reads only the breaker STATE — and a config-disabled Claude never trips
+    the breaker, so it stays CLOSED and autarky NEVER engaged under
+    ``JARVIS_PROVIDER_CLAUDE_DISABLED=true``. The sole-lane DW was then held to
+    the 90s reflex cap and TIMED OUT on slow hosts (live container soak,
+    2026-06-20). A config-disabled Claude is *more* dead than a breaker-open one;
+    this predicate lets the autarky path treat it as such. Reuses the existing
+    ``_CLAUDE_DISABLED_ENV`` constant (no new flag). NEVER raises."""
+    try:
+        return os.environ.get(_CLAUDE_DISABLED_ENV, "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
+        return False
+
+
 def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
     """Slice 23 — autonomous registry-driven sentinel activation.
 
@@ -5242,13 +5263,20 @@ class CandidateGenerator:
             # OFF (or breaker CLOSED) is the byte-identical legacy cascade.
             _fallback_dead = False
             if _dw_autarky_enabled():
-                try:
-                    from backend.core.ouroboros.governance.doubleword_provider import (
-                        _claude_breaker_open as _autarky_breaker_open,
-                    )
-                    _fallback_dead = _autarky_breaker_open()
-                except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
-                    _fallback_dead = False
+                # A CONFIG-disabled Claude (JARVIS_PROVIDER_CLAUDE_DISABLED) is the
+                # deadest fallback of all — never constructed — yet it leaves the
+                # circuit breaker CLOSED, so the breaker-state check below misses it.
+                # Check it first so the sole-lane DW gets the full runway instead of
+                # the reflex cap (the live-soak TIMEOUT root, 2026-06-20).
+                _fallback_dead = _claude_config_disabled()
+                if not _fallback_dead:
+                    try:
+                        from backend.core.ouroboros.governance.doubleword_provider import (
+                            _claude_breaker_open as _autarky_breaker_open,
+                        )
+                        _fallback_dead = _autarky_breaker_open()
+                    except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
+                        _fallback_dead = False
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id, force_batch=_force_batch,
                 fallback_dead=_fallback_dead,
