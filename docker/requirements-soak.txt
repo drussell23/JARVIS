@@ -50,3 +50,10 @@ fastembed
 # Slice 156 — interactive Discord control gateway (bot). Light (pure-python + aiohttp
 # already present). Gated JARVIS_DISCORD_GATEWAY_ENABLED default-FALSE.
 discord.py>=2.3
+
+# 2026-06-20 — Oracle codebase-graph dependency. WITHOUT this the container boots
+# with "Oracle failed to boot: networkx is required" and runs with the codebase
+# graph unavailable (degraded exploration/context). Confirmed missing in the
+# live Docker Desktop run; the rest of governance/__init__'s import graph is
+# already satisfied (verified by in-container import). Pure-python wheel, light.
+networkx>=3.0
