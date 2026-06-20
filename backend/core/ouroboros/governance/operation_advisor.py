@@ -1513,6 +1513,30 @@ class OperationAdvisor:
                 test_coverage=1.0, chronic_entropy=0.0, risk_score=0.0,
             )
 
+        # Formal Calibration Mode (2026-06-20) — a SANCTIONED, scoped bypass for a
+        # blast-radius-1 system test, NOT a hack. Engages ONLY when the env master
+        # (JARVIS_CALIBRATION_MODE_ENABLED) is on AND this exact target is inside an
+        # active set_calibration_target scope. Every other op keeps the strict gates
+        # below. Surfaces a distinct CALIBRATION_OVERRIDE reason so the greenlight is
+        # auditable in the trace (Manifesto §7). NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.calibration_context import (
+                is_calibration_target as _is_calibration_target,
+            )
+            if _is_calibration_target(target_files):
+                return Advisory(
+                    decision=AdvisoryDecision.RECOMMEND,
+                    reasons=[
+                        "CALIBRATION_OVERRIDE: blast-radius-1 system test — formally "
+                        "greenlit by calibration scope (strict gates preserved for "
+                        "all other ops)",
+                    ],
+                    blast_radius=0, test_coverage=1.0,
+                    chronic_entropy=0.0, risk_score=0.0,
+                )
+        except Exception:  # noqa: BLE001 — calibration must never break the gate
+            pass
+
         reasons: List[str] = []
         risk_factors: List[float] = []
 
