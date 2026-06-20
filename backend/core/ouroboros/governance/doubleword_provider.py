@@ -833,6 +833,22 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
             return False
         if not _route_ok:
             return False
+        # Dynamic Transport Router (2026-06-20): when enabled, the all-or-nothing
+        # static blanket below is REPLACED by a per-op payload heuristic — a
+        # localized fix streams (RT, fast), a large/multi-file refactor batches
+        # (viable now the webhook-vs-poll retrieve-hang is fixed). The
+        # ledger-degraded-stream override (Slice 41) still forces batch regardless
+        # (a broken wire must batch at any size). Removes the force-RT/force-batch
+        # hardcode dichotomy. Gated; OFF → the legacy static decision below.
+        try:
+            from backend.core.ouroboros.governance.payload_transport_heuristic import (
+                dynamic_transport_enabled as _dyn_on,
+                should_batch_by_payload as _dyn_should_batch,
+            )
+            if _dyn_on():
+                return _dyn_should_batch(context, model_id) or _slice41_ledger_force_batch()
+        except Exception:  # noqa: BLE001 — fall through to the static decision
+            pass
         # Slice 36 static opt-out (default ON per operator authorization).
         _raw = os.environ.get(_SLICE36_FORCE_BATCH_ENV, "1").strip().lower()
         _static_on = _raw not in ("0", "false", "no", "off")
