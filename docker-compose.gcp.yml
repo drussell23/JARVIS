@@ -41,3 +41,14 @@ services:
       OUROBOROS_BATTLE_COST_CAP: "10.00"
       # Preemption Shield armed (default-on; explicit for auditability)
       JARVIS_PREEMPTION_SHIELD_ENABLED: "true"
+      # --- Sovereign Telemetry & Calibration run (2026-06-20) ---
+      # Telemetry Mesh: reuse the EXISTING native per-op stage profiler — emits
+      # STAGE_PROMPT_ASSEMBLY / BUDGET / AEGIS_AUTH / HTTP_DISPATCH / RESPONSE_PARSE
+      # timings per op. If STAGE_HTTP_DISPATCH never appears, the abort is pre-HTTP
+      # (the short-circuit); if it does, the abort is in parse. Structured, not print().
+      JARVIS_DISPATCH_PROFILER_ENABLED: "true"
+      # Formal Calibration Bypass: the OperationAdvisor natively greenlights ONLY the
+      # blast-radius-1 seed (tests/seed/test_seed_defect.py) so the dispatch path can
+      # be exercised; all other ops keep the strict heuristic gates.
+      JARVIS_CALIBRATION_MODE_ENABLED: "true"
+      JARVIS_CALIBRATION_TARGET_PATH: "tests/seed/test_seed_defect.py"
