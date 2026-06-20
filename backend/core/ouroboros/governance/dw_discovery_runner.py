@@ -745,6 +745,44 @@ def get_heavy_probe_budget() -> Optional[Any]:
     return _get_or_create_heavy_probe_budget()
 
 
+async def shutdown_background_loops(*, timeout_s: float = 5.0) -> int:
+    """GracefulTeardownMatrix (2026-06-20) — cancel the DW background loops at
+    shutdown so they don't leak ("Task was destroyed but it is pending!") and
+    hang the process on their pending awaits (aiohttp connector timeouts) for
+    minutes. Production-safe shutdown counterpart to ``reset_boot_state_for_tests``
+    (cancels ONLY the two tasks; does NOT drop ledgers/singletons). Awaits the
+    cancellations with a hard bound so a stuck task cannot wedge teardown.
+    Returns the number of tasks cancelled. NEVER raises."""
+    global _REFRESH_TASK, _HEAVY_PROBE_TASK
+    cancelled = []
+    try:
+        for _t in (_REFRESH_TASK, _HEAVY_PROBE_TASK):
+            if _t is not None and not _t.done():
+                _t.cancel()
+                cancelled.append(_t)
+        if cancelled:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*cancelled, return_exceptions=True),
+                    timeout=max(0.1, float(timeout_s)),
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                # A task refused to yield within the bound — it's cancelled and
+                # will be GC'd; teardown proceeds regardless (the watchdog/forced
+                # exit is the final backstop). Never block shutdown.
+                pass
+        _REFRESH_TASK = None
+        _HEAVY_PROBE_TASK = None
+        if cancelled:
+            logger.info(
+                "[DWDiscovery] shutdown_background_loops: cancelled %d loop(s)",
+                len(cancelled),
+            )
+    except Exception as exc:  # noqa: BLE001 — teardown must never raise
+        logger.debug("[DWDiscovery] shutdown_background_loops swallowed: %s", exc)
+    return len(cancelled)
+
+
 def reset_boot_state_for_tests() -> None:
     """Test hook — clears the boot flag, cancels any refresh task,
     drops the ledger singletons. Production code MUST NOT call this."""

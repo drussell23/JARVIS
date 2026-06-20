@@ -42,19 +42,28 @@ class TestBuildCommand(unittest.TestCase):
         self.assertEqual(cmds[0][:3], ["aws", "s3", "sync"])
         self.assertIn("s3://my-vault/jarvis", cmds[0])
 
-    def test_gcs(self):
+    def test_gcs_is_native_no_argv(self):
+        # Native GCS Vault (2026-06-20): gcs is handled by the native SDK path,
+        # NOT a gsutil subprocess — build_backup_commands returns [] (no CLI).
         cmds = SP.build_backup_commands(
             "gcs", ".jarvis", "gs://jarvis-473803-deployments/crucible-state",
         )
-        self.assertEqual(len(cmds), 1)
-        self.assertEqual(cmds[0][:2], ["gsutil", "-m"])
-        self.assertIn("rsync", cmds[0])
-        self.assertIn("gs://jarvis-473803-deployments/crucible-state", cmds[0])
-        # mirror semantics: -d prunes remote deletions (matches rsync/s3 --delete)
-        self.assertIn("-d", cmds[0])
+        self.assertEqual(cmds, [])
 
-    def test_gcs_empty_target_noop(self):
-        self.assertEqual(SP.build_backup_commands("gcs", ".jarvis", ""), [])
+    def test_parse_gs_uri(self):
+        self.assertEqual(
+            SP._parse_gs_uri("gs://bucket/crucible-state/.jarvis"),
+            ("bucket", "crucible-state/.jarvis"),
+        )
+        self.assertEqual(SP._parse_gs_uri("gs://bucket"), ("bucket", ""))
+        self.assertEqual(SP._parse_gs_uri("gs://bucket/"), ("bucket", ""))
+        self.assertIsNone(SP._parse_gs_uri("s3://bucket/x"))
+        self.assertIsNone(SP._parse_gs_uri(""))
+        self.assertIsNone(SP._parse_gs_uri("gs://"))
+
+    def test_gcs_push_failsoft_bad_uri(self):
+        # Non-gs target → False, never raises (no SDK call attempted).
+        self.assertFalse(SP._gcs_push_blocking(".", "not-a-uri"))
 
     def test_git_is_three_step(self):
         cmds = SP.build_backup_commands("git", ".jarvis", "origin")
