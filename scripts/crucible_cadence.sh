@@ -49,14 +49,15 @@ if [[ -n "${GH_TOKEN:-}" ]]; then
 fi
 
 _sync_state() {
-  # After EVERY soak: mirror .jarvis → GCS (fail-soft; preemption-resume input).
-  # Direct gsutil (one-shot) — same argv the Evidence Vault's `gcs` backend
-  # builds (build_backup_commands), but inline so the loop never blocks on a
-  # long-lived daemon. The Vault daemon/systemd path remains for non-cadence use.
+  # After EVERY soak: push .jarvis → GCS via the NATIVE google-cloud-storage SDK
+  # (ADC from the instance metadata server) — NOT gsutil, which the lean soak
+  # container does not ship. Fail-soft; the push is the preemption-resume input.
   if [[ -n "${JARVIS_BACKUP_TARGET:-}" ]]; then
-    gsutil -m rsync -r -d /app/.jarvis "${JARVIS_BACKUP_TARGET}" 2>/dev/null \
-      && echo "[crucible] state synced → ${JARVIS_BACKUP_TARGET}" \
-      || echo "[crucible] state sync failed (non-fatal)"
+    if python3 -m backend.core.ouroboros.governance.state_persistence_daemon --once 2>&1 | sed 's/^/[vault] /'; then
+      echo "[crucible] state pushed → ${JARVIS_BACKUP_TARGET} (native SDK)"
+    else
+      echo "[crucible] state push failed (non-fatal)"
+    fi
   fi
 }
 
@@ -80,6 +81,15 @@ except Exception as exc:  # noqa: BLE001
     print("propose pass error (non-fatal): %s" % exc)
 PYEOF
 }
+
+# Preemption-RESUME: before the first soak, pull the prior .jarvis ledger from
+# GCS via the native SDK (a re-ignited node continues mid-cadence instead of
+# starting over). Fail-soft — a fresh node with no prior state is a clean start.
+if [[ -n "${JARVIS_BACKUP_TARGET:-}" ]]; then
+  echo "🧬 [crucible] native GCS restore (preemption-resume) from ${JARVIS_BACKUP_TARGET}…"
+  python3 -m backend.core.ouroboros.governance.state_persistence_daemon --restore 2>&1 | sed 's/^/[vault] /' || \
+    echo "[crucible] restore no-op (fresh node)"
+fi
 
 ITER=0
 while true; do

@@ -80,20 +80,11 @@ echo "[ignition] .env written (DW key len=${#DW_KEY}, pin=${PIN:-<default>}, gh_
 [ -z "$GH_TOK" ] && echo "[ignition] WARNING: no github-token secret / jarvis-gh-token metadata — graduation PRs cannot be pushed"
 mkdir -p "$APP_DIR/.jarvis"
 
-# ---- 3b. Amnesia-proofing: RESTORE .jarvis from GCS before boot ------------
-# A preempted Spot node restarts here (startup-script runs on every boot). Pull
-# the prior graduation ledger + soak history so the Crucible resumes its cadence
-# (e.g. interrupted at Soak 2 → continues at Soak 3) instead of starting over.
-# Fail-soft: an empty/absent bucket path is a no-op (fresh node).
-GCS_STATE="gs://jarvis-473803-deployments/crucible-state/.jarvis"
-if command -v gsutil >/dev/null 2>&1; then
-  echo "[ignition] restoring .jarvis from ${GCS_STATE} (resume) …"
-  gsutil -m rsync -r "$GCS_STATE" "$APP_DIR/.jarvis" 2>/dev/null \
-    && echo "[ignition] .jarvis restored from GCS" \
-    || echo "[ignition] no prior GCS state (fresh node) — starting clean"
-else
-  echo "[ignition] gsutil not present — skipping GCS restore"
-fi
+# ---- 3b. Amnesia-proofing: RESTORE handled NATIVELY inside the container ----
+# Preemption-resume (pulling the prior .jarvis ledger from GCS) is done by the
+# Crucible cadence entrypoint (crucible_cadence.sh) via the NATIVE
+# google-cloud-storage SDK (ADC from the metadata server) BEFORE its first soak —
+# not here with a host gsutil. Single native source of truth; no CLI reliance.
 
 # ---- 4. Boot the container --------------------------------------------------
 # `jarvis-crucible-mode=true` metadata arms the autonomic graduation cadence

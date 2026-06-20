@@ -1961,6 +1961,27 @@ class GovernedLoopService:
 
         self._state = ServiceState.STOPPING
 
+        # GracefulTeardownMatrix (2026-06-20) — cancel the DW discovery/heavy-probe
+        # background loops FIRST. Left pending they leak ("Task was destroyed but
+        # it is pending!") and wedge teardown for minutes on their aiohttp
+        # connector-timeout awaits (the live-soak post-summary 5-min hang). Bounded
+        # + fail-soft; never blocks shutdown.
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                shutdown_background_loops as _dw_shutdown_loops,
+            )
+            await _dw_shutdown_loops(timeout_s=5.0)
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+        # Close the DW provider's aiohttp session so its connector doesn't linger
+        # waiting on a TCP timeout during teardown (reuses force_session_reset).
+        try:
+            _dw_ref = getattr(self, "_doubleword_ref", None)
+            if _dw_ref is not None and hasattr(_dw_ref, "force_session_reset"):
+                await asyncio.wait_for(_dw_ref.force_session_reset(), timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+
         # Slice 101 — publish session_end onto the cognitive bus before the
         # drain so observational subscribers can react. Fire-and-forget,
         # NEVER raises, inert unless JARVIS_COGNITIVE_BUS_ENABLED.
