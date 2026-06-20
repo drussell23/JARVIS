@@ -126,6 +126,20 @@ def is_paused() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+def _timeout_salvage_enabled() -> bool:
+    """Master for COMPLETED-WORK SALVAGE on subprocess timeout. Default TRUE —
+    failure-path-only: it ONLY engages when the subprocess exceeded its hard kill
+    cap AND a ``session_outcome=='complete'`` summary is already on disk (the
+    battle-test finished its work, then hung in cleanup). Without it, a soak that
+    completed cleanly but overran its post-summary cleanup window is discarded as
+    ``infra`` and never counts toward graduation — the live-soak blocker
+    (2026-06-20). Kill switch = pure rollback to the legacy discard. NEVER
+    raises."""
+    return os.environ.get(
+        "JARVIS_LIVE_FIRE_TIMEOUT_SALVAGE_ENABLED", "true",
+    ).strip().lower() in _TRUTHY
+
+
 # Debug-log capture bound (Sovereign Telemetry Unification, 2026-06-15).
 # The self-heal trajectory the Arbiter parses can span the whole log, so the
 # captured slice must be larger than the legacy 8KB tail — but still bounded
@@ -1553,16 +1567,52 @@ def _run_battle_test_subprocess(
     # Forward NTP skew during subprocess cannot move this; backward
     # skew is absorbed by _SESSION_DETECTION_GRACE_S below.
     start_wall_anchor = time.time()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(project_root),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        check=False,
-    )
     sessions_root = project_root / ".ouroboros" / "sessions"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(project_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # COMPLETED-WORK SALVAGE (2026-06-20). The subprocess exceeded the hard
+        # kill cap — but the battle-test may have already FINISHED its work and
+        # written a terminal summary.json (stop_reason=wall_clock_cap), then hung
+        # in post-summary cleanup (e.g. leaked asyncio shutdown tasks —
+        # dw_discovery_refresh_loop / dw_heavy_probe_loop). A soak that finished
+        # its work must be GRADED ON ITS SUMMARY, not discarded as infra: the
+        # overrun was cleanup, not lost work. Read the session written during
+        # this run; if it carries session_outcome=='complete' (proof
+        # _generate_report ran fully), return it for normal grading. Only when no
+        # COMPLETE summary exists do we propagate the timeout (a genuine hang
+        # with no result). Gated; default-ON (failure-path-only). NEVER masks a
+        # real hang — requires a complete summary on disk.
+        if _timeout_salvage_enabled():
+            _salv_summary, _salv_tail = _read_most_recent_session(
+                sessions_root,
+                after_epoch=start_wall_anchor - _SESSION_DETECTION_GRACE_S,
+            )
+            if (
+                isinstance(_salv_summary, dict)
+                and str(_salv_summary.get("session_outcome", "")) == "complete"
+            ):
+                logger.warning(
+                    "[LiveFireSoak] subprocess exceeded %ss BUT a COMPLETE "
+                    "summary was written (stop_reason=%s, dur=%.0fs) — grading "
+                    "on the finished soak; the overrun was post-summary cleanup "
+                    "(leaked shutdown tasks), not lost work.",
+                    timeout_s, _salv_summary.get("stop_reason", "?"),
+                    float(_salv_summary.get("duration_s", 0.0) or 0.0),
+                )
+                # Synthetic exit 0 — the battle-test's own clean exit code had it
+                # not hung; downstream grades on the summary, not the code.
+                return (0, _salv_summary, _salv_tail)
+        # No complete summary → genuine hang; let the caller record the timeout.
+        raise
     summary, debug_tail = _read_most_recent_session(
         sessions_root,
         after_epoch=start_wall_anchor - _SESSION_DETECTION_GRACE_S,
