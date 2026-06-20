@@ -5408,6 +5408,7 @@ class CandidateGenerator:
             # runway instead of the 30s/75s reflex cap. Gated default-TRUE;
             # OFF (or breaker CLOSED) is the byte-identical legacy cascade.
             _fallback_dead = False
+            _autarky_reason = ""  # "structural" (expected) | "breaker_open" (abnormal)
             if _dw_autarky_enabled():
                 # A CONFIG-disabled Claude (JARVIS_PROVIDER_CLAUDE_DISABLED) is the
                 # deadest fallback of all — never constructed — yet it leaves the
@@ -5415,12 +5416,16 @@ class CandidateGenerator:
                 # Check it first so the sole-lane DW gets the full runway instead of
                 # the reflex cap (the live-soak TIMEOUT root, 2026-06-20).
                 _fallback_dead = _claude_config_disabled()
-                if not _fallback_dead:
+                if _fallback_dead:
+                    _autarky_reason = "structural"
+                else:
                     try:
                         from backend.core.ouroboros.governance.doubleword_provider import (
                             _claude_breaker_open as _autarky_breaker_open,
                         )
                         _fallback_dead = _autarky_breaker_open()
+                        if _fallback_dead:
+                            _autarky_reason = "breaker_open"
                     except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
                         _fallback_dead = False
             primary_budget = self._compute_primary_budget(
@@ -5428,10 +5433,20 @@ class CandidateGenerator:
                 fallback_dead=_fallback_dead,
             )
             if _fallback_dead and primary_budget > _PRIMARY_MAX_TIMEOUT_S:
-                logger.warning(
+                # Severity matches reality: STRUCTURAL autarky (operator-attested
+                # JARVIS_PROVIDER_CLAUDE_DISABLED) is the intended steady state →
+                # INFO (observable, not alarming, no warning-count inflation). An
+                # actual breaker OPEN (economic/transport failures) is a real
+                # fallback-lane degradation → WARNING. The message now states the
+                # ACCURATE reason instead of always claiming "breaker OPEN".
+                _structural = _autarky_reason == "structural"
+                _emit = logger.info if _structural else logger.warning
+                _emit(
                     "[CandidateGenerator] ⚡ DW AUTARKY ENGAGED: Claude fallback "
-                    "breaker OPEN — granting DW the full %.1fs budget (vs %.1fs "
-                    "reflex cap), no dead-lane handoff. route=%s op=%s model=%s",
+                    "%s — granting DW the full %.1fs budget (vs %.1fs reflex cap), "
+                    "no dead-lane handoff. route=%s op=%s model=%s",
+                    "structurally disabled (autarky)" if _structural
+                    else "breaker OPEN (degraded)",
                     primary_budget, _PRIMARY_MAX_TIMEOUT_S,
                     getattr(context, "provider_route", "?"),
                     getattr(context, "op_id", "?")[:16],
