@@ -75,6 +75,29 @@ class ProviderAvailabilitySnapshot:
     dw_latency_p95_s: Optional[float] = None
 
 
+# Claude-lane unavailability reasons that are EXPECTED steady states — an
+# operator-attested configuration, not a degradation. Co-located with the reason
+# taxonomy (_resolve_claude) so the two never drift. Used by observability
+# consumers to pick the log SEVERITY: an expected state is forensic (DEBUG), an
+# abnormal one (breaker_open_*, half_open_probing) is actionable (WARNING).
+_EXPECTED_CLAUDE_UNAVAILABLE_REASONS: frozenset = frozenset({
+    "structurally_disabled",  # JARVIS_PROVIDER_CLAUDE_DISABLED — pure-DW autarky
+    "breaker_disabled",       # breaker not authoritative → lane assumed usable
+})
+
+
+def is_expected_unavailability(claude_reason: Optional[str]) -> bool:
+    """True iff a Claude-lane ``claude_reason`` denotes an EXPECTED, operator-
+    intended unavailability (e.g. structurally disabled in autarky) rather than
+    an ABNORMAL degradation (economic/transport breaker open, half-open probing).
+
+    Lets observability emit the budget-synthesis adaptation at the SEVERITY that
+    matches reality — steady-state autarky is not a warning. Pure; NEVER raises."""
+    if not claude_reason:
+        return False
+    return str(claude_reason).strip().lower() in _EXPECTED_CLAUDE_UNAVAILABLE_REASONS
+
+
 def _env_true(var: str) -> bool:
     return os.environ.get(var, "").strip().lower() in _TRUE_TOKENS
 

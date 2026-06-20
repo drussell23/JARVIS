@@ -764,17 +764,35 @@ class UrgencyRouter:
             route, snapshot, legacy, tool_loop_demanded=tool_loop_demanded,
         )
         if synthesized != legacy:
-            # §7 observability — make the dynamic allocation visible without grep.
-            logger.warning(
+            # §7 observability — make the dynamic allocation visible without grep,
+            # at the SEVERITY that matches reality. An EXPECTED unavailability
+            # (operator-attested autarky: claude structurally_disabled) is the
+            # intended steady state — forensic DEBUG, not a per-op WARNING that
+            # breeds alarm fatigue / inflates warning-count telemetry. An ABNORMAL
+            # unavailability (economic/transport breaker open, half-open probing)
+            # is a genuine fallback-lane degradation the operator should see →
+            # WARNING. Classification lives with the reason taxonomy (single
+            # source of truth, no drift).
+            _claude_reason = getattr(snapshot, "claude_reason", "?")
+            try:
+                from backend.core.ouroboros.governance.provider_availability import (
+                    is_expected_unavailability as _is_expected,
+                )
+                _expected = _is_expected(_claude_reason)
+            except Exception:  # noqa: BLE001 — never block routing on a log gate
+                _expected = False
+            _log = logger.debug if _expected else logger.warning
+            _log(
                 "[BudgetSynth] route=%s claude=unavailable:%s dw=%s tool_loop=%s "
-                "→ dw_wait=%.1fs tier0=%.2f reserve=%.1f",
+                "→ dw_wait=%.1fs tier0=%.2f reserve=%.1f%s",
                 getattr(route, "value", route),
-                getattr(snapshot, "claude_reason", "?"),
+                _claude_reason,
                 getattr(snapshot, "dw_reason", "?"),
                 tool_loop_demanded,
                 synthesized.get("max_dw_wait_s", 0.0),
                 synthesized.get("tier0_fraction", 0.0),
                 synthesized.get("tier1_reserve_s", 0.0),
+                " (expected/autarky)" if _expected else "",
             )
         return synthesized
 
