@@ -3726,6 +3726,15 @@ class CandidateGenerator:
                     _s201_bandit_ok().record_outcome(model_id, success=True)
                 except Exception:  # noqa: BLE001
                     pass
+                try:
+                    # Override Matrix — clear the model-pin soft-lock streak on a
+                    # real success (passive observed outcome; no active probe).
+                    from backend.core.ouroboros.governance.model_pinning_heuristic import (
+                        note_pin_outcome as _pin_ok,
+                    )
+                    _pin_ok(model_id, success=True)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Slice 20C — zero-candidate drift detection. The
                 # parser succeeded (we're on the success branch) but
                 # may have returned an empty candidates tuple while
@@ -3922,6 +3931,16 @@ class CandidateGenerator:
                         get_bandit_router as _s201_bandit_fail,
                     )
                     _s201_bandit_fail().record_outcome(model_id, success=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    # Override Matrix — feed the model-pin soft-lock a real
+                    # failure (429/500/live-transport). At threshold the pin
+                    # enters cooldown and routing yields to the EWMA ranking.
+                    from backend.core.ouroboros.governance.model_pinning_heuristic import (
+                        note_pin_outcome as _pin_fail,
+                    )
+                    _pin_fail(model_id, success=False)
                 except Exception:  # noqa: BLE001
                     pass
                 # Slice 77 — dynamic transport telemetry. The moment a LIVE
