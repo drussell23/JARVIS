@@ -412,7 +412,7 @@ class ProviderTopology:
                 key = (route or "").strip().lower()
                 ranked = holder.assignments_by_route.get(key, ())
                 if ranked:
-                    return _fleet_guarded(route, ranked)
+                    return _pin_and_fleet_guarded(route, ranked)
             # Fall through to YAML — cold-start, stale, route missing,
             # or route empty in catalog. YAML stays authoritative for
             # all four fallback conditions
@@ -422,7 +422,7 @@ class ProviderTopology:
             return ()
         effective = entry.effective_dw_models
         if effective:
-            return _fleet_guarded(route, effective)
+            return _pin_and_fleet_guarded(route, effective)
         # ── Slice 10B-ii — trusted-seed runtime bypass ──
         # YAML + dynamic catalog both returned empty; consult
         # PromotionLedger for operator-attested trusted seeds that
@@ -430,7 +430,7 @@ class ProviderTopology:
         # :func:`_trusted_seed_dw_models_for_route` for the gate
         # composition (re-uses dw_catalog_classifier.gate_for_route
         # so the same param/price thresholds apply).
-        return _fleet_guarded(route, _trusted_seed_dw_models_for_route(route))
+        return _pin_and_fleet_guarded(route, _trusted_seed_dw_models_for_route(route))
 
     def fallback_tolerance_for_route(self, route: str) -> str:
         """Return the v2 ``fallback_tolerance`` for *route*.
@@ -678,6 +678,26 @@ def _fleet_guarded(route: str, result: Tuple[str, ...]) -> Tuple[str, ...]:
     except Exception:
         pass
     return result
+
+
+def _pin_and_fleet_guarded(route: str, result: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Sovereign Context-Routing Override Matrix (2026-06-20) composed OVER the
+    FleetEvaluator re-rank.
+
+    Order is deliberate: ``_fleet_guarded`` first (measured EWMA quality
+    ordering), then the operator pin on top. A healthy pin
+    (``JARVIS_DW_PRIMARY_OVERRIDE``) is promoted to Rank 1; a soft-locked pin
+    (consecutive failures over threshold → cooldown) yields straight back to the
+    EWMA ordering. Pin unset → returns the fleet result byte-identically. Pure +
+    fail-soft: any error returns the fleet-guarded result unchanged."""
+    fleet_ranked = _fleet_guarded(route, result)
+    try:
+        from backend.core.ouroboros.governance.model_pinning_heuristic import (
+            apply_model_pin,
+        )
+        return apply_model_pin(route, fleet_ranked)
+    except Exception:
+        return fleet_ranked
 
 
 def _locate_policy_yaml() -> Optional[Path]:
