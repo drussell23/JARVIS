@@ -4430,29 +4430,68 @@ class DoublewordProvider:
     async def _await_batch_result(
         self, batch_id: str, *, op_id: str = "dw-batch-await",
     ) -> Optional[str]:
-        """Wait for batch result via webhook future or adaptive poll fallback.
+        """Wait for batch result by RACING the webhook future against adaptive poll.
 
-        Tier 1: If a ``BatchFutureRegistry`` is wired and the batch has a
-        registered future, await it (zero polling — webhook resolves it).
+        Async Batch Recovery Matrix (2026-06-20). The prior design awaited the
+        webhook future FIRST and only polled on its exception — so when the
+        ``batch.completed`` webhook can't be delivered (e.g. a cloud node with no
+        public ingress for DW's callback), Tier 1 blocked the ENTIRE budget
+        (``_DW_MAX_WAIT_S``, cut off by the op's wall budget → 180s TimeoutError)
+        while the working poll path (Tier 2) was never reached. The live trace
+        proved DW completes a batch in ~11s, so polling would have caught it
+        trivially.
 
-        Tier 2: Adaptive exponential backoff polling with jitter.
+        Fix: run BOTH concurrently and take whichever resolves first —
+          * webhook (zero-poll, instant when ingress exists), AND
+          * adaptive exponential-backoff poll (always works; catches the ~11s
+            completion regardless of webhook reachability).
+        The loser is cancelled. A webhook that never arrives no longer starves
+        the op; a reachable webhook still wins instantly. NEVER blocks the loop
+        beyond the first resolver.
 
         Slice 2B-ii — ``op_id`` is forwarded to ``_adaptive_poll_batch``
         for per-call Aegis lease accounting.
         """
-        # Tier 1: webhook-driven (if registry wired)
+        # Always run the poll path — it is the reachability-independent ground truth.
+        poll_task = asyncio.ensure_future(
+            self._adaptive_poll_batch(batch_id, op_id=op_id)
+        )
         registry = getattr(self, "_batch_registry", None)
-        if registry is not None:
-            try:
-                return await registry.wait(batch_id, timeout=_DW_MAX_WAIT_S)
-            except asyncio.TimeoutError:
-                logger.warning("[DoublewordProvider] Webhook wait timed out for %s", batch_id)
-                return None
-            except Exception:
-                pass  # No future registered or rejected — fall through to Tier 2
+        if registry is None:
+            return await poll_task
 
-        # Tier 2: adaptive backoff poll
-        return await self._adaptive_poll_batch(batch_id, op_id=op_id)
+        # Race webhook (zero-poll) vs poll (always-works). First non-None wins.
+        webhook_task = asyncio.ensure_future(
+            registry.wait(batch_id, timeout=_DW_MAX_WAIT_S)
+        )
+        pending = {poll_task, webhook_task}
+        result: Optional[str] = None
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                _winner_resolved = False
+                for t in done:
+                    try:
+                        r = t.result()
+                    except Exception:  # noqa: BLE001 — a failed arm yields to the other
+                        r = None
+                    if r is not None:
+                        result = r
+                        _winner_resolved = True
+                        break
+                if _winner_resolved:
+                    break
+            return result
+        finally:
+            for t in (poll_task, webhook_task):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
 
     @staticmethod
     def _next_poll_interval(attempt: int, *, network_error: bool = False) -> float:
