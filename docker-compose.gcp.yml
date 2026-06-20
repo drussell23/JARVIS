@@ -55,6 +55,14 @@ services:
       # batch arm rides the unproven batch-through-aegis-passthrough path; re-enable
       # once that path is validated under aegis.
       JARVIS_DW_DYNAMIC_TRANSPORT_ENABLED: "false"
+      # PIN RT (load-bearing for shields-up): both force-batch triggers default ON
+      # (_SLICE36_FORCE_BATCH_ENV="1", breaker-aware="true"). With Claude DISABLED
+      # above, leaving them at default would force the STANDARD/COMPLEX *batch*-through-
+      # aegis-passthrough path — the unproven weak link that regressed the dual soak.
+      # =0 reverts to the legacy RT-only routing that proved state=applied with shields
+      # up. Remove these two once batch-through-aegis is validated under the proxy.
+      JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX: "0"
+      JARVIS_DW_FORCE_BATCH_ON_CLAUDE_BREAKER: "0"
       # real cores → give DW generation full runway (no 90s reflex-cap timeouts)
       OUROBOROS_TIER0_MAX_WAIT_S: "600"
       JARVIS_GENERATION_TIMEOUT_S: "900"
