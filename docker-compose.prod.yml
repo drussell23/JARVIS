@@ -1,0 +1,77 @@
+# JARVIS Sovereign Cloud Orchestrator — production generative run (2026-06-19)
+# =============================================================================
+# Infrastructure-as-Code path to the FIRST real state=applied run on a
+# high-compute Linux host — the environment the local 16GB M1 could never be
+# (nested event-loop starvation + pytest SIGKILL@30s + AST pool pinned to 1).
+#
+# REUSES the existing soak image (docker/Dockerfile.soak — deps + full code) and
+# the .env/.jarvis secret+persistence pattern; the ONLY prod-specific changes
+# are (a) entrypoint -> scripts/launch_linux_prod.sh (computes $(nproc) inside
+# the container, sources deploy/ouroboros_linux_prod.env), and (b) NO cpu cap so
+# AST parsing scales to every host core.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml logs -f jarvis-prod
+#   docker compose -f docker-compose.prod.yml down
+#
+# Secrets: .env (DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY) injected at runtime
+# only — NEVER baked into the image. .jarvis/ is bind-mounted so the funded
+# keys + episodic/evidence chain survive container death.
+# =============================================================================
+services:
+  jarvis-prod:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.soak
+      args:
+        # Oracle-capable parse pool wants the heavier reqs; launch with
+        # SOAK_REQUIREMENTS=requirements-soak-oracle.txt for full AST power.
+        SOAK_REQUIREMENTS: ${SOAK_REQUIREMENTS:-requirements-soak.txt}
+    image: jarvis-sovereign-prod:latest
+    container_name: jarvis-sovereign-prod
+    working_dir: /app
+    restart: always            # survives crash + host reboot (if dockerd enabled on boot)
+    stop_grace_period: 30s
+
+    # Funded provider creds — runtime only, never in the image.
+    env_file:
+      - path: .env
+        required: false
+
+    # Prod tunings that eliminate the M1 bottlenecks. launch_linux_prod.sh also
+    # sources deploy/ouroboros_linux_prod.env; these are pinned here so a bare
+    # `compose up` (without the launcher) still gets the right horizons, and so
+    # `compose config` documents the contract explicitly.
+    environment:
+      # the session's three fixes (all default-on; explicit for auditability)
+      JARVIS_FLEET_EVALUATOR_ENABLED: "true"
+      JARVIS_PROVIDER_QUOTA_ISOLATION_ENABLED: "true"
+      JARVIS_SBA_RESERVATION_TTL_S: "600"
+      # Blocker #1 — give the full-repo pytest sweep room (was SIGKILLed @30s)
+      JARVIS_INTENT_PYTEST_TIMEOUT_S: "180"
+      JARVIS_TEST_TIMEOUT_S: "180"
+      JARVIS_TEST_PER_TEST_TIMEOUT_S: "30"
+      # Blocker #2 — AST parse pool; launch_linux_prod.sh raises to nproc-1 at
+      # boot. This is the conservative floor if run without the launcher.
+      JARVIS_AST_HELPER_POOL_MAX_WORKERS: "8"
+      JARVIS_BG_POOL_SIZE: "6"
+      # Blocker #3 — real soak leashes (a dedicated host can run long + spend)
+      OUROBOROS_BATTLE_COST_CAP: "10.00"
+      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "3600"
+      OUROBOROS_BATTLE_HEADLESS: "true"
+      # Set to "true" for pure DW autarky if Claude credits are exhausted.
+      # JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+
+    volumes:
+      # Funded keys + signed roadmap READ from host; evidence/episodic chain
+      # WRITTEN back → survive container death (the persistence vault).
+      - ./.jarvis:/app/.jarvis
+
+    # Entrypoint override: the nproc-scaling Linux launcher (refuses non-Linux;
+    # inside the container it IS Linux). Computes AST pool = cores-1, BG = cores/2.
+    entrypoint: ["bash", "scripts/launch_linux_prod.sh"]
+    command: []
+
+    # NO deploy.resources.limits.cpus — the prod run WANTS every host core for
+    # unthrottled AST parsing + a non-starved event loop (the opposite of the
+    # 4-core soak cap). Add a cpus limit back only on a shared/noisy host.
