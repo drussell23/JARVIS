@@ -681,6 +681,30 @@ class DwCatalogClient:
         self._memory_snapshot: Optional[CatalogSnapshot] = None
         self._memory_hydrated: bool = False
 
+    async def _auth_headers(self) -> Dict[str, str]:
+        """JIT credential resolution for the catalog fetch (2026-06-20).
+
+        When Aegis is enabled the raw provider key is CONFISCATED (scrubbed)
+        from the loop process's env, so ``self._api_key`` is empty here — the
+        legacy ``Bearer {self._api_key}`` header 401s and the catalog never
+        hydrates (dw=unknown → no DW model → exhaustion). Read the working
+        credential from the Aegis vault at call time instead (the SAME
+        mechanism the generative DW path uses; verified: dw_session_auth_header
+        → GET /models 200). Falls back to the raw Bearer for non-Aegis/legacy
+        contexts. NEVER raises — fail-soft to the legacy header."""
+        try:
+            from backend.core.ouroboros.aegis import client as _aegis_client
+            if _aegis_client.is_enabled():
+                from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                    dw_session_auth_header as _aegis_auth,
+                )
+                vault = await _aegis_auth()
+                if vault.get("Authorization"):
+                    return dict(vault)
+        except Exception:  # noqa: BLE001 — never break discovery on bridge fault
+            pass
+        return {"Authorization": f"Bearer {self._api_key}"}
+
     async def fetch(self) -> CatalogSnapshot:
         """Issue ``GET /models``, parse response, persist + return.
 
@@ -690,10 +714,8 @@ class DwCatalogClient:
         t0 = time.monotonic()
         try:
             url = f"{self._base_url}/models"
-            headers = {
-                "Authorization": f"Bearer {self._api_key}",
-                "Accept": "application/json",
-            }
+            headers = await self._auth_headers()
+            headers["Accept"] = "application/json"
             timeout = _fetch_timeout_s()
             async with self._session.get(
                 url, headers=headers, timeout=timeout,

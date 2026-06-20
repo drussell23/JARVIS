@@ -768,6 +768,37 @@ def reset_boot_state_for_tests() -> None:
         _LAST_SNAPSHOT_ID = ""
 
 
+async def _await_aegis_credential_ready(
+    *, max_attempts: int = 6, base_delay_s: float = 0.5,
+) -> bool:
+    """Daemon-readiness handshake: when Aegis is enabled, poll the vault
+    (dw_session_auth_header) with bounded exponential backoff until it returns
+    a valid Authorization header (daemon bound + credential held). Returns True
+    when ready (or Aegis disabled — nothing to wait for), False on timeout.
+    NEVER raises — discovery proceeds regardless (fail-soft)."""
+    try:
+        from backend.core.ouroboros.aegis import client as _aegis_client
+        if not _aegis_client.is_enabled():
+            return True
+        from backend.core.ouroboros.governance.aegis_provider_bridge import (
+            dw_session_auth_header as _aegis_auth,
+        )
+        import asyncio as _asyncio
+        delay = base_delay_s
+        for _ in range(max(1, max_attempts)):
+            try:
+                vault = await _aegis_auth()
+                if vault.get("Authorization"):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            await _asyncio.sleep(delay)
+            delay = min(delay * 2.0, 8.0)
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def boot_discovery_once(
     *,
     session: Any,
@@ -799,6 +830,14 @@ async def boot_discovery_once(
         ledger = _get_or_create_ledger()
         modality_ledger = _get_or_create_modality_ledger()  # Slice G
         ttft_observer = _get_or_create_ttft_observer()  # Slice 12.2.C
+        # Daemon-readiness handshake (2026-06-20): when Aegis is enabled the
+        # catalog credential comes from the daemon's vault, which may not be
+        # bound+credentialed at the instant boot fires (the 3 boot-race 401s).
+        # Briefly await vault readiness (bounded exp-backoff) so the FIRST
+        # discovery already authenticates — no transient empty-catalog window.
+        # Fail-soft: on timeout we proceed anyway (run_discovery is fail-soft +
+        # the periodic refresh retries).
+        await _await_aegis_credential_ready()
         first_result = await run_discovery(
             session=session,
             base_url=base_url,
