@@ -5232,6 +5232,20 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001 — never let watchdog arm crash signal handler
             pass
 
+        # Graceful Preemption Shield — SYNCHRONOUS, corruption-first. On a GCP
+        # Spot SIGTERM we have ~30s before SIGKILL; the existing async cleanup
+        # below can exceed that and says nothing about the working tree. Engage
+        # the shield FIRST (git-safety stash + child-worker halt) so a mid-APPLY
+        # file write / dangling index.lock can't leave a corrupt clone. Gated,
+        # idempotent, bounded, fail-soft — NEVER raises into the signal path.
+        try:
+            from backend.core.ouroboros.battle_test.graceful_preemption import (
+                engage as _preemption_shield_engage,
+            )
+            _preemption_shield_engage(signal_name=signal_name)
+        except Exception:  # noqa: BLE001 — shield must never break shutdown
+            pass
+
         # Stamp the signal-specific reason before the write runs so the
         # partial summary carries an actionable classifier instead of the
         # generic "shutdown_signal" catch-all. Keep the existing value if

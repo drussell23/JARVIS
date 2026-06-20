@@ -1,0 +1,43 @@
+# GCP Sovereign Cloud overlay — 8 vCPU / 16GB e2-custom Spot node.
+# =============================================================================
+# Overlay on docker-compose.prod.yml for the cloud soak. The host now has REAL
+# cores (the 2-CPU Docker-Desktop floor is gone), so the memory-pressure /
+# sensor-governor throttling from the M1 desktop overlay is NOT needed and is
+# omitted — the swarm runs at full prod horizons.
+#
+# What IS retained from the desktop diagnosis (these are core-count-independent —
+# they each block the asyncio event loop or DW lane regardless of how many cores
+# the box has, so they stay off for the first clean state=applied proof):
+#   - posture collector + semantic-index build run synchronously on the loop and
+#     can stall it 14-45s → starve the in-flight DW SSE read. OFF.
+#   - the heavy surface-health boot probe (550B model) false-degrades the whole
+#     DIRECT_STREAMING lane on slow DW cold-starts. OFF.
+#   - Aegis OFF for the FIRST proof (isolate the loop from the AegisForward
+#     DW-streaming path; #69590 fixed the leak but the rupture validation is a
+#     separate aegis-ON soak). Turn back on once that soak is green.
+#
+# The pin (JARVIS_DW_PRIMARY_OVERRIDE=openai/gpt-oss-120b) + pure-DW autarky are
+# already supplied by deploy/ouroboros_linux_prod.env (sourced by the entrypoint)
+# and overridable via the .env the startup script writes from instance metadata.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.gcp.yml up -d --build
+# =============================================================================
+services:
+  jarvis-prod:
+    environment:
+      # pure DW autarky (Claude credits exhausted; safe via autarky fix #69589)
+      JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+      # advisory metacognition OFF the event loop (core-count-independent stalls)
+      JARVIS_DIRECTION_INFERRER_ENABLED: "false"
+      JARVIS_SEMANTIC_INFERENCE_ENABLED: "false"
+      # don't let the heavy 550B boot probe false-degrade the DW stream lane
+      JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
+      # first proof isolates the loop from the AegisForward DW-streaming path
+      JARVIS_AEGIS_ENABLED: "false"
+      # real cores → give DW generation full runway (no 90s reflex-cap timeouts)
+      OUROBOROS_TIER0_MAX_WAIT_S: "600"
+      JARVIS_GENERATION_TIMEOUT_S: "900"
+      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "3600"
+      OUROBOROS_BATTLE_COST_CAP: "10.00"
+      # Preemption Shield armed (default-on; explicit for auditability)
+      JARVIS_PREEMPTION_SHIELD_ENABLED: "true"

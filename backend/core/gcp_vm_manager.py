@@ -4639,7 +4639,89 @@ class GCPVMManager:
                 return running_vms[0]
             # No running VMs - return any VM
             return next(iter(self.managed_vms.values()), None)
-    
+
+    async def start_soak_vm(
+        self,
+        *,
+        vm_name: Optional[str] = None,
+        extra_metadata: Optional[Dict[str, str]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Provision a fire-and-forget Ouroboros **soak** Spot VM.
+
+        Sovereign Cloud Ignition (2026-06-20): a deliberate one-shot soak runner,
+        NOT a memory-offload server. It REUSES the full instance-build recipe
+        (``_build_instance_config`` → machine type from ``config.machine_type``
+        e.g. ``e2-custom-8-16384``, boot disk, network, Spot scheduling +
+        max_run_duration dead-man's-switch, the custom startup script from
+        ``config.startup_script_path``) but deliberately BYPASSES the
+        offload-only gating that ``start_spot_vm`` enforces:
+
+          * NO firewall health-check gate — a soak VM serves no traffic to the
+            Mac, so ``jarvis-allow-health-checks`` is irrelevant.
+          * NO active-VM reuse — each soak is a fresh node.
+          * NO component model — ``components=["ouroboros_soak"]`` is a label only.
+
+        ``extra_metadata`` is appended to the instance metadata AFTER the recipe
+        builds it (the recipe's ``metadata`` param is vestigial) — this is how the
+        DW API key + ``JARVIS_DW_PRIMARY_OVERRIDE`` pin reach the VM for the
+        startup script to consume. Returns ``(success, vm_name_or_error)``.
+
+        Requires: ``config.startup_script_path`` set + readable, GCP enabled,
+        project/zone valid. NEVER raises — all failures return ``(False, msg)``."""
+        if not self.config.enabled:
+            return False, "GCP_DISABLED: set GCP_ENABLED/GCP_VM_ENABLED=true"
+        is_valid, validation_error = self.config.is_valid_for_vm_operations()
+        if not is_valid:
+            return False, f"CONFIG_INVALID: {validation_error}"
+        if not (self.config.startup_script_path and os.path.exists(self.config.startup_script_path)):
+            return False, (
+                "SOAK_STARTUP_SCRIPT_MISSING: set config.startup_script_path to a "
+                f"readable file (got {self.config.startup_script_path!r})"
+            )
+        # Soak runs the script, never a golden image / container offload server.
+        self.config.use_golden_image = False
+        self.config.use_container = False
+        self.config.use_spot = True
+
+        name = vm_name or f"jarvis-ouroboros-soak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        try:
+            if self.instances_client is None:
+                await self._initialize_gcp_clients()
+            client = self.instances_client
+            if client is None:
+                return False, "COMPUTE_CLIENT_UNAVAILABLE: compute_v1 not importable / no ADC"
+            # Reuse the proven instance-build recipe (machine type, disk, network,
+            # Spot scheduling, startup-script metadata).
+            instance = self._build_instance_config(
+                name, ["ouroboros_soak"], "ouroboros_soak", {},
+            )
+            # Append soak-specific metadata (DW key + pin) the recipe doesn't carry.
+            if extra_metadata:
+                if instance.metadata is None:
+                    instance.metadata = compute_v1.Metadata(items=[])
+                for k, v in extra_metadata.items():
+                    if k and v is not None:
+                        instance.metadata.items.append(
+                            compute_v1.Items(key=str(k), value=str(v))
+                        )
+            logger.info(
+                "[SoakVM] creating Spot soak node name=%s machine=%s zone=%s "
+                "startup_script=%s extra_meta_keys=%s",
+                name, self.config.machine_type, self.config.zone,
+                os.path.basename(self.config.startup_script_path),
+                sorted((extra_metadata or {}).keys()),
+            )
+            client.insert(
+                project=self.config.project_id,
+                zone=self.config.zone,
+                instance_resource=instance,
+            )
+            logger.info("[SoakVM] insert submitted for %s — VM booting", name)
+            return True, name
+        except Exception as exc:  # noqa: BLE001 — never raise into the launcher
+            logger.error("[SoakVM] create failed for %s: %s", name, exc, exc_info=True)
+            return False, f"SOAK_CREATE_FAILED:{type(exc).__name__}:{str(exc)[:160]}"
+
     async def start_spot_vm(self) -> Tuple[bool, Optional[str]]:
         """
         Start a Spot VM for immediate use.
