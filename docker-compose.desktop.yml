@@ -44,12 +44,66 @@ services:
       # --- constrained pools (don't oversubscribe the small VM) ---
       JARVIS_AST_HELPER_POOL_MAX_WORKERS: "2"
       JARVIS_BG_POOL_SIZE: "2"
+      # --- shed heavy ADVISORY on-loop metacognition on the 2-CPU VM ---
+      # On this constrained host the posture collector (DirectionInferrer) and the
+      # SemanticIndex build run SYNCHRONOUSLY on the asyncio loop and block it for
+      # 14-45s per cycle (observed: posture_observer.run_one_cycle blocked_ms=44979,
+      # postmortem_failure_rate=30137, commit_ratios=14551, semantic_index.build).
+      # A 45s loop stall STARVES the in-flight DW streaming read → the aiohttp SSE
+      # stream ruptures → RuntimeError → dw_surface_health transport_degraded — which
+      # is why the loop's DW call fails while an isolated in-container curl/aiohttp to
+      # the SAME endpoint with the SAME key returns 200 + SSE. Both subsystems are
+      # purely advisory (CONTEXT_EXPANSION prompt injection); disabling them does NOT
+      # touch GENERATE/VALIDATE/APPLY. Existing operator opt-out flags — legitimate
+      # constrained-host tuning, restored to default-ON for the Linux prod host.
+      JARVIS_DIRECTION_INFERRER_ENABLED: "false"
+      JARVIS_SEMANTIC_INFERENCE_ENABLED: "false"
+      # --- don't let a HEAVY boot probe false-degrade the whole DW stream lane ---
+      # The surface-health sweep probes via build_heavyprobe_adapter against the
+      # promoted fleet — including nvidia/Nemotron-550B, which RuntimeErrors on this
+      # constrained host (cold/too-slow on DW). One heavy-model probe failure records
+      # DIRECT_STREAMING=transport_degraded, then the WARM-BOOT armor forces every op
+      # to BATCH — but ops needing Iron-Gate exploration REQUIRE the RT streaming tool
+      # loop and cannot batch, so they skip → fallback_skipped:no_fallback_configured
+      # (Claude off) → exhaust → 60s cooldown, never attempting DW at all. Under pure
+      # DW autarky (DW is the SOLE lane) the armor's batch-fallback adds no resilience,
+      # while its false positive blocks all generation. Direct DW streaming is proven
+      # healthy in-container (curl + aiohttp: 200 + SSE) once loop starvation is gone.
+      # Documented operator opt-out (preflight_probe.is_surface_health_enabled).
+      JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
       # --- pure DW autarky on the M1 (Claude credits out; J-Prime can't hold) ---
       JARVIS_PROVIDER_CLAUDE_DISABLED: "true"
+      # Operator opt-out of the Aegis credential proxy for the LOCAL single-container
+      # soak (env-precedence over the default-TRUE master, flags.py:217). Rationale:
+      # the Aegis passthrough routes (/v1/models, /v1/files, /v1/batches) work, but the
+      # AegisForward OpenAI-compat STREAMING path (/v1/chat/completions) ruptures the
+      # upstream connection ("aegis-daemon ERROR Unclosed connection") under DW-heavy
+      # RT load — the graduation soaks (2026-05-25) only exercised Claude /v1/messages
+      # forwarding, never DW streaming. The rupture surfaces to the loop as
+      # live_transport RuntimeError on every model → exhaustion → (Claude disabled) →
+      # no state=applied. Direct DW is PROVEN working in-container (curl + aiohttp:
+      # 200 + SSE). Aegis's only benefit here is scrubbing the key across a process
+      # boundary that doesn't exist in a single container (the key already lives in
+      # this container's env), so direct DW is the correct architecture for the local
+      # dev soak. The AegisForward DW-streaming defect is tracked for a separate
+      # production fix; aegis stays default-ON everywhere else.
+      JARVIS_AEGIS_ENABLED: "false"
       JARVIS_PROVIDER_QUOTA_ISOLATION_ENABLED: "true"
       JARVIS_FLEET_EVALUATOR_ENABLED: "true"
       JARVIS_FLEET_SENTINEL_ENABLED: "true"
+      # --- give DW real runway on the slow 2-CPU host ---
+      # Root cause of the generation TIMEOUTs: DW AUTARKY (Slice 225 full-runway grant)
+      # never engages here because _claude_breaker_open() reads only the Claude circuit
+      # breaker STATE — config-disabled Claude (JARVIS_PROVIDER_CLAUDE_DISABLED) leaves
+      # that breaker CLOSED, so DW is held to the 90s standard _TIER0_MAX_WAIT_S cap and
+      # the Venom tool loop + DW SSE generation blows it on this slow allocation →
+      # fsm_failure_mode=TIMEOUT → exhaust (Claude off, no fallback). Until the autarky
+      # gap is fixed in code (treat config-disabled Claude as breaker-open), lift the DW
+      # cap + total budget directly so a slow-but-complete generation can land. Wall cap
+      # (1800s) still bounds the session; one op gets up to ~600s.
+      OUROBOROS_TIER0_MAX_WAIT_S: "600"
+      JARVIS_GENERATION_TIMEOUT_S: "900"
       # --- modest leashes for a desktop run ---
       OUROBOROS_BATTLE_COST_CAP: "3.00"
-      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "1800"
+      OUROBOROS_BATTLE_MAX_WALL_SECONDS: "2400"
       JARVIS_INTENT_PYTEST_TIMEOUT_S: "180"
