@@ -109,6 +109,75 @@ def cascade_breaker_consult_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def autarky_backoff_wait_enabled() -> bool:
+    """Master switch for the Sovereign Autarky Backoff-Wait (2026-06-20).
+
+    Default TRUE — failure-path-only + autarky-only: it ONLY changes behavior
+    when (a) the sole-provider primary is in transient backoff AND (b) there is
+    NO fallback configured (DW-only mode). In every other state (fallback
+    present, primary healthy) it is byte-identical. Without it, a transient DW
+    TIMEOUT routes a STANDARD op to the absent Claude fallback and fails it with
+    ``fallback_skipped`` despite ample remaining budget to wait out the short
+    backoff and re-attempt the sole provider. Kill switch = pure rollback to the
+    legacy degrade-immediately path. NEVER raises."""
+    raw = (os.environ.get("JARVIS_AUTARKY_BACKOFF_WAIT_ENABLED", "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _autarky_backoff_max_wait_s() -> float:
+    """Hard cap on a SINGLE autarky backoff-wait (don't sleep absurdly long even
+    if budget allows). Env-tunable; defensive default 90s. NEVER raises."""
+    raw = (os.environ.get("JARVIS_AUTARKY_BACKOFF_MAX_WAIT_S", "") or "").strip()
+    try:
+        v = float(raw) if raw else 90.0
+        return v if v > 0 else 90.0
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _autarky_retry_margin_s() -> float:
+    """Budget that MUST remain AFTER the wait to attempt the primary call — so we
+    never burn the whole budget sleeping and then have nothing left to generate.
+    Env-tunable; defensive default 30s. NEVER raises."""
+    raw = (os.environ.get("JARVIS_AUTARKY_RETRY_MARGIN_S", "") or "").strip()
+    try:
+        v = float(raw) if raw else 30.0
+        return v if v > 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def autarky_should_wait_and_retry(
+    *,
+    has_fallback: bool,
+    enabled: bool,
+    eta_s: float,
+    remaining_s: float,
+    max_wait_s: float,
+    margin_s: float,
+) -> "Optional[float]":
+    """Pure decision: in DW-only autarky, should we WAIT out the sole provider's
+    transient backoff and re-attempt the primary (instead of routing to an absent
+    fallback)? Returns the bounded wait in seconds when yes, else ``None``.
+
+    Yes IFF: enabled AND no fallback AND a real positive backoff exists AND the
+    bounded wait + the post-wait call margin fit inside the remaining budget.
+    Pure + total — NEVER raises; trivially unit-testable."""
+    if not enabled or has_fallback:
+        return None
+    try:
+        if eta_s <= 0 or remaining_s <= 0:
+            return None
+        wait = min(float(eta_s), float(max_wait_s))
+        if wait <= 0:
+            return None
+        if wait + float(margin_s) < float(remaining_s):
+            return wait
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
 def should_cascade_to_claude(
     *, has_fallback: bool, claude_breaker_open: bool, enabled: bool,
 ) -> bool:
@@ -5097,18 +5166,57 @@ class CandidateGenerator:
         # Dynamic fallback: skip a primary in active backoff.
         if not self.fsm.should_attempt_primary():
             _eta_s = max(0.0, self.fsm.recovery_eta() - time.monotonic())
-            logger.warning(
-                "[CandidateGenerator] Dynamic fallback engaged — primary "
-                "in %s backoff (consecutive_failures=%d, "
-                "recovery_eta=+%.0fs) — routing %s op to fallback "
-                "without re-attempting primary",
+            _mode_name = (
                 self.fsm._failure_mode.name
-                if self.fsm._failure_mode is not None else "UNKNOWN",
-                self.fsm._consecutive_failures,
-                _eta_s,
-                getattr(context, "provider_route", "?"),
+                if self.fsm._failure_mode is not None else "UNKNOWN"
             )
-            return await self._call_fallback(context, deadline)
+            # Sovereign Autarky Backoff-Wait (2026-06-20): in DW-only mode there
+            # is no fallback — routing to it is a guaranteed fallback_skipped
+            # failure. If the sole provider's transient backoff clears within our
+            # remaining budget, WAIT it out and re-attempt the primary instead of
+            # failing the op. Bounded to ONE wait-and-retry per dispatch: if the
+            # re-attempt also fails, control falls to the existing degrade path
+            # (record_primary_failure → _call_fallback → clean fallback_skipped),
+            # so a genuinely-dead provider self-limits and never loops.
+            _autarky_wait = autarky_should_wait_and_retry(
+                has_fallback=self._fallback is not None,
+                enabled=autarky_backoff_wait_enabled(),
+                eta_s=_eta_s,
+                remaining_s=self._remaining_seconds(deadline),
+                max_wait_s=_autarky_backoff_max_wait_s(),
+                margin_s=_autarky_retry_margin_s(),
+            )
+            if _autarky_wait is not None:
+                logger.info(
+                    "[CandidateGenerator] Sovereign autarky backoff-wait — sole "
+                    "provider %s in %s backoff (consecutive_failures=%d, "
+                    "eta=+%.0fs); waiting %.0fs then RE-ATTEMPTING primary "
+                    "(remaining_s=%.0f, route=%s) — no absent-fallback failure",
+                    self.fsm.primary_name if hasattr(self.fsm, "primary_name")
+                    else "primary",
+                    _mode_name, self.fsm._consecutive_failures, _eta_s,
+                    _autarky_wait, self._remaining_seconds(deadline),
+                    getattr(context, "provider_route", "?"),
+                )
+                try:
+                    await asyncio.sleep(_autarky_wait)
+                except asyncio.CancelledError:
+                    raise
+                # Fall through to the primary attempt below (do NOT route to the
+                # absent fallback). The backoff window has now elapsed, so
+                # should_attempt_primary() is True on the next FSM read.
+            else:
+                logger.warning(
+                    "[CandidateGenerator] Dynamic fallback engaged — primary "
+                    "in %s backoff (consecutive_failures=%d, "
+                    "recovery_eta=+%.0fs) — routing %s op to fallback "
+                    "without re-attempting primary",
+                    _mode_name,
+                    self.fsm._consecutive_failures,
+                    _eta_s,
+                    getattr(context, "provider_route", "?"),
+                )
+                return await self._call_fallback(context, deadline)
 
         try:
             # Slice 30 — explicit model_id propagation (no ContextVar magic)
