@@ -34,6 +34,15 @@ services:
       JARVIS_DW_SURFACE_HEALTH_ENABLED: "false"
       # first proof isolates the loop from the AegisForward DW-streaming path
       JARVIS_AEGIS_ENABLED: "false"
+      # THE KILLING BLOW (2026-06-20 trace): Slice 36/41 forced the BATCH path for
+      # STANDARD + Claude-disabled (stale "RT TTFT 66s" evidence) — but the DW batch
+      # job submits (~600ms) and then NEVER completes within the 180s budget →
+      # STAGE_PROVIDER_GENERATE TimeoutError → fsm_exhausted on every model. RT
+      # streaming is PROVEN fast in-container (curl gpt-oss-120b = 0.78s). Force RT,
+      # not batch: disable both force-batch escape hatches so the loop uses the fast,
+      # working real-time chat/completions path.
+      JARVIS_DW_FORCE_BATCH_STANDARD_COMPLEX: "0"
+      JARVIS_DW_FORCE_BATCH_ON_CLAUDE_BREAKER: "0"
       # real cores → give DW generation full runway (no 90s reflex-cap timeouts)
       OUROBOROS_TIER0_MAX_WAIT_S: "600"
       JARVIS_GENERATION_TIMEOUT_S: "900"
