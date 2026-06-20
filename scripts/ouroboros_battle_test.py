@@ -1397,6 +1397,25 @@ def main() -> None:
     ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
+    # Sovereign Telemetry (2026-06-20) — authoritative operator log-level override.
+    # ``logging.basicConfig`` above is a NO-OP when an imported module already
+    # installed a root handler (classic Python logging gotcha), so the root can end
+    # up at WARNING and silence the dispatch_profiler's INFO op_summary trace. When
+    # JARVIS_LOG_LEVEL is set we force it via explicit setLevel (which always wins),
+    # on the root AND the dispatch surfaces the telemetry mesh needs. Unset =
+    # legacy behavior (byte-identical).
+    _ov_level = os.environ.get("JARVIS_LOG_LEVEL", "").strip().upper()
+    if _ov_level:
+        _ov_resolved = getattr(logging, _ov_level, None)
+        if isinstance(_ov_resolved, int):
+            logging.getLogger().setLevel(_ov_resolved)
+            for _surface in (
+                "backend.core.ouroboros.governance.candidate_generator",
+                "backend.core.ouroboros.governance.doubleword_provider",
+                "backend.core.ouroboros.telemetry.dispatch_profiler",
+            ):
+                logging.getLogger(_surface).setLevel(_ov_resolved)
+
     # Gap #7 follow-up: O+V's own boot-accounting loggers (module
     # discovery, kernel init, graceful-shutdown, termination-hook
     # registration) emit DEBUG/INFO during early boot that's pure
