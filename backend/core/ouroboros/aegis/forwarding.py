@@ -738,6 +738,21 @@ async def forward_request(
             except (ConnectionResetError, aiohttp.ClientConnectionError):
                 client_disconnected = True
 
+            # Release the upstream response on EVERY exit path. Before this,
+            # only the guillotine branch released it; the normal-completion,
+            # client-disconnect, and upstream-read-failed paths left the upstream
+            # ClientResponse unreleased, so when ``async with session`` closed,
+            # aiohttp logged "Unclosed connection" and orphaned the upstream
+            # socket (observed every DW stream forward in the 2026-06-20 soak).
+            # release() is idempotent and safe after a full drain; on an early
+            # break it returns/closes the connection cleanly instead of leaking.
+            # Sync in aiohttp 3.x (not a coroutine — matches the guillotine
+            # branch's no-await call). Guarded so cleanup never fails loud.
+            try:
+                upstream_resp.release()
+            except Exception:  # noqa: BLE001 — cleanup must never fail-loud
+                pass
+
     actual_cost = usage.cost_usd(price)
 
     if guillotine_fired:
