@@ -123,14 +123,14 @@ async def resolve_loop_project_root(
     try:
         from backend.core.ouroboros.governance.execution_context import (
             is_primary_checkout,
-            is_autonomous as _ec_is_autonomous,  # noqa: F401 — re-used below
+            is_autonomous,
             _is_cloud_container,
         )
         _forced = _deterministic_force(
             root,
             is_primary=bool(is_primary_checkout(root)),
             container=bool(_is_cloud_container()),
-            autonomous=bool(_ec_is_autonomous(root)),
+            autonomous=bool(is_autonomous(root)),
         )
     except Exception:  # noqa: BLE001 — can't prove force → legacy path
         _forced = False
