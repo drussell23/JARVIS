@@ -214,3 +214,37 @@ async def test_proposer_vetoes_when_evidence_dirty(monkeypatch, tmp_path):
     assert res.proposed is False
     assert res.detail == "evidence_did_not_clear_veto"
     assert reviewer.calls == []
+
+
+# ---- Multi-line / trailing-comma default literal (2026-06-21) ----
+def test_flip_multiline_trailing_comma_empty_default():
+    """black-formatted multi-line os.environ.get with a trailing comma + empty
+    default must be located and flipped (the literal_site_unresolved bug that
+    blocked JARVIS_COMMAND_BUS_BRIDGE_ENABLED graduation)."""
+    from backend.core.ouroboros.governance.graduation.graduation_pr_proposer import (
+        flip_default_to_true,
+        _flag_default_pattern,
+    )
+    src = (
+        "def master_enabled():\n"
+        "    raw = os.environ.get(\n"
+        '        "JARVIS_COMMAND_BUS_BRIDGE_ENABLED", "",\n'
+        "    ).strip().lower()\n"
+        "    return raw in {'1', 'true'}\n"
+    )
+    assert len(list(_flag_default_pattern("JARVIS_COMMAND_BUS_BRIDGE_ENABLED").finditer(src))) == 1
+    r = flip_default_to_true(src, "JARVIS_COMMAND_BUS_BRIDGE_ENABLED")
+    assert r.changed is True
+    assert '"JARVIS_COMMAND_BUS_BRIDGE_ENABLED", "true",' in r.new_text
+
+
+def test_flip_singleline_no_comma_still_works():
+    """Regression guard: the comma-tolerant pattern must NOT break the classic
+    single-line no-comma form."""
+    from backend.core.ouroboros.governance.graduation.graduation_pr_proposer import (
+        flip_default_to_true,
+    )
+    src = 'x = os.environ.get("JARVIS_FOO", "false")\n'
+    r = flip_default_to_true(src, "JARVIS_FOO")
+    assert r.changed is True
+    assert 'os.environ.get("JARVIS_FOO", "true")' in r.new_text

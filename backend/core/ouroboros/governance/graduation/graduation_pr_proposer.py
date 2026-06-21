@@ -115,7 +115,7 @@ def _flag_default_pattern(flag: str) -> re.Pattern:
     # group 'q' = opening quote of the default literal; 'lit' = its contents.
     return re.compile(
         r"os\.environ\.get\(\s*[\"']" + f + r"[\"']\s*,\s*"
-        r"(?P<q>[\"'])(?P<lit>[^\"']*)(?P=q)\s*\)"
+        r"(?P<q>[\"'])(?P<lit>[^\"']*)(?P=q)\s*,?\s*\)"
     )
 
 
