@@ -476,6 +476,24 @@ async def _spawn_park_continuation(
         _continuation_timeout = max(_legacy_timeout, _thinking_cont_timeout)
     else:
         _continuation_timeout = _legacy_timeout
+    # Sovereign Transport Profiler Matrix (2026-06-20) — continuation/batch budget
+    # coherence. The reason this op was PARKED is that it is batch-bound; its inner
+    # provider call gets the batch budget (force_batch → _compute_primary_budget →
+    # JARVIS_DW_BATCH_TIMEOUT_S, default 300s). If the out-of-pool continuation's
+    # OUTER wait_for stays at the legacy ~185s gen wall, it SEVERS the batch before
+    # it completes — the live wedge: 7 batches completed at the DW level (one op at
+    # 257s) yet every op errored because the 185s continuation cancelled them first.
+    # Widen the continuation to the SAME batch floor (batch_cap + overhead, ~330s)
+    # the budget layer already granted — pure alignment, NOT a blind extension.
+    # max() only widens, never shrinks. Fail-soft → legacy on any error.
+    try:
+        if _resolve_async_batch_payload(ctx, _op_route):
+            from backend.core.ouroboros.governance.candidate_generator import (
+                force_batch_gen_timeout_floor_s as _batch_floor,
+            )
+            _continuation_timeout = max(_continuation_timeout, _batch_floor())
+    except Exception:  # noqa: BLE001 — never raise from the timeout calc
+        pass
 
     async def _continuation() -> None:
         store = get_default_store()
