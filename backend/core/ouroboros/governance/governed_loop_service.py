@@ -1122,6 +1122,12 @@ class GovernedLoopService:
         self._oracle_indexer_task: Optional[asyncio.Task] = None
         self._oracle: Optional[Any] = None
 
+        # YM-T10 SEAM 1 — Sovereign Daemon Injection Protocol (Layer 2).
+        # Strong ref to the operator-presence watcher daemon so it is not GC'd
+        # while running; cancelled in stop(). Spawn + attach are fail-soft and
+        # no-op when JARVIS_OPERATOR_YIELD_ENABLED is off (byte-identical).
+        self._operator_presence_task: Optional[asyncio.Task] = None
+
         # C+ autonomy infrastructure
         self._command_bus: Optional[CommandBus] = None
         self._event_emitter: Optional[EventEmitter] = None
@@ -1511,6 +1517,16 @@ class GovernedLoopService:
             # Master-flag-gated by each observer's own substrate flags;
             # fail-open per observer; never blocks the loop.
             await self._start_governance_observers()
+
+            # YM-T10 SEAM 1 — non-blocking daemon boot of the Layer-2
+            # operator-presence watcher + yield bridge. The pool (_bg_pool) is
+            # built in _build_components() earlier in start(); the bus self-
+            # resolves via get_event_bus_if_exists() (bus=None). Both the
+            # watcher .run() and bridge .attach() are already no-op when
+            # JARVIS_OPERATOR_YIELD_ENABLED is off, so this is byte-identical
+            # when the flag is off. Hard requirement: the watcher/attach must
+            # NEVER prevent or crash boot — the helper wraps both fail-soft.
+            await self._start_operator_yield_layer()
 
             # Wave 3 (6) Slice 5a — register parallel-dispatch env flags into
             # the FlagRegistry so `/help flags --search parallel_dispatch`
@@ -2084,6 +2100,21 @@ class GovernedLoopService:
             except asyncio.CancelledError:
                 pass
 
+        # YM-T10 SEAM 1 — cancel the operator-presence watcher daemon
+        # alongside the other background tasks. Fail-soft.
+        _op_pres_task = getattr(self, "_operator_presence_task", None)
+        if _op_pres_task is not None and not _op_pres_task.done():
+            _op_pres_task.cancel()
+            try:
+                await _op_pres_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — never block shutdown
+                logger.debug(
+                    "[GovernedLoop] operator-presence task cancel swallowed",
+                    exc_info=True,
+                )
+
         # Slice 5 Arc A — stop PostureObserver cleanly (no orphan tasks)
         observer = getattr(self, "_posture_observer", None)
         if observer is not None:
@@ -2179,6 +2210,74 @@ class GovernedLoopService:
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
         logger.info("[GovernedLoop] Stopped")
+
+    # ------------------------------------------------------------------
+    # YM-T10 SEAM 1 — Sovereign Daemon Injection Protocol (Layer 2)
+    # ------------------------------------------------------------------
+
+    async def _start_operator_yield_layer(self) -> None:
+        """Spawn the operator-presence watcher daemon + attach the yield bridge.
+
+        Layer-2 production activation (YM-T10 SEAM 1). Two independent,
+        fully fail-soft steps:
+
+          1. Spawn ``OperatorPresenceWatcher().run(bus=None)`` as a background
+             daemon task (mirrors the oracle/health-probe ``create_task``
+             pattern). A strong ref is stored on ``self`` so the task is not
+             GC'd; it is cancelled in ``stop()``.
+          2. ``await operator_yield_bridge.attach(bus=None, pool=self._bg_pool)``
+             once during boot, after the pool exists.
+
+        Both ``run()`` and ``attach()`` are already no-op when
+        ``JARVIS_OPERATOR_YIELD_ENABLED`` is off, and they self-resolve the
+        TrinityEventBus singleton when ``bus=None`` — so this method is
+        byte-identical to pre-YM-T10 when the flag is off.
+
+        HARD REQUIREMENT: nothing here may prevent or crash boot. Every step
+        is wrapped so a failure logs + degrades; the main loop runs regardless.
+        """
+        pool = getattr(self, "_bg_pool", None)
+
+        # Step 1 — spawn the watcher daemon (fail-soft).
+        try:
+            from backend.core.ouroboros.governance.operator_presence import (
+                OperatorPresenceWatcher,
+            )
+
+            watcher = OperatorPresenceWatcher()
+            self._operator_presence_task = asyncio.create_task(
+                watcher.run(bus=None),
+                name="operator_presence_watcher",
+            )
+            logger.info(
+                "[GovernedLoop] Operator-presence watcher daemon spawned "
+                "(YM-T10 SEAM 1; no-op when JARVIS_OPERATOR_YIELD_ENABLED off)",
+            )
+        except Exception:  # noqa: BLE001 — watcher must NEVER crash boot
+            logger.warning(
+                "[GovernedLoop] Operator-presence watcher spawn failed "
+                "(non-fatal; loop continues)",
+                exc_info=True,
+            )
+            self._operator_presence_task = None
+
+        # Step 2 — attach the yield bridge (fail-soft, independent of step 1).
+        try:
+            from backend.core.ouroboros.governance import (
+                operator_yield_bridge as _oyb,
+            )
+
+            await _oyb.attach(bus=None, pool=pool)
+            logger.info(
+                "[GovernedLoop] Operator-yield bridge attach() invoked "
+                "(YM-T10 SEAM 1; no-op when yield off)",
+            )
+        except Exception:  # noqa: BLE001 — attach must NEVER crash boot
+            logger.warning(
+                "[GovernedLoop] Operator-yield bridge attach failed "
+                "(non-fatal; loop continues)",
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Tier 0.5 batch 1 — governance observer boot/shutdown helpers

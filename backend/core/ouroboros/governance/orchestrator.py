@@ -65,6 +65,9 @@ from backend.core.ouroboros.governance.change_engine import (
     ChangeRequest,
     ChangeResult,
 )
+from backend.core.ouroboros.governance.mutation_critical_section import (
+    maybe_mutation_section,
+)
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.learning_bridge import OperationOutcome
 from backend.core.ouroboros.governance.cost_governor import (
@@ -8968,9 +8971,13 @@ class GovernedOrchestrator:
             if len(_candidate_files) > 1:
                 _t_apply = time.monotonic()
                 try:
-                    change_result = await self._apply_multi_file_candidate(
-                        ctx, best_candidate, _candidate_files, snapshots,
-                    )
+                    # LR-B (spec 5.4): mark the on-disk multi-file apply as a
+                    # critical mutation so the operator-yield drains before it
+                    # can park the op mid-batch (no-op when the yield is off).
+                    async with maybe_mutation_section(ctx.op_id):
+                        change_result = await self._apply_multi_file_candidate(
+                            ctx, best_candidate, _candidate_files, snapshots,
+                        )
                 except Exception as exc:
                     logger.error(
                         "Multi-file change engine raised for %s: %s", ctx.op_id, exc
@@ -8993,7 +9000,11 @@ class GovernedOrchestrator:
                 change_request = self._build_change_request(ctx, best_candidate)
                 _t_apply = time.monotonic()
                 try:
-                    change_result = await self._stack.change_engine.execute(change_request)
+                    # LR-B (spec 5.4): mark the on-disk single-file apply as a
+                    # critical mutation so the operator-yield drains before it
+                    # can park the op mid-write (no-op when the yield is off).
+                    async with maybe_mutation_section(ctx.op_id):
+                        change_result = await self._stack.change_engine.execute(change_request)
                 except Exception as exc:
                     logger.error(
                         "Change engine raised for %s: %s", ctx.op_id, exc
@@ -9601,22 +9612,26 @@ class GovernedOrchestrator:
                     _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
                     _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
                     _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)  # rough estimate
-                _commit_result = await asyncio.wait_for(
-                    _committer.commit(
-                        op_id=ctx.op_id,
-                        description=ctx.description,
-                        target_files=ctx.target_files,
-                        risk_tier=ctx.risk_tier,
-                        provider_name=_provider,
-                        generation_cost=_cost,
-                        # Mythos §7.4: originating signal + rationale for
-                        # zero-context reviewers.
-                        signal_source=getattr(ctx, "signal_source", ""),
-                        signal_urgency=getattr(ctx, "signal_urgency", ""),
-                        rationale=ctx.description,
-                    ),
-                    timeout=30.0,
-                )
+                # LR-B (spec 5.4): the git commit is a critical mutation —
+                # an in-progress commit must not be parked by the
+                # operator-yield (no-op when the yield is off).
+                async with maybe_mutation_section(ctx.op_id):
+                    _commit_result = await asyncio.wait_for(
+                        _committer.commit(
+                            op_id=ctx.op_id,
+                            description=ctx.description,
+                            target_files=ctx.target_files,
+                            risk_tier=ctx.risk_tier,
+                            provider_name=_provider,
+                            generation_cost=_cost,
+                            # Mythos §7.4: originating signal + rationale for
+                            # zero-context reviewers.
+                            signal_source=getattr(ctx, "signal_source", ""),
+                            signal_urgency=getattr(ctx, "signal_urgency", ""),
+                            rationale=ctx.description,
+                        ),
+                        timeout=30.0,
+                    )
                 if _commit_result.committed:
                     _committed_hash = _commit_result.commit_hash
                     try:
