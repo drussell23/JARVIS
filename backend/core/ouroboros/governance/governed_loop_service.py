@@ -1961,6 +1961,31 @@ class GovernedLoopService:
 
         self._state = ServiceState.STOPPING
 
+        # Sovereign Epistemic Context Matrix LR2: reconcile this session's memory
+        # quarantine vs live disk on teardown; refresh oracle for revalidated
+        # nodes. Fail-soft — never blocks shutdown.
+        try:
+            from pathlib import Path as _Path
+            from backend.core.ouroboros.governance.epistemic_quarantine import QuarantineLedger
+            _sess_dir = getattr(self, "_session_dir", None)
+            # derive repo root the same way the loop does elsewhere:
+            _cfg = getattr(self, "_config", None)
+            _root = str(getattr(_cfg, "project_root", "") or "") or "."
+            _sid = _Path(str(_sess_dir)).name if _sess_dir else ""
+            if _sid:
+                _led = QuarantineLedger(
+                    str(_Path(_root) / ".jarvis" / "epistemic_quarantine.jsonl"),
+                    _sid,
+                )
+                _rec = _led.reconcile(root=_root)
+                _oracle = getattr(self, "_oracle", None)
+                if _rec.get("revalidated") and _oracle is not None:
+                    _upd = getattr(_oracle, "incremental_update", None)
+                    if _upd is not None:
+                        await _upd()
+        except Exception:  # noqa: BLE001 — never block shutdown
+            pass
+
         # GracefulTeardownMatrix (2026-06-20) — cancel the DW discovery/heavy-probe
         # background loops FIRST. Left pending they leak ("Task was destroyed but
         # it is pending!") and wedge teardown for minutes on their aiohttp

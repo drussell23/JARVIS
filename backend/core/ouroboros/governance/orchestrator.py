@@ -381,6 +381,48 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FAILFAST_CIRCUIT_OPEN_REASON = "all_providers_exhausted_circuit_open"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Sovereign Epistemic Context Matrix — non-retryable terminal reason codes
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Terminal reason codes that MUST NOT be re-driven through GENERATE_RETRY.
+# Historically the orchestrator decided retryability imperatively at each
+# terminal site (infra-class escalates immediately, exhaustion parks the op,
+# advisor/plan-rejection short-circuits, etc.) — there was no single
+# grep-discoverable set. This frozenset gathers the codes whose terminal
+# state is genuinely unrecoverable within the same op so a classifier exists
+# (and is unit-testable). It is *descriptive* of the already-non-retryable
+# sites plus the new ``deadlock_override_failed`` terminal (raised when LR3's
+# one-shot governance-deadlock breaker fails mid-Venom): retrying a wedged
+# governance deadlock just re-wedges, so it terminates non-retryably.
+_NONRETRYABLE_TERMINAL_REASONS: "frozenset[str]" = frozenset({
+    "deadlock_override_failed",      # LR3 governance deadlock breaker failed
+    "advisor_blocked",               # OperationAdvisor pre-gen veto
+    "plan_rejected",                 # human/plan-review rejected the plan
+    "plan_required_unavailable",     # plan mandatory but generator unavailable
+    "plan_review_unavailable",       # plan-review mandatory but unavailable
+    "plan_approval_expired",         # approval window elapsed
+    "swebp_repo_root_rejected",      # repo-root boundary rejection
+    "validation_infra_failure",      # infra-class VALIDATE failure (non-retry)
+    "validation_budget_exhausted",   # VALIDATE budget gone
+    "op_cost_cap_exceeded",          # per-op cost cap blown
+    "user_cancelled",                # cooperative cancellation
+    _FAILFAST_CIRCUIT_OPEN_REASON,   # fail-fast exhaustion breaker open
+})
+
+
+def _is_nonretryable_terminal(reason_code: str) -> bool:
+    """Return True iff ``reason_code`` is a non-retryable terminal reason.
+
+    Pure, side-effect-free classifier over ``_NONRETRYABLE_TERMINAL_REASONS``.
+    Always returns a ``bool`` and never raises (coerces non-str input to str).
+    """
+    try:
+        return str(reason_code) in _NONRETRYABLE_TERMINAL_REASONS
+    except Exception:  # noqa: BLE001 — classifier must never raise
+        return False
+
+
 def _failfast_cb_enabled() -> bool:
     """Fail-Fast Exhaustion Circuit Breaker master switch.
 
@@ -3418,6 +3460,35 @@ class GovernedOrchestrator:
                                 )
                         except Exception as _dep_exc:
                             logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
+
+                    # Sovereign Epistemic Context Matrix (spec 5.1): on a heavy GOAL, build a
+                    # bounded, hash-validated candidate DAG from the oracle to seed Venom +
+                    # the Information-Gain Governor. Fail-soft; never blocks GENERATE.
+                    try:
+                        from backend.core.ouroboros.governance.epistemic_prefetch import (
+                            build_prefetch_manifest, is_heavy_goal,
+                        )
+                        if is_heavy_goal(ctx.target_files, int(getattr(ctx, "blast_radius", 0) or 0)):
+                            _pf_oracle = _oracle_ref if _oracle_ref is not None else getattr(self._stack, "oracle", None)
+                            _pf_timeout = float(os.environ.get("JARVIS_EPISTEMIC_PREFETCH_TIMEOUT_S", "8") or "8")
+                            _manifest = await asyncio.wait_for(
+                                build_prefetch_manifest(
+                                    target_files=tuple(ctx.target_files or ()),
+                                    root=str(self._config.project_root),
+                                    oracle=_pf_oracle,
+                                    goal_text=str(getattr(ctx, "goal", "") or getattr(ctx, "description", "") or ""),
+                                    is_heavy=True,
+                                ),
+                                timeout=_pf_timeout,
+                            )
+                            if _manifest:
+                                ctx = dataclasses.replace(ctx, prefetch_manifest=_manifest)
+                                logger.info(
+                                    "[Orchestrator] Epistemic prefetch manifest: %d entries [%s]",
+                                    len(_manifest), ctx.op_id,
+                                )
+                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001 — never block GENERATE
+                        pass
                 except Exception as exc:
                     logger.warning(
                         "[Orchestrator] Context expansion failed for op=%s: %s; "
@@ -4478,6 +4549,19 @@ class GovernedOrchestrator:
             # the union of every tool call the model has made for this op, then
             # dedup-by-(tool, arguments_hash) happens inside diversity_score().
             _op_explore_records: List[Any] = []
+
+            # Sovereign Epistemic Context Matrix (LR3): bind the governance
+            # deadlock exception so the generation retry loop's dedicated catch
+            # can resolve it. Lazy import (no module-level coupling to
+            # tool_executor); fail-soft to a sentinel that can never be raised
+            # so the generic Exception handler still covers everything.
+            try:
+                from backend.core.ouroboros.governance.tool_executor import (
+                    GovernanceDeadlockError,
+                )
+            except Exception:  # noqa: BLE001 — never block GENERATE on import
+                class GovernanceDeadlockError(RuntimeError):  # type: ignore[no-redef]
+                    """Unreachable sentinel — import failed; never raised."""
 
             for attempt in range(1 + self._config.max_generate_retries):
                 # ── Per-op cost cap check (Manifesto §5/§7) ──
@@ -5589,6 +5673,33 @@ class GovernedOrchestrator:
 
                     # Success -- break out of retry loop
                     break
+
+                except GovernanceDeadlockError as _dl_exc:
+                    # Sovereign Epistemic Context Matrix (LR3): the one-shot
+                    # governance-deadlock breaker raised mid-Venom and could
+                    # not recover. This is a NON-RETRYABLE terminal — retrying
+                    # a wedged governance deadlock just re-wedges. Terminate
+                    # the op with deadlock_override_failed; do NOT fall through
+                    # to the generic retry/demotion path below.
+                    logger.warning(
+                        "[Orchestrator] Governance deadlock override failed "
+                        "for %s: %s — terminating (non-retryable)",
+                        ctx.op_id, _dl_exc,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="deadlock_override_failed",
+                    )
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "deadlock_override_failed",
+                            "error": str(_dl_exc)[:200],
+                            "nonretryable": True,
+                        },
+                    )
+                    return ctx
 
                 except Exception as exc:
                     _err_msg = str(exc)
