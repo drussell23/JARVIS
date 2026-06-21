@@ -217,6 +217,12 @@ async def maybe_park_or_resume(
     # via batch → detach. Over-parking is harmless (the continuation runs generate()
     # out-of-pool either way); under-parking re-wedges the worker. Fail-soft.
     _async_batch = _resolve_async_batch_payload(ctx, provider_route)
+    # Operator-Yield Bridge (spec §5.4, LR-B, Task 8). When the operator is
+    # active, the bridge's module suspend flag is set; we feed it into the park
+    # decision so the op parks at THIS safe checkpoint to free the worker.
+    # operator_suspended() is itself gated on JARVIS_OPERATOR_YIELD_ENABLED, so
+    # this resolves False (byte-identical) when the yield feature is off.
+    _op_suspended = _resolve_operator_suspended()
     if (
         master_on
         and pool is not None
@@ -226,8 +232,38 @@ async def maybe_park_or_resume(
             queue_pressure=queue_pressure,
             is_resumed=False,
             async_batch_payload=_async_batch,
+            operator_suspended=_op_suspended,
         )
     ):
+        # Drain-before-park (LR-B). If THIS park is happening because of the
+        # operator-yield suspend flag (and would NOT have parked otherwise),
+        # we MUST NOT park mid-mutation — await the mutation critical-section
+        # drain first. If it wedges past JARVIS_OPERATOR_YIELD_DRAIN_MAX_S,
+        # ABANDON the operator-yield park and let the op run normally (it will
+        # finish its mutation rather than be torn mid-apply). Gated; no-op when
+        # yield off (_op_suspended is False).
+        _park_is_operator_yield = (
+            _op_suspended
+            and not should_park_for_route(
+                provider_route,
+                queue_pressure=queue_pressure,
+                is_resumed=False,
+                async_batch_payload=_async_batch,
+                operator_suspended=False,
+            )
+        )
+        if _park_is_operator_yield:
+            _drained = await _drain_before_operator_park(ctx_op_id)
+            if not _drained:
+                logger.warning(
+                    "[OperatorYield] drain abandoned op=%s — not parking "
+                    "mid-mutation; op continues normally",
+                    ctx_op_id,
+                )
+                return await asyncio.wait_for(
+                    orch._generator.generate(ctx, deadline),
+                    timeout=gen_timeout + outer_grace_s,
+                )
         # Determine attempt_seq.  For the first GENERATE call this is
         # 1; GENERATE_RETRY would bump this.  We resolve via the BG
         # op's ``park_attempt_seq`` (which the worker bumps on each
@@ -291,6 +327,55 @@ async def maybe_park_or_resume(
 # ---------------------------------------------------------------------------
 # Internals — kept here so the seam logic is one file, easy to review
 # ---------------------------------------------------------------------------
+
+
+def _resolve_operator_suspended() -> bool:
+    """True iff the operator-yield bridge has its suspend flag set (and the
+    yield feature is enabled). Resolved fresh each call. NEVER raises — on any
+    failure returns False (byte-identical legacy behaviour)."""
+    try:
+        from backend.core.ouroboros.governance.operator_yield_bridge import (
+            operator_suspended,
+        )
+        return bool(operator_suspended())
+    except Exception:  # noqa: BLE001 — never raise from the park gate
+        return False
+
+
+def _operator_yield_drain_max_s() -> float:
+    """Resolved JARVIS_OPERATOR_YIELD_DRAIN_MAX_S (default 30s). Read at call
+    time; invalid values fall back to the default. Never raises."""
+    try:
+        raw = os.environ.get("JARVIS_OPERATOR_YIELD_DRAIN_MAX_S", "")
+        if not raw:
+            return 30.0
+        v = float(raw)
+        return v if v > 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+async def _drain_before_operator_park(ctx_op_id: str) -> bool:
+    """Await the mutation critical-section drain before an operator-yield park.
+
+    Returns True if the op has no in-flight mutation (safe to park) or drained
+    within the timeout; False if it wedged past JARVIS_OPERATOR_YIELD_DRAIN_MAX_S
+    (caller MUST abandon the park — never park mid-mutation). Fail-soft: any
+    bookkeeping error fails OPEN to True (drained) — the drain guard exists to
+    prevent tearing a mutation, and if its own machinery is unavailable we defer
+    to the existing park semantics rather than wedge the op."""
+    try:
+        from backend.core.ouroboros.governance.mutation_critical_section import (
+            drain,
+        )
+        return await drain(ctx_op_id, _operator_yield_drain_max_s())
+    except Exception:  # noqa: BLE001 — fail-open to "drained"
+        logger.debug(
+            "[OperatorYield] drain machinery unavailable for op=%s; "
+            "fail-open to drained",
+            ctx_op_id, exc_info=True,
+        )
+        return True
 
 
 def _resolve_async_batch_payload(ctx: Any, provider_route: str) -> bool:

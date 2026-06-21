@@ -139,6 +139,15 @@ _DEFAULT_PARK_ROUTES = frozenset({"background", "complex"})
 # because the batch-strangle wedge proved 'standard' diff-codegen needs it too.
 _BATCH_CAPABLE_ROUTES = frozenset({"standard", "complex", "background"})
 
+# Routes the park/resume machinery actually supports — the union of the
+# throughput-park routes (background/complex) and the batch-capable routes
+# (standard/complex/background). Used by the operator-yield path: when the
+# operator becomes active the op parks on ANY of these (the resume
+# continuation + submit_for_resume can rehydrate them). IMMEDIATE/SPECULATIVE
+# are deliberately excluded — they have no resume continuation path, so
+# parking them would strand the op.
+_PARK_SUPPORTED_ROUTES = _DEFAULT_PARK_ROUTES | _BATCH_CAPABLE_ROUTES
+
 
 def _resolved_park_routes() -> frozenset:
     """Resolve the set of routes eligible for parking. Read at call time.
@@ -161,6 +170,7 @@ def should_park_for_route(
     queue_pressure: bool,
     is_resumed: bool = False,
     async_batch_payload: bool = False,
+    operator_suspended: bool = False,
 ) -> bool:
     """Single source of truth for "should this op park before its
     provider await?"  Pure function — no I/O, no side effects.
@@ -195,6 +205,17 @@ def should_park_for_route(
         ``True`` iff this dispatch is a resume-after-park.  Resumed
         dispatches MUST NOT re-park (would loop indefinitely); they
         materialize from the store and proceed.
+    operator_suspended:
+        ``True`` iff the operator-yield bridge (spec §5.4, LR-B) has
+        observed an ``operator.active`` edge and set its module suspend
+        flag.  When set, the op parks at its next SAFE checkpoint —
+        regardless of queue pressure — so the worker slot is freed for
+        the duration of operator activity.  Only routes the park/resume
+        machinery actually supports (``_PARK_SUPPORTED_ROUTES``) honour
+        this; IMMEDIATE/SPECULATIVE never park (no resume continuation).
+        ``is_resumed`` still wins (a resumed dispatch never re-parks).
+        Caller resolves this from ``operator_yield_bridge.operator_suspended()``
+        which is itself gated on ``JARVIS_OPERATOR_YIELD_ENABLED``.
 
     Returns
     -------
@@ -213,6 +234,20 @@ def should_park_for_route(
         return False
     if is_resumed:
         return False
+    # Operator-Yield Bridge (spec §5.4, LR-B). When the operator becomes
+    # active, the loop must gracefully PARK its op at the next SAFE checkpoint
+    # to free the worker for the human — regardless of queue pressure (no one
+    # need be waiting; the point is to yield the slot, not to optimize
+    # throughput). Honoured only on routes the park/resume machinery supports
+    # (the union of batch-capable + throughput-park routes); IMMEDIATE/
+    # SPECULATIVE have no resume continuation and so never park here. The
+    # drain-before-park (mutation_critical_section.drain) is enforced at the
+    # park-emit seam (generate_park_wrapper), NOT here — this remains a pure
+    # decision function. Caller gates `operator_suspended` on
+    # JARVIS_OPERATOR_YIELD_ENABLED, so this is byte-identical when the yield
+    # feature is off (the param defaults False).
+    if operator_suspended:
+        return (provider_route or "").strip().lower() in _PARK_SUPPORTED_ROUTES
     # Sovereign Transport Profiler Matrix (2026-06-20) — ACTIVE DETACHMENT.
     # An ASYNC_BATCH_PAYLOAD op MUST park regardless of queue pressure: its
     # provider call is a minutes-long async batch poll, so holding the worker slot
