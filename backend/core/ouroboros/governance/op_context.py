@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+    from backend.core.ouroboros.governance.epistemic_prefetch import PrefetchEntry
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 from backend.core.ouroboros.governance.risk_engine import RiskTier
@@ -1115,6 +1116,11 @@ class OperationContext:
     # skips redundant re-exploration. Authority-free (observation block).
     # Default None — non-handoff ops are byte-identical to today.
     exploration_manifest: Optional["ExplorationManifest"] = None  # Slice 89
+
+    # ---- Sovereign Epistemological Context Matrix (spec 5.1): bounded, hash- ----
+    # validated candidate DAG from the DAG Router; seeds Venom + the Governor's
+    # round-0 baseline. Empty tuple = no prefetch (light op / oracle cold / off).
+    prefetch_manifest: Tuple["PrefetchEntry", ...] = field(default_factory=tuple)
 
     # ------------------------------------------------------------------
     # Post-init
