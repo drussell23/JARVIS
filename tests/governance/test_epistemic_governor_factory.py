@@ -13,7 +13,8 @@ def test_build_governor_disabled_returns_none(monkeypatch):
 def test_build_governor_returns_governor_with_prefetch_excerpts(monkeypatch):
     monkeypatch.setenv("JARVIS_CONTEXT_GOVERNOR_ENABLED", "true")
     manifest = (PrefetchEntry("a.py", "h", 0.9, "CALL_GRAPH", "def a(): pass"),)
-    ctx = types.SimpleNamespace(prefetch_manifest=manifest, task_complexity="moderate")
+    ctx = types.SimpleNamespace(prefetch_manifest=manifest, task_complexity="moderate",
+                                target_files=("a.py", "b.py"), blast_radius=0)
     gov = cg.build_governor_for(ctx)
     assert gov is not None
     # round-0 baseline seeded from the excerpt -> re-reading it = low gain
@@ -32,3 +33,20 @@ def test_build_governor_failsoft_on_bad_context(monkeypatch):
     # a context missing prefetch_manifest entirely must not raise
     gov = cg.build_governor_for(object())
     assert gov is None or gov is not None  # just must not raise
+
+
+def test_build_governor_none_for_light_op(monkeypatch):
+    monkeypatch.setenv("JARVIS_CONTEXT_GOVERNOR_ENABLED", "true")
+    manifest = (PrefetchEntry("a.py", "h", 0.9, "CALL_GRAPH", "def a(): pass"),)
+    # single target file, no blast radius -> NOT heavy -> None (light op untouched)
+    ctx = types.SimpleNamespace(prefetch_manifest=manifest, task_complexity="simple",
+                                target_files=("a.py",), blast_radius=0)
+    assert cg.build_governor_for(ctx) is None
+
+
+def test_build_governor_heavy_empty_manifest_still_returns_governor(monkeypatch):
+    monkeypatch.setenv("JARVIS_CONTEXT_GOVERNOR_ENABLED", "true")
+    # heavy (2 files) but EMPTY manifest (cold oracle) -> still a governor
+    ctx = types.SimpleNamespace(prefetch_manifest=(), task_complexity="moderate",
+                                target_files=("a.py", "b.py"), blast_radius=0)
+    assert cg.build_governor_for(ctx) is not None

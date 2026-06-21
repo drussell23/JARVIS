@@ -37,6 +37,19 @@ def prefetch_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+def is_heavy_goal(target_files, blast_radius: int = 0) -> bool:
+    """A heavy GOAL = multi-file OR high blast radius. The arc's target scope
+    for both prefetch and the Information-Gain Governor. Never raises."""
+    try:
+        thresh = int((os.environ.get("OUROBOROS_BLAST_RADIUS_THRESHOLD", "") or "5").strip())
+    except (TypeError, ValueError):
+        thresh = 5
+    try:
+        return (len(target_files or ()) > 1) or (int(blast_radius or 0) > thresh)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _topk() -> int:
     try:
         return max(1, int((os.environ.get(_ENV_TOPK, "") or "8").strip()))

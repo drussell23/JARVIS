@@ -241,10 +241,24 @@ def _resolve_complexity(context) -> str:
 def build_governor_for(context):
     """Construct a FRESH InformationGainGovernor per generation attempt from the
     op's prefetch manifest + Iron Gate floors. Returns None when disabled or
-    when there's nothing to govern. Fail-soft: never raises."""
+    when the op is not a heavy GOAL (light ops stay byte-identical). A heavy op
+    with an empty manifest still yields a cold governor. Fail-soft: never raises."""
     try:
         if not governor_enabled():
             return None
+        # Scope the governor to heavy GOALs (the arc's target). Light ops are
+        # left byte-identical. A heavy op with an EMPTY manifest (cold oracle)
+        # STILL gets a governor — that's the worst wandering case and exactly
+        # where info-gain convergence matters most.
+        try:
+            from backend.core.ouroboros.governance.epistemic_prefetch import is_heavy_goal
+            if not is_heavy_goal(
+                getattr(context, "target_files", ()) or (),
+                int(getattr(context, "blast_radius", 0) or 0),
+            ):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
         manifest = tuple(getattr(context, "prefetch_manifest", ()) or ())
         excerpts = [e.content_excerpt for e in manifest if getattr(e, "content_excerpt", "")]
         # Iron Gate floors for this op's complexity (reuse the same source as the

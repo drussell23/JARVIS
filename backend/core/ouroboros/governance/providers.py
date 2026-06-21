@@ -5423,7 +5423,7 @@ class PrimeProvider:
             except Exception:  # noqa: BLE001 — never block the tool loop
                 _op_weight_lines = None
             # Task 6a — Information-Gain Governor for this generation attempt.
-            # build_governor_for returns None when disabled/empty → byte-identical.
+            # build_governor_for returns None for non-heavy ops (light ops byte-identical).
             try:
                 from backend.core.ouroboros.governance.context_governor import build_governor_for
                 _epi_governor = build_governor_for(context)
@@ -9433,7 +9433,7 @@ class ClaudeProvider:
             except Exception:  # noqa: BLE001 — never block the tool loop
                 _op_weight_lines = None
             # Task 6a — Information-Gain Governor for this generation attempt.
-            # build_governor_for returns None when disabled/empty → byte-identical.
+            # build_governor_for returns None for non-heavy ops (light ops byte-identical).
             try:
                 from backend.core.ouroboros.governance.context_governor import build_governor_for
                 _epi_governor = build_governor_for(context)

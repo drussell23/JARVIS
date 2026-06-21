@@ -130,3 +130,15 @@ def test_target_files_excluded_from_normalized(monkeypatch, tmp_path):
         target_files=("a.py", "b.py"), root=str(tmp_path),
         oracle=_FakeOracleObj(nb), goal_text="g", is_heavy=True))
     assert all(e.rel_path != "a.py" for e in out)
+
+
+def test_is_heavy_goal_multifile():
+    assert ep.is_heavy_goal(("a.py", "b.py"), 0) is True
+
+
+def test_is_heavy_goal_high_blast():
+    assert ep.is_heavy_goal(("a.py",), 99) is True
+
+
+def test_is_heavy_goal_light():
+    assert ep.is_heavy_goal(("a.py",), 0) is False
