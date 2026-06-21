@@ -34,7 +34,7 @@ import time
 logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Set, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
@@ -282,6 +282,46 @@ def _attach_tool_records(
     except Exception:  # noqa: BLE001 — never break a re-raise
         pass
     return exc
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Epistemological Context Matrix (spec §5.2, LR3) — terminal
+# governance deadlock exception.
+# ---------------------------------------------------------------------------
+
+
+class GovernanceDeadlockError(RuntimeError):
+    """Raised when the InformationGainGovernor's one-shot deadlock breaker
+    fails to re-align exploration with the mandatory safety floor (LR3).
+
+    Terminal by contract: the governor already issued (and the coordinator
+    already consumed) the ``deadlock_break`` directive, yet the next decay
+    still found the Iron Gate floor unmet. The loop MUST NOT retry — a second
+    pass would loop at the safety gate. The orchestrator maps this to
+    ``terminal_reason_code = deadlock_override_failed``.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Epistemological Context Matrix (spec §5.1) — prefetch seed.
+# ---------------------------------------------------------------------------
+
+
+def _build_prefetch_seed_prefix(entries) -> str:
+    """Render the validated prefetch manifest as an opening context block for
+    Venom (spec 5.1). Bounded by construction (entries already seed-budgeted).
+    Labelled as memory-supplied so the model treats it as a HINT, not as having
+    satisfied the Iron Gate (which still requires live reads)."""
+    if not entries:
+        return ""
+    parts = ["# Pre-fetched context (memory-supplied hints - VERIFY against "
+             "live files before patching):"]
+    for e in entries:
+        if not getattr(e, "content_excerpt", ""):
+            continue
+        parts.append(f"\n## {e.rel_path}  (relevance={e.relevance:.2f}, "
+                     f"satisfies={e.category_hint})\n{e.content_excerpt}")
+    return "\n".join(parts) + "\n\n" if len(parts) > 1 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -4595,6 +4635,22 @@ _READONLY_EXPLORATION_TOOLS: frozenset = frozenset({
 })
 
 
+def _final_write_nudge_text() -> str:
+    """The imperative final-write nudge appended when convergence is forced
+    (Slice 3E time/round/context axes — and the Sovereign Epistemic Governor's
+    ``converge`` verdict, which reuses this exact wording so the model receives
+    a single, consistent convergence signal regardless of which trigger fired).
+    """
+    return (
+        "\n\n[SYSTEM] FINAL ROUND — exploration budget exhausted. "
+        "You MUST emit your final patch JSON now. Any further "
+        "tool calls will be IGNORED and the operation will fail. "
+        "Synthesize what you have learned from your tool calls "
+        "so far and produce the patch in the required JSON "
+        "format.\n"
+    )
+
+
 def _convergence_explore_call_threshold() -> int:
     """Slice 85 — cumulative read-only-call count that forces convergence.
 
@@ -5616,6 +5672,20 @@ class ToolLoopCoordinator:
         # latency blows the deadline. ``None`` / light ops → byte-identical (the
         # static Slice-85 threshold). The caller computes it via the existing
         # ``providers._max_target_line_count``; no parallel weight calc here.
+        prefetched_candidates: Optional[Sequence[Any]] = None,
+        # Sovereign Epistemological Context Matrix (spec §5.1) — memory-supplied
+        # PrefetchEntry sequence. When present, a bounded, clearly-labelled
+        # "memory-supplied hints" block is PREPENDED to the opening prompt so
+        # Venom starts directed, not blind. Memory is a HINT — it does NOT
+        # satisfy the Iron Gate (live reads still required). ``None`` →
+        # byte-identical legacy behavior (orchestrator pre-Task-6 passes nothing).
+        governor: Optional[Any] = None,
+        # Sovereign Epistemological Context Matrix (spec §5.2) — an
+        # InformationGainGovernor. When present, its per-round verdict is
+        # consulted at the per_round_observer seat and honored (converge /
+        # deadlock_break / deadlock_failed). Advisory: any governor exception
+        # other than GovernanceDeadlockError is swallowed. ``None`` →
+        # byte-identical legacy behavior.
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -5672,6 +5742,18 @@ class ToolLoopCoordinator:
         records: List[ToolExecutionRecord] = []
         # Slice 89 — parallel salient-arg list; populated at dispatch alongside records
         salient_args: List[Tuple[str, str]] = []
+        # ── Sovereign Epistemological Context Matrix (spec §5.1) — prefetch seed ──
+        # Prepend the memory-supplied hint block to the OPENING prompt so Venom
+        # starts directed. Folded into ``prompt`` itself (the compaction base) so
+        # the seed is treated as stable context and never compacted/truncated as
+        # if it were a tool-result appendix. Bounded + clearly labelled as a HINT
+        # (does NOT satisfy the Iron Gate — live reads still required). ``None`` /
+        # empty entries → byte-identical: ``_build_prefetch_seed_prefix`` returns
+        # "" and the concatenation is a no-op.
+        if prefetched_candidates:
+            _seed_prefix = _build_prefetch_seed_prefix(prefetched_candidates)
+            if _seed_prefix:
+                prompt = _seed_prefix + prompt
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
         # ── Slice 3G — envelope-override for per-op worktrees ──
@@ -5985,14 +6067,7 @@ class ToolLoopCoordinator:
                     else "round_cap" if _trigger_rounds
                     else "context_horizon"
                 )
-                current_prompt += (
-                    "\n\n[SYSTEM] FINAL ROUND — exploration budget exhausted. "
-                    "You MUST emit your final patch JSON now. Any further "
-                    "tool calls will be IGNORED and the operation will fail. "
-                    "Synthesize what you have learned from your tool calls "
-                    "so far and produce the patch in the required JSON "
-                    "format.\n"
-                )
+                current_prompt += _final_write_nudge_text()
                 _final_nudge_issued = True
                 if _BUDGET_TELEMETRY_ENABLED:
                     logger.info(
@@ -6564,6 +6639,75 @@ class ToolLoopCoordinator:
                     logger.debug(
                         "[ToolLoop] per_round_observer raised at "
                         "op=%s round=%d (swallowed)",
+                        op_id[:12] if op_id else "?", round_index,
+                        exc_info=True,
+                    )
+
+            # ── Sovereign Epistemological Context Matrix (spec §5.2) ──
+            # Information-Gain Governor: consult AFTER the pure observer, at the
+            # same round boundary, and HONOR the verdict. The governor measures
+            # this round's NEW information against the running corpus (seeded at
+            # round-0 by the prefetch) and, when gain decays, forces a safe
+            # handoff. Advisory by contract — any governor exception other than
+            # GovernanceDeadlockError is swallowed so it can never destabilize
+            # the loop. GovernanceDeadlockError (LR3 terminal) propagates.
+            #
+            # ``round_tool_results`` = this round's read-only EXPLORATION tool
+            # output texts (the gain signal — only looking-around counts; a
+            # progress tool is excluded, mirroring _READONLY_EXPLORATION_TOOLS).
+            # ``ledger=None``: no ExplorationLedger is held at this seat; the
+            # governor's floor probe is exception-safe and treats an
+            # unavailable floor as satisfied (Task 6 will wire the real ledger).
+            if governor is not None:
+                try:
+                    _round_readonly_results = [
+                        (tr.output or "")
+                        for tc, tr, *_ in (exec_results or [])
+                        if tc.name in _READONLY_EXPLORATION_TOOLS
+                    ]
+                    _verdict = governor.observe_round(
+                        round_index, _round_readonly_results, None,
+                    )
+                    _action = getattr(_verdict, "action", "continue")
+                    if _action == "converge":
+                        if not _final_nudge_issued:
+                            current_prompt += _final_write_nudge_text()
+                            _final_nudge_issued = True
+                            logger.info(
+                                "[ToolLoop] op=%s governor verdict=converge "
+                                "(gain=%.3f) — final-write nudge issued",
+                                op_id[:12] if op_id else "?",
+                                getattr(_verdict, "info_gain", -1.0),
+                            )
+                    elif _action == "deadlock_break":
+                        current_prompt += "\n\n" + getattr(
+                            _verdict, "directive", "",
+                        )
+                        governor.mark_deadlock_round_consumed()
+                        logger.warning(
+                            "[ToolLoop] op=%s governor verdict=deadlock_break "
+                            "(missing=%s) — directive injected, one-shot consumed",
+                            op_id[:12] if op_id else "?",
+                            getattr(_verdict, "missing_categories", ()),
+                        )
+                    elif _action == "deadlock_failed":
+                        # LR3 terminal — MUST propagate (never retry).
+                        self._last_records = list(records)
+                        self._last_salient_args = list(salient_args)
+                        self._finalize_run(op_id)
+                        raise _attach_tool_records(
+                            GovernanceDeadlockError(
+                                "deadlock_override_failed"
+                            ),
+                            records,
+                        )
+                    # "continue" → no action.
+                except GovernanceDeadlockError:
+                    raise  # terminal — do not swallow
+                except Exception:  # noqa: BLE001 — governor is advisory
+                    logger.debug(
+                        "[ToolLoop] governor raised at op=%s round=%d "
+                        "(swallowed)",
                         op_id[:12] if op_id else "?", round_index,
                         exc_info=True,
                     )
