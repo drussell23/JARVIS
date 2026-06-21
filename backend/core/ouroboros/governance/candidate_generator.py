@@ -5469,10 +5469,13 @@ class CandidateGenerator:
                     )
                     if _get_tp().is_batch_only(model_id):
                         _force_batch = True
-                        try:
-                            context.async_batch_payload = True
-                        except Exception:  # noqa: BLE001 — frozen/legacy ctx
-                            pass
+                        # NB: OperationContext is FROZEN — we deliberately do NOT
+                        # stamp a ctx tag (it would raise FrozenInstanceError, and
+                        # consumers can't rely on it). Every consumer of "is this op
+                        # batch-bound?" checks the immortal profile directly with the
+                        # resolved model: the budget here (force_batch), the Zero-Shot
+                        # ban-immunity seam below (is_batch_only(_dp_model)), and the
+                        # park gate (generate_park_wrapper._resolve_async_batch_payload).
             except Exception:  # noqa: BLE001 — defensive, legacy budget
                 pass
             # Slice 225 Phase 2 — Sovereign DW Autarky. Read the Claude fallback
@@ -5636,14 +5639,20 @@ class CandidateGenerator:
                         from backend.core.ouroboros.governance.dw_fault_taxonomy import (  # noqa: E501
                             is_generation_timeout as _zs_is_timeout,
                         )
-                        # Ban-immunity (Transport Profiler Matrix): an
-                        # ASYNC_BATCH_PAYLOAD op times out only because the batch
-                        # poll is async-slow, NOT because the model is dead — banning
-                        # it would blacklist the fleet's best diff-capable models for
-                        # transport latency. Skip the quarantine for batch-bound ops.
-                        _zs_batch_immune = bool(
-                            getattr(context, "async_batch_payload", False)
-                        )
+                        # Ban-immunity (Transport Profiler Matrix): a batch-only
+                        # model times out only because the batch poll is async-slow,
+                        # NOT because the model is dead — banning it would blacklist
+                        # the fleet's best diff-capable models for transport latency.
+                        # Checked DIRECTLY against the immortal profile with the
+                        # resolved model (OperationContext is frozen — no ctx tag).
+                        _zs_batch_immune = False
+                        try:
+                            from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                                get_transport_profile as _zs_get_tp,
+                            )
+                            _zs_batch_immune = _zs_get_tp().is_batch_only(_dp_model)
+                        except Exception:  # noqa: BLE001
+                            _zs_batch_immune = False
                         if (
                             not _zs_batch_immune
                             and (
