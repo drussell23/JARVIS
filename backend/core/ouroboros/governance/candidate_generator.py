@@ -5597,6 +5597,35 @@ class CandidateGenerator:
                 except Exception as _dp_exc:  # noqa: BLE001
                     _dp_provider_outcome = "error"
                     _dp_provider_err = type(_dp_exc).__name__
+                    # Zero-Shot timeout quarantine (Sovereign Zero-Shot & Decay
+                    # Matrix). This is the ONLY seam where the raw, unwrapped
+                    # provider exception is visible WITH the model_id in scope:
+                    # the sentinel-dispatch FSM downstream re-wraps a primary
+                    # TimeoutError into RuntimeError('all_providers_exhausted')
+                    # before it reaches the outer dispatch handler, so a hook
+                    # there never sees TimeoutError. A 180s provider timeout is
+                    # unambiguous → 1-strike cold-storage (bypass the n>=3 σ
+                    # window) so the model is skipped on the very next op rather
+                    # than tainting two more soaks. Fail-soft, gated, never
+                    # raises — must not perturb the cascade.
+                    try:
+                        from backend.core.ouroboros.governance.dw_fault_taxonomy import (  # noqa: E501
+                            is_generation_timeout as _zs_is_timeout,
+                        )
+                        if (
+                            isinstance(_dp_exc, asyncio.TimeoutError)
+                            or _zs_is_timeout(_dp_exc)
+                        ):
+                            from backend.core.ouroboros.governance.dw_discovery_runner import (  # noqa: E501
+                                get_ttft_observer as _zs_get_obs,
+                            )
+                            _zs_obs = _zs_get_obs()
+                            if _zs_obs is not None:
+                                _zs_obs.record_timeout(
+                                    _dp_model, op_id=str(_dp_op_id)[:24],
+                                )
+                    except Exception:  # noqa: BLE001 — never raise from quarantine
+                        pass
                     raise
                 finally:
                     # Slice 34 Phase 2 — record STAGE_PROVIDER_GENERATE
