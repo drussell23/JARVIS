@@ -96,7 +96,7 @@ O+V boot ─────►  resolve_loop_project_root(repo_root, session_id)
 
 ### 5.1 Layer 1a — Deterministic self-enforcing isolation (`autonomous_workspace.py` + `execution_context.py`)
 - Add `_is_cloud_container() -> bool` to `execution_context.py`: deterministic check for a designated isolated runtime (env markers `OUROBOROS_CLOUD_NODE`/`KUBERNETES_SERVICE_HOST`/`/.dockerenv` presence + GCE metadata best-effort). Default: not-container. Never raises.
-- In `resolve_loop_project_root()` (before the `file_isolation_enabled()` early-return at line 73): compute `force = is_primary_checkout(root) and not _is_cloud_container() and is_autonomous(root)`. If `force` → proceed to worktree routing **even when `file_isolation_enabled()` is False**, and emit `[DeterministicLock] forced isolation despite JARVIS_FILE_ISOLATION_ENABLED=<x> (primary checkout, autonomous)`.
+- In `resolve_loop_project_root()` (before the `file_isolation_enabled()` early-return at line 73): compute `force = is_primary_checkout(root) and not _is_cloud_container() and is_autonomous(root)`. If `force` → **dual-arm BOTH flags in-process** (`os.environ["JARVIS_FILE_ISOLATION_ENABLED"]="true"` AND `os.environ["JARVIS_EXECUTION_BOUNDARY_ENABLED"]="true"` — LR-A, so the downstream Stage A commit gate also reads armed), proceed to worktree routing **even when the flags were False**, and emit `[DeterministicLock] forced isolation+boundary despite env (primary checkout, autonomous)`. The two flags are set as a pair, before routing — never one without the other.
 - Gating: `JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED` (default **TRUE** — this is the safety fix; OFF reverts to pure flag-driven legacy). The override is **failure-path-only**: when already isolated (worktree) or in a container or non-autonomous (operator present), it's a no-op.
 
 ### 5.2 Layer 1b — Raw-write denial (`tool_executor.py` + `operator_commit_authority`)
@@ -110,6 +110,7 @@ O+V boot ─────►  resolve_loop_project_root(repo_root, session_id)
 ### 5.4 Layer 2b — Governor suspend + park trigger (`sensor_governor.py` + `op_park_store.py` + `generate_park_wrapper.py`)
 - `SensorGovernor` gains injectable `operator_active_fn: Optional[Callable[[], bool]]` (mirrors `_posture_fn`). When it returns True, the weighted cap is **hard-zeroed** (no NEW ops admitted) — distinct from the soft 0.2× emergency brake.
 - A subscriber to `operator.active` triggers the **existing** park path for the in-flight op: `should_park_for_route(..., operator_suspended=True)` (new param) → `op_park_store.park()` → worker freed, descriptor stored. On `operator.idle`, `operator_suspended=False` and the existing resume continuation (`background_agent_pool.submit_for_resume` → `maybe_park_or_resume` RESUME path) rehydrates the op into the FSM.
+- **Atomic Yield Integrity (LR-B):** the park trigger does NOT call `park()` immediately. It first `await`s a per-op **mutation critical-section guard** to drain — a lightweight `asyncio` counter/section entered around the apply/commit path (`ChangeEngine.execute`, the tool-loop `write_file`/`edit_file`, the AutoCommitter commit). If a critical mutation is executing, the yield waits for *that* operation to complete (bounded by `JARVIS_OPERATOR_YIELD_DRAIN_MAX_S`, default 30s) and parks only at the next safe checkpoint. If the section never drains within the cap (wedged mutation), the yield is **abandoned** (logged) and the op runs to its own terminal — we never park a half-applied mutation. The guard is reused by both the park trigger and any future safe-checkpoint consumer; it is a no-op when `JARVIS_OPERATOR_YIELD_ENABLED=false`.
 - Gating: `JARVIS_OPERATOR_YIELD_ENABLED` (default **FALSE** initially — advisory behavior change; graduate after soak). When off, byte-identical.
 
 ### 5.5 Layer 3 — Verification (`scripts/verify_file_isolation.py` extension + a focused test)
@@ -126,6 +127,7 @@ O+V boot ─────►  resolve_loop_project_root(repo_root, session_id)
 | `JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED` | `true` | Layer 1a override (safety fix; OFF = legacy flag-driven) |
 | `JARVIS_OPERATOR_IDLE_S` | `45` | Idle threshold for presence |
 | `JARVIS_OPERATOR_YIELD_ENABLED` | `false` | Layer 2 yield (advisory; graduate after soak) |
+| `JARVIS_OPERATOR_YIELD_DRAIN_MAX_S` | `30` | LR-B: max wait for an in-flight critical mutation to drain before parking; exceeded → abandon yield, op runs to terminal (never park mid-mutation) |
 | `JARVIS_FILE_ISOLATION_ENABLED` | (existing, false) | still honored; the lock can only force it *on*, never off |
 | `JARVIS_EXECUTION_BOUNDARY_ENABLED` | (existing, false) | Stage A commit denial (forced on by the lock alongside isolation) |
 
@@ -147,5 +149,8 @@ O+V boot ─────►  resolve_loop_project_root(repo_root, session_id)
 - **Layer 1 first** (the actual incident fix — deterministic override + raw-write guard + verify I5). Highest value, default-on.
 - **Layer 2 second** (graceful yield — presence detector + events + governor/park wire). Advisory, default-off, graduate after soak.
 
-## 8. Open question (one)
-- **OQ1.** Should the deterministic lock, when it forces isolation, also auto-enable `JARVIS_EXECUTION_BOUNDARY_ENABLED` (Stage A commit denial)? Leaning **yes** — forcing isolation without commit denial leaves a partial gap; the lock should arm both together. (To confirm at plan time.)
+## 8. Locked Resolutions (operator-ratified 2026-06-21 — absolute, not open)
+
+- **LR-A — Absolute Dual-Arming.** When the deterministic lock fires (primary checkout, autonomous, non-container) it **forces BOTH** `JARVIS_FILE_ISOLATION_ENABLED=true` **AND** `JARVIS_EXECUTION_BOUNDARY_ENABLED=true` — atomically, as a pair. Forcing file isolation without commit denial leaves a catastrophic gap; the lockdown is absolute. Implemented in §5.1 (the override sets both before routing) and asserted in §5.5 (I5 verifies both are armed when the lock fires). The lock can only ever set these *on*, never off (Invariant I-A).
+
+- **LR-B — Atomic Yield Integrity (the Corruption Guard).** The operator-yield park sequence MUST be atomic with respect to in-flight critical mutations. When `operator.active` arrives, if the generative loop is mid critical state mutation (an executing `write_file`/`edit_file`/`ChangeEngine.execute`/git commit), the yield path MUST **wait for that specific atomic operation to resolve** before invoking `op_park_store.park()`. We never park a half-written file or an in-progress commit — the FSM must only ever rehydrate from a consistent checkpoint. Mechanism: a per-op **mutation critical-section guard** (an `asyncio` re-entrant section / counter around the apply/commit path); the park trigger `await`s the section to drain (bounded by `JARVIS_OPERATOR_YIELD_DRAIN_MAX_S`, default 30s — if a mutation wedges past the cap, the yield is **abandoned** and the op continues to its own terminal rather than risk a corrupt park). Implemented in §5.4.
