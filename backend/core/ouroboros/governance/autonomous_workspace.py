@@ -52,6 +52,48 @@ def file_isolation_enabled() -> bool:
     return os.environ.get(_ENV_FILE_ISOLATION, "").strip().lower() in _TRUTHY
 
 
+def _deterministic_lock_enabled() -> bool:
+    """LR-A gate — ``JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED`` (default
+    TRUE). Off → :func:`resolve_loop_project_root` reverts to pure legacy
+    flag-driven behavior (no forced arming)."""
+    import os
+    return (
+        os.environ.get("JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED", "true")
+        or ""
+    ).strip().lower() in _TRUTHY
+
+
+def _deterministic_force(
+    root: Any,
+    is_primary: bool,
+    container: bool,
+    autonomous: bool,
+) -> bool:
+    """LR-A trigger: force isolation iff lock on AND in primary checkout AND
+    not a container AND autonomous (no operator present). Pure. Never
+    raises."""
+    try:
+        return bool(
+            _deterministic_lock_enabled()
+            and is_primary
+            and (not container)
+            and autonomous
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _arm_boundary_flags() -> None:
+    """LR-A: force-arm BOTH flags as a pair, in-process, so downstream Stage A
+    (commit denial) and Stage B (isolation) both read armed. Never raises."""
+    import os
+    try:
+        os.environ["JARVIS_FILE_ISOLATION_ENABLED"] = "true"
+        os.environ["JARVIS_EXECUTION_BOUNDARY_ENABLED"] = "true"
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def workspace_branch(session_id: str) -> str:
     """Quarantine branch name. Intentionally identical to the
     Ledger-Sovereignty commit-workspace branch so file + commit isolation
@@ -70,7 +112,39 @@ async def resolve_loop_project_root(
     session (see module docstring). NEVER raises — any failure falls back
     to ``repo_root``."""
     root = Path(repo_root)
-    if not file_isolation_enabled():
+    # LR-A deterministic isolation lock: when O+V boots in the PRIMARY
+    # checkout, autonomous (no operator present), and NOT a container, FORCE
+    # isolation by arming BOTH boundary flags as a pair and falling through to
+    # worktree routing — EVEN WHEN those flags were explicitly false. The
+    # autonomy check below re-confirms (and will pass, since we only force when
+    # autonomous), so routing proceeds. Off / not-this-situation → byte-
+    # identical legacy behavior. Fail-soft: any failure here leaves the legacy
+    # early-return intact.
+    try:
+        from backend.core.ouroboros.governance.execution_context import (
+            is_primary_checkout,
+            is_autonomous as _ec_is_autonomous,  # noqa: F401 — re-used below
+            _is_cloud_container,
+        )
+        _forced = _deterministic_force(
+            root,
+            is_primary=bool(is_primary_checkout(root)),
+            container=bool(_is_cloud_container()),
+            autonomous=bool(_ec_is_autonomous(root)),
+        )
+    except Exception:  # noqa: BLE001 — can't prove force → legacy path
+        _forced = False
+    if _forced:
+        _arm_boundary_flags()
+        logger.warning(
+            "[DeterministicLock] forced isolation+boundary despite env "
+            "(primary checkout, autonomous) root=%s session=%s",
+            root,
+            session_id,
+        )
+        # DO NOT early-return — fall through to the (now-armed) worktree
+        # routing below.
+    elif not file_isolation_enabled():
         return root
     # Cryptographic autonomy check (Stage A primitive) — human sessions
     # keep the primary checkout.
