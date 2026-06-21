@@ -91,3 +91,21 @@ def test_deadlock_breaker_one_shot_even_if_coordinator_forgets_to_mark():
     # coordinator does NOT call mark_deadlock_round_consumed()
     v2 = g.observe_round(1, ["aaa"], ledger=None)
     assert v2.action == "deadlock_failed"
+
+
+def test_floor_probe_exception_fails_open_to_converge():
+    class _Boom:
+        def is_satisfied(self, ledger):
+            raise RuntimeError("floor exploded")
+        def missing_categories(self, ledger):
+            return ()
+    g = _gov(floors=_Boom(), decay_rounds=1, prefetch=["aaa"])
+    v = g.observe_round(0, ["aaa"], ledger=None)
+    assert v.action == "converge"   # exception -> floor_met=True -> safe converge
+
+
+def test_empty_round_results_zero_gain():
+    g = _gov(floors=_Floors(met=True), decay_rounds=1, prefetch=["aaa"])
+    v = g.observe_round(0, [], ledger=None)
+    assert v.info_gain == 0.0
+    assert v.action == "converge"   # zero gain -> decay (1 round) -> floor met

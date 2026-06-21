@@ -4,7 +4,7 @@
 Decides, after each Venom round, whether continued exploration yields enough
 NEW information to justify the budget — and forces a mathematically safe
 handoff when it does not. Synchronous + sub-millisecond on the hot path
-(TF-IDF/cosine over hashed tokens; NO model call). Deep embeds, if any, are the
+(TF-cosine over hashed tokens; NO model call). Deep embeds, if any, are the
 coordinator's async concern — the governor never awaits.
 
 LR1: the delta corpus is seeded with the prefetch excerpts as the round-0
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -35,6 +36,22 @@ _CATEGORY_TOOLS = {
 }
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name, "") or "").strip()
+    try:
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+# Elastic budget multipliers applied to Venom's convergence threshold.
+# Warm = prefetch supplied a baseline (compress exploration); cold = no prefetch
+# (allow more exploration, but only while info-gain stays high — the decay path
+# is what actually stops a cold loop). Tunable; reflect prefetch richness at
+# construction, not runtime corpus growth.
+_WARM_BUDGET_SCALE = _env_float("JARVIS_GOVERNOR_WARM_BUDGET_SCALE", 0.6)
+_COLD_BUDGET_SCALE = _env_float("JARVIS_GOVERNOR_COLD_BUDGET_SCALE", 1.4)
 
 
 def _tokens(text: str) -> Counter:
@@ -82,8 +99,9 @@ class InformationGainGovernor:
         self._warm = bool(self._corpus)
 
     def _budget_scale(self) -> float:
-        # warm cache -> compress; cold -> expand.
-        return 0.6 if self._warm else 1.4
+        # Determined at construction; reflects prefetch richness, not runtime
+        # corpus growth. Warm -> compress; cold -> expand (decay still stops it).
+        return _WARM_BUDGET_SCALE if self._warm else _COLD_BUDGET_SCALE
 
     def _directive(self, missing: Tuple[str, ...]) -> str:
         lines = ["STOP broad exploration. To satisfy the mandatory safety "
@@ -100,6 +118,8 @@ class InformationGainGovernor:
         self._deadlock_consumed = True
         self._deadlock_pending = False
 
+    # round_index: coordinator-facing interface parameter; reserved for future
+    # per-round decay curves (e.g. tighter threshold on later rounds).
     def observe_round(self, round_index: int, round_tool_results: List[str],
                       ledger: Any) -> GovernorVerdict:
         if not self.enabled:
@@ -139,9 +159,13 @@ class InformationGainGovernor:
             # The governor self-defends against a coordinator that forgets to
             # call mark_deadlock_round_consumed(); we never emit a second
             # deadlock_break (no looping at the safety gate).
+            logger.debug("[ContextGovernor] deadlock_failed gain=%.3f missing=%s",
+                         gain, missing)
             return GovernorVerdict("deadlock_failed", gain, scale,
                                    missing_categories=missing)
         self._deadlock_pending = True
+        logger.debug("[ContextGovernor] deadlock_break gain=%.3f missing=%s",
+                     gain, missing)
         return GovernorVerdict("deadlock_break", gain, scale,
                                missing_categories=missing,
                                directive=self._directive(missing))
