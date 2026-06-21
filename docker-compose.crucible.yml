@@ -75,6 +75,21 @@ services:
       # bounded-but-sufficient window (well under the 2700s live_fire_soak wait) so
       # the COMPLETE summary lands and the wall-cap soak grades clean.
       JARVIS_BATTLE_SHUTDOWN_DEADLINE_S: "180"
+      # --- Sovereign GitOps Identity Matrix (2026-06-21) ---
+      # Autonomous git identity — git inherits these env vars directly (NO
+      # `git config`). Inherit from host env if set, else Ouroboros default.
+      GIT_AUTHOR_NAME: "${GIT_AUTHOR_NAME:-Ouroboros Sovereign Crucible}"
+      GIT_AUTHOR_EMAIL: "${GIT_AUTHOR_EMAIL:-ouroboros@jarvis.ai}"
+      GIT_COMMITTER_NAME: "${GIT_COMMITTER_NAME:-Ouroboros Sovereign Crucible}"
+      GIT_COMMITTER_EMAIL: "${GIT_COMMITTER_EMAIL:-ouroboros@jarvis.ai}"
+      # Trust the auto-provisioned workspace via git ENV-config (no global mutation).
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "*"
+      # Self-provisioning graduation workspace (clone-if-missing / reset-if-stale).
+      JARVIS_GRADUATION_WORKSPACE_ENABLED: "true"
+      JARVIS_AUTO_COMMIT_WORKSPACE: "/graduation_workspace"
+      JARVIS_GRADUATION_GIT_REMOTE: "${JARVIS_GRADUATION_GIT_REMOTE:-github.com/drussell23/JARVIS-AI-Agent.git}"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"
