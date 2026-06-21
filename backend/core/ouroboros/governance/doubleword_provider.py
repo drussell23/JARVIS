@@ -161,10 +161,12 @@ def _clamp_reasoning_effort(eff: str) -> str:
 # trivial/simple ops, so a trivial op routed to such a model gets cancelled. Floor the
 # effort UP to the model's minimum supported value. Env-driven map (generic
 # substring→effort matching — no hardcoded model in the algorithm); the default carries
-# the one model DW has told us rejects "none". Override/extend via
+# the models DW has told us reject "none": deepseek-v4-pro (Seb @ DW, 2026-06-08)
+# and the gpt-oss family (Meryem @ DW, 2026-06-21 — gpt-oss-120b can't disable
+# reasoning, so reasoning_effort="none" errors). Override/extend via
 # JARVIS_DW_MODEL_MIN_EFFORT="substr:effort,substr:effort". Ideally resolved from DW's
 # /v1/models capability metadata once exposed (open question to DW).
-_DEFAULT_DW_MODEL_MIN_EFFORT: str = "deepseek-v4-pro:low"
+_DEFAULT_DW_MODEL_MIN_EFFORT: str = "deepseek-v4-pro:low,gpt-oss:low"
 
 
 def _dw_model_min_effort_map() -> Dict[str, str]:
@@ -206,6 +208,19 @@ def _dw_model_min_effort(model_id: str) -> str:
         _dyn = _resolver(mid)
         if _dyn:
             return _dyn
+    except Exception:  # noqa: BLE001 — fall through to the static floor
+        pass
+    # Sovereign Reasoning-Capability Profiler (2026-06-21) — ADAPTIVE tier.
+    # A model that PROVED (via a live reasoning-rejection error) it can't disable
+    # reasoning carries a learned floor. Consulted AFTER DW's authoritative catalog
+    # but BEFORE the static seed map — self-heals for ANY model DW adds, no hardcode.
+    try:
+        from backend.core.ouroboros.governance.dw_reasoning_profile import (
+            get_reasoning_profile as _rp,
+        )
+        _learned = _rp().learned_min_effort(model_id)
+        if _learned:
+            return _learned
     except Exception:  # noqa: BLE001 — fall through to the static floor
         pass
     # Slice 168 — static env-map fallback.
@@ -3265,6 +3280,17 @@ class DoublewordProvider:
                     if resp.status >= 300:
                         self._last_error_status = resp.status
                         err_body = await resp.text()
+                        # Sovereign Reasoning-Capability Profiler — ADAPTIVE learn:
+                        # if DW rejected our reasoning knob, remember this model needs
+                        # a floor so we never send the rejected effort again (Meryem @
+                        # DW, 2026-06-21: gpt-oss-120b can't disable reasoning).
+                        try:
+                            from backend.core.ouroboros.governance.dw_reasoning_profile import (  # noqa: E501
+                                maybe_learn_from_error as _rp_learn,
+                            )
+                            _rp_learn(_effective_model, body.get("reasoning_effort", ""), err_body)
+                        except Exception:  # noqa: BLE001
+                            pass
                         # Phase 12 Slice F — Substrate Error Unmasking.
                         # Preserve full response body + model_id so
                         # downstream classifier can distinguish modality
