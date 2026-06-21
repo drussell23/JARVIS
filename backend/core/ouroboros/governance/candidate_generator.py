@@ -68,6 +68,23 @@ from backend.core.ouroboros.governance.dw_latency_tracker import (
     DwLatencyTracker,
 )
 
+# LR3 terminal sentinel: the Information-Gain Governor's deadlock-override
+# failure (raised inside the Venom tool loop). It MUST propagate through every
+# broad-catch failback site below UNRECLASSIFIED so the orchestrator's
+# ``except GovernanceDeadlockError`` terminal catch can stamp
+# terminal_reason_code="deadlock_override_failed". Top-level import is
+# cycle-safe (verified: tool_executor does not import candidate_generator); a
+# fallback class keeps every ``except GovernanceDeadlockError`` clause
+# evaluable even if the import is severed under an unusual load order
+# (mirrors orchestrator.py's defensive fallback class).
+try:
+    from backend.core.ouroboros.governance.tool_executor import (
+        GovernanceDeadlockError,
+    )
+except Exception:  # noqa: BLE001 -- defensive; keep except-clauses evaluable
+    class GovernanceDeadlockError(RuntimeError):  # type: ignore[no-redef]
+        """Fallback shim -- real class lives in tool_executor."""
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -3007,6 +3024,8 @@ class CandidateGenerator:
                     )
                     try:
                         return await self._call_fallback(context, deadline)
+                    except GovernanceDeadlockError:
+                        raise  # LR3 terminal -- never wrap as fallback_failed
                     except Exception as exc:
                         raise RuntimeError(
                             f"background_fallback_failed:"
@@ -3850,6 +3869,16 @@ class CandidateGenerator:
                     _attempt_result = await self._try_primary_then_fallback(
                         context, deadline, model_id=model_id,
                     )
+            except GovernanceDeadlockError:
+                # LR3 terminal: the Information-Gain Governor's deadlock-override
+                # failure (raised inside the Venom tool loop) MUST reach the
+                # orchestrator's ``except GovernanceDeadlockError`` terminal catch
+                # so it stamps terminal_reason_code="deadlock_override_failed".
+                # If stored in _attempt_exc it gets reclassified by the per-model
+                # rotation taxonomy (not internal_fault, not generation_timeout,
+                # not fsm_exhausted) and re-driven as a transport failure /
+                # all_providers_exhausted; the deadlock would never surface.
+                raise
             except Exception as exc:
                 _attempt_exc = exc
             finally:
@@ -4715,6 +4744,8 @@ class CandidateGenerator:
             )
             try:
                 return await self._call_fallback(context, deadline)
+            except GovernanceDeadlockError:
+                raise  # LR3 terminal -- never wrap as fallback_failed
             except Exception as exc:
                 raise RuntimeError(
                     f"background_fallback_failed:forced:"
@@ -4751,6 +4782,8 @@ class CandidateGenerator:
                 )
                 try:
                     return await self._call_fallback(context, deadline)
+                except GovernanceDeadlockError:
+                    raise  # LR3 terminal -- never wrap as fallback_failed
                 except Exception as exc:
                     raise RuntimeError(
                         f"background_fallback_failed:dw_unavailable:"
@@ -4860,6 +4893,8 @@ class CandidateGenerator:
             )
             try:
                 return await self._call_fallback(context, deadline)
+            except GovernanceDeadlockError:
+                raise  # LR3 terminal -- never wrap as fallback_failed
             except Exception as exc:
                 raise RuntimeError(
                     f"background_fallback_failed:dw={_dw_error[:80]}:"
@@ -5337,6 +5372,11 @@ class CandidateGenerator:
             if self.fsm._consecutive_failures > 0:
                 self.fsm.record_primary_success()
             return result
+        except GovernanceDeadlockError:
+            # LR3 terminal: do NOT cascade a deadlock-override failure into the
+            # Claude fallback (that would reclassify it as a transient primary
+            # failure). Propagate to the orchestrator's terminal catch.
+            raise
         except (Exception, asyncio.CancelledError) as exc:
             mode = FailbackStateMachine.classify_exception(exc)
             # Phase 3.1 observability: surface local-tier degradations (memory /
@@ -6742,6 +6782,12 @@ class CandidateGenerator:
                         # W3(7) cooperative cancel — operator/watchdog/signal.
                         # NEVER retry; honor the cancel immediately.
                         raise
+                    except GovernanceDeadlockError:
+                        # LR3 terminal: the fallback (Claude) tool loop hit the
+                        # Information-Gain Governor deadlock-override failure.
+                        # NEVER retry / reclassify; propagate to the orchestrator's
+                        # terminal catch so it stamps deadlock_override_failed.
+                        raise
                     except (Exception, asyncio.CancelledError) as inner_exc:
                         # Slice 3C — harvest tool-records from the failed
                         # attempt BEFORE any other handling. Best-effort:
@@ -7011,6 +7057,12 @@ class CandidateGenerator:
                         await asyncio.sleep(_backoff)
                         continue
                 # Unreachable — loop either returns or raises.
+        except GovernanceDeadlockError:
+            # LR3 terminal: defense-in-depth. The inner-retry handler already
+            # re-raises this, but guard the outer catch too so a deadlock can
+            # never be folded into the all_providers_exhausted taxonomy. Must
+            # reach the orchestrator's deadlock_override_failed terminal catch.
+            raise
         except (Exception, asyncio.CancelledError) as exc:
             # Cooperative cancel via W3(7) cancel-token — propagate
             # immediately (NEVER treat as exhaustion). The inner loop

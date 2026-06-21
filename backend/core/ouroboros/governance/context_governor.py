@@ -1,0 +1,281 @@
+# backend/core/ouroboros/governance/context_governor.py
+"""Information-Gain Governor (spec section 5.2, LR1, LR3).
+
+Decides, after each Venom round, whether continued exploration yields enough
+NEW information to justify the budget — and forces a mathematically safe
+handoff when it does not. Synchronous + sub-millisecond on the hot path
+(TF-cosine over hashed tokens; NO model call). Deep embeds, if any, are the
+coordinator's async concern — the governor never awaits.
+
+LR1: the delta corpus is seeded with the prefetch excerpts as the round-0
+     baseline; round-1 gain is measured against what memory already supplied.
+LR3: the deadlock breaker is one-shot; a second decay after it is consumed
+     yields action="deadlock_failed" (the coordinator turns that into the fatal
+     terminal deadlock_override_failed).
+"""
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, List, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Iron Gate category -> canonical tool(s) for the deadlock-break directive.
+# Mirrors exploration_engine._TOOL_CATEGORY.
+_CATEGORY_TOOLS = {
+    "COMPREHENSION": ["read_file"],
+    "DISCOVERY": ["search_code"],
+    "CALL_GRAPH": ["get_callers"],
+    "STRUCTURE": ["list_symbols"],
+    "HISTORY": ["git_blame", "git_log"],
+}
+
+_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
+
+# Verdict action vocabulary — the single source of truth shared with the Venom
+# coordinator's dispatch (tool_executor.py) so a rename can never silently break
+# the safety-critical deadlock_failed branch.
+ACTION_CONTINUE = "continue"
+ACTION_CONVERGE = "converge"
+ACTION_DEADLOCK_BREAK = "deadlock_break"
+ACTION_DEADLOCK_FAILED = "deadlock_failed"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name, "") or "").strip()
+    try:
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+# Elastic budget multipliers applied to Venom's convergence threshold.
+# Warm = prefetch supplied a baseline (compress exploration); cold = no prefetch
+# (allow more exploration, but only while info-gain stays high — the decay path
+# is what actually stops a cold loop). Tunable; reflect prefetch richness at
+# construction, not runtime corpus growth.
+_WARM_BUDGET_SCALE = _env_float("JARVIS_GOVERNOR_WARM_BUDGET_SCALE", 0.6)
+_COLD_BUDGET_SCALE = _env_float("JARVIS_GOVERNOR_COLD_BUDGET_SCALE", 1.4)
+
+
+def _tokens(text: str) -> Counter:
+    return Counter(t.lower() for t in _TOKEN_RE.findall(text or ""))
+
+
+def _cosine(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    common = set(a) & set(b)
+    num = sum(a[t] * b[t] for t in common)
+    da = math.sqrt(sum(v * v for v in a.values()))
+    db = math.sqrt(sum(v * v for v in b.values()))
+    if da == 0 or db == 0:
+        return 0.0
+    return num / (da * db)
+
+
+@dataclass(frozen=True)
+class GovernorVerdict:
+    action: str            # continue | converge | deadlock_break | deadlock_failed
+    info_gain: float
+    budget_scale: float
+    missing_categories: Tuple[str, ...] = ()
+    directive: str = ""
+
+
+@dataclass
+class InformationGainGovernor:
+    prefetch_excerpts: Sequence[str]
+    floors: Any
+    enabled: bool = True
+    min_gain: float = 0.15
+    decay_rounds: int = 2
+    _corpus: Counter = field(default_factory=Counter)
+    _low_streak: int = 0
+    _warm: bool = False
+    _deadlock_consumed: bool = False
+    _deadlock_pending: bool = False
+
+    def __post_init__(self) -> None:
+        # LR1: round-0 baseline IS the prefetch.
+        joined = "\n".join(self.prefetch_excerpts or [])
+        self._corpus = _tokens(joined)
+        self._warm = bool(self._corpus)
+
+    def _budget_scale(self) -> float:
+        # Determined at construction; reflects prefetch richness, not runtime
+        # corpus growth. Warm -> compress; cold -> expand (decay still stops it).
+        return _WARM_BUDGET_SCALE if self._warm else _COLD_BUDGET_SCALE
+
+    def _directive(self, missing: Tuple[str, ...]) -> str:
+        lines = ["STOP broad exploration. To satisfy the mandatory safety "
+                 "floor you MUST now call ONLY these tools, nothing else:"]
+        for cat in missing:
+            tools = _CATEGORY_TOOLS.get(cat, ["read_file"])
+            lines.append(f"  - {cat}: call {' or '.join(tools)} "
+                         f"on the most relevant target file.")
+        lines.append("Then immediately emit your patch.")
+        return "\n".join(lines)
+
+    def mark_deadlock_round_consumed(self) -> None:
+        """Coordinator calls this after appending the deadlock directive (LR3)."""
+        self._deadlock_consumed = True
+        self._deadlock_pending = False
+
+    # round_index: coordinator-facing interface parameter; reserved for future
+    # per-round decay curves (e.g. tighter threshold on later rounds).
+    def observe_round(self, round_index: int, round_tool_results: List[str],
+                      ledger: Any) -> GovernorVerdict:
+        if not self.enabled:
+            return GovernorVerdict(ACTION_CONTINUE, 1.0, 1.0)
+        scale = self._budget_scale()
+        new = _tokens("\n".join(round_tool_results or []))
+        sim = _cosine(new, self._corpus)
+        gain = max(0.0, 1.0 - sim) if new else 0.0
+        self._corpus.update(new)
+
+        if gain < self.min_gain:
+            self._low_streak += 1
+        else:
+            self._low_streak = 0
+
+        decayed = self._low_streak >= self.decay_rounds
+        if not decayed:
+            return GovernorVerdict(ACTION_CONTINUE, gain, scale)
+
+        floor_met = True
+        missing: Tuple[str, ...] = ()
+        try:
+            floor_met = bool(self.floors.is_satisfied(ledger))
+            if not floor_met:
+                missing = tuple(self.floors.missing_categories(ledger))
+        except Exception:  # noqa: BLE001 — floor probe must not crash governor
+            floor_met = True
+
+        if floor_met:
+            return GovernorVerdict(ACTION_CONVERGE, gain, scale)
+
+        if self._deadlock_consumed or self._deadlock_pending:
+            # LR3 (iron-clad): the one-shot directive was already issued —
+            # either explicitly consumed by the coordinator, OR still pending
+            # from a prior deadlock_break the coordinator failed to mark. Either
+            # way the floor is STILL unmet after the shot, so escalate to fatal.
+            # The governor self-defends against a coordinator that forgets to
+            # call mark_deadlock_round_consumed(); we never emit a second
+            # deadlock_break (no looping at the safety gate).
+            logger.debug("[ContextGovernor] deadlock_failed gain=%.3f missing=%s",
+                         gain, missing)
+            return GovernorVerdict(ACTION_DEADLOCK_FAILED, gain, scale,
+                                   missing_categories=missing)
+        self._deadlock_pending = True
+        logger.debug("[ContextGovernor] deadlock_break gain=%.3f missing=%s",
+                     gain, missing)
+        return GovernorVerdict(ACTION_DEADLOCK_BREAK, gain, scale,
+                               missing_categories=missing,
+                               directive=self._directive(missing))
+
+
+# ── Sovereign Epistemological Context Matrix — Task 6a: GENERATE-path wiring ──
+# Bridge exploration_engine's Iron Gate floor evaluation into the governor's
+# is_satisfied/missing_categories shape (no re-implementation of scoring), and
+# a fail-soft factory that builds a FRESH governor per generation attempt from
+# the op's prefetch manifest + the SAME Iron Gate floors the post-GENERATE gate
+# uses. exploration_engine is imported LAZILY inside every method/function so a
+# context_governor → exploration_engine edge can never create an import cycle
+# (verified: exploration_engine does NOT import context_governor).
+
+
+class _IronGateFloorAdapter:
+    """Bridges exploration_engine's floor evaluation into the governor's
+    is_satisfied/missing_categories shape. Reuses ExplorationFloors +
+    evaluate_exploration — no re-implementation of scoring. Exception-safe."""
+
+    def __init__(self, floors) -> None:
+        self._floors = floors
+
+    def is_satisfied(self, ledger) -> bool:
+        if ledger is None or self._floors is None:
+            return True
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                evaluate_exploration,
+            )
+            return bool(evaluate_exploration(ledger, self._floors).sufficient)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def missing_categories(self, ledger):
+        if ledger is None or self._floors is None:
+            return ()
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                evaluate_exploration,
+            )
+            verdict = evaluate_exploration(ledger, self._floors)
+            return tuple(c.name for c in verdict.missing_categories)
+        except Exception:  # noqa: BLE001
+            return ()
+
+
+def governor_enabled() -> bool:
+    return (os.environ.get("JARVIS_CONTEXT_GOVERNOR_ENABLED", "true") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _resolve_complexity(context) -> str:
+    """Derive the Iron Gate complexity string from the op context.
+
+    Matches generate_runner / orchestrator EXACTLY: both derive the string fed
+    to ``ExplorationFloors.from_env_with_adapted`` via
+    ``getattr(ctx, "task_complexity", "") or ""`` (orchestrator.py:5009,
+    generate_runner.py:1089). We mirror that so the governor's floor tier ==
+    the real post-GENERATE Iron Gate's tier. Empty string is preserved (the
+    floors helper handles it); we never invent a tier."""
+    return str(getattr(context, "task_complexity", "") or "")
+
+
+def build_governor_for(context):
+    """Construct a FRESH InformationGainGovernor per generation attempt from the
+    op's prefetch manifest + Iron Gate floors. Returns None when disabled or
+    when the op is not a heavy GOAL (light ops stay byte-identical). A heavy op
+    with an empty manifest still yields a cold governor. Fail-soft: never raises."""
+    try:
+        if not governor_enabled():
+            return None
+        # Scope the governor to heavy GOALs (the arc's target). Light ops are
+        # left byte-identical. A heavy op with an EMPTY manifest (cold oracle)
+        # STILL gets a governor — that's the worst wandering case and exactly
+        # where info-gain convergence matters most.
+        try:
+            from backend.core.ouroboros.governance.epistemic_prefetch import is_heavy_goal
+            if not is_heavy_goal(
+                getattr(context, "target_files", ()) or (),
+                int(getattr(context, "blast_radius", 0) or 0),
+            ):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        manifest = tuple(getattr(context, "prefetch_manifest", ()) or ())
+        excerpts = [e.content_excerpt for e in manifest if getattr(e, "content_excerpt", "")]
+        # Iron Gate floors for this op's complexity (reuse the same source as the
+        # post-GENERATE Iron Gate so the governor's floor == the real gate).
+        complexity = _resolve_complexity(context)
+        floors = None
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                ExplorationFloors,
+            )
+            floors = ExplorationFloors.from_env_with_adapted(complexity)
+        except Exception:  # noqa: BLE001
+            floors = None
+        return InformationGainGovernor(
+            prefetch_excerpts=excerpts,
+            floors=_IronGateFloorAdapter(floors),
+            enabled=True,
+        )
+    except Exception:  # noqa: BLE001 — governor is advisory; never block generation
+        return None
