@@ -437,6 +437,12 @@ class BattleTestHarness:
             BoundedShutdownWatchdog as _BoundedShutdownWatchdog,
         )
         self._shutdown_watchdog = _BoundedShutdownWatchdog()
+        try:
+            self._shutdown_watchdog.register_pre_exit_flush(
+                self._watchdog_pre_exit_flush
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # TerminationHookRegistry Slice 3 — install per-process
         # active-harness singleton so termination hooks dispatched
@@ -687,6 +693,26 @@ class BattleTestHarness:
                 _sys.stderr.write(
                     f"[Harness] atexit fallback failed: {exc!r}\n"
                 )
+
+    def _watchdog_pre_exit_flush(self) -> None:
+        """Sync complete-summary writer the BoundedShutdownWatchdog calls right
+        before os._exit (which skips atexit). A watchdog fire during shutdown
+        means the session reached a terminal stop_reason and the DRAIN hung —
+        the work is done, so stamp complete. Idempotent (no-op if already
+        written). Sync, fail-soft, runs on the watchdog thread. NEVER raises."""
+        try:
+            if getattr(self, "_summary_written", False):
+                return
+            _clean = {
+                "wall_clock_cap", "idle_timeout", "budget_exhausted",
+                "cost_cap", "session_exhausted", "shutdown_signal",
+                "process_memory_cap",
+            }
+            _root = (self._stop_reason or "").split(":")[0].strip()
+            _outcome = "complete" if _root in _clean else "incomplete_kill"
+            self._atexit_fallback_write(session_outcome=_outcome)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Properties
@@ -1848,8 +1874,18 @@ class BattleTestHarness:
             logger.error("Session %s boot failed: %s", self._session_id, exc)
             self._stop_reason = f"boot_failure: {exc}"
         finally:
+            # Sovereign Telemetry Flush Failsafe (2026-06-21) — persist the
+            # COMPLETE summary BEFORE the (slow, possibly-hanging) component
+            # drain. _generate_report reads recorder/ledger/score-history (no
+            # dependency on drained components), so it is safe + fresher first.
+            try:
+                await self._generate_report()
+            except Exception as _rep_exc:  # noqa: BLE001
+                logger.error(
+                    "Session %s pre-drain report write failed: %s",
+                    self._session_id, _rep_exc, exc_info=True,
+                )
             await self._shutdown_components()
-            await self._generate_report()
             # Harness Epic Slice 1 — disarm the bounded-shutdown watchdog
             # since clean shutdown completed within deadline. Without
             # this disarm, a race between graceful shutdown completion

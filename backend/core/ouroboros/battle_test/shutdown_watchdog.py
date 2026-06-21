@@ -124,6 +124,11 @@ class BoundedShutdownWatchdog:
     ) -> None:
         self._exit_fn = exit_fn
         self._sleep_fn = sleep_fn
+        # Sovereign Telemetry Flush Failsafe (2026-06-21) — synchronous
+        # best-effort callback invoked in the FINAL MILLISECOND before os._exit.
+        # os._exit() skips atexit, so a teardown overrunning the deadline would
+        # otherwise lose the summary. Idempotent + fail-soft + must not hang.
+        self._pre_exit_flush: Optional[Callable[[], None]] = None
         # The arm event signals "shutdown requested; deadline running".
         self._arm_event = threading.Event()
         # The disarm event lets disarm() interrupt a sleeping thread.
@@ -234,6 +239,11 @@ class BoundedShutdownWatchdog:
         # Wake the thread if it's blocked
         self._arm_event.set()
         self._disarm_event.set()
+
+    def register_pre_exit_flush(self, callback):
+        """Register the sync telemetry-flush callback invoked right before
+        os._exit (which skips atexit). Sync, idempotent, fail-soft. NEVER raises."""
+        self._pre_exit_flush = callback
 
     def _thread_loop(self) -> None:
         """Daemon thread body — wait, sleep deadline, fire os._exit."""
@@ -370,6 +380,25 @@ class BoundedShutdownWatchdog:
                         except Exception:  # noqa: BLE001
                             continue
             except Exception:  # noqa: BLE001
+                pass
+
+            # Sovereign Telemetry Flush Failsafe — the final millisecond.
+            # os._exit() skips atexit; this is the LAST chance to save the
+            # summary. Idempotent in the harness callback; fail-soft — the
+            # os._exit MUST still fire even if the flush raises/is absent.
+            try:
+                _flush = self._pre_exit_flush
+                if _flush is not None:
+                    _flush()
+                    try:
+                        sys.stderr.write(
+                            "[BoundedShutdownWatchdog] pre-exit telemetry "
+                            "flush invoked\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+            except Exception:
                 pass
 
             # GO
