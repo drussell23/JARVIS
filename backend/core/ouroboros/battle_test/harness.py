@@ -1236,6 +1236,37 @@ class BattleTestHarness:
             # Start GLS activity monitor — pokes watchdog when operations are in-flight
             self._activity_monitor_task = asyncio.ensure_future(self._monitor_gls_activity())
 
+            # Sovereign Infinite-Horizon Batch Matrix (2026-06-21) — parked-batch
+            # liveness probe. A PARKED ASYNC_BATCH_PAYLOAD op frees its worker and
+            # waits OUT-OF-POOL on DoubleWord's batch queue (up to the SLA horizon),
+            # so the GLS-op activity check sees "0 ops progressing" and the idle
+            # watchdog reaps the session mid-batch (the live wedge: op-019ee8ca
+            # applied at 06:11, a later batch parked at 06:16:46 and the session
+            # idle-timed-out at 06:21:53 → in_flight → graded infra → NOT clean,
+            # even though the pipeline was healthily waiting on DW). Register a
+            # liveness probe that reports hot while the BG pool has any live park
+            # continuation — the same mechanism that protects fire-and-forget
+            # autoscore evals. Inert (returns False) when nothing is parked →
+            # byte-identical when no batch op is in flight. NEVER raises.
+            def _parked_batch_in_flight() -> bool:
+                try:
+                    from backend.core.ouroboros.governance._governance_state import (
+                        get_bound_bg_pool as _get_pool,
+                    )
+                    _pool = _get_pool()
+                    if _pool is None:
+                        return False
+                    _tasks = getattr(_pool, "_park_continuation_tasks", None) or ()
+                    return any(not t.done() for t in _tasks)
+                except Exception:  # noqa: BLE001 — fail-open: not-hot on error
+                    return False
+            self.register_session_liveness_probe(_parked_batch_in_flight)
+            logger.info(
+                "[Harness] registered parked-batch session-liveness probe "
+                "(idle watchdog will not reap while a parked ASYNC_BATCH_PAYLOAD "
+                "op is awaiting DoubleWord)"
+            )
+
             # Start provider cost monitor — feeds real API spend into CostTracker
             self._cost_monitor_task = asyncio.ensure_future(self._monitor_provider_costs())
 
