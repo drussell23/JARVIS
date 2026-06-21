@@ -6668,8 +6668,11 @@ class ToolLoopCoordinator:
                     _verdict = governor.observe_round(
                         round_index, _round_readonly_results, None,
                     )
+                    from backend.core.ouroboros.governance.context_governor import (
+                        ACTION_CONVERGE, ACTION_DEADLOCK_BREAK, ACTION_DEADLOCK_FAILED,
+                    )
                     _action = getattr(_verdict, "action", "continue")
-                    if _action == "converge":
+                    if _action == ACTION_CONVERGE:
                         if not _final_nudge_issued:
                             current_prompt += _final_write_nudge_text()
                             _final_nudge_issued = True
@@ -6679,7 +6682,7 @@ class ToolLoopCoordinator:
                                 op_id[:12] if op_id else "?",
                                 getattr(_verdict, "info_gain", -1.0),
                             )
-                    elif _action == "deadlock_break":
+                    elif _action == ACTION_DEADLOCK_BREAK:
                         current_prompt += "\n\n" + getattr(
                             _verdict, "directive", "",
                         )
@@ -6690,7 +6693,7 @@ class ToolLoopCoordinator:
                             op_id[:12] if op_id else "?",
                             getattr(_verdict, "missing_categories", ()),
                         )
-                    elif _action == "deadlock_failed":
+                    elif _action == ACTION_DEADLOCK_FAILED:
                         # LR3 terminal — MUST propagate (never retry).
                         self._last_records = list(records)
                         self._last_salient_args = list(salient_args)

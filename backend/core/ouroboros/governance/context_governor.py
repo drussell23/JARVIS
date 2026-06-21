@@ -37,6 +37,14 @@ _CATEGORY_TOOLS = {
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
 
+# Verdict action vocabulary — the single source of truth shared with the Venom
+# coordinator's dispatch (tool_executor.py) so a rename can never silently break
+# the safety-critical deadlock_failed branch.
+ACTION_CONTINUE = "continue"
+ACTION_CONVERGE = "converge"
+ACTION_DEADLOCK_BREAK = "deadlock_break"
+ACTION_DEADLOCK_FAILED = "deadlock_failed"
+
 
 def _env_float(name: str, default: float) -> float:
     raw = (os.environ.get(name, "") or "").strip()
@@ -123,7 +131,7 @@ class InformationGainGovernor:
     def observe_round(self, round_index: int, round_tool_results: List[str],
                       ledger: Any) -> GovernorVerdict:
         if not self.enabled:
-            return GovernorVerdict("continue", 1.0, 1.0)
+            return GovernorVerdict(ACTION_CONTINUE, 1.0, 1.0)
         scale = self._budget_scale()
         new = _tokens("\n".join(round_tool_results or []))
         sim = _cosine(new, self._corpus)
@@ -137,7 +145,7 @@ class InformationGainGovernor:
 
         decayed = self._low_streak >= self.decay_rounds
         if not decayed:
-            return GovernorVerdict("continue", gain, scale)
+            return GovernorVerdict(ACTION_CONTINUE, gain, scale)
 
         floor_met = True
         missing: Tuple[str, ...] = ()
@@ -149,7 +157,7 @@ class InformationGainGovernor:
             floor_met = True
 
         if floor_met:
-            return GovernorVerdict("converge", gain, scale)
+            return GovernorVerdict(ACTION_CONVERGE, gain, scale)
 
         if self._deadlock_consumed or self._deadlock_pending:
             # LR3 (iron-clad): the one-shot directive was already issued —
@@ -161,11 +169,11 @@ class InformationGainGovernor:
             # deadlock_break (no looping at the safety gate).
             logger.debug("[ContextGovernor] deadlock_failed gain=%.3f missing=%s",
                          gain, missing)
-            return GovernorVerdict("deadlock_failed", gain, scale,
+            return GovernorVerdict(ACTION_DEADLOCK_FAILED, gain, scale,
                                    missing_categories=missing)
         self._deadlock_pending = True
         logger.debug("[ContextGovernor] deadlock_break gain=%.3f missing=%s",
                      gain, missing)
-        return GovernorVerdict("deadlock_break", gain, scale,
+        return GovernorVerdict(ACTION_DEADLOCK_BREAK, gain, scale,
                                missing_categories=missing,
                                directive=self._directive(missing))
