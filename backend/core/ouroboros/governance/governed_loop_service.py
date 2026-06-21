@@ -1967,11 +1967,26 @@ class GovernedLoopService:
         try:
             from pathlib import Path as _Path
             from backend.core.ouroboros.governance.epistemic_quarantine import QuarantineLedger
-            _sess_dir = getattr(self, "_session_dir", None)
             # derive repo root the same way the loop does elsewhere:
             _cfg = getattr(self, "_config", None)
             _root = str(getattr(_cfg, "project_root", "") or "") or "."
-            _sid = _Path(str(_sess_dir)).name if _sess_dir else ""
+            # LR2 reader/writer agreement: resolve the session id the SAME way
+            # the 6c WRITER (orchestrator._resolve_session_id) does -- via the
+            # canonical get_active_session_id() -- with a pid-<getpid()> fallback.
+            # The previous _session_dir-derived id was always "" on the service
+            # (self._session_dir is only ever set on the harness), so the
+            # ``if _sid:`` guard never fired and reconcile never ran. Worse, the
+            # writer keys by get_active_session_id() while this read keyed by
+            # _session_dir.name -- a latent mismatch. Now they agree.
+            _sid = ""
+            try:
+                from backend.core.ouroboros.governance.strategic_direction import get_active_session_id
+                _sid = str(get_active_session_id() or "")
+            except Exception:  # noqa: BLE001
+                _sid = ""
+            if not _sid:
+                import os as _os
+                _sid = f"pid-{_os.getpid()}"
             if _sid:
                 _led = QuarantineLedger(
                     str(_Path(_root) / ".jarvis" / "epistemic_quarantine.jsonl"),
