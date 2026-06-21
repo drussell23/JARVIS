@@ -1388,6 +1388,35 @@ class GovernedOrchestrator:
     # the list identity held inside ``self._state``, not on a local
     # copy — so the existing call sites keep working unchanged.
 
+    def _resolve_session_id(self) -> str:
+        """Best-available session id for session-scoped memory quarantine (LR2).
+        Falls back to a stable per-process token so a NEW process (a NEW soak) is
+        a NEW session scope even if no explicit session id is plumbed. Never raises."""
+        try:
+            # Canonical session source used elsewhere in the orchestrator.
+            from backend.core.ouroboros.governance.strategic_direction import (
+                get_active_session_id,
+            )
+            _v = get_active_session_id()
+            if _v:
+                return str(_v)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for attr in ("_session_id", "session_id"):
+                v = getattr(self, attr, None)
+                if v:
+                    return str(v)
+            _sd = getattr(self, "_session_dir", None)
+            if _sd:
+                from pathlib import Path as _P
+                return _P(str(_sd)).name
+        except Exception:  # noqa: BLE001
+            pass
+        # stable per-process fallback (a process == a session for the daemon)
+        import os as _os
+        return f"pid-{_os.getpid()}"
+
     @property
     def _subagent_scheduler(self) -> Any:
         """Alias to ``_config.execution_graph_scheduler``.
@@ -3987,6 +4016,26 @@ class GovernedOrchestrator:
                                 ctx.op_id, _plan_decision.approver,
                             )
             ctx = ctx.advance(OperationPhase.GENERATE)
+
+            # Cryptographic Truth Guard (spec 5.3.1 / LR2): re-validate the prefetch
+            # manifest against live disk right before it is consumed. Stale entries
+            # are dropped from the seed (Venom reads them fresh) and quarantined
+            # (session-scoped) for sibling workers + teardown reconcile. Fail-soft.
+            if getattr(ctx, "prefetch_manifest", ()):
+                try:
+                    from backend.core.ouroboros.governance.epistemic_prefetch import revalidate_manifest
+                    from backend.core.ouroboros.governance.epistemic_quarantine import QuarantineLedger
+                    _root = str(self._config.project_root)
+                    _sid = self._resolve_session_id()
+                    _led = QuarantineLedger(
+                        path=os.path.join(_root, ".jarvis", "epistemic_quarantine.jsonl"),
+                        session_id=_sid,
+                    )
+                    _validated = revalidate_manifest(ctx.prefetch_manifest, _root, ledger=_led)
+                    if _validated != ctx.prefetch_manifest:
+                        ctx = dataclasses.replace(ctx, prefetch_manifest=_validated)
+                except Exception:  # noqa: BLE001 — never block GENERATE
+                    pass
 
             # ── Option C: DW topology early-detection circuit breaker ──
             # Pre-GENERATE check: if route=BACKGROUND AND topology says

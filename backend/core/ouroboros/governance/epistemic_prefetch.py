@@ -181,3 +181,38 @@ async def build_prefetch_manifest(
     except Exception:  # noqa: BLE001 — never block GENERATE on prefetch
         logger.debug("[EpistemicPrefetch] build swallowed", exc_info=True)
         return ()
+
+
+def revalidate_manifest(manifest, root: str, ledger=None):
+    """Cryptographic Truth Guard (spec 5.3.1, LR2) at CONSUMPTION time.
+
+    Re-hash each manifest entry against live disk; keep entries whose live hash
+    still matches the stored sha256, DROP entries that are stale or unreadable
+    (so Venom reads them fresh instead of ingesting stale content). When a
+    ``ledger`` is given, stale entries are quarantined (session-scoped) so
+    sibling workers + the teardown reconcile see them. Returns the filtered
+    tuple. Never raises."""
+    try:
+        if not manifest:
+            return ()
+        import os as _os
+        kept = []
+        for e in manifest:
+            rel = getattr(e, "rel_path", "")
+            stored = getattr(e, "sha256", "")
+            if not rel or not stored:
+                continue
+            _data, live = atomic_read_and_hash(_os.path.join(root, rel))
+            if live and live == stored:
+                kept.append(e)
+            else:
+                # stale or unreadable -> drop from seed; quarantine if possible
+                if ledger is not None:
+                    try:
+                        ledger.quarantine(rel, reason="stale_at_consume",
+                                          root=root, expected_sha=stored)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return tuple(kept)
+    except Exception:  # noqa: BLE001 — Truth Guard must never block generation
+        return tuple(manifest or ())  # fail-open to the unvalidated manifest
