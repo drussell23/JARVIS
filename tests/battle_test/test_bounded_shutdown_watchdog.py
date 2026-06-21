@@ -433,3 +433,59 @@ def test_harness_wires_watchdog_at_three_sites():
     assert "_wdg.disarm()" in src
     # Construction at __init__
     assert "BoundedShutdownWatchdog as _BoundedShutdownWatchdog" in src
+
+
+# ---- Sovereign Telemetry Flush Failsafe — pre-exit flush hook (2026-06-21) ----
+def test_pre_exit_flush_invoked_before_exit_on_deadline(monkeypatch):
+    monkeypatch.setenv("JARVIS_BATTLE_BOUNDED_SHUTDOWN_ENABLED", "true")
+    order = []
+    wdg = BoundedShutdownWatchdog(
+        exit_fn=lambda code: order.append(("exit", code)),
+        sleep_fn=lambda s: None,
+    )
+    try:
+        wdg.register_pre_exit_flush(lambda: order.append(("flush", None)))
+        wdg.arm(reason="wall_clock_cap", deadline_s=0.0)
+        deadline = time.monotonic() + 2.0
+        while not wdg.fired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert wdg.fired is True
+        assert ("flush", None) in order
+        assert ("exit", EXIT_CODE_HARNESS_WEDGED) in order
+        assert order.index(("flush", None)) < order.index(
+            ("exit", EXIT_CODE_HARNESS_WEDGED)
+        )
+    finally:
+        wdg.stop(); wdg._thread.join(timeout=1.0)
+
+
+def test_pre_exit_flush_raising_does_not_block_exit(monkeypatch):
+    monkeypatch.setenv("JARVIS_BATTLE_BOUNDED_SHUTDOWN_ENABLED", "true")
+    exit_calls = []
+    def _boom():
+        raise RuntimeError("flush exploded")
+    wdg = BoundedShutdownWatchdog(exit_fn=exit_calls.append, sleep_fn=lambda s: None)
+    try:
+        wdg.register_pre_exit_flush(_boom)
+        wdg.arm(reason="wall_clock_cap", deadline_s=0.0)
+        deadline = time.monotonic() + 2.0
+        while not wdg.fired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert wdg.fired is True
+        assert EXIT_CODE_HARNESS_WEDGED in exit_calls
+    finally:
+        wdg.stop(); wdg._thread.join(timeout=1.0)
+
+
+def test_no_pre_exit_flush_registered_still_exits(monkeypatch):
+    monkeypatch.setenv("JARVIS_BATTLE_BOUNDED_SHUTDOWN_ENABLED", "true")
+    exit_calls = []
+    wdg = BoundedShutdownWatchdog(exit_fn=exit_calls.append, sleep_fn=lambda s: None)
+    try:
+        wdg.arm(reason="wall_clock_cap", deadline_s=0.0)
+        deadline = time.monotonic() + 2.0
+        while not wdg.fired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert EXIT_CODE_HARNESS_WEDGED in exit_calls
+    finally:
+        wdg.stop(); wdg._thread.join(timeout=1.0)
