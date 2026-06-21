@@ -433,6 +433,18 @@ def _inline_extract_fingerprint(tc: "ToolCall") -> str:
         return str(args)[:1000]
 
 
+def _deny_primary_raw_write(is_primary: bool, autonomous: bool) -> bool:
+    """Defense-in-depth (spec 5.2): deny autonomous raw writes to a primary
+    checkout when the deterministic isolation lock is enabled. Pure. Never raises."""
+    import os
+    try:
+        if (os.environ.get("JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED", "true") or "").strip().lower() not in ("1", "true", "yes", "on"):
+            return False
+        return bool(is_primary and autonomous)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _format_denial(tool_name: str, policy_result: PolicyResult) -> str:
     safe_name = tool_name.replace("\n", "\\n").replace("\r", "\\r")
     safe_reason = policy_result.reason_code.replace("\n", "\\n").replace("\r", "\\r")
@@ -3061,6 +3073,42 @@ class GoverningToolPolicy:
                         "this guarantee)."
                     ),
                 )
+
+        # Rule 0e: raw-write guard (spec 5.2 — close the incident vector).
+        # Defense-in-depth: deny AUTONOMOUS raw file writes (edit_file /
+        # write_file) to a PRIMARY checkout when the deterministic isolation
+        # lock is enabled. Today only commits are denied at the OCA boundary;
+        # the incident was raw file writes to the primary checkout. This is a
+        # no-op when the lock is disabled OR not primary OR not autonomous —
+        # byte-identical to legacy behavior. Fail-soft: any error computing
+        # is_primary/autonomous falls through to existing behavior, never
+        # crashing the tool loop.
+        if name in ("edit_file", "write_file"):
+            try:
+                from backend.core.ouroboros.governance.execution_context import (
+                    is_autonomous as _is_autonomous,
+                    is_primary_checkout as _is_primary_checkout,
+                )
+                _is_primary = _is_primary_checkout(repo_root)
+                _autonomous = _is_autonomous(repo_root)
+                if _deny_primary_raw_write(_is_primary, _autonomous):
+                    logger.warning(
+                        "[RawWriteGuard] denied %s op=%s", name, ctx.op_id
+                    )
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.primary_checkout_raw_write",
+                        detail=(
+                            f"Tool {name!r} refused: autonomous raw write to the "
+                            "PRIMARY checkout is denied while the deterministic "
+                            "isolation lock is enabled (spec 5.2 — closes the "
+                            "incident vector). Route this write through an "
+                            "isolated worktree, or supply a signed operator "
+                            "presence marker."
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 — fail-soft: never crash the loop
+                pass
 
         # Rule 1: read_file — path must be within repo_root
         if name == "read_file":

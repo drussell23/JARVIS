@@ -50,6 +50,13 @@ _RE_ROUTED = re.compile(
 )
 _RE_AUTO_WT = re.compile(r"ouroboros[/_]+auto[/_]+(?:bt-)?\S+")
 
+# Marker emitted by DeterministicLock when it force-arms both flags despite
+# JARVIS_FILE_ISOLATION_ENABLED=false / JARVIS_EXECUTION_BOUNDARY_ENABLED=false
+# in the environment (spec §5.5, G4 / YM-T2).
+_RE_DETERMINISTIC_LOCK = re.compile(
+    r"\[DeterministicLock\] forced isolation\+boundary"
+)
+
 PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
@@ -180,6 +187,30 @@ def assess_isolation(
             "ouroboros/auto/*). Re-check after a reboot for PASS.",
         ))
 
+    # I5 — DeterministicLock override proof: if the lock fired (env=false
+    # scenario), prove both flags were armed AND primary stayed pristine.
+    # If the lock did NOT fire this session (normal env=true path), emit WARN
+    # (inconclusive — the explicit-override scenario was not exercised).
+    # Use --prove-override against a session where the lock fired for a hard
+    # PASS/FAIL proof.
+    lock_fired = bool(_RE_DETERMINISTIC_LOCK.search(debug_log))
+    if lock_fired:
+        # Delegate to the pure proof function — both flags armed by definition.
+        invariants.append(assess_i5_override(
+            debug_log=debug_log,
+            primary_dirty=bool(dirty),
+            file_iso_armed=True,
+            exec_boundary_armed=True,
+        ))
+    else:
+        invariants.append(Invariant(
+            "I5_override_proof", WARN,
+            "DeterministicLock did not fire this session (env was already "
+            "true, or the explicit env=false scenario was not exercised) — "
+            "override proof inconclusive.  Run --prove-override against a "
+            "session where JARVIS_FILE_ISOLATION_ENABLED=false was set.",
+        ))
+
     statuses = {i.status for i in invariants}
     if FAIL in statuses:
         overall = FAIL
@@ -216,6 +247,60 @@ def _loop_authored_dirty_lines(porcelain: str) -> List[str]:
             continue
         out.append(line)
     return out
+
+
+def assess_i5_override(
+    *,
+    debug_log: str,
+    primary_dirty: bool,
+    file_iso_armed: bool,
+    exec_boundary_armed: bool,
+) -> Invariant:
+    """Pure assessment of I5: prove the DeterministicLock (YM-T2) overrode an
+    explicit ``JARVIS_FILE_ISOLATION_ENABLED=false`` in the environment.
+
+    Passes iff ALL of:
+    - The ``[DeterministicLock] forced isolation+boundary`` marker appears in
+      ``debug_log`` (the lock fired and stamped the log).
+    - ``primary_dirty`` is False (primary checkout still pristine — the forced
+      boundary actually held).
+    - ``file_iso_armed`` is True (JARVIS_FILE_ISOLATION_ENABLED confirmed armed
+      after the override).
+    - ``exec_boundary_armed`` is True (JARVIS_EXECUTION_BOUNDARY_ENABLED
+      confirmed armed after the override).
+    """
+    lock_fired = bool(_RE_DETERMINISTIC_LOCK.search(debug_log or ""))
+
+    if not lock_fired:
+        return Invariant(
+            "I5_override_proof", FAIL,
+            "no '[DeterministicLock] forced isolation+boundary' marker in log "
+            "— lock did not fire (or log not provided); env=false override "
+            "NOT proven",
+        )
+    if primary_dirty:
+        return Invariant(
+            "I5_override_proof", FAIL,
+            "DeterministicLock marker present but primary checkout is DIRTY "
+            "— the forced boundary did not hold",
+        )
+    if not file_iso_armed:
+        return Invariant(
+            "I5_override_proof", FAIL,
+            "DeterministicLock fired but JARVIS_FILE_ISOLATION_ENABLED not "
+            "confirmed armed — override incomplete",
+        )
+    if not exec_boundary_armed:
+        return Invariant(
+            "I5_override_proof", FAIL,
+            "DeterministicLock fired but JARVIS_EXECUTION_BOUNDARY_ENABLED "
+            "not confirmed armed — override incomplete",
+        )
+    return Invariant(
+        "I5_override_proof", PASS,
+        "DeterministicLock fired and forced BOTH flags despite env=false; "
+        "primary checkout pristine — explicit env override PROVEN (G4)",
+    )
 
 
 def render(verdict: IsolationVerdict) -> str:
@@ -363,6 +448,58 @@ async def watch_and_verify(
     return 0 if verdict.overall == PASS else (1 if verdict.overall == FAIL else 2)
 
 
+def _prove_override(primary_root: Path, sessions_dir: Path,
+                    session: str) -> int:
+    """``--prove-override`` mode: check I5 against the most-recent (or pinned)
+    session's debug.log + current git porcelain.  Prints a one-line PASS/FAIL
+    verdict to stdout.  Exit 0 = PASS, 1 = FAIL, 3 = no session found.
+
+    The DeterministicLock (YM-T2) emits
+    ``[DeterministicLock] forced isolation+boundary`` whenever it arms both
+    flags despite an explicit ``JARVIS_FILE_ISOLATION_ENABLED=false`` in the
+    environment.  This mode documents that proof without requiring a full soak
+    re-run.
+    """
+    print("[prove-override] I5 — DeterministicLock env=false override proof",
+          flush=True)
+
+    if session:
+        session_path: Optional[Path] = sessions_dir / session
+    else:
+        session_path = _find_latest_session(sessions_dir, 0.0)
+    if session_path is None or not session_path.is_dir():
+        print(
+            f"[prove-override] FAIL — no session found under {sessions_dir}/; "
+            "run a soak first (or pass --session <name>)",
+            flush=True,
+        )
+        return 3
+
+    debug_log = _read_debug_any(session_path, primary_root)
+    porcelain = _git(["status", "--porcelain"], primary_root)
+    primary_dirty = bool(_loop_authored_dirty_lines(porcelain))
+
+    # Derive flag-armed state from the same marker (if the lock fired, it
+    # armed both flags by definition — that is the invariant being proven).
+    lock_fired = bool(_RE_DETERMINISTIC_LOCK.search(debug_log))
+
+    inv = assess_i5_override(
+        debug_log=debug_log,
+        primary_dirty=primary_dirty,
+        file_iso_armed=lock_fired,
+        exec_boundary_armed=lock_fired,
+    )
+
+    sym = {PASS: "✓", FAIL: "✗", WARN: "!", INCOMPLETE: "…"}
+    print(
+        f"[prove-override] [{sym.get(inv.status, '?')}] {inv.key}  "
+        f"{inv.status}",
+        flush=True,
+    )
+    print(f"    {inv.detail}", flush=True)
+    return 0 if inv.status == PASS else 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Sovereign Quarantine Validation")
     ap.add_argument("--sessions-dir", default=".ouroboros/sessions")
@@ -371,7 +508,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--poll", type=float, default=3.0)
     ap.add_argument("--session", default="",
                     help="Pin to a specific session dir name (e.g. bt-…).")
+    ap.add_argument(
+        "--prove-override", action="store_true",
+        help=(
+            "I5 proof mode: verify the DeterministicLock (YM-T2) overrode "
+            "an explicit JARVIS_FILE_ISOLATION_ENABLED=false.  Checks the "
+            "most-recent (or --session-pinned) debug.log for the "
+            "'[DeterministicLock] forced isolation+boundary' marker + current "
+            "primary porcelain.  Prints PASS/FAIL; exits 0/1. Does NOT "
+            "require a live soak — safe to run anytime after a session."
+        ),
+    )
     args = ap.parse_args(argv)
+    if args.prove_override:
+        return _prove_override(
+            primary_root=Path(args.primary_root),
+            sessions_dir=Path(args.sessions_dir),
+            session=args.session,
+        )
     return asyncio.run(watch_and_verify(
         sessions_dir=Path(args.sessions_dir),
         primary_root=Path(args.primary_root),

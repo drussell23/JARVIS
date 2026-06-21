@@ -28,11 +28,20 @@ _QPATH = "/repo/.worktrees/ouroboros__auto__bt-2026-06-16-x"
 _COMPLETE = {"session_outcome": "complete"}
 
 
+_LOCK_MARKER = (
+    "[DeterministicLock] forced isolation+boundary despite env "
+    "(primary checkout, autonomous) root=/repo session=bt-2026-06-16-x"
+)
+
+
 def test_all_invariants_pass():
+    # I5 requires the DeterministicLock marker to be present in the log
+    # (otherwise I5 is WARN/inconclusive, which demotes the overall verdict).
     log = (
         "phase=GENERATE\n" + _ROUTED + "\n"
         f"APPLY wrote {_QPATH}/backend/x.py\n"
         f"VALIDATE cwd={_QPATH}\n"
+        + _LOCK_MARKER + "\n"
     )
     v = vfi.assess_isolation(
         debug_log=log,
@@ -47,6 +56,7 @@ def test_all_invariants_pass():
     assert keys["I2_mutations_quarantined"] == vfi.PASS
     assert keys["I3_primary_pristine"] == vfi.PASS
     assert keys["I4_worktree_reaped"] == vfi.PASS
+    assert keys["I5_override_proof"] == vfi.PASS
 
 
 def test_primary_dirty_fails_i3():
