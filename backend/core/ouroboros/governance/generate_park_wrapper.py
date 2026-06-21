@@ -476,33 +476,65 @@ async def _spawn_park_continuation(
         _continuation_timeout = max(_legacy_timeout, _thinking_cont_timeout)
     else:
         _continuation_timeout = _legacy_timeout
-    # Sovereign Transport Profiler Matrix (2026-06-20) — continuation/batch budget
-    # coherence. The reason this op was PARKED is that it is batch-bound; its inner
-    # provider call gets the batch budget (force_batch → _compute_primary_budget →
-    # JARVIS_DW_BATCH_TIMEOUT_S, default 300s). If the out-of-pool continuation's
-    # OUTER wait_for stays at the legacy ~185s gen wall, it SEVERS the batch before
-    # it completes — the live wedge: 7 batches completed at the DW level (one op at
-    # 257s) yet every op errored because the 185s continuation cancelled them first.
-    # Widen the continuation to the SAME batch floor (batch_cap + overhead, ~330s)
-    # the budget layer already granted — pure alignment, NOT a blind extension.
-    # max() only widens, never shrinks. Fail-soft → legacy on any error.
+    # Sovereign Infinite-Horizon Batch Matrix (2026-06-20). The op was PARKED
+    # because it is batch-bound — its worker slot is FREED, so it costs zero CPU
+    # while DoubleWord's batch queue churns. The poll layer is lifecycle-aware (it
+    # gives up ONLY on terminal failed/expired/cancelled, else polls on); the only
+    # thing severing an actively-processing batch is the OUTER budget. So decouple
+    # this continuation from the legacy ~185s/330s wall entirely: widen its outer
+    # wait_for to the batch SLA horizon AND hand generate() a FRESH deadline that
+    # far out, so the inner _compute_primary_budget (under the parked-horizon
+    # ContextVar set in _continuation) also gets the horizon. Confined to this
+    # out-of-pool task — an in-pool dispatch never inherits it. Bounded by the
+    # session wall-clock cap in soaks. Fail-soft → legacy budget on any error.
+    _is_batch_horizon_op = False
+    _gen_deadline = deadline
     try:
         if _resolve_async_batch_payload(ctx, _op_route):
             from backend.core.ouroboros.governance.candidate_generator import (
-                force_batch_gen_timeout_floor_s as _batch_floor,
+                batch_sla_horizon_s as _horizon_s,
             )
-            _continuation_timeout = max(_continuation_timeout, _batch_floor())
+            from datetime import timedelta as _td, timezone as _tz
+            _h = _horizon_s()
+            _continuation_timeout = max(_continuation_timeout, _h)
+            # Fresh, far-out deadline so the inner remaining-budget == horizon.
+            _gen_deadline = datetime.now(_tz.utc) + _td(seconds=_h)
+            _is_batch_horizon_op = True
     except Exception:  # noqa: BLE001 — never raise from the timeout calc
-        pass
+        _is_batch_horizon_op = False
+        _gen_deadline = deadline
 
     async def _continuation() -> None:
         store = get_default_store()
+        # Lift the inner force-batch cap to the SLA horizon for THIS task only.
+        _horizon_token = None
+        if _is_batch_horizon_op:
+            try:
+                from backend.core.ouroboros.governance.candidate_generator import (
+                    set_parked_batch_horizon as _set_horizon,
+                )
+                _horizon_token = _set_horizon(True)
+            except Exception:  # noqa: BLE001
+                _horizon_token = None
         try:
             # The actual provider call — out-of-pool, slot is free.
-            generation = await asyncio.wait_for(
-                orch._generator.generate(ctx, deadline),
-                timeout=_continuation_timeout,
-            )
+            try:
+                generation = await asyncio.wait_for(
+                    orch._generator.generate(ctx, _gen_deadline),
+                    timeout=_continuation_timeout,
+                )
+            finally:
+                # Reset the parked-batch-horizon ContextVar as soon as the
+                # provider call returns/raises (success, failure, or cancel) —
+                # the horizon is only meant to cover the generate() await.
+                if _horizon_token is not None:
+                    try:
+                        from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501
+                            reset_parked_batch_horizon as _reset_horizon,
+                        )
+                        _reset_horizon(_horizon_token)
+                    except Exception:  # noqa: BLE001
+                        pass
             await store.complete(
                 token, payload={"generation": generation},
             )
