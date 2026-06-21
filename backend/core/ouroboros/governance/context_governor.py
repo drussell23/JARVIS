@@ -131,8 +131,14 @@ class InformationGainGovernor:
         if floor_met:
             return GovernorVerdict("converge", gain, scale)
 
-        if self._deadlock_consumed:
-            # LR3: one-shot already spent and floor STILL unmet -> fatal.
+        if self._deadlock_consumed or self._deadlock_pending:
+            # LR3 (iron-clad): the one-shot directive was already issued —
+            # either explicitly consumed by the coordinator, OR still pending
+            # from a prior deadlock_break the coordinator failed to mark. Either
+            # way the floor is STILL unmet after the shot, so escalate to fatal.
+            # The governor self-defends against a coordinator that forgets to
+            # call mark_deadlock_round_consumed(); we never emit a second
+            # deadlock_break (no looping at the safety gate).
             return GovernorVerdict("deadlock_failed", gain, scale,
                                    missing_categories=missing)
         self._deadlock_pending = True

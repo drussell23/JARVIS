@@ -78,3 +78,16 @@ def test_deadlock_breaker_is_one_shot():
     g.mark_deadlock_round_consumed()
     v2 = g.observe_round(1, ["aaa"], ledger=None)
     assert v2.action == "deadlock_failed"
+
+
+def test_deadlock_breaker_one_shot_even_if_coordinator_forgets_to_mark():
+    # LR3 self-defense: if the coordinator never calls
+    # mark_deadlock_round_consumed(), a SECOND decay with floor still unmet must
+    # STILL escalate to deadlock_failed -- never a second deadlock_break.
+    g = _gov(floors=_Floors(met=False, missing=("CALL_GRAPH",)),
+             decay_rounds=1, prefetch=["aaa"])
+    v1 = g.observe_round(0, ["aaa"], ledger=None)
+    assert v1.action == "deadlock_break"
+    # coordinator does NOT call mark_deadlock_round_consumed()
+    v2 = g.observe_round(1, ["aaa"], ledger=None)
+    assert v2.action == "deadlock_failed"
