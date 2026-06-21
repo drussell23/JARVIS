@@ -207,6 +207,10 @@ async def maybe_park_or_resume(
     # Path 2 — PARK-EMIT
     # ----------------------------------------------------------------
     queue_pressure = pool is not None and pool.queue_depth() > 0
+    # Sovereign Transport Profiler Matrix (2026-06-20): a known batch-only op is
+    # stamped ASYNC_BATCH_PAYLOAD before the budget layer; it MUST detach regardless
+    # of queue pressure (its provider call is a minutes-long async batch poll).
+    _async_batch = bool(getattr(ctx, "async_batch_payload", False))
     if (
         master_on
         and pool is not None
@@ -215,6 +219,7 @@ async def maybe_park_or_resume(
             provider_route,
             queue_pressure=queue_pressure,
             is_resumed=False,
+            async_batch_payload=_async_batch,
         )
     ):
         # Determine attempt_seq.  For the first GENERATE call this is
