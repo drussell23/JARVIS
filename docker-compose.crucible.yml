@@ -90,6 +90,12 @@ services:
       JARVIS_GRADUATION_WORKSPACE_ENABLED: "true"
       JARVIS_AUTO_COMMIT_WORKSPACE: "/graduation_workspace"
       JARVIS_GRADUATION_GIT_REMOTE: "${JARVIS_GRADUATION_GIT_REMOTE:-github.com/drussell23/JARVIS-AI-Agent.git}"
+      # --- Sovereign Ephemeral Self-Termination Matrix (2026-06-21) ---
+      # This is an EPHEMERAL crucible node — the instant it opens a graduation PR,
+      # it flushes state to GCS and self-deletes its own GCE VM (metadata-server SA
+      # + Compute REST API; no gcloud, no external watcher). Gated here ONLY; the
+      # base image defaults this OFF so non-ephemeral deployments never self-destruct.
+      JARVIS_SOVEREIGN_SELF_TERMINATE_ENABLED: "true"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"

@@ -713,7 +713,7 @@ def _maybe_propose_source_pr(decision: GraduationDecision) -> bool:
 
         async def _go() -> None:
             try:
-                await propose_graduation_pr(
+                _res = await propose_graduation_pr(
                     flag,
                     soak_evidence=evidence,
                     session_ids=session_ids,
@@ -721,6 +721,25 @@ def _maybe_propose_source_pr(decision: GraduationDecision) -> bool:
                     ttft_ceiling_ms=ceiling,
                     repo_root=repo_root,
                 )
+                # Sovereign Ephemeral Self-Termination Matrix (2026-06-21):
+                # the instant a graduation PR opens, the ephemeral crucible
+                # node flushes state to GCS and severs its own compute. Gated
+                # default-OFF (only the ephemeral overlay opts in); fires ONLY
+                # on a genuine pr_url; fail-soft — NEVER undoes the graduation.
+                if (
+                    _res is not None
+                    and getattr(_res, "proposed", False)
+                    and getattr(_res, "pr_url", None)
+                ):
+                    try:
+                        from backend.core.ouroboros.governance.sovereign_self_termination import (  # noqa: E501
+                            trigger_self_termination,
+                        )
+                        await asyncio.to_thread(
+                            trigger_self_termination, _res.pr_url,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[GraduationEngine] PR proposal failed: %s", exc)
 
