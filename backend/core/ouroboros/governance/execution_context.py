@@ -25,6 +25,7 @@ Authority posture: pure detection, stdlib-only at module top, NEVER raises.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import List, Optional
@@ -99,4 +100,21 @@ def is_autonomous(
         return True
 
 
-__all__ = ["is_autonomous", "is_primary_checkout"]
+_DOCKERENV_PATH = "/.dockerenv"
+
+
+def _is_cloud_container() -> bool:
+    """Deterministic best-effort: are we in a designated isolated runtime
+    (cloud node / k8s / docker)? Such runtimes are already isolated, so the
+    deterministic primary-checkout lock should NOT force a worktree there.
+    Never raises."""
+    try:
+        for marker in ("OUROBOROS_CLOUD_NODE", "KUBERNETES_SERVICE_HOST"):
+            if (os.environ.get(marker, "") or "").strip():
+                return True
+        return os.path.exists(_DOCKERENV_PATH)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+__all__ = ["_is_cloud_container", "is_autonomous", "is_primary_checkout"]
