@@ -3922,6 +3922,22 @@ class CandidateGenerator:
                     getattr(exc, "is_terminal_auth_error", lambda: False)()
                 )
 
+                # Zero-Shot latency quarantine (2026-06-20): an explicit
+                # generation TimeoutError (the 180s wall) OR a tool-loop deadline
+                # is unambiguous evidence THIS model is unusable now. Flag it
+                # cold-storage IMMEDIATELY (bypassing the n>=3 σ window that would
+                # let it taint 2 more soaks) so the selector skips it next op. The
+                # ban self-decays after a TTL (autonomic forgiveness). Fail-soft.
+                if isinstance(exc, asyncio.TimeoutError) or _s241_gen_timeout(exc):
+                    try:
+                        from backend.core.ouroboros.governance.dw_discovery_runner import (
+                            get_ttft_observer as _zs_get_obs,
+                        )
+                        _zs_obs = _zs_get_obs()
+                        if _zs_obs is not None and model_id:
+                            _zs_obs.record_timeout(model_id, op_id=op_id_short)
+                    except Exception:  # noqa: BLE001 — never block dispatch
+                        pass
                 if _s241_gen_timeout(exc):
                     # Slice 241 — OUR op-level tool-loop budget exhaustion
                     # (tool_loop_deadline / max_rounds / starved), NOT a DW

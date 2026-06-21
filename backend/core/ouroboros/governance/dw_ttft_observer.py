@@ -173,6 +173,29 @@ def _promotion_ceiling_ms() -> int:
         return 5000
 
 
+def _zeroshot_ttl_s() -> float:
+    """TTL for a zero-shot (1-strike) timeout ban before the model decays back
+    into a probing state. Env ``JARVIS_TTFT_ZEROSHOT_TTL_S``; default 8h. Clamped
+    to [5min, 24h] so a transient API-instability window self-forgives without a
+    typo permanently crippling the fleet OR thrashing on a still-broken model.
+    NEVER raises."""
+    raw = (os.environ.get("JARVIS_TTFT_ZEROSHOT_TTL_S", "") or "").strip()
+    try:
+        v = float(raw) if raw else 28800.0  # 8 hours
+    except (TypeError, ValueError):
+        v = 28800.0
+    return max(300.0, min(v, 24 * 3600.0))
+
+
+def zeroshot_timeout_quarantine_enabled() -> bool:
+    """Master for the zero-shot timeout quarantine. Default TRUE — failure-path-
+    only (only acts on an explicit TimeoutError). =0 reverts to pure σ-based
+    cold-storage. NEVER raises."""
+    return (os.environ.get("JARVIS_TTFT_ZEROSHOT_ENABLED", "true") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _cold_sigma() -> float:
     """``JARVIS_TOPOLOGY_TTFT_COLD_SIGMA`` (default 2.0).
 
@@ -466,6 +489,13 @@ class TtftObserver:
         # drift on the DW dynamic-promotion path). Shares the same
         # RLock + drop-oldest bounded-deque discipline.
         self._latency_samples: Dict[str, Deque[ProviderLatencySample]] = {}
+        # Zero-Shot Decay Matrix (2026-06-20): model_id → ban_unix for models
+        # that hit the explicit generation TimeoutError wall. A single 180s
+        # timeout is UNAMBIGUOUS evidence the model is unusable NOW — no σ window
+        # needed (the n>=3 stddev test would let it taint 2 more soaks first). The
+        # ban is NOT permanent: is_cold_storage decays it after a TTL so a
+        # transient API-instability window self-forgives → model re-enters probing.
+        self._zero_shot_bans: Dict[str, float] = {}
         self._lock = threading.RLock()
         self._loaded = False
 
@@ -525,6 +555,16 @@ class TtftObserver:
                         continue
                 if buf:
                     self._samples[mid] = buf
+            # Zero-Shot bans — additive field; absent in pre-2026-06-20 files
+            # (loads as empty, no schema bump → old state still loads clean).
+            bans_raw = payload.get("zero_shot_bans", {})
+            if isinstance(bans_raw, Mapping):
+                for mid, ts in bans_raw.items():
+                    try:
+                        if isinstance(mid, str):
+                            self._zero_shot_bans[mid] = float(ts)
+                    except (ValueError, TypeError):
+                        continue
 
     def save(self) -> None:
         """Write all sample buffers to disk atomically. NEVER raises."""
@@ -542,6 +582,10 @@ class TtftObserver:
                     ]
                     for mid, buf in self._samples.items()
                 },
+                # Zero-Shot Decay Matrix — persisted so a 1-strike timeout ban
+                # survives the subprocess fork boundary (immortal, like the
+                # entitlement bans) yet still decays by wall-clock TTL on read.
+                "zero_shot_bans": dict(self._zero_shot_bans),
             }
             try:
                 _atomic_write(
@@ -604,6 +648,43 @@ class TtftObserver:
             ))
             self._maybe_autosave()
 
+    def record_timeout(self, model_id: str, op_id: str = "") -> None:
+        """Zero-Shot quarantine (2026-06-20): flag ``model_id`` as cold-storage
+        IMMEDIATELY on an explicit generation TimeoutError — bypassing the n>=3 σ
+        window (a 180s timeout is unambiguous; waiting for a variance window lets
+        the model taint two more soaks). The ban carries a wall-clock timestamp so
+        is_cold_storage can DECAY it after the TTL → the model re-enters probing
+        when the upstream latency resolves. NEVER raises."""
+        if not model_id or not model_id.strip():
+            return
+        if not zeroshot_timeout_quarantine_enabled():
+            return
+        self._ensure_loaded()
+        with self._lock:
+            self._zero_shot_bans[model_id] = time.time()
+            logger.warning(
+                "[TtftObserver] ZERO-SHOT timeout quarantine: model=%s op=%s "
+                "(TTL=%.0fs) — bypassing σ window", model_id, op_id, _zeroshot_ttl_s(),
+            )
+            self._maybe_autosave()
+
+    def _zero_shot_active(self, model_id: str) -> bool:
+        """True iff a non-expired zero-shot ban exists for ``model_id``. Expired
+        bans are decayed (removed) here so the model re-enters probing. Caller
+        holds ``self._lock``. NEVER raises."""
+        ts = self._zero_shot_bans.get(model_id)
+        if ts is None:
+            return False
+        if (time.time() - float(ts)) >= _zeroshot_ttl_s():
+            # TTL elapsed — autonomic forgiveness: decay the ban, re-probe.
+            self._zero_shot_bans.pop(model_id, None)
+            logger.info(
+                "[TtftObserver] zero-shot ban DECAYED (TTL elapsed) — "
+                "model=%s re-enters probing", model_id,
+            )
+            return False
+        return True
+
     def clear(self, model_id: str) -> None:
         """Drop all samples for ``model_id``. Used by sentinel on
         catalog refresh + by operator-driven reset paths. NEVER raises."""
@@ -611,8 +692,14 @@ class TtftObserver:
             return
         self._ensure_loaded()
         with self._lock:
+            removed = False
             if model_id in self._samples:
                 del self._samples[model_id]
+                removed = True
+            if model_id in self._zero_shot_bans:
+                self._zero_shot_bans.pop(model_id, None)
+                removed = True
+            if removed:
                 self._maybe_autosave()
 
     # ------------------------------------------------------------------
@@ -735,6 +822,12 @@ class TtftObserver:
         NEVER raises."""
         if not tracking_enabled():
             return False
+        # Zero-Shot bypass (with TTL decay): an explicit timeout quarantine fires
+        # immediately, no σ window required, and self-forgives after the TTL.
+        self._ensure_loaded()
+        with self._lock:
+            if self._zero_shot_active(model_id):
+                return True
         s = self.stats(model_id)
         if s is None:
             return False
