@@ -1033,7 +1033,22 @@ def get_default_governor() -> SensorGovernor:
     global _default_governor
     with _singleton_lock:
         if _default_governor is None:
-            _default_governor = SensorGovernor()
+            # YM-T10 SEAM 2 — Governor DI (the hard-zero link).
+            # Wire the deterministic operator-presence probe into the governor
+            # so its hard-zero op gate can yield the worker to the operator.
+            # Lazy import inside the construction site avoids an import cycle
+            # (operator_presence imports trinity_event_bus, not sensor_governor).
+            # Byte-identical when yield off: operator_present() returns False
+            # (idle by default) and the governor's hard-zero is itself gated.
+            _operator_active_fn: Optional[Callable[[], bool]] = None
+            try:
+                from backend.core.ouroboros.governance.operator_presence import (
+                    operator_present,
+                )
+                _operator_active_fn = operator_present
+            except Exception:  # noqa: BLE001 — fail-soft; governor still works
+                _operator_active_fn = None
+            _default_governor = SensorGovernor(operator_active_fn=_operator_active_fn)
         return _default_governor
 
 

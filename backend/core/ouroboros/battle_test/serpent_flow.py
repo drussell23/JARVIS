@@ -5126,6 +5126,22 @@ class SerpentREPL:
                     if not line:
                         continue
 
+                    # YM-T10 SEAM 3 — zero-latency operator-presence stamp.
+                    # Every non-empty human submission marks the operator as
+                    # present (a single time.monotonic() write). Lazy import +
+                    # fail-soft: this is the highest-signal human-input
+                    # boundary and must NEVER perturb REPL dispatch. No-op for
+                    # the yield feature when JARVIS_OPERATOR_YIELD_ENABLED off
+                    # (the stamp is harmless; only operator_present() reads it,
+                    # and operator_suspended() stays gated off).
+                    try:
+                        from backend.core.ouroboros.governance.operator_presence import (
+                            note_human_input,
+                        )
+                        note_human_input()
+                    except Exception:
+                        pass  # fail-soft — input dispatch is never blocked
+
                     # Gap #7 Slice 4 — @filepath mention extraction.
                     # Operators type ``@backend/auth.py do X`` and the
                     # path is auto-attached via the existing /attach
