@@ -394,7 +394,10 @@ _FAILFAST_CIRCUIT_OPEN_REASON = "all_providers_exhausted_circuit_open"
 # (and is unit-testable). It is *descriptive* of the already-non-retryable
 # sites plus the new ``deadlock_override_failed`` terminal (raised when LR3's
 # one-shot governance-deadlock breaker fails mid-Venom): retrying a wedged
-# governance deadlock just re-wedges, so it terminates non-retryably.
+# governance deadlock just re-wedges, so it terminates non-retryably. This is
+# the AUTHORITATIVE source of truth for the non-retry decision — the
+# ``except GovernanceDeadlockError`` terminal path consults it via
+# ``_is_nonretryable_terminal`` rather than deciding implicitly.
 _NONRETRYABLE_TERMINAL_REASONS: "frozenset[str]" = frozenset({
     "deadlock_override_failed",      # LR3 governance deadlock breaker failed
     "advisor_blocked",               # OperationAdvisor pre-gen veto
@@ -413,6 +416,12 @@ _NONRETRYABLE_TERMINAL_REASONS: "frozenset[str]" = frozenset({
 
 def _is_nonretryable_terminal(reason_code: str) -> bool:
     """Return True iff ``reason_code`` is a non-retryable terminal reason.
+
+    This is the AUTHORITATIVE registry of terminal reason codes that must never
+    be retried. It is consulted by the ``GovernanceDeadlockError`` terminal path
+    (``except GovernanceDeadlockError`` in ``run``) as the single source of
+    truth for the non-retry decision, and is available to future terminal sites
+    that need the same classification.
 
     Pure, side-effect-free classifier over ``_NONRETRYABLE_TERMINAL_REASONS``.
     Always returns a ``bool`` and never raises (coerces non-str input to str).
@@ -5735,20 +5744,23 @@ class GovernedOrchestrator:
                         "for %s: %s — terminating (non-retryable)",
                         ctx.op_id, _dl_exc,
                     )
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
-                        terminal_reason_code="deadlock_override_failed",
-                    )
-                    await self._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {
-                            "reason": "deadlock_override_failed",
-                            "error": str(_dl_exc)[:200],
-                            "nonretryable": True,
-                        },
-                    )
-                    return ctx
+                    _reason = "deadlock_override_failed"
+                    # Authoritative non-retry registry (single source of truth).
+                    if _is_nonretryable_terminal(_reason):
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code=_reason,
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": _reason,
+                                "error": str(_dl_exc)[:200],
+                                "nonretryable": True,
+                            },
+                        )
+                        return ctx
 
                 except Exception as exc:
                     _err_msg = str(exc)

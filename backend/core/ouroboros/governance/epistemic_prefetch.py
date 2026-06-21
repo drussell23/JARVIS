@@ -207,6 +207,8 @@ def revalidate_manifest(manifest, root: str, ledger=None):
                 kept.append(e)
             else:
                 # stale or unreadable -> drop from seed; quarantine if possible
+                logger.debug("[TruthGuard] stale rel=%s expected=%s live=%s quarantined=%s",
+                             rel, (stored or "")[:12], (live or "")[:12], ledger is not None)
                 if ledger is not None:
                     try:
                         ledger.quarantine(rel, reason="stale_at_consume",

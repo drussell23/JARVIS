@@ -6683,6 +6683,11 @@ class ToolLoopCoordinator:
                         ACTION_CONVERGE, ACTION_DEADLOCK_BREAK, ACTION_DEADLOCK_FAILED,
                     )
                     _action = getattr(_verdict, "action", "continue")
+                    logger.debug("[ContextGovernor] op=%s round=%d gain=%.3f action=%s scale=%.2f",
+                                 op_id[:12] if op_id else "?", round_index,
+                                 getattr(_verdict, "info_gain", -1.0),
+                                 getattr(_verdict, "action", "?"),
+                                 getattr(_verdict, "budget_scale", 1.0))
                     if _action == ACTION_CONVERGE:
                         if not _final_nudge_issued:
                             current_prompt += _final_write_nudge_text()
