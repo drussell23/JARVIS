@@ -57,6 +57,56 @@ def _field(item: Any, key: str, default):
     return getattr(item, key, default)
 
 
+# FileNeighborhood category list -> (Iron Gate category, base relevance).
+# Leverage-ordered: callers (get_callers, exploration weight 2.5) rank highest;
+# semantic_support (seed-origin, graph_proximity 0.5 per oracle fusion) lowest.
+_NEIGHBORHOOD_CATEGORIES = (
+    ("callers", "CALL_GRAPH", 1.0),
+    ("callees", "CALL_GRAPH", 0.9),
+    ("test_counterparts", "COMPREHENSION", 0.8),
+    ("imports", "DISCOVERY", 0.7),
+    ("importers", "DISCOVERY", 0.7),
+    ("inheritors", "STRUCTURE", 0.6),
+    ("base_classes", "STRUCTURE", 0.6),
+    ("semantic_support", "COMPREHENSION", 0.5),
+)
+
+
+def _strip_repo(key: str) -> str:
+    """'repo:rel/path.py' -> 'rel/path.py'. Tolerates a missing 'repo:' prefix."""
+    return key.split(":", 1)[1] if ":" in key else key
+
+
+def _normalize_neighborhood(nbh: Any) -> list:
+    """Coerce oracle's return into a uniform list of
+    {rel_path, score, category_hint} dicts.
+
+    - Falsy -> [].
+    - list/tuple (test shape + future item-shaped callers) -> passthrough.
+    - FileNeighborhood dataclass -> flatten its category lists, mapping each to
+      its Iron Gate category + leverage relevance; dedupe by rel_path keeping
+      the HIGHEST-leverage category (a file that is both a caller and an import
+      is credited as CALL_GRAPH). target_files are intentionally excluded.
+    """
+    if not nbh:
+        return []
+    if isinstance(nbh, (list, tuple)):
+        return list(nbh)
+    best = {}  # rel_path -> (relevance, category_hint)
+    for attr, cat, rel_score in _NEIGHBORHOOD_CATEGORIES:
+        for key in (getattr(nbh, attr, None) or []):
+            rel = _strip_repo(str(key))
+            if not rel:
+                continue
+            prev = best.get(rel)
+            if prev is None or rel_score > prev[0]:
+                best[rel] = (rel_score, cat)
+    return [
+        {"rel_path": rel, "score": sc, "category_hint": cat}
+        for rel, (sc, cat) in best.items()
+    ]
+
+
 async def build_prefetch_manifest(
     *,
     target_files: Tuple[str, ...],
@@ -75,10 +125,11 @@ async def build_prefetch_manifest(
         topk = _topk()
         neighborhood = await oracle.get_fused_neighborhood(
             list(target_files), goal_text, k_semantic=topk)
-        if not neighborhood:
+        items = _normalize_neighborhood(neighborhood)
+        if not items:
             return ()
         ranked = sorted(
-            neighborhood,
+            items,
             key=lambda it: float(_field(it, "score", 0.0) or 0.0),
             reverse=True,
         )[:topk]

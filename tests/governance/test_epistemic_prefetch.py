@@ -75,3 +75,60 @@ def test_seed_byte_budget_truncates_excerpt(monkeypatch, tmp_path):
         oracle=_FakeOracle(neighborhood=nbh), goal_text="g", is_heavy=True))
     assert out[0].content_excerpt == ""
     assert out[0].sha256 != ""
+
+
+class _FakeNeighborhood:
+    def __init__(self, **lists):
+        for k in ("target_files", "imports", "importers", "callers", "callees",
+                  "inheritors", "base_classes", "test_counterparts",
+                  "semantic_support"):
+            setattr(self, k, lists.get(k, []))
+
+
+class _FakeOracleObj:
+    def __init__(self, nbh):
+        self._nbh = nbh
+    def is_semantic_ready(self):
+        return True
+    async def get_fused_neighborhood(self, files, query, k_semantic=8):
+        return self._nbh
+
+
+def test_normalize_passthrough_for_list():
+    items = ep._normalize_neighborhood([{"rel_path": "a.py", "score": 0.5}])
+    assert items == [{"rel_path": "a.py", "score": 0.5}]
+
+
+def test_normalize_dedupes_keeping_highest_leverage():
+    nb = _FakeNeighborhood(callers=["r:x.py"], imports=["r:x.py"])
+    items = ep._normalize_neighborhood(nb)
+    assert len(items) == 1
+    assert items[0]["category_hint"] == "CALL_GRAPH"  # caller(1.0) beats import(0.7)
+
+
+def test_normalizes_real_fileneighborhood(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_EPISTEMIC_PREFETCH_ENABLED", "true")
+    (tmp_path / "caller.py").write_text("import dep\n", encoding="utf-8")
+    (tmp_path / "sem.py").write_text("x = 1\n", encoding="utf-8")
+    import asyncio as _aio
+    nb = _FakeNeighborhood(callers=["jarvis:caller.py"],
+                           semantic_support=["jarvis:sem.py"])
+    out = _aio.run(ep.build_prefetch_manifest(
+        target_files=("a.py", "b.py"), root=str(tmp_path),
+        oracle=_FakeOracleObj(nb), goal_text="g", is_heavy=True))
+    paths = {e.rel_path: e for e in out}
+    assert paths["caller.py"].category_hint == "CALL_GRAPH"
+    assert paths["sem.py"].category_hint == "COMPREHENSION"
+    assert paths["caller.py"].relevance > paths["sem.py"].relevance
+
+
+def test_target_files_excluded_from_normalized(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_EPISTEMIC_PREFETCH_ENABLED", "true")
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    import asyncio as _aio
+    # 'a.py' is BOTH a target and shows up as a caller -> must be excluded
+    nb = _FakeNeighborhood(callers=["jarvis:a.py"])
+    out = _aio.run(ep.build_prefetch_manifest(
+        target_files=("a.py", "b.py"), root=str(tmp_path),
+        oracle=_FakeOracleObj(nb), goal_text="g", is_heavy=True))
+    assert all(e.rel_path != "a.py" for e in out)
