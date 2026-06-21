@@ -7190,7 +7190,10 @@ class BattleTestHarness:
                 # checkpoint with reason=shutdown_cancel before
                 # returning so the in-flight state is captured.
                 try:
-                    if self._session_wal is not None:
+                    if self._session_wal is not None and not self._summary_written:
+                        # Skip the shutdown_cancel checkpoint once the final
+                        # complete summary is on disk — otherwise cancelling the
+                        # WAL during the drain re-clobbers it with in_flight.
                         state = self._slice12g3_build_checkpoint_state(
                             reason="shutdown_cancel",
                         )
@@ -7201,8 +7204,13 @@ class BattleTestHarness:
                     pass
                 raise
             try:
-                if self._session_wal is None:
-                    return  # WAL gone — exit gracefully
+                if self._session_wal is None or self._summary_written:
+                    # WAL gone, OR the final complete summary has been written
+                    # (Telemetry Flush Failsafe) — the periodic checkpoint must
+                    # NEVER overwrite session_outcome=complete with an in_flight
+                    # tick during a hanging drain (the bt-084639 clobber: mtime
+                    # 09:30:01 rewrote the 09:27:10 complete summary → infra).
+                    return
                 state = self._slice12g3_build_checkpoint_state(
                     reason="periodic",
                 )
