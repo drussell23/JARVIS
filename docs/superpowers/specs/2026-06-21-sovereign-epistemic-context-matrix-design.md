@@ -178,7 +178,7 @@ class GovernorVerdict:
 
 #### 5.2.1 Lightweight Semantic Δ (Constraint 2 — Zero-Latency Governor)
 Deep embedding every round is forbidden on the synchronous path.
-- **Primary (sync, in-observer):** TF-IDF / hashed-token cosine over the round's new tool-result text vs the accumulated exploration corpus. Pure stdlib + numpy, sub-millisecond, no model call.
+- **Primary (sync, in-observer):** TF-IDF / hashed-token cosine over the round's new tool-result text vs the accumulated exploration corpus. Pure stdlib + numpy, sub-millisecond, no model call. **The corpus is initialized to the prefetch-DAG excerpts as the round-0 baseline** (LR1) — Round-1 Δ is therefore measured against what memory already supplied, never against an empty cache, so the Governor cannot artificially inflate Information Gain on the first real read.
 - **Refinement (async, off-path):** an `asyncio.create_task` deep-embed via `EmbeddingService` *batched* across rounds; its result, when ready, recalibrates the lightweight estimator's threshold for *subsequent* rounds. The observer **never awaits** it.
 - `info_gain` ∈ [0,1]. Decay = `info_gain < JARVIS_GOVERNOR_MIN_GAIN` (default 0.15) for `JARVIS_GOVERNOR_DECAY_ROUNDS` (default 2) consecutive rounds.
 
@@ -195,9 +195,11 @@ On Δ-decay the governor consults the live `exploration_ledger`:
   1. Computes `missing = required_floor_categories − covered_categories` and the score gap.
   2. Maps each missing category → its canonical tool via `_TOOL_CATEGORY` (CALL_GRAPH→`get_callers`, HISTORY→`git_blame`/`git_log`, STRUCTURE→`list_symbols`, DISCOVERY→`search_code`, COMPREHENSION→`read_file`), targeting the highest-relevance prefetch-manifest paths.
   3. Emits a **strict zero-shot directive** (`directive`) instructing Venom to call exactly those tools on exactly those targets — nothing else — to satisfy the floor immediately.
-  4. The coordinator appends the directive (one bounded round, reusing the enforcement-round cap at `tool_executor.py:4781-4795` so the breaker itself can't loop). After that round the floor is met → graceful handoff.
+  4. The coordinator appends the directive for **exactly ONE dedicated bounded round** (its own counter, distinct from the enforcement-round cap — LR3). After that single round the ledger is re-evaluated:
+     - **Floor now satisfied** → graceful handoff (the intended path).
+     - **Floor STILL unsatisfied** (Venom hallucinated, refused, or failed to fetch the missing categories) → the Governor **MUST NOT loop and MUST NOT fall through to GENERATE_RETRY**. It forcefully fails the operation with terminal `deadlock_override_failed` (a `fatal_governance_error`). This is a hard circuit breaker: we do not tolerate infinite looping at the safety gate.
 
-This *actively bridges* the floor gap rather than passively avoiding it — the loop terminates **mathematically safe** (Iron Gate satisfied) and **never** on `tool_loop_deadline_exceeded`.
+This *actively bridges* the floor gap rather than passively avoiding it — the loop terminates **mathematically safe** (Iron Gate satisfied) and **never** on `tool_loop_deadline_exceeded`. The only non-success exit is the explicit one-shot circuit-breaker fatal.
 
 #### 5.2.4 Handoff invariant
 The governor never raises. The only terminal outcomes it produces are `converge` and `deadlock_break→converge`. The pre-existing wall-clock deadline remains an independent backstop owned by the coordinator (untouched), but in the happy path the governor converges before it can fire.
@@ -216,6 +218,7 @@ The governor never raises. The only terminal outcomes it produces are `converge`
 Heavy GOALs may run under `ProcessPoolExecutor` (parallel dispatch / L3 worktrees), so a file can be mutated by a sibling unit mid-verify.
 - **Atomic read-then-hash:** read the file's bytes **once** and hash *those exact bytes* (no read→stat→re-read window). The hash describes a single atomic snapshot; a concurrent writer either lands before or after, never tears the hash.
 - **Cross-process quarantine ledger:** on a detected mismatch, the node is quarantined in a **process-shared invalidation set** so no sibling worker ingests the stale node. Mechanism (honest tradeoff): a small on-disk quarantine ledger at `.jarvis/epistemic_quarantine.jsonl` (append-only, atomic temp+rename, mirrors the `op_context`/`state_drift` `.jarvis` convention) that all workers consult before consuming a memory node. An in-memory `set` is insufficient — it would not cross process boundaries; the on-disk ledger (or a `multiprocessing.Manager` dict when a shared manager is already in scope) is the load-bearing cross-process barrier. Reads are best-effort + fail-open-to-fresh-read (a quarantine-ledger error must never block a legitimate live read).
+- **Session-bound TTL + terminal reconciliation (LR2):** every quarantine record is stamped with the current `session_id`; consult-time filtering ignores any record whose `session_id != current` — so **stale memory from a previous soak can never permanently cripple the oracle** (no infinite TTL). On session termination the FSM **flushes/reconciles** the session's quarantine back to the primary oracle store: each quarantined node is re-hashed against live disk and either (a) re-validated + the oracle node refreshed to ground-truth, or (b) dropped. Reconciliation is fail-soft (a flush error leaves the append-only ledger intact for the next boot to filter out by session_id) and reuses the existing `.jarvis` GCS-vault flush path so the reconciliation survives Spot preemption.
 - **Invariant:** quarantine only ever *removes trust* from memory; it can never cause a patch to apply against stale content (that path is still guarded independently by `state_drift.should_block_apply()` at APPLY).
 
 ---
@@ -251,7 +254,7 @@ Every component returns control unchanged when its flag is off — the loop beha
 - **Oracle cold / absent:** prefetch returns `()`; Venom runs exactly as today. Never block GENERATE on oracle.
 - **Governor exception:** swallowed in the observer (already exception-safe per `tool_executor.py:6554-6569`); loop falls back to existing budget behavior.
 - **Quarantine-ledger I/O error:** fail-open to a fresh live read.
-- **Deadlock-breaker can't satisfy floor in its bounded round:** falls through to the *existing* `ExplorationInsufficientError` → GENERATE_RETRY path (no regression vs today).
+- **Deadlock-breaker can't satisfy floor in its one dedicated round:** terminal `deadlock_override_failed` (`fatal_governance_error`). Hard circuit breaker — no loop, no GENERATE_RETRY fallthrough (LR3). The op fails cleanly and auditably rather than spinning at the safety gate.
 
 ### 6.3 Performance / latency
 - Per-round governor cost: sub-ms (TF-IDF/cosine on cached vectors). No synchronous model calls — Constraint 2.
@@ -294,8 +297,11 @@ Every component returns control unchanged when its flag is off — the loop beha
 
 ---
 
-## 10. Open Questions (resolve during planning)
-- **OQ1.** Exact TF-IDF corpus scope for Δ — per-op accumulated tool-results only, or include the prefetch excerpts as the round-0 baseline? (Leaning: prefetch = round-0 baseline so the first real read's Δ is measured against what memory already supplied.)
-- **OQ2.** Quarantine ledger TTL / compaction — bound size like other `.jarvis` ledgers (reuse an existing ring pattern).
-- **OQ3.** Whether the deadlock-breaker's bounded round should consume an enforcement-round slot or a dedicated counter (leaning: dedicated, so it never starves legitimate enforcement re-prompts).
+## 10. Locked Resolutions (operator-ratified 2026-06-21 — absolute, not open)
+
+- **LR1 — Prefetch is the Δ round-0 baseline.** The TF-IDF/cosine corpus is seeded with the prefetch-DAG excerpts before Round 1. The Governor measures Round-1 Information Gain against what memory already supplied, never against an empty cache. Rationale: an empty baseline artificially inflates Δ on the first real read and defeats the Governor. Implemented in §5.2.1.
+- **LR2 — Quarantine TTL is strictly session-bound, with terminal reconciliation.** Every `.jarvis/epistemic_quarantine.jsonl` record carries the current `session_id`; consult-time filtering ignores foreign-session records (no infinite TTL — stale memory from a prior soak can never permanently cripple the oracle). On session termination the FSM flushes/reconciles the session's quarantine back into the primary oracle store (re-hash → re-validate-and-refresh or drop), fail-soft, over the existing `.jarvis` GCS-vault flush path. Implemented in §5.3.1.
+- **LR3 — Deadlock-breaker is a one-shot circuit breaker.** The Active Iron Gate routing gets EXACTLY ONE dedicated bounded round (its own counter, never the enforcement-round cap). If the floor is still unmet after that round (Venom hallucinated / refused / failed), the Governor forcefully terminates the op with `deadlock_override_failed` (`fatal_governance_error`) — it MUST NOT loop and MUST NOT fall through to GENERATE_RETRY. We do not tolerate infinite loops at the safety gate. Implemented in §5.2.3 and §6.2.
+
+These resolutions are binding inputs to the implementation plan; sub-agents implement them verbatim, not by interpretation.
 ```
