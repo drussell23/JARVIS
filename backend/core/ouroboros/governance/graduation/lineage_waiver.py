@@ -54,6 +54,8 @@ Forward-looking (deferred — separate slice, not in scope here):
 """
 from __future__ import annotations
 
+import os
+
 import re
 
 
@@ -172,6 +174,70 @@ Capture groups:
      ``wall_clock_cap+atexit_fallback`` / etc.)
 
 Bytes-pinned via AST regression."""
+
+
+# Sovereign Temporal Lineage Waiver (2026-06-21) — legacy infra-latency downgrade.
+# A soak downgraded ONLY by the contract metrics predicate (TTFT/cognitive) while
+# having NO actual runner failures was conservatively bucketed outcome=runner
+# (kind=default_conservative), which permanently blocks graduation under the
+# runner==0 gate. Those downgrades were caused by DW batch LATENCY — fixed by the
+# Infinite-Horizon Batch Matrix. This waiver forgives them, but ONLY before the
+# architectural fix landed (temporal bound), so any metric downgrade AFTER the fix
+# is still a ruthless hard runner failure. Forgiven rows route to the audit-visible
+# `waived_legacy_infra_latency` bucket, distinct from clean ops and hard FSM faults.
+LEGACY_INFRA_LATENCY_NOTE_SUFFIX = "contract_metrics_predicate_downgraded"
+LEGACY_INFRA_LATENCY_NO_RUNNER_TOKEN = "complete_no_runner_failures"
+# Cutoff = the Infinite-Horizon Batch Matrix merge commit epoch (558111b,
+# 2026-06-21T06:04:48Z). Env-overridable. Downgrades recorded strictly BEFORE this
+# are legacy infra-latency (waivable); at/after it are hard failures.
+_LATENCY_WAIVER_CUTOFF_DEFAULT = 1782021888.0
+
+
+def latency_waiver_cutoff_epoch() -> float:
+    """Resolve the temporal cutoff (unix epoch) before which a metrics-predicate
+    downgrade is forgiven as legacy infra-latency. Env:
+    ``JARVIS_GRADUATION_LATENCY_WAIVER_CUTOFF_EPOCH``. NEVER raises."""
+    raw = (os.environ.get("JARVIS_GRADUATION_LATENCY_WAIVER_CUTOFF_EPOCH", "") or "").strip()
+    try:
+        return float(raw) if raw else _LATENCY_WAIVER_CUTOFF_DEFAULT
+    except (TypeError, ValueError):
+        return _LATENCY_WAIVER_CUTOFF_DEFAULT
+
+
+def is_legacy_infra_latency_downgrade(
+    *,
+    outcome: str,
+    notes: str,
+    recorded_at_epoch: float,
+    cutoff_epoch: float = None,  # type: ignore[assignment]
+) -> bool:
+    """True iff ``(outcome, notes, recorded_at_epoch)`` is a PRE-fix metrics-
+    predicate downgrade with no actual runner failures — waivable as legacy
+    infra-latency. Tight + temporally bounded:
+
+      * outcome MUST be exactly ``"runner"``.
+      * notes MUST contain ``complete_no_runner_failures`` (zero real faults) AND
+        end with ``contract_metrics_predicate_downgraded`` (metrics-only downgrade).
+      * recorded_at_epoch MUST be > 0 AND strictly BEFORE the cutoff (the
+        Infinite-Horizon fix). A downgrade at/after the fix is NOT waived.
+
+    Pure function. NEVER raises. Non-string / non-positive epoch → False."""
+    if not isinstance(outcome, str) or outcome != "runner":
+        return False
+    if not isinstance(notes, str):
+        return False
+    if LEGACY_INFRA_LATENCY_NO_RUNNER_TOKEN not in notes:
+        return False
+    if not notes.endswith(LEGACY_INFRA_LATENCY_NOTE_SUFFIX):
+        return False
+    try:
+        epoch = float(recorded_at_epoch)
+    except (TypeError, ValueError):
+        return False
+    if epoch <= 0.0:
+        return False
+    cutoff = latency_waiver_cutoff_epoch() if cutoff_epoch is None else cutoff_epoch
+    return epoch < cutoff
 
 
 def is_pre_slice_7c_shutdown_misclassification(
