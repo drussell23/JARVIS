@@ -98,3 +98,30 @@ def test_record_timeout_never_raises():
     o.record_timeout("")        # empty
     o.record_timeout(None)      # type: ignore
     assert o.is_cold_storage("") is False
+
+
+def test_quarantine_guard_predicate_matches_timeout_not_wrapped_runtimeerror():
+    """The candidate_generator seam fires record_timeout iff the RAW provider
+    exception is a TimeoutError. The sentinel-dispatch FSM re-wraps a primary
+    TimeoutError into RuntimeError('all_providers_exhausted:...') downstream, so
+    the OUTER handler never sees TimeoutError — which is exactly why the in-flight
+    quarantine hook must live at the _call_primary seam where the raw exception is
+    visible. This locks in that diagnosis: the guard must reject the wrapped error
+    and accept the raw timeout."""
+    import asyncio
+
+    from backend.core.ouroboros.governance.dw_fault_taxonomy import (
+        is_generation_timeout,
+    )
+
+    def _guard(exc: BaseException) -> bool:
+        return isinstance(exc, asyncio.TimeoutError) or is_generation_timeout(exc)
+
+    # Raw budget timeout from race_or_wait_for → quarantine fires.
+    assert _guard(asyncio.TimeoutError()) is True
+    # The downstream-wrapped exhaustion error → quarantine must NOT fire
+    # (proves the outer handler is the wrong seam; the _call_primary seam is right).
+    wrapped = RuntimeError(
+        "all_providers_exhausted:fallback_skipped:no_fallback_configured"
+    )
+    assert _guard(wrapped) is False
