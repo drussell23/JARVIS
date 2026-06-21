@@ -109,6 +109,17 @@ def cascade_breaker_consult_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _latency_quarantine_enabled() -> bool:
+    """Master for the cold-storage latency quarantine at the DW selector seam.
+    Default TRUE — failure-path-only: it only skips a model the TtftObserver has
+    flagged as COLD_STORAGE (a real TTFT spike) AND only when another candidate
+    remains. When the observer is absent/disabled it short-circuits, so this is a
+    free no-op unless there's positive latency evidence. =0 reverts to the legacy
+    (entitlement-breaker-only) selection. NEVER raises."""
+    raw = (os.environ.get("JARVIS_DW_LATENCY_QUARANTINE_ENABLED", "true") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def autarky_backoff_wait_enabled() -> bool:
     """Master switch for the Sovereign Autarky Backoff-Wait (2026-06-20).
 
@@ -3653,6 +3664,30 @@ class CandidateGenerator:
                 )
                 attempts.append(f"{model_id}:skipped_{state.lower()}")
                 continue
+            # Latency quarantine (2026-06-20): the entitlement breaker (above)
+            # bans 403'd models; this bans models the TtftObserver has flagged as
+            # COLD STORAGE (latest TTFT > mean + Nσ — weights evicted from VRAM →
+            # the 180s-timeout black hole). Reuses the existing observer; only
+            # skips when there's at least one OTHER candidate left to try (never
+            # quarantines the sole remaining model into a no-op). Gated on the
+            # observer's own master flag; fail-open (never blocks dispatch).
+            if _latency_quarantine_enabled() and model_id != ranked_models[-1]:
+                try:
+                    from backend.core.ouroboros.governance.dw_ttft_observer import (
+                        get_ttft_observer as _get_ttft_obs,
+                    )
+                    _obs = _get_ttft_obs()
+                    if _obs is not None and _obs.is_cold_storage(model_id):
+                        logger.info(
+                            "[CandidateGenerator] Latency quarantine: route=%s "
+                            "model=%s COLD_STORAGE (TTFT spike) — skipping to a "
+                            "warmer candidate (op=%s)",
+                            provider_route, model_id, op_id_short,
+                        )
+                        attempts.append(f"{model_id}:skipped_cold_storage")
+                        continue
+                except Exception:  # noqa: BLE001 — observer must never block dispatch
+                    pass
             # Slice 20C — schema drift rotation. If this model has
             # produced a structurally-bad output earlier in this same
             # op (json_parse_error_after_heal / schema_id_hallucination
