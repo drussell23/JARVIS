@@ -52,6 +52,16 @@ services:
       JARVIS_TOPOLOGY_SENTINEL_ENABLED: "true"
       JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED: "true"
       JARVIS_DW_LATENCY_QUARANTINE_ENABLED: "true"
+      # --- Sovereign Transport Profiler & Batch Exemption Matrix (2026-06-20) ---
+      # Learn-then-detach: a batch-only model (RT yields done_before_content) is
+      # learned immortally (dw_transport_profile, GCS-backed), then every op for it
+      # is tagged ASYNC_BATCH_PAYLOAD before the budget layer → extended batch
+      # budget + Zero-Shot quarantine immunity + active park-detachment (frees the
+      # worker, resumes on BatchFutureRegistry webhook/poll). JARVIS_BG_PARK_ENABLED
+      # is the ONLY non-default flip — the park substrate exists but defaults off
+      # per §33.1; the rest default-on (failure-path-only, byte-identical when idle).
+      JARVIS_DW_TRANSPORT_PROFILE_ENABLED: "true"
+      JARVIS_BG_PARK_ENABLED: "true"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"

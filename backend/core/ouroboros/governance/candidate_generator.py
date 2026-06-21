@@ -5451,6 +5451,30 @@ class CandidateGenerator:
                 _force_batch = _slice36_should_force_batch(context)
             except Exception:  # noqa: BLE001 — defensive, legacy budget
                 _force_batch = False
+            # Sovereign Transport Profiler Matrix (2026-06-20) — learn-then-detach.
+            # The transport-hedge (default-on) makes _slice36_should_force_batch
+            # return False, so a batch-ONLY model (RT yields done_before_content)
+            # gets the RT/autarky budget (180s) even though only the batch arm can
+            # win → the batch poll is strangled mid-flight (the live-soak TIMEOUT
+            # root). When the immortal profile knows this model is batch-only, force
+            # the batch budget (reuses the EXISTING force_batch branch in
+            # _compute_primary_budget → batch cap) AND stamp the op
+            # ASYNC_BATCH_PAYLOAD so the Zero-Shot quarantine grants it immunity and
+            # the park layer actively detaches it. Gated + fail-soft → legacy on any
+            # failure (byte-identical when the profile is empty/off).
+            try:
+                if model_id:
+                    from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                        get_transport_profile as _get_tp,
+                    )
+                    if _get_tp().is_batch_only(model_id):
+                        _force_batch = True
+                        try:
+                            context.async_batch_payload = True
+                        except Exception:  # noqa: BLE001 — frozen/legacy ctx
+                            pass
+            except Exception:  # noqa: BLE001 — defensive, legacy budget
+                pass
             # Slice 225 Phase 2 — Sovereign DW Autarky. Read the Claude fallback
             # breaker (read-only, no probe side effect — same _claude_breaker_open
             # predicate the Slice 127 P2.1 IMMEDIATE reroute uses). When the
@@ -5612,9 +5636,20 @@ class CandidateGenerator:
                         from backend.core.ouroboros.governance.dw_fault_taxonomy import (  # noqa: E501
                             is_generation_timeout as _zs_is_timeout,
                         )
+                        # Ban-immunity (Transport Profiler Matrix): an
+                        # ASYNC_BATCH_PAYLOAD op times out only because the batch
+                        # poll is async-slow, NOT because the model is dead — banning
+                        # it would blacklist the fleet's best diff-capable models for
+                        # transport latency. Skip the quarantine for batch-bound ops.
+                        _zs_batch_immune = bool(
+                            getattr(context, "async_batch_payload", False)
+                        )
                         if (
-                            isinstance(_dp_exc, asyncio.TimeoutError)
-                            or _zs_is_timeout(_dp_exc)
+                            not _zs_batch_immune
+                            and (
+                                isinstance(_dp_exc, asyncio.TimeoutError)
+                                or _zs_is_timeout(_dp_exc)
+                            )
                         ):
                             from backend.core.ouroboros.governance.dw_discovery_runner import (  # noqa: E501
                                 get_ttft_observer as _zs_get_obs,

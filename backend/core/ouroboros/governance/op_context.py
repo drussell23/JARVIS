@@ -977,6 +977,12 @@ class OperationContext:
     # fail-soft). Carried forward so the op reaches the governance floor / COMPLETE and
     # the operator sees it (Discord embed / telemetry) rather than the op dying.
     infra_warning: str = ""
+    # Sovereign Transport Profiler Matrix (2026-06-20) — stamped True BEFORE the
+    # budget layer when the resolved DW model is known batch-only (RT yields
+    # done_before_content; learned + immortal in dw_transport_profile). Routes the
+    # op to the extended batch budget, grants Zero-Shot quarantine immunity, and
+    # triggers active park-detachment. Default False → byte-identical legacy.
+    async_batch_payload: bool = False
     rollback_occurred: bool = False
     # P2-6: Runbook-grade observability — cross-operation correlation identifier.
     # For single-repo ops: defaults to op_id (self-referential).

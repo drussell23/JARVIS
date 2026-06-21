@@ -2382,6 +2382,24 @@ class DoublewordProvider:
                         _s193_record_hedge_outcome(winner, rupture_swallowed)
                     except Exception:  # noqa: BLE001
                         pass
+                    # Sovereign Transport Profiler Matrix (2026-06-20) — LEARN step.
+                    # batch winning WITH the RT rupture swallowed is the canonical
+                    # "RT yields done_before_content → batch-only" signal, observed at
+                    # the cleanest point with the resolved model in scope. Record it
+                    # IMMORTALLY so every subsequent op for this model is tagged
+                    # ASYNC_BATCH_PAYLOAD before the budget layer (extended batch
+                    # budget + Zero-Shot immunity + active park-detachment). Gated +
+                    # fail-soft — never perturbs the dispatch.
+                    try:
+                        if winner == "batch" and rupture_swallowed:
+                            from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                                get_transport_profile as _tp_learn,
+                            )
+                            _tp_model = self._resolve_effective_model(context) or ""
+                            if _tp_model:
+                                _tp_learn().record_batch_only(_tp_model)
+                    except Exception:  # noqa: BLE001 — never raise from learn step
+                        pass
 
                 def _s194_on_abandoned(
                     fast_exc: Optional[BaseException],

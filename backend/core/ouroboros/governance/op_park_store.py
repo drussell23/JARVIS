@@ -133,6 +133,12 @@ _ENV_PARK_ROUTES = "JARVIS_BG_PARK_ROUTES"
 # override via JARVIS_BG_PARK_ROUTES (CSV of route names).
 _DEFAULT_PARK_ROUTES = frozenset({"background", "complex"})
 
+# Superset of routes that can dispatch via the DW batch API (Slice 36 route gate
+# is standard/complex; background is batch-native). An ASYNC_BATCH_PAYLOAD op on
+# any of these must detach. Distinct from _DEFAULT_PARK_ROUTES (throughput tuning)
+# because the batch-strangle wedge proved 'standard' diff-codegen needs it too.
+_BATCH_CAPABLE_ROUTES = frozenset({"standard", "complex", "background"})
+
 
 def _resolved_park_routes() -> frozenset:
     """Resolve the set of routes eligible for parking. Read at call time.
@@ -154,6 +160,7 @@ def should_park_for_route(
     *,
     queue_pressure: bool,
     is_resumed: bool = False,
+    async_batch_payload: bool = False,
 ) -> bool:
     """Single source of truth for "should this op park before its
     provider await?"  Pure function — no I/O, no side effects.
@@ -206,6 +213,19 @@ def should_park_for_route(
         return False
     if is_resumed:
         return False
+    # Sovereign Transport Profiler Matrix (2026-06-20) — ACTIVE DETACHMENT.
+    # An ASYNC_BATCH_PAYLOAD op MUST park regardless of queue pressure: its
+    # provider call is a minutes-long async batch poll, so holding the worker slot
+    # for it is pure starvation (the v-180012 fleet-wide wedge), not a throughput
+    # nicety. Detach it unconditionally → free the slot → resume on batch
+    # completion. The route gate here is the SUPERSET of routes that actually
+    # dispatch via batch (standard/complex/background) — NOT the throughput-tuned
+    # _resolved_park_routes (which omits 'standard'); the live wedge proved
+    # standard-route diff-codegen is exactly where batch-only models land.
+    # IMMEDIATE/SPECULATIVE never force-batch (Slice 36 route gate) so the tag is
+    # never set there, but the gate is explicit for defense-in-depth.
+    if async_batch_payload:
+        return (provider_route or "").strip().lower() in _BATCH_CAPABLE_ROUTES
     if not queue_pressure:
         return False
     eligible = _resolved_park_routes()
