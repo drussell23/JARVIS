@@ -67,6 +67,14 @@ services:
       # at the 300s/330s legacy budget. Mirrors the poll horizon (DOUBLEWORD_MAX_WAIT_S).
       # Bounded by the session wall-clock cap (OUROBOROS_BATTLE_MAX_WALL_SECONDS).
       JARVIS_DW_BATCH_SLA_HORIZON_S: "3600"
+      # Wall-cap shutdown with parked batch continuations + DW background loops to
+      # drain takes longer than the 30s default — the wall_clock_cap graceful
+      # _generate_report (which stamps session_outcome=complete) was being cut by
+      # the BoundedShutdownWatchdog os._exit at 30s, leaving only a partial
+      # in_flight summary → graded infra despite state=applied. Give the drain a
+      # bounded-but-sufficient window (well under the 2700s live_fire_soak wait) so
+      # the COMPLETE summary lands and the wall-cap soak grades clean.
+      JARVIS_BATTLE_SHUTDOWN_DEADLINE_S: "180"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"
