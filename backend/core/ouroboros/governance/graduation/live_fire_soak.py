@@ -1166,6 +1166,16 @@ class LiveFireSoakHarness:
         subprocess but the dispatcher never entered its branch).
         """
         env = dict(os.environ)
+        # Aegis Session Lifecycle fix (2026-06-20): each forked battle-test runs
+        # its OWN aegis_preflight, which spawns a FRESH daemon + mints a FRESH
+        # SINGLE-USE bootstrap PSK + a fresh ephemeral daemon URL. Inheriting the
+        # PARENT's (already-consumed) JARVIS_AEGIS_BOOTSTRAP_PSK / stale
+        # JARVIS_AEGIS_URL makes the fork's session/establish hit a consumed PSK
+        # (403 psk_already_consumed) or talk to a dead daemon URL → pre-forward
+        # lease 403 → generation never reaches DW. Strip them so every fork
+        # bootstraps aegis CLEANLY; the fork's own preflight repopulates both.
+        for _stale in ("JARVIS_AEGIS_BOOTSTRAP_PSK", "JARVIS_AEGIS_URL"):
+            env.pop(_stale, None)
         env[flag_name] = "true"
         for dep in get_dependencies(flag_name):
             env[dep] = "true"

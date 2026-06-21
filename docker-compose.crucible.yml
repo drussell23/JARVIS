@@ -43,6 +43,15 @@ services:
       # --- TTFT/AST veto thresholds (env-tunable; defaults explicit) ---
       JARVIS_CRUCIBLE_TTFT_CEILING_MS: "30000"
       JARVIS_CRUCIBLE_TTFT_DEGRADE_RATIO: "1.5"
+      # --- Autonomous Fleet Latency & Entitlement Discovery (Layer 2) ---
+      # Arm the topology sentinel so entitlement_blocked (403) models flip to
+      # TERMINAL_OPEN and the selector EXCLUDES them; arm the heavy probe so it
+      # autonomously discovers entitlement/latency health BEFORE generation
+      # dispatches to a dead/slow model. Latency quarantine (cold-storage skip)
+      # is default-on in code. No hardcoded model whitelist — the fleet adapts.
+      JARVIS_TOPOLOGY_SENTINEL_ENABLED: "true"
+      JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED: "true"
+      JARVIS_DW_LATENCY_QUARANTINE_ENABLED: "true"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"
