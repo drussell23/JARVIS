@@ -974,6 +974,65 @@ def force_batch_gen_timeout_floor_s() -> float:
     return batch_cap + overhead
 
 
+# ---------------------------------------------------------------------------
+# Sovereign Infinite-Horizon Batch Matrix (2026-06-20)
+# ---------------------------------------------------------------------------
+# A PARKED ASYNC_BATCH_PAYLOAD op has had its worker slot freed — it costs ZERO
+# CPU while DoubleWord's batch queue churns. Severing it at the 300s/330s legacy
+# budget while DW is ACTIVELY processing the batch (validating / in_progress /
+# finalizing) is pure waste: the live wedge is mode=TIMEOUT "Batch retrieval
+# failed" (NOT a 403 — the retrieval HTTP path never returned >=300; the batch
+# simply hadn't finished). The poll layer (_adaptive_poll_batch) is ALREADY
+# lifecycle-aware — it returns ONLY on `completed` or terminal `failed/expired/
+# cancelled`, and otherwise keeps polling up to DOUBLEWORD_MAX_WAIT_S. The only
+# thing cutting it short is the OUTER budget. So: when (and ONLY when) the parked
+# out-of-pool continuation is running a batch-bound op, lift the force-batch cap
+# to the batch SLA horizon. Confined to the continuation via an async-task-local
+# ContextVar so an IN-pool dispatch can NEVER inherit the long budget and wedge a
+# live worker. Bounded by the session wall-clock cap in soaks.
+import contextvars as _ctxvars  # noqa: E402
+
+_PARKED_BATCH_HORIZON: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "jarvis_parked_batch_horizon_active", default=False,
+)
+
+
+def batch_sla_horizon_s() -> float:
+    """The async-batch SLA horizon in seconds — how long a PARKED batch op may
+    wait for DW while the worker slot is free. Default mirrors the poll horizon
+    (``DOUBLEWORD_MAX_WAIT_S``, 3600s). Clamped [300s, 24h]. Env override:
+    ``JARVIS_DW_BATCH_SLA_HORIZON_S``. NEVER raises."""
+    default = _envf_or_default("DOUBLEWORD_MAX_WAIT_S", 3600.0)
+    raw = _envf_or_default("JARVIS_DW_BATCH_SLA_HORIZON_S", default)
+    return max(300.0, min(raw, 24 * 3600.0))
+
+
+def set_parked_batch_horizon(active: bool):
+    """Mark the current async task as a parked-batch continuation so
+    ``_compute_primary_budget`` lifts the force-batch cap to the SLA horizon.
+    Returns the ContextVar token; reset it in a finally. NEVER raises."""
+    try:
+        return _PARKED_BATCH_HORIZON.set(bool(active))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reset_parked_batch_horizon(token) -> None:
+    """Reset the parked-batch-horizon ContextVar (paired with set_). NEVER raises."""
+    try:
+        if token is not None:
+            _PARKED_BATCH_HORIZON.reset(token)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _parked_batch_horizon_active() -> bool:
+    try:
+        return bool(_PARKED_BATCH_HORIZON.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def apply_force_batch_deadline_floor(
     gen_timeout_s: float, *, force_batch: bool
 ) -> float:
@@ -7243,7 +7302,17 @@ class CandidateGenerator:
         # (Slice 36 precondition) → no fallback to reserve for, so the batch
         # gets the full remaining runway up to the batch cap.
         if force_batch:
-            batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
+            # Sovereign Infinite-Horizon Batch Matrix: a PARKED batch continuation
+            # (worker freed, zero CPU) gets the full SLA horizon so an
+            # actively-processing DW batch is never severed mid-flight. The
+            # ContextVar is set ONLY by the out-of-pool park continuation, so an
+            # in-pool dispatch keeps the bounded 300s cap (never wedges a live
+            # worker). The poll itself is lifecycle-aware (gives up only on terminal
+            # status), so this just stops the OUTER budget from cutting it short.
+            if _parked_batch_horizon_active():
+                batch_cap = batch_sla_horizon_s()
+            else:
+                batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
             return max(min(total_s, batch_cap), 0.0)
 
         # Slice 225 Phase 2 — Sovereign DW Autarky. When the Claude fallback

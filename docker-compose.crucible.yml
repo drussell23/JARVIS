@@ -62,6 +62,11 @@ services:
       # per §33.1; the rest default-on (failure-path-only, byte-identical when idle).
       JARVIS_DW_TRANSPORT_PROFILE_ENABLED: "true"
       JARVIS_BG_PARK_ENABLED: "true"
+      # Infinite-Horizon Batch Matrix: a PARKED batch op (worker freed, zero CPU)
+      # may wait the full async-batch SLA horizon for DW rather than being severed
+      # at the 300s/330s legacy budget. Mirrors the poll horizon (DOUBLEWORD_MAX_WAIT_S).
+      # Bounded by the session wall-clock cap (OUROBOROS_BATTLE_MAX_WALL_SECONDS).
+      JARVIS_DW_BATCH_SLA_HORIZON_S: "3600"
       # --- Cadence tuning ---
       JARVIS_CRUCIBLE_CADENCE_SLEEP_S: "30"
       OUROBOROS_BATTLE_COST_CAP: "1.00"

@@ -94,6 +94,36 @@ def test_resolve_async_batch_payload_reads_profile_not_frozen_ctx(monkeypatch):
     prof.clear("Qwen/Qwen3.5-397B-A17B-FP8-dottxt")
 
 
+def test_batch_sla_horizon_default_override_clamp(monkeypatch):
+    from backend.core.ouroboros.governance.candidate_generator import (
+        batch_sla_horizon_s,
+    )
+    monkeypatch.delenv("JARVIS_DW_BATCH_SLA_HORIZON_S", raising=False)
+    monkeypatch.delenv("DOUBLEWORD_MAX_WAIT_S", raising=False)
+    assert batch_sla_horizon_s() == 3600.0          # mirrors poll horizon
+    monkeypatch.setenv("JARVIS_DW_BATCH_SLA_HORIZON_S", "1800")
+    assert batch_sla_horizon_s() == 1800.0
+    monkeypatch.setenv("JARVIS_DW_BATCH_SLA_HORIZON_S", "999999")
+    assert batch_sla_horizon_s() == 24 * 3600.0     # clamp 24h
+    monkeypatch.setenv("JARVIS_DW_BATCH_SLA_HORIZON_S", "10")
+    assert batch_sla_horizon_s() == 300.0           # floor
+
+
+def test_parked_batch_horizon_contextvar_isolated():
+    """The horizon ContextVar must default off and be task-local — an in-pool
+    dispatch must NEVER inherit the parked continuation's long budget."""
+    from backend.core.ouroboros.governance.candidate_generator import (
+        set_parked_batch_horizon,
+        reset_parked_batch_horizon,
+        _parked_batch_horizon_active,
+    )
+    assert _parked_batch_horizon_active() is False
+    tok = set_parked_batch_horizon(True)
+    assert _parked_batch_horizon_active() is True
+    reset_parked_batch_horizon(tok)
+    assert _parked_batch_horizon_active() is False
+
+
 def test_resolve_async_batch_payload_false_when_no_batch_only(monkeypatch):
     from backend.core.ouroboros.governance import generate_park_wrapper as GPW
 
