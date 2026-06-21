@@ -207,10 +207,16 @@ async def maybe_park_or_resume(
     # Path 2 — PARK-EMIT
     # ----------------------------------------------------------------
     queue_pressure = pool is not None and pool.queue_depth() > 0
-    # Sovereign Transport Profiler Matrix (2026-06-20): a known batch-only op is
-    # stamped ASYNC_BATCH_PAYLOAD before the budget layer; it MUST detach regardless
-    # of queue pressure (its provider call is a minutes-long async batch poll).
-    _async_batch = bool(getattr(ctx, "async_batch_payload", False))
+    # Sovereign Transport Profiler Matrix (2026-06-20): a known batch-only op MUST
+    # detach regardless of queue pressure (its provider call is a minutes-long async
+    # batch poll). OperationContext is FROZEN, so we cannot stamp a tag on it (the
+    # _resolve_effective_model docstring records the FrozenInstanceError that defeated
+    # the old setattr pattern) — and the budget-seam tag would be set INSIDE generate()
+    # anyway, AFTER this park decision. So resolve it HERE, directly from the immortal
+    # profile: if any ranked DW model for this route is batch-only, the op will dispatch
+    # via batch → detach. Over-parking is harmless (the continuation runs generate()
+    # out-of-pool either way); under-parking re-wedges the worker. Fail-soft.
+    _async_batch = _resolve_async_batch_payload(ctx, provider_route)
     if (
         master_on
         and pool is not None
@@ -285,6 +291,35 @@ async def maybe_park_or_resume(
 # ---------------------------------------------------------------------------
 # Internals — kept here so the seam logic is one file, easy to review
 # ---------------------------------------------------------------------------
+
+
+def _resolve_async_batch_payload(ctx: Any, provider_route: str) -> bool:
+    """True iff this op should be treated as an ASYNC_BATCH_PAYLOAD (detach the
+    worker for a long async batch poll).
+
+    Resolved directly from the immortal transport profile (NOT a ctx tag —
+    OperationContext is frozen, and the budget-seam tag is set inside generate(),
+    too late for this pre-dispatch decision). If ANY ranked DW model for this route
+    is known batch-only, the op may dispatch via batch → detach. NEVER raises —
+    on any failure returns False (legacy in-pool await; never wedges incorrectly,
+    just forgoes the optimization)."""
+    try:
+        from backend.core.ouroboros.governance.dw_transport_profile import (
+            get_transport_profile,
+        )
+        route = (provider_route or "").strip().lower()
+        if route not in ("standard", "complex", "background"):
+            return False
+        from backend.core.ouroboros.governance.provider_topology import (
+            get_topology,
+        )
+        models = get_topology().dw_models_for_route(route) or ()
+        if not models:
+            return False
+        profile = get_transport_profile()
+        return any(profile.is_batch_only(m) for m in models)
+    except Exception:  # noqa: BLE001 — never raise from the park gate
+        return False
 
 
 def _resolve_next_park_attempt(pool: Any, ctx_op_id: str) -> int:
