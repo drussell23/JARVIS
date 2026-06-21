@@ -185,6 +185,24 @@ def topology_backpressure_mult() -> float:
     return min(1.0, raw)
 
 
+def _operator_hard_zero(operator_active: bool) -> bool:
+    """True iff the operator-yield is enabled AND an operator is active.
+
+    When True the governor must admit NO new ops (hard-zero, distinct
+    from the soft 0.2× emergency brake). Pure. Never raises.
+
+    Spec §5.4 — byte-identical when ``JARVIS_OPERATOR_YIELD_ENABLED``
+    is off (default) or when ``operator_active`` is False.
+    """
+    try:
+        raw = os.environ.get("JARVIS_OPERATOR_YIELD_ENABLED", "false") or ""
+        if raw.strip().lower() not in ("1", "true", "yes", "on"):
+            return False
+        return bool(operator_active)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -482,6 +500,7 @@ class SensorGovernor:
         topology_state_fn: Optional[
             Callable[[], Tuple[str, ...]]
         ] = None,
+        operator_active_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._specs: Dict[str, SensorBudgetSpec] = {}
         # Per-sensor deques of emission timestamps (monotonic seconds)
@@ -497,6 +516,13 @@ class SensorGovernor:
         self._topology_state_fn = (
             topology_state_fn or _default_topology_state_fn
         )
+        # Task 7 (spec §5.4) — operator-active hard-zero. When set and
+        # JARVIS_OPERATOR_YIELD_ENABLED is on, request_budget() returns
+        # allowed=False with reason_code='governor.operator_active_yield'
+        # for ALL sensors while the operator is present. Hard-zero —
+        # overrides even a fully-open per-sensor budget. Byte-identical
+        # when None (default) or yield flag is off.
+        self._operator_active_fn: Optional[Callable[[], bool]] = operator_active_fn
         self._lock = threading.Lock()
 
     # -- registration -------------------------------------------------------
@@ -696,6 +722,32 @@ class SensorGovernor:
 
             now = time.monotonic()
             self._evict_expired(now)
+
+            # Task 7 (spec §5.4) — operator-active hard-zero.
+            # Evaluated BEFORE cap math: when an operator is present
+            # the governor emits NO new ops regardless of remaining
+            # budget. Distinct from the soft 0.2× emergency brake.
+            # Fail-soft: callable exceptions → inactive (False).
+            if self._operator_active_fn is not None:
+                try:
+                    _op_active = bool(self._operator_active_fn())
+                except Exception:  # noqa: BLE001
+                    _op_active = False
+                if _operator_hard_zero(_op_active):
+                    _decision = BudgetDecision(
+                        allowed=False,
+                        sensor_name=sensor_name,
+                        urgency=urgency,
+                        posture=posture,
+                        weighted_cap=0,
+                        current_count=len(
+                            self._per_sensor.get(sensor_name, ())
+                        ),
+                        remaining=0,
+                        reason_code="governor.operator_active_yield",
+                    )
+                    self._decisions.append(_decision)
+                    return _decision
 
             brake = self._emergency_brake_active()
             topology_blocked = self._topology_blocking(urgency)
