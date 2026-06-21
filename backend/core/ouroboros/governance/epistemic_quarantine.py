@@ -57,7 +57,12 @@ class QuarantineLedger:
 
     def quarantine(self, rel_path: str, *, reason: str = "",
                    root: str = "", expected_sha: str = "") -> None:
-        """Append a quarantine record for the CURRENT session. Never raises."""
+        """Append a quarantine record for the CURRENT session. Never raises.
+
+        Footgun: a record appended without an explicit ``expected_sha`` will
+        always be classified as ``dropped`` by ``reconcile()`` because the
+        empty string cannot match any live file hash, so the node can never be
+        proven revalidated."""
         rec = {
             "session_id": self._session_id,
             "rel_path": rel_path,
