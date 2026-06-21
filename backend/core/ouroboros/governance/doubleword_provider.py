@@ -1772,6 +1772,24 @@ class DoublewordProvider:
                 "[DoublewordProvider] Batch %s submitted async (model=%s, op=%s)",
                 batch_id, _effective_model, operation_id,
             )
+            # Sovereign Transport Profiler Matrix (2026-06-20) — LEARN step (broad).
+            # ANY model dispatched via the batch path is batch-bound: the system chose
+            # batch for it (force-batch cortex / hedge / sequential fallback), so its
+            # provider call is a minutes-long async batch poll that the RT/autarky
+            # budget (180s) strangles. Record it IMMORTALLY here — the single point
+            # common to ALL batch dispatches (the hedge-outcome seam only sees the
+            # ~1-in-16 ops that actually race; force-batch skips the hedge). The NEXT
+            # op for this model is tagged ASYNC_BATCH_PAYLOAD before the budget layer
+            # → batch budget + Zero-Shot immunity + park-detachment. Learn-then-detach:
+            # first contact may still time out once, then immortal. Gated + fail-soft.
+            try:
+                if _effective_model:
+                    from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                        get_transport_profile as _tp_learn,
+                    )
+                    _tp_learn().record_batch_only(_effective_model)
+            except Exception:  # noqa: BLE001 — never raise from learn step
+                pass
             return PendingBatch(
                 op_id=operation_id,
                 batch_id=batch_id,
