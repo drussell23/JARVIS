@@ -6655,9 +6655,12 @@ class ToolLoopCoordinator:
             # ``round_tool_results`` = this round's read-only EXPLORATION tool
             # output texts (the gain signal — only looking-around counts; a
             # progress tool is excluded, mirroring _READONLY_EXPLORATION_TOOLS).
-            # ``ledger=None``: no ExplorationLedger is held at this seat; the
-            # governor's floor probe is exception-safe and treats an
-            # unavailable floor as satisfied (Task 6 will wire the real ledger).
+            # Task 6a: the real ExplorationLedger is now built LIVE from the
+            # accumulated ToolExecutionRecords and handed to the governor so its
+            # floor probe (the Iron Gate floor adapter) reflects what the model
+            # has actually explored this op. Fail-soft: any ledger-build failure
+            # yields None, which the governor's exception-safe floor probe treats
+            # as satisfied — byte-identical to the pre-6a ``ledger=None`` path.
             if governor is not None:
                 try:
                     _round_readonly_results = [
@@ -6665,8 +6668,16 @@ class ToolLoopCoordinator:
                         for tc, tr, *_ in (exec_results or [])
                         if tc.name in _READONLY_EXPLORATION_TOOLS
                     ]
+                    _live_ledger = None
+                    try:
+                        from backend.core.ouroboros.governance.exploration_engine import (
+                            ExplorationLedger,
+                        )
+                        _live_ledger = ExplorationLedger.from_records(records)
+                    except Exception:  # noqa: BLE001 — ledger advisory; governor handles None
+                        _live_ledger = None
                     _verdict = governor.observe_round(
-                        round_index, _round_readonly_results, None,
+                        round_index, _round_readonly_results, ledger=_live_ledger,
                     )
                     from backend.core.ouroboros.governance.context_governor import (
                         ACTION_CONVERGE, ACTION_DEADLOCK_BREAK, ACTION_DEADLOCK_FAILED,

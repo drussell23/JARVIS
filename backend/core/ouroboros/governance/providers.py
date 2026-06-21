@@ -5422,6 +5422,13 @@ class PrimeProvider:
                 )
             except Exception:  # noqa: BLE001 — never block the tool loop
                 _op_weight_lines = None
+            # Task 6a — Information-Gain Governor for this generation attempt.
+            # build_governor_for returns None when disabled/empty → byte-identical.
+            try:
+                from backend.core.ouroboros.governance.context_governor import build_governor_for
+                _epi_governor = build_governor_for(context)
+            except Exception:  # noqa: BLE001
+                _epi_governor = None
             try:
                 raw, tool_records_list = await self._tool_loop.run(
                     prompt=prompt,
@@ -5435,6 +5442,8 @@ class PrimeProvider:
                     per_round_observer=_eb_observer,
                     repo_root_override=_evidence_override,
                     op_weight_lines=_op_weight_lines,
+                    prefetched_candidates=getattr(context, "prefetch_manifest", None),
+                    governor=_epi_governor,
                 )
             finally:
                 # Idempotent close — no-op when master flag off.
@@ -9423,6 +9432,13 @@ class ClaudeProvider:
                 )
             except Exception:  # noqa: BLE001 — never block the tool loop
                 _op_weight_lines = None
+            # Task 6a — Information-Gain Governor for this generation attempt.
+            # build_governor_for returns None when disabled/empty → byte-identical.
+            try:
+                from backend.core.ouroboros.governance.context_governor import build_governor_for
+                _epi_governor = build_governor_for(context)
+            except Exception:  # noqa: BLE001
+                _epi_governor = None
             raw, tool_records_list = await self._tool_loop.run(
                 prompt=prompt_text,
                 generate_fn=_generate_raw,
@@ -9434,6 +9450,8 @@ class ClaudeProvider:
                 is_read_only=bool(getattr(context, "is_read_only", False)),
                 repo_root_override=_evidence_override,
                 op_weight_lines=_op_weight_lines,
+                prefetched_candidates=getattr(context, "prefetch_manifest", None),
+                governor=_epi_governor,
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)

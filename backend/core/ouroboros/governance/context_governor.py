@@ -177,3 +177,91 @@ class InformationGainGovernor:
         return GovernorVerdict(ACTION_DEADLOCK_BREAK, gain, scale,
                                missing_categories=missing,
                                directive=self._directive(missing))
+
+
+# ── Sovereign Epistemological Context Matrix — Task 6a: GENERATE-path wiring ──
+# Bridge exploration_engine's Iron Gate floor evaluation into the governor's
+# is_satisfied/missing_categories shape (no re-implementation of scoring), and
+# a fail-soft factory that builds a FRESH governor per generation attempt from
+# the op's prefetch manifest + the SAME Iron Gate floors the post-GENERATE gate
+# uses. exploration_engine is imported LAZILY inside every method/function so a
+# context_governor → exploration_engine edge can never create an import cycle
+# (verified: exploration_engine does NOT import context_governor).
+
+
+class _IronGateFloorAdapter:
+    """Bridges exploration_engine's floor evaluation into the governor's
+    is_satisfied/missing_categories shape. Reuses ExplorationFloors +
+    evaluate_exploration — no re-implementation of scoring. Exception-safe."""
+
+    def __init__(self, floors) -> None:
+        self._floors = floors
+
+    def is_satisfied(self, ledger) -> bool:
+        if ledger is None or self._floors is None:
+            return True
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                evaluate_exploration,
+            )
+            return bool(evaluate_exploration(ledger, self._floors).sufficient)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def missing_categories(self, ledger):
+        if ledger is None or self._floors is None:
+            return ()
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                evaluate_exploration,
+            )
+            verdict = evaluate_exploration(ledger, self._floors)
+            return tuple(c.name for c in verdict.missing_categories)
+        except Exception:  # noqa: BLE001
+            return ()
+
+
+def governor_enabled() -> bool:
+    return (os.environ.get("JARVIS_CONTEXT_GOVERNOR_ENABLED", "true") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _resolve_complexity(context) -> str:
+    """Derive the Iron Gate complexity string from the op context.
+
+    Matches generate_runner / orchestrator EXACTLY: both derive the string fed
+    to ``ExplorationFloors.from_env_with_adapted`` via
+    ``getattr(ctx, "task_complexity", "") or ""`` (orchestrator.py:5009,
+    generate_runner.py:1089). We mirror that so the governor's floor tier ==
+    the real post-GENERATE Iron Gate's tier. Empty string is preserved (the
+    floors helper handles it); we never invent a tier."""
+    return str(getattr(context, "task_complexity", "") or "")
+
+
+def build_governor_for(context):
+    """Construct a FRESH InformationGainGovernor per generation attempt from the
+    op's prefetch manifest + Iron Gate floors. Returns None when disabled or
+    when there's nothing to govern. Fail-soft: never raises."""
+    try:
+        if not governor_enabled():
+            return None
+        manifest = tuple(getattr(context, "prefetch_manifest", ()) or ())
+        excerpts = [e.content_excerpt for e in manifest if getattr(e, "content_excerpt", "")]
+        # Iron Gate floors for this op's complexity (reuse the same source as the
+        # post-GENERATE Iron Gate so the governor's floor == the real gate).
+        complexity = _resolve_complexity(context)
+        floors = None
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                ExplorationFloors,
+            )
+            floors = ExplorationFloors.from_env_with_adapted(complexity)
+        except Exception:  # noqa: BLE001
+            floors = None
+        return InformationGainGovernor(
+            prefetch_excerpts=excerpts,
+            floors=_IronGateFloorAdapter(floors),
+            enabled=True,
+        )
+    except Exception:  # noqa: BLE001 — governor is advisory; never block generation
+        return None
