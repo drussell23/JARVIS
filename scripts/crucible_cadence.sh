@@ -103,6 +103,18 @@ while true; do
     echo "[crucible] soak run returned non-zero (non-fatal)"
   _propose
   _sync_state
+  # Sovereign Fleet-Wide Hibernation Matrix: if 100% of diff-capable DW models
+  # are quarantined (entitlement TERMINAL_OPEN + latency cold-storage), generation
+  # has nowhere to go — DeepSleep instead of burning Spot credits spinning. On
+  # wake, flush the ephemeral quarantine + re-probe so a recovered DW is found.
+  if python3 -m backend.core.ouroboros.governance.fleet_exhaustion --check 2>/dev/null; then
+    DEEP=$(python3 -m backend.core.ouroboros.governance.fleet_exhaustion --deepsleep-s 2>/dev/null || echo 2700)
+    echo "🛌 [crucible] FLEET EXHAUSTED — DeepSleep ${DEEP}s (idling CPU; DW outage/total-quarantine)"
+    sleep "${DEEP}"
+    echo "⏰ [crucible] DeepSleep over — flushing quarantine + re-probing fleet"
+    python3 -m backend.core.ouroboros.governance.fleet_exhaustion --flush 2>&1 | sed 's/^/[fleet] /' || true
+    continue
+  fi
   echo "🧬 [crucible] iteration ${ITER} done — sleeping ${SLEEP_S}s"
   sleep "${SLEEP_S}"
 done
