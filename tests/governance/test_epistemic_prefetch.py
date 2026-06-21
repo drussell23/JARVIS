@@ -110,10 +110,9 @@ def test_normalizes_real_fileneighborhood(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_EPISTEMIC_PREFETCH_ENABLED", "true")
     (tmp_path / "caller.py").write_text("import dep\n", encoding="utf-8")
     (tmp_path / "sem.py").write_text("x = 1\n", encoding="utf-8")
-    import asyncio as _aio
     nb = _FakeNeighborhood(callers=["jarvis:caller.py"],
                            semantic_support=["jarvis:sem.py"])
-    out = _aio.run(ep.build_prefetch_manifest(
+    out = asyncio.run(ep.build_prefetch_manifest(
         target_files=("a.py", "b.py"), root=str(tmp_path),
         oracle=_FakeOracleObj(nb), goal_text="g", is_heavy=True))
     paths = {e.rel_path: e for e in out}
@@ -125,10 +124,9 @@ def test_normalizes_real_fileneighborhood(monkeypatch, tmp_path):
 def test_target_files_excluded_from_normalized(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_EPISTEMIC_PREFETCH_ENABLED", "true")
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
-    import asyncio as _aio
     # 'a.py' is BOTH a target and shows up as a caller -> must be excluded
     nb = _FakeNeighborhood(callers=["jarvis:a.py"])
-    out = _aio.run(ep.build_prefetch_manifest(
+    out = asyncio.run(ep.build_prefetch_manifest(
         target_files=("a.py", "b.py"), root=str(tmp_path),
         oracle=_FakeOracleObj(nb), goal_text="g", is_heavy=True))
     assert all(e.rel_path != "a.py" for e in out)

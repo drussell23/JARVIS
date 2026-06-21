@@ -86,7 +86,9 @@ def _normalize_neighborhood(nbh: Any) -> list:
     - FileNeighborhood dataclass -> flatten its category lists, mapping each to
       its Iron Gate category + leverage relevance; dedupe by rel_path keeping
       the HIGHEST-leverage category (a file that is both a caller and an import
-      is credited as CALL_GRAPH). target_files are intentionally excluded.
+      is credited as CALL_GRAPH). Note: target_files exclusion is applied by
+      build_prefetch_manifest (the caller), not here — this normalizer emits
+      every category file.
     """
     if not nbh:
         return []
