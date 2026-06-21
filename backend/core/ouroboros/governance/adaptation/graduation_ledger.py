@@ -756,6 +756,7 @@ class GraduationLedger:
                 is_incomplete_summary_runner_lineage,
                 is_legacy_contract_downgrade,
                 is_pre_slice_7c_shutdown_misclassification,
+                is_legacy_infra_latency_downgrade,
             )
         except ImportError:
             def is_legacy_contract_downgrade(  # type: ignore
@@ -770,6 +771,11 @@ class GraduationLedger:
                 *, outcome: str, notes: str,
             ) -> bool:
                 return False
+            def is_legacy_infra_latency_downgrade(  # type: ignore
+                *, outcome: str, notes: str, recorded_at_epoch: float,
+                cutoff_epoch: float = None,  # type: ignore[assignment]
+            ) -> bool:
+                return False
         try:
             from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
                 coerce_kind as _coerce_kind,
@@ -782,6 +788,7 @@ class GraduationLedger:
             "clean": 0, "infra": 0, "runner": 0, "migration": 0,
             "runner_legacy_downgrade": 0,
             "runner_incomplete_summary_waived": 0,
+            "waived_legacy_infra_latency": 0,
             "unique_sessions": 0, "required": policy.required_clean_sessions,
         }
         seen_per_outcome: Dict[str, set] = {
@@ -789,6 +796,7 @@ class GraduationLedger:
             "runner": set(), "migration": set(),
             "runner_legacy_downgrade": set(),
             "runner_incomplete_summary_waived": set(),
+            "waived_legacy_infra_latency": set(),
         }
         all_sessions: set = set()
         for r in self._read_all():
@@ -832,6 +840,17 @@ class GraduationLedger:
                     outcome_key = (
                         "runner_incomplete_summary_waived"
                     )
+                    routed = True
+                # Sovereign Temporal Lineage Waiver (2026-06-21) — a PRE-Infinite-
+                # Horizon metrics-predicate downgrade with no actual runner
+                # failures routes to the audit-visible legacy-infra-latency bucket
+                # (temporally bounded; post-fix downgrades stay hard runner faults).
+                if not routed and is_legacy_infra_latency_downgrade(
+                    outcome=outcome_key,
+                    notes=r.notes,
+                    recorded_at_epoch=r.recorded_at_epoch,
+                ):
+                    outcome_key = "waived_legacy_infra_latency"
                     routed = True
                 # Slice 7c (2026-05-07) — pre-Slice-7c shutdown
                 # misclassification waiver. Detects rows
@@ -884,6 +903,7 @@ class GraduationLedger:
             "clean", "infra", "runner", "migration",
             "runner_legacy_downgrade",
             "runner_incomplete_summary_waived",
+            "waived_legacy_infra_latency",
         ):
             counts[k] = min(len(seen_per_outcome[k]), MAX_CLEAN_COUNT)
         counts["unique_sessions"] = min(
@@ -925,6 +945,7 @@ def _zero_progress(flag_name: str) -> Dict[str, int]:
         # Slice 7 lineage waiver — empty-summary attribution
         # bucket; same shape-parity contract as Slice 5.
         "runner_incomplete_summary_waived": 0,
+        "waived_legacy_infra_latency": 0,
         "unique_sessions": 0,
         "required": policy.required_clean_sessions if policy else 3,
     }
