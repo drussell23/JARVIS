@@ -29,6 +29,7 @@ This module owns two layers:
 from __future__ import annotations
 
 import ast
+import asyncio
 import os
 import re
 from dataclasses import dataclass
@@ -221,6 +222,21 @@ async def propose_graduation_pr(
     # The crucible only PROPOSES when the evidence clears the math veto.
     if not manifest_recommends_merge(soak_evidence, required_clean=required_clean):
         return ProposalResult(False, flag, "", None, "evidence_did_not_clear_veto")
+
+    # Sovereign GitOps Identity Matrix (2026-06-21) — autonomously provision a
+    # CLEAN, AUTHORIZED git workspace at repo_root so the proposer NEVER needs a
+    # manual `git clone` + `git config`. Production path only (reviewer is None);
+    # an injected reviewer means the caller owns the repo. Fail-soft.
+    if reviewer is None:
+        try:
+            from backend.core.ouroboros.governance.graduation.graduation_workspace import (  # noqa: E501
+                ensure_clean_workspace,
+            )
+            _ws_ok, _ws_detail = await asyncio.to_thread(ensure_clean_workspace, repo_root)
+            if not _ws_ok:
+                return ProposalResult(False, flag, "", None, f"workspace_unready:{_ws_detail}")
+        except Exception as _ws_exc:  # noqa: BLE001
+            return ProposalResult(False, flag, "", None, f"workspace_error:{_ws_exc}")
 
     if registry is None:
         try:
