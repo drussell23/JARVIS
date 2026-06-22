@@ -682,6 +682,16 @@ class _TeeRouter:
         except Exception:  # noqa: BLE001 — defensive
             pass
         if self._upstream is None:
+            # Persist the orphaned envelope so it is never silently dropped.
+            # Lazy import avoids any circular-import risk; fail-soft so a DLQ
+            # error cannot break the ingest path.
+            try:
+                from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                    intake_dlq as _dlq,
+                )
+                _dlq.append_dlq(envelope, reason="no_router")
+            except Exception:  # noqa: BLE001
+                pass
             return "captured"
         try:
             result = await self._upstream.ingest(envelope)
