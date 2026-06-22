@@ -67,18 +67,46 @@ PIN="$(meta jarvis-dw-primary-override)"
 GH_TOK="$(gcloud secrets versions access latest --secret=github-token \
   --project="${GCP_PROJECT:-jarvis-473803}" 2>/dev/null || true)"
 [ -z "$GH_TOK" ] && GH_TOK="$(meta jarvis-gh-token)"
+# A1: the HMAC secret that validates the SIGNED roadmap.yaml. The reader's
+# REQUIRE_SIGNATURE defaults TRUE, so without this the hydrated roadmap fails
+# verification → zero goals → silent no-op. Travels as instance metadata
+# (project-scoped; same channel as the DW key), never in git/the image.
+HMAC_SECRET="$(meta jarvis-roadmap-hmac-secret)"
 {
   [ -n "$DW_KEY" ] && echo "DOUBLEWORD_API_KEY=$DW_KEY"
   [ -n "$PIN" ] && echo "JARVIS_DW_PRIMARY_OVERRIDE=$PIN"
   # JIT GitHub auth — gh CLI + git both read GH_TOKEN; never logged (len only).
   [ -n "$GH_TOK" ] && echo "GH_TOKEN=$GH_TOK"
   [ -n "$GH_TOK" ] && echo "GITHUB_TOKEN=$GH_TOK"
+  # A1 roadmap signature secret — read by roadmap_reader (env_file → container).
+  [ -n "$HMAC_SECRET" ] && echo "JARVIS_ROADMAP_READER_HMAC_SECRET=$HMAC_SECRET"
 } > "$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
-echo "[ignition] .env written (DW key len=${#DW_KEY}, pin=${PIN:-<default>}, gh_token len=${#GH_TOK})"
+echo "[ignition] .env written (DW key len=${#DW_KEY}, pin=${PIN:-<default>}, gh_token len=${#GH_TOK}, hmac len=${#HMAC_SECRET})"
 [ -z "$DW_KEY" ] && echo "[ignition] WARNING: no jarvis-dw-api-key metadata — DW calls will 401"
 [ -z "$GH_TOK" ] && echo "[ignition] WARNING: no github-token secret / jarvis-gh-token metadata — graduation PRs cannot be pushed"
+[ -z "$HMAC_SECRET" ] && echo "[ignition] WARNING: no jarvis-roadmap-hmac-secret metadata — signed roadmap will FAIL verification (no file-00 will emit)"
 mkdir -p "$APP_DIR/.jarvis"
+
+# ---- 3c. A1 Strategic Ignition — hydrate the SIGNED roadmap from the GCS Vault.
+# The Vault (gs://<project>-deployments/crucible-state/.jarvis) is the source of
+# truth where the operator-signed roadmap + graduation ledgers live. Pull
+# roadmap.yaml from it so roadmap_reader has GOAL-001 (the first file-00) to
+# decompose + emit. Uses the same host gcloud already relied on above (gcloud
+# secrets, line ~67). On any miss, fall back to the committed UNSIGNED draft
+# (reader needs REQUIRE_SIGNATURE=false to parse that) so the node still has *a*
+# roadmap rather than silently emitting nothing.
+ROADMAP_VAULT="gs://${GCP_PROJECT:-jarvis-473803}-deployments/crucible-state/.jarvis/roadmap.yaml"
+echo "[ignition] hydrating signed roadmap <- $ROADMAP_VAULT"
+if command -v gcloud >/dev/null 2>&1 && \
+   gcloud storage cp "$ROADMAP_VAULT" "$APP_DIR/.jarvis/roadmap.yaml" 2>/dev/null; then
+  echo "[ignition] roadmap.yaml hydrated from GCS Vault (signed source of truth)"
+elif [ -f "$APP_DIR/.jarvis/roadmap.draft.yaml" ]; then
+  cp "$APP_DIR/.jarvis/roadmap.draft.yaml" "$APP_DIR/.jarvis/roadmap.yaml"
+  echo "[ignition] WARNING: Vault miss — using committed roadmap.draft.yaml (UNSIGNED; set JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE=false to parse it)"
+else
+  echo "[ignition] ERROR: no roadmap source (Vault miss + no committed draft) — roadmap reader will be a NO_ROADMAP no-op"
+fi
 
 # ---- 3b. Amnesia-proofing: RESTORE handled NATIVELY inside the container ----
 # Preemption-resume (pulling the prior .jarvis ledger from GCS) is done by the

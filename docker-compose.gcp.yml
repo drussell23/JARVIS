@@ -81,4 +81,29 @@ services:
       # collection errors from running the whole deps-incomplete tests/ tree.
       JARVIS_INTENT_TEST_DIR: "tests/seed"
       JARVIS_INTENT_TEST_INTERVAL_S: "60"
+      # ── A1 STRATEGIC IGNITION CHAIN (2026-06-22) ─────────────────────────────
+      # Arm the strategic-GOAL source so this cloud node emits its first file-00
+      # (the signed roadmap's GOAL-001) end-to-end and the [A1Trace] breadcrumbs
+      # fire. Ported verbatim from the proven A1 venue
+      # (docker-compose.dw-cortex-soak.yml). Without these the node soaks but the
+      # roadmap daemon never spawns → no strategic GOAL is ever emitted (the exact
+      # silent-no-op A1 exists to kill). The signed roadmap.yaml is hydrated from
+      # the GCS Vault by deploy/gcp_ouroboros_startup.sh; the HMAC secret that
+      # validates it travels via .env (startup writes it from instance metadata),
+      # NEVER committed here.
+      JARVIS_ROADMAP_READER_ENABLED: "1"          # parse signed roadmap → envelopes
+      JARVIS_ROADMAP_ORCHESTRATOR_ENABLED: "1"    # the daemon that emits GOALs into intake
+      JARVIS_GOAL_DECOMPOSITION_ENABLED: "1"      # GOAL → sub-goals
+      JARVIS_MULTI_STEP_ORCHESTRATION_ENABLED: "1"  # sub-goals → emitted pipeline work
+      JARVIS_M10_CADENCE_ENABLED: "1"             # ProposalSynthesizer cadence
+      JARVIS_SUBGOAL_COMPLETION_WRITEBACK_ENABLED: "1"  # close PROPOSED→COMPLETED loop
+      JARVIS_PROGRESS_LEDGER_ENABLED: "1"         # done_count / next_targets tracking
+      # Autonomous-PR path: GOAL-001 edits governance files → boundary gate routes
+      # it to APPROVAL_REQUIRED → ouroboros/review PR (the A1 milestone artifact,
+      # human-reviewed, never auto-merged). Needs GH_TOKEN (startup writes it from
+      # Secret Manager `github-token`).
+      JARVIS_ORANGE_PR_ENABLED: "1"
+      # A1 observability — breadcrumbs + DLQ default-true; pinned for soak audit.
+      JARVIS_A1_TRACE_ENABLED: "1"
+      JARVIS_INTAKE_DLQ_ENABLED: "1"
 
