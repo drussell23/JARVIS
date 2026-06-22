@@ -485,6 +485,12 @@ class CLASSIFYRunner(PhaseRunner):
                         ctx.op_id,
                         is_read_only=ctx.is_read_only,
                         repo_root=_adv_repo_root,
+                        # C1: feed intake evidence so the Advisor extracts
+                        # scoped_symbols (re-injected sub-goals) → call-graph
+                        # blast radius. Matches the orchestrator inline path.
+                        intake_evidence_json=getattr(
+                            ctx, "intake_evidence_json", ""
+                        ) or "",
                     )
 
             if _advisory.decision == AdvisoryDecision.BLOCK:
@@ -494,15 +500,23 @@ class CLASSIFYRunner(PhaseRunner):
                 )
                 if _serpent:
                     await _serpent.stop(success=False)
-                ctx = ctx.advance(
-                    OperationPhase.CANCELLED,
-                    terminal_reason_code="advisor_blocked",
+                # C2 live-path fix: this EXTRACTED CLASSIFY runner is the
+                # default-on path (JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED=true),
+                # so the BLOCK must route through the SAME chunking seam as the
+                # orchestrator's legacy inline block — otherwise recursive
+                # chunking is dormant in production (soak 2026-06-22 caught this:
+                # 17 BLOCKs, 0 decomposed). Delegates to the shared method on the
+                # orchestrator; fail-soft to the exact legacy advisor_blocked.
+                ctx = await orch._decompose_block_or_legacy(ctx, _advisory)
+                _reason = (
+                    getattr(ctx, "terminal_reason_code", None)
+                    or "advisor_blocked"
                 )
                 return PhaseResult(
                     next_ctx=ctx,
                     next_phase=None,
                     status="fail",
-                    reason="advisor_blocked",
+                    reason=_reason,
                     artifacts={
                         "advisory": _advisory,
                         "consciousness_bridge": None,
