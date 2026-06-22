@@ -100,7 +100,7 @@ pygame>=2.5.0  # For audio feedback
 # Note: scikit-learn is already included above as version 1.3.2
 
 # Structured web browsing (optional — search works without it via API)
-playwright>=1.40.0  # For page navigation, content extraction, form automation
+playwright>=1.60.0  # For page navigation, content extraction, form automation
 
 # Computer Vision dependencies
 opencv-python>=4.8.0  # For image processing
