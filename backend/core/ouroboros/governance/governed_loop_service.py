@@ -1134,6 +1134,10 @@ class GovernedLoopService:
         self._feedback_engine: Optional[AutonomyFeedbackEngine] = None
         self._command_consumer_task: Optional[asyncio.Task] = None
         self._feedback_loop_task: Optional[asyncio.Task] = None
+        # C2 -- TransportCircuitBreaker HALF-OPEN probe daemon.
+        # Periodically calls run_probe_if_due for each DW transport lane
+        # so OPEN lanes self-heal. Default-OFF (JARVIS_TRANSPORT_BREAKER_ENABLED).
+        self._transport_breaker_probe_task: Optional[asyncio.Task] = None
         self._safety_net: Optional[ProductionSafetyNet] = None
         self._subagent_scheduler: Optional[Any] = None
         # Gap #3 Slice 5 — hoisted from inner block so the
@@ -1461,6 +1465,29 @@ class GovernedLoopService:
             self._health_probe_task = asyncio.create_task(
                 self._health_probe_loop(), name="health_probe_loop"
             )
+
+            # C2 -- TransportCircuitBreaker HALF-OPEN probe daemon.
+            # Only started when the master gate is ON (default OFF, byte-identical
+            # when disabled). The daemon calls run_probe_if_due periodically so
+            # OPEN batch/realtime lanes self-heal instead of staying OPEN forever.
+            try:
+                from backend.core.ouroboros.governance.transport_circuit_breaker import (
+                    breaker_enabled as _tcb_enabled,
+                )
+                if _tcb_enabled():
+                    self._transport_breaker_probe_task = asyncio.create_task(
+                        self._transport_breaker_probe_loop(),
+                        name="transport_breaker_probe_loop",
+                    )
+                    logger.info(
+                        "[GovernedLoop] C2 TransportCircuitBreaker probe "
+                        "daemon started (JARVIS_TRANSPORT_BREAKER_ENABLED=true)",
+                    )
+            except Exception as _tcb_exc:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] C2 transport breaker probe daemon "
+                    "skipped (import/gate error): %r", _tcb_exc,
+                )
 
             # Slice 5 Arc A — start PostureObserver so SensorGovernor's
             # default_posture_fn sees live readings. Without this, posture
@@ -2181,6 +2208,20 @@ class GovernedLoopService:
                 await self._health_probe_task
             except asyncio.CancelledError:
                 pass
+
+        # C2 -- cancel the TransportCircuitBreaker probe daemon if running.
+        _tcb_task = getattr(self, "_transport_breaker_probe_task", None)
+        if _tcb_task is not None and not _tcb_task.done():
+            _tcb_task.cancel()
+            try:
+                await _tcb_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] transport_breaker_probe_task cancel swallowed",
+                    exc_info=True,
+                )
 
         # YM-T10 SEAM 1 — cancel the operator-presence watcher daemon
         # alongside the other background tasks. Fail-soft.
@@ -6382,6 +6423,82 @@ class GovernedLoopService:
                 return
             except Exception as exc:
                 logger.warning("[GovernedLoop] health_probe_loop error: %s", exc)
+
+    async def _transport_breaker_probe_loop(self) -> None:
+        """C2 -- Periodic HALF-OPEN probe driver for the TransportCircuitBreaker.
+
+        Fired once per ``JARVIS_TRANSPORT_BREAKER_PROBE_INTERVAL_S`` (default 30s).
+        For each lane (batch + realtime) calls ``run_probe_if_due`` so an OPEN
+        lane's recovery deadline check fires and the lane self-heals via the
+        cheap DW ping probe.
+
+        Completely fail-soft: any import / probe error is caught and logged at
+        DEBUG. CancelledError exits cleanly. The daemon is only started when
+        JARVIS_TRANSPORT_BREAKER_ENABLED=true; default OFF = byte-identical.
+
+        Probe function: attempts a lightweight DW catalog/models endpoint GET
+        through the appropriate lane.  Reuses the DW provider's existing
+        ``_dw_batch_lane_healthy`` check for batch, and the realtime streaming
+        pre-flight for realtime. Falls back to a no-op True probe when neither
+        is reachable (safe -- the breaker just transitions OPEN->CLOSED without
+        real network evidence; cost ~0).
+        """
+        import time as _t
+
+        _PROBE_INTERVAL_DEFAULT = 30.0
+
+        async def _probe_fn(lane: str) -> bool:
+            """Minimal bounded DW health probe for the given lane. Never raises."""
+            try:
+                if lane == "batch":
+                    from backend.core.ouroboros.governance.doubleword_provider import (
+                        _dw_batch_lane_healthy as _batch_ok,
+                    )
+                    return bool(_batch_ok())
+                # realtime: reuse the existing preflight gate (side-effect-free).
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    _dw_streaming_warm_degraded as _rt_degraded,
+                )
+                return not bool(_rt_degraded())
+            except Exception:  # noqa: BLE001 -- probe failure = ok=False
+                return False
+
+        while True:
+            try:
+                _interval = 30.0
+                try:
+                    _interval = float(
+                        __import__("os").environ.get(
+                            "JARVIS_TRANSPORT_BREAKER_PROBE_INTERVAL_S",
+                            _PROBE_INTERVAL_DEFAULT,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(max(5.0, _interval))
+                try:
+                    from backend.core.ouroboros.governance.transport_circuit_breaker import (
+                        breaker_enabled as _tcb_on,
+                        get_transport_breaker as _get_tb,
+                        run_probe_if_due as _run_probe,
+                    )
+                    if not _tcb_on():
+                        continue
+                    _tb = _get_tb()
+                    _now = _t.monotonic()
+                    for _lane in ("batch", "realtime"):
+                        await _run_probe(_tb, _lane, _probe_fn, now=_now)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[GovernedLoop] C2 transport breaker probe tick failed",
+                        exc_info=True,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug(
+                    "[GovernedLoop] transport_breaker_probe_loop error: %s", exc,
+                )
 
     async def _curriculum_loop(self) -> None:
         """Publish curriculum signal every interval. Never crashes the service."""
