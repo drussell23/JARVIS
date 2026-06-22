@@ -44,12 +44,47 @@ def _cfg(**over):
     ("raised LocalEgressOverweightError attempted=900000", "EGRESS_BLOCK", False, False),
     ("[SOVEREIGN YIELD] op=x lineage=y stalled reduction", "SOVEREIGN_YIELD", False, False),
     ("created Pull request #69661 ouroboros/review/op-1", "CONVERGENCE", True, False),
-    ("Traceback (most recent call last):", "FATAL", False, True),
+    ("Fatal Python error: Segmentation fault", "FATAL", False, True),
 ])
 def test_classify(line, kind, success, fatal):
     ev = ss.EventMatcher().classify(line)
     assert ev is not None and ev.kind == kind
     assert ev.is_success is success and ev.is_fatal is fatal
+
+
+# -- Boot-handling hardening (incidents #1 sudo + #2 boot-traceback) --------- #
+def test_bare_traceback_is_not_fatal():
+    # A bare boot traceback must NOT classify as FATAL (it auto-killed a healthy
+    # booting node). Only strong death markers are fatal.
+    assert ss.EventMatcher().classify("Traceback (most recent call last):") is None
+    assert ss.EventMatcher().classify("some FATAL-sounding banner text") is None
+
+
+@pytest.mark.parametrize("line", [
+    "sudo: docker: command not found",
+    "ssh: connect to host 1.2.3.4 port 22: Connection refused",
+    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+    "Warning: Permanently added 'compute.123' to the list of known hosts.",
+])
+def test_boot_noise_is_ignored(line):
+    assert ss.is_boot_noise(line) is True
+    assert ss.looks_live(line) is False
+
+
+@pytest.mark.parametrize("line", [
+    "WARNING [A1Trace] accept op=op-1",
+    "CRITICAL [Chunking] decompose emitted 0 sub-goals",
+    "INFO [Orchestrator] Advisor BLOCKED",
+])
+def test_organism_lines_are_live_and_not_noise(line):
+    assert ss.looks_live(line) is True
+    assert ss.is_boot_noise(line) is False
+
+
+def test_strong_fatal_markers_still_fire():
+    for s in ("Fatal Python error: bus error", "container abc exited",
+              "OOMKilled", "exited with code 137"):
+        assert ss.EventMatcher().classify(s).is_fatal is True
 
 
 def test_classify_noise_returns_none():
