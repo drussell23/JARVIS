@@ -1,4 +1,4 @@
-"""transport_circuit_breaker.py -- Sovereign Transport Circuit Breaker (Matrix A1).
+"""transport_circuit_breaker.py -- Sovereign Transport Circuit Breaker (Matrix A1+A2).
 
 Three-state per-lane breaker (CLOSED / OPEN / HALF_OPEN) that rotates DW traffic
 off a dead transport lane (batch) onto the healthy sibling (realtime) and
@@ -12,6 +12,7 @@ Env knobs (all optional, sensible defaults):
     JARVIS_TRANSPORT_BREAKER_MAX_S     (float, default 600.0) -- exp-backoff cap.
     JARVIS_TRANSPORT_BREAKER_JITTER_FRAC (float, default 0.2) -- jitter band.
     JARVIS_TRANSPORT_BREAKER_WINDOW    (int, default 20)    -- rolling-window size.
+    JARVIS_TRANSPORT_BREAKER_PROBE_TIMEOUT_S (float, default 15.0) -- probe timeout.
 
 Design constraints:
 - Pure leaf module -- NO import of candidate_generator (cycle prevention).
@@ -22,12 +23,13 @@ Design constraints:
 """
 from __future__ import annotations
 
+import asyncio
 import collections
 import enum
 import hashlib
 import logging
 import os
-from typing import Deque
+from typing import Awaitable, Callable, Deque
 
 _LOG = logging.getLogger(__name__)
 
@@ -325,6 +327,60 @@ class TransportCircuitBreaker:
             return ls._deadline
         except Exception:
             return 0.0
+
+
+# ---------------------------------------------------------------------------
+# A2: HALF-OPEN async probe driver
+# ---------------------------------------------------------------------------
+
+async def run_probe_if_due(
+    breaker: TransportCircuitBreaker,
+    lane: str,
+    probe_fn: Callable[[str], Awaitable[object]] | None,
+    *,
+    now: float,
+) -> bool | None:
+    """Fire a bounded async health probe when the lane is due for one.
+
+    Protocol:
+    1. Call ``breaker.due_for_probe(lane, now=now)``.
+       - If False (lane not due): return None immediately.
+       - If True: lane transitions OPEN -> HALF_OPEN inside due_for_probe.
+    2. ``await asyncio.wait_for(probe_fn(lane), timeout=<env>)``
+    3. Call ``breaker.note_probe_result(lane, ok=<truthiness>, now=now)``.
+    4. Return the raw probe result.
+
+    Fail-soft: a probe that raises OR times out counts as ok=False.
+    Never propagates exceptions into the caller.
+
+    Env:
+        JARVIS_TRANSPORT_BREAKER_PROBE_TIMEOUT_S (float, default 15.0)
+    """
+    if not breaker.due_for_probe(lane, now=now):
+        return None
+
+    timeout = _env_float("JARVIS_TRANSPORT_BREAKER_PROBE_TIMEOUT_S", 15.0)
+    _SENTINEL = object()  # marks the error path
+    result: object = _SENTINEL
+    ok = False
+    try:
+        result = await asyncio.wait_for(probe_fn(lane), timeout=timeout)  # type: ignore[misc]
+        ok = bool(result)
+    except Exception:
+        _LOG.debug(
+            "[TransportBreaker] probe lane=%s timed-out or raised; ok=False",
+            lane,
+            exc_info=True,
+        )
+        ok = False
+
+    breaker.note_probe_result(lane, ok=ok, now=now)
+
+    # Error path (timeout or raise): sentinel still set -> return False.
+    # Normal path: return the actual probe result (truthy or falsy).
+    if result is _SENTINEL:
+        return False
+    return result  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
