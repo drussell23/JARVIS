@@ -226,8 +226,8 @@ def _apply_rule(body: dict, rule: dict) -> dict:
     """Apply a single sanitize rule to a copy of ``body``.
 
     Handles two directives:
-      - strip: [param, ...] — removes listed top-level keys
-      - floor_reasoning: True — delegates to doubleword_provider reasoning floor
+      - strip: [param, ...] - removes listed top-level keys
+      - floor_reasoning: True - delegates to doubleword_provider reasoning floor
 
     Lazy import of doubleword_provider to avoid circular import cycle.
     NEVER raises (fail-soft -> return body unchanged on any error).

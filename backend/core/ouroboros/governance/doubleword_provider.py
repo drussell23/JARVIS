@@ -5208,6 +5208,20 @@ class DoublewordProvider:
         if response_format is not None:
             body["response_format"] = response_format
 
+        # Sovereign Egress Interceptor (review finding #1) — guard the heavy
+        # non-streaming lane too so I1 (DW never receives an oversized/malformed
+        # request) holds on EVERY generation egress, not just the two GENERATE
+        # chokepoints. Same fail-soft asymmetry: confirmed overweight blocks;
+        # any sanitize/estimate bug passes through.
+        if egress_interceptor_enabled():
+            try:
+                body = sanitize_egress_body(body, effective_model)
+                assert_egress_weight(body, effective_model)
+            except LocalEgressOverweightError:
+                raise
+            except Exception:  # noqa: BLE001 — never block a valid request
+                pass
+
         session = await self._get_session()
         t0 = time.monotonic()
 

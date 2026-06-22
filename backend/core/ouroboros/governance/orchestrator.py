@@ -4742,8 +4742,9 @@ class GovernedOrchestrator:
                 return ctx
 
         # Wave 2 (5) Slice 5a/5b - GENERATERunner delegation gate.
-        # Flag JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED (default false) routes
-        # the 1611-line GENERATE block through the extracted PhaseRunner.
+        # Flag JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED (default TRUE) routes
+        # the 1611-line GENERATE block through the extracted PhaseRunner
+        # (the LIVE path — the inline block below is the legacy fallback).
         # Cross-phase artifacts (generation, _episodic_memory) threaded
         # via artifacts for VALIDATE consumption.
         if _phase_runner_generate_extracted():
