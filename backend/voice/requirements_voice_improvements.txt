@@ -9,7 +9,7 @@ pvporcupine==3.0.2
 
 # Audio Processing (should already be installed)
 librosa>=0.10.0
-soundfile>=0.12.1
+soundfile>=0.14.0
 scipy>=1.11.0
 numpy>=1.24.0
 
