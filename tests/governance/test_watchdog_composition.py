@@ -387,15 +387,14 @@ def test_reinjected_shed_reaches_fixpoint_and_terminates(
 ):
     """End-to-end boundedness via the REAL re-injection mechanism.
 
-    In the live loop the self-healed sub-goal carries the shed text AS its new
-    op description. So on the next stall the self-heal receives ``description ==
-    prior shed text``. shed(shed_text + source) truncated to target converges to
-    a FIXPOINT (once the shed text fills the budget, re-shedding it returns the
-    same bytes). At the fixpoint the shed-hash repeats -> already marked -> the
-    self-heal yields to advisor_blocked. This proves the chain TERMINATES: the
-    self-heal hops are bounded by the number of distinct shed payloads, which is
-    finite because each hop is a monotone non-growing AST reduction toward a
-    fixpoint. Here we drive that re-injection loop directly and assert it stops.
+    In the live loop the self-healed sub-goal is re-injected by the multi-step
+    ``_make_envelope`` as ``f"{title}\\n\\n{description}"`` -- NOT the raw shed
+    text. The OLD version of this test fed back the raw ``description`` only,
+    which masked the title-prefix window shift (the degenerate
+    ~compression_target/82-hop bound). Here we model the REAL envelope transform
+    and assert the chain terminates within ``max_self_heal_hops() + 1`` hops via
+    the bounded per-lineage self-heal counter -- the structural bound that holds
+    regardless of the shed/envelope truncation dynamics.
     """
     target_file = tmp_path / "irr.py"
     target_file.write_text(_HEAVY)
@@ -418,11 +417,15 @@ def test_reinjected_shed_reaches_fixpoint_and_terminates(
     ledger = dedup.get_attempt_ledger()
     orch = _make_orch(router=_FakeRouter())
 
-    # Drive the re-injection loop: each iteration feeds the PRIOR shed text back
-    # as the new op description (exactly what the multi-step emitter does live).
+    max_hops = cw_mod.max_self_heal_hops()
+
+    # Drive the re-injection loop modeling the REAL _make_envelope transform:
+    # each iteration feeds back ``f"{title}\n\n{description}"`` (what the
+    # multi-step emitter produces live), NOT the raw shed text.
     description = "irreducible heavy goal"
     terminated = False
-    for hop in range(25):  # hard cap: must terminate well before this
+    hops_taken = 0
+    for hop in range(max_hops + 5):  # hard cap: must terminate well before this
         ctx = _make_ctx(
             op_id=f"op-irr-{hop}",
             description=description,
@@ -440,12 +443,79 @@ def test_reinjected_shed_reaches_fixpoint_and_terminates(
             terminated = True
             break
         assert out.terminal_reason_code == "decomposed"
-        # Re-injection: the emitted sub-goal's description becomes the next op's
-        # description (the live multi-step emitter carries it forward).
-        plan = advance_calls[-1]
-        description = plan.sub_goals[0].description
+        hops_taken += 1
+        # REAL re-injection: the multi-step _make_envelope wraps the sub-goal as
+        # f"{title}\n\n{description}" -> THAT becomes the next op description.
+        sub = advance_calls[-1].sub_goals[0]
+        description = f"{sub.title}\n\n{sub.description}"
 
     assert terminated, (
-        "the re-injected shed chain MUST reach a fixpoint and terminate "
-        "advisor_blocked -- the loop cannot run forever"
+        "the re-injected shed chain MUST terminate advisor_blocked -- the loop "
+        "cannot run forever"
+    )
+    assert hops_taken <= max_hops, (
+        f"self-heal MUST be bounded by max_self_heal_hops() ({max_hops}); "
+        f"took {hops_taken} hops before terminating"
+    )
+
+
+# ===========================================================================
+# Test 8 -- HOP BUDGET: JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS=1 caps at 1 hop.
+# ===========================================================================
+
+def test_max_self_heal_hops_env_caps_self_heal(monkeypatch, tmp_path):
+    """JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS=1 -> at most ONE self-heal hop per
+    invariant lineage before the de-dup backstop (advisor_blocked) takes over.
+    Proves the bound is env-tunable and enforced by the hop counter, NOT the
+    shed/envelope dynamics.
+    """
+    monkeypatch.setenv("JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS", "1")
+    assert cw_mod.max_self_heal_hops() == 1
+
+    target_file = tmp_path / "cap.py"
+    target_file.write_text(_HEAVY)
+    target_files = (str(target_file),)
+    compression_target = 350
+
+    advance_calls: list = []
+
+    async def _fake_advance(plan, *, router=None, **kw):
+        advance_calls.append(plan)
+        return SimpleNamespace(emitted_count=1)
+
+    monkeypatch.setattr(orch_mod, "advance_orchestration", _fake_advance)
+
+    lineage = subgoal_hash(target_files, ())
+    cw_mod.get_reduction_tracker().record_pass(lineage, 1000, 1000)  # stall
+
+    ledger = dedup.get_attempt_ledger()
+    orch = _make_orch(router=_FakeRouter())
+
+    description = "heavy goal capped at one hop"
+    outcomes: list = []
+    for hop in range(5):
+        ctx = _make_ctx(
+            op_id=f"op-cap-{hop}",
+            description=description,
+            target_files=target_files,
+        )
+        ledger.mark(subgoal_hash(target_files, description))
+        out = _run(
+            orch._decompose_block_or_legacy(
+                ctx, _block_advisory(),
+                compression_target=compression_target,
+            )
+        )
+        outcomes.append(out.terminal_reason_code)
+        if out.terminal_reason_code == "advisor_blocked":
+            break
+        sub = advance_calls[-1].sub_goals[0]
+        description = f"{sub.title}\n\n{sub.description}"
+
+    # Exactly ONE 'decomposed' (the single allowed self-heal) then blocked.
+    assert outcomes.count("decomposed") <= 1, (
+        f"MAX_SELF_HEAL_HOPS=1 must allow at most one self-heal; got {outcomes}"
+    )
+    assert outcomes[-1] == "advisor_blocked", (
+        f"chain must terminate advisor_blocked; got {outcomes}"
     )

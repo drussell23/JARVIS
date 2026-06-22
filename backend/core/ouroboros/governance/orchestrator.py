@@ -137,6 +137,7 @@ from backend.core.ouroboros.governance.convergence_watchdog import (
     get_reduction_tracker,
     watchdog_enabled,
     emit_sovereign_yield,
+    max_self_heal_hops,
 )
 from backend.core.ouroboros.governance.epistemic_shedder import shed_to_fit
 
@@ -2099,6 +2100,8 @@ class GovernedOrchestrator:
         path. ``None`` is returned when:
 
         - the lineage has NOT stalled yet (de-dup hard-fails as before), OR
+        - the lineage's cumulative self-heal hop count exceeds
+          ``max_self_heal_hops()`` (the structural bound, see TERMINATION), OR
         - the deep shed could not produce a sub-goal (fail-soft), OR
         - the shed result is a FIXPOINT (its hash is already a duplicate -> the
           shed can no longer reduce the payload, so the de-dup ledger is the
@@ -2106,10 +2109,24 @@ class GovernedOrchestrator:
         - the re-injection emitted zero sub-goals, OR
         - ANY exception (fail-soft -- NEVER crash a dispatch).
 
-        TERMINATION: at most ONE self-heal hop per lineage. The fixpoint check
-        (shed-hash duplicate) guarantees the loop cannot re-inject the same
-        irreducible shed forever -- the second arrival of an irreducible
-        lineage finds its shed-hash already marked and yields to advisor_blocked.
+        TERMINATION: self-heal is capped at ``max_self_heal_hops()`` (env
+        ``JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS``, default 3) re-injections per
+        INVARIANT lineage; the de-dup ledger remains the final backstop.
+
+        Why a hop counter and not the fixpoint guard alone: the multi-step
+        ``_make_envelope`` re-injects the sub-goal as
+        ``f"{title}\n\n{description}"``. Historically the shed sub-goal carried
+        a ``title=description[:80]`` prefix, so the tier3 truncation window
+        shifted ~82 chars EACH hop -- the shed text kept changing and the
+        fixpoint (shed-hash duplicate) guard was not hit until
+        ~``compression_target/82`` hops (~7,300 at the 600k ceiling), each a
+        real re-injection -> a multi-minute storm. The bounded hop counter caps
+        self-heals at a small constant REGARDLESS of the shed/envelope dynamics
+        because ``_lineage = subgoal_hash(target_files, ())`` is invariant
+        across re-injection. (Fix 2 additionally sets the shed ``title=""`` so
+        the prefix is a constant ``"\n\n"`` and the natural fixpoint converges
+        immediately -- defense in depth.) The fixpoint check still short-circuits
+        the common irreducible case before the budget is even consumed.
         """
         try:
             # INVARIANT LINEAGE: stable across re-injection (files do not change
@@ -2126,6 +2143,22 @@ class GovernedOrchestrator:
             if not _verdict.stalled:
                 # Not enough consecutive stalls yet -> de-dup hard-fails as
                 # before (the watchdog only intervenes on a proven stall).
+                return None
+
+            # BOUNDED SELF-HEAL (the REAL termination bound): cap the cumulative
+            # self-heal re-injections per INVARIANT lineage at a small env
+            # constant. Because ``_lineage`` is stable across re-injection, this
+            # holds REGARDLESS of the shed/envelope truncation dynamics (the
+            # _make_envelope title-prefix shifts the tier3 window each hop, so
+            # the fixpoint-only guard alone bounded at ~compression_target/82
+            # hops -- a multi-minute storm). Over budget -> fall to the de-dup
+            # final backstop (advisor_blocked).
+            if get_reduction_tracker().record_self_heal_hop(_lineage) > max_self_heal_hops():
+                logger.warning(
+                    "[SOVEREIGN YIELD] op=%s lineage=%s self-heal hop budget "
+                    "exhausted (max=%d) -> advisor_blocked backstop",
+                    ctx.op_id, _lineage, max_self_heal_hops(),
+                )
                 return None
 
             _sub, _tier = shed_block_goal_to_fit(

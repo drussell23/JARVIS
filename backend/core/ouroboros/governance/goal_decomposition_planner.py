@@ -810,7 +810,15 @@ def shed_block_goal_to_fit(
         sub = SubGoal(
             sub_goal_id=f"{parent_goal_id}-shed",
             parent_goal_id=parent_goal_id,
-            title=str(description or "")[:80],
+            # EMPTY title (defense-in-depth, faster natural fixpoint): the
+            # multi-step ``_make_envelope`` builds the re-injected op
+            # description as ``f"{title}\n\n{description}"``. A non-empty
+            # ``description[:80]`` prefix shifts the tier3 truncation window by
+            # ~82 chars EACH hop, so the shed text keeps changing and the
+            # fixpoint guard isn't hit for ~compression_target/82 hops. An empty
+            # title makes the prefix a constant ``"\n\n"`` from hop 0, so the
+            # re-injected payload converges to a fixpoint immediately.
+            title="",
             description=shed,
             # Mutation/code sub-goal. SubGoalKind has no dedicated MUTATION
             # member; ATOMIC is the kind decompose_for_block emits for a

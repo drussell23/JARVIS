@@ -16,8 +16,13 @@ stall_passes_threshold() -> int
 watchdog_enabled() -> bool
     JARVIS_CONVERGENCE_WATCHDOG_ENABLED (default true).
 
+max_self_heal_hops() -> int
+    JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS (default 3, clamp >=1). The real
+    termination bound on watchdog self-heal per invariant lineage.
+
 class ReductionTracker
     record_pass(lineage_id, parent_chars, max_child_chars) -> WatchdogVerdict
+    record_self_heal_hop(lineage_id) -> int  # bounded per-lineage hop counter
     reset(lineage_id)
 
 get_reduction_tracker() -> ReductionTracker
@@ -45,10 +50,12 @@ _ENV_STALL_RATIO = "JARVIS_WATCHDOG_STALL_RATIO"
 _ENV_STALL_PASSES = "JARVIS_WATCHDOG_STALL_PASSES"
 _ENV_ENABLED = "JARVIS_CONVERGENCE_WATCHDOG_ENABLED"
 _ENV_TRACKER_SIZE = "JARVIS_WATCHDOG_TRACKER_SIZE"
+_ENV_MAX_SELF_HEAL_HOPS = "JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS"
 
 _DEFAULT_STALL_RATIO = 0.95
 _DEFAULT_STALL_PASSES = 2
 _DEFAULT_TRACKER_SIZE = 256
+_DEFAULT_MAX_SELF_HEAL_HOPS = 3
 
 
 def stall_ratio_threshold() -> float:
@@ -71,6 +78,26 @@ def watchdog_enabled() -> bool:
     """Return True if JARVIS_CONVERGENCE_WATCHDOG_ENABLED is not 'false'/'0' (default true)."""
     val = os.environ.get(_ENV_ENABLED, "true").strip().lower()
     return val not in ("false", "0", "no", "off")
+
+
+def max_self_heal_hops() -> int:
+    """Return the max self-heal re-injections per invariant lineage.
+
+    Reads ``JARVIS_WATCHDOG_MAX_SELF_HEAL_HOPS`` (default 3). Clamped to >=1.
+    Fail-soft: any parse error returns the default (3).
+
+    This is the REAL mathematical termination bound on the watchdog self-heal:
+    because the lineage id is invariant across re-injection, a bounded
+    per-lineage counter caps the number of shed-and-continue hops at a small
+    constant REGARDLESS of the shed/envelope truncation dynamics (the
+    title-prefix window shift that defeated the fixpoint-only guard).
+    """
+    try:
+        return max(1, int(os.environ.get(
+            _ENV_MAX_SELF_HEAL_HOPS, _DEFAULT_MAX_SELF_HEAL_HOPS,
+        )))
+    except (ValueError, TypeError):
+        return _DEFAULT_MAX_SELF_HEAL_HOPS
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +140,10 @@ class ReductionTracker:
         self._max_lineages: int = max(1, max_lineages)
         # OrderedDict used for LRU eviction of oldest lineages.
         self._lineages: Dict[str, collections.deque] = collections.OrderedDict()
+        # Bounded per-lineage cumulative self-heal hop counter. SAME cap +
+        # LRU-eviction discipline as ``_lineages`` (no new unbounded store);
+        # this is the structural termination bound on watchdog self-heal.
+        self._self_heal_hops: Dict[str, int] = collections.OrderedDict()
 
     # ------------------------------------------------------------------
     def record_pass(
@@ -169,10 +200,43 @@ class ReductionTracker:
             logger.debug("[ConvergenceWatchdog] record_pass fail-soft", exc_info=True)
             return _SAFE_VERDICT
 
+    def record_self_heal_hop(self, lineage_id: str) -> int:
+        """Increment and return the cumulative self-heal count for *lineage_id*.
+
+        Bounded per-lineage counter mirroring the LRU-eviction discipline of
+        ``record_pass`` (same ``_max_lineages`` cap, oldest evicted). Because
+        the lineage id is INVARIANT across re-injection, this caps the number
+        of watchdog self-heal hops per lineage at a small constant regardless
+        of the shed/envelope truncation dynamics.
+
+        Fail-soft: any exception returns ``_DEFAULT_MAX_SELF_HEAL_HOPS + 1`` so
+        the caller treats it as over-budget and falls to advisor_blocked (the
+        de-dup final backstop) -- a failure NEVER grants an unbounded hop.
+        """
+        try:
+            if lineage_id in self._self_heal_hops:
+                self._self_heal_hops.move_to_end(lineage_id)
+                self._self_heal_hops[lineage_id] += 1
+            else:
+                if len(self._self_heal_hops) >= self._max_lineages:
+                    self._self_heal_hops.popitem(last=False)  # evict oldest
+                self._self_heal_hops[lineage_id] = 1
+            return self._self_heal_hops[lineage_id]
+        except Exception:  # pragma: no cover — fail-soft -> over-budget
+            logger.debug(
+                "[ConvergenceWatchdog] record_self_heal_hop fail-soft",
+                exc_info=True,
+            )
+            return _DEFAULT_MAX_SELF_HEAL_HOPS + 1
+
     def reset(self, lineage_id: str) -> None:
-        """Clear all recorded passes for *lineage_id*. Fail-soft."""
+        """Clear all recorded passes + self-heal hops for *lineage_id*. Fail-soft."""
         try:
             self._lineages.pop(lineage_id, None)
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            self._self_heal_hops.pop(lineage_id, None)
         except Exception:  # pragma: no cover
             pass
 
