@@ -769,6 +769,72 @@ def estimate_subgoal_payload_chars(
             return 0
 
 
+def shed_block_goal_to_fit(
+    target_files: Tuple[str, ...],
+    description: str,
+    target_chars: int,
+    parent_goal_id: str,
+    *,
+    source_reader: Callable[[str], str] | None = None,
+) -> Tuple["SubGoal | None", str]:
+    """Deep-payload structural shed (Sovereign Ledger-Watchdog Composition).
+
+    Reads the FULL target-file source, sheds it via the tiered epistemic
+    shedder, and returns ONE SubGoal carrying the shed source INLINE in
+    description with scoped_symbols CLEARED -- so estimate_subgoal_payload_chars
+    measures <= target_chars (the next egress check passes -> loop breaks).
+
+    The egress payload of a BLOCK GOAL is dominated by the scoped-symbol SOURCE
+    segments (the file content the model must read/edit), NOT the prose
+    description. Shedding the description alone is therefore useless: the ruler
+    keeps measuring the full file. This helper reads the real source, runs the
+    pure-AST tiered shedder over it, and inlines the shed result into the
+    description while CLEARING scoped_symbols -- so the next
+    ``estimate_subgoal_payload_chars`` pass measures only the (now-shed) inline
+    text and converges below the egress ceiling.
+
+    Returns ``(SubGoal | None, tier)``. Fail-soft -> ``(None, "none")``.
+    """
+    try:
+        from backend.core.ouroboros.governance.epistemic_shedder import (  # noqa: PLC0415
+            shed_to_fit,
+        )
+        reader = source_reader or _read_source_for_estimate
+        parts = [str(description or "")]
+        for fp in (target_files or ()):
+            src = reader(str(fp))
+            if src:
+                parts.append(src)
+        full = "\n".join(p for p in parts if p)
+        shed, tier = shed_to_fit(full, max(1, int(target_chars)))
+        sub = SubGoal(
+            sub_goal_id=f"{parent_goal_id}-shed",
+            parent_goal_id=parent_goal_id,
+            # EMPTY title (defense-in-depth, faster natural fixpoint): the
+            # multi-step ``_make_envelope`` builds the re-injected op
+            # description as ``f"{title}\n\n{description}"``. A non-empty
+            # ``description[:80]`` prefix shifts the tier3 truncation window by
+            # ~82 chars EACH hop, so the shed text keeps changing and the
+            # fixpoint guard isn't hit for ~compression_target/82 hops. An empty
+            # title makes the prefix a constant ``"\n\n"`` from hop 0, so the
+            # re-injected payload converges to a fixpoint immediately.
+            title="",
+            description=shed,
+            # Mutation/code sub-goal. SubGoalKind has no dedicated MUTATION
+            # member; ATOMIC is the kind decompose_for_block emits for a
+            # single non-boundary mutation sub-goal (_fallback uses ATOMIC).
+            kind=SubGoalKind.ATOMIC,
+            target_files=tuple(target_files or ()),
+            depends_on_sub_ids=(),
+            estimated_complexity="moderate",
+            boundary_crossed=False,
+            scoped_symbols=(),  # CLEARED: shed source is inline in description
+        )
+        return sub, tier
+    except Exception:  # noqa: BLE001 — deep shed must never crash a dispatch
+        return None, "none"
+
+
 # A duck-typed alias for the scoper's ScopedTarget (avoids an import cycle /
 # hard dependency at module load — the planner already lazy-imports the scoper).
 ScopedTargetLike = Any
