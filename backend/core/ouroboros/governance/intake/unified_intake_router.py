@@ -949,6 +949,14 @@ class UnifiedIntakeRouter:
             return await self._ingest_impl(envelope)
 
     async def _ingest_impl(self, envelope: IntentEnvelope) -> str:
+        # A1-T4 — hop 2/5 (ingest): the live router accepts the envelope.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("ingest", envelope.causal_id, router="attached")
+        except Exception:  # noqa: BLE001
+            pass
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
@@ -1571,6 +1579,16 @@ class UnifiedIntakeRouter:
         """
         ikey = envelope.idempotency_key
 
+        # A1-T4 — hop 3/5 (dequeue): the dispatch loop has pulled this
+        # envelope off the priority queue and is handing it to dispatch.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("dequeue", envelope.causal_id)
+        except Exception:  # noqa: BLE001
+            pass
+
         # --- Route to RuntimeTaskOrchestrator for runtime tasks ---
         if self._runtime_orchestrator is not None and self._is_runtime_task(envelope):
             try:
@@ -1770,6 +1788,15 @@ class UnifiedIntakeRouter:
                 "[IntakeRouter] attachment hoist skipped op=%s: %s",
                 envelope.causal_id, _exc,
             )
+        # A1-T4 — hop 4/5 (submit): the envelope's OperationContext is handed
+        # to the GovernedLoopService (the FSM entry). goal id == ctx.op_id.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("submit", ctx.op_id, target="GLS")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
             if _submit_fn is not None:

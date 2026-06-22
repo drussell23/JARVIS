@@ -681,6 +681,20 @@ class _TeeRouter:
             self.captured.append(envelope)
         except Exception:  # noqa: BLE001 — defensive
             pass
+        # A1-T4 — hop 1/5 (emit): the roadmap orchestrator emits a strategic
+        # GOAL into intake. First breadcrumb of the soak proof chain.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace(
+                "emit",
+                getattr(envelope, "causal_id", None)
+                or getattr(envelope, "goal_id", "?"),
+                source="roadmap",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if self._upstream is None:
             # Persist the orphaned envelope so it is never silently dropped.
             # Lazy import avoids any circular-import risk; fail-soft so a DLQ

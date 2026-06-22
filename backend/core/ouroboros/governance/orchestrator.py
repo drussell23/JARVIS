@@ -2217,6 +2217,17 @@ class GovernedOrchestrator:
     async def _run_pipeline(self, ctx: OperationContext) -> OperationContext:
         """Internal pipeline logic -- phases 1 through 8."""
 
+        # A1-T4 — hop 5/5 (accept): the GOAL enters the governed FSM at
+        # CLASSIFY. The fifth + final breadcrumb; the five ordered [A1Trace]
+        # lines in a soak's stdout are the A1 milestone proof.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("accept", ctx.op_id, phase="CLASSIFY")
+        except Exception:  # noqa: BLE001
+            pass
+
         # ── Ouroboros Serpent: visual indicator that the pipeline is active ──
         _serpent = None
         try:
