@@ -116,6 +116,7 @@ from backend.core.ouroboros.governance.goal_decomposition_planner import (
     chunking_enabled,
     decompose_for_block,
     estimate_subgoal_payload_chars,
+    shed_block_goal_to_fit,
 )
 from backend.core.ouroboros.governance.adaptive_recursion_governor import (
     recursion_budget,
@@ -2081,6 +2082,112 @@ class GovernedOrchestrator:
                 "[Orchestrator] Route cost heartbeat failed", exc_info=True,
             )
 
+    async def _watchdog_self_heal(
+        self,
+        ctx: OperationContext,
+        target_files: tuple,
+        description: str,
+        compression_target: int,
+        ledger: Any,
+    ) -> "OperationContext | None":
+        """Funnel-inversion self-heal: give the watchdog a shed-and-CONTINUE
+        chance on a DUPLICATE GOAL before the de-dup ledger hard-fails it to
+        advisor_blocked (Sovereign Ledger-Watchdog Composition).
+
+        Returns the advanced (terminal ``decomposed``) context on a successful
+        self-heal, or ``None`` to fall through to the legacy advisor_blocked
+        path. ``None`` is returned when:
+
+        - the lineage has NOT stalled yet (de-dup hard-fails as before), OR
+        - the deep shed could not produce a sub-goal (fail-soft), OR
+        - the shed result is a FIXPOINT (its hash is already a duplicate -> the
+          shed can no longer reduce the payload, so the de-dup ledger is the
+          final mathematical backstop -> advisor_blocked), OR
+        - the re-injection emitted zero sub-goals, OR
+        - ANY exception (fail-soft -- NEVER crash a dispatch).
+
+        TERMINATION: at most ONE self-heal hop per lineage. The fixpoint check
+        (shed-hash duplicate) guarantees the loop cannot re-inject the same
+        irreducible shed forever -- the second arrival of an irreducible
+        lineage finds its shed-hash already marked and yields to advisor_blocked.
+        """
+        try:
+            # INVARIANT LINEAGE: stable across re-injection (files do not change
+            # per re-injection; the op description does). This lets the tracker
+            # accumulate consecutive stalls across distinct op_ids.
+            _lineage = subgoal_hash(target_files, ())
+            # An exact repeat of an already-seen GOAL is a FULL stall: there was
+            # no reduction at all (ratio ~1.0). Feed parent==child so the
+            # tracker registers a stall pass.
+            _len = max(1, len(description))
+            _verdict = get_reduction_tracker().record_pass(
+                _lineage, _len, _len,
+            )
+            if not _verdict.stalled:
+                # Not enough consecutive stalls yet -> de-dup hard-fails as
+                # before (the watchdog only intervenes on a proven stall).
+                return None
+
+            _sub, _tier = shed_block_goal_to_fit(
+                target_files, description, compression_target, ctx.op_id,
+            )
+            if _sub is None:
+                return None
+
+            # FIXPOINT GUARD (termination keystone): if the shed result's hash
+            # is ALREADY a duplicate, the shed can no longer reduce the payload
+            # -> the de-dup ledger is the final backstop -> advisor_blocked.
+            _shed_h = subgoal_hash(_sub.target_files, _sub.description)
+            if is_duplicate(_shed_h, ledger, frozenset()):
+                return None
+
+            # Self-heal: emit the ONE shed sub-goal DIRECTLY. We do NOT re-run
+            # decompose_for_block -- it would re-read the full files and undo the
+            # shed. The shed sub-goal carries the shed source inline.
+            emit_sovereign_yield(
+                ctx.op_id,
+                lineage_id=_lineage,
+                ratio=_verdict.ratio,
+                consecutive_stalls=_verdict.consecutive_stalls,
+                parent_chars=len(description),
+                child_chars=len(_sub.description),
+                tier=_tier,
+            )
+            plan = DecomposedPlan(
+                parent_goal_id=ctx.op_id,
+                sub_goals=(_sub,),
+                dag_valid=True,
+                dag_depth=1,
+                topological_order=(_sub.sub_goal_id,),
+                diagnostic="watchdog_self_heal_reinject",
+            )
+            router = getattr(
+                getattr(self._stack, "governed_loop_service", None),
+                "_intake_router",
+                None,
+            )
+            report = await advance_orchestration(plan, router=router)
+            if getattr(report, "emitted_count", 0) >= 1:
+                # Mark the shed-hash so the next arrival of THIS irreducible
+                # lineage finds it duplicate at the fixpoint guard -> bounded.
+                ledger.mark(_shed_h)
+                logger.warning(
+                    "[SOVEREIGN YIELD] op=%s self-healed: shed-and-continue "
+                    "(tier=%s) -> 1 fitting sub-goal",
+                    ctx.op_id, _tier,
+                )
+                return ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="decomposed",
+                )
+            return None
+        except Exception:  # noqa: BLE001 -- fail-soft -> legacy advisor_blocked
+            logger.debug(
+                "[Orchestrator] watchdog self-heal fail-soft -> legacy "
+                "advisor_blocked (op=%s)", ctx.op_id, exc_info=True,
+            )
+            return None
+
     async def _decompose_block_or_legacy(
         self,
         ctx: OperationContext,
@@ -2125,7 +2232,31 @@ class GovernedOrchestrator:
                 # B4 de-dup -- primary infinite-cycle guard.
                 h = subgoal_hash(target_files, description)
                 ledger = get_attempt_ledger()
-                if not is_duplicate(h, ledger, frozenset()):
+                # FUNNEL INVERSION (Sovereign Ledger-Watchdog Composition):
+                # the de-dup ledger previously HARD-FAILED a repeating GOAL to
+                # advisor_blocked BEFORE the watchdog could run, so the
+                # structural self-heal was inert live. Give the watchdog a
+                # shed-and-CONTINUE chance on the egress re-chunk path (compression
+                # _target set + watchdog enabled) before the legacy hard-fail. The
+                # de-dup ledger REMAINS the final mathematical backstop: a stalled
+                # lineage whose shed cannot reduce further (fixpoint) yields a
+                # duplicate shed-hash -> self-heal returns None -> advisor_blocked.
+                _dup = is_duplicate(h, ledger, frozenset())
+                if (
+                    _dup
+                    and compression_target is not None
+                    and watchdog_enabled()
+                ):
+                    _healed = await self._watchdog_self_heal(
+                        ctx,
+                        target_files,
+                        description,
+                        compression_target,
+                        ledger,
+                    )
+                    if _healed is not None:
+                        return _healed
+                if not _dup:
                     # Recursion depth from intake evidence (fail-soft to 0).
                     depth = 0
                     try:
@@ -2236,34 +2367,37 @@ class GovernedOrchestrator:
                                     (estimate_subgoal_payload_chars(s) for s in _all_subs),
                                     default=0,
                                 )
-                                # Use ctx.op_id as the stable lineage root id.
-                                # goal.goal_id == ctx.op_id (set at _BlockGoal
-                                # construction above), so either is equivalent;
-                                # ctx.op_id is explicit and never None.
-                                _lineage = ctx.op_id
+                                # INVARIANT LINEAGE (Ledger-Watchdog
+                                # Composition): the lineage id MUST be stable
+                                # across re-injections so the tracker can
+                                # accumulate consecutive stalls. ctx.op_id is
+                                # per-op (each re-injection is a NEW op_id) so
+                                # "2 consecutive stalls" was never reached --
+                                # the watchdog was inert live. subgoal_hash over
+                                # (target_files, ()) is invariant across the same
+                                # GOAL's re-injections (the op description
+                                # changes per re-injection but the files do not).
+                                _lineage = subgoal_hash(target_files, ())
                                 _verdict = get_reduction_tracker().record_pass(
                                     _lineage, _parent_chars, _max_child,
                                 )
                                 if _verdict.stalled:
-                                    # Stalled: structurally shed the heaviest
-                                    # sub-goal's description to fit the egress
-                                    # ceiling, emit [SOVEREIGN YIELD], and replace
-                                    # the non-shrinking slice with ONE fitting
-                                    # sub-goal so the next pass can make progress.
-                                    _heaviest = (
-                                        max(
-                                            _all_subs,
-                                            key=lambda s: estimate_subgoal_payload_chars(s),
-                                        )
-                                        if _all_subs
-                                        else None
+                                    # Stalled: deep-payload structural shed.
+                                    # Shedding the description alone is useless --
+                                    # the payload is dominated by the scoped-symbol
+                                    # SOURCE segments. shed_block_goal_to_fit reads
+                                    # the real file source, sheds it, and inlines
+                                    # the shed result with scoped_symbols CLEARED
+                                    # so the next egress estimate measures
+                                    # <= target. Replace the non-shrinking slice
+                                    # with that ONE fitting sub-goal so the next
+                                    # pass makes progress.
+                                    _shed_sub, _tier = shed_block_goal_to_fit(
+                                        target_files,
+                                        goal.description,
+                                        compression_target,
+                                        ctx.op_id,
                                     )
-                                    _src = (
-                                        getattr(_heaviest, "description", "") or ""
-                                    ) if _heaviest is not None else (
-                                        goal.description or ""
-                                    )
-                                    _shed, _tier = shed_to_fit(_src, compression_target)
                                     emit_sovereign_yield(
                                         ctx.op_id,
                                         lineage_id=_lineage,
@@ -2273,13 +2407,7 @@ class GovernedOrchestrator:
                                         child_chars=_max_child,
                                         tier=_tier,
                                     )
-                                    if _heaviest is not None:
-                                        # Replace the heaviest sub-goal with a
-                                        # shed copy.  SubGoal is a frozen
-                                        # dataclass so we use dataclasses.replace.
-                                        _shed_sub = dataclasses.replace(
-                                            _heaviest, description=_shed,
-                                        )
+                                    if _shed_sub is not None:
                                         _all_subs = (_shed_sub,)
                             except Exception:  # noqa: BLE001
                                 # Fail-soft: watchdog error -> legacy slice path.
