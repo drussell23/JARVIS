@@ -2466,15 +2466,25 @@ class GovernedOrchestrator:
                             self._stack, "governed_loop_service", None,
                         )
                         router = getattr(_gls_ref, "_intake_router", None)
-                        # I1 -- capture the report and check emitted_count.
+                        # I1 -- capture the report and check FORWARD PROGRESS.
+                        # Sovereign State-Propagation Bridge: gate on
+                        # ``made_forward_progress`` (emitted_count >= 1 OR a
+                        # sub-goal dispatched THIS tick), NOT the lagging
+                        # ``emitted_count`` aggregate alone. ``emitted_count`` is
+                        # computed over the pre-emit completion_status ledger, so
+                        # it STRUCTURALLY reads 0 on a fresh decompose even when
+                        # router.ingest succeeded (emitted_this_tick >= 1) --
+                        # gating on it false-negatived every first emit and
+                        # wrongly DLQ'd a dispatched GOAL.
                         report = await advance_orchestration(plan, router=router)
-                        if report.emitted_count >= 1:
+                        if report.made_forward_progress:
                             ledger.mark(h)
                             logger.warning(
                                 "[Orchestrator] BLOCK decomposed into %d "
-                                "sub-goals (test_first=%s, emitted=%d) op=%s",
+                                "sub-goals (test_first=%s, emitted=%d "
+                                "dispatched_this_tick=%d) op=%s",
                                 len(subs), zero_cov, report.emitted_count,
-                                ctx.op_id,
+                                report.emitted_this_tick, ctx.op_id,
                             )
                             return ctx.advance(
                                 OperationPhase.CANCELLED,

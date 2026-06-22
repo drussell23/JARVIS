@@ -137,7 +137,7 @@ def test_enabled_decomposes_and_reinjects(monkeypatch):
         captured["router"] = router
         # I1: the seam returns "decomposed" only when >=1 sub-goal was emitted.
         from types import SimpleNamespace
-        return SimpleNamespace(emitted_count=1)
+        return SimpleNamespace(emitted_count=1, emitted_this_tick=1, made_forward_progress=True)
 
     monkeypatch.setattr(orch_mod, "advance_orchestration", _fake_advance)
 
@@ -165,7 +165,7 @@ def test_enabled_marks_ledger_after_reinject(monkeypatch):
 
     async def _fake_advance(plan, *, router=None, **kw):
         from types import SimpleNamespace
-        return SimpleNamespace(emitted_count=1)  # I1: >=1 emit -> decomposed
+        return SimpleNamespace(emitted_count=1, emitted_this_tick=1, made_forward_progress=True)  # I1: forward progress -> decomposed
 
     monkeypatch.setattr(orch_mod, "advance_orchestration", _fake_advance)
     orch = _make_orch(router=_FakeRouter())
