@@ -93,6 +93,36 @@ logger = logging.getLogger("Ouroboros.GovernedLoop")
 
 
 # ---------------------------------------------------------------------------
+# T4 — Sovereign Telemetry Boot-Guard
+# ---------------------------------------------------------------------------
+# Extracted helper so unit tests can verify the exact warning string without
+# booting the full GovernedLoopService. Default-ON means this fires ONLY when
+# an operator has explicitly set JARVIS_DW_EGRESS_INTERCEPTOR_ENABLED=false
+# (or 0/no/off). Never raises — boot must never crash due to this guard.
+
+
+def _warn_if_egress_guard_disabled(log: logging.Logger) -> bool:
+    """Emit a loud [SOVEREIGN WARNING] when the egress interceptor is OFF.
+
+    Returns True (warning emitted) when the guard is disabled, False otherwise.
+    NEVER raises — the check is always fail-soft.
+    """
+    try:
+        from backend.core.ouroboros.governance.dw_egress_interceptor import (
+            egress_interceptor_enabled,
+        )
+        if not egress_interceptor_enabled():
+            log.warning(
+                "[SOVEREIGN WARNING] API Citizenship Guard Disabled: Egress Interceptor "
+                "is OFF. Node is vulnerable to overweight payload dispatch."
+            )
+            return True
+    except Exception:  # noqa: BLE001
+        pass  # never let this guard crash boot
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Slice 2B-ii.1 — Aegis-aware provider construction gate
 # ---------------------------------------------------------------------------
 # Closes the Catch-22 surfaced by Aegis Detonation soak bt-2026-05-24-222008:
@@ -1426,6 +1456,12 @@ class GovernedLoopService:
             self._seed_autonomy_policies()
             self._attach_to_stack()
             self._started_at = time.monotonic()
+
+            # T4 — Sovereign Telemetry Boot-Guard: emit a loud [SOVEREIGN WARNING]
+            # when the operator has explicitly disabled the egress interceptor.
+            # Default-ON (guard is active), so this fires only on an opt-out.
+            # Fail-soft — never raises, never blocks boot.
+            _warn_if_egress_guard_disabled(logger)
 
             # Wire curriculum and reactor event background tasks
             if self._config.curriculum_enabled:
