@@ -106,4 +106,22 @@ services:
       # A1 observability — breadcrumbs + DLQ default-true; pinned for soak audit.
       JARVIS_A1_TRACE_ENABLED: "1"
       JARVIS_INTAKE_DLQ_ENABLED: "1"
+      # ── C2 CONVERGENCE MATRICES (2026-06-22, PR #69644) ──────────────────────
+      # Arm the full convergence path so a BLOCKed strategic GOAL (GOAL-001) can
+      # decompose into a test-first + symbol-scoped plan that clears the Advisor,
+      # and DW generation rotates off a dead transport lane. All default-OFF in
+      # code; enabled HERE for the C2 soak. Each is fail-soft + gated.
+      #   Matrix A — self-healing transport circuit breaker (batch TIMEOUT trips
+      #   OPEN -> rotate to healthy realtime lane -> jittered HALF-OPEN probe).
+      JARVIS_TRANSPORT_BREAKER_ENABLED: "1"
+      #   Matrix B — adaptive recursive chunking on Advisor BLOCK (AST-symbol +
+      #   test-first sub-goals, adaptive governor, semantic de-dup). The op is
+      #   never lost (decomposed only when >=1 sub-goal emits, else legacy).
+      JARVIS_RECURSIVE_CHUNKING_ENABLED: "1"
+      #   C1 — call-graph blast radius (oracle.get_callers, not the file import
+      #   graph) for symbol-scoped sub-goals. Needs the oracle-blast prerequisite
+      #   (a live oracle). Fail-soft to file-level when the oracle is unavailable,
+      #   so chunking's test-first path still clears the zero-coverage veto half.
+      JARVIS_ADVISOR_ORACLE_BLAST_ENABLED: "1"
+      JARVIS_ADVISOR_CALLGRAPH_BLAST_ENABLED: "1"
 
