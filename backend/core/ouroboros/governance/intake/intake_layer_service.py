@@ -986,6 +986,47 @@ class IntakeLayerService:
         router = self._router
         assert router is not None
         await router.start()
+
+        # A1-T2 — event-driven router-ready valve. The router is now attached
+        # (self._gls._intake_router set above) AND its dispatch loop is live.
+        # Signal readiness so the roadmap-ignition daemon (a separate service)
+        # can stop waiting and emit its first strategic GOAL into a pipe that
+        # will actually drain it. Two surfaces, both best-effort + idempotent:
+        #   1. the process-global flag (authoritative "already ready" check),
+        #   2. the TrinityEventBus event (async wakeup; absent bus is fine —
+        #      the daemon degrades to a bounded flag-poll, never a blind sleep).
+        # Publish failure must NOT crash boot: the flag is already set, so the
+        # daemon's probe path still passes.
+        try:
+            from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                EVENT_ROUTER_READY as _A1_READY_TOPIC,
+                mark_router_ready as _a1_mark_router_ready,
+            )
+
+            _a1_mark_router_ready()
+            try:
+                from backend.core.trinity_event_bus import (
+                    get_event_bus_if_exists as _a1_get_bus,
+                    TrinityEvent as _A1TrinityEvent,
+                    RepoType as _A1RepoType,
+                )
+
+                _a1_bus = _a1_get_bus()
+                if _a1_bus is not None:
+                    await _a1_bus.publish(
+                        _A1TrinityEvent(
+                            topic=_A1_READY_TOPIC,
+                            source=_A1RepoType.JARVIS,
+                        )
+                    )
+            except Exception as _a1_pub_exc:  # noqa: BLE001 — publish is best-effort
+                logger.debug(
+                    "[IntakeLayer] router-ready publish skipped: %r",
+                    _a1_pub_exc,
+                )
+        except Exception as _a1_exc:  # noqa: BLE001 — readiness signal is fail-soft
+            logger.debug("[IntakeLayer] router-ready mark skipped: %r", _a1_exc)
+
         for sensor in self._sensors:
             await sensor.start()
 

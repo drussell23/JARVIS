@@ -64,7 +64,22 @@ def _goal_id(envelope: Any) -> str:
 
 
 def _to_serializable(envelope: Any) -> Any:
-    """Return a JSON-serialisable representation of *envelope*."""
+    """Return a JSON-serialisable representation of *envelope*.
+
+    Prefers a typed ``to_dict()`` (e.g. :class:`IntentEnvelope`) so the DLQ
+    stores a faithful JSON object that ``replay_dlq`` can hand back to a
+    reconstructing ``ingest_fn`` (via ``IntentEnvelope.from_dict``). Only a
+    truly opaque object falls back to a lossy ``repr`` — which is observable
+    in the DLQ but not replayable (logged loud at append time regardless).
+    """
+    to_dict = getattr(envelope, "to_dict", None)
+    if callable(to_dict):
+        try:
+            d = to_dict()
+            json.dumps(d)  # confirm the dict is genuinely JSON-safe
+            return d
+        except Exception:  # noqa: BLE001 — fall through to the generic paths
+            pass
     try:
         json.dumps(envelope)
         return envelope

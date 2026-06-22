@@ -36,6 +36,164 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# A1-T2 — event-driven router-ready valve (intake.router.ready)
+# ---------------------------------------------------------------------------
+# The roadmap-ignition daemon (GovernedLoopService) must never emit a
+# strategic GOAL before the intake router is attached AND its dispatch loop
+# is running, otherwise the envelope lands in a void (the silent-drop race
+# A1 exists to kill). Readiness is a process-global signal because the
+# IntakeLayerService (which marks ready) and the GLS daemon (which waits on
+# it) are distinct services sharing one process + event loop.
+#
+# The signal has TWO surfaces, both required for a race-free handoff:
+#   * ``_ROUTER_READY`` (threading.Event) — the checkable "already ready"
+#     truth; safe to read synchronously from the async daemon. This is the
+#     authoritative state even when no TrinityEventBus exists.
+#   * ``EVENT_ROUTER_READY`` on the TrinityEventBus — the async wakeup so the
+#     daemon doesn't have to poll. Best-effort: a missing bus degrades to a
+#     bounded flag-poll, never to a blind sleep.
+#
+# ``await_router_ready`` implements subscribe-then-check: it subscribes to the
+# topic FIRST, then checks the flag, so a "ready fired before I subscribed"
+# cannot deadlock it. No sleep-poll on the happy (bus-present) path.
+EVENT_ROUTER_READY = "intake.router.ready"
+
+# Bus-absent degraded path: how often to re-check the readiness flag while
+# bounded by the caller's timeout. Env-tunable; never a blind fixed settle.
+_ENV_READY_POLL_S = "JARVIS_A1_ROUTER_READY_POLL_S"
+
+_ROUTER_READY = threading.Event()
+
+
+def mark_router_ready() -> None:
+    """Signal that the intake router is attached + its dispatch loop is live.
+
+    Idempotent. Called by IntakeLayerService immediately after
+    ``await router.start()`` succeeds. Sets the process-global flag that the
+    roadmap daemon's readiness probe reads.
+    """
+    _ROUTER_READY.set()
+
+
+def router_is_ready() -> bool:
+    """Return True once :func:`mark_router_ready` has been called this process."""
+    return _ROUTER_READY.is_set()
+
+
+def _reset_router_ready_for_tests() -> None:
+    """Test-only: clear the process-global readiness flag."""
+    _ROUTER_READY.clear()
+
+
+def _ready_poll_interval_s() -> float:
+    """Bus-absent flag-poll cadence (env-tunable, fail-soft default 0.25s)."""
+    try:
+        val = float((os.environ.get(_ENV_READY_POLL_S, "") or "0.25").strip())
+        return val if val > 0 else 0.25
+    except (TypeError, ValueError):
+        return 0.25
+
+
+async def await_router_ready(bus: Any, timeout_s: float) -> bool:
+    """Race-free wait for ``intake.router.ready``; never raises.
+
+    Subscribe-then-check: subscribe to :data:`EVENT_ROUTER_READY` on *bus*
+    FIRST, then check :func:`router_is_ready` — so a ready that fired before
+    the subscription cannot deadlock the wait. Returns True if the router is
+    ready within *timeout_s*, else False (the caller routes the stall to the
+    DLQ rather than emitting into a void). No blind sleep on any path.
+
+    Parameters
+    ----------
+    bus:
+        A TrinityEventBus (or None). When None, falls back to a bounded
+        flag-poll — still event-flagged + bounded, never a fixed settle.
+    timeout_s:
+        Maximum seconds to wait before returning False.
+    """
+    woke = asyncio.Event()
+    if bus is not None:
+        async def _on_ready(_ev: Any) -> None:
+            woke.set()
+
+        try:
+            await bus.subscribe(EVENT_ROUTER_READY, _on_ready)
+        except Exception as exc:  # noqa: BLE001 — bus is best-effort
+            logger.debug("[A1] router-ready subscribe failed: %r", exc)
+            bus = None  # degrade to flag-poll below
+
+    # CHECK AFTER SUBSCRIBE — closes the ready-before-subscribe race.
+    if router_is_ready():
+        return True
+
+    try:
+        if bus is not None:
+            await asyncio.wait_for(woke.wait(), timeout=timeout_s)
+            return True
+        # Degraded (no usable bus): bounded poll on the authoritative flag.
+        interval = _ready_poll_interval_s()
+
+        async def _until_ready() -> None:
+            while not router_is_ready():
+                await asyncio.sleep(interval)
+
+        await asyncio.wait_for(_until_ready(), timeout=timeout_s)
+        return True
+    except asyncio.TimeoutError:
+        # Re-check once in case readiness landed exactly at the deadline.
+        return router_is_ready()
+
+
+# ---------------------------------------------------------------------------
+# A1-T3 — DAG-weight pre-flight tag
+# ---------------------------------------------------------------------------
+# A heavy multi-file strategic GOAL must route through the Epistemic Context
+# Matrix prefetch (so its Venom exploration doesn't blow the generation
+# deadline). The prefetch ALREADY recomputes heaviness at GENERATE — we do
+# NOT duplicate it. This tag instead makes the intake-origin heaviness
+# explicit + observable: it rides ``envelope.evidence`` (a mutable dict that
+# the dispatch path already snapshots onto ``ctx.intake_evidence_json`` — the
+# established "typed signal context" side-channel), so observers + the soak's
+# breadcrumbs can see that intake classified the GOAL heavy. Pure, fail-soft,
+# gated by the existing prefetch flag (no-op + byte-identical when off).
+def stamp_dag_weight(envelope: Any) -> bool:
+    """Stamp ``evidence["dag_weight"] = "heavy"`` on a heavy intake GOAL.
+
+    Reuses :func:`epistemic_prefetch.is_heavy_goal` (multi-file OR high blast
+    radius). Returns True iff the tag was stamped. No-op (returns False) when
+    the prefetch flag is off, the GOAL is light, ``evidence`` is not a dict,
+    or anything goes wrong. NEVER raises — intake must not fail on a tag.
+    """
+    try:
+        from backend.core.ouroboros.governance.epistemic_prefetch import (
+            is_heavy_goal,
+            prefetch_enabled,
+        )
+
+        if not prefetch_enabled():
+            return False
+        target_files = getattr(envelope, "target_files", None)
+        blast_radius = getattr(envelope, "blast_radius", 0)
+        if not is_heavy_goal(target_files, blast_radius):
+            return False
+        evidence = getattr(envelope, "evidence", None)
+        if not isinstance(evidence, dict):
+            # Tag is best-effort observability; if there's no dict to ride,
+            # the prefetch still recomputes heaviness independently.
+            return False
+        evidence["dag_weight"] = "heavy"
+        logger.info(
+            "[A1] dag_weight=heavy stamped goal=%s files=%d",
+            getattr(envelope, "causal_id", "?"),
+            len(target_files or ()),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — never fail intake on a tag
+        logger.debug("[A1] dag_weight stamp skipped: %r", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # F1 Slice 2 — shadow-mode flag for observational IntakePriorityQueue
 # ---------------------------------------------------------------------------
 # When ``JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW=true`` AND the master flag
@@ -791,6 +949,14 @@ class UnifiedIntakeRouter:
             return await self._ingest_impl(envelope)
 
     async def _ingest_impl(self, envelope: IntentEnvelope) -> str:
+        # A1-T4 — hop 2/5 (ingest): the live router accepts the envelope.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("ingest", envelope.causal_id, router="attached")
+        except Exception:  # noqa: BLE001
+            pass
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
@@ -1413,6 +1579,16 @@ class UnifiedIntakeRouter:
         """
         ikey = envelope.idempotency_key
 
+        # A1-T4 — hop 3/5 (dequeue): the dispatch loop has pulled this
+        # envelope off the priority queue and is handing it to dispatch.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("dequeue", envelope.causal_id)
+        except Exception:  # noqa: BLE001
+            pass
+
         # --- Route to RuntimeTaskOrchestrator for runtime tasks ---
         if self._runtime_orchestrator is not None and self._is_runtime_task(envelope):
             try:
@@ -1477,6 +1653,13 @@ class UnifiedIntakeRouter:
             if _env_routing
             else ""
         )
+        # A1-T3 — stamp intake-origin DAG weight onto evidence BEFORE the
+        # snapshot below, so a heavy multi-file GOAL's heaviness rides the
+        # existing intake_evidence_json side-channel onto ctx (observable to
+        # the prefetch + soak breadcrumbs). Reuses is_heavy_goal; never
+        # duplicates the prefetch. Pure, fail-soft, gated by the prefetch flag.
+        stamp_dag_weight(envelope)
+
         # ClusterIntelligence-CrossSession Slice 4: snapshot
         # envelope.evidence as JSON onto ctx so post-verify
         # cascade observers (and future arcs needing typed signal
@@ -1605,6 +1788,15 @@ class UnifiedIntakeRouter:
                 "[IntakeRouter] attachment hoist skipped op=%s: %s",
                 envelope.causal_id, _exc,
             )
+        # A1-T4 — hop 4/5 (submit): the envelope's OperationContext is handed
+        # to the GovernedLoopService (the FSM entry). goal id == ctx.op_id.
+        try:
+            from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
+                a1trace as _a1trace,
+            )
+            _a1trace("submit", ctx.op_id, target="GLS")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
             if _submit_fn is not None:

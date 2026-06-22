@@ -1912,31 +1912,113 @@ class GovernedLoopService:
 
                     async def _roadmap_ignition_daemon() -> None:
                         cad = _RmCadence()
-                        # brief settle so intake/router are attached
-                        await _aio_rm.sleep(20)
+                        # A1-T2 — event-driven router-ready valve. Replaces the
+                        # blind 20s settle (a poll-hack) with a race-free,
+                        # bounded wait for the intake router's dispatch loop, so
+                        # a strategic GOAL is never emitted into a void (the
+                        # silent-drop race A1 exists to kill). No sleep-poll on
+                        # the happy (bus-present) path. Bind the readiness API
+                        # once here so the loop body is NameError-safe even if
+                        # the import fails (fail-open to the legacy emit).
+                        try:
+                            from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                                await_router_ready as _a1_await_ready,
+                                router_is_ready as _a1_router_is_ready,
+                            )
+                            from backend.core.trinity_event_bus import (
+                                get_event_bus_if_exists as _a1_get_bus,
+                            )
+                        except Exception:  # noqa: BLE001
+                            _a1_await_ready = None
+                            _a1_router_is_ready = None
+                            _a1_get_bus = None
+                        if _a1_await_ready is not None:
+                            try:
+                                _a1_timeout = float(
+                                    (os.environ.get(
+                                        "JARVIS_A1_ROUTER_READY_TIMEOUT_S", ""
+                                    ) or "60").strip()
+                                )
+                            except (TypeError, ValueError):
+                                _a1_timeout = 60.0
+                            try:
+                                _a1_bus = _a1_get_bus() if _a1_get_bus else None
+                                await _a1_await_ready(_a1_bus, _a1_timeout)
+                            except Exception as _a1_vex:  # noqa: BLE001
+                                logger.debug(
+                                    "[GovernedLoop] router-ready valve "
+                                    "swallowed: %r",
+                                    _a1_vex,
+                                )
+                        _a1_timeout_dlq_done = False
                         while True:
                             try:
-                                _router = getattr(self, "_intake_router", None)
-                                _rep = await _rmo_execute(
-                                    router=_router,
-                                    max_iterations_override=1,
-                                )
-                                try:
-                                    from backend.core.ouroboros.governance.progress_ledger import (  # noqa: E501
-                                        ledger_enabled as _pl_on,
-                                        update_progress as _pl_update,
-                                    )
-                                    if _pl_on() and _rep is not None:
-                                        _pl_update(
-                                            completed=[],
-                                            next_targets=[(
-                                                "GOAL-001",
-                                                "roadmap orchestrator polling "
-                                                "(strategic ignition mesh live)",
-                                            )],
+                                # A1-T2 — never emit into a void: guard each
+                                # emit on the authoritative readiness flag. If
+                                # the valve timed out (router never attached),
+                                # record the stall LOUD + persisted exactly once
+                                # and skip the emit; retry on the next cadence
+                                # tick (the router may come up late). Fail-open
+                                # to the legacy emit if the probe is unavailable.
+                                if _a1_router_is_ready is not None:
+                                    try:
+                                        _a1_ready = _a1_router_is_ready()
+                                    except Exception:  # noqa: BLE001
+                                        _a1_ready = True
+                                else:
+                                    _a1_ready = True
+                                if not _a1_ready:
+                                    if not _a1_timeout_dlq_done:
+                                        try:
+                                            from backend.core.ouroboros.governance import (  # noqa: E501
+                                                intake_dlq as _a1_dlq,
+                                            )
+                                            _a1_dlq.append_dlq(
+                                                {
+                                                    "source": "roadmap_ignition",
+                                                    "reason":
+                                                        "router_ready_timeout",
+                                                    "goal_id":
+                                                        "roadmap_ignition_gate",
+                                                    "note": "router not ready "
+                                                            "within timeout",
+                                                },
+                                                reason="router_ready_timeout",
+                                            )
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                        logger.critical(
+                                            "[A1] roadmap daemon: router not "
+                                            "ready within timeout — emit "
+                                            "skipped, marker DLQ'd (retrying "
+                                            "on next tick)"
                                         )
-                                except Exception:  # noqa: BLE001
-                                    pass
+                                        _a1_timeout_dlq_done = True
+                                else:
+                                    _router = getattr(
+                                        self, "_intake_router", None
+                                    )
+                                    _rep = await _rmo_execute(
+                                        router=_router,
+                                        max_iterations_override=1,
+                                    )
+                                    try:
+                                        from backend.core.ouroboros.governance.progress_ledger import (  # noqa: E501
+                                            ledger_enabled as _pl_on,
+                                            update_progress as _pl_update,
+                                        )
+                                        if _pl_on() and _rep is not None:
+                                            _pl_update(
+                                                completed=[],
+                                                next_targets=[(
+                                                    "GOAL-001",
+                                                    "roadmap orchestrator "
+                                                    "polling (strategic "
+                                                    "ignition mesh live)",
+                                                )],
+                                            )
+                                    except Exception:  # noqa: BLE001
+                                        pass
                             except _aio_rm.CancelledError:
                                 break
                             except Exception as _re:  # noqa: BLE001
