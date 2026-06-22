@@ -145,6 +145,55 @@ async def await_router_ready(bus: Any, timeout_s: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# A1-T3 — DAG-weight pre-flight tag
+# ---------------------------------------------------------------------------
+# A heavy multi-file strategic GOAL must route through the Epistemic Context
+# Matrix prefetch (so its Venom exploration doesn't blow the generation
+# deadline). The prefetch ALREADY recomputes heaviness at GENERATE — we do
+# NOT duplicate it. This tag instead makes the intake-origin heaviness
+# explicit + observable: it rides ``envelope.evidence`` (a mutable dict that
+# the dispatch path already snapshots onto ``ctx.intake_evidence_json`` — the
+# established "typed signal context" side-channel), so observers + the soak's
+# breadcrumbs can see that intake classified the GOAL heavy. Pure, fail-soft,
+# gated by the existing prefetch flag (no-op + byte-identical when off).
+def stamp_dag_weight(envelope: Any) -> bool:
+    """Stamp ``evidence["dag_weight"] = "heavy"`` on a heavy intake GOAL.
+
+    Reuses :func:`epistemic_prefetch.is_heavy_goal` (multi-file OR high blast
+    radius). Returns True iff the tag was stamped. No-op (returns False) when
+    the prefetch flag is off, the GOAL is light, ``evidence`` is not a dict,
+    or anything goes wrong. NEVER raises — intake must not fail on a tag.
+    """
+    try:
+        from backend.core.ouroboros.governance.epistemic_prefetch import (
+            is_heavy_goal,
+            prefetch_enabled,
+        )
+
+        if not prefetch_enabled():
+            return False
+        target_files = getattr(envelope, "target_files", None)
+        blast_radius = getattr(envelope, "blast_radius", 0)
+        if not is_heavy_goal(target_files, blast_radius):
+            return False
+        evidence = getattr(envelope, "evidence", None)
+        if not isinstance(evidence, dict):
+            # Tag is best-effort observability; if there's no dict to ride,
+            # the prefetch still recomputes heaviness independently.
+            return False
+        evidence["dag_weight"] = "heavy"
+        logger.info(
+            "[A1] dag_weight=heavy stamped goal=%s files=%d",
+            getattr(envelope, "causal_id", "?"),
+            len(target_files or ()),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — never fail intake on a tag
+        logger.debug("[A1] dag_weight stamp skipped: %r", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # F1 Slice 2 — shadow-mode flag for observational IntakePriorityQueue
 # ---------------------------------------------------------------------------
 # When ``JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW=true`` AND the master flag
@@ -1586,6 +1635,13 @@ class UnifiedIntakeRouter:
             if _env_routing
             else ""
         )
+        # A1-T3 — stamp intake-origin DAG weight onto evidence BEFORE the
+        # snapshot below, so a heavy multi-file GOAL's heaviness rides the
+        # existing intake_evidence_json side-channel onto ctx (observable to
+        # the prefetch + soak breadcrumbs). Reuses is_heavy_goal; never
+        # duplicates the prefetch. Pure, fail-soft, gated by the prefetch flag.
+        stamp_dag_weight(envelope)
+
         # ClusterIntelligence-CrossSession Slice 4: snapshot
         # envelope.evidence as JSON onto ctx so post-verify
         # cascade observers (and future arcs needing typed signal
