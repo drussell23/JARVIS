@@ -159,3 +159,29 @@ def test_run_probe_lane_is_half_open_during_probe():
     # Lane was HALF_OPEN when probe ran, CLOSED after
     assert seen_state == [tcb.BreakerState.HALF_OPEN]
     assert b.state("batch") is tcb.BreakerState.CLOSED
+
+
+def test_both_lanes_open_no_rotate_defers_to_dual_lane_breaker():
+    """Total outage (both lanes OPEN) -> do NOT rotate onto a second dead lane;
+    return preferred so dual_lane_breaker owns the terminal pause."""
+    b = _fresh()
+    t = 0.0
+    for _ in range(20):
+        b.record("batch", ok=False, failure_mode="TIMEOUT", now=t)
+        b.record("realtime", ok=False, failure_mode="TIMEOUT", now=t)
+        t += 1.0
+    assert b.state("batch") is tcb.BreakerState.OPEN
+    assert b.state("realtime") is tcb.BreakerState.OPEN
+    assert b.select_lane("batch", now=t) == "batch"   # no rotate onto dead sibling
+
+
+def test_single_lane_open_rotates_to_healthy_sibling():
+    b = _fresh()
+    t = 0.0
+    for _ in range(20):
+        b.record("batch", ok=False, failure_mode="TIMEOUT", now=t)
+        b.record("realtime", ok=True, now=t)   # realtime stays healthy
+        t += 1.0
+    assert b.state("batch") is tcb.BreakerState.OPEN
+    assert b.state("realtime") is tcb.BreakerState.CLOSED
+    assert b.select_lane("batch", now=t) == "realtime"

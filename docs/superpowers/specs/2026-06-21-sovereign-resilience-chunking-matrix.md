@@ -39,7 +39,9 @@ Live evidence:
 | Need | Existing asset | Anchor |
 |---|---|---|
 | Failback FSM states (PRIMARY_READY/FALLBACK_ACTIVE/PRIMARY_DEGRADED/QUEUE_ONLY) | `candidate_generator.py` FailbackFSM | `:1635-1638`, `:1784` |
-| Per-failure-mode backoff params | `_RECOVERY_PARAMS` (TIMEOUT 45→300, SERVER_ERROR 60→600) | `candidate_generator.py:1663-1671` |
+| **Full-jitter backoff primitive** (the ONE jitter algorithm) | `circuit_breaker.full_jitter_delay(attempt, *, base_s, cap_s, rng)` | `circuit_breaker.py:396` |
+| **Dynamic recovery-window timing** (episode tracker + Slice-242 adaptive prior; composes `full_jitter_delay`) | `dw_transport_recovery.DWTransportRecovery` — `note_degraded/note_recovered/dynamic_recovery_window_s` | `dw_transport_recovery.py:76-150` |
+| **Total-outage breaker** (both lanes dead → terminal pause; we COMPOSE, never duplicate) | `dual_lane_breaker.DualLaneOutageBreaker` — `record_total_outage/record_success/is_tripped` | `dual_lane_breaker.py:72-140` |
 | Lane-health signal (computed, unused) | Slice183 `batch_lane_healthy` dispatch telemetry | `candidate_generator.py` (Slice183 log site) |
 | Failure taxonomy + breaker primitives | `topology_sentinel.py` FailureSource, breaker states | `:429-465` |
 | Transport selection (batch vs realtime/SSE) | dynamic transport router (`JARVIS_DW_DYNAMIC_TRANSPORT_ENABLED`) + `doubleword_provider` | `doubleword_provider.py` SSE `:3307-3369`, batch `:4457-4715` |
@@ -68,6 +70,8 @@ A classic three-state breaker keyed **per transport lane** (`batch`, `realtime`)
 - **Recovery timer (jittered exponential):** OPEN carries a recovery deadline = `min(base × 2^consecutive_open, max) ± jitter`, reusing `_RECOVERY_PARAMS` magnitudes (env-tunable, never literal). No permanent pin.
 - **HALF-OPEN** when the timer expires: the breaker emits **one lightweight async probe** to the OPEN lane (a tiny generation/ping through that exact transport). Probe success → **CLOSED** (resume optimal batch). Probe failure → back to **OPEN** with the next (longer, jittered) timer.
 - **Self-healing invariant:** no state transition needs human input; the probe is fire-and-forget and bounded; a probe that hangs counts as failure via its own timeout.
+- **REUSE (no duplicate timer/jitter):** the recovery-window timing is **delegated to one `dw_transport_recovery.DWTransportRecovery` instance per lane** (`note_degraded` on trip/probe-fail, `dynamic_recovery_window_s` for the deadline, `note_recovered` on probe-success) — which already composes `circuit_breaker.full_jitter_delay` + the Slice-242 adaptive prior. This module reimplements **no** jitter or exponential-backoff math. The genuinely-new layer is only the per-lane state machine + the adaptive failure-rate trip + `select_lane` rotation + the async probe.
+- **COMPOSE with `dual_lane_breaker` (no overlap of authority):** `select_lane` rotates a single dead lane to its healthy sibling; when BOTH lanes are OPEN (total outage) it stops rotating and returns the preferred lane, leaving the terminal session-pause to `dual_lane_breaker` (which owns total-outage). The two breakers handle disjoint cases (partial vs total).
 
 **A2. Wiring into the dispatch path.** At the transport-selection site, consult `breaker.select_lane(router_choice)` so the *computed-but-ignored* `batch_lane_healthy` finally has teeth: an OPEN batch lane forces realtime regardless of the router's first choice. Each generation attempt reports its lane + outcome to `breaker.record(lane, outcome)`. The HALF-OPEN probe is scheduled by an idle async tick (reuse an existing daemon cadence; no new always-on loop). Reuses the FailbackFSM classification (`mode=TIMEOUT` etc.) — the breaker consumes the *same* failure-mode signal, it does not re-classify.
 
