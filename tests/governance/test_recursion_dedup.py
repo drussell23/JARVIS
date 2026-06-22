@@ -149,3 +149,11 @@ def test_not_duplicate_similar_but_different_scope():
     h2 = d.subgoal_hash(("a.py::G",), "do x")
     led.mark(h1)
     assert not d.is_duplicate(h2, led, frozenset()), "different scope must not be flagged as dup"
+
+
+def test_get_attempt_ledger_is_process_global_singleton():
+    """get_attempt_ledger() returns the same AttemptLedger instance each call."""
+    led1 = d.get_attempt_ledger()
+    led2 = d.get_attempt_ledger()
+    assert led1 is led2, "singleton must return the same instance"
+    assert isinstance(led1, d.AttemptLedger)

@@ -97,6 +97,25 @@ from backend.core.ouroboros.governance.risk_engine import (
     RiskClassification,
     RiskTier,
 )
+# B5 -- BLOCK -> decompose -> re-inject seam. Leaf modules (no orchestrator
+# back-edge), so module-level import is circular-safe. Bound here as module
+# attributes so the seam is fully unit-testable via monkeypatch.
+from backend.core.ouroboros.governance.goal_decomposition_planner import (
+    DecomposedPlan,
+    chunking_enabled,
+    decompose_for_block,
+)
+from backend.core.ouroboros.governance.adaptive_recursion_governor import (
+    recursion_budget,
+)
+from backend.core.ouroboros.governance.recursion_dedup import (
+    get_attempt_ledger,
+    is_duplicate,
+    subgoal_hash,
+)
+from backend.core.ouroboros.governance.multi_step_orchestrator import (
+    advance_orchestration,
+)
 from backend.core.ouroboros.governance.policy_engine import PolicyEngine, PolicyDecision
 from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
@@ -109,6 +128,21 @@ from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTer
 from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
+
+
+@dataclass(frozen=True)
+class _BlockGoal:
+    """Duck-typed RoadmapGoal-like view of a BLOCKed op for B5 decomposition.
+
+    ``decompose_for_block`` reads ``goal_id`` / ``title`` / ``description`` /
+    ``target_files`` (fail-soft). This adapter projects an OperationContext
+    onto that shape without importing the roadmap goal type.
+    """
+
+    goal_id: str
+    title: str
+    description: str
+    target_files: Tuple[str, ...]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2035,6 +2069,122 @@ class GovernedOrchestrator:
                 "[Orchestrator] Route cost heartbeat failed", exc_info=True,
             )
 
+    async def _decompose_block_or_legacy(
+        self,
+        ctx: OperationContext,
+        advisory: Any,
+    ) -> OperationContext:
+        """B5 -- the BLOCK -> decompose -> re-inject seam.
+
+        At the OperationAdvisor BLOCK site, attempt to decompose the GOAL
+        into AST-symbol-scoped + test-first sub-goals and re-inject them via
+        the dep-gated multi-step emitter (gated by the B3 adaptive governor +
+        B4 de-dup ledger). On success the parent terminates ``decomposed``;
+        the READY sub-goals carry the work forward.
+
+        Fail-soft is ABSOLUTE: chunking-off, governor-not-allowed, duplicate,
+        or ANY exception falls through to the EXACT legacy termination
+        (``advisor_blocked``). The op is NEVER lost.
+
+        Mutates nothing; returns the advanced (terminal CANCELLED) context.
+        """
+        if chunking_enabled():
+            try:
+                target_files = tuple(getattr(ctx, "target_files", ()) or ())
+                description = ctx.description or ""
+
+                # B4 de-dup -- primary infinite-cycle guard. Process-global
+                # ledger so a recursively-chunked GOAL cannot cycle.
+                h = subgoal_hash(target_files, description)
+                ledger = get_attempt_ledger()
+                if not is_duplicate(h, ledger, frozenset()):
+                    # Recursion depth from intake evidence (fail-soft to 0).
+                    depth = 0
+                    try:
+                        evidence_json = (
+                            getattr(ctx, "intake_evidence_json", "") or ""
+                        )
+                        if evidence_json and "recursion_depth" in evidence_json:
+                            evidence = json.loads(evidence_json)
+                            if isinstance(evidence, dict):
+                                depth = int(
+                                    evidence.get("recursion_depth", 0) or 0
+                                )
+                    except Exception:  # noqa: BLE001
+                        depth = 0
+
+                    # Live load signals: no clean accessor at this seam, so
+                    # default to 0/0.0/0 (fail-soft). The de-dup ledger is the
+                    # PRIMARY cycle guard; the governor bounds fan-out + depth.
+                    budget = recursion_budget(
+                        queue_len=0,
+                        loop_blocked_ms=0.0,
+                        pressure_level=0,
+                        depth=depth,
+                    )
+                    if budget.allowed:
+                        # zero-coverage -> prepend a mandatory test-gen sub-goal
+                        # that every mutation sub-goal blocks on. Prefer the
+                        # typed Advisory field; fall back to the reasons string.
+                        zero_cov = False
+                        try:
+                            zero_cov = float(
+                                getattr(advisory, "test_coverage", 1.0)
+                            ) <= 0.0
+                        except Exception:  # noqa: BLE001
+                            zero_cov = False
+                        if not zero_cov:
+                            zero_cov = any(
+                                "coverage" in str(r).lower()
+                                for r in getattr(advisory, "reasons", ())
+                            )
+
+                        goal = _BlockGoal(
+                            goal_id=ctx.op_id,
+                            title=description[:80],
+                            description=description,
+                            target_files=target_files,
+                        )
+                        subs = decompose_for_block(
+                            goal, zero_coverage=zero_cov,
+                        )[: max(1, budget.max_fanout)]
+                        plan = DecomposedPlan(
+                            parent_goal_id=ctx.op_id,
+                            sub_goals=tuple(subs),
+                            dag_valid=True,
+                            dag_depth=depth + 1,
+                            topological_order=tuple(
+                                s.sub_goal_id for s in subs
+                            ),
+                            diagnostic="block_decompose_reinject",
+                        )
+                        _gls = getattr(
+                            self._stack, "governed_loop_service", None,
+                        )
+                        router = getattr(_gls, "_intake_router", None)
+                        await advance_orchestration(plan, router=router)
+                        ledger.mark(h)
+                        logger.warning(
+                            "[Orchestrator] BLOCK decomposed into %d "
+                            "sub-goals (test_first=%s) op=%s",
+                            len(subs), zero_cov, ctx.op_id,
+                        )
+                        return ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="decomposed",
+                        )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[Orchestrator] chunking seam fail-soft -> legacy "
+                    "advisor_blocked (op=%s)", ctx.op_id, exc_info=True,
+                )
+
+        # Legacy fall-through -- EXACT today's behavior. The op is never lost.
+        return ctx.advance(
+            OperationPhase.CANCELLED,
+            terminal_reason_code="advisor_blocked",
+        )
+
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
 
@@ -2400,10 +2550,13 @@ class GovernedOrchestrator:
                     )
                     if _serpent:
                         await _serpent.stop(success=False)
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
-                        terminal_reason_code="advisor_blocked",
-                    )
+                    # B5 KEYSTONE -- instead of unconditionally terminating,
+                    # attempt to decompose the GOAL into AST-symbol-scoped +
+                    # test-first sub-goals and re-inject them (gated by the
+                    # B3 governor + B4 de-dup). Fail-soft to the EXACT legacy
+                    # advisor_blocked termination on ANY error / chunking-off
+                    # / governor-not-allowed / duplicate. The op is NEVER lost.
+                    ctx = await self._decompose_block_or_legacy(ctx, _advisory)
                     return ctx
 
                 if _advisory.decision != AdvisoryDecision.RECOMMEND:

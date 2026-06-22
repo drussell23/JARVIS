@@ -166,6 +166,18 @@ def persistence_enabled() -> bool:
     return _flag(_ENV_PERSIST, default=True)
 
 
+_ENV_RECURSIVE_CHUNKING = "JARVIS_RECURSIVE_CHUNKING_ENABLED"
+
+
+def chunking_enabled() -> bool:
+    """Master flag for the B5 BLOCK -> decompose -> re-inject seam.
+
+    Default-FALSE: when off, the OperationAdvisor BLOCK site terminates
+    byte-identically to today (terminal_reason_code=advisor_blocked).
+    """
+    return _flag(_ENV_RECURSIVE_CHUNKING, default=False)
+
+
 def _read_clamped_int(
     name: str, default: int, lo: int, hi: int,
 ) -> int:

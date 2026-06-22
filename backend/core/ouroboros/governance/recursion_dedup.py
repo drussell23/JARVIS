@@ -107,3 +107,24 @@ def is_duplicate(
     Both checks are O(1).
     """
     return ledger.seen(h) or h in active_plan_hashes
+
+
+# ---------------------------------------------------------------------------
+# Process-global singleton (B5 seam)
+# ---------------------------------------------------------------------------
+
+_ATTEMPT_LEDGER_SINGLETON: AttemptLedger | None = None
+
+
+def get_attempt_ledger() -> AttemptLedger:
+    """Return the process-global AttemptLedger, creating it on first use.
+
+    The BLOCK -> decompose -> re-inject seam needs a single attempt ledger
+    that survives across operations so a recursively-chunked GOAL cannot
+    cycle. Lazily constructed so the bound env (JARVIS_RECURSION_LEDGER_SIZE)
+    is read at first use.
+    """
+    global _ATTEMPT_LEDGER_SINGLETON
+    if _ATTEMPT_LEDGER_SINGLETON is None:
+        _ATTEMPT_LEDGER_SINGLETON = AttemptLedger()
+    return _ATTEMPT_LEDGER_SINGLETON
