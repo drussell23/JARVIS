@@ -115,6 +115,7 @@ from backend.core.ouroboros.governance.goal_decomposition_planner import (
     DecomposedPlan,
     chunking_enabled,
     decompose_for_block,
+    estimate_subgoal_payload_chars,
 )
 from backend.core.ouroboros.governance.adaptive_recursion_governor import (
     recursion_budget,
@@ -127,6 +128,16 @@ from backend.core.ouroboros.governance.recursion_dedup import (
 from backend.core.ouroboros.governance.multi_step_orchestrator import (
     advance_orchestration,
 )
+# T3 -- Convergence Watchdog wiring. Leaf modules (no orchestrator back-edge).
+# Bound at module level so the seam is monkeypatch-testable (same discipline
+# as decompose_for_block above).  estimate_subgoal_payload_chars already
+# imported from goal_decomposition_planner above.
+from backend.core.ouroboros.governance.convergence_watchdog import (
+    get_reduction_tracker,
+    watchdog_enabled,
+    emit_sovereign_yield,
+)
+from backend.core.ouroboros.governance.epistemic_shedder import shed_to_fit
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
@@ -2210,6 +2221,69 @@ class GovernedOrchestrator:
                             goal, zero_coverage=zero_cov,
                             compression_target=compression_target,
                         )
+                        # T3 -- Convergence Watchdog: detect stalled reduction
+                        # trajectory on the egress re-chunk path and structurally
+                        # shed weight instead of looping forever.
+                        # Guard: only active when compression_target is set (i.e.
+                        # the egress-overweight re-chunk path) and the watchdog is
+                        # enabled.  Fail-soft: any exception falls through to the
+                        # legacy slice path unchanged; the de-dup ledger remains
+                        # the backstop against infinite cycles.
+                        if compression_target is not None and watchdog_enabled():
+                            try:
+                                _parent_chars = estimate_subgoal_payload_chars(goal)
+                                _max_child = max(
+                                    (estimate_subgoal_payload_chars(s) for s in _all_subs),
+                                    default=0,
+                                )
+                                # Use ctx.op_id as the stable lineage root id.
+                                # goal.goal_id == ctx.op_id (set at _BlockGoal
+                                # construction above), so either is equivalent;
+                                # ctx.op_id is explicit and never None.
+                                _lineage = ctx.op_id
+                                _verdict = get_reduction_tracker().record_pass(
+                                    _lineage, _parent_chars, _max_child,
+                                )
+                                if _verdict.stalled:
+                                    # Stalled: structurally shed the heaviest
+                                    # sub-goal's description to fit the egress
+                                    # ceiling, emit [SOVEREIGN YIELD], and replace
+                                    # the non-shrinking slice with ONE fitting
+                                    # sub-goal so the next pass can make progress.
+                                    _heaviest = (
+                                        max(
+                                            _all_subs,
+                                            key=lambda s: estimate_subgoal_payload_chars(s),
+                                        )
+                                        if _all_subs
+                                        else None
+                                    )
+                                    _src = (
+                                        getattr(_heaviest, "description", "") or ""
+                                    ) if _heaviest is not None else (
+                                        goal.description or ""
+                                    )
+                                    _shed, _tier = shed_to_fit(_src, compression_target)
+                                    emit_sovereign_yield(
+                                        ctx.op_id,
+                                        lineage_id=_lineage,
+                                        ratio=_verdict.ratio,
+                                        consecutive_stalls=_verdict.consecutive_stalls,
+                                        parent_chars=_parent_chars,
+                                        child_chars=_max_child,
+                                        tier=_tier,
+                                    )
+                                    if _heaviest is not None:
+                                        # Replace the heaviest sub-goal with a
+                                        # shed copy.  SubGoal is a frozen
+                                        # dataclass so we use dataclasses.replace.
+                                        _shed_sub = dataclasses.replace(
+                                            _heaviest, description=_shed,
+                                        )
+                                        _all_subs = (_shed_sub,)
+                            except Exception:  # noqa: BLE001
+                                # Fail-soft: watchdog error -> legacy slice path.
+                                pass
                         _prereq = [
                             s for s in _all_subs if not s.depends_on_sub_ids
                         ]
