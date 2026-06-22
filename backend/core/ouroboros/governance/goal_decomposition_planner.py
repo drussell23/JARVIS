@@ -665,6 +665,174 @@ def heuristic_decompose(goal: Any) -> Tuple[SubGoal, ...]:
     ),)
 
 
+# ---------------------------------------------------------------------------
+# B2: Test-first prerequisite injection (decompose_for_block)
+# ---------------------------------------------------------------------------
+
+
+def decompose_for_block(
+    goal: Any,
+    *,
+    zero_coverage: bool,
+    scoper: Any = None,
+) -> Tuple[SubGoal, ...]:
+    """Decompose a GOAL for an OperationAdvisor BLOCK into topo-ordered SubGoals.
+
+    When ``zero_coverage=True`` the decomposer prepends a mandatory
+    "Generate PyTest suite" sub-goal (kind=SEQUENTIAL) that every mutation
+    sub-goal BLOCKS ON (via ``depends_on_sub_ids``), so the AI builds its
+    own safety net before mutating.
+
+    When ``zero_coverage=False`` the test-gen sub-goal is omitted; only the
+    (symbol-scoped) mutation sub-goal(s) are returned.
+
+    Target narrowing: B1 ``isolate_symbols`` is called per-file to narrow
+    ``target_files`` to the symbol-bearing files.  On any scoper error the
+    whole-file fallback is used (fail-soft).
+
+    Args:
+        goal: RoadmapGoal-like object — must have ``goal_id``, ``title``,
+              ``description``, ``target_files``.
+        zero_coverage: When True, prepend a test-gen sub-goal.
+        scoper: Callable with the same signature as ``isolate_symbols``
+                (injectable for testing; defaults to B1 ``isolate_symbols``).
+
+    Returns:
+        Non-empty topo-ordered tuple of :class:`SubGoal` artifacts.
+        NEVER raises.
+    """
+    # Lazy-import B1 module to avoid circular-import risk at module load.
+    if scoper is None:
+        try:
+            from backend.core.ouroboros.governance.ast_symbol_scoper import (  # noqa: PLC0415
+                isolate_symbols as _isolate_symbols,
+            )
+            scoper = _isolate_symbols
+        except Exception:  # noqa: BLE001
+            scoper = None
+
+    # --- Extract goal fields (fail-soft) ------------------------------------
+    try:
+        parent_id = str(getattr(goal, "goal_id", "") or "")
+        title = str(getattr(goal, "title", "") or "")
+        description = str(getattr(goal, "description", "") or "")
+        raw_files = getattr(goal, "target_files", None)
+        if raw_files is None:
+            target_files: Tuple[str, ...] = ()
+        else:
+            target_files = tuple(str(f) for f in raw_files)
+    except Exception:  # noqa: BLE001
+        target_files = ()
+        parent_id = ""
+        title = ""
+        description = ""
+
+    # --- Whole-file fallback sub-goal (used on error paths) -----------------
+    def _fallback() -> Tuple[SubGoal, ...]:
+        files = target_files or ("",)
+        boundary = _is_boundary_crossed(files)
+        return (SubGoal(
+            sub_goal_id=f"{parent_id or 'unknown'}::step-00",
+            parent_goal_id=parent_id or "unknown",
+            title=title or "mutate",
+            description=description,
+            kind=SubGoalKind.SEQUENTIAL if boundary else SubGoalKind.ATOMIC,
+            target_files=files,
+            depends_on_sub_ids=(),
+            estimated_complexity="moderate",
+            boundary_crossed=boundary,
+        ),)
+
+    if not parent_id or not title:
+        return _fallback()
+
+    # --- Symbol-scope each target file via B1 scoper -----------------------
+    def _scoped_files_for(files: Tuple[str, ...]) -> Tuple[str, ...]:
+        """Return the set of files that have matching symbols (or all files
+        if the scoper is unavailable / fails)."""
+        if not files or scoper is None:
+            return files
+        bearing: list[str] = []
+        for fp in files:
+            try:
+                targets = scoper(fp, description)
+                # ScopedTarget.symbol == "" means whole-file fallback from B1
+                # — still counts as "bearing" (the file is a target).
+                bearing.append(fp)
+            except Exception:  # noqa: BLE001
+                bearing.append(fp)
+        return tuple(bearing) if bearing else files
+
+    symbol_files = _scoped_files_for(target_files)
+    if not symbol_files:
+        symbol_files = target_files or ("",)
+
+    boundary = _is_boundary_crossed(symbol_files)
+
+    # --- Build sub-goals ---------------------------------------------------
+    out: List[SubGoal] = []
+
+    if zero_coverage:
+        # step-00: mandatory test-gen prerequisite
+        test_id = f"{parent_id}::step-00"
+        # Derive a short symbol hint for the title from the description
+        # (first word that looks like a Python identifier, or empty).
+        _sym_hint = ""
+        for _tok in description.split():
+            _clean = _tok.strip(".,;:()[]")
+            if _clean.isidentifier() and len(_clean) > 3:
+                _sym_hint = _clean
+                break
+        test_title = (
+            f"Generate PyTest suite for {_sym_hint}" if _sym_hint
+            else f"Generate PyTest suite for {title}"
+        )
+        out.append(SubGoal(
+            sub_goal_id=test_id,
+            parent_goal_id=parent_id,
+            title=test_title,
+            description=(
+                f"Generate a comprehensive PyTest test suite covering "
+                f"the symbols targeted by: {description[:512]}"
+            ),
+            kind=SubGoalKind.SEQUENTIAL,
+            target_files=symbol_files,
+            depends_on_sub_ids=(),
+            estimated_complexity="moderate",
+            boundary_crossed=boundary,
+        ))
+
+        # step-01: mutation sub-goal that blocks on the test
+        mutation_id = f"{parent_id}::step-01"
+        out.append(SubGoal(
+            sub_goal_id=mutation_id,
+            parent_goal_id=parent_id,
+            title=title,
+            description=description,
+            kind=SubGoalKind.SEQUENTIAL,
+            target_files=symbol_files,
+            depends_on_sub_ids=(test_id,),
+            estimated_complexity="moderate",
+            boundary_crossed=boundary,
+        ))
+    else:
+        # No test-gen sub-goal; just the (symbol-scoped) mutation sub-goal.
+        mutation_id = f"{parent_id}::step-00"
+        out.append(SubGoal(
+            sub_goal_id=mutation_id,
+            parent_goal_id=parent_id,
+            title=title,
+            description=description,
+            kind=SubGoalKind.SEQUENTIAL if boundary else SubGoalKind.ATOMIC,
+            target_files=symbol_files,
+            depends_on_sub_ids=(),
+            estimated_complexity="moderate",
+            boundary_crossed=boundary,
+        ))
+
+    return tuple(out)
+
+
 # DAG validation
 
 
@@ -1613,6 +1781,7 @@ __all__ = [
     "kind_glyph",
     "status_glyph",
     "heuristic_decompose",
+    "decompose_for_block",
     "decompose_goal",
     "emit_sub_goal_envelopes",
     "decompose_and_emit",
