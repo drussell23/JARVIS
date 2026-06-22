@@ -1414,6 +1414,65 @@ def immediate_reroute_to_dw(
 
 
 # ---------------------------------------------------------------------------
+# A3 Transport Circuit Breaker seam
+# ---------------------------------------------------------------------------
+
+def _breaker_select_transport(preferred: str) -> str:
+    """Return the actual transport lane to use for the current DW dispatch attempt.
+
+    When the TransportCircuitBreaker is enabled and the preferred lane is OPEN,
+    rotates traffic to the sibling lane (batch->realtime or realtime->batch).
+    When the breaker is disabled (default), returns ``preferred`` unchanged --
+    fully OFF byte-identical.
+
+    Contract: NEVER raises -- any error inside the breaker returns ``preferred``.
+
+    Env:
+        JARVIS_TRANSPORT_BREAKER_ENABLED (bool, default false) -- master switch.
+    """
+    try:
+        from backend.core.ouroboros.governance.transport_circuit_breaker import (
+            breaker_enabled as _tb_enabled,
+            get_transport_breaker as _get_tb,
+        )
+        if not _tb_enabled():
+            return preferred
+        import time as _t
+        return _get_tb().select_lane(preferred, now=_t.monotonic())
+    except Exception:  # noqa: BLE001 -- breaker must NEVER break dispatch
+        return preferred
+
+
+def _breaker_record_outcome(
+    lane: str,
+    *,
+    ok: bool,
+    failure_mode: str | None,
+) -> None:
+    """Feed an attempt outcome into the TransportCircuitBreaker for ``lane``.
+
+    Guarded by the master gate and fully fail-soft.  Callers do NOT need to
+    check ``breaker_enabled()`` -- this function handles the guard internally.
+
+    Args:
+        lane:         The transport lane that was actually used ("batch" / "realtime").
+        ok:           True on success, False on any failure.
+        failure_mode: The FailureSource name (e.g. "LIVE_TRANSPORT"), or None on success.
+    """
+    try:
+        from backend.core.ouroboros.governance.transport_circuit_breaker import (
+            breaker_enabled as _tb_enabled,
+            get_transport_breaker as _get_tb,
+        )
+        if not _tb_enabled():
+            return
+        import time as _t
+        _get_tb().record(lane, ok=ok, failure_mode=failure_mode, now=_t.monotonic())
+    except Exception:  # noqa: BLE001 -- record must NEVER break dispatch
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
 
@@ -3725,6 +3784,20 @@ class CandidateGenerator:
                 _s183_tb.format_exc(),
             )
             _s182_force_batch = False
+        # A3 Transport Circuit Breaker -- lane-rotation seam.
+        # When _s182_force_batch is True, the preferred transport is "batch".
+        # If the breaker is enabled and that lane is OPEN, _breaker_select_transport
+        # returns "realtime" -- we honour it by clearing the force-batch flag so
+        # doubleword_provider stays on the SSE/realtime path.  When the breaker is
+        # disabled (default) or the lane is CLOSED, this is a zero-cost no-op.
+        if _s182_force_batch:
+            _a3_chosen_lane = _breaker_select_transport("batch")
+            if _a3_chosen_lane == "realtime":
+                logger.info(
+                    "[A3-Breaker] batch lane OPEN -- rotating to realtime for op=%s",
+                    op_id_short,
+                )
+                _s182_force_batch = False
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
             # Phase 12 Slice H — TERMINAL_OPEN bypasses dispatch
@@ -3965,6 +4038,10 @@ class CandidateGenerator:
                             )
                 except Exception:  # noqa: BLE001 — drift is enhancement
                     pass
+                # A3 Transport Circuit Breaker -- record success outcome.
+                # Lane: "batch" if force-batch was armed (_s182_fb_token set), else "realtime".
+                _a3_success_lane = "batch" if _s182_fb_token is not None else "realtime"
+                _breaker_record_outcome(_a3_success_lane, ok=True, failure_mode=None)
                 return _attempt_result
 
             if _attempt_exc is not None:
@@ -4151,6 +4228,16 @@ class CandidateGenerator:
                         f"{type(exc).__name__}: {err_str[:300]!r}", op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
+                # A3 Transport Circuit Breaker -- record failure outcome.
+                # Only LIVE transport failures are meaningful to the breaker;
+                # GENERATION_TIMEOUT / FSM_EXHAUSTED / HTTP classification are
+                # OUR-side faults, not transport ruptures.
+                _a3_fail_lane = "batch" if _s182_fb_token is not None else "realtime"
+                _breaker_record_outcome(
+                    _a3_fail_lane,
+                    ok=False,
+                    failure_mode=failure_source.name,
+                )
                 try:
                     # Slice 201 — feed the bandit a FAILURE reward for this arm
                     # so its posterior learns which models actually deliver.
