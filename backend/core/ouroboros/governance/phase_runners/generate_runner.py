@@ -1576,6 +1576,79 @@ class GENERATERunner(PhaseRunner):
                 _err_msg = str(exc)
                 _route = getattr(ctx, "provider_route", "")
 
+                # ── Sovereign Egress Interceptor Mesh (T3) — route-back ──
+                # The LIVE generate-failure handler. When OUR egress interceptor
+                # blocked an over-ceiling DW body (LocalEgressOverweightError,
+                # re-raised from candidate_generator carrying max_allowed_size),
+                # this is NOT a vendor rupture and NOT a retryable generation
+                # failure — retrying the SAME oversized body would just block
+                # again. Instead route it BACK to context-aware chunking:
+                # decompose the GOAL with compression_target=max_allowed_size so
+                # each re-injected sub-goal fits under the ceiling, then terminate
+                # this op ``decomposed`` (the sub-goals carry the work forward) —
+                # exactly the BLOCK->decompose->re-inject seam. Chunking-eligible
+                # gate: only when at least one target_file is present (a symbol-
+                # scopable mutation). Fail-soft ABSOLUTE: any error falls through
+                # to the legacy generation-failure path below (op is never lost).
+                try:
+                    from backend.core.ouroboros.governance.dw_fault_taxonomy import (  # noqa: E501
+                        is_local_egress_overweight as _egress_overweight,
+                    )
+                    if _egress_overweight(exc):
+                        _max_allowed = getattr(exc, "max_allowed_size", None)
+                        _eligible = bool(
+                            getattr(ctx, "target_files", ()) or ()
+                        )
+                        from backend.core.ouroboros.governance.goal_decomposition_planner import (  # noqa: E501
+                            chunking_enabled as _chunking_enabled,
+                        )
+                        if (
+                            _eligible
+                            and _chunking_enabled()
+                            and isinstance(_max_allowed, int)
+                        ):
+                            logger.warning(
+                                "[Orchestrator] LOCAL_EGRESS_OVERWEIGHT op=%s — "
+                                "egress interceptor blocked an over-ceiling body "
+                                "(max_allowed=%d); routing BACK to context-aware "
+                                "chunking (compression_target=%d) instead of a "
+                                "doomed retry",
+                                ctx.op_id, _max_allowed, _max_allowed,
+                            )
+                            _re_ctx = await orch._decompose_block_or_legacy(
+                                ctx, None, compression_target=_max_allowed,
+                            )
+                            await orch._record_ledger(
+                                _re_ctx,
+                                OperationState.COMPLETED,
+                                {
+                                    "reason": "local_egress_overweight_rechunk",
+                                    "max_allowed_size": _max_allowed,
+                                    "terminal_reason_code": getattr(
+                                        _re_ctx, "terminal_reason_code", "",
+                                    ),
+                                },
+                            )
+                            return PhaseResult(
+                                next_ctx=_re_ctx,
+                                next_phase=None,
+                                status="fail",
+                                reason=(
+                                    getattr(_re_ctx, "terminal_reason_code", "")
+                                    or "local_egress_overweight_rechunk"
+                                ),
+                                artifacts={
+                                    "generation": generation,
+                                    "episodic_memory": _episodic_memory,
+                                },
+                            )
+                except Exception:  # noqa: BLE001 — fail-soft to legacy path
+                    logger.debug(
+                        "[Orchestrator] egress re-chunk seam fail-soft -> legacy "
+                        "generation-failure path (op=%s)",
+                        getattr(ctx, "op_id", "?"), exc_info=True,
+                    )
+
                 # ── Partial shadow log (widened) ──
                 # Fire the ExplorationLedger shadow pass for EVERY
                 # generation failure, regardless of route/cause. The

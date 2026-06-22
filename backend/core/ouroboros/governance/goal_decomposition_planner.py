@@ -686,6 +686,95 @@ def heuristic_decompose(goal: Any) -> Tuple[SubGoal, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Sovereign Egress Interceptor Mesh (T3) — compression-target estimation
+# ---------------------------------------------------------------------------
+
+
+def _read_source_for_estimate(file_path: str) -> str:
+    """Read ``file_path`` for payload estimation. Fail-soft -> "".
+
+    Kept as a tiny module-level seam so the compression-target estimator is
+    injectable in tests (monkeypatch this) without a real filesystem. NEVER
+    raises."""
+    try:
+        with open(file_path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:  # noqa: BLE001 — estimation must never block decomposition
+        return ""
+
+
+def _symbol_segment_chars(
+    ref: str,
+    *,
+    scoped_targets_by_ref: Mapping[str, "ScopedTargetLike"],
+    source_reader: Callable[[str], str],
+) -> int:
+    """Estimate the source-segment char footprint of one ``"file::Symbol"``
+    ref using its scoper line range. Fail-soft -> a small constant. NEVER
+    raises."""
+    try:
+        tgt = scoped_targets_by_ref.get(ref)
+        if tgt is None:
+            return len(ref)
+        fp = str(getattr(tgt, "file_path", "") or "")
+        start = int(getattr(tgt, "lineno", 0) or 0)
+        end = int(getattr(tgt, "end_lineno", 0) or 0)
+        source = source_reader(fp)
+        if not source or start <= 0 or end < start:
+            return len(ref)
+        lines = source.splitlines(keepends=True)
+        # 1-indexed inclusive line range -> slice.
+        segment = "".join(lines[start - 1:end])
+        return len(segment) if segment else len(ref)
+    except Exception:  # noqa: BLE001
+        return len(ref)
+
+
+def estimate_subgoal_payload_chars(
+    sub_goal: "SubGoal",
+    *,
+    source_reader: Callable[[str], str] | None = None,
+    scoped_targets_by_ref: "Mapping[str, ScopedTargetLike] | None" = None,
+) -> int:
+    """Estimate the egress payload (chars) a sub-goal would carry.
+
+    Reuses T1's :func:`estimate_body_chars` (dw_egress_interceptor) over a
+    pseudo request body composed of the sub-goal's description PLUS the source
+    segments of its scoped symbols (the file content the model must read/edit
+    to satisfy the sub-goal). This is the same notion of "body weight" the
+    egress interceptor measures, so the chunker slices against the SAME ruler
+    that blocked the dispatch. Fail-soft -> len(description). NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.dw_egress_interceptor import (  # noqa: PLC0415
+            estimate_body_chars as _estimate_body_chars,
+        )
+        reader = source_reader or _read_source_for_estimate
+        by_ref = scoped_targets_by_ref or {}
+        content = str(getattr(sub_goal, "description", "") or "")
+        for ref in (getattr(sub_goal, "scoped_symbols", ()) or ()):
+            content += _symbol_segment_chars(
+                # _symbol_segment_chars returns an int count; accumulate it
+                # as a synthetic block so estimate_body_chars sums correctly.
+                str(ref),
+                scoped_targets_by_ref=by_ref,
+                source_reader=reader,
+            ) * "x"
+        body = {"messages": [{"content": content}]}
+        return _estimate_body_chars(body)
+    except Exception:  # noqa: BLE001
+        try:
+            return len(str(getattr(sub_goal, "description", "") or ""))
+        except Exception:  # noqa: BLE001
+            return 0
+
+
+# A duck-typed alias for the scoper's ScopedTarget (avoids an import cycle /
+# hard dependency at module load — the planner already lazy-imports the scoper).
+ScopedTargetLike = Any
+
+
+# ---------------------------------------------------------------------------
 # B2: Test-first prerequisite injection (decompose_for_block)
 # ---------------------------------------------------------------------------
 
@@ -695,6 +784,7 @@ def decompose_for_block(
     *,
     zero_coverage: bool,
     scoper: Any = None,
+    compression_target: int | None = None,
 ) -> Tuple[SubGoal, ...]:
     """Decompose a GOAL for an OperationAdvisor BLOCK into topo-ordered SubGoals.
 
@@ -716,6 +806,15 @@ def decompose_for_block(
         zero_coverage: When True, prepend a test-gen sub-goal.
         scoper: Callable with the same signature as ``isolate_symbols``
                 (injectable for testing; defaults to B1 ``isolate_symbols``).
+        compression_target: Sovereign Egress Interceptor Mesh (T3). When set
+                (the interceptor's ``max_allowed_size``), the scoped symbols are
+                partitioned so each emitted mutation sub-goal's estimated payload
+                (via T1 ``estimate_body_chars``, reused by
+                ``estimate_subgoal_payload_chars``) is <= the target — a too-large
+                symbol SET is split into several sub-goals; a single irreducible
+                symbol is emitted alone with a WARNING (never silently exceeded).
+                ``None`` (default) is byte-identical to the legacy single
+                mutation sub-goal.
 
     Returns:
         Non-empty topo-ordered tuple of :class:`SubGoal` artifacts.
@@ -776,18 +875,22 @@ def decompose_for_block(
     # those (no symbol to scope to → Advisor stays file-level).
     def _scoped_files_for(
         files: Tuple[str, ...],
-    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        """Return ``(bearing_files, scoped_symbols)``.
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, Any]]:
+        """Return ``(bearing_files, scoped_symbols, targets_by_ref)``.
 
         ``bearing_files`` is the set of files that are mutation targets
         (or all files if the scoper is unavailable / fails — fail-soft).
         ``scoped_symbols`` is the de-duplicated tuple of ``"file::Symbol"``
         refs the scoper matched (empty when the scoper is unavailable, no
-        symbol matched, or only whole-file fallbacks were produced)."""
+        symbol matched, or only whole-file fallbacks were produced).
+        ``targets_by_ref`` maps each ref to its ScopedTarget (carrying the
+        line range) so the T3 compression-target slicer can estimate each
+        symbol's source-segment footprint. Empty when no symbols matched."""
         if not files or scoper is None:
-            return files, ()
+            return files, (), {}
         bearing: list[str] = []
         symbols: list[str] = []
+        by_ref: Dict[str, Any] = {}
         seen: set[str] = set()
         for fp in files:
             try:
@@ -805,14 +908,93 @@ def decompose_for_block(
                     if ref not in seen:
                         seen.add(ref)
                         symbols.append(ref)
+                        by_ref[ref] = tgt
             except Exception:  # noqa: BLE001
                 bearing.append(fp)
         bearing_t = tuple(bearing) if bearing else files
-        return bearing_t, tuple(symbols)
+        return bearing_t, tuple(symbols), by_ref
 
-    symbol_files, scoped_symbols = _scoped_files_for(target_files)
+    symbol_files, scoped_symbols, _targets_by_ref = _scoped_files_for(target_files)
     if not symbol_files:
         symbol_files = target_files or ("",)
+
+    # --- T3 compression-target slicing -------------------------------------
+    # When a compression_target is supplied (the egress interceptor's
+    # max_allowed_size), partition the scoped symbols into ordered groups so
+    # each group's estimated payload (via T1's estimate_body_chars, reused by
+    # estimate_subgoal_payload_chars) is <= the target. A single symbol that
+    # alone exceeds the target is IRREDUCIBLE — it is emitted on its own with a
+    # clear WARNING (never silently exceeded, never dropped). Returns the
+    # ORIGINAL whole set as one group when chunking is unnecessary or unset, so
+    # the legacy behavior is byte-identical (compression_target=None / no
+    # symbols / fits-already). NEVER raises.
+    def _partition_for_target(
+        refs: Tuple[str, ...],
+    ) -> List[Tuple[str, ...]]:
+        if compression_target is None or compression_target <= 0:
+            return [refs] if refs else [()]
+        if not refs:
+            return [()]
+        try:
+            # Every sub-goal also carries the description in its payload (see
+            # estimate_subgoal_payload_chars), so reserve that floor from the
+            # symbol budget — keeps the FULL estimated payload <= target, not
+            # just the symbol segments. Clamp the effective budget to >=1 so a
+            # description already at/over the ceiling still makes forward
+            # progress (one symbol per group) rather than looping.
+            _desc_floor = len(description or "")
+            _budget = max(1, compression_target - _desc_floor)
+
+            # Per-symbol estimate via the shared T1 estimator (same ruler as
+            # the interceptor). A symbol is the source segment of its node.
+            def _ref_chars(ref: str) -> int:
+                seg = _symbol_segment_chars(
+                    ref,
+                    scoped_targets_by_ref=_targets_by_ref,
+                    source_reader=_read_source_for_estimate,
+                )
+                return int(seg)
+
+            groups: List[Tuple[str, ...]] = []
+            current: List[str] = []
+            current_chars = 0
+            for ref in refs:
+                rc = _ref_chars(ref)
+                if rc > _budget:
+                    # Irreducible: flush any pending group, emit this symbol
+                    # alone, and WARN — never silently exceed.
+                    if current:
+                        groups.append(tuple(current))
+                        current = []
+                        current_chars = 0
+                    logger.warning(
+                        "[Chunking] IRREDUCIBLE symbol %r estimated %d chars > "
+                        "compression_target %d — emitting it as a standalone "
+                        "sub-goal (cannot split a single symbol further); the "
+                        "egress interceptor may still block it, but it is NEVER "
+                        "silently dropped or under-reported",
+                        ref, rc, compression_target,
+                    )
+                    groups.append((ref,))
+                    continue
+                if current and (current_chars + rc) > _budget:
+                    groups.append(tuple(current))
+                    current = [ref]
+                    current_chars = rc
+                else:
+                    current.append(ref)
+                    current_chars += rc
+            if current:
+                groups.append(tuple(current))
+            return groups or [refs]
+        except Exception:  # noqa: BLE001 — fail-soft: one group = legacy
+            logger.debug(
+                "[Chunking] compression-target partition fail-soft -> single "
+                "group", exc_info=True,
+            )
+            return [refs]
+
+    _symbol_groups = _partition_for_target(scoped_symbols)
 
     boundary = _is_boundary_crossed(symbol_files)
 
@@ -849,38 +1031,44 @@ def decompose_for_block(
             boundary_crossed=boundary,
         ))
 
-        # step-01: mutation sub-goal that blocks on the test.
-        # Only the MUTATION sub-goal carries scoped_symbols — the test-gen
+        # step-01..: mutation sub-goal(s) that block on the test.
+        # Only the MUTATION sub-goals carry scoped_symbols — the test-gen
         # sub-goal above writes a new test file, it doesn't mutate the
-        # scoped symbols, so its blast stays file-level.
-        mutation_id = f"{parent_id}::step-01"
-        out.append(SubGoal(
-            sub_goal_id=mutation_id,
-            parent_goal_id=parent_id,
-            title=title,
-            description=description,
-            kind=SubGoalKind.SEQUENTIAL,
-            target_files=symbol_files,
-            depends_on_sub_ids=(test_id,),
-            estimated_complexity="moderate",
-            boundary_crossed=boundary,
-            scoped_symbols=scoped_symbols,
-        ))
+        # scoped symbols, so its blast stays file-level. When a
+        # compression_target split the symbols into >1 group, emit one
+        # mutation sub-goal per group (each <= target); otherwise byte-
+        # identical single step-01.
+        for _gi, _group in enumerate(_symbol_groups, start=1):
+            mutation_id = f"{parent_id}::step-{_gi:02d}"
+            out.append(SubGoal(
+                sub_goal_id=mutation_id,
+                parent_goal_id=parent_id,
+                title=title,
+                description=description,
+                kind=SubGoalKind.SEQUENTIAL,
+                target_files=symbol_files,
+                depends_on_sub_ids=(test_id,),
+                estimated_complexity="moderate",
+                boundary_crossed=boundary,
+                scoped_symbols=_group,
+            ))
     else:
-        # No test-gen sub-goal; just the (symbol-scoped) mutation sub-goal.
-        mutation_id = f"{parent_id}::step-00"
-        out.append(SubGoal(
-            sub_goal_id=mutation_id,
-            parent_goal_id=parent_id,
-            title=title,
-            description=description,
-            kind=SubGoalKind.SEQUENTIAL if boundary else SubGoalKind.ATOMIC,
-            target_files=symbol_files,
-            depends_on_sub_ids=(),
-            estimated_complexity="moderate",
-            boundary_crossed=boundary,
-            scoped_symbols=scoped_symbols,
-        ))
+        # No test-gen sub-goal; just the (symbol-scoped) mutation sub-goal(s).
+        # One sub-goal per compression-target group (legacy single when unset).
+        for _gi, _group in enumerate(_symbol_groups):
+            mutation_id = f"{parent_id}::step-{_gi:02d}"
+            out.append(SubGoal(
+                sub_goal_id=mutation_id,
+                parent_goal_id=parent_id,
+                title=title,
+                description=description,
+                kind=SubGoalKind.SEQUENTIAL if boundary else SubGoalKind.ATOMIC,
+                target_files=symbol_files,
+                depends_on_sub_ids=(),
+                estimated_complexity="moderate",
+                boundary_crossed=boundary,
+                scoped_symbols=_group,
+            ))
 
     return tuple(out)
 
@@ -1867,6 +2055,7 @@ __all__ = [
     "status_glyph",
     "heuristic_decompose",
     "decompose_for_block",
+    "estimate_subgoal_payload_chars",
     "decompose_goal",
     "emit_sub_goal_envelopes",
     "decompose_and_emit",
