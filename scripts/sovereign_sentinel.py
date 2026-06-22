@@ -130,10 +130,61 @@ _DEFAULT_RULES: Tuple[Tuple[str, str, str, bool, bool, bool], ...] = (
     ("CONVERGENCE",     "=", r"ouroboros/review|orange PR|\bPR #\d+|Pull request.*creat|"
                              r"\[SOVEREIGN GRADUATION\]|gh pr create|state=APPROVE|APPROVED",
                                                                                           True,  False, True),
-    ("FATAL",           "X", r"Traceback \(most recent call last\)|FATAL|"
-                             r"session_outcome=incomplete_kill|Fatal Python error|"
-                             r"CRITICAL.*unhandled|panic:",                               False, True,  False),
+    # FATAL = genuine PROCESS/NODE death only. A bare ``Traceback`` or the word
+    # ``FATAL`` appears routinely in HEALTHY boots (retried imports, optional-dep
+    # probes, handled exceptions) -- matching them auto-killed a healthy booting
+    # node (incident #2). Require strong, unambiguous death markers; the loud
+    # ``[SovereignPropagation]``/``REAL DROP`` app signals are governance events,
+    # not node-fatals, so they are NOT here.
+    ("FATAL",           "X", r"Fatal Python error|session_outcome=incomplete_kill|"
+                             r"panic:|Segmentation fault|OOMKilled|Out of memory: Kill|"
+                             r"container .*(exited|died)|exited with code [1-9]|"
+                             r"systemd.*Failed with result",                             False, True,  False),
 )
+
+
+# Boot / transport NOISE -- ssh, docker-not-yet-installed, gcloud chatter. These
+# lines are NOT organism output: they must never arm "node live", be classified,
+# or trigger a kill. (incident #1: ``sudo: docker: command not found`` was read
+# as a "log line" and armed a false stall clock.)
+_BOOT_NOISE: Pattern[str] = re.compile(
+    r"command not found|Connection (refused|timed out|closed|reset)|"
+    r"Permission denied|Could not resolve|No route to host|Permanently added|"
+    r"Pseudo-terminal|Updating project ssh|Waiting for .*propagate|"
+    r"Cannot connect to the Docker daemon|Is the docker daemon running|"
+    r"No such container|kex_exchange|banner exchange|^ssh:|Warning: Permanently|"
+    r"WARNING: The|gnome-keyring|/usr/bin/python|Pulling from|Pull complete|"
+    r"Downloaded newer image|docker:|Unable to find image",
+    re.IGNORECASE,
+)
+# A REAL organism log line: the app logs ``LEVEL [Module] ...`` or a known FSM
+# marker. Only such a line confirms the node is genuinely live (and arms the
+# stall clock + enables fatal-kill). Anything before that is still booting.
+_ORGANISM_LINE: Pattern[str] = re.compile(
+    # The app logs ``LEVEL [Module] ...`` (bracketed module) -- require the ``[``
+    # so ssh's ``Warning: Permanently added ...`` (colon) is NOT mistaken for an
+    # organism WARNING. Plus the explicit FSM/subsystem markers.
+    r"^\s*(CRITICAL|ERROR|WARNING|INFO|DEBUG)\s+\[|\[A1Trace\]|\[Orchestrator\]|"
+    r"\[Chunking\]|\[SOVEREIGN|\[IntakeDLQ\]|Advisor BLOCK|GovernedLoop|"
+    r"Ouroboros|IntakeLayer|intake.router",
+    re.IGNORECASE,
+)
+
+
+def is_boot_noise(line: str) -> bool:
+    """True for ssh/docker/gcloud boot chatter that must be ignored entirely."""
+    try:
+        return bool(_BOOT_NOISE.search(line)) and not _ORGANISM_LINE.search(line)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def looks_live(line: str) -> bool:
+    """True iff the line is genuine organism output (node is actually up)."""
+    try:
+        return bool(_ORGANISM_LINE.search(line))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class EventMatcher:
@@ -408,10 +459,20 @@ class Sentinel:
                 line = await q.get()
                 if line is None:
                     break
+                # (1) Drop ssh/docker/gcloud boot chatter entirely -- it is not
+                #     organism output and must never arm clocks or trigger a kill.
+                if is_boot_noise(line):
+                    continue
                 now = time.monotonic()
+                # (2) Arm "node live" + the stall clock ONLY on a real organism
+                #     log line. Until then the node is still booting -- a stray
+                #     boot traceback must NOT be treated as a fatal (incident #2).
                 if self._first_line_at is None:
+                    if not looks_live(line):
+                        continue
                     self._first_line_at = now
-                    _log("first log line received -- node is live; stall clock armed.")
+                    _log("organism log line received -- node is LIVE; "
+                         "stall clock armed, fatal-detection enabled.")
                 ev = self._matcher.classify(line)
                 if ev is not None:
                     self.note(ev, now)
@@ -420,6 +481,9 @@ class Sentinel:
                         self.verdict = "converged"
                         _log("=== CONVERGENCE DETECTED (orange PR / graduation). "
                              "Leaving the node up for inspection; auto-kill stood down. ===")
+                    # Fatal-kill is reachable only AFTER the organism is live (the
+                    # gate above ``continue``s on boot lines), so a boot-phase
+                    # traceback can never trigger it.
                     if ev.is_fatal and self._cfg.kill_on_fatal and not self._converged:
                         await self._teardown_and_stop(f"fatal:{ev.kind}")
                         break
