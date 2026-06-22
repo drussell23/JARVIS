@@ -1116,6 +1116,8 @@ def _publish_event(report: OrchestrationReport) -> None:
                 "blocked_count": report.blocked_count,
                 "ready_count": report.ready_count,
                 "emitted_count": report.emitted_count,
+                "emitted_this_tick": report.emitted_this_tick,
+                "made_forward_progress": report.made_forward_progress,
                 "done_count": report.done_count,
                 "failed_count": report.failed_count,
                 "completion_ratio": report.completion_ratio,
