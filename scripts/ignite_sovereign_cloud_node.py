@@ -31,20 +31,25 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _STARTUP_SCRIPT = _REPO_ROOT / "deploy" / "gcp_ouroboros_startup.sh"
 
 
-def _read_dw_key() -> str:
-    """Read DOUBLEWORD_API_KEY from the process env or the repo ``.env``."""
-    k = os.environ.get("DOUBLEWORD_API_KEY", "").strip()
-    if k:
-        return k
+def _read_env_var(name: str) -> str:
+    """Read *name* from the process env or the repo ``.env`` (never printed)."""
+    v = os.environ.get(name, "").strip()
+    if v:
+        return v
     env_path = _REPO_ROOT / ".env"
     if env_path.is_file():
         m = re.search(
-            r'^\s*(?:export\s+)?DOUBLEWORD_API_KEY\s*=\s*["\']?([^"\'\n]+)',
+            rf'^\s*(?:export\s+)?{re.escape(name)}\s*=\s*["\']?([^"\'\n]+)',
             env_path.read_text(), re.M,
         )
         if m:
             return m.group(1).strip()
     return ""
+
+
+def _read_dw_key() -> str:
+    """Read DOUBLEWORD_API_KEY from the process env or the repo ``.env``."""
+    return _read_env_var("DOUBLEWORD_API_KEY")
 
 
 def _mask(key: str) -> str:
@@ -91,6 +96,16 @@ async def _ignite(args: argparse.Namespace) -> int:
         "jarvis-dw-api-key": dw_key,
         "jarvis-dw-primary-override": args.pin,
     }
+    # A1: ship the roadmap HMAC secret so the node can VERIFY the signed
+    # roadmap.yaml it hydrates from the GCS Vault (reader REQUIRE_SIGNATURE
+    # defaults TRUE). Without it the strategic GOAL never emits — no file-00.
+    hmac_secret = _read_env_var("JARVIS_ROADMAP_READER_HMAC_SECRET")
+    if hmac_secret:
+        md["jarvis-roadmap-hmac-secret"] = hmac_secret
+        print(f"   roadmap HMAC via metadata: {_mask(hmac_secret)}")
+    else:
+        print("   WARNING: no JARVIS_ROADMAP_READER_HMAC_SECRET in env/.env — "
+              "signed roadmap will fail verification (no file-00 will emit)")
     if args.crucible:
         # Arm the autonomic graduation cadence (crucible overlay on the node).
         md["jarvis-crucible-mode"] = "true"
