@@ -97,6 +97,17 @@ from backend.core.ouroboros.governance.risk_engine import (
     RiskClassification,
     RiskTier,
 )
+from backend.core.ouroboros.governance.policy_engine import PolicyEngine, PolicyDecision
+from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
+from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
+from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
+# patch_benchmarker is intentionally NOT imported at module level — see
+# `_run_benchmark` for the deferred import. This makes `patch_benchmarker`
+# safely hot-reloadable via ModuleHotReloader: a module-level
+# `from X import Y` would capture a stale class reference at orchestrator
+# import time and never re-bind on reload.
+from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
+
 # B5 -- BLOCK -> decompose -> re-inject seam. Leaf modules (no orchestrator
 # back-edge), so module-level import is circular-safe. Bound here as module
 # attributes so the seam is fully unit-testable via monkeypatch.
@@ -116,16 +127,6 @@ from backend.core.ouroboros.governance.recursion_dedup import (
 from backend.core.ouroboros.governance.multi_step_orchestrator import (
     advance_orchestration,
 )
-from backend.core.ouroboros.governance.policy_engine import PolicyEngine, PolicyDecision
-from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
-from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
-from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
-# patch_benchmarker is intentionally NOT imported at module level — see
-# `_run_benchmark` for the deferred import. This makes `patch_benchmarker`
-# safely hot-reloadable via ModuleHotReloader: a module-level
-# `from X import Y` would capture a stale class reference at orchestrator
-# import time and never re-bind on reload.
-from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
@@ -2082,9 +2083,18 @@ class GovernedOrchestrator:
         B4 de-dup ledger). On success the parent terminates ``decomposed``;
         the READY sub-goals carry the work forward.
 
+        I1 fix: captures the OrchestrationReport and only returns
+        ``decomposed`` when ``report.emitted_count >= 1``.  If
+        ``advance_orchestration`` emits zero sub-goals (master OFF, router
+        None, all ingests fail) we fall through to the EXACT legacy
+        ``advisor_blocked`` terminal so the op is NEVER silently lost.
+
         Fail-soft is ABSOLUTE: chunking-off, governor-not-allowed, duplicate,
         or ANY exception falls through to the EXACT legacy termination
         (``advisor_blocked``). The op is NEVER lost.
+
+        M2 fix: reads real queue_len / loop_blocked_ms / pressure_level via
+        fail-soft accessors; falls back to 0 when the signal is unreachable.
 
         Mutates nothing; returns the advanced (terminal CANCELLED) context.
         """
@@ -2093,8 +2103,7 @@ class GovernedOrchestrator:
                 target_files = tuple(getattr(ctx, "target_files", ()) or ())
                 description = ctx.description or ""
 
-                # B4 de-dup -- primary infinite-cycle guard. Process-global
-                # ledger so a recursively-chunked GOAL cannot cycle.
+                # B4 de-dup -- primary infinite-cycle guard.
                 h = subgoal_hash(target_files, description)
                 ledger = get_attempt_ledger()
                 if not is_duplicate(h, ledger, frozenset()):
@@ -2105,7 +2114,8 @@ class GovernedOrchestrator:
                             getattr(ctx, "intake_evidence_json", "") or ""
                         )
                         if evidence_json and "recursion_depth" in evidence_json:
-                            evidence = json.loads(evidence_json)
+                            import json as _json
+                            evidence = _json.loads(evidence_json)
                             if isinstance(evidence, dict):
                                 depth = int(
                                     evidence.get("recursion_depth", 0) or 0
@@ -2113,19 +2123,55 @@ class GovernedOrchestrator:
                     except Exception:  # noqa: BLE001
                         depth = 0
 
-                    # Live load signals: no clean accessor at this seam, so
-                    # default to 0/0.0/0 (fail-soft). The de-dup ledger is the
-                    # PRIMARY cycle guard; the governor bounds fan-out + depth.
+                    # M2 -- real load signals, each read fail-soft (default 0).
+                    # queue_len: intake priority-queue depth
+                    _queue_len = 0
+                    try:
+                        _gls = getattr(
+                            self._stack, "governed_loop_service", None,
+                        )
+                        _router = getattr(_gls, "_intake_router", None)
+                        if _router is not None and hasattr(
+                            _router, "intake_queue_depth"
+                        ):
+                            _queue_len = int(_router.intake_queue_depth())
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                    # loop_blocked_ms: latest max from loop_sink stats
+                    _loop_ms = 0.0
+                    try:
+                        from backend.core.ouroboros.telemetry.loop_sink import (
+                            get_stats as _ls_stats,
+                        )
+                        _ls = _ls_stats()
+                        if _ls:
+                            _loop_ms = max(
+                                v.get("max_ms", 0.0) for v in _ls.values()
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                    # pressure_level: MemoryPressureGate rank
+                    _pressure = 0
+                    try:
+                        from backend.core.ouroboros.governance.memory_pressure_gate import (
+                            get_default_gate as _mpg_gate,
+                            _LEVEL_RANK as _MPG_RANK,
+                        )
+                        _pressure = int(
+                            _MPG_RANK.get(_mpg_gate().pressure(), 0)
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
                     budget = recursion_budget(
-                        queue_len=0,
-                        loop_blocked_ms=0.0,
-                        pressure_level=0,
+                        queue_len=_queue_len,
+                        loop_blocked_ms=_loop_ms,
+                        pressure_level=_pressure,
                         depth=depth,
                     )
                     if budget.allowed:
-                        # zero-coverage -> prepend a mandatory test-gen sub-goal
-                        # that every mutation sub-goal blocks on. Prefer the
-                        # typed Advisory field; fall back to the reasons string.
                         zero_cov = False
                         try:
                             zero_cov = float(
@@ -2145,9 +2191,23 @@ class GovernedOrchestrator:
                             description=description,
                             target_files=target_files,
                         )
-                        subs = decompose_for_block(
+                        # Fan-out budget caps the MUTATION sub-goals but must
+                        # NEVER sever a dependency chain: a mutation that blocks
+                        # on a test prerequisite is meaningless without it. Keep
+                        # ALL prerequisites (no-dep sub-goals, e.g. the test-gen)
+                        # + up to budget.max_fanout dependent sub-goals. (A bare
+                        # slice would, under load with max_fanout=1, keep only
+                        # the test and silently drop the actual fix.)
+                        _all_subs = decompose_for_block(
                             goal, zero_coverage=zero_cov,
-                        )[: max(1, budget.max_fanout)]
+                        )
+                        _prereq = [
+                            s for s in _all_subs if not s.depends_on_sub_ids
+                        ]
+                        _dependent = [
+                            s for s in _all_subs if s.depends_on_sub_ids
+                        ]
+                        subs = _prereq + _dependent[: max(1, budget.max_fanout)]
                         plan = DecomposedPlan(
                             parent_goal_id=ctx.op_id,
                             sub_goals=tuple(subs),
@@ -2158,21 +2218,56 @@ class GovernedOrchestrator:
                             ),
                             diagnostic="block_decompose_reinject",
                         )
-                        _gls = getattr(
+                        _gls_ref = getattr(
                             self._stack, "governed_loop_service", None,
                         )
-                        router = getattr(_gls, "_intake_router", None)
-                        await advance_orchestration(plan, router=router)
-                        ledger.mark(h)
-                        logger.warning(
-                            "[Orchestrator] BLOCK decomposed into %d "
-                            "sub-goals (test_first=%s) op=%s",
-                            len(subs), zero_cov, ctx.op_id,
-                        )
-                        return ctx.advance(
-                            OperationPhase.CANCELLED,
-                            terminal_reason_code="decomposed",
-                        )
+                        router = getattr(_gls_ref, "_intake_router", None)
+                        # I1 -- capture the report and check emitted_count.
+                        report = await advance_orchestration(plan, router=router)
+                        if report.emitted_count >= 1:
+                            ledger.mark(h)
+                            logger.warning(
+                                "[Orchestrator] BLOCK decomposed into %d "
+                                "sub-goals (test_first=%s, emitted=%d) op=%s",
+                                len(subs), zero_cov, report.emitted_count,
+                                ctx.op_id,
+                            )
+                            return ctx.advance(
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code="decomposed",
+                            )
+                        else:
+                            # advance_orchestration master OFF / router None /
+                            # all ingests failed -- the op MUST NOT be silently
+                            # lost. Fall through to legacy advisor_blocked.
+                            logger.critical(
+                                "[Chunking] decompose emitted 0 sub-goals "
+                                "-- falling back to advisor_blocked (op=%s). "
+                                "Diagnostic: %s",
+                                ctx.op_id,
+                                getattr(report, "diagnostic", "unknown"),
+                            )
+                            # I1 optional DLQ append -- best-effort (sync, fire-and-forget).
+                            try:
+                                from backend.core.ouroboros.governance.intake_dlq import (
+                                    append_dlq as _dlq_append,
+                                )
+                                # Build a minimal envelope-like dict for the DLQ.
+                                _dlq_envelope = {
+                                    "goal_id": ctx.op_id,
+                                    "reason": "decompose_emitted_zero",
+                                    "description": description[:200],
+                                    "depth": depth,
+                                    "diagnostic": getattr(
+                                        report, "diagnostic", ""
+                                    ),
+                                }
+                                _dlq_append(
+                                    _dlq_envelope,
+                                    reason="decompose_emitted_zero",
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[Orchestrator] chunking seam fail-soft -> legacy "
@@ -2541,6 +2636,15 @@ class GovernedOrchestrator:
                     ctx.op_id,
                     is_read_only=ctx.is_read_only,
                     repo_root=_adv_repo_root,
+                    # C1: feed the intake evidence so the Advisor can extract
+                    # scoped_symbols (stamped by decompose_for_block on
+                    # re-injected sub-goals) and compute call-graph blast radius
+                    # instead of the whole-file import-graph heuristic. Gated by
+                    # JARVIS_ADVISOR_CALLGRAPH_BLAST_ENABLED (default off) — no
+                    # behavior change until enabled + a scoped sub-goal flows.
+                    intake_evidence_json=getattr(
+                        ctx, "intake_evidence_json", ""
+                    ) or "",
                 )
 
                 if _advisory.decision == AdvisoryDecision.BLOCK:
@@ -2550,12 +2654,8 @@ class GovernedOrchestrator:
                     )
                     if _serpent:
                         await _serpent.stop(success=False)
-                    # B5 KEYSTONE -- instead of unconditionally terminating,
-                    # attempt to decompose the GOAL into AST-symbol-scoped +
-                    # test-first sub-goals and re-inject them (gated by the
-                    # B3 governor + B4 de-dup). Fail-soft to the EXACT legacy
-                    # advisor_blocked termination on ANY error / chunking-off
-                    # / governor-not-allowed / duplicate. The op is NEVER lost.
+                    # I1 / B5 -- attempt decompose before terminal cancel.
+                    # Fail-soft: falls through to advisor_blocked on any error.
                     ctx = await self._decompose_block_or_legacy(ctx, _advisory)
                     return ctx
 

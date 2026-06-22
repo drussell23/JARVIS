@@ -135,7 +135,9 @@ def test_enabled_decomposes_and_reinjects(monkeypatch):
     async def _fake_advance(plan, *, router=None, **kw):
         captured["plan"] = plan
         captured["router"] = router
-        return None
+        # I1: the seam returns "decomposed" only when >=1 sub-goal was emitted.
+        from types import SimpleNamespace
+        return SimpleNamespace(emitted_count=1)
 
     monkeypatch.setattr(orch_mod, "advance_orchestration", _fake_advance)
 
@@ -162,7 +164,8 @@ def test_enabled_marks_ledger_after_reinject(monkeypatch):
     monkeypatch.setenv("JARVIS_RECURSIVE_CHUNKING_ENABLED", "true")
 
     async def _fake_advance(plan, *, router=None, **kw):
-        return None
+        from types import SimpleNamespace
+        return SimpleNamespace(emitted_count=1)  # I1: >=1 emit -> decomposed
 
     monkeypatch.setattr(orch_mod, "advance_orchestration", _fake_advance)
     orch = _make_orch(router=_FakeRouter())

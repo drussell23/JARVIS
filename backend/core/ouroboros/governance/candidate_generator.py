@@ -1251,8 +1251,88 @@ def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# A3 Transport Circuit Breaker -- lane-selection + outcome helpers
+# ---------------------------------------------------------------------------
+
+def _breaker_select_transport(preferred: str) -> str:
+    """Return the actual transport lane to use for the current DW dispatch attempt.
+
+    When the TransportCircuitBreaker is enabled and the preferred lane is OPEN,
+    rotates traffic to the sibling lane (batch->realtime or realtime->batch).
+    When the breaker is disabled (default), returns ``preferred`` unchanged --
+    fully OFF byte-identical.
+
+    Contract: NEVER raises -- any error inside the breaker returns ``preferred``.
+
+    Env:
+        JARVIS_TRANSPORT_BREAKER_ENABLED (bool, default false) -- master switch.
+    """
+    try:
+        from backend.core.ouroboros.governance.transport_circuit_breaker import (
+            breaker_enabled as _tb_enabled,
+            get_transport_breaker as _get_tb,
+        )
+        if not _tb_enabled():
+            return preferred
+        import time as _t
+        return _get_tb().select_lane(preferred, now=_t.monotonic())
+    except Exception:  # noqa: BLE001 -- breaker must NEVER break dispatch
+        return preferred
+
+
+# I2 -- filter set: only LIVE transport signals are meaningful to the per-lane
+# TransportCircuitBreaker. GENERATION_TIMEOUT / FSM_EXHAUSTED / HTTP status
+# classification / auth terminals are OUR-side faults, NOT vendor transport
+# ruptures. Recording them would spuriously trip the lane breaker on OUR bugs.
+_BREAKER_RECORD_SOURCES: "frozenset[str]" = frozenset({
+    "LIVE_TRANSPORT",
+    "LIVE_HTTP_5XX",
+    "LIVE_STREAM_STALL",
+    "LIVE_HTTP_429",
+})
+
+
+def _breaker_record_outcome(
+    lane: str,
+    *,
+    ok: bool,
+    failure_mode: "Optional[str]",
+) -> None:
+    """Feed an attempt outcome into the TransportCircuitBreaker for ``lane``.
+
+    Guarded by the master gate and fully fail-soft.  Callers do NOT need to
+    check ``breaker_enabled()`` -- this function handles the guard internally.
+
+    I2 filter: on ok=False, only records when ``failure_mode`` is a live
+    transport signal (LIVE_TRANSPORT / LIVE_HTTP_5XX / LIVE_STREAM_STALL /
+    LIVE_HTTP_429). Generation-side faults (GENERATION_TIMEOUT, FSM_EXHAUSTED)
+    and auth terminals are silently dropped -- they are OUR fault, not the
+    transport lane's.
+
+    Args:
+        lane:         The transport lane actually used ("batch" / "realtime").
+        ok:           True on success, False on any failure.
+        failure_mode: The FailureSource name (e.g. "LIVE_TRANSPORT"), or None on success.
+    """
+    try:
+        from backend.core.ouroboros.governance.transport_circuit_breaker import (
+            breaker_enabled as _tb_enabled,
+            get_transport_breaker as _get_tb,
+        )
+        if not _tb_enabled():
+            return
+        # I2: skip recording non-transport failures (they are OUR-side, not lane faults)
+        if not ok and failure_mode not in _BREAKER_RECORD_SOURCES:
+            return
+        import time as _t
+        _get_tb().record(lane, ok=ok, failure_mode=failure_mode, now=_t.monotonic())
+    except Exception:  # noqa: BLE001 -- record must NEVER break dispatch
+        pass
+
+
 def dw_preflight_gate_enabled() -> bool:
-    """Slice 76 Phase 2 master flag — default TRUE. When off, dispatch is
+    """Slice 76 Phase 2 master flag -- default TRUE. When off, dispatch is
     byte-identical to the pre-Slice-76 path (no pre-flight short-circuit)."""
     raw = os.environ.get(
         "JARVIS_DW_PREFLIGHT_GATE_ENABLED", "true",
@@ -1411,65 +1491,6 @@ def immediate_reroute_to_dw(
         and claude_breaker_enabled
         and not claude_allows_request
     )
-
-
-# ---------------------------------------------------------------------------
-# A3 Transport Circuit Breaker seam
-# ---------------------------------------------------------------------------
-
-def _breaker_select_transport(preferred: str) -> str:
-    """Return the actual transport lane to use for the current DW dispatch attempt.
-
-    When the TransportCircuitBreaker is enabled and the preferred lane is OPEN,
-    rotates traffic to the sibling lane (batch->realtime or realtime->batch).
-    When the breaker is disabled (default), returns ``preferred`` unchanged --
-    fully OFF byte-identical.
-
-    Contract: NEVER raises -- any error inside the breaker returns ``preferred``.
-
-    Env:
-        JARVIS_TRANSPORT_BREAKER_ENABLED (bool, default false) -- master switch.
-    """
-    try:
-        from backend.core.ouroboros.governance.transport_circuit_breaker import (
-            breaker_enabled as _tb_enabled,
-            get_transport_breaker as _get_tb,
-        )
-        if not _tb_enabled():
-            return preferred
-        import time as _t
-        return _get_tb().select_lane(preferred, now=_t.monotonic())
-    except Exception:  # noqa: BLE001 -- breaker must NEVER break dispatch
-        return preferred
-
-
-def _breaker_record_outcome(
-    lane: str,
-    *,
-    ok: bool,
-    failure_mode: str | None,
-) -> None:
-    """Feed an attempt outcome into the TransportCircuitBreaker for ``lane``.
-
-    Guarded by the master gate and fully fail-soft.  Callers do NOT need to
-    check ``breaker_enabled()`` -- this function handles the guard internally.
-
-    Args:
-        lane:         The transport lane that was actually used ("batch" / "realtime").
-        ok:           True on success, False on any failure.
-        failure_mode: The FailureSource name (e.g. "LIVE_TRANSPORT"), or None on success.
-    """
-    try:
-        from backend.core.ouroboros.governance.transport_circuit_breaker import (
-            breaker_enabled as _tb_enabled,
-            get_transport_breaker as _get_tb,
-        )
-        if not _tb_enabled():
-            return
-        import time as _t
-        _get_tb().record(lane, ok=ok, failure_mode=failure_mode, now=_t.monotonic())
-    except Exception:  # noqa: BLE001 -- record must NEVER break dispatch
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -4228,10 +4249,10 @@ class CandidateGenerator:
                         f"{type(exc).__name__}: {err_str[:300]!r}", op_id_short,
                     )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
-                # A3 Transport Circuit Breaker -- record failure outcome.
-                # Only LIVE transport failures are meaningful to the breaker;
-                # GENERATION_TIMEOUT / FSM_EXHAUSTED / HTTP classification are
-                # OUR-side faults, not transport ruptures.
+                # A3 Transport Circuit Breaker -- record failure outcome (I2 filtered).
+                # Only LIVE transport signals are meaningful to the per-lane breaker;
+                # GENERATION_TIMEOUT / FSM_EXHAUSTED / HTTP classification (OUR-side faults)
+                # are silently dropped by _breaker_record_outcome's _BREAKER_RECORD_SOURCES gate.
                 _a3_fail_lane = "batch" if _s182_fb_token is not None else "realtime"
                 _breaker_record_outcome(
                     _a3_fail_lane,
@@ -5664,6 +5685,23 @@ class CandidateGenerator:
                         # park gate (generate_park_wrapper._resolve_async_batch_payload).
             except Exception:  # noqa: BLE001 — defensive, legacy budget
                 pass
+            # M3 — Transport Circuit Breaker at the primary dynamic transport-selection
+            # point. A batch choice arriving via the dynamic router (_slice36 or
+            # is_batch_only profile) is also rotated when the batch lane is OPEN.
+            # When the breaker is disabled (default) or the lane is CLOSED this is a
+            # zero-cost no-op (returns "batch" unchanged -> _force_batch stays True).
+            if _force_batch:
+                try:
+                    _m3_chosen = _breaker_select_transport("batch")
+                    if _m3_chosen == "realtime":
+                        logger.info(
+                            "[A3-Breaker/M3] batch lane OPEN at dynamic-select -- "
+                            "rotating to realtime for op=%s model=%s",
+                            getattr(context, "op_id", "?")[:16], model_id or "?",
+                        )
+                        _force_batch = False
+                except Exception:  # noqa: BLE001 -- breaker consult never blocks dispatch
+                    pass
             # Slice 225 Phase 2 — Sovereign DW Autarky. Read the Claude fallback
             # breaker (read-only, no probe side effect — same _claude_breaker_open
             # predicate the Slice 127 P2.1 IMMEDIATE reroute uses). When the

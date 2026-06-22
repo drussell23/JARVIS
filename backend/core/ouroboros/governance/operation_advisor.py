@@ -133,6 +133,65 @@ def _advisor_oracle_blast_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# ── Sovereign Call-Graph Risk Matrix (C1 root-cause) ──
+#
+# When a sub-goal is AST symbol-scoped (``file::Symbol``), the Advisor's
+# import-graph blast radius (who imports the *file*) is the wrong signal —
+# the mutation only touches a few symbols, so risk should be measured over
+# the CALL graph (who CALLS those symbols). This master gates that sharper
+# path. Default FALSE → OFF byte-identical (the existing file-level scan
+# runs EXACTLY). The call-graph blast is same-or-sharper (a widely-called
+# symbol still measures high and stays BLOCKed), reuses the oracle's
+# pre-built call graph (no parallel analyzer), and is fail-soft.
+ADVISOR_CALLGRAPH_BLAST_ENABLED_ENV_VAR: str = (
+    "JARVIS_ADVISOR_CALLGRAPH_BLAST_ENABLED"
+)
+
+
+def _advisor_callgraph_blast_enabled() -> bool:
+    """Master flag for the symbol-scoped call-graph blast path.
+
+    Default FALSE — operators graduate the flag after parity validation.
+    """
+    raw = os.environ.get(
+        ADVISOR_CALLGRAPH_BLAST_ENABLED_ENV_VAR, "",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+# Evidence key the decomposition planner stamps (see
+# goal_decomposition_planner._make_envelope_for_sub_goal). Rides
+# intake → ctx.intake_evidence_json → the Advisor, mirroring the
+# repo_root side-channel.
+EVIDENCE_SCOPED_SYMBOLS_KEY: str = "scoped_symbols"
+
+
+def extract_scoped_symbols(intake_evidence_json: str) -> Tuple[str, ...]:
+    """Parse ``scoped_symbols`` (``"file::Symbol"`` refs) from an
+    envelope evidence JSON string.
+
+    Mirrors :func:`resolve_envelope_repo_root`: empty / malformed JSON /
+    missing-key / wrong-type all collapse to ``()`` (no scope → the
+    Advisor stays file-level). NEVER raises.
+    """
+    if not intake_evidence_json:
+        return ()
+    try:
+        evidence = json.loads(intake_evidence_json)
+    except (ValueError, TypeError):
+        return ()
+    if not isinstance(evidence, dict):
+        return ()
+    raw = evidence.get(EVIDENCE_SCOPED_SYMBOLS_KEY)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: List[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            out.append(item)
+    return tuple(out)
+
+
 # ── Slice 12S (2026-05-23) — Cooperative async blast scan ──
 #
 # bt-2026-05-23-171810 surfaced a fresh wedge AFTER Slice 12P+12R proved
@@ -1118,6 +1177,8 @@ class OperationAdvisor:
         op_id: str = "",
         is_read_only: bool = False,
         repo_root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
+        intake_evidence_json: str = "",
     ) -> "Advisory":
         """Async wrapper around :meth:`advise` that dispatches through
         the dedicated ``advisor-blast`` ThreadPoolExecutor — NOT the
@@ -1151,14 +1212,26 @@ class OperationAdvisor:
         path verbatim — byte-identical rollback.
         """
         # ── Slice 12S — cooperative dispatch ──
+        # NOTE (AST pin, test_advise_async_dispatches_cooperative_first):
+        # this guard MUST remain the FIRST executable statement so the
+        # cooperative path can't be displaced below run_in_executor. The
+        # C1 symbol-scope resolution (kwarg wins, else evidence) is done
+        # INSIDE each branch to keep that invariant.
         if _advisor_blast_cooperative_enabled():
+            _scoped = scoped_symbols or extract_scoped_symbols(
+                intake_evidence_json
+            )
             return await self._advise_async_cooperative(
                 target_files,
                 description,
                 op_id,
                 is_read_only=is_read_only,
                 repo_root=repo_root,
+                scoped_symbols=_scoped,
             )
+        _scoped = scoped_symbols or extract_scoped_symbols(
+            intake_evidence_json
+        )
 
         loop = asyncio.get_running_loop()
         executor = _get_advisor_blast_executor()
@@ -1193,6 +1266,7 @@ class OperationAdvisor:
                     op_id,
                     is_read_only=is_read_only,
                     repo_root=repo_root,
+                    scoped_symbols=_scoped,
                 )
             finally:
                 _advisor_busy_decr()
@@ -1212,6 +1286,7 @@ class OperationAdvisor:
         *,
         is_read_only: bool = False,
         repo_root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
     ) -> "Advisory":
         """Slice 12S cooperative-async advisor path.
 
@@ -1253,7 +1328,7 @@ class OperationAdvisor:
         _advisor_busy_incr()
         try:
             blast_radius = await self._compute_blast_radius_async(
-                target_files, root=repo_root,
+                target_files, root=repo_root, scoped_symbols=scoped_symbols,
             )
         finally:
             _advisor_busy_decr()
@@ -1264,6 +1339,7 @@ class OperationAdvisor:
             is_read_only=is_read_only,
             repo_root=repo_root,
             _precomputed_blast_radius=blast_radius,
+            scoped_symbols=scoped_symbols,
         )
 
     async def _compute_blast_radius_async(
@@ -1271,6 +1347,7 @@ class OperationAdvisor:
         target_files: Tuple[str, ...],
         *,
         root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
     ) -> int:
         """Slice 12S cooperative-async sibling of
         :meth:`_compute_blast_radius`.
@@ -1293,6 +1370,15 @@ class OperationAdvisor:
         cooperative path gives the loop a scheduling slot between
         every 64-file batch.
         """
+        # C1 — symbol-scoped call-graph blast (mirror of the sync path).
+        # Bypasses the cooperative file scan entirely when it resolves;
+        # OFF byte-identical otherwise (no scope / master off / oracle
+        # absent / unresolved → file-level scan below). The oracle BFS is
+        # in-memory (no disk I/O), so it cannot starve the loop.
+        cg = self._maybe_symbol_blast_radius(scoped_symbols)
+        if cg is not None:
+            return cg
+
         from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
             blast_radius_conservative_cap,
             blast_radius_max_bytes_per_file,
@@ -1474,6 +1560,8 @@ class OperationAdvisor:
         is_read_only: bool = False,
         repo_root: Optional[Path] = None,
         _precomputed_blast_radius: Optional[int] = None,
+        scoped_symbols: Tuple[str, ...] = (),
+        intake_evidence_json: str = "",
     ) -> Advisory:
         """Evaluate an operation and return advisory judgment.
 
@@ -1546,11 +1634,18 @@ class OperationAdvisor:
         # Slice 12S — accept a precomputed value when the caller already
         # ran the cooperative async scan; preserves byte-identical
         # behavior when the kwarg is absent (None).
+        # C1 — resolve the AST symbol scope: an explicit kwarg wins;
+        # otherwise parse it from the envelope evidence side-channel
+        # (mirrors how repo_root rides ctx.intake_evidence_json). Empty →
+        # the call-graph path is inert and blast stays file-level.
+        _scoped = scoped_symbols
+        if not _scoped and intake_evidence_json:
+            _scoped = extract_scoped_symbols(intake_evidence_json)
         if _precomputed_blast_radius is not None:
             blast_radius = _precomputed_blast_radius
         else:
             blast_radius = self._compute_blast_radius(
-                target_files, root=repo_root,
+                target_files, root=repo_root, scoped_symbols=_scoped,
             )
         if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
             reasons.append(
@@ -1726,17 +1821,73 @@ class OperationAdvisor:
     # Signal computation (all deterministic)
     # ------------------------------------------------------------------
 
+    def _maybe_symbol_blast_radius(
+        self,
+        scoped_symbols: Tuple[str, ...],
+    ) -> Optional[int]:
+        """C1 — call-graph blast radius for an AST symbol-scoped op.
+
+        Returns an int (the distinct transitive-caller count, capped at
+        50) ONLY when ALL of: a non-empty symbol scope, the call-graph
+        master is ON, the oracle-blast master is ON (shares the oracle
+        prerequisite), a live ``_active_oracle`` is registered, AND the
+        oracle resolves every scoped symbol. Returns ``None`` in every
+        other case (no scope / master off / oracle absent / any symbol
+        unresolved / any error) — the signal to fall through to the
+        file-level import-graph scan EXACTLY. NEVER raises (fail-soft).
+        """
+        if not scoped_symbols:
+            return None
+        if not _advisor_callgraph_blast_enabled():
+            return None
+        if not _advisor_oracle_blast_enabled():
+            return None
+        if _active_oracle is None:
+            return None
+        try:
+            from backend.core.ouroboros.governance.call_graph_blast import (
+                symbol_blast_radius,
+            )
+            radius = symbol_blast_radius(scoped_symbols, oracle=_active_oracle)
+        except Exception:  # noqa: BLE001 — fail-soft, never block advise
+            logger.debug(
+                "[Advisor] call-graph blast failed for scoped_symbols=%r "
+                "— falling back to file-level scan",
+                scoped_symbols, exc_info=True,
+            )
+            return None
+        if radius is None:
+            return None
+        logger.info(
+            "[Advisor] call-graph blast radius=%d for %d scoped symbol(s) "
+            "(sharper than file-level import graph)",
+            radius, len(scoped_symbols),
+        )
+        return radius
+
     def _compute_blast_radius(
         self,
         target_files: Tuple[str, ...],
         *,
         root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
     ) -> int:
         """Count files that import the targets. AST-based, deterministic.
 
         ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
         ``None`` (pre-B.2.0 behavior). Callers MUST validate the override
         path through :func:`resolve_envelope_repo_root` first.
+
+        ``scoped_symbols`` (C1 — Sovereign Call-Graph Risk Matrix) — when
+        the op is AST symbol-scoped (``"file::Symbol"`` refs) AND the
+        call-graph master is ON AND the oracle is available, blast radius
+        is measured over the transitive CALLERS of those symbols (the
+        execution path) instead of the file's import graph. This is the
+        same-or-sharper signal that lets a symbol-scoped sub-goal clear
+        the file-level veto. Returns the call-graph count when it
+        resolves; otherwise (no scope / master off / oracle absent /
+        unresolved / error) falls through to the EXACT file-level
+        computation below — OFF byte-identical, fail-soft.
 
         Results are TTL-memoized per
         (frozenset(target_files), str(scan_root)) — see the
@@ -1747,6 +1898,17 @@ class OperationAdvisor:
         with the cache, repeat calls (signal coalescing on the same target
         files; WAL replay of stuck envelopes) return in microseconds.
         """
+        # C1 — symbol-scoped call-graph blast (BEFORE the file-level scan).
+        # Gated so OFF is byte-identical: requires a non-empty scope, the
+        # call-graph master, the oracle-blast master (the oracle handle is
+        # the same prerequisite), and a live oracle. Fail-soft: any miss
+        # or error falls through to the file-level path EXACTLY (the
+        # symbol_blast_radius helper never raises and returns None on any
+        # unresolved symbol).
+        cg = self._maybe_symbol_blast_radius(scoped_symbols)
+        if cg is not None:
+            return cg
+
         scan_root = root if root is not None else self._project_root
 
         # Cache lookup — frozenset key makes the cache invariant to

@@ -352,6 +352,13 @@ class SubGoal:
     depends_on_sub_ids: Tuple[str, ...]
     estimated_complexity: str  # trivial | moderate | complex
     boundary_crossed: bool
+    # C1 root-cause (Sovereign Call-Graph Risk Matrix) — the AST symbols
+    # this sub-goal mutates, as ``"file::Symbol"`` refs from B1
+    # ``isolate_symbols``. Additive, default ``()`` → pre-change
+    # byte-identical when unset. Rides the envelope evidence to the
+    # OperationAdvisor so blast radius is measured over the CALL graph
+    # (who calls these symbols), not the file's import graph.
+    scoped_symbols: Tuple[str, ...] = ()
     schema_version: str = GOAL_DECOMPOSITION_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -367,6 +374,7 @@ class SubGoal:
                 self.estimated_complexity[:32]
             ),
             "boundary_crossed": bool(self.boundary_crossed),
+            "scoped_symbols": list(self.scoped_symbols),
             "schema_version": self.schema_version,
         }
 
@@ -759,23 +767,50 @@ def decompose_for_block(
         return _fallback()
 
     # --- Symbol-scope each target file via B1 scoper -----------------------
-    def _scoped_files_for(files: Tuple[str, ...]) -> Tuple[str, ...]:
-        """Return the set of files that have matching symbols (or all files
-        if the scoper is unavailable / fails)."""
+    # C1 root-cause fix: STOP discarding the ScopedTarget results. We now
+    # capture each matched ``"file::Symbol"`` ref so it can ride the
+    # envelope evidence to the OperationAdvisor, which measures blast
+    # radius over the CALL graph (who calls those symbols) instead of the
+    # file's import graph. ``ScopedTarget.symbol == ""`` is B1's
+    # whole-file fallback marker (parse failure / no match) — we skip
+    # those (no symbol to scope to → Advisor stays file-level).
+    def _scoped_files_for(
+        files: Tuple[str, ...],
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        """Return ``(bearing_files, scoped_symbols)``.
+
+        ``bearing_files`` is the set of files that are mutation targets
+        (or all files if the scoper is unavailable / fails — fail-soft).
+        ``scoped_symbols`` is the de-duplicated tuple of ``"file::Symbol"``
+        refs the scoper matched (empty when the scoper is unavailable, no
+        symbol matched, or only whole-file fallbacks were produced)."""
         if not files or scoper is None:
-            return files
+            return files, ()
         bearing: list[str] = []
+        symbols: list[str] = []
+        seen: set[str] = set()
         for fp in files:
             try:
                 targets = scoper(fp, description)
                 # ScopedTarget.symbol == "" means whole-file fallback from B1
-                # — still counts as "bearing" (the file is a target).
+                # — still counts as "bearing" (the file is a target) but
+                # carries no symbol to scope the call-graph blast to.
                 bearing.append(fp)
+                for tgt in (targets or ()):
+                    sym = str(getattr(tgt, "symbol", "") or "")
+                    if not sym:
+                        continue
+                    sym_fp = str(getattr(tgt, "file_path", "") or "") or fp
+                    ref = f"{sym_fp}::{sym}"
+                    if ref not in seen:
+                        seen.add(ref)
+                        symbols.append(ref)
             except Exception:  # noqa: BLE001
                 bearing.append(fp)
-        return tuple(bearing) if bearing else files
+        bearing_t = tuple(bearing) if bearing else files
+        return bearing_t, tuple(symbols)
 
-    symbol_files = _scoped_files_for(target_files)
+    symbol_files, scoped_symbols = _scoped_files_for(target_files)
     if not symbol_files:
         symbol_files = target_files or ("",)
 
@@ -814,7 +849,10 @@ def decompose_for_block(
             boundary_crossed=boundary,
         ))
 
-        # step-01: mutation sub-goal that blocks on the test
+        # step-01: mutation sub-goal that blocks on the test.
+        # Only the MUTATION sub-goal carries scoped_symbols — the test-gen
+        # sub-goal above writes a new test file, it doesn't mutate the
+        # scoped symbols, so its blast stays file-level.
         mutation_id = f"{parent_id}::step-01"
         out.append(SubGoal(
             sub_goal_id=mutation_id,
@@ -826,6 +864,7 @@ def decompose_for_block(
             depends_on_sub_ids=(test_id,),
             estimated_complexity="moderate",
             boundary_crossed=boundary,
+            scoped_symbols=scoped_symbols,
         ))
     else:
         # No test-gen sub-goal; just the (symbol-scoped) mutation sub-goal.
@@ -840,6 +879,7 @@ def decompose_for_block(
             depends_on_sub_ids=(),
             estimated_complexity="moderate",
             boundary_crossed=boundary,
+            scoped_symbols=scoped_symbols,
         ))
 
     return tuple(out)
@@ -911,9 +951,17 @@ def _make_envelope_for_sub_goal(
     *,
     repo_override: Optional[str] = None,
     source_override: Optional[str] = None,
+    parent_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Compose intake.intent_envelope.make_envelope for one
-    sub-goal. NEVER raises."""
+    sub-goal. NEVER raises.
+
+    ``parent_evidence`` (M1) — when the parent goal/op carries a
+    ``recursion_depth`` in its evidence, the child inherits
+    ``parent_depth + 1`` so re-injected sub-goals carry a monotonically
+    increasing depth (the orchestrator's recursion-bound seam reads it).
+    Absent / malformed → depth defaults to 0 → child stamped depth 1.
+    """
     try:
         from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
             make_envelope,
@@ -921,6 +969,16 @@ def _make_envelope_for_sub_goal(
     except ImportError:
         return None
     try:
+        # M1 — inherit + increment recursion depth from the parent.
+        parent_depth = 0
+        if isinstance(parent_evidence, dict):
+            try:
+                parent_depth = int(parent_evidence.get("recursion_depth", 0) or 0)
+            except (ValueError, TypeError):
+                parent_depth = 0
+        if parent_depth < 0:
+            parent_depth = 0
+        child_depth = parent_depth + 1
         # Map SubGoalKind → urgency. Cage-touching / sequential
         # ⇒ tighter urgency band so they don't race siblings.
         kind = sub_goal.kind
@@ -961,6 +1019,14 @@ def _make_envelope_for_sub_goal(
                 "estimated_complexity": (
                     sub_goal.estimated_complexity
                 ),
+                # C1 — ride the AST symbol scope to ctx.intake_evidence_json
+                # so the OperationAdvisor measures call-graph blast radius.
+                # Empty tuple → key present-but-empty → Advisor stays
+                # file-level (byte-identical to the unscoped path).
+                "scoped_symbols": list(sub_goal.scoped_symbols),
+                # M1 — monotonic recursion depth for the orchestrator's
+                # recursion-bound seam.
+                "recursion_depth": child_depth,
                 "signature": sub_goal.sub_goal_id,
             },
             requires_human_ack=False,
@@ -1068,6 +1134,7 @@ async def emit_sub_goal_envelopes(
     *,
     router: Any = None,
     now_unix: Optional[float] = None,
+    parent_evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[SubGoalEmitOutcome, ...]:
     """Emit one IntentEnvelope per sub-goal in topological
     order. NEVER raises.
@@ -1075,7 +1142,11 @@ async def emit_sub_goal_envelopes(
     When ``router`` is None: dry-run mode — envelopes are
     constructed (validation runs through IntentEnvelope's own
     __post_init__) but NOT submitted. Outcomes record the
-    dry-run status."""
+    dry-run status.
+
+    ``parent_evidence`` (M1) — the parent op's evidence dict, threaded
+    into each child envelope so ``recursion_depth`` increments across
+    the re-injection. ``None`` (default) → children start at depth 1."""
     outcomes: List[SubGoalEmitOutcome] = []
     if plan is None or not plan.sub_goals:
         return ()
@@ -1088,7 +1159,9 @@ async def emit_sub_goal_envelopes(
         sub = by_id.get(sid)
         if sub is None:
             continue
-        env = _make_envelope_for_sub_goal(sub)
+        env = _make_envelope_for_sub_goal(
+            sub, parent_evidence=parent_evidence,
+        )
         if env is None:
             outcomes.append(SubGoalEmitOutcome(
                 sub_goal_id=sid,
