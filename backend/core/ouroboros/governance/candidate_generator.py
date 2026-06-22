@@ -4078,7 +4078,43 @@ class CandidateGenerator:
                     is_internal_fault as _s185_internal,
                     is_generation_timeout as _s241_gen_timeout,
                     is_fsm_exhaustion as _fsm_exhausted,
+                    is_local_egress_overweight as _egress_overweight,
                 )
+                # Sovereign Egress Interceptor Mesh (T3) — OUR-side egress
+                # interceptor blocked an over-ceiling body. DW never received the
+                # request (good API citizenship); no socket failed. Classify
+                # LOCAL_EGRESS_OVERWEIGHT (weight 0.0) so it NEVER trips the model/
+                # topology breaker or corrupts surface-health, THEN re-raise the
+                # ORIGINAL exception so its structured ``max_allowed_size`` survives
+                # to the orchestrator's generate-failure path, which routes it BACK
+                # to context-aware chunking (decompose_for_block(compression_target)).
+                # Re-raising immediately is correct: every sibling model would
+                # reject the SAME oversized body, so continuing the rotation only
+                # burns the loop and discards the compression math. Fail-soft:
+                # classification + report_failure are best-effort and never block
+                # the re-raise.
+                if _egress_overweight(exc):
+                    try:
+                        sentinel.report_failure(
+                            model_id,
+                            FailureSource.LOCAL_EGRESS_OVERWEIGHT,
+                            f"{type(exc).__name__}:{str(exc)[:120]}",
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry, never block
+                        logger.debug(
+                            "[CandidateGenerator] egress-overweight report_failure raised",
+                            exc_info=True,
+                        )
+                    logger.warning(
+                        "[CandidateGenerator] LOCAL_EGRESS_OVERWEIGHT (weight 0.0, "
+                        "NOT a vendor rupture): our egress interceptor blocked an "
+                        "over-ceiling body for model=%s — re-raising with "
+                        "max_allowed_size=%s so the orchestrator re-chunks to fit "
+                        "(op=%s)",
+                        model_id, getattr(exc, "max_allowed_size", "?"),
+                        op_id_short,
+                    )
+                    raise exc
                 if _s185_internal(exc):
                     logger.error(
                         "[CandidateGenerator] INTERNAL_FAULT (%s) — NOT a vendor rupture; "

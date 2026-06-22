@@ -2074,8 +2074,16 @@ class GovernedOrchestrator:
         self,
         ctx: OperationContext,
         advisory: Any,
+        *,
+        compression_target: int | None = None,
     ) -> OperationContext:
         """B5 -- the BLOCK -> decompose -> re-inject seam.
+
+        Sovereign Egress Interceptor Mesh (T3): ``compression_target`` (the
+        egress interceptor's ``max_allowed_size``) is threaded into
+        ``decompose_for_block`` so each re-injected sub-goal's estimated
+        payload fits under the local egress ceiling. ``None`` (default) is
+        byte-identical to the legacy BLOCK-decompose behavior.
 
         At the OperationAdvisor BLOCK site, attempt to decompose the GOAL
         into AST-symbol-scoped + test-first sub-goals and re-inject them via
@@ -2200,6 +2208,7 @@ class GovernedOrchestrator:
                         # the test and silently drop the actual fix.)
                         _all_subs = decompose_for_block(
                             goal, zero_coverage=zero_cov,
+                            compression_target=compression_target,
                         )
                         _prereq = [
                             s for s in _all_subs if not s.depends_on_sub_ids
@@ -4733,8 +4742,9 @@ class GovernedOrchestrator:
                 return ctx
 
         # Wave 2 (5) Slice 5a/5b - GENERATERunner delegation gate.
-        # Flag JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED (default false) routes
-        # the 1611-line GENERATE block through the extracted PhaseRunner.
+        # Flag JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED (default TRUE) routes
+        # the 1611-line GENERATE block through the extracted PhaseRunner
+        # (the LIVE path — the inline block below is the legacy fallback).
         # Cross-phase artifacts (generation, _episodic_memory) threaded
         # via artifacts for VALIDATE consumption.
         if _phase_runner_generate_extracted():

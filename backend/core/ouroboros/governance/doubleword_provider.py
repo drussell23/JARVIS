@@ -54,6 +54,15 @@ from backend.core.ouroboros.governance.stream_rupture import (
 from backend.core.ouroboros.governance.control_plane_watchdog import (
     recent_lag_ms as _recent_lag_ms,
 )
+# T2 — Sovereign Egress Interceptor: sanitize + weight-check bodies before
+# they leave the process toward DoubleWord. Lazy provider-imports live inside
+# dw_egress_interceptor.py (not here) to avoid any circular-import cycle.
+from backend.core.ouroboros.governance.dw_egress_interceptor import (
+    LocalEgressOverweightError,
+    assert_egress_weight,
+    egress_interceptor_enabled,
+    sanitize_egress_body,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1712,38 +1721,51 @@ class DoublewordProvider:
         # Slice 38 — canonical JSONL composition via single helper.
         # Replaces raw ``json.dumps(...)`` which omitted the trailing
         # ``\n`` and made DW reject the upload with HTTP 500.
+        # T2 — Batch egress chokepoint: build the inner body dict as a local
+        # variable so the egress interceptor can sanitize + weight-check it
+        # BEFORE it is serialized into JSONL. I2 asymmetry: only CONFIRMED
+        # overweight blocks; sanitize/estimate errors pass through unchanged.
+        _batch_body: dict = {
+            "model": _effective_model,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
+                    "RULES: "
+                    "1. Start your response with { and end with }. "
+                    "2. No text before or after the JSON. No markdown fences. No explanations. "
+                    "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
+                    "4. No trailing commas before } or ]. "
+                    "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
+                    "6. NEVER return unified diffs, patches, or partial file content. "
+                    "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
+                    "(1 sentence, max 200 chars). Missing rationale will be rejected."
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": _retry_max_tokens,
+            "temperature": _DW_TEMPERATURE,
+            # Slice 54/55 — Qwen3.5 reasoning control. reasoning_effort
+            # (DW-honored; the old enable_thinking flag was ignored) is
+            # derived from task_complexity (Slice 55) — leaf work stays
+            # "none" (fast/cheap), high-impact core gets a CoT buffer.
+            **_reasoning_request_params(
+                complexity=getattr(ctx, "task_complexity", "") or "",
+                model=_effective_model,
+            ),
+        }
+        if egress_interceptor_enabled():
+            try:
+                _batch_body = sanitize_egress_body(_batch_body, _effective_model)
+                assert_egress_weight(_batch_body, _effective_model)
+            except LocalEgressOverweightError:
+                raise  # block egress; bubbles to candidate_generator (T3)
+            except Exception:  # noqa: BLE001
+                pass  # I2: sanitize/estimate bug never blocks valid request
         jsonl_line = self._compose_jsonl_batch_entry({
             "custom_id": operation_id,
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {
-                "model": _effective_model,
-                "messages": [
-                    {"role": "system", "content": (
-                        "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
-                        "RULES: "
-                        "1. Start your response with { and end with }. "
-                        "2. No text before or after the JSON. No markdown fences. No explanations. "
-                        "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
-                        "4. No trailing commas before } or ]. "
-                        "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
-                        "6. NEVER return unified diffs, patches, or partial file content. "
-                        "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
-                        "(1 sentence, max 200 chars). Missing rationale will be rejected."
-                    )},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": _retry_max_tokens,
-                "temperature": _DW_TEMPERATURE,
-                # Slice 54/55 — Qwen3.5 reasoning control. reasoning_effort
-                # (DW-honored; the old enable_thinking flag was ignored) is
-                # derived from task_complexity (Slice 55) — leaf work stays
-                # "none" (fast/cheap), high-impact core gets a CoT buffer.
-                **_reasoning_request_params(
-                    complexity=getattr(ctx, "task_complexity", "") or "",
-                    model=_effective_model,
-                ),
-            },
+            "body": _batch_body,
         })
 
         # Slice 35 Phase 2 — batch path stage profiler (composes
@@ -3141,6 +3163,19 @@ class DoublewordProvider:
                 # task_complexity (see _reasoning_request_params).
                 **_reasoning_request_params(complexity=_complexity or "", model=_effective_model),
             }
+
+            # T2 — Realtime egress chokepoint: sanitize + weight-check the
+            # assembled body BEFORE stream flag is set or session.post fires.
+            # I2 asymmetry (binding): only CONFIRMED overweight blocks;
+            # sanitize/estimate errors never block a valid request.
+            if egress_interceptor_enabled():
+                try:
+                    body = sanitize_egress_body(body, _effective_model)
+                    assert_egress_weight(body, _effective_model)
+                except LocalEgressOverweightError:
+                    raise  # block egress; bubbles to candidate_generator (T3)
+                except Exception:  # noqa: BLE001
+                    pass  # I2: sanitize/estimate bug never blocks valid request
 
             if _stream_callback is not None:
                 # Streaming path: SSE for token-by-token output.
@@ -5172,6 +5207,20 @@ class DoublewordProvider:
         }
         if response_format is not None:
             body["response_format"] = response_format
+
+        # Sovereign Egress Interceptor (review finding #1) — guard the heavy
+        # non-streaming lane too so I1 (DW never receives an oversized/malformed
+        # request) holds on EVERY generation egress, not just the two GENERATE
+        # chokepoints. Same fail-soft asymmetry: confirmed overweight blocks;
+        # any sanitize/estimate bug passes through.
+        if egress_interceptor_enabled():
+            try:
+                body = sanitize_egress_body(body, effective_model)
+                assert_egress_weight(body, effective_model)
+            except LocalEgressOverweightError:
+                raise
+            except Exception:  # noqa: BLE001 — never block a valid request
+                pass
 
         session = await self._get_session()
         t0 = time.monotonic()

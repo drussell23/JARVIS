@@ -110,3 +110,23 @@ def is_fsm_exhaustion(exc: BaseException) -> bool:
         return any(m in msg for m in _FSM_EXHAUSTION_MARKERS)
     except Exception:  # noqa: BLE001 — the taxonomy must never itself throw
         return False
+
+
+def is_local_egress_overweight(exc: BaseException) -> bool:
+    """True iff ``exc`` is a ``LocalEgressOverweightError`` — OUR-side egress
+    interceptor refusing to dispatch a body bigger than the local ceiling
+    (Sovereign Egress Interceptor Mesh, T1). This is NOT a vendor rupture: no
+    socket failed, DoubleWord never even received the request — WE blocked it to
+    stay a good API citizen. Like FSM_EXHAUSTED it must classify weight-0.0
+    (``FailureSource.LOCAL_EGRESS_OVERWEIGHT``) so it NEVER trips the DW model /
+    topology breaker or corrupts surface-health; instead the orchestrator routes
+    it BACK to context-aware chunking. Type-matched (no fragile string match) via
+    an isolated lazy import so this taxonomy module stays import-light and
+    NEVER raises → False."""
+    try:
+        from backend.core.ouroboros.governance.dw_egress_interceptor import (  # noqa: PLC0415
+            LocalEgressOverweightError,
+        )
+        return isinstance(exc, LocalEgressOverweightError)
+    except Exception:  # noqa: BLE001 — the taxonomy must never itself throw
+        return False

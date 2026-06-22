@@ -449,6 +449,14 @@ class FailureSource(str, enum.Enum):
     # and (being != LIVE_TRANSPORT) the degrade/sever consumers ignore it — so one
     # op's no-candidate can NEVER sever the DW lane or corrupt vendor surface-health.
     FSM_EXHAUSTED = "fsm_exhausted"                # 0.0
+    # Sovereign Egress Interceptor Mesh (2026-06-22, T3) — OUR-side egress
+    # interceptor refused to dispatch an over-ceiling body (LocalEgressOverweight).
+    # DoubleWord never received the request; no socket failed — WE blocked it to
+    # stay a good API citizen. Weight 0.0: like FSM_EXHAUSTED it is telemetry-only
+    # and (being != LIVE_TRANSPORT) the degrade/sever/surface-health consumers
+    # ignore it — so an oversized payload can NEVER sever the DW lane. The
+    # orchestrator routes it BACK to context-aware chunking instead.
+    LOCAL_EGRESS_OVERWEIGHT = "local_egress_overweight"  # 0.0
 
 
 _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
@@ -462,6 +470,7 @@ _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
     FailureSource.LIGHT_PROBE_TIMEOUT: 1.0,
     FailureSource.GENERATION_TIMEOUT: 0.0,
     FailureSource.FSM_EXHAUSTED: 0.0,
+    FailureSource.LOCAL_EGRESS_OVERWEIGHT: 0.0,
 }
 
 
