@@ -36,6 +36,115 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# A1-T2 — event-driven router-ready valve (intake.router.ready)
+# ---------------------------------------------------------------------------
+# The roadmap-ignition daemon (GovernedLoopService) must never emit a
+# strategic GOAL before the intake router is attached AND its dispatch loop
+# is running, otherwise the envelope lands in a void (the silent-drop race
+# A1 exists to kill). Readiness is a process-global signal because the
+# IntakeLayerService (which marks ready) and the GLS daemon (which waits on
+# it) are distinct services sharing one process + event loop.
+#
+# The signal has TWO surfaces, both required for a race-free handoff:
+#   * ``_ROUTER_READY`` (threading.Event) — the checkable "already ready"
+#     truth; safe to read synchronously from the async daemon. This is the
+#     authoritative state even when no TrinityEventBus exists.
+#   * ``EVENT_ROUTER_READY`` on the TrinityEventBus — the async wakeup so the
+#     daemon doesn't have to poll. Best-effort: a missing bus degrades to a
+#     bounded flag-poll, never to a blind sleep.
+#
+# ``await_router_ready`` implements subscribe-then-check: it subscribes to the
+# topic FIRST, then checks the flag, so a "ready fired before I subscribed"
+# cannot deadlock it. No sleep-poll on the happy (bus-present) path.
+EVENT_ROUTER_READY = "intake.router.ready"
+
+# Bus-absent degraded path: how often to re-check the readiness flag while
+# bounded by the caller's timeout. Env-tunable; never a blind fixed settle.
+_ENV_READY_POLL_S = "JARVIS_A1_ROUTER_READY_POLL_S"
+
+_ROUTER_READY = threading.Event()
+
+
+def mark_router_ready() -> None:
+    """Signal that the intake router is attached + its dispatch loop is live.
+
+    Idempotent. Called by IntakeLayerService immediately after
+    ``await router.start()`` succeeds. Sets the process-global flag that the
+    roadmap daemon's readiness probe reads.
+    """
+    _ROUTER_READY.set()
+
+
+def router_is_ready() -> bool:
+    """Return True once :func:`mark_router_ready` has been called this process."""
+    return _ROUTER_READY.is_set()
+
+
+def _reset_router_ready_for_tests() -> None:
+    """Test-only: clear the process-global readiness flag."""
+    _ROUTER_READY.clear()
+
+
+def _ready_poll_interval_s() -> float:
+    """Bus-absent flag-poll cadence (env-tunable, fail-soft default 0.25s)."""
+    try:
+        val = float((os.environ.get(_ENV_READY_POLL_S, "") or "0.25").strip())
+        return val if val > 0 else 0.25
+    except (TypeError, ValueError):
+        return 0.25
+
+
+async def await_router_ready(bus: Any, timeout_s: float) -> bool:
+    """Race-free wait for ``intake.router.ready``; never raises.
+
+    Subscribe-then-check: subscribe to :data:`EVENT_ROUTER_READY` on *bus*
+    FIRST, then check :func:`router_is_ready` — so a ready that fired before
+    the subscription cannot deadlock the wait. Returns True if the router is
+    ready within *timeout_s*, else False (the caller routes the stall to the
+    DLQ rather than emitting into a void). No blind sleep on any path.
+
+    Parameters
+    ----------
+    bus:
+        A TrinityEventBus (or None). When None, falls back to a bounded
+        flag-poll — still event-flagged + bounded, never a fixed settle.
+    timeout_s:
+        Maximum seconds to wait before returning False.
+    """
+    woke = asyncio.Event()
+    if bus is not None:
+        async def _on_ready(_ev: Any) -> None:
+            woke.set()
+
+        try:
+            await bus.subscribe(EVENT_ROUTER_READY, _on_ready)
+        except Exception as exc:  # noqa: BLE001 — bus is best-effort
+            logger.debug("[A1] router-ready subscribe failed: %r", exc)
+            bus = None  # degrade to flag-poll below
+
+    # CHECK AFTER SUBSCRIBE — closes the ready-before-subscribe race.
+    if router_is_ready():
+        return True
+
+    try:
+        if bus is not None:
+            await asyncio.wait_for(woke.wait(), timeout=timeout_s)
+            return True
+        # Degraded (no usable bus): bounded poll on the authoritative flag.
+        interval = _ready_poll_interval_s()
+
+        async def _until_ready() -> None:
+            while not router_is_ready():
+                await asyncio.sleep(interval)
+
+        await asyncio.wait_for(_until_ready(), timeout=timeout_s)
+        return True
+    except asyncio.TimeoutError:
+        # Re-check once in case readiness landed exactly at the deadline.
+        return router_is_ready()
+
+
+# ---------------------------------------------------------------------------
 # F1 Slice 2 — shadow-mode flag for observational IntakePriorityQueue
 # ---------------------------------------------------------------------------
 # When ``JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW=true`` AND the master flag
