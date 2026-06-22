@@ -133,8 +133,43 @@ async def _ignite(args: argparse.Namespace) -> int:
           f"{result} --zone {cfg.zone} --project {cfg.project_id}")
     print("   monitor loop:   gcloud compute ssh "
           f"{result} --zone {cfg.zone} --project {cfg.project_id} "
-          "--command 'docker logs -f jarvis-sovereign-prod'")
+          "--command 'sudo docker logs -f jarvis-sovereign-prod'")
+    # Deep lifecycle integration: auto-spawn the Sovereign Telemetry Sentinel as
+    # a detached daemon attached to THIS instance -- FSM-aware parsing + the
+    # Autopsy-then-kill Good-Citizen protocol, with no operator action.
+    if not getattr(args, "no_sentinel", False):
+        _spawn_sentinel_daemon(str(result), cfg.zone, cfg.project_id)
+    else:
+        print("   sentinel: skipped (--no-sentinel)")
     return 0
+
+
+def _spawn_sentinel_daemon(node: str, zone: str, project: str) -> None:
+    """Spawn ``sovereign_sentinel.py`` detached, watching ``node``. Fail-soft:
+    a spawn failure never fails the ignition (the node is already up)."""
+    if os.environ.get("JARVIS_IGNITE_SPAWN_SENTINEL", "true").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        print("   sentinel: disabled (JARVIS_IGNITE_SPAWN_SENTINEL=false)")
+        return
+    try:
+        import subprocess
+        sentinel = _REPO_ROOT / "scripts" / "sovereign_sentinel.py"
+        if not sentinel.exists():
+            print("   sentinel: script not found -- skipping daemon spawn")
+            return
+        logdir = _REPO_ROOT / "autopsy_reports"
+        logdir.mkdir(parents=True, exist_ok=True)
+        logf = open(logdir / f"sentinel_{node}.log", "a", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, str(sentinel),
+             "--node", node, "--zone", zone, "--project", project],
+            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        print(f"   🛰️  sentinel daemon spawned (autopsy+auto-kill armed) "
+              f"-> autopsy_reports/sentinel_{node}.log")
+    except Exception as exc:  # noqa: BLE001 -- never fail ignition on sentinel spawn
+        print(f"   sentinel: spawn failed (non-fatal): {exc!r}")
 
 
 def main() -> int:
@@ -148,6 +183,8 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true", help="validate config, do not create the VM")
     p.add_argument("--crucible", action="store_true",
                    help="arm the autonomic Sovereign Cognitive Graduation Crucible cadence")
+    p.add_argument("--no-sentinel", action="store_true",
+                   help="do NOT auto-spawn the Sovereign Telemetry Sentinel daemon")
     args = p.parse_args()
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))

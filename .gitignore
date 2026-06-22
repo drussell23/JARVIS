@@ -407,3 +407,4 @@ terraform/terraform.tfvars
 **/*.pyc
 **/*.pyo
 **/.pytest_cache/
+autopsy_reports/
