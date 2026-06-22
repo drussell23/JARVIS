@@ -18,7 +18,7 @@ huggingface_hub>=0.20.0,<0.22.0
 numpy>=1.24.0,<2.0.0
 
 # HTTP client (for health checks and speechbrain model fetching)
-aiohttp>=3.9.0
+aiohttp>=3.14.1
 requests>=2.31.0
 
 # Monitoring (optional)

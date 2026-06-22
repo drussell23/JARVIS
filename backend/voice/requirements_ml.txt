@@ -25,7 +25,7 @@ speechbrain>=0.5.16  # Advanced speaker recognition with x-vectors
 resemblyzer>=0.1.1.dev0  # Lightweight voice encoder (fallback)
 
 # HTTP client for GCP Whisper
-aiohttp>=3.9.0
+aiohttp>=3.14.1
 
 # System resources monitoring
 psutil>=5.9.0
