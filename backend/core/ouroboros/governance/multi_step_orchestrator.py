@@ -323,7 +323,24 @@ class OrchestrationReport:
     run_records: Tuple[SubGoalRunRecord, ...]
     diagnostic: str
     elapsed_s: float
+    # Sovereign State-Propagation Bridge: the GROUND-TRUTH count of sub-goals
+    # actually dispatched to the router THIS tick (router.ingest succeeded).
+    # ``emitted_count`` aggregates run-state over the pre-emit completion_status
+    # ledger, so it STRUCTURALLY cannot reflect this tick's just-completed emit
+    # (it lags by a tick). The forward-progress gate must read THIS field, not
+    # the lagging aggregate, or a freshly-decomposed-and-dispatched GOAL is
+    # false-negatived as "emitted 0" and wrongly DLQ'd. Default 0 keeps the
+    # early-return construction sites (master-off / dedup) byte-identical.
+    emitted_this_tick: int = 0
     schema_version: str = MULTI_STEP_ORCHESTRATOR_SCHEMA_VERSION
+
+    @property
+    def made_forward_progress(self) -> bool:
+        """True iff this tick made real forward progress: a sub-goal was either
+        dispatched this tick (ground truth) OR is already in-flight per the
+        ledger. This is the correct success predicate for the BLOCK->decompose
+        re-inject gate -- NOT the lagging ``emitted_count`` alone."""
+        return self.emitted_count >= 1 or self.emitted_this_tick >= 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -335,6 +352,8 @@ class OrchestrationReport:
             "blocked_count": int(self.blocked_count),
             "ready_count": int(self.ready_count),
             "emitted_count": int(self.emitted_count),
+            "emitted_this_tick": int(self.emitted_this_tick),
+            "made_forward_progress": bool(self.made_forward_progress),
             "done_count": int(self.done_count),
             "failed_count": int(self.failed_count),
             "completion_ratio": float(self.completion_ratio),
@@ -958,6 +977,23 @@ async def advance_orchestration(
     ratio = (done - failed) / total if total > 0 else 0.0
 
     emitted_this_tick = sum(1 for o in emit_outcomes if o.emitted)
+
+    # Zero-Drop policy (Sovereign State-Propagation Bridge): a REAL silent drop
+    # is when we SELECTED ready sub-goals to emit (``to_emit`` non-empty) but
+    # NONE were actually dispatched (every router.ingest failed / envelope was
+    # None). That -- and only that -- is a propagation failure worth a loud
+    # signal; a successful dispatch (emitted_this_tick >= 1) is NOT a drop even
+    # though the lagging ``emitted`` aggregate reads 0 this tick.
+    if to_emit and emitted_this_tick == 0:
+        _errs = "; ".join(
+            f"{o.sub_goal_id}:{o.error}" for o in emit_outcomes if not o.emitted
+        )[:400]
+        logger.critical(
+            "[SovereignPropagation] REAL DROP: %d ready sub-goal(s) selected for "
+            "emit but 0 dispatched (parent=%s) -- failures: %s",
+            len(to_emit), parent_goal_id, _errs or "unknown",
+        )
+
     diagnostic = (
         f"verdict={verdict.value}; "
         f"total={total} blocked={blocked} ready={ready} "
@@ -981,6 +1017,7 @@ async def advance_orchestration(
         run_records=run_records,
         diagnostic=diagnostic,
         elapsed_s=max(0.0, time.time() - started),
+        emitted_this_tick=emitted_this_tick,
     )
     _persist_report(report)
     _publish_event(report)
