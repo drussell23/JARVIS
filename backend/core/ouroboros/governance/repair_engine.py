@@ -248,18 +248,34 @@ class RepairIterationRecord:
 class RepairResult:
     """Terminal outcome returned by RepairEngine.run() to the orchestrator.
 
-    Note: ``terminal`` is always ``"L2_CONVERGED"`` or ``"L2_STOPPED"``.
+    Note: ``terminal`` is ``"L2_CONVERGED"`` | ``"L2_STOPPED"`` | ``"L2_PIVOT"``.
     ``"L2_ABORTED"`` is never returned — ``asyncio.CancelledError`` is
     re-raised directly so the orchestrator can handle POSTMORTEM itself.
     Non-CancelledError infra errors are returned as ``"L2_STOPPED"`` with a
     structured ``stop_reason`` (e.g. ``"sandbox_infra_error:OSError"``).
+
+    Adaptive Epistemic Feedback Matrix (T3 — Graceful Semantic Pivot):
+    ``terminal == "L2_PIVOT"`` is the UNRESOLVABLE-PATH signal. It is
+    emitted ONLY when the run exhausts AND ``epistemic_feedback_enabled()``
+    AND ``pivot_verdict(repeated_count, temp_at_floor)`` is True — i.e. the
+    SAME ``failure_signature_hash`` persisted after the temperature hit the
+    floor. The orchestrator routes an ``L2_PIVOT`` to a graceful semantic
+    pivot (decompose-further at the failure locus, or HITL DLQ if atomic)
+    instead of cancelling. ``failure_signature_hash`` + ``stderr_tail``
+    ride along so the decomposer can bias its scope at the failure locus.
+    When ``epistemic_feedback_enabled()`` is False the pivot is NEVER
+    emitted — the run returns ``L2_STOPPED`` byte-identically.
     """
 
-    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"
+    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"|"L2_PIVOT"
     candidate: Optional[Dict[str, Any]]  # converged candidate dict, or None
-    stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"
+    stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"|"L2_PIVOT"
     summary: Dict[str, Any]              # key metrics for ledger payload
     iterations: Tuple[RepairIterationRecord, ...]
+    # T3 — Graceful Semantic Pivot payload (only meaningful when
+    # terminal == "L2_PIVOT"; empty strings otherwise so OFF byte-identical).
+    failure_signature_hash: str = ""
+    stderr_tail: str = ""
 
 
 @dataclass(frozen=True)
@@ -328,6 +344,74 @@ def _patch_sig(diff: str) -> str:
     """SHA-256 hex digest of a unified diff (delegates to failure_classifier)."""
     from backend.core.ouroboros.governance.failure_classifier import patch_signature_hash
     return patch_signature_hash(diff)
+
+
+def _epistemic_base_temp() -> float:
+    """Base sampling temperature for the T2 parametric-degeneration floor.
+
+    Defaults to ``0.2`` — the shared codegen default across the Claude / Prime /
+    DoubleWord providers (``_DW_TEMPERATURE`` default, ClaudeProvider non-thinking
+    default, PrimeProvider hardcoded). Override via ``JARVIS_EPISTEMIC_BASE_TEMP``.
+    Fail-soft: any parse error returns ``0.2``.
+    """
+    import os
+    try:
+        return float(os.environ.get("JARVIS_EPISTEMIC_BASE_TEMP", "0.2"))
+    except (ValueError, TypeError):
+        return 0.2
+
+
+def _env_trace_tail_chars() -> int:
+    """Max chars of stderr tail to carry on an L2_PIVOT (failure-locus hint).
+
+    Reuses ``JARVIS_EPISTEMIC_TRACE_MAX_CHARS`` (default ``2500``) — the same
+    knob ``epistemic_feedback.build_failure_context`` uses for its trace tail.
+    Fail-soft: any parse error returns ``2500``.
+    """
+    import os
+    try:
+        return int(os.environ.get("JARVIS_EPISTEMIC_TRACE_MAX_CHARS", "2500"))
+    except (ValueError, TypeError):
+        return 2500
+
+
+def _epistemic_temp_floor() -> float:
+    """The temperature floor used by the T3 graceful-semantic-pivot trigger.
+
+    Mirrors ``epistemic_feedback.temperature_for_attempt``'s
+    ``JARVIS_EPISTEMIC_TEMP_FLOOR`` (default ``0.0``). When the live
+    ``epistemic_temperature`` reaches this floor AND the same failure
+    signature persists, the run is on an UNRESOLVABLE PATH and pivots.
+    Fail-soft: any parse error returns ``0.0``.
+    """
+    import os
+    try:
+        return float(os.environ.get("JARVIS_EPISTEMIC_TEMP_FLOOR", "0.0"))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _epistemic_temp_floor_epsilon() -> float:
+    """Floor-band tolerance for the T3 graceful-semantic-pivot trigger.
+
+    The parametric temperature decays geometrically
+    (``temperature_for_attempt`` = ``max(floor, base * decay**n)``), so under
+    the shipping defaults (base ``0.2``, decay ``0.5``, floor ``0.0``) it is
+    ALWAYS strictly greater than the ``0.0`` floor (0.2, 0.1, 0.05, 0.025 ...)
+    and never EQUALS it. A strict ``temp <= floor`` test would therefore make
+    the pivot dead-by-default. This epsilon widens the floor into a BAND so the
+    temperature is treated as "at floor" once it has decayed into the band
+    (``temp <= floor + epsilon``), making the pivot reachable under defaults.
+    Env: ``JARVIS_EPISTEMIC_TEMP_FLOOR_EPSILON`` (default ``0.06``). Fail-soft:
+    any parse error returns ``0.06``.
+    """
+    import os
+    try:
+        return float(
+            os.environ.get("JARVIS_EPISTEMIC_TEMP_FLOOR_EPSILON", "0.06")
+        )
+    except (ValueError, TypeError):
+        return 0.06
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +746,18 @@ class RepairEngine:
         repair_context = None
         seen_pairs: Set[Tuple[str, str]] = set()
         class_retry_counts: Dict[str, int] = {}
+        # Adaptive Epistemic Feedback Matrix (T2):
+        #   * ``prior_sandbox_content`` carries the in-sandbox content of the PRIOR
+        #     iteration's candidate (the last STABLE-ish source) so the hybrid
+        #     epistemic diff can show prior-stable vs current-failing.
+        #   * ``signature_seen_counts`` counts how many times each
+        #     ``failure_signature_hash`` has recurred this run; the count drives the
+        #     parametric temperature degeneration (repeated signature → lower temp).
+        #   * ``epistemic_temperature`` is the override threaded into the NEXT
+        #     iteration's GENERATE call; ``None`` until the first repeated signature.
+        prior_sandbox_content: str = ""
+        signature_seen_counts: Dict[str, int] = {}
+        epistemic_temperature: Optional[float] = None
         no_progress_streak = 0
         prev_failing_count: Optional[int] = None
         prev_failure_class: Optional[str] = None
@@ -711,6 +807,41 @@ class RepairEngine:
                 iterations=tuple(records + [rec]),
             )
 
+        def _pivoted(reason: str, sig: str, stderr_tail: str) -> RepairResult:
+            """T3 — Graceful Semantic Pivot terminal.
+
+            Emitted in place of ``_stopped`` ONLY when the run exhausts AND
+            ``epistemic_feedback_enabled()`` AND ``pivot_verdict(...)`` is
+            True (the same ``failure_signature_hash`` persisted after the
+            temperature hit the floor). Carries the failure signature + the
+            stderr tail so the orchestrator can decompose-further AT the
+            failure locus. ``terminal == "L2_PIVOT"`` is otherwise shaped
+            like ``_stopped`` so every existing consumer that only checks
+            ``L2_CONVERGED``/``L2_STOPPED`` is unaffected.
+            """
+            rec = RepairIterationRecord(
+                op_id=ctx.op_id,
+                iteration=iteration,
+                repair_state=L2State.L2_STOPPED.value,
+                outcome="stopped",
+                stop_reason=reason,
+                failure_signature_hash=sig,
+            )
+            self._emit_record(ctx.op_id, rec)
+            return RepairResult(
+                terminal="L2_PIVOT",
+                candidate=None,
+                stop_reason=reason,
+                summary={
+                    "iterations": iteration,
+                    "total_validation_runs": total_validation_runs,
+                    "pivot": "unresolvable_path",
+                },
+                iterations=tuple(records + [rec]),
+                failure_signature_hash=sig,
+                stderr_tail=stderr_tail,
+            )
+
         while True:
             # ----------------------------------------------------------------
             # Kill conditions (checked BEFORE every iteration)
@@ -747,6 +878,9 @@ class RepairEngine:
                     ctx, pipeline_deadline,
                     repair_context=repair_context,
                     hypothesis_seed=None,  # LINEAR FSM does not seed
+                    # T2: signature-driven temperature floor computed at the END of
+                    # the prior iteration (None until a signature first repeats).
+                    temperature=epistemic_temperature,
                 )
                 if gen_outcome.candidate is None:
                     # ──────────────────────────────────────────────────
@@ -1170,6 +1304,76 @@ class RepairEngine:
                     if diverge_escape_enabled() else None
                 )
                 if _esc is None:
+                    # ──────────────────────────────────────────────────
+                    # T3 — Graceful Semantic Pivot decision point.
+                    # The run is genuinely exhausting (oscillation /
+                    # no-progress, escape disabled or budget gone). Before
+                    # the legacy terminal stop, ask the epistemic verdict:
+                    # if the SAME failure signature has persisted AND the
+                    # parametric temperature has degenerated to its floor,
+                    # this is an UNRESOLVABLE PATH — pivot (decompose-
+                    # further at the failure locus) instead of dead-stop.
+                    # Fail-soft ABSOLUTE: any error → exact legacy _stopped.
+                    # OFF byte-identical: epistemic_feedback_enabled()==False
+                    # short-circuits to _stopped before any pivot machinery.
+                    # ──────────────────────────────────────────────────
+                    try:
+                        from backend.core.ouroboros.governance.epistemic_feedback import (
+                            epistemic_feedback_enabled as _efe,
+                            pivot_verdict as _pv,
+                        )
+                        if _efe():
+                            # repeated_signature_count: how many prior
+                            # iterations already produced THIS exact
+                            # failure signature (0 on first sight). The
+                            # current iteration's increment happens later
+                            # in the epistemic block, so .get() here is the
+                            # count of PRIOR recurrences.
+                            _repeat_for_sig = int(
+                                signature_seen_counts.get(fail_sig, 0)
+                            )
+                            # temp_at_floor: the live degenerated temperature
+                            # (set at the end of the previous iteration) has
+                            # reached the configured floor. None (iter 1, no
+                            # prior recurrence) is NOT at floor.
+                            _floor = _epistemic_temp_floor()
+                            _floor_epsilon = _epistemic_temp_floor_epsilon()
+                            # Floor-RELATIVE band: the geometric temperature
+                            # decay is always strictly > a 0.0 floor, so a
+                            # strict ``<= floor`` test would make the pivot
+                            # dead-by-default. Treat the temperature as "at
+                            # floor" once it has decayed into the band
+                            # ``[floor, floor + epsilon]`` so the pivot becomes
+                            # reachable under the shipping defaults.
+                            _temp_at_floor = (
+                                epistemic_temperature is not None
+                                and float(epistemic_temperature)
+                                <= _floor + _floor_epsilon
+                            )
+                            if _pv(_repeat_for_sig, _temp_at_floor):
+                                _stderr_tail = ""
+                                try:
+                                    _raw = getattr(svr, "stderr", "") or ""
+                                    _tt = _env_trace_tail_chars()
+                                    _stderr_tail = (
+                                        _raw[-_tt:] if len(_raw) > _tt else _raw
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    _stderr_tail = ""
+                                _logger.warning(
+                                    "[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
+                                    "op=%s sig=%s repeated=%d temp_at_floor=%s "
+                                    "diverged=%s -> L2_PIVOT (decompose-further "
+                                    "at failure locus)",
+                                    ctx.op_id, (fail_sig or "")[:12],
+                                    _repeat_for_sig, _temp_at_floor,
+                                    _diverged_reason,
+                                )
+                                return _pivoted(
+                                    _diverged_reason, fail_sig, _stderr_tail,
+                                )
+                    except Exception:  # noqa: BLE001 — pivot is advisory; fail to legacy
+                        pass
                     # Escape disabled or budget exhausted → terminal stop (legacy behavior).
                     return _stopped(_diverged_reason)
                 escalation_count += 1
@@ -1204,6 +1408,57 @@ class RepairEngine:
                 ctx, file_path, classification.failing_test_ids,
                 cone_depth_override=_cone_depth_override,
             )
+
+            # ----------------------------------------------------------------
+            # Adaptive Epistemic Feedback Matrix (T2) — hybrid diff + trace +
+            # signature-driven temperature floor. Fail-soft: ANY error here falls
+            # back to the legacy repair_context (empty epistemic fields, base temp)
+            # so the repair loop NEVER crashes on epistemic computation. OFF
+            # byte-identical when epistemic_feedback_enabled() is False.
+            # ----------------------------------------------------------------
+            _epistemic_diff = ""
+            _epistemic_trace = ""
+            try:
+                from backend.core.ouroboros.governance.epistemic_feedback import (
+                    epistemic_feedback_enabled,
+                    build_failure_context,
+                    temperature_for_attempt,
+                )
+                # Count the CURRENT signature's recurrence this run (1 on first sight).
+                signature_seen_counts[fail_sig] = (
+                    signature_seen_counts.get(fail_sig, 0) + 1
+                )
+                _repeated_count = signature_seen_counts[fail_sig] - 1  # 0 on first sight
+                if epistemic_feedback_enabled():
+                    # Rich context: prior STABLE candidate vs current FAILING candidate,
+                    # plus the FULL sandbox stderr (NOT the 300-char failure_summary).
+                    _full_block = build_failure_context(
+                        prior_src=prior_sandbox_content,
+                        failed_src=sandbox_content,
+                        stderr=svr.stderr,
+                        failing_tests=classification.failing_test_ids,
+                        sub_goal_label=getattr(ctx, "op_id", "") or "",
+                    )
+                    # The assembled block carries diff + trace; place it in the diff
+                    # field (rendered under EPISTEMIC DIFF) and keep the raw stderr
+                    # tail in the trace field so the prompt receives BOTH the hybrid
+                    # diff AND the full trace with clear labels.
+                    _epistemic_diff = _full_block or ""
+                    _epistemic_trace = svr.stderr or ""
+                    # Parametric degeneration: lower the temperature for the NEXT
+                    # GENERATE when this signature has recurred. _repeated_count=0 →
+                    # base temp unchanged (temperature_for_attempt returns base).
+                    _base_temp = _epistemic_base_temp()
+                    epistemic_temperature = temperature_for_attempt(
+                        _base_temp, _repeated_count,
+                    )
+                else:
+                    epistemic_temperature = None
+            except Exception:  # noqa: BLE001 — epistemic is advisory, never fatal
+                _epistemic_diff = ""
+                _epistemic_trace = ""
+                epistemic_temperature = None
+
             repair_context = RepairContext(
                 iteration=iteration,
                 max_iterations=budget.max_iterations,
@@ -1217,7 +1472,13 @@ class RepairEngine:
                 escalation_directive=(
                     pending_escalation.paradigm if pending_escalation else None
                 ),
+                prior_iteration_diff=_epistemic_diff,
+                failure_trace=_epistemic_trace,
             )
+
+            # T2: the current failing candidate becomes the PRIOR-stable source for the
+            # NEXT iteration's hybrid epistemic diff.
+            prior_sandbox_content = sandbox_content
 
             outcome = "progress" if is_progress else "no_progress"
             rec = RepairIterationRecord(
@@ -1405,6 +1666,7 @@ class RepairEngine:
         *,
         repair_context: Any,
         hypothesis_seed: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> CandidateGenerationResult:
         """Generate a single repair candidate via the prime provider.
 
@@ -1500,11 +1762,33 @@ class RepairEngine:
         _effective_timeout_s = max(
             1.0, min(_per_iter_bound, _remaining_pipeline_s),
         )
+        # Adaptive Epistemic Feedback Matrix (T2): thread the signature-driven
+        # temperature override into the provider generate call. Passed only when the
+        # caller supplied a non-None value AND it differs from the implicit provider
+        # default, so the legacy call shape (no temperature kwarg) is preserved when
+        # epistemic feedback is OFF. Fail-soft: if the provider's generate signature
+        # rejects ``temperature`` (older stub / 3rd-party provider), retry WITHOUT it
+        # so the repair loop never crashes on a kwarg mismatch.
+        async def _invoke_generate() -> Any:
+            if temperature is not None:
+                try:
+                    return await self._prime.generate(
+                        ctx, pipeline_deadline,
+                        repair_context=repair_context,
+                        temperature=temperature,
+                    )
+                except TypeError:
+                    # Provider does not accept temperature — fall back to legacy shape.
+                    return await self._prime.generate(
+                        ctx, pipeline_deadline, repair_context=repair_context,
+                    )
+            return await self._prime.generate(
+                ctx, pipeline_deadline, repair_context=repair_context,
+            )
+
         try:
             gen_result = await asyncio.wait_for(
-                self._prime.generate(
-                    ctx, pipeline_deadline, repair_context=repair_context,
-                ),
+                _invoke_generate(),
                 timeout=_effective_timeout_s,
             )
         except asyncio.CancelledError:

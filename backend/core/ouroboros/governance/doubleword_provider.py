@@ -1275,6 +1275,25 @@ class DoublewordProvider:
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
+        # Adaptive Epistemic Feedback Matrix (T2): per-call signature-driven temperature
+        # override stashed by ``generate(temperature=...)`` and consulted by the realtime
+        # codegen payload site. ``None`` → module-level ``_DW_TEMPERATURE`` (byte-identical).
+        self._epistemic_temp_override: Optional[float] = None
+
+    def _eff_dw_temperature(self) -> float:
+        """Effective sampling temperature for the DW codegen payload (T2).
+
+        Returns the per-call epistemic override when ``generate(temperature=...)``
+        supplied one, else the module-level ``_DW_TEMPERATURE``. Fail-soft: any error
+        falls back to ``_DW_TEMPERATURE`` so the payload build never raises.
+        """
+        try:
+            override = getattr(self, "_epistemic_temp_override", None)
+            if override is not None:
+                return float(override)
+        except Exception:
+            pass
+        return _DW_TEMPERATURE
 
     def _resolve_effective_model(self, ctx: Any) -> str:
         """Resolve the DW model for this call.
@@ -2108,6 +2127,7 @@ class DoublewordProvider:
         repair_context: Optional[Any] = None,
         *,
         prompt_override: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> GenerationResult:
         """Generate code via Doubleword batch API (blocking).
 
@@ -2153,6 +2173,14 @@ class DoublewordProvider:
         # pre-Slice-8 DW generation path is preserved.
         _dw_repair_context = repair_context  # noqa: F841 — reserved
         del _dw_repair_context
+        # Adaptive Epistemic Feedback Matrix (T2): accept the signature-driven
+        # temperature override for Protocol uniformity with Claude/Prime so the L2
+        # ``_generate_repair_candidate`` call never raises a TypeError when the prime
+        # provider is DW. Stash it for the duration of this call; the realtime codegen
+        # payload site consults ``_eff_dw_temperature()``. ``None`` (default) → the
+        # module-level ``_DW_TEMPERATURE`` is used (byte-identical to pre-T2). Cleared
+        # in ``finally`` so it never leaks across calls.
+        self._epistemic_temp_override = temperature
         if not self.is_available:
             return GenerationResult(
                 candidates=(),
@@ -3158,7 +3186,9 @@ class DoublewordProvider:
                     {"role": "user", "content": _user_content},
                 ],
                 "max_tokens": _eff_max_tokens,
-                "temperature": _DW_TEMPERATURE,
+                # T2 epistemic temperature floor: per-call signature-driven override
+                # (else module-level _DW_TEMPERATURE — byte-identical when no override).
+                "temperature": self._eff_dw_temperature(),
                 # Slice 54/55 — reasoning control, effort derived from
                 # task_complexity (see _reasoning_request_params).
                 **_reasoning_request_params(complexity=_complexity or "", model=_effective_model),

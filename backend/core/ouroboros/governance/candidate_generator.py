@@ -1293,11 +1293,136 @@ _BREAKER_RECORD_SOURCES: "frozenset[str]" = frozenset({
 })
 
 
+def lane_escalation_enabled() -> bool:
+    """Dynamic Lane Escalation (Part 2, T4) master flag -- default TRUE.
+
+    When TRUE, ``_breaker_record_outcome`` re-arms the transport breaker's VISION
+    for the ONE failure class the legacy ``_BREAKER_RECORD_SOURCES`` allowlist was
+    blind to: a *batch-lane retrieval TIMEOUT* (the DW batch poll never completing
+    inside its deadline). Such a failure is wrapped into an FSM_EXHAUSTED
+    ``all_providers_exhausted`` and would otherwise be dropped -- so the armed
+    batch->realtime breaker never tripped on the live C2 wedge.
+
+    When FALSE, the breaker stays blind EXACTLY as before (byte-identical): the
+    batch-TIMEOUT bypass is skipped and only the legacy LIVE_* allowlist records.
+    NEVER raises.
+    """
+    raw = os.environ.get("JARVIS_LANE_ESCALATION_ENABLED", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _is_trippable_batch_lane_timeout(
+    lane: str, exc: "Optional[BaseException]"
+) -> bool:
+    """True iff (gate ON) ``exc`` on ``lane`` is a DW batch-lane retrieval TIMEOUT
+    that SHOULD be recorded as a trippable transport failure even though its
+    surface classification is FSM_EXHAUSTED (excluded by the legacy allowlist).
+
+    Delegates the load-bearing decision to the taxonomy predicate
+    (``is_batch_lane_retrieval_timeout``) which keys on lane=batch +
+    fsm_failure_mode=TIMEOUT + DoublewordInfraError "batch retrieval" -- and
+    rejects generic exhaustion, tool-loop deadlines, and LOCAL_EGRESS_OVERWEIGHT.
+    Fail-soft: any error -> False (record nothing, legacy behavior).
+    """
+    try:
+        if exc is None or not lane_escalation_enabled():
+            return False
+        from backend.core.ouroboros.governance.dw_fault_taxonomy import (
+            is_batch_lane_retrieval_timeout as _batch_timeout,
+        )
+        return bool(_batch_timeout(exc, lane=lane))
+    except Exception:  # noqa: BLE001 -- classification error => record nothing
+        return False
+
+
+def _is_realtime_lane_collapse(
+    lane: str, exc: "Optional[BaseException]"
+) -> bool:
+    """True iff (gate ON) ``exc`` on ``lane`` is a realtime-lane generation
+    TIMEOUT -- i.e. LANE COLLAPSE: after T4 rotated this op off the wedged batch
+    lane onto realtime, the realtime lane ALSO timed out (both transport lanes
+    exhausted by timeout for this op).
+
+    Delegates the load-bearing decision to the taxonomy predicate
+    (``is_realtime_lane_timeout``) which keys on lane=realtime +
+    fsm_failure_mode=TIMEOUT (or a bare asyncio TimeoutError) and rejects batch
+    timeouts, tool-loop generation deadlines, and LOCAL_EGRESS_OVERWEIGHT.
+    Fail-soft: any error -> False (no collapse declared, legacy behavior)."""
+    try:
+        if exc is None or not lane_escalation_enabled():
+            return False
+        from backend.core.ouroboros.governance.dw_fault_taxonomy import (
+            is_realtime_lane_timeout as _rt_timeout,
+        )
+        return bool(_rt_timeout(exc, lane=lane))
+    except Exception:  # noqa: BLE001 -- classification error => no collapse
+        return False
+
+
+def _record_lane_collapse_dilation(
+    op_id: "Optional[str]",
+    lane: str,
+    exc: "Optional[BaseException]",
+) -> int:
+    """On detected LANE COLLAPSE (realtime-lane timeout after batch rotation):
+    emit ``[SOVEREIGN YIELD: LANE COLLAPSE]`` and record ONE bounded per-op
+    deadline-dilation hop. Returns the cumulative hop count for ``op_id`` (the
+    number to use when computing the dilated deadline for the NEXT attempt), or
+    ``0`` when no dilation should happen (gate off / not a collapse / over the
+    hop cap / fail-soft).
+
+    Bounded by ``JARVIS_LANE_DILATION_MAX_HOPS``: once the recorded hop count
+    EXCEEDS the cap, returns 0 so the dispatcher STOPS dilating and falls
+    through to the existing immortal-queue / DLQ backstop (the terminal). NEVER
+    raises -> 0 (legacy deadline, op never lost)."""
+    try:
+        if not lane_escalation_enabled():
+            return 0
+        if not _is_realtime_lane_collapse(lane, exc):
+            return 0
+        _op = (op_id or "?")
+        from backend.core.ouroboros.governance.convergence_watchdog import (
+            get_lane_dilation_tracker as _get_dt,
+            lane_dilation_max_hops as _max_hops,
+            emit_sovereign_yield as _yield,
+        )
+        cap = _max_hops()
+        if cap <= 0:
+            return 0  # dilation disabled -> straight to backstop
+        hops = _get_dt().record_dilation_hop(_op)
+        if hops > cap:
+            # Over budget: bounded -- no further dilation, fall to backstop.
+            logger.warning(
+                "[SOVEREIGN YIELD: LANE COLLAPSE] op=%s realtime+batch exhausted "
+                "by TIMEOUT, dilation hops=%d > cap=%d -> immortal/DLQ backstop",
+                _op[:16], hops, cap,
+            )
+            return 0
+        # Within budget: emit the sovereign-yield telemetry + signal dilation.
+        try:
+            _yield(
+                _op,
+                lineage_id=_op,
+                ratio=0.0,
+                consecutive_stalls=hops,
+                parent_chars=0,
+                child_chars=0,
+                tier="lane",
+                reason="LANE COLLAPSE",
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must never break dispatch
+            pass
+        return int(hops)
+    except Exception:  # noqa: BLE001 -- never perturb the dispatch error path
+        return 0
+
+
 def _breaker_record_outcome(
     lane: str,
     *,
     ok: bool,
     failure_mode: "Optional[str]",
+    exc: "Optional[BaseException]" = None,
 ) -> None:
     """Feed an attempt outcome into the TransportCircuitBreaker for ``lane``.
 
@@ -1310,10 +1435,23 @@ def _breaker_record_outcome(
     and auth terminals are silently dropped -- they are OUR fault, not the
     transport lane's.
 
+    T4 batch-TIMEOUT vision bypass: the SOLE exception to the I2 filter. When
+    ``JARVIS_LANE_ESCALATION_ENABLED`` is ON and ``exc`` is a *batch-lane
+    retrieval TIMEOUT* (lane=batch + fsm_failure_mode=TIMEOUT +
+    DoublewordInfraError "batch retrieval" -- the DW batch poll deadline, NOT a
+    generic exhaustion, NOT an our-side LOCAL_* fault), the FSM_EXHAUSTED
+    exclusion is bypassed for THAT failure only and it is recorded as a trippable
+    batch-lane transport failure. The batch lane trips OPEN -> ``select_lane``
+    rotates the op to realtime. Every other FSM_EXHAUSTED / GENERATION_TIMEOUT /
+    LOCAL_EGRESS_OVERWEIGHT stays dropped.
+
     Args:
         lane:         The transport lane actually used ("batch" / "realtime").
         ok:           True on success, False on any failure.
         failure_mode: The FailureSource name (e.g. "LIVE_TRANSPORT"), or None on success.
+        exc:          The originating exception (T4 batch-TIMEOUT classification);
+                      optional and back-compatible -- omitting it preserves the
+                      legacy allowlist-only behavior.
     """
     try:
         from backend.core.ouroboros.governance.transport_circuit_breaker import (
@@ -1322,8 +1460,15 @@ def _breaker_record_outcome(
         )
         if not _tb_enabled():
             return
-        # I2: skip recording non-transport failures (they are OUR-side, not lane faults)
-        if not ok and failure_mode not in _BREAKER_RECORD_SOURCES:
+        # I2: skip recording non-transport failures (they are OUR-side, not lane
+        # faults) -- UNLESS T4's batch-lane retrieval TIMEOUT bypass applies. The
+        # bypass is the single, surgically-scoped re-arming of the breaker's
+        # vision; it cannot fire on a generic exhaustion or an our-side fault.
+        if (
+            not ok
+            and failure_mode not in _BREAKER_RECORD_SOURCES
+            and not _is_trippable_batch_lane_timeout(lane, exc)
+        ):
             return
         import time as _t
         _get_tb().record(lane, ok=ok, failure_mode=failure_mode, now=_t.monotonic())
@@ -4289,12 +4434,33 @@ class CandidateGenerator:
                 # Only LIVE transport signals are meaningful to the per-lane breaker;
                 # GENERATION_TIMEOUT / FSM_EXHAUSTED / HTTP classification (OUR-side faults)
                 # are silently dropped by _breaker_record_outcome's _BREAKER_RECORD_SOURCES gate.
+                # T4 (Dynamic Lane Escalation): ``exc`` is forwarded so the record helper
+                # can re-arm the breaker's vision for the SINGLE batch-lane retrieval
+                # TIMEOUT case (FSM_EXHAUSTED-wrapped DW batch-poll deadline) -> trip the
+                # batch lane OPEN -> select_lane rotates the op to realtime.
                 _a3_fail_lane = "batch" if _s182_fb_token is not None else "realtime"
                 _breaker_record_outcome(
                     _a3_fail_lane,
                     ok=False,
                     failure_mode=failure_source.name,
+                    exc=exc,
                 )
+                # T5 (Dynamic Lane Escalation) -- LANE COLLAPSE detection. After
+                # T4 rotated this op off the wedged batch lane onto realtime, a
+                # realtime-lane TIMEOUT here means BOTH transport lanes have now
+                # failed by timeout for this op. Emit [SOVEREIGN YIELD: LANE
+                # COLLAPSE] + record a BOUNDED per-op deadline-dilation hop so the
+                # immortal queue's NEXT re-attempt runs at a dilated deadline
+                # (DW under heavy global load). Bounded by
+                # JARVIS_LANE_DILATION_MAX_HOPS -> falls to the existing
+                # immortal/DLQ backstop once exhausted. Fail-soft; OFF byte-id.
+                try:
+                    _t5_full_op = getattr(context, "op_id", "") or getattr(
+                        context, "operation_id", "",
+                    ) or ""
+                    _record_lane_collapse_dilation(_t5_full_op, _a3_fail_lane, exc)
+                except Exception:  # noqa: BLE001 -- never perturb the error path
+                    pass
                 try:
                     # Slice 201 — feed the bandit a FAILURE reward for this arm
                     # so its posterior learns which models actually deliver.
@@ -5769,6 +5935,15 @@ class CandidateGenerator:
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id, force_batch=_force_batch,
                 fallback_dead=_fallback_dead,
+                # T5 -- per-op deadline dilation seam: a LANE-COLLAPSED op (both
+                # transport lanes timed out) carries a recorded dilation hop, so
+                # this re-attempt's budget is scaled up (bounded). No hops / gate
+                # off -> byte-identical legacy budget.
+                op_id=(
+                    getattr(context, "op_id", "")
+                    or getattr(context, "operation_id", "")
+                    or ""
+                ),
             )
             if _fallback_dead and primary_budget > _PRIMARY_MAX_TIMEOUT_S:
                 # Severity matches reality: STRUCTURAL autarky (operator-attested
@@ -7457,12 +7632,41 @@ class CandidateGenerator:
         return final_budget
 
     @staticmethod
+    def _apply_lane_dilation(budget: float, op_id: str) -> float:
+        """Dynamic Lane Escalation (Part 2, T5) -- per-op deadline dilation seam.
+
+        When ``JARVIS_LANE_ESCALATION_ENABLED`` is ON and this op has recorded
+        one or more LANE COLLAPSE dilation hops (realtime+batch both timed out),
+        scale the computed primary ``budget`` by ``factor ** hops`` (capped at
+        ``JARVIS_LANE_DILATION_MAX_S``) for THIS re-attempt. The hop count is the
+        bounded per-op counter recorded by ``_record_lane_collapse_dilation`` --
+        the immortal queue re-attempts the op with the SAME op_id, so each
+        re-attempt picks up the recorded dilation.
+
+        OFF / no hops recorded -> returns ``budget`` unchanged (byte-identical).
+        Fail-soft: any error -> legacy ``budget`` (op never lost)."""
+        try:
+            if not op_id or not lane_escalation_enabled():
+                return budget
+            from backend.core.ouroboros.governance.convergence_watchdog import (
+                get_lane_dilation_tracker as _get_dt,
+                compute_dilated_deadline as _dilate,
+            )
+            hops = _get_dt().hops(op_id)
+            if hops <= 0:
+                return budget
+            return _dilate(budget, hops)
+        except Exception:  # noqa: BLE001 -- dilation must NEVER break dispatch
+            return budget
+
+    @staticmethod
     def _compute_primary_budget(
         total_s: float,
         *,
         model_id: str = "",
         force_batch: bool = False,
         fallback_dead: bool = False,
+        op_id: str = "",
     ) -> float:
         """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
 
@@ -7526,7 +7730,9 @@ class CandidateGenerator:
                 batch_cap = batch_sla_horizon_s()
             else:
                 batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
-            return max(min(total_s, batch_cap), 0.0)
+            return CandidateGenerator._apply_lane_dilation(
+                max(min(total_s, batch_cap), 0.0), op_id,
+            )
 
         # Slice 225 Phase 2 — Sovereign DW Autarky. When the Claude fallback
         # lane is unreliable (breaker OPEN/HALF_OPEN — incl. the terminal_quota
@@ -7544,7 +7750,9 @@ class CandidateGenerator:
             autarky_cap = _envf_or_default(
                 "JARVIS_DW_AUTARKY_MAX_BUDGET_S", 180.0,
             )
-            return max(min(total_s, autarky_cap), 0.0)
+            return CandidateGenerator._apply_lane_dilation(
+                max(min(total_s, autarky_cap), 0.0), op_id,
+            )
 
         fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
 
@@ -7566,7 +7774,7 @@ class CandidateGenerator:
             total_s - fb_reserve,
             effective_max,
         )
-        return max(budget, 0.0)
+        return CandidateGenerator._apply_lane_dilation(max(budget, 0.0), op_id)
 
 
 # ---------------------------------------------------------------------------

@@ -520,6 +520,25 @@ class VALIDATERunner(PhaseRunner):
                             f"prev={_l2_soft_stop_history[-1] if _l2_soft_stop_history else '?'}",
                         )
                         continue  # next inner Slice 6 retry-loop iteration
+                    elif directive[0] == "l2_pivot":
+                        # T3 — Graceful Semantic Pivot. _l2_hook left ctx
+                        # UNADVANCED; the shared pivot handler owns the terminal
+                        # (decompose-further at the failure locus, or HITL DLQ if
+                        # atomic). DAG-preserving — sibling ops untouched.
+                        _fsm_log("l2_pivot_return")
+                        _pivot_sig = directive[2] if len(directive) > 2 else ""
+                        _pivot_tail = directive[3] if len(directive) > 3 else ""
+                        _pivot_ctx = await orch._handle_l2_pivot(
+                            directive[1], _pivot_sig, _pivot_tail,
+                        )
+                        _reason = (
+                            _pivot_ctx.terminal_reason_code or "l2_pivot"
+                        )
+                        return PhaseResult(
+                            next_ctx=_pivot_ctx, next_phase=None, status="fail",
+                            reason=_reason,
+                            artifacts={"best_candidate": None, "best_validation": best_validation},
+                        )
                     elif directive[0] in ("cancel", "fatal"):
                         _fsm_log("l2_escape_return", f"directive={directive[0]!r}")
                         # directive[1] is the advanced ctx (CANCELLED/POSTMORTEM)

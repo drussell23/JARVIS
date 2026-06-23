@@ -2534,6 +2534,204 @@ class GovernedOrchestrator:
             terminal_reason_code="advisor_blocked",
         )
 
+    async def _handle_l2_pivot(
+        self,
+        ctx: "OperationContext",
+        signature_hash: str,
+        stderr_tail: str,
+    ) -> "OperationContext":
+        """T3 — Graceful Semantic Pivot handler for an ``l2_pivot`` directive.
+
+        The L2 repair engine declared THIS sub-goal's path UNRESOLVABLE (the
+        same ``failure_signature_hash`` persisted after the temperature hit
+        the floor — verdict from the real ``pivot_verdict``). Instead of
+        dead-stopping, we yield gracefully:
+
+          1. Emit a ``[SOVEREIGN YIELD: UNRESOLVABLE PATH]`` telemetry line
+             (reusing :func:`emit_sovereign_yield`).
+          2. ``decompose_for_block`` the op into AST-symbol-scoped sub-goals
+             with a ``failure_hint`` so the scoper biases the failure locus
+             (the symbol implicated in the stderr tail) FIRST, and re-inject
+             them via the SAME ``advance_orchestration`` seam the
+             BLOCK-decompose path uses. On forward progress the parent
+             terminates ``decomposed`` (the pivot is PROGRESS, not a cancel).
+          3. If decompose yields no further split (already atomic) → flag for
+             human review via :func:`append_dlq` and soft-terminate.
+
+        DAG-preserving: only THIS op pivots; sibling ops are NEVER touched.
+
+        Fail-soft ABSOLUTE: ANY error → the EXACT legacy L2 escape terminal
+        (CANCELLED with ``l2_unresolvable_pivot_failed``). The op is NEVER
+        lost — same I1 guarantee as the BLOCK-decompose seam.
+        """
+        _entry_phase = ctx.phase
+        _escape_terminal = self._l2_escape_terminal(_entry_phase)
+        try:
+            target_files = tuple(getattr(ctx, "target_files", ()) or ())
+            description = ctx.description or ""
+
+            # 1. YIELD telemetry — reuse the sovereign-yield emitter with the
+            #    UNRESOLVABLE_PATH reason so the log carries the [SOVEREIGN
+            #    YIELD: UNRESOLVABLE PATH] label.
+            try:
+                emit_sovereign_yield(
+                    ctx.op_id,
+                    lineage_id=(signature_hash or "")[:16],
+                    ratio=0.0,
+                    consecutive_stalls=0,
+                    parent_chars=len(description),
+                    child_chars=0,
+                    tier="epistemic_pivot",
+                    reason="UNRESOLVABLE_PATH",
+                )
+            except Exception:  # noqa: BLE001 — telemetry is advisory
+                logger.warning(
+                    "[SOVEREIGN YIELD: UNRESOLVABLE PATH] op=%s sig=%s "
+                    "(emitter fail-soft)",
+                    ctx.op_id, (signature_hash or "")[:12],
+                )
+
+            # 2. Decompose-further AT the failure locus. failure_hint biases
+            #    the scoper to split the implicated symbol first.
+            goal = _BlockGoal(
+                goal_id=ctx.op_id,
+                title=description[:80],
+                description=description,
+                target_files=target_files,
+            )
+            _failure_hint = {
+                "signature_hash": signature_hash or "",
+                "stderr_tail": stderr_tail or "",
+            }
+            sub_goals = decompose_for_block(
+                goal,
+                zero_coverage=False,
+                failure_hint=_failure_hint,
+            )
+
+            # An ATOMIC op cannot be split further: decompose returns a single
+            # whole-op fallback sub-goal whose id mirrors the parent and which
+            # carries no narrower scope. Treat "no genuine further split" as
+            # atomic → HITL DLQ.
+            _is_atomic = self._pivot_is_atomic(sub_goals, ctx.op_id)
+
+            if not _is_atomic and sub_goals:
+                # Re-inject via the SAME multi-step seam the BLOCK-decompose
+                # path uses. NO parallel re-inject path.
+                plan = DecomposedPlan(
+                    parent_goal_id=ctx.op_id,
+                    sub_goals=tuple(sub_goals),
+                    dag_valid=True,
+                    dag_depth=1,
+                    topological_order=tuple(
+                        s.sub_goal_id for s in sub_goals
+                    ),
+                    diagnostic="l2_pivot_decompose_reinject",
+                )
+                _gls_ref = getattr(
+                    self._stack, "governed_loop_service", None,
+                )
+                router = getattr(_gls_ref, "_intake_router", None)
+                report = await advance_orchestration(plan, router=router)
+                if report.made_forward_progress:
+                    logger.warning(
+                        "[Orchestrator] L2_PIVOT decomposed-further into %d "
+                        "sub-goals (emitted=%d dispatched_this_tick=%d) "
+                        "op=%s sig=%s — DAG-preserving pivot",
+                        len(sub_goals), report.emitted_count,
+                        report.emitted_this_tick, ctx.op_id,
+                        (signature_hash or "")[:12],
+                    )
+                    return ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="decomposed",
+                    )
+                # Re-inject emitted zero — fall through to DLQ (op never lost).
+                logger.critical(
+                    "[Orchestrator] L2_PIVOT decompose emitted 0 sub-goals "
+                    "op=%s — routing to DLQ (op never lost)", ctx.op_id,
+                )
+
+            # 3. Atomic OR re-inject made no progress → HITL DLQ.
+            try:
+                from backend.core.ouroboros.governance.intake_dlq import (
+                    append_dlq as _dlq_append,
+                )
+                _dlq_envelope = {
+                    "goal_id": ctx.op_id,
+                    "reason": "l2_unresolvable_awaiting_human",
+                    "description": description[:200],
+                    "failure_signature_hash": signature_hash or "",
+                    "stderr_tail": (stderr_tail or "")[:500],
+                }
+                _dlq_append(
+                    _dlq_envelope,
+                    reason="l2_unresolvable_awaiting_human",
+                )
+            except Exception:  # noqa: BLE001 — DLQ is best-effort
+                logger.debug(
+                    "[Orchestrator] L2_PIVOT DLQ append fail-soft op=%s",
+                    ctx.op_id, exc_info=True,
+                )
+            ctx = ctx.advance(
+                _escape_terminal,
+                terminal_reason_code="l2_unresolvable_awaiting_human",
+            )
+            await self._record_ledger(ctx, OperationState.FAILED, {
+                "reason": "l2_unresolvable_awaiting_human",
+                "entry_phase": _entry_phase.name,
+                "terminal": _escape_terminal.name,
+                "failure_signature_hash": signature_hash or "",
+            })
+            return ctx
+
+        except Exception as exc:  # noqa: BLE001 — fail-soft ABSOLUTE
+            # ANY pivot error → exact legacy L2 escape; the op is NEVER lost.
+            logger.debug(
+                "[Orchestrator] L2_PIVOT handler fail-soft -> legacy escape "
+                "op=%s err=%r", ctx.op_id, exc, exc_info=True,
+            )
+            ctx = ctx.advance(
+                _escape_terminal,
+                terminal_reason_code="l2_unresolvable_pivot_failed",
+            )
+            try:
+                await self._record_ledger(ctx, OperationState.FAILED, {
+                    "reason": "l2_unresolvable_pivot_failed",
+                    "entry_phase": _entry_phase.name,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+            return ctx
+
+    @staticmethod
+    def _pivot_is_atomic(sub_goals: tuple, parent_op_id: str) -> bool:
+        """Return True iff ``decompose_for_block`` produced NO genuine further
+        split — i.e. the op is already atomic and must route to HITL DLQ.
+
+        Atomic markers (any one ⇒ atomic):
+          • empty result,
+          • a single sub-goal that mirrors the parent (whole-op fallback:
+            its ``sub_goal_id`` starts with the parent op id and it carries
+            no ``scoped_symbols``).
+        A genuine further split (≥1 sub-goal carrying ``scoped_symbols``, or
+        ≥2 sub-goals) is NOT atomic. Fail-soft → True (safer to DLQ for human
+        review than to re-inject a non-split).
+        """
+        try:
+            if not sub_goals:
+                return True
+            if len(sub_goals) >= 2:
+                return False
+            only = sub_goals[0]
+            _scoped = tuple(getattr(only, "scoped_symbols", ()) or ())
+            if _scoped:
+                return False
+            # Single, unscoped, whole-op fallback → atomic.
+            return True
+        except Exception:  # noqa: BLE001
+            return True
+
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
 
@@ -7745,6 +7943,18 @@ class GovernedOrchestrator:
                                 f"prev={_l2_soft_stop_history[-1] if _l2_soft_stop_history else '?'}",
                             )
                             continue  # next iteration of the inner Slice 6 loop
+                        elif directive[0] == "l2_pivot":
+                            # T3 — Graceful Semantic Pivot. _l2_hook left ctx
+                            # UNADVANCED; the pivot handler owns the terminal
+                            # (decompose-further at the failure locus, or HITL
+                            # DLQ if atomic). DAG-preserving — siblings untouched.
+                            _fsm_log("l2_pivot_return")
+                            _pivot_ctx = directive[1]
+                            _pivot_sig = directive[2] if len(directive) > 2 else ""
+                            _pivot_tail = directive[3] if len(directive) > 3 else ""
+                            return await self._handle_l2_pivot(
+                                _pivot_ctx, _pivot_sig, _pivot_tail,
+                            )
                         elif directive[0] in ("cancel", "fatal"):
                             _fsm_log("l2_escape_return", f"directive={directive[0]!r}")
                             return directive[1]  # ctx was advanced inside _l2_hook
@@ -10009,6 +10219,17 @@ class GovernedOrchestrator:
                                     )
                             except Exception as _apply_exc:
                                 logger.debug("[Orchestrator] L2 repair apply error: %s", _apply_exc)
+                        elif directive[0] == "l2_pivot":
+                            # T3 — Graceful Semantic Pivot in the VERIFY phase.
+                            # Route through the shared pivot handler (decompose-
+                            # further at the failure locus or HITL DLQ) and
+                            # return its terminal ctx. DAG-preserving.
+                            _pivot_sig = directive[2] if len(directive) > 2 else ""
+                            _pivot_tail = directive[3] if len(directive) > 3 else ""
+                            ctx = await self._handle_l2_pivot(
+                                directive[1], _pivot_sig, _pivot_tail,
+                            )
+                            return ctx
                         elif directive[0] in ("cancel", "fatal"):
                             # L2 decided to escape. _l2_hook has already advanced
                             # ctx to the phase-appropriate terminal (POSTMORTEM
@@ -10439,6 +10660,29 @@ class GovernedOrchestrator:
                                         "[Orchestrator] Visual VERIFY L2 apply "
                                         "error: %s", _vv_apply_exc,
                                     )
+                            elif _vv_directive[0] == "l2_pivot":
+                                # T3 -- Graceful Semantic Pivot in the Visual
+                                # VERIFY phase. Mirror the VERIFY consumer:
+                                # route through the shared pivot handler
+                                # (decompose-further at the failure locus or
+                                # HITL DLQ) and return its terminal ctx so an
+                                # unresolvable op is NOT mis-marked COMPLETE.
+                                # DAG-preserving; OFF byte-identical (engine
+                                # only emits L2_PIVOT when epistemic feedback
+                                # is enabled).
+                                _vv_pivot_sig = (
+                                    _vv_directive[2]
+                                    if len(_vv_directive) > 2 else ""
+                                )
+                                _vv_pivot_tail = (
+                                    _vv_directive[3]
+                                    if len(_vv_directive) > 3 else ""
+                                )
+                                ctx = await self._handle_l2_pivot(
+                                    _vv_directive[1],
+                                    _vv_pivot_sig, _vv_pivot_tail,
+                                )
+                                return ctx
                             elif _vv_directive[0] in ("cancel", "fatal"):
                                 # L2 escaped — inherit the terminal ctx.
                                 ctx = _vv_directive[1]
@@ -11436,6 +11680,32 @@ class GovernedOrchestrator:
                     **l2_result.summary,
                 })
                 return ("cancel", ctx)
+
+        elif l2_result.terminal == "L2_PIVOT":
+            # ──────────────────────────────────────────────────────────
+            # Adaptive Epistemic Feedback Matrix (T3) — Graceful Semantic
+            # Pivot. The repair engine has declared this sub-goal's path
+            # UNRESOLVABLE (same failure_signature_hash persisted after the
+            # temperature degenerated to its floor — verdict from the real
+            # ``pivot_verdict``). Rather than dead-stop, surface a
+            # ``l2_pivot`` directive carrying the signature + stderr tail so
+            # the caller can route to ``decompose_for_block`` at the failure
+            # locus (or HITL DLQ if already atomic) WITHOUT touching sibling
+            # DAG ops. ctx is left UNADVANCED — the pivot handler owns the
+            # terminal. The engine ONLY emits L2_PIVOT when
+            # ``epistemic_feedback_enabled()`` is True, so this branch is
+            # unreachable (OFF byte-identical) with the feature disabled.
+            # ──────────────────────────────────────────────────────────
+            _pivot_sig = getattr(l2_result, "failure_signature_hash", "") or ""
+            _pivot_tail = getattr(l2_result, "stderr_tail", "") or ""
+            await self._record_ledger(ctx, OperationState.SANDBOXING, {
+                "event": "l2_pivot",
+                "reason": "unresolvable_path",
+                "failure_signature_hash": _pivot_sig,
+                "entry_phase": _entry_phase.name,
+                **l2_result.summary,
+            })
+            return ("l2_pivot", ctx, _pivot_sig, _pivot_tail)
 
         elif l2_result.terminal == "L2_STOPPED":
             # ──────────────────────────────────────────────────────────

@@ -317,7 +317,42 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # 2. document the change in the arc memory file with explicit
     #    Phase tag + the byte-equivalence verification approach;
     # 3. include a soak validating the new behavior under cadence.
-    EXPECTED_DIGEST = "9e881fdde25ec5b1"
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix T2 (2026-06-22). _run_inner
+    # gained signature-recurrence tracking + hybrid-diff/trace assembly + a
+    # signature-driven temperature override threaded into the GENERATE call. The
+    # epistemic computation is fully wrapped in try/except and OFF byte-identical
+    # when epistemic_feedback_enabled() is False (verified by
+    # tests/governance/test_epistemic_repair_threading.py); LINEAR rollback
+    # semantics are preserved (the new fields default empty; the temperature
+    # override is None until a signature first repeats). Pin updated atomically.
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix T3 — Graceful Semantic
+    # Pivot (2026-06-22). _run_inner's divergence terminal-stop (escape
+    # disabled / budget exhausted, ``_esc is None``) now consults the REAL
+    # ``pivot_verdict`` BEFORE the legacy ``_stopped``: when
+    # ``epistemic_feedback_enabled()`` AND the same failure signature persisted
+    # after the temperature degenerated to its floor, it returns a new
+    # ``L2_PIVOT`` outcome (via ``_pivoted``) carrying the signature + stderr
+    # tail so the orchestrator can decompose-further at the failure locus. The
+    # whole pivot decision is nested under ``if _efe():`` inside a try/except,
+    # so OFF byte-identical (feedback disabled → exact legacy ``_stopped``;
+    # verified by tests/governance/test_epistemic_pivot.py). Pin updated
+    # atomically.
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix T3 -- Pivot Reachability
+    # (2026-06-22, final-review finding #1). The divergence pivot check's
+    # ``_temp_at_floor`` was a STRICT ``temp <= floor`` test, but the
+    # geometric temperature decay (0.2, 0.1, 0.05, 0.025 ...) is always
+    # strictly greater than the 0.0 default floor -> ``_temp_at_floor`` was
+    # NEVER True under shipping defaults -> the L2_PIVOT was dead-by-default.
+    # The check is now floor-RELATIVE (``temp <= floor + epsilon``, epsilon
+    # from ``JARVIS_EPISTEMIC_TEMP_FLOOR_EPSILON`` default 0.06) so the pivot
+    # becomes reachable once the temperature decays into the floor band. The
+    # change is still nested under ``if _efe():`` -> OFF byte-identical
+    # (verified by tests/governance/test_epistemic_pivot.py reachability
+    # test). Pin updated atomically.
+    EXPECTED_DIGEST = "51bf4e5724ad2afc"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

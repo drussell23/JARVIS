@@ -3533,6 +3533,24 @@ Rules:
         _cone = getattr(_rc, "dependency_cone", None)
         if _cone:
             _repair_block = f"{_repair_block}\n\n{_cone}"
+        # Adaptive Epistemic Feedback Matrix (T2) — additive hybrid epistemic diff
+        # (prior stable candidate vs current failing iteration) + FULL sandbox stderr
+        # trace. Present only when the L2 loop populated them (gated by
+        # epistemic_feedback_enabled()); when both are empty the repair block is
+        # byte-identical to pre-T2 behavior. The 300-char failure_summary above stays
+        # for backward-compat; these fields carry the richer context.
+        _epistemic_diff = getattr(_rc, "prior_iteration_diff", "") or ""
+        if _epistemic_diff:
+            _repair_block = (
+                f"{_repair_block}\n\n## EPISTEMIC DIFF (prior stable vs current failing)\n"
+                f"{_epistemic_diff}"
+            )
+        _epistemic_trace = getattr(_rc, "failure_trace", "") or ""
+        if _epistemic_trace:
+            _repair_block = (
+                f"{_repair_block}\n\n## FULL FAILURE TRACE\n"
+                f"{_epistemic_trace}"
+            )
         parts.append(_repair_block)
 
     parts.append(schema_instruction)
@@ -5169,8 +5187,15 @@ class PrimeProvider:
         context: OperationContext,
         deadline: datetime,
         repair_context: Optional[Any] = None,
+        *,
+        temperature: Optional[float] = None,
     ) -> GenerationResult:
         """Generate code candidates via PrimeClient with optional tool-call loop.
+
+        ``temperature`` (Adaptive Epistemic Feedback Matrix, T2): optional sampling
+        override threaded by ``RepairEngine`` to lower temperature when the SAME
+        failure signature repeats across L2 iterations. ``None`` (default) preserves
+        the legacy hardcoded ``0.2`` so non-repair callers stay byte-identical.
 
         When ``tools_enabled=True``, the model may respond with a 2b.2-tool
         schema response to request tool execution. The loop re-sends the prompt
@@ -5287,12 +5312,16 @@ class PrimeProvider:
 
         _last_response: list = [None]
 
+        # T2 epistemic temperature override: signature-driven floor from RepairEngine.
+        # None (non-repair callers) preserves the legacy hardcoded 0.2 byte-identically.
+        _eff_temperature = 0.2 if temperature is None else float(temperature)
+
         async def _generate_raw(p: str) -> str:
             resp = await self._client.generate(
                 prompt=p,
                 system_prompt=_CODEGEN_SYSTEM_PROMPT,
                 max_tokens=_retry_max_tokens,
-                temperature=0.2,
+                temperature=_eff_temperature,
                 model_name=_brain_model,
                 task_profile=_task_profile,
             )
@@ -8333,8 +8362,18 @@ class ClaudeProvider:
         context: OperationContext,
         deadline: datetime,
         repair_context: Optional[Any] = None,
+        *,
+        temperature: Optional[float] = None,
     ) -> GenerationResult:
         """Generate code candidates via Claude API with optional tool-call loop.
+
+        ``temperature`` (Adaptive Epistemic Feedback Matrix, T2): optional sampling
+        override threaded by ``RepairEngine`` to lower temperature when the SAME
+        failure signature repeats across L2 iterations. ``None`` (default) preserves
+        the legacy ``1.0 if thinking else 0.2`` behavior so non-repair callers stay
+        byte-identical. The override is IGNORED when extended thinking is enabled
+        (Anthropic requires ``temperature=1.0`` with thinking) — a structural
+        constraint that takes precedence over the epistemic floor.
 
         When ``tools_enabled=True``, the model may respond with a 2b.2-tool
         schema response to request tool execution. The loop re-sends the
@@ -8659,7 +8698,17 @@ class ClaudeProvider:
                 _thinking_reason = "budget-starved"
 
             _thinking_reason_out[0] = _thinking_reason
-            _temperature = 1.0 if _use_thinking else 0.2
+            # T2 epistemic temperature floor: when NOT in thinking mode and the
+            # RepairEngine supplied a signature-driven override, honor it; otherwise
+            # the legacy 0.2 (non-thinking) / 1.0 (thinking) behavior is byte-identical.
+            # Thinking always pins 1.0 (Anthropic structural requirement) — the floor
+            # never overrides that.
+            if _use_thinking:
+                _temperature = 1.0
+            elif temperature is not None:
+                _temperature = float(temperature)
+            else:
+                _temperature = 0.2
             _thinking_param: Optional[Dict[str, Any]] = None
             if _use_thinking and _thinking_tokens > 0:
                 _thinking_param = {
