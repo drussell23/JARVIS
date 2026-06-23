@@ -409,3 +409,7 @@ terraform/terraform.tfvars
 **/.pytest_cache/
 autopsy_reports/
 .cursorrules.tmp
+
+# adversarial cognitive soak scratch artifacts
+/impl.py
+/test_impl.py

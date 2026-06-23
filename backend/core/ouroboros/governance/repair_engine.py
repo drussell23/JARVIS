@@ -1320,7 +1320,7 @@ class RepairEngine:
                     try:
                         from backend.core.ouroboros.governance.epistemic_feedback import (
                             epistemic_feedback_enabled as _efe,
-                            pivot_verdict as _pv,
+                            should_pivot as _sp,
                         )
                         if _efe():
                             # repeated_signature_count: how many prior
@@ -1350,7 +1350,24 @@ class RepairEngine:
                                 and float(epistemic_temperature)
                                 <= _floor + _floor_epsilon
                             )
-                            if _pv(_repeat_for_sig, _temp_at_floor):
+                            # Composite verdict (additive, gated default-true):
+                            # pivot on the legacy stuck-signature trigger OR on
+                            # repair-budget exhaustion. A model that THRASHES --
+                            # producing a DIFFERENT failure signature each
+                            # iteration -- keeps _repeat_for_sig at 0 and so
+                            # would NEVER trip the legacy stuck-wall test; the
+                            # budget backstop (iteration >= max_iterations)
+                            # catches that non-convergence and pivots-to-
+                            # decompose instead of silently exhausting to the
+                            # legacy terminal _stopped. Flag off -> only the
+                            # legacy trigger (byte-identical).
+                            _do_pivot, _pivot_reason = _sp(
+                                repeated_signature_count=_repeat_for_sig,
+                                temp_at_floor=_temp_at_floor,
+                                total_attempts=int(iteration),
+                                max_attempts=int(budget.max_iterations),
+                            )
+                            if _do_pivot:
                                 _stderr_tail = ""
                                 try:
                                     _raw = getattr(svr, "stderr", "") or ""
@@ -1363,10 +1380,13 @@ class RepairEngine:
                                 _logger.warning(
                                     "[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
                                     "op=%s sig=%s repeated=%d temp_at_floor=%s "
-                                    "diverged=%s -> L2_PIVOT (decompose-further "
-                                    "at failure locus)",
+                                    "reason=%s iteration=%d/%d diverged=%s -> "
+                                    "L2_PIVOT (decompose-further at failure "
+                                    "locus)",
                                     ctx.op_id, (fail_sig or "")[:12],
                                     _repeat_for_sig, _temp_at_floor,
+                                    _pivot_reason, int(iteration),
+                                    int(budget.max_iterations),
                                     _diverged_reason,
                                 )
                                 return _pivoted(
