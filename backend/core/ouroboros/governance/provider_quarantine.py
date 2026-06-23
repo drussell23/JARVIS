@@ -129,6 +129,21 @@ class ProviderHealthGradient:
             logger.debug("[ProviderQuarantine] success_rate fail-soft", exc_info=True)
             return 1.0
 
+    def window_full(self, route: str) -> bool:
+        """Return True iff the rolling window for *route* has reached maxlen.
+
+        Public predicate so consumers (e.g. the Failover FSM's recovery gate)
+        never reach into the private ``_get_window`` deque. Fail-soft: any
+        exception returns False (conservative -- not yet enough evidence).
+        """
+        try:
+            dq = self._get_window(route)
+            maxlen = dq.maxlen
+            return maxlen is not None and len(dq) >= maxlen
+        except Exception:  # pragma: no cover
+            logger.debug("[ProviderQuarantine] window_full fail-soft", exc_info=True)
+            return False
+
     def is_global_outage(self, route: str) -> bool:
         """Return True iff the window is FULL AND success_rate == 0.0.
 

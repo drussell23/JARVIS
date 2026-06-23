@@ -67,7 +67,12 @@ import enum
 import logging
 import os
 import subprocess
-from typing import Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
+
+# Phase 3c -- Cryo-DLQ re-entry. Imported at module level (bound as a module
+# attribute) so tests can monkeypatch ``fl.replay_dlq``. intake_dlq is a
+# stdlib-only leaf module with no import-cycle risk into this controller.
+from backend.core.ouroboros.governance.intake_dlq import replay_dlq
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +349,7 @@ class FailoverLifecycleController:
         node_ready_fn: Optional[Callable[[str], bool]] = None,
         clock_fn: Optional[Callable[[], float]] = None,
         route: Optional[str] = None,
+        on_serving_fn: Optional[Callable[[], Awaitable[Any]]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -351,6 +357,14 @@ class FailoverLifecycleController:
         self._node_ready_fn = node_ready_fn or _default_node_ready_fn
         self._clock_fn = clock_fn or _default_clock_fn
         self._route = route or _route()
+        # Phase 3c -- DORMANT/AWAKENING -> SERVING re-entry hook. Fired once on
+        # the transition into SERVING so the Cryo-DLQ ops sealed during the
+        # outage can be drained back through intake (which re-routes them to
+        # J-Prime via the generation seam). Default: the controller's own
+        # drain_cryo_dlq bound to the intake router ingest (resolved lazily).
+        # Injectable for testability. Fail-soft -- a hook error never blocks
+        # the SERVING transition.
+        self._on_serving_fn = on_serving_fn or self._default_on_serving
 
         self._state = FailoverState.DORMANT
         self._endpoint: Optional[str] = None
@@ -409,6 +423,99 @@ class FailoverLifecycleController:
         if not lifecycle_enabled():
             return
         self._outage_started_at = None
+
+    # ------------------------------------------------------------------
+    # Cryo-DLQ re-entry (Phase 3c)
+    # ------------------------------------------------------------------
+
+    async def drain_cryo_dlq(
+        self,
+        ingest_fn: Callable[[Any], Awaitable[Any]],
+        *,
+        path: Optional[str] = None,
+    ) -> int:
+        """Re-ingest the Cryo-DLQ ops sealed during the outage. Fail-soft.
+
+        Reuses ``intake_dlq.replay_dlq`` (the existing replay + atomic-rewrite
+        path -- NO new queue). The drained ops flow back through *ingest_fn*
+        (the intake router ingest), which re-dispatches them; while the FSM is
+        SERVING the generation seam routes them to J-Prime (Tier-2), bypassing
+        DW. ``replay_dlq`` is itself fail-soft: a per-entry ingest error keeps
+        that entry in the DLQ for the next attempt -- the op is never lost.
+
+        OFF (master gate false) -> no-op (returns 0): byte-identical legacy
+        (the FSM stays DORMANT and this is never reached on the SERVING path).
+        Returns the count of successfully drained entries (0 on any error).
+        """
+        if not lifecycle_enabled():
+            return 0
+        try:
+            return int(await replay_dlq(path, ingest_fn))
+        except Exception as exc:  # noqa: BLE001 -- drain must never break the FSM
+            logger.warning(
+                "[FailoverLifecycle] drain_cryo_dlq fail-soft err=%r "
+                "-- DLQ left intact for the next attempt", exc,
+            )
+            return 0
+
+    async def _default_on_serving(self) -> None:
+        """Default SERVING hook: drain the Cryo-DLQ through the intake router.
+
+        Resolves the live intake router lazily (so there is no import cycle and
+        no hard dependency when the router isn't wired -- e.g. unit tests).
+        The ingest_fn reconstructs an ``IntentEnvelope`` from each persisted
+        ``to_dict`` payload and forwards it to ``router.ingest``. When no router
+        is reachable the drain is a fail-soft no-op (the DLQ stays intact for a
+        later boot-time replay -- the op is never lost)."""
+        router = self._resolve_intake_router()
+        if router is None:
+            logger.info(
+                "[FailoverLifecycle] on_serving: no intake router reachable "
+                "-- Cryo-DLQ drain deferred (DLQ intact)"
+            )
+            return
+
+        async def _ingest(env: Any) -> Any:
+            # Reconstruct the typed envelope from the persisted dict so the
+            # router receives the same shape it would on a live emit. A raw
+            # (non-dict) payload is forwarded as-is (router decides).
+            envelope: Any = env
+            if isinstance(env, dict):
+                try:
+                    from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501,PLC0415
+                        IntentEnvelope,
+                    )
+                    envelope = IntentEnvelope.from_dict(env)
+                except Exception:  # noqa: BLE001 -- fall back to the raw dict
+                    envelope = env
+            return await router.ingest(envelope)
+
+        drained = await self.drain_cryo_dlq(_ingest)
+        logger.info(
+            "[FailoverLifecycle] on_serving: Cryo-DLQ re-entry drained=%d ops "
+            "-> intake (re-routes to J-Prime Tier-2)", drained,
+        )
+
+    @staticmethod
+    def _resolve_intake_router() -> Optional[Any]:
+        """Best-effort lookup of the live intake router singleton. Fail-soft."""
+        try:
+            from backend.core.ouroboros.governance.intake import (  # noqa: PLC0415
+                unified_intake_router as _uir,
+            )
+            for attr in (
+                "get_default_intake_router",
+                "get_intake_router",
+                "get_router",
+            ):
+                fn = getattr(_uir, attr, None)
+                if callable(fn):
+                    return fn()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[FailoverLifecycle] intake router resolve fail-soft", exc_info=True
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Endpoint construction
@@ -499,10 +606,9 @@ class FailoverLifecycleController:
             # Window FULL check mirrors is_global_outage: reuse success_rate +
             # the FULL gate. is_global_outage(False) does NOT imply recovered,
             # so we require an explicit success_rate threshold over a full
-            # window. We detect FULL by re-using the gradient's own window.
-            window = grad._get_window(self._route)  # bounded deque
-            maxlen = window.maxlen
-            if maxlen is None or len(window) < maxlen:
+            # window. The FULL gate is the public window_full() predicate
+            # (Phase 3c clean-seam fix -- no private _get_window access).
+            if not grad.window_full(self._route):
                 return False
             return grad.success_rate(self._route) >= _recovery_threshold()
         except Exception as exc:  # noqa: BLE001
@@ -611,6 +717,20 @@ class FailoverLifecycleController:
         self._last_probe_at = None
         self._recovered_streak = 0
         logger.info("[FailoverLifecycle] SERVING via J-Prime endpoint=%s", self._endpoint)
+
+        # Phase 3c -- Cryo-DLQ re-entry. Fire the on-serving hook so the ops
+        # sealed during the outage drain back through intake and re-route to
+        # J-Prime via the generation seam. Fail-soft ABSOLUTE: a hook error
+        # never blocks (or reverts) the SERVING transition -- the op is never
+        # lost (the DLQ replay is itself fail-soft + leaves survivors intact).
+        try:
+            if self._on_serving_fn is not None:
+                await self._maybe_await(self._on_serving_fn)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FailoverLifecycle] on_serving (Cryo-DLQ drain) fail-soft "
+                "err=%r -- SERVING transition holds", exc,
+            )
 
     async def _tick_serving(self, *, now: float) -> None:
         # Pace the DW-recovery probe by probe_interval(t_outage, forecast).
