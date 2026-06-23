@@ -4681,7 +4681,11 @@ class GCPVMManager:
         # Soak runs the script, never a golden image / container offload server.
         self.config.use_golden_image = False
         self.config.use_container = False
-        self.config.use_spot = True
+        # NOTE: do NOT force use_spot here -- it was overriding the caller's intent
+        # (the ignition sets use_spot=False for an uninterrupted ON-DEMAND soak), which
+        # is why "ON-DEMAND"-labelled nodes were still created preemptible and got
+        # compute.instances.preempted mid-soak. Honor the config; the field's
+        # default_factory (GCP_USE_SPOT_VMS, default true) preserves the legacy default.
 
         name = vm_name or f"jarvis-ouroboros-soak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         try:
