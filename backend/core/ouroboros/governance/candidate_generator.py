@@ -4230,6 +4230,25 @@ class CandidateGenerator:
                     )
                 except Exception:  # noqa: BLE001 -- gradient is advisory, never blocks
                     pass
+                # Phase 1 Outage Ledger -- record DW recovery for the forecaster
+                # + async Trinity export. Only runs if an outage was open (fail-soft).
+                try:
+                    from backend.core.ouroboros.governance.outage_ledger import (  # noqa: PLC0415
+                        get_outage_ledger as _ol_get,
+                        emit_outage_event as _ol_emit,
+                    )
+                    _ol_ledger = _ol_get()
+                    if _ol_ledger.has_open_outage():
+                        _ol_recent = _ol_ledger.recent(1)
+                        if _ol_recent:
+                            _ol_open = _ol_recent[-1]
+                            if _ol_open.ended_ts is None:
+                                _ol_ledger.close_outage(_ol_open.outage_id)
+                                _ol_closed = _ol_ledger.recent(1)
+                                if _ol_closed:
+                                    _ol_emit("DW_OUTAGE_RECOVERED", _ol_closed[-1])
+                except Exception:  # noqa: BLE001 -- outage ledger never blocks the op
+                    pass
                 return _attempt_result
 
             if _attempt_exc is not None:
@@ -4810,6 +4829,29 @@ class CandidateGenerator:
                     if quarantine_op(
                         context, route=provider_route, telemetry=_q_telemetry,
                     ):
+                        # Phase 1 Outage Ledger -- record DW global outage for the
+                        # recovery forecaster + async Trinity export (fail-soft).
+                        try:
+                            from backend.core.ouroboros.governance.outage_ledger import (  # noqa: PLC0415
+                                get_outage_ledger,
+                                emit_outage_event,
+                            )
+                            _ol_rec_id = get_outage_ledger().open_outage(
+                                failure_mode=_q_telemetry.get("failure_mode", "TIMEOUT"),
+                                error_codes=[str(_q_telemetry.get("last_failure", ""))],
+                                lane=str(_q_telemetry.get("lanes", "batch+realtime")),
+                                model_ids=[
+                                    m for m in [
+                                        getattr(context, "model_id", None),
+                                    ] if m
+                                ],
+                                dilation_hops=int(_q_hops) if _q_hops != -1 else 0,
+                            )
+                            _ol_rec = get_outage_ledger().recent(1)
+                            if _ol_rec:
+                                emit_outage_event("DW_OUTAGE_DETECTED", _ol_rec[-1])
+                        except Exception:  # noqa: BLE001 -- outage ledger never blocks the op
+                            pass
                         # Global outage DEDUCED -> terminal Cryo-DLQ seal. Do NOT
                         # immortal re-queue. The op is sealed (replayable), not lost.
                         logger.warning(
