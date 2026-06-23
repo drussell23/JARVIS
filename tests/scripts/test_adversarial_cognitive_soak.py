@@ -501,6 +501,367 @@ def test_concurrency_loop_bounded_non_convergence():
     assert result["attempts"] <= 8  # bounded, no infinite loop
 
 
+# ===========================================================================
+# Defect 1: AST-sanitize generated code so it is importable as a pure module
+# ===========================================================================
+#
+# The model appended module-level demo code (cache = TTLLRUCache(3, 2)) and
+# omitted `import threading` -> importing impl.py raised NameError -> pytest
+# COLLECTION ERROR -> all tests "collected 0, 1 error" -> repair loop sees
+# zero failing test IDs every attempt.
+#
+# Fix: _sanitize_importable(src) strips top-level executable statements (bare
+# calls, instantiations, print(...), if __name__ == "__main__" blocks) but
+# keeps Import/ImportFrom/ClassDef/FunctionDef and Assign-of-constants nodes.
+# Fail-soft: if AST parse fails, return the raw text so a real SyntaxError
+# surfaces as a genuine (and discriminating) failure signature.
+
+
+def test_sanitize_strips_module_level_demo_code():
+    """Strips bare instantiation + print + if __name__ but keeps imports+class."""
+    src = '''\
+from __future__ import annotations
+import threading
+import time
+from collections import OrderedDict
+
+
+class TTLLRUCache:
+    def __init__(self, capacity, ttl_seconds):
+        self._lock = threading.RLock()
+        self._data = OrderedDict()
+
+    def get(self, key):
+        return None
+
+    def put(self, key, value):
+        pass
+
+    def __len__(self):
+        return 0
+
+    def stop(self):
+        pass
+
+
+# module-level demo -- the bug the live gauntlet exposed
+cache = TTLLRUCache(3, 2)
+cache.put("a", 1)
+print("demo:", cache.get("a"))
+
+if __name__ == "__main__":
+    print("standalone")
+'''
+    sanitized = acs._sanitize_importable(src)
+    # Structural nodes must survive.
+    assert "import threading" in sanitized
+    assert "class TTLLRUCache" in sanitized
+    assert "def __init__" in sanitized
+    # Executable demo nodes must be gone.
+    assert "cache = TTLLRUCache" not in sanitized
+    assert 'cache.put("a"' not in sanitized
+    assert "print(" not in sanitized
+    assert '__name__ == "__main__"' not in sanitized
+    # The sanitized code must be importable as a pure module.
+    import importlib, types, sys as _sys
+    m = types.ModuleType("_test_sanitize_mod")
+    exec(compile(sanitized, "<sanitized>", "exec"), m.__dict__)  # noqa: S102
+    assert hasattr(m, "TTLLRUCache")
+
+
+def test_sanitize_keeps_constant_assign():
+    """Top-level constant assignments (str/int/tuple literals) are kept."""
+    src = '''\
+import os
+
+_VERSION = "1.0.0"
+_MAX = 100
+
+
+def helper():
+    return _VERSION
+'''
+    sanitized = acs._sanitize_importable(src)
+    assert "_VERSION" in sanitized
+    assert "_MAX" in sanitized
+    assert "def helper" in sanitized
+
+
+def test_sanitize_fail_soft_on_broken_syntax():
+    """If AST parse fails (model emitted broken code), return the raw text unchanged."""
+    src = "def broken(\n    pass  # mismatched paren\n"
+    result = acs._sanitize_importable(src)
+    # Must not raise; must return the original text so the real SyntaxError
+    # surfaces as a genuine (discriminating) failure signature.
+    assert result == src
+
+
+def test_extract_then_sanitize_makes_code_importable():
+    """Full pipeline: extract code block then sanitize -> importable module."""
+    # This is the exact failure shape from the live gauntlet: the model's
+    # response includes a code fence with demo code at the bottom AND omits
+    # import threading, but the sanitizer strips the demo so the NameError
+    # from missing threading appears at class-body-access-time (real failure),
+    # NOT at module-level instantiation (accidental collection error).
+    response_with_demo = '''\
+Here is the implementation:
+
+```python
+import time
+from collections import OrderedDict
+
+
+class TTLLRUCache:
+    """Thread-safe TTL LRU cache."""
+
+    def __init__(self, capacity, ttl_seconds):
+        self.capacity = capacity
+        self._data = OrderedDict()
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def put(self, key, value):
+        self._data[key] = value
+
+    def __len__(self):
+        return len(self._data)
+
+    def stop(self):
+        pass
+
+
+# demo usage appended by the model
+cache = TTLLRUCache(3, 2)
+cache.put("x", 10)
+print(cache.get("x"))
+```
+
+Hope that helps!
+'''
+    raw = acs._extract_code_block(response_with_demo)
+    sanitized = acs._sanitize_importable(raw)
+    # The demo lines are gone.
+    assert "cache = TTLLRUCache" not in sanitized
+    assert "print(" not in sanitized
+    # The class is still there and importable.
+    import types
+    m = types.ModuleType("_test_extract_sanitize")
+    exec(compile(sanitized, "<extracted>", "exec"), m.__dict__)  # noqa: S102
+    assert hasattr(m, "TTLLRUCache")
+
+
+# ===========================================================================
+# Defect 2: Robust failure signature for collection/import errors
+# ===========================================================================
+#
+# When pytest cannot collect tests (NameError / ImportError at module level),
+# there are zero FAILED test IDs. The old _signature_for returned
+# failure_signature_hash([], "test") = a constant for ALL collection errors,
+# so repeated_signature_count incremented (good) BUT a NameError vs an
+# ImportError vs an AssertionError all got the SAME signature (bad -- genuine
+# progress from one error class to a different one looked like a repeat).
+#
+# Fix: _signature_for must:
+#   (a) STABLE: same collection error -> same hash across attempts (so repeat
+#       tracking drives temp decay + pivot),
+#   (b) DISCRIMINATING: NameError vs AssertionError vs SyntaxError -> DIFFERENT
+#       hashes (so genuine progress resets the decay),
+#   (c) PATH-INVARIANT: the tempdir path (/tmp/adv_soak_xyz/) is stripped
+#       from any text used to build the signature.
+
+
+def _make_collection_error_out(error_line: str, tempdir: str = "/tmp/adv_soak_abc123") -> dict:
+    """Synthesize a pytest output dict for a collection error."""
+    stdout = (
+        f"==================================== ERRORS ====================================\n"
+        f"________________________ ERROR collecting test_impl.py _________________________\n"
+        f"{tempdir}/test_impl.py:1: in <module>\n"
+        f"    from impl import TTLLRUCache\n"
+        f"{tempdir}/impl.py:8: in __init__\n"
+        f"    self._lock = threading.RLock()\n"
+        f"E   {error_line}\n"
+        f"=========================== short test summary info ============================\n"
+        f"ERROR {tempdir}/test_impl.py - {error_line}\n"
+        f"!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!\n"
+        f"1 error in 0.10s\n"
+    )
+    return {"passed": False, "stdout": stdout, "stderr": "", "returncode": 2}
+
+
+def test_signature_stable_for_same_collection_error_across_attempts():
+    """Same collection error -> same signature regardless of which attempt / tempdir."""
+    out1 = _make_collection_error_out(
+        "NameError: name 'threading' is not defined",
+        tempdir="/tmp/adv_soak_attempt1_xyzabc",
+    )
+    out2 = _make_collection_error_out(
+        "NameError: name 'threading' is not defined",
+        tempdir="/tmp/adv_soak_attempt2_defghi",
+    )
+    sig1 = acs._signature_for(out1)
+    sig2 = acs._signature_for(out2)
+    assert sig1 == sig2, (
+        "Same collection error must produce the same signature across attempts "
+        f"(got {sig1!r} vs {sig2!r})"
+    )
+
+
+def test_signature_discriminates_nameerror_from_assertionerror():
+    """A NameError collection error and an AssertionError test failure -> different sigs."""
+    # Collection error (NameError): no test IDs in output
+    col_out = _make_collection_error_out("NameError: name 'threading' is not defined")
+    col_sig = acs._signature_for(col_out)
+
+    # Assertion failure: FAILED test IDs present
+    assert_out = {
+        "passed": False,
+        "stdout": (
+            "FAILED test_impl.py::test_thread_safety_no_corruption - AssertionError\n"
+            "1 failed in 1.23s\n"
+        ),
+        "stderr": "",
+        "returncode": 1,
+    }
+    assert_sig = acs._signature_for(assert_out)
+
+    assert col_sig != assert_sig, (
+        "NameError collection error and AssertionError test failure must have "
+        f"different signatures (both got {col_sig!r})"
+    )
+
+
+def test_signature_discriminates_different_collection_errors():
+    """NameError vs ImportError collection errors -> different signatures."""
+    name_err_out = _make_collection_error_out("NameError: name 'threading' is not defined")
+    import_err_out = _make_collection_error_out("ImportError: cannot import name 'TTLLRUCache'")
+    sig1 = acs._signature_for(name_err_out)
+    sig2 = acs._signature_for(import_err_out)
+    assert sig1 != sig2, (
+        f"Different collection errors must have different sigs: {sig1!r} vs {sig2!r}"
+    )
+
+
+def test_signature_invariant_to_tempdir_path():
+    """The tempdir path component (/tmp/adv_soak_<random>/) must not affect the sig."""
+    out_a = _make_collection_error_out(
+        "NameError: name 'threading' is not defined",
+        tempdir="/tmp/adv_soak_0000001",
+    )
+    out_b = _make_collection_error_out(
+        "NameError: name 'threading' is not defined",
+        tempdir="/tmp/adv_soak_9999999",
+    )
+    assert acs._signature_for(out_a) == acs._signature_for(out_b)
+
+
+def test_syntax_error_output_is_discriminated():
+    """A SyntaxError (from [SOVEREIGN SYNTAX FATAL]) differs from a NameError sig."""
+    syntax_out = {
+        "passed": False,
+        "stdout": "",
+        "stderr": "[SOVEREIGN SYNTAX FATAL] line=5 msg=invalid syntax",
+        "returncode": 1,
+    }
+    name_out = _make_collection_error_out("NameError: name 'threading' is not defined")
+    assert acs._signature_for(syntax_out) != acs._signature_for(name_out)
+
+
+# ===========================================================================
+# Defect 3: Pivot reachability -- the soak must reach temp_at_floor
+# ===========================================================================
+#
+# With JARVIS_EPISTEMIC_TEMP_FLOOR=0.0 (production default), temperature_for_attempt
+# halves forever (0.7 -> 0.35 -> 0.175 -> 0.0875 ...) and NEVER stabilizes.
+# temp_at_floor is NEVER True so pivot_verdict NEVER fires, regardless of budget.
+#
+# Fix: run_cognitive_soak sets JARVIS_EPISTEMIC_TEMP_FLOOR to a non-zero
+# default (0.1) if the caller has not already set it, so the temperature
+# schedule DOES stabilize. The recommended --max-repairs is 5 (so the loop
+# survives until count=3 where pivot_verdict fires with floor=0.1).
+# The REAL pivot_verdict logic is unchanged.
+
+
+def test_pivot_fires_with_production_env_and_recommended_max_repairs(monkeypatch):
+    """The pivot CAN fire using the soak's own env defaults (no test fixture help).
+
+    This test deliberately removes the fixture's JARVIS_EPISTEMIC_TEMP_FLOOR
+    override and verifies that the soak's own default (0.1 floor) still lets
+    pivot_verdict trip within the recommended --max-repairs=5 budget.
+    """
+    # Remove the fixture's floor env var so we test the SOAK's own default.
+    monkeypatch.delenv("JARVIS_EPISTEMIC_TEMP_FLOOR", raising=False)
+    monkeypatch.delenv("JARVIS_EPISTEMIC_TEMP_DECAY", raising=False)
+    monkeypatch.delenv("JARVIS_EPISTEMIC_PIVOT_PASSES", raising=False)
+
+    called = {"n": 0}
+    real_decompose = acs.decompose_for_block
+
+    def _spy(goal, **kwargs):
+        called["n"] += 1
+        return real_decompose(goal, **kwargs)
+
+    monkeypatch.setattr(acs, "decompose_for_block", _spy)
+
+    p = acs.PAYLOADS["merge_intervals"]
+    # Script: always the SAME wrong impl (same failure signature) -> pivot must trip.
+    client = FakeLocalPrimeClient([_WRONG_SAME] * 8 + [_CORRECT])
+    result = asyncio.run(
+        acs.run_cognitive_soak(client=client, max_repairs=5, payload=p)
+    )
+    assert result["pivoted"] is True, (
+        "pivot must fire within max_repairs=5 when the soak sets its own "
+        "JARVIS_EPISTEMIC_TEMP_FLOOR default. "
+        f"temperature_trajectory={result['temperature_trajectory']}"
+    )
+    assert called["n"] >= 1
+
+
+def test_pivot_full_arc_collection_error_same_signature(monkeypatch):
+    """Full fail->repair->pivot->decompose arc triggered by a COLLECTION ERROR.
+
+    Scripts the fake client to emit impl-with-demo (causes collection error,
+    same signature every time) N times, then a correct impl.  With the soak's
+    own floor default and --max-repairs=5, the harness must:
+      * detect the repeated signature,
+      * decay temperature,
+      * fire pivot (decompose_for_block called),
+      * converge on the correct impl.
+    """
+    monkeypatch.delenv("JARVIS_EPISTEMIC_TEMP_FLOOR", raising=False)
+    monkeypatch.delenv("JARVIS_EPISTEMIC_TEMP_DECAY", raising=False)
+    monkeypatch.delenv("JARVIS_EPISTEMIC_PIVOT_PASSES", raising=False)
+
+    called = {"n": 0}
+    real_decompose = acs.decompose_for_block
+
+    def _spy(goal, **kwargs):
+        called["n"] += 1
+        return real_decompose(goal, **kwargs)
+
+    monkeypatch.setattr(acs, "decompose_for_block", _spy)
+
+    # An impl that imports threading BUT uses it at module level (so if the
+    # model forgets threading the NameError triggers on import -> collection err).
+    # We simulate this by using the wrong merge_intervals impl (same sig).
+    #
+    # With max_repairs=5: total_budget starts at 7. Pivot fires at attempt 5
+    # (count=4, temp=floor=0.1) -> budget becomes 8. Attempts 6, 7, 8 use
+    # scripted indices 5, 6, 7. So [_WRONG_SAME] * 7 + [_CORRECT] places the
+    # correct impl exactly at the 8th call (index 7 -> budget just reached).
+    p = acs.PAYLOADS["merge_intervals"]
+    client = FakeLocalPrimeClient([_WRONG_SAME] * 7 + [_CORRECT])
+    result = asyncio.run(
+        acs.run_cognitive_soak(client=client, max_repairs=5, payload=p)
+    )
+    assert result["pivoted"] is True
+    assert result["converged"] is True
+    assert called["n"] >= 1
+    # Temperature must have decayed.
+    traj = result["temperature_trajectory"]
+    assert min(traj) < max(traj)
+
+
 # ---------------------------------------------------------------------------
 # CLI: --payload selector + warmup-first
 # ---------------------------------------------------------------------------

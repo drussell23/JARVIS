@@ -37,7 +37,9 @@ to be true and talks to a local Ollama at http://127.0.0.1:11434.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
+import hashlib
 import os
 import re
 import subprocess
@@ -430,6 +432,90 @@ ADVERSARIAL_PAYLOAD = MERGE_INTERVALS_PAYLOAD
 
 _CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
+# ---------------------------------------------------------------------------
+# AST node types that are safe to keep at module scope (pure definitions).
+# Module-level calls / instantiations are stripped so impl.py is importable
+# as a pure module even when the model appends demo/usage code.
+# ---------------------------------------------------------------------------
+_SAFE_STMT_TYPES = (
+    ast.Import,
+    ast.ImportFrom,
+    ast.ClassDef,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+)
+
+
+def _is_constant_assign(node: ast.AST) -> bool:
+    """True for top-level assignments whose RHS is a pure literal / constant.
+
+    We keep ``_FOO = "bar"`` but strip ``cache = TTLLRUCache(3, 2)``.
+    """
+    if not isinstance(node, ast.Assign):
+        return False
+    try:
+        # ast.Constant covers str/int/float/bool/None/bytes/tuple literals.
+        # ast.Tuple of constants (e.g. ``_ITEMS = (1, 2, 3)``) is also fine.
+        return isinstance(node.value, (ast.Constant, ast.JoinedStr)) or (
+            isinstance(node.value, ast.Tuple)
+            and all(isinstance(e, ast.Constant) for e in node.value.elts)
+        )
+    except Exception:
+        return False
+
+
+def _sanitize_importable(src: str) -> str:
+    """Strip top-level executable statements from generated code.
+
+    Keeps: Import, ImportFrom, ClassDef, FunctionDef, AsyncFunctionDef, and
+    Assign-of-constants (e.g. ``_VERSION = "1.0.0"``).
+
+    Drops: bare calls (``cache = TTLLRUCache(3, 2)``), print statements,
+    ``if __name__ == "__main__":`` blocks, and all other module-level
+    executable expressions.
+
+    Fail-soft: if ``ast.parse`` fails (the model emitted broken syntax), the
+    raw text is returned unchanged so the real SyntaxError still surfaces as a
+    genuine (discriminating) failure signature -- we do NOT hide the bug.
+    """
+    if not src:
+        return src
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        # Broken syntax -> return raw text so the real SyntaxError is visible.
+        return src
+    except Exception:
+        return src
+
+    # Reconstruct by extracting only the safe line ranges from the source.
+    # ast.get_source_segment requires Python 3.8+ (we target 3.9+) but is
+    # unreliable for multi-statement nodes.  Instead we work at the statement
+    # level by collecting line spans and slicing the original source lines.
+    src_lines = src.splitlines(keepends=True)
+    kept_ranges: list[tuple[int, int]] = []  # (start_lineno, end_lineno), 1-based
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Module):
+            break  # walk() visits all nodes; only top-level stmts matter
+
+    for stmt in tree.body:
+        if isinstance(stmt, _SAFE_STMT_TYPES) or _is_constant_assign(stmt):
+            start = getattr(stmt, "lineno", None)
+            end = getattr(stmt, "end_lineno", None)
+            if start is not None and end is not None:
+                kept_ranges.append((start, end))
+
+    if not kept_ranges:
+        # Nothing survived -- keep raw (better than empty, will fail loudly).
+        return src
+
+    out_lines: list[str] = []
+    for start, end in kept_ranges:
+        out_lines.extend(src_lines[start - 1:end])
+
+    return "".join(out_lines)
+
 
 def _extract_code_block(text: str) -> str:
     """Extract the first fenced python code block; fall back to raw text.
@@ -529,18 +615,82 @@ def _failing_test_ids(out: Dict[str, Any]) -> List[str]:
         return []
 
 
+# Patterns used to extract a discriminating fingerprint from collection errors.
+# We strip absolute tempdir paths (which vary per attempt) before hashing so
+# the signature is invariant to the random tempdir name.
+_COLLECTION_ERR_RE = re.compile(r"^E\s+(.+)", re.MULTILINE)
+_SOVEREIGN_SYNTAX_RE = re.compile(r"\[SOVEREIGN SYNTAX FATAL\][^\n]*", re.MULTILINE)
+# Matches the randomly-generated tempdir prefix (e.g. /tmp/adv_soak_xyz123/).
+_TEMPDIR_RE = re.compile(r"/[^\s]*/adv_soak_[^/\s]+/")
+
+
+def _collection_error_fingerprint(out: Dict[str, Any]) -> Optional[str]:
+    """Extract a stable, discriminating fingerprint for a collection/import error.
+
+    Returns a normalised string (error class + first E-line message with path
+    stripped) that can be hashed, or None if this is not a collection error.
+
+    A collection error is recognised by: returncode==2 AND no FAILED test IDs
+    AND an "E  ErrorType:" line in the output.
+    """
+    try:
+        if out.get("returncode", -1) not in (1, 2):
+            return None
+        ids = _failing_test_ids(out)
+        if ids:
+            # Real FAILED test IDs exist -> not a collection error.
+            return None
+        blob = (out.get("stdout") or "") + "\n" + (out.get("stderr") or "")
+        # Check for [SOVEREIGN SYNTAX FATAL] first (highest specificity).
+        syntax_match = _SOVEREIGN_SYNTAX_RE.search(blob)
+        if syntax_match:
+            norm = _TEMPDIR_RE.sub("<tmpdir>/", syntax_match.group(0))
+            return "sovereign_syntax:" + norm.strip()
+        # Look for "E  SomeError: message" lines from pytest's collection phase.
+        e_lines = _COLLECTION_ERR_RE.findall(blob)
+        if e_lines:
+            # Take the first substantive error line; strip the tempdir path.
+            first = _TEMPDIR_RE.sub("<tmpdir>/", e_lines[0].strip())
+            return "collection_error:" + first
+        # No discriminating content -- treat as an unknown collection error.
+        return "collection_error:unknown"
+    except Exception:
+        return None
+
+
 def _signature_for(out: Dict[str, Any]) -> str:
     """Logical failure signature -- reuse the production failure_signature_hash.
 
-    Failure class is "test" here (a real assertion failure, not syntax/env).
+    Produces a STABLE, DISCRIMINATING signature for ALL failure shapes:
+      (a) Failing test IDs (assertion failures): stable via sorted test IDs.
+      (b) Collection/import errors (no test IDs): stable + discriminating via
+          the normalised error-class + message (tempdir path stripped).
+      (c) SyntaxError ([SOVEREIGN SYNTAX FATAL]): via the syntax fatal line.
+
+    A repeated identical error -> same hash (drives temp decay + pivot).
+    A different error type -> different hash (genuine progress resets decay).
+    Tempdir paths are normalised out so the hash is attempt-independent.
     """
     try:
+        # Attempt (a): failing test IDs -- highest fidelity.
         ids = _failing_test_ids(out)
-        return failure_signature_hash(ids, "test")
+        if ids:
+            return failure_signature_hash(ids, "test")
+        # Attempt (b)/(c): collection/import/syntax error -- derive from the
+        # error text so different errors produce different hashes.
+        fingerprint = _collection_error_fingerprint(out)
+        if fingerprint is not None:
+            # Hash the fingerprint ourselves (failure_signature_hash expects
+            # iterables; we build a single-element list for compatibility).
+            return failure_signature_hash([fingerprint], "env")
+        # Fallback: stable hash from the last 200 chars of stderr (normalized).
+        tail = _TEMPDIR_RE.sub("<tmpdir>/", (out.get("stderr") or "")[-200:])
+        return failure_signature_hash([tail], "test")
     except Exception:
-        # Last-resort stable-ish fallback from the stderr tail.
         try:
-            return failure_signature_hash([(out.get("stderr") or "")[-200:]], "test")
+            return failure_signature_hash(
+                [(out.get("stderr") or "")[-200:]], "test"
+            )
         except Exception:
             return "unknown"
 
@@ -577,7 +727,7 @@ def _say(line: str = "") -> None:
 async def run_cognitive_soak(
     *,
     client: Any,
-    max_repairs: int = 3,
+    max_repairs: int = 5,
     payload: "Optional[AdversarialPayload]" = None,
 ) -> Dict[str, Any]:
     """Drive the adversarial payload through the REAL cognitive loop.
@@ -594,6 +744,18 @@ async def run_cognitive_soak(
             "adversarial_cognitive_soak refuses to run: set "
             "JARVIS_CHAOS_INJECTOR_ENABLED=true"
         )
+
+    # Pivot reachability: the production default JARVIS_EPISTEMIC_TEMP_FLOOR=0.0
+    # causes temperature_for_attempt to halve forever (0.7 -> 0.35 -> 0.175 ->
+    # 0.0875 ...) so temp_at_floor is NEVER True and pivot_verdict NEVER fires.
+    # Set a soak-specific non-zero floor (0.1) so the schedule stabilises and
+    # the real pivot_verdict CAN trip.  Only set if the caller has not already
+    # provided an explicit value (i.e. respect env overrides).
+    _SOAK_DEFAULT_TEMP_FLOOR = "0.1"
+    _floor_env_key = "JARVIS_EPISTEMIC_TEMP_FLOOR"
+    _floor_was_absent = _floor_env_key not in os.environ
+    if _floor_was_absent:
+        os.environ[_floor_env_key] = _SOAK_DEFAULT_TEMP_FLOOR
 
     payload = payload or ADVERSARIAL_PAYLOAD
     base_temp = float(os.environ.get("JARVIS_ADV_SOAK_BASE_TEMP", "0.7"))
@@ -613,6 +775,7 @@ async def run_cognitive_soak(
     decomposed = False
     converged = False
     attempts = 0
+    out: Dict[str, Any] = {}
 
     prev_impl = ""
     epistemic_feedback = ""
@@ -651,6 +814,8 @@ async def run_cognitive_soak(
     _say(f"Payload: {payload.title}")
     _say(f"Entry symbol: {payload.entry_symbol}  | base_temp={base_temp}  | "
          f"max_repairs={max_repairs}")
+    _say(f"  floor={os.environ.get(_floor_env_key, '?')}  "
+         f"(soak default: {_SOAK_DEFAULT_TEMP_FLOOR})")
     _say("-" * 72)
 
     # --- Bounded loop -------------------------------------------------------
@@ -659,118 +824,125 @@ async def run_cognitive_soak(
     total_budget = 1 + max_repairs + 1
     pivot_extra_used = False
 
-    while attempts < total_budget:
-        is_repair = attempts > 0
-        temperature = temperature_for_attempt(base_temp, repeated_signature_count)
-        temperature_trajectory.append(temperature)
-        attempts += 1
+    try:
+        while attempts < total_budget:
+            is_repair = attempts > 0
+            temperature = temperature_for_attempt(base_temp, repeated_signature_count)
+            temperature_trajectory.append(temperature)
+            attempts += 1
 
-        phase = "REPAIR" if is_repair else "GENERATE"
-        _say(f"[attempt {attempts}] phase={phase}  temperature={temperature:.4f}  "
-             f"repeated_sig_count={repeated_signature_count}  "
-             f"diff_injected={bool(epistemic_feedback)}")
+            phase = "REPAIR" if is_repair else "GENERATE"
+            _say(f"[attempt {attempts}] phase={phase}  temperature={temperature:.4f}  "
+                 f"repeated_sig_count={repeated_signature_count}  "
+                 f"diff_injected={bool(epistemic_feedback)}")
 
-        raw = await _generate(temperature, epistemic_feedback)
-        impl_src = _extract_code_block(raw)
+            raw = await _generate(temperature, epistemic_feedback)
+            impl_src = _sanitize_importable(_extract_code_block(raw))
 
-        out = _run_pytest_in_tempdir(
-            impl_src, payload.tests, timeout_s=pytest_timeout_s, payload=payload
-        )
-        passed = bool(out["passed"])
+            out = _run_pytest_in_tempdir(
+                impl_src, payload.tests, timeout_s=pytest_timeout_s, payload=payload
+            )
+            passed = bool(out["passed"])
 
-        iterations.append({
-            "attempt": attempts,
-            "temperature": round(temperature, 6),
-            "signature": None,  # filled below on fail
-            "diff_injected": bool(epistemic_feedback),
-            "test_result": "PASS" if passed else "FAIL",
-        })
+            iterations.append({
+                "attempt": attempts,
+                "temperature": round(temperature, 6),
+                "signature": None,  # filled below on fail
+                "diff_injected": bool(epistemic_feedback),
+                "test_result": "PASS" if passed else "FAIL",
+            })
 
-        if passed:
-            converged = True
-            _say(f"  -> PASS (pytest green). Cognitive convergence reached on "
-                 f"attempt {attempts}.")
-            iterations[-1]["test_result"] = "PASS"
-            final_out = out
-            break
+            if passed:
+                converged = True
+                _say(f"  -> PASS (pytest green). Cognitive convergence reached on "
+                     f"attempt {attempts}.")
+                iterations[-1]["test_result"] = "PASS"
+                out = out
+                break
 
-        # --- FAIL path ------------------------------------------------------
-        sig = _signature_for(out)
-        signatures.append(sig)
-        iterations[-1]["signature"] = sig[:12]
-        fail_ids = _failing_test_ids(out)
-        _say(f"  -> FAIL  signature={sig[:12]}  failing={len(fail_ids)} "
-             f"({', '.join(t.split('::')[-1] for t in fail_ids) or 'n/a'})")
+            # --- FAIL path ------------------------------------------------------
+            sig = _signature_for(out)
+            signatures.append(sig)
+            iterations[-1]["signature"] = sig[:12]
+            fail_ids = _failing_test_ids(out)
+            _say(f"  -> FAIL  signature={sig[:12]}  failing={len(fail_ids)} "
+                 f"({', '.join(t.split('::')[-1] for t in fail_ids) or 'n/a'})")
 
-        # Same-signature repeat tracking drives temperature decay + pivot.
-        if last_signature is not None and sig == last_signature:
-            repeated_signature_count += 1
-        last_signature = sig
+            # Same-signature repeat tracking drives temperature decay + pivot.
+            if last_signature is not None and sig == last_signature:
+                repeated_signature_count += 1
+            last_signature = sig
 
-        # Build the Hybrid Epistemic Diff (REAL builder) and inject next turn.
-        epistemic_feedback = build_failure_context(
-            prior_src=prev_impl,
-            failed_src=impl_src,
-            stderr=(out.get("stdout") or "") + "\n" + (out.get("stderr") or ""),
-            failing_tests=fail_ids,
-            sub_goal_label=payload.title,
-        )
-        if epistemic_feedback:
-            epistemic_diffs_injected += 1
-            _say(f"  -> injected Hybrid Epistemic Diff "
-                 f"({len(epistemic_feedback)} chars) into next prompt")
-        prev_impl = impl_src
+            # Build the Hybrid Epistemic Diff (REAL builder) and inject next turn.
+            epistemic_feedback = build_failure_context(
+                prior_src=prev_impl,
+                failed_src=impl_src,
+                stderr=(out.get("stdout") or "") + "\n" + (out.get("stderr") or ""),
+                failing_tests=fail_ids,
+                sub_goal_label=payload.title,
+            )
+            if epistemic_feedback:
+                epistemic_diffs_injected += 1
+                _say(f"  -> injected Hybrid Epistemic Diff "
+                     f"({len(epistemic_feedback)} chars) into next prompt")
+            prev_impl = impl_src
 
-        # --- Pivot check (REAL pivot_verdict) -------------------------------
-        # Floor is reached when one more decay no longer changes the temperature.
-        next_temp = temperature_for_attempt(base_temp, repeated_signature_count + 1)
-        temp_at_floor = abs(next_temp - temperature) < 1e-9
+            # --- Pivot check (REAL pivot_verdict) -------------------------------
+            # Floor is reached when one more decay no longer changes the temperature.
+            next_temp = temperature_for_attempt(base_temp, repeated_signature_count + 1)
+            temp_at_floor = abs(next_temp - temperature) < 1e-9
 
-        if not pivoted and pivot_verdict(repeated_signature_count, temp_at_floor):
-            pivoted = True
-            _say("")
-            _say("[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
-                 f"same signature x{repeated_signature_count}, temp at floor "
-                 f"({temperature:.4f}). Pivoting -> decompose_for_block.")
-            failure_hint = {
-                "signature_hash": sig,
-                "stderr_tail": (out.get("stdout") or "")[-1200:],
-            }
-            try:
-                sub_goals = decompose_for_block(
-                    _build_goal(payload),
-                    zero_coverage=False,
-                    failure_hint=failure_hint,
-                )
-                decomposed = bool(sub_goals)
-                if sub_goals:
-                    # Re-aim at the SMALLEST/most-atomic mutation sub-chunk.
-                    chunk = sub_goals[-1]
-                    decomposed_description = (
-                        f"{getattr(chunk, 'title', '')}: "
-                        f"{getattr(chunk, 'description', '')}"
-                    )[:1500]
-                    _say(f"  -> decompose emitted {len(sub_goals)} sub-goal(s); "
-                         f"re-aiming at hyper-atomic chunk: "
-                         f"{getattr(chunk, 'sub_goal_id', '?')}")
-            except Exception as e:  # noqa: BLE001
-                _say(f"  -> decompose_for_block error (fail-soft): {e}")
-                decomposed = False
+            if not pivoted and pivot_verdict(repeated_signature_count, temp_at_floor):
+                pivoted = True
+                _say("")
+                _say("[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
+                     f"same signature x{repeated_signature_count}, temp at floor "
+                     f"({temperature:.4f}). Pivoting -> decompose_for_block.")
+                failure_hint = {
+                    "signature_hash": sig,
+                    "stderr_tail": (out.get("stdout") or "")[-1200:],
+                }
+                try:
+                    sub_goals = decompose_for_block(
+                        _build_goal(payload),
+                        zero_coverage=False,
+                        failure_hint=failure_hint,
+                    )
+                    decomposed = bool(sub_goals)
+                    if sub_goals:
+                        # Re-aim at the SMALLEST/most-atomic mutation sub-chunk.
+                        chunk = sub_goals[-1]
+                        decomposed_description = (
+                            f"{getattr(chunk, 'title', '')}: "
+                            f"{getattr(chunk, 'description', '')}"
+                        )[:1500]
+                        _say(f"  -> decompose emitted {len(sub_goals)} sub-goal(s); "
+                             f"re-aiming at hyper-atomic chunk: "
+                             f"{getattr(chunk, 'sub_goal_id', '?')}")
+                except Exception as e:  # noqa: BLE001
+                    _say(f"  -> decompose_for_block error (fail-soft): {e}")
+                    decomposed = False
 
-            # Reset the repeat counter so the post-pivot attempt gets a fair
-            # (higher) temperature against the SMALLER chunk -- bounded by the
-            # one pivot_extra grant.
-            if not pivot_extra_used:
-                pivot_extra_used = True
-                total_budget += 1
-                repeated_signature_count = 0
-                last_signature = None
-            _say("")
+                # Reset the repeat counter so the post-pivot attempt gets a fair
+                # (higher) temperature against the SMALLER chunk -- bounded by the
+                # one pivot_extra grant.
+                if not pivot_extra_used:
+                    pivot_extra_used = True
+                    total_budget += 1
+                    repeated_signature_count = 0
+                    last_signature = None
+                _say("")
 
-        if attempts >= total_budget:
-            break
+            if attempts >= total_budget:
+                break
 
-    final_out = locals().get("final_out", out if "out" in locals() else {})
+    finally:
+        # Restore the env var to its original state so the soak does not leak
+        # env mutations across subsequent calls in the same process (e.g. tests).
+        if _floor_was_absent:
+            os.environ.pop(_floor_env_key, None)
+
+    final_out = out
 
     result = {
         "converged": converged,
@@ -925,8 +1097,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Actually drive the real local Ollama model.")
     parser.add_argument("--model", default="qwen2.5-coder:7b",
                         help="Local model name (default: qwen2.5-coder:7b).")
-    parser.add_argument("--max-repairs", type=int, default=3,
-                        help="Max repair iterations before pivot (default: 3).")
+    parser.add_argument("--max-repairs", type=int, default=5,
+                        help=(
+                            "Max repair iterations before pivot (default: 5). "
+                            "With the soak's floor=0.1 / decay=0.5, the temperature "
+                            "schedule stabilises at attempt 4 and pivot_verdict can "
+                            "trip at count>=2+temp_at_floor. Use >=5 to guarantee the "
+                            "pivot is reachable within a bounded budget."
+                        ))
     parser.add_argument("--payload", choices=sorted(PAYLOADS.keys()),
                         default=DEFAULT_PAYLOAD,
                         help=f"Adversarial payload to drive (default: {DEFAULT_PAYLOAD}).")
