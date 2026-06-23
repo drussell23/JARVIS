@@ -204,6 +204,97 @@ def is_batch_lane_retrieval_timeout(exc: BaseException, *, lane: str) -> bool:
         return False
 
 
+# Dynamic Lane Escalation (Part 2, T5) -- REALTIME-LANE COLLAPSE TIMEOUT. After
+# T4 rotates a wedged op off the batch lane onto realtime, the realtime lane can
+# ALSO time out (DW under heavy global load -- the streaming/generation deadline
+# elapses with no candidate). That is "lane collapse": BOTH transport lanes have
+# now failed by TIMEOUT for the SAME op. Left unhandled the immortal queue would
+# re-attempt forever at the same (too-small) deadline. T5 detects this so the
+# dispatcher can emit [SOVEREIGN YIELD: LANE COLLAPSE] and DILATE the deadline a
+# bounded number of times before falling through to the existing immortal/DLQ
+# backstop. This predicate mirrors ``is_batch_lane_retrieval_timeout`` exactly --
+# it draws the ONE clean line: a *realtime-lane* generation/streaming TIMEOUT,
+# and nothing else (never a batch timeout, a tool-loop generation budget, an
+# our-side egress block, or an internal Python bug).
+_REALTIME_LANE_TIMEOUT_MODE = "TIMEOUT"
+
+
+def _carries_realtime_timeout(exc: BaseException) -> bool:
+    """True iff ``exc`` (directly or via its ``.exhaustion_report``) is a DW
+    *realtime/streaming* generation TIMEOUT -- the deadline elapsed before a
+    candidate was produced on the realtime lane.
+
+    Two shapes are accepted, mirroring :func:`_carries_batch_retrieval_timeout`:
+      * the WRAPPED ``RuntimeError("all_providers_exhausted:...")`` (pure-DW
+        autarky) carrying ``.exhaustion_report`` with ``fsm_failure_mode ==
+        "TIMEOUT"`` -- the realtime lane never returned a candidate inside the
+        per-op deadline; this is the dominant shape after a batch->realtime
+        rotation in autarky;
+      * the BARE ``asyncio.TimeoutError`` (the realtime ``wait_for`` budget
+        elapsed and was recorded before any cascade wrapping).
+
+    A *batch* retrieval timeout (recognised by the "batch retrieval" message)
+    is explicitly NOT a realtime timeout and is rejected so the two predicates
+    never overlap. NEVER raises -> False.
+    """
+    try:
+        # A batch-retrieval timeout is a different lane class -- exclude it so
+        # the realtime predicate can never fire on a batch wedge.
+        if _carries_batch_retrieval_timeout(exc):
+            return False
+        # Shape 1: the wrapped all_providers_exhausted RuntimeError whose
+        # structured report records a TIMEOUT failure mode.
+        report = getattr(exc, "exhaustion_report", None)
+        if isinstance(report, dict):
+            mode = str(report.get("fsm_failure_mode", "")).upper()
+            if mode == _REALTIME_LANE_TIMEOUT_MODE:
+                return True
+        # Shape 2: the bare asyncio.TimeoutError (realtime wait_for budget
+        # elapsed). Matched by class name to avoid importing asyncio here.
+        if type(exc).__name__ in ("TimeoutError", "CancelledError"):
+            # CancelledError is the timeout's underlying mechanism in some
+            # asyncio paths; treat a bare cancellation on realtime as a timeout.
+            if type(exc).__name__ == "CancelledError":
+                # Only when not carrying a non-timeout report.
+                return report is None
+            return True
+        return False
+    except Exception:  # noqa: BLE001 -- the taxonomy must never itself throw
+        return False
+
+
+def is_realtime_lane_timeout(exc: BaseException, *, lane: str) -> bool:
+    """True iff ``exc`` is a DW *realtime-lane* generation TIMEOUT -- the
+    failure class that, AFTER a batch->realtime rotation, signals LANE COLLAPSE
+    (both transport lanes exhausted by timeout for this op).
+
+    Both conditions MUST hold:
+      * ``lane == "realtime"`` -- the attempt was actually on the realtime lane
+        (a batch attempt must NEVER feed a realtime-collapse signal), AND
+      * ``exc`` carries a realtime generation/streaming TIMEOUT (see
+        :func:`_carries_realtime_timeout`).
+
+    Excluded by construction (so a collapse is never spuriously declared on an
+    our-side fault): batch-retrieval timeouts (``is_batch_lane_retrieval_timeout``
+    -- a different lane class), tool-loop generation deadlines
+    (``is_generation_timeout``), ``LocalEgressOverweightError``
+    (``is_local_egress_overweight``), and any internal Python logic bug. NEVER
+    raises -> False.
+    """
+    try:
+        if lane != "realtime":
+            return False
+        if exc is None:
+            return False
+        # An our-side egress block or a tool-loop generation budget deadline can
+        # never be a transport-lane realtime timeout; reject defensively.
+        if is_local_egress_overweight(exc) or is_generation_timeout(exc):
+            return False
+        return _carries_realtime_timeout(exc)
+    except Exception:  # noqa: BLE001 -- the taxonomy must never itself throw
+        return False
+
+
 def is_local_egress_overweight(exc: BaseException) -> bool:
     """True iff ``exc`` is a ``LocalEgressOverweightError`` — OUR-side egress
     interceptor refusing to dispatch a body bigger than the local ceiling

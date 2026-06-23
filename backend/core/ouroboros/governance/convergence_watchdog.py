@@ -257,6 +257,175 @@ def get_reduction_tracker() -> ReductionTracker:
 
 
 # ---------------------------------------------------------------------------
+# LaneDilationTracker — bounded per-op deadline-dilation hop counter (T5)
+# ---------------------------------------------------------------------------
+#
+# Dynamic Lane Escalation (Part 2, T5). After T4 rotates a wedged op off the
+# batch lane onto realtime, the realtime lane can ALSO time out -- "lane
+# collapse" (both transport lanes exhausted by TIMEOUT for the SAME op). Rather
+# than re-attempt forever at the same too-small deadline, the dispatcher DILATES
+# (increases) the per-op generation deadline a BOUNDED number of times. This
+# tracker is the structural termination bound: a per-op hop counter reusing the
+# EXACT bounded-LRU discipline of ReductionTracker.record_self_heal_hop (no new
+# persistent store, no background task) -- once the op exceeds the env-tunable
+# hop cap, no further dilation happens and the op falls through to the existing
+# immortal-queue / DLQ backstop unchanged.
+
+_ENV_LANE_DILATION_TRACKER_SIZE = "JARVIS_LANE_DILATION_TRACKER_SIZE"
+_ENV_LANE_DILATION_FACTOR = "JARVIS_LANE_DILATION_FACTOR"
+_ENV_LANE_DILATION_MAX_HOPS = "JARVIS_LANE_DILATION_MAX_HOPS"
+_ENV_LANE_DILATION_MAX_S = "JARVIS_LANE_DILATION_MAX_S"
+
+_DEFAULT_LANE_DILATION_TRACKER_SIZE = 256
+_DEFAULT_LANE_DILATION_FACTOR = 1.5
+_DEFAULT_LANE_DILATION_MAX_HOPS = 2
+
+
+def lane_dilation_factor() -> float:
+    """Per-collapse deadline multiplier (default 1.5). Clamped to >= 1.0 so a
+    dilation can never SHRINK a deadline. Fail-soft: any parse error -> default."""
+    try:
+        val = float(os.environ.get(
+            _ENV_LANE_DILATION_FACTOR, _DEFAULT_LANE_DILATION_FACTOR,
+        ))
+        return val if val >= 1.0 else _DEFAULT_LANE_DILATION_FACTOR
+    except (ValueError, TypeError):
+        return _DEFAULT_LANE_DILATION_FACTOR
+
+
+def lane_dilation_max_hops() -> int:
+    """Max deadline dilations per op (default 2). Clamped to >= 0 (0 disables
+    dilation entirely -> immediate backstop). Fail-soft: parse error -> default.
+
+    This is the REAL termination bound: rotate -> dilate(xfactor) ->
+    dilate(xfactor again, capped) -> give up to the existing immortal/DLQ
+    backstop. The cap is env-tunable, never a magic literal."""
+    try:
+        return max(0, int(os.environ.get(
+            _ENV_LANE_DILATION_MAX_HOPS, _DEFAULT_LANE_DILATION_MAX_HOPS,
+        )))
+    except (ValueError, TypeError):
+        return _DEFAULT_LANE_DILATION_MAX_HOPS
+
+
+def lane_dilation_max_s(base_deadline_s: float) -> float:
+    """Absolute ceiling for a dilated deadline (seconds).
+
+    Reads ``JARVIS_LANE_DILATION_MAX_S`` when set; otherwise defaults to
+    ``base_deadline_s * 3`` (so the dilation can at most triple the base
+    deadline regardless of factor x hops). Fail-soft: any parse error or a
+    non-positive override -> the base*3 default."""
+    default_cap = max(0.0, base_deadline_s) * 3.0
+    raw = os.environ.get(_ENV_LANE_DILATION_MAX_S)
+    if raw is None:
+        return default_cap
+    try:
+        val = float(raw)
+        return val if val > 0 else default_cap
+    except (ValueError, TypeError):
+        return default_cap
+
+
+class LaneDilationTracker:
+    """Bounded per-op deadline-dilation hop counter (lane collapse, T5).
+
+    Mirrors ``ReductionTracker``'s LRU discipline EXACTLY: the outer dict is
+    bounded to ``JARVIS_LANE_DILATION_TRACKER_SIZE`` ops (oldest evicted via
+    OrderedDict popitem(last=False)); each op holds a single small int hop
+    count. The op_id is INVARIANT across the immortal queue's re-attempts, so a
+    bounded per-op counter caps the number of deadline dilations at a small
+    constant regardless of retry dynamics -- the structural no-infinite-loop
+    guarantee.
+    """
+
+    def __init__(self) -> None:
+        try:
+            max_ops = int(os.environ.get(
+                _ENV_LANE_DILATION_TRACKER_SIZE,
+                _DEFAULT_LANE_DILATION_TRACKER_SIZE,
+            ))
+        except (ValueError, TypeError):
+            max_ops = _DEFAULT_LANE_DILATION_TRACKER_SIZE
+        self._max_ops: int = max(1, max_ops)
+        self._hops: Dict[str, int] = collections.OrderedDict()
+
+    def record_dilation_hop(self, op_id: str) -> int:
+        """Increment and return the cumulative dilation hop count for *op_id*.
+
+        Bounded per-op counter mirroring ``record_self_heal_hop``: same LRU
+        eviction (oldest popped when over capacity), move-to-end on touch.
+
+        Fail-soft: any exception returns ``lane_dilation_max_hops() + 1`` so the
+        caller treats it as over-budget and STOPS dilating (falls to backstop)
+        -- a failure NEVER grants an unbounded dilation."""
+        try:
+            if op_id in self._hops:
+                self._hops.move_to_end(op_id)
+                self._hops[op_id] += 1
+            else:
+                if len(self._hops) >= self._max_ops:
+                    self._hops.popitem(last=False)  # evict oldest
+                self._hops[op_id] = 1
+            return self._hops[op_id]
+        except Exception:  # pragma: no cover -- fail-soft -> over-budget
+            logger.debug(
+                "[ConvergenceWatchdog] record_dilation_hop fail-soft",
+                exc_info=True,
+            )
+            return lane_dilation_max_hops() + 1
+
+    def hops(self, op_id: str) -> int:
+        """Return the current dilation hop count for *op_id* (0 if never
+        dilated). Fail-soft -> 0. Read-only: does NOT touch LRU order."""
+        try:
+            return int(self._hops.get(op_id, 0))
+        except Exception:  # pragma: no cover
+            return 0
+
+    def reset(self, op_id: str) -> None:
+        """Clear the dilation hops for *op_id* (e.g. on terminal success).
+        Fail-soft."""
+        try:
+            self._hops.pop(op_id, None)
+        except Exception:  # pragma: no cover
+            pass
+
+
+_LANE_DILATION_TRACKER_SINGLETON: "LaneDilationTracker | None" = None
+
+
+def get_lane_dilation_tracker() -> "LaneDilationTracker":
+    """Return the process-global LaneDilationTracker (mirrors
+    get_reduction_tracker singleton pattern)."""
+    global _LANE_DILATION_TRACKER_SINGLETON
+    if _LANE_DILATION_TRACKER_SINGLETON is None:
+        _LANE_DILATION_TRACKER_SINGLETON = LaneDilationTracker()
+    return _LANE_DILATION_TRACKER_SINGLETON
+
+
+def compute_dilated_deadline(base_deadline_s: float, hops: int) -> float:
+    """Pure: the dilated deadline for an op that has dilated ``hops`` times.
+
+    = ``base_deadline_s * (lane_dilation_factor() ** hops)`` capped at
+    :func:`lane_dilation_max_s`. ``hops <= 0`` returns the base deadline
+    unchanged (byte-identical, no dilation). Fail-soft: any error returns the
+    base deadline -- the op is NEVER lost, just runs at the legacy deadline."""
+    try:
+        if hops <= 0 or base_deadline_s <= 0:
+            return max(0.0, base_deadline_s)
+        factor = lane_dilation_factor()
+        dilated = base_deadline_s * (factor ** hops)
+        cap = lane_dilation_max_s(base_deadline_s)
+        return max(base_deadline_s, min(dilated, cap))
+    except Exception:  # pragma: no cover -- fail-soft -> legacy deadline
+        logger.debug(
+            "[ConvergenceWatchdog] compute_dilated_deadline fail-soft",
+            exc_info=True,
+        )
+        return max(0.0, base_deadline_s)
+
+
+# ---------------------------------------------------------------------------
 # Sovereign yield telemetry
 # ---------------------------------------------------------------------------
 
