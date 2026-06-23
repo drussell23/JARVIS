@@ -25,6 +25,12 @@ Design constraints (all enforced):
   * REAL pytest subprocess execution for VALIDATE,
   * bounded -- no infinite loop.
 
+Two payloads ship (``--payload {merge_intervals,concurrency_lru}``); the default
+is the Concurrency Gauntlet (a thread-safe TTL+LRU cache) because the round-1
+merge-intervals payload was zero-shot solved -> the repair loop never fired. The
+``--run`` path warms the model into VRAM first (``LocalPrimeClient.warmup``) so
+the cold-start latency never trips a spurious timeout.
+
 This is NOT run automatically. ``--run`` requires JARVIS_CHAOS_INJECTOR_ENABLED
 to be true and talks to a local Ollama at http://127.0.0.1:11434.
 """
@@ -81,13 +87,25 @@ def gate_enabled() -> bool:
 
 @dataclass(frozen=True)
 class AdversarialPayload:
-    """A moderately complex coding sub-goal at the edge of a 7B's window.
+    """A coding sub-goal at (or past) the edge of a 7B's first-pass window.
 
-    Chosen task: merge-overlapping-intervals WITH the half-open adjacency edge
-    case (intervals that only TOUCH at an endpoint, e.g. [1,2] and [2,3], must
-    merge into [1,3]). A first draft from a 7B typically uses ``s < last_end``
-    (strict) and silently botches adjacency -- a subtle, deterministic edge case
-    that the test suite pins.
+    Two payloads ship (selectable via ``--payload``):
+
+      * ``merge_intervals`` -- merge-overlapping-intervals WITH the half-open
+        adjacency edge case (intervals that only TOUCH at an endpoint, e.g.
+        [1,2] and [2,3], must merge into [1,3]). A 7B first draft typically uses
+        ``s < last_end`` (strict) and silently botches adjacency. This proved
+        *too easy* in round 1 (zero-shot solved -> the repair loop never fired).
+
+      * ``concurrency_lru`` -- a thread-safe TTL+LRU cache with NON-BLOCKING
+        background eviction. 7B first drafts almost universally (a) omit the
+        ``threading.Lock`` around the OrderedDict mutations and/or (b) write a
+        blocking ``while True: sleep`` eviction loop instead of a daemon thread.
+        Both are caught deterministically by the test suite, so the epistemic
+        repair -> pivot -> decompose loop is actually exercised UNDER FIRE.
+
+    ``requirements`` is the per-payload requirements block (list of lines),
+    keeping ``build_prompt`` payload-agnostic.
     """
 
     title: str
@@ -97,6 +115,8 @@ class AdversarialPayload:
     test_filename: str
     tests: str
     system_prompt: str
+    requirements: tuple
+    decompose_focus: str = ""
 
     def build_prompt(self, epistemic_feedback: str = "") -> str:
         """Compose the generation prompt; append the Hybrid Epistemic Diff (if any)."""
@@ -108,13 +128,7 @@ class AdversarialPayload:
             self.description,
             "</description>",
             "<requirements>",
-            f"- Define a top-level function named `{self.entry_symbol}`.",
-            "- Handle the empty input case.",
-            "- Sort the intervals first.",
-            "- CRITICAL EDGE CASE: intervals that only TOUCH at an endpoint",
-            "  (e.g. (1, 2) and (2, 3)) MUST merge into (1, 3) -- adjacency counts",
-            "  as overlap. Use `<=`, not `<`.",
-            "- Return a list of tuples.",
+            *list(self.requirements),
             "</requirements>",
             "<output_format>",
             "Return ONLY a single Python code block (```python ... ```) with the",
@@ -172,7 +186,7 @@ _TESTS = textwrap.dedent(
 ).strip()
 
 
-ADVERSARIAL_PAYLOAD = AdversarialPayload(
+MERGE_INTERVALS_PAYLOAD = AdversarialPayload(
     title="Merge overlapping intervals (with adjacency edge case)",
     description=(
         "Implement `merge_intervals(intervals)` that merges a list of "
@@ -185,12 +199,229 @@ ADVERSARIAL_PAYLOAD = AdversarialPayload(
     impl_filename="impl.py",
     test_filename="test_impl.py",
     tests=_TESTS,
+    requirements=(
+        "- Define a top-level function named `merge_intervals`.",
+        "- Handle the empty input case.",
+        "- Sort the intervals first.",
+        "- CRITICAL EDGE CASE: intervals that only TOUCH at an endpoint",
+        "  (e.g. (1, 2) and (2, 3)) MUST merge into (1, 3) -- adjacency counts",
+        "  as overlap. Use `<=`, not `<`.",
+        "- Return a list of tuples.",
+    ),
+    decompose_focus=(
+        " HYPER-ATOMIC FOCUS: get the adjacency edge case right first -- "
+        "merge intervals that only touch at an endpoint using `<=`."
+    ),
     system_prompt=(
         "You are a precise senior Python engineer. You write correct, minimal "
         "implementations and you reason carefully about edge cases before "
         "emitting code. Output a single Python code block only."
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Payload #2: the Concurrency Gauntlet (thread-safe TTL+LRU cache)
+# ---------------------------------------------------------------------------
+#
+# Deliberately HARD for a 7B first pass. The test suite pins TWO bugs that 7B
+# drafts almost universally hit:
+#   (a) no threading.Lock around the OrderedDict mutations -> concurrent
+#       get/put corrupts state (KeyError / changed-size-during-iteration);
+#   (b) lazy-only TTL (expiry checked only on access) or a blocking
+#       `while True: sleep` eviction loop -> the background-eviction +
+#       non-blocking-constructor tests fail.
+#
+# Non-flaky by construction:
+#   * thread-safety test uses a SHORT ttl so a (correct) background reaper is
+#     ACTIVELY evicting while 8 threads hammer overlapping keys for ~1.5s; the
+#     missing-lock multi-step read-modify-write (`if k in d` -> move_to_end ->
+#     assign, racing the lazy/reaper pop) deterministically raises KeyError on
+#     a buggy impl, while a locked impl is exception-free (verified 10/10);
+#   * the invariant asserted is DETERMINISTIC (no exception AND len <= capacity),
+#     never a timing-dependent exact value;
+#   * TTL + non-blocking margins are generous (0.5s ttl, 1.5s wait, 5s ceiling)
+#     so a correct impl is never flaky.
+
+_LRU_TESTS = textwrap.dedent(
+    '''
+    from impl import TTLLRUCache
+
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+
+    def test_basic_get_put():
+        c = TTLLRUCache(capacity=2, ttl_seconds=100.0)
+        try:
+            c.put("a", 1)
+            c.put("b", 2)
+            assert c.get("a") == 1
+            assert c.get("b") == 2
+            assert c.get("missing") is None
+        finally:
+            c.stop()
+
+
+    def test_lru_capacity_eviction_order():
+        c = TTLLRUCache(capacity=2, ttl_seconds=100.0)
+        try:
+            c.put("a", 1)
+            c.put("b", 2)
+            assert c.get("a") == 1  # touch "a" -> "b" is the LRU
+            c.put("c", 3)           # inserting "c" must evict the LRU ("b")
+            assert c.get("b") is None
+            assert c.get("a") == 1
+            assert c.get("c") == 3
+            assert len(c) <= 2
+        finally:
+            c.stop()
+
+
+    def test_thread_safety_no_corruption():
+        capacity = 16
+        # Short ttl: a correct background reaper is ACTIVELY evicting while the
+        # threads concurrently mutate. A missing-lock impl races on the
+        # multi-step read-modify-write and raises (KeyError / changed-size);
+        # a locked impl is exception-free and never exceeds capacity.
+        c = TTLLRUCache(capacity=capacity, ttl_seconds=0.05)
+        n_threads = 8
+        duration_s = 1.5
+        errors = []
+        invariant_violations = []
+        stop = threading.Event()
+
+        def worker(tid):
+            try:
+                i = 0
+                while not stop.is_set():
+                    k = (i + tid) % 24  # overlapping keys across threads -> churn
+                    if i % 2 == 0:
+                        c.put(k, tid * 1000 + i)
+                    else:
+                        c.get(k)
+                    if len(c) > capacity:
+                        invariant_violations.append(len(c))
+                    i += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        try:
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                futs = [ex.submit(worker, t) for t in range(n_threads)]
+                time.sleep(duration_s)
+                stop.set()
+                for f in futs:
+                    f.result()
+            assert not errors, \\
+                "concurrent access raised (missing lock?): " + "; ".join(errors[:5])
+            assert not invariant_violations, (
+                "len exceeded capacity under concurrency (corruption): "
+                + str(invariant_violations[:5])
+            )
+            assert len(c) <= capacity
+        finally:
+            c.stop()
+
+
+    def test_ttl_background_eviction_not_lazy():
+        c = TTLLRUCache(capacity=10, ttl_seconds=0.5)
+        try:
+            c.put("x", 42)
+            assert c.get("x") == 42  # present immediately
+            # Wait WITHOUT accessing "x". A lazy-only TTL leaves it resident;
+            # a background mechanism must have evicted it.
+            time.sleep(1.5)
+            assert len(c) == 0, (
+                "entry not evicted by background mechanism (lazy-only TTL?): len="
+                + str(len(c))
+            )
+        finally:
+            c.stop()
+
+
+    def test_constructor_and_ops_do_not_block():
+        start = time.monotonic()
+        c = TTLLRUCache(capacity=4, ttl_seconds=10.0)
+        try:
+            c.put("a", 1)
+            assert c.get("a") == 1
+        finally:
+            c.stop()
+        elapsed = time.monotonic() - start
+        # A blocking `while True: sleep` eviction loop in __init__/put would hang
+        # far past this. Generous ceiling; a correct impl finishes in ms.
+        assert elapsed < 5.0, \\
+            "construction + ops blocked (blocking eviction loop?): " + str(elapsed)
+    '''
+).strip()
+
+
+CONCURRENCY_LRU_PAYLOAD = AdversarialPayload(
+    title="Thread-safe TTL+LRU cache with non-blocking background eviction",
+    description=(
+        "Implement `class TTLLRUCache` with `__init__(self, capacity, "
+        "ttl_seconds)`, `get(self, key)`, and `put(self, key, value)`. It is a "
+        "bounded LRU cache (least-recently-used eviction when over capacity) "
+        "with per-entry time-to-live. It MUST be thread-safe: concurrent get/put "
+        "from many threads must not corrupt state or lose updates. TTL eviction "
+        "MUST be performed by a NON-BLOCKING background mechanism (a daemon "
+        "thread or async task) -- entries expire about `ttl_seconds` after "
+        "insertion and are removed even if never accessed again. Do NOT use a "
+        "blocking `while True: sleep(...)` loop on the construction path; the "
+        "constructor must return promptly. Also provide a `stop(self)` method "
+        "that cleanly halts the background mechanism (so callers do not leak "
+        "threads)."
+    ),
+    entry_symbol="TTLLRUCache",
+    impl_filename="impl.py",
+    test_filename="test_impl.py",
+    tests=_LRU_TESTS,
+    requirements=(
+        "- Define a top-level class named `TTLLRUCache` with the exact methods:",
+        "  `__init__(self, capacity, ttl_seconds)`, `get(self, key)`,",
+        "  `put(self, key, value)`, and `stop(self)`. Implement `__len__` too.",
+        "- THREAD SAFETY: guard ALL mutations of the internal store with a",
+        "  `threading.Lock`/`RLock`. Concurrent get/put from 8+ threads must",
+        "  never raise and must never let the store exceed `capacity`.",
+        "- LRU: `get` and `put` mark a key most-recently-used; eviction when over",
+        "  capacity removes the least-recently-used entry.",
+        "- TTL: entries expire ~`ttl_seconds` after insertion. Eviction MUST be",
+        "  driven by a NON-BLOCKING background mechanism (daemon thread / async",
+        "  task) so expired entries are removed even if never accessed -- NOT",
+        "  lazily-only on access, and NOT via a blocking `while True: sleep`",
+        "  loop that stalls construction.",
+        "- Provide `stop(self)` to halt the background mechanism cleanly.",
+        "- Use `collections.OrderedDict` (or equivalent) for LRU ordering.",
+    ),
+    decompose_focus=(
+        " HYPER-ATOMIC FOCUS: first make it thread-safe -- wrap EVERY OrderedDict "
+        "mutation in a single threading.Lock -- and replace any blocking eviction "
+        "loop with a daemon thread that wakes periodically and reaps expired keys "
+        "under that same lock."
+    ),
+    system_prompt=(
+        "You are a precise senior Python engineer specializing in concurrent "
+        "data structures. You reason carefully about thread-safety (locks around "
+        "every shared-state mutation) and about non-blocking background work "
+        "before emitting code. Output a single Python code block only."
+    ),
+)
+
+
+# Registry for the --payload selector. Default is the Concurrency Gauntlet for
+# this round (the merge-intervals payload was zero-shot solved last round).
+PAYLOADS: Dict[str, AdversarialPayload] = {
+    "merge_intervals": MERGE_INTERVALS_PAYLOAD,
+    "concurrency_lru": CONCURRENCY_LRU_PAYLOAD,
+}
+DEFAULT_PAYLOAD = "concurrency_lru"
+
+# Back-compat alias: existing callers/tests referenced ADVERSARIAL_PAYLOAD as
+# the merge-intervals payload. Keep it pointing there so existing assertions
+# stay valid; the --run default is the Concurrency Gauntlet via DEFAULT_PAYLOAD.
+ADVERSARIAL_PAYLOAD = MERGE_INTERVALS_PAYLOAD
 
 
 # ---------------------------------------------------------------------------
@@ -217,20 +448,30 @@ def _extract_code_block(text: str) -> str:
         return str(text)
 
 
-def _run_pytest_in_tempdir(impl_src: str, tests_src: str, *, timeout_s: int = 90) -> Dict[str, Any]:
+def _run_pytest_in_tempdir(
+    impl_src: str,
+    tests_src: str,
+    *,
+    timeout_s: int = 90,
+    payload: "Optional[AdversarialPayload]" = None,
+) -> Dict[str, Any]:
     """Write impl + tests to a tempdir and run REAL pytest as a subprocess.
+
+    ``payload`` supplies the impl/test filenames (defaults to the back-compat
+    ADVERSARIAL_PAYLOAD when not given).
 
     Returns {passed: bool, stdout: str, stderr: str, returncode: int}. Fail-soft:
     a missing impl / timeout / crash is reported as a non-pass, never raises.
     """
+    payload = payload or ADVERSARIAL_PAYLOAD
     result: Dict[str, Any] = {"passed": False, "stdout": "", "stderr": "", "returncode": -1}
     if not impl_src:
         result["stderr"] = "empty implementation (model produced no code block)"
         return result
     try:
         with tempfile.TemporaryDirectory(prefix="adv_soak_") as d:
-            impl_path = os.path.join(d, ADVERSARIAL_PAYLOAD.impl_filename)
-            test_path = os.path.join(d, ADVERSARIAL_PAYLOAD.test_filename)
+            impl_path = os.path.join(d, payload.impl_filename)
+            test_path = os.path.join(d, payload.test_filename)
             with open(impl_path, "w", encoding="ascii", errors="replace") as f:
                 f.write(impl_src)
             with open(test_path, "w", encoding="ascii", errors="replace") as f:
@@ -309,16 +550,13 @@ def _signature_for(out: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_goal() -> Any:
+def _build_goal(payload: "Optional[AdversarialPayload]" = None) -> Any:
+    payload = payload or ADVERSARIAL_PAYLOAD
     return types.SimpleNamespace(
-        goal_id="adv-soak-merge-intervals",
-        title=ADVERSARIAL_PAYLOAD.title,
-        description=(
-            ADVERSARIAL_PAYLOAD.description
-            + " HYPER-ATOMIC FOCUS: get the adjacency edge case right first -- "
-            "merge intervals that only touch at an endpoint using `<=`."
-        ),
-        target_files=(ADVERSARIAL_PAYLOAD.impl_filename,),
+        goal_id="adv-soak-" + payload.entry_symbol.lower().replace("_", "-"),
+        title=payload.title,
+        description=(payload.description + (payload.decompose_focus or "")),
+        target_files=(payload.impl_filename,),
     )
 
 
@@ -336,7 +574,12 @@ def _say(line: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_cognitive_soak(*, client: Any, max_repairs: int = 3) -> Dict[str, Any]:
+async def run_cognitive_soak(
+    *,
+    client: Any,
+    max_repairs: int = 3,
+    payload: "Optional[AdversarialPayload]" = None,
+) -> Dict[str, Any]:
     """Drive the adversarial payload through the REAL cognitive loop.
 
     Returns a result dict:
@@ -352,10 +595,15 @@ async def run_cognitive_soak(*, client: Any, max_repairs: int = 3) -> Dict[str, 
             "JARVIS_CHAOS_INJECTOR_ENABLED=true"
         )
 
-    payload = ADVERSARIAL_PAYLOAD
+    payload = payload or ADVERSARIAL_PAYLOAD
     base_temp = float(os.environ.get("JARVIS_ADV_SOAK_BASE_TEMP", "0.7"))
-    pytest_timeout_s = int(os.environ.get("JARVIS_ADV_SOAK_PYTEST_TIMEOUT_S", "90"))
-    gen_timeout_s = float(os.environ.get("JARVIS_ADV_SOAK_GEN_TIMEOUT_S", "240"))
+    # Generous: the LRU payload's thread-safety test runs ~1.5s of real
+    # concurrency on top of process startup, so keep a comfortable margin.
+    pytest_timeout_s = int(os.environ.get("JARVIS_ADV_SOAK_PYTEST_TIMEOUT_S", "120"))
+    # Generous per-generate budget so a slow-but-valid CPU generation (a cold
+    # local 7B can take well over a minute on the first real tokens) is not cut
+    # off. The harness warms the model first, but keep the ceiling high anyway.
+    gen_timeout_s = float(os.environ.get("JARVIS_ADV_SOAK_GEN_TIMEOUT_S", "360"))
 
     iterations: List[Dict[str, Any]] = []
     temperature_trajectory: List[float] = []
@@ -425,7 +673,9 @@ async def run_cognitive_soak(*, client: Any, max_repairs: int = 3) -> Dict[str, 
         raw = await _generate(temperature, epistemic_feedback)
         impl_src = _extract_code_block(raw)
 
-        out = _run_pytest_in_tempdir(impl_src, payload.tests, timeout_s=pytest_timeout_s)
+        out = _run_pytest_in_tempdir(
+            impl_src, payload.tests, timeout_s=pytest_timeout_s, payload=payload
+        )
         passed = bool(out["passed"])
 
         iterations.append({
@@ -488,7 +738,7 @@ async def run_cognitive_soak(*, client: Any, max_repairs: int = 3) -> Dict[str, 
             }
             try:
                 sub_goals = decompose_for_block(
-                    _build_goal(),
+                    _build_goal(payload),
                     zero_coverage=False,
                     failure_hint=failure_hint,
                 )
@@ -586,13 +836,18 @@ def print_report(result: Dict[str, Any]) -> None:
 
 def _build_real_client(model: str) -> LocalPrimeClient:
     cfg = LocalConfig.from_env()
-    # Pin to the soak target regardless of env model default.
+    # Pin to the soak target regardless of env model default, and raise the
+    # adaptive-timeout ceiling generously so a slow-but-valid CPU generation
+    # from a cold/large 7B is not severed by the client's own timeout (the
+    # harness also warms the model first). Reuses the existing LocalConfig env
+    # knob (JARVIS_LOCAL_INFERENCE_TIMEOUT_MS) -- defaults to 360s here.
+    ceiling_ms = int(os.environ.get("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", "360000"))
     cfg = LocalConfig(
         base_url=os.environ.get("JARVIS_LOCAL_MODEL_BASE_URL", "http://127.0.0.1:11434"),
         model_name=model,
         keep_alive_seconds=cfg.keep_alive_seconds,
-        timeout_seed_ms=cfg.timeout_seed_ms,
-        timeout_ceiling_ms=cfg.timeout_ceiling_ms,
+        timeout_seed_ms=max(cfg.timeout_seed_ms, ceiling_ms),
+        timeout_ceiling_ms=max(cfg.timeout_ceiling_ms, ceiling_ms),
         timeout_floor_ms=cfg.timeout_floor_ms,
         output_ratio=cfg.output_ratio,
         margin_sigma=cfg.margin_sigma,
@@ -604,19 +859,54 @@ def _build_real_client(model: str) -> LocalPrimeClient:
     return LocalPrimeClient(cfg)
 
 
+async def _warmup_client(client: Any, *, timeout_s: float) -> bool:
+    """Force the model into VRAM before the cognitive clock starts.
+
+    Reuses the production ``LocalPrimeClient.warmup``. Logs the confirmed
+    warm-load time or a fail-soft warning. Never raises.
+    """
+    import time as _time
+    _say("-" * 72)
+    _say(f"[soak] warming up model (forcing weights into VRAM, timeout={timeout_s:.0f}s) ...")
+    t0 = _time.monotonic()
+    try:
+        ok = await client.warmup(timeout_s=timeout_s)
+    except Exception as e:  # noqa: BLE001 -- fail-soft, never block the soak
+        _say(f"[soak] warmup raised (fail-soft, proceeding cold): {e}")
+        return False
+    elapsed = _time.monotonic() - t0
+    if ok:
+        _say(f"[soak] warmup confirmed in {elapsed:.1f}s (model in memory)")
+    else:
+        _say(f"[soak] WARNING: warmup did not confirm in {elapsed:.1f}s "
+             f"(timeout/unreachable) -- proceeding cold (fail-soft)")
+    return bool(ok)
+
+
 async def _amain(args: argparse.Namespace) -> int:
     if not gate_enabled():
         _say("REFUSED: set JARVIS_CHAOS_INJECTOR_ENABLED=true to run the soak.")
         return 2
+
+    payload = PAYLOADS.get(args.payload, PAYLOADS[DEFAULT_PAYLOAD])
+
     if not args.run:
         _say("Dry mode: pass --run to drive the real local model. (Gate is ON.)")
         _say(f"Would target model={args.model} at "
              f"{os.environ.get('JARVIS_LOCAL_MODEL_BASE_URL', 'http://127.0.0.1:11434')}")
+        _say(f"Selected payload: {args.payload} -- {payload.title}")
         return 0
 
     client = _build_real_client(args.model)
     try:
-        result = await run_cognitive_soak(client=client, max_repairs=args.max_repairs)
+        # Warmup-first: eliminate the cold-start spurious timeout the first
+        # round hit, so the cognitive loop starts against a warm model.
+        warmup_timeout_s = float(os.environ.get("JARVIS_ADV_SOAK_WARMUP_TIMEOUT_S",
+                                                str(args.warmup_timeout)))
+        await _warmup_client(client, timeout_s=warmup_timeout_s)
+        result = await run_cognitive_soak(
+            client=client, max_repairs=args.max_repairs, payload=payload
+        )
         print_report(result)
         return 0 if result.get("converged") else 1
     finally:
@@ -637,6 +927,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Local model name (default: qwen2.5-coder:7b).")
     parser.add_argument("--max-repairs", type=int, default=3,
                         help="Max repair iterations before pivot (default: 3).")
+    parser.add_argument("--payload", choices=sorted(PAYLOADS.keys()),
+                        default=DEFAULT_PAYLOAD,
+                        help=f"Adversarial payload to drive (default: {DEFAULT_PAYLOAD}).")
+    parser.add_argument("--warmup-timeout", type=float, default=180.0,
+                        help="Seconds to wait for the VRAM warmup before the loop "
+                             "(default: 180; env JARVIS_ADV_SOAK_WARMUP_TIMEOUT_S).")
     args = parser.parse_args(argv)
     try:
         return asyncio.run(_amain(args))
