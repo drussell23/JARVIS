@@ -42,6 +42,12 @@ def test_startup_script_installs_ollama_pulls_model_and_sentinels(bake):
     assert "ollama.com/install.sh" in script  # installs Ollama
     assert "ollama pull qwen2.5-coder:7b" in script  # pulls the model
     assert "ollama serve" in script  # serves
+    # ROOT-CAUSE REGRESSION GUARD (v1 bake abort): HOME must be exported before
+    # any ollama call, else the Go CLI/server panics "$HOME is not defined".
+    assert "export HOME=" in script
+    # before the actual pull COMMAND (use the full command, not the bare words
+    # which also appear in the explanatory comment).
+    assert script.index("export HOME=") < script.index("ollama pull qwen2.5-coder:7b")
     # sentinel written ONLY after the pull (inside the success branch)
     assert "/var/run/jprime_bake_ready" in script
     assert script.startswith("#!")

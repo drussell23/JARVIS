@@ -138,9 +138,16 @@ def build_startup_script(model: str, *, sentinel_path: str = _SENTINEL_PATH) -> 
 # serving, and writes the readiness sentinel ONLY after the pull completes.
 set -uo pipefail
 
+# ROOT-CAUSE FIX (v1 bake abort): Ollama (Go) calls envconfig.Models() at CLI
+# AND server startup and PANICS with "$HOME is not defined". GCP metadata
+# startup-scripts run as root with HOME unset, so both `ollama serve` (nohup)
+# and the `ollama pull` CLI died instantly. Export HOME before ANY ollama call.
+export HOME=/root
+export OLLAMA_HOST=127.0.0.1:{_OLLAMA_PORT}
+
 LOG=/var/log/jprime_bake.log
 exec > >(tee -a "$LOG") 2>&1
-echo "[jprime-bake] startup-script begin $(date -u +%FT%TZ)"
+echo "[jprime-bake] startup-script begin $(date -u +%FT%TZ) (HOME=$HOME)"
 
 # Never leave a stale sentinel from a re-run.
 rm -f {sentinel_q} || true
@@ -149,13 +156,16 @@ rm -f {sentinel_q} || true
 echo "[jprime-bake] installing Ollama serving runtime"
 curl -fsSL https://ollama.com/install.sh | sh
 
-# 2. Serve. Prefer the systemd unit the installer ships; fall back to nohup.
-if systemctl list-unit-files 2>/dev/null | grep -q '^ollama.service'; then
+# 2. Serve. Prefer the systemd unit the installer ships (it runs ollama with a
+#    correct per-service HOME); fall back to nohup (HOME exported above) only if
+#    systemd is not the init. Detect via /run/systemd/system -- NOT a brittle
+#    unit-name grep, which raced the installer and wrongly chose nohup in v1.
+if [ -d /run/systemd/system ]; then
     echo "[jprime-bake] starting ollama via systemd"
-    systemctl enable ollama || true
-    systemctl restart ollama || true
+    systemctl daemon-reload || true
+    systemctl enable --now ollama || systemctl restart ollama || true
 else
-    echo "[jprime-bake] systemd unit absent -- starting ollama via nohup"
+    echo "[jprime-bake] systemd not init -- starting ollama via nohup (HOME=$HOME)"
     nohup ollama serve > /var/log/ollama_serve.log 2>&1 &
 fi
 
