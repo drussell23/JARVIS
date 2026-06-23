@@ -41,7 +41,7 @@ DORMANT. A JARVIS_HANDBACK_COOLDOWN_S cooldown blocks immediate re-awaken.
 
 Env gates
 ---------
-JARVIS_FAILOVER_LIFECYCLE_ENABLED   default "false" (flips after a soak)
+JARVIS_FAILOVER_LIFECYCLE_ENABLED   default "true" (GRADUATED 2026-06-23; hot-revert=false)
     OFF -> controller is inert: stays DORMANT, never awakens. Today's
     behavior exactly (quarantine -> Cryo-DLQ).
 JARVIS_FAILOVER_ROUTE                default "dw" (the quarantine route key)
@@ -107,8 +107,16 @@ def _env_str(name: str, default: str) -> str:
 
 
 def lifecycle_enabled() -> bool:
-    """Master gate. Default FALSE -- OFF means inert (stays DORMANT)."""
-    return _enabled("JARVIS_FAILOVER_LIFECYCLE_ENABLED", "false")
+    """Master gate. GRADUATED to default TRUE (2026-06-23) after the Adversarial
+    Cognitive Soak proved the full net live: VRAM pre-warm + Hybrid Epistemic
+    Diff injection + temperature decay + budget-exhaustion [SOVEREIGN YIELD:
+    UNRESOLVABLE PATH] + semantic symbol-scoped decompose + graceful retry (no
+    lockup, no dropped state); composed with the chaos-gauntlet (phantom-recovery,
+    no-thrash) + the LIVE dead-man self-delete drill (T+221s) + Opus-reviewed
+    OFF-byte-identical / op-never-lost / 3-independent-teardowns.
+    Hot-revert: ``export JARVIS_FAILOVER_LIFECYCLE_ENABLED=false`` -> inert
+    (stays DORMANT, today's behavior exactly)."""
+    return _enabled("JARVIS_FAILOVER_LIFECYCLE_ENABLED", "true")
 
 
 def _route() -> str:
