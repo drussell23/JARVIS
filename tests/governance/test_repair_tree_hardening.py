@@ -317,7 +317,16 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # 2. document the change in the arc memory file with explicit
     #    Phase tag + the byte-equivalence verification approach;
     # 3. include a soak validating the new behavior under cadence.
-    EXPECTED_DIGEST = "9e881fdde25ec5b1"
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix T2 (2026-06-22). _run_inner
+    # gained signature-recurrence tracking + hybrid-diff/trace assembly + a
+    # signature-driven temperature override threaded into the GENERATE call. The
+    # epistemic computation is fully wrapped in try/except and OFF byte-identical
+    # when epistemic_feedback_enabled() is False (verified by
+    # tests/governance/test_epistemic_repair_threading.py); LINEAR rollback
+    # semantics are preserved (the new fields default empty; the temperature
+    # override is None until a signature first repeats). Pin updated atomically.
+    EXPECTED_DIGEST = "8adaf3734fbb1009"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

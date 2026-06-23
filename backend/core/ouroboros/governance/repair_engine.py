@@ -330,6 +330,21 @@ def _patch_sig(diff: str) -> str:
     return patch_signature_hash(diff)
 
 
+def _epistemic_base_temp() -> float:
+    """Base sampling temperature for the T2 parametric-degeneration floor.
+
+    Defaults to ``0.2`` — the shared codegen default across the Claude / Prime /
+    DoubleWord providers (``_DW_TEMPERATURE`` default, ClaudeProvider non-thinking
+    default, PrimeProvider hardcoded). Override via ``JARVIS_EPISTEMIC_BASE_TEMP``.
+    Fail-soft: any parse error returns ``0.2``.
+    """
+    import os
+    try:
+        return float(os.environ.get("JARVIS_EPISTEMIC_BASE_TEMP", "0.2"))
+    except (ValueError, TypeError):
+        return 0.2
+
+
 # ---------------------------------------------------------------------------
 # RepairEngine
 # ---------------------------------------------------------------------------
@@ -662,6 +677,18 @@ class RepairEngine:
         repair_context = None
         seen_pairs: Set[Tuple[str, str]] = set()
         class_retry_counts: Dict[str, int] = {}
+        # Adaptive Epistemic Feedback Matrix (T2):
+        #   * ``prior_sandbox_content`` carries the in-sandbox content of the PRIOR
+        #     iteration's candidate (the last STABLE-ish source) so the hybrid
+        #     epistemic diff can show prior-stable vs current-failing.
+        #   * ``signature_seen_counts`` counts how many times each
+        #     ``failure_signature_hash`` has recurred this run; the count drives the
+        #     parametric temperature degeneration (repeated signature → lower temp).
+        #   * ``epistemic_temperature`` is the override threaded into the NEXT
+        #     iteration's GENERATE call; ``None`` until the first repeated signature.
+        prior_sandbox_content: str = ""
+        signature_seen_counts: Dict[str, int] = {}
+        epistemic_temperature: Optional[float] = None
         no_progress_streak = 0
         prev_failing_count: Optional[int] = None
         prev_failure_class: Optional[str] = None
@@ -747,6 +774,9 @@ class RepairEngine:
                     ctx, pipeline_deadline,
                     repair_context=repair_context,
                     hypothesis_seed=None,  # LINEAR FSM does not seed
+                    # T2: signature-driven temperature floor computed at the END of
+                    # the prior iteration (None until a signature first repeats).
+                    temperature=epistemic_temperature,
                 )
                 if gen_outcome.candidate is None:
                     # ──────────────────────────────────────────────────
@@ -1204,6 +1234,57 @@ class RepairEngine:
                 ctx, file_path, classification.failing_test_ids,
                 cone_depth_override=_cone_depth_override,
             )
+
+            # ----------------------------------------------------------------
+            # Adaptive Epistemic Feedback Matrix (T2) — hybrid diff + trace +
+            # signature-driven temperature floor. Fail-soft: ANY error here falls
+            # back to the legacy repair_context (empty epistemic fields, base temp)
+            # so the repair loop NEVER crashes on epistemic computation. OFF
+            # byte-identical when epistemic_feedback_enabled() is False.
+            # ----------------------------------------------------------------
+            _epistemic_diff = ""
+            _epistemic_trace = ""
+            try:
+                from backend.core.ouroboros.governance.epistemic_feedback import (
+                    epistemic_feedback_enabled,
+                    build_failure_context,
+                    temperature_for_attempt,
+                )
+                # Count the CURRENT signature's recurrence this run (1 on first sight).
+                signature_seen_counts[fail_sig] = (
+                    signature_seen_counts.get(fail_sig, 0) + 1
+                )
+                _repeated_count = signature_seen_counts[fail_sig] - 1  # 0 on first sight
+                if epistemic_feedback_enabled():
+                    # Rich context: prior STABLE candidate vs current FAILING candidate,
+                    # plus the FULL sandbox stderr (NOT the 300-char failure_summary).
+                    _full_block = build_failure_context(
+                        prior_src=prior_sandbox_content,
+                        failed_src=sandbox_content,
+                        stderr=svr.stderr,
+                        failing_tests=classification.failing_test_ids,
+                        sub_goal_label=getattr(ctx, "op_id", "") or "",
+                    )
+                    # The assembled block carries diff + trace; place it in the diff
+                    # field (rendered under EPISTEMIC DIFF) and keep the raw stderr
+                    # tail in the trace field so the prompt receives BOTH the hybrid
+                    # diff AND the full trace with clear labels.
+                    _epistemic_diff = _full_block or ""
+                    _epistemic_trace = svr.stderr or ""
+                    # Parametric degeneration: lower the temperature for the NEXT
+                    # GENERATE when this signature has recurred. _repeated_count=0 →
+                    # base temp unchanged (temperature_for_attempt returns base).
+                    _base_temp = _epistemic_base_temp()
+                    epistemic_temperature = temperature_for_attempt(
+                        _base_temp, _repeated_count,
+                    )
+                else:
+                    epistemic_temperature = None
+            except Exception:  # noqa: BLE001 — epistemic is advisory, never fatal
+                _epistemic_diff = ""
+                _epistemic_trace = ""
+                epistemic_temperature = None
+
             repair_context = RepairContext(
                 iteration=iteration,
                 max_iterations=budget.max_iterations,
@@ -1217,7 +1298,13 @@ class RepairEngine:
                 escalation_directive=(
                     pending_escalation.paradigm if pending_escalation else None
                 ),
+                prior_iteration_diff=_epistemic_diff,
+                failure_trace=_epistemic_trace,
             )
+
+            # T2: the current failing candidate becomes the PRIOR-stable source for the
+            # NEXT iteration's hybrid epistemic diff.
+            prior_sandbox_content = sandbox_content
 
             outcome = "progress" if is_progress else "no_progress"
             rec = RepairIterationRecord(
@@ -1405,6 +1492,7 @@ class RepairEngine:
         *,
         repair_context: Any,
         hypothesis_seed: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> CandidateGenerationResult:
         """Generate a single repair candidate via the prime provider.
 
@@ -1500,11 +1588,33 @@ class RepairEngine:
         _effective_timeout_s = max(
             1.0, min(_per_iter_bound, _remaining_pipeline_s),
         )
+        # Adaptive Epistemic Feedback Matrix (T2): thread the signature-driven
+        # temperature override into the provider generate call. Passed only when the
+        # caller supplied a non-None value AND it differs from the implicit provider
+        # default, so the legacy call shape (no temperature kwarg) is preserved when
+        # epistemic feedback is OFF. Fail-soft: if the provider's generate signature
+        # rejects ``temperature`` (older stub / 3rd-party provider), retry WITHOUT it
+        # so the repair loop never crashes on a kwarg mismatch.
+        async def _invoke_generate() -> Any:
+            if temperature is not None:
+                try:
+                    return await self._prime.generate(
+                        ctx, pipeline_deadline,
+                        repair_context=repair_context,
+                        temperature=temperature,
+                    )
+                except TypeError:
+                    # Provider does not accept temperature — fall back to legacy shape.
+                    return await self._prime.generate(
+                        ctx, pipeline_deadline, repair_context=repair_context,
+                    )
+            return await self._prime.generate(
+                ctx, pipeline_deadline, repair_context=repair_context,
+            )
+
         try:
             gen_result = await asyncio.wait_for(
-                self._prime.generate(
-                    ctx, pipeline_deadline, repair_context=repair_context,
-                ),
+                _invoke_generate(),
                 timeout=_effective_timeout_s,
             )
         except asyncio.CancelledError:

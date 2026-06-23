@@ -1869,3 +1869,11 @@ class RepairContext:
     # diverges (local minimum). Switches the generation paradigm (localized patch → full-method /
     # module-level rewrite). ``None`` outside a divergence → prompt byte-identical.
     escalation_directive: Optional[str] = None
+    # Adaptive Epistemic Feedback Matrix (T2): hybrid epistemic diff between the prior STABLE
+    # candidate and the current FAILING iteration, plus the FULL sandbox stderr trace (NOT the
+    # 300-char ``failure_summary`` excerpt, which stays for backward-compat). Populated by the L2
+    # repair loop only when ``epistemic_feedback_enabled()`` and the diff/trace are non-empty;
+    # both default to ``""`` so the repair prompt is byte-identical when the feature is OFF or the
+    # context could not be assembled (fail-soft). Rendered into the REPAIR MODE prompt block.
+    prior_iteration_diff: str = ""
+    failure_trace: str = ""
