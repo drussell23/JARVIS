@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 import re
 import subprocess
 import sys
@@ -196,6 +197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--repo", default="", help="owner/repo (default: gh's current).")
     p.add_argument("--sentinel-log", action="append", default=[], help="Sentinel log path(s) (repeatable).")
     p.add_argument("--out", default="", help="output markdown path (default: sovereign_pr_<n>_<ts>.md).")
+    p.add_argument("--ingest", action="store_true", help="chain epistemic_memory_ingest.py to absorb the PR lesson into .cursorrules.")
     args = p.parse_args(argv)
 
     repo = args.repo or None
@@ -223,6 +225,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     print(f"[extractor] wrote {out_path} ({len(md)} chars; PR #{number}; "
           f"{len(logs)} sentinel log(s) scanned).")
+
+    # Hook: chain the Autonomous Epistemic Memory Matrix so the PR's structural
+    # lesson is absorbed into .cursorrules. Best-effort, never fails the extract.
+    if getattr(args, "ingest", False):
+        try:
+            _ing = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "epistemic_memory_ingest.py")
+            _argv = [sys.executable, _ing, "--pr", str(number)]
+            if repo:
+                _argv += ["--repo", repo]
+            print("[extractor] -> epistemic_memory_ingest (absorbing lesson into .cursorrules)")
+            subprocess.run(_argv, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[extractor] epistemic ingest hook failed (non-fatal): {exc!r}")
     return 0
 
 

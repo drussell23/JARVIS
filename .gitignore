@@ -408,3 +408,4 @@ terraform/terraform.tfvars
 **/*.pyo
 **/.pytest_cache/
 autopsy_reports/
+.cursorrules.tmp
