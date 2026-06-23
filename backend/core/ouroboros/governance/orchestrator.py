@@ -11591,6 +11591,25 @@ class GovernedOrchestrator:
             except Exception:  # noqa: BLE001 — emission must never break the pipeline
                 logger.debug("[Orchestrator] repair-trajectory emit skipped", exc_info=True)
 
+            # Sovereign RSI Flywheel (Phase 4a): synthesize a token-dense DPO
+            # preference pair from this converged epistemic-repair trajectory and
+            # export it fire-and-forget to reactor-core's ingestor. Distinct from
+            # the emitter above: applies the Epistemic Purity gate (drops infra-
+            # caused rejections), the golden-ratio gate (both proven states), and
+            # AST-symbol isolation (token-dense, not raw full_content). Gated
+            # (JARVIS_DPO_SYNTHESIS_ENABLED, default ON), fail-soft — never
+            # affects repair/APPLY. Only runs on a resolved repair (chosen present);
+            # a yield/pivot has candidate is None and never reaches here.
+            try:
+                from backend.core.ouroboros.governance.dpo_synthesizer import (
+                    RepairTrajectory, synthesize_and_emit,
+                )
+                _dpo_traj = RepairTrajectory.from_repair(ctx, l2_result)
+                if _dpo_traj is not None:
+                    synthesize_and_emit(_dpo_traj)
+            except Exception:  # noqa: BLE001 — DPO synthesis must never break the pipeline
+                logger.debug("[Orchestrator] DPO pair synthesis skipped", exc_info=True)
+
             # Post-L2 canonical validation is architecturally broken for
             # Python candidates: test_runner.PythonAdapter.run hard-codes
             # sandbox_dir=None (see its docstring at run() line 228-237) so
