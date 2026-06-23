@@ -845,12 +845,62 @@ ScopedTargetLike = Any
 # ---------------------------------------------------------------------------
 
 
+def _bias_symbols_by_failure(
+    scoped_symbols: Tuple[str, ...],
+    failure_hint: dict,
+) -> Tuple[str, ...]:
+    """Reorder ``scoped_symbols`` so failure-locus symbols come FIRST.
+
+    A scoped symbol ref has the shape ``"file::Symbol"``. We extract the
+    ``Symbol`` tail of each ref and check whether its identifier appears in
+    the failure hint's ``stderr_tail`` (a Python identifier token match, so
+    a ``def foo`` / ``foo(`` / ``in foo`` in the traceback biases ``foo``).
+    Matched symbols are moved to the front (stable order preserved within
+    the matched and unmatched groups). Fail-soft: empty / unusable hint or
+    no match returns the input order unchanged. NEVER raises.
+    """
+    if not scoped_symbols:
+        return scoped_symbols
+    try:
+        tail = str(failure_hint.get("stderr_tail", "") or "")
+    except Exception:  # noqa: BLE001
+        return scoped_symbols
+    if not tail:
+        return scoped_symbols
+    # Tokenize the stderr tail into identifier tokens (one-time, bounded).
+    try:
+        import re as _re
+        _tokens = frozenset(_re.findall(r"[A-Za-z_][A-Za-z0-9_]*", tail))
+    except Exception:  # noqa: BLE001
+        return scoped_symbols
+    if not _tokens:
+        return scoped_symbols
+
+    def _symbol_of(ref: str) -> str:
+        # "file::Symbol" -> "Symbol"; fall back to the whole ref.
+        _r = str(ref or "")
+        return _r.rsplit("::", 1)[-1] if "::" in _r else _r
+
+    matched: list[str] = []
+    rest: list[str] = []
+    for ref in scoped_symbols:
+        sym = _symbol_of(ref)
+        if sym and sym in _tokens:
+            matched.append(ref)
+        else:
+            rest.append(ref)
+    if not matched:
+        return scoped_symbols  # no locus match — preserve original order
+    return tuple(matched + rest)
+
+
 def decompose_for_block(
     goal: Any,
     *,
     zero_coverage: bool,
     scoper: Any = None,
     compression_target: int | None = None,
+    failure_hint: dict | None = None,
 ) -> Tuple[SubGoal, ...]:
     """Decompose a GOAL for an OperationAdvisor BLOCK into topo-ordered SubGoals.
 
@@ -881,6 +931,15 @@ def decompose_for_block(
                 symbol is emitted alone with a WARNING (never silently exceeded).
                 ``None`` (default) is byte-identical to the legacy single
                 mutation sub-goal.
+        failure_hint: Adaptive Epistemic Feedback Matrix (T3 — Graceful
+                Semantic Pivot). When set, a dict ``{signature_hash,
+                stderr_tail}`` describing an UNRESOLVABLE-PATH failure. The
+                scoped symbols are REORDERED so the symbol(s) implicated by
+                the failure (names appearing in ``stderr_tail`` — e.g. a
+                failing function in the traceback) are scoped FIRST, so the
+                emitted sub-goal(s) split AT the failure locus. Fail-soft:
+                an unusable / empty hint, or any error, yields the normal
+                decomposition order (byte-identical to ``failure_hint=None``).
 
     Returns:
         Non-empty topo-ordered tuple of :class:`SubGoal` artifacts.
@@ -983,6 +1042,21 @@ def decompose_for_block(
     symbol_files, scoped_symbols, _targets_by_ref = _scoped_files_for(target_files)
     if not symbol_files:
         symbol_files = target_files or ("",)
+
+    # --- T3 failure-locus biasing ------------------------------------------
+    # When a failure_hint is supplied, reorder the scoped symbols so the
+    # symbol(s) implicated by the failure (their name appears in the stderr
+    # tail) are scoped FIRST. This makes the FIRST emitted mutation sub-goal
+    # (and, under a compression_target, the first chunk) split AT the failure
+    # locus instead of an arbitrary symbol. Fail-soft: any error or no match
+    # leaves the original order untouched (byte-identical to no hint).
+    if failure_hint:
+        try:
+            scoped_symbols = _bias_symbols_by_failure(
+                scoped_symbols, failure_hint,
+            )
+        except Exception:  # noqa: BLE001 — biasing is advisory, never fatal
+            pass
 
     # --- T3 compression-target slicing -------------------------------------
     # When a compression_target is supplied (the egress interceptor's

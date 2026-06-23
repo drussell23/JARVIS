@@ -326,7 +326,20 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # tests/governance/test_epistemic_repair_threading.py); LINEAR rollback
     # semantics are preserved (the new fields default empty; the temperature
     # override is None until a signature first repeats). Pin updated atomically.
-    EXPECTED_DIGEST = "8adaf3734fbb1009"
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix T3 — Graceful Semantic
+    # Pivot (2026-06-22). _run_inner's divergence terminal-stop (escape
+    # disabled / budget exhausted, ``_esc is None``) now consults the REAL
+    # ``pivot_verdict`` BEFORE the legacy ``_stopped``: when
+    # ``epistemic_feedback_enabled()`` AND the same failure signature persisted
+    # after the temperature degenerated to its floor, it returns a new
+    # ``L2_PIVOT`` outcome (via ``_pivoted``) carrying the signature + stderr
+    # tail so the orchestrator can decompose-further at the failure locus. The
+    # whole pivot decision is nested under ``if _efe():`` inside a try/except,
+    # so OFF byte-identical (feedback disabled → exact legacy ``_stopped``;
+    # verified by tests/governance/test_epistemic_pivot.py). Pin updated
+    # atomically.
+    EXPECTED_DIGEST = "820642969b9aa5e5"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

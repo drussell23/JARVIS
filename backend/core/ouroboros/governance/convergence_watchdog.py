@@ -269,17 +269,27 @@ def emit_sovereign_yield(
     parent_chars: int,
     child_chars: int,
     tier: str,
+    reason: str | None = None,
 ) -> None:
     """Emit a [SOVEREIGN YIELD] WARNING and best-effort SSE event. Never raises.
 
-    Log format:
+    Log format (default):
         [SOVEREIGN YIELD] op=<op_id> lineage=<lineage_id> stalled reduction
         ratio=<ratio:.3f> passes=<consecutive_stalls> -> structural weight-shed
         (tier=<tier>) parent=<parent_chars> child=<child_chars>
+
+    Adaptive Epistemic Feedback Matrix (T3): when ``reason`` is supplied the
+    label becomes ``[SOVEREIGN YIELD: <reason>]`` (e.g. ``UNRESOLVABLE_PATH``)
+    so the graceful-semantic-pivot yield is grep-distinguishable from the
+    weight-shed yield. ``reason=None`` (default) is byte-identical to the
+    legacy format. ``reason`` also rides the SSE payload when set.
     """
     try:
+        _label = (
+            f"[SOVEREIGN YIELD: {reason}]" if reason else "[SOVEREIGN YIELD]"
+        )
         logger.warning(
-            "[SOVEREIGN YIELD] op=%s lineage=%s stalled reduction ratio=%.3f"
+            _label + " op=%s lineage=%s stalled reduction ratio=%.3f"
             " passes=%d -> structural weight-shed (tier=%s) parent=%d child=%d",
             op_id,
             lineage_id,
@@ -298,17 +308,20 @@ def emit_sovereign_yield(
         from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: PLC0415
             publish_task_event,
         )
+        _payload = {
+            "lineage_id": lineage_id,
+            "ratio": ratio,
+            "consecutive_stalls": consecutive_stalls,
+            "parent_chars": parent_chars,
+            "child_chars": child_chars,
+            "tier": tier,
+        }
+        if reason:
+            _payload["reason"] = reason
         publish_task_event(
             "sovereign_yield",
             op_id,
-            {
-                "lineage_id": lineage_id,
-                "ratio": ratio,
-                "consecutive_stalls": consecutive_stalls,
-                "parent_chars": parent_chars,
-                "child_chars": child_chars,
-                "tier": tier,
-            },
+            _payload,
         )
     except Exception:  # pragma: no cover — fail-soft, SSE stack optional
         pass

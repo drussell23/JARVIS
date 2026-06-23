@@ -248,18 +248,34 @@ class RepairIterationRecord:
 class RepairResult:
     """Terminal outcome returned by RepairEngine.run() to the orchestrator.
 
-    Note: ``terminal`` is always ``"L2_CONVERGED"`` or ``"L2_STOPPED"``.
+    Note: ``terminal`` is ``"L2_CONVERGED"`` | ``"L2_STOPPED"`` | ``"L2_PIVOT"``.
     ``"L2_ABORTED"`` is never returned — ``asyncio.CancelledError`` is
     re-raised directly so the orchestrator can handle POSTMORTEM itself.
     Non-CancelledError infra errors are returned as ``"L2_STOPPED"`` with a
     structured ``stop_reason`` (e.g. ``"sandbox_infra_error:OSError"``).
+
+    Adaptive Epistemic Feedback Matrix (T3 — Graceful Semantic Pivot):
+    ``terminal == "L2_PIVOT"`` is the UNRESOLVABLE-PATH signal. It is
+    emitted ONLY when the run exhausts AND ``epistemic_feedback_enabled()``
+    AND ``pivot_verdict(repeated_count, temp_at_floor)`` is True — i.e. the
+    SAME ``failure_signature_hash`` persisted after the temperature hit the
+    floor. The orchestrator routes an ``L2_PIVOT`` to a graceful semantic
+    pivot (decompose-further at the failure locus, or HITL DLQ if atomic)
+    instead of cancelling. ``failure_signature_hash`` + ``stderr_tail``
+    ride along so the decomposer can bias its scope at the failure locus.
+    When ``epistemic_feedback_enabled()`` is False the pivot is NEVER
+    emitted — the run returns ``L2_STOPPED`` byte-identically.
     """
 
-    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"
+    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"|"L2_PIVOT"
     candidate: Optional[Dict[str, Any]]  # converged candidate dict, or None
-    stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"
+    stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"|"L2_PIVOT"
     summary: Dict[str, Any]              # key metrics for ledger payload
     iterations: Tuple[RepairIterationRecord, ...]
+    # T3 — Graceful Semantic Pivot payload (only meaningful when
+    # terminal == "L2_PIVOT"; empty strings otherwise so OFF byte-identical).
+    failure_signature_hash: str = ""
+    stderr_tail: str = ""
 
 
 @dataclass(frozen=True)
@@ -343,6 +359,36 @@ def _epistemic_base_temp() -> float:
         return float(os.environ.get("JARVIS_EPISTEMIC_BASE_TEMP", "0.2"))
     except (ValueError, TypeError):
         return 0.2
+
+
+def _env_trace_tail_chars() -> int:
+    """Max chars of stderr tail to carry on an L2_PIVOT (failure-locus hint).
+
+    Reuses ``JARVIS_EPISTEMIC_TRACE_MAX_CHARS`` (default ``2500``) — the same
+    knob ``epistemic_feedback.build_failure_context`` uses for its trace tail.
+    Fail-soft: any parse error returns ``2500``.
+    """
+    import os
+    try:
+        return int(os.environ.get("JARVIS_EPISTEMIC_TRACE_MAX_CHARS", "2500"))
+    except (ValueError, TypeError):
+        return 2500
+
+
+def _epistemic_temp_floor() -> float:
+    """The temperature floor used by the T3 graceful-semantic-pivot trigger.
+
+    Mirrors ``epistemic_feedback.temperature_for_attempt``'s
+    ``JARVIS_EPISTEMIC_TEMP_FLOOR`` (default ``0.0``). When the live
+    ``epistemic_temperature`` reaches this floor AND the same failure
+    signature persists, the run is on an UNRESOLVABLE PATH and pivots.
+    Fail-soft: any parse error returns ``0.0``.
+    """
+    import os
+    try:
+        return float(os.environ.get("JARVIS_EPISTEMIC_TEMP_FLOOR", "0.0"))
+    except (ValueError, TypeError):
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +782,41 @@ class RepairEngine:
                 stop_reason=reason,
                 summary={"iterations": iteration, "total_validation_runs": total_validation_runs},
                 iterations=tuple(records + [rec]),
+            )
+
+        def _pivoted(reason: str, sig: str, stderr_tail: str) -> RepairResult:
+            """T3 — Graceful Semantic Pivot terminal.
+
+            Emitted in place of ``_stopped`` ONLY when the run exhausts AND
+            ``epistemic_feedback_enabled()`` AND ``pivot_verdict(...)`` is
+            True (the same ``failure_signature_hash`` persisted after the
+            temperature hit the floor). Carries the failure signature + the
+            stderr tail so the orchestrator can decompose-further AT the
+            failure locus. ``terminal == "L2_PIVOT"`` is otherwise shaped
+            like ``_stopped`` so every existing consumer that only checks
+            ``L2_CONVERGED``/``L2_STOPPED`` is unaffected.
+            """
+            rec = RepairIterationRecord(
+                op_id=ctx.op_id,
+                iteration=iteration,
+                repair_state=L2State.L2_STOPPED.value,
+                outcome="stopped",
+                stop_reason=reason,
+                failure_signature_hash=sig,
+            )
+            self._emit_record(ctx.op_id, rec)
+            return RepairResult(
+                terminal="L2_PIVOT",
+                candidate=None,
+                stop_reason=reason,
+                summary={
+                    "iterations": iteration,
+                    "total_validation_runs": total_validation_runs,
+                    "pivot": "unresolvable_path",
+                },
+                iterations=tuple(records + [rec]),
+                failure_signature_hash=sig,
+                stderr_tail=stderr_tail,
             )
 
         while True:
@@ -1200,6 +1281,67 @@ class RepairEngine:
                     if diverge_escape_enabled() else None
                 )
                 if _esc is None:
+                    # ──────────────────────────────────────────────────
+                    # T3 — Graceful Semantic Pivot decision point.
+                    # The run is genuinely exhausting (oscillation /
+                    # no-progress, escape disabled or budget gone). Before
+                    # the legacy terminal stop, ask the epistemic verdict:
+                    # if the SAME failure signature has persisted AND the
+                    # parametric temperature has degenerated to its floor,
+                    # this is an UNRESOLVABLE PATH — pivot (decompose-
+                    # further at the failure locus) instead of dead-stop.
+                    # Fail-soft ABSOLUTE: any error → exact legacy _stopped.
+                    # OFF byte-identical: epistemic_feedback_enabled()==False
+                    # short-circuits to _stopped before any pivot machinery.
+                    # ──────────────────────────────────────────────────
+                    try:
+                        from backend.core.ouroboros.governance.epistemic_feedback import (
+                            epistemic_feedback_enabled as _efe,
+                            pivot_verdict as _pv,
+                        )
+                        if _efe():
+                            # repeated_signature_count: how many prior
+                            # iterations already produced THIS exact
+                            # failure signature (0 on first sight). The
+                            # current iteration's increment happens later
+                            # in the epistemic block, so .get() here is the
+                            # count of PRIOR recurrences.
+                            _repeat_for_sig = int(
+                                signature_seen_counts.get(fail_sig, 0)
+                            )
+                            # temp_at_floor: the live degenerated temperature
+                            # (set at the end of the previous iteration) has
+                            # reached the configured floor. None (iter 1, no
+                            # prior recurrence) is NOT at floor.
+                            _floor = _epistemic_temp_floor()
+                            _temp_at_floor = (
+                                epistemic_temperature is not None
+                                and float(epistemic_temperature) <= _floor
+                            )
+                            if _pv(_repeat_for_sig, _temp_at_floor):
+                                _stderr_tail = ""
+                                try:
+                                    _raw = getattr(svr, "stderr", "") or ""
+                                    _tt = _env_trace_tail_chars()
+                                    _stderr_tail = (
+                                        _raw[-_tt:] if len(_raw) > _tt else _raw
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    _stderr_tail = ""
+                                _logger.warning(
+                                    "[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
+                                    "op=%s sig=%s repeated=%d temp_at_floor=%s "
+                                    "diverged=%s -> L2_PIVOT (decompose-further "
+                                    "at failure locus)",
+                                    ctx.op_id, (fail_sig or "")[:12],
+                                    _repeat_for_sig, _temp_at_floor,
+                                    _diverged_reason,
+                                )
+                                return _pivoted(
+                                    _diverged_reason, fail_sig, _stderr_tail,
+                                )
+                    except Exception:  # noqa: BLE001 — pivot is advisory; fail to legacy
+                        pass
                     # Escape disabled or budget exhausted → terminal stop (legacy behavior).
                     return _stopped(_diverged_reason)
                 escalation_count += 1
