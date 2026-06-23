@@ -6326,18 +6326,29 @@ class GCPVMManager:
         # Configure as Spot VM with Hard Duration Limit
         # This is the "Dead Man's Switch": GCP kills the VM after max_run_duration seconds
         # even if the local script crashes or loses connectivity.
+        # Lifetime cap (auto-delete) applies to BOTH provisioning models so a node
+        # never runs unbounded. Valid range 60s..604800s.
+        max_duration_seconds = int(self.config.max_vm_lifetime_hours * 3600)
+        max_duration_seconds = max(60, min(max_duration_seconds, 604800))
         if self.config.use_spot:
-            # Calculate duration in seconds (default 3 hours = 10800s)
-            max_duration_seconds = int(self.config.max_vm_lifetime_hours * 3600)
-            
-            # Ensure duration is valid (must be between 60s and 604800s for Spot)
-            max_duration_seconds = max(60, min(max_duration_seconds, 604800))
-            
             instance.scheduling = compute_v1.Scheduling(
                 preemptible=True,
                 on_host_maintenance="TERMINATE",
                 automatic_restart=False,
                 provisioning_model="SPOT",
+                instance_termination_action="DELETE",
+                max_run_duration=compute_v1.Duration(seconds=max_duration_seconds)
+            )
+        else:
+            # ON-DEMAND (STANDARD): no preemption -> an UNINTERRUPTED window for a
+            # deep convergence FSM (Spot was preempted ~33min into a soak). Keep the
+            # max_run_duration auto-delete so the node is still cost-bounded; live-
+            # migrate on host maintenance instead of terminating.
+            instance.scheduling = compute_v1.Scheduling(
+                preemptible=False,
+                on_host_maintenance="MIGRATE",
+                automatic_restart=True,
+                provisioning_model="STANDARD",
                 instance_termination_action="DELETE",
                 max_run_duration=compute_v1.Duration(seconds=max_duration_seconds)
             )
