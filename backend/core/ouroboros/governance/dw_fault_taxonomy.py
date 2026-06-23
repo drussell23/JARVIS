@@ -149,8 +149,13 @@ def _carries_batch_retrieval_timeout(exc: BaseException) -> bool:
     """
     try:
         # Shape 1: the bare DoublewordInfraError (or any exc whose own message is
-        # the batch-retrieval marker).
-        if type(exc).__name__ == "DoublewordInfraError":
+        # the batch-retrieval marker). Subclasses count too -- the Sovereign
+        # Temporal Breaker raises ``SovereignBatchTimeoutError`` (a
+        # ``DoublewordInfraError`` subclass) for a perpetual in_progress batch;
+        # walk the MRO class names so the breaker's discrete error is recognised
+        # WITHOUT importing the provider (this taxonomy stays dependency-free).
+        _mro_names = {c.__name__ for c in type(exc).__mro__}
+        if "DoublewordInfraError" in _mro_names:
             if _BATCH_RETRIEVAL_TIMEOUT_MARKER in str(exc).lower():
                 return True
         # Shape 2: the wrapped all_providers_exhausted RuntimeError. The wrapper's

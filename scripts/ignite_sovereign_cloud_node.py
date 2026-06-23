@@ -76,7 +76,11 @@ async def _ignite(args: argparse.Namespace) -> int:
     cfg.zone = args.zone
     cfg.region = args.zone.rsplit("-", 1)[0]
     cfg.machine_type = args.machine
-    cfg.use_spot = True
+    # ON-DEMAND by default: Spot instances have no guaranteed lifetime and were
+    # preempted ~33min into a convergence soak (before the FSM could play out the
+    # batch-wait + lane escalation). A deep, long-running convergence FSM needs an
+    # UNINTERRUPTED window. ``--spot`` opts back into the cheaper preemptible node.
+    cfg.use_spot = bool(getattr(args, "spot", False))
     cfg.use_golden_image = False
     cfg.use_container = False
     cfg.boot_disk_size_gb = args.disk_gb
@@ -84,7 +88,8 @@ async def _ignite(args: argparse.Namespace) -> int:
     cfg.startup_script_path = str(_STARTUP_SCRIPT)
 
     print("🐍 Sovereign Cloud Ignition")
-    print(f"   project={cfg.project_id} zone={cfg.zone} machine={cfg.machine_type} (SPOT)")
+    print(f"   project={cfg.project_id} zone={cfg.zone} machine={cfg.machine_type} "
+          f"({'SPOT' if cfg.use_spot else 'ON-DEMAND'})")
     print(f"   disk={cfg.boot_disk_size_gb}GB max_lifetime={cfg.max_vm_lifetime_hours}h")
     print(f"   pin={args.pin}   DW key={_mask(dw_key)}")
     print(f"   startup_script={_STARTUP_SCRIPT.name}")
@@ -185,6 +190,9 @@ def main() -> int:
                    help="arm the autonomic Sovereign Cognitive Graduation Crucible cadence")
     p.add_argument("--no-sentinel", action="store_true",
                    help="do NOT auto-spawn the Sovereign Telemetry Sentinel daemon")
+    p.add_argument("--spot", action="store_true",
+                   help="use a preemptible SPOT node (cheaper, no guaranteed lifetime); "
+                        "default is ON-DEMAND for uninterrupted convergence soaks")
     args = p.parse_args()
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))

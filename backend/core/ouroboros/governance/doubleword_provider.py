@@ -1143,6 +1143,73 @@ class DoublewordInfraError(Exception):
         return self.status_code == 0
 
 
+class SovereignBatchTimeoutError(DoublewordInfraError):
+    """Sovereign Temporal Breaker — our OWN temporal boundary on a wedged batch.
+
+    A DW batch can return ``200 OK`` with ``status="in_progress"`` FOREVER (DW
+    accepts the batch but never finalizes it). The existing lane escalation is
+    ERROR-BOUND: it only fires when a poll RAISES ``DoublewordInfraError("Batch
+    retrieval failed")``. A perpetual ``in_progress`` never raises -> the FSM
+    waits forever (the node stalls). This error is raised by
+    ``_adaptive_poll_batch`` when a batch stays ``in_progress`` past
+    ``JARVIS_DW_BATCH_TIMEOUT_S`` so the lane-escalation predicate
+    (``dw_fault_taxonomy.is_batch_lane_retrieval_timeout`` Shape 1) catches it
+    and rotates the op off the wedged batch lane onto realtime.
+
+    The message MUST contain "Batch retrieval failed" (Shape 1 marker) and the
+    class subclasses ``DoublewordInfraError`` so the predicate's class-ancestry
+    walk recognises it. ``status_code=0`` -> non-HTTP (our-side temporal trip,
+    never trips a vendor breaker).
+    """
+
+    def __init__(
+        self,
+        elapsed_s: float = 0.0,
+        deadline_s: float = 0.0,
+        *,
+        model_id: str = "",
+    ) -> None:
+        super().__init__(
+            "Batch retrieval failed: sovereign temporal breaker "
+            "(in_progress exceeded JARVIS_DW_BATCH_TIMEOUT_S; "
+            f"elapsed={elapsed_s:.1f}s deadline={deadline_s:.1f}s)",
+            status_code=0,
+            model_id=model_id,
+        )
+        self.elapsed_s = elapsed_s
+        self.deadline_s = deadline_s
+
+
+def _dw_temporal_breaker_enabled() -> bool:
+    """Sovereign Temporal Breaker master gate. Default TRUE.
+
+    OFF -> exact legacy behavior (poll to ``_DW_MAX_WAIT_S``, byte-identical;
+    a perpetual in_progress falls through to the legacy timeout -> None).
+    NEVER raises (fail-soft -> enabled).
+    """
+    try:
+        return os.environ.get(
+            "JARVIS_DW_TEMPORAL_BREAKER_ENABLED", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: default enabled
+        return True
+
+
+def _batch_temporal_deadline_s() -> float:
+    """TIGHTER, error-emitting temporal bound for an in_progress batch.
+
+    Reads ``JARVIS_DW_BATCH_TIMEOUT_S`` (Slice 43, default 300s) — the SAME
+    env the candidate_generator's OUTER GENERATE deadline derives from, so the
+    two stay coherent. This is a tighter inner bound than ``_DW_MAX_WAIT_S``
+    (the outer poll ceiling, which remains the legacy backstop). A bad/missing
+    env -> default; NEVER raises (fail-soft -> legacy default).
+    """
+    try:
+        return float(os.environ.get("JARVIS_DW_BATCH_TIMEOUT_S", "300"))
+    except Exception:  # noqa: BLE001 — fail-soft: default
+        return 300.0
+
+
 @dataclass
 class DoublewordStats:
     """Cumulative stats for observability (Pillar 7)."""
@@ -4707,6 +4774,19 @@ class DoublewordProvider:
         """
         deadline = time.monotonic() + _DW_MAX_WAIT_S
         attempt = 0
+        # Sovereign Temporal Breaker — wall-clock of batch poll initiation.
+        # The TIGHTER inner bound (_batch_temporal_deadline_s, default 300s
+        # from JARVIS_DW_BATCH_TIMEOUT_S) emits a DISCRETE error so the lane
+        # escalation catches it; the outer _DW_MAX_WAIT_S deadline above is
+        # the legacy backstop and is NOT removed. Resolved fail-soft.
+        try:
+            _batch_started = time.monotonic()
+            _temporal_breaker_on = _dw_temporal_breaker_enabled()
+            _temporal_deadline_s = _batch_temporal_deadline_s()
+        except Exception:  # noqa: BLE001 — fail-soft: legacy behavior
+            _batch_started = time.monotonic()
+            _temporal_breaker_on = False
+            _temporal_deadline_s = 0.0
 
         while time.monotonic() < deadline:
             # Slice 37 Phase 2 — per-iteration cleanup discipline.
@@ -4767,8 +4847,43 @@ class DoublewordProvider:
                             batch_id, status,
                         )
                         return None
+                    # Still in_progress — Sovereign Temporal Breaker check
+                    # BEFORE the adaptive backoff. A perpetual in_progress
+                    # never raises on its own, so we enforce our OWN temporal
+                    # boundary: past JARVIS_DW_BATCH_TIMEOUT_S -> raise a
+                    # DISCRETE SovereignBatchTimeoutError. It is re-raised by
+                    # the dedicated guard below (NOT swallowed by the generic
+                    # ``except Exception`` that continues the loop) so it
+                    # propagates up through poll_and_retrieve ->
+                    # _generate_via_batch -> candidate_generator where the
+                    # lane-escalation predicate runs.
+                    if _temporal_breaker_on:
+                        try:
+                            _elapsed = time.monotonic() - _batch_started
+                            _over_deadline = _elapsed > _temporal_deadline_s
+                        except Exception:  # noqa: BLE001 — fail-soft: legacy
+                            _over_deadline = False
+                        if _over_deadline:
+                            logger.error(
+                                "[DoublewordProvider] Batch %s sovereign "
+                                "temporal breaker tripped: in_progress "
+                                "elapsed=%.1fs > deadline=%.1fs "
+                                "(JARVIS_DW_BATCH_TIMEOUT_S)",
+                                batch_id, _elapsed, _temporal_deadline_s,
+                            )
+                            raise SovereignBatchTimeoutError(
+                                elapsed_s=_elapsed,
+                                deadline_s=_temporal_deadline_s,
+                                model_id=getattr(self, "_model", "") or "",
+                            )
                     # Still in_progress — adaptive backoff
             except asyncio.CancelledError:
+                raise
+            except SovereignBatchTimeoutError:
+                # Sovereign Temporal Breaker — re-raise like CancelledError so
+                # the discrete temporal-trip error ESCAPES the swallowing
+                # ``except Exception`` below (which would otherwise continue the
+                # poll loop and re-establish the perpetual-in_progress stall).
                 raise
             except Exception as exc:
                 _is_network = "connect" in str(exc).lower() or "timeout" in str(exc).lower()
