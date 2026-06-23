@@ -54,6 +54,7 @@ JARVIS_JPRIME_MIN_UPTIME_S          default 300.0
 JARVIS_HANDBACK_COOLDOWN_S          default 300.0
 JARVIS_JPRIME_FAILOVER_PORT         default 11434
 JARVIS_FAILOVER_TICK_S              default 5.0 (run() loop base cadence)
+JARVIS_FAILOVER_AWAKEN_TIMEOUT_S    default 600.0 (AWAKENING self-heal deadline)
 GCP_PROJECT_ID / GCP_ZONE / etc.    awaken target identity (gcloud wrapper)
 
 Fail-soft: every provisioning / probe call is wrapped. An awaken failure -> log
@@ -148,6 +149,10 @@ def _failover_port() -> int:
 
 def _tick_s() -> float:
     return max(0.1, _env_float("JARVIS_FAILOVER_TICK_S", 5.0))
+
+
+def _awaken_timeout_s() -> float:
+    return max(1.0, _env_float("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", 600.0))
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +376,7 @@ class FailoverLifecycleController:
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
+        self._awakening_started_at: Optional[float] = None  # set on -> AWAKENING
         self._serving_started_at: Optional[float] = None  # set on -> SERVING
         self._last_probe_at: Optional[float] = None
         self._last_handback_at: Optional[float] = None  # cooldown anchor
@@ -671,6 +677,7 @@ class FailoverLifecycleController:
 
         # AWAKEN: build deadman startup-script, spin up the node.
         self._state = FailoverState.AWAKENING
+        self._awakening_started_at = now
         self._recovered_streak = 0
         self._probe_trajectory = []
         await self._do_awaken()
@@ -688,10 +695,12 @@ class FailoverLifecycleController:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FailoverLifecycle] awaken raised -- stay DORMANT err=%r", exc)
             self._state = FailoverState.DORMANT
+            self._awakening_started_at = None
             return
         if not ok:
             logger.warning("[FailoverLifecycle] awaken returned falsy -- revert DORMANT")
             self._state = FailoverState.DORMANT
+            self._awakening_started_at = None
             return
         self._endpoint = self._build_endpoint()
         logger.info("[FailoverLifecycle] AWAKENING node endpoint=%s", self._endpoint)
@@ -703,6 +712,35 @@ class FailoverLifecycleController:
         return build_deadman_startup_script(port=_failover_port())
 
     async def _tick_awakening(self, *, now: float) -> None:
+        # AWAKENING deadline: if the node never becomes ready within the timeout,
+        # proactively tear it down and revert to DORMANT + arm the cooldown so we
+        # do not immediately retry-storm the same wedged image.
+        awakening_started = self._awakening_started_at
+        if awakening_started is not None:
+            elapsed = now - awakening_started
+            if elapsed > _awaken_timeout_s():
+                logger.warning(
+                    "[FailoverLifecycle] AWAKENING timed out after %.1fs -- "
+                    "node never became ready, tearing down + reverting to DORMANT",
+                    elapsed,
+                )
+                # Proactive teardown (fail-soft -- dead-man's switch is the backstop).
+                try:
+                    await self._maybe_await(self._vm_delete_fn)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[FailoverLifecycle] AWAKENING timeout vm_delete fail-soft "
+                        "err=%r -- reverting DORMANT anyway (Dead-Man's Switch backstop)",
+                        exc,
+                    )
+                # Revert to DORMANT + arm cooldown (re-use handback cooldown anchor
+                # so the same anti-thrash window blocks an immediate re-awaken).
+                self._state = FailoverState.DORMANT
+                self._awakening_started_at = None
+                self._endpoint = None
+                self._last_handback_at = now
+                return
+
         # Observed ensure-ready gate: only -> SERVING when the node answers.
         endpoint = self._endpoint or self._build_endpoint()
         try:
@@ -712,6 +750,7 @@ class FailoverLifecycleController:
             ready = False
         if not ready:
             return  # keep waiting; next tick re-probes (fail-soft).
+        self._awakening_started_at = None
         self._state = FailoverState.SERVING
         self._serving_started_at = now
         self._last_probe_at = None
@@ -839,6 +878,7 @@ class FailoverLifecycleController:
 
         # 4. DORMANT + arm anti-thrash cooldown.
         self._state = FailoverState.DORMANT
+        self._awakening_started_at = None
         self._serving_started_at = None
         self._last_probe_at = None
         self._recovered_streak = 0

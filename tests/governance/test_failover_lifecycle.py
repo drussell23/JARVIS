@@ -503,6 +503,130 @@ async def test_no_awaken_without_global_outage(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# AWAKENING timeout: proactive teardown + DORMANT revert + cooldown
+# ---------------------------------------------------------------------------
+
+async def test_awakening_timeout_triggers_delete_and_dormant(monkeypatch):
+    """AWAKENING that never becomes ready -> after timeout: vm_delete_fn called,
+    state reverts to DORMANT, cooldown is armed (last_handback_at set)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", "30")
+    clock = FakeClock()
+    delete_calls = []
+    awaken_calls = []
+
+    ctrl = _make_ctrl(
+        clock,
+        vm_awaken_fn=lambda *, startup_script: awaken_calls.append(1) or True,
+        vm_delete_fn=lambda: delete_calls.append(1) or True,
+        # node is NEVER ready
+        node_ready_fn=lambda endpoint: False,
+    )
+    monkeypatch.setattr(ctrl, "_get_forecast",
+                        lambda: _fake_forecast("HIGH", p50=300.0))
+    _fill_outage()
+
+    # First tick: DORMANT -> AWAKENING (awaken_fn succeeds).
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.AWAKENING
+    assert len(awaken_calls) == 1
+    assert delete_calls == []
+
+    # Ticks within the timeout: stays AWAKENING.
+    clock.advance(25.0)
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.AWAKENING
+    assert delete_calls == []
+
+    # Advance past the timeout (30s).
+    clock.advance(10.0)  # total elapsed from awakening_started_at = 35s > 30s
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.DORMANT
+    assert len(delete_calls) == 1
+    # Cooldown anchor must be set so the anti-thrash window blocks re-awaken.
+    assert ctrl._last_handback_at is not None
+
+
+async def test_awakening_ready_before_timeout_no_premature_teardown(monkeypatch):
+    """AWAKENING that becomes ready BEFORE the timeout -> transitions to SERVING
+    normally without calling vm_delete_fn."""
+    monkeypatch.setenv("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", "300")
+    clock = FakeClock()
+    delete_calls = []
+    ready_state = {"ready": False}
+
+    ctrl = _make_ctrl(
+        clock,
+        vm_delete_fn=lambda: delete_calls.append(1) or True,
+        node_ready_fn=lambda endpoint: ready_state["ready"],
+    )
+    monkeypatch.setattr(ctrl, "_get_forecast",
+                        lambda: _fake_forecast("HIGH", p50=300.0))
+    _fill_outage()
+
+    await ctrl.tick()  # -> AWAKENING
+    assert ctrl.state == FailoverState.AWAKENING
+
+    # Node becomes ready at 60s, well under the 300s timeout.
+    clock.advance(60.0)
+    ready_state["ready"] = True
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.SERVING
+    assert delete_calls == []  # no premature teardown
+
+
+async def test_awakening_timeout_env_tunable(monkeypatch):
+    """JARVIS_FAILOVER_AWAKEN_TIMEOUT_S controls the deadline exactly."""
+    monkeypatch.setenv("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", "60")
+    clock = FakeClock()
+    delete_calls = []
+
+    ctrl = _make_ctrl(
+        clock,
+        vm_delete_fn=lambda: delete_calls.append(1) or True,
+        node_ready_fn=lambda endpoint: False,
+    )
+    monkeypatch.setattr(ctrl, "_get_forecast",
+                        lambda: _fake_forecast("HIGH", p50=300.0))
+    _fill_outage()
+
+    await ctrl.tick()  # -> AWAKENING
+    assert ctrl.state == FailoverState.AWAKENING
+
+    # At exactly 60s elapsed the timeout should fire (elapsed > 60 at 60.1).
+    clock.advance(60.5)
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.DORMANT
+    assert len(delete_calls) == 1
+
+
+async def test_awakening_timeout_delete_raises_still_reverts_dormant(monkeypatch):
+    """If vm_delete_fn raises during AWAKENING timeout, state still reverts to
+    DORMANT (fail-soft -- Dead-Man's Switch remains the cost backstop)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", "30")
+    clock = FakeClock()
+
+    def del_boom():
+        raise RuntimeError("delete exploded during awakening timeout")
+
+    ctrl = _make_ctrl(
+        clock,
+        vm_delete_fn=del_boom,
+        node_ready_fn=lambda endpoint: False,
+    )
+    monkeypatch.setattr(ctrl, "_get_forecast",
+                        lambda: _fake_forecast("HIGH", p50=300.0))
+    _fill_outage()
+
+    await ctrl.tick()  # -> AWAKENING
+    assert ctrl.state == FailoverState.AWAKENING
+
+    clock.advance(35.0)
+    # Must not raise; must still revert to DORMANT despite delete failure.
+    await ctrl.tick()
+    assert ctrl.state == FailoverState.DORMANT
+
+
+# ---------------------------------------------------------------------------
 # Singleton + public API surface
 # ---------------------------------------------------------------------------
 
