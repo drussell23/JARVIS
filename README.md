@@ -330,6 +330,12 @@ Deterministic post-APPLY hook. When the agentic layer modifies `requirements.txt
 
 ### Ouroboros + Venom: The Proactive Autonomous Developer (O+V)
 
+<p align="center">
+  <img src="docs/images/ov-logo.jpeg" alt="Ouroboros + Venom (O+V) — the autonomous self-development engine" width="480">
+</p>
+
+<p align="center"><em>O+V — the Ouroboros serpent (the self-improvement loop) encircling the Venom &ldquo;V&rdquo; (the agentic tool engine).</em></p>
+
 **The Paradigm Shift: Proactive, Not Reactive**
 
 Traditional AI coding assistants (Claude Code, Cursor, Copilot) are *reactive* -- they wait for a human to type a prompt, then respond. Ouroboros + Venom (O+V) inverts this relationship. O+V is a **proactive autonomous developer** that continuously explores the codebase, detects improvement opportunities through 16 sensors, synthesizes patches, validates them, and applies them -- all without human intervention unless the severity of the change demands it.
