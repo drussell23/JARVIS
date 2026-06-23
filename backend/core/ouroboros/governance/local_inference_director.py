@@ -275,6 +275,37 @@ class LocalPrimeClient:
             tokens_used=lc.output_tokens,
         )
 
+    async def warmup(self, *, timeout_s: float) -> bool:
+        """Force model weights into VRAM via a minimal 1-token generation.
+
+        Fires a lightweight dummy generation (prompt "warmup", num_predict/
+        max_tokens 1, temperature 0.0) at the configured endpoint, bounded by
+        asyncio.wait_for(timeout_s). Returns True on a successful completion,
+        False on timeout or any error. Fail-soft -- never raises.
+
+        This is the cold-load forcing call: awaiting it guarantees the model is
+        resident in VRAM before the first real Sovereign generation clock starts.
+        Reusable by the FSM AWAKENING gate and the soak harness.
+        """
+        async def _do_warmup() -> bool:
+            sess = await self._ensure_session()
+            url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
+            body = {
+                "model": self._cfg.model_name,
+                "messages": [{"role": "user", "content": "warmup"}],
+                "max_tokens": 1,
+                "num_predict": 1,
+                "temperature": 0.0,
+            }
+            async with sess.post(url, json=body) as resp:
+                await resp.json()
+            return True
+
+        try:
+            return await asyncio.wait_for(_do_warmup(), timeout=timeout_s)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001 -- fail-soft
+            return False
+
     async def _check_health(self) -> Any:
         """Drop-in PrimeClient._check_health -> PrimeStatus (AVAILABLE iff Ollama reachable)."""
         from backend.core.prime_client import PrimeStatus

@@ -155,6 +155,16 @@ def _awaken_timeout_s() -> float:
     return max(1.0, _env_float("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", 600.0))
 
 
+def _warmup_enabled() -> bool:
+    """VRAM pre-warm gate. Default TRUE -- OFF -> straight to SERVING (legacy)."""
+    return _enabled("JARVIS_FAILOVER_WARMUP_ENABLED", "true")
+
+
+def _warmup_timeout_s() -> float:
+    """Cold-load budget for the dummy generation. Distinct from per-op clock."""
+    return max(1.0, _env_float("JARVIS_FAILOVER_WARMUP_TIMEOUT_S", 180.0))
+
+
 # ---------------------------------------------------------------------------
 # FailoverState
 # ---------------------------------------------------------------------------
@@ -355,6 +365,7 @@ class FailoverLifecycleController:
         clock_fn: Optional[Callable[[], float]] = None,
         route: Optional[str] = None,
         on_serving_fn: Optional[Callable[[], Awaitable[Any]]] = None,
+        warmup_fn: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -362,6 +373,10 @@ class FailoverLifecycleController:
         self._node_ready_fn = node_ready_fn or _default_node_ready_fn
         self._clock_fn = clock_fn or _default_clock_fn
         self._route = route or _route()
+        # VRAM pre-warm boundary (Phase 3b+). Injectable for tests. Default:
+        # construct a LocalPrimeClient pointed at jprime_endpoint() and call
+        # warmup(timeout_s=_warmup_timeout_s()). None defers to _default_warmup_fn.
+        self._warmup_fn = warmup_fn  # None -> default built lazily in _tick_awakening
         # Phase 3c -- DORMANT/AWAKENING -> SERVING re-entry hook. Fired once on
         # the transition into SERVING so the Cryo-DLQ ops sealed during the
         # outage can be drained back through intake (which re-routes them to
@@ -531,6 +546,38 @@ class FailoverLifecycleController:
         host = _env_str("JARVIS_FAILOVER_NODE_HOST", _GCLOUD_NODE_NAME)
         port = _failover_port()
         return "http://{}:{}".format(host, port)
+
+    def _build_default_warmup_fn(self) -> Callable[[], Awaitable[bool]]:
+        """Build the default warmup callable: LocalPrimeClient pointed at
+        the awakened endpoint, calling warmup(timeout_s=_warmup_timeout_s()).
+
+        Built lazily here (not in __init__) so the endpoint is known and the
+        local_inference_director import only happens when needed (OFF path
+        never touches this). Returns an async callable -> bool.
+        """
+        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+            LocalConfig,
+            LocalPrimeClient,
+        )
+        endpoint = self._endpoint or self._build_endpoint()
+        timeout = _warmup_timeout_s()
+
+        import dataclasses  # noqa: PLC0415
+        # Build a config that targets the awakened node's base URL.
+        base_cfg = LocalConfig.from_env()
+        node_cfg = dataclasses.replace(base_cfg, base_url=endpoint)
+        client = LocalPrimeClient(node_cfg)
+
+        async def _warmup() -> bool:
+            try:
+                return await client.warmup(timeout_s=timeout)
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return _warmup
 
     # ------------------------------------------------------------------
     # Forecast helpers
@@ -750,6 +797,30 @@ class FailoverLifecycleController:
             ready = False
         if not ready:
             return  # keep waiting; next tick re-probes (fail-soft).
+
+        # VRAM pre-warm gate (Phase 3b+): after the node transport is up but
+        # BEFORE transitioning to SERVING, fire a lightweight dummy generation
+        # to force model weights into VRAM. The awaited completion IS the
+        # readiness signal -- no arbitrary sleep. Fail-soft: if warmup times
+        # out or errors, log a warning and proceed to SERVING anyway (the outer
+        # AWAKENING deadline is still the hard bound; we never deadlock here).
+        if _warmup_enabled():
+            warmup_ok = False
+            try:
+                warmup_fn = self._warmup_fn or self._build_default_warmup_fn()
+                warmup_ok = bool(await self._maybe_await(warmup_fn))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[FailoverLifecycle] warmup raised fail-soft err=%r "
+                    "-- proceeding to SERVING (first op may be cold)", exc,
+                )
+            if not warmup_ok:
+                logger.warning(
+                    "[FailoverLifecycle] warmup did not confirm within %.0fs "
+                    "-- proceeding to SERVING (first op may be cold)",
+                    _warmup_timeout_s(),
+                )
+
         self._awakening_started_at = None
         self._state = FailoverState.SERVING
         self._serving_started_at = now
