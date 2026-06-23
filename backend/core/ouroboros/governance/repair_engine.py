@@ -391,6 +391,29 @@ def _epistemic_temp_floor() -> float:
         return 0.0
 
 
+def _epistemic_temp_floor_epsilon() -> float:
+    """Floor-band tolerance for the T3 graceful-semantic-pivot trigger.
+
+    The parametric temperature decays geometrically
+    (``temperature_for_attempt`` = ``max(floor, base * decay**n)``), so under
+    the shipping defaults (base ``0.2``, decay ``0.5``, floor ``0.0``) it is
+    ALWAYS strictly greater than the ``0.0`` floor (0.2, 0.1, 0.05, 0.025 ...)
+    and never EQUALS it. A strict ``temp <= floor`` test would therefore make
+    the pivot dead-by-default. This epsilon widens the floor into a BAND so the
+    temperature is treated as "at floor" once it has decayed into the band
+    (``temp <= floor + epsilon``), making the pivot reachable under defaults.
+    Env: ``JARVIS_EPISTEMIC_TEMP_FLOOR_EPSILON`` (default ``0.06``). Fail-soft:
+    any parse error returns ``0.06``.
+    """
+    import os
+    try:
+        return float(
+            os.environ.get("JARVIS_EPISTEMIC_TEMP_FLOOR_EPSILON", "0.06")
+        )
+    except (ValueError, TypeError):
+        return 0.06
+
+
 # ---------------------------------------------------------------------------
 # RepairEngine
 # ---------------------------------------------------------------------------
@@ -1314,9 +1337,18 @@ class RepairEngine:
                             # reached the configured floor. None (iter 1, no
                             # prior recurrence) is NOT at floor.
                             _floor = _epistemic_temp_floor()
+                            _floor_epsilon = _epistemic_temp_floor_epsilon()
+                            # Floor-RELATIVE band: the geometric temperature
+                            # decay is always strictly > a 0.0 floor, so a
+                            # strict ``<= floor`` test would make the pivot
+                            # dead-by-default. Treat the temperature as "at
+                            # floor" once it has decayed into the band
+                            # ``[floor, floor + epsilon]`` so the pivot becomes
+                            # reachable under the shipping defaults.
                             _temp_at_floor = (
                                 epistemic_temperature is not None
-                                and float(epistemic_temperature) <= _floor
+                                and float(epistemic_temperature)
+                                <= _floor + _floor_epsilon
                             )
                             if _pv(_repeat_for_sig, _temp_at_floor):
                                 _stderr_tail = ""

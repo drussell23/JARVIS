@@ -10660,6 +10660,29 @@ class GovernedOrchestrator:
                                         "[Orchestrator] Visual VERIFY L2 apply "
                                         "error: %s", _vv_apply_exc,
                                     )
+                            elif _vv_directive[0] == "l2_pivot":
+                                # T3 -- Graceful Semantic Pivot in the Visual
+                                # VERIFY phase. Mirror the VERIFY consumer:
+                                # route through the shared pivot handler
+                                # (decompose-further at the failure locus or
+                                # HITL DLQ) and return its terminal ctx so an
+                                # unresolvable op is NOT mis-marked COMPLETE.
+                                # DAG-preserving; OFF byte-identical (engine
+                                # only emits L2_PIVOT when epistemic feedback
+                                # is enabled).
+                                _vv_pivot_sig = (
+                                    _vv_directive[2]
+                                    if len(_vv_directive) > 2 else ""
+                                )
+                                _vv_pivot_tail = (
+                                    _vv_directive[3]
+                                    if len(_vv_directive) > 3 else ""
+                                )
+                                ctx = await self._handle_l2_pivot(
+                                    _vv_directive[1],
+                                    _vv_pivot_sig, _vv_pivot_tail,
+                                )
+                                return ctx
                             elif _vv_directive[0] in ("cancel", "fatal"):
                                 # L2 escaped — inherit the terminal ctx.
                                 ctx = _vv_directive[1]
