@@ -224,7 +224,10 @@ def quarantine_op(ctx: Any, *, route: str, telemetry: dict) -> bool:
                 parent_chars=0,
                 child_chars=0,
                 tier="provider",
-                reason="UPSTREAM_QUARANTINE",
+                # Space form so the emitted marker matches the documented/grepped
+                # [SOVEREIGN YIELD: UPSTREAM QUARANTINE] (parity with LANE COLLAPSE /
+                # UNRESOLVABLE PATH and the Sentinel/watcher patterns).
+                reason="UPSTREAM QUARANTINE",
             )
         except Exception:
             logger.debug(
