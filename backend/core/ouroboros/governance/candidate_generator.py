@@ -78,6 +78,17 @@ from backend.core.ouroboros.governance.provider_quarantine import (
     quarantine_op,
 )
 
+# Phase 3c -- Sovereign Provider Failover Lifecycle: seamless DAG re-entry.
+# Top import is cycle-safe -- failover_lifecycle imports only stdlib +
+# intake_dlq (stdlib leaf) at module-import time; everything else (forecaster,
+# quarantine gradient, intake router) is lazy. Verified via
+# `python3 -c "import ...candidate_generator"`. Bound as module attributes so
+# the seam is monkeypatchable in tests.
+from backend.core.ouroboros.governance.failover_lifecycle import (
+    get_failover_controller,
+    lifecycle_enabled,
+)
+
 # LR3 terminal sentinel: the Information-Gain Governor's deadlock-override
 # failure (raised inside the Venom tool loop). It MUST propagate through every
 # broad-catch failback site below UNRECLASSIFIED so the orchestrator's
@@ -3739,6 +3750,62 @@ class CandidateGenerator:
     # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
 
+    async def _failover_local_dispatch(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        endpoint: str,
+    ) -> Optional[GenerationResult]:
+        """Phase 3c -- run generation through the LocalPrimeClient at *endpoint*.
+
+        Builds a ``PrimeProvider`` wrapping a ``LocalPrimeClient`` pointed at the
+        awakened J-Prime node's OpenAI-compatible endpoint and calls its
+        ``.generate(context, deadline)``. The PrimeProvider seat produces the
+        exact ``GenerationResult`` shape the dispatch returns, so APPLY/VERIFY
+        downstream is byte-identical.
+
+        Reuses the existing PrimeProvider seat + LocalPrimeClient -- NO new
+        provider. The client is bound at the endpoint via ``LocalConfig`` (the
+        ``base_url`` override); nothing is hardcoded. Bounded by the op's own
+        remaining budget. Returns the ``GenerationResult`` on success or ``None``
+        to fall through to the DW path (the caller treats both empty + None as
+        fall-through). Fail-soft -- the caller's try/except is the final net.
+        """
+        import dataclasses as _f3c_dc
+
+        from backend.core.ouroboros.governance.local_inference_director import (
+            LocalConfig as _F3cLocalConfig,
+            LocalPrimeClient as _F3cLocalPrimeClient,
+        )
+        from backend.core.ouroboros.governance.providers import (
+            PrimeProvider as _F3cPrimeProvider,
+        )
+
+        # Point a LocalConfig at the awakened endpoint (base_url override).
+        # All other knobs read from env via from_env() -> nothing hardcoded.
+        _cfg = _f3c_dc.replace(
+            _F3cLocalConfig.from_env(), base_url=endpoint,
+        )
+        _client = _F3cLocalPrimeClient(_cfg)
+        try:
+            _provider = _F3cPrimeProvider(
+                _client,
+                repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+            )
+            remaining = self._remaining_seconds(deadline)
+            if remaining <= 0.0:
+                return None
+            return await asyncio.wait_for(
+                _provider.generate(context, deadline),
+                timeout=remaining,
+            )
+        finally:
+            # Release the pooled aiohttp session (zero hanging FDs). Best-effort.
+            try:
+                await _client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
     async def _dispatch_via_sentinel(
         self,
         context: OperationContext,
@@ -3770,6 +3837,52 @@ class CandidateGenerator:
             handled by the existing ``_generate_immediate`` dispatcher
             below).
         """
+        # ── Phase 3c — Sovereign Failover DAG re-entry (THE seam) ──────────
+        # When the Failover FSM is SERVING (J-Prime warm at its :11434
+        # endpoint), generation re-enters through the LocalPrimeClient
+        # (Tier-2 self-hosted), BYPASSING the DoubleWord sentinel entirely.
+        # This is the single chokepoint every DW dispatch (Slice-23 sentinel
+        # activation AND the immortal re-queue recursion) funnels through, so
+        # one branch here re-routes all of them.
+        #
+        # Byte-identical when OFF: ``lifecycle_enabled()`` is false by default
+        # -> ``is_jprime_serving()`` is always false -> this branch is never
+        # taken -> the legacy DW path below runs unchanged.
+        #
+        # Fail-soft ABSOLUTE: if the local route errors (endpoint missing,
+        # LocalPrimeClient raises, empty result), we log + fall through to the
+        # normal DW path -- the op is NEVER lost.
+        try:
+            if lifecycle_enabled() and get_failover_controller().is_jprime_serving():
+                _ep = get_failover_controller().jprime_endpoint()
+                if _ep:
+                    _local_result = await self._failover_local_dispatch(
+                        context, deadline, _ep,
+                    )
+                    if _local_result is not None and len(
+                        getattr(_local_result, "candidates", ()) or ()
+                    ) > 0:
+                        logger.info(
+                            "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime "
+                            "SERVING -> routed generation to LocalPrimeClient "
+                            "endpoint=%s (DW bypassed) op=%s route=%s",
+                            _ep,
+                            getattr(context, "op_id", "?")[:16],
+                            provider_route,
+                        )
+                        return _local_result
+                    logger.info(
+                        "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime "
+                        "local route empty/failed -> falling through to DW "
+                        "(op=%s route=%s)",
+                        getattr(context, "op_id", "?")[:16], provider_route,
+                    )
+        except Exception as _f3c_exc:  # noqa: BLE001 -- seam must never break the op
+            logger.warning(
+                "[CandidateGenerator] Phase 3c failover seam fail-soft err=%r "
+                "-> legacy DW path (op never lost)", _f3c_exc,
+            )
+
         from backend.core.ouroboros.governance.provider_topology import (
             get_topology as _get_topology,
         )
