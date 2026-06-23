@@ -228,7 +228,7 @@ def test_quarantine_op_calls_both_sides_and_returns_true():
     op_arg, tier_arg, reason_arg = emit_calls[0]
     assert op_arg == "op-test-001"
     assert tier_arg == "provider"
-    assert reason_arg == "UPSTREAM_QUARANTINE"
+    assert reason_arg == "UPSTREAM QUARANTINE"
     assert len(dlq_calls) == 1
     _, dlq_reason = dlq_calls[0]
     assert dlq_reason == "upstream_quarantine:dw_global_outage"
