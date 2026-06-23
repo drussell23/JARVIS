@@ -46,6 +46,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import pathlib
 import re
 import shlex
 import subprocess
@@ -314,12 +315,135 @@ def _cleanup_node(args: argparse.Namespace, node: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Abort-autopsy (captures bake-node diagnostics BEFORE teardown so the
+# operator can diagnose why a readiness / validation / early-failure abort
+# happened -- same principle as sovereign_sentinel.py autopsy).
+# Bounded + fail-soft: NEVER raises, NEVER blocks teardown.
+# --------------------------------------------------------------------------- #
+_AUTOPSY_DIR = os.environ.get("JPRIME_BAKE_AUTOPSY_DIR", "autopsy_reports")
+
+# Commands to capture from the remote node (label, remote shell cmd).
+_AUTOPSY_CMDS: List[Tuple[str, str]] = [
+    ("jprime_bake.log",          "sudo cat /var/log/jprime_bake.log 2>/dev/null || echo '(absent)'"),
+    ("ollama_serve.log",         "sudo cat /var/log/ollama_serve.log 2>/dev/null || echo '(absent)'"),
+    ("ollama_list.txt",          "ollama list 2>&1 || echo '(ollama list failed)'"),
+    ("systemctl_ollama.txt",     "systemctl status ollama --no-pager 2>&1 || echo '(systemd unavailable)'"),
+    ("journalctl_ollama.txt",    "journalctl -u ollama --no-pager 2>/dev/null | tail -50 || echo '(journalctl unavailable)'"),
+    ("df_h.txt",                 "df -h / 2>&1"),
+    ("ollama_api_tags.json",     "curl -s localhost:11434/api/tags 2>&1 || echo '(curl failed)'"),
+]
+
+# Hard per-command SSH timeout for autopsy capture (seconds).
+_AUTOPSY_CMD_TIMEOUT_S: float = float(os.environ.get("JPRIME_BAKE_AUTOPSY_CMD_TIMEOUT_S", "30"))
+
+
+def _run_autopsy(args: argparse.Namespace, node: str, reason: str) -> Optional[pathlib.Path]:
+    """Capture diagnostic artifacts from the bake node into a local file.
+
+    Must be called BEFORE _cleanup_node (node must still exist).
+    Bounded + fail-soft: any failure is logged and silently skipped so
+    teardown is NEVER blocked. Returns the path written, or None on failure.
+    """
+    try:
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]", "_", node)[:60]
+        outdir = pathlib.Path(_AUTOPSY_DIR)
+        outdir.mkdir(parents=True, exist_ok=True)
+        report_path = outdir / f"bake_{safe_node}_{stamp}.log"
+
+        lines: List[str] = [
+            f"# JARVIS J-Prime bake autopsy",
+            f"# node    : {node}",
+            f"# reason  : {reason}",
+            f"# captured: {stamp}",
+            f"# zone    : {args.zone}",
+            f"# project : {args.project}",
+            "",
+        ]
+
+        for label, remote_cmd in _AUTOPSY_CMDS:
+            lines.append(f"{'=' * 60}")
+            lines.append(f"# {label}")
+            lines.append(f"{'=' * 60}")
+            try:
+                rc, out = _run(
+                    _ssh_cmd(args, node, remote_cmd),
+                    timeout_s=_AUTOPSY_CMD_TIMEOUT_S,
+                )
+                body = out.strip() if out else "(empty output)"
+                lines.append(f"[rc={rc}]")
+                lines.append(body)
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"[capture failed: {exc!r}]")
+            lines.append("")
+
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        _log(f"autopsy written -> {report_path}")
+        return report_path
+    except Exception as exc:  # noqa: BLE001 -- autopsy NEVER blocks teardown
+        _log(f"autopsy FAILED (proceeding to teardown): {exc!r}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Poll loop.
 # --------------------------------------------------------------------------- #
-def _poll_readiness(args: argparse.Namespace, node: str) -> bool:
+
+# Patterns in the bake log that signal an unrecoverable failure so we can
+# abort early instead of burning the full timeout.
+_EARLY_FAIL_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bERROR\b", re.IGNORECASE),
+    re.compile(r"ollama pull failed", re.IGNORECASE),
+    re.compile(r"startup-script.*exit.*[1-9]", re.IGNORECASE),
+    re.compile(r"\bjprime-bake\].*ERROR", re.IGNORECASE),
+    re.compile(r"curl.*failed", re.IGNORECASE),
+    re.compile(r"^[^#]*exit [1-9]", re.IGNORECASE),
+]
+
+
+def _check_bake_log(args: argparse.Namespace, node: str
+                    ) -> Tuple[Optional[str], Optional[str]]:
+    """SSH-fetch the last 5 lines of the bake log; return (last_line, fail_reason).
+
+    last_line  -- the most recent log line for live-progress display (or None).
+    fail_reason -- non-None if an early-failure marker was found in the tail.
+
+    Fail-soft: any SSH/parse error returns (None, None).
+    """
+    remote = "sudo tail -n 5 /var/log/jprime_bake.log 2>/dev/null || true"
+    try:
+        rc, out = _run(_ssh_cmd(args, node, remote), timeout_s=30.0)
+        if rc != 0 or not out:
+            return None, None
+        text = out.strip()
+        lines = [l for l in text.splitlines() if l.strip()]
+        last_line = lines[-1] if lines else None
+        for line in lines:
+            for pat in _EARLY_FAIL_PATTERNS:
+                if pat.search(line):
+                    return last_line, f"early-failure marker in log: {line.strip()[:200]}"
+        return last_line, None
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _poll_readiness(args: argparse.Namespace, node: str) -> Tuple[bool, str]:
     """Poll the node (via SSH) for the sentinel + `ollama list` model presence.
 
-    Exponential-ish backoff, bounded by --bake-timeout-s. Returns True on ready.
+    Exponential-ish backoff, bounded by --bake-timeout-s.
+
+    Returns (ready, abort_reason):
+      (True, "")            -- node is ready.
+      (False, "<reason>")   -- timed-out or early-failure detected.
+
+    Three behaviours added vs the original:
+      1. Live progress: every poll attempt also SSH-fetches the last bake-log
+         line and prints it so the operator sees install/pull progress.
+      2. Early-failure detection: if the bake log contains an unambiguous
+         failure marker (ERROR / ollama pull failed / etc.) we abort
+         immediately rather than burning the full bake_timeout_s.
+      3. Return is now a 2-tuple (ready, reason) so callers can distinguish
+         timeout from early-fail for the autopsy manifest.
     """
     deadline = time.monotonic() + float(args.bake_timeout_s)
     delay = 15.0
@@ -334,7 +458,17 @@ def _poll_readiness(args: argparse.Namespace, node: str) -> bool:
         rc, out = _run(_ssh_cmd(args, node, check), timeout_s=90.0)
         if rc == 0 and "JPRIME_READY" in out:
             _log(f"readiness: node ready (attempt {attempt})")
-            return True
+            return True, ""
+
+        # Live progress: fetch last bake-log lines (every attempt; bounded 30s).
+        # Also checks for early-failure markers -- bail out immediately if found.
+        last_line, fail_reason = _check_bake_log(args, node)
+        if last_line:
+            _log(f"node progress: {last_line}")
+        if fail_reason:
+            _log(f"readiness: EARLY ABORT -- {fail_reason}")
+            return False, f"early_failure: {fail_reason}"
+
         remaining = int(deadline - time.monotonic())
         _log(
             f"readiness: not ready (attempt {attempt}, rc={rc}); "
@@ -345,7 +479,7 @@ def _poll_readiness(args: argparse.Namespace, node: str) -> bool:
         time.sleep(delay)
         delay = min(delay * 1.5, 120.0)
     _log(f"readiness: TIMEOUT after {args.bake_timeout_s}s")
-    return False
+    return False, "readiness_timeout"
 
 
 # --------------------------------------------------------------------------- #
@@ -443,6 +577,8 @@ def _execute_bake(args: argparse.Namespace, node: str, startup_script: str) -> i
     import tempfile
     fd, sp_path = tempfile.mkstemp(prefix="jprime_startup_", suffix=".sh")
     node_exists = False
+    bake_succeeded = False          # tracks whether we reached SUCCESS (skip autopsy)
+    abort_reason: str = ""          # reason passed to autopsy manifest
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(startup_script)
@@ -452,19 +588,23 @@ def _execute_bake(args: argparse.Namespace, node: str, startup_script: str) -> i
         rc, out = _run(_create_node_cmd(args, node, sp_path), timeout_s=300.0)
         if rc != 0:
             _abort(f"provision failed rc={rc}: {out.strip()[:400]}")
+            abort_reason = f"provision_failed rc={rc}"
             return 4
         node_exists = True
         _log(f"node {node} created; startup-script installing Ollama + pulling model")
 
-        # 2. POLL READINESS.
-        if not _poll_readiness(args, node):
-            _abort("readiness timeout -- model never finished pulling")
+        # 2. POLL READINESS (includes live progress + early-fail detection).
+        ready, poll_abort_reason = _poll_readiness(args, node)
+        if not ready:
+            _abort(f"readiness abort: {poll_abort_reason}")
+            abort_reason = poll_abort_reason
             return 5
 
         # 3. VALIDATION LOCK -- never snapshot a broken image.
         passed, sample = _validate_generation(args, node)
         if not passed:
             _abort(f"validation failed: {sample}")
+            abort_reason = f"validation_failed: {sample[:200]}"
             return 6
         _log("validation: PASS -- node generated plausible Python (loaded in RAM)")
         _log(f"validation sample: {sample[:300]!r}")
@@ -477,6 +617,7 @@ def _execute_bake(args: argparse.Namespace, node: str, startup_script: str) -> i
         ], timeout_s=300.0)
         if rc != 0:
             _abort(f"instance stop failed rc={rc}: {out.strip()[:300]}")
+            abort_reason = f"instance_stop_failed rc={rc}"
             return 7
 
         # If --force replacing an existing image, delete the old one first.
@@ -496,10 +637,12 @@ def _execute_bake(args: argparse.Namespace, node: str, startup_script: str) -> i
         ], timeout_s=900.0)
         if rc != 0:
             _abort(f"image create failed rc={rc}: {out.strip()[:400]}")
+            abort_reason = f"image_create_failed rc={rc}"
             return 8
         _log(f"golden image created: {args.image_name}")
 
         # 6. DELETE-TO-SNAPSHOT happens in the finally cleanup.
+        bake_succeeded = True
         _report_success(args, node, sample)
         return 0
     finally:
@@ -508,6 +651,13 @@ def _execute_bake(args: argparse.Namespace, node: str, startup_script: str) -> i
         except OSError:
             pass
         if node_exists:
+            # ABORT-AUTOPSY: on any non-success path (readiness timeout,
+            # early-failure, validation-fail, image-create-fail) -- capture
+            # node diagnostics BEFORE teardown so the operator can diagnose
+            # why the bake failed. Bounded + fail-soft: autopsy NEVER blocks
+            # teardown. A successful bake does NOT autopsy.
+            if not bake_succeeded:
+                _run_autopsy(args, node, abort_reason or "unknown_abort")
             # ALWAYS tear the node + disk down -- success or failure. The image
             # (if created) is the durable artifact; the VM must never linger.
             _cleanup_node(args, node)
