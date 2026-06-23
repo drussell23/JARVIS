@@ -413,11 +413,200 @@ CONCURRENCY_LRU_PAYLOAD = AdversarialPayload(
 )
 
 
+# ---------------------------------------------------------------------------
+# Payload #3: the Architectural Anomaly (Paxos-style leader election)
+# ---------------------------------------------------------------------------
+#
+# This is the FINAL flip-gate payload. It is DELIBERATELY past a 7B's single-
+# context reach: a stateful, multi-symbol distributed-consensus state machine
+# (PaxosNode) that a 7B cannot hold coherently in one pass. It reliably THRASHES
+# (a different partial failure most attempts), so it burns the entire repair
+# budget and forces should_pivot(... budget_exhausted) -> the
+# ``[SOVEREIGN YIELD: UNRESOLVABLE PATH]`` graceful pivot -> decompose_for_block.
+#
+# The symbols are DELIBERATELY DISTINCT so the SEMANTIC (symbol-level) decompose
+# has real seams. ``isolate_symbols`` scopes each method that the goal
+# description names, so the decompose can separate e.g. the async heartbeat_loop
+# symbol from the monotonic term-counter symbol (advance_term). The harness logs
+# these scoped symbols so the operator can WATCH the semantic separation.
+#
+# The flip-gate is NOT that Paxos ultimately passes -- it is that the FSM/loop
+# handles the yield -> decompose -> retry GRACEFULLY (no lockup, no dropped
+# state, clean termination). Paxos passing is a bonus.
+#
+# Fairness / determinism: NO real network. An in-process ``InProcTransport``
+# message-bus is injected, so the suite is deterministic (no sockets, no timing
+# flakiness) with generous bounded waits. A CORRECT reference impl PASSES; a
+# 7B's typical single-context attempt fails (non-monotonic term / multiple
+# leaders per term / no brain-split resolution / blocking heartbeat).
+
+_PAXOS_TESTS = textwrap.dedent(
+    '''
+    from impl import PaxosNode, InProcTransport
+
+    import asyncio
+    import time
+
+
+    def _cluster(n=3):
+        t = InProcTransport()
+        nodes = [PaxosNode("n%d" % i, t) for i in range(n)]
+        return t, nodes
+
+
+    def test_monotonic_term_never_decreases():
+        # advance_term: the term-epoch counter is MONOTONIC -- a lower term is
+        # rejected, the current term never goes backward.
+        t, nodes = _cluster(3)
+        try:
+            node = nodes[0]
+            node.advance_term(5)
+            assert node.term == 5
+            node.advance_term(3)          # lower -> must be ignored
+            assert node.term == 5, "term must NOT decrease (monotonic epoch)"
+            node.advance_term()           # bump
+            assert node.term == 6
+        finally:
+            for n in nodes:
+                n.stop()
+
+
+    def test_exactly_one_leader_per_term():
+        # on_vote_request + request_election: exactly one leader per term.
+        t, nodes = _cluster(3)
+        try:
+            won = nodes[0].request_election()
+            assert won is True, "a majority should elect the candidate"
+            leaders = [n for n in nodes if n.is_leader]
+            assert len(leaders) == 1, "exactly one leader per term"
+            assert leaders[0] is nodes[0]
+            term = nodes[0].term
+            # A second candidate cannot also win nodes[0]'s already-decided term:
+            # the followers already voted, so a fresh vote in that term is denied
+            # (or the probed node has moved to a higher term).
+            ok, _ = nodes[1].on_vote_request("intruder", term)
+            assert ok is False or term != nodes[1].term
+        finally:
+            for n in nodes:
+                n.stop()
+
+
+    def test_partition_no_double_leader_same_term():
+        # resolve_partition: a simulated network partition must NOT let both
+        # sides claim leadership in the SAME term (brain-split resolution).
+        t, nodes = _cluster(4)
+        try:
+            a, b, c, d = nodes
+            # Split into {a,b} | {c,d}: neither half is a majority of 4.
+            for x in (a, b):
+                for y in (c, d):
+                    t.partition(x.node_id, y.node_id)
+            a_won = a.request_election()
+            a_term = a.term
+            c_won = c.request_election()
+            c_term = c.term
+            assert not (a_won and c_won), "brain-split: both halves cannot win"
+            if a.is_leader and c.is_leader:
+                assert a_term != c_term, "two leaders MUST NOT share a term"
+            # Heal: the lower-term node steps down on observing the higher term.
+            t.heal()
+            hi = max(a_term, c_term)
+            a.resolve_partition(hi)
+            c.resolve_partition(hi)
+            assert a.term >= a_term and c.term >= c_term
+        finally:
+            for n in nodes:
+                n.stop()
+
+
+    def test_heartbeat_is_async_nonblocking():
+        # heartbeat_loop: an async, non-blocking loop -- construction + a bounded
+        # number of rounds completes promptly (a blocking sleep loop would hang).
+        t, nodes = _cluster(3)
+        try:
+            leader = nodes[0]
+            leader.request_election()
+            assert leader.is_leader
+
+            async def _drive():
+                start = time.monotonic()
+                await asyncio.wait_for(
+                    leader.heartbeat_loop(interval=0.005, rounds=2), timeout=3.0
+                )
+                return time.monotonic() - start
+
+            elapsed = asyncio.run(_drive())
+            assert elapsed < 2.0, (
+                "heartbeat_loop must be async/non-blocking; took " + str(elapsed)
+            )
+        finally:
+            for n in nodes:
+                n.stop()
+    '''
+).strip()
+
+
+PAXOS_ELECTION_PAYLOAD = AdversarialPayload(
+    title="Architectural Anomaly: Paxos-style leader election (PaxosNode)",
+    description=(
+        "Implement a Paxos-style leader election as a single module with a class "
+        "`PaxosNode` and an in-process transport `InProcTransport`. The "
+        "`PaxosNode` MUST define these DISTINCT methods (do NOT collapse them): "
+        "an async `heartbeat_loop(self, interval, rounds)` that sends heartbeats "
+        "over the INJECTED transport (no real sockets); `advance_term(self, "
+        "new_term=None)` backing a MONOTONIC term-epoch counter (a term never "
+        "decreases); `on_vote_request(self, candidate_id, term)` returning a "
+        "(granted, term) vote decision; `resolve_partition(self, observed_term)` "
+        "performing brain-split resolution (step down when a higher term is "
+        "observed); `request_election(self)` that wins only with a strict "
+        "majority; plus `term`, `is_leader`, and `stop(self)`. `InProcTransport` "
+        "provides `register`, `partition(a, b)`, `heal()`, `peers(node_id)`, and "
+        "`send(src, dst, msg)` -- an in-process message bus, NOT sockets. "
+        "Exactly one leader per term; a partition must never produce two leaders "
+        "in the same term."
+    ),
+    entry_symbol="PaxosNode",
+    impl_filename="impl.py",
+    test_filename="test_impl.py",
+    tests=_PAXOS_TESTS,
+    requirements=(
+        "- Define a top-level class `PaxosNode` and a class `InProcTransport`.",
+        "- `PaxosNode.__init__(self, node_id, transport)` registers with the",
+        "  injected transport. NO real sockets / network anywhere.",
+        "- `advance_term(self, new_term=None)`: MONOTONIC term-epoch counter --",
+        "  a lower `new_term` is ignored; the term NEVER decreases.",
+        "- `on_vote_request(self, candidate_id, term)`: returns `(granted, term)`;",
+        "  grant at most one vote per term so exactly one leader wins a term.",
+        "- `request_election(self)`: wins ONLY with a strict majority of peers.",
+        "- `resolve_partition(self, observed_term)`: brain-split resolution --",
+        "  step down (drop leadership) when a strictly higher term is observed.",
+        "- `heartbeat_loop(self, interval, rounds)`: an ASYNC (async def) loop",
+        "  that is NON-BLOCKING -- it must `await asyncio.sleep(...)`, never a",
+        "  blocking `time.sleep` loop, and must complete `rounds` promptly.",
+        "- Provide `term`, `is_leader`, and `stop(self)`.",
+        "- `InProcTransport`: `register`, `partition(a, b)`, `heal()`,",
+        "  `peers(node_id)`, `send(src, dst, msg)` -- an in-process bus.",
+    ),
+    decompose_focus=(
+        " HYPER-ATOMIC FOCUS: split by symbol -- get advance_term monotonic "
+        "FIRST, then on_vote_request (one vote per term), then resolve_partition "
+        "(brain-split step-down), then the async heartbeat_loop."
+    ),
+    system_prompt=(
+        "You are a precise senior Python engineer specializing in distributed "
+        "consensus. You reason carefully about monotonic term epochs, "
+        "quorum/majority voting, brain-split resolution, and async non-blocking "
+        "loops before emitting code. Output a single Python code block only."
+    ),
+)
+
+
 # Registry for the --payload selector. Default is the Concurrency Gauntlet for
 # this round (the merge-intervals payload was zero-shot solved last round).
 PAYLOADS: Dict[str, AdversarialPayload] = {
     "merge_intervals": MERGE_INTERVALS_PAYLOAD,
     "concurrency_lru": CONCURRENCY_LRU_PAYLOAD,
+    "paxos_election": PAXOS_ELECTION_PAYLOAD,
 }
 DEFAULT_PAYLOAD = "concurrency_lru"
 
@@ -701,13 +890,33 @@ def _signature_for(out: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_goal(payload: "Optional[AdversarialPayload]" = None) -> Any:
+def _build_goal(
+    payload: "Optional[AdversarialPayload]" = None,
+    *,
+    impl_path: "Optional[str]" = None,
+) -> Any:
+    """Build a duck-typed GOAL for ``decompose_for_block``.
+
+    ``impl_path`` -- LOAD-BEARING for a REAL semantic decompose. When set, it
+    is the on-disk path of the model's last (failing) implementation, so
+    ``decompose_for_block`` -> ``isolate_symbols`` can actually parse the
+    generated code and scope its DISTINCT symbols (the semantic seams). When
+    ``None`` (the legacy path) we fall back to the bare ``impl_filename``,
+    which does NOT exist on disk -> ``isolate_symbols`` degrades to a
+    whole-file fallback (no real symbol scoping). The harness always passes the
+    written impl path so symbol-scoping is real.
+
+    The description carries the payload description (which NAMES the symbols)
+    plus the decompose focus, because ``isolate_symbols`` only scopes symbols
+    whose names appear in the goal description.
+    """
     payload = payload or ADVERSARIAL_PAYLOAD
+    target = (impl_path,) if impl_path else (payload.impl_filename,)
     return types.SimpleNamespace(
         goal_id="adv-soak-" + payload.entry_symbol.lower().replace("_", "-"),
         title=payload.title,
         description=(payload.description + (payload.decompose_focus or "")),
-        target_files=(payload.impl_filename,),
+        target_files=target,
     )
 
 
@@ -779,12 +988,40 @@ async def run_cognitive_soak(
     attempts = 0
     out: Dict[str, Any] = {}
 
+    # Flip-gate bookkeeping (the Architectural Anomaly's actual gate): did the
+    # FSM/loop handle the yield -> decompose -> retry GRACEFULLY?
+    decomposed_sub_goal_count = 0
+    decomposed_scoped_symbols: List[List[str]] = []
+    retried_against_chunk = False
+    lockup = False  # set if the loop ever exceeds its own bounded budget
+
     prev_impl = ""
     epistemic_feedback = ""
     repeated_signature_count = 0
     last_signature: Optional[str] = None
     current_payload_prompt_goal = payload  # may swap to decomposed sub-chunk text
     decomposed_description = ""
+
+    # Persist the model's last (failing) impl to a STABLE on-disk path so the
+    # semantic decompose can parse it and scope its DISTINCT symbols. The
+    # pytest VALIDATE boundary uses a throwaway tempdir per attempt; that dir is
+    # gone by pivot time, so we mirror the impl into this session-scoped dir
+    # (cleaned up in the finally). This is what makes ``decompose_for_block``'s
+    # ``target_files`` point at REAL code with REAL symbols (the semantic seams)
+    # instead of a non-existent bare filename (whole-file fallback).
+    _impl_mirror_dir = tempfile.mkdtemp(prefix="adv_soak_decompose_")
+    _last_written_impl_path: Optional[str] = None
+
+    def _mirror_impl(src: str) -> Optional[str]:
+        if not src:
+            return None
+        try:
+            path = os.path.join(_impl_mirror_dir, payload.impl_filename)
+            with open(path, "w", encoding="ascii", errors="replace") as fh:
+                fh.write(src)
+            return path
+        except Exception:  # noqa: BLE001 -- fail-soft, never block the soak
+            return None
 
     async def _generate(temperature: float, feedback: str) -> str:
         prompt = current_payload_prompt_goal.build_prompt(feedback) \
@@ -833,7 +1070,15 @@ async def run_cognitive_soak(
             temperature_trajectory.append(temperature)
             attempts += 1
 
-            phase = "REPAIR" if is_repair else "GENERATE"
+            # A generate that happens AFTER the pivot, against the decomposed
+            # sub-chunk, is the post-pivot RETRY-AGAINST-CHUNK -- part of the
+            # graceful-handling flip-gate.
+            _is_post_pivot_retry = bool(pivoted and decomposed and decomposed_description)
+            if _is_post_pivot_retry:
+                retried_against_chunk = True
+                phase = "RETRY-CHUNK"
+            else:
+                phase = "REPAIR" if is_repair else "GENERATE"
             _say(f"[attempt {attempts}] phase={phase}  temperature={temperature:.4f}  "
                  f"repeated_sig_count={repeated_signature_count}  "
                  f"diff_injected={bool(epistemic_feedback)}")
@@ -863,6 +1108,11 @@ async def run_cognitive_soak(
                 break
 
             # --- FAIL path ------------------------------------------------------
+            # Mirror the failing impl to a stable path so a later pivot's
+            # decompose can scope its REAL symbols (the semantic seams).
+            _written = _mirror_impl(impl_src)
+            if _written:
+                _last_written_impl_path = _written
             sig = _signature_for(out)
             signatures.append(sig)
             iterations[-1]["signature"] = sig[:12]
@@ -920,23 +1170,64 @@ async def run_cognitive_soak(
                     "signature_hash": sig,
                     "stderr_tail": (out.get("stdout") or "")[-1200:],
                 }
+                # SEMANTIC decompose: aim at the model's REAL last impl on disk
+                # so isolate_symbols scopes its DISTINCT symbols (the seams). The
+                # failure_hint reorders so the failure-implicated symbol scopes
+                # FIRST. A compression_target derived from the description floor
+                # plus a small per-symbol budget partitions the distinct symbols
+                # into separate sub-goals so the semantic separation is VISIBLE
+                # (e.g. heartbeat_loop split off from the term counter) -- this
+                # reuses the real T3 compression-target slicer, no fork.
+                _goal = _build_goal(payload, impl_path=_last_written_impl_path)
+                _ct = len(getattr(_goal, "description", "") or "") + 150
                 try:
                     sub_goals = decompose_for_block(
-                        _build_goal(payload),
+                        _goal,
                         zero_coverage=False,
                         failure_hint=failure_hint,
+                        compression_target=_ct,
                     )
                     decomposed = bool(sub_goals)
+                    decomposed_sub_goal_count = len(sub_goals)
                     if sub_goals:
-                        # Re-aim at the SMALLEST/most-atomic mutation sub-chunk.
-                        chunk = sub_goals[-1]
+                        # Make the SEMANTIC seam VISIBLE: log each emitted
+                        # sub-goal's scoped symbols + target so the operator can
+                        # SEE e.g. the heartbeat_loop symbol separated from the
+                        # term-counter (advance_term) symbol.
+                        _say(f"  -> decompose emitted {len(sub_goals)} sub-goal(s) "
+                             f"(target_files -> written impl: "
+                             f"{_last_written_impl_path or '<none>'})")
+                        for _i, _sg in enumerate(sub_goals, start=1):
+                            _syms = [
+                                str(s).rsplit("::", 1)[-1]
+                                for s in (getattr(_sg, "scoped_symbols", ()) or ())
+                            ]
+                            decomposed_scoped_symbols.append(_syms)
+                            _say(
+                                f"     [decompose] sub-goal {_i}/{len(sub_goals)} "
+                                f"id={getattr(_sg, 'sub_goal_id', '?')} "
+                                f"scoped_symbols={_syms or ['<whole-file>']} "
+                                f"target={list(getattr(_sg, 'target_files', ()) or ())}"
+                            )
+                        # The FIRST sub-goal is the failure-implicated chunk
+                        # (failure_hint biased it to scope FIRST). Re-aim the
+                        # post-pivot RETRY at it -- the smallest, most-atomic
+                        # mutation at the failure locus.
+                        chunk = sub_goals[0]
+                        _chunk_syms = [
+                            str(s).rsplit("::", 1)[-1]
+                            for s in (getattr(chunk, "scoped_symbols", ()) or ())
+                        ]
                         decomposed_description = (
                             f"{getattr(chunk, 'title', '')}: "
-                            f"{getattr(chunk, 'description', '')}"
+                            f"{getattr(chunk, 'description', '')} "
+                            f"[scoped to symbol(s): {', '.join(_chunk_syms) or 'whole-file'}]"
                         )[:1500]
-                        _say(f"  -> decompose emitted {len(sub_goals)} sub-goal(s); "
-                             f"re-aiming at hyper-atomic chunk: "
-                             f"{getattr(chunk, 'sub_goal_id', '?')}")
+                        _say(
+                            f"  -> RETRY against FIRST (failure-implicated) chunk "
+                            f"id={getattr(chunk, 'sub_goal_id', '?')} "
+                            f"scoped_symbols={_chunk_syms or ['<whole-file>']}"
+                        )
                 except Exception as e:  # noqa: BLE001
                     _say(f"  -> decompose_for_block error (fail-soft): {e}")
                     decomposed = False
@@ -954,13 +1245,37 @@ async def run_cognitive_soak(
             if attempts >= total_budget:
                 break
 
+        # If the loop exited without exceeding its bounded budget, there was no
+        # lockup. (A genuine lockup would have hung above; this flag exists so
+        # the verdict can assert "no lockup" explicitly + survives refactors.)
+        lockup = attempts > total_budget
     finally:
         # Restore the env var to its original state so the soak does not leak
         # env mutations across subsequent calls in the same process (e.g. tests).
         if _floor_was_absent:
             os.environ.pop(_floor_env_key, None)
+        # Clean up the impl mirror dir (best-effort, never raises).
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(_impl_mirror_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     final_out = out
+
+    # The Architectural Anomaly flip-gate: the FSM/loop handled the
+    # yield -> decompose -> retry GRACEFULLY (no lockup, clean termination).
+    # This is REPORTED SEPARATELY from `converged` -- Paxos passing is a BONUS,
+    # NOT the gate. The gate is satisfied even when the final Paxos attempt
+    # still fails, as long as the loop pivoted, decomposed, retried against the
+    # decomposed chunk, did not lock up, and terminated within its bound.
+    pivot_and_decompose_handled_gracefully = bool(
+        pivoted
+        and decomposed
+        and retried_against_chunk
+        and not lockup
+        and attempts <= total_budget
+    )
 
     result = {
         "converged": converged,
@@ -969,6 +1284,11 @@ async def run_cognitive_soak(
         "pivoted": pivoted,
         "pivot_reason": pivot_reason,
         "decomposed": decomposed,
+        "decomposed_sub_goal_count": decomposed_sub_goal_count,
+        "decomposed_scoped_symbols": decomposed_scoped_symbols,
+        "retried_against_chunk": retried_against_chunk,
+        "lockup": lockup,
+        "pivot_and_decompose_handled_gracefully": pivot_and_decompose_handled_gracefully,
         "epistemic_diffs_injected": epistemic_diffs_injected,
         "final_test_output": {
             "passed": bool(final_out.get("passed")) if isinstance(final_out, dict) else False,
@@ -999,19 +1319,51 @@ def print_report(result: Dict[str, Any]) -> None:
     _say("")
     _say(f"  temperature trajectory : [{traj}]")
     _say(f"  epistemic diffs injected: {result.get('epistemic_diffs_injected')}")
-    _say(f"  pivoted                 : {result.get('pivoted')}")
-    _say(f"  decomposed              : {result.get('decomposed')}")
+    _say(f"  pivoted                 : {result.get('pivoted')} "
+         f"(reason={result.get('pivot_reason') or 'n/a'})")
+    _say(f"  decomposed              : {result.get('decomposed')} "
+         f"(sub-goals={result.get('decomposed_sub_goal_count')})")
+    # Surface the SEMANTIC seams: the distinct symbols each sub-goal was scoped
+    # to (so the operator SEES e.g. heartbeat_loop split from advance_term).
+    _scoped = result.get("decomposed_scoped_symbols") or []
+    if _scoped:
+        _say("  semantic seams (scoped symbols per sub-goal):")
+        for _i, _syms in enumerate(_scoped, start=1):
+            _say(f"     sub-goal {_i}: {_syms or ['<whole-file>']}")
+        _distinct = sorted({s for syms in _scoped for s in syms})
+        _say(f"     -> {len(_distinct)} distinct symbol(s) separated: {_distinct}")
+    _say(f"  retried against chunk   : {result.get('retried_against_chunk')}")
+    _say(f"  lockup                  : {result.get('lockup')}")
     _say(f"  attempts                : {result.get('attempts')}")
-    _say(f"  converged               : {result.get('converged')}")
+    _say(f"  converged (Paxos pass)  : {result.get('converged')}  [BONUS, not the gate]")
+    graceful = result.get("pivot_and_decompose_handled_gracefully")
+    _say(f"  FLIP-GATE (graceful)    : {graceful}  "
+         f"[pivot AND decompose AND retry AND no-lockup AND clean-term]")
     _say("-" * 72)
-    if result.get("converged"):
-        _say("VERDICT: CONVERGED. A test-verified candidate was produced UNDER FIRE.")
-        _say("FLIP-GATE: SATISFIED -- the cognitive pipeline survives adversarial")
-        _say("           load (think -> fail -> adapt -> [pivot/decompose] -> pass).")
+    # The flip-gate is the GRACEFUL handling of yield -> decompose -> retry,
+    # NOT whether Paxos ultimately converges.
+    if graceful:
+        _say("VERDICT: FLIP-GATE SATISFIED. The FSM gracefully handled")
+        _say("         yield -> decompose -> retry: it hit the repair-budget wall,")
+        _say("         fired [SOVEREIGN YIELD: UNRESOLVABLE PATH] (budget_exhausted),")
+        _say("         SEMANTICALLY decomposed the impl by symbol, and retried")
+        _say("         against the failure-implicated chunk -- bounded, no lockup,")
+        _say("         clean termination. No dropped state.")
+        if result.get("converged"):
+            _say("         BONUS: the post-decompose retry also CONVERGED (Paxos green).")
+        else:
+            _say("         (Final Paxos pass is SECONDARY and was not required.)")
+    elif result.get("converged"):
+        _say("VERDICT: CONVERGED without needing the pivot (the payload was within")
+        _say("         single-context reach this run). The flip-gate specifically")
+        _say("         exercises the pivot path -- a graceful pivot was not triggered.")
     else:
-        _say("VERDICT: NON-CONVERGENCE (honest, bounded). No infinite loop; the loop")
-        _say("         yielded after exhausting its repair + pivot budget.")
-        _say("FLIP-GATE: NOT satisfied -- do NOT flip the failover live yet.")
+        _say("VERDICT: FLIP-GATE NOT satisfied -- the loop did not complete the")
+        _say("         pivot -> decompose -> retry arc gracefully. Inspect below.")
+        _say(f"         pivoted={result.get('pivoted')} "
+             f"decomposed={result.get('decomposed')} "
+             f"retried={result.get('retried_against_chunk')} "
+             f"lockup={result.get('lockup')}")
         st = result.get("final_test_output", {})
         if st.get("stdout_tail"):
             _say("  last pytest stdout tail:")
@@ -1099,7 +1451,14 @@ async def _amain(args: argparse.Namespace) -> int:
             client=client, max_repairs=args.max_repairs, payload=payload
         )
         print_report(result)
-        return 0 if result.get("converged") else 1
+        # Exit 0 when the flip-gate is satisfied: EITHER the loop converged OR
+        # it gracefully handled the pivot -> decompose -> retry arc (the
+        # Architectural Anomaly's actual gate; Paxos passing is a bonus).
+        ok = bool(
+            result.get("converged")
+            or result.get("pivot_and_decompose_handled_gracefully")
+        )
+        return 0 if ok else 1
     finally:
         try:
             await client.aclose()

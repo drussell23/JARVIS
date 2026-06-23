@@ -1032,3 +1032,517 @@ def test_warmup_called_once_before_loop(monkeypatch):
     assert events[0] == "warmup"
     assert "generate" in events
     assert events.index("warmup") < events.index("generate")
+
+
+# ===========================================================================
+# Payload #3: the Architectural Anomaly (Paxos-style leader election)
+# ===========================================================================
+#
+# The FINAL flip-gate. The Paxos payload is past a 7B's single-context reach,
+# so a model reliably THRASHES -> burns the repair budget -> fires
+# should_pivot(budget_exhausted) -> [SOVEREIGN YIELD: UNRESOLVABLE PATH] ->
+# decompose_for_block SEMANTICALLY chops it by SYMBOL -> retry against the
+# first (failure-implicated) chunk. The gate is the GRACEFUL handling of that
+# arc (pivot AND decompose AND retry AND no-lockup AND clean termination), NOT
+# whether Paxos ultimately passes.
+#
+# We prove three things with the REAL pytest subprocess boundary + REAL
+# primitives (should_pivot / decompose_for_block / isolate_symbols), no Ollama:
+#   (a) the embedded CORRECT reference PaxosNode PASSES the suite + a known-
+#       thrashy multi-symbol stub FAILS it (the suite discriminates + is fair);
+#   (b) a FakeLocalPrimeClient that NEVER converges (always a thrashy multi-
+#       symbol PaxosNode) -> pivot(budget_exhausted) -> decompose_for_block IS
+#       called with target_files pointing at the WRITTEN impl -> the emitted
+#       sub-goals' scoped symbols are LOGGED -> a retry against the first chunk
+#       happens -> the loop terminates cleanly with
+#       pivot_and_decompose_handled_gracefully=True and no lockup;
+#   (c) the scoped-symbol logging shows >1 distinct symbol separated (the
+#       semantic seam) when the generated impl has distinct symbols.
+
+# A CORRECT reference PaxosNode + in-process transport (no sockets). Passes the
+# fair, deterministic gauntlet suite.
+_PAXOS_CORRECT = '''```python
+from __future__ import annotations
+import threading
+
+
+class InProcTransport:
+    """In-process message bus shared by PaxosNodes. No sockets."""
+
+    def __init__(self):
+        self._nodes = {}
+        self._lock = threading.RLock()
+        self._partition = set()
+
+    def register(self, node):
+        with self._lock:
+            self._nodes[node.node_id] = node
+
+    def partition(self, a, b):
+        with self._lock:
+            self._partition.add(frozenset((a, b)))
+
+    def heal(self):
+        with self._lock:
+            self._partition.clear()
+
+    def _blocked(self, src, dst):
+        return frozenset((src, dst)) in self._partition
+
+    def send(self, src, dst, msg):
+        with self._lock:
+            if self._blocked(src, dst):
+                return None
+            node = self._nodes.get(dst)
+        if node is None:
+            return None
+        return node.deliver(src, msg)
+
+    def peers(self, node_id):
+        with self._lock:
+            return [n for n in self._nodes if n != node_id]
+
+
+class PaxosNode:
+    def __init__(self, node_id, transport):
+        self.node_id = node_id
+        self._transport = transport
+        self._lock = threading.RLock()
+        self._term = 0
+        self._leader_of_term = {}
+        self._is_leader = False
+        self._stop = threading.Event()
+        transport.register(self)
+
+    def advance_term(self, new_term=None):
+        with self._lock:
+            if new_term is None:
+                new_term = self._term + 1
+            if new_term < self._term:
+                return self._term
+            self._term = new_term
+            self._is_leader = False
+            return self._term
+
+    @property
+    def term(self):
+        with self._lock:
+            return self._term
+
+    @property
+    def is_leader(self):
+        with self._lock:
+            return self._is_leader
+
+    def on_vote_request(self, candidate_id, term):
+        with self._lock:
+            if term < self._term:
+                return (False, self._term)
+            if term > self._term:
+                self._term = term
+                self._is_leader = False
+            voted = self._leader_of_term.get(term)
+            if voted is None or voted == candidate_id:
+                self._leader_of_term[term] = candidate_id
+                return (True, self._term)
+            return (False, self._term)
+
+    def request_election(self):
+        with self._lock:
+            self.advance_term()
+            term = self._term
+            self._leader_of_term[term] = self.node_id
+            votes = 1
+        peers = self._transport.peers(self.node_id)
+        for p in peers:
+            resp = self._transport.send(self.node_id, p, ("vote", term))
+            if resp and resp[0]:
+                votes += 1
+        total = len(peers) + 1
+        with self._lock:
+            if votes * 2 > total and self._term == term:
+                self._is_leader = True
+                self._leader_of_term[term] = self.node_id
+                return True
+            return False
+
+    def resolve_partition(self, observed_term):
+        with self._lock:
+            if observed_term > self._term:
+                self._term = observed_term
+                self._is_leader = False
+                return True
+            return False
+
+    def deliver(self, src, msg):
+        kind = msg[0]
+        if kind == "vote":
+            return self.on_vote_request(src, msg[1])
+        if kind == "heartbeat":
+            self.resolve_partition(msg[1])
+            return ("ack", self.term)
+        return None
+
+    async def heartbeat_loop(self, interval=0.01, rounds=1):
+        import asyncio
+        for _ in range(rounds):
+            if self._stop.is_set():
+                break
+            with self._lock:
+                term = self._term
+                leader = self._is_leader
+            if leader:
+                for p in self._transport.peers(self.node_id):
+                    self._transport.send(self.node_id, p, ("heartbeat", term))
+            await asyncio.sleep(interval)
+
+    def stop(self):
+        self._stop.set()
+```'''
+
+# A THRASHY stub: structurally complete (all the DISTINCT symbols the goal
+# names, so isolate_symbols finds real seams) but SEMANTICALLY broken on every
+# axis the suite checks (non-monotonic term, quorum-free leader, no brain-split
+# step-down, BLOCKING non-async heartbeat). This is the shape a 7B ships when it
+# cannot hold the full state machine -- it FAILS the gauntlet.
+_PAXOS_THRASH = '''```python
+from __future__ import annotations
+
+
+class InProcTransport:
+    def __init__(self):
+        pass
+
+    def register(self, node):
+        pass
+
+    def partition(self, a, b):
+        pass
+
+    def heal(self):
+        pass
+
+    def peers(self, node_id):
+        return []
+
+    def send(self, src, dst, msg):
+        return None
+
+
+class PaxosNode:
+    def __init__(self, node_id, transport):
+        self.node_id = node_id
+        self._term = 0
+        self._is_leader = False
+
+    def advance_term(self, new_term=None):
+        # BUG: not monotonic -- accepts a lower term.
+        self._term = new_term if new_term is not None else self._term + 1
+        return self._term
+
+    @property
+    def term(self):
+        return self._term
+
+    @property
+    def is_leader(self):
+        return self._is_leader
+
+    def on_vote_request(self, candidate_id, term):
+        # BUG: always grants -> multiple leaders per term.
+        return (True, term)
+
+    def request_election(self):
+        # BUG: no quorum -- claims leadership unconditionally.
+        self._is_leader = True
+        return True
+
+    def resolve_partition(self, observed_term):
+        # BUG: never steps down.
+        return False
+
+    def heartbeat_loop(self, interval=0.01, rounds=1):
+        # BUG: NOT async + blocking.
+        import time
+        time.sleep(interval * rounds)
+
+    def stop(self):
+        pass
+```'''
+
+
+# Thrash VARIANTS that each FAIL a DIFFERENT subset of the suite, so the
+# failure SIGNATURE (the sorted set of failing test IDs) differs across
+# attempts (never repeats consecutively) -> the legacy stuck-signature pivot
+# can NOT trip; only the budget-exhaustion thrash backstop in should_pivot can.
+# Each variant keeps the DISTINCT symbols isolate_symbols needs for a real
+# semantic seam, and survives _sanitize_importable (pure definitions only).
+#
+# We perturb which axes are CORRECT so the failing-test-ID set differs:
+#   Variant B: monotonic term is CORRECT -> only the OTHER 3 tests fail.
+#   Variant C: monotonic term AND async heartbeat are CORRECT -> only 2 fail.
+# (_PAXOS_THRASH fails all 4.) Three distinct failing-ID sets -> three distinct
+# signatures, none repeating back-to-back across the rotation.
+
+# Variant B: advance_term is correctly monotonic; the rest stay broken.
+_PAXOS_THRASH_MONOTONIC_OK = '''```python
+from __future__ import annotations
+
+
+class InProcTransport:
+    def register(self, node): pass
+    def partition(self, a, b): pass
+    def heal(self): pass
+    def peers(self, node_id): return []
+    def send(self, src, dst, msg): return None
+
+
+class PaxosNode:
+    def __init__(self, node_id, transport):
+        self.node_id = node_id
+        self._term = 0
+        self._is_leader = False
+
+    def advance_term(self, new_term=None):
+        # CORRECT: monotonic.
+        if new_term is None:
+            new_term = self._term + 1
+        if new_term < self._term:
+            return self._term
+        self._term = new_term
+        return self._term
+
+    @property
+    def term(self):
+        return self._term
+
+    @property
+    def is_leader(self):
+        return self._is_leader
+
+    def on_vote_request(self, candidate_id, term):
+        return (True, term)  # BUG: always grants
+
+    def request_election(self):
+        self._is_leader = True  # BUG: no quorum
+        return True
+
+    def resolve_partition(self, observed_term):
+        return False  # BUG: never steps down
+
+    def heartbeat_loop(self, interval=0.01, rounds=1):
+        import time
+        time.sleep(interval * rounds)  # BUG: blocking, not async
+
+    def stop(self):
+        pass
+```'''
+
+# Variant C: advance_term monotonic AND heartbeat_loop async non-blocking
+# correct; only the leader/partition axes stay broken (fewer failing tests).
+_PAXOS_THRASH_MONOTONIC_HB_OK = '''```python
+from __future__ import annotations
+
+
+class InProcTransport:
+    def register(self, node): pass
+    def partition(self, a, b): pass
+    def heal(self): pass
+    def peers(self, node_id): return []
+    def send(self, src, dst, msg): return None
+
+
+class PaxosNode:
+    def __init__(self, node_id, transport):
+        self.node_id = node_id
+        self._term = 0
+        self._is_leader = False
+
+    def advance_term(self, new_term=None):
+        if new_term is None:
+            new_term = self._term + 1
+        if new_term < self._term:
+            return self._term
+        self._term = new_term
+        return self._term
+
+    @property
+    def term(self):
+        return self._term
+
+    @property
+    def is_leader(self):
+        return self._is_leader
+
+    def on_vote_request(self, candidate_id, term):
+        return (True, term)  # BUG: always grants
+
+    def request_election(self):
+        self._is_leader = True  # BUG: no quorum
+        return True
+
+    def resolve_partition(self, observed_term):
+        return False  # BUG: never steps down
+
+    async def heartbeat_loop(self, interval=0.01, rounds=1):
+        # CORRECT: async, non-blocking, bounded rounds.
+        import asyncio
+        for _ in range(rounds):
+            await asyncio.sleep(interval)
+
+    def stop(self):
+        pass
+```'''
+
+
+def test_paxos_payload_registered():
+    assert "paxos_election" in acs.PAYLOADS
+    p = acs.PAYLOADS["paxos_election"]
+    assert p.entry_symbol == "PaxosNode"
+    # The DISTINCT symbols are named in the description so isolate_symbols
+    # scopes them (the semantic seams).
+    for sym in ("heartbeat_loop", "advance_term", "resolve_partition",
+                "on_vote_request"):
+        assert sym in p.description, sym
+    assert "def test_monotonic_term_never_decreases" in p.tests
+    assert "def test_partition_no_double_leader_same_term" in p.tests
+
+
+def test_paxos_correct_reference_passes_suite():
+    # LOAD-BEARING: the suite is FAIR -- a correct impl PASSES it.
+    p = acs.PAYLOADS["paxos_election"]
+    out = acs._run_pytest_in_tempdir(
+        acs._extract_code_block(_PAXOS_CORRECT), p.tests, timeout_s=120, payload=p
+    )
+    assert out["passed"] is True, out["stdout"][-2000:] + "\n" + out["stderr"][-1000:]
+
+
+def test_paxos_thrash_stub_fails_suite():
+    # LOAD-BEARING: the suite DISCRIMINATES -- a thrashy stub FAILS it.
+    p = acs.PAYLOADS["paxos_election"]
+    out = acs._run_pytest_in_tempdir(
+        acs._extract_code_block(_PAXOS_THRASH), p.tests, timeout_s=120, payload=p
+    )
+    assert out["passed"] is False
+    blob = (out["stdout"] or "") + (out["stderr"] or "")
+    # At least the monotonic-term and one-leader checks should flag it.
+    assert "test_monotonic_term_never_decreases" in blob or \
+        "test_exactly_one_leader_per_term" in blob
+
+
+def test_paxos_thrash_stub_has_distinct_symbols_for_decompose():
+    # The thrash stub has the DISTINCT symbols isolate_symbols needs for a
+    # REAL semantic seam (this is what (c) below depends on).
+    import tempfile as _tf
+    import os as _os
+    from backend.core.ouroboros.governance.ast_symbol_scoper import isolate_symbols
+    p = acs.PAYLOADS["paxos_election"]
+    src = acs._sanitize_importable(acs._extract_code_block(_PAXOS_THRASH))
+    with _tf.TemporaryDirectory() as d:
+        path = _os.path.join(d, "impl.py")
+        with open(path, "w", encoding="ascii", errors="replace") as f:
+            f.write(src)
+        targets = isolate_symbols(path, p.description + p.decompose_focus)
+        syms = sorted({t.symbol for t in targets if t.symbol})
+    # Multiple DISTINCT scoped symbols -> a real semantic seam.
+    assert len(syms) > 1, syms
+    assert any("heartbeat_loop" in s for s in syms)
+    assert any("advance_term" in s for s in syms)
+
+
+def test_paxos_never_converges_pivots_decomposes_retries_gracefully(monkeypatch):
+    """THE FLIP-GATE: a never-converging thrashy 7B drives the full arc.
+
+    pivot(budget_exhausted) -> decompose_for_block called with target_files at
+    the WRITTEN impl -> scoped symbols logged -> retry against the first chunk
+    -> clean termination with pivot_and_decompose_handled_gracefully=True and
+    no lockup. Paxos NEVER passes here (bonus not required).
+    """
+    monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+
+    captured = {"goals": [], "n": 0}
+    real_decompose = acs.decompose_for_block
+
+    def _spy(goal, **kwargs):
+        captured["n"] += 1
+        captured["goals"].append(goal)
+        return real_decompose(goal, **kwargs)
+
+    monkeypatch.setattr(acs, "decompose_for_block", _spy)
+
+    p = acs.PAYLOADS["paxos_election"]
+    # A DIFFERENT thrashy failure each attempt (never-repeating signature) ->
+    # the legacy stuck-signature pivot can NOT trip; only the budget-exhaustion
+    # thrash backstop can. The trailing constant thrash covers any post-pivot
+    # extra GENERATE (still fails -> Paxos never converges, by design).
+    client = FakeLocalPrimeClient([
+        _PAXOS_THRASH,                  # all 4 tests fail (sig X)
+        _PAXOS_THRASH_MONOTONIC_OK,     # 3 fail (sig Y != X)
+        _PAXOS_THRASH_MONOTONIC_HB_OK,  # 2 fail (sig Z != Y)
+        _PAXOS_THRASH,                  # back to 4 (sig X != Z)
+        _PAXOS_THRASH_MONOTONIC_OK,     # 3 fail (sig Y != X)
+        _PAXOS_THRASH_MONOTONIC_HB_OK,  # post-pivot retry padding
+        _PAXOS_THRASH,
+    ])
+    result = asyncio.run(
+        acs.run_cognitive_soak(client=client, max_repairs=5, payload=p)
+    )
+
+    # The signatures must NOT all be identical (genuine thrash, not a stuck wall).
+    sigs = result["signatures"]
+    assert len(set(sigs)) > 1, f"expected DIFFERENT signatures (thrash), got {sigs!r}"
+
+    # The arc fired -- specifically on the budget-exhaustion thrash backstop.
+    assert result["pivoted"] is True
+    assert result["pivot_reason"] == "budget_exhausted", result["pivot_reason"]
+    assert result["decomposed"] is True
+    assert captured["n"] >= 1, "decompose_for_block must be exercised"
+
+    # target_files pointed at the WRITTEN impl on disk (so symbol-scoping is
+    # REAL, not a whole-file fallback on a non-existent bare filename).
+    goal = captured["goals"][0]
+    tf = list(getattr(goal, "target_files", ()) or ())
+    assert len(tf) == 1
+    assert tf[0].endswith("impl.py")
+    assert os.path.isabs(tf[0]) or "adv_soak_decompose_" in tf[0], tf
+    # It carries the goal id derived from the Paxos payload.
+    assert getattr(goal, "goal_id", "").startswith("adv-soak-paxosnode")
+
+    # Retry happened + handled gracefully + no lockup + bounded.
+    assert result["retried_against_chunk"] is True
+    assert result["lockup"] is False
+    assert result["pivot_and_decompose_handled_gracefully"] is True
+    assert result["converged"] is False  # Paxos never passes here (by design)
+    # Bounded, no infinite loop: initial GENERATE + max_repairs + the initial
+    # +1 reserve + the one pivot-granted extra GENERATE.
+    assert result["attempts"] <= 1 + 5 + 2
+
+
+def test_paxos_decompose_logs_distinct_scoped_symbols(monkeypatch):
+    """(c): the scoped-symbol seams show >1 DISTINCT symbol separated."""
+    monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+    p = acs.PAYLOADS["paxos_election"]
+    client = FakeLocalPrimeClient([_PAXOS_THRASH])
+    result = asyncio.run(
+        acs.run_cognitive_soak(client=client, max_repairs=5, payload=p)
+    )
+    assert result["pivoted"] is True
+    assert result["decomposed"] is True
+    # The harness recorded the scoped symbols per emitted sub-goal.
+    scoped = result["decomposed_scoped_symbols"]
+    assert scoped, "scoped symbols must be recorded for the operator to watch"
+    distinct = sorted({s for syms in scoped for s in syms})
+    # >1 distinct symbol -> a REAL semantic seam (the gen impl had distinct
+    # symbols). e.g. heartbeat_loop separated from advance_term.
+    assert len(distinct) > 1, distinct
+    assert any("heartbeat_loop" in s for s in distinct), distinct
+    assert any("advance_term" in s for s in distinct), distinct
+
+
+def test_paxos_dry_mode_selector(monkeypatch, capsys):
+    monkeypatch.setenv("JARVIS_CHAOS_INJECTOR_ENABLED", "true")
+    rc = acs.main(["--payload", "paxos_election"])  # dry mode
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "paxos_election" in out
+    assert acs.PAXOS_ELECTION_PAYLOAD.title in out
