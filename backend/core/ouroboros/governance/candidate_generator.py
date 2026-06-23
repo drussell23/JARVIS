@@ -67,6 +67,16 @@ from backend.core.ouroboros.governance.op_context import (
 from backend.core.ouroboros.governance.dw_latency_tracker import (
     DwLatencyTracker,
 )
+# Task T2 -- Autonomous Provider Quarantine Matrix. Top import is cycle-safe:
+# provider_quarantine top-level imports only stdlib and lazy-imports its
+# downstream deps (convergence_watchdog, intake_dlq), so it never re-enters
+# candidate_generator at module-import time. Verified via
+# `python3 -c "import ...candidate_generator"`.
+from backend.core.ouroboros.governance.provider_quarantine import (
+    get_provider_health_gradient,
+    quarantine_enabled,
+    quarantine_op,
+)
 
 # LR3 terminal sentinel: the Information-Gain Governor's deadlock-override
 # failure (raised inside the Venom tool loop). It MUST propagate through every
@@ -4208,6 +4218,18 @@ class CandidateGenerator:
                 # Lane: "batch" if force-batch was armed (_s182_fb_token set), else "realtime".
                 _a3_success_lane = "batch" if _s182_fb_token is not None else "realtime"
                 _breaker_record_outcome(_a3_success_lane, ok=True, failure_mode=None)
+                # Task T2 -- provider health gradient RECOVERY. A real DW
+                # candidate returned, so the per-route success window records a
+                # success: this autonomously CLEARS a previously-deduced global
+                # outage (is_global_outage flips False once one True lands in a
+                # full all-False window). Fail-soft: gradient errors never
+                # perturb the success return.
+                try:
+                    get_provider_health_gradient().record_sweep(
+                        provider_route, success=True,
+                    )
+                except Exception:  # noqa: BLE001 -- gradient is advisory, never blocks
+                    pass
                 return _attempt_result
 
             if _attempt_exc is not None:
@@ -4572,6 +4594,18 @@ class CandidateGenerator:
             ", ".join(attempts),
             fallback_tolerance, op_id_short, last_failure or "none",
         )
+        # Task T2 -- provider health gradient FAILURE record. Every ranked DW
+        # model failed for this route: that is ONE failed dispatch sweep. The
+        # gradient DEDUCES a global outage from the RATE of these sweeps over a
+        # bounded rolling window (NOT a hops count) -- a full all-False window
+        # trips is_global_outage, consumed at the immortal re-queue intercept
+        # below. Fail-soft: gradient errors never perturb the dispatch path.
+        try:
+            get_provider_health_gradient().record_sweep(
+                provider_route, success=False,
+            )
+        except Exception:  # noqa: BLE001 -- gradient is advisory, never blocks
+            pass
         if fallback_tolerance == "queue":
             # Defect #5 fix (2026-05-03) — Read-only cascade reflex.
             # Soak v5 (bt-2026-05-03-060330) had 17/19 BG ops terminal-
@@ -4736,6 +4770,72 @@ class CandidateGenerator:
             # a capped attempt count. A transient TOTAL DW outage is survived (the warm-boot
             # + intra-DW failover route the recovered attempt to batch); a permanently-dead
             # DW still fails — but only after exhausting the queue budget, never instantly.
+            # Task T2 -- UPSTREAM QUARANTINE intercept (the keystone). BEFORE the
+            # immortal re-queue: if the provider health gradient has DEDUCED a
+            # global DW outage (full rolling window of all-failed sweeps for this
+            # route -- a RATE, never a hops count), the immortal queue would
+            # otherwise re-queue this op forever (observed dilation hops=77,
+            # hammering a degraded upstream). Instead, terminally seal the op in
+            # the Cryo-DLQ via [SOVEREIGN YIELD: UPSTREAM QUARANTINE] and raise a
+            # terminal error -- the op is NOT lost (it is replayable from the DLQ).
+            # A TRANSIENT failure (window not yet all-False) leaves is_global_outage
+            # False, so the EXISTING immortal retry below runs unchanged.
+            #
+            # Fail-soft ABSOLUTE: any gradient/quarantine error -> fall through to
+            # the legacy immortal path (the I1 op-never-lost guarantee holds). When
+            # quarantine_enabled() is false the whole block is skipped -> the legacy
+            # immortal loop is byte-identical.
+            try:
+                if quarantine_enabled() and get_provider_health_gradient().is_global_outage(
+                    provider_route
+                ):
+                    try:
+                        from backend.core.ouroboros.governance.convergence_watchdog import (  # noqa: PLC0415
+                            get_lane_dilation_tracker as _q_get_dt,
+                        )
+                        _q_hops = _q_get_dt().hops(
+                            getattr(context, "op_id", "") or "",
+                        )
+                    except Exception:  # noqa: BLE001 -- telemetry best-effort
+                        _q_hops = -1
+                    _q_telemetry = {
+                        "route": provider_route,
+                        "fleet_exhausted": True,
+                        "fleet_size": len(ranked_models),
+                        "lanes": "batch+realtime",
+                        "failure_mode": "TIMEOUT",
+                        "dilation_hops": _q_hops,
+                        "last_failure": (last_failure or "all_models_open")[:120],
+                    }
+                    if quarantine_op(
+                        context, route=provider_route, telemetry=_q_telemetry,
+                    ):
+                        # Global outage DEDUCED -> terminal Cryo-DLQ seal. Do NOT
+                        # immortal re-queue. The op is sealed (replayable), not lost.
+                        logger.warning(
+                            "[CandidateGenerator] UPSTREAM QUARANTINE: route=%s "
+                            "global DW outage deduced (full-window all-failure) -- "
+                            "op sealed in Cryo-DLQ, immortal re-queue SKIPPED "
+                            "(op=%s, hops=%s)",
+                            provider_route, op_id_short, _q_hops,
+                        )
+                        raise RuntimeError(
+                            "upstream_quarantine:dw_global_outage"
+                        )
+                    # quarantine_op returned False (DLQ seal failed) -> fall through
+                    # to the legacy immortal path so the op is never lost.
+            except RuntimeError as _q_terminal:
+                # The terminal quarantine signal must propagate (it is the op's
+                # terminal outcome -- sealed in the DLQ, handled by the caller as a
+                # generation failure, NOT a silent drop). Only re-raise OUR
+                # sentinel; any other RuntimeError is unexpected and falls through.
+                if str(_q_terminal).startswith("upstream_quarantine:"):
+                    raise
+            except Exception:  # noqa: BLE001 -- quarantine must never itself break the op
+                logger.debug(
+                    "[CandidateGenerator] UPSTREAM QUARANTINE intercept fail-soft "
+                    "-> legacy immortal path", exc_info=True,
+                )
             try:
                 from backend.core.ouroboros.governance.dw_immortal import (
                     immortal_should_retry as _imm_should_retry,
