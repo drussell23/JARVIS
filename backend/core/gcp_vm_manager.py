@@ -10588,7 +10588,34 @@ fi
                 metadata_items.append(compute_v1.Items(key="startup-script", value=startup_script))
                 logger.info("   📜 Standard startup script attached (expected: ~10-15min)")
 
-            # Build instance with STOP termination (Invincible Node)
+            # Scheduling honors use_spot. SPOT = invincible (survive preemption via
+            # STOP). ON-DEMAND (use_spot=False) = STANDARD provisioning, NO preemption
+            # -> an UNINTERRUPTED window for a deep convergence FSM (a Spot node was
+            # `compute.instances.preempted` ~17min into a soak because THIS create path
+            # hardcoded SPOT regardless of use_spot). On-demand keeps a max_run_duration
+            # auto-delete so it stays cost-bounded.
+            if self.config.use_spot:
+                _soak_sched = compute_v1.Scheduling(
+                    preemptible=True,
+                    on_host_maintenance="TERMINATE",
+                    automatic_restart=False,
+                    provisioning_model="SPOT",
+                    instance_termination_action="STOP",  # INVINCIBLE: Survive preemption
+                )
+                _vm_class = "invincible"
+            else:
+                _ondemand_secs = max(60, min(int(self.config.max_vm_lifetime_hours * 3600), 604800))
+                _soak_sched = compute_v1.Scheduling(
+                    preemptible=False,
+                    on_host_maintenance="MIGRATE",
+                    automatic_restart=True,
+                    provisioning_model="STANDARD",
+                    instance_termination_action="DELETE",
+                    max_run_duration=compute_v1.Duration(seconds=_ondemand_secs),
+                )
+                _vm_class = "on-demand"
+
+            # Build instance (scheduling per use_spot)
             instance = compute_v1.Instance(
                 name=instance_name,
                 machine_type=machine_type_url,
@@ -10600,16 +10627,10 @@ fi
                 labels={
                     "created-by": "jarvis",
                     "type": "prime-node",
-                    "vm-class": "invincible",
+                    "vm-class": _vm_class,
                     "deployment-mode": deployment_mode.replace("-", "_"),
                 },
-                scheduling=compute_v1.Scheduling(
-                    preemptible=True,
-                    on_host_maintenance="TERMINATE",
-                    automatic_restart=False,
-                    provisioning_model="SPOT",
-                    instance_termination_action="STOP",  # INVINCIBLE: Survive preemption
-                ),
+                scheduling=_soak_sched,
             )
 
             # Create the VM
