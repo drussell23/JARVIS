@@ -60,6 +60,7 @@ if _REPO not in sys.path:
 from backend.core.ouroboros.governance.epistemic_feedback import (  # noqa: E402
     build_failure_context,
     pivot_verdict,
+    should_pivot,
     temperature_for_attempt,
 )
 from backend.core.ouroboros.governance.failure_classifier import (  # noqa: E402
@@ -772,6 +773,7 @@ async def run_cognitive_soak(
     signatures: List[str] = []
     epistemic_diffs_injected = 0
     pivoted = False
+    pivot_reason = ""
     decomposed = False
     converged = False
     attempts = 0
@@ -892,12 +894,28 @@ async def run_cognitive_soak(
             next_temp = temperature_for_attempt(base_temp, repeated_signature_count + 1)
             temp_at_floor = abs(next_temp - temperature) < 1e-9
 
-            if not pivoted and pivot_verdict(repeated_signature_count, temp_at_floor):
+            # Composite verdict: pivot on the legacy stuck-wall trigger OR on
+            # budget-exhaustion (thrash / non-convergence backstop). A model
+            # that emits a DIFFERENT failure each attempt resets
+            # repeated_signature_count and so would NEVER trip the legacy
+            # stuck-signature trigger -- the budget backstop catches it once it
+            # has burned the initial GENERATE + all max_repairs attempts.
+            _pivot_budget = 1 + max_repairs
+            _do_pivot, _pivot_reason = should_pivot(
+                repeated_signature_count=repeated_signature_count,
+                temp_at_floor=temp_at_floor,
+                total_attempts=attempts,
+                max_attempts=_pivot_budget,
+            )
+            if not pivoted and _do_pivot:
                 pivoted = True
+                pivot_reason = _pivot_reason
                 _say("")
                 _say("[SOVEREIGN YIELD: UNRESOLVABLE PATH] "
-                     f"same signature x{repeated_signature_count}, temp at floor "
-                     f"({temperature:.4f}). Pivoting -> decompose_for_block.")
+                     f"reason={_pivot_reason} same signature x{repeated_signature_count}, "
+                     f"temp at floor ({temperature:.4f}), "
+                     f"attempts={attempts}/{_pivot_budget}. "
+                     f"Pivoting -> decompose_for_block.")
                 failure_hint = {
                     "signature_hash": sig,
                     "stderr_tail": (out.get("stdout") or "")[-1200:],
@@ -949,6 +967,7 @@ async def run_cognitive_soak(
         "attempts": attempts,
         "temperature_trajectory": temperature_trajectory,
         "pivoted": pivoted,
+        "pivot_reason": pivot_reason,
         "decomposed": decomposed,
         "epistemic_diffs_injected": epistemic_diffs_injected,
         "final_test_output": {

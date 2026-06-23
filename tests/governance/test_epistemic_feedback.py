@@ -437,6 +437,135 @@ class TestPivotVerdict:
 
 
 # ---------------------------------------------------------------------------
+# 7b. should_pivot — composite stuck-signature OR thrash backstop
+# ---------------------------------------------------------------------------
+
+class TestShouldPivot:
+    """should_pivot composes the legacy stuck-wall trigger with a
+    budget-exhaustion (thrash / non-convergence) backstop."""
+
+    def _reload(self, monkeypatch):
+        mod = _import_module()
+        importlib.reload(mod)
+        return _import_module()
+
+    def test_stuck_signature_reason(self, monkeypatch):
+        """(a) Legacy condition (temp_at_floor AND count>=stall_passes) ->
+        (True, 'stuck_signature')."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+        mod = self._reload(monkeypatch)
+        # mid-budget so the thrash backstop does NOT also fire
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count=2,
+            temp_at_floor=True,
+            total_attempts=1,
+            max_attempts=5,
+        )
+        assert pivot is True
+        assert reason == "stuck_signature"
+
+    def test_budget_exhausted_reason_thrash(self, monkeypatch):
+        """(b) THE FIX: total_attempts>=max_attempts pivots even with
+        repeated_signature_count=0 (the thrash / never-repeating case)."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+        mod = self._reload(monkeypatch)
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count=0,
+            temp_at_floor=False,
+            total_attempts=5,
+            max_attempts=5,
+        )
+        assert pivot is True
+        assert reason == "budget_exhausted"
+
+    def test_false_mid_budget_not_stuck(self, monkeypatch):
+        """(c) mid-budget, not stuck -> (False, '')."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+        mod = self._reload(monkeypatch)
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count=0,
+            temp_at_floor=False,
+            total_attempts=2,
+            max_attempts=5,
+        )
+        assert pivot is False
+        assert reason == ""
+
+    def test_flag_off_only_legacy_trigger(self, monkeypatch):
+        """(d) JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED=false -> ONLY the legacy
+        trigger applies; budget-exhaustion does NOT pivot (OFF byte-identical
+        to today's pivot_verdict behavior)."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "false")
+        mod = self._reload(monkeypatch)
+        # Thrash case that WOULD pivot when on:
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count=0,
+            temp_at_floor=False,
+            total_attempts=5,
+            max_attempts=5,
+        )
+        assert pivot is False
+        assert reason == ""
+        # ...but the legacy stuck-wall trigger STILL fires with the flag off:
+        pivot2, reason2 = mod.should_pivot(
+            repeated_signature_count=2,
+            temp_at_floor=True,
+            total_attempts=1,
+            max_attempts=5,
+        )
+        assert pivot2 is True
+        assert reason2 == "stuck_signature"
+
+    def test_flag_off_equals_pivot_verdict(self, monkeypatch):
+        """OFF byte-identical: with the flag off, should_pivot's verdict
+        matches pivot_verdict exactly across the grid (ignoring budget)."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "false")
+        mod = self._reload(monkeypatch)
+        for count in (0, 1, 2, 5):
+            for floor in (True, False):
+                legacy = mod.pivot_verdict(count, floor)
+                pivot, _ = mod.should_pivot(
+                    repeated_signature_count=count,
+                    temp_at_floor=floor,
+                    total_attempts=99,  # would trip budget if on
+                    max_attempts=5,
+                )
+                assert pivot is legacy
+
+    def test_fail_soft_on_bad_input(self, monkeypatch):
+        """(e) fail-soft -> (False, '') on non-numeric input."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+        mod = self._reload(monkeypatch)
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count="bad",
+            temp_at_floor=False,
+            total_attempts="bad",
+            max_attempts=5,
+        )
+        assert pivot is False
+        assert reason == ""
+
+    def test_stuck_signature_takes_precedence(self, monkeypatch):
+        """When BOTH triggers would fire, stuck_signature wins (legacy first)."""
+        monkeypatch.setenv("JARVIS_EPISTEMIC_PIVOT_PASSES", "2")
+        monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+        mod = self._reload(monkeypatch)
+        pivot, reason = mod.should_pivot(
+            repeated_signature_count=3,
+            temp_at_floor=True,
+            total_attempts=5,
+            max_attempts=5,
+        )
+        assert pivot is True
+        assert reason == "stuck_signature"
+
+
+# ---------------------------------------------------------------------------
 # 8. epistemic_feedback_enabled
 # ---------------------------------------------------------------------------
 

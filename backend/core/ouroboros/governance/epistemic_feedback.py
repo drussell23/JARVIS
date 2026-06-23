@@ -200,6 +200,56 @@ def pivot_verdict(repeated_signature_count: int, temp_at_floor: bool) -> bool:
         return False
 
 
+def should_pivot(
+    *,
+    repeated_signature_count: int,
+    temp_at_floor: bool,
+    total_attempts: int,
+    max_attempts: int,
+) -> tuple[bool, str]:
+    """Composite Graceful-Pivot verdict — stuck-wall OR thrash backstop.
+
+    Returns ``(pivot, reason)``:
+
+      - ``(True, "stuck_signature")`` if the legacy
+        ``pivot_verdict(repeated_signature_count, temp_at_floor)`` is True
+        (the model is stuck on the SAME failure signature with the
+        parametric temperature degenerated to its floor — preserved EXACTLY
+        by calling it internally), OR
+      - ``(True, "budget_exhausted")`` if ``total_attempts >= max_attempts``
+        (the THRASH / non-convergence backstop — the model failed
+        ``max_attempts`` times without converging, regardless of whether the
+        failure signature ever repeated; a model that emits a DIFFERENT
+        failure each attempt resets ``repeated_signature_count`` and so would
+        otherwise NEVER pivot), else
+      - ``(False, "")``.
+
+    The thrash backstop is gated by ``JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED``
+    (default true). When that flag is false, ONLY the legacy stuck-signature
+    trigger applies, so the OFF behavior is byte-identical to today's
+    ``pivot_verdict`` call sites.
+
+    Fail-soft: never raises -> ``(False, "")`` on any error.
+    """
+    try:
+        # Legacy stuck-wall trigger — preserved exactly (additive: never
+        # mutate pivot_verdict's contract).
+        if pivot_verdict(repeated_signature_count, temp_at_floor):
+            return True, "stuck_signature"
+
+        # Thrash / non-convergence backstop (gated default-true).
+        if _env_bool("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", True):
+            try:
+                if int(total_attempts) >= int(max_attempts):
+                    return True, "budget_exhausted"
+            except (ValueError, TypeError):
+                return False, ""
+
+        return False, ""
+    except Exception:
+        return False, ""
+
+
 def epistemic_feedback_enabled() -> bool:
     """Returns True if JARVIS_EPISTEMIC_FEEDBACK_ENABLED is set to a truthy value (default true)."""
     return _env_bool("JARVIS_EPISTEMIC_FEEDBACK_ENABLED", True)

@@ -221,6 +221,116 @@ def test_run_cognitive_soak_refuses_when_gate_off(monkeypatch):
         asyncio.run(acs.run_cognitive_soak(client=client, max_repairs=3))
 
 
+# ---------------------------------------------------------------------------
+# THRASH / non-convergence pivot (THE FIX exposed by the Concurrency Gauntlet)
+# A model that produces a DIFFERENT failure each attempt never repeats a
+# signature, so the legacy stuck-signature pivot NEVER trips. The
+# budget-exhaustion backstop in should_pivot must catch it.
+# ---------------------------------------------------------------------------
+
+# Distinct failure modes (each a DIFFERENT signature, never repeating):
+# 1. Module-level NameError on import (collection error)
+_THRASH_IMPORT_ERR = """```python
+def merge_intervals(intervals):
+    return _undefined_symbol(intervals)
+```"""
+
+# 2. SyntaxError (collection error, different text)
+_THRASH_SYNTAX_ERR = """```python
+def merge_intervals(intervals)
+    return intervals
+```"""
+
+# 3. Returns the input untouched -> different assertion failures
+_THRASH_IDENTITY = """```python
+def merge_intervals(intervals):
+    return list(intervals)
+```"""
+
+# 4. Returns empty -> yet another distinct assertion failure
+_THRASH_EMPTY = """```python
+def merge_intervals(intervals):
+    return []
+```"""
+
+# 5. Raises a different runtime error
+_THRASH_TYPEERROR = """```python
+def merge_intervals(intervals):
+    return intervals + 1
+```"""
+
+
+def test_thrash_never_repeating_signature_pivots_on_budget(monkeypatch):
+    """THE FIX: a model that emits a DIFFERENT failure each attempt
+    (never-repeating signature) must STILL pivot -> decompose, via the
+    budget-exhaustion backstop, instead of silently exhausting.
+
+    Pre-fix (legacy pivot_verdict only) this would NEVER pivot because
+    repeated_signature_count stays 0.
+    """
+    real_decompose = acs.decompose_for_block
+    seen = {}
+
+    def _spy(goal, **kwargs):
+        seen["called"] = True
+        seen["goal"] = goal
+        return real_decompose(goal, **kwargs)
+
+    monkeypatch.setattr(acs, "decompose_for_block", _spy)
+    monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "true")
+
+    # Five DISTINCT failure modes, none repeating -> repeated_signature_count
+    # stays 0 throughout. With max_repairs=3 the pivot budget is 1+3=4, so the
+    # pivot must fire once attempts reach 4. The trailing _CORRECT lets the
+    # post-pivot extra GENERATE converge against the decomposed chunk.
+    client = FakeLocalPrimeClient([
+        _THRASH_IMPORT_ERR,
+        _THRASH_SYNTAX_ERR,
+        _THRASH_IDENTITY,
+        _THRASH_EMPTY,
+        _THRASH_TYPEERROR,
+        _CORRECT,
+    ])
+    result = asyncio.run(acs.run_cognitive_soak(client=client, max_repairs=3))
+
+    # The signatures must NOT all be identical (genuine thrash, not a stuck wall).
+    sigs = result["signatures"]
+    assert len(set(sigs)) > 1, f"expected DIFFERENT signatures (thrash), got {sigs!r}"
+
+    # The fix: it pivoted on budget-exhaustion, NOT on a repeated signature.
+    assert result["pivoted"] is True, "thrash must pivot on budget-exhaustion"
+    assert result["pivot_reason"] == "budget_exhausted", result["pivot_reason"]
+    assert seen.get("called") is True, "decompose_for_block must be exercised"
+    assert result["decomposed"] is True
+
+
+def test_thrash_does_not_pivot_when_flag_off(monkeypatch):
+    """OFF byte-identical: with JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED=false the
+    thrash (never-repeating signature) does NOT pivot -- legacy behavior."""
+    real_decompose = acs.decompose_for_block
+    seen = {}
+
+    def _spy(goal, **kwargs):
+        seen["called"] = True
+        return real_decompose(goal, **kwargs)
+
+    monkeypatch.setattr(acs, "decompose_for_block", _spy)
+    monkeypatch.setenv("JARVIS_EPISTEMIC_THRASH_PIVOT_ENABLED", "false")
+
+    client = FakeLocalPrimeClient([
+        _THRASH_IMPORT_ERR,
+        _THRASH_SYNTAX_ERR,
+        _THRASH_IDENTITY,
+        _THRASH_EMPTY,
+        _THRASH_TYPEERROR,
+    ])
+    result = asyncio.run(acs.run_cognitive_soak(client=client, max_repairs=3))
+
+    assert result["pivoted"] is False, "flag off -> no thrash pivot (legacy)"
+    assert result["pivot_reason"] == ""
+    assert seen.get("called") is not True
+
+
 # ===========================================================================
 # Payload #2: the Concurrency Gauntlet (thread-safe TTL+LRU cache)
 # ===========================================================================
