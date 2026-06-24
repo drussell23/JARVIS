@@ -22,6 +22,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { DagNodeView } from '../lib/projection';
 import { dagStateColor } from '../lib/theme';
+import { TEXT, BORDER } from '../lib/tokens';
 
 export interface DAGCanvasProps {
   readonly nodes: readonly DagNodeView[];
@@ -41,8 +42,8 @@ export function buildFlowNodes(views: readonly DagNodeView[]): Node[] {
     data: { label: `${v.nodeId}\n${v.state}` },
     style: {
       background: dagStateColor(v.state),
-      color: '#ffffff',
-      border: '1px solid rgba(255,255,255,0.25)',
+      color: TEXT.inverse,
+      border: `1px solid ${BORDER.nodeEdge}`,
       borderRadius: 8,
       fontSize: 11,
       width: CELL_W - 40,

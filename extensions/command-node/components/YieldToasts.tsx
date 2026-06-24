@@ -6,11 +6,12 @@
  */
 
 import { YieldAlert } from '../lib/projection';
+import { STATE } from '../lib/tokens';
 
 const REASON_COLOR: Record<string, string> = {
-  FRACTURE: '#dc2626',
-  QUARANTINE: '#ea580c',
-  RECOVERED: '#16a34a',
+  FRACTURE: STATE.danger,
+  QUARANTINE: STATE.attention,
+  RECOVERED: STATE.ok,
 };
 
 export interface YieldToastsProps {
@@ -29,11 +30,11 @@ export function YieldToasts({ alerts }: YieldToastsProps): JSX.Element | null {
           key={a.key}
           className="yield-toast"
           data-reason={a.reason}
-          style={{ borderLeftColor: REASON_COLOR[a.reason] ?? '#6b7280' }}
+          style={{ borderLeftColor: REASON_COLOR[a.reason] ?? STATE.pending }}
         >
           <span
             className="yield-badge"
-            style={{ backgroundColor: REASON_COLOR[a.reason] ?? '#6b7280' }}
+            style={{ backgroundColor: REASON_COLOR[a.reason] ?? STATE.pending }}
           >
             {a.reason}
           </span>

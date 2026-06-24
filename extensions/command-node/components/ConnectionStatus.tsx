@@ -7,15 +7,16 @@
  */
 
 import { ConnectionState } from '../hooks/useSovereignStream';
+import { STATE } from '../lib/tokens';
 
 const STATE_COLOR: Record<ConnectionState, string> = {
-  disconnected: '#6b7280',
-  connecting: '#ca8a04',
-  connected: '#16a34a',
-  reconnecting: '#ea580c',
-  error: '#dc2626',
-  closed: '#6b7280',
-  polling: '#0891b2',
+  disconnected: STATE.pending,
+  connecting: STATE.warn,
+  connected: STATE.ok,
+  reconnecting: STATE.attention,
+  error: STATE.danger,
+  closed: STATE.pending,
+  polling: STATE.applied,
 };
 
 const STATE_LABEL: Record<ConnectionState, string> = {

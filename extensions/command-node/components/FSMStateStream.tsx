@@ -10,6 +10,7 @@
 
 import { OUROBOROS_PHASES } from '../lib/types';
 import { OpFsmState } from '../lib/projection';
+import { STATE } from '../lib/tokens';
 
 export interface FSMStateStreamProps {
   readonly ops: readonly OpFsmState[];
@@ -23,17 +24,17 @@ function phaseIndex(phase: string): number {
 function riskBadgeColor(tier: string | undefined): string {
   switch (tier) {
     case 'safe_auto':
-      return '#16a34a';
+      return STATE.ok;
     case 'notify_apply':
-      return '#ca8a04';
+      return STATE.warn;
     case 'approval_required':
-      return '#ea580c';
+      return STATE.attention;
     case 'critical_elevation':
-      return '#dc2626';
+      return STATE.danger;
     case 'blocked':
-      return '#991b1b';
+      return STATE.dangerDeep;
     default:
-      return '#6b7280';
+      return STATE.pending;
   }
 }
 

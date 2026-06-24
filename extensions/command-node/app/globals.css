@@ -1,11 +1,162 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * ============================================================================
+ *  SOVEREIGN DESIGN TOKENS -- the single source of truth.
+ * ============================================================================
+ *
+ *  This :root block is the ONLY place raw hex / raw values are allowed in the
+ *  entire Command Node frontend. Every component (CSS class OR inline style)
+ *  pulls from a SEMANTIC token (a tailwind class backed by a var, or
+ *  var(--token) directly). A future Figma extraction overwrites THIS block
+ *  1:1 -- the canonical names are documented in DESIGN_TOKENS.md.
+ *
+ *  Aesthetic: a military-grade AGI console. Deep space-black layered
+ *  surfaces, an electric neon-cyan primary with layered neon-glow shadows,
+ *  the established Trinity repo identity (Body=blue / Mind=amber /
+ *  Nerves=violet), and an explicit semantic-state palette.
+ *
+ *  Theme: dark is the default (and currently the only) theme. The structure
+ *  is mode-agnostic: a `[data-theme="light"]` (or a Figma-exported override)
+ *  can redefine the same token names without touching a single component.
+ * ----------------------------------------------------------------------------
+ */
 :root {
-  --bg: #0b0f17;
-  --panel: #131926;
-  --panel-2: #0e131d;
-  --border: #1f2937;
-  --text: #e5e7eb;
-  --muted: #9ca3af;
-  --accent: #3b82f6;
+  /* --- Raw palette (primitive scale -- referenced only by semantic tokens) - */
+  --space-black: #05070d;
+  --space-900: #080b12;
+  --space-800: #0b0f17;
+  --space-700: #0e131d;
+  --space-600: #131926;
+  --space-500: #1a2233;
+  --ink-700: #1f2937;
+  --ink-600: #2b3648;
+  --ink-500: #374151;
+  --ink-400: #4b5563;
+  --ink-300: #6b7280;
+  --ink-200: #9ca3af;
+  --ink-100: #cbd5e1;
+  --ink-050: #e5e7eb;
+  --white: #ffffff;
+
+  --cyan-bright: #22d3ee;
+  --cyan-core: #06b6d4;
+  --cyan-deep: #0891b2;
+
+  --blue-core: #2563eb;
+  --blue-bright: #3b82f6;
+  --blue-deep: #1d4ed8;
+  --amber-core: #d97706;
+  --amber-bright: #f59e0b;
+  --violet-core: #7c3aed;
+  --violet-bright: #8b5cf6;
+
+  --green-core: #16a34a;
+  --green-bright: #22c55e;
+  --red-core: #dc2626;
+  --red-deep: #991b1b;
+  --red-mid: #b91c1c;
+  --warn-core: #ca8a04;
+  --orange-core: #ea580c;
+
+  /* --- Semantic surfaces (layered elevation, near-black) ------------------ */
+  --surface-0: var(--space-800); /* app canvas (deepest) */
+  --surface-1: var(--space-600); /* panels / cards */
+  --surface-2: var(--space-700); /* inset / recessed regions */
+  --surface-3: var(--space-500); /* raised chips / buttons */
+  --surface-overlay: var(--space-900); /* modal scrim base */
+  --surface-center: #111827; /* graph center node (deep neutral) */
+
+  /* --- Borders & dividers ------------------------------------------------- */
+  --border-subtle: var(--ink-700);
+  --border-strong: var(--ink-500);
+  --border-bright: var(--ink-100);
+
+  /* --- Text --------------------------------------------------------------- */
+  --text-primary: var(--ink-050);
+  --text-muted: var(--ink-200);
+  --text-inverse: var(--white);
+  --text-on-accent: var(--space-black);
+
+  /* --- Primary / accent (electric neon) ----------------------------------- */
+  --accent: var(--cyan-core);
+  --accent-bright: var(--cyan-bright);
+  --accent-deep: var(--cyan-deep);
+  --accent-ring: rgba(34, 211, 238, 0.35);
+
+  /* --- Trinity repo identity (load-bearing -- keep) ----------------------- */
+  --repo-body: var(--blue-core); /* jarvis = Body */
+  --repo-body-border: var(--blue-bright);
+  --repo-mind: var(--amber-core); /* prime = Mind */
+  --repo-mind-border: var(--amber-bright);
+  --repo-nerves: var(--violet-core); /* reactor = Nerves */
+  --repo-nerves-border: var(--violet-bright);
+  --repo-unknown: var(--ink-300);
+  --repo-unknown-border: var(--ink-200);
+
+  /* --- Semantic state ----------------------------------------------------- */
+  --state-ok: var(--green-core); /* AUTHORIZED / complete */
+  --state-ok-bright: var(--green-bright);
+  --state-danger: var(--red-core); /* REJECTED / FRACTURE */
+  --state-danger-deep: var(--red-deep); /* blocked */
+  --state-warn: var(--warn-core);
+  --state-pending: var(--ink-300);
+  --state-running: var(--blue-core);
+  --state-applied: var(--cyan-deep);
+  --state-attention: var(--orange-core); /* quarantine / reconnecting */
+
+  /* --- Neon-glow box-shadow tokens (the console's signature glow) --------- */
+  --glow-primary: 0 0 0 1px rgba(34, 211, 238, 0.45),
+    0 0 12px rgba(34, 211, 238, 0.35), 0 0 28px rgba(6, 182, 212, 0.25);
+  --glow-danger: 0 0 0 1px rgba(220, 38, 38, 0.5),
+    0 0 12px rgba(220, 38, 38, 0.4), 0 0 30px rgba(153, 27, 27, 0.3);
+  --glow-ok: 0 0 0 1px rgba(34, 197, 94, 0.5),
+    0 0 12px rgba(22, 163, 74, 0.4), 0 0 28px rgba(22, 163, 74, 0.25);
+  --glow-warn: 0 0 0 1px rgba(202, 138, 4, 0.45),
+    0 0 12px rgba(202, 138, 4, 0.35);
+  --shadow-panel: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.66);
+
+  /* --- Typography --------------------------------------------------------- */
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+  --text-xl: 28px;
+
+  /* --- Radius ------------------------------------------------------------- */
+  --radius-xs: 3px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+
+  /* --- Spacing scale ------------------------------------------------------ */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-8: 24px;
+
+  /* --- Borders & rings ---------------------------------------------------- */
+  --border-width: 1px;
+
+  /* --- Texture (subtle scanline / grid console overlay) ------------------- */
+  --scanline-color: rgba(34, 211, 238, 0.03);
+  --grid-color: rgba(148, 163, 184, 0.04);
+  --node-edge: rgba(255, 255, 255, 0.25); /* graph-node hairline overlay */
+  --z-modal: 100;
+  --z-toast: 50;
+
   color-scheme: dark;
 }
 
@@ -18,39 +169,53 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
-    Helvetica, Arial, sans-serif;
-  font-size: 14px;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+}
+
+/* Subtle console grid + scanline texture on the canvas. */
+body {
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      var(--scanline-color) 0,
+      var(--scanline-color) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    linear-gradient(var(--grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+  background-size: 100% 3px, 40px 40px, 40px 40px;
 }
 
 .mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--text-muted);
 }
 
 .badge {
   display: inline-block;
-  padding: 1px 6px;
-  border-radius: 6px;
-  font-size: 11px;
-  color: #fff;
-  background: #374151;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-inverse);
+  background: var(--surface-3);
 }
 
 .badge-provider {
-  background: #1d4ed8;
+  background: var(--blue-deep);
 }
 .badge-route {
-  background: #4b5563;
+  background: var(--ink-400);
 }
 .badge-cross,
 .badge-repo {
-  background: #b91c1c;
+  background: var(--red-mid);
 }
 
 /* --- Mission-control 3-region layout --- */
@@ -63,8 +228,8 @@ body {
     'fsm    fsm'
     'dag    side';
   height: 100vh;
-  gap: 8px;
-  padding: 8px;
+  gap: var(--space-4);
+  padding: var(--space-4);
 }
 
 .cn-topbar {
@@ -72,27 +237,27 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  padding: var(--space-3) var(--space-5);
+  background: var(--surface-1);
+  border: var(--border-width) solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
 
 .cn-fsm {
   grid-area: fsm;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px;
+  background: var(--surface-1);
+  border: var(--border-width) solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
   overflow-x: auto;
   max-height: 220px;
 }
 
 .cn-dag {
   grid-area: dag;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border-subtle);
+  border-radius: var(--radius-md);
   overflow: hidden;
   position: relative;
 }
@@ -101,33 +266,33 @@ body {
   grid-area: side;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
   overflow-y: auto;
 }
 
 .cn-side > .blast-graph,
 .cn-side > .elevation-queue {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px;
+  background: var(--surface-1);
+  border: var(--border-width) solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
 }
 
 /* --- FSM ribbon --- */
 .op-ribbon {
-  margin-bottom: 10px;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 8px;
+  margin-bottom: var(--space-5);
+  border-bottom: var(--border-width) solid var(--border-subtle);
+  padding-bottom: var(--space-4);
 }
 .op-ribbon-head {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
   align-items: center;
-  margin-bottom: 6px;
+  margin-bottom: var(--space-3);
 }
 .op-id {
-  font-family: ui-monospace, monospace;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
   max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -138,7 +303,7 @@ body {
   list-style: none;
   margin: 0;
   padding: 0;
-  gap: 2px;
+  gap: var(--space-1);
 }
 .phase {
   display: flex;
@@ -152,22 +317,22 @@ body {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: #374151;
-  margin-bottom: 3px;
+  background: var(--ink-500);
+  margin-bottom: var(--space-2);
 }
 .phase-done .phase-dot {
-  background: #16a34a;
+  background: var(--state-ok);
 }
 .phase-active .phase-dot {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.35);
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .phase-active .phase-label {
-  color: var(--accent);
+  color: var(--accent-bright);
   font-weight: 600;
 }
 .phase-future .phase-label {
-  color: var(--muted);
+  color: var(--text-muted);
 }
 
 /* --- DAG --- */
@@ -182,7 +347,7 @@ body {
 }
 .dag-empty,
 .blast-graph .muted {
-  padding: 16px;
+  padding: var(--space-6);
 }
 
 /* --- Blast radius --- */
@@ -192,51 +357,51 @@ body {
 .blast-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 6px;
-  font-size: 12px;
+  gap: var(--space-5);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
 }
 .blast-legend {
   display: flex;
-  gap: 10px;
-  margin-bottom: 6px;
-  font-size: 11px;
+  gap: var(--space-5);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-xs);
 }
 .legend-item {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 .legend-swatch {
   display: inline-block;
   width: 10px;
   height: 10px;
-  border-radius: 3px;
-  border: 1px solid;
+  border-radius: var(--radius-xs);
+  border: var(--border-width) solid;
 }
 .blast-detail {
-  margin-top: 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px;
-  background: var(--panel-2);
+  margin-top: var(--space-4);
+  border: var(--border-width) solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  background: var(--surface-2);
 }
 .blast-detail-head {
   display: flex;
   justify-content: space-between;
-  border-bottom: 1px solid;
-  padding-bottom: 4px;
-  margin-bottom: 6px;
+  border-bottom: var(--border-width) solid;
+  padding-bottom: var(--space-2);
+  margin-bottom: var(--space-3);
 }
 .blast-detail dl {
   display: grid;
   grid-template-columns: 70px 1fr;
-  gap: 2px 8px;
+  gap: var(--space-1) var(--space-4);
   margin: 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 .blast-detail dt {
-  color: var(--muted);
+  color: var(--text-muted);
 }
 .blast-detail dd {
   margin: 0;
@@ -249,8 +414,8 @@ body {
   align-items: baseline;
 }
 .elevation-head h2 {
-  font-size: 14px;
-  margin: 0 0 4px 0;
+  font-size: var(--text-base);
+  margin: 0 0 var(--space-2) 0;
 }
 .elevation-list {
   list-style: none;
@@ -258,56 +423,64 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .elevation-item {
-  border: 1px solid var(--border);
+  border: var(--border-width) solid var(--border-subtle);
   border-left: 3px solid var(--accent);
-  border-radius: 6px;
-  padding: 8px;
-  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  background: var(--surface-2);
 }
 .elevation-item.focused {
-  outline: 1px solid var(--accent);
+  outline: var(--border-width) solid var(--accent);
 }
 .elevation-row {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-4);
   align-items: center;
 }
 .elevation-summary {
-  margin: 6px 0;
-  font-size: 12px;
-  color: var(--muted);
+  margin: var(--space-3) 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 .elevation-actions {
   display: flex;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .btn {
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: #1f2937;
-  color: var(--text);
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-sm);
+  border: var(--border-width) solid var(--border-subtle);
+  background: var(--surface-3);
+  color: var(--text-primary);
   cursor: pointer;
 }
 .btn-view:hover {
-  background: #374151;
+  background: var(--ink-500);
+}
+.btn-authorize {
+  border-color: var(--accent-deep);
+  color: var(--accent-bright);
+}
+.btn-authorize:hover {
+  box-shadow: var(--glow-primary);
 }
 .btn-authorize[disabled] {
   opacity: 0.5;
   cursor: not-allowed;
+  box-shadow: none;
 }
 
 /* --- Connection status --- */
 .conn-status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
 }
 .conn-dot {
   width: 10px;
@@ -315,7 +488,7 @@ body {
   border-radius: 50%;
 }
 .conn-eid {
-  color: var(--muted);
+  color: var(--text-muted);
   max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -325,33 +498,224 @@ body {
 /* --- Yield toasts --- */
 .yield-toasts {
   position: fixed;
-  right: 16px;
-  bottom: 16px;
+  right: var(--space-6);
+  bottom: var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  z-index: 50;
+  gap: var(--space-3);
+  z-index: var(--z-toast);
 }
 .yield-toast {
   display: flex;
   align-items: center;
-  gap: 8px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-left: 4px solid #6b7280;
-  border-radius: 8px;
-  padding: 8px 12px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  gap: var(--space-4);
+  background: var(--surface-1);
+  border: var(--border-width) solid var(--border-subtle);
+  border-left: 4px solid var(--state-pending);
+  border-radius: var(--radius-md);
+  padding: var(--space-4) var(--space-5);
+  box-shadow: var(--shadow-panel);
 }
 .yield-badge {
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  color: #fff;
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--text-inverse);
 }
 .link {
   background: none;
   border: none;
-  color: var(--muted);
+  color: var(--text-muted);
   cursor: pointer;
+}
+
+/*
+ * ============================================================================
+ *  AuthorizeElevation biometric modal (Phase 2 write-path).
+ *  Every surface is locked to the FSM state; neon-glow signals the active /
+ *  terminal state. All values pull from the Sovereign tokens above.
+ * ============================================================================
+ */
+.auth-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(5, 7, 13, 0.78);
+  backdrop-filter: blur(3px);
+}
+.auth-modal {
+  width: min(520px, 92vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--surface-1);
+  border: var(--border-width) solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal), var(--glow-primary);
+  padding: var(--space-8);
+  font-family: var(--font-sans);
+}
+.auth-modal[data-state='AUTHORIZED'] {
+  box-shadow: var(--shadow-modal), var(--glow-ok);
+  border-color: var(--state-ok);
+}
+.auth-modal[data-state='REJECTED'],
+.auth-modal[data-state='ERROR'] {
+  box-shadow: var(--shadow-modal), var(--glow-danger);
+  border-color: var(--state-danger);
+}
+.auth-modal[data-immutable-orange='true'] {
+  box-shadow: var(--shadow-modal), var(--glow-warn);
+  border-color: var(--state-attention);
+}
+.auth-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--space-5);
+}
+.auth-title {
+  margin: 0;
+  font-size: var(--text-md);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent-bright);
+}
+.auth-pr {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.auth-state-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+  font-size: var(--text-sm);
+}
+.auth-state-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--state-pending);
+}
+.auth-state-dot[data-active='true'] {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.auth-state-dot[data-tone='ok'] {
+  background: var(--state-ok);
+  box-shadow: var(--glow-ok);
+}
+.auth-state-dot[data-tone='danger'] {
+  background: var(--state-danger);
+  box-shadow: var(--glow-danger);
+}
+.auth-phrase-block {
+  border: var(--border-width) solid var(--accent-deep);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  padding: var(--space-6);
+  margin-bottom: var(--space-6);
+  box-shadow: var(--glow-primary);
+}
+.auth-phrase-label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+  margin-bottom: var(--space-3);
+}
+.auth-phrase {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  line-height: 1.35;
+  color: var(--accent-bright);
+  word-break: break-word;
+}
+.auth-meta {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-1) var(--space-5);
+  margin-bottom: var(--space-6);
+}
+.auth-meta .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.auth-body {
+  font-size: var(--text-base);
+  line-height: 1.5;
+  margin-bottom: var(--space-6);
+}
+.auth-verdict {
+  border-radius: var(--radius-md);
+  padding: var(--space-5);
+  margin-bottom: var(--space-6);
+  font-size: var(--text-sm);
+  border: var(--border-width) solid var(--border-subtle);
+  background: var(--surface-2);
+}
+.auth-verdict[data-tone='ok'] {
+  border-color: var(--state-ok);
+}
+.auth-verdict[data-tone='danger'] {
+  border-color: var(--state-danger);
+}
+.auth-verdict[data-tone='orange'] {
+  border-color: var(--state-attention);
+}
+.auth-verdict-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: var(--space-3);
+}
+.auth-verdict[data-tone='ok'] .auth-verdict-title {
+  color: var(--state-ok-bright);
+}
+.auth-verdict[data-tone='danger'] .auth-verdict-title {
+  color: var(--state-danger);
+}
+.auth-verdict[data-tone='orange'] .auth-verdict-title {
+  color: var(--state-attention);
+}
+.auth-score {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+.auth-actions {
+  display: flex;
+  gap: var(--space-4);
+  justify-content: flex-end;
+}
+.btn-primary {
+  background: var(--accent-deep);
+  border-color: var(--accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+}
+.btn-primary:hover:not([disabled]) {
+  box-shadow: var(--glow-primary);
+}
+.btn-primary[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.auth-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-deep);
+  border-top-color: transparent;
+  animation: auth-spin 0.8s linear infinite;
+}
+@keyframes auth-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
