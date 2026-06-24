@@ -2806,6 +2806,14 @@ Rules:
     # an attention-mechanism interference problem, not an injection
     # problem. Moving the block to the tail + wrapping in the override
     # XML is the compensating response.
+    # Sovereign Cross-Repo Mutator G1: force the Oracle-traced cross-repo blast
+    # radius into the generation context so the model SEES every downstream
+    # symbol in a DIFFERENT repo that depends on what it is about to mutate.
+    # Empty (default / master OFF) -> byte-identical legacy.
+    _cross_repo_blast = getattr(ctx, "cross_repo_blast_prompt", "")
+    if isinstance(_cross_repo_blast, str) and _cross_repo_blast.strip():
+        parts.append(_cross_repo_blast.strip())
+
     _strategic_memory = getattr(ctx, "strategic_memory_prompt", "")
     if isinstance(_strategic_memory, str) and _strategic_memory.strip():
         parts.append(_strategic_memory.strip())

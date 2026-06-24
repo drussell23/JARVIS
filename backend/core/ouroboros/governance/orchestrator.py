@@ -4113,6 +4113,31 @@ class GovernedOrchestrator:
                 except Exception:  # noqa: BLE001 — promoter is additive; never break the pipeline
                     logger.debug("[CrossRepoPromoter] hook skipped", exc_info=True)
 
+                # ---- Cross-Repo Mutator G1: blast-radius context (GENERATE) ----
+                # If the promoter elevated the op to cross-repo AND the master
+                # arming switch is ON, trace the Oracle cross-repo dependents,
+                # emit the operator-visible ASCII blast tree, and inject the
+                # rendered prompt block into the generation context. Gated +
+                # fail-soft → "" when off / on any error (byte-identical; the
+                # promoter + immutable-Orange floor already elevate the tier).
+                try:
+                    from backend.core.ouroboros.governance.cross_repo_master_flag import (
+                        cross_repo_mutation_enabled,
+                    )
+                    if cross_repo_mutation_enabled() and ctx.cross_repo:
+                        from backend.core.ouroboros.governance.multi_repo.cross_repo_wiring import (
+                            build_blast_context_block,
+                        )
+                        _blast_block = await build_blast_context_block(
+                            ctx, oracle=getattr(self._stack, "oracle", None),
+                        )
+                        if _blast_block:
+                            ctx = dataclasses.replace(
+                                ctx, cross_repo_blast_prompt=_blast_block
+                            )
+                except Exception:  # noqa: BLE001 — additive; never break the pipeline
+                    logger.debug("[CrossRepoBlast] G1 hook skipped", exc_info=True)
+
                 # ---- Phase 2b: CONTEXT_EXPANSION ----
                 try:
                     expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
@@ -12693,6 +12718,67 @@ class GovernedOrchestrator:
                 self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
                 await self._publish_outcome(ctx, OperationState.FAILED, verify_result.reason_code)
                 return ctx
+
+            # ---- Cross-Repo Mutator G2: air-gapped Trinity sandbox gate ----
+            # AFTER the existing CrossRepoVerifier (structure/compilation/
+            # integration) passes and BEFORE promoting the ephemeral branches,
+            # run the air-gapped Trinity integration sandbox. A FRACTURE (broken
+            # Body<->Mind<->Nerves handshake; the FRACTURE yield is emitted
+            # inside the gate) routes into the SAME compensating rollback the
+            # verify-failure path uses — the op is sealed/terminal, never
+            # half-applied across repos. Gated + fail-CLOSED (gate returns a
+            # FRACTURE on any uncertainty); no-op PASS when the master switch is
+            # OFF (byte-identical legacy).
+            try:
+                from backend.core.ouroboros.governance.cross_repo_master_flag import (
+                    cross_repo_mutation_enabled,
+                )
+                _g2_armed = cross_repo_mutation_enabled()
+            except Exception:  # noqa: BLE001
+                _g2_armed = False
+            if _g2_armed:
+                from backend.core.ouroboros.governance.multi_repo.cross_repo_wiring import (
+                    run_apply_sandbox_gate,
+                )
+                _sandbox_root = str(
+                    (repo_roots.get(ctx.primary_repo) if isinstance(repo_roots, dict) else None)
+                    or self._config.project_root
+                )
+                _verdict = await run_apply_sandbox_gate(
+                    ctx, candidate_root=_sandbox_root, op_id=ctx.op_id,
+                )
+                if getattr(_verdict, "fracture", False):
+                    logger.warning(
+                        "[Orchestrator] Cross-repo Trinity sandbox FRACTURE "
+                        "op=%s reason=%s — routing to compensating rollback",
+                        ctx.op_id, getattr(_verdict, "reason", "?"),
+                    )
+                    comp_ok = await strategy.compensate_after_verify_failure(
+                        saga_result=apply_result,
+                        patch_map=patch_map,
+                        op_id=ctx.op_id,
+                        reason_code="cross_repo_fracture",
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code="cross_repo_fracture",
+                        rollback_occurred=comp_ok,
+                    )
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "cross_repo_fracture",
+                            "saga_id": apply_result.saga_id,
+                            "compensated": comp_ok,
+                            "sandbox_reason": getattr(_verdict, "reason", ""),
+                        },
+                    )
+                    self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
+                    await self._publish_outcome(
+                        ctx, OperationState.FAILED, "cross_repo_fracture"
+                    )
+                    return ctx
 
             # B+ mode: promote ephemeral branches before declaring success
             promote_state, promoted_shas = await strategy.promote_all(
