@@ -413,3 +413,7 @@ autopsy_reports/
 # adversarial cognitive soak scratch artifacts
 /impl.py
 /test_impl.py
+
+# A1 Live-Fire Chaos Harness run outputs (transient)
+a1_runs/
+a1_autopsy/
