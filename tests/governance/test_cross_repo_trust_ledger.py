@@ -29,6 +29,7 @@ def _clean_env(tmp_path, monkeypatch):
     for k in (
         "JARVIS_TRUST_BASE",
         "JARVIS_TRUST_MIN_STREAK",
+        "JARVIS_TRUST_MIN_COMPLEXITY",
         "JARVIS_TRUST_W_DEPENDENTS",
         "JARVIS_TRUST_W_AST",
         "JARVIS_TRUST_W_DEPTH",
@@ -173,26 +174,96 @@ def test_adaptive_threshold_scales_with_complexity(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_100_trivial_merges_do_not_graduate(monkeypatch):
-    # The load-bearing magic-N rejection: 100 trivial (complexity ~0.1)
-    # clean merges accumulate trust 10.0, but the dynamic threshold floor
-    # keeps the bar above raw count. With base high enough that 100x0.1
-    # stays under threshold, graduation by COUNT alone is impossible.
-    monkeypatch.setenv("JARVIS_TRUST_BASE", "15.0")
-    monkeypatch.setenv("JARVIS_TRUST_MIN_STREAK", "2")
+def test_100_trivial_merges_do_not_graduate():
+    # The load-bearing magic-N rejection at DEFAULT env (no JARVIS_TRUST_BASE
+    # override).  100 trivial (complexity ~0.07) clean merges accumulate trust
+    # ~7.0.  Under DEFAULT env:
+    #   * JARVIS_TRUST_BASE = 3.0 (default)
+    #   * max_complexity_in_streak = 0.07 -> threshold = 3.0 * max(0.07,1.0)
+    #     = 3.0 (trust bar NOT cleared by 7.0 ... wait, 7.0 > 3.0).
+    #   BUT the NEW non-trivial gate fires first:
+    #   * JARVIS_TRUST_MIN_COMPLEXITY = 1.0 (default)
+    #   * max_complexity_in_streak = 0.07 < 1.0 -> has_nontrivial = False
+    #   -> graduated = False regardless of trust or streak count.
+    # Result: trivial-ONLY streaks CANNOT graduate under DEFAULT env.
+    trivial_complexity = ctl.complexity_weight(
+        blast_dependents=0, ast_node_count=1, boundary_depth=0, body_chars=100,
+    )
     led = _ledger()
     for i in range(100):
         led.record_outcome(
             repo="jarvis", pr_id=f"trivial-{i}", outcome="clean_merge",
-            complexity=0.1,
+            complexity=trivial_complexity,
         )
     st = led.trust_state("jarvis")
-    # trust == 100 * 0.1 == 10.0; threshold == 15.0 * max(0.1, 1.0) == 15.0.
-    # 10.0 < 15.0 -> never graduates regardless of the 100 count.
-    assert st.trust == pytest.approx(10.0)
-    assert not led.is_graduated("jarvis"), (
-        "100 trivial PRs must not graduate via raw count"
+    # Confirm the complexity is indeed below the default min-complexity floor.
+    assert trivial_complexity < 1.0, (
+        f"expected a trivial weight <1.0, got {trivial_complexity}"
     )
+    # max_complexity_in_streak < 1.0 -> non-trivial gate blocks graduation.
+    assert not led.is_graduated("jarvis"), (
+        "100 trivial PRs must not graduate via raw count (default env)"
+    )
+    # streak and trust still accumulate (only the graduation gate fires).
+    assert st.streak == 100
+    assert st.trust == pytest.approx(trivial_complexity * 100)
+
+
+def test_graduation_requires_nontrivial_complexity(monkeypatch):
+    """A trivial-ONLY streak (all complexity_weight < JARVIS_TRUST_MIN_COMPLEXITY)
+    can NEVER graduate even if accumulated trust and streak count far exceed the
+    threshold.  Adding a single PR with weight >= the floor, plus sufficient trust
+    and streak, DOES graduate."""
+    monkeypatch.setenv("JARVIS_TRUST_BASE", "1.0")
+    monkeypatch.setenv("JARVIS_TRUST_MIN_STREAK", "2")
+    # Default JARVIS_TRUST_MIN_COMPLEXITY = 1.0 (not set -> default).
+    led = _ledger()
+    # Pile up 50 sub-floor PRs.  trust = 50*0.5 = 25 >> threshold=1.0*1.0=1.0;
+    # streak = 50 >> min_streak=2.  But has_nontrivial=False -> NOT graduated.
+    for i in range(50):
+        led.record_outcome(
+            repo="jarvis", pr_id=f"sub-{i}", outcome="clean_merge",
+            complexity=0.5,
+        )
+    assert not led.is_graduated("jarvis"), (
+        "trivial-only streak must not graduate even with trust >> threshold"
+    )
+
+    # Now add ONE non-trivial PR (complexity >= 1.0).
+    led.record_outcome(
+        repo="jarvis", pr_id="nontrivial-1", outcome="clean_merge",
+        complexity=1.0,
+    )
+    # trust = 25 + 1.0 = 26.0; max_complexity = 1.0 >= 1.0 -> has_nontrivial
+    # = True; threshold = 1.0 * max(1.0, 1.0) = 1.0; streak = 51 >= 2.
+    # -> graduated.
+    assert led.is_graduated("jarvis"), (
+        "streak with at least one non-trivial PR (complexity>=1.0) and "
+        "sufficient trust + streak MUST graduate"
+    )
+
+
+def test_graduation_nontrivial_floor_is_env_tunable(monkeypatch):
+    """JARVIS_TRUST_MIN_COMPLEXITY is env-tunable: raising it above the PR
+    weight blocks graduation; lowering it to 0.0 disables the extra gate."""
+    monkeypatch.setenv("JARVIS_TRUST_BASE", "1.0")
+    monkeypatch.setenv("JARVIS_TRUST_MIN_STREAK", "2")
+    led = _ledger()
+    # PRs with complexity 0.8 each.
+    for i in range(5):
+        led.record_outcome(
+            repo="jarvis", pr_id=f"mid-{i}", outcome="clean_merge",
+            complexity=0.8,
+        )
+    # With floor=1.0 (default): max 0.8 < 1.0 -> NOT graduated.
+    assert not led.is_graduated("jarvis")
+    # Raise floor to 2.0: still blocked.
+    monkeypatch.setenv("JARVIS_TRUST_MIN_COMPLEXITY", "2.0")
+    assert not led.is_graduated("jarvis")
+    # Lower floor to 0.5: 0.8 >= 0.5 -> has_nontrivial = True.
+    # trust=4.0; threshold=1.0*max(0.8,1.0)=1.0; streak=5>=2 -> graduated.
+    monkeypatch.setenv("JARVIS_TRUST_MIN_COMPLEXITY", "0.5")
+    assert led.is_graduated("jarvis")
 
 
 def test_truly_trivial_never_clears_threshold(monkeypatch):

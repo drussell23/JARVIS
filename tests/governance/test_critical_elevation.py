@@ -28,6 +28,7 @@ def _isolate(tmp_path, monkeypatch):
     for k in (
         "JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED",
         "JARVIS_TRUST_BASE", "JARVIS_TRUST_MIN_STREAK",
+        "JARVIS_TRUST_MIN_COMPLEXITY",
         "JARVIS_MIN_RISK_TIER", "JARVIS_PARANOIA_MODE",
         "JARVIS_AUTO_APPLY_QUIET_HOURS",
     ):
@@ -192,6 +193,53 @@ def test_unknown_repo_fail_closed_critical_elevation(monkeypatch):
     )
     assert floor in ("critical_elevation", "approval_required")
     assert floor is not None
+
+
+def test_garbage_flag_value_fails_closed_for_jarvis(monkeypatch):
+    """JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED=GARBAGE/maybe/1.5 must
+    NOT disable the jarvis hard-halt (fail-CLOSED: garbage -> enabled).
+    Only explicit falsy tokens (0/false/no/off) disable the jarvis hard-halt.
+    prime/reactor are unaffected (Immutable Orange never reads this flag)."""
+    for garbage_value in ("GARBAGE", "maybe", "1.5", "TRUE_MAYBE", "nope"):
+        monkeypatch.setenv(
+            "JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED", garbage_value,
+        )
+        # is_critical_elevation_enabled must be True for garbage values.
+        assert ce.is_critical_elevation_enabled(), (
+            f"garbage flag value {garbage_value!r} silently disabled the "
+            "jarvis hard-halt (fails OPEN) — must fail-CLOSED (enabled)"
+        )
+        # The jarvis hard-halt must still fire (not graduated -> critical_elevation).
+        floor = ce.cross_repo_elevation_floor(
+            target_repo="jarvis", crosses_repo=True,
+        )
+        assert floor == "critical_elevation", (
+            f"garbage flag {garbage_value!r}: jarvis floor={floor!r}, "
+            "expected critical_elevation"
+        )
+        # prime/reactor: Immutable Orange stays approval_required regardless.
+        for repo in ("prime", "reactor"):
+            assert ce.cross_repo_elevation_floor(
+                target_repo=repo, crosses_repo=True,
+            ) == "approval_required", (
+                f"Immutable Orange broken for {repo!r} with flag={garbage_value!r}"
+            )
+
+    # Confirm only explicit falsy tokens actually disable the jarvis halt.
+    for falsy_value in ("0", "false", "no", "off", "False", "OFF", "NO"):
+        monkeypatch.setenv(
+            "JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED", falsy_value,
+        )
+        assert not ce.is_critical_elevation_enabled(), (
+            f"explicit falsy {falsy_value!r} should disable the jarvis halt"
+        )
+        # Even with the jarvis halt disabled, prime/reactor stay Orange.
+        for repo in ("prime", "reactor"):
+            assert ce.cross_repo_elevation_floor(
+                target_repo=repo, crosses_repo=True,
+            ) == "approval_required", (
+                f"Immutable Orange broken for {repo!r} with flag={falsy_value!r}"
+            )
 
 
 def test_record_cross_repo_outcome_convenience(monkeypatch):

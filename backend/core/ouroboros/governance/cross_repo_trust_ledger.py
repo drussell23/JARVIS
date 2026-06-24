@@ -383,8 +383,18 @@ class CrossRepoTrustLedger:
             acc.max_complexity_in_streak, 1.0,
         )
         min_streak = _env_int("JARVIS_TRUST_MIN_STREAK", 2)
+        # Hard gate: the streak MUST contain at least one PR whose
+        # complexity_weight >= JARVIS_TRUST_MIN_COMPLEXITY (default 1.0).
+        # A trivial-only streak (all weights below the floor) can NEVER
+        # graduate regardless of count or accumulated trust. Fail-CLOSED:
+        # any error in reading the env leaves the gate in its default
+        # (1.0), so a streak of only sub-1.0 PRs still cannot pass.
+        min_complexity = _env_float("JARVIS_TRUST_MIN_COMPLEXITY", 1.0)
+        has_nontrivial = acc.max_complexity_in_streak >= min_complexity
         graduated = (
-            acc.trust >= threshold and acc.streak >= min_streak
+            acc.trust >= threshold
+            and acc.streak >= min_streak
+            and has_nontrivial
         )
         return TrustState(
             repo=repo_clean,

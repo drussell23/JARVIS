@@ -51,9 +51,11 @@ _IMMUTABLE_ORANGE_REPOS = frozenset({"prime", "reactor"})
 # auto-merge.
 _BODY_REPO = "jarvis"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
 _ENV_CRITICAL_ELEVATION = "JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED"
+
+# Only these tokens explicitly disable the jarvis hard-halt (fail-CLOSED:
+# garbage / typo values are treated as enabled, never open the halt).
+_FALSY = frozenset({"0", "false", "no", "off"})
 
 
 class GovernanceTier:
@@ -75,11 +77,21 @@ def is_critical_elevation_enabled() -> bool:
     """Master flag for the *jarvis* CRITICAL_ELEVATION hard-halt
     (``JARVIS_CROSS_REPO_CRITICAL_ELEVATION_ENABLED``, default true).
 
+    Fail-CLOSED: only an EXPLICIT falsy token disables the jarvis hard-halt.
+    Unset -> default true (enabled). A garbage/typo value (e.g. ``GARBAGE``,
+    ``maybe``, ``1.5``) resolves to ENABLED (never silently open the halt).
+
+      * disabled only when: ``value.strip().lower() in {"0","false","no","off"}``
+      * anything else (including unset, ``true``, ``1``, ``GARBAGE``) -> enabled.
+
     NOTE: this flag governs ONLY the jarvis hard-halt. The Immutable Orange
     floor for prime/reactor is NOT gated by it — even with this flag off,
     prime/reactor stay >= approval_required (permanent Sovereign Law)."""
-    raw = os.environ.get(_ENV_CRITICAL_ELEVATION, "true").strip().lower()
-    return raw in _TRUTHY
+    raw = os.environ.get(_ENV_CRITICAL_ELEVATION)
+    if raw is None:
+        # Unset -> default enabled.
+        return True
+    return raw.strip().lower() not in _FALSY
 
 
 def _is_immutable_orange(target_repo: str) -> bool:
