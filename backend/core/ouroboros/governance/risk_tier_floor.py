@@ -86,7 +86,16 @@ _ORDER = {
     "safe_auto": 0,
     "notify_apply": 1,
     "approval_required": 2,
-    "blocked": 3,
+    # CRITICAL_ELEVATION (Sovereign Cross-Repo Mutator G3) — conceptually
+    # ABOVE approval_required: a cross-repo PR is created but merge is
+    # HARD-HALTED for explicit operator approval regardless of CI/test/
+    # sandbox status. More restrictive than approval_required but NOT a
+    # permanent block, so it ranks between approval_required(2) and
+    # blocked(4). Strictest-wins correctness: any approval_required floor
+    # composed with a critical_elevation floor resolves to
+    # critical_elevation.
+    "critical_elevation": 3,
+    "blocked": 4,
 }
 
 
@@ -494,12 +503,57 @@ def _recursion_depth_floor(
         return None
 
 
+def _cross_repo_elevation_floor(
+    target_repo: Optional[str],
+    crosses_repo: bool,
+) -> Optional[str]:
+    """Sovereign Cross-Repo Mutator G3 — compose the cross-repo governance
+    floor (CRITICAL_ELEVATION + the Immutable Orange Protocol) into the
+    strictest-wins composition.
+
+    Backward-compatible: when ``target_repo`` is None (the default for every
+    existing single-repo caller), returns ``None`` immediately — byte-
+    identical to this gate not existing. Only when a caller supplies cross-
+    repo context does the floor apply.
+
+    Delegates to ``critical_elevation.cross_repo_elevation_floor`` which is
+    itself fail-CLOSED (prime/reactor -> approval_required permanently;
+    jarvis -> critical_elevation until graduated). NEVER raises — the floor
+    must stay robust. A failure here, however, must NOT silently relax a
+    cross-repo op: if cross-repo context WAS supplied and the lookup raises,
+    fall back to the MORE restrictive default for the target class.
+    """
+    if target_repo is None and not crosses_repo:
+        return None
+    try:
+        from backend.core.ouroboros.governance.critical_elevation import (
+            cross_repo_elevation_floor,
+        )
+        return cross_repo_elevation_floor(
+            target_repo=target_repo or "",
+            crosses_repo=crosses_repo,
+        )
+    except Exception:  # noqa: BLE001 — fail-CLOSED, never relax cross-repo
+        logger.debug(
+            "[RiskFloor] cross-repo floor lookup failed — fail-closed",
+            exc_info=True,
+        )
+        if not crosses_repo:
+            return None
+        repo_norm = (target_repo or "").strip().lower()
+        if repo_norm in ("prime", "reactor"):
+            return "approval_required"
+        return "critical_elevation"
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
     signal_source: str = "",
     op_id: Optional[str] = None,
     target_files: Optional[Sequence[Any]] = None,
+    target_repo: Optional[str] = None,
+    crosses_repo: bool = False,
 ) -> Optional[str]:
     """Compose the floor signals into a single recommendation.
 
@@ -566,6 +620,14 @@ def recommended_floor(
     recursion = _recursion_depth_floor(target_files)
     if recursion is not None:
         candidates.append(recursion)
+    # Sovereign Cross-Repo Mutator G3 — the CRITICAL_ELEVATION + Immutable
+    # Orange floor. Byte-identical for existing single-repo callers
+    # (target_repo None + crosses_repo False -> None). prime/reactor ->
+    # approval_required (permanent Sovereign Law); jarvis crossing a
+    # boundary -> critical_elevation until the Trust Ledger graduates it.
+    cross_repo = _cross_repo_elevation_floor(target_repo, crosses_repo)
+    if cross_repo is not None:
+        candidates.append(cross_repo)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
@@ -580,6 +642,8 @@ def apply_floor_to_name(
     signal_source: str = "",
     op_id: Optional[str] = None,
     target_files: Optional[Sequence[Any]] = None,
+    target_repo: Optional[str] = None,
+    crosses_repo: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """Apply the recommended floor to a tier *name*.
 
@@ -608,6 +672,8 @@ def apply_floor_to_name(
             signal_source=signal_source,
             op_id=op_id,
             target_files=target_files,
+            target_repo=target_repo,
+            crosses_repo=crosses_repo,
         )
     except Exception:  # noqa: BLE001
         # Slice 163 — FAIL-CLOSED. A failure computing the recommendation must NOT
@@ -627,6 +693,8 @@ def apply_floor_to_risk_tier(
     signal_source: str = "",
     op_id: Optional[str] = None,
     target_files: Optional[Sequence[Any]] = None,
+    target_repo: Optional[str] = None,
+    crosses_repo: bool = False,
 ) -> Any:
     """Slice 165 — apply the governance floor to a ``RiskTier`` ENUM (composing
     :func:`apply_floor_to_name` + the name<->RiskTier mapping that was previously
@@ -642,13 +710,20 @@ def apply_floor_to_risk_tier(
         effective, applied = apply_floor_to_name(
             risk_tier.name.lower(),
             signal_source=signal_source, op_id=op_id, target_files=target_files,
+            target_repo=target_repo, crosses_repo=crosses_repo,
         )
         if applied is None:
             return risk_tier
+        # RiskTier has no CRITICAL_ELEVATION member — it is a governance-
+        # level state strictly ABOVE approval_required but below blocked. At
+        # the enum layer it floors to APPROVAL_REQUIRED (the closest, never-
+        # weaker enum tier); the hard-halt semantics are enforced by the
+        # governance/orange-PR layer that reads the name-level floor.
         tgt = {
             "safe_auto": RiskTier.SAFE_AUTO,
             "notify_apply": RiskTier.NOTIFY_APPLY,
             "approval_required": RiskTier.APPROVAL_REQUIRED,
+            "critical_elevation": RiskTier.APPROVAL_REQUIRED,
             "blocked": RiskTier.BLOCKED,
         }.get(effective)
         if tgt is not None and risk_tier.value < tgt.value:
