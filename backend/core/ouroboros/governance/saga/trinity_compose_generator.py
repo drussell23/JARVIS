@@ -43,7 +43,7 @@ Env knobs (no hardcoding of the tunables):
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # PyYAML available across soak/prod images.
     import yaml  # type: ignore
@@ -181,20 +181,43 @@ def _service(
     overrides: Dict[str, str],
     network: str,
     with_healthcheck: bool,
+    prebaked_image: str = "",
 ) -> Dict[str, Any]:
-    """One Trinity service: base image + repo bind-mount (ro) + server + env."""
-    svc: Dict[str, Any] = {
-        "image": base_image,
-        # Bind-mount the repo READ-ONLY -> the sandbox can never mutate the
-        # sibling repo's working tree (no cross-repo write through the sandbox).
-        "volumes": ["%s:/app:ro" % repo_root],
-        "working_dir": "/app",
-        "command": ["bash", "-lc", _install_and_start(server_cmd)],
-        # Every provider base URL points at the in-network sinkhole.
-        "environment": dict(overrides),
-        "networks": [network],
-        "expose": [str(port)],
-    }
+    """One Trinity service: base image + repo bind-mount (ro) + server + env.
+
+    When ``prebaked_image`` is supplied (the Pre-Flight Cache Manager baked a
+    hash-tagged image with the repo's deps already pip-installed in a WAN phase),
+    use that image directly and run the repo's OWN server command -- NO bind
+    mount, NO ``apt-get``/``pip`` at boot. This is what lets the air-gapped
+    (``internal: true``) boot succeed even though PyPI is unreachable: the deps
+    are already inside the image, baked WAN-connected before the air-gap is
+    entered. The legacy base-image + bind-mount + pip-at-boot path is preserved
+    byte-identical when ``prebaked_image`` is empty (prebake disabled / inert).
+    """
+    if prebaked_image:
+        # Deps already baked into the image (WAN phase). The repo is COPYed into
+        # /app at bake time, so just exec its server -- no mount, no pip.
+        svc: Dict[str, Any] = {
+            "image": prebaked_image,
+            "working_dir": "/app",
+            "command": ["bash", "-lc", "exec %s" % server_cmd],
+            "environment": dict(overrides),
+            "networks": [network],
+            "expose": [str(port)],
+        }
+    else:
+        svc = {
+            "image": base_image,
+            # Bind-mount the repo READ-ONLY -> the sandbox can never mutate the
+            # sibling repo's working tree (no cross-repo write through sandbox).
+            "volumes": ["%s:/app:ro" % repo_root],
+            "working_dir": "/app",
+            "command": ["bash", "-lc", _install_and_start(server_cmd)],
+            # Every provider base URL points at the in-network sinkhole.
+            "environment": dict(overrides),
+            "networks": [network],
+            "expose": [str(port)],
+        }
     if with_healthcheck:
         svc["healthcheck"] = _healthcheck(port=port)
     return svc
@@ -208,6 +231,7 @@ def generate_trinity_compose(
     mock_port: int = _DEFAULT_MOCK_PORT,
     base_image: str = _DEFAULT_BASE_IMAGE,
     egress_mock_script: str = "/app/scripts/trinity_sandbox_egress_mock.py",
+    images: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Generate the REAL air-gapped 3-repo Trinity compose dict.
 
@@ -220,11 +244,22 @@ def generate_trinity_compose(
 
     Cryptographic sinkhole: one ``internal: true`` network; every service's
     provider URLs overridden to the in-network ``egress-mock``.
+
+    Pre-baked images (Pre-Flight Cache Manager): ``images`` maps a repo key
+    (``"jarvis"`` / ``"prime"`` / ``"reactor"``) to a hash-tagged image that the
+    bake phase produced WAN-connected (deps already pip-installed + repo COPYed
+    in). When present for a service, that service runs from the cached image with
+    NO bind-mount and NO pip-at-boot -- which is what makes the air-gapped boot
+    succeed (PyPI is unreachable on the ``internal: true`` net). When ``images``
+    is None / a key is absent, the legacy base-image + bind-mount + pip-at-boot
+    path is used byte-identical (prebake disabled / inert).
     """
     # Env may override the passed defaults so an operator can tune without
     # touching the call site; explicit non-default args still win.
     if base_image == _DEFAULT_BASE_IMAGE:
         base_image = _base_image()
+
+    image_map: Dict[str, str] = dict(images or {})
 
     overrides = _provider_url_overrides(mock_port=mock_port)
     net = TRINITY_NETWORK
@@ -240,6 +275,7 @@ def generate_trinity_compose(
         overrides=overrides,
         network=net,
         with_healthcheck=True,
+        prebaked_image=image_map.get("prime", ""),
     )
     services["reactor"] = _service(
         repo_root=reactor_root,
@@ -249,6 +285,7 @@ def generate_trinity_compose(
         overrides=overrides,
         network=net,
         with_healthcheck=True,
+        prebaked_image=image_map.get("reactor", ""),
     )
 
     # Body (jarvis): the integration driver / in-network vantage. Health-GATED
@@ -265,6 +302,7 @@ def generate_trinity_compose(
         overrides=overrides,
         network=net,
         with_healthcheck=False,
+        prebaked_image=image_map.get("jarvis", ""),
     )
     jarvis_svc["depends_on"] = {
         "prime": {"condition": "service_healthy"},
