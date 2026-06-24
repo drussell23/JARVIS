@@ -381,6 +381,11 @@ class SubagentScheduler:
         self._recovery_queue: List[str] = []
         self._running = False
         self._lock = asyncio.Lock()
+        # Swarm Phase 1c — per-graph Zero-Trust AgentMessageBus. Created at
+        # graph-start, torn down + GC'd in the graph finally (alongside the 1b
+        # sandbox vaporization). Gated JARVIS_SWARM_MESSAGE_BUS_ENABLED
+        # (default false -> no bus, workers silent as Phase 1b).
+        self._graph_buses: Dict[str, Any] = {}
 
     async def start(self) -> None:
         """Start the scheduler lifecycle."""
@@ -510,9 +515,67 @@ class SubagentScheduler:
             "completed_graphs": sorted(self._merged_patches.keys()),
         }
 
+    def _build_bus_for_graph(self, graph: ExecutionGraph) -> Optional[Any]:
+        """Construct the per-graph AgentMessageBus (Phase 1c).
+
+        Gated by ``JARVIS_SWARM_MESSAGE_BUS_ENABLED`` (default false). Returns
+        None when the gate is off OR the graph carries no swarm-synthesized
+        workers — in both cases behavior is byte-identical to Phase 1b (no
+        bus, workers stay silent). Each swarm worker is registered as a member
+        of THIS graph (the sender tag). Fail-CLOSED: any construction error ->
+        None (graph runs without a bus; teardown has nothing to do).
+        """
+        try:
+            from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+                AgentMessageBus,
+                bus_enabled,
+            )
+            if not bus_enabled():
+                return None
+            swarm_units = [
+                u for u in graph.units if getattr(u, "is_swarm_worker", False)
+            ]
+            if not swarm_units:
+                return None
+            bus = AgentMessageBus(graph_id=graph.graph_id, op_id=graph.op_id)
+            for unit in swarm_units:
+                bus.register_worker(unit.unit_id)
+            self._graph_buses[graph.graph_id] = bus
+            logger.info(
+                "[SubagentScheduler] AgentMessageBus created graph=%s members=%d",
+                graph.graph_id, len(swarm_units),
+            )
+            return bus
+        except Exception:  # noqa: BLE001 — bus must never break graph execution.
+            logger.debug(
+                "[SubagentScheduler] bus construction failed (non-fatal); "
+                "graph runs without 1c coordination", exc_info=True,
+            )
+            return None
+
+    def _destroy_bus_for_graph(self, graph_id: str) -> None:
+        """Per-graph lifecycle isolation: tear down the bus + zero its secret.
+
+        Composes with the 1b sandbox vaporization. NEVER raises.
+        """
+        bus = self._graph_buses.pop(graph_id, None)
+        if bus is None:
+            return
+        try:
+            bus.destroy()
+            logger.info("[SubagentScheduler] AgentMessageBus destroyed graph=%s", graph_id)
+        except Exception:  # noqa: BLE001 — teardown must never break cleanup.
+            logger.debug("[SubagentScheduler] bus destroy raised (non-fatal)", exc_info=True)
+
+    def get_bus(self, graph_id: str) -> Optional[Any]:
+        """Return the live per-graph bus (or None when off / after teardown)."""
+        return self._graph_buses.get(graph_id)
+
     async def _run_graph(self, graph_id: str) -> None:
         state = self._graphs[graph_id]
         graph = state.graph
+        # Swarm Phase 1c — per-graph Zero-Trust bus (gated; None when off).
+        self._build_bus_for_graph(graph)
         try:
             while True:
                 pending = self._pending_units(graph, state)
@@ -680,6 +743,12 @@ class SubagentScheduler:
                 state,
             )
             self._finish_graph(graph_id, state)
+        finally:
+            # Swarm Phase 1c — per-graph lifecycle isolation: the bus + its
+            # graph-scoped secret cease on DAG completion (success / failure /
+            # cancellation), composing with the 1b sandbox vaporization in the
+            # per-unit executor. No global / persistent bus survives the graph.
+            self._destroy_bus_for_graph(graph_id)
 
     async def _execute_unit_guarded(
         self,
