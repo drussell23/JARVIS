@@ -325,6 +325,81 @@ def test_remote_with_money_gate_calls_hypervisor(monkeypatch):
 
 
 # ===========================================================================
+# 5b. provision_and_run_remote wires transport=git + --on-demand passthrough.
+# ===========================================================================
+
+
+def test_provision_remote_sets_transport_git(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, env=None, check=False):
+        captured["argv"] = list(argv)
+        captured["env"] = dict(env or {})
+
+        class _CP:
+            returncode = 0
+        return _CP()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.delenv("JARVIS_IAC_SYNC_TRANSPORT", raising=False)
+    rc = harness.provision_and_run_remote(cost_cap=10.0, wall_seconds=3600, seed=0)
+    assert rc == 0
+    assert captured["env"].get("JARVIS_IAC_SYNC_TRANSPORT") == "git", \
+        "the A1 remote path must drive the fast-WAN git transport"
+
+
+def test_provision_remote_on_demand_passthrough_present(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, env=None, check=False):
+        captured["argv"] = list(argv)
+
+        class _CP:
+            returncode = 0
+        return _CP()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.setenv("JARVIS_IAC_ON_DEMAND", "1")
+    harness.provision_and_run_remote(cost_cap=10.0, wall_seconds=3600, seed=0)
+    assert "--on-demand" in captured["argv"], \
+        "JARVIS_IAC_ON_DEMAND=1 must append --on-demand to the hypervisor argv"
+
+
+def test_provision_remote_on_demand_absent_by_default(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, env=None, check=False):
+        captured["argv"] = list(argv)
+
+        class _CP:
+            returncode = 0
+        return _CP()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.delenv("JARVIS_IAC_ON_DEMAND", raising=False)
+    harness.provision_and_run_remote(cost_cap=10.0, wall_seconds=3600, seed=0)
+    assert "--on-demand" not in captured["argv"], \
+        "without JARVIS_IAC_ON_DEMAND the node stays Spot (no --on-demand)"
+
+
+def test_provision_remote_respects_operator_tar_pin(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, env=None, check=False):
+        captured["env"] = dict(env or {})
+
+        class _CP:
+            returncode = 0
+        return _CP()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.setenv("JARVIS_IAC_SYNC_TRANSPORT", "tar")
+    harness.provision_and_run_remote(cost_cap=10.0, wall_seconds=3600, seed=0)
+    assert captured["env"].get("JARVIS_IAC_SYNC_TRANSPORT") == "tar", \
+        "an explicit operator tar pin must be respected (setdefault, not override)"
+
+
+# ===========================================================================
 # 6. --dry-run-local --stub-soak: A1_DISPATCH_PROVEN end-to-end (real wiring).
 # ===========================================================================
 

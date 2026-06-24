@@ -88,6 +88,43 @@ _DEFAULT_DEADMAN_BOOT_GRACE_S = int(os.environ.get("JARVIS_IAC_DEADMAN_BOOT_GRAC
 # The remote root the 3 repos sync into.
 _REMOTE_TRINITY_ROOT = os.environ.get("JARVIS_IAC_REMOTE_ROOT", "/opt/trinity")
 
+# --------------------------------------------------------------------------- #
+# Git-clone transport (JARVIS_IAC_SYNC_TRANSPORT=git) -- the node clones origin
+# at the EXACT local HEAD commit over FAST WAN, replacing the <1MB/s IAP tar-pipe
+# (which runs over the SSH tunnel and killed 3 A1 soak runs). 581MB over WAN is
+# ~1-2min vs ~10min+ over the tar-pipe. Parity-guaranteed: local HEAD must be on
+# origin (pushed) and the node's resulting HEAD must == the local sha. PUBLIC
+# repo -> ANONYMOUS clone, NO token.
+#
+# Bounded clone timeout (581MB over WAN ~1-2min; 300s == ample margin).
+_DEFAULT_GIT_CLONE_TIMEOUT_S = int(
+    os.environ.get("JARVIS_IAC_GIT_CLONE_TIMEOUT_S", "300")
+)
+# Strict secret-injection timeout. A node without .env is USELESS -> fail-CLOSED
+# fast (do NOT keep a secretless node warm). 30s == strict.
+_DEFAULT_SECRET_TIMEOUT_S = int(os.environ.get("JARVIS_IAC_SECRET_TIMEOUT_S", "30"))
+# The secret/untracked files git clone CANNOT bring (gitignored). Comma-separated.
+# `.env` always required; operator may add untracked sqlite / `.jarvis/*.jsonl`
+# ledgers the test needs. NEVER log the CONTENTS of these (paths ok).
+_DEFAULT_SECRET_FILES = os.environ.get("JARVIS_IAC_SECRET_FILES", ".env")
+# Overlap the deps install (reads requirements.txt -- needs NO secret) with the
+# secret injection -> faster boot. Env-gated; default ON.
+_DEFAULT_CONCURRENT_DEPS = os.environ.get("JARVIS_IAC_CONCURRENT_DEPS", "true")
+# The node-side deps install command (empty == skip gracefully). Uses a node pip
+# cache dir if cheap (PIP_CACHE_DIR) -- the main win is the concurrency overlap.
+_DEFAULT_DEPS_CMD = os.environ.get("JARVIS_IAC_DEPS_CMD", "")
+
+# Marker stamped into a sync-failure detail to classify it as a BURN failure (a
+# secret transfer failed -> the node is useless, do NOT keep-warm).
+SYNC_FAILURE_BURN = "SECRET_FAILURE_BURN"
+
+
+class GitTransportError(RuntimeError):
+    """Raised on a fail-CLOSED git-transport parity violation (HEAD not on
+    origin, or the node's checked-out HEAD != the local sha). The caller maps
+    this to a transport failure (clone/parity -> resumable keep-warm; secret ->
+    burn). NEVER carries secret file contents."""
+
 # Default rsync excludes -- keep the beam lean (env-overridable, comma-separated).
 _DEFAULT_RSYNC_EXCLUDES = os.environ.get(
     "JARVIS_IAC_RSYNC_EXCLUDES",
@@ -781,6 +818,299 @@ def _rsync_cmd(
     ]
 
 
+# --------------------------------------------------------------------------- #
+# Git-clone transport: resolve -> clone (parity) -> (concurrent: deps || secrets).
+#
+# The node clones origin at the EXACT local HEAD over fast WAN. NO hardcoded
+# `main` -- the EXACT commit being soaked + its branch are read from the local
+# repo (parity local-dev <-> remote-soak). PUBLIC repo -> anonymous clone.
+# --------------------------------------------------------------------------- #
+def _git_cmd(local_root: str, *git_args: str) -> List[str]:
+    """A local `git -C <root> <args...>` command (routed through `_run`)."""
+    return ["git", "-C", local_root, *git_args]
+
+
+def resolve_local_git_target(local_root: str) -> Tuple[str, str, str]:
+    """Resolve `(origin_url, commit_sha, branch)` for the EXACT local HEAD being
+    soaked -- and VERIFY HEAD is reachable on origin (pushed). NO hardcoded
+    branch: the commit + branch + origin url are read live from the local repo.
+
+    Parity guarantee: the node can only clone PUSHED commits, so if local HEAD is
+    NOT on origin we fail-CLOSED here (before spending a cent on a node that would
+    clone a STALE commit). Raises GitTransportError on any resolution failure or
+    when HEAD is unpushed.
+    """
+    rc, out = _run(_git_cmd(local_root, "rev-parse", "HEAD"), timeout_s=30.0)
+    if rc != 0 or not (out or "").strip():
+        raise GitTransportError(f"git rev-parse HEAD failed in {local_root}: {out.strip()[:200]}")
+    sha = out.strip().splitlines()[0].strip()
+
+    rc, out = _run(_git_cmd(local_root, "rev-parse", "--abbrev-ref", "HEAD"), timeout_s=30.0)
+    if rc != 0 or not (out or "").strip():
+        raise GitTransportError(f"git rev-parse --abbrev-ref HEAD failed in {local_root}: {out.strip()[:200]}")
+    branch = out.strip().splitlines()[0].strip()
+
+    rc, out = _run(_git_cmd(local_root, "remote", "get-url", "origin"), timeout_s=30.0)
+    if rc != 0 or not (out or "").strip():
+        raise GitTransportError(f"git remote get-url origin failed in {local_root}: {out.strip()[:200]}")
+    origin_url = out.strip().splitlines()[0].strip()
+
+    # Parity gate: HEAD MUST be on origin (the node can only clone pushed commits).
+    # Primary check: `git branch -r --contains <sha>` lists the remote branches
+    # that contain the sha; if any origin/* contains it -> pushed.
+    rc, out = _run(_git_cmd(local_root, "branch", "-r", "--contains", sha), timeout_s=30.0)
+    pushed = rc == 0 and any(
+        ln.strip().startswith("origin/") for ln in (out or "").splitlines()
+    )
+    if not pushed:
+        # Fallback: ask the remote directly via ls-remote (the sha may sit on a
+        # remote branch our local refs haven't fetched).
+        rc2, out2 = _run(_git_cmd(local_root, "ls-remote", "origin"), timeout_s=60.0)
+        pushed = rc2 == 0 and sha in (out2 or "")
+    if not pushed:
+        raise GitTransportError(
+            f"HEAD {sha} not on origin/{branch} -- push before soak "
+            f"(the node can only clone pushed commits)"
+        )
+    return origin_url, sha, branch
+
+
+def _git_clone_remote_shell(origin_url: str, commit_sha: str, remote_dir: str) -> str:
+    """The node-side shell: rm the dir, anonymous clone, checkout the EXACT sha,
+    then echo the resulting HEAD (the parity probe reads the LAST line). The repo
+    is PUBLIC -> anonymous clone, NO token. Quoted for safe SSH transport."""
+    rd = shlex.quote(remote_dir)
+    url = shlex.quote(origin_url)
+    sha = shlex.quote(commit_sha)
+    return (
+        f"rm -rf {rd} && "
+        f"git clone {url} {rd} && "
+        f"git -C {rd} checkout {sha} && "
+        f"git -C {rd} rev-parse HEAD"
+    )
+
+
+def git_clone_on_node(
+    args: argparse.Namespace, node: str, origin_url: str, commit_sha: str,
+    branch: str, remote_dir: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[bool, str]:
+    """SSH the node to anonymously clone *origin_url*, checkout the EXACT
+    *commit_sha*, and PARITY-ASSERT the node's resulting HEAD == *commit_sha*.
+
+    Streams the clone progress as the `synced` phase (resume-aware checkpointing
+    happens in the caller on success). Bounded by JARVIS_IAC_GIT_CLONE_TIMEOUT_S.
+    On a clone rc!=0 -> returns (False, detail) (resumable). On a PARITY mismatch
+    (node HEAD != sha) -> raises GitTransportError (the caller burns -- a node on
+    the WRONG commit defeats the entire parity invariant)."""
+    timeout_s = float(getattr(
+        args, "git_clone_timeout_s", _DEFAULT_GIT_CLONE_TIMEOUT_S))
+    remote = _git_clone_remote_shell(origin_url, commit_sha, remote_dir)
+    cmd = _ssh_cmd(args, node, remote)
+    _log(f"git-clone on {node}: {origin_url}@{commit_sha[:12]} (branch {branch}) "
+         f"-> {remote_dir} (anonymous, streamed, timeout={int(timeout_s)}s)")
+    rc, captured = _run_streaming_labeled(
+        cmd, label="synced", log_path=log_path, timeout_s=timeout_s,
+    )
+    if rc != 0:
+        return False, f"git clone of {origin_url} failed rc={rc}: {''.join(captured).strip()[:300]}"
+    # Parity probe: the LAST non-empty captured line is the node's `rev-parse HEAD`.
+    node_head = ""
+    for ln in reversed(captured):
+        s = ln.strip()
+        if s:
+            node_head = s
+            break
+    if node_head != commit_sha:
+        raise GitTransportError(
+            f"node {node} HEAD parity FAILED: node checked out {node_head[:12] or '<none>'} "
+            f"but local soak commit is {commit_sha[:12]} -- mismatch, burn (no stale-commit soak)"
+        )
+    return True, f"cloned + parity-verified @ {commit_sha[:12]}"
+
+
+def _secret_files() -> List[str]:
+    """The configured secret/untracked files git clone can't bring. `.env` always
+    included even if absent from the env list (the parity-incomplete tree needs
+    it)."""
+    raw = os.environ.get("JARVIS_IAC_SECRET_FILES", _DEFAULT_SECRET_FILES)
+    files = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    if ".env" not in files:
+        files.insert(0, ".env")
+    # de-dup, preserve order
+    seen: set = set()
+    out: List[str] = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _scp_secret_push_cmd(
+    args: argparse.Namespace, node: str, local_path: str, remote_path: str,
+) -> List[str]:
+    """`gcloud compute scp` over IAP pushing a SINGLE secret file. Carries PATHS
+    only -- NEVER the file CONTENTS (no contents ever touch the argv or the log)."""
+    return [
+        "gcloud", "compute", "scp",
+        f"--project={args.project}", f"--zone={args.zone}",
+        "--tunnel-through-iap",
+        local_path, f"{node}:{remote_path}",
+    ]
+
+
+def inject_secrets_to_node(
+    args: argparse.Namespace, node: str, remote_dir: str,
+    local_root: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Asynchronously inject the secret/untracked files the git clone CANNOT
+    bring (.env + any operator-configured untracked ledgers) into *remote_dir*.
+
+    STRICT timeout (JARVIS_IAC_SECRET_TIMEOUT_S, default 30s). FAIL-CLOSED: if ANY
+    REQUIRED secret fails to transfer (timeout / error) -> returns (False, ...) so
+    the transport FAILS and the node BURNS (a node without .env is useless -- do
+    NOT keep-warm). NEVER logs secret file CONTENTS (paths only).
+
+    `.env` is REQUIRED -- if it's missing locally the injection fails-CLOSED.
+    Operator-added extra files that are absent locally are skipped with a notice
+    (only `.env` is hard-required)."""
+    root = local_root or str(_REPO_ROOT)
+    timeout_s = float(getattr(args, "secret_timeout_s", _DEFAULT_SECRET_TIMEOUT_S))
+    for rel in _secret_files():
+        local_path = os.path.join(root, rel)
+        required = (rel == ".env")
+        if not os.path.isfile(local_path):
+            if required:
+                return False, f"required secret '{rel}' missing locally -- cannot inject (burn)"
+            _log(f"secret '{rel}' absent locally -- skipping (not required)")
+            continue
+        remote_path = remote_dir.rstrip("/") + "/" + rel
+        # Ensure the parent dir exists on the node for nested ledgers (.jarvis/..).
+        parent = os.path.dirname(rel)
+        if parent:
+            mkdir = f"mkdir -p {shlex.quote(remote_dir.rstrip('/') + '/' + parent)}"
+            _run(_ssh_cmd(args, node, mkdir), timeout_s=timeout_s)
+        _log(f"injecting secret '{rel}' -> {node}:{remote_path} (strict {int(timeout_s)}s, contents NOT logged)")
+        rc, out = _run(
+            _scp_secret_push_cmd(args, node, local_path, remote_path),
+            timeout_s=timeout_s,
+        )
+        if rc != 0:
+            # Do NOT echo `out` verbatim if it could carry contents -- scp errors
+            # are path/transport messages, but stay conservative: report rel only.
+            return False, f"secret '{rel}' transfer FAILED rc={rc} -- fail-CLOSED, burn"
+    return True, "secrets injected"
+
+
+def run_node_deps_install(
+    args: argparse.Namespace, node: str, remote_dir: str,
+    log_path: Optional[pathlib.Path] = None,
+) -> Tuple[bool, str]:
+    """Run the node-side deps install (reads requirements.txt -- needs NO secret).
+    Designed to overlap inject_secrets_to_node for a faster boot. Uses a node pip
+    cache dir (PIP_CACHE_DIR) if cheap. Empty/not-configured deps cmd -> skip
+    gracefully. Bounded by the sync timeout. Returns (ok, detail). Fail-soft."""
+    deps_cmd = os.environ.get("JARVIS_IAC_DEPS_CMD", _DEFAULT_DEPS_CMD).strip()
+    if not deps_cmd:
+        return True, "deps install skipped (no JARVIS_IAC_DEPS_CMD)"
+    cache = "export PIP_CACHE_DIR=/opt/trinity/.pip_cache; mkdir -p /opt/trinity/.pip_cache; "
+    remote = f"cd {shlex.quote(remote_dir)} && {cache}{deps_cmd}"
+    cmd = _ssh_cmd(args, node, remote)
+    _log(f"deps install on {node} (concurrent with secret injection, streamed)")
+    rc, captured = _run_streaming_labeled(
+        cmd, label="synced", log_path=log_path, timeout_s=float(args.sync_timeout_s),
+    )
+    if rc != 0:
+        return False, f"deps install failed rc={rc}: {''.join(captured).strip()[:300]}"
+    return True, "deps installed"
+
+
+def is_secret_failure(detail: str) -> bool:
+    """Classify a sync-failure *detail* as a SECRET failure (-> BURN, the node is
+    useless without .env) vs a clone/parity failure (-> resumable keep-warm). The
+    secret path stamps SYNC_FAILURE_BURN / the word 'secret' into its detail."""
+    d = (detail or "").lower()
+    return SYNC_FAILURE_BURN.lower() in d or "secret" in d
+
+
+def _git_transport_sync(
+    args: argparse.Namespace, node: str,
+    log_path: Optional[pathlib.Path] = None,
+) -> Tuple[bool, str]:
+    """Run the git-clone transport for the jarvis repo: resolve the local target
+    (parity gate) -> clone+checkout on the node (parity-assert) -> overlap the
+    deps install with the secret injection -> join.
+
+    Returns (ok, detail). Clone/parity failures are RESUMABLE (keep-warm); a
+    SECRET failure is stamped SYNC_FAILURE_BURN so the orchestrator BURNS (a node
+    without .env is useless). NEVER logs secret CONTENTS."""
+    pairs = _resolve_repo_paths(args)
+    # The git transport clones the jarvis repo (the cwd repo == origin). prime /
+    # reactor (if configured + are their own remotes) still ride the tar-pipe;
+    # the A1 soak only needs jarvis. Resolve jarvis's local root.
+    jarvis_root = ""
+    for name, local in pairs:
+        if name == "jarvis":
+            jarvis_root = local
+            break
+    if not jarvis_root:
+        return False, "jarvis repo path unset -- cannot run git transport"
+
+    remote_dir = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+
+    # 1) Resolve local target + parity gate (HEAD must be pushed). fail-CLOSED.
+    try:
+        origin_url, commit_sha, branch = resolve_local_git_target(jarvis_root)
+    except GitTransportError as exc:
+        return False, f"git target resolution failed (fail-CLOSED): {exc}"
+
+    # 2) Clone + checkout on the node, parity-assert (mismatch -> burn).
+    try:
+        ok, detail = git_clone_on_node(
+            args, node, origin_url, commit_sha, branch, remote_dir, log_path=log_path,
+        )
+    except GitTransportError as exc:
+        # Parity violation == wrong-commit soak -> BURN (defeats the invariant).
+        return False, f"{SYNC_FAILURE_BURN}: parity violation -- {exc}"
+    if not ok:
+        return False, detail  # clone rc!=0 -> resumable keep-warm.
+
+    # 3) Concurrency: launch deps install ALONGSIDE the secret injection, join.
+    concurrent = os.environ.get(
+        "JARVIS_IAC_CONCURRENT_DEPS", _DEFAULT_CONCURRENT_DEPS
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    deps_result: Dict[str, Tuple[bool, str]] = {}
+    secret_result: Dict[str, Tuple[bool, str]] = {}
+
+    def _deps() -> None:
+        deps_result["r"] = run_node_deps_install(args, node, remote_dir, log_path=log_path)
+
+    def _secrets() -> None:
+        secret_result["r"] = inject_secrets_to_node(
+            args, node, remote_dir, local_root=jarvis_root)
+
+    if concurrent:
+        import threading
+        t_deps = threading.Thread(target=_deps, name="iac-deps", daemon=True)
+        t_deps.start()                       # deps launched FIRST (overlaps secrets)
+        _secrets()                           # secrets run on this thread
+        t_deps.join(timeout=float(args.sync_timeout_s) + 30.0)
+    else:
+        _secrets()
+        _deps()
+
+    secret_ok, secret_detail = secret_result.get("r", (False, "secret injection did not run"))
+    deps_ok, deps_detail = deps_result.get("r", (True, "deps skipped"))
+
+    # SECRET failure -> fail-CLOSED -> BURN (the node is useless without .env).
+    if not secret_ok:
+        return False, f"{SYNC_FAILURE_BURN}: {secret_detail}"
+    # Deps failure is resumable (a re-run re-installs); do NOT burn for deps.
+    if not deps_ok:
+        return False, f"deps install failed (resumable): {deps_detail}"
+    return True, "synced"
+
+
 def _delete_node_cmd(args: argparse.Namespace, node: str) -> List[str]:
     return [
         "gcloud", "compute", "instances", "delete", node,
@@ -906,6 +1236,27 @@ def sync_repos_to_node(
     """
     transport = os.environ.get("JARVIS_IAC_SYNC_TRANSPORT", "tar").strip().lower()
     pairs = _resolve_repo_paths(args)
+    # GIT TRANSPORT: the node clones origin at the EXACT local HEAD over FAST WAN
+    # (replacing the <1MB/s IAP tar-pipe). resolve -> clone (parity) -> (concurrent
+    # deps || secret injection) -> join. Clone/parity failure = resumable keep-warm;
+    # SECRET failure = burn (a node without .env is useless). Done BEFORE the
+    # tar-pipe workspace-prep (the clone's `rm -rf && git clone` owns the dir).
+    if transport == "git":
+        # Ensure the remote root is writable by the login user (the startup-script
+        # created it as ROOT). The clone then `rm -rf`s + recreates the jarvis dir.
+        _root = shlex.quote(_REMOTE_TRINITY_ROOT)
+        _prep = (
+            f"sudo mkdir -p {_root} && "
+            f'sudo chown -R "$(id -un)":"$(id -gn)" {_root} && '
+            f"echo workspace_ready {_root}"
+        )
+        _prc, _pcap = _run_streaming_labeled(
+            _ssh_cmd(args, node, _prep), label="synced", log_path=log_path,
+            timeout_s=float(args.sync_timeout_s),
+        )
+        if _prc != 0:
+            return False, f"remote workspace prep failed rc={_prc}: {''.join(_pcap).strip()[:300]}"
+        return _git_transport_sync(args, node, log_path=log_path)
     # PREP: the startup-script created _REMOTE_TRINITY_ROOT as ROOT, so the scp/ssh
     # user cannot write into it ("stat remote: No such file or directory" / perm
     # denied). Create the per-repo subdirs + chown the whole tree to the login
@@ -1438,7 +1789,15 @@ def _execute(
             if not ok:
                 _abort(f"sync abort: {detail}")
                 abort_reason = detail
-                resumable_failure = True
+                # A SECRET failure (git transport: .env couldn't be injected, or a
+                # parity violation) is NOT resumable -- a node without .env / on the
+                # WRONG commit is useless. Leave resumable_failure False so the
+                # finally-block BURNS it (do NOT keep-warm a secretless node).
+                if is_secret_failure(detail):
+                    _log("sync failure classified SECRET/PARITY -> BURN (node useless, no keep-warm)")
+                    resumable_failure = False
+                else:
+                    resumable_failure = True
                 return 6
             data = ledger.mark_phase(data, "synced")
         else:
@@ -1604,6 +1963,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remote air-gap compose boot (env JARVIS_IAC_BOOT_CMD; empty == folded into surgery)")
     p.add_argument("--boot-timeout-s", type=int,
                    default=int(os.environ.get("JARVIS_IAC_BOOT_TIMEOUT_S", "600")))
+    # -- git-clone transport (JARVIS_IAC_SYNC_TRANSPORT=git) --
+    p.add_argument("--git-clone-timeout-s", dest="git_clone_timeout_s", type=int,
+                   default=_DEFAULT_GIT_CLONE_TIMEOUT_S,
+                   help="bound the node-side anonymous git clone of origin@HEAD "
+                        "(env JARVIS_IAC_GIT_CLONE_TIMEOUT_S; 581MB over WAN ~1-2min)")
+    p.add_argument("--secret-timeout-s", dest="secret_timeout_s", type=int,
+                   default=_DEFAULT_SECRET_TIMEOUT_S,
+                   help="STRICT per-secret scp timeout for the .env injection "
+                        "(env JARVIS_IAC_SECRET_TIMEOUT_S; fail-CLOSED -> burn)")
     # -- checkpoint / resume (resume-don't-restart) --
     p.add_argument("--state-path", default=_DEFAULT_STATE_PATH,
                    help="checkpoint ledger path (env JARVIS_IAC_STATE_PATH)")

@@ -1067,10 +1067,20 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
         "--surgery-cmd", remote_cmd,
         "--surgery-timeout-s", str(wall_seconds + 600),
     ]
+    # --on-demand pass-through (env-gated): provision a STANDARD (no Spot
+    # preemption) node for an uninterrupted multi-stage run when the operator
+    # opts in. JARVIS_IAC_ON_DEMAND in {1,true,yes} -> append --on-demand.
+    if os.environ.get("JARVIS_IAC_ON_DEMAND", "").strip().lower() in {"1", "true", "yes"}:
+        argv.append("--on-demand")
     if extra_args:
         argv.extend(extra_args)
     env = dict(os.environ)
     env["JARVIS_IAC_HYPERVISOR_ENABLED"] = "1"
+    # GIT TRANSPORT: drive Run #4 over the fast-WAN git-clone transport (the node
+    # clones origin at the EXACT local HEAD), replacing the <1MB/s IAP tar-pipe
+    # that killed 3 A1 soak runs. Env-gated / default-ON for the A1 remote path
+    # (the operator can pin tar via JARVIS_IAC_SYNC_TRANSPORT=tar before --remote).
+    env.setdefault("JARVIS_IAC_SYNC_TRANSPORT", "git")
     # Signal the on-node run to fail-CLOSED on a failed verdict: HOLD the Black Box
     # (do not drop the completion-sentinel) until the local checksum verification.
     env.setdefault("JARVIS_A1_BLACKBOX_HOLD_ON_FAILURE", "1")
