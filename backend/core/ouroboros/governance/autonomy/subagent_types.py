@@ -51,6 +51,18 @@ class WorkUnitSpec:
     max_attempts: int = 1
     timeout_s: float = 180.0
     acceptance_tests: Tuple[str, ...] = ()
+    # --- Swarm Phase 1a — Dynamic Agent Instantiation (additive) ----------
+    # These fields are populated ONLY by the SwarmOrchestrator when it
+    # synthesizes a worker shape from AST/semantic inspection of the
+    # sub-goal (the Golden Rule). When all are None, this is a legacy
+    # fixed-type work unit and the scheduler / executor behave
+    # byte-identically to pre-swarm — they are never read on that path.
+    # See worker_synthesizer.py / swarm_orchestrator.py.
+    system_prompt_template: Optional[str] = None
+    allowed_tools: Optional[Tuple[str, ...]] = None
+    mutation_budget: Optional[int] = None
+    context_budget_tokens: Optional[int] = None
+    worker_role: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.unit_id:
@@ -65,11 +77,35 @@ class WorkUnitSpec:
             raise ValueError(f"WorkUnitSpec[{self.unit_id}] max_attempts must be >= 1")
         if self.timeout_s <= 0.0:
             raise ValueError(f"WorkUnitSpec[{self.unit_id}] timeout_s must be > 0")
+        # Swarm fields — validated only when populated (fail-CLOSED: a
+        # negative budget is treated as 0/read-only at the factory, never
+        # as "unbounded").
+        if self.mutation_budget is not None and self.mutation_budget < 0:
+            raise ValueError(
+                f"WorkUnitSpec[{self.unit_id}] mutation_budget must be >= 0 when set"
+            )
+        if self.context_budget_tokens is not None and self.context_budget_tokens < 0:
+            raise ValueError(
+                f"WorkUnitSpec[{self.unit_id}] context_budget_tokens must be >= 0 when set"
+            )
 
     @property
     def effective_owned_paths(self) -> Tuple[str, ...]:
         """Return owned paths, defaulting to target_files when unspecified."""
         return self.owned_paths or self.target_files
+
+    @property
+    def is_swarm_worker(self) -> bool:
+        """True when this unit carries a SwarmOrchestrator-synthesized shape.
+
+        A legacy fixed-type unit leaves all swarm fields None and this is
+        False — the scheduler/executor never read the swarm path for it.
+        """
+        return (
+            self.system_prompt_template is not None
+            or self.allowed_tools is not None
+            or self.worker_role is not None
+        )
 
 
 def _validate_unit_dag(units: Tuple[WorkUnitSpec, ...]) -> None:
@@ -361,6 +397,16 @@ def execution_graph_to_dict(graph: ExecutionGraph) -> Dict[str, Any]:
                 "max_attempts": unit.max_attempts,
                 "timeout_s": unit.timeout_s,
                 "acceptance_tests": list(unit.acceptance_tests),
+                # Swarm Phase 1a — additive; absent/None for legacy units.
+                "system_prompt_template": unit.system_prompt_template,
+                "allowed_tools": (
+                    list(unit.allowed_tools)
+                    if unit.allowed_tools is not None
+                    else None
+                ),
+                "mutation_budget": unit.mutation_budget,
+                "context_budget_tokens": unit.context_budget_tokens,
+                "worker_role": unit.worker_role,
             }
             for unit in graph.units
         ],
@@ -381,6 +427,31 @@ def execution_graph_from_dict(data: Dict[str, Any]) -> ExecutionGraph:
             max_attempts=int(unit.get("max_attempts", 1)),
             timeout_s=float(unit.get("timeout_s", 180.0)),
             acceptance_tests=tuple(unit.get("acceptance_tests", ())),
+            system_prompt_template=(
+                str(unit["system_prompt_template"])
+                if unit.get("system_prompt_template") is not None
+                else None
+            ),
+            allowed_tools=(
+                tuple(str(t) for t in unit["allowed_tools"])
+                if unit.get("allowed_tools") is not None
+                else None
+            ),
+            mutation_budget=(
+                int(unit["mutation_budget"])
+                if unit.get("mutation_budget") is not None
+                else None
+            ),
+            context_budget_tokens=(
+                int(unit["context_budget_tokens"])
+                if unit.get("context_budget_tokens") is not None
+                else None
+            ),
+            worker_role=(
+                str(unit["worker_role"])
+                if unit.get("worker_role") is not None
+                else None
+            ),
         )
         for unit in data.get("units", [])
     )
