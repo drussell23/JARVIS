@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSovereignStream } from '../hooks/useSovereignStream';
+import { useBiometricAuth } from '../hooks/useBiometricAuth';
 import { resolveConfig } from '../lib/config';
 import { ObservabilityClient } from '../lib/api';
 import { BlastRadiusResponse } from '../lib/types';
@@ -29,6 +30,8 @@ import FSMStateStream from '../components/FSMStateStream';
 import DAGCanvas from '../components/DAGCanvas';
 import BlastRadiusGraph from '../components/BlastRadiusGraph';
 import ElevationQueue from '../components/ElevationQueue';
+import type { AuthorizeTarget } from '../components/ElevationQueue';
+import AuthorizeElevationModal from '../components/AuthorizeElevationModal';
 import ConnectionStatus from '../components/ConnectionStatus';
 import YieldToasts from '../components/YieldToasts';
 
@@ -45,6 +48,30 @@ export default function Page(): JSX.Element {
   const [report, setReport] = useState<BlastRadiusResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // --- Biometric write-path (Phase 2) -------------------------------------
+  // The modal is unreachable until an operator clicks Authorize on a pending
+  // elevation. The hook drives the FSM <-> API <-> Web Audio flow; the
+  // backend is the sole authority on the verdict.
+  const auth = useBiometricAuth({ endpoint: cfg.observabilityBase });
+  const [authTarget, setAuthTarget] = useState<AuthorizeTarget | null>(null);
+
+  const onAuthorize = useCallback(
+    (target: AuthorizeTarget): void => {
+      setAuthTarget(target);
+      void auth.open({
+        prId: target.prId,
+        astMutationId: target.astMutationId,
+        blastRadiusHash: target.blastRadiusHash,
+      });
+    },
+    [auth],
+  );
+
+  const closeAuth = useCallback((): void => {
+    auth.reset();
+    setAuthTarget(null);
+  }, [auth]);
 
   const clientRef = useRef<ObservabilityClient | null>(null);
   if (clientRef.current === null) {
@@ -97,11 +124,22 @@ export default function Page(): JSX.Element {
         <ElevationQueue
           entries={elevations}
           onViewBlastRadius={(opId) => void loadBlastRadius(opId)}
+          onAuthorize={onAuthorize}
           focusedOpId={focusedOpId}
+          authDisabled={auth.disabled}
         />
       </div>
 
       <YieldToasts alerts={yieldAlerts} />
+
+      {authTarget !== null ? (
+        <AuthorizeElevationModal
+          auth={auth}
+          prId={authTarget.prId}
+          targetRepo={authTarget.targetRepo}
+          onClose={closeAuth}
+        />
+      ) : null}
     </main>
   );
 }

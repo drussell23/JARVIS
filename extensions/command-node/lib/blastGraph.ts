@@ -7,6 +7,7 @@
 import type { Edge, Node } from 'reactflow';
 import { AffectedNode, BlastRadiusResponse } from './types';
 import { repoStyle } from './theme';
+import { SURFACE, TEXT, BORDER } from './tokens';
 
 export const CENTER_NODE_ID = '__center__';
 
@@ -52,9 +53,9 @@ export function buildBlastGraph(
       kind: 'center',
     },
     style: {
-      background: '#111827',
-      color: '#ffffff',
-      border: '2px solid #f9fafb',
+      background: SURFACE.center,
+      color: TEXT.inverse,
+      border: `2px solid ${BORDER.bright}`,
       borderRadius: 10,
       fontSize: 12,
       width: 150,
@@ -85,7 +86,7 @@ export function buildBlastGraph(
         },
         style: {
           background: style.color,
-          color: '#ffffff',
+          color: TEXT.inverse,
           border: `2px solid ${style.border}`,
           borderRadius: 8,
           fontSize: 10,

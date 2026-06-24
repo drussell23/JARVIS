@@ -1,31 +1,72 @@
 'use client';
 
 /**
- * ElevationQueue -- read-only list of pending CRITICAL_ELEVATION PRs
- * from cross_repo_elevation_pending events.
+ * ElevationQueue -- the list of pending CRITICAL_ELEVATION PRs from
+ * cross_repo_elevation_pending events.
  *
- * Phase 1 is VIEW ONLY. The "Authorize" affordance is a DISABLED
- * placeholder clearly marked as Phase 2 (biometric) -- there is no
- * write/auth code anywhere in this component. The only active action is
- * "view blast radius", which asks the parent to focus the graph on the
- * op.
+ * Read surface for the blast radius (view-only) + the Phase 2 write
+ * affordance: "Authorize" now opens the biometric AuthorizeElevationModal
+ * (it does NOT authorize anything itself -- it hands the PR + its mutation
+ * metadata up to the parent, which drives the FSM-gated modal; the backend
+ * is the sole authority).
+ *
+ * If the biometric write-path is gated off, the parent passes
+ * authDisabled=true and the Authorize button is disabled with a clear
+ * "biometric auth disabled" hint (no crash).
  */
 
 import { ElevationEntry } from '../lib/projection';
 import { repoStyle } from '../lib/theme';
 
+/** The fields the modal needs to fetch a challenge for an elevation. */
+export interface AuthorizeTarget {
+  readonly prId: string;
+  readonly astMutationId: string;
+  readonly blastRadiusHash: string;
+  readonly targetRepo: string;
+}
+
 export interface ElevationQueueProps {
   readonly entries: readonly ElevationEntry[];
   /** Ask the parent to load + focus the blast radius for this op. */
   readonly onViewBlastRadius: (opId: string) => void;
+  /** Open the biometric authorize modal for this elevation. */
+  readonly onAuthorize: (target: AuthorizeTarget) => void;
   /** The op currently focused in the blast graph (for highlighting). */
   readonly focusedOpId?: string | null;
+  /** True when the write-path backend is gated off (Authorize disabled). */
+  readonly authDisabled?: boolean;
+}
+
+/**
+ * Derive a stable mutation id / blast hash when the server did not stamp
+ * them on the SSE payload. The challenge binds to these exact strings;
+ * deterministic derivation keeps a retry stable for the same PR.
+ */
+function resolveAstMutationId(e: ElevationEntry): string {
+  return e.ast_mutation_id ?? e.opId;
+}
+
+function resolveBlastHash(e: ElevationEntry): string {
+  if (e.blast_radius_hash !== undefined && e.blast_radius_hash !== '') {
+    return e.blast_radius_hash;
+  }
+  // Deterministic, dependency-free FNV-1a hash of the summary as a fallback.
+  let h = 0x811c9dc5;
+  const s = e.blast_radius_summary;
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 export function ElevationQueue({
   entries,
   onViewBlastRadius,
+  onAuthorize,
   focusedOpId = null,
+  authDisabled = false,
 }: ElevationQueueProps): JSX.Element {
   return (
     <section className="elevation-queue" data-testid="elevation-queue"
@@ -69,11 +110,25 @@ export function ElevationQueue({
                   </button>
                   <button
                     className="btn btn-authorize"
-                    disabled
-                    title="Disabled in Phase 1 -- biometric authorization arrives in Phase 2"
-                    aria-disabled="true"
+                    disabled={authDisabled}
+                    aria-disabled={authDisabled ? 'true' : 'false'}
+                    title={
+                      authDisabled
+                        ? 'Biometric auth disabled on this node'
+                        : 'Authorize this cross-repo elevation (biometric)'
+                    }
+                    onClick={() =>
+                      onAuthorize({
+                        prId: e.pr_id,
+                        astMutationId: resolveAstMutationId(e),
+                        blastRadiusHash: resolveBlastHash(e),
+                        targetRepo: e.target_repo,
+                      })
+                    }
                   >
-                    Authorize (Phase 2: biometric)
+                    {authDisabled
+                      ? 'Authorize (disabled)'
+                      : 'Authorize (biometric)'}
                   </button>
                 </div>
               </li>

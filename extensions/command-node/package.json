@@ -2,7 +2,7 @@
   "name": "jarvis-command-node",
   "version": "0.1.0",
   "private": true,
-  "description": "Sovereign Command Node -- Phase 1 read-only mission-control dashboard for the JARVIS Ouroboros loop. Consumes the existing /observability SSE + GET surface. No write-path, no biometric -- visualization only.",
+  "description": "Sovereign Command Node -- mission-control dashboard for the JARVIS Ouroboros loop. Phase 1: read-only /observability SSE + GET visualization. Phase 2: Sovereign design tokens (zero hardcoded hex) + the biometric AuthorizeElevation write-path (strict XState FSM + Web Audio capture). The frontend captures + transmits; the backend is the sole authority.",
   "license": "UNLICENSED",
   "scripts": {
     "dev": "next dev",
@@ -14,10 +14,12 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@xstate/react": "^5.0.5",
     "next": "^14.2.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "reactflow": "^11.11.4"
+    "reactflow": "^11.11.4",
+    "xstate": "^5.32.2"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.4.8",
@@ -26,7 +28,10 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
     "jsdom": "^24.1.1",
+    "postcss": "^8.4.40",
+    "tailwindcss": "^3.4.7",
     "typescript": "^5.5.4",
     "vitest": "^2.0.5"
   },

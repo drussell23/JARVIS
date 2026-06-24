@@ -3,11 +3,16 @@
  *
  * The repo color map is load-bearing for the blast-radius graph: a
  * cross-boundary blast must be visually obvious. Body/jarvis=blue,
- * Mind/prime=amber, Nerves/reactor=violet. Unknown repos render
- * neutral gray (open vocabulary -- never crash on a new repo).
+ * Mind/prime=amber, Nerves/reactor=violet. Unknown repos render the
+ * neutral token (open vocabulary -- never crash on a new repo).
+ *
+ * NO raw hex: every color here is a `var(--token)` reference resolved
+ * against `app/globals.css` `:root`. The Sovereign token block is the
+ * single source of truth (see lib/tokens.ts + DESIGN_TOKENS.md).
  */
 
 import { DagNodeState, TrinityRepo } from './types';
+import { REPO_TOKENS, STATE } from './tokens';
 
 export interface RepoStyle {
   readonly label: string;
@@ -16,15 +21,27 @@ export interface RepoStyle {
 }
 
 const REPO_STYLES: Record<string, RepoStyle> = {
-  jarvis: { label: 'Body', color: '#2563eb', border: '#3b82f6' },
-  prime: { label: 'Mind', color: '#d97706', border: '#f59e0b' },
-  reactor: { label: 'Nerves', color: '#7c3aed', border: '#8b5cf6' },
+  jarvis: {
+    label: 'Body',
+    color: REPO_TOKENS.jarvis.fill,
+    border: REPO_TOKENS.jarvis.border,
+  },
+  prime: {
+    label: 'Mind',
+    color: REPO_TOKENS.prime.fill,
+    border: REPO_TOKENS.prime.border,
+  },
+  reactor: {
+    label: 'Nerves',
+    color: REPO_TOKENS.reactor.fill,
+    border: REPO_TOKENS.reactor.border,
+  },
 };
 
 const NEUTRAL: RepoStyle = {
   label: 'Unknown',
-  color: '#6b7280',
-  border: '#9ca3af',
+  color: REPO_TOKENS.unknown.fill,
+  border: REPO_TOKENS.unknown.border,
 };
 
 export function repoStyle(repo: TrinityRepo): RepoStyle {
@@ -32,13 +49,13 @@ export function repoStyle(repo: TrinityRepo): RepoStyle {
 }
 
 export const DAG_STATE_COLORS: Record<string, string> = {
-  pending: '#6b7280',
-  running: '#2563eb',
-  applied: '#0891b2',
-  fractured: '#dc2626',
-  complete: '#16a34a',
+  pending: STATE.pending,
+  running: STATE.running,
+  applied: STATE.applied,
+  fractured: STATE.danger,
+  complete: STATE.ok,
 };
 
 export function dagStateColor(state: DagNodeState): string {
-  return DAG_STATE_COLORS[state] ?? '#6b7280';
+  return DAG_STATE_COLORS[state] ?? STATE.pending;
 }

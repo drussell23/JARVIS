@@ -92,6 +92,73 @@ export interface BlastRadiusResponse extends Envelope {
   readonly risk_level: BlastRiskLevel;
 }
 
+// --- Phase 2 biometric write-path -----------------------------------------
+
+/**
+ * The single-use, TTL-bounded challenge minted by the backend
+ * (`GET /command-node/elevation/{pr_id}/challenge`). The operator must
+ * speak THIS phrase; a stale enrollment recording cannot answer it. The
+ * nonce is consumed atomically on use -- a fresh challenge MUST be fetched
+ * for every retry (no resending a spent nonce).
+ */
+export interface ElevationChallenge {
+  readonly nonce: string;
+  readonly phrase: string;
+  readonly pr_id: string;
+  readonly ast_mutation_id: string;
+  readonly blast_radius_hash: string;
+  readonly issued_at: number;
+  readonly ttl_s: number;
+}
+
+export interface ChallengeResponse extends Envelope {
+  readonly challenge: ElevationChallenge;
+}
+
+export type AuthDecision = 'AUTHORIZED' | 'REJECTED' | string;
+
+/**
+ * The backend verdict from `POST /command-node/authorize-elevation`.
+ * The frontend reflects this -- it never computes it. `reason` carries
+ * the rejection cause, including the load-bearing `immutable_orange`
+ * cause (Mind/Nerves PRs are permanently human-merge-only by law, NOT a
+ * biometric failure).
+ */
+export interface ElevationVerdict {
+  readonly decision: AuthDecision;
+  readonly reason: string;
+  readonly ecapa_score: number;
+  readonly antispoof_ok: boolean;
+  readonly freshness_ok: boolean;
+  readonly pr_id: string;
+  readonly ast_mutation_id: string;
+  readonly target_repo: TrinityRepo;
+}
+
+/** The POST body for an authorization attempt. */
+export interface AuthorizeRequest {
+  readonly pr_id: string;
+  readonly nonce: string;
+  readonly ast_mutation_id: string;
+  readonly audio_b64: string;
+  readonly sample_rate: number;
+}
+
+/**
+ * The canonical "immutable_orange" rejection reason. Detected to render
+ * the special copy that explains this is a governance law, not a
+ * biometric mismatch.
+ */
+export const IMMUTABLE_ORANGE_REASON = 'immutable_orange';
+
+/** True when a verdict was rejected because the target repo is Mind/Nerves. */
+export function isImmutableOrange(verdict: ElevationVerdict | null): boolean {
+  if (verdict === null) {
+    return false;
+  }
+  return verdict.reason.toLowerCase().includes(IMMUTABLE_ORANGE_REASON);
+}
+
 // --- SSE event frames -----------------------------------------------------
 
 export type TaskEventType =
@@ -157,6 +224,14 @@ export interface CrossRepoElevationPayload {
   readonly pr_id: string;
   readonly target_repo: TrinityRepo;
   readonly blast_radius_summary: string;
+  /**
+   * The mutation identity + blast-radius hash the challenge is bound to.
+   * OPTIONAL + additive (older servers omit them); the modal needs them to
+   * fetch a challenge, so the UI falls back to the op_id / a stable hash of
+   * the summary when the server does not stamp them.
+   */
+  readonly ast_mutation_id?: string;
+  readonly blast_radius_hash?: string;
 }
 
 export type SovereignYieldReason =
