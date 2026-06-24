@@ -36,6 +36,17 @@ def iac():
     return _load_module()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    """Keep every test's checkpoint ledger + autopsy logs inside a tmp dir -- never
+    touch the repo's real `.hypervisor_state.json` / autopsy_reports/. The default
+    state path is relative (`.hypervisor_state.json`), so chdir'ing to a tmp dir
+    isolates it regardless of import-time env capture."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_IAC_STATE_PATH", str(tmp_path / "state.json"))
+    return tmp_path
+
+
 @pytest.fixture()
 def args(iac):
     """Parse a default arg namespace (dry-run defaults) the tests can mutate."""
@@ -43,7 +54,12 @@ def args(iac):
 
 
 class _Recorder:
-    """Records every (cmd) passed to the faked _run / _run_streaming, in order."""
+    """Records every (cmd) passed to the faked _run / _run_streaming, in order.
+
+    The streaming long phases (provision / sync / prebake / boot / surgery) funnel
+    through `_run_streaming`; the non-streaming calls (poll, delete, describe)
+    funnel through `_run`. Both record into the SAME ordered `calls` list so the
+    burn-order assertions still see provision (create) before burn (delete)."""
 
     def __init__(self):
         self.calls = []
@@ -52,6 +68,16 @@ class _Recorder:
         self.calls.append(cmd)
         # Default: success + benign output. Specific tests override behavior.
         return 0, ""
+
+    def stream(self, cmd, *, label="", log_path=None, timeout_s=3600.0):
+        # Streaming variant -- mirrors _run_streaming_labeled's signature.
+        self.calls.append(cmd)
+        return 0, []
+
+    def patch(self, monkeypatch, iac):
+        """Patch BOTH subprocess boundaries onto this recorder."""
+        monkeypatch.setattr(iac, "_run", self.run)
+        monkeypatch.setattr(iac, "_run_streaming_labeled", self.stream)
 
     def joined(self):
         return [" ".join(c) for c in self.calls]
@@ -110,7 +136,7 @@ def test_provision_cmd_uses_e2_standard_8_spot_delete_maxrun_scope(iac, args):
 
 def test_provision_node_writes_startup_to_tmpfile_and_runs(iac, args, monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(iac, "_run", rec.run)
+    rec.patch(monkeypatch, iac)  # provision streams -> patch both boundaries
     ok, detail = iac.provision_sandbox_node(args, "sovereign-sandbox-y", "SCRIPT BODY")
     assert ok
     assert len(rec.calls) == 1
@@ -123,7 +149,7 @@ def test_provision_node_writes_startup_to_tmpfile_and_runs(iac, args, monkeypatc
 # --------------------------------------------------------------------------- #
 def test_sync_issues_commands_with_excludes_for_three_repos(iac, args, monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(iac, "_run", rec.run)
+    rec.patch(monkeypatch, iac)  # sync streams -> patch both boundaries
     monkeypatch.setenv("JARVIS_IAC_SYNC_TRANSPORT", "rsync")
     args.prime_repo_path = "/repos/prime"
     args.reactor_repo_path = "/repos/reactor"
@@ -143,7 +169,7 @@ def test_sync_issues_commands_with_excludes_for_three_repos(iac, args, monkeypat
 
 def test_sync_fails_soft_on_unset_repo_path(iac, args, monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(iac, "_run", rec.run)
+    rec.patch(monkeypatch, iac)
     monkeypatch.delenv("JARVIS_PRIME_REPO_PATH", raising=False)
     monkeypatch.delenv("JARVIS_REACTOR_REPO_PATH", raising=False)
     args.prime_repo_path = None
@@ -277,10 +303,12 @@ def test_execute_refused_without_gate_issues_zero_commands(iac, monkeypatch):
 # --------------------------------------------------------------------------- #
 def _wire_execute_fakes(iac, monkeypatch, rec, *, surgery_behavior):
     """Wire provision/ready/sync to succeed; surgery_behavior drives phase 3."""
-    monkeypatch.setattr(iac, "_run", rec.run)
+    rec.patch(monkeypatch, iac)
     monkeypatch.setattr(iac, "provision_sandbox_node", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(iac, "poll_node_ready", lambda *a, **k: (True, ""))
     monkeypatch.setattr(iac, "sync_repos_to_node", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(iac, "run_remote_prebake", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(iac, "run_remote_boot", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(iac, "run_autopsy", lambda *a, **k: None)
     monkeypatch.setattr(iac, "run_remote_surgery", surgery_behavior)
 
@@ -327,10 +355,13 @@ def test_burn_runs_on_exception(iac, args, monkeypatch):
 def test_burn_is_after_everything(iac, args, monkeypatch):
     """Assert the delete (burn) is the LAST instances-command issued."""
     rec = _Recorder()
-    # Don't stub _run for describe -- let provision/sync use real-ish recorder.
-    monkeypatch.setattr(iac, "_run", rec.run)
+    # Don't stub provision -- let it stream through the recorder so `create` is
+    # recorded; both boundaries funnel into the same ordered call list.
+    rec.patch(monkeypatch, iac)
     monkeypatch.setattr(iac, "poll_node_ready", lambda *a, **k: (True, ""))
     monkeypatch.setattr(iac, "sync_repos_to_node", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(iac, "run_remote_prebake", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(iac, "run_remote_boot", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(iac, "run_autopsy", lambda *a, **k: None)
     monkeypatch.setattr(
         iac, "run_remote_surgery",
