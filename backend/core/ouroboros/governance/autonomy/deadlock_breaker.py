@@ -133,6 +133,29 @@ def _emit_yield(op_id: str, reason: str) -> None:
         logger.debug("[DeadlockBreaker] publish_sovereign_yield failed", exc_info=True)
 
 
+def _emit_swarm_deadlock(graph_id: str, worker_a: str, worker_b: str, trigger: str) -> None:
+    """Best-effort swarm_deadlock telemetry edge. NEVER raises.
+
+    Composes the authoritative [SOVEREIGN YIELD] WARNING + the sovereign_yield
+    SSE event -- this is a dedicated swarm-topology beacon (graph_id + pair +
+    trigger). Only emitted when a graph_id is known; fail-soft otherwise.
+    """
+    if not graph_id:
+        return
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_swarm_deadlock,
+        )
+
+        publish_swarm_deadlock(
+            str(graph_id), [str(worker_a), str(worker_b)], str(trigger)
+        )
+    except Exception:  # noqa: BLE001 -- fail-soft
+        logger.debug(
+            "[DeadlockBreaker] publish_swarm_deadlock failed", exc_info=True
+        )
+
+
 @dataclass
 class EpistemicDeadlockBreaker:
     """Watches a clarification pair and shatters an epistemic deadlock.
@@ -158,6 +181,7 @@ class EpistemicDeadlockBreaker:
     worker_a: str
     worker_b: str
     op_id: str = ""
+    graph_id: str = ""
     detector: SemanticStagnationDetector = field(default_factory=SemanticStagnationDetector)
     kill_unit: Optional[Callable[[str], Any]] = None
     _transcript: List[str] = field(default_factory=list)
@@ -255,6 +279,9 @@ class EpistemicDeadlockBreaker:
             len(dissolved),
         )
         _emit_yield(self.op_id, _YIELD_REASON)
+        # Phase 1d -- dedicated swarm-topology deadlock beacon (graph_id +
+        # pair + trigger). Best-effort; composes the yield above.
+        _emit_swarm_deadlock(self.graph_id, self.worker_a, self.worker_b, trigger)
 
         raise DeadlockInterruptedException(
             correlation_id=self.correlation_id,

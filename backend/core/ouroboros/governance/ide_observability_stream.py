@@ -1398,6 +1398,40 @@ EVENT_TYPE_DAG_NODE_UPDATED = "dag_node_updated"
 Composes sovereign_state_propagation_bridge -- no parallel state. Broker
 exception NEVER raises into the DAG runner."""
 
+# Sovereign Multi-Agent Swarm Phase 1d (2026-06-24) -- the swarm.* telemetry
+# mesh. Five additive event types exposing the live swarm topology to IDE /
+# Command Node consumers: worker spawn, the message EDGE (never content), node
+# vaporization, deadlock, and the Sentinel ingress block. All best-effort
+# (fail-soft publish helpers) and authority-free (read-only telemetry only).
+# Gated by the swarm master flags at the producer side -- OFF -> no swarm runs
+# -> these never fire (byte-identical to Phase 1c).
+EVENT_TYPE_SWARM_NODE_SPAWNED = "swarm_node_spawned"
+"""Emitted when a swarm worker is spawned. Payload: graph_id + worker_id +
+role + allowed_tools_count + read_only + schema_version. The dashboard adds a
+node to the swarm graph. No goal / prompt content -- topology only."""
+
+EVENT_TYPE_SWARM_MESSAGE_SENT = "swarm_message_sent"
+"""Emitted on a SUCCESSFUL AgentMessageBus delivery -- the EDGE only. Payload:
+graph_id + from_worker + to_worker + kind + msg_id + schema_version. Carries
+NO payload CONTENT: the SSE channel sees that w1 messaged w2 (and what kind),
+never what was said."""
+
+EVENT_TYPE_SWARM_NODE_VAPORIZED = "swarm_node_vaporized"
+"""Emitted when a worker's EphemeralMemorySandbox is vaporized. Payload:
+graph_id + worker_id + turns_cleared + schema_version. The dashboard marks the
+node terminated. Composes the deterministic teardown -- no parallel state."""
+
+EVENT_TYPE_SWARM_DEADLOCK = "swarm_deadlock"
+"""Emitted when the EpistemicDeadlockBreaker shatters a clarification pair.
+Payload: graph_id + pair (the two worker ids) + trigger + schema_version.
+Best-effort beacon alongside the authoritative [SOVEREIGN YIELD] WARNING."""
+
+EVENT_TYPE_SWARM_SENTINEL_BLOCK = "swarm_sentinel_block"
+"""Emitted when the Sentinel Ingress Filter strips/drops a worker->worker
+imperative-injection (or fails CLOSED). Payload: op_id + reason +
+schema_version. Reason carries the disposition (strip / drop / fail_closed:*)
+but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
@@ -1585,6 +1619,11 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CROSS_REPO_ELEVATION_PENDING,     # Command Node Phase 1 (2026-06-23 -- cross-repo elevation pending)
     EVENT_TYPE_SOVEREIGN_YIELD,                  # Command Node Phase 1 (2026-06-23 -- convergence stall yield)
     EVENT_TYPE_DAG_NODE_UPDATED,                 # Command Node Phase 1 (2026-06-23 -- DAG node state update)
+    EVENT_TYPE_SWARM_NODE_SPAWNED,               # Swarm Phase 1d (2026-06-24 -- worker spawned)
+    EVENT_TYPE_SWARM_MESSAGE_SENT,               # Swarm Phase 1d (2026-06-24 -- message EDGE, no content)
+    EVENT_TYPE_SWARM_NODE_VAPORIZED,             # Swarm Phase 1d (2026-06-24 -- sandbox vaporized)
+    EVENT_TYPE_SWARM_DEADLOCK,                    # Swarm Phase 1d (2026-06-24 -- deadlock shattered)
+    EVENT_TYPE_SWARM_SENTINEL_BLOCK,             # Swarm Phase 1d (2026-06-24 -- Sentinel imperative block)
 })
 
 
@@ -4657,6 +4696,159 @@ def publish_dag_node(op_id: str, node_id: str, state: str) -> None:
                 "op_id": op_id,
                 "node_id": node_id,
                 "state": state,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Multi-Agent Swarm Phase 1d -- publish helpers (2026-06-24)
+# All helpers are fail-soft: a broker exception or missing broker NEVER
+# propagates to the caller (the swarm is NEVER affected by telemetry). All are
+# authority-free (read-only telemetry). Gated at the call site by the swarm
+# master flags -- OFF -> the producer never fires.
+# ---------------------------------------------------------------------------
+
+
+def publish_swarm_node_spawned(
+    graph_id: str,
+    worker_id: str,
+    role: str,
+    allowed_tools_count: int,
+    read_only: bool,
+) -> None:
+    """Publish a swarm worker-spawn event. Best-effort, fail-soft.
+
+    Payload is topology-only: graph_id + worker_id + role +
+    allowed_tools_count + read_only. NO goal / prompt content. NEVER raises.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SWARM_NODE_SPAWNED,
+            graph_id,
+            {
+                "graph_id": graph_id,
+                "worker_id": worker_id,
+                "role": role,
+                "allowed_tools_count": int(allowed_tools_count),
+                "read_only": bool(read_only),
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_swarm_message_sent(
+    graph_id: str,
+    from_worker: str,
+    to_worker: str,
+    kind: str,
+    msg_id: str,
+) -> None:
+    """Publish a swarm message EDGE event. Best-effort, fail-soft.
+
+    Payload is the EDGE only: graph_id + from_worker + to_worker + kind +
+    msg_id. It carries NO payload CONTENT -- consumers learn that w1 messaged
+    w2 (and the kind), never what was said. NEVER raises.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SWARM_MESSAGE_SENT,
+            graph_id,
+            {
+                "graph_id": graph_id,
+                "from_worker": from_worker,
+                "to_worker": to_worker,
+                "kind": kind,
+                "msg_id": msg_id,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_swarm_node_vaporized(
+    graph_id: str,
+    worker_id: str,
+    turns_cleared: int,
+) -> None:
+    """Publish a swarm node-vaporized event. Best-effort, fail-soft.
+
+    Payload: graph_id + worker_id + turns_cleared. Composes the deterministic
+    sandbox teardown. NEVER raises.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SWARM_NODE_VAPORIZED,
+            graph_id,
+            {
+                "graph_id": graph_id,
+                "worker_id": worker_id,
+                "turns_cleared": int(turns_cleared),
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_swarm_deadlock(
+    graph_id: str,
+    pair: Sequence[str],
+    trigger: str,
+) -> None:
+    """Publish a swarm deadlock event. Best-effort, fail-soft.
+
+    Payload: graph_id + pair (the two worker ids) + trigger. Beacon alongside
+    the authoritative [SOVEREIGN YIELD] WARNING. NEVER raises.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SWARM_DEADLOCK,
+            graph_id,
+            {
+                "graph_id": graph_id,
+                "pair": [str(p) for p in (pair or ())],
+                "trigger": trigger,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_swarm_sentinel_block(op_id: str, reason: str) -> None:
+    """Publish a Sentinel ingress-block event. Best-effort, fail-soft.
+
+    Payload: op_id + reason. The reason carries the disposition (strip / drop /
+    fail_closed:*) but NEVER the offending content. NEVER raises.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SWARM_SENTINEL_BLOCK,
+            op_id,
+            {
+                "op_id": op_id,
+                "reason": reason,
                 "schema_version": STREAM_SCHEMA_VERSION,
             },
         )

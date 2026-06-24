@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSovereignStream } from '../hooks/useSovereignStream';
+import { useSwarmTopology } from '../hooks/useSwarmTopology';
 import { useBiometricAuth } from '../hooks/useBiometricAuth';
 import { resolveConfig } from '../lib/config';
 import { ObservabilityClient } from '../lib/api';
@@ -28,6 +29,7 @@ import {
 } from '../lib/projection';
 import FSMStateStream from '../components/FSMStateStream';
 import DAGCanvas from '../components/DAGCanvas';
+import SwarmTopology from '../components/SwarmTopology';
 import BlastRadiusGraph from '../components/BlastRadiusGraph';
 import ElevationQueue from '../components/ElevationQueue';
 import type { AuthorizeTarget } from '../components/ElevationQueue';
@@ -43,6 +45,24 @@ export default function Page(): JSX.Element {
   const dagNodes = useMemo(() => projectDagNodes(events), [events]);
   const elevations = useMemo(() => projectElevationQueue(events), [events]);
   const yieldAlerts = useMemo(() => projectYieldAlerts(events), [events]);
+
+  // Phase 1d swarm topology (same SSE buffer, swarm.* frames folded).
+  const swarm = useSwarmTopology(events);
+  const [mainPanel, setMainPanel] = useState<'dag' | 'swarm'>('dag');
+  const [swarmGraphId, setSwarmGraphId] = useState<string | null>(null);
+
+  // Auto-focus the newest swarm graph; keep the operator's pick if still live.
+  useEffect(() => {
+    if (swarm.graphIds.length === 0) {
+      if (swarmGraphId !== null) {
+        setSwarmGraphId(null);
+      }
+      return;
+    }
+    if (swarmGraphId === null || !swarm.graphIds.includes(swarmGraphId)) {
+      setSwarmGraphId(swarm.graphIds[swarm.graphIds.length - 1]!);
+    }
+  }, [swarm.graphIds, swarmGraphId]);
 
   const [focusedOpId, setFocusedOpId] = useState<string | null>(null);
   const [report, setReport] = useState<BlastRadiusResponse | null>(null);
@@ -116,7 +136,49 @@ export default function Page(): JSX.Element {
       </div>
 
       <div className="cn-dag">
-        <DAGCanvas nodes={dagNodes} />
+        <div className="cn-tabs" role="tablist" aria-label="topology view">
+          <button
+            className={`cn-tab${mainPanel === 'dag' ? ' active' : ''}`}
+            role="tab"
+            aria-selected={mainPanel === 'dag'}
+            onClick={() => setMainPanel('dag')}
+          >
+            Execution DAG
+          </button>
+          <button
+            className={`cn-tab${mainPanel === 'swarm' ? ' active' : ''}`}
+            role="tab"
+            aria-selected={mainPanel === 'swarm'}
+            onClick={() => setMainPanel('swarm')}
+          >
+            Swarm Topology
+            {swarm.graphIds.length > 0 ? (
+              <span className="cn-tab-count">{swarm.graphIds.length}</span>
+            ) : null}
+          </button>
+          {mainPanel === 'swarm' && swarm.graphIds.length > 1 ? (
+            <select
+              className="cn-graph-select"
+              data-testid="swarm-graph-select"
+              aria-label="swarm graph selector"
+              value={swarmGraphId ?? ''}
+              onChange={(e) => setSwarmGraphId(e.target.value)}
+            >
+              {swarm.graphIds.map((g) => (
+                <option key={g} value={g}>
+                  {g}
+                </option>
+              ))}
+            </select>
+          ) : null}
+        </div>
+        <div className="cn-panel-body">
+          {mainPanel === 'dag' ? (
+            <DAGCanvas nodes={dagNodes} />
+          ) : (
+            <SwarmTopology state={swarm.state} graphId={swarmGraphId} />
+          )}
+        </div>
       </div>
 
       <div className="cn-side">

@@ -183,10 +183,21 @@ export type SovereignEventType =
   | 'sovereign_yield'
   | 'dag_node_updated';
 
+// Phase 1d swarm-topology event types. These ride the same
+// /observability/stream SSE; payloads carry NO message content (the
+// dashboard only VISUALIZES the swarm mesh, it never sees payloads).
+export type SwarmEventType =
+  | 'swarm_node_spawned'
+  | 'swarm_message_sent'
+  | 'swarm_node_vaporized'
+  | 'swarm_deadlock'
+  | 'swarm_sentinel_block';
+
 export type StreamEventType =
   | TaskEventType
   | ControlEventType
-  | SovereignEventType;
+  | SovereignEventType
+  | SwarmEventType;
 
 /** The 11-phase Ouroboros governance pipeline. */
 export const OUROBOROS_PHASES = [
@@ -346,4 +357,116 @@ export function isDagNodeUpdatedEvent(
   payload: DagNodeUpdatedPayload;
 } {
   return frame.event_type === 'dag_node_updated';
+}
+
+// --- Phase 1d swarm-topology payloads -------------------------------------
+
+/**
+ * A swarm worker came online (an AgentMessageBus participant). `read_only`
+ * distinguishes an observer/reviewer worker from a mutating one -- they are
+ * colored differently in the topology. `allowed_tools_count` is the size of
+ * the worker's scoped tool budget (display-only). NO payload content ever
+ * crosses this surface.
+ */
+export interface SwarmNodeSpawnedPayload {
+  readonly graph_id: string;
+  readonly worker_id: string;
+  readonly role: string;
+  readonly allowed_tools_count: number;
+  readonly read_only: boolean;
+}
+
+/**
+ * One worker sent a message to another over the AgentMessageBus. Carries the
+ * message KIND and id only -- never the body. Lights up a transient pulse on
+ * the from->to edge.
+ */
+export interface SwarmMessageSentPayload {
+  readonly graph_id: string;
+  readonly from_worker: string;
+  readonly to_worker: string;
+  readonly kind: string;
+  readonly msg_id: string;
+}
+
+/** A worker was vaporized; its turns were cleared and it leaves the mesh. */
+export interface SwarmNodeVaporizedPayload {
+  readonly graph_id: string;
+  readonly worker_id: string;
+  readonly turns_cleared: number;
+}
+
+/** A deadlocked worker pair, surfaced as a severed (danger) edge. */
+export interface SwarmDeadlockPayload {
+  readonly graph_id: string;
+  readonly pair: readonly [string, string];
+  readonly trigger: string;
+}
+
+/**
+ * The sentinel blocked a message (op-scoped, NOT graph-scoped -- the backend
+ * stamps op_id, not graph_id). Surfaced as a transient block marker.
+ */
+export interface SwarmSentinelBlockPayload {
+  readonly op_id: string;
+  readonly reason: string;
+}
+
+export function isSwarmNodeSpawnedEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & {
+  event_type: 'swarm_node_spawned';
+  payload: SwarmNodeSpawnedPayload;
+} {
+  return frame.event_type === 'swarm_node_spawned';
+}
+
+export function isSwarmMessageSentEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & {
+  event_type: 'swarm_message_sent';
+  payload: SwarmMessageSentPayload;
+} {
+  return frame.event_type === 'swarm_message_sent';
+}
+
+export function isSwarmNodeVaporizedEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & {
+  event_type: 'swarm_node_vaporized';
+  payload: SwarmNodeVaporizedPayload;
+} {
+  return frame.event_type === 'swarm_node_vaporized';
+}
+
+export function isSwarmDeadlockEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & {
+  event_type: 'swarm_deadlock';
+  payload: SwarmDeadlockPayload;
+} {
+  return frame.event_type === 'swarm_deadlock';
+}
+
+export function isSwarmSentinelBlockEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & {
+  event_type: 'swarm_sentinel_block';
+  payload: SwarmSentinelBlockPayload;
+} {
+  return frame.event_type === 'swarm_sentinel_block';
+}
+
+const SWARM_EVENT_TYPES: ReadonlySet<SwarmEventType> = new Set([
+  'swarm_node_spawned',
+  'swarm_message_sent',
+  'swarm_node_vaporized',
+  'swarm_deadlock',
+  'swarm_sentinel_block',
+]);
+
+export function isSwarmEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & { event_type: SwarmEventType } {
+  return SWARM_EVENT_TYPES.has(frame.event_type as SwarmEventType);
 }

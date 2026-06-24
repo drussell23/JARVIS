@@ -477,6 +477,153 @@ class BoundSender:
 
 
 # ---------------------------------------------------------------------------
+# the MANDATORY filtering inbox (the structural Sentinel boundary, part a)
+# ---------------------------------------------------------------------------
+
+
+def epistemic_purity_filter(*args: Any, **kwargs: Any) -> Any:
+    """Thin re-export so :class:`SentinelInbox` can be patched in tests and so
+    the bus does not import the Sentinel at module load (avoids an import cycle:
+    swarm_sentinel imports ``_normalize_for_scan`` from THIS module). Lazily
+    delegates to ``swarm_sentinel.epistemic_purity_filter``. NEVER raises --
+    fail-CLOSED (treat as a drop) if the Sentinel cannot be reached.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+            epistemic_purity_filter as _impl,
+        )
+
+        return _impl(*args, **kwargs)
+    except Exception:  # noqa: BLE001 -- fail-CLOSED: synthesize a DROP result.
+        from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+            FilterDisposition,
+            FilterResult,
+        )
+
+        return FilterResult(
+            allowed=False,
+            disposition=FilterDisposition.DROPPED,
+            content="",
+            injection_count=1,
+            reasons=("sentinel_unreachable",),
+        )
+
+
+class SentinelInbox:
+    """The ONLY inbox object a worker ever receives (the load-bearing fix).
+
+    Workers MUST NEVER hold the raw ``bus.subscribe()`` deque. A SentinelInbox
+    wraps that deque + the Sentinel filter: ``read()``/``drain()`` runs
+    :func:`epistemic_purity_filter` over every message's free-text on read --
+    DROPPED messages never surface -- and returns the surviving peer content
+    ONLY wrapped in the quarantine fence (``render_peer_content_fenced``) so even
+    a scan-missed imperative renders as inert, never-obey data.
+
+    Q2 hardening: every read hardcodes ``sender_is_commander=False``. The
+    Commander is NOT a registered bus worker, so a message arriving via a
+    worker's inbox is ALWAYS non-Commander -- there is no spoofable flag a worker
+    could carry to claim imperative authority through the bus.
+
+    The filter is mandatory on the only read path; there is no method that
+    returns unfenced peer content.
+    """
+
+    __slots__ = ("_worker_id", "_inbox", "_op_id")
+
+    def __init__(self, worker_id: str, inbox: "Deque[AgentMessage]", *, op_id: str = ""):
+        self._worker_id = str(worker_id)
+        self._inbox = inbox
+        self._op_id = str(op_id or "")
+
+    @staticmethod
+    def framing_clause() -> str:
+        """The standing never-obey system-prompt clause the worker-context
+        builder MUST inject when this inbox is wired. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+                PEER_DATA_FRAMING,
+            )
+
+            return PEER_DATA_FRAMING
+        except Exception:  # noqa: BLE001 -- fail-soft
+            return ""
+
+    def _free_text(self, msg: "AgentMessage") -> str:
+        """Extract the free-text from a delivered (already-quarantined) message.
+
+        The bus fences the payload under ``untrusted_peer_data``. We surface the
+        human-readable free-text fields (``text`` / ``content`` / ``message`` /
+        ``finding`` / ``artifact``) for the Sentinel + fence. Anything else is
+        already structural DATA fenced by the bus. NEVER raises.
+        """
+        try:
+            body = msg.payload.get(_QUARANTINE_KEY, msg.payload)
+            if isinstance(body, dict):
+                for key in ("text", "content", "message", "finding", "artifact"):
+                    val = body.get(key)
+                    if isinstance(val, str) and val:
+                        return val
+                # No canonical free-text field -> render a stable repr (still
+                # fenced + filtered, so it can only surface as inert data).
+                return json.dumps(body, sort_keys=True, default=str)[: _max_payload_str_len()]
+            if isinstance(body, str):
+                return body
+            return ""
+        except Exception:  # noqa: BLE001 -- fail-soft -> empty (filtered as clean)
+            return ""
+
+    def read(self) -> List[str]:
+        """Drain the inbox, filter each message, and return surviving peer
+        content ONLY as fenced, never-obey data. DROPPED messages do not appear.
+
+        Q2: ``sender_is_commander`` is hardcoded False (inbox = worker channel).
+        Fail-CLOSED: any per-message error drops that message. NEVER raises.
+        """
+        from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+            render_peer_content_fenced,
+        )
+
+        out: List[str] = []
+        try:
+            while self._inbox:
+                msg = self._inbox.popleft()
+                try:
+                    text = self._free_text(msg)
+                    # The Commander never delivers via a worker inbox -> False.
+                    result = epistemic_purity_filter(
+                        text, sender_is_commander=False, op_id=self._op_id
+                    )
+                    if not getattr(result, "allowed", False):
+                        continue  # DROPPED -> never surfaces.
+                    sender = str(getattr(msg, "from_worker", "") or "?")
+                    out.append(
+                        render_peer_content_fenced(
+                            sender, getattr(result, "content", "")
+                        )
+                    )
+                except Exception:  # noqa: BLE001 -- per-message fail-CLOSED (drop)
+                    logger.debug(
+                        "[SentinelInbox] read drop (fail-closed)", exc_info=True
+                    )
+                    continue
+        except Exception:  # noqa: BLE001 -- never raise into the worker.
+            logger.debug("[SentinelInbox] read raised (non-fatal)", exc_info=True)
+        return out
+
+    # ``drain`` is an explicit alias: both consume + filter.
+    drain = read
+
+    def __len__(self) -> int:
+        """Pending (unfiltered) message count -- operator signal only. The count
+        may include messages that will be DROPPED on read (it is NOT a delivery
+        promise). NEVER raises."""
+        try:
+            return len(self._inbox)
+        except Exception:  # noqa: BLE001
+            return 0
+
+
+# ---------------------------------------------------------------------------
 # the Zero-Trust per-graph bus
 # ---------------------------------------------------------------------------
 
@@ -755,6 +902,35 @@ class AgentMessageBus:
             _emit_yield(op_id, reason.value)
         return False
 
+    def _emit_message_edge(self, msg: AgentMessage, recipient: str) -> None:
+        """Best-effort swarm_message_sent telemetry -- the EDGE, NOT content.
+
+        Emits graph_id + from_worker + to_worker + kind + msg_id only; the
+        delivered payload (now quarantined) is NEVER surfaced. Fail-soft: a
+        broker exception / import failure NEVER propagates into ``send`` (the
+        bus must never be disturbed by telemetry). NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_swarm_message_sent,
+            )
+
+            kind_val = (
+                msg.kind.value if isinstance(msg.kind, MessageKind) else str(msg.kind)
+            )
+            publish_swarm_message_sent(
+                self.graph_id,
+                str(msg.from_worker or ""),
+                str(recipient or ""),
+                kind_val,
+                str(msg.msg_id or ""),
+            )
+        except Exception:  # noqa: BLE001 -- fail-soft, never disturbs the bus
+            logger.debug(
+                "[AgentBus] publish_swarm_message_sent failed (non-fatal)",
+                exc_info=True,
+            )
+
     def send(self, msg: AgentMessage) -> bool:
         """Zero-Trust ingress. Returns True iff the message was DELIVERED.
 
@@ -871,6 +1047,12 @@ class AgentMessageBus:
             # LRU -> a unique-correlation flood cannot OOM the response map).
             if msg.kind is MessageKind.CLARIFICATION_RESPONSE and msg.correlation_id:
                 self._record_response(msg.correlation_id, msg)
+
+            # Phase 1d -- swarm telemetry: emit the message EDGE (NOT content).
+            # Best-effort, fail-soft: telemetry NEVER affects the swarm. Only on
+            # a real delivery (here, post-admission); an evicted (inbox_full)
+            # message is still an edge that crossed, so we emit regardless.
+            self._emit_message_edge(msg, recipient)
             return True
         except Exception:  # noqa: BLE001 -- the bus NEVER crashes on a message.
             logger.debug("[AgentBus] send raised -> DROP (fail-closed)", exc_info=True)
@@ -881,7 +1063,12 @@ class AgentMessageBus:
 
     def subscribe(self, worker_id: str) -> Deque[AgentMessage]:
         """Return the worker's bounded inbox deque (auto-provisions on demand
-        for a registered member; unknown workers get an empty bounded deque)."""
+        for a registered member; unknown workers get an empty bounded deque).
+
+        INTERNAL / TELEMETRY USE: this raw deque must NEVER be handed to a
+        worker. Workers receive a :class:`SentinelInbox` via
+        :meth:`sentinel_inbox` (the mandatory filter on the only read path).
+        """
         wid = str(worker_id)
         inbox = self._inboxes.get(wid)
         if inbox is None:
@@ -889,6 +1076,19 @@ class AgentMessageBus:
             if wid in self._members:
                 self._inboxes[wid] = inbox
         return inbox
+
+    def sentinel_inbox(self, worker_id: str) -> "SentinelInbox":
+        """Return the MANDATORY filtering inbox for ``worker_id``.
+
+        This is the ONLY inbox object a worker may receive. It wraps the raw
+        deque + the Sentinel filter so that every read drops injection-positive
+        peer messages and surfaces survivors ONLY inside the never-obey
+        quarantine fence. There is no worker-facing path that returns the raw
+        deque (see the shipped-code invariant in ``subagent_factory``).
+        """
+        return SentinelInbox(
+            str(worker_id), self.subscribe(worker_id), op_id=self.op_id
+        )
 
     def request(
         self,
