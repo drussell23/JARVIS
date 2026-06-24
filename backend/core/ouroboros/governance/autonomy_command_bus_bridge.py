@@ -123,7 +123,7 @@ def master_enabled() -> bool:
     is a no-op + :func:`start_default_bridge` returns None
     immediately. NEVER raises."""
     raw = os.environ.get(
-        "JARVIS_COMMAND_BUS_BRIDGE_ENABLED", "",
+        "JARVIS_COMMAND_BUS_BRIDGE_ENABLED", "true",
     ).strip().lower()
     if raw == "":
         return False
