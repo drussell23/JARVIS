@@ -487,6 +487,271 @@ def local_autopsy(*, run_id: str, autopsy_root: str, debug_log: str,
 
 
 # ===========================================================================
+# Black Box Flight Recorder -- checksum-gated, fail-CLOSED teardown.
+#
+# THE INVARIANT: on failure, the GCP node MUST NOT self-delete until the Black
+# Box archive is confirmed (cryptographic sha256) received on the LOCAL Mac.
+# Fail-CLOSED toward DATA PRESERVATION: uncertain -> HOLD the node, never burn.
+#
+# HONEST NAT REALITY: a GCP node cannot push INTO the NAT'd Mac. So the LOCAL
+# orchestrator PULLS the archive over the IAP SSH tunnel it already holds
+# (gcloud compute scp --tunnel-through-iap), recomputes the sha256 LOCALLY, and
+# ONLY THEN authorizes the node's Compute-SA self-delete. Same guarantee, works
+# through NAT.
+# ===========================================================================
+
+
+_BLACK_BOX_SCRIPT = os.path.join(_SCRIPTS_DIR, "a1_black_box.py")
+# The node-side dir the bundler writes the archive into (env-overridable).
+_BLACK_BOX_NODE_OUT = os.environ.get("JARVIS_A1_BLACKBOX_NODE_OUT", "/tmp/a1_black_box")
+# The remote jarvis repo root on the node (matches the IaC sync target).
+_BLACK_BOX_REMOTE_REPO = os.environ.get("JARVIS_A1_BLACKBOX_REMOTE_REPO", "/opt/trinity/jarvis")
+
+
+def blackbox_pull_retries() -> int:
+    """Bounded pull retries before HOLDING the node (env, default 3)."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_A1_BLACKBOX_PULL_RETRIES", "3")))
+    except ValueError:
+        return 3
+
+
+def assert_dw_primary(env: Dict[str, str]) -> "tuple":
+    """DW-primary pre-launch assertion: Claude MUST be disabled AND a DW primary
+    override MUST be set. Returns (ok, reason). The Linux overlay already sets
+    both; this asserts they SURVIVED env composition (a soak that silently lost
+    them would let Claude serve -- defeating the DW-primary audit)."""
+    claude_disabled = (env.get("JARVIS_PROVIDER_CLAUDE_DISABLED", "") or "").strip().lower()
+    dw_override = (env.get("JARVIS_DW_PRIMARY_OVERRIDE", "") or "").strip()
+    if claude_disabled not in {"true", "1", "yes", "on"}:
+        return False, ("JARVIS_PROVIDER_CLAUDE_DISABLED is %r (must be true) -- "
+                       "Claude is not disabled; the DW-primary audit is invalid."
+                       % (env.get("JARVIS_PROVIDER_CLAUDE_DISABLED"),))
+    if not dw_override:
+        return False, ("JARVIS_DW_PRIMARY_OVERRIDE is unset -- DW is not pinned as "
+                       "primary; refusing to launch a non-DW-primary soak.")
+    return True, ""
+
+
+class IapBlackBoxTransport:
+    """The local side of the Black Box pull -- drives the IaC hypervisor's IAP
+    SSH/scp command builders (NO reimplementation) to: (1) run the node-side
+    bundler over SSH, (2) PULL the archive + .sha256 over scp, (3) recompute the
+    sha256 LOCALLY, (4) on a verified match, authorize the node self-delete via
+    the hypervisor's burn_node. All subprocess is injectable for tests."""
+
+    def __init__(self, *, node: str, hypervisor_args: Any,
+                 runner: Optional[Callable[..., subprocess.CompletedProcess]] = None) -> None:
+        self.node = node
+        self.args = hypervisor_args
+        self._run = runner or self._default_run
+        self._hyper = None  # lazily imported (avoids heavy import on dev boxes)
+
+    @staticmethod
+    def _default_run(argv: Sequence[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(list(argv), capture_output=True, text=True, check=False)
+
+    def _hypervisor(self):
+        if self._hyper is None:
+            spec = importlib.util.spec_from_file_location(
+                "sovereign_iac_hypervisor", _HYPERVISOR_SCRIPT)
+            assert spec and spec.loader
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules.setdefault("sovereign_iac_hypervisor", mod)
+            spec.loader.exec_module(mod)
+            self._hyper = mod
+        return self._hyper
+
+    def bundle_on_node(self, *, run_id: str, out_dir: str) -> Optional[Dict[str, str]]:
+        """SSH-exec the node-side bundler; parse BLACK_BOX_ARCHIVE/SHA256."""
+        hyper = self._hypervisor()
+        remote = (
+            "cd %s && python3 scripts/a1_black_box.py --bundle --run-id %s --out %s"
+            % (_BLACK_BOX_REMOTE_REPO, run_id, out_dir)
+        )
+        argv = hyper._ssh_cmd(self.args, self.node, remote)
+        cp = self._run(argv)
+        out = (cp.stdout or "") + (cp.stderr or "")
+        archive = sha = ""
+        for line in out.splitlines():
+            if line.startswith("BLACK_BOX_ARCHIVE="):
+                archive = line.split("=", 1)[1].strip()
+            elif line.startswith("BLACK_BOX_SHA256="):
+                sha = line.split("=", 1)[1].strip()
+        if not archive or not sha:
+            _log("[BlackBox] node bundle did not emit archive+sha256 (out=%r)" % (out[-300:],))
+            return None
+        return {"archive": archive, "sha256": sha, "sha_path": archive + ".sha256"}
+
+    def pull_archive(self, *, node_archive: str, node_sha_path: str,
+                     local_dir: str) -> Optional[str]:
+        """scp the archive (+ .sha256) over IAP into local_dir, recompute the
+        sha256 of the PULLED archive locally. Returns the local hex digest, or
+        None on any pull failure (fail-CLOSED -> the caller HOLDS the node)."""
+        import hashlib
+        hyper = self._hypervisor()
+        os.makedirs(local_dir, exist_ok=True)
+        for src in (node_archive, node_sha_path):
+            # The hypervisor's _scp_cmd builds a PUSH (`... <local> <node>:<remote>`);
+            # for a PULL we need `<node>:<remote> <local>`, so build the IAP scp
+            # with the direction reversed (same flag shape, reused transport).
+            argv = self._scp_pull_cmd(src, local_dir)
+            cp = self._run(argv)
+            if cp.returncode != 0:
+                _log("[BlackBox] scp pull failed for %s rc=%d" % (src, cp.returncode))
+                return None
+        local_archive = os.path.join(local_dir, os.path.basename(node_archive))
+        if not os.path.isfile(local_archive):
+            _log("[BlackBox] pulled archive missing on disk: %s" % (local_archive,))
+            return None
+        digest = hashlib.sha256()
+        try:
+            with open(local_archive, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            _log("[BlackBox] local sha256 recompute failed: %r" % (exc,))
+            return None
+        return digest.hexdigest()
+
+    def _scp_pull_cmd(self, node_src: str, local_dir: str) -> List[str]:
+        """A PULL scp over IAP: `gcloud compute scp --recurse --tunnel-through-iap
+        --project=.. --zone=.. <node>:<remote> <local>` (reuses the hypervisor's
+        flag shape; only the direction differs from the push builder)."""
+        project = getattr(self.args, "project", None)
+        zone = getattr(self.args, "zone", None)
+        cmd = ["gcloud", "compute", "scp", "--recurse"]
+        if project:
+            cmd.append("--project=%s" % (project,))
+        if zone:
+            cmd.append("--zone=%s" % (zone,))
+        cmd.extend(["--tunnel-through-iap", "%s:%s" % (self.node, node_src), local_dir])
+        return cmd
+
+    def teardown(self, *, node: str) -> bool:
+        """Authorize the node self-delete -- ONLY reached after a verified local
+        sha256 match. Reuses the hypervisor's burn_node (quadruple teardown)."""
+        hyper = self._hypervisor()
+        try:
+            hyper.burn_node(self.args, node)
+            return True
+        except Exception as exc:  # noqa: BLE001 -- a burn error never crashes the harness
+            _log("[BlackBox] teardown warning: %r" % (exc,))
+            return False
+
+
+@dataclass
+class TeardownDecision:
+    authorized: bool
+    held: bool
+    reason: str = ""
+    node_sha256: str = ""
+    local_sha256: str = ""
+    held_node_file: str = ""
+    local_archive_dir: str = ""
+
+
+class BlackBoxTeardownDecider:
+    """The checksum-gated, fail-CLOSED teardown FSM. On a failed A1 run it:
+      1. (node) runs the bundler -> archive + sha256 on the node;
+      2. (local) PULLs the archive + .sha256 over IAP, recomputes the sha256;
+      3. MATCH -> authorize teardown (the existing dead-man / IaC self-delete);
+         MISMATCH or pull-fail (after bounded retries) -> DO NOT BURN: HOLD the
+         node, write HELD_NODE.txt with the manual-extract command, loud log.
+    Fail-CLOSED toward DATA PRESERVATION at every branch."""
+
+    def __init__(self, *, run_id: str, node: str, autopsy_root: str,
+                 transport: Any, pull_retries: int = 3) -> None:
+        self.run_id = run_id
+        self.node = node
+        self.autopsy_root = autopsy_root
+        self.transport = transport
+        self.pull_retries = max(1, int(pull_retries))
+
+    def _local_dir(self) -> str:
+        return os.path.join(self.autopsy_root, self.run_id)
+
+    def _hold(self, reason: str, *, node_sha: str = "", local_sha: str = "") -> TeardownDecision:
+        """HOLD the node (never burn). Write HELD_NODE.txt with the manual-extract
+        command so an operator can recover the data by hand."""
+        _log("[BlackBox] DATA NOT CONFIRMED -- NODE HELD for manual extraction: %s" % (reason,))
+        local_dir = self._local_dir()
+        held_file = ""
+        try:
+            os.makedirs(local_dir, exist_ok=True)
+            held_file = os.path.join(local_dir, "HELD_NODE.txt")
+            manual = (
+                "gcloud compute ssh %s --tunnel-through-iap "
+                "--command 'cat %s/black_box_%s.tar.gz' > %s/black_box_%s.tar.gz"
+                % (self.node, _BLACK_BOX_NODE_OUT, self.run_id, local_dir, self.run_id)
+            )
+            with open(held_file, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "A1 BLACK BOX -- NODE HELD (data NOT confirmed on local Mac)\n"
+                    "==========================================================\n"
+                    "run_id     : %s\n" % (self.run_id,)
+                    + "node       : %s\n" % (self.node,)
+                    + "reason     : %s\n" % (reason,)
+                    + "node_sha256 : %s\n" % (node_sha or "<none>",)
+                    + "local_sha256: %s\n" % (local_sha or "<none>",)
+                    + "\nThe node was NOT burned (fail-CLOSED to data preservation).\n"
+                    + "Manually extract the Black Box, then delete the node by hand:\n\n"
+                    + "  # 1. pull the archive over IAP:\n  %s\n\n" % (manual,)
+                    + "  # 2. verify, THEN delete the node:\n"
+                    + "  gcloud compute instances delete %s --quiet\n" % (self.node,)
+                )
+            _log("[BlackBox] HELD_NODE.txt written -> %s" % (held_file,))
+        except OSError as exc:
+            _log("[BlackBox] HELD_NODE.txt write warning: %r" % (exc,))
+        return TeardownDecision(
+            authorized=False, held=True, reason=reason,
+            node_sha256=node_sha, local_sha256=local_sha,
+            held_node_file=held_file, local_archive_dir=local_dir,
+        )
+
+    def run(self) -> TeardownDecision:
+        # 1. Bundle on the node.
+        bundle = self.transport.bundle_on_node(
+            run_id=self.run_id, out_dir=_BLACK_BOX_NODE_OUT)
+        if not bundle:
+            return self._hold("node-side bundle failed -- no archive to confirm")
+        node_sha = bundle.get("sha256", "")
+        node_archive = bundle.get("archive", "")
+        node_sha_path = bundle.get("sha_path", node_archive + ".sha256")
+        local_dir = self._local_dir()
+
+        # 2. PULL + recompute locally, bounded retries.
+        local_sha: Optional[str] = None
+        for attempt in range(1, self.pull_retries + 1):
+            local_sha = self.transport.pull_archive(
+                node_archive=node_archive, node_sha_path=node_sha_path,
+                local_dir=local_dir)
+            if local_sha is not None:
+                break
+            _log("[BlackBox] pull attempt %d/%d failed -- retrying"
+                 % (attempt, self.pull_retries))
+        if local_sha is None:
+            return self._hold(
+                "archive pull failed after %d retries -- data not on local Mac"
+                % (self.pull_retries,), node_sha=node_sha)
+
+        # 3. Compare. MATCH -> authorize teardown. MISMATCH -> HOLD.
+        if local_sha != node_sha:
+            return self._hold(
+                "sha256 MISMATCH (node=%s local=%s) -- archive corrupt in transit"
+                % (node_sha[:16], local_sha[:16]),
+                node_sha=node_sha, local_sha=local_sha)
+        _log("[BlackBox] sha256 VERIFIED on local Mac (%s) -- authorizing teardown"
+             % (node_sha[:16],))
+        self.transport.teardown(node=self.node)
+        return TeardownDecision(
+            authorized=True, held=False, reason="sha256 verified locally",
+            node_sha256=node_sha, local_sha256=local_sha,
+            local_archive_dir=local_dir,
+        )
+
+
+# ===========================================================================
 # The orchestration run.
 # ===========================================================================
 
@@ -507,6 +772,10 @@ class HarnessRun:
     stub_soak: bool = False
     stub_log_goal: str = "GOAL-A1-STUB"
     env: Optional[Dict[str, str]] = None
+    # Black Box Flight Recorder: when set (remote on-node runs), a FAILED verdict
+    # runs the checksum-gated, fail-CLOSED teardown decision BEFORE any node burn.
+    blackbox_node: str = ""
+    blackbox_teardown_fn: Optional[Callable[..., Any]] = None
     _verdict: Dict[str, Any] = field(default_factory=dict)
 
     def report_dir(self) -> str:
@@ -582,7 +851,7 @@ class HarnessRun:
             proven = bool(verdict.get("proven"))
             _log("STEP audit VERDICT: %s" % ("A1_DISPATCH_PROVEN" if proven else "FAILED"))
 
-            # f. AUTOPSY ON FAILURE.
+            # f. AUTOPSY ON FAILURE + BLACK BOX checksum-gated teardown.
             if not proven:
                 _log("STEP autopsy: failed verdict -> black-box capture")
                 self.autopsy_fn(
@@ -590,6 +859,9 @@ class HarnessRun:
                     debug_log=handle.debug_log, verdict=verdict,
                     chaos_manifest=self._chaos_manifest_path(),
                 )
+                # Black Box: PULL the node-side archive, verify the sha256 LOCALLY,
+                # and ONLY authorize the node self-delete on a match -- else HOLD.
+                self._blackbox_on_failure(verdict)
             return 0 if proven else 1
         except (KeyboardInterrupt, SystemExit):
             # SIGINT / explicit exit -- revert (finally) then propagate so the
@@ -635,7 +907,8 @@ class HarnessRun:
 
     def _safe_autopsy(self, verdict: Dict[str, Any]) -> None:
         """Invoke the autopsy black-box on a failure path. Best-effort: never
-        raises (it must not mask the underlying error)."""
+        raises (it must not mask the underlying error). Also runs the Black Box
+        checksum-gated teardown decision (fail-CLOSED -> HOLD on any doubt)."""
         try:
             self.autopsy_fn(
                 run_id=self.run_id, autopsy_root=self.autopsy_root,
@@ -644,6 +917,34 @@ class HarnessRun:
             )
         except Exception as exc:  # noqa: BLE001
             _log("autopsy invocation warning: %r" % (exc,))
+        self._blackbox_on_failure(verdict)
+
+    def _blackbox_on_failure(self, verdict: Dict[str, Any]) -> Optional[Any]:
+        """Run the Black Box checksum-gated teardown decision on a failed run.
+        Only active when a remote node is wired (blackbox_teardown_fn set) --
+        local/dry-run paths have no node to hold/burn, so this is a no-op there.
+
+        Fail-CLOSED: any error in the decision path leaves the node UN-burned
+        (we never reach a teardown call on an exception)."""
+        if self.blackbox_teardown_fn is None:
+            return None
+        try:
+            decision = self.blackbox_teardown_fn(
+                run_id=self.run_id, node=self.blackbox_node,
+                autopsy_root=self.autopsy_root,
+                debug_log=getattr(self, "_debug_log_path", "") or "",
+                verdict=verdict, chaos_manifest=self._chaos_manifest_path(),
+            )
+            self._blackbox_decision = decision
+            if getattr(decision, "held", False):
+                _log("[BlackBox] node HELD (data unconfirmed) -- NOT burned: %s"
+                     % (getattr(decision, "reason", ""),))
+            elif getattr(decision, "authorized", False):
+                _log("[BlackBox] teardown AUTHORIZED (sha256 verified locally)")
+            return decision
+        except Exception as exc:  # noqa: BLE001 -- a decision error must HOLD, never burn
+            _log("[BlackBox] decision error -- holding node (fail-CLOSED): %r" % (exc,))
+            return None
 
     def _collect_report(self, verdict: Dict[str, Any]) -> None:
         rd = self.report_dir()
@@ -722,12 +1023,39 @@ def estimate_remote_cost(wall_seconds: int) -> float:
     return round(_NODE_COST_PER_HOUR * (wall_seconds / 3600.0), 4)
 
 
+def make_blackbox_teardown_fn(*, node: str, hypervisor_args: Any,
+                              pull_retries: Optional[int] = None) -> Callable[..., Any]:
+    """Factory: a teardown function the HarnessRun calls on a FAILED verdict. It
+    bundles the Black Box on the node, PULLs it over IAP, verifies the sha256
+    LOCALLY, and authorizes the node self-delete ONLY on a match -- else HOLDs.
+    Wired into build_live_run when a node + hypervisor args are available."""
+    transport = IapBlackBoxTransport(node=node, hypervisor_args=hypervisor_args)
+    retries = pull_retries if pull_retries is not None else blackbox_pull_retries()
+
+    def _teardown(*, run_id, node, autopsy_root, debug_log, verdict, chaos_manifest):
+        decider = BlackBoxTeardownDecider(
+            run_id=run_id, node=node, autopsy_root=autopsy_root,
+            transport=transport, pull_retries=retries,
+        )
+        return decider.run()
+
+    return _teardown
+
+
 def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
                              extra_args: Optional[Sequence[str]] = None) -> int:
     """Drive sovereign_iac_hypervisor.py to provision the Linux node, sync the
     repo, and run this harness with --execute-on-node remotely (streaming stdout
     back). Cost-bounded + node dead-man + teardown-always (the hypervisor owns
-    the node lifecycle / self-delete). Only reached AFTER the money-gate."""
+    the node lifecycle / self-delete).
+
+    BLACK BOX INVARIANT: the node-side dead-man fires on the completion-sentinel.
+    To keep diagnostic data safe, the orchestrator must NOT let the node burn its
+    Black Box before the archive is confirmed on the local Mac. We pass
+    ``JARVIS_A1_BLACKBOX_HOLD_ON_FAILURE=1`` into the hypervisor env so the on-node
+    failure path withholds the completion-sentinel until the local PULL + sha256
+    verification authorizes it (the checksum-gated teardown). Only reached AFTER
+    the money-gate."""
     remote_cmd = (
         "JARVIS_IAC_HYPERVISOR_ENABLED=1 python3 scripts/a1_live_fire_chaos_harness.py "
         "--execute-on-node --cost-cap %s --max-wall-seconds %d --seed %d"
@@ -743,7 +1071,11 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
         argv.extend(extra_args)
     env = dict(os.environ)
     env["JARVIS_IAC_HYPERVISOR_ENABLED"] = "1"
-    _log("STEP remote: provisioning node + remote surgery (dead-man armed)")
+    # Signal the on-node run to fail-CLOSED on a failed verdict: HOLD the Black Box
+    # (do not drop the completion-sentinel) until the local checksum verification.
+    env.setdefault("JARVIS_A1_BLACKBOX_HOLD_ON_FAILURE", "1")
+    _log("STEP remote: provisioning node + remote surgery (dead-man armed, "
+         "Black Box checksum-gate active)")
     cp = subprocess.run(argv, env=env, check=False)
     return cp.returncode
 
@@ -817,8 +1149,13 @@ def _print_composed_env_for_audit() -> None:
         _log("  %s=%s" % (flag, env.get(flag, "?")))
     for k in ("JARVIS_ROADMAP_ORCHESTRATOR_ENABLED", "JARVIS_IDE_STREAM_ENABLED",
               "JARVIS_A1_TRACE_ENABLED", "JARVIS_PROVIDER_CLAUDE_DISABLED",
+              "JARVIS_DW_PRIMARY_OVERRIDE",
               "OUROBOROS_BATTLE_MAX_WALL_SECONDS"):
         _log("  %s=%s" % (k, env.get(k, "<unset>")))
+    # DW-primary pre-launch assertion -- surface its verdict for audit.
+    ok, reason = assert_dw_primary(env)
+    _log("  DW-primary assertion: %s%s"
+         % ("PINNED" if ok else "NOT PINNED", "" if ok else " (%s)" % (reason,)))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -916,6 +1253,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --- ON-NODE: the real soak+audit (only on the provisioned Linux node) --
     if args.execute_on_node:
         _print_composed_env_for_audit()
+        # DW-primary pre-launch assertion: Claude MUST be disabled AND DW pinned.
+        # The Linux overlay sets both; this asserts they SURVIVED composition.
+        ok, reason = assert_dw_primary(compose_env())
+        if not ok:
+            _log("REFUSED: DW-primary not pinned -- %s" % (reason,))
+            return 2
         run = build_live_run(args)
         _ACTIVE_CHAOS.append(run.chaos)
         _install_revert_signal_handlers()
