@@ -128,11 +128,15 @@ class CommandNodeRouter:
         resolve_target_repo_fn: Optional[Any] = None,
         voice_verify_fn: Optional[Any] = None,
         approve_fn: Optional[Any] = None,
+        phrase_match_fn: Optional[Any] = None,
     ) -> None:
         self._middleware = middleware
         self._resolve_target_repo_fn = resolve_target_repo_fn
         self._voice_verify_fn = voice_verify_fn
         self._approve_fn = approve_fn
+        # Phase 3 -- injectable ASR phrase-match (default: the middleware
+        # binds the real local-Whisper asr_phrase_match when None + REQUIRE).
+        self._phrase_match_fn = phrase_match_fn
         self._rate_tracker: Dict[str, List[float]] = {}
 
     # --- wiring -----------------------------------------------------------
@@ -303,6 +307,7 @@ class CommandNodeRouter:
                 voice_verify_fn=self._voice_verify_fn,
                 approve_fn=self._approve_fn,
                 resolve_target_repo_fn=self._resolve_target_repo_fn,
+                phrase_match_fn=self._phrase_match_fn,
             )
         except Exception:  # noqa: BLE001 -- FAIL-CLOSED, never leak
             logger.error(

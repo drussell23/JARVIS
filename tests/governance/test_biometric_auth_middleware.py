@@ -68,10 +68,28 @@ def _issue(m, *, pr_id="PR-100", ast_mutation_id="ast-abc",
     )
 
 
+_PHRASE_SENTINEL = object()
+
+
+def _passing_phrase_match():
+    """A zero-arg phrase-match predicate that always PASSES. Phase 3 flips
+    REQUIRE_PHRASE_MATCH to default-true, so tests that aren't exercising
+    phrase-match must inject a passing verifier (the real asr_phrase_match
+    would otherwise try to run local Whisper on fake audio). NO real Whisper
+    runs in any test."""
+    return True
+
+
 async def _authorize(m, ch, *, verdict=None, approve_record=None,
                      target_repo="jarvis", pr_id=None, ast_mutation_id=None,
-                     nonce=None, raise_in_verify=False, phrase_match_fn=None):
+                     nonce=None, raise_in_verify=False,
+                     phrase_match_fn=_PHRASE_SENTINEL):
     approve_record = approve_record if approve_record is not None else []
+    # Default to a passing phrase-match (Phase 3 default-true REQUIRE). An
+    # explicit None / fn / callable overrides it; explicit None means
+    # "no fn wired" (the H1 unavailable path).
+    if phrase_match_fn is _PHRASE_SENTINEL:
+        phrase_match_fn = _passing_phrase_match
 
     async def _verify(audio, sample_rate):  # noqa: ARG001
         if raise_in_verify:
@@ -304,6 +322,7 @@ def test_approve_failure_does_not_authorize():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     assert res.decision == "REJECTED"
 
@@ -323,6 +342,7 @@ def test_resolve_repo_exception_fails_closed():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=lambda **k: None,
         resolve_target_repo_fn=_resolve,
+        phrase_match_fn=lambda: True,
     ))
     assert res.decision == "REJECTED"
 
@@ -344,6 +364,7 @@ def test_audio_not_persisted_only_sha256_in_audit():
         audio=audio, sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=lambda **k: {"ok": True},
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     assert m._audit_calls, "an audit record must be emitted"
     rec = m._audit_calls[-1]
@@ -401,6 +422,7 @@ def test_m2_authorized_audit_fails_rejects_and_approve_not_called():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     # Must be REJECTED because audit write failed.
     assert res.decision == "REJECTED"
@@ -435,6 +457,7 @@ def test_m2_audit_written_before_approve_fn():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     assert res.decision == "AUTHORIZED"
     # The audit entry must appear before the approve entry in the log.
@@ -476,6 +499,9 @@ def test_m2_rejected_plus_audit_fail_is_still_rejected_fail_soft():
         voice_verify_fn=_good_verify,
         approve_fn=lambda **k: None,
         resolve_target_repo_fn=lambda pr: "prime",
+        # Pass phrase-match so BOTH gate terms pass; Immutable Orange must
+        # STILL reject (THE LAW composes AFTER the concurrent gate).
+        phrase_match_fn=lambda: True,
     ))
     # Must remain REJECTED; the audit-sink failure must not raise.
     assert res.decision == "REJECTED"
@@ -536,6 +562,7 @@ def test_m1_relaxed_floor_rejects():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     assert res.decision == "REJECTED"
     assert "floor_relaxed" in res.reason
@@ -574,6 +601,7 @@ def test_m1_floor_check_fn_exception_fails_closed():
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=lambda **k: None,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: True,
     ))
     assert res.decision == "REJECTED"
 
@@ -608,14 +636,32 @@ def test_m1_static_floor_check_relaxed_floors():
 
 
 # ===========================================================================
-# H1 -- Phrase-match guard tests
+# H1 / Phase 3 -- Biometric-Semantic Binding (concurrent ECAPA + ASR gate)
 # ===========================================================================
 
 
-def test_h1_require_phrase_match_true_no_fn_rejects(monkeypatch):
-    """H1: REQUIRE_PHRASE_MATCH=true + no phrase_match_fn -> REJECTED
-    fail_closed:phrase_match_required_but_unavailable."""
+def test_phase3_require_phrase_match_default_is_true(monkeypatch):
+    """Phase 3: REQUIRE_PHRASE_MATCH default flips to TRUE -- phrase-match
+    is mandatory by default; only an explicit 'false' disables it."""
+    monkeypatch.delenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", raising=False)
+    assert mw._require_phrase_match() is True
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "false")
+    assert mw._require_phrase_match() is False
     monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
+    assert mw._require_phrase_match() is True
+
+
+def test_h1_required_but_asr_broken_rejects(monkeypatch):
+    """H1: REQUIRE=true (default) + no fn wired AND the default ASR cannot
+    be bound -> REJECTED fail_closed:phrase_match_required_but_unavailable.
+    (Now only fires if someone both requires it AND breaks the ASR.)"""
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
+    # Simulate a broken ASR: the default resolver returns None.
+    monkeypatch.setattr(
+        mw.BiometricAuthMiddleware,
+        "_resolve_default_phrase_match_fn",
+        staticmethod(lambda: None),
+    )
     m = _fresh_middleware()
     ch = _issue(m)
 
@@ -633,54 +679,23 @@ def test_h1_require_phrase_match_true_no_fn_rejects(monkeypatch):
         audio=b"x", sample_rate=16000,
         voice_verify_fn=_verify, approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
-        phrase_match_fn=None,  # not wired
+        phrase_match_fn=None,  # not wired -> default ASR -> broken
     ))
     assert res.decision == "REJECTED"
     assert "phrase_match_required_but_unavailable" in res.reason
     assert approve_calls == []
 
 
-def test_h1_require_phrase_match_true_passing_fn_authorizes(monkeypatch):
-    """H1: REQUIRE_PHRASE_MATCH=true + passing phrase_match_fn -> AUTHORIZED."""
-    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
-    m = _fresh_middleware()
-    ch = _issue(m)
-    res = asyncio.run(_authorize(m, ch, target_repo="jarvis",
-                                 phrase_match_fn=lambda: True))
-    assert res.decision == "AUTHORIZED"
+def test_phase3_explicit_false_degraded_mode_authorizes(monkeypatch):
+    """Phase 3: an explicit REQUIRE=false disables phrase-match (degraded /
+    loopback-only mode). With no fn wired + a valid biometric -> AUTHORIZED.
+    A one-time [SECURITY] warning is logged."""
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "false")
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_AUTH_ENABLED", "true")
+    # Reset the one-time status latch so this run actually logs.
+    monkeypatch.setattr(mw, "_PHRASE_MATCH_STATUS_LOGGED", False)
+    import logging as _logging
 
-
-def test_h1_require_phrase_match_true_failing_fn_rejects(monkeypatch):
-    """H1: REQUIRE_PHRASE_MATCH=true + failing phrase_match_fn -> REJECTED."""
-    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
-    m = _fresh_middleware()
-    ch = _issue(m)
-
-    approve_calls: list = []
-
-    async def _verify(audio, sample_rate):  # noqa: ARG001
-        return _good_verdict(score=1.0)
-
-    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
-        approve_calls.append(pr_id)
-        return {}
-
-    res = asyncio.run(m.authorize_elevation(
-        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
-        audio=b"x", sample_rate=16000,
-        voice_verify_fn=_verify, approve_fn=_approve,
-        resolve_target_repo_fn=lambda pr: "jarvis",
-        phrase_match_fn=lambda: False,
-    ))
-    assert res.decision == "REJECTED"
-    assert "phrase_match_failed" in res.reason
-    assert approve_calls == []
-
-
-def test_h1_default_false_no_phrase_match_fn_still_authorized(monkeypatch):
-    """H1: Default (REQUIRE_PHRASE_MATCH not set / false) -> behaves as
-    today: no phrase_match_fn is fine, AUTHORIZED with valid biometric."""
-    monkeypatch.delenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", raising=False)
     m = _fresh_middleware()
     ch = _issue(m)
     res = asyncio.run(_authorize(m, ch, target_repo="jarvis",
@@ -688,30 +703,204 @@ def test_h1_default_false_no_phrase_match_fn_still_authorized(monkeypatch):
     assert res.decision == "AUTHORIZED"
 
 
-def test_h1_phrase_match_fn_exception_fails_closed(monkeypatch):
-    """H1: phrase_match_fn raises -> fail-CLOSED REJECT (never authorize)."""
-    monkeypatch.delenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", raising=False)
+def test_phase3_explicit_false_logs_security_warning(monkeypatch, caplog):
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "false")
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_AUTH_ENABLED", "true")
+    monkeypatch.setattr(mw, "_PHRASE_MATCH_STATUS_LOGGED", False)
     m = _fresh_middleware()
     ch = _issue(m)
+    import logging
+    with caplog.at_level(logging.WARNING, logger="CommandNode.BiometricAuth"):
+        asyncio.run(_authorize(m, ch, target_repo="jarvis",
+                               phrase_match_fn=None))
+    joined = " ".join(r.message for r in caplog.records)
+    assert "[SECURITY]" in joined
+    assert "DISABLED" in joined or "disabled" in joined
 
-    async def _verify(audio, sample_rate):  # noqa: ARG001
-        return _good_verdict(score=1.0)
 
+# --- the concurrent gate matrix: BOTH must pass ---------------------------
+
+
+def _ecapa_fn(passed: bool):
+    async def _v(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0) if passed else _bad_verdict(
+            authenticated=False, score=0.0)
+    return _v
+
+
+def _asr_fn(passed: bool, wer=None, transcript="spoken phrase"):
+    """An asr_phrase_match-shaped fake: takes kwargs, returns (passed, info)."""
+    async def _p(*, audio, sample_rate, expected_phrase):  # noqa: ARG001
+        info = {
+            "transcript": transcript if passed else "",
+            "wer": (0.0 if passed else 1.0) if wer is None else wer,
+            "threshold": 0.10,
+        }
+        return passed, info
+    return _p
+
+
+def _run_gate(m, ch, *, ecapa_pass, wer_pass, target_repo="jarvis"):
     approve_calls: list = []
 
     async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
-        approve_calls.append(pr_id)
+        approve_calls.append((pr_id, ast_mutation_id))
         return {}
 
-    def _raising_phrase_match():
-        raise RuntimeError("ASR pipeline exploded")
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"\x00\x01pcm", sample_rate=16000,
+        voice_verify_fn=_ecapa_fn(ecapa_pass),
+        approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: target_repo,
+        phrase_match_fn=_asr_fn(wer_pass),
+    ))
+    res._approve_record = approve_calls
+    return res
+
+
+def test_gate_ecapa_pass_wer_pass_authorized():
+    m = _fresh_middleware()
+    res = _run_gate(m, _issue(m), ecapa_pass=True, wer_pass=True)
+    assert res.decision == "AUTHORIZED"
+    assert len(res._approve_record) == 1
+
+
+def test_gate_ecapa_pass_wer_fail_rejects_phrase_mismatch():
+    m = _fresh_middleware()
+    res = _run_gate(m, _issue(m), ecapa_pass=True, wer_pass=False)
+    assert res.decision == "REJECTED"
+    assert res.reason == "phrase_mismatch"
+    assert res._approve_record == []
+
+
+def test_gate_ecapa_fail_wer_pass_rejects_biometric_mismatch():
+    m = _fresh_middleware()
+    res = _run_gate(m, _issue(m), ecapa_pass=False, wer_pass=True)
+    assert res.decision == "REJECTED"
+    # The biometric (speaker) failure is reported, NOT phrase_mismatch.
+    assert "biometric" in res.reason
+    assert res.reason != "phrase_mismatch"
+    assert res._approve_record == []
+
+
+def test_gate_both_fail_rejects():
+    m = _fresh_middleware()
+    res = _run_gate(m, _issue(m), ecapa_pass=False, wer_pass=False)
+    assert res.decision == "REJECTED"
+    assert res._approve_record == []
+
+
+def test_gate_ecapa_raises_fails_closed():
+    """Either future raising (return_exceptions) -> that side False -> REJECT."""
+    m = _fresh_middleware()
+    ch = _issue(m)
+
+    async def _boom_ecapa(audio, sample_rate):  # noqa: ARG001
+        raise RuntimeError("ecapa exploded")
 
     res = asyncio.run(m.authorize_elevation(
         pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
         audio=b"x", sample_rate=16000,
-        voice_verify_fn=_verify, approve_fn=_approve,
+        voice_verify_fn=_boom_ecapa,
+        approve_fn=lambda **k: None,
         resolve_target_repo_fn=lambda pr: "jarvis",
-        phrase_match_fn=_raising_phrase_match,
+        phrase_match_fn=_asr_fn(True),
     ))
     assert res.decision == "REJECTED"
-    assert approve_calls == []
+    assert "fail_closed" in res.reason or "biometric" in res.reason
+
+
+def test_gate_phrase_raises_fails_closed():
+    m = _fresh_middleware()
+    ch = _issue(m)
+
+    async def _boom_phrase(*, audio, sample_rate, expected_phrase):  # noqa: ARG001,E501
+        raise RuntimeError("ASR exploded")
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_ecapa_fn(True),
+        approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=_boom_phrase,
+    ))
+    assert res.decision == "REJECTED"
+    assert res.reason == "phrase_mismatch"
+
+
+def test_gate_runs_concurrently_not_sequentially():
+    """Assert the ECAPA + ASR verifiers run CONCURRENTLY (via gather), not
+    sequentially: both are invoked, and neither short-circuits the other.
+    A recording fake proves both started before either decision is made."""
+    m = _fresh_middleware()
+    ch = _issue(m)
+    started: list = []
+    finished: list = []
+
+    async def _ecapa(audio, sample_rate):  # noqa: ARG001
+        started.append("ecapa")
+        # Yield so the other coro can interleave (proves concurrency).
+        await asyncio.sleep(0.01)
+        finished.append("ecapa")
+        return _good_verdict(score=1.0)
+
+    async def _phrase(*, audio, sample_rate, expected_phrase):  # noqa: ARG001
+        started.append("phrase")
+        await asyncio.sleep(0.01)
+        finished.append("phrase")
+        return True, {"transcript": "x", "wer": 0.0, "threshold": 0.10}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_ecapa, approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=_phrase,
+    ))
+    assert res.decision == "AUTHORIZED"
+    # BOTH verifiers were invoked.
+    assert set(started) == {"ecapa", "phrase"}
+    # Concurrency: BOTH started before EITHER finished (sequential execution
+    # would have one finish before the second starts).
+    assert started == ["ecapa", "phrase"] or started == ["phrase", "ecapa"]
+    assert len(started) == 2 and len(finished) == 2
+
+
+def test_gate_legacy_zero_arg_phrase_match_fn_supported():
+    """The legacy zero-arg phrase-match predicate still works (composes with
+    the concurrent gate)."""
+    m = _fresh_middleware()
+    res_ok = asyncio.run(_authorize(m, _issue(m), target_repo="jarvis",
+                                    phrase_match_fn=lambda: True))
+    assert res_ok.decision == "AUTHORIZED"
+    res_bad = asyncio.run(_authorize(m, _issue(m), target_repo="jarvis",
+                                     phrase_match_fn=lambda: False))
+    assert res_bad.decision == "REJECTED"
+    assert res_bad.reason == "phrase_mismatch"
+
+
+def test_gate_audit_includes_wer_and_transcript_hash():
+    """Phase 3: the AUTHORIZED audit record carries wer + transcript_hash
+    (sha256, NOT the transcript) + phrase_match_ok."""
+    import hashlib
+    m = _fresh_middleware()
+    ch = _issue(m)
+    transcript = "the immutable orange protocol still holds"
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_ecapa_fn(True),
+        approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=_asr_fn(True, wer=0.0, transcript=transcript),
+    ))
+    assert res.decision == "AUTHORIZED"
+    rec = m._audit_calls[-1]
+    assert rec["phrase_match_ok"] is True
+    assert rec["wer"] == 0.0
+    assert rec["transcript_hash"] == hashlib.sha256(
+        transcript.encode("utf-8")).hexdigest()
+    # The transcript text itself must NEVER appear in the audit record.
+    assert transcript not in repr(rec)

@@ -61,6 +61,12 @@ _PAYLOAD_FIELDS = (
     "freshness_ok",
     "decision",
     "audio_sha256",
+    # Phase 3 -- Biometric-Semantic Binding evidence. The transcript is
+    # NEVER persisted -- only its sha256 (``transcript_hash``). Added to the
+    # hashed payload so the WER + phrase verdict are tamper-evident too.
+    "wer",
+    "transcript_hash",
+    "phrase_match_ok",
 )
 
 
