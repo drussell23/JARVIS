@@ -191,8 +191,14 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     # 1. Linux production overlay (pytest 180s, AST pool, Claude-disabled autarky).
     env.update(_parse_env_overlay(_LINUX_ENV_OVERLAY))
     # 2. Every derived cognitive flag ON.
-    for flag in derive_cognitive_flags():
+    flags = derive_cognitive_flags()
+    for flag in flags:
         env[flag] = "true"
+    # 2b. Hand the SAME derived flag set to the auditor via its override env var.
+    # The auditor's load_audit_flags() lacks the harness's AST-source fallback, so
+    # on a node where the heavy CADENCE_POLICY import fails (aiohttp path) it dies
+    # at flag_set_load (the run #7 wall) -- give it the already-derived list here.
+    env["JARVIS_A1_AUDIT_FLAGS"] = ",".join(flags)
     # 3. Orchestration-required flags (a strategic GOAL source + SSE + A1Trace).
     env["JARVIS_ROADMAP_ORCHESTRATOR_ENABLED"] = "1"
     env["JARVIS_IDE_STREAM_ENABLED"] = "1"

@@ -1327,14 +1327,28 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         "python3 -m pip --version >/dev/null 2>&1 "
         "|| (sudo apt-get update -y -qq && sudo apt-get install -y -q python3-pip) >/dev/null 2>&1 "
         "|| (curl -fsSL https://bootstrap.pypa.io/get-pip.py | sudo python3) >/dev/null 2>&1 || true; "
-        # Filter the multi-GB ML libs the controlled harness never exercises +
-        # strip Ouroboros comment lines / drop the heavy set, keep aiohttp/fastapi/etc.
+        # Filter the multi-GB ML libs + the native-build packages a BARE Debian node
+        # cannot build (PyAudio needs portaudio; pyobjc is mac-only; webrtcvad/
+        # sounddevice need build libs) -- the A1 code-repair loop exercises NONE.
         "grep -ivE '^(#|torch|torchaudio|torchvision|tensorflow|transformers|vllm|"
         "llama|nvidia|triton|xformers|onnx|scipy|scikit|sentencepiece|accelerate|"
-        "bitsandbytes|fastembed|peft|trl|datasets)' requirements.txt > /tmp/req_light.txt 2>/dev/null "
-        "|| cp requirements.txt /tmp/req_light.txt; "
-        "sudo python3 -m pip install --break-system-packages -q -r /tmp/req_light.txt 2>&1 "
-        "| tail -4 || python3 -m pip install --user -q -r /tmp/req_light.txt 2>&1 | tail -4 || true; "
+        "bitsandbytes|fastembed|peft|trl|datasets|pyaudio|pyobjc|webrtcvad|"
+        "sounddevice|soundfile|pyttsx3|playsound)' requirements.txt "
+        # Strip INLINE comments (`pkg>=x  # note`) + trailing space so each line is a
+        # CLEAN pip spec -- else the per-package loop feeds pip `pkg # note` -> parse fail.
+        "| sed -E 's/[[:space:]]*#.*$//; s/[[:space:]]*$//' > /tmp/req_light.txt 2>/dev/null "
+        "|| sed -E 's/[[:space:]]*#.*$//; s/[[:space:]]*$//' requirements.txt > /tmp/req_light.txt; "
+        # PER-PACKAGE, continue-on-failure: a single unbuildable straggler must NOT
+        # abort the batch (the atomic `-r` did exactly that on PyAudio -> killed aiohttp).
+        "while IFS= read -r _pkg; do case \"$_pkg\" in ''|\\#*) continue;; esac; "
+        "sudo python3 -m pip install --break-system-packages -q \"$_pkg\" 2>/dev/null "
+        "|| echo \"[deps] skip unbuildable: $_pkg\"; done < /tmp/req_light.txt; "
+        # HARD-ENSURE the A1-critical core -- the loop is dead without these.
+        # pytest-asyncio is LOAD-BEARING: the repo's conftest has an autouse ASYNC
+        # fixture -- without the plugin EVERY test ERRORS at setup -> the chaos
+        # injector can never confirm a green test (the runs #4-6 wall).
+        "sudo python3 -m pip install --break-system-packages -q aiohttp httpx pydantic "
+        "pytest pytest-asyncio pyyaml requests anyio sniffio fastapi uvicorn orjson 2>&1 | tail -1; "
         "python3 -c 'import aiohttp; print(\"[deps] aiohttp ok\", aiohttp.__version__)' 2>&1 | tail -1",
     )
     # cd into the synced jarvis repo, install deps, run the surgery. The completion
@@ -1348,7 +1362,11 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         f"{dep_install}; "
         f"({args.surgery_cmd}) 2>&1 | tee /tmp/surgery.out; rc=${{PIPESTATUS[0]}}; "
         # verdict-conditional sentinel: only burn on a terminal verdict.
-        "if grep -qE 'VERDICT:|CROSS-REPO FRACTURE|ROLLBACK VERIFIED' /tmp/surgery.out; then "
+        # Drop the burn-sentinel ONLY on a SUCCESS verdict -- a FAILED A1 verdict
+        # ('STEP audit VERDICT: FAILED') must KEEP the node warm so the Black Box
+        # can be pulled + inspected before teardown (the dead-man + max-run-duration
+        # remain the no-orphan backstop). Run #7 burned on FAILED + lost the box.
+        "if grep -qE 'A1_DISPATCH_PROVEN|VERDICT: PASS|ROLLBACK VERIFIED' /tmp/surgery.out; then "
         f"sudo touch {sentinel_q2} 2>/dev/null || touch {sentinel_q2} 2>/dev/null || true; "
         "echo '[iac] verdict reached -- completion-sentinel dropped (dead-man will burn)'; "
         "else echo '[iac] no verdict (resumable) -- sentinel NOT dropped, node stays warm'; fi; "
