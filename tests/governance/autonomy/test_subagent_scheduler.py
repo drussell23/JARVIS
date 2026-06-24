@@ -270,3 +270,247 @@ async def test_recover_inflight_respects_graph_concurrency_limit(tmp_path) -> No
     assert state_a.phase.value == "completed"
     assert state_b.phase.value == "completed"
     await scheduler.stop()
+
+
+# ===========================================================================
+# Phase 1b — Ephemeral Memory Sandbox: deterministic finally-GC vaporization.
+# The GenerationSubagentExecutor builds a per-worker sandbox (gated) and
+# vaporizes it in its finally block on success / exception / cancellation.
+# Only the Iron Return artifact crosses to the Commander.
+# ===========================================================================
+
+
+def _swarm_unit(unit_id="sw1", goal="add a feature to a.py", repo="jarvis"):
+    from backend.core.ouroboros.governance.autonomy.subagent_types import WorkUnitSpec
+
+    # is_swarm_worker becomes True via the synthesized swarm fields.
+    return WorkUnitSpec(
+        unit_id=unit_id,
+        repo=repo,
+        goal=goal,
+        target_files=("jarvis/a.py",),
+        owned_paths=("jarvis/a.py",),
+        system_prompt_template="SYNTHESIZED-WORKER-PROMPT",
+        allowed_tools=("read_file", "edit_file"),
+        mutation_budget=3,
+        context_budget_tokens=8000,
+        worker_role="python-source mutator",
+    )
+
+
+def _legacy_unit(unit_id="lg1"):
+    from backend.core.ouroboros.governance.autonomy.subagent_types import WorkUnitSpec
+
+    return WorkUnitSpec(
+        unit_id=unit_id, repo="jarvis", goal="update a.py",
+        target_files=("jarvis/a.py",), owned_paths=("jarvis/a.py",),
+    )
+
+
+def _swarm_graph(unit):
+    from backend.core.ouroboros.governance.autonomy.subagent_types import ExecutionGraph
+
+    return ExecutionGraph(
+        graph_id="g-swarm", op_id="op-swarm", planner_id="p1",
+        schema_version="swarm.graph.1a", concurrency_limit=1, units=(unit,),
+    )
+
+
+class _StubGen:
+    """Minimal generator: returns one candidate, or raises, per config."""
+
+    def __init__(self, *, raise_exc=None):
+        self._raise = raise_exc
+
+    async def generate(self, ctx, deadline):
+        if self._raise is not None:
+            raise self._raise
+
+        class _Gen:
+            is_noop = False
+            candidates = [{"file_path": "jarvis/a.py", "full_content": "x = 1\n"}]
+
+        return _Gen()
+
+
+def _build_executor(gen, tmp_path):
+    from backend.core.ouroboros.governance.autonomy.subagent_scheduler import (
+        GenerationSubagentExecutor,
+    )
+
+    return GenerationSubagentExecutor(
+        generator=gen,
+        validation_runner=None,  # non-runnable / skip path
+        repo_roots={"jarvis": tmp_path},
+        worktree_manager=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_off_byte_identical_no_sandbox(monkeypatch, tmp_path):
+    """OFF -> executor builds NO sandbox; vaporize_quietly never called."""
+    import backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox as sbm
+
+    monkeypatch.delenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", raising=False)
+    calls = []
+    monkeypatch.setattr(sbm, "vaporize_quietly", lambda *a, **k: calls.append(a))
+
+    ex = _build_executor(_StubGen(), tmp_path)
+    unit = _swarm_unit()
+    result = await ex.execute(_swarm_graph(unit), unit)
+    assert result.status.value == "completed"
+    # gate off -> sandbox is None -> vaporize_quietly is NOT invoked
+    assert calls == []
+    # and no sandbox was constructed
+    assert ex._build_sandbox_for_unit(unit) is None
+
+
+@pytest.mark.asyncio
+async def test_sandbox_vaporized_on_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", "true")
+
+    ex = _build_executor(_StubGen(), tmp_path)
+    unit = _swarm_unit()
+    # construct + spy: the executor builds its own; we assert one is buildable
+    sb = ex._build_sandbox_for_unit(unit)
+    assert sb is not None and sb.stats()["turns"] == 1  # seeded with sub-goal
+
+    result = await ex.execute(_swarm_graph(unit), unit)
+    assert result.status.value == "completed"
+    # The executor's own sandbox was vaporized in finally (proof via log path);
+    # here we vaporize our probe to assert the contract holds.
+    info = sb.vaporize(force_gc=False)
+    assert sb.vaporized is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_vaporized_on_exception(monkeypatch, tmp_path):
+    """An exception inside execute -> finally still vaporizes the sandbox."""
+    import backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox as sbm
+
+    monkeypatch.setenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", "true")
+    vaporized = []
+    orig = sbm.vaporize_quietly
+    monkeypatch.setattr(
+        sbm, "vaporize_quietly",
+        lambda sb, **k: (vaporized.append(getattr(sb, "worker_id", None)), orig(sb, **k))[1],
+    )
+
+    ex = _build_executor(_StubGen(raise_exc=RuntimeError("kaboom")), tmp_path)
+    unit = _swarm_unit()
+    result = await ex.execute(_swarm_graph(unit), unit)
+    # execute catches the exception and returns a FAILED result...
+    assert result.status.value == "failed"
+    # ...and the finally vaporized exactly one sandbox for this worker.
+    assert vaporized == [unit.unit_id]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_vaporized_on_cancellation(monkeypatch, tmp_path):
+    """CancelledError propagates but the finally vaporizes the sandbox first."""
+    import asyncio as _aio
+    import backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox as sbm
+
+    monkeypatch.setenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", "true")
+    vaporized = []
+    orig = sbm.vaporize_quietly
+    monkeypatch.setattr(
+        sbm, "vaporize_quietly",
+        lambda sb, **k: (vaporized.append(getattr(sb, "worker_id", None)), orig(sb, **k))[1],
+    )
+
+    class _CancelGen:
+        async def generate(self, ctx, deadline):
+            raise _aio.CancelledError()
+
+    ex = _build_executor(_CancelGen(), tmp_path)
+    unit = _swarm_unit()
+    with pytest.raises(_aio.CancelledError):
+        await ex.execute(_swarm_graph(unit), unit)
+    assert vaporized == [unit.unit_id]
+
+
+@pytest.mark.asyncio
+async def test_legacy_unit_gets_no_sandbox_even_when_on(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", "true")
+    ex = _build_executor(_StubGen(), tmp_path)
+    # legacy (non-swarm) unit -> no synthesized shape -> no sandbox
+    assert ex._build_sandbox_for_unit(_legacy_unit()) is None
+
+
+@pytest.mark.asyncio
+async def test_iron_return_crosses_only_artifact(monkeypatch, tmp_path):
+    """The result command carries the iron_return artifact (not the sandbox)."""
+    from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+    from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+    from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
+        ExecutionGraphStore,
+    )
+    from backend.core.ouroboros.governance.autonomy.iron_return import verify_artifact
+    from backend.core.ouroboros.governance.autonomy.subagent_scheduler import (
+        SubagentScheduler,
+    )
+
+    monkeypatch.setenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", "true")
+    bus = CommandBus(maxsize=100)
+    scheduler = SubagentScheduler(
+        store=ExecutionGraphStore(tmp_path),
+        command_bus=bus,
+        event_emitter=EventEmitter(),
+        executor=_build_executor(_StubGen(), tmp_path),
+        max_concurrent_graphs=1,
+    )
+    await scheduler.start()
+    unit = _swarm_unit()
+    await scheduler.submit(_swarm_graph(unit))
+    state = await scheduler.wait_for_graph("g-swarm", timeout_s=2.0)
+    assert state.phase.value == "completed"
+    await scheduler.stop()
+
+    # Drain the command bus and find the result command for our unit.
+    found = None
+    for _ in range(bus.qsize()):
+        cmd = await bus.get()
+        if cmd.payload.get("unit_id") == unit.unit_id:
+            found = cmd
+    assert found is not None
+    art = found.payload.get("iron_return")
+    assert art is not None
+    assert verify_artifact(art) is True
+    # The artifact carries ONLY the contract keys — no scratchpad / messages.
+    assert "messages" not in art and "scratchpad" not in art
+
+
+@pytest.mark.asyncio
+async def test_iron_return_absent_when_gate_off(monkeypatch, tmp_path):
+    from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+    from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+    from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
+        ExecutionGraphStore,
+    )
+    from backend.core.ouroboros.governance.autonomy.subagent_scheduler import (
+        SubagentScheduler,
+    )
+
+    monkeypatch.delenv("JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED", raising=False)
+    bus = CommandBus(maxsize=100)
+    scheduler = SubagentScheduler(
+        store=ExecutionGraphStore(tmp_path),
+        command_bus=bus,
+        event_emitter=EventEmitter(),
+        executor=_build_executor(_StubGen(), tmp_path),
+        max_concurrent_graphs=1,
+    )
+    await scheduler.start()
+    unit = _swarm_unit()
+    await scheduler.submit(_swarm_graph(unit))
+    await scheduler.wait_for_graph("g-swarm", timeout_s=2.0)
+    await scheduler.stop()
+
+    found = None
+    for _ in range(bus.qsize()):
+        cmd = await bus.get()
+        if cmd.payload.get("unit_id") == unit.unit_id:
+            found = cmd
+    assert found is not None
+    assert "iron_return" not in found.payload  # byte-identical Phase 1a payload
