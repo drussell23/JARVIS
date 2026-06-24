@@ -49,16 +49,21 @@ M1 -- Real floor enforcement (kill the dead no-op):
   Any import/runtime error -> False (fail-CLOSED). This is defense in depth
   beneath the Immutable Orange + jarvis-allowlist (which stay authoritative).
 
-H1 -- Teeth on the deferred ASR phrase-match guard:
-  ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH`` env var (default false).
-  Injectable ``phrase_match_fn`` hook to ``authorize_elevation`` (default
-  None). If the env var is true and no phrase_match_fn is wired ->
-  fail-CLOSED REJECT with reason
-  "fail_closed:phrase_match_required_but_unavailable". When provided,
-  phrase_match_fn must return truthy for an AUTHORIZED decision. A loud
-  one-time [SECURITY] warning is emitted when auth is enabled but
-  phrase-match is not required (replay defense relies solely on signal-level
-  anti-spoof/liveness without the H1 guard).
+H1 -- CLOSED (Phase 3): Biometric-Semantic Binding
+  ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH`` now defaults to **true** --
+  phrase-match is MANDATORY by default. The spoken content is bound to the
+  audio: the operator must utter the live challenge phrase, transcribed by
+  the LOCAL Whisper ASR and WER-matched (>= 90% by default) against the
+  expected phrase. The ECAPA voice biometric (``voice_verify_fn``) and the
+  ASR phrase-match (``phrase_match_fn`` -> ``asr_phrase_match``) run
+  CONCURRENTLY (``asyncio.gather(..., return_exceptions=True)``) on the SAME
+  audio buffer. The fail-CLOSED gate: **BOTH must pass**. Either side
+  failing / raising -> REJECT. An explicit ``=false`` disables phrase-match
+  for a degraded / loopback-only mode and THEN logs the signal-level-only
+  [SECURITY] warning. When the default real ``asr_phrase_match`` is used,
+  the old ``phrase_match_required_but_unavailable`` reject now only fires if
+  someone both REQUIRES it AND breaks the ASR (e.g. injects a None fn while
+  requiring).
 """
 from __future__ import annotations
 
@@ -73,24 +78,36 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 logger = logging.getLogger("CommandNode.BiometricAuth")
 
-# --- one-time [SECURITY] warning for missing phrase-match --------------------
-_PHRASE_MATCH_WARNING_EMITTED = False
+# --- one-time phrase-match status log ----------------------------------------
+_PHRASE_MATCH_STATUS_LOGGED = False
 
 
-def _maybe_emit_phrase_match_warning() -> None:
-    """Emit a loud one-time [SECURITY] warning when auth is enabled but
-    phrase-match is not required. Call from the first authorize_elevation
-    so the warning fires lazily (auth may not be enabled at import time)."""
-    global _PHRASE_MATCH_WARNING_EMITTED
-    if _PHRASE_MATCH_WARNING_EMITTED:
+def _maybe_log_phrase_match_status(*, require_pm: bool) -> None:
+    """Phase 3: emit a one-time status log on the FIRST authorize_elevation.
+
+    When phrase-match is ACTIVE (the default), confirm the semantic binding
+    is in force. When someone has EXPLICITLY disabled it
+    (``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH=false``), emit the loud
+    [SECURITY] warning that replay defense now relies solely on signal-level
+    anti-spoof / liveness (degraded / loopback-only mode)."""
+    global _PHRASE_MATCH_STATUS_LOGGED
+    if _PHRASE_MATCH_STATUS_LOGGED:
         return
-    _PHRASE_MATCH_WARNING_EMITTED = True
-    logger.warning(
-        "[SECURITY] biometric replay defense relies solely on signal-level "
-        "anti-spoof/liveness; enable JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH "
-        "+ wire phrase_match_fn (Phase 3 ASR) before any attacker-reachable "
-        "(non-loopback) deployment."
-    )
+    _PHRASE_MATCH_STATUS_LOGGED = True
+    if require_pm:
+        logger.info(
+            "[CommandNode] Biometric-Semantic Binding ACTIVE -- local ASR "
+            "WER phrase-match runs CONCURRENTLY with the ECAPA biometric; "
+            "both must pass (H1 closed)."
+        )
+    else:
+        logger.warning(
+            "[SECURITY] phrase-match EXPLICITLY DISABLED "
+            "(JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH=false) -- biometric "
+            "replay defense relies solely on signal-level anti-spoof/liveness "
+            "(degraded / loopback-only mode). Re-enable before any "
+            "attacker-reachable (non-loopback) deployment."
+        )
 
 
 # --- env knobs (no hardcoding) --------------------------------------------
@@ -125,13 +142,14 @@ def is_command_node_auth_enabled() -> bool:
 
 
 def _require_phrase_match() -> bool:
-    """H1 -- ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH`` (default false).
-    When true, a wired ``phrase_match_fn`` must PASS as an additional AND
-    term in the biometric decision. Absence of a wired fn with this env
-    true -> fail-CLOSED REJECT."""
+    """H1 (Phase 3 -- CLOSED) -- ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH``
+    (default **true**). When true (the default), the ASR phrase-match runs
+    CONCURRENTLY with the ECAPA biometric and BOTH must pass. Only an
+    explicit ``"false"`` (case-insensitive) disables it (degraded /
+    loopback-only mode)."""
     return os.environ.get(
-        "JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "false",
-    ).strip().lower() == "true"
+        "JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true",
+    ).strip().lower() != "false"
 
 
 # --- the Immutable Orange floor (THE LAW) ---------------------------------
@@ -449,7 +467,7 @@ class BiometricAuthMiddleware:
         ] = None,
         approve_fn: Optional[Callable[..., Any]] = None,
         resolve_target_repo_fn: Optional[Callable[[str], str]] = None,
-        phrase_match_fn: Optional[Callable[[], bool]] = None,
+        phrase_match_fn: Optional[Callable[..., Any]] = None,
     ) -> AuthorizationResult:
         """Authorize (or REJECT) a CRITICAL_ELEVATION operator-approval
         step. FAIL-CLOSED at every step; any exception -> REJECTED.
@@ -458,28 +476,37 @@ class BiometricAuthMiddleware:
           a. Freshness / anti-replay FIRST (consume the nonce ATOMICALLY
              under the lock BEFORE verifying -- a concurrent/replayed
              same-nonce request fails immediately).
-          b. Biometric (authenticated AND score>=threshold AND anti-spoof
-             AND liveness -- checked explicitly, never one bool).
-          c. H1 phrase-match guard (optional AND term; fail-CLOSED when
-             env requires it but no fn is wired).
-          d. Immutable Orange re-check (THE LAW): target in
+          b. CONCURRENT validation gate (Phase 3 -- Biometric-Semantic
+             Binding): the ECAPA biometric (``voice_verify_fn``) and the ASR
+             phrase-match (``phrase_match_fn`` -> ``asr_phrase_match``) run
+             CONCURRENTLY via ``asyncio.gather(..., return_exceptions=True)``
+             on the SAME audio buffer. The fail-CLOSED gate: BOTH must pass.
+             ECAPA-pass + WER-pass -> biometric_pass. ECAPA-pass + WER-fail
+             -> REJECT phrase_mismatch. WER-pass + ECAPA-fail -> REJECT
+             biometric_mismatch (the specific biometric sub-reason). Either
+             future RAISING -> that side False -> REJECT fail_closed:...
+          c. Immutable Orange re-check (THE LAW): target in
              {prime,reactor} -> REJECT regardless of a perfect biometric.
-          e. M1 floor re-check: governance floor must be approval_required
+          d. M1 floor re-check: governance floor must be approval_required
              or stricter; relaxed floor -> REJECT fail_closed:floor_relaxed.
-          f. M2 audit-then-approve: write audit record DURABLY (fsync)
+          e. M2 audit-then-approve: write audit record DURABLY (fsync)
              BEFORE calling approve_fn. Audit write failure -> REJECT
              fail_closed:audit_unavailable; approve_fn is NEVER called.
-          g. Decision: call approve_fn; return AUTHORIZED.
+          f. Decision: call approve_fn; return AUTHORIZED.
 
         Audio is hashed (sha256) for the audit record then dropped. The
-        raw audio is NEVER persisted.
+        transcript is NEVER persisted -- only ``sha256(transcript)`` reaches
+        the audit ledger. The raw audio is NEVER persisted.
 
-        H1 phrase_match_fn hook:
-          If JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH=true and no
-          phrase_match_fn is provided -> REJECTED
+        phrase_match_fn (Phase 3):
+          By default (REQUIRE_PHRASE_MATCH=true) and with no fn injected, the
+          real ``asr_phrase_match`` (local Whisper + WER) is used. An injected
+          fn may be either the ``asr_phrase_match`` form (awaitable, takes
+          ``audio`` / ``sample_rate`` / ``expected_phrase`` kwargs, returns
+          ``(passed, info)``) or a legacy zero-arg predicate (returns truthy).
+          If REQUIRE is true but ``phrase_match_fn`` is explicitly None AND the
+          default cannot be bound -> REJECT
           fail_closed:phrase_match_required_but_unavailable.
-          If phrase_match_fn is provided, it must return truthy; falsy
-          -> REJECTED biometric:phrase_match_failed.
         """
         voice_verify_fn = voice_verify_fn or _default_voice_verify_fn
         approve_fn = approve_fn or _default_approve_fn
@@ -487,9 +514,11 @@ class BiometricAuthMiddleware:
             resolve_target_repo_fn or _default_resolve_target_repo_fn
         )
 
-        # H1 -- emit one-time [SECURITY] warning if phrase-match not required.
-        if is_command_node_auth_enabled() and not _require_phrase_match():
-            _maybe_emit_phrase_match_warning()
+        # Phase 3 -- one-time status log (semantic binding ACTIVE, or the
+        # inverse [SECURITY] warning if someone explicitly disabled it).
+        require_pm = _require_phrase_match()
+        if is_command_node_auth_enabled():
+            _maybe_log_phrase_match_status(require_pm=require_pm)
 
         # Audio in-memory only -- retain ONLY its hash.
         try:
@@ -502,6 +531,9 @@ class BiometricAuthMiddleware:
         ecapa_score: Optional[float] = None
         antispoof_ok = False
         challenge: Optional[Challenge] = None
+        wer_value: Optional[float] = None
+        transcript_hash: Optional[str] = None
+        phrase_match_ok = False
 
         try:
             # ----- (a) FRESHNESS / ANTI-REPLAY (atomic consume) -----
@@ -518,70 +550,93 @@ class BiometricAuthMiddleware:
                     blast_radius_hash=None,
                 )
 
-            # ----- (b) BIOMETRIC (reuse via injectable adapter) -----
-            verdict = await voice_verify_fn(audio, sample_rate)
-            if not isinstance(verdict, dict):
-                verdict = {}
-            authenticated = bool(verdict.get("authenticated", False))
-            try:
-                ecapa_score = float(verdict.get("score"))
-            except (TypeError, ValueError):
-                ecapa_score = None
-            antispoof_ok = bool(verdict.get("antispoof_ok", False))
-            liveness_ok = bool(verdict.get("liveness_ok", False))
-            voiceprint_id = verdict.get("voiceprint_id")
-
-            biometric_pass = (
-                authenticated
-                and ecapa_score is not None
-                and ecapa_score >= self._threshold
-                and antispoof_ok
-                and liveness_ok
-            )
-            if not biometric_pass:
-                return self._reject(
-                    reason=self._biometric_reject_reason(
-                        authenticated, ecapa_score, antispoof_ok, liveness_ok,
-                    ),
-                    pr_id=pr_id, ast_mutation_id=ast_mutation_id,
-                    freshness_ok=True, antispoof_ok=antispoof_ok,
-                    ecapa_score=ecapa_score, target_repo=None,
-                    voiceprint_id=voiceprint_id,
-                    audio_sha256=audio_sha256, challenge_nonce=nonce,
-                    blast_radius_hash=challenge.blast_radius_hash,
-                )
-
-            # ----- (c) H1 PHRASE-MATCH GUARD -----
-            require_pm = _require_phrase_match()
-            if require_pm and phrase_match_fn is None:
-                # Required but no verifier wired -> fail-CLOSED.
-                return self._reject(
-                    reason="fail_closed:phrase_match_required_but_unavailable",
-                    pr_id=pr_id, ast_mutation_id=ast_mutation_id,
-                    freshness_ok=True, antispoof_ok=antispoof_ok,
-                    ecapa_score=ecapa_score, target_repo=None,
-                    voiceprint_id=voiceprint_id,
-                    audio_sha256=audio_sha256, challenge_nonce=nonce,
-                    blast_radius_hash=challenge.blast_radius_hash,
-                )
-            if phrase_match_fn is not None:
-                # phrase_match_fn is an AND term; falsy -> REJECT.
-                try:
-                    pm_result = phrase_match_fn()
-                except Exception:  # noqa: BLE001 -- fail-CLOSED
-                    pm_result = False
-                if not pm_result:
+            # ----- (b) CONCURRENT VALIDATION GATE (Phase 3) -----
+            # The ECAPA biometric and the ASR phrase-match run CONCURRENTLY
+            # on the SAME audio buffer. The fail-CLOSED gate: BOTH must pass.
+            #
+            # If phrase-match is REQUIRED (default) but no fn is wired AND the
+            # real asr_phrase_match cannot be bound -> fail-CLOSED before any
+            # work (preserves the H1 "required_but_unavailable" reject only for
+            # the someone-broke-the-ASR case).
+            effective_pm_fn = phrase_match_fn
+            if require_pm and effective_pm_fn is None:
+                effective_pm_fn = self._resolve_default_phrase_match_fn()
+                if effective_pm_fn is None:
                     return self._reject(
-                        reason="biometric:phrase_match_failed",
+                        reason="fail_closed:phrase_match_required_but_unavailable",
                         pr_id=pr_id, ast_mutation_id=ast_mutation_id,
-                        freshness_ok=True, antispoof_ok=antispoof_ok,
-                        ecapa_score=ecapa_score, target_repo=None,
-                        voiceprint_id=voiceprint_id,
+                        freshness_ok=True, antispoof_ok=False,
+                        ecapa_score=None, target_repo=None,
+                        voiceprint_id=None,
                         audio_sha256=audio_sha256, challenge_nonce=nonce,
                         blast_radius_hash=challenge.blast_radius_hash,
                     )
 
-            # ----- (d) IMMUTABLE ORANGE re-check (THE LAW) -----
+            # Build the two awaitables. They are scheduled CONCURRENTLY via
+            # asyncio.gather(return_exceptions=True): a raise in either side
+            # is captured (not propagated) and mapped to a fail-CLOSED False.
+            ecapa_coro = self._run_ecapa(voice_verify_fn, audio, sample_rate)
+            phrase_coro = self._run_phrase_match(
+                effective_pm_fn,
+                audio=audio,
+                sample_rate=sample_rate,
+                expected_phrase=challenge.phrase,
+                require_pm=require_pm,
+            )
+            ecapa_res, phrase_res = await asyncio.gather(
+                ecapa_coro, phrase_coro, return_exceptions=True,
+            )
+
+            # ----- ECAPA side -----
+            if isinstance(ecapa_res, BaseException):
+                logger.error(
+                    "[BiometricAuth] ECAPA future raised in gather -- "
+                    "fail-closed", exc_info=ecapa_res,
+                )
+                ecapa_pass = False
+                ecapa_score = None
+                antispoof_ok = False
+                liveness_ok = False
+                voiceprint_id = None
+                ecapa_reason = "fail_closed:biometric_error"
+            else:
+                (ecapa_pass, ecapa_score, antispoof_ok, liveness_ok,
+                 voiceprint_id, ecapa_reason) = ecapa_res
+
+            # ----- Phrase-match side -----
+            if isinstance(phrase_res, BaseException):
+                logger.error(
+                    "[BiometricAuth] phrase-match future raised in gather -- "
+                    "fail-closed", exc_info=phrase_res,
+                )
+                phrase_pass = False
+            else:
+                phrase_pass, wer_value, transcript_hash = phrase_res
+
+            phrase_match_ok = bool(phrase_pass)
+
+            # ----- the BOTH-MUST-PASS fail-CLOSED gate -----
+            # Decision precedence on a partial pass: a biometric (speaker)
+            # failure is the stronger signal -> report biometric_mismatch
+            # first; otherwise a phrase failure -> phrase_mismatch.
+            if not (ecapa_pass and phrase_match_ok):
+                if not ecapa_pass:
+                    reason = ecapa_reason or "biometric_mismatch"
+                else:
+                    reason = "phrase_mismatch"
+                return self._reject(
+                    reason=reason,
+                    pr_id=pr_id, ast_mutation_id=ast_mutation_id,
+                    freshness_ok=True, antispoof_ok=antispoof_ok,
+                    ecapa_score=ecapa_score, target_repo=None,
+                    voiceprint_id=voiceprint_id,
+                    audio_sha256=audio_sha256, challenge_nonce=nonce,
+                    blast_radius_hash=challenge.blast_radius_hash,
+                    wer=wer_value, transcript_hash=transcript_hash,
+                    phrase_match_ok=phrase_match_ok,
+                )
+
+            # ----- (c) IMMUTABLE ORANGE re-check (THE LAW) -----
             target_repo = resolve_target_repo_fn(pr_id)
             if _is_immutable_orange(target_repo):
                 return self._reject(
@@ -592,6 +647,8 @@ class BiometricAuthMiddleware:
                     voiceprint_id=voiceprint_id,
                     audio_sha256=audio_sha256, challenge_nonce=nonce,
                     blast_radius_hash=challenge.blast_radius_hash,
+                    wer=wer_value, transcript_hash=transcript_hash,
+                    phrase_match_ok=phrase_match_ok,
                 )
             # Fail-CLOSED: a biometric may authorize ONLY the Body
             # (jarvis). Any unknown / unresolved target -> REJECT (never
@@ -606,8 +663,10 @@ class BiometricAuthMiddleware:
                     voiceprint_id=voiceprint_id,
                     audio_sha256=audio_sha256, challenge_nonce=nonce,
                     blast_radius_hash=challenge.blast_radius_hash,
+                    wer=wer_value, transcript_hash=transcript_hash,
+                    phrase_match_ok=phrase_match_ok,
                 )
-            # ----- (e) M1 REAL FLOOR RE-CHECK -----
+            # ----- (d) M1 REAL FLOOR RE-CHECK -----
             _floor_ok = (
                 self._floor_check_fn(target_repo)
                 if self._floor_check_fn is not None
@@ -622,9 +681,11 @@ class BiometricAuthMiddleware:
                     voiceprint_id=voiceprint_id,
                     audio_sha256=audio_sha256, challenge_nonce=nonce,
                     blast_radius_hash=challenge.blast_radius_hash,
+                    wer=wer_value, transcript_hash=transcript_hash,
+                    phrase_match_ok=phrase_match_ok,
                 )
 
-            # ----- (f) M2 AUDIT-THEN-APPROVE (durable write FIRST) -----
+            # ----- (e) M2 AUDIT-THEN-APPROVE (durable write FIRST) -----
             # Build the audit record dict for the AUTHORIZED outcome.
             _auth_record = {
                 "pr_id": pr_id,
@@ -638,6 +699,11 @@ class BiometricAuthMiddleware:
                 "freshness_ok": True,
                 "decision": "AUTHORIZED",
                 "audio_sha256": audio_sha256,
+                # Phase 3 -- Biometric-Semantic Binding evidence. The
+                # transcript itself is NEVER persisted; only its sha256.
+                "wer": wer_value,
+                "transcript_hash": transcript_hash,
+                "phrase_match_ok": phrase_match_ok,
             }
             # Write durably BEFORE approve_fn. If the durable write fails
             # (fsync not confirmed) -> REJECT with audit_unavailable and
@@ -662,7 +728,7 @@ class BiometricAuthMiddleware:
                     voiceprint_id=voiceprint_id,
                 )
 
-            # ----- (g) DECISION: call the existing approval path -----
+            # ----- (f) DECISION: call the existing approval path -----
             await _maybe_await(approve_fn(
                 pr_id=pr_id, ast_mutation_id=ast_mutation_id,
             ))
@@ -693,7 +759,142 @@ class BiometricAuthMiddleware:
                 blast_radius_hash=(
                     challenge.blast_radius_hash if challenge else None
                 ),
+                wer=wer_value, transcript_hash=transcript_hash,
+                phrase_match_ok=phrase_match_ok,
             )
+
+    # --- Phase 3: concurrent-gate workers --------------------------------
+
+    async def _run_ecapa(
+        self,
+        voice_verify_fn: Callable[[bytes, int], Awaitable[Dict[str, Any]]],
+        audio: bytes,
+        sample_rate: int,
+    ) -> Any:
+        """Run the ECAPA biometric and reduce it to a tuple
+        ``(pass, score, antispoof_ok, liveness_ok, voiceprint_id, reason)``.
+
+        Scheduled inside ``asyncio.gather(return_exceptions=True)`` -- a
+        raised exception here is captured by gather (NOT swallowed) and
+        mapped to a fail-CLOSED False by the caller. The biometric pass
+        requires authenticated AND score>=threshold AND anti-spoof AND
+        liveness -- never one bool."""
+        verdict = await voice_verify_fn(audio, sample_rate)
+        if not isinstance(verdict, dict):
+            verdict = {}
+        authenticated = bool(verdict.get("authenticated", False))
+        try:
+            score: Optional[float] = float(verdict.get("score"))
+        except (TypeError, ValueError):
+            score = None
+        antispoof_ok = bool(verdict.get("antispoof_ok", False))
+        liveness_ok = bool(verdict.get("liveness_ok", False))
+        voiceprint_id = verdict.get("voiceprint_id")
+        ecapa_pass = (
+            authenticated
+            and score is not None
+            and score >= self._threshold
+            and antispoof_ok
+            and liveness_ok
+        )
+        reason = (
+            "" if ecapa_pass
+            else self._biometric_reject_reason(
+                authenticated, score, antispoof_ok, liveness_ok,
+            )
+        )
+        return (ecapa_pass, score, antispoof_ok, liveness_ok,
+                voiceprint_id, reason)
+
+    async def _run_phrase_match(
+        self,
+        phrase_match_fn: Optional[Callable[..., Any]],
+        *,
+        audio: bytes,
+        sample_rate: int,
+        expected_phrase: str,
+        require_pm: bool,
+    ) -> Any:
+        """Run the ASR phrase-match and reduce it to a tuple
+        ``(pass, wer, transcript_hash)``.
+
+        When phrase-match is NOT required and no fn is wired, this is a
+        no-op PASS (legacy / degraded mode) -- the BOTH-must-pass gate then
+        reduces to the ECAPA result alone.
+
+        Supports two ``phrase_match_fn`` shapes:
+          * the ``asr_phrase_match`` form -- awaitable, accepts
+            ``audio`` / ``sample_rate`` / ``expected_phrase`` kwargs, returns
+            ``(passed, {transcript, wer, threshold})``;
+          * a legacy zero-arg predicate returning truthy / falsy.
+
+        The transcript is hashed (sha256) here and DROPPED -- only its hash
+        leaves this method. Scheduled inside
+        ``asyncio.gather(return_exceptions=True)``.
+        """
+        if phrase_match_fn is None:
+            # Not required + not wired -> no-op PASS (the ECAPA term still
+            # governs the gate). If it WERE required, the caller already
+            # fail-CLOSED before scheduling this coroutine.
+            return (True, None, None)
+
+        # Inspect the callable to decide how to invoke it. The asr_phrase_match
+        # form takes keyword args; the legacy predicate takes none.
+        import inspect
+
+        try:
+            sig = inspect.signature(phrase_match_fn)
+            takes_kwargs = bool(sig.parameters)
+        except (TypeError, ValueError):
+            takes_kwargs = True  # builtins / C funcs -> assume the rich form
+
+        if takes_kwargs:
+            raw = phrase_match_fn(
+                audio=audio,
+                sample_rate=sample_rate,
+                expected_phrase=expected_phrase,
+            )
+            result = await _maybe_await(raw)
+            # asr_phrase_match returns (passed, info-dict).
+            if isinstance(result, tuple) and len(result) == 2:
+                passed, info = result
+                wer = None
+                transcript = ""
+                if isinstance(info, dict):
+                    wer = info.get("wer")
+                    transcript = info.get("transcript", "") or ""
+                t_hash = (
+                    hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+                    if transcript else None
+                )
+                return (bool(passed), wer, t_hash)
+            # A bare truthy / falsy return is also accepted.
+            return (bool(result), None, None)
+
+        # Legacy zero-arg predicate.
+        raw = phrase_match_fn()
+        result = await _maybe_await(raw)
+        return (bool(result), None, None)
+
+    @staticmethod
+    def _resolve_default_phrase_match_fn() -> Optional[Callable[..., Any]]:
+        """Bind the REAL local-Whisper ``asr_phrase_match`` as the default
+        phrase-match verifier (lazy import so the middleware imports cleanly
+        without the ASR module's deps). Returns None on any import failure
+        -> the caller fail-CLOSES with ``phrase_match_required_but_unavailable``
+        (only fires if someone REQUIRES phrase-match AND the ASR is broken)."""
+        try:
+            from backend.core.ouroboros.governance.command_node.semantic_phrase_match import (  # noqa: E501
+                asr_phrase_match,
+            )
+            return asr_phrase_match
+        except Exception:  # noqa: BLE001 -- fail-CLOSED
+            logger.error(
+                "[BiometricAuth] could not bind default asr_phrase_match -- "
+                "fail-closed (phrase_match_required_but_unavailable)",
+                exc_info=True,
+            )
+            return None
 
     # --- atomic nonce consume --------------------------------------------
 
@@ -845,6 +1046,12 @@ class BiometricAuthMiddleware:
             "freshness_ok": res.freshness_ok,
             "decision": res.decision,
             "audio_sha256": kw.get("audio_sha256"),
+            # Phase 3 -- semantic-binding evidence (transcript NEVER stored;
+            # only its sha256). Present even on REJECTED so the ledger shows
+            # whether the phrase-match passed / failed / was unavailable.
+            "wer": kw.get("wer"),
+            "transcript_hash": kw.get("transcript_hash"),
+            "phrase_match_ok": kw.get("phrase_match_ok"),
         }
         try:
             sink = self._audit_sink

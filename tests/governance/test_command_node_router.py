@@ -152,6 +152,8 @@ def test_challenge_then_authorize_body_pr(monkeypatch):
         voice_verify_fn=_verify,
         approve_fn=_approve,
         resolve_target_repo_fn=lambda pr: "jarvis",
+        # Phase 3: inject a passing ASR phrase-match (NO real Whisper in tests).
+        phrase_match_fn=lambda: True,
     )
     # 1. challenge
     creq = _challenge_request("PR-7", "ast-7")
@@ -186,6 +188,9 @@ def test_authorize_immutable_orange_rejected_403(monkeypatch):
         voice_verify_fn=_verify,
         approve_fn=lambda **k: None,
         resolve_target_repo_fn=lambda pr: "prime",
+        # Phase 3: a passing phrase-match -- proves Immutable Orange rejects
+        # even when BOTH biometric + phrase-match pass (THE LAW composes AFTER).
+        phrase_match_fn=lambda: True,
     )
     creq = _challenge_request("PR-X", "ast-x")
     challenge = json.loads(_run(router._handle_challenge(creq)).body)["challenge"]
