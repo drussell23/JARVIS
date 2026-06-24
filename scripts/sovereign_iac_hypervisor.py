@@ -48,14 +48,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import pathlib
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # Repo root (the jarvis repo == the cwd repo).
@@ -98,6 +100,19 @@ _DEFAULT_SURGERY_CMD = os.environ.get(
     "python3 scripts/cross_repo_first_surgery.py --run",
 )
 
+# The remote prebake command -- the WAN Docker image layer build that happens ON
+# the node (it has WAN) BEFORE the air-gapped compose. This is the step that hits
+# first-run friction (a PyPI timeout pulling wheels). Streaming the remote
+# `docker build` layer output line-by-line + checkpointing it as its own phase is
+# exactly why a resume can skip a completed sync + re-run only the prebake.
+# Empty == prebake is folded into the surgery command (legacy single-exec).
+_DEFAULT_PREBAKE_CMD = os.environ.get("JARVIS_IAC_PREBAKE_CMD", "")
+
+# The remote boot command -- the air-gapped compose bring-up that happens AFTER
+# the prebake and BEFORE the surgery. Streamed as the `booted` phase. Empty ==
+# the boot is folded into the surgery command (legacy single-exec).
+_DEFAULT_BOOT_CMD = os.environ.get("JARVIS_IAC_BOOT_CMD", "")
+
 # Completion-sentinel the surgery writes -- the node-side dead-man fires
 # IMMEDIATELY when it appears (don't wait the idle timeout).
 _COMPLETION_SENTINEL = os.environ.get(
@@ -106,6 +121,38 @@ _COMPLETION_SENTINEL = os.environ.get(
 
 # Local autopsy output dir.
 _AUTOPSY_DIR = os.environ.get("JARVIS_IAC_AUTOPSY_DIR", "autopsy_reports")
+
+# --------------------------------------------------------------------------- #
+# Checkpoint ledger (resume-don't-restart). A local JSON file records the live
+# node + per-phase completion so a 40-min multi-stage run that hits first-run
+# friction (PyPI timeout in the prebake, an SSH blip) can be RE-RUN to RESUME
+# from the first incomplete phase against the still-warm node, instead of
+# re-provisioning + re-syncing from zero. Env-overridable path -- no hardcoding.
+# --------------------------------------------------------------------------- #
+_DEFAULT_STATE_PATH = os.environ.get("JARVIS_IAC_STATE_PATH", ".hypervisor_state.json")
+
+# The node-side dead-man idle timeout the operator can tune so a warm node left
+# for resume is bounded (no infinite orphan) yet generous enough to re-run an
+# --execute resume. This is the env the spec calls out; it feeds the same
+# dead-man builder knob (_DEFAULT_DEADMAN_IDLE_TIMEOUT_S) when set.
+_DEFAULT_NODE_IDLE_TIMEOUT_S = int(
+    os.environ.get(
+        "JARVIS_IAC_NODE_IDLE_TIMEOUT_S",
+        os.environ.get("JARVIS_IAC_DEADMAN_IDLE_TIMEOUT_S", "3600"),
+    )
+)
+
+# The ordered pipeline phases recorded in the ledger. The orchestrator walks
+# these in order; a RESUME skips every phase already marked complete and starts
+# at the first incomplete one.
+_PHASE_ORDER: List[str] = [
+    "provisioned",
+    "docker_ready",
+    "synced",
+    "prebaked",
+    "booted",
+    "surgery_done",
+]
 
 # Readiness sentinel written by the node startup-script once Docker is up.
 _READY_SENTINEL = "/var/run/sovereign_iac_ready"
@@ -124,6 +171,129 @@ def _log(msg: str) -> None:
 
 def _abort(msg: str) -> None:
     print(f"[IAC ABORTED: {msg}]", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint ledger -- the resume-don't-restart state file.
+# --------------------------------------------------------------------------- #
+class CheckpointLedger:
+    """A local `.hypervisor_state.json` ledger recording the live node + per-phase
+    completion so an --execute that hit a *resumable* mid-pipeline failure can be
+    RE-RUN to resume from the first incomplete phase against the still-warm node.
+
+    Schema (JSON):
+        {
+          "run_id": "<cli-passed or now-stamp>",
+          "node_name": "...", "zone": "...", "project": "...",
+          "external_ip": "<ip or ''>",   # connection info (best-effort)
+          "phases": { "<phase>": {"status": "complete", "ts": "<iso>"}, ... },
+          "updated": "<iso>"
+        }
+
+    Atomic writes (tmpfile + os.replace). Fail-soft: a corrupt/absent ledger
+    reads as empty; a write error logs and is swallowed (the run still works,
+    it just loses resumability for that step). NO authority -- it never decides
+    to spend money on its own; resume only happens when the node is verified
+    ALIVE by the orchestrator.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = pathlib.Path(path)
+
+    # -- read -------------------------------------------------------------- #
+    def read(self) -> Dict[str, Any]:
+        try:
+            if not self.path.exists():
+                return {}
+            raw = self.path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception as exc:  # noqa: BLE001 -- a corrupt ledger reads as empty
+            _log(f"checkpoint read failed ({exc!r}); treating as no checkpoint")
+            return {}
+
+    # -- write (atomic) ---------------------------------------------------- #
+    def write(self, data: Dict[str, Any]) -> None:
+        try:
+            data = dict(data)
+            data["updated"] = _iso_now()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix=self.path.name + ".", suffix=".tmp",
+                dir=str(self.path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, sort_keys=True)
+                os.replace(tmp, str(self.path))
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+        except Exception as exc:  # noqa: BLE001 -- a write error never crashes the run
+            _log(f"checkpoint write failed ({exc!r}); resumability degraded for this step")
+
+    # -- mutate ------------------------------------------------------------ #
+    def init_run(
+        self, *, run_id: str, node_name: str, zone: str, project: str,
+        external_ip: str = "",
+    ) -> Dict[str, Any]:
+        """Seed a fresh ledger for a brand-new node (clears any prior phases)."""
+        data: Dict[str, Any] = {
+            "run_id": run_id,
+            "node_name": node_name,
+            "zone": zone,
+            "project": project,
+            "external_ip": external_ip,
+            "phases": {},
+        }
+        self.write(data)
+        return data
+
+    def mark_phase(self, data: Dict[str, Any], phase: str, **info: Any) -> Dict[str, Any]:
+        """Stamp *phase* complete and persist atomically. `info` (e.g. external_ip)
+        is merged at the top level so connection info can be recorded as it lands."""
+        phases = dict(data.get("phases") or {})
+        phases[phase] = {"status": "complete", "ts": _iso_now()}
+        data["phases"] = phases
+        for k, v in info.items():
+            data[k] = v
+        self.write(data)
+        return data
+
+    def clear(self) -> None:
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except OSError as exc:
+            _log(f"checkpoint clear failed ({exc!r}); next run uses --fresh semantics anyway")
+
+    # -- queries ----------------------------------------------------------- #
+    @staticmethod
+    def phase_complete(data: Dict[str, Any], phase: str) -> bool:
+        rec = (data.get("phases") or {}).get(phase) or {}
+        return rec.get("status") == "complete"
+
+    @classmethod
+    def first_incomplete(cls, data: Dict[str, Any]) -> Optional[str]:
+        """First phase in _PHASE_ORDER not yet complete (None == all done)."""
+        for phase in _PHASE_ORDER:
+            if not cls.phase_complete(data, phase):
+                return phase
+        return None
+
+    @classmethod
+    def completed_phases(cls, data: Dict[str, Any]) -> List[str]:
+        return [p for p in _PHASE_ORDER if cls.phase_complete(data, p)]
+
+
+def _iso_now() -> str:
+    """ISO-8601 UTC timestamp for ledger records (stable, sortable)."""
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +341,7 @@ def _run_streaming(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,  # line-buffered
+            bufsize=1,  # line-buffered -- lines arrive + stream as the command runs
         )
         deadline = time.monotonic() + timeout_s
         assert proc.stdout is not None
@@ -192,6 +362,53 @@ def _run_streaming(
     except Exception as exc:  # noqa: BLE001 -- never crash the orchestrator
         captured.append(f"[IAC] streaming exec failed: {exc!r}\n")
         return 1, captured
+
+
+def _make_labeled_sink(label: str, log_path: Optional[pathlib.Path]) -> Callable[[str], None]:
+    """Build a sink that prefixes every streamed line with `[<label>] ` and TEES
+    it to *log_path* (the per-run autopsy log) so the full live stream is also
+    captured on disk for post-mortem -- the operator follows which stage is
+    talking in real-time, and nothing is lost if the terminal scrolls away.
+
+    Fail-soft on the file write (a tee failure never stops the live stream)."""
+    prefix = f"[{label}] "
+
+    def _sink(line: str) -> None:
+        # Normalize the raw line (it usually carries its own trailing newline)
+        # to exactly one prefixed line; stream LIVE to the local terminal.
+        out = prefix + line.rstrip("\n") + "\n"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        if log_path is not None:
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(out)
+            except Exception:  # noqa: BLE001 -- a tee failure never blocks the stream
+                pass
+
+    return _sink
+
+
+def _run_streaming_labeled(
+    cmd: List[str], *, label: str, log_path: Optional[pathlib.Path] = None,
+    timeout_s: float = 3600.0,
+) -> Tuple[int, List[str]]:
+    """Convenience: stream *cmd* live with a phase `label` prefix + tee to log.
+    Used for the long phases (provision / sync / prebake / surgery)."""
+    return _run_streaming(cmd, timeout_s=timeout_s, sink=_make_labeled_sink(label, log_path))
+
+
+def _run_log_path(run_id: str) -> Optional[pathlib.Path]:
+    """The per-run tee log `autopsy_reports/iac_run_<run-id>.log` -- the full
+    streamed transcript for autopsy. Fail-soft (None if the dir can't be made)."""
+    try:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:80] or "run"
+        outdir = pathlib.Path(_AUTOPSY_DIR)
+        outdir.mkdir(parents=True, exist_ok=True)
+        return outdir / f"iac_run_{safe}.log"
+    except Exception as exc:  # noqa: BLE001
+        _log(f"run-log path setup failed ({exc!r}); streaming continues without tee")
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -513,7 +730,9 @@ def _rsync_cmd(
         "--tunnel-through-iap --command"
     )
     return [
-        "rsync", "-az", "--delete",
+        # -v + --progress so the live stream carries per-file + progress-bar
+        # output the operator can watch line-by-line during the long sync.
+        "rsync", "-az", "--delete", "--progress", "-v",
         *exclude_flags,
         "-e", ssh_transport,
         local_dir.rstrip("/") + "/",
@@ -537,26 +756,55 @@ def _describe_node_cmd(args: argparse.Namespace, node: str) -> List[str]:
     ]
 
 
+def _describe_status_cmd(args: argparse.Namespace, node: str) -> List[str]:
+    """Describe the node's lifecycle status -- RUNNING means it is warm + alive
+    and a RESUME can reconnect to it (vs burned / preempted / terminated)."""
+    return [
+        "gcloud", "compute", "instances", "describe", node,
+        f"--project={args.project}", f"--zone={args.zone}",
+        "--format=value(status)",
+    ]
+
+
+def node_is_alive(args: argparse.Namespace, node: str) -> bool:
+    """Verify the node is still warm via `gcloud instances describe status`.
+
+    Returns True ONLY when describe succeeds AND status == RUNNING. A burned /
+    preempted / terminated node (describe rc != 0, or any non-RUNNING status)
+    returns False -> the orchestrator starts clean. Fail-soft: a describe error
+    is treated as 'not alive' (cannot confirm warm == start fresh, never resume
+    into a node we cannot prove is up)."""
+    rc, out = _run(_describe_status_cmd(args, node), timeout_s=60.0)
+    alive = rc == 0 and (out or "").strip().upper() == "RUNNING"
+    _log(f"resume-check: node {node} status={(out or '').strip() or '<none>'} -> {'ALIVE' if alive else 'not resumable'}")
+    return alive
+
+
 # --------------------------------------------------------------------------- #
 # Phase 1: Cloud Projector (provision).
 # --------------------------------------------------------------------------- #
 def provision_sandbox_node(
-    args: argparse.Namespace, node: str, startup_script: str
+    args: argparse.Namespace, node: str, startup_script: str,
+    log_path: Optional[pathlib.Path] = None,
 ) -> Tuple[bool, str]:
-    """Create the e2-standard-8 Spot node with the burn startup-script.
+    """Create the e2-standard-8 Spot node with the burn startup-script, STREAMING
+    the `gcloud compute instances create` output line-by-line to the local
+    terminal (prefixed `[provision] ...`) so the operator follows provisioning
+    live instead of waiting on a silent capture.
 
     Returns (ok, detail). Fail-soft.
     """
-    import tempfile
-
     fd, sp_path = tempfile.mkstemp(prefix="sovereign_iac_startup_", suffix=".sh")
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(startup_script)
         _log(f"provisioning {node} (e2-standard-8 SPOT, 32GB, DELETE-on-preempt)")
-        rc, out = _run(_create_node_cmd(args, node, sp_path), timeout_s=300.0)
+        rc, captured = _run_streaming_labeled(
+            _create_node_cmd(args, node, sp_path),
+            label="provision", log_path=log_path, timeout_s=300.0,
+        )
         if rc != 0:
-            return False, f"provision failed rc={rc}: {out.strip()[:400]}"
+            return False, f"provision failed rc={rc}: {''.join(captured).strip()[:400]}"
         return True, "provisioned"
     finally:
         try:
@@ -604,10 +852,13 @@ def _resolve_repo_paths(args: argparse.Namespace) -> List[Tuple[str, str]]:
 
 
 def sync_repos_to_node(
-    args: argparse.Namespace, node: str, excludes: List[str]
+    args: argparse.Namespace, node: str, excludes: List[str],
+    log_path: Optional[pathlib.Path] = None,
 ) -> Tuple[bool, str]:
-    """rsync/scp the 3 repos into /opt/trinity/{jarvis,prime,reactor}. Excludes
-    .git/__pycache__/node_modules/.venv/etc -- keep the beam lean. Bounded.
+    """rsync/scp the 3 repos into /opt/trinity/{jarvis,prime,reactor}, STREAMING
+    the transfer output (rsync --progress -v / scp progress) line-by-line to the
+    local terminal (prefixed `[sync] ...`). Excludes .git/__pycache__/etc -- keep
+    the beam lean. Bounded.
 
     Transport selected by JARVIS_IAC_SYNC_TRANSPORT (default scp -- robust over
     IAP). Returns (ok, detail). Fail-soft.
@@ -622,10 +873,12 @@ def sync_repos_to_node(
             cmd = _rsync_cmd(args, node, local, remote_dir, excludes)
         else:
             cmd = _scp_cmd(args, node, local, remote_dir, excludes)
-        _log(f"syncing {name}: {local} -> {node}:{remote_dir} (transport={transport})")
-        rc, out = _run(cmd, timeout_s=float(args.sync_timeout_s))
+        _log(f"syncing {name}: {local} -> {node}:{remote_dir} (transport={transport}, streamed)")
+        rc, captured = _run_streaming_labeled(
+            cmd, label="sync", log_path=log_path, timeout_s=float(args.sync_timeout_s),
+        )
         if rc != 0:
-            return False, f"sync of '{name}' failed rc={rc}: {out.strip()[:300]}"
+            return False, f"sync of '{name}' failed rc={rc}: {''.join(captured).strip()[:300]}"
     return True, "synced"
 
 
@@ -667,19 +920,96 @@ def parse_verdict(captured: List[str]) -> str:
     return "UNKNOWN"
 
 
+def _remote_prebake_shell(args: argparse.Namespace) -> str:
+    """The remote prebake shell: cd into the synced jarvis repo, set the trinity
+    env, run the WAN prebake command (the `docker build` layer pull). Does NOT
+    touch the completion-sentinel -- prebake is a mid-pipeline step the resume
+    can re-run; only the surgery's terminal verdict drops the sentinel."""
+    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+    pr = f"{_REMOTE_TRINITY_ROOT}/prime"
+    rr = f"{_REMOTE_TRINITY_ROOT}/reactor"
+    env = (
+        f"export JARVIS_PRIME_REPO_PATH={shlex.quote(pr)}; "
+        f"export JARVIS_REACTOR_REPO_PATH={shlex.quote(rr)}; "
+        "export JARVIS_TRINITY_PREBAKE_ENABLED=1; "
+    )
+    return f"cd {shlex.quote(jr)} && {env} {args.prebake_cmd}"
+
+
+def run_remote_prebake(
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[bool, str]:
+    """SSH-exec the WAN prebake (remote `docker build` layer build) remotely,
+    STREAMING the layer-build output line-by-line to the local terminal
+    (prefixed `[prebake] ...`). This is the first-run-friction step (PyPI
+    timeout); checkpointing it as its own phase lets a resume skip a completed
+    sync and re-run ONLY the prebake. Returns (ok, detail). Fail-soft.
+
+    When JARVIS_IAC_PREBAKE_CMD is empty the prebake is folded into the surgery
+    command (legacy single-exec) -- this returns ok with a 'skipped' detail."""
+    if not (args.prebake_cmd or "").strip():
+        return True, "prebake folded into surgery (no JARVIS_IAC_PREBAKE_CMD)"
+    remote = _remote_prebake_shell(args)
+    cmd = _ssh_cmd(args, node, remote)
+    _log("running remote prebake (WAN docker build, streaming to local terminal)...")
+    rc, captured = _run_streaming_labeled(
+        cmd, label="prebake", log_path=log_path, timeout_s=float(args.prebake_timeout_s),
+    )
+    if rc != 0:
+        return False, f"prebake failed rc={rc}: {''.join(captured).strip()[:400]}"
+    return True, "prebaked"
+
+
+def _remote_boot_shell(args: argparse.Namespace) -> str:
+    """The remote boot shell: cd into the synced jarvis repo, set the trinity env,
+    bring up the air-gapped compose (the `booted` phase). No completion-sentinel
+    -- boot is a mid-pipeline step a resume can re-run."""
+    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+    pr = f"{_REMOTE_TRINITY_ROOT}/prime"
+    rr = f"{_REMOTE_TRINITY_ROOT}/reactor"
+    env = (
+        f"export JARVIS_PRIME_REPO_PATH={shlex.quote(pr)}; "
+        f"export JARVIS_REACTOR_REPO_PATH={shlex.quote(rr)}; "
+    )
+    return f"cd {shlex.quote(jr)} && {env} {args.boot_cmd}"
+
+
+def run_remote_boot(
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[bool, str]:
+    """SSH-exec the air-gapped compose boot remotely, STREAMING line-by-line
+    (prefixed `[boot] ...`). Checkpointed as the `booted` phase. Returns
+    (ok, detail). Fail-soft. Empty JARVIS_IAC_BOOT_CMD == folded into surgery."""
+    if not (args.boot_cmd or "").strip():
+        return True, "boot folded into surgery (no JARVIS_IAC_BOOT_CMD)"
+    remote = _remote_boot_shell(args)
+    cmd = _ssh_cmd(args, node, remote)
+    _log("running remote boot (air-gap compose, streaming to local terminal)...")
+    rc, captured = _run_streaming_labeled(
+        cmd, label="boot", log_path=log_path, timeout_s=float(args.boot_timeout_s),
+    )
+    if rc != 0:
+        return False, f"boot failed rc={rc}: {''.join(captured).strip()[:400]}"
+    return True, "booted"
+
+
 def run_remote_surgery(
-    args: argparse.Namespace, node: str
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
 ) -> Tuple[int, List[str], str]:
     """SSH-exec the Trinity surgery remotely, STREAMING stdout/stderr to the local
-    terminal in real-time. Returns (rc, captured_lines, verdict). Fail-soft.
+    terminal in real-time (prefixed `[surgery] ...`). Returns (rc, captured_lines,
+    verdict). Fail-soft.
 
     The WAN prebake happens ON the node before the air-gap compose -- the surgery
-    command drives the full prebake -> air-gap flow locally on the node.
+    command drives the full prebake -> air-gap flow locally on the node (when no
+    separate JARVIS_IAC_PREBAKE_CMD ran the prebake as its own checkpointed phase).
     """
     remote = _remote_surgery_shell(args)
     cmd = _ssh_cmd(args, node, remote)
     _log("running remote surgery (streaming to local terminal in real-time)...")
-    rc, captured = _run_streaming(cmd, timeout_s=float(args.surgery_timeout_s))
+    rc, captured = _run_streaming_labeled(
+        cmd, label="surgery", log_path=log_path, timeout_s=float(args.surgery_timeout_s),
+    )
     verdict = parse_verdict(captured)
     _log(f"remote surgery finished rc={rc} verdict={verdict}")
     return rc, captured, verdict
@@ -835,64 +1165,285 @@ def _print_plan(args: argparse.Namespace, node: str, startup_script: str, exclud
           "--i-understand-this-spends-money to run.")
 
 
+def _print_checkpoint_plan(args: argparse.Namespace, ledger: CheckpointLedger, run_id: str) -> None:
+    """Dry-run: surface the checkpoint/resume + streaming plan (spends nothing)."""
+    print("-" * 72)
+    print("CHECKPOINT / RESUME PLAN (resume-don't-restart):")
+    print(f"  state ledger     : {ledger.path}  (env JARVIS_IAC_STATE_PATH)")
+    print(f"  run-id           : {run_id}")
+    print(f"  phase order      : {' -> '.join(_PHASE_ORDER)}")
+    data = ledger.read()
+    if data.get("node_name"):
+        completed = CheckpointLedger.completed_phases(data)
+        resume_at = CheckpointLedger.first_incomplete(data)
+        print(f"  EXISTING checkpoint: node={data.get('node_name')} "
+              f"zone={data.get('zone')} completed={completed or '<none>'}")
+        if args.fresh:
+            print("  --fresh           : the checkpoint would be CLEARED -> brand-new node")
+        else:
+            print(f"  on --execute      : if node is RUNNING -> RESUME from '{resume_at}' "
+                  f"(skip {completed or '<none>'}); if GONE -> fresh node")
+    else:
+        print("  EXISTING checkpoint: <none>  -> --execute starts a fresh node")
+    print(f"  keep-warm-on-fail : {args.keep_warm_on_failure}  "
+          f"(resumable failure -> node LEFT WARM + checkpoint persisted + non-zero exit)")
+    print(f"  burn-on-failure   : {args.burn_on_failure}  (force-burn even on resumable failure)")
+    print("  NO-ORPHAN BACKSTOP: keep-warm is bounded -- node-side dead-man "
+          f"idle>{args.node_idle_timeout_s}s + max-run-duration={args.max_run_duration_s}s "
+          "+ Spot DELETE-on-preempt remain armed + independent of this process.")
+    print("-" * 72)
+    print("STREAMING PLAN (every long phase streams stdout/stderr LIVE, line-by-line):")
+    print("  [provision] gcloud compute instances create ... (provisioning)")
+    print("  [sync]      rsync --progress -v / scp ... (per-file + progress bars)")
+    print("  [prebake]   remote docker build ... (WAN image layer builds)")
+    print("  [boot]      remote air-gap compose bring-up ...")
+    print("  [surgery]   remote Trinity surgery + FRACTURE/PASS ...")
+    print(f"  tee log     : {_AUTOPSY_DIR}/iac_run_<run-id>.log (full transcript captured)")
+    print("-" * 72)
+
+
 # --------------------------------------------------------------------------- #
 # Execute pipeline.
 # --------------------------------------------------------------------------- #
-def _execute(args: argparse.Namespace, node: str, startup_script: str, excludes: List[str]) -> int:
-    node_exists = False
+def resolve_run_context(
+    args: argparse.Namespace, ledger: CheckpointLedger, default_node: str, run_id: str,
+) -> Tuple[str, Dict[str, Any], bool]:
+    """Decide RESUME vs FRESH from the ledger + the live node status.
+
+    Returns (node, ledger_data, resuming):
+      * RESUME  -- a node is recorded AND verified still RUNNING AND not --fresh:
+                   reconnect to the warm node, ledger_data carries the completed
+                   phases, resuming=True. The orchestrator skips completed phases.
+      * FRESH   -- no record / recorded node GONE (burned/preempted) / --fresh:
+                   the ledger is cleared + re-seeded for `default_node`,
+                   resuming=False.
+
+    No money is spent here -- a resume only reconnects to a node ALREADY proven
+    alive by `node_is_alive` (gcloud describe status == RUNNING)."""
+    prior = ledger.read()
+    recorded_node = (prior.get("node_name") or "").strip()
+
+    if args.fresh:
+        if recorded_node:
+            _log(f"--fresh: ignoring checkpoint for {recorded_node}, starting clean")
+        ledger.clear()
+        data = ledger.init_run(
+            run_id=run_id, node_name=default_node, zone=args.zone, project=args.project,
+        )
+        return default_node, data, False
+
+    if not recorded_node:
+        data = ledger.init_run(
+            run_id=run_id, node_name=default_node, zone=args.zone, project=args.project,
+        )
+        return default_node, data, False
+
+    # A node is recorded -- is it still warm? Reuse its zone/project from the
+    # ledger so the alive-check targets the SAME node that was provisioned.
+    probe_args = argparse.Namespace(**vars(args))
+    probe_args.zone = prior.get("zone") or args.zone
+    probe_args.project = prior.get("project") or args.project
+    if node_is_alive(probe_args, recorded_node):
+        completed = CheckpointLedger.completed_phases(prior)
+        resume_at = CheckpointLedger.first_incomplete(prior) or "surgery_done"
+        synced = CheckpointLedger.phase_complete(prior, "synced")
+        print(
+            f"[IAC RESUME] node {recorded_node} warm, files synced={synced}, "
+            f"resuming from phase {resume_at} (skipping {completed or '<none>'})",
+            flush=True,
+        )
+        # Inherit the recorded zone/project so we keep talking to the same node.
+        args.zone = probe_args.zone
+        args.project = probe_args.project
+        return recorded_node, prior, True
+
+    # Recorded node is GONE (burned / preempted / terminated) -> start clean.
+    _log(f"checkpoint node {recorded_node} is GONE (not RUNNING) -- starting fresh")
+    ledger.clear()
+    data = ledger.init_run(
+        run_id=run_id, node_name=default_node, zone=args.zone, project=args.project,
+    )
+    return default_node, data, False
+
+
+def _execute(
+    args: argparse.Namespace, node: str, startup_script: str, excludes: List[str],
+    ledger: Optional[CheckpointLedger] = None, ledger_data: Optional[Dict[str, Any]] = None,
+    resuming: bool = False, log_path: Optional[pathlib.Path] = None,
+) -> int:
+    """Run the checkpointed pipeline. Each phase, on success, stamps the ledger
+    (atomic) so a *resumable* mid-pipeline failure can be re-run to resume from
+    the first incomplete phase against the still-warm node.
+
+    BURN POLICY (the #1 invariant, refined for resumability):
+      * TERMINAL outcome (PASS / FRACTURE)  -> BURN ALWAYS. The surgery reached a
+        verdict; the node has served its purpose.
+      * UNRECOVERABLE error (raised exception / SSH-drop mid-finally) -> BURN. We
+        cannot prove the node is in a resumable state, so we do not leave it warm.
+      * --burn-on-failure -> BURN even on a resumable failure (operator cleanup).
+      * RESUMABLE mid-pipeline failure (e.g. prebake PyPI timeout) with
+        --keep-warm-on-failure (default TRUE) -> DO NOT burn: log the autopsy,
+        leave the node WARM, persist the checkpoint, EXIT non-zero so the operator
+        re-runs --execute to resume.
+
+    NO-ORPHAN BACKSTOP (the trade made explicit): keep-warm enables resume, but a
+    warm-left node can NEVER orphan forever -- the node-side dead-man (idle >
+    JARVIS_IAC_NODE_IDLE_TIMEOUT_S) + the GCP max_run_duration hard ceiling + the
+    Spot DELETE-on-preempt are still armed and independent of this process. The
+    idle timeout is generous enough to permit a resume yet bounded; the max-run
+    duration is the absolute ceiling. The local burn is one of FOUR teardowns;
+    skipping it for resume does not remove the other three.
+    """
+    if ledger is None:
+        ledger = CheckpointLedger(args.state_path)
+    data: Dict[str, Any] = ledger_data if ledger_data is not None else ledger.read()
+
+    node_exists = resuming or CheckpointLedger.phase_complete(data, "provisioned")
     verdict = "UNKNOWN"
     surgery_output: List[str] = []
     surgery_rc = 1
     abort_reason = ""
     succeeded = False
-    try:
-        # PHASE 1: PROVISION.
-        ok, detail = provision_sandbox_node(args, node, startup_script)
-        if not ok:
-            _abort(detail)
-            abort_reason = detail
-            return 4
-        node_exists = True
-        _log(f"node {node} created; startup-script installing Docker + burn watchdog")
+    resumable_failure = False  # set True when a phase fails recoverably
 
-        # PHASE 1b: POLL READY.
-        ready, reason = poll_node_ready(args, node)
-        if not ready:
-            _abort(f"readiness abort: {reason}")
-            abort_reason = reason
-            return 5
+    def _done(phase: str) -> bool:
+        return CheckpointLedger.phase_complete(data, phase)
+
+    try:
+        # PHASE 1: PROVISION. (skip if already provisioned on a warm resume)
+        if not _done("provisioned"):
+            ok, detail = provision_sandbox_node(args, node, startup_script, log_path=log_path)
+            if not ok:
+                _abort(detail)
+                abort_reason = detail
+                resumable_failure = True
+                return 4
+            node_exists = True
+            data = ledger.mark_phase(data, "provisioned")
+            _log(f"node {node} created; startup-script installing Docker + burn watchdog")
+        else:
+            _log("[resume] phase provisioned already complete -- skipping create")
+        node_exists = True
+
+        # PHASE 1b: DOCKER READY (poll for the ready sentinel).
+        if not _done("docker_ready"):
+            ready, reason = poll_node_ready(args, node)
+            if not ready:
+                _abort(f"readiness abort: {reason}")
+                abort_reason = reason
+                resumable_failure = True
+                return 5
+            data = ledger.mark_phase(data, "docker_ready")
+        else:
+            _log("[resume] phase docker_ready already complete -- skipping poll")
 
         # PHASE 2: SYNC BRIDGE.
-        ok, detail = sync_repos_to_node(args, node, excludes)
-        if not ok:
-            _abort(f"sync abort: {detail}")
-            abort_reason = detail
-            return 6
+        if not _done("synced"):
+            ok, detail = sync_repos_to_node(args, node, excludes, log_path=log_path)
+            if not ok:
+                _abort(f"sync abort: {detail}")
+                abort_reason = detail
+                resumable_failure = True
+                return 6
+            data = ledger.mark_phase(data, "synced")
+        else:
+            _log("[resume] phase synced already complete -- skipping sync")
 
-        # PHASE 3: REMOTE SURGERY (streamed).
-        surgery_rc, surgery_output, verdict = run_remote_surgery(args, node)
-        succeeded = True  # we reached the verdict; PASS or FRACTURE are both terminal
-        return 0 if verdict in ("PASS", "FRACTURE") else 7
+        # PHASE 2b: PREBAKE (WAN docker build -- the first-run-friction step).
+        if not _done("prebaked"):
+            ok, detail = run_remote_prebake(args, node, log_path=log_path)
+            if not ok:
+                _abort(f"prebake abort: {detail}")
+                abort_reason = detail
+                resumable_failure = True
+                return 8
+            data = ledger.mark_phase(data, "prebaked")
+        else:
+            _log("[resume] phase prebaked already complete -- skipping prebake")
+
+        # PHASE 2c: BOOT (air-gapped compose bring-up).
+        if not _done("booted"):
+            ok, detail = run_remote_boot(args, node, log_path=log_path)
+            if not ok:
+                _abort(f"boot abort: {detail}")
+                abort_reason = detail
+                resumable_failure = True
+                return 9
+            data = ledger.mark_phase(data, "booted")
+        else:
+            _log("[resume] phase booted already complete -- skipping boot")
+
+        # PHASE 3: REMOTE SURGERY (streamed). This is TERMINAL -- PASS/FRACTURE.
+        surgery_rc, surgery_output, verdict = run_remote_surgery(args, node, log_path=log_path)
+        if verdict in ("PASS", "FRACTURE"):
+            data = ledger.mark_phase(data, "surgery_done", verdict=verdict)
+            succeeded = True  # reached a terminal verdict
+            return 0
+        # No verdict -> the surgery did not converge; treat as resumable (the node
+        # is warm + synced + prebaked, a re-run resumes straight at surgery).
+        resumable_failure = True
+        return 7
     finally:
-        # PHASE 4: THE ULTIMATE BURN -- ALWAYS runs (PASS / FRACTURE / exception
-        # / SSH-drop). The burn is the #1 invariant: no orphaned 32GB node under
-        # ANY exit. Autopsy-before-burn on failure (NEVER blocks the burn).
-        if node_exists:
-            if not succeeded or verdict not in ("PASS", "FRACTURE"):
+        # PHASE 4: THE ULTIMATE BURN -- refined for resumability.
+        #
+        # keep_warm == True iff: a RESUMABLE failure happened AND
+        # --keep-warm-on-failure AND NOT --burn-on-failure AND we did NOT reach a
+        # terminal verdict. A raised exception bypasses the resumable_failure flag
+        # (it's set only on the recoverable return paths), so an exception / SSH
+        # drop ALWAYS burns -- we cannot prove a crashed run left a resumable node.
+        terminal = succeeded and verdict in ("PASS", "FRACTURE")
+        keep_warm = (
+            node_exists
+            and resumable_failure
+            and args.keep_warm_on_failure
+            and not args.burn_on_failure
+            and not terminal
+        )
+        if node_exists and keep_warm:
+            # Autopsy (never blocks), persist the checkpoint, leave the node WARM.
+            run_autopsy(args, node, abort_reason or f"verdict={verdict}", surgery_output)
+            ledger.write(data)
+            print(
+                f"[IAC KEEP-WARM] node {node} left RUNNING after resumable failure "
+                f"({abort_reason or 'no verdict'}); checkpoint persisted -> {ledger.path}. "
+                f"Re-run --execute to RESUME. NO-ORPHAN BACKSTOP armed: node-side "
+                f"dead-man idle>{args.node_idle_timeout_s}s + max-run-duration="
+                f"{args.max_run_duration_s}s + Spot DELETE-on-preempt.",
+                flush=True,
+            )
+        elif node_exists:
+            # Terminal verdict / exception / --burn-on-failure -> BURN ALWAYS.
+            if not terminal:
                 run_autopsy(args, node, abort_reason or f"verdict={verdict}", surgery_output)
             burn_node(args, node)
             verify_node_gone(args, node)
-        _report(args, node, verdict, surgery_rc, node_exists)
+            # Surgery reached a verdict -> the run is DONE, clear the checkpoint.
+            if terminal:
+                ledger.clear()
+        _report(args, node, verdict, surgery_rc, node_exists, keep_warm)
 
 
-def _report(args: argparse.Namespace, node: str, verdict: str, surgery_rc: int, node_existed: bool) -> None:
+def _report(
+    args: argparse.Namespace, node: str, verdict: str, surgery_rc: int,
+    node_existed: bool, kept_warm: bool = False,
+) -> None:
     print("=" * 72)
     print("[IAC] SESSION REPORT")
     print("=" * 72)
-    print(f"  node       : {node} ({'provisioned + burned' if node_existed else 'never provisioned'})")
+    if not node_existed:
+        node_state = "never provisioned"
+    elif kept_warm:
+        node_state = "LEFT WARM (resumable -- re-run --execute)"
+    else:
+        node_state = "provisioned + burned"
+    print(f"  node       : {node} ({node_state})")
     print(f"  verdict    : {verdict}")
     print(f"  surgery rc : {surgery_rc}")
-    print("  teardown   : quadruple (local-delete + remote-deadman + spot-DELETE + max-run-duration)")
+    if kept_warm:
+        print("  teardown   : DEFERRED (keep-warm) -- backstop: node-deadman + "
+              "spot-DELETE + max-run-duration (no infinite orphan)")
+    else:
+        print("  teardown   : quadruple (local-delete + remote-deadman + spot-DELETE + max-run-duration)")
     print("=" * 72)
 
 
@@ -948,6 +1499,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--node-name", default=None, help="node name (default sovereign-sandbox-<ts>)")
     p.add_argument("--i-understand-this-spends-money", action="store_true",
                    help="REAL-MONEY safety gate (required with --execute)")
+    # -- prebake / boot phases (streamed + checkpointed when their cmds are set) --
+    p.add_argument("--prebake-cmd", default=_DEFAULT_PREBAKE_CMD,
+                   help="remote WAN docker-build prebake (env JARVIS_IAC_PREBAKE_CMD; "
+                        "empty == folded into surgery)")
+    p.add_argument("--prebake-timeout-s", type=int,
+                   default=int(os.environ.get("JARVIS_IAC_PREBAKE_TIMEOUT_S", "1800")))
+    p.add_argument("--boot-cmd", default=_DEFAULT_BOOT_CMD,
+                   help="remote air-gap compose boot (env JARVIS_IAC_BOOT_CMD; empty == folded into surgery)")
+    p.add_argument("--boot-timeout-s", type=int,
+                   default=int(os.environ.get("JARVIS_IAC_BOOT_TIMEOUT_S", "600")))
+    # -- checkpoint / resume (resume-don't-restart) --
+    p.add_argument("--state-path", default=_DEFAULT_STATE_PATH,
+                   help="checkpoint ledger path (env JARVIS_IAC_STATE_PATH)")
+    p.add_argument("--run-id", default=None,
+                   help="run id stamped into the checkpoint (default: the node timestamp)")
+    p.add_argument("--node-idle-timeout-s", type=int, default=_DEFAULT_NODE_IDLE_TIMEOUT_S,
+                   help="node-side dead-man idle timeout, generous enough to allow a "
+                        "resume yet bounded (env JARVIS_IAC_NODE_IDLE_TIMEOUT_S)")
+    p.add_argument("--fresh", action="store_true",
+                   help="ignore + clear any checkpoint; provision a brand-new node")
+    p.add_argument("--keep-warm-on-failure", dest="keep_warm_on_failure",
+                   action="store_true", default=True,
+                   help="on a RESUMABLE mid-pipeline failure leave the node WARM + "
+                        "persist the checkpoint so --execute can resume (default TRUE; "
+                        "the dead-man + max-run-duration remain the no-orphan backstop)")
+    p.add_argument("--no-keep-warm-on-failure", dest="keep_warm_on_failure",
+                   action="store_false",
+                   help="burn the node even on a resumable failure (legacy always-burn)")
+    p.add_argument("--burn-on-failure", action="store_true",
+                   help="force a burn even on a resumable failure (overrides keep-warm)")
+    p.add_argument("--burn", action="store_true",
+                   help="force-burn the checkpointed node (cleanup) then exit")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print the plan + commands WITHOUT executing (default)")
@@ -957,18 +1540,50 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_burn_checkpointed(args: argparse.Namespace, ledger: CheckpointLedger) -> int:
+    """`--burn`: force-burn the node recorded in the checkpoint (cleanup), then
+    clear the ledger. Reuses the same gcloud-delete + verify-gone path. If no
+    node is recorded, there is nothing to burn."""
+    data = ledger.read()
+    node = (data.get("node_name") or args.node_name or "").strip()
+    if not node:
+        _log("--burn: no checkpointed node to burn (clean ledger)")
+        return 0
+    # Talk to the node's recorded zone/project.
+    args.zone = data.get("zone") or args.zone
+    args.project = data.get("project") or args.project
+    _log(f"--burn: force-burning checkpointed node {node}")
+    burn_node(args, node)
+    verify_node_gone(args, node)
+    ledger.clear()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     stamp = _now_stamp()
-    node = args.node_name or default_node_name(stamp)
+    run_id = args.run_id or stamp
+    default_node = args.node_name or default_node_name(stamp)
     excludes = parse_excludes(args.rsync_excludes)
-    startup_script = build_startup_script(completion_sentinel=args.completion_sentinel)
+    # The dead-man idle timeout the startup-script bakes in is the resume-aware
+    # JARVIS_IAC_NODE_IDLE_TIMEOUT_S -- generous enough to permit a re-run resume
+    # yet bounded so a warm-left node can never orphan forever (the max-run
+    # duration is the absolute ceiling regardless).
+    startup_script = build_startup_script(
+        completion_sentinel=args.completion_sentinel,
+        idle_timeout_s=args.node_idle_timeout_s,
+    )
+    ledger = CheckpointLedger(args.state_path)
 
     if args.dry_run:
         if not _master_enabled():
             _log(f"NOTE: master gate {_ENV_MASTER} is OFF (dry-run prints the plan anyway).")
-        _print_plan(args, node, startup_script, excludes)
+        _print_plan(args, default_node, startup_script, excludes)
+        _print_checkpoint_plan(args, ledger, run_id)
         return 0
+
+    if args.burn:
+        return _force_burn_checkpointed(args, ledger)
 
     ok, reason = check_triple_gate(args)
     if not ok:
@@ -977,7 +1592,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     _log("EXECUTE mode -- this WILL provision a 32GB GCP node and spend money")
-    return _execute(args, node, startup_script, excludes)
+    # RESUME vs FRESH: reconnect to a warm checkpointed node + skip done phases.
+    node, ledger_data, resuming = resolve_run_context(args, ledger, default_node, run_id)
+    log_path = _run_log_path(ledger_data.get("run_id") or run_id)
+    return _execute(
+        args, node, startup_script, excludes,
+        ledger=ledger, ledger_data=ledger_data, resuming=resuming, log_path=log_path,
+    )
 
 
 if __name__ == "__main__":
