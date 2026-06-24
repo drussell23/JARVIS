@@ -14,14 +14,19 @@ Covers the red-team findings:
     HIGH #3     -- NFKC-normalized elevation scan + structural data-only fence.
     HIGH #4     -- bounded _responses + stagnation _pairs (anti-OOM).
     LOW         -- destroy() wipes the bytearray secret in place.
+    STRUCTURAL  -- BoundSender identity lock: issue_sender(w1) can ONLY send as
+                   w1; no from_worker override exists on the public API.
 """
 from __future__ import annotations
+
+import inspect
 
 import pytest
 
 from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
     AgentMessage,
     AgentMessageBus,
+    BoundSender,
     MessageKind,
     quarantine_payload,
     sign_with_key,
@@ -130,10 +135,10 @@ def test_insider_own_identity_still_delivers():
 
 
 def test_make_signed_does_not_leak_graph_secret_to_caller():
-    """make_signed stamps the from_worker's derived key; the returned message
+    """_make_signed_internal stamps the from_worker's derived key; the returned message
     carries only a hex digest, never the secret/key bytes."""
     bus, _ = _insider_bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={},
     )
     assert isinstance(msg.signature, str) and len(msg.signature) == 64
@@ -338,3 +343,194 @@ def test_inbox_full_counts_drop_not_delivery():
     # are counted as inbox_full drops -- no double count.
     assert bus.delivered == 8
     assert bus.dropped.get("inbox_full", 0) == 64 - 8
+
+
+# ---------------------------------------------------------------------------
+# STRUCTURAL -- BoundSender identity lock (no from_worker override on public API)
+# ---------------------------------------------------------------------------
+
+
+def test_make_signed_old_name_not_in_public_dir():
+    """make_signed (the forgery-capable primitive) must no longer appear as a
+    public name on the bus. Only _make_signed_internal (underscore-private)
+    exists; workers CANNOT call it by convention."""
+    bus = AgentMessageBus(graph_id="g-lock", op_id="op-lock")
+    public_names = [n for n in dir(bus) if not n.startswith("_")]
+    assert "make_signed" not in public_names, (
+        "make_signed must be privatized to _make_signed_internal"
+    )
+
+
+def test_make_signed_internal_is_private():
+    """_make_signed_internal exists but is underscore-private (not in public dir)."""
+    bus = AgentMessageBus(graph_id="g-priv", op_id="op-priv")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    # The private method must exist and be callable (for internal/bus use).
+    assert hasattr(bus, "_make_signed_internal")
+    msg = bus._make_signed_internal(
+        from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={},
+    )
+    assert isinstance(msg, AgentMessage)
+    # But it must NOT appear in the public API.
+    public_names = [n for n in dir(bus) if not n.startswith("_")]
+    assert "_make_signed_internal" not in public_names
+    assert "make_signed" not in public_names
+
+
+def test_issue_sender_returns_bound_sender():
+    """issue_sender(w1) returns a BoundSender locked to w1."""
+    bus = AgentMessageBus(graph_id="g-bs", op_id="op-bs")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender = bus.issue_sender("w1")
+    assert isinstance(sender, BoundSender)
+
+
+def test_bound_sender_send_method_has_no_from_worker_param():
+    """BoundSender.send() MUST NOT accept a from_worker parameter.
+    This is the structural identity lock: the caller cannot override who they
+    are sending as."""
+    bus = AgentMessageBus(graph_id="g-bs2", op_id="op-bs2")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender = bus.issue_sender("w1")
+    sig = inspect.signature(sender.send)
+    param_names = list(sig.parameters.keys())
+    assert "from_worker" not in param_names, (
+        "BoundSender.send() must NOT have a from_worker parameter -- "
+        "identity is locked at issue_sender() time"
+    )
+
+
+def test_bound_sender_delivers_message_as_bound_worker():
+    """A BoundSender for w1 sends a message that delivers to w2 with
+    from_worker == 'w1' and verifies correctly at ingress."""
+    bus = AgentMessageBus(graph_id="g-bs3", op_id="op-bs3")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender = bus.issue_sender("w1")
+    result = sender.send(
+        to_worker="w2",
+        kind=MessageKind.FINDING,
+        payload={"note": "structural identity test"},
+    )
+    assert result is True
+    inbox = bus.subscribe("w2")
+    assert len(inbox) == 1
+    delivered = inbox[0]
+    assert delivered.from_worker == "w1"
+    assert delivered.payload[_QUARANTINE_KEY]["note"] == "structural identity test"
+
+
+def test_bound_sender_w1_cannot_send_as_w2():
+    """A BoundSender for w1 has no API path to send as w2.
+    The send() method has no from_worker parameter -- the identity is
+    STRUCTURALLY locked, not just documentarily locked."""
+    bus = AgentMessageBus(graph_id="g-bs4", op_id="op-bs4")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender_w1 = bus.issue_sender("w1")
+    # Confirm there is no from_worker kwarg to pass.
+    sig = inspect.signature(sender_w1.send)
+    assert "from_worker" not in sig.parameters
+    # Even if the caller tries to inject it as **kwargs, the message must
+    # still arrive with from_worker=="w1", not "w2".
+    # (This is guaranteed by the BoundSender implementation, not by magic
+    # -- but the absence of the parameter is the structural proof.)
+    result = sender_w1.send(
+        to_worker="w2",
+        kind=MessageKind.STATUS,
+        payload={"k": "v"},
+    )
+    assert result is True
+    delivered = bus.subscribe("w2")[0]
+    assert delivered.from_worker == "w1"
+
+
+def test_bound_sender_w1_cannot_send_as_fleet_commander():
+    """A BoundSender for w1 has no API path to send as fleet_commander.
+    The send() method has no from_worker parameter."""
+    bus = AgentMessageBus(graph_id="g-bs5", op_id="op-bs5")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender_w1 = bus.issue_sender("w1")
+    sig = inspect.signature(sender_w1.send)
+    assert "from_worker" not in sig.parameters
+    # Confirm a legit send still works (no false positive).
+    result = sender_w1.send(
+        to_worker="w2",
+        kind=MessageKind.STATUS,
+        payload={"k": "v"},
+    )
+    assert result is True
+    # The delivered message is from w1, never fleet_commander.
+    delivered = bus.subscribe("w2")[0]
+    assert delivered.from_worker == "w1"
+    assert "commander" not in delivered.from_worker.lower()
+
+
+def test_issue_sender_unknown_worker_raises():
+    """issue_sender raises for a worker_id not registered in this graph.
+    Fail-CLOSED: no silent success for unknown workers."""
+    bus = AgentMessageBus(graph_id="g-bs6", op_id="op-bs6")
+    bus.register_worker("w1")
+    with pytest.raises(ValueError, match="not a registered member"):
+        bus.issue_sender("ghost_worker")
+
+
+def test_issue_sender_commander_id_not_registered_raises():
+    """issue_sender for 'fleet_commander' (never registered) raises.
+    A caller cannot obtain a BoundSender for an unregistered authority id."""
+    bus = AgentMessageBus(graph_id="g-bs7", op_id="op-bs7")
+    bus.register_worker("w1")
+    with pytest.raises(ValueError, match="not a registered member"):
+        bus.issue_sender("fleet_commander")
+
+
+def test_bound_sender_signs_only_as_bound_worker_key():
+    """The BoundSender for w1 signs messages with w1's derived key only.
+    Ingress re-verifies against the CLAIMED sender's key -> passes for w1."""
+    bus = AgentMessageBus(graph_id="g-bs8", op_id="op-bs8")
+    bus.register_worker("w1")
+    bus.register_worker("w2")
+    sender = bus.issue_sender("w1")
+    result = sender.send(to_worker="w2", kind=MessageKind.STATUS, payload={})
+    assert result is True
+    # Delivered -> ingress passed -> signature verified against w1's key.
+    assert bus.delivered == 1
+    assert bus.dropped == {}
+
+
+def test_existing_peer_forgery_still_dropped(yield_spy):
+    """Regression: the existing insider peer-forgery test still holds after
+    the BoundSender refactor. w1 signing with its own key but claiming w2 ->
+    identity_forgery."""
+    bus, keys = _insider_bus()
+    forged = AgentMessage(
+        msg_id="reg-forge",
+        from_worker="w2",
+        to_worker="w3",
+        kind=MessageKind.FINDING,
+        payload={"note": "still forged"},
+    )
+    forged.signature = sign_with_key(keys["w1"], forged)
+    assert bus.send(forged) is False
+    assert any(r == "identity_forgery" for _, r in yield_spy)
+
+
+def test_existing_commander_forgery_still_dropped(yield_spy):
+    """Regression: the existing insider Commander-forgery test still holds.
+    w1 signing with its own key but claiming fleet_commander -> DROP."""
+    bus, keys = _insider_bus()
+    forged = AgentMessage(
+        msg_id="reg-cmd",
+        from_worker="fleet_commander",
+        to_worker="w2",
+        kind=MessageKind.STATUS,
+        payload={"directive": "phase go"},
+    )
+    forged.signature = sign_with_key(keys["w1"], forged)
+    assert bus.send(forged) is False
+    assert any(r in ("identity_forgery", "bad_signature", "spoofed_sender")
+               for _, r in yield_spy)

@@ -54,7 +54,7 @@ def test_spoof_fleet_commander_dropped_and_yield(yield_spy):
     # A validly-signed message (rogue holds nothing — but even WITH a valid
     # signature) claiming from_worker="fleet_commander" must DROP: the sender
     # is not a registered member of this graph.
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="fleet_commander",
         to_worker="w1",
         kind=MessageKind.STATUS,
@@ -67,7 +67,7 @@ def test_spoof_fleet_commander_dropped_and_yield(yield_spy):
 
 def test_spoof_commander_variant_id_dropped(yield_spy):
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="commander-007",
         to_worker="w1",
         kind=MessageKind.FINDING,
@@ -88,7 +88,7 @@ def test_forged_signature_wrong_secret_dropped(yield_spy):
     forger.register_worker("w1")
     forger.register_worker("w2")
     # Sign with the forger's secret, then inject into the legit bus.
-    forged = forger.make_signed(
+    forged = forger._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": "v"},
     )
     assert legit.send(forged) is False
@@ -98,7 +98,7 @@ def test_forged_signature_wrong_secret_dropped(yield_spy):
 
 def test_tampered_payload_after_signing_dropped(yield_spy):
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING,
         payload={"note": "ok"},
     )
@@ -131,7 +131,7 @@ def test_cross_graph_replay_dropped(yield_spy):
     graph_b.register_worker("w1")
     graph_b.register_worker("w2")
     # Validly signed in graph A.
-    msg = graph_a.make_signed(
+    msg = graph_a._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": "v"},
     )
     assert graph_a.send(msg) is True
@@ -162,7 +162,7 @@ def test_cross_graph_replay_dropped(yield_spy):
 )
 def test_context_elevation_injection_dropped(yield_spy, payload):
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING, payload=payload,
     )
     assert bus.send(msg) is False, f"elevation payload not dropped: {payload}"
@@ -189,7 +189,7 @@ def test_delivered_message_is_data_only():
     cage = _Cage()
     before = (cage.allowed_tools, cage.mutation_budget, cage.scope)
     # A perfectly legit FINDING. Its payload is just data.
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING,
         payload={"observation": "module X imports Y"},
     )
@@ -215,7 +215,7 @@ def test_delivered_message_is_data_only():
 def test_oversized_payload_rejected_no_crash():
     bus = _bus()
     huge = {"blob": "x" * (200 * 1024)}  # > default 64KiB cap
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING, payload=huge,
     )
     assert bus.send(msg) is False
@@ -242,7 +242,7 @@ def test_deeply_nested_payload_no_crash():
     for _ in range(200):
         current["next"] = {}
         current = current["next"]
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING, payload=nested,
     )
     # Deep nesting is treated as hostile (elevation scan depth guard) -> drop,
@@ -269,7 +269,7 @@ def test_flood_bounded_no_crash():
     bus.register_worker("w2")
     delivered = 0
     for i in range(10000):
-        msg = bus.make_signed(
+        msg = bus._make_signed_internal(
             from_worker="w1", to_worker="w2", kind=MessageKind.STATUS,
             payload={"i": i}, msg_id=f"m{i}",
         )
@@ -290,7 +290,7 @@ def test_flood_bounded_no_crash():
 
 def test_unregistered_sender_dropped(yield_spy):
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="ghost", to_worker="w1", kind=MessageKind.STATUS, payload={"k": 1},
     )
     assert bus.send(msg) is False
@@ -305,12 +305,12 @@ def test_unregistered_sender_dropped(yield_spy):
 
 def test_replay_consumed_id_deduped():
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": 1},
         msg_id="dup-id",
     )
     assert bus.send(msg) is True
-    replay = bus.make_signed(
+    replay = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": 1},
         msg_id="dup-id",
     )
@@ -325,7 +325,7 @@ def test_replay_consumed_id_deduped():
 
 def test_delivered_payload_sanitized():
     bus = _bus()
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING,
         payload={"log": "line1\x00\x07line2", "key": "sk-" + "A" * 30},
     )

@@ -19,6 +19,15 @@ Security model -- Zero-Trust, fail-CLOSED, advisory-only:
       never holds). The bus authenticates INDIVIDUAL identity, not just
       membership: a prompt-injected legitimate member CANNOT forge a message
       as a peer or as the Commander.
+    * **Structural sender-identity lock (Phase 1c+).** Workers MUST use the
+      :meth:`AgentMessageBus.issue_sender` factory to obtain a
+      :class:`BoundSender` locked to their own worker_id. ``BoundSender.send()``
+      has NO ``from_worker`` parameter -- the caller CANNOT override who they
+      are sending as. The forgery-capable primitive ``_make_signed_internal``
+      (which CAN sign as any registered id because the bus holds the graph
+      secret) is underscore-private and reserved for internal bus use only
+      (e.g. the ``request()`` helper). Workers that hold only the bus object
+      should use ``issue_sender()``, not ``_make_signed_internal``.
     * Every ingress message passes a Zero-Trust gate: it re-derives the CLAIMED
       ``from_worker``'s per-worker key from the graph secret and verifies the
       HMAC signature against THAT key (``hmac.compare_digest``). A message
@@ -406,6 +415,68 @@ def _emit_yield(op_id: str, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# bound, identity-locked sender capability
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BoundSender:
+    """A sender capability locked to a single worker_id.
+
+    Obtained via :meth:`AgentMessageBus.issue_sender`. The ``send()`` method
+    has NO ``from_worker`` parameter -- the caller CANNOT override who they are
+    sending as. Messages are always stamped ``from_worker = <bound_worker_id>``
+    and signed with THAT worker's derived key only (NOT the graph secret and
+    NOT ``_make_signed_internal``).
+
+    This is the STRUCTURAL sender-identity lock: a worker holding a BoundSender
+    for itself has NO API path to send as a peer or as the Commander.
+
+    Workers MUST use this interface rather than calling
+    ``_make_signed_internal`` directly (which is bus-internal).
+    """
+
+    _worker_id: str
+    _worker_key: bytes
+    _bus_send: Any  # callable: AgentMessageBus.send
+
+    def send(
+        self,
+        to_worker: str,
+        kind: MessageKind,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        correlation_id: str = "",
+        ttl_s: float = 0.0,
+        msg_id: Optional[str] = None,
+    ) -> bool:
+        """Build and deliver a message FROM the bound worker.
+
+        ``from_worker`` is always ``self._worker_id`` -- there is no parameter
+        to override it. The message is signed with the bound worker's own
+        derived key. The bus ingress re-verifies the signature on delivery.
+
+        Returns True iff the message was delivered; False on any drop (same
+        semantics as :meth:`AgentMessageBus.send`). NEVER raises.
+        """
+        try:
+            import secrets as _secrets
+            msg = AgentMessage(
+                msg_id=msg_id or _secrets.token_hex(8),
+                from_worker=self._worker_id,
+                to_worker=str(to_worker),
+                kind=kind,
+                payload=dict(payload or {}),
+                correlation_id=str(correlation_id),
+                ttl_s=ttl_s,
+            )
+            msg.signature = sign_with_key(self._worker_key, msg)
+            return self._bus_send(msg)
+        except Exception:  # noqa: BLE001 -- fail-CLOSED, never raises
+            return False
+
+
+# ---------------------------------------------------------------------------
 # the Zero-Trust per-graph bus
 # ---------------------------------------------------------------------------
 
@@ -488,6 +559,35 @@ class AgentMessageBus:
     def members(self) -> Tuple[str, ...]:
         return tuple(sorted(self._members))
 
+    def issue_sender(self, worker_id: str) -> "BoundSender":
+        """Return a :class:`BoundSender` locked to ``worker_id``.
+
+        The returned object's ``send()`` method has NO ``from_worker``
+        parameter -- the caller CANNOT override who they are sending as.
+        This is the STRUCTURAL sender-identity lock: a BoundSender for w1
+        has NO API path to send as w2 or ``fleet_commander``.
+
+        Raises ``ValueError`` if ``worker_id`` is not a registered member of
+        this graph (fail-CLOSED: no silent success for unknown workers). Also
+        raises if the bus is destroyed.
+        """
+        if self._destroyed:
+            raise ValueError(
+                "[AgentBus] issue_sender(" + repr(worker_id) + "): bus is destroyed"
+            )
+        wid = str(worker_id)
+        if wid not in self._members:
+            raise ValueError(
+                "[AgentBus] issue_sender(" + repr(worker_id) + "): " + repr(wid) +
+                " is not a registered member of this graph -- register_worker() first"
+            )
+        worker_key = self._derive_worker_key(wid)
+        return BoundSender(
+            _worker_id=wid,
+            _worker_key=worker_key,
+            _bus_send=self.send,
+        )
+
     # -- per-worker identity (the graph secret NEVER leaves the bus) ------
 
     def _derive_worker_key(self, worker_id: str) -> bytes:
@@ -506,7 +606,7 @@ class AgentMessageBus:
 
     # -- signing ----------------------------------------------------------
 
-    def make_signed(
+    def _make_signed_internal(
         self,
         *,
         from_worker: str,
@@ -519,15 +619,13 @@ class AgentMessageBus:
     ) -> AgentMessage:
         """Build a message and stamp it with the FROM_WORKER's per-worker key.
 
-        Convenience for a legitimate in-graph sender stamping its OWN identity:
-        the signature is computed under ``HMAC(graph_secret, from_worker)``, the
-        same key that worker received at registration. A caller using this to
-        claim a foreign ``from_worker`` produces a signature that DOES verify at
-        ingress (because the bus holds the graph secret) -- so this helper is
-        ONLY for the bus's own internal/legit use (e.g. ``request()``); it is
-        NOT exposed as a "sign as anyone" primitive to workers. A worker signs
-        externally with :func:`sign_with_key` using ITS OWN returned key, and
-        cannot derive another id's key.
+        INTERNAL BUS USE ONLY. This primitive CAN sign as any registered
+        identity because the bus holds the graph secret -- that is why it is
+        underscore-private. Callers outside the bus MUST use
+        :meth:`issue_sender` to obtain a :class:`BoundSender` that is
+        structurally locked to a single worker_id (no ``from_worker`` override
+        is possible via the BoundSender API). ``_make_signed_internal`` is used
+        by the bus's own ``request()`` helper and similar internal plumbing.
         """
         msg = AgentMessage(
             msg_id=msg_id or secrets.token_hex(8),
@@ -811,7 +909,7 @@ class AgentMessageBus:
         that polls ``response_for``; this sync form does not sleep.
         """
         corr = correlation_id or secrets.token_hex(8)
-        msg = self.make_signed(
+        msg = self._make_signed_internal(
             from_worker=from_worker,
             to_worker=to_worker,
             kind=MessageKind.CLARIFICATION_REQUEST,

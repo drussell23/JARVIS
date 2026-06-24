@@ -40,7 +40,7 @@ def test_legit_send_and_subscribe():
     bus = _make_bus()
     bus.register_worker("w1")
     bus.register_worker("w2")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1",
         to_worker="w2",
         kind=MessageKind.FINDING,
@@ -60,7 +60,7 @@ def test_artifact_handoff_roundtrip():
     bus = _make_bus()
     bus.register_worker("producer")
     bus.register_worker("consumer")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="producer",
         to_worker="consumer",
         kind=MessageKind.ARTIFACT_HANDOFF,
@@ -89,7 +89,7 @@ def test_request_response_roundtrip():
     assert len(answerer_inbox) == 1
     assert answerer_inbox[0].kind is MessageKind.CLARIFICATION_REQUEST
     # Answer comes back bound to the same correlation id.
-    reply = bus.make_signed(
+    reply = bus._make_signed_internal(
         from_worker="answerer",
         to_worker="asker",
         kind=MessageKind.CLARIFICATION_RESPONSE,
@@ -104,7 +104,7 @@ def test_request_response_roundtrip():
 def test_message_to_unknown_recipient_dropped_sender_never_blocks():
     bus = _make_bus()
     bus.register_worker("w1")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1",
         to_worker="nonexistent",
         kind=MessageKind.STATUS,
@@ -119,7 +119,7 @@ def test_per_graph_teardown_destroys_bus():
     bus = _make_bus()
     bus.register_worker("w1")
     bus.register_worker("w2")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"x": 1}
     )
     assert bus.send(msg) is True
@@ -140,7 +140,7 @@ def test_per_graph_distinct_secrets():
     k1 = b1.register_worker("w")
     k2 = b2.register_worker("w")
     assert k1 and k2 and k1 != k2
-    m1 = b1.make_signed(from_worker="w", to_worker="w", kind=MessageKind.STATUS, payload={})
+    m1 = b1._make_signed_internal(from_worker="w", to_worker="w", kind=MessageKind.STATUS, payload={})
     # The signature minted in graph A does NOT verify in graph B.
     assert b2._verify_signature(m1) is False
 
@@ -149,7 +149,7 @@ def test_metrics_snapshot_no_content():
     bus = _make_bus()
     bus.register_worker("w1")
     bus.register_worker("w2")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.FINDING,
         payload={"secret_note": "do not leak"},
     )
@@ -165,13 +165,13 @@ def test_dedup_replay_consumed_id():
     bus = _make_bus()
     bus.register_worker("w1")
     bus.register_worker("w2")
-    msg = bus.make_signed(
+    msg = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": "v"},
         msg_id="fixed-id",
     )
     assert bus.send(msg) is True
     # Re-send the exact same msg (same id) -> deduped.
-    msg2 = bus.make_signed(
+    msg2 = bus._make_signed_internal(
         from_worker="w1", to_worker="w2", kind=MessageKind.STATUS, payload={"k": "v"},
         msg_id="fixed-id",
     )
