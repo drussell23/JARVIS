@@ -34,6 +34,10 @@ from backend.core.ouroboros.governance.saga.trinity_compose_generator import (
     serialize_compose,
     assert_sinkhole,
 )
+from backend.core.ouroboros.governance.saga.trinity_prebake_manager import (
+    PrebakeResult,
+    prebake_if_needed,
+)
 from backend.core.ouroboros.governance.saga.trinity_handshake_suite import (
     HandshakeHttpRunner,
     HandshakeResult,
@@ -133,6 +137,7 @@ class TrinityDockerRunner:
         jarvis_url: str = "http://jarvis:8091",
         prime_url: str = "http://prime:8000",
         reactor_url: str = "http://reactor:8090",
+        dockerfile_dir: str = "deploy/sandbox",
     ) -> None:
         self._jarvis_root = jarvis_root
         self._prime_root = prime_root
@@ -145,6 +150,7 @@ class TrinityDockerRunner:
         self._jarvis_url = jarvis_url
         self._prime_url = prime_url
         self._reactor_url = reactor_url
+        self._dockerfile_dir = dockerfile_dir
 
     # ------------------------------------------------------------------ #
     # Compose lifecycle (each behind the injectable cmd boundary)
@@ -187,16 +193,52 @@ class TrinityDockerRunner:
         mutated_endpoints: Sequence[MutatedEndpoint],
         overlay_writer: Optional[Callable[[str], str]] = None,
     ) -> TrinityBootVerdict:
-        """Generate -> sinkhole-assert -> up -> health-gate -> handshake -> down.
+        """Pre-flight bake -> generate -> sinkhole-assert -> up -> health-gate ->
+        handshake -> down.
+
+        The Pre-Flight Cache Manager runs FIRST (BEFORE generate + up): in a
+        WAN-connected phase it ensures a hash-tagged image exists per repo
+        (deps already baked in), so the air-gapped (``internal: true``) boot can
+        run the cached images with NO pip-at-boot. WAN-bake and air-gap-run are
+        strictly separated: baking is done here, the air-gapped network is only
+        entered at ``up``.
+
+        Fail-CLOSED: if prebake is enabled but a bake FAILS, we abort to FRACTURE
+        and NEVER ``up`` the air-gapped compose with a missing image. If prebake
+        is disabled, the generator uses its existing base-image path (existing
+        behavior, byte-identical).
 
         NEVER raises (fail-CLOSED). ``down -v`` ALWAYS runs in ``finally``.
         """
+        # 0. PRE-FLIGHT BAKE (WAN-connected, BEFORE the air-gap).
+        prebake: PrebakeResult = await prebake_if_needed(
+            jarvis_root=self._jarvis_root,
+            prime_root=self._prime_root,
+            reactor_root=self._reactor_root,
+            runner=self._cmd_runner,
+            dockerfile_dir=self._dockerfile_dir,
+        )
+        if not prebake.ok:
+            # Bake failed -> fail-CLOSED: do NOT enter the air-gapped boot with a
+            # missing image. FRACTURE.
+            return TrinityBootVerdict(
+                passed=False,
+                fracture=True,
+                reason="prebake_failed:%s" % prebake.reason,
+                sinkhole_ok=False,
+            )
+        # Skipped (disabled) -> images empty -> generator uses its base-image
+        # path (existing behavior). Otherwise the cached image map is passed so
+        # the air-gapped boot uses the pre-baked images (no pip-at-boot).
+        images = None if prebake.skipped else dict(prebake.images)
+
         compose = generate_trinity_compose(
             jarvis_root=self._jarvis_root,
             prime_root=self._prime_root,
             reactor_root=self._reactor_root,
             mock_port=self._mock_port,
             base_image=self._base_image,
+            images=images,
         )
 
         # Static sinkhole guarantee BEFORE any boot (fail-CLOSED).

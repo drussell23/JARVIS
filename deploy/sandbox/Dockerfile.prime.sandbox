@@ -1,0 +1,36 @@
+# Dockerfile.prime.sandbox -- J-Prime (Mind) pre-baked Trinity sandbox image.
+#
+# TEMPLATE for the Pre-Flight Cache Manager's WAN-connected BAKE phase.
+# Built via:  docker build -f deploy/sandbox/Dockerfile.prime.sandbox -t <tag> <prime-root>
+# Build CONTEXT = the J-Prime repo root (JARVIS_PRIME_REPO_PATH); the Dockerfile
+# stays JARVIS-side (never a cross-repo write into the sibling).
+#
+# Deps pip-installed HERE, WAN-connected, BEFORE the air-gapped network is
+# entered. The hash-tagged image carries them -- no pip-at-boot on the sinkhole.
+FROM python:3.11-slim
+
+# curl is required by the compose healthcheck (curl -f .../health).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build context = the J-Prime repo root.
+COPY . /app
+
+# Install the repo's deps in the WAN bake phase. requirements.txt preferred;
+# fall back to `pip install .` for a pyproject-only repo. Fail-CLOSED: install
+# failure fails the BUILD (no `|| true`) so a broken image is never cached.
+RUN if [ -f requirements.txt ]; then \
+        pip install --no-cache-dir -r requirements.txt; \
+    elif [ -f pyproject.toml ]; then \
+        pip install --no-cache-dir .; \
+    fi
+
+# J-Prime exposes /health on :8000.
+HEALTHCHECK --interval=5s --timeout=3s --retries=20 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# J-Prime's own server. The compose generator runs the same command in-network.
+CMD ["python", "run_server.py"]
