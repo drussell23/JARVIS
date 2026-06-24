@@ -755,6 +755,35 @@ class AgentMessageBus:
             _emit_yield(op_id, reason.value)
         return False
 
+    def _emit_message_edge(self, msg: AgentMessage, recipient: str) -> None:
+        """Best-effort swarm_message_sent telemetry -- the EDGE, NOT content.
+
+        Emits graph_id + from_worker + to_worker + kind + msg_id only; the
+        delivered payload (now quarantined) is NEVER surfaced. Fail-soft: a
+        broker exception / import failure NEVER propagates into ``send`` (the
+        bus must never be disturbed by telemetry). NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_swarm_message_sent,
+            )
+
+            kind_val = (
+                msg.kind.value if isinstance(msg.kind, MessageKind) else str(msg.kind)
+            )
+            publish_swarm_message_sent(
+                self.graph_id,
+                str(msg.from_worker or ""),
+                str(recipient or ""),
+                kind_val,
+                str(msg.msg_id or ""),
+            )
+        except Exception:  # noqa: BLE001 -- fail-soft, never disturbs the bus
+            logger.debug(
+                "[AgentBus] publish_swarm_message_sent failed (non-fatal)",
+                exc_info=True,
+            )
+
     def send(self, msg: AgentMessage) -> bool:
         """Zero-Trust ingress. Returns True iff the message was DELIVERED.
 
@@ -871,6 +900,12 @@ class AgentMessageBus:
             # LRU -> a unique-correlation flood cannot OOM the response map).
             if msg.kind is MessageKind.CLARIFICATION_RESPONSE and msg.correlation_id:
                 self._record_response(msg.correlation_id, msg)
+
+            # Phase 1d -- swarm telemetry: emit the message EDGE (NOT content).
+            # Best-effort, fail-soft: telemetry NEVER affects the swarm. Only on
+            # a real delivery (here, post-admission); an evicted (inbox_full)
+            # message is still an edge that crossed, so we emit regardless.
+            self._emit_message_edge(msg, recipient)
             return True
         except Exception:  # noqa: BLE001 -- the bus NEVER crashes on a message.
             logger.debug("[AgentBus] send raised -> DROP (fail-closed)", exc_info=True)

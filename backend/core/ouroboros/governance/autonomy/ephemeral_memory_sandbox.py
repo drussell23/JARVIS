@@ -327,19 +327,49 @@ class EphemeralMemorySandbox:
             )
 
 
-def vaporize_quietly(sandbox: Optional[Any], *, force_gc: Optional[bool] = None) -> None:
+def vaporize_quietly(
+    sandbox: Optional[Any],
+    *,
+    force_gc: Optional[bool] = None,
+    graph_id: str = "",
+) -> None:
     """Vaporize a (possibly None / possibly-broken) sandbox, never raising.
 
     Fail-CLOSED helper for the executor ``finally`` block: an unreadable /
     None / non-sandbox object is treated as needs-vaporize and swallowed so the
     teardown path can never break the executor's guaranteed cleanup.
+
+    When ``graph_id`` is provided, emits a best-effort ``swarm_node_vaporized``
+    telemetry edge (graph_id + worker_id + turns_cleared) AFTER vaporization.
+    The emit is fail-soft: a broker/import failure NEVER disturbs teardown.
     """
     if sandbox is None:
         return
+    stats: Optional[Dict[str, Any]] = None
     try:
-        sandbox.vaporize(force_gc=force_gc)
+        stats = sandbox.vaporize(force_gc=force_gc)
     except Exception:  # noqa: BLE001 — teardown must never raise
         logger.warning(
             "[SwarmSandbox] vaporize raised (swallowed; treated as vaporized)",
             exc_info=True,
         )
+    # Best-effort vaporize telemetry (never disturbs teardown).
+    if graph_id:
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_swarm_node_vaporized,
+            )
+
+            worker_id = str(getattr(sandbox, "worker_id", "") or "")
+            turns_cleared = 0
+            if isinstance(stats, dict):
+                try:
+                    turns_cleared = int(stats.get("turns_cleared", 0) or 0)
+                except (TypeError, ValueError):
+                    turns_cleared = 0
+            publish_swarm_node_vaporized(str(graph_id), worker_id, turns_cleared)
+        except Exception:  # noqa: BLE001 — telemetry fail-soft
+            logger.debug(
+                "[SwarmSandbox] publish_swarm_node_vaporized failed (non-fatal)",
+                exc_info=True,
+            )

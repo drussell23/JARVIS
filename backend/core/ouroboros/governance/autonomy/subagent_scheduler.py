@@ -235,7 +235,10 @@ class GenerationSubagentExecutor:
                 from backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox import (
                     vaporize_quietly,
                 )
-                vaporize_quietly(_sandbox)
+                # Pass graph_id so vaporize emits the best-effort
+                # swarm_node_vaporized telemetry edge (fail-soft; never
+                # disturbs the finally-guaranteed teardown).
+                vaporize_quietly(_sandbox, graph_id=getattr(graph, "graph_id", ""))
 
     @staticmethod
     def _build_sandbox_for_unit(unit: WorkUnitSpec) -> Optional[Any]:

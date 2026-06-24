@@ -61,11 +61,28 @@ def route_for_shape(shape: WorkerShape) -> WorkerRoute:
 
 @dataclass
 class BuiltWorker:
-    """A constructed-but-not-yet-run worker: cage + prompt + route.
+    """A constructed-but-not-yet-run worker: cage + prompt + route + voice.
 
     ``backend`` is the ``ScopedToolBackend`` cage (allowlist + mutation
-    count gate). ``route`` is the capability path. ``dispatch`` lazily
-    resolves and invokes the right executor path.
+    count gate). ``route`` is the capability path.
+
+    **Sovereign Wiring (Phase 1d -- give workers voice).** When the swarm
+    message bus is enabled AND a bus is supplied to :meth:`SubagentFactory.build`,
+    the worker is granted:
+
+      * ``sender`` -- an identity-locked :class:`~.agent_message_bus.BoundSender`
+        (from ``bus.issue_sender(worker_id)``). The worker can do
+        artifact-handoff + clarification-request via ``sender.send(...)``. The
+        BoundSender has NO ``from_worker`` parameter -- the worker CANNOT send
+        as a peer / the Commander. The worker NEVER receives the bus object or
+        the graph secret -- only this capability locked to its own id.
+      * ``inbox`` -- the worker's bounded inbox deque (``bus.subscribe``). The
+        worker reads peer messages from here; a recipient-side reader MUST pass
+        each message's content through the Sentinel ingress filter
+        (``swarm_sentinel.epistemic_purity_filter``) BEFORE ingesting it.
+
+    When the bus is OFF (no bus supplied), ``sender`` + ``inbox`` are ``None``
+    and the worker stays silent exactly as Phase 1c -- byte-identical.
     """
 
     worker_id: str
@@ -75,6 +92,8 @@ class BuiltWorker:
     scope_paths: Tuple[str, ...]
     backend: Any              # ScopedToolBackend (the cage)
     context_budget_tokens: int
+    sender: Any = None        # BoundSender (identity-locked) | None when bus OFF
+    inbox: Any = None         # bounded inbox deque | None when bus OFF
 
     @property
     def allowed_tools(self) -> Tuple[str, ...]:
@@ -83,6 +102,11 @@ class BuiltWorker:
     @property
     def mutation_budget(self) -> int:
         return self.shape.mutation_budget
+
+    @property
+    def has_voice(self) -> bool:
+        """True iff this worker was granted a BoundSender (bus enabled)."""
+        return self.sender is not None
 
 
 class SubagentFactory:
@@ -148,12 +172,25 @@ class SubagentFactory:
         worker_id: str,
         goal: str,
         scope_paths: Sequence[str],
+        bus: Optional[Any] = None,
+        graph_id: str = "",
     ) -> BuiltWorker:
         """Build a :class:`BuiltWorker` from a synthesized shape.
 
         Constructs the ScopedToolBackend cage with the synthesized
         allowlist + budget, renders the worker system prompt, and computes
         the capability route. Never raises for a benign shape.
+
+        Sovereign Wiring (Phase 1d): when ``bus`` is supplied AND the swarm
+        message bus master gate is ON, the worker is registered on the bus and
+        granted an identity-locked :class:`BoundSender` (+ its inbox) so it can
+        coordinate with peers. The worker NEVER gets the bus object or the
+        graph secret -- only the BoundSender capability locked to its own id.
+        When ``bus`` is None OR the gate is OFF, ``sender``/``inbox`` stay None
+        and the worker is silent (byte-identical to Phase 1c).
+
+        Also emits a best-effort ``swarm_node_spawned`` telemetry edge when a
+        ``graph_id`` is known (topology only; fail-soft).
         """
         shape = worker_spec
         route = route_for_shape(shape)
@@ -166,12 +203,17 @@ class SubagentFactory:
             mutation_budget=shape.mutation_budget,
             read_only=shape.read_only,
         )
+
+        sender, inbox = self._wire_voice(bus, worker_id)
+
         logger.info(
             "[SubagentFactory] built worker=%s role=%r route=%s "
-            "tools=%s mutation_budget=%d read_only=%s ctx_budget=%d",
+            "tools=%s mutation_budget=%d read_only=%s ctx_budget=%d voice=%s",
             worker_id, shape.role, route.value, list(shape.allowed_tools),
             shape.mutation_budget, shape.read_only, shape.context_budget_tokens,
+            sender is not None,
         )
+        self._emit_spawn_telemetry(graph_id, worker_id, shape)
         return BuiltWorker(
             worker_id=worker_id,
             shape=shape,
@@ -180,7 +222,69 @@ class SubagentFactory:
             scope_paths=tuple(str(p) for p in scope_paths),
             backend=backend,
             context_budget_tokens=shape.context_budget_tokens,
+            sender=sender,
+            inbox=inbox,
         )
+
+    # -- Sovereign Wiring: give the worker a voice (Phase 1d) -------------
+
+    @staticmethod
+    def _wire_voice(bus: Optional[Any], worker_id: str) -> Tuple[Any, Any]:
+        """Register the worker on the bus + issue its BoundSender + inbox.
+
+        Returns ``(sender, inbox)`` or ``(None, None)`` when the bus is absent
+        OR the master gate is OFF. Fail-CLOSED: any wiring error -> silent
+        worker ``(None, None)`` (a worker without a sender simply cannot
+        coordinate -- it never gets a half-wired / forgeable capability).
+
+        The worker NEVER receives the bus object or the graph secret -- only
+        the identity-locked BoundSender (and its own bounded inbox).
+        """
+        if bus is None:
+            return (None, None)
+        try:
+            from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+                bus_enabled,
+            )
+
+            if not bus_enabled():
+                return (None, None)
+            # Register (idempotent) so issue_sender succeeds + the inbox exists.
+            bus.register_worker(worker_id)
+            sender = bus.issue_sender(worker_id)
+            inbox = bus.subscribe(worker_id)
+            return (sender, inbox)
+        except Exception:  # noqa: BLE001 -- fail-CLOSED -> silent worker
+            logger.debug(
+                "[SubagentFactory] voice wiring failed for worker=%s -> silent",
+                worker_id, exc_info=True,
+            )
+            return (None, None)
+
+    @staticmethod
+    def _emit_spawn_telemetry(
+        graph_id: str, worker_id: str, shape: WorkerShape
+    ) -> None:
+        """Best-effort swarm_node_spawned telemetry. Topology only. NEVER raises."""
+        if not graph_id:
+            return
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_swarm_node_spawned,
+            )
+
+            publish_swarm_node_spawned(
+                str(graph_id),
+                str(worker_id),
+                str(shape.role),
+                len(shape.allowed_tools),
+                bool(shape.read_only),
+            )
+        except Exception:  # noqa: BLE001 -- fail-soft
+            logger.debug(
+                "[SubagentFactory] publish_swarm_node_spawned failed (non-fatal)",
+                exc_info=True,
+            )
 
 
 class _NullToolBackend:

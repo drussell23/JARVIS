@@ -166,3 +166,92 @@ def test_built_worker_prompt_reflects_shape():
     assert "python-source mutator" in built.system_prompt
     assert "fix the bug" in built.system_prompt
     assert "read_only_mode = FALSE" in built.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Wiring (Phase 1d): BoundSender injection on/off (give them voice)
+# ---------------------------------------------------------------------------
+
+
+def _make_bus(graph_id: str = "g1"):
+    from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+        AgentMessageBus,
+    )
+
+    return AgentMessageBus(graph_id=graph_id)
+
+
+def test_no_bus_means_no_voice_byte_identical_1c():
+    """No bus supplied -> sender/inbox are None (silent worker, as Phase 1c)."""
+    factory = SubagentFactory()
+    built = factory.build(
+        _read_only_shape(), worker_id="w1", goal="analyze", scope_paths=["a.py"],
+    )
+    assert built.sender is None
+    assert built.inbox is None
+    assert built.has_voice is False
+
+
+def test_bus_supplied_but_gate_off_means_no_voice(monkeypatch):
+    """Even with a bus, the master gate OFF -> no BoundSender (byte-identical)."""
+    monkeypatch.setenv("JARVIS_SWARM_MESSAGE_BUS_ENABLED", "false")
+    factory = SubagentFactory()
+    bus = _make_bus()
+    built = factory.build(
+        _read_only_shape(), worker_id="w1", goal="analyze",
+        scope_paths=["a.py"], bus=bus, graph_id="g1",
+    )
+    assert built.sender is None
+    assert built.inbox is None
+    assert built.has_voice is False
+
+
+def test_bus_on_grants_identity_locked_boundsender(monkeypatch):
+    """Gate ON + bus -> worker gets an identity-locked BoundSender + inbox.
+
+    The worker NEVER gets the bus object or the graph secret -- only the
+    BoundSender locked to its own id (no from_worker override possible)."""
+    monkeypatch.setenv("JARVIS_SWARM_MESSAGE_BUS_ENABLED", "true")
+    from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+        BoundSender,
+    )
+
+    factory = SubagentFactory()
+    bus = _make_bus()
+    built = factory.build(
+        _read_only_shape(), worker_id="w1", goal="analyze",
+        scope_paths=["a.py"], bus=bus, graph_id="g1",
+    )
+    assert built.has_voice is True
+    assert isinstance(built.sender, BoundSender)
+    # The sender is locked to THIS worker's id -- the worker never holds the
+    # bus object or the graph secret.
+    assert built.sender._worker_id == "w1"
+    assert built.sender is not bus
+    # The BoundSender.send signature has NO from_worker parameter (structural
+    # identity lock).
+    import inspect
+
+    params = inspect.signature(built.sender.send).parameters
+    assert "from_worker" not in params
+    # The inbox is the worker's bounded deque on the bus.
+    assert built.inbox is bus.subscribe("w1")
+
+
+def test_boundsender_actually_delivers_to_a_peer(monkeypatch):
+    """The granted BoundSender can deliver an artifact-handoff to a peer."""
+    monkeypatch.setenv("JARVIS_SWARM_MESSAGE_BUS_ENABLED", "true")
+    from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+        MessageKind,
+    )
+
+    factory = SubagentFactory()
+    bus = _make_bus()
+    bus.register_worker("w2")  # the peer recipient
+    built = factory.build(
+        _read_only_shape(), worker_id="w1", goal="analyze",
+        scope_paths=["a.py"], bus=bus, graph_id="g1",
+    )
+    ok = built.sender.send("w2", MessageKind.ARTIFACT_HANDOFF, {"artifact": "x"})
+    assert ok is True
+    assert len(bus.subscribe("w2")) == 1
