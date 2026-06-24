@@ -973,6 +973,10 @@ class OperationContext:
     strategic_memory_fact_ids: Tuple[str, ...] = ()
     strategic_memory_prompt: str = ""
     strategic_memory_digest: str = ""
+    # Sovereign Cross-Repo Mutator G1 (2026-06-23): the Oracle-traced cross-repo
+    # blast-radius prompt block, stamped at GENERATE when ctx.cross_repo and the
+    # master arming switch is ON. Empty (default) -> byte-identical legacy.
+    cross_repo_blast_prompt: str = ""
     terminal_reason_code: str = ""
     # Slice 160 — non-fatal infrastructure-hook warning (e.g. pip install failed under
     # fail-soft). Carried forward so the op reaches the governance floor / COMPLETE and
