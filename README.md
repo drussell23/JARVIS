@@ -4,6 +4,8 @@
 
 **The Body of the Trinity AGI OS**
 
+> 📜 **[The Trinity Manifesto](./TRINITY_MANIFESTO.md)** — the canonical architecture: the Body/Mind/Nerves boundaries, the RSI Flywheel, and the absolute safety laws (the Immutable Orange Protocol + the Air-Gapped Sandbox).
+
 **Author:** [Derek J. Russell](https://github.com/drussell23) -- RSI/AGI Researcher & Trinity Architect
 
 JARVIS is the control plane and execution layer of a three-repository AGI ecosystem. It owns macOS integration, screen vision, voice biometric authentication, focus-preserving UI automation, and the 102K-line unified supervisor that boots and coordinates the entire stack with a single command. All model references are resolved at runtime from a shared YAML policy -- zero hardcoded model names remain anywhere in the interactive or governance pipelines.
