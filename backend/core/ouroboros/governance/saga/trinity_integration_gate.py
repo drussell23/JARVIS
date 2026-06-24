@@ -681,6 +681,108 @@ async def run_trinity_sandbox_gate(
                 )
 
 
+# --------------------------------------------------------------------------- #
+# REAL sandbox gate -- drives the generated 3-repo compose + handshake suite
+# --------------------------------------------------------------------------- #
+async def run_real_trinity_sandbox_gate(
+    *,
+    op_id: str,
+    jarvis_root: str,
+    prime_root: str,
+    reactor_root: str,
+    mutated_endpoints: Any,
+    http_runner: Any,
+    mock_port: int = 9900,
+    base_image: str = "python:3.11-slim",
+    cmd_runner: Optional[Any] = None,
+    health_checker: Optional[Any] = None,
+    overlay_writer: Optional[Any] = None,
+) -> SandboxVerdict:
+    """Production G2 path: REAL air-gapped 3-repo Trinity sandbox.
+
+    Replaces the simulated overlay path: generates the real compose
+    (``trinity_compose_generator``), drives ``TrinityDockerRunner`` (up ->
+    health-gate -> handshake suite -> teardown-always), and maps the boot
+    verdict onto :class:`SandboxVerdict`.
+
+    The roots come from ``RepoRegistry.from_env()`` at the call site (no
+    hardcoded paths). Fail-CLOSED: any fracture emits the SOVEREIGN YIELD.
+    When the gate flag is OFF, returns a no-op pass (the surrounding cross-repo
+    path is itself master-gated OFF).
+    """
+    if not gate_enabled():
+        return SandboxVerdict(
+            passed=True,
+            fracture=False,
+            reason="gate_disabled",
+            air_gapped=False,
+            handshake_ok=False,
+            containers=(),
+        )
+
+    # Lazy import to keep this module import-clean without the compose deps.
+    from backend.core.ouroboros.governance.saga.trinity_docker_runner import (  # noqa: PLC0415
+        TrinityDockerRunner,
+    )
+
+    runner = TrinityDockerRunner(
+        jarvis_root=jarvis_root,
+        prime_root=prime_root,
+        reactor_root=reactor_root,
+        http_runner=http_runner,
+        mock_port=mock_port,
+        base_image=base_image,
+        cmd_runner=cmd_runner,
+        health_checker=health_checker,
+    )
+
+    async def _drive() -> SandboxVerdict:
+        boot = await runner.run(
+            mutated_endpoints=mutated_endpoints,
+            overlay_writer=overlay_writer,
+        )
+        if boot.fracture or not boot.passed:
+            _emit_fracture(op_id)
+        return SandboxVerdict(
+            passed=boot.passed,
+            fracture=boot.fracture,
+            reason=boot.reason,
+            air_gapped=boot.sinkhole_ok,
+            handshake_ok=bool(boot.handshake and boot.handshake.passed),
+            containers=("jarvis", "prime", "reactor", EGRESS_MOCK_SERVICE),
+        )
+
+    try:
+        return await asyncio.wait_for(_drive(), timeout=_timeout_s())
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[TrinitySandboxGate] real sandbox timed out after %ss -> FRACTURE",
+            _timeout_s(),
+        )
+        _emit_fracture(op_id)
+        return SandboxVerdict(
+            passed=False,
+            fracture=True,
+            reason="real_sandbox_timeout",
+            air_gapped=False,
+            handshake_ok=False,
+            containers=(),
+        )
+    except Exception as exc:  # fail-CLOSED
+        logger.warning(
+            "[TrinitySandboxGate] real sandbox error -> FRACTURE: %s", exc, exc_info=True
+        )
+        _emit_fracture(op_id)
+        return SandboxVerdict(
+            passed=False,
+            fracture=True,
+            reason="real_sandbox_error:%s" % exc,
+            air_gapped=False,
+            handshake_ok=False,
+            containers=(),
+        )
+
+
 def _write_overlay(
     overlay_yaml: str, overlay_writer: Optional[Any], candidate_root: str
 ) -> str:
