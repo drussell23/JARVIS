@@ -471,26 +471,16 @@ def emit_sovereign_yield(
     except Exception:  # pragma: no cover
         pass
 
-    # Best-effort SSE event — lazy import so the module can be used without
+    # Best-effort SSE event -- lazy import so the module can be used without
     # the full SSE broker stack loaded.
+    # Command Node Phase 1 (2026-06-23): upgraded to use the dedicated
+    # publish_sovereign_yield helper (EVENT_TYPE_SOVEREIGN_YIELD is now in
+    # _VALID_EVENT_TYPES so the event is no longer silently dropped).
+    _yield_reason = reason or tier
     try:
         from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: PLC0415
-            publish_task_event,
+            publish_sovereign_yield as _pub_yield,
         )
-        _payload = {
-            "lineage_id": lineage_id,
-            "ratio": ratio,
-            "consecutive_stalls": consecutive_stalls,
-            "parent_chars": parent_chars,
-            "child_chars": child_chars,
-            "tier": tier,
-        }
-        if reason:
-            _payload["reason"] = reason
-        publish_task_event(
-            "sovereign_yield",
-            op_id,
-            _payload,
-        )
-    except Exception:  # pragma: no cover — fail-soft, SSE stack optional
+        _pub_yield(op_id, _yield_reason)
+    except Exception:  # pragma: no cover -- fail-soft, SSE stack optional
         pass

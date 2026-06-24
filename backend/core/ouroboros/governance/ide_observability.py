@@ -487,6 +487,14 @@ class IDEObservabilityRouter:
             "/observability/repair-tree/branch/{ref}",
             self._handle_repair_tree_by_ref,
         )
+        # Sovereign Command Node Phase 1 (2026-06-23) -- read-only blast-radius
+        # projection for a given op_id via oracle.get_blast_radius.
+        # Authority-free: lazy-imports oracle only; no orchestrator/policy/
+        # change_engine imports anywhere in this module.
+        app.router.add_get(
+            "/observability/blast-radius/{op_id}",
+            self._handle_blast_radius,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -4317,6 +4325,77 @@ class IDEObservabilityRouter:
             scheduler=self._scheduler,
             git_worktree_paths=paths,
         )
+
+
+    async def _handle_blast_radius(self, request: "web.Request") -> Any:
+        """GET /observability/blast-radius/{op_id} -- read-only blast-radius
+        projection for a given op_id.
+
+        Authority-free: lazy-imports only ``backend.core.ouroboros.oracle``
+        (read-only call-graph oracle). No orchestrator / policy / change_engine
+        imports. Follows identical security posture to all other GET endpoints:
+        ide_observability_enabled() gate + rate-limit + CORS + no-store.
+
+        Response shape::
+
+            {
+              "schema_version": "1.0",
+              "op_id": "op-abc123",
+              "source": "jarvis:backend/core/.../foo.py",
+              "directly_affected": ["jarvis:...", ...],
+              "transitively_affected": ["jarvis:...", ...],
+              "broken_imports": [["jarvis:...", "import_name"], ...],
+              "broken_calls": [["jarvis:...", "call_name"], ...],
+              "total_affected": 7,
+              "risk_level": "low" | "medium" | "high" | "critical" | "unknown"
+            }
+
+        Returns 404 (with empty lists) when the op_id is not found in the
+        oracle graph -- the oracle returns an empty BlastRadius with
+        risk_level="unknown" for unknown identifiers.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        op_id = request.match_info.get("op_id", "")
+        if not op_id or not _OP_ID_RE.match(op_id):
+            return self._error_response(
+                request, 400, "blast_radius.invalid_op_id",
+            )
+        try:
+            # Lazy import avoids heavy oracle startup at module-load time.
+            # Authority-invariant: oracle is read-only; it never triggers
+            # orchestrator / policy / change_engine actions.
+            from backend.core.ouroboros import oracle as _oracle_mod  # noqa: PLC0415
+            _oracle = _oracle_mod.get_oracle()
+            report = _oracle.get_blast_radius(op_id)
+            payload = report.to_dict()
+            found = payload.get("risk_level", "unknown") != "unknown"
+        except Exception:  # noqa: BLE001 -- empty rather than 500
+            logger.debug(
+                "[IDEObservability] blast_radius projection failed op=%s",
+                op_id,
+                exc_info=True,
+            )
+            payload = {
+                "source": "",
+                "directly_affected": [],
+                "transitively_affected": [],
+                "broken_imports": [],
+                "broken_calls": [],
+                "total_affected": 0,
+                "risk_level": "unknown",
+            }
+            found = False
+        payload["op_id"] = op_id
+        status = 200 if found else 404
+        return self._json_response(request, status, payload)
+
 
 
 
