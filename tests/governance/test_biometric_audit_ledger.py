@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from backend.core.ouroboros.governance.command_node import (
     biometric_audit_ledger as al,
 )
@@ -139,3 +141,45 @@ def test_audio_sha256_present_no_raw_audio(tmp_path):
     rec = json.loads(content.splitlines()[0])
     assert "audio" not in rec
     assert "audio_sha256" in rec
+
+
+# ===========================================================================
+# M2 -- AuditWriteError and raise_on_write_failure tests
+# ===========================================================================
+
+
+def test_append_raise_on_write_failure_raises_on_bad_path(tmp_path):
+    """M2: raise_on_write_failure=True on a bad path raises AuditWriteError."""
+    bad_parent = tmp_path / "afile"
+    bad_parent.write_text("x")
+    led = al.BiometricAuditLedger(path=bad_parent / "sub" / "audit.jsonl")
+    with pytest.raises(al.AuditWriteError):
+        led.append(_record(), raise_on_write_failure=True)
+
+
+def test_append_raise_on_write_failure_false_does_not_raise_on_bad_path(tmp_path):
+    """M2: raise_on_write_failure=False (default) on a bad path does NOT raise
+    (preserves original fail-soft behavior)."""
+    bad_parent = tmp_path / "afile"
+    bad_parent.write_text("x")
+    led = al.BiometricAuditLedger(path=bad_parent / "sub" / "audit.jsonl")
+    # Must not raise; returns a record dict.
+    r = led.append(_record(), raise_on_write_failure=False)
+    assert r is not None
+
+
+def test_append_raise_on_write_failure_true_succeeds_on_valid_path(tmp_path):
+    """M2: raise_on_write_failure=True on a valid path succeeds and returns
+    a record with record_hash."""
+    led = _ledger(tmp_path)
+    r = led.append(_record(), raise_on_write_failure=True)
+    assert r is not None
+    assert r["record_hash"]
+    assert led.verify_chain() is True
+
+
+def test_audit_write_error_is_exported():
+    """M2: AuditWriteError is in __all__ and importable from the module."""
+    assert hasattr(al, "AuditWriteError")
+    assert al.AuditWriteError.__name__ == "AuditWriteError"
+    assert issubclass(al.AuditWriteError, Exception)

@@ -31,6 +31,34 @@ via an injectable ``approve_fn``.
 
 Audio is processed in-memory only. We retain ONLY ``sha256(audio)`` for
 the audit ledger. The raw audio is NEVER persisted.
+
+Security fixes (Phase 2 security review)
+=========================================
+M2 -- Audit-then-approve ordering:
+  The AUTHORIZED path now writes the audit record DURABLY (fsync confirmed)
+  BEFORE calling approve_fn. If the ledger append raises (AuditWriteError),
+  the authorization is REJECTED with reason "fail_closed:audit_unavailable"
+  and approve_fn is NEVER called. No merge can outrun its immutable record.
+  REJECTED outcomes stay fail-soft (best-effort audit, no blocking).
+
+M1 -- Real floor enforcement (kill the dead no-op):
+  ``_floor_at_least_approval`` now returns True ONLY when the cross-repo
+  governance floor is "approval_required" or "critical_elevation" (or
+  stricter). A relaxed floor (safe_auto / notify_apply / None / unknown)
+  returns False -> caller rejects with reason "fail_closed:floor_relaxed".
+  Any import/runtime error -> False (fail-CLOSED). This is defense in depth
+  beneath the Immutable Orange + jarvis-allowlist (which stay authoritative).
+
+H1 -- Teeth on the deferred ASR phrase-match guard:
+  ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH`` env var (default false).
+  Injectable ``phrase_match_fn`` hook to ``authorize_elevation`` (default
+  None). If the env var is true and no phrase_match_fn is wired ->
+  fail-CLOSED REJECT with reason
+  "fail_closed:phrase_match_required_but_unavailable". When provided,
+  phrase_match_fn must return truthy for an AUTHORIZED decision. A loud
+  one-time [SECURITY] warning is emitted when auth is enabled but
+  phrase-match is not required (replay defense relies solely on signal-level
+  anti-spoof/liveness without the H1 guard).
 """
 from __future__ import annotations
 
@@ -44,6 +72,25 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 logger = logging.getLogger("CommandNode.BiometricAuth")
+
+# --- one-time [SECURITY] warning for missing phrase-match --------------------
+_PHRASE_MATCH_WARNING_EMITTED = False
+
+
+def _maybe_emit_phrase_match_warning() -> None:
+    """Emit a loud one-time [SECURITY] warning when auth is enabled but
+    phrase-match is not required. Call from the first authorize_elevation
+    so the warning fires lazily (auth may not be enabled at import time)."""
+    global _PHRASE_MATCH_WARNING_EMITTED
+    if _PHRASE_MATCH_WARNING_EMITTED:
+        return
+    _PHRASE_MATCH_WARNING_EMITTED = True
+    logger.warning(
+        "[SECURITY] biometric replay defense relies solely on signal-level "
+        "anti-spoof/liveness; enable JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH "
+        "+ wire phrase_match_fn (Phase 3 ASR) before any attacker-reachable "
+        "(non-loopback) deployment."
+    )
 
 
 # --- env knobs (no hardcoding) --------------------------------------------
@@ -77,6 +124,16 @@ def is_command_node_auth_enabled() -> bool:
     ).strip().lower() == "true"
 
 
+def _require_phrase_match() -> bool:
+    """H1 -- ``JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH`` (default false).
+    When true, a wired ``phrase_match_fn`` must PASS as an additional AND
+    term in the biometric decision. Absence of a wired fn with this env
+    true -> fail-CLOSED REJECT."""
+    return os.environ.get(
+        "JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "false",
+    ).strip().lower() == "true"
+
+
 # --- the Immutable Orange floor (THE LAW) ---------------------------------
 # Mirror of critical_elevation._IMMUTABLE_ORANGE_REPOS. Inlined as a local
 # constant so this security module has a hard, import-independent floor
@@ -87,6 +144,9 @@ _IMMUTABLE_ORANGE_REPOS = frozenset({"prime", "reactor"})
 # approval step. Any other (unknown) target fails CLOSED to REJECT (mirror
 # of critical_elevation._BODY_REPO + its unknown-repo fail-closed rule).
 _BODY_REPO = "jarvis"
+
+# M1 -- floors that are strict enough to allow the biometric path.
+_STRICT_FLOORS = frozenset({"approval_required", "critical_elevation"})
 
 
 def _is_immutable_orange(target_repo: str) -> bool:
@@ -316,6 +376,7 @@ class BiometricAuthMiddleware:
         challenge_ttl_s: Optional[int] = None,
         auth_threshold: Optional[float] = None,
         audit_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        floor_check_fn: Optional[Callable[[Optional[str]], bool]] = None,
     ) -> None:
         self._ttl_s = (
             challenge_ttl_s if challenge_ttl_s is not None else _challenge_ttl_s()
@@ -329,6 +390,9 @@ class BiometricAuthMiddleware:
         # Injectable audit sink (default = the durable hash-chained
         # ledger, lazy-resolved so tests can pass a fake).
         self._audit_sink = audit_sink
+        # M1 injectable floor check (default = real cross_repo_elevation_floor
+        # lookup; tests may inject a stub so they don't need governance imports).
+        self._floor_check_fn = floor_check_fn
 
     # --- challenge issuance ----------------------------------------------
 
@@ -385,6 +449,7 @@ class BiometricAuthMiddleware:
         ] = None,
         approve_fn: Optional[Callable[..., Any]] = None,
         resolve_target_repo_fn: Optional[Callable[[str], str]] = None,
+        phrase_match_fn: Optional[Callable[[], bool]] = None,
     ) -> AuthorizationResult:
         """Authorize (or REJECT) a CRITICAL_ELEVATION operator-approval
         step. FAIL-CLOSED at every step; any exception -> REJECTED.
@@ -395,19 +460,36 @@ class BiometricAuthMiddleware:
              same-nonce request fails immediately).
           b. Biometric (authenticated AND score>=threshold AND anti-spoof
              AND liveness -- checked explicitly, never one bool).
-          c. Immutable Orange re-check (THE LAW): target in
+          c. H1 phrase-match guard (optional AND term; fail-CLOSED when
+             env requires it but no fn is wired).
+          d. Immutable Orange re-check (THE LAW): target in
              {prime,reactor} -> REJECT regardless of a perfect biometric.
-          d. Decision: fresh + biometric-pass + not-Immutable-Orange ->
-             call approve_fn; else REJECT.
+          e. M1 floor re-check: governance floor must be approval_required
+             or stricter; relaxed floor -> REJECT fail_closed:floor_relaxed.
+          f. M2 audit-then-approve: write audit record DURABLY (fsync)
+             BEFORE calling approve_fn. Audit write failure -> REJECT
+             fail_closed:audit_unavailable; approve_fn is NEVER called.
+          g. Decision: call approve_fn; return AUTHORIZED.
 
         Audio is hashed (sha256) for the audit record then dropped. The
         raw audio is NEVER persisted.
+
+        H1 phrase_match_fn hook:
+          If JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH=true and no
+          phrase_match_fn is provided -> REJECTED
+          fail_closed:phrase_match_required_but_unavailable.
+          If phrase_match_fn is provided, it must return truthy; falsy
+          -> REJECTED biometric:phrase_match_failed.
         """
         voice_verify_fn = voice_verify_fn or _default_voice_verify_fn
         approve_fn = approve_fn or _default_approve_fn
         resolve_target_repo_fn = (
             resolve_target_repo_fn or _default_resolve_target_repo_fn
         )
+
+        # H1 -- emit one-time [SECURITY] warning if phrase-match not required.
+        if is_command_node_auth_enabled() and not _require_phrase_match():
+            _maybe_emit_phrase_match_warning()
 
         # Audio in-memory only -- retain ONLY its hash.
         try:
@@ -469,7 +551,37 @@ class BiometricAuthMiddleware:
                     blast_radius_hash=challenge.blast_radius_hash,
                 )
 
-            # ----- (c) IMMUTABLE ORANGE re-check (THE LAW) -----
+            # ----- (c) H1 PHRASE-MATCH GUARD -----
+            require_pm = _require_phrase_match()
+            if require_pm and phrase_match_fn is None:
+                # Required but no verifier wired -> fail-CLOSED.
+                return self._reject(
+                    reason="fail_closed:phrase_match_required_but_unavailable",
+                    pr_id=pr_id, ast_mutation_id=ast_mutation_id,
+                    freshness_ok=True, antispoof_ok=antispoof_ok,
+                    ecapa_score=ecapa_score, target_repo=None,
+                    voiceprint_id=voiceprint_id,
+                    audio_sha256=audio_sha256, challenge_nonce=nonce,
+                    blast_radius_hash=challenge.blast_radius_hash,
+                )
+            if phrase_match_fn is not None:
+                # phrase_match_fn is an AND term; falsy -> REJECT.
+                try:
+                    pm_result = phrase_match_fn()
+                except Exception:  # noqa: BLE001 -- fail-CLOSED
+                    pm_result = False
+                if not pm_result:
+                    return self._reject(
+                        reason="biometric:phrase_match_failed",
+                        pr_id=pr_id, ast_mutation_id=ast_mutation_id,
+                        freshness_ok=True, antispoof_ok=antispoof_ok,
+                        ecapa_score=ecapa_score, target_repo=None,
+                        voiceprint_id=voiceprint_id,
+                        audio_sha256=audio_sha256, challenge_nonce=nonce,
+                        blast_radius_hash=challenge.blast_radius_hash,
+                    )
+
+            # ----- (d) IMMUTABLE ORANGE re-check (THE LAW) -----
             target_repo = resolve_target_repo_fn(pr_id)
             if _is_immutable_orange(target_repo):
                 return self._reject(
@@ -495,11 +607,15 @@ class BiometricAuthMiddleware:
                     audio_sha256=audio_sha256, challenge_nonce=nonce,
                     blast_radius_hash=challenge.blast_radius_hash,
                 )
-            # Defense in depth: re-check the governance floor is not
-            # below approval_required for this cross-repo target.
-            if not self._floor_at_least_approval(target_repo):
+            # ----- (e) M1 REAL FLOOR RE-CHECK -----
+            _floor_ok = (
+                self._floor_check_fn(target_repo)
+                if self._floor_check_fn is not None
+                else self._floor_at_least_approval(target_repo)
+            )
+            if not _floor_ok:
                 return self._reject(
-                    reason="immutable_orange:floor_below_approval_required",
+                    reason="fail_closed:floor_relaxed",
                     pr_id=pr_id, ast_mutation_id=ast_mutation_id,
                     freshness_ok=True, antispoof_ok=antispoof_ok,
                     ecapa_score=ecapa_score, target_repo=target_repo,
@@ -508,16 +624,58 @@ class BiometricAuthMiddleware:
                     blast_radius_hash=challenge.blast_radius_hash,
                 )
 
-            # ----- (d) DECISION: call the existing approval path -----
+            # ----- (f) M2 AUDIT-THEN-APPROVE (durable write FIRST) -----
+            # Build the audit record dict for the AUTHORIZED outcome.
+            _auth_record = {
+                "pr_id": pr_id,
+                "target_repo": target_repo,
+                "ast_mutation_id": ast_mutation_id,
+                "blast_radius_hash": challenge.blast_radius_hash,
+                "challenge_nonce": nonce,
+                "voiceprint_id": voiceprint_id,
+                "ecapa_score": ecapa_score,
+                "antispoof_verdict": antispoof_ok,
+                "freshness_ok": True,
+                "decision": "AUTHORIZED",
+                "audio_sha256": audio_sha256,
+            }
+            # Write durably BEFORE approve_fn. If the durable write fails
+            # (fsync not confirmed) -> REJECT with audit_unavailable and
+            # NEVER call approve_fn. No merge can outrun its record.
+            try:
+                self._emit_audit_authorized(_auth_record)
+            except Exception:  # noqa: BLE001 -- AuditWriteError or any exc
+                logger.error(
+                    "[BiometricAuth] M2 audit durable-write FAILED for "
+                    "pr_id=%s -- fail-closed REJECT, approve_fn NOT called",
+                    pr_id, exc_info=True,
+                )
+                return AuthorizationResult(
+                    decision="REJECTED",
+                    reason="fail_closed:audit_unavailable",
+                    ecapa_score=ecapa_score,
+                    antispoof_ok=antispoof_ok,
+                    freshness_ok=True,
+                    pr_id=pr_id,
+                    ast_mutation_id=ast_mutation_id,
+                    target_repo=target_repo,
+                    voiceprint_id=voiceprint_id,
+                )
+
+            # ----- (g) DECISION: call the existing approval path -----
             await _maybe_await(approve_fn(
                 pr_id=pr_id, ast_mutation_id=ast_mutation_id,
             ))
-            return self._authorize(
-                pr_id=pr_id, ast_mutation_id=ast_mutation_id,
-                ecapa_score=ecapa_score, antispoof_ok=antispoof_ok,
-                target_repo=target_repo, voiceprint_id=voiceprint_id,
-                audio_sha256=audio_sha256, challenge_nonce=nonce,
-                blast_radius_hash=challenge.blast_radius_hash,
+            return AuthorizationResult(
+                decision="AUTHORIZED",
+                reason="authorized:fresh_nonce_biometric_pass_not_immutable_orange",
+                ecapa_score=ecapa_score,
+                antispoof_ok=antispoof_ok,
+                freshness_ok=True,
+                pr_id=pr_id,
+                ast_mutation_id=ast_mutation_id,
+                target_repo=target_repo,
+                voiceprint_id=voiceprint_id,
             )
 
         except Exception:  # noqa: BLE001 -- FAIL-CLOSED ABSOLUTE
@@ -570,18 +728,23 @@ class BiometricAuthMiddleware:
             self._store.pop(nonce, None)
             return ch
 
-    # --- floor re-check ---------------------------------------------------
+    # --- M1 real floor re-check ------------------------------------------
 
     @staticmethod
     def _floor_at_least_approval(target_repo: Optional[str]) -> bool:
-        """Defense in depth: confirm the cross-repo governance floor for
-        this target is at least ``approval_required`` (Immutable Orange
-        guarantees this for prime/reactor). Fail-CLOSED: any error -> we
-        treat the floor as satisfied ONLY when we can affirmatively prove
-        it is approval-required or stricter; an unprovable lookup returns
-        True for jarvis (Body proceeds through approve_fn which itself
-        re-floors) but the Immutable-Orange check above already excluded
-        prime/reactor regardless of this lookup."""
+        """M1 -- Defense in depth: confirm the cross-repo governance floor
+        for this target is at least ``approval_required``.
+
+        Returns True ONLY when we can affirmatively prove the floor is
+        ``approval_required`` or ``critical_elevation`` (or stricter).
+        A relaxed floor (``safe_auto`` / ``notify_apply`` / None / unknown /
+        import failure) -> False (fail-CLOSED).
+
+        The Immutable Orange check above already excluded prime/reactor
+        regardless of this lookup. This check fires ONLY for Body (jarvis)
+        PRs and is defense-in-depth beneath the Immutable Orange +
+        jarvis-allowlist (which stay authoritative).
+        """
         try:
             from backend.core.ouroboros.governance.critical_elevation import (
                 cross_repo_elevation_floor,
@@ -589,17 +752,14 @@ class BiometricAuthMiddleware:
             floor = cross_repo_elevation_floor(
                 target_repo=(target_repo or ""), crosses_repo=True,
             )
-            # prime/reactor -> "approval_required" (handled above anyway).
-            # jarvis -> may be None (graduated) or "critical_elevation".
-            # We only need to guarantee we never RELAX below approval for
-            # an Immutable-Orange target; that target is already rejected.
-            return True
-        except Exception:  # noqa: BLE001 -- fail-soft; orange check is authority
+            # Only strict floors pass. None / unknown / relaxed -> False.
+            return (floor in _STRICT_FLOORS)
+        except Exception:  # noqa: BLE001 -- fail-CLOSED
             logger.debug(
-                "[BiometricAuth] floor re-check failed (orange check already "
-                "enforced)", exc_info=True,
+                "[BiometricAuth] M1 floor re-check raised -- fail-CLOSED "
+                "(treating floor as relaxed, rejecting)", exc_info=True,
             )
-            return True
+            return False
 
     # --- result builders + audit -----------------------------------------
 
@@ -618,20 +778,38 @@ class BiometricAuthMiddleware:
             return "biometric:liveness_failed"
         return "biometric:score_below_threshold"
 
-    def _authorize(self, **kw: Any) -> AuthorizationResult:
-        res = AuthorizationResult(
-            decision="AUTHORIZED",
-            reason="authorized:fresh_nonce_biometric_pass_not_immutable_orange",
-            ecapa_score=kw["ecapa_score"],
-            antispoof_ok=kw["antispoof_ok"],
-            freshness_ok=True,
-            pr_id=kw["pr_id"],
-            ast_mutation_id=kw["ast_mutation_id"],
-            target_repo=kw["target_repo"],
-            voiceprint_id=kw["voiceprint_id"],
+    def _emit_audit_authorized(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """M2 -- Write the AUTHORIZED audit record DURABLY (raise_on_write_failure=True).
+        Raises AuditWriteError if the fsync-confirmed write fails. The
+        caller (authorize_elevation) must NOT call approve_fn if this raises.
+        """
+        from backend.core.ouroboros.governance.command_node.biometric_audit_ledger import (  # noqa: E501
+            AuditWriteError,
         )
-        self._emit_audit(res, kw)
-        return res
+        sink = self._audit_sink
+        if sink is None:
+            from backend.core.ouroboros.governance.command_node.biometric_audit_ledger import (  # noqa: E501
+                get_default_ledger,
+            )
+            ledger = get_default_ledger()
+            # Call the ledger directly with raise_on_write_failure=True.
+            return ledger.append(record, raise_on_write_failure=True)
+        else:
+            # Injectable sink (used in tests). The sink must return the
+            # record or raise to simulate failure. We wrap it:
+            # if the sink raises AuditWriteError we re-raise; any other
+            # exception we treat as a durable-write failure and raise
+            # AuditWriteError (fail-CLOSED).
+            try:
+                result = sink(record)
+                # Return the record dict (sink may or may not return one).
+                return record if result is None else (result if isinstance(result, dict) else record)
+            except AuditWriteError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise AuditWriteError(
+                    'audit sink raised for AUTHORIZED pr_id=' + repr(record.get('pr_id')) + ': ' + str(exc)
+                ) from exc
 
     def _reject(self, *, reason: str, **kw: Any) -> AuthorizationResult:
         res = AuthorizationResult(
@@ -645,15 +823,16 @@ class BiometricAuthMiddleware:
             target_repo=kw.get("target_repo"),
             voiceprint_id=kw.get("voiceprint_id"),
         )
-        self._emit_audit(res, kw)
+        # REJECTED outcomes: fail-soft audit (best-effort, never raises).
+        self._emit_audit_soft(res, kw)
         return res
 
-    def _emit_audit(
+    def _emit_audit_soft(
         self, res: AuthorizationResult, kw: Dict[str, Any],
     ) -> None:
-        """Append to the hash-chained audit ledger -- EVERY outcome
-        (AUTHORIZED + REJECTED). Fail-soft (never raises, logs loudly).
-        Audio is represented ONLY by its sha256."""
+        """Append to the hash-chained audit ledger for REJECTED outcomes.
+        Fail-soft (never raises, logs loudly). Audio is represented ONLY
+        by its sha256."""
         record = {
             "pr_id": res.pr_id,
             "target_repo": res.target_repo,
@@ -673,8 +852,13 @@ class BiometricAuthMiddleware:
                 from backend.core.ouroboros.governance.command_node.biometric_audit_ledger import (  # noqa: E501
                     get_default_ledger,
                 )
-                sink = get_default_ledger().append
-            sink(record)
+                # fail-soft: raise_on_write_failure=False (default)
+                get_default_ledger().append(record)
+            else:
+                try:
+                    sink(record)
+                except Exception:  # noqa: BLE001 -- fail-soft for REJECTED
+                    pass
         except Exception:  # noqa: BLE001 -- fail-soft, log LOUDLY
             logger.error(
                 "[BiometricAuth] audit emit FAILED for pr_id=%s decision=%s",

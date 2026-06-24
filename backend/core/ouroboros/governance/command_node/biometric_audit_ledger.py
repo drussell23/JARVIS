@@ -18,6 +18,16 @@ governance imports at module load).
 The record schema NEVER contains the raw audio -- only ``audio_sha256``.
 
 Append-only at ``.jarvis/command_node_audit.jsonl``.
+
+M2 (audit-then-approve ordering)
+=================================
+``append`` now accepts ``raise_on_write_failure=True`` (default False).
+The AUTHORIZED path in BiometricAuthMiddleware calls append with
+raise_on_write_failure=True BEFORE calling approve_fn -- so no merge can
+outrun its immutable record. If the durable write (fsync confirmed) fails,
+``AuditWriteError`` is raised, the middleware catches it, rejects the
+authorization, and NEVER calls approve_fn. REJECTED outcomes always use
+the default fail-soft mode (never raise).
 """
 from __future__ import annotations
 
@@ -52,6 +62,14 @@ _PAYLOAD_FIELDS = (
     "decision",
     "audio_sha256",
 )
+
+
+class AuditWriteError(Exception):
+    """Raised by :meth:`BiometricAuditLedger.append` when
+    ``raise_on_write_failure=True`` and the durable write (fsync
+    confirmed) fails. Used by the middleware to enforce the
+    audit-then-approve ordering invariant: no merge can outrun its
+    immutable record."""
 
 
 def _default_audit_path() -> Path:
@@ -130,14 +148,28 @@ class BiometricAuditLedger:
 
     # --- public API -------------------------------------------------------
 
-    def append(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def append(
+        self,
+        payload: Dict[str, Any],
+        *,
+        raise_on_write_failure: bool = False,
+    ) -> Dict[str, Any]:
         """Append a hash-chained record. Returns the full record dict
         (including ``ts`` / ``prev_hash`` / ``record_hash``).
 
-        Fail-soft: a write failure is logged LOUDLY but never raises --
-        a security ledger must never crash the authorization path. The
-        record (with its hash) is still returned so the caller can mirror
-        it elsewhere if desired.
+        Default (``raise_on_write_failure=False``): fail-soft -- a write
+        failure is logged LOUDLY but never raises. The record (with its
+        hash) is still returned so the caller can mirror it elsewhere.
+
+        When ``raise_on_write_failure=True`` (used by the AUTHORIZED path
+        in BiometricAuthMiddleware): raises :exc:`AuditWriteError` if the
+        record cannot be durably written (fsync confirmed). This enforces
+        the audit-then-approve ordering invariant: the middleware gates
+        ``approve_fn`` behind a confirmed audit write so no merge can
+        outrun its immutable record.
+
+        REJECTED outcomes ALWAYS call ``append`` with the default fail-soft
+        mode (``raise_on_write_failure=False``) so they never raise.
         """
         record: Dict[str, Any] = {}
         # Stamp ts first so it participates in the canonical payload.
@@ -158,7 +190,7 @@ class BiometricAuditLedger:
                 fh.write(line + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-        except Exception:  # noqa: BLE001 -- fail-soft, log LOUDLY
+        except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[CommandNodeAudit] FAILED to persist audit record for "
                 "pr_id=%r decision=%r -- record computed but NOT durably "
@@ -168,6 +200,10 @@ class BiometricAuditLedger:
                 self.path,
                 exc_info=True,
             )
+            if raise_on_write_failure:
+                raise AuditWriteError(
+                    "audit durable-write failed for pr_id=" + repr(record.get("pr_id")) + ": " + str(exc)
+                ) from exc
         return record
 
     def verify_chain(self) -> bool:
@@ -250,6 +286,7 @@ def get_default_ledger() -> BiometricAuditLedger:
 
 
 __all__ = [
+    "AuditWriteError",
     "GENESIS_HASH",
     "BiometricAuditLedger",
     "compute_record_hash",

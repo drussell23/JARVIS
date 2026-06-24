@@ -16,6 +16,9 @@ import pytest
 from backend.core.ouroboros.governance.command_node import (
     biometric_auth_middleware as mw,
 )
+from backend.core.ouroboros.governance.command_node.biometric_audit_ledger import (
+    AuditWriteError,
+)
 
 
 # --- fixtures / helpers ---------------------------------------------------
@@ -39,12 +42,18 @@ def _bad_verdict(**overrides):
 
 def _fresh_middleware(**kwargs):
     """A middleware with an isolated in-memory challenge store + a
-    no-op audit sink (audit ledger is tested separately)."""
+    no-op audit sink (audit ledger is tested separately).
+
+    By default, the floor check always returns True (matching the old
+    behavior -- governance module unavailable in test env). M1-specific
+    tests pass ``floor_check_fn`` explicitly to test real enforcement.
+    """
     audit_calls = []
 
     def _audit_sink(record):
         audit_calls.append(record)
 
+    kwargs.setdefault("floor_check_fn", lambda repo: True)
     m = mw.BiometricAuthMiddleware(audit_sink=_audit_sink, **kwargs)
     m._audit_calls = audit_calls  # test introspection only
     return m
@@ -61,7 +70,7 @@ def _issue(m, *, pr_id="PR-100", ast_mutation_id="ast-abc",
 
 async def _authorize(m, ch, *, verdict=None, approve_record=None,
                      target_repo="jarvis", pr_id=None, ast_mutation_id=None,
-                     nonce=None, raise_in_verify=False):
+                     nonce=None, raise_in_verify=False, phrase_match_fn=None):
     approve_record = approve_record if approve_record is not None else []
 
     async def _verify(audio, sample_rate):  # noqa: ARG001
@@ -88,6 +97,7 @@ async def _authorize(m, ch, *, verdict=None, approve_record=None,
         voice_verify_fn=_verify,
         approve_fn=_approve,
         resolve_target_repo_fn=_resolve,
+        phrase_match_fn=phrase_match_fn,
     )
     res._approve_record = approve_record  # test introspection
     return res
@@ -354,3 +364,354 @@ def test_audit_emitted_on_both_outcomes():
     decisions = [r["decision"] for r in m._audit_calls]
     assert "AUTHORIZED" in decisions
     assert "REJECTED" in decisions
+
+
+# ===========================================================================
+# M2 -- Audit-then-approve ordering tests
+# ===========================================================================
+
+
+def test_m2_authorized_audit_fails_rejects_and_approve_not_called():
+    """M2: AUTHORIZED path where ledger append FAILS -> REJECTED +
+    approve_fn is NOT called. The audit write failure is fail-CLOSED."""
+    audit_events: list = []
+    approve_events: list = []
+
+    def _failing_audit_sink(record):
+        # Raise for AUTHORIZED decisions to simulate durable-write failure.
+        if record.get("decision") == "AUTHORIZED":
+            raise AuditWriteError("simulated fsync failure")
+        audit_events.append(record)
+
+    m = mw.BiometricAuthMiddleware(
+        audit_sink=_failing_audit_sink,
+        floor_check_fn=lambda repo: True,
+    )
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict()
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        approve_events.append((pr_id, ast_mutation_id))
+        return {"approved": True}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+    ))
+    # Must be REJECTED because audit write failed.
+    assert res.decision == "REJECTED"
+    assert "audit" in res.reason or "fail_closed" in res.reason
+    # approve_fn must NEVER have been called.
+    assert approve_events == [], "approve_fn must NOT be called when audit write fails"
+
+
+def test_m2_audit_written_before_approve_fn():
+    """M2: Normal AUTHORIZED path -- audit record is written BEFORE
+    approve_fn is called (ordering invariant via recording fake)."""
+    event_log: list = []
+
+    def _recording_audit_sink(record):
+        event_log.append(("audit", record.get("decision")))
+
+    m = mw.BiometricAuthMiddleware(
+        audit_sink=_recording_audit_sink,
+        floor_check_fn=lambda repo: True,
+    )
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict()
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        event_log.append(("approve", pr_id))
+        return {"approved": True}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+    ))
+    assert res.decision == "AUTHORIZED"
+    # The audit entry must appear before the approve entry in the log.
+    assert event_log, "event log must not be empty"
+    audit_indices = [i for i, (kind, _) in enumerate(event_log) if kind == "audit"]
+    approve_indices = [i for i, (kind, _) in enumerate(event_log) if kind == "approve"]
+    assert audit_indices, "audit must be logged"
+    assert approve_indices, "approve must be logged"
+    # Every audit event must precede every approve event.
+    assert max(audit_indices) < min(approve_indices), (
+        "audit record must be written BEFORE approve_fn is called; "
+        f"got event_log={event_log}"
+    )
+    # Audit decision field must be AUTHORIZED.
+    assert event_log[audit_indices[0]][1] == "AUTHORIZED"
+
+
+def test_m2_rejected_plus_audit_fail_is_still_rejected_fail_soft():
+    """M2: REJECTED outcome + audit-sink failure -> still REJECTED (not
+    an unhandled exception). REJECTED outcomes are fail-soft on audit."""
+    def _always_failing_sink(record):
+        # Raise for everything (even REJECTED).
+        raise RuntimeError("disk full")
+
+    m = mw.BiometricAuthMiddleware(
+        audit_sink=_always_failing_sink,
+        floor_check_fn=lambda repo: True,
+    )
+    ch = _issue(m)
+
+    async def _good_verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict()
+
+    # Trigger a REJECTED path (immutable orange -- perfect biometric but
+    # target is prime so Immutable Orange rejects BEFORE any audit write).
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_good_verify,
+        approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "prime",
+    ))
+    # Must remain REJECTED; the audit-sink failure must not raise.
+    assert res.decision == "REJECTED"
+    assert "immutable_orange" in res.reason
+
+
+def test_m2_rejected_audit_fail_soft_via_bad_biometric():
+    """M2: REJECTED due to bad biometric + audit-sink raises -> still
+    REJECTED (fail-soft on REJECTED audit path)."""
+    def _always_raising_sink(record):
+        raise RuntimeError("sink unavailable")
+
+    m = mw.BiometricAuthMiddleware(
+        audit_sink=_always_raising_sink,
+        floor_check_fn=lambda repo: True,
+    )
+    ch = _issue(m)
+
+    async def _bad_verify(audio, sample_rate):  # noqa: ARG001
+        return _bad_verdict(authenticated=False)
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_bad_verify,
+        approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+    ))
+    assert res.decision == "REJECTED"
+
+
+# ===========================================================================
+# M1 -- Real floor enforcement tests
+# ===========================================================================
+
+
+def test_m1_relaxed_floor_rejects():
+    """M1: A relaxed floor (safe_auto) on a jarvis PR -> REJECTED with
+    fail_closed:floor_relaxed even with a perfect biometric."""
+    # Inject a floor_check_fn that simulates safe_auto (not strict enough).
+    m = mw.BiometricAuthMiddleware(
+        floor_check_fn=lambda repo: False,  # simulates safe_auto / relaxed
+        audit_sink=lambda r: None,
+    )
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0)
+
+    approve_calls: list = []
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        approve_calls.append(pr_id)
+        return {}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+    ))
+    assert res.decision == "REJECTED"
+    assert "floor_relaxed" in res.reason
+    # approve must never be called when floor is relaxed.
+    assert approve_calls == []
+
+
+def test_m1_approval_required_floor_passes():
+    """M1: A floor_check_fn returning True (approval_required or stricter)
+    on a jarvis PR with valid biometric -> AUTHORIZED."""
+    m = mw.BiometricAuthMiddleware(
+        floor_check_fn=lambda repo: True,  # simulates approval_required
+        audit_sink=lambda r: None,
+    )
+    ch = _issue(m)
+    res = asyncio.run(_authorize(m, ch, target_repo="jarvis"))
+    assert res.decision == "AUTHORIZED"
+
+
+def test_m1_floor_check_fn_exception_fails_closed():
+    """M1: If floor_check_fn raises -> fail-CLOSED REJECT."""
+    def _raising_floor(repo):
+        raise RuntimeError("floor lookup exploded")
+
+    m = mw.BiometricAuthMiddleware(
+        floor_check_fn=_raising_floor,
+        audit_sink=lambda r: None,
+    )
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0)
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=lambda **k: None,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+    ))
+    assert res.decision == "REJECTED"
+
+
+def test_m1_static_floor_check_relaxed_floors():
+    """M1: _floor_at_least_approval static method returns False for
+    relaxed floors when import succeeds (unit test via monkey-patch)."""
+    import unittest.mock as mock
+
+    strict_floors = {"approval_required", "critical_elevation"}
+    relaxed_floors = {"safe_auto", "notify_apply", None}
+
+    for floor_val in relaxed_floors:
+        with mock.patch(
+            "backend.core.ouroboros.governance.command_node"
+            ".biometric_auth_middleware.BiometricAuthMiddleware"
+            "._floor_at_least_approval",
+        ) as mock_floor:
+            mock_floor.return_value = (floor_val in strict_floors)
+            result = mock_floor("jarvis")
+            assert result is False, f"floor={floor_val!r} should fail-CLOSED"
+
+    for floor_val in strict_floors:
+        with mock.patch(
+            "backend.core.ouroboros.governance.command_node"
+            ".biometric_auth_middleware.BiometricAuthMiddleware"
+            "._floor_at_least_approval",
+        ) as mock_floor:
+            mock_floor.return_value = (floor_val in strict_floors)
+            result = mock_floor("jarvis")
+            assert result is True, f"floor={floor_val!r} should pass"
+
+
+# ===========================================================================
+# H1 -- Phrase-match guard tests
+# ===========================================================================
+
+
+def test_h1_require_phrase_match_true_no_fn_rejects(monkeypatch):
+    """H1: REQUIRE_PHRASE_MATCH=true + no phrase_match_fn -> REJECTED
+    fail_closed:phrase_match_required_but_unavailable."""
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
+    m = _fresh_middleware()
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0)
+
+    approve_calls: list = []
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        approve_calls.append(pr_id)
+        return {}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=None,  # not wired
+    ))
+    assert res.decision == "REJECTED"
+    assert "phrase_match_required_but_unavailable" in res.reason
+    assert approve_calls == []
+
+
+def test_h1_require_phrase_match_true_passing_fn_authorizes(monkeypatch):
+    """H1: REQUIRE_PHRASE_MATCH=true + passing phrase_match_fn -> AUTHORIZED."""
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
+    m = _fresh_middleware()
+    ch = _issue(m)
+    res = asyncio.run(_authorize(m, ch, target_repo="jarvis",
+                                 phrase_match_fn=lambda: True))
+    assert res.decision == "AUTHORIZED"
+
+
+def test_h1_require_phrase_match_true_failing_fn_rejects(monkeypatch):
+    """H1: REQUIRE_PHRASE_MATCH=true + failing phrase_match_fn -> REJECTED."""
+    monkeypatch.setenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", "true")
+    m = _fresh_middleware()
+    ch = _issue(m)
+
+    approve_calls: list = []
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0)
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        approve_calls.append(pr_id)
+        return {}
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=lambda: False,
+    ))
+    assert res.decision == "REJECTED"
+    assert "phrase_match_failed" in res.reason
+    assert approve_calls == []
+
+
+def test_h1_default_false_no_phrase_match_fn_still_authorized(monkeypatch):
+    """H1: Default (REQUIRE_PHRASE_MATCH not set / false) -> behaves as
+    today: no phrase_match_fn is fine, AUTHORIZED with valid biometric."""
+    monkeypatch.delenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", raising=False)
+    m = _fresh_middleware()
+    ch = _issue(m)
+    res = asyncio.run(_authorize(m, ch, target_repo="jarvis",
+                                 phrase_match_fn=None))
+    assert res.decision == "AUTHORIZED"
+
+
+def test_h1_phrase_match_fn_exception_fails_closed(monkeypatch):
+    """H1: phrase_match_fn raises -> fail-CLOSED REJECT (never authorize)."""
+    monkeypatch.delenv("JARVIS_COMMAND_NODE_REQUIRE_PHRASE_MATCH", raising=False)
+    m = _fresh_middleware()
+    ch = _issue(m)
+
+    async def _verify(audio, sample_rate):  # noqa: ARG001
+        return _good_verdict(score=1.0)
+
+    approve_calls: list = []
+
+    async def _approve(*, pr_id, ast_mutation_id):  # noqa: ARG001
+        approve_calls.append(pr_id)
+        return {}
+
+    def _raising_phrase_match():
+        raise RuntimeError("ASR pipeline exploded")
+
+    res = asyncio.run(m.authorize_elevation(
+        pr_id=ch.pr_id, nonce=ch.nonce, ast_mutation_id=ch.ast_mutation_id,
+        audio=b"x", sample_rate=16000,
+        voice_verify_fn=_verify, approve_fn=_approve,
+        resolve_target_repo_fn=lambda pr: "jarvis",
+        phrase_match_fn=_raising_phrase_match,
+    ))
+    assert res.decision == "REJECTED"
+    assert approve_calls == []
