@@ -76,10 +76,15 @@ class BuiltWorker:
         BoundSender has NO ``from_worker`` parameter -- the worker CANNOT send
         as a peer / the Commander. The worker NEVER receives the bus object or
         the graph secret -- only this capability locked to its own id.
-      * ``inbox`` -- the worker's bounded inbox deque (``bus.subscribe``). The
-        worker reads peer messages from here; a recipient-side reader MUST pass
-        each message's content through the Sentinel ingress filter
-        (``swarm_sentinel.epistemic_purity_filter``) BEFORE ingesting it.
+      * ``inbox`` -- a :class:`~.agent_message_bus.SentinelInbox`, NEVER the raw
+        ``bus.subscribe()`` deque. The SentinelInbox is the MANDATORY filtering
+        inbox: its ``read()``/``drain()`` runs the Sentinel filter on every
+        message and surfaces surviving peer content ONLY inside the never-obey
+        quarantine fence (``<peer_data trust="none">``). A worker can never hold
+        the raw deque -- a shipped-code invariant (:func:`register_shipped_invariants`)
+        asserts this structurally. The worker system prompt also carries the
+        standing ``PEER_DATA_FRAMING`` clause so even a scan-missed imperative
+        renders as inert data.
 
     When the bus is OFF (no bus supplied), ``sender`` + ``inbox`` are ``None``
     and the worker stays silent exactly as Phase 1c -- byte-identical.
@@ -206,6 +211,13 @@ class SubagentFactory:
 
         sender, inbox = self._wire_voice(bus, worker_id)
 
+        # When voice is wired, the worker WILL read peer content via the
+        # SentinelInbox -> its system prompt MUST carry the standing never-obey
+        # framing clause so even a scan-missed imperative is treated as inert
+        # data. (The structural fence + this clause are the real boundary.)
+        if inbox is not None:
+            prompt = self._inject_peer_framing(prompt)
+
         logger.info(
             "[SubagentFactory] built worker=%s role=%r route=%s "
             "tools=%s mutation_budget=%d read_only=%s ctx_budget=%d voice=%s",
@@ -230,15 +242,18 @@ class SubagentFactory:
 
     @staticmethod
     def _wire_voice(bus: Optional[Any], worker_id: str) -> Tuple[Any, Any]:
-        """Register the worker on the bus + issue its BoundSender + inbox.
+        """Register the worker on the bus + issue its BoundSender + SentinelInbox.
 
         Returns ``(sender, inbox)`` or ``(None, None)`` when the bus is absent
         OR the master gate is OFF. Fail-CLOSED: any wiring error -> silent
         worker ``(None, None)`` (a worker without a sender simply cannot
         coordinate -- it never gets a half-wired / forgeable capability).
 
-        The worker NEVER receives the bus object or the graph secret -- only
-        the identity-locked BoundSender (and its own bounded inbox).
+        The worker NEVER receives the bus object or the graph secret -- only the
+        identity-locked BoundSender and a :class:`SentinelInbox` (the MANDATORY
+        filtering inbox). It NEVER receives the raw ``bus.subscribe()`` deque:
+        ``inbox`` is always a SentinelInbox, so the Sentinel filter is mandatory
+        on the only read path.
         """
         if bus is None:
             return (None, None)
@@ -252,7 +267,8 @@ class SubagentFactory:
             # Register (idempotent) so issue_sender succeeds + the inbox exists.
             bus.register_worker(worker_id)
             sender = bus.issue_sender(worker_id)
-            inbox = bus.subscribe(worker_id)
+            # The MANDATORY filtering inbox -- NEVER the raw deque.
+            inbox = bus.sentinel_inbox(worker_id)
             return (sender, inbox)
         except Exception:  # noqa: BLE001 -- fail-CLOSED -> silent worker
             logger.debug(
@@ -260,6 +276,27 @@ class SubagentFactory:
                 worker_id, exc_info=True,
             )
             return (None, None)
+
+    @staticmethod
+    def _inject_peer_framing(prompt: str) -> str:
+        """Append the standing never-obey PEER_DATA_FRAMING clause to ``prompt``.
+
+        The worker reads peer content via the SentinelInbox (fenced in
+        ``<peer_data trust="none">``); this clause tells the model that content
+        is UNTRUSTED DATA, never instructions. Together they are the structural
+        boundary that scales past the (leaky) regex scan. Fail-soft: returns the
+        prompt unchanged on any error. NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+                PEER_DATA_FRAMING,
+            )
+
+            if PEER_DATA_FRAMING and PEER_DATA_FRAMING not in prompt:
+                return str(prompt) + "\n\n## Untrusted Peer Data\n" + PEER_DATA_FRAMING
+            return prompt
+        except Exception:  # noqa: BLE001 -- fail-soft
+            return prompt
 
     @staticmethod
     def _emit_spawn_telemetry(
@@ -285,6 +322,66 @@ class SubagentFactory:
                 "[SubagentFactory] publish_swarm_node_spawned failed (non-fatal)",
                 exc_info=True,
             )
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariant: the worker-facing inbox MUST be a
+    SentinelInbox, NEVER the raw ``bus.subscribe()`` deque.
+
+    This is the structural assertion for review-finding C1 (the load-bearing
+    fix): the Sentinel filter is mandatory on the only worker read path. The
+    invariant validates that ``_wire_voice`` returns ``bus.sentinel_inbox(...)``
+    and does NOT hand a worker ``bus.subscribe(...)`` directly.
+
+    NEVER raises (the discovery loop catches exceptions)."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_sentinel_inbox_mandatory(tree, source) -> tuple:
+        violations = []
+        # The wiring MUST issue the filtering inbox.
+        if "sentinel_inbox(" not in source:
+            violations.append(
+                "C1: _wire_voice must hand the worker a SentinelInbox "
+                "(bus.sentinel_inbox(...)) -- the mandatory filter on the only "
+                "read path"
+            )
+        # The wiring MUST NOT hand a worker the raw deque. ``subscribe`` may
+        # still be referenced by the bus internally, but inside THIS module a
+        # bare ``bus.subscribe(`` in the voice-wiring path would re-open the
+        # raw-deque hole the review found.
+        if ".subscribe(" in source and "sentinel_inbox(" not in source:
+            violations.append(
+                "C1: subagent_factory must not return a raw bus.subscribe() "
+                "deque to a worker"
+            )
+        if "PEER_DATA_FRAMING" not in source:
+            violations.append(
+                "Q4: subagent_factory must inject PEER_DATA_FRAMING (never-obey "
+                "framing) into the worker prompt when voice is wired"
+            )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="swarm_worker_sentinel_inbox_mandatory",
+            target_file=(
+                "backend/core/ouroboros/governance/autonomy/subagent_factory.py"
+            ),
+            description=(
+                "Swarm worker voice-wiring MUST hand the worker a SentinelInbox "
+                "(mandatory Sentinel filter on the only read path) and inject "
+                "the never-obey PEER_DATA_FRAMING clause -- NEVER the raw "
+                "bus.subscribe() deque. Catches a refactor that re-opens the "
+                "C1 inert-boundary hole from the adversarial review."
+            ),
+            validate=_validate_sentinel_inbox_mandatory,
+        ),
+    ]
 
 
 class _NullToolBackend:

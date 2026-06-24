@@ -234,8 +234,22 @@ def test_bus_on_grants_identity_locked_boundsender(monkeypatch):
 
     params = inspect.signature(built.sender.send).parameters
     assert "from_worker" not in params
-    # The inbox is the worker's bounded deque on the bus.
-    assert built.inbox is bus.subscribe("w1")
+    # C1: the worker's inbox is a SentinelInbox (the mandatory filter), NEVER
+    # the raw bus.subscribe() deque.
+    from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
+        SentinelInbox,
+    )
+
+    assert isinstance(built.inbox, SentinelInbox)
+    import collections
+
+    assert not isinstance(built.inbox, collections.deque)
+    # The never-obey framing clause was injected into the worker prompt.
+    from backend.core.ouroboros.governance.autonomy.swarm_sentinel import (
+        PEER_DATA_FRAMING,
+    )
+
+    assert PEER_DATA_FRAMING in built.system_prompt
 
 
 def test_boundsender_actually_delivers_to_a_peer(monkeypatch):
