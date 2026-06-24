@@ -67,10 +67,21 @@ class GenerationSubagentExecutor:
         When a WorktreeManager is provided, each unit executes in an isolated
         git worktree — preventing filesystem conflicts between parallel units.
         The worktree is always cleaned up in the finally block.
+
+        Swarm Phase 1b — when ``JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED`` is on,
+        a fresh per-worker ``EphemeralMemorySandbox`` is constructed here
+        (seeded with the synthesized sub-goal prompt). The worker's tool-loop
+        is fed from THIS sandbox alone — it has no read-access to the parent /
+        global Ouroboros conversation. The sandbox is deterministically
+        VAPORIZED in the finally block (del + gated gc.collect + best-effort
+        cuda cache flush), composing with the worktree cleanup. Only the Iron
+        Return artifact crosses back to the Commander; the sandbox never does.
+        OFF -> no sandbox is constructed and behavior is byte-identical to 1a.
         """
         started_at_ns = time.monotonic_ns()
         causal_parent_id = graph.causal_trace_id
         _worktree_path: Optional[Path] = None
+        _sandbox: Optional[Any] = self._build_sandbox_for_unit(unit)
         try:
             if len(unit.target_files) != 1:
                 raise RuntimeError(
@@ -213,6 +224,57 @@ class GenerationSubagentExecutor:
                     logger.warning(
                         "[SubagentExecutor] Worktree cleanup failed: %s", cleanup_exc
                     )
+            # --- Swarm Phase 1b — deterministic sandbox vaporization. -------
+            # finally-guaranteed (success / failure / cancellation); composes
+            # with the worktree cleanup above + WorktreeManager.reap_orphans()
+            # for SIGKILL/OOM. The Iron Return artifact has already crossed to
+            # the Commander (built from the result, NOT the sandbox) by the
+            # time we get here — the scratchpad never escapes. Fail-CLOSED: an
+            # unreadable / None sandbox is swallowed, never breaks cleanup.
+            if _sandbox is not None:
+                from backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox import (
+                    vaporize_quietly,
+                )
+                vaporize_quietly(_sandbox)
+
+    @staticmethod
+    def _build_sandbox_for_unit(unit: WorkUnitSpec) -> Optional[Any]:
+        """Construct the per-worker EphemeralMemorySandbox (Phase 1b).
+
+        Gated by ``JARVIS_SWARM_EPHEMERAL_SANDBOX_ENABLED`` (default false).
+        Returns None when the gate is off OR the unit is a legacy fixed-type
+        unit (no synthesized swarm shape) — in both cases the worker path is
+        byte-identical to Phase 1a (no sandbox isolation / no GC).
+
+        The sandbox is seeded with the synthesized sub-goal prompt
+        (``system_prompt_template``) when present, else the raw goal — never
+        from any parent/global conversation. Fail-CLOSED: any construction
+        error -> None (worker falls back to the non-sandboxed path; teardown
+        has nothing to do).
+        """
+        try:
+            from backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox import (
+                EphemeralMemorySandbox,
+                sandbox_enabled,
+            )
+            if not sandbox_enabled():
+                return None
+            # Only swarm-synthesized workers get an isolated sandbox; legacy
+            # fixed-type units keep Phase 1a behavior.
+            if not getattr(unit, "is_swarm_worker", False):
+                return None
+            seed = unit.system_prompt_template or unit.goal
+            return EphemeralMemorySandbox(
+                worker_id=unit.unit_id,
+                sub_goal_prompt=str(seed),
+                max_tokens=unit.context_budget_tokens,
+            )
+        except Exception:  # noqa: BLE001 — sandbox must never break execution
+            logger.debug(
+                "[SubagentExecutor] sandbox construction failed (non-fatal); "
+                "worker runs without 1b isolation", exc_info=True,
+            )
+            return None
 
     async def _validate_candidate(
         self,
@@ -897,22 +959,57 @@ class SubagentScheduler:
                 )
 
     def _emit_result_command(self, graph: ExecutionGraph, result: WorkUnitResult) -> None:
+        payload: Dict[str, Any] = {
+            "graph_id": graph.graph_id,
+            "op_id": graph.op_id,
+            "unit_id": result.unit_id,
+            "repo": result.repo,
+            "status": result.status.value,
+            "failure_class": result.failure_class,
+            "error": result.error,
+        }
+        # --- Swarm Phase 1b — the Iron Return crossing. -------------------
+        # Only the cryptographic artifact (status / payload / diff_hash)
+        # crosses to the Commander (L1). The worker's scratchpad — every
+        # intermediate message + failed tool attempt — stayed in the
+        # EphemeralMemorySandbox, which is vaporized in the executor finally
+        # and is NEVER referenced here. Gated; OFF -> byte-identical (no
+        # iron_return key in the payload).
+        iron = self._maybe_build_iron_artifact(result)
+        if iron is not None:
+            payload["iron_return"] = iron
         cmd = CommandEnvelope(
             source_layer="L3",
             target_layer="L1",
             command_type=CommandType.REPORT_WORK_UNIT_RESULT,
-            payload={
-                "graph_id": graph.graph_id,
-                "op_id": graph.op_id,
-                "unit_id": result.unit_id,
-                "repo": result.repo,
-                "status": result.status.value,
-                "failure_class": result.failure_class,
-                "error": result.error,
-            },
+            payload=payload,
             ttl_s=300.0,
         )
         self._command_bus.try_put(cmd)
+
+    @staticmethod
+    def _maybe_build_iron_artifact(result: WorkUnitResult) -> Optional[Dict[str, Any]]:
+        """Build the Iron Return artifact for the Commander (Phase 1b, gated).
+
+        Returns None when the sandbox gate is OFF (byte-identical Phase 1a) or
+        on any failure (fail-soft — the legacy status fields still cross).
+        """
+        try:
+            from backend.core.ouroboros.governance.autonomy.ephemeral_memory_sandbox import (
+                sandbox_enabled,
+            )
+            if not sandbox_enabled():
+                return None
+            from backend.core.ouroboros.governance.autonomy.iron_return import (
+                build_iron_artifact,
+            )
+            return build_iron_artifact(result)
+        except Exception:  # noqa: BLE001 — never break result reporting
+            logger.debug(
+                "[SubagentScheduler] iron artifact build failed (non-fatal)",
+                exc_info=True,
+            )
+            return None
 
     async def _emit_graph_event(
         self,
