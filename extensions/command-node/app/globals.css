@@ -1,0 +1,357 @@
+:root {
+  --bg: #0b0f17;
+  --panel: #131926;
+  --panel-2: #0e131d;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --accent: #3b82f6;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+    Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #fff;
+  background: #374151;
+}
+
+.badge-provider {
+  background: #1d4ed8;
+}
+.badge-route {
+  background: #4b5563;
+}
+.badge-cross,
+.badge-repo {
+  background: #b91c1c;
+}
+
+/* --- Mission-control 3-region layout --- */
+.command-node {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  grid-template-columns: 1fr 360px;
+  grid-template-areas:
+    'topbar topbar'
+    'fsm    fsm'
+    'dag    side';
+  height: 100vh;
+  gap: 8px;
+  padding: 8px;
+}
+
+.cn-topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.cn-fsm {
+  grid-area: fsm;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  overflow-x: auto;
+  max-height: 220px;
+}
+
+.cn-dag {
+  grid-area: dag;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.cn-side {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.cn-side > .blast-graph,
+.cn-side > .elevation-queue {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+/* --- FSM ribbon --- */
+.op-ribbon {
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.op-ribbon-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.op-id {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.phase-track {
+  display: flex;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  gap: 2px;
+}
+.phase {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 70px;
+  font-size: 9px;
+  text-align: center;
+}
+.phase-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #374151;
+  margin-bottom: 3px;
+}
+.phase-done .phase-dot {
+  background: #16a34a;
+}
+.phase-active .phase-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.35);
+}
+.phase-active .phase-label {
+  color: var(--accent);
+  font-weight: 600;
+}
+.phase-future .phase-label {
+  color: var(--muted);
+}
+
+/* --- DAG --- */
+.dag-canvas,
+.blast-flow {
+  width: 100%;
+  height: 100%;
+}
+.cn-dag .dag-canvas {
+  position: absolute;
+  inset: 0;
+}
+.dag-empty,
+.blast-graph .muted {
+  padding: 16px;
+}
+
+/* --- Blast radius --- */
+.blast-flow {
+  height: 320px;
+}
+.blast-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.blast-legend {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid;
+}
+.blast-detail {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--panel-2);
+}
+.blast-detail-head {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid;
+  padding-bottom: 4px;
+  margin-bottom: 6px;
+}
+.blast-detail dl {
+  display: grid;
+  grid-template-columns: 70px 1fr;
+  gap: 2px 8px;
+  margin: 0;
+  font-size: 12px;
+}
+.blast-detail dt {
+  color: var(--muted);
+}
+.blast-detail dd {
+  margin: 0;
+}
+
+/* --- Elevation queue --- */
+.elevation-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.elevation-head h2 {
+  font-size: 14px;
+  margin: 0 0 4px 0;
+}
+.elevation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.elevation-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--panel-2);
+}
+.elevation-item.focused {
+  outline: 1px solid var(--accent);
+}
+.elevation-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.elevation-summary {
+  margin: 6px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.elevation-actions {
+  display: flex;
+  gap: 6px;
+}
+.btn {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #1f2937;
+  color: var(--text);
+  cursor: pointer;
+}
+.btn-view:hover {
+  background: #374151;
+}
+.btn-authorize[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- Connection status --- */
+.conn-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.conn-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.conn-eid {
+  color: var(--muted);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Yield toasts --- */
+.yield-toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 50;
+}
+.yield-toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid #6b7280;
+  border-radius: 8px;
+  padding: 8px 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.yield-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  color: #fff;
+}
+.link {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}

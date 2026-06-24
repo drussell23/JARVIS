@@ -1371,6 +1371,33 @@ EVENT_TYPE_EVALUATOR_TRACE_FRAME = "evaluator_trace_frame"
 # object the dashboard renders as a prior distribution + confidence band.
 EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT = "cognitive_why_snapshot"
 
+# Sovereign Command Node Phase 1 (2026-06-23) -- four additive event types
+# exposing FSM phase transitions, cross-repo elevation gates, sovereign yield
+# telemetry, and DAG node state updates to IDE consumers. All are best-effort
+# (fail-soft publish helpers) and authority-free (read-only projection only).
+EVENT_TYPE_FSM_PHASE_CHANGED = "fsm_phase_changed"
+"""Emitted at every Ouroboros FSM phase transition. Payload: op_id + phase
++ route + risk_tier + schema_version. Best-effort hook in orchestrator;
+broker exception NEVER raises into the phase runner."""
+
+EVENT_TYPE_CROSS_REPO_ELEVATION_PENDING = "cross_repo_elevation_pending"
+"""Emitted when a cross-repo elevation request becomes pending (Orange/
+APPROVAL_REQUIRED with a cross-repo target recorded in critical_elevation).
+Payload: pr_id + target_repo + blast_radius_summary + schema_version.
+Authority-free; broker exception NEVER raises into the elevation path."""
+
+EVENT_TYPE_SOVEREIGN_YIELD = "sovereign_yield"
+"""Emitted by convergence_watchdog.emit_sovereign_yield when the reduction
+trajectory stalls or on graceful semantic-pivot yields (UNRESOLVABLE_PATH).
+Payload: op_id + reason + schema_version. The existing WARNING log is
+authoritative; this SSE event is a best-effort observability beacon."""
+
+EVENT_TYPE_DAG_NODE_UPDATED = "dag_node_updated"
+"""Emitted when a sub-goal DAG node transitions state (PENDING / DISPATCHED
+/ COMPLETE / FAILED / DLQ). Payload: op_id + node_id + state + schema_version.
+Composes sovereign_state_propagation_bridge -- no parallel state. Broker
+exception NEVER raises into the DAG runner."""
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
@@ -1554,6 +1581,10 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # per-model quality calibration result)
     EVENT_TYPE_FLEET_GRADUATED,                   # Sovereign Fleet Evaluator (2026-06-19 —
                                                   # quality-aware routing flipped authoritative)
+    EVENT_TYPE_FSM_PHASE_CHANGED,                # Command Node Phase 1 (2026-06-23 -- FSM phase transition)
+    EVENT_TYPE_CROSS_REPO_ELEVATION_PENDING,     # Command Node Phase 1 (2026-06-23 -- cross-repo elevation pending)
+    EVENT_TYPE_SOVEREIGN_YIELD,                  # Command Node Phase 1 (2026-06-23 -- convergence stall yield)
+    EVENT_TYPE_DAG_NODE_UPDATED,                 # Command Node Phase 1 (2026-06-23 -- DAG node state update)
 })
 
 
@@ -4518,3 +4549,116 @@ def register_flags(registry: Any) -> int:
                 exc_info=True,
             )
     return count
+
+
+# ---------------------------------------------------------------------------
+# Sovereign Command Node Phase 1 -- publish helpers (2026-06-23)
+# All helpers are fail-soft: a broker exception or missing broker NEVER
+# propagates to the caller. All are authority-free (read-only telemetry).
+# ---------------------------------------------------------------------------
+
+
+def publish_fsm_phase(op_id: str, phase: str, route: str, risk_tier: str) -> None:
+    """Publish FSM phase transition event. Best-effort, fail-soft.
+
+    Call sites: orchestrator._run_pipeline phase-transition seams.
+    Wrapped in try/except at the call site so this helper NEVER
+    disrupts the pipeline. Payload keyed by the command node spec.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_FSM_PHASE_CHANGED,
+            op_id,
+            {
+                "op_id": op_id,
+                "phase": phase,
+                "route": route,
+                "risk_tier": risk_tier,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_elevation_pending(
+    pr_id: str,
+    target_repo: str,
+    blast_radius_summary: dict,
+) -> None:
+    """Publish cross-repo elevation pending event. Best-effort, fail-soft.
+
+    Call sites: critical_elevation layer when elevation becomes pending.
+    Wrapped in try/except at the call site. Payload keyed by command
+    node spec -- blast_radius_summary is a bounded dict projection, NOT
+    the full BlastRadius object (avoids large payloads on the SSE channel).
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_CROSS_REPO_ELEVATION_PENDING,
+            pr_id,
+            {
+                "pr_id": pr_id,
+                "target_repo": target_repo,
+                "blast_radius_summary": blast_radius_summary,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_sovereign_yield(op_id: str, reason: str) -> None:
+    """Publish sovereign yield event. Best-effort, fail-soft.
+
+    Replaces (or composes alongside) the existing publish_task_event
+    call in convergence_watchdog.emit_sovereign_yield. Carries a
+    dedicated SSE event type so IDE consumers can subscribe with a
+    type filter rather than inspecting task payloads.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_SOVEREIGN_YIELD,
+            op_id,
+            {
+                "op_id": op_id,
+                "reason": reason,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_dag_node(op_id: str, node_id: str, state: str) -> None:
+    """Publish DAG node state update event. Best-effort, fail-soft.
+
+    Call sites: sovereign_state_propagation_bridge or any site that
+    transitions a sub-goal DAG node through PENDING / DISPATCHED /
+    COMPLETE / FAILED / DLQ. Wrapped in try/except at the call site.
+    """
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        broker.publish(
+            EVENT_TYPE_DAG_NODE_UPDATED,
+            op_id,
+            {
+                "op_id": op_id,
+                "node_id": node_id,
+                "state": state,
+                "schema_version": STREAM_SCHEMA_VERSION,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
