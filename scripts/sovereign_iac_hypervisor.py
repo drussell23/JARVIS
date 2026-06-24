@@ -527,12 +527,19 @@ if [ "${UPTIME_S}" -lt "${BOOT_GRACE_S}" ]; then
     echo "[sovereign-burn] BOOT GRACE active (uptime=${UPTIME_S}s < grace=${BOOT_GRACE_S}s) -- skip"
     exit 0
 fi
-if [ -f "${ACTIVITY_FILE}" ]; then
-    FILE_AGE_S=$(( $(date +%s) - $(stat -c %Y "${ACTIVITY_FILE}" 2>/dev/null || echo 0) ))
-    if [ "${FILE_AGE_S}" -lt "${IDLE_TIMEOUT_S}" ]; then
-        echo "[sovereign-burn] activity recent (age=${FILE_AGE_S}s < ${IDLE_TIMEOUT_S}s) -- no action"
-        exit 0
-    fi
+# FAIL-SAFE: if the activity file does NOT exist, we CANNOT determine idleness
+# (the IaC sandbox node has no Ollama bumping it) -- so DO NOT delete on a missing
+# file. The no-orphan guarantee then rests on max-run-duration (GCP hard ceiling)
+# + the completion-sentinel (verdict burn) + the local orchestrator delete. Only
+# an EXISTING activity file older than the timeout triggers an idle self-delete.
+if [ ! -f "${ACTIVITY_FILE}" ]; then
+    echo "[sovereign-burn] no activity file -- cannot assess idle; relying on max-run-duration + sentinel -- skip"
+    exit 0
+fi
+FILE_AGE_S=$(( $(date +%s) - $(stat -c %Y "${ACTIVITY_FILE}" 2>/dev/null || echo 0) ))
+if [ "${FILE_AGE_S}" -lt "${IDLE_TIMEOUT_S}" ]; then
+    echo "[sovereign-burn] activity recent (age=${FILE_AGE_S}s < ${IDLE_TIMEOUT_S}s) -- no action"
+    exit 0
 fi
 echo "[sovereign-burn] IDLE > ${IDLE_TIMEOUT_S}s and uptime > boot_grace -- initiating self-DELETE"
 _self_delete
@@ -595,6 +602,9 @@ def build_startup_script(
         "apt-get install -y docker.io docker-compose-plugin rsync || "
         "curl -fsSL https://get.docker.com | sh || true\n"
         "systemctl enable --now docker || service docker start || true\n"
+        "# Bootstrap python3-pip + build tools at BOOT (system pkgs, no repo needed)\n"
+        "# so the surgery harness deps install cleanly later (apt is fresh here).\n"
+        "apt-get install -y python3-pip python3-dev build-essential || true\n"
         "\n"
         "# 2. Open the minimal local firewall (sandbox is internal-network only).\n"
         "iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true\n"
@@ -670,8 +680,15 @@ def build_startup_script(
 def _create_node_cmd(
     args: argparse.Namespace, node: str, startup_script_path: str
 ) -> List[str]:
-    """e2-standard-8 (32GB) SPOT node, DELETE-on-preempt, max_run_duration,
-    cloud-platform scope (the dead-man needs it)."""
+    """e2-standard-8 (32GB) node, max_run_duration + DELETE (cost ceiling),
+    cloud-platform scope (the dead-man needs it). SPOT by default (cheapest);
+    --on-demand uses STANDARD for an UNINTERRUPTED window (no preemption) when a
+    multi-stage run needs to complete without a Spot reclaim mid-surgery."""
+    on_demand = bool(getattr(args, "on_demand", False))
+    sched = (
+        ["--provisioning-model=STANDARD"] if on_demand
+        else ["--provisioning-model=SPOT"]
+    )
     return [
         "gcloud", "compute", "instances", "create", node,
         f"--project={args.project}", f"--zone={args.zone}",
@@ -680,7 +697,7 @@ def _create_node_cmd(
         f"--image-project={args.source_image_project}",
         f"--boot-disk-size={args.boot_disk_size}",
         "--boot-disk-type=pd-balanced",
-        "--provisioning-model=SPOT",
+        *sched,
         "--instance-termination-action=DELETE",
         f"--max-run-duration={args.max_run_duration_s}s",
         "--scopes=cloud-platform",
@@ -695,6 +712,30 @@ def _ssh_cmd(args: argparse.Namespace, node: str, remote: str) -> List[str]:
         f"--project={args.project}", f"--zone={args.zone}",
         "--tunnel-through-iap", "--command", remote,
     ]
+
+
+def _tar_pipe_cmd(
+    args: argparse.Namespace, node: str, local: str, remote_dir: str,
+    excludes: List[str],
+) -> List[str]:
+    """Bulletproof remote sync: `tar czf - -C <local> <excludes> . | gcloud ssh
+    <node> --command 'tar xzf - -C <remote_dir>'`. Avoids the well-known
+    `gcloud compute scp --recurse` IAP flakiness ('stat remote: No such file or
+    directory') by streaming a tarball through the SSH tunnel and extracting it
+    into the pre-created remote dir. Returns a `bash -lc` command (a shell
+    pipeline) so the existing streaming runner can drive it. The tar progress
+    streams to the local terminal (prefixed [sync])."""
+    excl = " ".join(f"--exclude={shlex.quote(e)}" for e in excludes)
+    # remote side: gcloud ssh exec that pipes stdin into `tar xzf - -C <dir>`
+    remote_extract = (
+        f"gcloud compute ssh {shlex.quote(node)} "
+        f"--project={shlex.quote(args.project)} --zone={shlex.quote(args.zone)} "
+        f"--tunnel-through-iap --command {shlex.quote('tar xzf - -C ' + shlex.quote(remote_dir))}"
+    )
+    pipeline = (
+        f"tar czf - -C {shlex.quote(local)} {excl} . | {remote_extract}"
+    )
+    return ["bash", "-lc", pipeline]
 
 
 def _scp_cmd(
@@ -863,13 +904,35 @@ def sync_repos_to_node(
     Transport selected by JARVIS_IAC_SYNC_TRANSPORT (default scp -- robust over
     IAP). Returns (ok, detail). Fail-soft.
     """
-    transport = os.environ.get("JARVIS_IAC_SYNC_TRANSPORT", "scp").strip().lower()
+    transport = os.environ.get("JARVIS_IAC_SYNC_TRANSPORT", "tar").strip().lower()
     pairs = _resolve_repo_paths(args)
+    # PREP: the startup-script created _REMOTE_TRINITY_ROOT as ROOT, so the scp/ssh
+    # user cannot write into it ("stat remote: No such file or directory" / perm
+    # denied). Create the per-repo subdirs + chown the whole tree to the login
+    # user BEFORE the transfer. Reuses sudo (passwordless on the GCP image).
+    _root = shlex.quote(_REMOTE_TRINITY_ROOT)
+    # Create + chown the root AND the per-repo subdirs: the tar-pipe transport
+    # (default) extracts the repo CONTENTS into a pre-existing subdir (no nesting).
+    _subdirs = " ".join(shlex.quote(f"{_REMOTE_TRINITY_ROOT}/{n}") for n, _ in pairs)
+    _prep = (
+        f"sudo mkdir -p {_subdirs} && "
+        f'sudo chown -R "$(id -un)":"$(id -gn)" {_root} && '
+        f"echo workspace_ready {_root}"
+    )
+    _log(f"preparing remote workspace {_REMOTE_TRINITY_ROOT} (mkdir + chown to login user)")
+    _prc, _pcap = _run_streaming_labeled(
+        _ssh_cmd(args, node, _prep), label="sync", log_path=log_path,
+        timeout_s=float(args.sync_timeout_s),
+    )
+    if _prc != 0:
+        return False, f"remote workspace prep failed rc={_prc}: {''.join(_pcap).strip()[:300]}"
     for name, local in pairs:
         if not local:
             return False, f"repo path for '{name}' is unset (set JARVIS_{name.upper()}_REPO_PATH)"
         remote_dir = f"{_REMOTE_TRINITY_ROOT}/{name}"
-        if transport == "rsync":
+        if transport == "tar":
+            cmd = _tar_pipe_cmd(args, node, local, remote_dir, excludes)
+        elif transport == "rsync":
             cmd = _rsync_cmd(args, node, local, remote_dir, excludes)
         else:
             cmd = _scp_cmd(args, node, local, remote_dir, excludes)
@@ -900,12 +963,44 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         "export JARVIS_CROSS_REPO_MUTATION_ENABLED=1; "
         "export JARVIS_CHAOS_INJECTOR_ENABLED=1; "
     )
-    # cd into the synced jarvis repo, run the surgery, ALWAYS drop the sentinel.
+    # The surgery harness imports the full JARVIS ouroboros stack (oracle ->
+    # engine -> aiohttp + ...). Install jarvis's deps on the host python BEFORE
+    # the surgery -- but FILTER the multi-GB ML libs (torch/transformers/...) the
+    # controlled harness never exercises (no inference), so the install is fast.
+    # pip skips already-satisfied on a resume (cheap re-run). WAN-connected (the
+    # HOST node, not the air-gapped container). Override via JARVIS_IAC_SURGERY_DEP_INSTALL.
+    dep_install = os.environ.get(
+        "JARVIS_IAC_SURGERY_DEP_INSTALL",
+        "echo '[deps] installing jarvis host deps (pip from boot; ML libs filtered)'; "
+        # pip is installed at BOOT (startup-script). Fallback-bootstrap if missing.
+        "python3 -m pip --version >/dev/null 2>&1 "
+        "|| (sudo apt-get update -y -qq && sudo apt-get install -y -q python3-pip) >/dev/null 2>&1 "
+        "|| (curl -fsSL https://bootstrap.pypa.io/get-pip.py | sudo python3) >/dev/null 2>&1 || true; "
+        # Filter the multi-GB ML libs the controlled harness never exercises +
+        # strip Ouroboros comment lines / drop the heavy set, keep aiohttp/fastapi/etc.
+        "grep -ivE '^(#|torch|torchaudio|torchvision|tensorflow|transformers|vllm|"
+        "llama|nvidia|triton|xformers|onnx|scipy|scikit|sentencepiece|accelerate|"
+        "bitsandbytes|fastembed|peft|trl|datasets)' requirements.txt > /tmp/req_light.txt 2>/dev/null "
+        "|| cp requirements.txt /tmp/req_light.txt; "
+        "sudo python3 -m pip install --break-system-packages -q -r /tmp/req_light.txt 2>&1 "
+        "| tail -4 || python3 -m pip install --user -q -r /tmp/req_light.txt 2>&1 | tail -4 || true; "
+        "python3 -c 'import aiohttp; print(\"[deps] aiohttp ok\", aiohttp.__version__)' 2>&1 | tail -1",
+    )
+    # cd into the synced jarvis repo, install deps, run the surgery. The completion
+    # sentinel (which arms the node-side dead-man to burn IMMEDIATELY) is dropped
+    # ONLY when the surgery reached a real VERDICT (PASS/FRACTURE) -- NOT on a
+    # resumable failure (e.g. a missing dep), so keep-warm actually keeps the node
+    # alive for a resume instead of the dead-man burning it out from under us.
+    sentinel_q2 = shlex.quote(args.completion_sentinel)
     return (
         f"cd {shlex.quote(jr)} && {env} "
-        f"({args.surgery_cmd}); rc=$?; "
-        f"sudo touch {shlex.quote(args.completion_sentinel)} 2>/dev/null "
-        f"|| touch {shlex.quote(args.completion_sentinel)} 2>/dev/null || true; "
+        f"{dep_install}; "
+        f"({args.surgery_cmd}) 2>&1 | tee /tmp/surgery.out; rc=${{PIPESTATUS[0]}}; "
+        # verdict-conditional sentinel: only burn on a terminal verdict.
+        "if grep -qE 'VERDICT:|CROSS-REPO FRACTURE|ROLLBACK VERIFIED' /tmp/surgery.out; then "
+        f"sudo touch {sentinel_q2} 2>/dev/null || touch {sentinel_q2} 2>/dev/null || true; "
+        "echo '[iac] verdict reached -- completion-sentinel dropped (dead-man will burn)'; "
+        "else echo '[iac] no verdict (resumable) -- sentinel NOT dropped, node stays warm'; fi; "
         "exit $rc"
     )
 
@@ -1519,6 +1614,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "resume yet bounded (env JARVIS_IAC_NODE_IDLE_TIMEOUT_S)")
     p.add_argument("--fresh", action="store_true",
                    help="ignore + clear any checkpoint; provision a brand-new node")
+    p.add_argument("--on-demand", dest="on_demand", action="store_true",
+                   help="provision STANDARD (on-demand, no Spot preemption) for an "
+                        "uninterrupted multi-stage run; keeps max-run-duration + DELETE")
     p.add_argument("--keep-warm-on-failure", dest="keep_warm_on_failure",
                    action="store_true", default=True,
                    help="on a RESUMABLE mid-pipeline failure leave the node WARM + "
