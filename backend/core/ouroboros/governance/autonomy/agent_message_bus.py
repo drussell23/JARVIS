@@ -6,19 +6,36 @@ FINDING / STATUS messages WITHOUT ever trusting one another.
 
 Security model -- Zero-Trust, fail-CLOSED, advisory-only:
     * The bus is constructed per-ExecutionGraph with a graph-scoped secret
-      (``secrets.token_bytes(32)``). It is torn down + GC'd on DAG completion
-      (the scheduler graph ``finally``). There is NO global / persistent bus.
-    * Every ingress message passes a Zero-Trust gate: HMAC signature verify
-      (``hmac.compare_digest``), sender authenticity (must be a REGISTERED
-      member of THIS graph -- a worker cannot claim to be the Commander),
-      privilege-injection ban (the payload is DATA, never authority -- no
-      ``grant_tool`` / ``raise_budget`` / ``authority`` / ``role`` directives),
-      Tier -1 sanitization (control-char strip + length cap + secret-shape
-      redaction), and bounded admission (per-worker inbox maxsize, dedup LRU,
-      TTL expiry, drop-oldest backpressure + single lag signal).
-    * Any verify/parse/probe failure DROPS the message and emits a
+      (``secrets.token_bytes(32)``, held as a mutable ``bytearray`` so it can be
+      overwritten in place on teardown). It is torn down + GC'd on DAG
+      completion (the scheduler graph ``finally``). There is NO global /
+      persistent bus.
+    * **Per-worker identity (NOT shared membership).** The graph secret NEVER
+      leaves the bus. At ``register_worker(worker_id)`` the bus derives a
+      per-worker key ``HMAC(graph_secret, worker_id)`` and returns it ONLY to
+      that worker. A worker signs with its OWN key. There is no public ``sign``
+      that lets a caller sign as an arbitrary identity, and no way for a worker
+      to obtain another worker's key (it would need the graph secret, which it
+      never holds). The bus authenticates INDIVIDUAL identity, not just
+      membership: a prompt-injected legitimate member CANNOT forge a message
+      as a peer or as the Commander.
+    * Every ingress message passes a Zero-Trust gate: it re-derives the CLAIMED
+      ``from_worker``'s per-worker key from the graph secret and verifies the
+      HMAC signature against THAT key (``hmac.compare_digest``). A message
+      signed with worker-A's key but claiming ``from_worker="w2"`` /
+      ``"fleet_commander"`` verifies against the CLAIMED id's key -> FAILS ->
+      DROP + SovereignYield (``identity_forgery``). Sender authenticity (must
+      be a REGISTERED member of THIS graph) is checked too. Then: structural
+      data-only payload quarantine (the delivered payload is DATA, never an
+      authority/tool/scope/budget input to any ScopedToolBackend) with an
+      NFKC-normalized elevation key-scan as advisory defense-in-depth, Tier -1
+      sanitization (control-char strip + length cap + secret-shape redaction),
+      and bounded admission (per-worker inbox maxsize, dedup LRU, TTL expiry,
+      drop-oldest backpressure + single lag signal).
+    * Any verify/derive/parse/probe failure DROPS the message and emits a
       SovereignYield. A delivered message can NEVER grant tools, raise a
-      budget, alter scope, or carry governance directives -- it is data.
+      budget, alter scope, or carry governance directives -- it is data fenced
+      as untrusted peer data.
     * A signature minted in graph A fails verification in graph B (different
       secret) -> DROP. Cross-graph isolation is structural.
 
@@ -46,6 +63,7 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -106,6 +124,29 @@ def _default_ttl_s() -> float:
     return float(_env_int("JARVIS_SWARM_BUS_DEFAULT_TTL_S", 300))
 
 
+def _responses_capacity() -> int:
+    """Bounded LRU cap for the request/response correlation map (anti-OOM)."""
+    return _env_int("JARVIS_SWARM_BUS_RESPONSES_CAPACITY", 1024)
+
+
+# Zero-width / format codepoints stripped before the NFKC elevation scan so a
+# zero-width-joined "grant<ZWSP>tool" style evasion collapses to the canonical
+# token. Declared by escape so this source file stays pure ASCII.
+_ZERO_WIDTH_CHARS = (
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\u2060",  # word joiner
+    "\ufeff",  # zero-width no-break space / BOM
+)
+
+# The fence marker wrapping a delivered payload as explicitly UNTRUSTED peer
+# data. The delivered payload is DATA-ONLY: it is NEVER passed as a tool / scope
+# / budget input to any ScopedToolBackend. Consumers MUST treat the value under
+# this key as adversary-controlled.
+_QUARANTINE_KEY = "untrusted_peer_data"
+
+
 # ---------------------------------------------------------------------------
 # message kinds
 # ---------------------------------------------------------------------------
@@ -122,18 +163,29 @@ class MessageKind(enum.Enum):
 
 
 # ---------------------------------------------------------------------------
-# privilege-injection ban (ContextElevation)
+# structural data-only payload quarantine + advisory elevation scan
 # ---------------------------------------------------------------------------
 
-# The payload is DATA. A received message can NEVER grant tools, raise a
-# budget, alter scope, or carry governance directives. Any key OR string value
-# matching these privilege-elevation shapes -> DROP + SovereignYield. This is
-# the structural ban on authority-as-data.
+# THE elevation defense is STRUCTURAL: a delivered payload is DATA-ONLY. It is
+# fenced under ``_QUARANTINE_KEY`` as explicitly untrusted peer data and is
+# NEVER passed as a tool / scope / budget / authority input to any
+# ScopedToolBackend. The key/value scan below is ADVISORY defense-in-depth --
+# it raises friction and produces telemetry, but it is NOT the boundary (a
+# denylist is always evadable via synonyms / confusables / prose-as-values;
+# the data-only fence is what actually contains authority-injection).
+#
+# Keys are NFKC-normalized + zero-width-stripped + lowercased before the scan,
+# so unicode-confusable evasions (``grant_tool`` written with a Latin-small-
+# letter-script-g, zero-width-joined tokens, etc.) collapse to the canonical
+# form and are still caught.
 _ELEVATION_KEYS = frozenset(
     {
         "elevate",
+        "escalate",
         "grant_tool",
         "grant_tools",
+        "give_tool",
+        "give_tools",
         "raise_budget",
         "mutation_budget",
         "budget_override",
@@ -142,7 +194,10 @@ _ELEVATION_KEYS = frozenset(
         "system",
         "role",
         "tool_allowlist",
+        "tool_allow_list",
         "allowed_tools",
+        "allow_list",
+        "allowlist",
         "tools",
         "scope",
         "scope_paths",
@@ -177,8 +232,34 @@ _ELEVATION_SUBSTRINGS = (
 )
 
 
+def _normalize_for_scan(text: str) -> str:
+    """NFKC-normalize, strip zero-width / format chars, lowercase.
+
+    Collapses unicode-confusable evasions (``grant_tool`` with a script-g, etc.)
+    and zero-width-joined tokens to their canonical comparable form. Pure;
+    fail-soft -> returns ``str(text)`` lowered on any error.
+    """
+    try:
+        s = unicodedata.normalize("NFKC", str(text))
+        for zw in _ZERO_WIDTH_CHARS:
+            s = s.replace(zw, "")
+        # Drop any residual Cf (format) codepoints not in the explicit list.
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+        return s.strip().lower()
+    except Exception:  # noqa: BLE001 -- fail-soft
+        try:
+            return str(text).strip().lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+
 def _is_elevation_attempt(payload: Any, *, _depth: int = 0) -> bool:
-    """Recursively scan a payload for privilege-elevation shapes.
+    """Recursively scan a payload for privilege-elevation shapes (ADVISORY).
+
+    Keys + string values are NFKC-normalized + zero-width-stripped before the
+    scan so confusable/zero-width evasions are still caught. This is
+    defense-in-depth telemetry, NOT the elevation boundary -- the structural
+    data-only fence (:func:`quarantine_payload`) is the boundary.
 
     Fail-CLOSED: any scan error -> treat as an elevation attempt (DROP).
     """
@@ -188,7 +269,7 @@ def _is_elevation_attempt(payload: Any, *, _depth: int = 0) -> bool:
             return True
         if isinstance(payload, dict):
             for key, value in payload.items():
-                key_norm = str(key).strip().lower()
+                key_norm = _normalize_for_scan(key)
                 if key_norm in _ELEVATION_KEYS:
                     return True
                 if any(sub in key_norm for sub in _ELEVATION_SUBSTRINGS):
@@ -201,12 +282,43 @@ def _is_elevation_attempt(payload: Any, *, _depth: int = 0) -> bool:
                 _is_elevation_attempt(item, _depth=_depth + 1) for item in payload
             )
         if isinstance(payload, str):
-            low = payload.strip().lower()
+            low = _normalize_for_scan(payload)
             return any(sub in low for sub in _ELEVATION_SUBSTRINGS)
         return False
     except Exception:  # noqa: BLE001 -- fail-CLOSED
         logger.debug("[AgentBus] elevation scan raised -> treating as attempt", exc_info=True)
         return True
+
+
+def sign_with_key(worker_key: bytes, msg: "AgentMessage") -> str:
+    """Compute the HMAC-SHA256 of ``msg`` under a PER-WORKER key.
+
+    This is how a worker signs its OWN outbound messages: it holds only the key
+    returned by :meth:`AgentMessageBus.register_worker` for its own id. There is
+    NO bus method that signs as an arbitrary identity. Fail-CLOSED -> empty
+    string on error (a missing signature never verifies).
+    """
+    try:
+        return hmac.new(bytes(worker_key), msg.canonical_bytes(), hashlib.sha256).hexdigest()
+    except Exception:  # noqa: BLE001 -- fail-CLOSED
+        return ""
+
+
+def quarantine_payload(payload: Any) -> Dict[str, Any]:
+    """Wrap a delivered payload as explicitly UNTRUSTED peer data.
+
+    Returns a single-key envelope ``{"untrusted_peer_data": <payload>}`` with a
+    clear fence marker. The wrapped value is DATA-ONLY: consumers MUST treat it
+    as adversary-controlled and MUST NOT pass it as a tool / scope / budget /
+    authority input to any ScopedToolBackend. This structural fence -- NOT the
+    advisory elevation key-scan -- is the real ContextElevation defense.
+
+    Fail-CLOSED: any error -> empty fenced envelope (never leaks raw payload).
+    """
+    try:
+        return {_QUARANTINE_KEY: payload}
+    except Exception:  # noqa: BLE001 -- fail-closed
+        return {_QUARANTINE_KEY: None}
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +383,7 @@ class _DropReason(str, enum.Enum):
     SPOOFED_SENDER = "spoofed_sender"
     UNREGISTERED_SENDER = "unregistered_sender"
     BAD_SIGNATURE = "bad_signature"
+    IDENTITY_FORGERY = "identity_forgery"
     CONTEXT_ELEVATION = "context_elevation_attempt"
     MALFORMED = "malformed_message"
     OVERSIZED = "oversized_payload"
@@ -315,9 +428,13 @@ class AgentMessageBus:
     ) -> None:
         self.graph_id = graph_id
         self.op_id = op_id or graph_id
-        # The graph-scoped secret -- minted fresh per bus. A signature from
-        # another graph fails here (cross-graph isolation).
-        self._secret = secret if secret is not None else secrets.token_bytes(32)
+        # The graph-scoped secret -- minted fresh per bus, held as a MUTABLE
+        # bytearray so destroy() can overwrite it in place. A signature derived
+        # from another graph's secret fails here (cross-graph isolation). This
+        # secret NEVER leaves the bus -- workers receive only a derived
+        # per-worker key.
+        raw = secret if secret is not None else secrets.token_bytes(32)
+        self._secret = bytearray(raw)
         self._inbox_maxsize = inbox_maxsize if inbox_maxsize else _inbox_maxsize()
         # Registered members of THIS graph -- only these may send.
         self._members: set[str] = set()
@@ -326,8 +443,12 @@ class AgentMessageBus:
         # Dedup LRU by msg_id (bounded).
         self._seen_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
         self._dedup_capacity = _dedup_capacity()
-        # Pending request/response correlation (request() round-trip).
-        self._responses: Dict[str, AgentMessage] = {}
+        # Pending request/response correlation (request() round-trip) -- bounded
+        # LRU so a unique-correlation flood can never OOM the map.
+        self._responses: "collections.OrderedDict[str, AgentMessage]" = (
+            collections.OrderedDict()
+        )
+        self._responses_capacity = _responses_capacity()
         # Counters (operator signal; never content).
         self.dropped: Dict[str, int] = collections.defaultdict(int)
         self.delivered: int = 0
@@ -336,19 +457,30 @@ class AgentMessageBus:
 
     # -- identity ---------------------------------------------------------
 
-    def register_worker(self, worker_id: str) -> None:
+    def register_worker(self, worker_id: str) -> bytes:
         """Register ``worker_id`` as a member of THIS graph (at spawn).
 
+        Derives and returns the worker's PER-WORKER key
+        ``HMAC(graph_secret, worker_id)`` -- the ONLY secret material a worker
+        ever holds. The graph secret itself NEVER leaves the bus. The worker
+        signs its outbound messages with this key (see :func:`sign_with_key`);
+        the bus re-derives the SAME key from the claimed sender id at ingress
+        and verifies against it, so a worker cannot forge a peer's / the
+        Commander's signature (it cannot derive another id's key without the
+        graph secret).
+
         Only registered members may send. Registration also provisions the
-        worker's bounded inbox.
+        worker's bounded inbox. Returns ``b""`` if the bus is destroyed or the
+        id is empty (fail-closed: no usable key).
         """
         if self._destroyed:
-            return
+            return b""
         wid = str(worker_id)
         if not wid:
-            return
+            return b""
         self._members.add(wid)
         self._inboxes.setdefault(wid, collections.deque(maxlen=self._inbox_maxsize))
+        return self._derive_worker_key(wid)
 
     def is_member(self, worker_id: str) -> bool:
         return str(worker_id) in self._members
@@ -356,13 +488,23 @@ class AgentMessageBus:
     def members(self) -> Tuple[str, ...]:
         return tuple(sorted(self._members))
 
-    # -- signing ----------------------------------------------------------
+    # -- per-worker identity (the graph secret NEVER leaves the bus) ------
 
-    def sign(self, msg: AgentMessage) -> str:
-        """Compute the graph-scoped HMAC-SHA256 over the canonical message."""
-        return hmac.new(
-            self._secret, msg.canonical_bytes(), hashlib.sha256
-        ).hexdigest()
+    def _derive_worker_key(self, worker_id: str) -> bytes:
+        """Derive the per-worker key ``HMAC(graph_secret, worker_id)``.
+
+        Internal: callers outside the bus get a key only via
+        :meth:`register_worker` (their OWN id). Fail-CLOSED -> ``b""`` on error
+        (an empty key produces a signature that never verifies).
+        """
+        try:
+            return hmac.new(
+                bytes(self._secret), str(worker_id).encode("utf-8"), hashlib.sha256
+            ).digest()
+        except Exception:  # noqa: BLE001 -- fail-CLOSED
+            return b""
+
+    # -- signing ----------------------------------------------------------
 
     def make_signed(
         self,
@@ -375,10 +517,17 @@ class AgentMessageBus:
         ttl_s: float = 0.0,
         msg_id: Optional[str] = None,
     ) -> AgentMessage:
-        """Build a message and stamp it with THIS bus's signature.
+        """Build a message and stamp it with the FROM_WORKER's per-worker key.
 
-        Convenience for legitimate in-graph senders. A rogue worker that does
-        not hold the secret cannot produce a valid signature.
+        Convenience for a legitimate in-graph sender stamping its OWN identity:
+        the signature is computed under ``HMAC(graph_secret, from_worker)``, the
+        same key that worker received at registration. A caller using this to
+        claim a foreign ``from_worker`` produces a signature that DOES verify at
+        ingress (because the bus holds the graph secret) -- so this helper is
+        ONLY for the bus's own internal/legit use (e.g. ``request()``); it is
+        NOT exposed as a "sign as anyone" primitive to workers. A worker signs
+        externally with :func:`sign_with_key` using ITS OWN returned key, and
+        cannot derive another id's key.
         """
         msg = AgentMessage(
             msg_id=msg_id or secrets.token_hex(8),
@@ -389,7 +538,7 @@ class AgentMessageBus:
             correlation_id=str(correlation_id),
             ttl_s=ttl_s,
         )
-        msg.signature = self.sign(msg)
+        msg.signature = sign_with_key(self._derive_worker_key(str(from_worker)), msg)
         return msg
 
     # -- dedup ------------------------------------------------------------
@@ -403,19 +552,62 @@ class AgentMessageBus:
         while len(self._seen_ids) > self._dedup_capacity:
             self._seen_ids.popitem(last=False)
 
+    def _record_response(self, correlation_id: str, msg: AgentMessage) -> None:
+        """Bounded-LRU insert into the response map (same eviction discipline as
+        the dedup LRU) so a unique-correlation flood can never OOM the map."""
+        self._responses[correlation_id] = msg
+        self._responses.move_to_end(correlation_id)
+        while len(self._responses) > self._responses_capacity:
+            self._responses.popitem(last=False)
+
     # -- ingress gate (THE security boundary) -----------------------------
 
     def _verify_signature(self, msg: AgentMessage) -> bool:
-        """Constant-time signature verify against the graph secret.
+        """Constant-time signature verify against the CLAIMED sender's key.
 
-        A signature minted with a different secret (another graph) fails here.
+        Re-derives ``HMAC(graph_secret, msg.from_worker)`` -- the per-worker key
+        of whoever the message CLAIMS to be from -- and verifies the signature
+        against THAT key. A message signed with worker-A's key but claiming
+        ``from_worker="w2"`` / ``"fleet_commander"`` is verified against the
+        CLAIMED id's key and FAILS: the bus authenticates INDIVIDUAL identity,
+        not just membership. A signature minted under a different graph's secret
+        also fails (cross-graph isolation). Fail-CLOSED on any error.
         """
         try:
-            expected = self.sign(msg)
             provided = str(msg.signature or "")
             if not provided:
                 return False
+            worker_key = self._derive_worker_key(str(msg.from_worker or ""))
+            if not worker_key:
+                return False
+            expected = sign_with_key(worker_key, msg)
+            if not expected:
+                return False
             return hmac.compare_digest(expected, provided)
+        except Exception:  # noqa: BLE001 -- fail-CLOSED
+            return False
+
+    def _signed_by_another_member(self, msg: AgentMessage) -> bool:
+        """True iff the signature verifies under SOME registered member's key
+        other than the (failing) claimed sender -- i.e. a real insider signed
+        this message and lied about ``from_worker``. Bounded by member count;
+        fail-CLOSED -> False (treated as a generic bad signature). NEVER raises.
+        """
+        try:
+            provided = str(msg.signature or "")
+            if not provided:
+                return False
+            claimed = str(msg.from_worker or "")
+            for member in self._members:
+                if member == claimed:
+                    continue
+                key = self._derive_worker_key(member)
+                if not key:
+                    continue
+                candidate = sign_with_key(key, msg)
+                if candidate and hmac.compare_digest(candidate, provided):
+                    return True
+            return False
         except Exception:  # noqa: BLE001 -- fail-CLOSED
             return False
 
@@ -482,15 +674,32 @@ class AgentMessageBus:
             if not msg.msg_id or not isinstance(msg.kind, MessageKind):
                 return self._drop(op_id, _DropReason.MALFORMED)
 
-            # 1. Signature -- missing / forged / tampered -> DROP + yield.
+            # 1. Signature -- verified against the CLAIMED sender's per-worker
+            #    key (re-derived from the graph secret). A REGISTERED INSIDER
+            #    (prompt-injected worker) holding only its OWN key that signs
+            #    then claims a peer / the Commander FAILS here -> the bus proves
+            #    INDIVIDUAL identity, not just membership.
+            sender = str(msg.from_worker or "")
             if not self._verify_signature(msg):
-                return self._drop(op_id, _DropReason.BAD_SIGNATURE, yield_it=True)
+                # Disambiguate for telemetry (both DROP + yield identically):
+                #   - identity_forgery: the signature DOES verify under some
+                #     OTHER registered member's key -> a real insider signed
+                #     this and lied about from_worker (peer/Commander spoof).
+                #   - bad_signature: verifies under no member key -> foreign
+                #     secret (cross-graph), tampered, or garbage.
+                reason = (
+                    _DropReason.IDENTITY_FORGERY
+                    if self._signed_by_another_member(msg)
+                    else _DropReason.BAD_SIGNATURE
+                )
+                return self._drop(op_id, reason, yield_it=True)
 
             # 2. Sender authenticity -- must be a REGISTERED member of THIS
             #    graph. A worker claiming "fleet_commander" / a Commander id /
-            #    an unregistered worker -> DROP + yield (spoofed_sender). The
-            #    signature alone is not enough: the sender tag must be real.
-            sender = str(msg.from_worker or "")
+            #    an unregistered worker -> DROP + yield. The signature verify
+            #    in step 1 already rejects forging a REGISTERED peer's identity;
+            #    this rejects claiming a non-member id (Commander / ghost) whose
+            #    key the attacker also cannot derive.
             if sender not in self._members:
                 # Distinguish a Commander-impersonation spoof from a plain
                 # unregistered sender for clearer telemetry, but both DROP.
@@ -511,10 +720,15 @@ class AgentMessageBus:
                 return self._drop(op_id, _DropReason.OVERSIZED)
 
             # 5. Sanitize (Tier -1) -- control-char strip + length cap +
-            #    secret-shape redaction on all string content.
-            msg.payload = self._sanitize_payload(msg.payload)
-            if not isinstance(msg.payload, dict):
+            #    secret-shape redaction on all string content -- THEN fence the
+            #    sanitized payload as untrusted peer DATA (structural data-only
+            #    quarantine). The delivered payload lives under
+            #    ``untrusted_peer_data`` and is NEVER an authority/tool/scope
+            #    input to any ScopedToolBackend.
+            sanitized = self._sanitize_payload(msg.payload)
+            if not isinstance(sanitized, dict):
                 return self._drop(op_id, _DropReason.MALFORMED)
+            msg.payload = quarantine_payload(sanitized)
 
             # 6. TTL expiry.
             if msg.is_expired():
@@ -534,10 +748,12 @@ class AgentMessageBus:
                 return self._drop(op_id, _DropReason.UNKNOWN_RECIPIENT)
 
             # 9. Bounded admission -- drop-oldest backpressure + single lag.
-            if len(inbox) >= self._inbox_maxsize:
+            inbox_full = len(inbox) >= self._inbox_maxsize
+            if inbox_full:
                 # deque(maxlen=...) drops the oldest on append; emit a single
                 # lag signal per bus so a flood produces one signal, not a
-                # storm.
+                # storm. This append EVICTS an oldest message -> count it as a
+                # drop (inbox_full), NOT as a clean delivery (no double-count).
                 if not self.lag_signalled:
                     self.lag_signalled = True
                     logger.warning(
@@ -550,11 +766,13 @@ class AgentMessageBus:
 
             self._record_seen(msg.msg_id)
             inbox.append(msg)
-            self.delivered += 1
+            if not inbox_full:
+                self.delivered += 1
 
-            # Correlation bookkeeping for request/response round-trips.
+            # Correlation bookkeeping for request/response round-trips (bounded
+            # LRU -> a unique-correlation flood cannot OOM the response map).
             if msg.kind is MessageKind.CLARIFICATION_RESPONSE and msg.correlation_id:
-                self._responses[msg.correlation_id] = msg
+                self._record_response(msg.correlation_id, msg)
             return True
         except Exception:  # noqa: BLE001 -- the bus NEVER crashes on a message.
             logger.debug("[AgentBus] send raised -> DROP (fail-closed)", exc_info=True)
@@ -623,8 +841,16 @@ class AgentMessageBus:
             self._inboxes.clear()
             self._seen_ids.clear()
             self._responses.clear()
-            # Overwrite the secret so it cannot be recovered from the object.
-            self._secret = b""
+            # Overwrite the secret IN PLACE (best-effort in-memory wipe). The
+            # secret is a mutable bytearray, so zeroing each byte scrubs the
+            # backing buffer rather than just rebinding the name (which would
+            # leave the old bytes alive until GC). Captured inbox refs held by
+            # other objects are out of scope for this wipe.
+            try:
+                for i in range(len(self._secret)):
+                    self._secret[i] = 0
+            except Exception:  # noqa: BLE001 -- best-effort
+                pass
         except Exception:  # noqa: BLE001 -- teardown must never break cleanup.
             logger.debug("[AgentBus] destroy raised (non-fatal)", exc_info=True)
 

@@ -3,7 +3,15 @@
 When two workers locked in a clarification round-trip either (a) trip the
 ``SemanticStagnationDetector`` (intelligent early break) OR (b) reach
 ``max_turn_budget + 1`` turns without a verified artifact (the dumb backstop),
-the breaker SHATTERS the deadlock:
+the breaker SHATTERS the deadlock.
+
+**Keyed by worker-PAIR, not correlation_id (red-team CRITICAL #2).** Both the
+integer turn budget AND the stagnation window are bucketed on the stable
+``frozenset({worker_a, worker_b})`` pair-key. A caller that mints a fresh
+``correlation_id`` on every turn (the default ``request()`` path) can NO LONGER
+reset the turn count or the similarity window -- cross-correlation turns
+between the same pair feed the SAME budget + the SAME stagnation bucket. The
+breaker SHATTERS the deadlock:
 
     1. kill both worker processes (cancel their units via the existing
        hard-kill / unit-cancel wrapper),
@@ -32,6 +40,7 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.governance.autonomy.stagnation_detector import (
     SemanticStagnationDetector,
+    pair_key,
 )
 from backend.core.ouroboros.governance.conversation_bridge import redact_secrets
 from backend.core.secure_logging import sanitize_for_log
@@ -153,14 +162,31 @@ class EpistemicDeadlockBreaker:
     kill_unit: Optional[Callable[[str], Any]] = None
     _transcript: List[str] = field(default_factory=list)
     _turns: int = 0
+    _pair_key: Any = None
 
     def __post_init__(self) -> None:
         if not self.op_id:
             self.op_id = self.correlation_id
+        # Stable, corr-rotation-immune bucket key for BOTH the turn budget
+        # (this instance's _turns) and the stagnation window (the detector
+        # bucket). Rotating the correlation_id cannot reset either.
+        self._pair_key = pair_key(self.worker_a, self.worker_b)
 
-    def observe_turn(self, turn_text: str, *, verified_artifact: bool = False) -> None:
+    def observe_turn(
+        self,
+        turn_text: str,
+        *,
+        verified_artifact: bool = False,
+        correlation_id: Optional[str] = None,  # accepted but NOT used as a key
+    ) -> None:
         """Record a turn from the pair. Raises :class:`DeadlockInterruptedException`
         on EITHER trigger.
+
+        ``correlation_id`` may rotate per turn (the default ``request()``
+        behavior) -- it is accepted for transcript/telemetry context but is
+        DELIBERATELY NOT used as the budget/stagnation key. Both the turn budget
+        and the stagnation window are keyed by the stable worker-PAIR, so corr
+        rotation cannot reset the count or the similarity window.
 
         Fail-CLOSED: a turn-count / artifact-ambiguity error -> interrupt.
         ``verified_artifact=True`` means the exchange produced a real artifact
@@ -174,16 +200,18 @@ class EpistemicDeadlockBreaker:
 
             # A verified artifact resolves the exchange -- never a deadlock.
             if verified_artifact:
-                self.detector.reset(self.correlation_id)
+                self.detector.reset(self._pair_key)
                 return
 
-            # (a) intelligent early break -- semantic stagnation.
-            stagnant = self.detector.observe(self.correlation_id, text)
+            # (a) intelligent early break -- semantic stagnation, bucketed by
+            #     the PAIR key (corr-rotation-immune).
+            stagnant = self.detector.observe(self._pair_key, text)
             if stagnant:
                 self._shatter("semantic_stagnation")
                 return  # unreachable -- _shatter raises
 
-            # (b) dumb backstop -- max_turn_budget + 1 without an artifact.
+            # (b) dumb backstop -- max_turn_budget + 1 without an artifact. The
+            #     count is per-pair (this instance), not per-correlation_id.
             if self._turns >= (max_turn_budget() + 1):
                 self._shatter("max_turn_budget")
                 return  # unreachable

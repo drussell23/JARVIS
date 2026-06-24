@@ -15,6 +15,7 @@ from backend.core.ouroboros.governance.autonomy.agent_message_bus import (
     AgentMessage,
     AgentMessageBus,
     MessageKind,
+    sign_with_key,
 )
 
 
@@ -33,9 +34,13 @@ def yield_spy(monkeypatch):
 
 
 def _bus(graph_id="g-red", op_id="op-red"):
+    """Build a bus with w1/w2 registered. Returns (bus, keys-by-worker-id)."""
     bus = AgentMessageBus(graph_id=graph_id, op_id=op_id)
-    bus.register_worker("w1")
-    bus.register_worker("w2")
+    keys = {
+        "w1": bus.register_worker("w1"),
+        "w2": bus.register_worker("w2"),
+    }
+    bus._keys = keys  # type: ignore[attr-defined]  # test convenience
     return bus
 
 
@@ -196,7 +201,10 @@ def test_delivered_message_is_data_only():
     # And the message exposes no authority-bearing attribute.
     assert not hasattr(delivered, "grant")
     assert not hasattr(delivered, "elevate")
-    assert delivered.payload == {"observation": "module X imports Y"}
+    # Delivered payload is structurally fenced as untrusted peer data (DATA-ONLY).
+    assert delivered.payload == {
+        "untrusted_peer_data": {"observation": "module X imports Y"}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +230,8 @@ def test_non_dict_payload_rejected_no_crash():
         msg_id="m1", from_worker="w1", to_worker="w2",
         kind=MessageKind.STATUS, payload="not a dict",  # type: ignore[arg-type]
     )
-    msg.signature = bus.sign(msg)
+    # w1 signs with ITS OWN per-worker key.
+    msg.signature = sign_with_key(bus._keys["w1"], msg)  # type: ignore[attr-defined]
     assert bus.send(msg) is False  # no crash
     assert len(bus.subscribe("w2")) == 0
 
@@ -321,7 +330,8 @@ def test_delivered_payload_sanitized():
         payload={"log": "line1\x00\x07line2", "key": "sk-" + "A" * 30},
     )
     assert bus.send(msg) is True
-    out = bus.subscribe("w2")[0].payload
+    # Unwrap the structural untrusted-peer-data fence.
+    out = bus.subscribe("w2")[0].payload["untrusted_peer_data"]
     # Control chars stripped.
     assert "\x00" not in out["log"]
     assert "\x07" not in out["log"]

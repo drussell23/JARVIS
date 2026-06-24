@@ -1,11 +1,20 @@
 """stagnation_detector -- Semantic Stagnation Detector (Phase 1c, G3).
 
 The intelligent early break for the Epistemic Deadlock Breaker. Tracks the
-clarification turns for a ``correlation_id`` (one request/response pair) and
+clarification turns for a **worker PAIR** (one request/response exchange) and
 computes a fast Jaccard / token-overlap similarity between consecutive turns.
 When the pair starts repeating the same logic (high similarity for a window of
 turns), it is looping -- signal the breaker to shatter EARLY, before the integer
 ``max_turn_budget`` is reached.
+
+**Keyed by worker-PAIR, not correlation_id (red-team CRITICAL #2).** A caller
+that mints a fresh ``correlation_id`` on every turn would otherwise reset the
+similarity window each turn and loop forever. By bucketing on a stable
+pair-key (``frozenset({worker_a, worker_b})``), cross-correlation turns between
+the SAME pair feed the SAME stagnation bucket -- rotating the correlation_id can
+no longer reset the count. The bucket key is supplied by the caller (the
+breaker passes its pair-key); a bare correlation_id is accepted for backward
+compatibility and used verbatim as the bucket key.
 
 Pure stdlib (no heavy dep): normalize -> lowercase token set -> Jaccard
 ``|A intersect B| / |A union B|``. Optionally a normalized-intent hash for
@@ -14,8 +23,10 @@ exact-repeat detection.
 Fail-CLOSED: an unparseable turn / detector error -> treat as a stagnation
 signal (break), never as "keep talking".
 
-**Gated under the swarm master (no standalone env flag needed).** Thresholds
-are env-tunable; the detector itself is a pure analyzer with no side effects.
+**Gated under the swarm master (no standalone env flag needed).** Thresholds +
+the per-pair bucket cap are env-tunable; the detector itself is a pure analyzer
+with no side effects. The pair-bucket map is a bounded LRU (anti-OOM under a
+unique-pair / unique-corr flood).
 """
 from __future__ import annotations
 
@@ -23,9 +34,9 @@ import hashlib
 import logging
 import os
 import re
-from collections import defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, FrozenSet, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +71,26 @@ def stagnation_threshold() -> float:
 def stagnation_window() -> int:
     """Consecutive stagnant turn-pairs required to declare SEMANTIC STAGNATION."""
     return _env_int("JARVIS_SWARM_STAGNATION_WINDOW", 2)
+
+
+def _pairs_capacity() -> int:
+    """Bounded-LRU cap on the per-pair bucket map (anti-OOM)."""
+    return _env_int("JARVIS_SWARM_STAGNATION_PAIRS_CAPACITY", 1024)
+
+
+# A bucket key is either a stable worker-pair (preferred) or a bare
+# correlation_id string (backward-compatible). Both hash + compare cleanly.
+BucketKey = Union[str, "FrozenSet[str]"]
+
+
+def pair_key(worker_a: str, worker_b: str) -> "FrozenSet[str]":
+    """Stable, order-insensitive bucket key for a worker PAIR.
+
+    ``frozenset({a, b})`` is identical regardless of which worker is "a" vs "b"
+    and is invariant to correlation_id rotation -- the structural fix for the
+    corr-rotation deadlock evasion (red-team CRITICAL #2).
+    """
+    return frozenset({str(worker_a or ""), str(worker_b or "")})
 
 
 def _normalize_tokens(text: str) -> frozenset:
@@ -99,12 +130,17 @@ class _PairState:
 
 
 class SemanticStagnationDetector:
-    """Per-``correlation_id`` looping detection via Jaccard similarity.
+    """Per-**worker-pair** looping detection via Jaccard similarity.
 
-    Feed each new turn's text via :meth:`observe`. Returns True the moment the
-    pair has produced ``window`` consecutive turn-pairs whose similarity is at
-    or above the threshold (or exact-repeat intent hashes) -- i.e. the exchange
-    is looping. Fail-CLOSED: any internal error -> True (stagnant).
+    Feed each new turn's text via :meth:`observe`, keyed by a stable bucket key
+    (a :func:`pair_key` frozenset, preferred) so rotating the correlation_id
+    cannot reset the window. Returns True the moment the pair has produced
+    ``window`` consecutive turn-pairs whose similarity is at or above the
+    threshold (or exact-repeat intent hashes) -- i.e. the exchange is looping.
+    Fail-CLOSED: any internal error -> True (stagnant).
+
+    The bucket map is a bounded LRU (``_pairs_capacity``) -- a unique-pair /
+    unique-corr flood evicts oldest, never OOMs.
     """
 
     def __init__(
@@ -115,18 +151,37 @@ class SemanticStagnationDetector:
     ) -> None:
         self._threshold = threshold if threshold is not None else stagnation_threshold()
         self._window = window if window is not None else stagnation_window()
-        self._pairs: Dict[str, _PairState] = defaultdict(_PairState)
+        # Bounded LRU keyed by bucket key (pair frozenset or bare corr).
+        self._pairs: "OrderedDict[BucketKey, _PairState]" = OrderedDict()
+        self._pairs_capacity = _pairs_capacity()
 
-    def observe(self, correlation_id: str, turn_text: str) -> bool:
-        """Record a turn for ``correlation_id`` and return True iff the pair is
-        now semantically stagnant.
+    def _bucket(self, key: BucketKey) -> _PairState:
+        """Fetch-or-create the bucket state for ``key`` with LRU discipline."""
+        state = self._pairs.get(key)
+        if state is None:
+            state = _PairState()
+            self._pairs[key] = state
+        self._pairs.move_to_end(key)
+        while len(self._pairs) > self._pairs_capacity:
+            self._pairs.popitem(last=False)
+        return state
+
+    def observe(self, correlation_id: BucketKey, turn_text: str) -> bool:
+        """Record a turn for a bucket key and return True iff the pair is now
+        semantically stagnant.
+
+        ``correlation_id`` is the bucket key: pass a :func:`pair_key` frozenset
+        to bucket by worker-PAIR (corr-rotation-immune), or a bare string for
+        backward-compatible per-id bucketing.
 
         Fail-CLOSED: a None/garbage turn or any error -> treat as a stagnation
         signal so the breaker shatters the loop rather than letting it spin.
         """
         try:
-            corr = str(correlation_id or "")
-            state = self._pairs[corr]
+            key: BucketKey = correlation_id if isinstance(
+                correlation_id, frozenset
+            ) else str(correlation_id or "")
+            state = self._bucket(key)
             text = turn_text if isinstance(turn_text, str) else str(turn_text)
 
             if state.turns:
@@ -152,9 +207,9 @@ class SemanticStagnationDetector:
             stagnant = state.consecutive_stagnant >= self._window
             if stagnant:
                 logger.warning(
-                    "[StagnationDetector] corr=%s SEMANTIC STAGNATION "
+                    "[StagnationDetector] bucket=%s SEMANTIC STAGNATION "
                     "(consecutive=%d window=%d threshold=%.2f)",
-                    corr,
+                    key,
                     state.consecutive_stagnant,
                     self._window,
                     self._threshold,
@@ -167,13 +222,20 @@ class SemanticStagnationDetector:
             )
             return True
 
-    def turn_count(self, correlation_id: str) -> int:
-        """Number of turns observed for a correlation id (fail-soft -> 0)."""
+    def turn_count(self, correlation_id: BucketKey) -> int:
+        """Number of turns observed for a bucket key (fail-soft -> 0)."""
         try:
-            return len(self._pairs[str(correlation_id or "")].turns)
+            key: BucketKey = correlation_id if isinstance(
+                correlation_id, frozenset
+            ) else str(correlation_id or "")
+            state = self._pairs.get(key)
+            return len(state.turns) if state is not None else 0
         except Exception:  # noqa: BLE001
             return 0
 
-    def reset(self, correlation_id: str) -> None:
-        """Forget a correlation id (e.g. after the breaker resolves it)."""
-        self._pairs.pop(str(correlation_id or ""), None)
+    def reset(self, correlation_id: BucketKey) -> None:
+        """Forget a bucket key (e.g. after the breaker resolves it)."""
+        key: BucketKey = correlation_id if isinstance(
+            correlation_id, frozenset
+        ) else str(correlation_id or "")
+        self._pairs.pop(key, None)

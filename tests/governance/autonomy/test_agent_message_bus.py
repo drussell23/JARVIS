@@ -51,7 +51,8 @@ def test_legit_send_and_subscribe():
     assert len(inbox) == 1
     delivered = inbox[0]
     assert delivered.from_worker == "w1"
-    assert delivered.payload["note"] == "found a bug in module X"
+    # Delivered payload is structurally fenced as untrusted peer data.
+    assert delivered.payload["untrusted_peer_data"]["note"] == "found a bug in module X"
     assert bus.delivered == 1
 
 
@@ -68,7 +69,7 @@ def test_artifact_handoff_roundtrip():
     assert bus.send(msg) is True
     inbox = bus.subscribe("consumer")
     assert inbox[0].kind is MessageKind.ARTIFACT_HANDOFF
-    assert inbox[0].payload["diff_hash"] == "abc123"
+    assert inbox[0].payload["untrusted_peer_data"]["diff_hash"] == "abc123"
 
 
 def test_request_response_roundtrip():
@@ -97,7 +98,7 @@ def test_request_response_roundtrip():
     )
     assert bus.send(reply) is True
     assert bus.response_for("corr-1") is not None
-    assert bus.response_for("corr-1").payload["answer"] == "v1.1"
+    assert bus.response_for("corr-1").payload["untrusted_peer_data"]["answer"] == "v1.1"
 
 
 def test_message_to_unknown_recipient_dropped_sender_never_blocks():
@@ -133,13 +134,15 @@ def test_per_graph_teardown_destroys_bus():
 def test_per_graph_distinct_secrets():
     b1 = AgentMessageBus(graph_id="A")
     b2 = AgentMessageBus(graph_id="B")
-    # Distinct graph-scoped secrets -> the same canonical message signs to
-    # different digests.
-    b1.register_worker("w")
-    b2.register_worker("w")
+    # Distinct graph-scoped secrets -> the SAME worker id derives a different
+    # per-worker key in each graph, so the same canonical message signs to a
+    # different digest. The graph secret never leaves the bus.
+    k1 = b1.register_worker("w")
+    k2 = b2.register_worker("w")
+    assert k1 and k2 and k1 != k2
     m1 = b1.make_signed(from_worker="w", to_worker="w", kind=MessageKind.STATUS, payload={})
-    # Sign the same canonical content under b2 -> different signature.
-    assert b1.sign(m1) != b2.sign(m1)
+    # The signature minted in graph A does NOT verify in graph B.
+    assert b2._verify_signature(m1) is False
 
 
 def test_metrics_snapshot_no_content():
