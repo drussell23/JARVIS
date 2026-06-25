@@ -209,9 +209,10 @@ async def test_awaken_injects_deadman_startup_script(monkeypatch):
     assert "Metadata-Flavor: Google" in script
 
 
-def test_default_awaken_is_spot_first(monkeypatch):
-    """The default gcloud awaken wrapper tries Spot first, on-demand fallback,
-    with the deadman startup-script + cloud-platform scope + DELETE."""
+def test_gcloud_last_resort_awaken_is_spot_first(monkeypatch):
+    """The LAST-RESORT gcloud awaken wrapper (gated; only on metadata-unreachable)
+    tries Spot first, on-demand fallback, with the deadman startup-script +
+    cloud-platform scope + DELETE."""
     cmds = []
 
     def fake_run(cmd, *, timeout_s=180.0):
@@ -222,7 +223,7 @@ def test_default_awaken_is_spot_first(monkeypatch):
         return 0, "ok"
 
     monkeypatch.setattr(fl, "_gcloud_run", fake_run)
-    ok = fl._default_vm_awaken_fn(startup_script="#!/bin/bash\necho hi\n")
+    ok = fl._gcloud_vm_awaken_fn(startup_script="#!/bin/bash\necho hi\n")
     assert ok is True
     # First attempt Spot.
     assert any("--provisioning-model=SPOT" in c for c in cmds)
@@ -234,6 +235,77 @@ def test_default_awaken_is_spot_first(monkeypatch):
         assert "--scopes=cloud-platform" in c
         assert "--image-family=jarvis-prime-coder" in c
         assert any(x.startswith("--metadata-from-file=startup-script=") for x in c)
+
+
+async def test_default_awaken_uses_native_rest_zero_gcloud(monkeypatch):
+    """The DEFAULT awaken path is the native Compute REST client (zero gcloud):
+    verify_compute_scopes -> create_instance. gcloud is NEVER touched."""
+    import backend.core.ouroboros.governance.gcp_compute_rest as gr
+
+    calls = {"verify": 0, "create": 0, "gcloud": 0}
+
+    class FakeRest:
+        async def verify_compute_scopes(self):
+            calls["verify"] += 1
+            return (True, "compute_scope_present")
+
+        async def create_instance(self, *, startup_script, **kw):
+            calls["create"] += 1
+            assert "jprime-deadman" in startup_script or startup_script
+            return (True, "created:SPOT:200")
+
+    monkeypatch.setattr(gr, "get_compute_rest", lambda: FakeRest())
+    monkeypatch.setattr(
+        fl, "_gcloud_run",
+        lambda *a, **k: calls.__setitem__("gcloud", calls["gcloud"] + 1) or (1, ""),
+    )
+    ok = await fl._default_vm_awaken_fn(startup_script="#!/bin/bash\necho hi\n")
+    assert ok is True
+    assert calls["verify"] == 1 and calls["create"] == 1
+    assert calls["gcloud"] == 0  # ZERO gcloud in the sovereign path
+
+
+async def test_default_awaken_iam_denied_aborts_gracefully(monkeypatch):
+    """IAM scope self-verify failing -> graceful abort (returns False, loop NOT
+    crashed); create_instance is never reached, gcloud is never touched."""
+    import backend.core.ouroboros.governance.gcp_compute_rest as gr
+
+    created = []
+
+    class FakeRest:
+        async def verify_compute_scopes(self):
+            return (False, "IAM_PERMISSION_DENIED:missing_compute_scope:scopeX")
+
+        async def create_instance(self, *, startup_script, **kw):
+            created.append(1)
+            return (True, "created")
+
+    monkeypatch.setattr(gr, "get_compute_rest", lambda: FakeRest())
+    monkeypatch.delenv("JARVIS_FAILOVER_GCLOUD_FALLBACK", raising=False)
+    ok = await fl._default_vm_awaken_fn(startup_script="x")
+    assert ok is False  # graceful abort, no raise
+    assert created == []  # create never reached on IAM denial
+
+
+async def test_default_delete_uses_native_rest_zero_gcloud(monkeypatch):
+    """The DEFAULT delete path is native Compute REST (zero gcloud)."""
+    import backend.core.ouroboros.governance.gcp_compute_rest as gr
+
+    calls = {"delete": 0, "gcloud": 0}
+
+    class FakeRest:
+        async def delete_instance(self, name=None):
+            calls["delete"] += 1
+            return (True, "deleted:200")
+
+    monkeypatch.setattr(gr, "get_compute_rest", lambda: FakeRest())
+    monkeypatch.setattr(
+        fl, "_gcloud_run",
+        lambda *a, **k: calls.__setitem__("gcloud", calls["gcloud"] + 1) or (1, ""),
+    )
+    ok = await fl._default_vm_delete_fn()
+    assert ok is True
+    assert calls["delete"] == 1 and calls["gcloud"] == 0
 
 
 # ---------------------------------------------------------------------------

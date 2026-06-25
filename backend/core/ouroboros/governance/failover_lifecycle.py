@@ -68,7 +68,7 @@ import enum
 import logging
 import os
 import subprocess
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 # Phase 3c -- Cryo-DLQ re-entry. Imported at module level (bound as a module
 # attribute) so tests can monkeypatch ``fl.replay_dlq``. intake_dlq is a
@@ -175,6 +175,18 @@ def _early_prewarm_enabled() -> bool:
     return _enabled("JARVIS_FAILOVER_EARLY_PREWARM_ENABLED", "false")
 
 
+def _gcloud_fallback_enabled() -> bool:
+    """Last-resort gcloud-CLI fallback gate. Default FALSE.
+
+    The native metadata-token Compute REST client (gcp_compute_rest) is the
+    PRIMARY -- and only -- path on the Sovereign awaken/delete. The gcloud
+    subprocess wrappers are retained ONLY as an explicit operator escape hatch
+    for the (rare) case where the metadata server is unreachable but a gcloud
+    binary + ambient credentials happen to exist. Default OFF: the sovereign
+    path has ZERO gcloud dependency."""
+    return _enabled("JARVIS_FAILOVER_GCLOUD_FALLBACK", "false")
+
+
 def _warmup_enabled() -> bool:
     """VRAM pre-warm gate. Default TRUE -- OFF -> straight to SERVING (legacy)."""
     return _enabled("JARVIS_FAILOVER_WARMUP_ENABLED", "true")
@@ -219,17 +231,76 @@ def _gcloud_run(cmd: List[str], *, timeout_s: float = 180.0):
         return 1, "[gcloud run failed: {!r}]".format(exc)
 
 
-def _default_vm_awaken_fn(*, startup_script: str) -> bool:
+async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
     """Create the J-Prime failover node from the golden image (Spot-first).
 
-    Awaken target (spec): image family jarvis-prime-coder, node
-    jarvis-prime-failover, machine e2-highmem-2, Spot-first with on-demand
-    fallback, --instance-termination-action=DELETE, SA + cloud-platform scope
-    (the Dead-Man's Switch self-delete needs it), startup-script = the deadman.
+    Sovereign path (PRIMARY, zero gcloud): native async GCP Compute REST via the
+    metadata-token client (gcp_compute_rest). The flow is:
+
+      1. ``verify_compute_scopes()`` -- dynamic IAM self-verification. A missing
+         compute scope (or unreachable metadata) yields a graceful
+         ``IAM_PERMISSION_DENIED`` locus -> awaken aborts cleanly (returns
+         False). The lifecycle stays DORMANT, the op stays sealed in the
+         Cryo-DLQ -- the cognitive loop is NEVER crashed.
+      2. ``create_instance()`` -- async instances.insert of the golden image
+         (sourceImage family), dynamic zone/project from metadata, Spot-first
+         with on-demand fallback, startup-script = the deadman.
+
+    Returns True iff the insert was accepted. Fail-soft -- never raises. The
+    on-ready transition + IP wiring are gated separately downstream.
+
+    LAST-RESORT fallback (only if metadata is unreachable AND
+    ``JARVIS_FAILOVER_GCLOUD_FALLBACK`` is armed): the legacy gcloud subprocess
+    wrapper. Default OFF -- the sovereign path has ZERO gcloud dependency.
+    """
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+            get_compute_rest,
+        )
+        client = get_compute_rest()
+        ok_scope, detail = await client.verify_compute_scopes()
+        if not ok_scope:
+            # Graceful IAM_PERMISSION_DENIED locus -- the loop is NOT crashed.
+            if "metadata_unreachable" in detail and _gcloud_fallback_enabled():
+                logger.warning(
+                    "[FailoverLifecycle] awaken: metadata unreachable for IAM "
+                    "self-verify -- gcloud last-resort fallback armed"
+                )
+                return _gcloud_vm_awaken_fn(startup_script=startup_script)
+            logger.warning(
+                "[FailoverLifecycle] awaken ABORTED (graceful): %s -- staying "
+                "DORMANT, op stays sealed in Cryo-DLQ (loop not crashed)", detail,
+            )
+            return False
+        ok_create, cdetail = await client.create_instance(startup_script=startup_script)
+        if ok_create:
+            logger.info(
+                "[FailoverLifecycle] awaken: node created via native Compute REST "
+                "(%s) -- zero gcloud", cdetail,
+            )
+            return True
+        logger.warning(
+            "[FailoverLifecycle] awaken: Compute REST insert failed (%s)", cdetail,
+        )
+        if _gcloud_fallback_enabled():
+            logger.warning(
+                "[FailoverLifecycle] awaken: gcloud last-resort fallback armed "
+                "-- attempting gcloud create"
+            )
+            return _gcloud_vm_awaken_fn(startup_script=startup_script)
+        return False
+    except Exception as exc:  # noqa: BLE001 -- awaken must never crash the loop
+        logger.warning("[FailoverLifecycle] awaken REST fail-soft err=%r", exc)
+        if _gcloud_fallback_enabled():
+            return _gcloud_vm_awaken_fn(startup_script=startup_script)
+        return False
+
+
+def _gcloud_vm_awaken_fn(*, startup_script: str) -> bool:
+    """LAST-RESORT gcloud-CLI awaken (gated by JARVIS_FAILOVER_GCLOUD_FALLBACK).
 
     Writes the startup-script to a temp file and shells out to gcloud. Returns
-    True on a 0 return code, False otherwise (fail-soft -- never raises). The
-    on-ready transition is gated separately by the ensure-ready probe.
+    True on a 0 return code, False otherwise (fail-soft -- never raises).
     """
     import tempfile
 
@@ -290,13 +361,45 @@ def _default_vm_awaken_fn(*, startup_script: str) -> bool:
                 pass
 
 
-def _default_vm_delete_fn() -> bool:
+async def _default_vm_delete_fn() -> bool:
     """Delete-to-snapshot: tear down the J-Prime failover node. Fail-soft.
 
-    The golden-image snapshot persists; only the live VM + disk are deleted.
-    Returns True on rc==0. Never raises. Even on failure the node's Dead-Man's
+    Sovereign path (PRIMARY, zero gcloud): native async Compute REST DELETE via
+    the metadata-token client -- the SAME REST contract as the bash dead-man.
+    Deleting the instance does NOT touch the golden image (the snapshot
+    persists). Returns True iff the delete was accepted (or the node was already
+    gone -- idempotent). Never raises. Even on failure the node's Dead-Man's
     Switch self-deletes after idle, so cost is still bounded.
+
+    LAST-RESORT gcloud fallback only if metadata is unreachable AND
+    ``JARVIS_FAILOVER_GCLOUD_FALLBACK`` is armed (default OFF).
     """
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+            get_compute_rest,
+        )
+        ok, detail = await get_compute_rest().delete_instance()
+        if ok:
+            logger.info(
+                "[FailoverLifecycle] delete-to-snapshot via Compute REST (%s) "
+                "-- zero gcloud", detail,
+            )
+            return True
+        logger.warning(
+            "[FailoverLifecycle] delete via Compute REST failed (%s)", detail,
+        )
+        if "metadata_unreachable" in detail and _gcloud_fallback_enabled():
+            return _gcloud_vm_delete_fn()
+        return False
+    except Exception as exc:  # noqa: BLE001 -- delete must never crash the loop
+        logger.warning("[FailoverLifecycle] delete REST fail-soft err=%r", exc)
+        if _gcloud_fallback_enabled():
+            return _gcloud_vm_delete_fn()
+        return False
+
+
+def _gcloud_vm_delete_fn() -> bool:
+    """LAST-RESORT gcloud-CLI delete (gated by JARVIS_FAILOVER_GCLOUD_FALLBACK)."""
     project = _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
     zone = _env_str("GCP_ZONE", "us-central1-a")
     node = _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME)
@@ -364,25 +467,43 @@ def _default_node_ready_fn(endpoint: str) -> bool:
         return False
 
 
-def _resolve_node_ip() -> str:
-    """Resolve the awakened failover node's reachable IP via gcloud describe.
+async def _default_resolve_node_ip() -> str:
+    """Resolve the awakened failover node's internal IP via native Compute REST.
 
-    Gap 3a boundary -- the missing wire. After ``_default_vm_awaken_fn`` creates
-    the node and it answers on :PORT, we must tell PrimeClient WHERE the node
-    is. This resolves the external (or, if no external, the internal) IP via a
-    single ``gcloud compute instances describe`` with a format selector, so the
-    Body can publish ``JARVIS_PRIME_URL`` / ``JARVIS_PRIME_HOST``.
+    Sovereign path (PRIMARY, zero gcloud): poll instances.get until status
+    RUNNING and extract networkInterfaces[0].networkIP (the internal IP -- the
+    Body shares the VPC). Dynamic zone/project/IP from metadata + the API
+    response -- NOTHING is hardcoded.
 
-    Returns the IP string, or "" if it cannot be resolved (fail-soft -- the
-    caller treats "" as "publish nothing" and PrimeProvider keeps its existing
-    configured target; the op is never lost). NEVER raises. Mockable in tests.
+    Returns the IP string, or "" if it cannot be resolved within the bounded
+    budget (fail-soft -- the caller treats "" as 'publish nothing' and
+    PrimeProvider keeps its existing configured target; the op is never lost).
+    NEVER raises.
+
+    LAST-RESORT gcloud fallback only when ``JARVIS_FAILOVER_GCLOUD_FALLBACK``
+    is armed (default OFF).
     """
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+            get_compute_rest,
+        )
+        ip = await get_compute_rest().await_running_ip()
+        if ip:
+            return ip
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[FailoverLifecycle] REST node IP resolve fail-soft err=%r", exc)
+    if _gcloud_fallback_enabled():
+        return _gcloud_resolve_node_ip()
+    return ""
+
+
+def _gcloud_resolve_node_ip() -> str:
+    """LAST-RESORT gcloud-describe node-IP resolution (gated). Prefers the
+    external NAT IP, falls back to the internal IP. NEVER raises."""
     project = _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
     zone = _env_str("GCP_ZONE", "us-central1-a")
     node = _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME)
 
-    # Prefer the external NAT IP; fall back to the internal IP if absent
-    # (e.g. an internal-only deployment where the Body shares the VPC).
     fmt_external = (
         "get(networkInterfaces[0].accessConfigs[0].natIP)"
     )
@@ -399,6 +520,13 @@ def _resolve_node_ip() -> str:
         if rc == 0 and ip:
             return ip
     return ""
+
+
+# Module-level boundary name kept stable for tests (they monkeypatch
+# ``fl._resolve_node_ip`` with a sync lambda). The default is the async
+# REST-primary resolver; _resolve_ip awaits it transparently when it is a
+# coroutine, so both a sync test lambda and the async default work.
+_resolve_node_ip = _default_resolve_node_ip
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +746,7 @@ class FailoverLifecycleController:
         port = _failover_port()
         return "http://{}:{}".format(host, port)
 
-    def _publish_endpoint(self) -> None:
+    async def _publish_endpoint(self) -> None:
         """Gap 3a -- resolve the node IP + write it where PrimeClient reads it.
 
         Steps (deterministic + logged; NEVER logs secrets):
@@ -636,12 +764,12 @@ class FailoverLifecycleController:
         """
         publish_fn = self._endpoint_publish_fn
         if publish_fn is not None:
-            ip = self._resolve_ip()
+            ip = await self._resolve_ip()
             if ip:
                 publish_fn(ip)
             return
 
-        ip = self._resolve_ip()
+        ip = await self._resolve_ip()
         if not ip:
             logger.info(
                 "[FailoverLifecycle] endpoint publish: node IP unresolved "
@@ -665,10 +793,16 @@ class FailoverLifecycleController:
         self._hot_swap_prime_client(host=ip, port=port)
 
     @staticmethod
-    def _resolve_ip() -> str:
-        """Call the module-level _resolve_node_ip boundary. Fail-soft -> ""."""
+    async def _resolve_ip() -> str:
+        """Call the module-level _resolve_node_ip boundary. Fail-soft -> "".
+
+        The boundary may be sync (an injected test lambda) or async (the native
+        Compute REST default) -- a coroutine result is awaited transparently."""
         try:
-            return str(_resolve_node_ip() or "").strip()
+            result = _resolve_node_ip()
+            if asyncio.iscoroutine(result):
+                result = await result
+            return str(result or "").strip()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FailoverLifecycle] node IP resolve fail-soft err=%r", exc)
             return ""
