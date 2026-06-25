@@ -686,13 +686,17 @@ class _TeeRouter:
         try:
             from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
                 a1trace as _a1trace,
+                emit_probe as _emit_probe,
             )
-            _a1trace(
-                "emit",
+            _gid = (
                 getattr(envelope, "causal_id", None)
-                or getattr(envelope, "goal_id", "?"),
-                source="roadmap",
+                or getattr(envelope, "goal_id", "?")
             )
+            _a1trace("emit", _gid, source="roadmap")
+            # Deep emit-hop telemetry (Run #17): capture goal_id, emit_ts,
+            # source, orchestrator-enabled so a later missing/out-of-order
+            # emit self-diagnoses. Observe-only, fail-soft.
+            _emit_probe(_gid, source="roadmap")
         except Exception:  # noqa: BLE001
             pass
         if self._upstream is None:
