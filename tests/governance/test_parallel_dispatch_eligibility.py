@@ -572,6 +572,7 @@ def test_reason_code_values_stable():
         "memory_clamp",
         "posture_clamp",
         "max_units_clamp",
+        "collision_forced_sequential",
     }
     actual = {c.value for c in ReasonCode}
     assert actual == expected

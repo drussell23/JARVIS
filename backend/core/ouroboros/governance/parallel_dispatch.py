@@ -185,6 +185,11 @@ class ReasonCode(str, enum.Enum):
     MEMORY_CLAMP = "memory_clamp"
     POSTURE_CLAMP = "posture_clamp"
     MAX_UNITS_CLAMP = "max_units_clamp"
+    # Zero-trust AST Collision Matrix (L3) — candidate units could not be
+    # partitioned into a >=2-unit pairwise-disjoint fan-out group because
+    # every parallelizable subset collided on the same file or an
+    # import-coupled file (or coupling was INDETERMINATE -> fail-closed).
+    COLLISION_FORCED_SEQUENTIAL = "collision_forced_sequential"
 
 
 @dataclass(frozen=True)
