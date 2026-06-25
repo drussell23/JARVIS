@@ -462,6 +462,49 @@ class OpLineageGraph:
 
 A1TRACE_HOPS: Tuple[str, ...] = ("emit", "ingest", "dequeue", "submit", "accept")
 
+# ---------------------------------------------------------------------------
+# Provenance-driven, origin-correct pipeline traversal (Run #17 fix)
+# ---------------------------------------------------------------------------
+#
+# THE BUG (run #17): the trace check required ALL five hops including ``emit``.
+# But the ``emit`` hop is produced ONLY by roadmap_orchestrator (source=
+# "roadmap"); a sensor op (TestFailure / OpportunityMiner / ...) ingests
+# WITHOUT an emit BY DESIGN. So an emit-less sensor op legitimately has no
+# ``emit`` hop, and the auditor wrongly failed it ``missing_or_out_of_order:
+# emit``.
+#
+# THE FIX: the auditor reads each op's ORIGIN from the Unified Provenance
+# Ledger's structured ``[Provenance]`` line (stamped at ingestion) -- after
+# verifying the hash-chain is intact (``chain_ok=True``) -- and validates the
+# pipeline THAT origin produces:
+#
+#   * SENSOR  -> ingest -> dequeue -> submit -> accept   (NO emit; VALID)
+#   * ROADMAP -> emit -> ingest -> dequeue -> submit -> accept
+#   * UNKNOWN / broken chain -> UNVERIFIABLE (honest, never a fake-pass /
+#     hardcoded bypass).
+#
+# The pipeline-to-validate is DERIVED from the origin CLASS -- there is NO
+# hardcoded op-id -> pipeline map. The origin class names + the per-class
+# required-hop sequences mirror ``governance.provenance_ledger.OriginClass``.
+
+# Origin-class -> the ordered hop sequence that origin's pipeline produces.
+# These mirror provenance_ledger.OriginClass semantics; SENSOR omits ``emit``.
+_PIPELINE_BY_ORIGIN: Dict[str, Tuple[str, ...]] = {
+    "sensor": ("ingest", "dequeue", "submit", "accept"),
+    "roadmap": ("emit", "ingest", "dequeue", "submit", "accept"),
+}
+
+# [Provenance] op=<id> origin=<src> origin_class=<class> chain_ok=<bool>
+_PROVENANCE_RE = re.compile(
+    r"\[Provenance\]\s+op=(?P<op>\S+)\s+origin=(?P<origin>\S+)\s+"
+    r"origin_class=(?P<klass>\S+)\s+chain_ok=(?P<chain>\S+)"
+)
+# [A1Trace][emit-probe] ... goal=<id> ... source=<src> -- the emit-probe also
+# witnesses an op's origin (roadmap vs non-roadmap) from the log stream alone.
+_EMIT_PROBE_SOURCE_RE = re.compile(
+    r"\[A1Trace\]\[emit-probe\].*goal=(?P<goal>\S+).*source=(?P<source>\S+)"
+)
+
 # [A1Trace] <hop> goal=<id> [k=v ...]
 _A1TRACE_RE = re.compile(r"\[A1Trace\]\s+(?P<hop>\w+)\s+goal=(?P<goal>\S+)")
 # [A1Trace] ... target_files=<csv> (optional extra kv carrying the op's files)
@@ -482,16 +525,94 @@ def parse_a1trace_line(line: str) -> Optional[Tuple[str, str]]:
         return None
 
 
+def parse_provenance_line(line: str) -> Optional[Tuple[str, str, str, bool]]:
+    """Parse one ``[Provenance] op=.. origin=.. origin_class=.. chain_ok=..``
+    line stamped by the Unified Provenance Ledger at ingestion. Returns
+    ``(op_id, origin, origin_class, chain_ok)`` or None. NEVER raises."""
+    try:
+        m = _PROVENANCE_RE.search(line)
+        if not m:
+            return None
+        chain = m.group("chain").strip().lower() in {"true", "1", "yes", "on"}
+        return m.group("op"), m.group("origin"), m.group("klass").lower(), chain
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_emit_probe_source(line: str) -> Optional[Tuple[str, str]]:
+    """Parse the emit-probe's ``goal=`` + ``source=`` from an
+    ``[A1Trace][emit-probe]`` line. Returns ``(goal_id, source)`` or None.
+    A secondary origin witness when no explicit [Provenance] line is present.
+    NEVER raises."""
+    try:
+        m = _EMIT_PROBE_SOURCE_RE.search(line)
+        if not m:
+            return None
+        return m.group("goal"), m.group("source")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _classify_origin_from_source(source: str) -> str:
+    """Derive an OriginClass VALUE ('sensor' / 'roadmap' / 'unknown') for a
+    raw source token. Reuses ``provenance_ledger.classify_origin`` (the SAME
+    enum-derived classifier the ingestion stamp uses) so the auditor and the
+    ledger agree -- no second hardcoded source map. Falls back to a minimal
+    local derivation only if the import is unavailable (standalone observer
+    outside the repo). NEVER raises."""
+    try:
+        import importlib
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        backend = os.path.join(repo_root, "backend")
+        for entry in (backend, repo_root):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+        for mod_path in (
+            "backend.core.ouroboros.governance.provenance_ledger",
+            "core.ouroboros.governance.provenance_ledger",
+        ):
+            try:
+                mod = importlib.import_module(mod_path)
+                return mod.classify_origin(source).value
+            except Exception:  # noqa: BLE001 -- try the next import path
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    # Minimal fallback: ROADMAP is the sole emit-producing origin; the empty /
+    # missing token is unknowable. Any other recognized-looking token defaults
+    # to SENSOR (the emit-less majority). This mirrors the enum invariant
+    # WITHOUT a hardcoded op-id list.
+    token = (source or "").strip().lower()
+    if not token:
+        return "unknown"
+    if token == "roadmap":
+        return "roadmap"
+    return "sensor"
+
+
 @dataclass
 class A1TraceTimeline:
-    """Tracks the ordered observation of the 5 A1Trace hops per goal id, plus a
-    global ordered-observation log. The criterion "5 hops in order" is met when
-    SOME goal id has all 5 hops observed in the canonical order."""
+    """Tracks the ordered observation of the A1Trace hops per goal id, plus a
+    global ordered-observation log.
+
+    Provenance-driven (Run #17 fix): the "hops in order" criterion is met when
+    SOME goal observed the hop sequence its ORIGIN actually produces:
+      * SENSOR  -> ingest -> dequeue -> submit -> accept   (NO emit)
+      * ROADMAP -> emit -> ingest -> dequeue -> submit -> accept
+    The per-goal origin class is fed via :meth:`set_origin` from the
+    ``[Provenance]`` line (or the emit-probe source) AFTER its hash-chain
+    verified intact. A goal whose origin is UNKNOWN or whose provenance chain
+    is broken is graded UNVERIFIABLE -- never a fake-pass / hardcoded bypass."""
 
     # goal_id -> list of (hop, ts) in observation order
     per_goal: Dict[str, List[Tuple[str, float]]] = field(default_factory=dict)
     # global ordered list of (hop, goal, ts)
     ordered: List[Tuple[str, str, float]] = field(default_factory=list)
+    # goal_id -> origin class ('sensor' / 'roadmap' / 'unknown')
+    origin_by_goal: Dict[str, str] = field(default_factory=dict)
+    # goal_ids whose provenance hash-chain was reported broken (chain_ok=False)
+    broken_chain_goals: set = field(default_factory=set)
 
     def observe(self, hop: str, goal_id: str, ts: Optional[float] = None) -> None:
         if hop not in A1TRACE_HOPS:
@@ -500,20 +621,69 @@ class A1TraceTimeline:
         self.per_goal.setdefault(goal_id, []).append((hop, ts))
         self.ordered.append((hop, goal_id, ts))
 
+    def set_origin(
+        self, goal_id: str, origin_class: str, *, chain_ok: bool = True
+    ) -> None:
+        """Record a goal's origin CLASS (from provenance). A broken chain
+        (``chain_ok=False``) marks the goal UNVERIFIABLE regardless of class."""
+        if not goal_id:
+            return
+        oc = (origin_class or "unknown").strip().lower()
+        if oc not in ("sensor", "roadmap"):
+            oc = "unknown"
+        self.origin_by_goal[goal_id] = oc
+        if not chain_ok:
+            self.broken_chain_goals.add(goal_id)
+
+    def set_origin_from_source(
+        self, goal_id: str, source: str, *, chain_ok: bool = True
+    ) -> None:
+        """Record a goal's origin from a raw source token (emit-probe witness),
+        classified via the SAME enum-derived classifier the ledger uses."""
+        self.set_origin(
+            goal_id, _classify_origin_from_source(source), chain_ok=chain_ok
+        )
+
+    def provenance_active(self) -> bool:
+        """True iff ANY provenance origin/chain signal was witnessed in this
+        stream. When False the auditor falls back to the LEGACY all-5-hops
+        (roadmap-shaped) check -- byte-identical pre-provenance behavior, so a
+        stream that never emits a [Provenance] line audits exactly as before."""
+        return bool(self.origin_by_goal) or bool(self.broken_chain_goals)
+
+    def required_hops(self, goal_id: str) -> Optional[Tuple[str, ...]]:
+        """The ordered hop sequence required for ``goal_id`` GIVEN its origin
+        class. Returns None when origin is UNKNOWN or the provenance chain was
+        reported broken (-> UNVERIFIABLE, never a fake-pass).
+
+        Legacy fallback: when NO provenance was witnessed anywhere in the
+        stream, every goal defaults to the full 5-hop roadmap pipeline (the
+        pre-provenance behavior) so existing audits stay byte-identical."""
+        if goal_id in self.broken_chain_goals:
+            return None
+        oc = self.origin_by_goal.get(goal_id)
+        if oc is None:
+            if not self.provenance_active():
+                # Pre-provenance stream -> legacy all-5-hops requirement.
+                return A1TRACE_HOPS
+            # Provenance is active but THIS goal had no witness -> indeterminate.
+            return None
+        return _PIPELINE_BY_ORIGIN.get(oc)  # None for 'unknown'
+
     def all_hops_in_order(self) -> bool:
-        """True iff some goal observed all 5 hops in canonical order."""
-        for goal_id, obs in self.per_goal.items():
-            if self._goal_in_order(obs):
-                return True
-        return False
+        """True iff some goal observed the hop sequence ITS ORIGIN produces, in
+        canonical order. Provenance-driven (Run #17 fix)."""
+        return self.winning_goal() is not None
 
     @staticmethod
-    def _goal_in_order(obs: Sequence[Tuple[str, float]]) -> bool:
-        # Walk the canonical hop list; each hop must appear at or after the
-        # index of the previous one in the observation sequence.
+    def _goal_in_order(
+        obs: Sequence[Tuple[str, float]], required: Sequence[str]
+    ) -> bool:
+        # Walk the REQUIRED hop list for this origin; each hop must appear at or
+        # after the index of the previous one in the observation sequence.
         seq = [h for h, _ in obs]
         cursor = 0
-        for hop in A1TRACE_HOPS:
+        for hop in required:
             found = -1
             for i in range(cursor, len(seq)):
                 if seq[i] == hop:
@@ -526,7 +696,8 @@ class A1TraceTimeline:
 
     def winning_goal(self) -> Optional[str]:
         for goal_id, obs in self.per_goal.items():
-            if self._goal_in_order(obs):
+            required = self.required_hops(goal_id)
+            if required and self._goal_in_order(obs, required):
                 return goal_id
         return None
 
@@ -537,6 +708,8 @@ class A1TraceTimeline:
             ],
             "all_hops_in_order": self.all_hops_in_order(),
             "winning_goal": self.winning_goal(),
+            "origin_by_goal": dict(self.origin_by_goal),
+            "broken_chain_goals": sorted(self.broken_chain_goals),
         }
 
 
@@ -901,6 +1074,24 @@ class A1GraduationAuditor:
         (e.g. ``[SemanticGuard]``, ``[IronGate]``). May raise (intervention)."""
         if not line:
             return
+        # Provenance line (origin stamp) -- record the goal's origin class +
+        # chain integrity so the trace check validates the ORIGIN-CORRECT
+        # pipeline (Run #17 fix). Checked BEFORE the A1Trace hop parse because a
+        # [Provenance] line is not an [A1Trace] hop line.
+        prov = parse_provenance_line(line)
+        if prov is not None:
+            op_id, _origin, origin_class, chain_ok = prov
+            self.trace.set_origin(op_id, origin_class, chain_ok=chain_ok)
+            return
+        # Emit-probe source witness -- a secondary origin signal (roadmap vs
+        # non-roadmap) when no explicit [Provenance] line was emitted. Does NOT
+        # override an existing provenance-stamped origin.
+        probe = parse_emit_probe_source(line)
+        if probe is not None:
+            goal, source = probe
+            if goal not in self.trace.origin_by_goal:
+                self.trace.set_origin_from_source(goal, source)
+            return
         # A1Trace hop?
         parsed = parse_a1trace_line(line)
         if parsed is not None:
@@ -1046,7 +1237,25 @@ class A1GraduationAuditor:
         winning = self.trace.winning_goal()
         if winning is not None:
             return []
-        # Report hops never observed for ANY goal.
+        # Origin-aware (Run #17 fix): if SOME goal has a determinate origin,
+        # report the hops missing for ITS required pipeline (sensor ops do NOT
+        # require ``emit``). Otherwise the origin itself is indeterminate ->
+        # UNVERIFIABLE rather than a false ``missing:emit``.
+        best: List[str] = []
+        for goal_id, obs in self.trace.per_goal.items():
+            required = self.trace.required_hops(goal_id)
+            if not required:
+                continue
+            seq = {h for (h, _t) in obs}
+            missing = [h for h in required if h not in seq]
+            if not best or len(missing) < len(best):
+                best = missing
+        if best:
+            return best
+        # No goal had a determinate (chain-verified, known) origin.
+        if self.trace.per_goal:
+            return ["unverifiable_origin"]
+        # Nothing observed at all.
         seen_hops = {h for (h, _g, _t) in self.trace.ordered}
         return [h for h in A1TRACE_HOPS if h not in seen_hops]
 

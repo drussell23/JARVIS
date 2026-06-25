@@ -962,6 +962,19 @@ class UnifiedIntakeRouter:
             _probe_ingest_order(envelope.causal_id)
         except Exception:  # noqa: BLE001
             pass
+        # Unified Provenance Ledger -- stamp a tamper-evident hash-chained
+        # ProvenanceRecord{op_id, origin=SignalSource, ...} at THE ingestion
+        # point so the GraduationAuditor can validate the origin-correct
+        # pipeline (sensor ops legitimately have NO emit hop -- the Run-#17
+        # fix). Gated JARVIS_PROVENANCE_LEDGER_ENABLED (default on), fail-soft:
+        # a ledger error NEVER blocks ingestion; OFF is byte-identical.
+        try:
+            from backend.core.ouroboros.governance.provenance_ledger import (  # noqa: PLC0415
+                stamp_provenance as _stamp_provenance,
+            )
+            _stamp_provenance(envelope.causal_id, envelope.source)
+        except Exception:  # noqa: BLE001
+            pass
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
