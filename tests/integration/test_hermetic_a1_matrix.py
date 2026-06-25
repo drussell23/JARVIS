@@ -46,7 +46,18 @@ from backend.core.ouroboros.governance.intent.test_watcher import TestWatcher
 from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
     TestFailureSensor,
 )
+from backend.core.ouroboros.governance.test_runner import (
+    BlockedPathError,
+    LanguageRouter,
+    PythonAdapter,
+)
 from tests.integration.event_simulator import EventSimulator
+
+# Reuse the absolute-parity fixture (deep non-sandbox path + cwd mismatch +
+# node allowlist) that reproduces the run-#13 post-apply scoped-verify bug.
+# NO duplication: the same fixture drives BOTH the boot-hydration path (above)
+# and the scoped-verify path (below), all local, async, ms, $0.
+from tests.integration.test_scoped_verify_parity import parity_repo  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +326,65 @@ async def test_resolver_anchors_no_cloud_no_hardcode(chaos_fixture_repo: dict) -
             assert not name.startswith("google"), (
                 f"{mod_rel} pulls in a cloud SDK ({name}) — not hermetic"
             )
+
+
+# ---------------------------------------------------------------------------
+# (c) POST-APPLY SCOPED-VERIFY PATH — the run-#13 fidelity-gap closure
+# ---------------------------------------------------------------------------
+#
+# The boot-hydration path (a) anchors via the resolver already. The scoped-
+# verify path (the orchestrator's LanguageRouter / PythonAdapter post-APPLY)
+# was a SEPARATE root-resolution site that the clean-tmpdir harness could not
+# reproduce (its /tmp shape is whitelisted by _ALLOWED_SANDBOX_PREFIXES). The
+# ``parity_repo`` fixture forces the node's exact mismatch (deep non-sandbox
+# repo + cwd != repo_root). This section proves: (1) the PRE-FIX disjoint root
+# reproduces the run-#13 "outside repo root" rejection, and (2) routing through
+# the authoritative ``resolve_repo_root`` scopes + detects the chaos test.
+
+
+@pytest.mark.asyncio
+async def test_scoped_verify_buggy_root_reproduces_run13(parity_repo: dict) -> None:
+    """Hermetic Matrix now exercises scoped-verify: the buggy (cwd-style,
+    non-.git) root hits the SAME 'outside repo root' security gate as run #13."""
+    src = parity_repo["src"]
+    buggy_root = parity_repo["buggy_root"]
+    router = LanguageRouter(
+        repo_root=buggy_root,
+        adapters={"python": PythonAdapter(repo_root=buggy_root)},
+    )
+    with pytest.raises(BlockedPathError, match="outside repo root"):
+        await asyncio.wait_for(
+            router.run(
+                changed_files=(src,), sandbox_dir=None,
+                timeout_budget_s=30.0, op_id="hermetic-scoped-buggy",
+            ),
+            timeout=35.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_scoped_verify_resolved_root_scopes_and_detects(
+    parity_repo: dict,
+) -> None:
+    """Hermetic Matrix scoped-verify under the FIX: resolve_repo_root anchors
+    at the parity .git -> the chaos test is scoped + RED, no rejection, even
+    with cwd != repo_root (the live node condition)."""
+    src = parity_repo["src"]
+    root = parity_repo["root"]
+    fixed_root = resolve_repo_root(start=src)
+    assert fixed_root == root.resolve()
+
+    router = LanguageRouter(
+        repo_root=fixed_root,
+        adapters={"python": PythonAdapter(repo_root=fixed_root)},
+    )
+    multi = await asyncio.wait_for(
+        router.run(
+            changed_files=(src,), sandbox_dir=None,
+            timeout_budget_s=30.0, op_id="hermetic-scoped-fixed",
+        ),
+        timeout=35.0,
+    )
+    total = sum(ar.test_result.total for ar in multi.adapter_results)
+    assert total >= 1, "scoped-verify discovered no tests (degradation present)"
+    assert multi.passed is False, "chaos bug not detected by scoped-verify"

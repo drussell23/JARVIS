@@ -4804,11 +4804,29 @@ class GovernedLoopService:
             LanguageRouter,
             PythonAdapter,
         )
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_repo_root,
+        )
+
+        # Run-#13 fix: anchor the post-apply scoped-verify repo_root at the
+        # authoritative ``.git`` root, NOT the bare ``self._config.project_root``
+        # (which falls back to ``os.getcwd()`` -- see GovernedLoopConfig). On the
+        # live node the process CWD did not match where the changed file resolved
+        # (``/opt/trinity/jarvis``), so the LanguageRouter / PythonAdapter
+        # rejected a perfectly valid ``tests/...py`` as "outside repo root"
+        # (``BlockedPathError`` in ``_normalize`` / ``_is_safe_path``) and the
+        # scoped-verify silently degraded. ``resolve_repo_root(start=...)`` walks
+        # the project_root's parents to its real ``.git`` anchor -- linked-
+        # worktree aware (isolation mode) and CWD-independent, the SAME single
+        # source of truth the TestWatcher boot-hydration already uses. When the
+        # configured project_root is already ``.git``-anchored, the resolved root
+        # is identical -> behavior unchanged. Fail-soft: never raises.
+        _validation_repo_root = resolve_repo_root(start=self._config.project_root)
         validation_runner = LanguageRouter(
-            repo_root=self._config.project_root,
+            repo_root=_validation_repo_root,
             adapters={
-                "python": PythonAdapter(repo_root=self._config.project_root),
-                "cpp": CppAdapter(repo_root=self._config.project_root),
+                "python": PythonAdapter(repo_root=_validation_repo_root),
+                "cpp": CppAdapter(repo_root=_validation_repo_root),
             },
         )
         self._validation_runner = validation_runner
