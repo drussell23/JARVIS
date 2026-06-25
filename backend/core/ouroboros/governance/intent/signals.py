@@ -54,9 +54,48 @@ class SignalSource(str, Enum):
     ``SignalSource.VISION_SENSOR == "vision_sensor"`` is ``True`` (StrEnum
     semantics), so string-based consumers and typed consumers interoperate
     transparently.
+
+    Members mirror the ``_VALID_SOURCES`` whitelist in
+    ``governance.intake.intent_envelope`` so a typed consumer can classify any
+    envelope's ``source`` string into an origin CLASS without a hardcoded
+    if/elif of specific op-ids. Each member's *value* is the exact source
+    token an envelope carries, so ``SignalSource("roadmap") is
+    SignalSource.ROADMAP`` and ``SignalSource("test_failure") is
+    SignalSource.TEST_FAILURE``.
     """
 
+    # The strategic-GOAL origin: RoadmapOrchestrator EMITS via the ``emit``
+    # hop (a1trace("emit", ..., source="roadmap")). The ONLY origin whose
+    # pipeline begins with an ``emit`` hop.
+    ROADMAP = "roadmap"
+
+    # Sensor origins -- each ingests an envelope WITHOUT a prior ``emit`` hop
+    # (the Run-#17 mode). Sourced from the _VALID_SOURCES whitelist.
+    TEST_FAILURE = "test_failure"
+    AI_MINER = "ai_miner"
+    CAPABILITY_GAP = "capability_gap"
+    RUNTIME_HEALTH = "runtime_health"
+    EXPLORATION = "exploration"
+    BACKLOG = "backlog"
+    ARCHITECTURE = "architecture"
+    CU_EXECUTION = "cu_execution"
+    INTENT_DISCOVERY = "intent_discovery"
+    TODO_SCANNER = "todo_scanner"
+    DOC_STALENESS = "doc_staleness"
+    GITHUB_ISSUE = "github_issue"
+    PERFORMANCE_REGRESSION = "performance_regression"
+    CROSS_REPO_DRIFT = "cross_repo_drift"
+    SECURITY_ADVISORY = "security_advisory"
+    META_DORMANCY_ALARM = "meta_dormancy_alarm"
+    WEB_INTELLIGENCE = "web_intelligence"
+    AUTO_PROPOSED = "auto_proposed"
     VISION_SENSOR = "vision_sensor"
+    CADENCE_SYNTHETIC = "cadence_synthetic"
+    SWE_BENCH_PRO = "swe_bench_pro"
+    TEST_COVERAGE = "test_coverage"
+    VOICE_HUMAN = "voice_human"
+    CLI_EMERGENCY = "cli_emergency"
+    HUMAN_OVERRIDE = "human_override"
 
 
 # ---------------------------------------------------------------------------
