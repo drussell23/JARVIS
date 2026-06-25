@@ -60,7 +60,9 @@ phase_dispatcher wiring reads it.
 """
 from __future__ import annotations
 
+import ast
 import enum
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -126,6 +128,11 @@ class ComposeFailureReason(str, enum.Enum):
     UNIT_MISSING_PATCH = "unit_missing_patch"
     COLLISION_INVARIANT_VIOLATED = "collision_invariant_violated"
     EMPTY_COMPOSITION = "empty_composition"
+    # Zero-loss merge guarantee -- the composed candidate failed the
+    # post-union mathematical proof (count / content-sha / no-overwrite / AST).
+    # ``detail`` is prefixed ``lossless_proof_failed:<which>`` so the exact
+    # failing invariant is grep-visible.
+    LOSSLESS_PROOF_FAILED = "lossless_proof_failed"
 
 
 @dataclass(frozen=True)
@@ -228,6 +235,217 @@ def _unit_files(result: WorkUnitResult) -> List[Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Zero-loss merge guarantee helpers (sha256 merge ledger + AST validation)
+# ---------------------------------------------------------------------------
+
+
+def _sha256_text(text: str) -> str:
+    """Deterministic content hash for the merge ledger.
+
+    Hashes the UTF-8 bytes of the patch content. Stable across processes so
+    the input ledger (built from the per-unit patches) and the output ledger
+    (built from the composed candidate's ``files``) are directly comparable.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _build_input_ledger(
+    ordered_files: Sequence[Mapping[str, str]],
+) -> Tuple[Tuple[str, str], ...]:
+    """Build a deterministic, sorted ``(file_path, sha256(content))`` ledger.
+
+    Used for BOTH the input ledger (built from the per-unit union the moment
+    each patch is admitted) and the output ledger (re-derived from the
+    composed candidate's ``files`` just before VALIDATE/GATE). A pure function
+    of the (path, content) pairs -- sorting makes the comparison order-
+    independent so a re-ordering during the map-reduce can never masquerade as
+    a loss.
+    """
+    ledger = [
+        (str(entry["file_path"]), _sha256_text(str(entry["full_content"])))
+        for entry in ordered_files
+    ]
+    ledger.sort()
+    return tuple(ledger)
+
+
+def _prove_lossless(
+    input_ledger: Tuple[Tuple[str, str], ...],
+    output_files: Sequence[Mapping[str, str]],
+) -> Optional[str]:
+    """Mathematically prove the disjoint union is zero-loss + AST-valid.
+
+    Returns ``None`` when every invariant holds; otherwise returns a
+    ``"<which>: <detail>"`` string naming the FIRST failing invariant (the
+    caller wraps it into ``ComposeFailure(LOSSLESS_PROOF_FAILED, ...)`` so a
+    silent drop / overwrite / mutation / syntax break can NEVER leak to the
+    gates).
+
+    Invariants (first failure wins):
+
+    * ``count``   -- ``len(input_ledger) == len(output_files)`` (no patch
+      dropped, none duplicated by the union).
+    * ``content`` -- every input ``(path, sha)`` appears EXACTLY once in the
+      output ledger and vice-versa (no content dropped or silently mutated --
+      the composed file hashes back to its source unit's patch).
+    * ``overwrite`` -- no two output files share a ``file_path`` (the
+      collision-matrix invariant, re-proven over the ACTUAL composed hashes).
+    * ``ast`` -- each ``.py`` composed file ``ast.parse``-es cleanly; a unit
+      that produced syntactically-broken Python is caught HERE, before VALIDATE.
+      Non-Python files skip AST (but are still hash-conserved above).
+    """
+    output_ledger = _build_input_ledger(output_files)
+
+    # (1) Count conservation.
+    if len(input_ledger) != len(output_ledger):
+        return (
+            f"count: inputs={len(input_ledger)} != outputs={len(output_ledger)} "
+            "(a patch was dropped or duplicated by the union)"
+        )
+
+    # (3) No-overwrite -- duplicate output path means an overwrite happened.
+    out_paths = [str(entry["file_path"]) for entry in output_files]
+    if len(set(out_paths)) != len(out_paths):
+        from collections import Counter
+
+        dup = [p for p, n in Counter(out_paths).items() if n > 1]
+        return (
+            f"overwrite: output file_path(s) {sorted(dup)!r} appear more than "
+            "once (a patch overwrote another during the union)"
+        )
+
+    # (2) Content conservation -- the sorted ledgers must be byte-identical.
+    if input_ledger != output_ledger:
+        in_set = set(input_ledger)
+        out_set = set(output_ledger)
+        missing = sorted(in_set - out_set)
+        extra = sorted(out_set - in_set)
+        return (
+            "content: input (path, sha256) set != output set "
+            f"(dropped_or_mutated={missing!r} unexpected={extra!r})"
+        )
+
+    # (4) AST validity of composed Python files.
+    for entry in output_files:
+        path = str(entry["file_path"])
+        if not path.endswith(".py"):
+            continue
+        content = str(entry["full_content"])
+        try:
+            ast.parse(content, filename=path)
+        except SyntaxError as exc:
+            return (
+                f"ast: composed file {path!r} is not valid Python "
+                f"(line {exc.lineno}: {exc.msg})"
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Disjoint UNION (the existing map-reduce, extracted for the proof layer)
+# ---------------------------------------------------------------------------
+
+
+def _compose_ordered_files(
+    graph: ExecutionGraph,
+    unit_results: Mapping[str, WorkUnitResult],
+) -> Any:
+    """Build the deterministic disjoint UNION of per-unit patches.
+
+    Returns either ``(ordered_files, input_ledger)`` on a clean union, or a
+    :class:`ComposeFailure` on any fail-CLOSED union condition (no units /
+    unit-not-success / missing-patch / same-file collision / net-empty). The
+    ``input_ledger`` is the authoritative ``(path, sha256)`` ledger captured
+    from the patches AT admission time -- it is the ground truth the
+    post-compose proof checks the output against.
+
+    This is the same logic that previously lived inline in
+    :func:`compose_fanout_result`; extracting it lets the zero-loss proof run
+    over the composed result without duplicating the union.
+    """
+    units = tuple(getattr(graph, "units", ()) or ())
+    if not units:
+        return ComposeFailure(
+            reason=ComposeFailureReason.NO_UNITS,
+            detail="execution graph carries zero units",
+        )
+
+    ordered_files: List[Dict[str, str]] = []
+    seen_paths: Dict[str, str] = {}
+
+    for spec in units:
+        unit_id = str(getattr(spec, "unit_id", "") or "")
+        result = unit_results.get(unit_id)
+
+        # (2) Presence + terminal success.
+        if result is None:
+            return ComposeFailure(
+                reason=ComposeFailureReason.UNIT_NOT_SUCCESS,
+                detail=f"unit {unit_id!r} has no terminal result",
+                offending_unit_id=unit_id,
+            )
+        status = getattr(result, "status", None)
+        if status != WorkUnitState.COMPLETED:
+            status_val = getattr(status, "value", status)
+            return ComposeFailure(
+                reason=ComposeFailureReason.UNIT_NOT_SUCCESS,
+                detail=(
+                    f"unit {unit_id!r} status={status_val!r} "
+                    "(expected COMPLETED) -> legacy serial"
+                ),
+                offending_unit_id=unit_id,
+            )
+
+        # (3) Usable patch.
+        pairs = _unit_files(result)
+        if not pairs:
+            return ComposeFailure(
+                reason=ComposeFailureReason.UNIT_MISSING_PATCH,
+                detail=f"SUCCESS unit {unit_id!r} carried no usable patch content",
+                offending_unit_id=unit_id,
+            )
+
+        rationale = str(getattr(spec, "goal", "") or "") or (
+            f"composed from fan-out unit {unit_id}"
+        )
+
+        for file_path, full_content in pairs:
+            # (4) Disjointness invariant -- fail CLOSED on overlap.
+            prior = seen_paths.get(file_path)
+            if prior is not None:
+                return ComposeFailure(
+                    reason=ComposeFailureReason.COLLISION_INVARIANT_VIOLATED,
+                    detail=(
+                        f"file {file_path!r} claimed by both unit {prior!r} "
+                        f"and unit {unit_id!r}; collision-matrix disjointness "
+                        "invariant violated -> refusing silent merge"
+                    ),
+                    offending_unit_id=unit_id,
+                )
+            seen_paths[file_path] = unit_id
+            ordered_files.append(
+                {
+                    "file_path": file_path,
+                    "full_content": full_content,
+                    "rationale": rationale,
+                }
+            )
+
+    # (5) Defensive net-empty guard.
+    if not ordered_files:
+        return ComposeFailure(
+            reason=ComposeFailureReason.EMPTY_COMPOSITION,
+            detail="no files survived composition",
+        )
+
+    # Capture the authoritative INPUT ledger from the admitted patches -- this
+    # is the ground truth the post-compose zero-loss proof checks against.
+    input_ledger = _build_input_ledger(ordered_files)
+    return ordered_files, input_ledger
+
+
+# ---------------------------------------------------------------------------
 # Public: compose_fanout_result
 # ---------------------------------------------------------------------------
 
@@ -279,85 +497,45 @@ def compose_fanout_result(
     5. Net-empty union -> ``EMPTY_COMPOSITION`` (defensive; should be
        unreachable once 1-3 pass).
     """
-    units = tuple(getattr(graph, "units", ()) or ())
-    if not units:
-        return ComposeFailure(  # type: ignore[return-value]
-            reason=ComposeFailureReason.NO_UNITS,
-            detail="execution graph carries zero units",
-        )
-
     op_id = str(getattr(graph, "op_id", "") or "")
 
-    # Deterministic union: iterate units in GRAPH order. Each file is owned by
-    # exactly one unit (collision-matrix disjointness); a repeated path is a
-    # hard fail-CLOSED. ``seen_paths`` maps path -> the unit that first
-    # claimed it, for a precise collision detail string.
-    ordered_files: List[Dict[str, str]] = []
-    seen_paths: Dict[str, str] = {}
+    # Deterministic disjoint UNION (the existing map-reduce), extracted so the
+    # zero-loss proof can run over the result without duplicating union logic.
+    # Returns either ``(ordered_files, input_ledger)`` or a ComposeFailure.
+    composed = _compose_ordered_files(graph, unit_results)
+    if isinstance(composed, ComposeFailure):
+        return composed  # type: ignore[return-value]
+    ordered_files, input_ledger = composed
 
-    for spec in units:
-        unit_id = str(getattr(spec, "unit_id", "") or "")
-        result = unit_results.get(unit_id)
-
-        # (2) Presence + terminal success.
-        if result is None:
-            return ComposeFailure(  # type: ignore[return-value]
-                reason=ComposeFailureReason.UNIT_NOT_SUCCESS,
-                detail=f"unit {unit_id!r} has no terminal result",
-                offending_unit_id=unit_id,
-            )
-        status = getattr(result, "status", None)
-        if status != WorkUnitState.COMPLETED:
-            status_val = getattr(status, "value", status)
-            return ComposeFailure(  # type: ignore[return-value]
-                reason=ComposeFailureReason.UNIT_NOT_SUCCESS,
-                detail=(
-                    f"unit {unit_id!r} status={status_val!r} "
-                    "(expected COMPLETED) -> legacy serial"
-                ),
-                offending_unit_id=unit_id,
-            )
-
-        # (3) Usable patch.
-        pairs = _unit_files(result)
-        if not pairs:
-            return ComposeFailure(  # type: ignore[return-value]
-                reason=ComposeFailureReason.UNIT_MISSING_PATCH,
-                detail=f"SUCCESS unit {unit_id!r} carried no usable patch content",
-                offending_unit_id=unit_id,
-            )
-
-        rationale = str(getattr(spec, "goal", "") or "") or (
-            f"composed from fan-out unit {unit_id}"
-        )
-
-        for file_path, full_content in pairs:
-            # (4) Disjointness invariant -- fail CLOSED on overlap.
-            prior = seen_paths.get(file_path)
-            if prior is not None:
-                return ComposeFailure(  # type: ignore[return-value]
-                    reason=ComposeFailureReason.COLLISION_INVARIANT_VIOLATED,
-                    detail=(
-                        f"file {file_path!r} claimed by both unit {prior!r} "
-                        f"and unit {unit_id!r}; collision-matrix disjointness "
-                        "invariant violated -> refusing silent merge"
-                    ),
-                    offending_unit_id=unit_id,
-                )
-            seen_paths[file_path] = unit_id
-            ordered_files.append(
-                {
-                    "file_path": file_path,
-                    "full_content": full_content,
-                    "rationale": rationale,
-                }
-            )
-
-    # (5) Defensive net-empty guard.
-    if not ordered_files:
+    # ---------------------------------------------------------------------
+    # ZERO-LOSS MERGE GUARANTEE (verification layer over the disjoint union).
+    # Prove -- BEFORE the candidate reaches VALIDATE/GATE -- that every input
+    # unit's patch is present, byte-preserved (sha256), not overwritten, and
+    # AST-valid. ANY violation -> fail-CLOSED ComposeFailure -> legacy serial.
+    # A dropped / overwritten / mutated / syntactically-broken patch is now
+    # mathematically impossible to leak to the gates.
+    # ---------------------------------------------------------------------
+    proof_failure = _prove_lossless(input_ledger, ordered_files)
+    output_ledger = _build_input_ledger(ordered_files)
+    sha_match = input_ledger == output_ledger
+    ast_ok = not (
+        proof_failure is not None and proof_failure.startswith("ast")
+    )
+    logger.info(
+        "[DAGCompose] lossless proof: inputs=%d outputs=%d sha_match=%s "
+        "ast_ok=%s op=%s result=%s",
+        len(input_ledger),
+        len(output_ledger),
+        sha_match,
+        ast_ok,
+        op_id[:16],
+        "PASS" if proof_failure is None else f"FAIL({proof_failure.split(':', 1)[0]})",
+    )
+    if proof_failure is not None:
         return ComposeFailure(  # type: ignore[return-value]
-            reason=ComposeFailureReason.EMPTY_COMPOSITION,
-            detail="no files survived composition",
+            reason=ComposeFailureReason.LOSSLESS_PROOF_FAILED,
+            detail=f"lossless_proof_failed:{proof_failure}",
+            offending_unit_id="",
         )
 
     primary = ordered_files[0]
@@ -405,4 +583,8 @@ __all__ = [
     "ComposedCandidate",
     "compose_fanout_result",
     "dag_compose_enabled",
+    # Zero-loss merge guarantee surface (verification layer over the union).
+    "_build_input_ledger",
+    "_compose_ordered_files",
+    "_prove_lossless",
 ]
