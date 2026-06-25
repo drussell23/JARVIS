@@ -674,6 +674,109 @@ async def _fire_terminal_postmortem(
 
 
 # ---------------------------------------------------------------------------
+# Wave 3 (6) Slice 4b — DAGComposer map-reduce wiring helper
+# ---------------------------------------------------------------------------
+
+
+def _maybe_compose_fanout(
+    *,
+    ctx: OperationContext,
+    pctx: PhaseContext,
+    fanout_result: Any,
+) -> Any:
+    """Compose a COMPLETED fan-out's per-unit patches into one candidate.
+
+    Returns a NEW ``GenerationResult`` whose single candidate is the
+    DAG-composed unified multi-file candidate when ALL of:
+
+    * ``JARVIS_WAVE3_DAG_COMPOSE_ENABLED`` is on, AND
+    * the fan-out terminal outcome is ``COMPLETED``, AND
+    * the composer returns a :class:`ComposedCandidate` (fail-CLOSED: every
+      unit terminally SUCCESS, no missing patch, disjointness intact).
+
+    Returns ``None`` in every other case — the caller then leaves
+    ``pctx.generation`` untouched and the legacy serial walk proceeds
+    exactly as today. This helper NEVER raises into the hot path: the
+    composer is a pure function, but any unexpected shape error here would
+    only cost us the composition optimization, so it is caught and treated
+    as a fall-through to serial (the safe, behavior-preserving default).
+    """
+    from backend.core.ouroboros.governance.dag_composer import (
+        ComposedCandidate,
+        compose_fanout_result,
+        dag_compose_enabled,
+    )
+    from backend.core.ouroboros.governance.parallel_dispatch import (
+        FanoutOutcome,
+    )
+
+    if not dag_compose_enabled():
+        return None
+
+    # Only a cleanly COMPLETED fan-out is composable. SKIPPED / FAILED /
+    # CANCELLED / TIMEOUT / SUBMIT_* all fall through to legacy serial.
+    if getattr(fanout_result, "outcome", None) != FanoutOutcome.COMPLETED:
+        return None
+
+    graph = getattr(fanout_result, "graph", None)
+    state = getattr(fanout_result, "state", None)
+    if graph is None or state is None:
+        return None
+    unit_results = getattr(state, "results", None)
+    if not unit_results:
+        return None
+
+    try:
+        composed = compose_fanout_result(graph, unit_results)
+    except Exception:  # noqa: BLE001 — composition is an optimization; any
+        # unexpected error falls back to the byte-identical serial path.
+        logger.debug(
+            "[PhaseDispatcher] dag_compose raised (suppressed) — "
+            "falling back to legacy serial",
+            exc_info=True,
+        )
+        return None
+
+    if not isinstance(composed, ComposedCandidate):
+        # ComposeFailure (fail-CLOSED) — legacy serial path. The composer
+        # already logged the reason; surface a single dispatcher breadcrumb.
+        logger.info(
+            "[PhaseDispatcher] dag_compose declined op=%s reason=%s "
+            "(fan-out result stashed; legacy serial walk proceeds)",
+            ctx.op_id[:16],
+            getattr(getattr(composed, "reason", None), "value", "unknown"),
+        )
+        return None
+
+    # Build a replacement GenerationResult carrying the unified candidate so
+    # VALIDATE -> GATE -> APPLY consume it via the EXISTING multi-file path.
+    from backend.core.ouroboros.governance.op_context import GenerationResult
+
+    prior = pctx.generation
+    replacement = GenerationResult(
+        candidates=(composed.candidate,),
+        provider_name=(
+            f"{getattr(prior, 'provider_name', '') or 'unknown'}"
+            "+dag_composer"
+        ),
+        generation_duration_s=float(
+            getattr(prior, "generation_duration_s", 0.0) or 0.0
+        ),
+        model_id=getattr(prior, "model_id", "") or "",
+    )
+    logger.info(
+        "[PhaseDispatcher] dag_compose op=%s replaced generation with "
+        "unified multi-file candidate n_files=%d (one VALIDATE/GATE/APPLY "
+        "walk via _apply_multi_file_candidate batch rollback)",
+        ctx.op_id[:16],
+        composed.n_files,
+    )
+    # Stash the composed candidate too for operator/test inspection.
+    pctx.extras["dag_composed_candidate"] = composed
+    return replacement
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher — the main event
 # ---------------------------------------------------------------------------
 
@@ -1002,17 +1105,37 @@ async def dispatch_pipeline(
                         scheduler=_scheduler,
                     )
                     # Slice 4 ships the submit + await primitive with
-                    # loud-fail error handling. Consumption of
-                    # per-unit results by downstream phases (VALIDATE /
-                    # slice4b) is a later-slice concern — for now the
-                    # result is stashed in extras so operators + tests
-                    # can inspect it, and the sequential phase walk
-                    # continues unchanged. This preserves behavioral
-                    # parity with the serial path while the enforce
-                    # surface matures.
+                    # loud-fail error handling. The result is ALWAYS
+                    # stashed in extras so operators + tests can inspect
+                    # it, regardless of whether Slice 4b composition runs.
                     pctx.extras["parallel_dispatch_fanout_result"] = (
                         _fanout_result
                     )
+
+                    # Wave 3 (6) Slice 4b — DAGComposer map-reduce.
+                    # When the fan-out COMPLETED and the composer flag is
+                    # on, union the successful disjoint per-unit patches
+                    # into ONE multi-file candidate and REPLACE
+                    # pctx.generation with it — so VALIDATE -> GATE ->
+                    # APPLY run ONCE on the unified set via the existing
+                    # multi-file consumer (_iter_candidate_files /
+                    # _apply_multi_file_candidate + batch rollback),
+                    # instead of re-running APPLY serially while the
+                    # parallel patches are ignored (the Slice-4b gap).
+                    #
+                    # Fail-CLOSED: on ANY unit failure / missing patch /
+                    # collision-invariant violation the composer returns
+                    # a ComposeFailure and we leave pctx.generation
+                    # untouched — the legacy serial walk proceeds exactly
+                    # as today (stash, no consumption). Flag OFF (default)
+                    # → byte-identical to pre-Slice-4b.
+                    _slice4b_composed = _maybe_compose_fanout(
+                        ctx=ctx,
+                        pctx=pctx,
+                        fanout_result=_fanout_result,
+                    )
+                    if _slice4b_composed is not None:
+                        pctx.generation = _slice4b_composed
             elif _master_on() and _shadow_on():
                 # Shadow-only path — per Slice 3, broad exception
                 # catch is acceptable because shadow has no
