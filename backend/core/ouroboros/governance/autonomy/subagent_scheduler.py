@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import logging
+import os
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,78 @@ _TERMINAL_GRAPH_PHASES = {
 }
 
 
+# --- L3 per-subagent telemetry (gated, fail-soft) --------------------------
+# Surfaces each parallel subagent's resource + cost footprint live:
+#   - worktree lifespan (create()->reap, monotonic seconds)
+#   - DoubleWord inference cost (from the provider's reported cost_usd)
+# Gated by JARVIS_L3_TELEMETRY_ENABLED (default true). OFF -> no [L3Telemetry]
+# lines and the execution path is byte-identical (telemetry never mutates
+# control flow). Every emit is wrapped fail-soft: a telemetry error is
+# swallowed and never affects the work-unit result.
+
+def _l3_telemetry_enabled() -> bool:
+    return os.environ.get("JARVIS_L3_TELEMETRY_ENABLED", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _fmt_opt_float(value: Optional[float]) -> str:
+    """Render an optional float honestly: None -> 'None', else a plain float."""
+    if value is None:
+        return "None"
+    return repr(float(value))
+
+
+def _emit_unit_telemetry(result: "WorkUnitResult", branch: str) -> None:
+    """Emit the per-unit [L3Telemetry] breadcrumb. Fail-soft + gated."""
+    if not _l3_telemetry_enabled():
+        return
+    try:
+        logger.info(
+            "[L3Telemetry] unit=%s worktree=%s lifespan_s=%s dw_cost_usd=%s status=%s",
+            result.unit_id,
+            branch or "-",
+            _fmt_opt_float(result.worktree_lifespan_s),
+            _fmt_opt_float(result.dw_cost_usd),
+            getattr(result.status, "value", result.status),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break execution
+        logger.debug("[L3Telemetry] per-unit emit failed (non-fatal)", exc_info=True)
+
+
+def _emit_graph_telemetry(
+    graph_id: str, results: Dict[str, "WorkUnitResult"]
+) -> None:
+    """Emit the graph-aggregate [L3Telemetry] line. Fail-soft + gated.
+
+    Honest sums: a None lifespan/cost contributes nothing (it is not a 0.0
+    measurement, it is the absence of one). total_* therefore aggregate only
+    the units that actually reported a value.
+    """
+    if not _l3_telemetry_enabled():
+        return
+    try:
+        total_lifespan = 0.0
+        total_cost = 0.0
+        for res in results.values():
+            if res.worktree_lifespan_s is not None:
+                total_lifespan += float(res.worktree_lifespan_s)
+            if res.dw_cost_usd is not None:
+                total_cost += float(res.dw_cost_usd)
+        logger.info(
+            "[L3Telemetry] graph=%s units=%d total_lifespan_s=%s total_dw_cost_usd=%s",
+            graph_id,
+            len(results),
+            repr(round(total_lifespan, 6)),
+            repr(round(total_cost, 6)),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break execution
+        logger.debug("[L3Telemetry] graph-aggregate emit failed (non-fatal)", exc_info=True)
+
+
 class GenerationSubagentExecutor:
     """Default work-unit executor backed by the existing governed generator."""
 
@@ -82,6 +156,12 @@ class GenerationSubagentExecutor:
         causal_parent_id = graph.causal_trace_id
         _worktree_path: Optional[Path] = None
         _sandbox: Optional[Any] = self._build_sandbox_for_unit(unit)
+        # --- L3 telemetry locals (fail-soft; never affect control flow) ---
+        _worktree_create_mono: Optional[float] = None
+        _worktree_lifespan_s: Optional[float] = None
+        _dw_cost_usd: Optional[float] = None
+        _branch_label: str = ""
+        _result: Optional[WorkUnitResult] = None
         try:
             if len(unit.target_files) != 1:
                 raise RuntimeError(
@@ -99,9 +179,17 @@ class GenerationSubagentExecutor:
             # main working copy while the contract still promises isolation.
             if self._worktree_manager is not None:
                 _branch = f"unit-{unit.unit_id}-{graph.graph_id}"
+                _branch_label = _branch
                 try:
                     _created = await self._worktree_manager.create(_branch)
                     _worktree_path = _created
+                    # Telemetry: monotonic stamp at create() success. Reap
+                    # stamp is taken in the finally block -> lifespan. Wrapped
+                    # so a clock hiccup never affects the unit.
+                    try:
+                        _worktree_create_mono = time.monotonic()
+                    except Exception:  # noqa: BLE001
+                        _worktree_create_mono = None
                     logger.info(
                         "[SubagentExecutor] Worktree created: %s -> %s",
                         _branch, _created,
@@ -114,7 +202,7 @@ class GenerationSubagentExecutor:
                         "— unit fails (isolation promised, not obtained)",
                         _branch, wt_exc,
                     )
-                    return WorkUnitResult(
+                    _result = WorkUnitResult(
                         unit_id=unit.unit_id,
                         repo=unit.repo,
                         status=WorkUnitState.FAILED,
@@ -132,6 +220,7 @@ class GenerationSubagentExecutor:
                         error=f"worktree_create_failed:{type(wt_exc).__name__}:{wt_exc}",
                         causal_parent_id=causal_parent_id,
                     )
+                    return _result
 
             op_id = f"{graph.op_id}:{unit.unit_id}"
             subctx = OperationContext.create(
@@ -145,8 +234,16 @@ class GenerationSubagentExecutor:
             subctx = subctx.with_pipeline_deadline(deadline)
 
             generation = await self._generator.generate(subctx, deadline)
+            # Telemetry: thread the provider's reported DW cost. Honest-null —
+            # a missing cost_usd attribute means the result carries no cost, so
+            # we report None rather than fabricating a 0.0 measurement.
+            try:
+                _gen_cost = getattr(generation, "cost_usd", None)
+                _dw_cost_usd = None if _gen_cost is None else float(_gen_cost)
+            except Exception:  # noqa: BLE001
+                _dw_cost_usd = None
             if generation.is_noop:
-                return WorkUnitResult(
+                _result = WorkUnitResult(
                     unit_id=unit.unit_id,
                     repo=unit.repo,
                     status=WorkUnitState.COMPLETED,
@@ -156,6 +253,7 @@ class GenerationSubagentExecutor:
                     finished_at_ns=time.monotonic_ns(),
                     causal_parent_id=causal_parent_id,
                 )
+                return _result
 
             best_candidate: Optional[Dict[str, Any]] = None
             best_failure_class = ""
@@ -177,7 +275,7 @@ class GenerationSubagentExecutor:
                 best_error = error
 
             if best_candidate is None:
-                return WorkUnitResult(
+                _result = WorkUnitResult(
                     unit_id=unit.unit_id,
                     repo=unit.repo,
                     status=WorkUnitState.FAILED,
@@ -189,9 +287,10 @@ class GenerationSubagentExecutor:
                     error=best_error or "no_valid_candidate",
                     causal_parent_id=causal_parent_id,
                 )
+                return _result
 
             patch = self._candidate_to_patch(unit.repo, repo_root, best_candidate)
-            return WorkUnitResult(
+            _result = WorkUnitResult(
                 unit_id=unit.unit_id,
                 repo=unit.repo,
                 status=WorkUnitState.COMPLETED,
@@ -201,8 +300,9 @@ class GenerationSubagentExecutor:
                 finished_at_ns=time.monotonic_ns(),
                 causal_parent_id=causal_parent_id,
             )
+            return _result
         except Exception as exc:
-            return WorkUnitResult(
+            _result = WorkUnitResult(
                 unit_id=unit.unit_id,
                 repo=unit.repo,
                 status=WorkUnitState.FAILED,
@@ -224,6 +324,40 @@ class GenerationSubagentExecutor:
                     logger.warning(
                         "[SubagentExecutor] Worktree cleanup failed: %s", cleanup_exc
                     )
+            # --- L3 telemetry: worktree lifespan (create()->reap) ----------
+            # The reap stamp is taken here (post-cleanup) so the lifespan
+            # spans the full isolated-worktree lifetime. Entirely fail-soft:
+            # any timing error leaves lifespan None and never disturbs the
+            # unit result or the teardown that follows.
+            if _worktree_create_mono is not None:
+                try:
+                    _worktree_lifespan_s = time.monotonic() - _worktree_create_mono
+                except Exception:  # noqa: BLE001
+                    _worktree_lifespan_s = None
+            # Attach telemetry fields to the (already-built) result and emit
+            # the per-unit breadcrumb. dataclasses.replace keeps WorkUnitResult
+            # frozen + back-compat. Gated: OFF -> result is byte-identical (no
+            # enrichment, no line). If anything here raises, the original
+            # _result is returned unchanged (fail-soft).
+            if _result is not None and _l3_telemetry_enabled():
+                try:
+                    _result = dataclasses.replace(
+                        _result,
+                        worktree_lifespan_s=_worktree_lifespan_s,
+                        dw_cost_usd=_dw_cost_usd,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[L3Telemetry] result enrichment failed (non-fatal)",
+                        exc_info=True,
+                    )
+                try:
+                    _emit_unit_telemetry(_result, _branch_label)
+                except Exception:  # noqa: BLE001 — telemetry never breaks the unit
+                    logger.debug(
+                        "[L3Telemetry] per-unit emit raised (non-fatal)",
+                        exc_info=True,
+                    )
             # --- Swarm Phase 1b — deterministic sandbox vaporization. -------
             # finally-guaranteed (success / failure / cancellation); composes
             # with the worktree cleanup above + WorktreeManager.reap_orphans()
@@ -239,6 +373,13 @@ class GenerationSubagentExecutor:
                 # swarm_node_vaporized telemetry edge (fail-soft; never
                 # disturbs the finally-guaranteed teardown).
                 vaporize_quietly(_sandbox, graph_id=getattr(graph, "graph_id", ""))
+            # Return the (telemetry-enriched) result from the finally block so
+            # the lifespan + cost fields — only fully known after reap — ride
+            # back on the WorkUnitResult. When _result is None (unreachable in
+            # practice: every try path assigns it) we fall through and the
+            # original return value stands.
+            if _result is not None:
+                return _result
 
     @staticmethod
     def _build_sandbox_for_unit(unit: WorkUnitSpec) -> Optional[Any]:
@@ -1006,6 +1147,16 @@ class SubagentScheduler:
             future.set_result(state)
 
     def _finish_graph(self, graph_id: str, state: GraphExecutionState) -> None:
+        # L3 telemetry: graph-aggregate footprint at terminal phase (COMPLETED
+        # / FAILED / CANCELLED). Fail-soft + gated inside the helper; wrapped
+        # again here so a broken emit can never abort graph finalization.
+        try:
+            _emit_graph_telemetry(graph_id, state.results)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[L3Telemetry] graph-aggregate emit raised (non-fatal)",
+                exc_info=True,
+            )
         self._set_graph_future_result(graph_id, state)
         self._graph_tasks.pop(graph_id, None)
         if self._running and self._recovery_queue:
