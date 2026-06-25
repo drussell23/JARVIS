@@ -1544,10 +1544,10 @@ def _remote_surgery_body_script(args: argparse.Namespace) -> str:
 
 def _remote_surgery_launch_shell(args: argparse.Namespace) -> str:
     """The SHORT remote shell the launching SSH runs: write surgery.sh to the node,
-    then LAUNCH it DETACHED (setsid/nohup, or systemd-run --scope if available) and
-    RETURN IMMEDIATELY. The detached surgery survives this SSH closing. Prefers
-    systemd-run when present (cgroup-scoped + --collect auto-clean); else falls
-    back to setsid+nohup (never hard-requires systemd)."""
+    then LAUNCH it DETACHED via setsid+nohup and RETURN IMMEDIATELY. The detached
+    surgery survives this SSH closing. setsid+nohup is auth-free (no systemd/polkit
+    dependency) -- `systemd-run --scope` was removed because it requires interactive
+    polkit auth over a non-interactive SSH --command and silently no-ops (run #16)."""
     jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
     script_path = f"{jr}/surgery.sh"
     script_q = shlex.quote(script_path)
@@ -1563,14 +1563,18 @@ def _remote_surgery_launch_shell(args: argparse.Namespace) -> str:
         f"echo {shlex.quote(b64)} | base64 -d > {script_q} && chmod +x {script_q}; "
         # truncate the prior out (idempotent relaunch starts a fresh log).
         f": > {out_q} 2>/dev/null || true; "
-        # DETACH: prefer systemd-run --scope --collect; else setsid nohup.
-        "if command -v systemd-run >/dev/null 2>&1; then "
-        f"systemd-run --scope --collect --unit=sovereign-surgery-$$ bash {script_q} "
-        f">{out_q} 2>&1 </dev/null & "
-        "echo '[iac] surgery launched detached (systemd-run --scope)'; "
-        "else "
+        # DETACH: setsid+nohup is PRIMARY -- it is auth-free and fully detaches from
+        # the SSH TTY (new session + SIGHUP-immune + stdin from /dev/null). We do NOT
+        # use `systemd-run --scope`: in a non-interactive SSH --command it fails with
+        # "Interactive authentication required" (polkit) and backgrounds nothing, yet
+        # the launcher's echo still reports success -> the surgery silently never runs
+        # (the run-#16 failure). setsid nohup has no such dependency.
+        "if command -v setsid >/dev/null 2>&1; then "
         f"setsid nohup bash {script_q} >{out_q} 2>&1 </dev/null & "
         "echo '[iac] surgery launched detached (setsid nohup)'; "
+        "else "
+        f"nohup bash {script_q} >{out_q} 2>&1 </dev/null & disown 2>/dev/null || true; "
+        "echo '[iac] surgery launched detached (nohup+disown)'; "
         "fi; "
         # return immediately -- do NOT wait on the surgery body.
         "echo '[iac] launcher returning (surgery detached, SSH may now close)'; "
