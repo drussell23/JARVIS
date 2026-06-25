@@ -200,9 +200,12 @@ async def test_on_fs_event_py_file_schedules_debounced_run(monkeypatch: Any) -> 
     assert sensor._fs_events_handled == 1
 
 
-async def _never_called() -> None:
+async def _never_called(*args: Any, **kwargs: Any) -> None:
     """Stand-in coroutine for _debounced_pytest_run; never actually runs
-    because the test cancels it before the 2s debounce completes."""
+    because the test cancels it before the 2s debounce completes.
+
+    Accepts ``*args/**kwargs`` so it tolerates the dynamic-scoping
+    ``changed_rel_path=`` kwarg threaded into the production call site."""
     await asyncio.sleep(10.0)
 
 

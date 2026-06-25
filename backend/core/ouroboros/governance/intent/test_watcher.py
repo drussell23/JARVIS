@@ -28,7 +28,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .signals import IntentSignal
 
@@ -145,7 +145,9 @@ class TestWatcher:
     # Subprocess invocation
     # ------------------------------------------------------------------
 
-    async def run_pytest(self) -> Tuple[str, int]:
+    async def run_pytest(
+        self, target_paths: Optional[Sequence[str]] = None
+    ) -> Tuple[str, int]:
         """Run pytest via the Slice 9 canonical helper.
 
         Slice 9 (operator-bound, empirical from bt-2026-05-22-000838):
@@ -158,15 +160,30 @@ class TestWatcher:
         single source of pipe-discipline + provenance + process-
         group cleanup. AST pin in
         ``test_slice9_canonical_pytest_helper.py`` forbids any
-        other path."""
+        other path.
+
+        Dynamic test scoping (2026-06-24): when *target_paths* is a
+        non-empty sequence, the pytest argv targets those node ids /
+        file paths instead of the whole ``test_dir``. This is the
+        FS-driven hot path — a single changed source file resolves
+        (via ``TestRunner.resolve_affected_tests``) to a bounded set
+        of its own test files, so a one-line edit no longer triggers
+        the full ``tests/`` sweep that SIGKILLs at the 180s ceiling
+        (the foil that blocked O+V's chaos self-detection in the A1
+        soak). When *target_paths* is None / empty, the legacy
+        whole-``test_dir`` behavior is byte-identical (back-compat).
+        """
         from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
             run_pytest_subprocess,
         )
+        # Scoped targets (FS-driven primary) vs. legacy whole-suite.
+        scoped = [str(p) for p in (target_paths or []) if str(p).strip()]
+        pytest_targets = scoped if scoped else [str(self.test_dir)]
         argv = [
             "python3",
             "-m",
             "pytest",
-            str(self.test_dir),
+            *pytest_targets,
             "--tb=short",
             "-q",
             "--no-header",
@@ -369,18 +386,25 @@ class TestWatcher:
     # Poll loop
     # ------------------------------------------------------------------
 
-    async def poll_once(self) -> List[IntentSignal]:
+    async def poll_once(
+        self, target_paths: Optional[Sequence[str]] = None
+    ) -> List[IntentSignal]:
         """Run one poll cycle: invoke pytest, parse output, process failures.
 
         If pytest times out (exit_code == -1), the cycle is skipped and
         existing failure streaks are preserved -- a timeout does NOT mean
         tests are passing.
 
+        *target_paths* (dynamic test scoping, 2026-06-24): pass-through to
+        :meth:`run_pytest`. A non-empty sequence scopes the run to those
+        test paths; None / empty preserves the legacy whole-``test_dir``
+        sweep (back-compat).
+
         Returns
         -------
         List of :class:`IntentSignal` emitted for stable failures.
         """
-        output, exit_code = await self.run_pytest()
+        output, exit_code = await self.run_pytest(target_paths=target_paths)
         if exit_code == -1:
             return []  # timeout -- skip cycle, preserve streaks
         failures = self.parse_pytest_output(output, exit_code)

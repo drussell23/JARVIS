@@ -101,6 +101,61 @@ def fs_events_enabled() -> bool:
     ).lower() in ("true", "1", "yes")
 
 
+# --- Dynamic test scoping (2026-06-24) ------------------------------------
+#
+# The FS-driven pytest run used to call ``poll_once()`` blind — pytest ran
+# the WHOLE ``tests/`` suite on every ``.py`` change. On a non-trivial repo
+# that sweep exceeds the 180s pytest ceiling and is SIGKILLed mid-run, so a
+# stable failure introduced by a single edit is NEVER detected. This is the
+# exact foil that blocked O+V's chaos self-detection in the A1 soak.
+#
+# Fix (reuse-first, no new mapper): the changed file's repo-relative path is
+# threaded to the EXISTING ``TestRunner.resolve_affected_tests`` — a 4-level
+# deterministic mapper (name-convention -> recursive search -> package
+# fallback -> repo fallback, capped at ``JARVIS_TEST_MAX_FILES``) — and the
+# bounded result is passed to ``poll_once(target_paths=...)``. A one-line
+# edit now runs ONLY that file's tests.
+#
+# Fail-safe ladder (never the whole ``tests/`` on a resolve failure):
+#   1. resolve_affected_tests -> bounded scoped targets (primary).
+#   2. resolver empty / errors -> nearest sibling ``tests/<mirror-dir>/``
+#      (bounded to a single directory, not the repo root).
+#   3. mirror dir unresolvable -> deep-background full-suite poll ONLY when
+#      ``JARVIS_TEST_FULL_SUITE_FALLBACK`` is explicitly true (default
+#      false); otherwise the run is skipped (a missed run is cheaper than a
+#      180s SIGKILL that detects nothing).
+#
+# Master gate ``JARVIS_TEST_DYNAMIC_SCOPING_ENABLED`` (default true). OFF ->
+# the FS path calls ``poll_once()`` with no target_paths == legacy
+# whole-suite behavior, byte-identical.
+
+
+def dynamic_scoping_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_DYNAMIC_SCOPING_ENABLED`` at call-time (default true).
+
+    Not cached so tests can monkeypatch the env per-case (same pattern as
+    ``fs_events_enabled``). OFF restores byte-identical legacy whole-suite
+    behavior on the FS path.
+    """
+    return os.environ.get(
+        "JARVIS_TEST_DYNAMIC_SCOPING_ENABLED", "true",
+    ).lower() in ("true", "1", "yes")
+
+
+def full_suite_fallback_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_FULL_SUITE_FALLBACK`` at call-time (default false).
+
+    The last-resort escape hatch: when scoping is on but NOTHING resolves
+    (no scoped targets, no mirror dir), only fall back to the whole-suite
+    poll if an operator has explicitly opted in. Default false means a
+    fully-unresolvable change skips the run rather than risking the 180s
+    SIGKILL that detects nothing.
+    """
+    return os.environ.get(
+        "JARVIS_TEST_FULL_SUITE_FALLBACK", "false",
+    ).lower() in ("true", "1", "yes")
+
+
 class TestFailureSensor:
     """Adapter that bridges TestWatcher → UnifiedIntakeRouter.
 
@@ -377,7 +432,7 @@ class TestFailureSensor:
         if self._debounce_task is not None and not self._debounce_task.done():
             self._debounce_task.cancel()
         self._debounce_task = asyncio.create_task(
-            self._debounced_pytest_run(),
+            self._debounced_pytest_run(changed_rel_path=rel_path),
             name="test_failure_debounced_run",
         )
 
@@ -445,8 +500,20 @@ class TestFailureSensor:
     # Phase 1 fallback: debounced subprocess pytest run
     # ------------------------------------------------------------------
 
-    async def _debounced_pytest_run(self) -> None:
-        """Wait 2s for edits to settle, then trigger a pytest run."""
+    async def _debounced_pytest_run(
+        self, changed_rel_path: str = ""
+    ) -> None:
+        """Wait 2s for edits to settle, then trigger a pytest run.
+
+        Dynamic test scoping (2026-06-24): *changed_rel_path* is the
+        FS-event's relative path. When scoping is enabled it is resolved
+        (via the existing :meth:`TestRunner.resolve_affected_tests`) to a
+        bounded set of scoped test targets and passed to
+        ``poll_once(target_paths=...)`` so ONLY that file's tests run — not
+        the whole ``tests/`` suite. Fail-safe: an unresolvable change skips
+        the run (or falls back to whole-suite only when
+        ``JARVIS_TEST_FULL_SUITE_FALLBACK`` is explicitly true).
+        """
         try:
             await asyncio.sleep(2.0)
             # Suppress if plugin results were consumed recently (Phase 2 active)
@@ -457,14 +524,155 @@ class TestFailureSensor:
                     time.monotonic() - self._last_plugin_ts,
                 )
                 return
-            if self._watcher is not None:
+            if self._watcher is None:
+                return
+
+            if not dynamic_scoping_enabled():
+                # OFF -> byte-identical legacy whole-suite behavior.
                 signals = await self._watcher.poll_once()
                 if signals:
                     await self.handle_signals(signals)
+                return
+
+            targets = await self._resolve_scoped_targets(changed_rel_path)
+            if targets is None:
+                # Nothing resolved (no scoped targets, no mirror dir).
+                if not full_suite_fallback_enabled():
+                    logger.debug(
+                        "TestFailureSensor: no scoped targets for %r and "
+                        "full-suite fallback disabled — skipping run",
+                        changed_rel_path,
+                    )
+                    return
+                logger.info(
+                    "TestFailureSensor: no scoped targets for %r — "
+                    "JARVIS_TEST_FULL_SUITE_FALLBACK on, running full suite",
+                    changed_rel_path,
+                )
+                signals = await self._watcher.poll_once()
+            else:
+                logger.info(
+                    "TestFailureSensor: scoped %d test target(s) for %r",
+                    len(targets), changed_rel_path,
+                )
+                signals = await self._watcher.poll_once(target_paths=targets)
+            if signals:
+                await self.handle_signals(signals)
         except asyncio.CancelledError:
             pass  # Newer edit arrived — debounce reset
         except Exception:
             logger.debug("TestFailureSensor: debounced run error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Dynamic test scoping — changed file -> scoped test targets
+    # ------------------------------------------------------------------
+
+    def _repo_root(self) -> Path:
+        """Best-effort repo root for the resolver / mirror-dir fallback.
+
+        Prefers the watcher's ``repo_path`` (set from ``JARVIS_REPO_PATH``),
+        falls back to the env var, then the cwd. Never raises.
+        """
+        candidate = getattr(self._watcher, "repo_path", None) or os.environ.get(
+            "JARVIS_REPO_PATH", "."
+        )
+        try:
+            return Path(candidate).resolve()
+        except Exception:
+            return Path(".").resolve()
+
+    async def _resolve_scoped_targets(
+        self, changed_rel_path: str
+    ) -> Optional[List[str]]:
+        """Map *changed_rel_path* -> bounded scoped pytest targets.
+
+        Returns
+        -------
+        * A non-empty ``List[str]`` of scoped test paths when the existing
+          ``TestRunner.resolve_affected_tests`` (or the bounded mirror-dir
+          fallback) yields targets.
+        * ``None`` when nothing resolved — the caller then either skips the
+          run or (opt-in) falls back to the whole suite. **Never** returns
+          the whole ``tests/`` directory implicitly.
+
+        Fail-safe by construction: any error in the resolver degrades to the
+        mirror-dir fallback, and any error there degrades to ``None``.
+        """
+        if not changed_rel_path:
+            return None
+
+        repo_root = self._repo_root()
+        changed_abs = (repo_root / changed_rel_path).resolve()
+
+        # Primary: reuse the existing 4-level deterministic mapper.
+        try:
+            from backend.core.ouroboros.governance.test_runner import TestRunner
+
+            runner = TestRunner(repo_root)
+            resolved = await runner.resolve_affected_tests((changed_abs,))
+            targets = [
+                str(p) for p in resolved
+                if not self._is_repo_test_root(p, repo_root)
+            ]
+            if targets:
+                return targets
+        except Exception as exc:  # noqa: BLE001 — resolver is best-effort
+            logger.debug(
+                "TestFailureSensor: resolve_affected_tests failed for %r: %s",
+                changed_rel_path, exc,
+            )
+
+        # Fail-safe: nearest sibling mirror tests/ dir (bounded, single dir).
+        mirror = self._mirror_tests_dir(changed_abs, repo_root)
+        if mirror is not None:
+            return [str(mirror)]
+        return None
+
+    @staticmethod
+    def _is_repo_test_root(path: Path, repo_root: Path) -> bool:
+        """True if *path* is a top-level repo test dir (the whole-suite root).
+
+        The resolver's strategy-4/last-resort returns the repo-level
+        ``tests/`` dir, which is exactly the whole-suite sweep we are
+        avoiding. Treat it as "did not scope" so the caller can fall to the
+        bounded mirror-dir or skip — never run it implicitly.
+        """
+        try:
+            from backend.core.ouroboros.governance.test_runner import (
+                _TEST_DIR_NAMES,
+            )
+        except Exception:
+            _TEST_DIR_NAMES = frozenset({"tests", "test"})
+        try:
+            rp = path.resolve()
+        except Exception:
+            rp = path
+        return rp.parent == repo_root and rp.name in _TEST_DIR_NAMES
+
+    def _mirror_tests_dir(
+        self, changed_abs: Path, repo_root: Path
+    ) -> Optional[Path]:
+        """Nearest sibling ``tests/`` dir for *changed_abs*, NOT the repo root.
+
+        Bounded to a single directory so a resolve miss still runs a small,
+        local slice instead of the whole suite. Returns ``None`` when the
+        only sibling test dir IS the repo root (caller then skips / opts in).
+        """
+        try:
+            from backend.core.ouroboros.governance.test_runner import (
+                _find_sibling_tests_dir,
+            )
+        except Exception:
+            return None
+        try:
+            sibling = _find_sibling_tests_dir(changed_abs)
+        except Exception:
+            return None
+        if sibling is None:
+            return None
+        if self._is_repo_test_root(sibling, repo_root):
+            return None
+        return sibling
 
     # ------------------------------------------------------------------
     # Poll fallback (safety net when event spine is unavailable)
