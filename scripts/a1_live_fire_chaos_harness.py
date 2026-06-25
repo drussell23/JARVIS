@@ -413,7 +413,14 @@ class AuditorRunner:
             "--timeout", str(timeout_s), "--verdict-out", verdict_out,
             "--strict" if self.strict else "--lenient",
         ]
-        cp = subprocess.run(argv, capture_output=True, text=True, check=False)
+        # The auditor's load_audit_flags() lacks the harness's AST-source fallback,
+        # so on a node where the heavy CADENCE_POLICY import fails it dies at
+        # flag_set_load (runs #7/#8). subprocess.run() inherits os.environ, which does
+        # NOT carry the soak's composed JARVIS_A1_AUDIT_FLAGS -- so set it explicitly
+        # on the auditor's env from the already-derived flag set (no CADENCE import).
+        env = dict(os.environ)
+        env.setdefault("JARVIS_A1_AUDIT_FLAGS", ",".join(derive_cognitive_flags()))
+        cp = subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
         if os.path.exists(verdict_out):
             try:
                 return json.loads(open(verdict_out, encoding="utf-8").read())
