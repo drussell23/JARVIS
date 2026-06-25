@@ -46,7 +46,19 @@ def _all_flags():
 
 
 def _make_auditor(strict=True, flags=None):
-    return aud.A1GraduationAuditor(flags=flags or _all_flags(), strict=strict)
+    # NOTE (2026-06-25, causal lineage scoping): these tests predate lineage
+    # scoping and assert the LEGACY global-lock semantics (any mid-loop human
+    # gate throws regardless of which op it belongs to). With scoping default-ON
+    # a gate on an op with no established chaos lineage is now UNVERIFIABLE_LINEAGE
+    # (still a non-pass, but via the verdict not a throw). To keep these
+    # primitive-lock assertions valid we construct with scoping OFF -- the
+    # documented legacy path. The scoped behavior is covered by the new
+    # tests/scripts/test_a1_lineage_scoping.py suite.
+    return aud.A1GraduationAuditor(
+        flags=flags or _all_flags(),
+        strict=strict,
+        lineage_scoping_enabled=False,
+    )
 
 
 def _feed_passing(a, *, include_unverifiable_eval=True, include_pr=True):

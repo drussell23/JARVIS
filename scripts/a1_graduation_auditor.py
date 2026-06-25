@@ -77,6 +77,10 @@ from typing import (
 )
 
 
+# Sentinel distinguishing "argument omitted" from "explicitly None".
+_SENTINEL: Any = object()
+
+
 # ===========================================================================
 # Exceptions
 # ===========================================================================
@@ -278,6 +282,180 @@ _FAMILY_SIGNALS: Dict[str, Dict[str, Tuple[str, ...]]] = {
 
 
 # ===========================================================================
+# Causal lineage scoping (run #13 fix) -- chaos manifest + op DAG
+# ===========================================================================
+#
+# THE BUG (run #13): the intervention-lock fired on ANY human gate anywhere in
+# the FSM, with no notion of WHICH op the gate belonged to. An UNRELATED
+# autonomous op (an OpportunityMiner "Cluster-coverage exploration",
+# blast_radius=6) CORRECTLY hit APPROVAL_REQUIRED -- the Immutable Orange safety
+# guard working AS DESIGNED -- and the global lock sank the graduation.
+#
+# THE FIX: scope the lock to the CHAOS-REPAIR op's causal subtree. The chaos
+# injector records the EXACT mutated source file in .jarvis/chaos_manifest.json;
+# that file is the ROOT of the chaos lineage. An op is IN the chaos lineage if:
+#   * its target_files include the chaos-manifest file, OR
+#   * it descends (parent_op_id / parent_goal_id chain) from an op that does.
+# A human gate on an op OUTSIDE the lineage is IGNORED for the lock (logged as
+# observed -- the safety system working), NOT a failure.
+#
+# Fail-CLOSED: if lineage CANNOT be determined for a gating op (no manifest, no
+# op identity), we do NOT fake-pass and do NOT false-fail -- we record an
+# explicit UNVERIFIABLE_LINEAGE locus that the final verdict surfaces as
+# not-proven. Never silently passes.
+#
+# Reuse, no new tracker: the chaos target comes from the existing manifest, the
+# op identity + dispatch breadcrumbs from the existing [A1Trace] goal= ids, and
+# the parent edges from the existing OperationContext / IntentEnvelope lineage
+# fields (parent_op_id / parent_goal_id) that the swarm DAG + decomposition
+# already stamp.
+
+
+def lineage_scoping_enabled_default() -> bool:
+    """Read ``JARVIS_A1_LINEAGE_SCOPING_ENABLED`` (default true). OFF restores
+    the legacy global-lock behavior (any mid-loop human gate trips the lock)."""
+    val = (
+        os.environ.get("JARVIS_A1_LINEAGE_SCOPING_ENABLED", "true") or ""
+    ).strip().lower()
+    return val not in {"0", "false", "no", "off"}
+
+
+def _default_chaos_manifest_path() -> str:
+    """Default chaos manifest location: ``<repo>/.jarvis/chaos_manifest.json``.
+    Mirrors ``chaos_injector_ast.MANIFEST_REL_PATH``."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, ".jarvis", "chaos_manifest.json")
+
+
+def load_chaos_target_files(path: Optional[str]) -> List[str]:
+    """Read the chaos manifest and return the chaos target file(s) -- both the
+    repo-relative and absolute forms (for robust correlation against op
+    target_files which may be either). Returns [] when no manifest exists or it
+    is unreadable (lineage then 'unknowable' -> fail-CLOSED at the lock)."""
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 -- absent / malformed manifest
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: List[str] = []
+    for key in ("target_file", "target_file_abs"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            out.append(val.strip())
+    # De-dup, keep order.
+    seen: set = set()
+    uniq: List[str] = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
+def _path_matches(target_files: Sequence[str], chaos_files: Sequence[str]) -> bool:
+    """True iff any of ``target_files`` references one of the chaos files. We
+    compare on normalized path tails so a rel path ('a/b/c.py') matches an abs
+    path ('/repo/a/b/c.py') and vice versa -- the manifest stores both, and op
+    payloads may carry either form."""
+    if not target_files or not chaos_files:
+        return False
+    norm_chaos = {os.path.normpath(c).strip(os.sep) for c in chaos_files if c}
+    for tf in target_files:
+        if not isinstance(tf, str) or not tf.strip():
+            continue
+        ntf = os.path.normpath(tf).strip(os.sep)
+        for nc in norm_chaos:
+            if ntf == nc or ntf.endswith(os.sep + nc) or nc.endswith(os.sep + ntf):
+                return True
+    return False
+
+
+@dataclass
+class _OpNode:
+    """Per-op lineage state assembled live from event payloads + A1Trace
+    breadcrumbs. Reuses the EXISTING lineage fields -- no new tracker."""
+
+    op_id: str
+    target_files: List[str] = field(default_factory=list)
+    parents: List[str] = field(default_factory=list)
+
+    def merge_target_files(self, files: Sequence[str]) -> None:
+        for f in files:
+            if isinstance(f, str) and f.strip() and f not in self.target_files:
+                self.target_files.append(f.strip())
+
+    def merge_parents(self, parents: Sequence[str]) -> None:
+        for p in parents:
+            if isinstance(p, str) and p.strip() and p not in self.parents:
+                self.parents.append(p.strip())
+
+
+class OpLineageGraph:
+    """Accumulates op identity -> {target_files, parent edges} from the live
+    stream, then answers "is op X in the chaos op's causal subtree?".
+
+    The chaos op = the op whose target_files include a chaos-manifest file. An
+    op is IN the chaos lineage if it IS a chaos op OR it descends (transitive
+    parent chain) from one. Pure / network-free; fed by the auditor's ingest."""
+
+    def __init__(self, chaos_files: Sequence[str]) -> None:
+        self.chaos_files: List[str] = list(chaos_files)
+        self.nodes: Dict[str, _OpNode] = {}
+
+    def has_chaos_target(self) -> bool:
+        return bool(self.chaos_files)
+
+    def observe_op(
+        self,
+        op_id: Optional[str],
+        *,
+        target_files: Optional[Sequence[str]] = None,
+        parents: Optional[Sequence[str]] = None,
+    ) -> None:
+        if not op_id or not isinstance(op_id, str):
+            return
+        node = self.nodes.get(op_id)
+        if node is None:
+            node = _OpNode(op_id=op_id)
+            self.nodes[op_id] = node
+        if target_files:
+            node.merge_target_files(target_files)
+        if parents:
+            node.merge_parents(parents)
+
+    def _is_chaos_root(self, op_id: str) -> bool:
+        node = self.nodes.get(op_id)
+        if node is None:
+            return False
+        return _path_matches(node.target_files, self.chaos_files)
+
+    def in_chaos_lineage(self, op_id: Optional[str]) -> bool:
+        """True iff ``op_id`` is the chaos op or transitively descends from one.
+        Bounded BFS up the parent chain with a visited guard (cycle-safe)."""
+        if not op_id or not self.chaos_files:
+            return False
+        seen: set = set()
+        frontier: List[str] = [op_id]
+        while frontier:
+            cur = frontier.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if self._is_chaos_root(cur):
+                return True
+            node = self.nodes.get(cur)
+            if node is not None:
+                for parent in node.parents:
+                    if parent not in seen:
+                        frontier.append(parent)
+        return False
+
+
+# ===========================================================================
 # A1Trace hop tracking
 # ===========================================================================
 
@@ -286,6 +464,10 @@ A1TRACE_HOPS: Tuple[str, ...] = ("emit", "ingest", "dequeue", "submit", "accept"
 
 # [A1Trace] <hop> goal=<id> [k=v ...]
 _A1TRACE_RE = re.compile(r"\[A1Trace\]\s+(?P<hop>\w+)\s+goal=(?P<goal>\S+)")
+# [A1Trace] ... target_files=<csv> (optional extra kv carrying the op's files)
+_A1TRACE_TARGETS_RE = re.compile(r"target_files=(?P<files>\S+)")
+# Op id embedded in a free log line: 'op=op-abc' / 'op_id=op-abc'.
+_LOG_OP_ID_RE = re.compile(r"\bop(?:_id)?=(?P<op>[\w.:-]+)")
 
 
 def parse_a1trace_line(line: str) -> Optional[Tuple[str, str]]:
@@ -450,6 +632,7 @@ class A1Verdict:
     criteria: Dict[str, bool]
     failure_locus: str = ""
     graduation_exception: Optional[Dict[str, Any]] = None
+    lineage: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -460,6 +643,7 @@ class A1Verdict:
             "a1trace_timeline": self.a1trace_timeline,
             "failure_locus": self.failure_locus,
             "graduation_exception": self.graduation_exception,
+            "lineage": self.lineage,
         }
 
     def to_json(self) -> str:
@@ -475,7 +659,14 @@ class A1GraduationAuditor:
     event raises :class:`GraduationFailedException` from the ingest call (so the
     network shell can tear down immediately)."""
 
-    def __init__(self, *, flags: Optional[Sequence[str]] = None, strict: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        flags: Optional[Sequence[str]] = None,
+        strict: bool = True,
+        chaos_manifest_path: Optional[str] = _SENTINEL,
+        lineage_scoping_enabled: Optional[bool] = None,
+    ) -> None:
         flag_list = list(flags) if flags is not None else load_audit_flags()
         self.strict = strict
         self.flags: Dict[str, FlagAuditState] = {}
@@ -496,14 +687,59 @@ class A1GraduationAuditor:
         self.tripped_exception: Optional[GraduationFailedException] = None
         self._last_fsm_phase = ""
 
+        # --- causal lineage scoping (run #13 fix) --------------------------- #
+        self.lineage_scoping_enabled = (
+            lineage_scoping_enabled
+            if lineage_scoping_enabled is not None
+            else lineage_scoping_enabled_default()
+        )
+        # _SENTINEL distinguishes "caller passed None (= no manifest)" from
+        # "caller did not pass it (= use the default repo location)".
+        if chaos_manifest_path is _SENTINEL:
+            self.chaos_manifest_path: Optional[str] = _default_chaos_manifest_path()
+        else:
+            self.chaos_manifest_path = chaos_manifest_path
+        self.chaos_target_files: List[str] = load_chaos_target_files(
+            self.chaos_manifest_path
+        )
+        self.lineage = OpLineageGraph(self.chaos_target_files)
+        # Human gates on ops OUTSIDE the chaos lineage -- logged for
+        # transparency (the safety system working), NOT a failure.
+        self.observed_unrelated_gates: List[str] = []
+        # Human gates whose lineage could NOT be determined (no manifest / no op
+        # identity). Fail-CLOSED: these surface UNVERIFIABLE_LINEAGE in the
+        # verdict -- never a fake-pass, never a false-throw.
+        self.unverifiable_lineage_gates: List[str] = []
+
     # ----- intervention-lock primitive -------------------------------------
 
     def _check_human_gate(
-        self, marker_text: str, event_type: str, payload: Dict[str, Any]
+        self,
+        marker_text: str,
+        event_type: str,
+        payload: Dict[str, Any],
+        *,
+        gate_op_id: Optional[str] = None,
     ) -> None:
         """Raise GraduationFailedException if ``marker_text`` is a mid-loop
-        human gate AND the terminal merge has not yet been reached. The
-        terminal CRITICAL_ELEVATION merge is the ONLY permitted gate."""
+        human gate that belongs to an op IN the chaos-repair op's causal
+        subtree AND the terminal merge has not yet been reached. The terminal
+        CRITICAL_ELEVATION merge is the ONLY permitted gate.
+
+        Causal lineage scoping (run #13 fix)
+        ------------------------------------
+        When scoping is enabled, the lock is a SMART referee -- it cares ONLY
+        about the chaos op's causal subtree:
+          * gate on an op IN the chaos lineage -> throw (autonomy not proven);
+          * gate on an op OUTSIDE the lineage (e.g. an unrelated OpportunityMiner
+            op correctly hitting APPROVAL_REQUIRED -- Immutable Orange working
+            as designed) -> IGNORED for the lock, LOGGED as observed;
+          * gate whose lineage is UNKNOWABLE (no manifest / no op identity) ->
+            fail-CLOSED: recorded as UNVERIFIABLE_LINEAGE (the verdict surfaces
+            it as not-proven). Never a fake-pass, never a false-throw.
+
+        When scoping is disabled, the legacy global-lock fires on ANY mid-loop
+        human gate (byte-identical pre-fix behavior)."""
         # First: is this the permitted terminal Sovereign merge gate?
         is_terminal_merge = (
             event_type in _TERMINAL_MERGE_EVENT_TYPES
@@ -520,10 +756,41 @@ class A1GraduationAuditor:
         )
         if not is_human_gate:
             return
-        # A human gate BEFORE the terminal merge => autonomy not proven.
+        # A human gate BEFORE the terminal merge => candidate for the lock.
         if self.terminal_merge_reached:
             return  # post-merge prompts are out of the autonomy window
         gate_label = event_type or marker_text
+
+        # ----- causal lineage scoping --------------------------------------- #
+        if self.lineage_scoping_enabled:
+            op_id = gate_op_id or self._extract_op_id(event_type, payload, marker_text)
+            if not op_id:
+                # No extractable op identity -> lineage unknowable. Fail-CLOSED:
+                # do NOT fake-pass (record UNVERIFIABLE_LINEAGE) and do NOT
+                # false-throw (we cannot prove it is the chaos op).
+                self.unverifiable_lineage_gates.append(
+                    "no_op_id:%s:%s" % (gate_label, marker_text[:80])
+                )
+                return
+            if not self.lineage.has_chaos_target():
+                # We have an op id but no chaos target to scope against -> we
+                # cannot prove this gate IS (or is NOT) the chaos op.
+                # Fail-CLOSED: UNVERIFIABLE_LINEAGE, never a silent pass.
+                self.unverifiable_lineage_gates.append(
+                    "no_manifest:%s:op=%s" % (gate_label, op_id)
+                )
+                return
+            if not self.lineage.in_chaos_lineage(op_id):
+                # Outside the chaos subtree -- the safety system working as
+                # designed. Logged for transparency, NOT a failure.
+                self.observed_unrelated_gates.append(
+                    "%s:op=%s (outside chaos lineage -- safety guard, ignored)"
+                    % (gate_label, op_id)
+                )
+                return
+            # In the chaos lineage -> the lock fires (autonomy not proven).
+            gate_label = "%s:op=%s" % (gate_label, op_id)
+
         exc = GraduationFailedException(
             "FAILURE LOCUS: intervention_lock -- mid-loop human gate "
             f"'{gate_label}' fired at FSM phase '{self._last_fsm_phase or '?'}' "
@@ -536,6 +803,51 @@ class A1GraduationAuditor:
         self.intervention_tripped = True
         self.tripped_exception = exc
         raise exc
+
+    @staticmethod
+    def _extract_op_id(
+        event_type: str, payload: Dict[str, Any], marker_text: str
+    ) -> str:
+        """Pull the op identity a gate belongs to. SSE gates carry ``op_id`` /
+        ``goal_id`` in the payload; free log lines carry ``op=`` / ``op_id=``.
+        Returns "" when no identity can be recovered (-> unknowable lineage)."""
+        for key in ("op_id", "goal_id", "op", "goal", "causal_id"):
+            val = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        m = _LOG_OP_ID_RE.search(marker_text or "")
+        if m:
+            # Strip trailing punctuation (e.g. 'op=op-x:' / 'op=op-x.' from
+            # 'ask_human op=op-x: clarify?') so the id matches the graph node.
+            return m.group("op").rstrip(":.-")
+        return ""
+
+    def _record_op_lineage_from_payload(self, payload: Dict[str, Any]) -> None:
+        """Feed the lineage graph from an SSE payload. Reuses the EXISTING op
+        identity (op_id / goal_id), target_files, and parent edges
+        (parent_op_id / parent_goal_id) -- no new tracking system."""
+        if not isinstance(payload, dict):
+            return
+        op_id = self._extract_op_id("", payload, "")
+        if not op_id:
+            return
+        target_files: List[str] = []
+        for key in ("target_files", "target_file", "files"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                target_files.append(val.strip())
+            elif isinstance(val, (list, tuple)):
+                target_files.extend(
+                    str(v).strip() for v in val if isinstance(v, str) and v.strip()
+                )
+        parents: List[str] = []
+        for key in ("parent_op_id", "parent_goal_id", "parent_id", "lineage_id"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                parents.append(val.strip())
+        self.lineage.observe_op(
+            op_id, target_files=target_files or None, parents=parents or None
+        )
 
     # ----- ingest ----------------------------------------------------------
 
@@ -553,8 +865,18 @@ class A1GraduationAuditor:
         except Exception:  # noqa: BLE001
             blob = event_type
 
-        # Intervention-lock FIRST (fail-CLOSED) -- may raise.
-        self._check_human_gate(blob, event_type, payload)
+        # Record op lineage metadata BEFORE the gate check so the chaos op +
+        # its descendants are known when a gate on them arrives.
+        self._record_op_lineage_from_payload(payload)
+
+        # Intervention-lock FIRST (fail-CLOSED) -- may raise. The gate's op id
+        # comes from the payload (op_id / goal_id) for scoped correlation.
+        self._check_human_gate(
+            blob,
+            event_type,
+            payload,
+            gate_op_id=self._extract_op_id(event_type, payload, blob),
+        )
 
         # FSM phase tracking.
         if event_type == "fsm_phase_changed":
@@ -584,9 +906,19 @@ class A1GraduationAuditor:
         if parsed is not None:
             hop, goal = parsed
             self.trace.observe(hop, goal)
+            # An A1Trace breadcrumb may carry the op's target_files (goal= IS
+            # the op id) -- record it so the chaos op can be identified from the
+            # log stream alone.
+            tm = _A1TRACE_TARGETS_RE.search(line)
+            if tm:
+                files = [f for f in tm.group("files").split(",") if f.strip()]
+                self.lineage.observe_op(goal, target_files=files or None)
             return
         # Intervention-lock on log-surfaced gates (ask_human etc.) -- may raise.
-        self._check_human_gate(line, "", {})
+        # The op id is parsed from the line ('op=op-abc') for scoped correlation.
+        self._check_human_gate(
+            line, "", {}, gate_op_id=self._extract_op_id("", {}, line)
+        )
         # Flag-family signal correlation from log markers.
         self._correlate_flag_signal(line)
         # PR / commit signal in a log line.
@@ -655,6 +987,10 @@ class A1GraduationAuditor:
         fsm_ok = self._fsm_reached_applied()
         no_intervention = not self.intervention_tripped
         pr_ok = self.pr_signal_observed
+        # Fail-CLOSED: any gate whose lineage could not be determined is an
+        # honest non-pass (UNVERIFIABLE_LINEAGE) -- we neither fake-pass nor
+        # false-fail; the run simply isn't proven until lineage is knowable.
+        lineage_ok = not self.unverifiable_lineage_gates
 
         criteria = {
             "a1trace_5_hops_in_order": trace_ok,
@@ -662,6 +998,7 @@ class A1GraduationAuditor:
             "twelve_flag_audit_passed": flag_pass,
             "intervention_lock_clean": no_intervention,
             "autonomous_pr_observed": pr_ok,
+            "lineage_verifiable": lineage_ok,
         }
         proven = all(criteria.values())
 
@@ -672,6 +1009,11 @@ class A1GraduationAuditor:
                 locus = (
                     self.tripped_exception.failure_locus
                     if self.tripped_exception else "intervention_lock"
+                )
+            elif not lineage_ok:
+                locus = "UNVERIFIABLE_LINEAGE:%s" % (
+                    self.unverifiable_lineage_gates[0]
+                    if self.unverifiable_lineage_gates else "unknown",
                 )
             elif not trace_ok:
                 missing = self._missing_hops()
@@ -692,6 +1034,12 @@ class A1GraduationAuditor:
             graduation_exception=(
                 self.tripped_exception.to_dict() if self.tripped_exception else None
             ),
+            lineage={
+                "scoping_enabled": self.lineage_scoping_enabled,
+                "chaos_target_files": list(self.chaos_target_files),
+                "observed_unrelated_gates": list(self.observed_unrelated_gates),
+                "unverifiable_lineage_gates": list(self.unverifiable_lineage_gates),
+            },
         )
 
     def _missing_hops(self) -> List[str]:
@@ -995,10 +1343,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--verdict-out", default="a1_verdict.json",
         help="Path to write the structured verdict JSON.",
     )
+    ap.add_argument(
+        "--chaos-manifest", default=None,
+        help="Path to the chaos manifest (default: <repo>/.jarvis/chaos_manifest.json). "
+             "Its target_file is the ROOT of the chaos-repair causal lineage the "
+             "intervention-lock scopes to.",
+    )
+    lineage_default = lineage_scoping_enabled_default()
+    ap.add_argument(
+        "--lineage-scoping", dest="lineage_scoping", action="store_true",
+        default=lineage_default,
+        help="Scope the intervention-lock to the chaos op's causal subtree "
+             "(default; env JARVIS_A1_LINEAGE_SCOPING_ENABLED).",
+    )
+    ap.add_argument(
+        "--no-lineage-scoping", dest="lineage_scoping", action="store_false",
+        help="Legacy global-lock: ANY mid-loop human gate trips the lock.",
+    )
     args = ap.parse_args(argv)
 
     try:
-        auditor = A1GraduationAuditor(strict=args.strict)
+        auditor = A1GraduationAuditor(
+            strict=args.strict,
+            chaos_manifest_path=(
+                args.chaos_manifest if args.chaos_manifest is not None else _SENTINEL
+            ),
+            lineage_scoping_enabled=args.lineage_scoping,
+        )
     except GraduationFailedException as exc:
         print("[A1Auditor] %s" % (str(exc),))
         return 2
