@@ -462,6 +462,10 @@ def test_each_long_phase_streams_with_its_label(iac, args, tmp_path, monkeypatch
     args.reactor_repo_path = "/repos/reactor"
     args.prebake_cmd = "docker build ."  # enable the prebake phase
     args.boot_cmd = "docker compose up -d"  # enable the boot phase
+    # This asserts the LEGACY single-stream surgery rides the streaming boundary
+    # with the `surgery` label -- pin the legacy path (the detached daemon path is
+    # default-ON and uses the short non-streaming probe boundary instead).
+    args.detached_surgery = False
     rec = _Recorder(stream_lines=["VERDICT: PASS\n"])
     rec.patch(monkeypatch, iac)
     monkeypatch.setattr(iac, "poll_node_ready", lambda *a, **k: (True, ""))
@@ -486,6 +490,7 @@ def test_prebake_and_boot_skipped_when_cmd_empty(iac, args, tmp_path, monkeypatc
     data = led.init_run(run_id="R", node_name="n", zone="z", project="p")
     args.prebake_cmd = ""
     args.boot_cmd = ""
+    args.detached_surgery = False  # legacy single-stream surgery (verdict via stream)
     rec = _Recorder(stream_lines=["VERDICT: PASS\n"])
     rec.patch(monkeypatch, iac)
     monkeypatch.setattr(iac, "poll_node_ready", lambda *a, **k: (True, ""))
