@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.core.ouroboros.governance.intent.signals import IntentSignal
 from backend.core.ouroboros.governance.intent.test_watcher import TestFailure
+from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
 from backend.core.ouroboros.governance.intake.intent_envelope import (
     IntentEnvelope,
     make_envelope,
@@ -742,17 +743,27 @@ class TestFailureSensor:
     # ------------------------------------------------------------------
 
     def _repo_root(self) -> Path:
-        """Best-effort repo root for the resolver / mirror-dir fallback.
+        """Authoritative repo root for the resolver / mirror-dir fallback.
 
-        Prefers the watcher's ``repo_path`` (set from ``JARVIS_REPO_PATH``),
-        falls back to the env var, then the cwd. Never raises.
+        Prefers the watcher's ``repo_path`` (which is itself now the
+        ``.git``-anchored :func:`resolve_repo_root` value, not bare ``"."``),
+        and falls back to the SAME canonical resolver — never to a raw ``"."``
+        / CWD that could disagree with where the changed-file paths anchor.
+        This single-source-of-truth is the run-#12 path-mismatch fix: the
+        boot-hydration ``git diff`` cwd, the ``TestRunner`` repo_root, and the
+        ``_normalize`` relative-to base are now one and the same anchor, so a
+        valid ``tests/...py`` is never rejected as "outside repo root" and the
+        scope never falls back to the 180s whole-suite sweep. Never raises.
         """
-        candidate = getattr(self._watcher, "repo_path", None) or os.environ.get(
-            "JARVIS_REPO_PATH", "."
-        )
+        candidate = getattr(self._watcher, "repo_path", None)
         try:
-            return Path(candidate).resolve()
-        except Exception:
+            if candidate:
+                return Path(candidate).resolve()
+        except Exception:  # noqa: BLE001 — fall through to the canonical resolver
+            pass
+        try:
+            return resolve_repo_root()
+        except Exception:  # noqa: BLE001 — defensive; resolver is fail-soft already
             return Path(".").resolve()
 
     async def _resolve_scoped_targets(
