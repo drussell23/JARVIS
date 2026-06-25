@@ -1030,6 +1030,13 @@ class OperationContext:
     provider_route: str = ""   # "immediate" | "standard" | "complex" | "background" | "speculative"
     provider_route_reason: str = ""  # human-readable reason for telemetry
     prefer_local: bool = False    # Quota Shield: route this op to the local J-Prime tier
+    # Sovereign Failover Mesh (Gap 3b): an explicit provider pin stamped when an
+    # op is sealed into the Cryo-DLQ on a DW global outage. On replay,
+    # CandidateGenerator HONORS this override and routes the op straight to the
+    # named provider (e.g. "gcp-jprime", the awakened J-Prime node) instead of
+    # re-cascading through the dead DW lane. Fail-CLOSED: if the named provider
+    # is unavailable, the op stays sealed in the DLQ (never routed to dead DW).
+    provider_override: str = ""   # "" = no override (legacy cascade); "gcp-jprime" = pin to J-Prime
 
     # ---- Truncation-retry shape flags (Task 2, feat/jprime-truncation-retry-diff-shape) ----
     # Stamped by the orchestrator GENERATE_RETRY path when a truncation/elision

@@ -211,11 +211,53 @@ def _import_append_dlq() -> Callable:  # type: ignore[type-arg]
 # quarantine_op — terminal quarantine action
 # ---------------------------------------------------------------------------
 
+def _failover_provider_override() -> str:
+    """The provider to pin a Cryo-DLQ-sealed op to on a DW outage (Gap 3b).
+
+    Default ``"gcp-jprime"`` -- the awakened J-Prime failover node. Env-tunable
+    (``JARVIS_FAILOVER_PROVIDER_OVERRIDE``); empty string disables the stamp
+    (legacy: replay re-cascades through the normal path). NEVER raises.
+    """
+    return (
+        os.environ.get("JARVIS_FAILOVER_PROVIDER_OVERRIDE", "gcp-jprime") or ""
+    ).strip()
+
+
+def _stamp_provider_override(ctx: Any) -> Any:
+    """Stamp ``provider_override`` on *ctx* so the Cryo-DLQ seal carries the
+    Gap-3b J-Prime pin. Handles frozen dataclasses via ``dataclasses.replace``.
+
+    Returns the (possibly new) ctx to seal. Fail-soft: on any error returns the
+    original ctx unchanged (the seal still happens; the op is never lost -- it
+    just replays via the legacy path instead of the J-Prime pin).
+    """
+    override = _failover_provider_override()
+    if not override:
+        return ctx
+    try:
+        import dataclasses  # noqa: PLC0415
+
+        if dataclasses.is_dataclass(ctx) and any(
+            f.name == "provider_override" for f in dataclasses.fields(ctx)
+        ):
+            return dataclasses.replace(ctx, provider_override=override)
+        # Non-dataclass / mutable: best-effort attribute set.
+        setattr(ctx, "provider_override", override)
+        return ctx
+    except Exception:  # noqa: BLE001 -- never block the seal
+        logger.debug(
+            "[ProviderQuarantine] provider_override stamp fail-soft", exc_info=True
+        )
+        return ctx
+
+
 def quarantine_op(ctx: Any, *, route: str, telemetry: dict) -> bool:
     """Seal a context op into the Cryo-DLQ via [SOVEREIGN YIELD: UPSTREAM QUARANTINE].
 
     Steps:
       (a) emit_sovereign_yield — logs [SOVEREIGN YIELD: UPSTREAM QUARANTINE]
+      (a.5) stamp provider_override="gcp-jprime" (Gap 3b) so replay routes the
+            op straight to the awakened J-Prime node, NOT the dead DW lane
       (b) append_dlq — persists to intake_dlq.jsonl with reason
           "upstream_quarantine:dw_global_outage"
 
@@ -256,6 +298,11 @@ def quarantine_op(ctx: Any, *, route: str, telemetry: dict) -> bool:
                 ctx.dw_telemetry = telemetry
         except Exception:  # pragma: no cover
             pass
+
+        # (a.5) Stamp the J-Prime provider_override (Gap 3b) BEFORE sealing so
+        # the persisted envelope carries the pin and replay routes to the
+        # awakened node, NOT the dead DW lane.
+        ctx = _stamp_provider_override(ctx)
 
         # (b) Append to Cryo-DLQ.
         append_fn = _import_append_dlq()

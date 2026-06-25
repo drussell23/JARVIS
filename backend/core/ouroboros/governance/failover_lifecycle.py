@@ -163,6 +163,18 @@ def _awaken_timeout_s() -> float:
     return max(1.0, _env_float("JARVIS_FAILOVER_AWAKEN_TIMEOUT_S", 600.0))
 
 
+def _early_prewarm_enabled() -> bool:
+    """Gap-2 sub-gate: degradation -> early pre-warm. Default FALSE.
+
+    Composes UNDER the master ``JARVIS_FAILOVER_LIFECYCLE_ENABLED`` gate. When
+    OFF (or when the master is off) the controller only awakens on the legacy
+    REACTIVE ``is_global_outage`` path -- byte-identical. When ON, a DEGRADED
+    (not-yet-outage) heartbeat reading plus a slow recovery forecast can awaken
+    J-Prime EARLY so the node is warm by the time DW formally collapses and the
+    op drops into the Cryo-DLQ. The operator arms this at soak time."""
+    return _enabled("JARVIS_FAILOVER_EARLY_PREWARM_ENABLED", "false")
+
+
 def _warmup_enabled() -> bool:
     """VRAM pre-warm gate. Default TRUE -- OFF -> straight to SERVING (legacy)."""
     return _enabled("JARVIS_FAILOVER_WARMUP_ENABLED", "true")
@@ -352,6 +364,43 @@ def _default_node_ready_fn(endpoint: str) -> bool:
         return False
 
 
+def _resolve_node_ip() -> str:
+    """Resolve the awakened failover node's reachable IP via gcloud describe.
+
+    Gap 3a boundary -- the missing wire. After ``_default_vm_awaken_fn`` creates
+    the node and it answers on :PORT, we must tell PrimeClient WHERE the node
+    is. This resolves the external (or, if no external, the internal) IP via a
+    single ``gcloud compute instances describe`` with a format selector, so the
+    Body can publish ``JARVIS_PRIME_URL`` / ``JARVIS_PRIME_HOST``.
+
+    Returns the IP string, or "" if it cannot be resolved (fail-soft -- the
+    caller treats "" as "publish nothing" and PrimeProvider keeps its existing
+    configured target; the op is never lost). NEVER raises. Mockable in tests.
+    """
+    project = _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
+    zone = _env_str("GCP_ZONE", "us-central1-a")
+    node = _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME)
+
+    # Prefer the external NAT IP; fall back to the internal IP if absent
+    # (e.g. an internal-only deployment where the Body shares the VPC).
+    fmt_external = (
+        "get(networkInterfaces[0].accessConfigs[0].natIP)"
+    )
+    fmt_internal = "get(networkInterfaces[0].networkIP)"
+    for fmt in (fmt_external, fmt_internal):
+        cmd = [
+            "gcloud", "compute", "instances", "describe", node,
+            "--zone={}".format(zone), "--format={}".format(fmt),
+        ]
+        if project:
+            cmd.append("--project={}".format(project))
+        rc, out = _gcloud_run(cmd, timeout_s=30.0)
+        ip = (out or "").strip().splitlines()[0].strip() if out else ""
+        if rc == 0 and ip:
+            return ip
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # FailoverLifecycleController
 # ---------------------------------------------------------------------------
@@ -374,6 +423,8 @@ class FailoverLifecycleController:
         route: Optional[str] = None,
         on_serving_fn: Optional[Callable[[], Awaitable[Any]]] = None,
         warmup_fn: Optional[Callable[[], Awaitable[bool]]] = None,
+        is_degrading_fn: Optional[Callable[[], bool]] = None,
+        endpoint_publish_fn: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -381,6 +432,18 @@ class FailoverLifecycleController:
         self._node_ready_fn = node_ready_fn or _default_node_ready_fn
         self._clock_fn = clock_fn or _default_clock_fn
         self._route = route or _route()
+        # Gap 2 -- early-degradation signal source. Default: the DW heartbeat
+        # singleton's is_degrading() (resolved lazily so the heartbeat module
+        # only loads when the early-prewarm sub-gate is armed). Injectable for
+        # tests. Fail-soft: a missing/erroring source reads as "not degrading"
+        # (fail-CLOSED -> reactive path only, no false pre-warm).
+        self._is_degrading_fn = is_degrading_fn  # None -> lazy default
+        # Gap 3a -- endpoint publish boundary. Default: resolve the node IP and
+        # write JARVIS_PRIME_URL / JARVIS_PRIME_HOST (where PrimeClient reads
+        # its endpoint) + best-effort hot-swap a live PrimeClient. Injectable
+        # for tests. Fail-soft: a publish error never blocks the SERVING
+        # transition (the op is never lost).
+        self._endpoint_publish_fn = endpoint_publish_fn  # None -> default
         # VRAM pre-warm boundary (Phase 3b+). Injectable for tests. Default:
         # construct a LocalPrimeClient pointed at jprime_endpoint() and call
         # warmup(timeout_s=_warmup_timeout_s()). None defers to _default_warmup_fn.
@@ -555,6 +618,90 @@ class FailoverLifecycleController:
         port = _failover_port()
         return "http://{}:{}".format(host, port)
 
+    def _publish_endpoint(self) -> None:
+        """Gap 3a -- resolve the node IP + write it where PrimeClient reads it.
+
+        Steps (deterministic + logged; NEVER logs secrets):
+          1. Resolve the awakened node's reachable IP (gcloud describe boundary,
+             injectable). On "" -> publish nothing (PrimeProvider keeps its
+             configured target). This is the fail-soft no-op.
+          2. Compose ``http://<ip>:<port>`` and set it as ``self._endpoint``
+             (so jprime_endpoint() advertises the live URL).
+          3. Export ``JARVIS_PRIME_URL`` + ``JARVIS_PRIME_HOST`` (the two env
+             vars PrimeClient resolves its base_url from) so a fresh PrimeClient
+             picks the node up, and best-effort hot-swap any already-live
+             PrimeClient via its update_endpoint() (Gap 3a completion).
+
+        If a custom publish boundary was injected, defer to it entirely.
+        """
+        publish_fn = self._endpoint_publish_fn
+        if publish_fn is not None:
+            ip = self._resolve_ip()
+            if ip:
+                publish_fn(ip)
+            return
+
+        ip = self._resolve_ip()
+        if not ip:
+            logger.info(
+                "[FailoverLifecycle] endpoint publish: node IP unresolved "
+                "-- PrimeProvider keeps configured target (fail-soft no-op)"
+            )
+            return
+
+        port = _failover_port()
+        url = "http://{}:{}".format(ip, port)
+        self._endpoint = url
+        # Write the two env vars PrimeClient reads its endpoint from.
+        os.environ["JARVIS_PRIME_URL"] = url
+        os.environ["JARVIS_PRIME_HOST"] = ip
+        logger.info(
+            "[FailoverLifecycle] endpoint WIRED: JARVIS_PRIME_URL=%s "
+            "JARVIS_PRIME_HOST=%s (PrimeProvider now targets the live node)",
+            url, ip,
+        )
+        # Best-effort hot-swap a live PrimeClient (if the provider state already
+        # holds one). Fail-soft -- the env vars above are the durable wire.
+        self._hot_swap_prime_client(host=ip, port=port)
+
+    @staticmethod
+    def _resolve_ip() -> str:
+        """Call the module-level _resolve_node_ip boundary. Fail-soft -> ""."""
+        try:
+            return str(_resolve_node_ip() or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FailoverLifecycle] node IP resolve fail-soft err=%r", exc)
+            return ""
+
+    @staticmethod
+    def _hot_swap_prime_client(*, host: str, port: int) -> None:
+        """Best-effort: hot-swap a live PrimeClient to the awakened node.
+
+        Resolves the PrimeProviderState's injected client lazily (no import
+        cycle, no hard dependency in unit tests). If the client exposes an
+        async ``update_endpoint(host, port)`` we schedule it; otherwise this is
+        a no-op (the env-var wire above is the durable path). Fail-soft."""
+        try:
+            from backend.core.ouroboros.governance._governance_state import (  # noqa: PLC0415
+                get_prime_provider_state,
+            )
+            state = get_prime_provider_state()
+            client = getattr(state, "client", None)
+            update = getattr(client, "update_endpoint", None)
+            if not callable(update):
+                return
+            result = update(host, port)
+            if asyncio.iscoroutine(result):
+                # Schedule on the running loop without blocking the FSM tick.
+                try:
+                    asyncio.ensure_future(result)
+                except RuntimeError:
+                    # No running loop (sync context) -- close the coroutine to
+                    # avoid a "never awaited" warning. Env wire still applies.
+                    result.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] prime client hot-swap fail-soft err=%r", exc)
+
     def _build_default_warmup_fn(self) -> Callable[[], Awaitable[bool]]:
         """Build the default warmup callable: LocalPrimeClient pointed at
         the awakened endpoint, calling warmup(timeout_s=_warmup_timeout_s()).
@@ -723,14 +870,93 @@ class FailoverLifecycleController:
             outage = grad.is_global_outage(self._route)
         except Exception:  # noqa: BLE001
             outage = False
-        if not outage:
+
+        if outage:
+            # Observed full outage. Apply the cryo-trigger cost gate (reactive).
+            if not self._should_awaken(now=now):
+                return
+            await self._enter_awakening(now=now)
             return
 
-        # Observed outage. Apply the cryo-trigger cost gate.
-        if not self._should_awaken(now=now):
+        # Gap 2 -- EARLY pre-warm path. NOT yet a full outage, but the heartbeat
+        # reports DEGRADATION. If the forecast also says recovery is slow
+        # (R > C*margin, HIGH confidence), pre-warm J-Prime NOW so the node is
+        # warm by the time DW formally collapses and the op drops into the
+        # Cryo-DLQ. Fail-CLOSED: not-degrading / low-confidence forecast / blip
+        # (R < C*margin) -> fall through (no behavior loss; the reactive path
+        # above remains the backstop on a later tick once the window fills).
+        if self._should_early_prewarm(now=now):
+            logger.info(
+                "[FailoverLifecycle] EARLY PRE-WARM: DW degrading + slow "
+                "forecast (R>C*margin) -> awakening J-Prime ahead of formal "
+                "outage (route=%s)", self._route,
+            )
+            await self._enter_awakening(now=now)
             return
 
-        # AWAKEN: build deadman startup-script, spin up the node.
+    def _should_early_prewarm(self, *, now: float) -> bool:
+        """Gap-2 decision: degradation + slow forecast -> pre-warm early?
+
+        Composes three independent gates (ALL must hold; fail-CLOSED on any):
+          1. The early-prewarm sub-gate is armed (env).
+          2. The heartbeat reports is_degrading() (DEGRADED, not yet outage).
+          3. The cost gate says it is worth paying the spin-up: HIGH-confidence
+             forecast with R(p50) > C*margin. LOW_CONFIDENCE -> decline (R is
+             unreliable; the reactive floor still applies once the window fills).
+        Pure-ish + fail-soft: any error -> False (decline -> reactive only).
+        """
+        if not _early_prewarm_enabled():
+            return False
+        try:
+            if not self._is_degrading():
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+
+        try:
+            forecast = self._get_forecast()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] early-prewarm forecast fail-soft err=%r", exc)
+            return False
+
+        confidence = getattr(forecast, "confidence", "LOW_CONFIDENCE")
+        if confidence != "HIGH":
+            # Fail-CLOSED: R unreliable -> do NOT speculatively pre-warm; the
+            # reactive is_global_outage path handles the real outage.
+            return False
+
+        r = float(getattr(forecast, "p50_s", 0.0))
+        threshold = _coldstart_s() * _awaken_margin()
+        decision = r > threshold
+        logger.info(
+            "[FailoverLifecycle] early-prewarm gate: degrading=True HIGH conf "
+            "R(p50)=%.1f threshold(C*margin)=%.1f -> %s",
+            r, threshold,
+            "PRE-WARM" if decision else "BLIP-SKIP (hold; reactive backstop)",
+        )
+        return decision
+
+    def _is_degrading(self) -> bool:
+        """Resolve the early-degradation signal. Default: the DW heartbeat
+        singleton's is_degrading(). Injectable + fail-soft (False on error)."""
+        fn = self._is_degrading_fn
+        if fn is None:
+            try:
+                from backend.core.ouroboros.governance.provider_heartbeat import (  # noqa: PLC0415
+                    get_dw_heartbeat,
+                )
+                fn = get_dw_heartbeat().is_degrading
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] heartbeat resolve fail-soft err=%r", exc)
+                return False
+        try:
+            return bool(fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] is_degrading fail-soft err=%r", exc)
+            return False
+
+    async def _enter_awakening(self, *, now: float) -> None:
+        """Shared DORMANT -> AWAKENING transition (reactive + early-prewarm)."""
         self._state = FailoverState.AWAKENING
         self._awakening_started_at = now
         self._recovered_streak = 0
@@ -828,6 +1054,20 @@ class FailoverLifecycleController:
                     "-- proceeding to SERVING (first op may be cold)",
                     _warmup_timeout_s(),
                 )
+
+        # Gap 3a -- WIRE the awakened node's reachable endpoint to PrimeClient
+        # BEFORE flipping to SERVING, so the moment the FSM advertises
+        # is_jprime_serving()/jprime_endpoint(), PrimeProvider already points at
+        # the live node. Fail-soft ABSOLUTE: a publish error never blocks (or
+        # reverts) the SERVING transition (the op is never lost -- PrimeProvider
+        # keeps its configured target on a publish miss).
+        try:
+            await self._maybe_await(self._publish_endpoint)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FailoverLifecycle] endpoint publish fail-soft err=%r "
+                "-- SERVING proceeds (PrimeProvider keeps configured target)", exc,
+            )
 
         self._awakening_started_at = None
         self._state = FailoverState.SERVING

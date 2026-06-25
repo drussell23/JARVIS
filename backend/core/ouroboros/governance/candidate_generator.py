@@ -3124,6 +3124,83 @@ class CandidateGenerator:
         except Exception:  # noqa: BLE001 — last-resort defensive
             return result
 
+    async def _honor_provider_override(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> Optional[GenerationResult]:
+        """Sovereign Failover Mesh Gap 3b — honor a Cryo-DLQ provider pin.
+
+        When ``context.provider_override == "gcp-jprime"`` (stamped at Cryo-DLQ
+        seal time on a DW global outage), route the op STRAIGHT to the awakened
+        J-Prime ``PrimeProvider`` -- NOT through the dead DW cascade.
+
+        Returns:
+          * a ``GenerationResult`` when J-Prime produced candidates (honored);
+          * ``None`` when there is no override (legacy dispatch continues);
+          * raises a terminal ``RuntimeError`` (fail-CLOSED) when the override
+            is set but J-Prime is unavailable / yielded nothing -- so the op
+            STAYS SEALED in the DLQ and is NEVER re-routed to dead DW.
+
+        Empty override -> None (byte-identical legacy). Fail-soft on the read
+        side: an unreadable override is treated as no override.
+        """
+        try:
+            override = (getattr(context, "provider_override", "") or "").strip()
+        except Exception:  # noqa: BLE001
+            override = ""
+        if not override:
+            return None  # legacy: no pin, normal cascade
+
+        op_id_short = (getattr(context, "op_id", "") or "?")[:16]
+
+        # Only "gcp-jprime" is a recognized pin today. An unknown override falls
+        # through to the legacy cascade (forward-compatible; never a hard error
+        # on an unrecognized value).
+        if override != "gcp-jprime":
+            logger.info(
+                "[CandidateGenerator] provider_override=%s unrecognized -- "
+                "falling through to legacy cascade [%s]",
+                override, op_id_short,
+            )
+            return None
+
+        # Fail-CLOSED gate: J-Prime must be wired AND advertising an endpoint.
+        if self._jprime is None or not getattr(
+            self._jprime, "provider_name", ""
+        ):
+            logger.warning(
+                "[CandidateGenerator] provider_override=gcp-jprime but no "
+                "PrimeProvider wired -- op STAYS SEALED in Cryo-DLQ (NOT routed "
+                "to dead DW) [%s]", op_id_short,
+            )
+            raise RuntimeError(
+                "provider_override_unavailable:gcp-jprime:no_prime_provider"
+            )
+
+        logger.info(
+            "[CandidateGenerator] Cryo-DLQ replay: provider_override=gcp-jprime "
+            "-> routing straight to awakened J-Prime (DW lane bypassed) [%s]",
+            op_id_short,
+        )
+        result = await self._try_jprime_primacy(
+            context, deadline, route_label="failover_override", force=True,
+        )
+        if result is not None:
+            return result
+
+        # J-Prime declined (sem saturated / timeout / error / no candidates).
+        # FAIL-CLOSED: do NOT cascade to the dead DW lane. Raise terminal so the
+        # op stays sealed in the DLQ for a later replay (the op is never lost).
+        logger.warning(
+            "[CandidateGenerator] provider_override=gcp-jprime but J-Prime "
+            "yielded no candidates -- op STAYS SEALED in Cryo-DLQ (NOT routed "
+            "to dead DW) [%s]", op_id_short,
+        )
+        raise RuntimeError(
+            "provider_override_unavailable:gcp-jprime:no_candidates"
+        )
+
     async def _generate_dispatch(
         self,
         context: OperationContext,
@@ -3135,6 +3212,19 @@ class CandidateGenerator:
         the hot path; the public ``generate()`` above wraps it only to
         observe exhaustion and success signals.
         """
+        # ── Sovereign Failover Mesh Gap 3b: provider_override honor-check ──
+        # When an op was sealed into the Cryo-DLQ on a DW global outage it
+        # carries provider_override="gcp-jprime" (the awakened J-Prime node).
+        # On replay we MUST route it straight to J-Prime, NOT re-cascade through
+        # the dead DW lane. Fail-CLOSED: if J-Prime is unavailable (no awakened
+        # endpoint), raise a terminal sentinel so the op STAYS SEALED in the DLQ
+        # (the orchestrator records a generation failure; the op is NOT lost and
+        # is NEVER sent to dead DW). Master gate inside the helper keeps OFF
+        # byte-identical (empty override -> no-op).
+        _override_result = await self._honor_provider_override(context, deadline)
+        if _override_result is not None:
+            return _override_result
+
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
@@ -5119,6 +5209,7 @@ class CandidateGenerator:
         deadline: datetime,
         *,
         route_label: str,
+        force: bool = False,
     ) -> Optional[GenerationResult]:
         """Phase 3 Scope α: try J-Prime first for BACKGROUND/SPECULATIVE.
 
@@ -5156,7 +5247,15 @@ class CandidateGenerator:
 
         # Quota Shield: prefer_local ops use the same local-first primacy path even
         # when jprime_primacy is otherwise off for this route.
-        if not (jprime_primacy_enabled() or getattr(context, "prefer_local", False)):
+        # Sovereign Failover Mesh Gap 3b: ``force=True`` (a Cryo-DLQ
+        # provider_override replay) bypasses the primacy-enabled guard entirely
+        # -- the op was explicitly pinned to J-Prime, so honor it regardless of
+        # the primacy flag for this route.
+        if not (
+            force
+            or jprime_primacy_enabled()
+            or getattr(context, "prefer_local", False)
+        ):
             return None
         if self._jprime is None or not getattr(
             self._jprime, "provider_name", ""
