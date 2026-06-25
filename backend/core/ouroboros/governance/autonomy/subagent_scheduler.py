@@ -530,6 +530,16 @@ class SubagentScheduler:
         # sandbox vaporization). Gated JARVIS_SWARM_MESSAGE_BUS_ENABLED
         # (default false -> no bus, workers silent as Phase 1b).
         self._graph_buses: Dict[str, Any] = {}
+        # Swarm — the live caller seam (closes the no-caller gap). Wraps the
+        # per-unit executor: when JARVIS_SWARM_ORCHESTRATOR_ENABLED is ON AND
+        # the DAG is genuinely multi-node parallelizable AND the unit is a
+        # swarm-synthesized worker, the invoker routes it through dynamic
+        # worker synthesis (worker_synthesizer) + the ScopedToolBackend cage
+        # (SubagentFactory) before executing via THIS same executor (worktree +
+        # sandbox). OFF / non-parallelizable / legacy-unit -> delegates straight
+        # to the executor, byte-identical. Built lazily (first execute) so
+        # construction never touches the heavy swarm imports until used.
+        self._swarm_invoker: Optional[Any] = None
 
     async def start(self) -> None:
         """Start the scheduler lifecycle."""
@@ -894,12 +904,45 @@ class SubagentScheduler:
             # per-unit executor. No global / persistent bus survives the graph.
             self._destroy_bus_for_graph(graph_id)
 
+    def _get_swarm_invoker(self) -> Any:
+        """Lazily build the SwarmUnitInvoker wrapping the per-unit executor.
+
+        The invoker is the live caller seam for the SwarmOrchestrator: it
+        decides per-unit whether to route through dynamic worker synthesis +
+        the ScopedToolBackend cage (swarm ON + parallelizable DAG + swarm unit)
+        or straight to the existing executor (OFF / non-parallelizable /
+        legacy unit -> byte-identical). Construction is fail-soft: any import
+        error -> None, and the caller falls back to the raw executor.
+        """
+        if self._swarm_invoker is not None:
+            return self._swarm_invoker
+        try:
+            from backend.core.ouroboros.governance.autonomy.swarm_invoker import (
+                SwarmUnitInvoker,
+            )
+            self._swarm_invoker = SwarmUnitInvoker(
+                legacy_executor=self._executor,
+                # The scheduler already builds the per-graph bus (Phase 1c); the
+                # invoker gives synthesized workers their voice from it.
+                get_bus=self.get_bus,
+            )
+        except Exception:  # noqa: BLE001 — never break execution on the seam.
+            logger.debug(
+                "[SubagentScheduler] swarm invoker build failed (non-fatal); "
+                "falling back to the raw executor", exc_info=True,
+            )
+            self._swarm_invoker = None
+        return self._swarm_invoker
+
     async def _execute_unit_guarded(
         self,
         graph: ExecutionGraph,
         unit: WorkUnitSpec,
     ) -> WorkUnitResult:
         try:
+            invoker = self._get_swarm_invoker()
+            if invoker is not None:
+                return await invoker.execute(graph, unit)
             return await self._executor.execute(graph, unit)
         except asyncio.CancelledError:
             now = time.monotonic_ns()
