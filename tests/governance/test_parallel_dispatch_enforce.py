@@ -854,11 +854,14 @@ def test_phase_dispatcher_enforce_branch_uses_narrow_catches():
     )
     source = dispatcher_path.read_text()
 
-    # Pattern: find the enforce branch body (between "if _master_on() and _enforce_on():"
-    # and the next elif/else at the same indentation level). Simple
-    # string search — the branch should NOT contain a broad
-    # 'except Exception' wrap around the enforce call.
-    enforce_idx = source.find("if _master_on() and _enforce_on():")
+    # Pattern: find the enforce branch body (between the enforce-branch
+    # condition and the next elif/else at the same indentation level). The
+    # condition was promoted to "if _legacy_enforce or _plan_drives:" when
+    # PLAN-enforce was wired to also drive this fan-out (the legacy
+    # "_master_on() and _enforce_on()" predicate now lives in _legacy_enforce).
+    # The branch should NOT contain a broad 'except Exception' wrap around the
+    # enforce_evaluate_fanout call. Simple string search.
+    enforce_idx = source.find("if _legacy_enforce or _plan_drives:")
     shadow_elif_idx = source.find("elif _master_on() and _shadow_on():", enforce_idx)
     assert enforce_idx >= 0 and shadow_elif_idx > enforce_idx, (
         "enforce branch structure not found as expected"
