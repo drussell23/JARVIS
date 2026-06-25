@@ -953,8 +953,13 @@ class UnifiedIntakeRouter:
         try:
             from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
                 a1trace as _a1trace,
+                probe_ingest_order as _probe_ingest_order,
             )
             _a1trace("ingest", envelope.causal_id, router="attached")
+            # Deep emit-hop telemetry (Run #17): emit the order-assertion vs
+            # this goal's prior emit (MISSING if none -- the Run-#17 mode).
+            # Observe-only, fail-soft.
+            _probe_ingest_order(envelope.causal_id)
         except Exception:  # noqa: BLE001
             pass
         # 1. Dedup check
