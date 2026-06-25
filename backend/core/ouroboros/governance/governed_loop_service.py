@@ -781,11 +781,29 @@ def _lazy_repair_budget_from_env() -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _default_project_root() -> Path:
+    """Authoritative repo root: ``.git``-anchored and cwd-independent, falling
+    back to cwd only when no ``.git`` is found. SOURCE fix for the run-#14 path
+    bug: ``os.getcwd()`` on the Linux node != the cloned repo root, so every
+    consumer reading ``project_root`` (8 files, 45 live rejections) normalized
+    scoped-test paths against the wrong root -> ``outside repo root`` -> the
+    chaos test was never detected. Routing the DEFAULT through the resolver
+    fixes all consumers at the source."""
+    try:
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_repo_root,
+        )
+
+        return resolve_repo_root()
+    except Exception:  # noqa: BLE001 -- never break config construction
+        return Path(os.getcwd())
+
+
 @dataclass(frozen=True)
 class GovernedLoopConfig:
     """Frozen configuration for the governed loop service."""
 
-    project_root: Path = field(default_factory=lambda: Path(os.getcwd()))
+    project_root: Path = field(default_factory=_default_project_root)
     claude_api_key: Optional[str] = None
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_cost_per_op: float = 0.50
@@ -852,8 +870,11 @@ class GovernedLoopConfig:
         import os
         from backend.core.ouroboros.governance.config_loader import load_layered_config
 
-        resolved_root = project_root if project_root is not None else Path(
-            os.getenv("JARVIS_PROJECT_ROOT", os.getcwd())
+        resolved_root = (
+            project_root if project_root is not None
+            else Path(os.environ["JARVIS_PROJECT_ROOT"])
+            if os.getenv("JARVIS_PROJECT_ROOT")
+            else _default_project_root()
         )
         _yaml_cfg = load_layered_config(global_root=Path.home(), repo_root=resolved_root)
 

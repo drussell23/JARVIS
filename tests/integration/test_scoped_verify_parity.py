@@ -347,3 +347,249 @@ def test_scoped_verify_path_uses_resolve_repo_root() -> None:
                 f"(authoritative .git anchor); got: {src!r}"
             )
     assert found_router, "LanguageRouter construction not found in GLS"
+
+
+# ===========================================================================
+# (6) COMPREHENSIVE HARNESS-PIPELINE PARITY -- the fidelity gap that let the
+#     run-#14 45 'outside repo root' rejections bleed undetected.
+#
+#     The earlier blocks (1-5) prove the SCOPED-VERIFY site is anchored. But
+#     the battle-test harness passes ``project_root`` / ``repo_path``
+#     EXPLICITLY (bypassing the now-fixed config DEFAULT), and on the Linux
+#     node ``cwd != /opt/trinity/jarvis`` -> every cwd/'.'-derived harness
+#     site fed ``_normalize`` a disjoint root -> 45 rejections -> the chaos
+#     test was NEVER scoped-detected.
+#
+#     These tests assert ZERO 'outside repo root' / BlockedPathError across
+#     the WHOLE detect->dispatch shape -- driving (a) a GovernedLoopConfig
+#     built the way the harness builds it (explicit project_root from a
+#     cwd-style value) and (b) the HarnessConfig repo_path normalization --
+#     under the absolute-parity shape (deep abs path + cwd != root + sandbox
+#     allowlist dropped). They MUST fail on a simulated unanchored regression
+#     and pass with every site routed through resolve_repo_root().
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_governed_loop_config_anchors_explicit_cwd_root(
+    parity_repo: dict,
+) -> None:
+    """The harness builds ``GovernedLoopConfig.from_env(project_root=X)`` with
+    an EXPLICIT root. Driving the SAME re-anchor the orchestrator's validation
+    path uses (``resolve_repo_root(start=changed_file)``) must land on the real
+    ``.git`` root, never the disjoint cwd-style value -- so the scoped-verify
+    sees ZERO 'outside repo root' rejection regardless of the config root.
+    """
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+    )
+
+    buggy_root = parity_repo["buggy_root"]  # disjoint, cwd-style (run #14 vector)
+    src = parity_repo["src"]
+    real_root = parity_repo["root"].resolve()
+
+    # The harness passes the (possibly cwd-derived) loop root EXPLICITLY.
+    cfg = GovernedLoopConfig.from_env(project_root=buggy_root)
+    assert isinstance(cfg.project_root, Path)
+
+    # The authoritative guarantee: the changed-file start always anchors at the
+    # real .git root regardless of the (possibly buggy) config root.
+    fixed_root = resolve_repo_root(start=src)
+    assert fixed_root == real_root
+
+    # And the scoped-verify driven with the file-anchored root sees ZERO
+    # rejection -- the whole point of the source fix.
+    assert _is_safe_path(parity_repo["test_file"], fixed_root)
+    assert _normalize(parity_repo["test_file"], fixed_root) == "pkg/tests/test_foo.py"
+
+
+def test_harness_config_repo_path_is_git_anchored(
+    parity_repo: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SOURCE fix, harness side: a ``HarnessConfig`` constructed the way the
+    CLI builds it (``repo_path`` defaulting to ``Path('.')`` / a cwd-style
+    value) MUST normalize ``repo_path`` to the authoritative root.
+
+    cwd is the disjoint ``buggy_root`` (set by the parity fixture). Pointing
+    ``JARVIS_REPO_PATH`` at the (made-plausible) real repo proves the
+    normalizer honors the operator override AND lands on a real repo root --
+    never the bare cwd the un-normalized default would yield.
+    """
+    from backend.core.ouroboros.battle_test.harness import HarnessConfig
+
+    real_root = parity_repo["root"].resolve()
+    # Make the parity repo a PLAUSIBLE JARVIS repo (it carries the canonical
+    # source-tree marker the harness resolver checks) -- the node reality where
+    # ``JARVIS_REPO_PATH`` points at the cloned repo. This mirrors the on-node
+    # tree without baking ``/opt/trinity`` into product code.
+    (real_root / "backend" / "core" / "ouroboros").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("JARVIS_REPO_PATH", str(real_root))
+    clear_cache()
+
+    # Bare '.' default -- the exact un-anchored shape the CLI passes. cwd is the
+    # disjoint buggy_root, so an un-normalized repo_path would leak cwd.
+    cfg = HarnessConfig(repo_path=Path("."))
+    resolved = Path(cfg.repo_path).resolve()
+    assert resolved == real_root, (
+        "HarnessConfig.repo_path was not anchored to the .git/override root: "
+        f"got {resolved} expected {real_root} (cwd-relative root leaked)"
+    )
+
+    # And an EXPLICIT cwd-style value (the CLI's args.repo_path on the node)
+    # is likewise normalized, never honored verbatim.
+    cfg2 = HarnessConfig(repo_path=parity_repo["buggy_root"])
+    assert Path(cfg2.repo_path).resolve() == real_root, (
+        "HarnessConfig did not normalize an explicit cwd-style repo_path"
+    )
+    clear_cache()
+
+
+@pytest.mark.asyncio
+async def test_no_outside_repo_root_across_pipeline(parity_repo: dict) -> None:
+    """The COMPREHENSIVE assertion: drive every repo-root-consuming surface the
+    detect->dispatch pipeline touches with the resolver-anchored root and prove
+    ZERO ``BlockedPathError`` / 'outside repo root' across all of them.
+
+    On a simulated unanchored regression (any site still using the cwd-style
+    ``buggy_root``) this raises -> the test fails loudly, closing the fidelity
+    gap that let 44 sites bleed undetected on the node.
+    """
+    from backend.core.ouroboros.governance.test_runner import TestRunner
+
+    src = parity_repo["src"]
+    test_file = parity_repo["test_file"]
+    real_root = parity_repo["root"].resolve()
+
+    fixed_root = resolve_repo_root(start=src)
+    assert fixed_root == real_root
+
+    # Surface 1: TestRunner _is_safe_path / _normalize (TestWatcher + sensor).
+    assert _is_safe_path(test_file, fixed_root)
+    assert _normalize(test_file, fixed_root) == "pkg/tests/test_foo.py"
+
+    # Surface 2: TestRunner.resolve_affected_tests deterministic scoping --
+    # the exact surface that logged the 45 'outside repo root' rejections on
+    # the node. With the anchored root it scopes WITHOUT raising.
+    runner = TestRunner(repo_root=fixed_root)
+    affected = await asyncio.wait_for(
+        runner.resolve_affected_tests(changed_files=(src,)),
+        timeout=15.0,
+    )
+    affected_strs = [str(p) for p in affected]
+    assert affected_strs, "no tests scoped under the anchored root (degradation)"
+    for p in affected_strs:
+        assert "outside repo root" not in p
+    # The chaos file's own test must be in scope (NOT the whole suite).
+    assert any(
+        str(test_file.resolve()) == str(Path(p).resolve()) for p in affected_strs
+    )
+
+    # Surface 3: prove the DISJOINT (regression) root DOES reject -- so the
+    # assertions above are load-bearing, not vacuous. A TestRunner built on the
+    # buggy root reproduces the node's 'outside repo root' rejection.
+    buggy_root = parity_repo["buggy_root"]
+    assert not _is_safe_path(test_file, buggy_root)
+    with pytest.raises(BlockedPathError):
+        _normalize(test_file, buggy_root)
+
+
+# ===========================================================================
+# (7) GREP/AST COMPLETENESS GUARD -- no project_root=/repo_path= reaching the
+#     config / TestRunner in governed_loop_service.py + the battle-test harness
+#     derives from a bare os.getcwd()/Path('.') without going through the
+#     resolver. Catches a future re-introduction LOCALLY.
+# ===========================================================================
+
+_GUARD_FILES = (
+    ("backend", "core", "ouroboros", "governance", "governed_loop_service.py"),
+    ("backend", "core", "ouroboros", "battle_test", "harness.py"),
+    ("scripts", "ouroboros_battle_test.py"),
+)
+
+# Source fragments that mark a value as authoritatively anchored. A
+# project_root=/repo_path= assignment whose RHS contains ANY of these is
+# allowlisted (it routes through the resolver, threads an already-resolved
+# root, or reads the config that itself is anchored).
+_ANCHORED_MARKERS = (
+    "resolve_repo_root",
+    "_resolve_runtime_repo_root",
+    "resolve_loop_project_root",
+    "_default_project_root",
+    "_loop_root",
+    "_validation_repo_root",
+    "self._config.repo_path",      # inherits the anchored HarnessConfig field
+    "self._config.project_root",   # inherits the anchored GovernedLoopConfig field
+    "_proj_root",                  # locally derived w/ explicit fallback handling
+    "_PROJECT_ROOT",               # scripts: __file__-derived, cwd-independent
+    "resolved_root",               # GLS from_env: already anchored above
+)
+
+# RHS fragments that mark a value as a FORBIDDEN cwd-relative root.
+_FORBIDDEN_CWD_MARKERS = (
+    "os.getcwd",
+    'Path(".")',
+    "Path('.')",
+    "_Path.cwd()",
+    "Path.cwd()",
+)
+
+
+def _scan_root_assignments(text: str):
+    """Yield (lineno, target, rhs_src) for every ``project_root=``/``repo_path=``
+    keyword arg and bare assignment in *text* whose RHS is a cwd-derived root.
+    AST-based: structural, not regex."""
+    import ast
+
+    tree = ast.parse(text)
+    findings = []
+
+    def _rhs(node) -> str:
+        return (ast.get_source_segment(text, node) or "").strip()
+
+    for node in ast.walk(tree):
+        # keyword args: foo(project_root=..., repo_path=...)
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg not in ("project_root", "repo_path"):
+                    continue
+                rhs = _rhs(kw.value)
+                findings.append((getattr(kw.value, "lineno", 0), kw.arg, rhs))
+        # bare assignments / annotated default: project_root = ...
+        targets = []
+        value = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        for t in targets:
+            name = getattr(t, "id", None) or getattr(t, "attr", None)
+            if name in ("project_root", "repo_path"):
+                findings.append((getattr(value, "lineno", 0), name, _rhs(value)))
+    return findings
+
+
+def test_no_unanchored_project_root_reaches_config_or_testrunner() -> None:
+    """Completeness guard: across GLS + the battle-test harness + the soak
+    entrypoint, NO ``project_root=``/``repo_path=`` whose RHS is a bare
+    ``os.getcwd()`` / ``Path('.')`` reaches the config / TestRunner without
+    routing through ``resolve_repo_root`` (or threading an already-anchored
+    root). A future re-introduction fails HERE, locally."""
+    repo = resolve_repo_root()
+    violations = []
+    for rel in _GUARD_FILES:
+        path = repo.joinpath(*rel)
+        text = path.read_text()
+        for lineno, target, rhs in _scan_root_assignments(text):
+            if not any(m in rhs for m in _FORBIDDEN_CWD_MARKERS):
+                continue  # not a cwd-derived RHS -> fine
+            if any(m in rhs for m in _ANCHORED_MARKERS):
+                continue  # cwd appears only as a fail-soft fallback past the anchor
+            violations.append(f"{rel[-1]}:{lineno} {target}={rhs!r}")
+    assert not violations, (
+        "unanchored cwd-relative project_root/repo_path site(s) found -- "
+        "route through resolve_repo_root():\n  " + "\n  ".join(violations)
+    )

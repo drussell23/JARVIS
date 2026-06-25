@@ -496,8 +496,13 @@ def _single_flight_preflight() -> None:
         # pgrep unavailable / timed out — fall through; rely on lock check
         pass
 
-    # (2) Lock-with-live-PID-and-non-stale-TTL check
-    project_root = _Path.cwd()
+    # (2) Lock-with-live-PID-and-non-stale-TTL check.
+    # Anchor at the ``__file__``-derived repo root (cwd-independent) -- NOT
+    # ``cwd``. On the Linux node ``cwd != /opt/trinity/jarvis`` so a cwd-rooted
+    # lock path pointed at the wrong ``.jarvis`` dir (the run-#14 class of bug:
+    # cwd-relative roots in the soak pipeline). ``_PROJECT_ROOT`` is the same
+    # root every other lock-path site here uses (e.g. the stale-lock sweep).
+    project_root = _PROJECT_ROOT
     lock_path = project_root / ".jarvis" / "intake_router.lock"
     if lock_path.exists():
         try:
@@ -1107,6 +1112,28 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Belt-and-suspenders repo-root anchor (run-#14 SOURCE fix).
+    # Export the authoritative ``.git``-anchored root into the env BEFORE any
+    # config is built, so ANY path that derived a root from cwd/'.' anywhere in
+    # the pipeline (a site we may have missed) still resolves to the real repo
+    # root rather than the process cwd. On the Linux node ``cwd != the cloned
+    # repo`` -> a cwd-relative root reached ``_normalize`` -> 45 'outside repo
+    # root' rejections -> the chaos test was never scoped-detected. ``setdefault``
+    # preserves an operator-provided override. We set BOTH conventions:
+    #   * ``JARVIS_REPO_PATH``    — read by ``resolve_repo_root`` / harness.
+    #   * ``JARVIS_PROJECT_ROOT`` — read by ``GovernedLoopConfig.from_env``.
+    try:
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_repo_root as _resolve_repo_root,
+        )
+
+        _anchor = str(_resolve_repo_root())
+    except Exception:  # noqa: BLE001 -- never block the soak on the anchor
+        _anchor = str(_PROJECT_ROOT)
+    os.environ.setdefault("JARVIS_REPO_PATH", _anchor)
+    os.environ.setdefault("JARVIS_PROJECT_ROOT", _anchor)
 
     # ------------------------------------------------------------------
     # Slice 123 Phase 3 — --production-soak profile.
