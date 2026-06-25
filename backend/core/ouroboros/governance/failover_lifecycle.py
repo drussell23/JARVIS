@@ -45,6 +45,15 @@ JARVIS_FAILOVER_LIFECYCLE_ENABLED   default "true" (GRADUATED 2026-06-23; hot-re
     OFF -> controller is inert: stays DORMANT, never awakens. Today's
     behavior exactly (quarantine -> Cryo-DLQ).
 JARVIS_FAILOVER_ROUTE                default "dw" (the quarantine route key)
+JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED default "false" (sub-gate). When ARMED
+    the reactive awaken fires on ANY tracked generation route reaching the SAME
+    full-window rate==0 ``is_global_outage`` -- the AUTHORITATIVE real-generation
+    -failure signal -- not only the single ``JARVIS_FAILOVER_ROUTE`` key. Closes
+    the run-#11 blindspot (DW's cheap probe passed while the BACKGROUND route
+    collapsed). OFF -> byte-identical single-route check.
+JARVIS_FAILOVER_OUTAGE_ROUTES        default "" (comma-separated explicit extra
+    routes to fold into the any-route check; the gradient's tracked routes are
+    authoritative -- this is an operator escape hatch only).
 JARVIS_JPRIME_COLDSTART_S           default 180.0
 JARVIS_CRYO_AWAKEN_MARGIN           default 1.5
 JARVIS_OUTAGE_CONFIRM_S             default 120.0 (reactive-floor confirm window)
@@ -173,6 +182,37 @@ def _early_prewarm_enabled() -> bool:
     J-Prime EARLY so the node is warm by the time DW formally collapses and the
     op drops into the Cryo-DLQ. The operator arms this at soak time."""
     return _enabled("JARVIS_FAILOVER_EARLY_PREWARM_ENABLED", "false")
+
+
+def _any_route_outage_enabled() -> bool:
+    """Authoritative-signal sub-gate: awaken on ANY route's real-generation
+    ``is_global_outage`` (the record_sweep-driven gradient), not only the single
+    configured ``JARVIS_FAILOVER_ROUTE`` key. Default FALSE -> byte-identical.
+
+    Run-#11 blindspot: DW's cheap HeavyProbe passed (partial single-token OK)
+    while the BACKGROUND *generation* route collapsed to rate==0 over a full
+    window (``dw_severed_queued``). The reactive awaken checked only
+    ``is_global_outage("dw")`` -- a key that is NEVER the urgency-routing key
+    ``candidate_generator.record_sweep`` populates -- so it stayed False and
+    J-Prime never awoke. When ARMED, the FSM reacts to ANY tracked route hitting
+    the SAME full-window rate==0 outage threshold (fail-CLOSED: a transient
+    blip / not-yet-full window does NOT trip it -- identical threshold to the
+    quarantine seal). Composes UNDER the master gate; OFF -> reactive path is
+    byte-identical (single ``self._route`` check)."""
+    return _enabled("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "false")
+
+
+def _outage_extra_routes() -> List[str]:
+    """Operator-pinnable explicit extra routes to fold into the any-route outage
+    check (comma-separated ``JARVIS_FAILOVER_OUTAGE_ROUTES``). Default empty ->
+    only the dynamically-tracked routes (plus ``self._route``) are considered.
+    No hardcoded route table -- the gradient's tracked routes are authoritative;
+    this is just an operator escape hatch for a route that hasn't recorded a
+    sweep yet. NEVER raises."""
+    raw = (os.environ.get("JARVIS_FAILOVER_OUTAGE_ROUTES", "") or "").strip()
+    if not raw:
+        return []
+    return [r.strip() for r in raw.split(",") if r.strip()]
 
 
 def _gcloud_fallback_enabled() -> bool:
@@ -999,11 +1039,7 @@ class FailoverLifecycleController:
             if (now - self._last_handback_at) < _handback_cooldown_s():
                 return
 
-        grad = self._gradient()
-        try:
-            outage = grad.is_global_outage(self._route)
-        except Exception:  # noqa: BLE001
-            outage = False
+        outage = self._real_outage()
 
         if outage:
             # Observed full outage. Apply the cryo-trigger cost gate (reactive).
@@ -1027,6 +1063,46 @@ class FailoverLifecycleController:
             )
             await self._enter_awakening(now=now)
             return
+
+    def _real_outage(self) -> bool:
+        """The AUTHORITATIVE real-generation-failure awaken signal.
+
+        Default (sub-gate OFF): the legacy single-route check --
+        ``is_global_outage(self._route)`` -- byte-identical to before.
+
+        When ``JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED`` is ARMED: ANY tracked
+        generation route (plus the configured ``self._route`` + any explicit
+        ``JARVIS_FAILOVER_OUTAGE_ROUTES``) reaching the SAME full-window rate==0
+        ``is_global_outage`` trips the awaken. This closes the run-#11 blindspot
+        where the BACKGROUND route collapsed (rate==0) while the FSM watched only
+        ``"dw"`` -- a key the live record_sweep path never populates. Same
+        threshold as the quarantine Cryo-DLQ seal (fail-CLOSED: a transient blip
+        or not-yet-full window never trips it). Fail-soft -> False (stay
+        reactive; no spurious awaken)."""
+        try:
+            grad = self._gradient()
+        except Exception:  # noqa: BLE001
+            return False
+        if not _any_route_outage_enabled():
+            try:
+                return bool(grad.is_global_outage(self._route))
+            except Exception:  # noqa: BLE001
+                return False
+        # Authoritative any-route path. Fold in the configured route + any
+        # operator-pinned extras so a route that hasn't recorded a sweep yet is
+        # still considered (harmless -- an empty/not-full window reads not-outage).
+        extra = [self._route] + _outage_extra_routes()
+        try:
+            any_fn = getattr(grad, "any_route_in_outage", None)
+            if callable(any_fn):
+                return bool(any_fn(extra_routes=extra))
+            # Fail-CLOSED fallback if the gradient predates the helper: union of
+            # the configured route + extras (no dynamic enumeration available).
+            return any(
+                bool(grad.is_global_outage(r)) for r in extra if r
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     def _should_early_prewarm(self, *, now: float) -> bool:
         """Gap-2 decision: degradation + slow forecast -> pre-warm early?

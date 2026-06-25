@@ -163,6 +163,59 @@ class ProviderHealthGradient:
             )
             return False
 
+    def tracked_routes(self) -> list:
+        """Return the list of routes that currently have a rolling window.
+
+        These are the routes the gradient has actually observed sweeps for
+        (e.g. ``"background"``, ``"standard"``, ``"complex"`` -- the live
+        urgency-routing keys ``candidate_generator.record_sweep`` populates).
+        Public so consumers (e.g. the Failover FSM) can react to ANY route's
+        outage rather than a single hardcoded key -- the run-#11 blindspot was
+        the FSM watching only ``"dw"`` while the BACKGROUND route's window hit
+        rate==0. Fail-soft: any error returns an empty list (conservative).
+        """
+        try:
+            return list(self._windows.keys())
+        except Exception:  # pragma: no cover
+            logger.debug("[ProviderQuarantine] tracked_routes fail-soft", exc_info=True)
+            return []
+
+    def any_route_in_outage(self, *, extra_routes: Any = None) -> bool:
+        """Return True iff ANY tracked route (plus any *extra_routes*) is in a
+        full ``is_global_outage`` (window FULL and success_rate == 0.0).
+
+        This is the AUTHORITATIVE real-generation-failure signal: a probe-based
+        heartbeat can pass (HeavyProbe partial-OK) while a specific *generation*
+        route (BACKGROUND in run #11) collapses to rate==0 across a full window.
+        Reuses ``is_global_outage`` per-route verbatim -- same threshold, no new
+        machinery, no relaxation (fail-CLOSED: a transient blip / not-yet-full
+        window never trips it). Fail-soft: any error returns False (stay
+        reactive -- no spurious awaken).
+
+        *extra_routes* lets the caller fold in a configured route key (e.g. the
+        FSM's ``JARVIS_FAILOVER_ROUTE``) even before that key has recorded a
+        sweep -- harmless because an empty / not-full window reads not-outage.
+        """
+        try:
+            routes = set(self.tracked_routes())
+            if extra_routes:
+                if isinstance(extra_routes, str):
+                    routes.add(extra_routes)
+                else:
+                    try:
+                        routes.update(str(r) for r in extra_routes if r)
+                    except TypeError:
+                        routes.add(str(extra_routes))
+            for route in routes:
+                if self.is_global_outage(route):
+                    return True
+            return False
+        except Exception:  # pragma: no cover
+            logger.debug(
+                "[ProviderQuarantine] any_route_in_outage fail-soft", exc_info=True
+            )
+            return False
+
     def reset(self, route: str) -> None:
         """Clear the window for *route*. Fail-soft."""
         try:

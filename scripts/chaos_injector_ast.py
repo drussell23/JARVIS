@@ -41,12 +41,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import json
 import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
 # Standalone-invocation bootstrap: ensure the repo root (parent of scripts/) is
 # on sys.path. We DELIBERATELY do not import anything from backend/* -- this is
@@ -915,6 +916,11 @@ class InjectConfig:
     test_timeout_s: float = 60.0
     verify_green: bool = True   # run the test pre-injection to confirm green
     max_attempts: int = 25
+    # Chaos Readiness Handshake: optional readiness surface to probe BEFORE
+    # mutating. Empty -> handshake skipped (standalone / dry-run / unit-test
+    # usage). Env fallbacks: JARVIS_CHAOS_READINESS_URL / _LOG.
+    readiness_url: str = ""
+    readiness_log: str = ""
 
 
 def _select_function_node(src: str, func_name: str, lineno: int) -> Optional[ast.FunctionDef]:
@@ -962,6 +968,22 @@ def do_inject(cfg: InjectConfig) -> int:
         # green-pre check for any candidate touching that file).
         _log("--force: reverting prior active mutation before re-injecting.")
         do_revert(cfg)
+
+    # CHAOS READINESS HANDSHAKE -- never mutate into a dead bus. If a readiness
+    # surface is configured (and the probe is enabled), wait for O+V's bus +
+    # TestWatcher to be listening before touching a single byte. A graceful
+    # timeout aborts the inject with a clear locus instead of mutating blind.
+    check = _build_readiness_check(cfg)
+    if check is not None and readiness_probe_enabled():
+        _log("readiness handshake: probing O+V bus/TestWatcher before mutating...")
+        ready, locus = asyncio.run(await_chaos_readiness(check))
+        if not ready:
+            _log(
+                f"readiness ABORT [{locus}]: O+V not ready; no mutation performed."
+            )
+            print(json.dumps({"status": "aborted", "failure_locus": locus}, indent=2))
+            return 7
+        _log("readiness OK: O+V bus/TestWatcher live -- proceeding to mutate.")
 
     candidates = acquire_candidates(cfg)
     if not candidates:
@@ -1236,6 +1258,212 @@ def do_list_candidates(cfg: InjectConfig) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Chaos Readiness Handshake -- never mutate into a dead bus.
+# --------------------------------------------------------------------------- #
+#
+# THE BUG (A1 live soak): the injector mutated a file BEFORE O+V's
+# TrinityEventBus + TestWatcher were initialized and listening, so the live
+# ``fs.changed`` event fired into a void and the mutation was lost. Boot
+# hydration recovers the offline case from ground truth; this handshake covers
+# the live case by REFUSING to mutate until the bus + TestWatcher are
+# demonstrably ready.
+#
+# The probe is ASYNC + bounded-deadline + exponential-backoff. It consults a
+# readiness surface that O+V already exposes -- preferred: an HTTP health
+# endpoint (``/channel/health`` / ``/observability/health``) carrying a
+# ``testwatcher_ready`` field; alternative: the stdout/log BOOT-MARKER
+# ``[TestWatcher] READY subscribed=fs.changed.*`` the TestFailureSensor emits
+# once its fs.changed subscription is live. On timeout it returns a graceful
+# (False, "CHAOS_READINESS_TIMEOUT") -- a clear locus, never a blind mutate.
+#
+# Gated ``JARVIS_CHAOS_READINESS_PROBE_ENABLED`` (default true). OFF -> the
+# probe is a no-op that reports ready (legacy blind-inject), preserving the
+# pre-handshake behavior byte-for-byte. NO ``time.sleep``: the synchronization
+# is ``asyncio.sleep`` with env-tuned bounded deadlines.
+
+TESTWATCHER_READY_MARKER = "[TestWatcher] READY subscribed=fs.changed.*"
+
+ReadinessCheck = Callable[[], Awaitable[bool]]
+
+
+def readiness_probe_enabled() -> bool:
+    """Re-read ``JARVIS_CHAOS_READINESS_PROBE_ENABLED`` (default true)."""
+    return os.environ.get(
+        "JARVIS_CHAOS_READINESS_PROBE_ENABLED", "true",
+    ).strip().lower() in ("true", "1", "yes")
+
+
+def _readiness_deadline_s() -> float:
+    """Bounded overall probe deadline (env ``JARVIS_CHAOS_READINESS_DEADLINE_S``)."""
+    try:
+        val = float(os.environ.get("JARVIS_CHAOS_READINESS_DEADLINE_S", "120"))
+        return val if val > 0 else 120.0
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _readiness_initial_backoff_s() -> float:
+    """Initial backoff between polls (env ``JARVIS_CHAOS_READINESS_BACKOFF_S``)."""
+    try:
+        val = float(os.environ.get("JARVIS_CHAOS_READINESS_BACKOFF_S", "0.5"))
+        return val if val > 0 else 0.5
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _readiness_backoff_max_s() -> float:
+    """Backoff ceiling (env ``JARVIS_CHAOS_READINESS_BACKOFF_MAX_S``)."""
+    try:
+        val = float(os.environ.get("JARVIS_CHAOS_READINESS_BACKOFF_MAX_S", "5"))
+        return val if val > 0 else 5.0
+    except (TypeError, ValueError):
+        return 5.0
+
+
+async def _fetch_health_json(url: str, timeout_s: float) -> Optional[dict]:
+    """Fetch + parse a JSON health surface off-loop. Returns None on any error.
+
+    Uses stdlib ``urllib`` in a worker thread so the probe stays non-blocking
+    and the injector keeps its zero-backend-import discipline (no aiohttp dep).
+    """
+    def _blocking() -> Optional[dict]:
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001 -- surface may not be up yet
+            return None
+
+    try:
+        return await asyncio.to_thread(_blocking)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def make_http_readiness_check(url: str, *, timeout_s: float = 2.0) -> ReadinessCheck:
+    """Build an async readiness check that polls an HTTP health surface.
+
+    Ready iff the JSON carries a truthy ``testwatcher_ready`` (or
+    ``testwatcher_subscribed``) field. An unreachable / non-JSON surface is
+    treated as not-ready (the probe keeps backing off), never an error.
+    """
+    async def _check() -> bool:
+        data = await _fetch_health_json(url, timeout_s)
+        if not isinstance(data, dict):
+            return False
+        return bool(
+            data.get("testwatcher_ready") or data.get("testwatcher_subscribed")
+        )
+
+    return _check
+
+
+def make_log_marker_readiness_check(
+    log_path: str, *, marker: str = TESTWATCHER_READY_MARKER,
+) -> ReadinessCheck:
+    """Build an async readiness check that scans a log/stdout file for *marker*.
+
+    Ready iff the boot-marker line is present. A missing / unreadable file is
+    not-ready, never an error. The read is off-loop (worker thread).
+    """
+    async def _check() -> bool:
+        def _blocking() -> bool:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    return marker in fh.read()
+            except OSError:
+                return False
+
+        try:
+            return await asyncio.to_thread(_blocking)
+        except Exception:  # noqa: BLE001
+            return False
+
+    return _check
+
+
+async def await_chaos_readiness(
+    check: ReadinessCheck,
+    *,
+    deadline_s: Optional[float] = None,
+    initial_backoff_s: Optional[float] = None,
+    backoff_factor: float = 2.0,
+    backoff_max_s: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """Async, bounded, exponential-backoff wait for O+V to be inject-ready.
+
+    Repeatedly awaits *check* (an async predicate over a readiness surface)
+    until it returns True or the overall *deadline_s* elapses. Between polls it
+    ``asyncio.sleep``s a backoff that grows by *backoff_factor* up to
+    *backoff_max_s* -- NO fixed wait constant, no blocking synchronous sleep.
+    A *check* that raises is swallowed (the surface may be transiently
+    unreachable) and the probe keeps backing off.
+
+    Returns
+    -------
+    ``(True, "")`` once ready, or ``(False, "CHAOS_READINESS_TIMEOUT")`` when
+    the deadline elapses without readiness -- a graceful failure locus the
+    caller surfaces instead of mutating into a dead bus.
+
+    Gated ``JARVIS_CHAOS_READINESS_PROBE_ENABLED`` (default true). OFF returns
+    ``(True, "")`` immediately WITHOUT consulting *check* (legacy blind inject).
+    """
+    if not readiness_probe_enabled():
+        return (True, "")
+
+    deadline = deadline_s if deadline_s is not None else _readiness_deadline_s()
+    backoff = (
+        initial_backoff_s
+        if initial_backoff_s is not None
+        else _readiness_initial_backoff_s()
+    )
+    backoff_ceiling = (
+        backoff_max_s if backoff_max_s is not None else _readiness_backoff_max_s()
+    )
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    while True:
+        try:
+            if await check():
+                return (True, "")
+        except Exception as exc:  # noqa: BLE001 -- surface errors must not crash the probe
+            _log("readiness check raised (treating as not-ready): %r" % (exc,))
+        # Deadline check BEFORE sleeping so we don't oversleep past it.
+        elapsed = loop.time() - start
+        if elapsed >= deadline:
+            _log(
+                "CHAOS_READINESS_TIMEOUT after %.1fs -- O+V bus/TestWatcher not "
+                "ready; refusing to mutate into a dead bus." % (elapsed,)
+            )
+            return (False, "CHAOS_READINESS_TIMEOUT")
+        # Bound the sleep so we never overshoot the deadline.
+        remaining = max(0.0, deadline - elapsed)
+        await asyncio.sleep(min(backoff, backoff_ceiling, remaining) or backoff_ceiling)
+        backoff = min(backoff * backoff_factor, backoff_ceiling)
+
+
+def _build_readiness_check(cfg: "InjectConfig") -> Optional[ReadinessCheck]:
+    """Pick the readiness surface from config / env. Returns None if none set.
+
+    Preference: explicit HTTP URL -> explicit log-marker path. When neither is
+    configured the handshake is skipped (the caller treats it as ready) so the
+    injector stays usable standalone (dry-run, unit tests) without a live O+V.
+    """
+    url = (cfg.readiness_url or os.environ.get("JARVIS_CHAOS_READINESS_URL", "")).strip()
+    if url:
+        return make_http_readiness_check(url)
+    log_path = (
+        cfg.readiness_log or os.environ.get("JARVIS_CHAOS_READINESS_LOG", "")
+    ).strip()
+    if log_path:
+        return make_log_marker_readiness_check(log_path)
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
 
@@ -1270,6 +1498,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Per-test pytest timeout (seconds).")
     p.add_argument("--no-verify", action="store_true",
                    help="Skip pre/post pytest verification (NOT recommended).")
+    p.add_argument("--readiness-url", default="",
+                   help="HTTP health surface to probe for 'testwatcher_ready' "
+                        "before mutating (Chaos Readiness Handshake). Env: "
+                        "JARVIS_CHAOS_READINESS_URL.")
+    p.add_argument("--readiness-log", default="",
+                   help="Log/stdout file to scan for the TestWatcher READY "
+                        "boot-marker before mutating. Env: "
+                        "JARVIS_CHAOS_READINESS_LOG.")
     return p
 
 
@@ -1284,6 +1520,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         force=bool(args.force),
         test_timeout_s=float(args.test_timeout),
         verify_green=not bool(args.no_verify),
+        readiness_url=str(args.readiness_url or ""),
+        readiness_log=str(args.readiness_log or ""),
     )
 
     if args.inject:
