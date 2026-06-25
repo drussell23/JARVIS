@@ -206,6 +206,85 @@ class TestWatcher:
         return result.stdout, result.returncode
 
     # ------------------------------------------------------------------
+    # Boot-Time Differential Hydration (offline-state blindspot fix)
+    # ------------------------------------------------------------------
+
+    async def diff_working_tree(self) -> List[str]:
+        """Enumerate uncommitted working-tree ``.py`` changes from ground truth.
+
+        Runs ``git diff --name-only HEAD`` (tracked, uncommitted) plus
+        ``git ls-files --others --exclude-standard`` (untracked) via
+        ``asyncio.create_subprocess_exec`` so the event loop is NEVER blocked.
+        Only ``.py`` paths are returned (the watcher's mutation surface).
+
+        This is the ground-truth half of Boot-Time Differential Hydration:
+        an event-driven watcher that boots AFTER a state mutation (chaos
+        injection BEFORE O+V boots, or any crash/restart in prod) loses the
+        ``fs.changed`` event forever. Reconstructing the change set from the
+        working tree is robust to that whole failure class.
+
+        Fail-soft by construction: a git error / missing binary / non-zero
+        return code logs at DEBUG and returns ``[]`` -- hydration is skipped,
+        boot is never crashed. Bounded by ``JARVIS_TESTWATCHER_HYDRATION_GIT_TIMEOUT_S``
+        (default 15s) so a wedged git cannot stall the boot path.
+        """
+        try:
+            timeout_s = float(
+                os.environ.get(
+                    "JARVIS_TESTWATCHER_HYDRATION_GIT_TIMEOUT_S", "15"
+                )
+            )
+        except (TypeError, ValueError):
+            timeout_s = 15.0
+
+        async def _git(*args: str) -> List[str]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", *args,
+                    cwd=str(self.repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except (OSError, Exception) as exc:  # noqa: BLE001 -- git is best-effort
+                logger.debug("[BootHydration] git %s spawn failed: %s", args, exc)
+                return []
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[BootHydration] git %s timed out (%.1fs)", args, timeout_s)
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                return []
+            except Exception as exc:  # noqa: BLE001 -- never crash boot
+                logger.debug("[BootHydration] git %s communicate failed: %s", args, exc)
+                return []
+            if proc.returncode not in (0, None):
+                logger.debug(
+                    "[BootHydration] git %s rc=%s -- skipping", args, proc.returncode
+                )
+                return []
+            text = (stdout or b"").decode("utf-8", errors="replace")
+            return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        changed: List[str] = []
+        seen: Set[str] = set()
+        # Tracked, uncommitted changes (the chaos mutation lands here).
+        for path in await _git("diff", "--name-only", "HEAD"):
+            if path.endswith(".py") and path not in seen:
+                seen.add(path)
+                changed.append(path)
+        # Untracked .py files (new modules a crash left behind).
+        for path in await _git("ls-files", "--others", "--exclude-standard"):
+            if path.endswith(".py") and path not in seen:
+                seen.add(path)
+                changed.append(path)
+        return changed
+
+    # ------------------------------------------------------------------
     # Output parsing
     # ------------------------------------------------------------------
 

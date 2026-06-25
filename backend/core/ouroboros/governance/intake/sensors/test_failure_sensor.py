@@ -156,6 +156,47 @@ def full_suite_fallback_enabled() -> bool:
     ).lower() in ("true", "1", "yes")
 
 
+# --- Boot-Time Differential Hydration (offline-state blindspot fix) --------
+#
+# An event-driven watcher that boots AFTER a state mutation loses the
+# ``fs.changed`` event forever. The A1 live soak proved this: the chaos bug is
+# mutated BEFORE O+V boots, so no FS event ever fires and the only fallback
+# (the full-suite poll) SIGKILLs at 180s without detecting it. The same hole
+# opens on ANY crash/restart in prod.
+#
+# On boot the sensor reconstructs the missed change set from GROUND TRUTH (the
+# working tree, via ``git diff --name-only HEAD``), resolves each changed file
+# to its tests through the SAME ``resolve_affected_tests`` mapper the live FS
+# path uses, and runs the localized SCOPED pytest immediately. De-dupe tracking
+# (``_hydrated_keys``) suppresses a redundant live ``fs.changed`` run for a file
+# that was just hydrated.
+#
+# Gated ``JARVIS_TESTWATCHER_BOOT_HYDRATION_ENABLED`` (default true). OFF ->
+# the sensor never hydrates == legacy byte-identical behavior.
+# ``JARVIS_TESTWATCHER_HYDRATION_DEDUP_TTL_S`` (default 120s) bounds the de-dupe
+# window so a genuinely-recurring later edit still re-runs.
+
+
+def boot_hydration_enabled() -> bool:
+    """Re-read ``JARVIS_TESTWATCHER_BOOT_HYDRATION_ENABLED`` (default true).
+
+    Not cached so tests can monkeypatch per-case (same pattern as
+    ``fs_events_enabled``). OFF restores byte-identical legacy boot behavior.
+    """
+    return os.environ.get(
+        "JARVIS_TESTWATCHER_BOOT_HYDRATION_ENABLED", "true",
+    ).lower() in ("true", "1", "yes")
+
+
+_HYDRATION_DEDUP_TTL_S: float = float(
+    os.environ.get("JARVIS_TESTWATCHER_HYDRATION_DEDUP_TTL_S", "120")
+)
+
+# Boot-marker the Chaos Readiness Handshake (and operators) grep for to know
+# the TestWatcher subscription is LIVE. Emitted once subscribe_to_bus succeeds.
+TESTWATCHER_READY_MARKER = "[TestWatcher] READY subscribed=fs.changed.*"
+
+
 class TestFailureSensor:
     """Adapter that bridges TestWatcher → UnifiedIntakeRouter.
 
@@ -192,6 +233,11 @@ class TestFailureSensor:
         # convergence tracking during the graduation arc).
         self._fs_events_handled: int = 0
         self._fs_events_ignored: int = 0
+        # Boot hydration de-dupe: changed_rel_path -> monotonic hydrated_at.
+        # A file hydrated on boot is suppressed from a redundant live
+        # fs.changed run for ``_HYDRATION_DEDUP_TTL_S``.
+        self._hydrated_keys: Dict[str, float] = {}
+        self._boot_hydrated: bool = False
 
     def _prune_stale_pending(self) -> None:
         """Drop pending target entries that have exceeded their TTL.
@@ -357,6 +403,99 @@ class TestFailureSensor:
             pass
 
     # ------------------------------------------------------------------
+    # Boot-Time Differential Hydration (offline-state blindspot fix)
+    # ------------------------------------------------------------------
+
+    def _is_recently_hydrated(self, changed_rel_path: str) -> bool:
+        """True if *changed_rel_path* was hydrated within the de-dupe TTL.
+
+        Lets a live ``fs.changed`` for a just-hydrated file be suppressed so
+        the same edit is not double-run (boot hydration + live event). A
+        different file (or one whose TTL expired) is not suppressed.
+        """
+        if _HYDRATION_DEDUP_TTL_S <= 0 or not changed_rel_path:
+            return False
+        ts = self._hydrated_keys.get(changed_rel_path)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > _HYDRATION_DEDUP_TTL_S:
+            # Expired -> drop the entry and allow a fresh run.
+            self._hydrated_keys.pop(changed_rel_path, None)
+            return False
+        return True
+
+    async def hydrate_on_boot(self) -> int:
+        """Reconstruct + scope-run tests for pre-boot working-tree changes.
+
+        Ground-truth recovery of the offline-state blindspot: enumerate
+        uncommitted ``.py`` changes via ``TestWatcher.diff_working_tree``
+        (async ``git diff --name-only HEAD``), resolve each through the SAME
+        ``resolve_affected_tests`` mapper the live FS path uses, run the
+        localized SCOPED pytest (NEVER the whole ``tests/`` suite), and ingest
+        any resulting stable signals. Each hydrated file is recorded so a
+        later live ``fs.changed`` for it is de-duped.
+
+        Returns the number of stable signals ingested. Gated
+        ``JARVIS_TESTWATCHER_BOOT_HYDRATION_ENABLED`` (default true); OFF /
+        no watcher / clean tree -> returns 0 with no side effects. Fail-soft:
+        any error logs at DEBUG and returns the count so far -- boot is never
+        crashed.
+        """
+        if not boot_hydration_enabled() or self._watcher is None:
+            return 0
+        try:
+            changed = await self._watcher.diff_working_tree()
+        except Exception:
+            logger.debug("[BootHydration] diff_working_tree failed", exc_info=True)
+            return 0
+        if not changed:
+            logger.debug("[BootHydration] clean working tree -- nothing to hydrate")
+            self._boot_hydrated = True
+            return 0
+
+        ingested = 0
+        now = time.monotonic()
+        for rel in changed:
+            try:
+                targets = await self._resolve_scoped_targets(rel)
+            except Exception:
+                logger.debug(
+                    "[BootHydration] resolve failed for %r", rel, exc_info=True
+                )
+                continue
+            if not targets:
+                # No scoped targets -> skip (never the 180s whole-suite sweep).
+                logger.debug(
+                    "[BootHydration] no scoped targets for %r -- skipping", rel
+                )
+                continue
+            # Record BEFORE running so a concurrent live event is de-duped.
+            self._hydrated_keys[rel] = now
+            try:
+                signals = await self._watcher.poll_once(target_paths=targets)
+            except Exception:
+                logger.debug(
+                    "[BootHydration] scoped poll failed for %r", rel, exc_info=True
+                )
+                continue
+            if signals:
+                results = await self.handle_signals(signals)
+                ingested += sum(1 for r in results if r is not None)
+                logger.info(
+                    "[BootHydration] %r -> %d scoped target(s), %d stable "
+                    "signal(s) ingested (NO fs.changed event needed)",
+                    rel, len(targets), len(signals),
+                )
+        self._boot_hydrated = True
+        if ingested:
+            logger.info(
+                "[BootHydration] boot hydration complete: %d stable failure(s) "
+                "recovered from working tree (%d changed .py file(s))",
+                ingested, len(changed),
+            )
+        return ingested
+
+    # ------------------------------------------------------------------
     # Event-driven path (Manifesto §3: zero polling, pure reflex)
     # ------------------------------------------------------------------
 
@@ -413,6 +552,29 @@ class TestFailureSensor:
             "FS events now PRIMARY (poll demoted to %ds fallback)",
             int(_TEST_FAILURE_FALLBACK_INTERVAL_S),
         )
+
+        # Boot-marker -- the subscription is now LIVE. The Chaos Readiness
+        # Handshake (and operators) grep this exact line to know the bus +
+        # TestWatcher are listening before any mutation. Emitted to stdout
+        # (flushed) so it lands in the soak log the external probe tails, and
+        # mirrored to the INFO log. Fail-soft: a print failure never breaks boot.
+        try:
+            import sys as _sys
+
+            print(TESTWATCHER_READY_MARKER, file=_sys.stdout, flush=True)
+        except Exception:  # noqa: BLE001 -- marker is best-effort
+            pass
+        logger.info("%s", TESTWATCHER_READY_MARKER)
+
+        # Boot-Time Differential Hydration -- reconstruct any pre-boot working-
+        # tree mutation from ground truth NOW that the subscription is live (so
+        # a file later touched live is de-duped). Gated + fail-soft inside
+        # ``hydrate_on_boot``; a missed FS event (chaos injected before boot,
+        # crash/restart) is no longer lost.
+        try:
+            await self.hydrate_on_boot()
+        except Exception:  # noqa: BLE001 -- hydration must never break intake boot
+            logger.debug("TestFailureSensor: boot hydration error", exc_info=True)
 
     async def _on_fs_event(self, event: Any) -> None:
         """Route events: test_results.json → instant consume; .py → debounced pytest."""
@@ -525,6 +687,18 @@ class TestFailureSensor:
                 )
                 return
             if self._watcher is None:
+                return
+
+            # Boot-hydration de-dupe: a file just reconstructed from the
+            # working tree on boot must not be re-run by the live event that
+            # the same edit also triggers. The TTL window expires so a genuine
+            # later edit still re-runs.
+            if changed_rel_path and self._is_recently_hydrated(changed_rel_path):
+                logger.debug(
+                    "TestFailureSensor: suppressing live run for %r -- "
+                    "hydrated on boot within de-dupe window",
+                    changed_rel_path,
+                )
                 return
 
             if not dynamic_scoping_enabled():
