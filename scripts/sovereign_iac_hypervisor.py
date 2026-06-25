@@ -47,10 +47,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as _dt
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import subprocess
@@ -197,6 +199,60 @@ _READY_SENTINEL = "/var/run/sovereign_iac_ready"
 # Verdict markers emitted by the remote surgery (mirrors cross_repo_first_surgery).
 _VERDICT_PASS = "VERDICT: PASS"
 _VERDICT_FRACTURE = "SOVEREIGN YIELD: CROSS-REPO FRACTURE"
+
+
+# --------------------------------------------------------------------------- #
+# Detached remote surgery (decouple the surgery from the SSH session lifetime).
+#
+# The deterministic run-#15 bug: the surgery rode ONE long-lived streaming SSH
+# session (`gcloud compute ssh --command=<whole surgery>`). During the heavy pip
+# install the IAP tunnel dropped (`Broken pipe / Connection closed by remote host
+# / rc=255`) and the harness fell over -- even though the NODE was fine. The fix:
+# the SSH call LAUNCHES the surgery DETACHED (setsid/nohup/systemd-run) and returns
+# immediately; the local harness then POLLS the node with SHORT disposable SSH
+# probes (exp-backoff + jitter), reading a node-side `soak_state.json` + a
+# `soak_in_progress.lock`, and TAILS `/tmp/surgery.out` by byte-offset (zero loss /
+# zero dup across a drop). A broken pipe on any probe is SWALLOWED + retried.
+#
+# Master gate: default-ON. OFF -> the legacy single long-stream path (byte-identical).
+# --------------------------------------------------------------------------- #
+def _env_truthy(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+_DETACHED_SURGERY_ENABLED = _env_truthy("JARVIS_IAC_DETACHED_SURGERY_ENABLED", "true")
+
+# Node-side surgery workspace + signal files (derived from the established trinity
+# workspace root -- no fresh hardcoded literal). The structured state + lock live
+# alongside the synced jarvis repo so the autopsy/keep-warm logic can find them.
+_REMOTE_JARVIS_DIR = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+_DEFAULT_SOAK_STATE_PATH = os.environ.get(
+    "JARVIS_IAC_SOAK_STATE_PATH", f"{_REMOTE_JARVIS_DIR}/soak_state.json"
+)
+_DEFAULT_SOAK_LOCK_PATH = os.environ.get(
+    "JARVIS_IAC_SOAK_LOCK_PATH", f"{_REMOTE_JARVIS_DIR}/soak_in_progress.lock"
+)
+# The detached surgery stdout sink the launcher redirects into (and the local
+# offset-tailer streams from). Env-overridable; defaults to the established path.
+_DEFAULT_SURGERY_OUT_PATH = os.environ.get(
+    "JARVIS_IAC_SURGERY_OUT_PATH", "/tmp/surgery.out"
+)
+
+# Poll/reconnect loop tuning (exp-backoff base/cap + jitter, all env-tuned).
+_DEFAULT_POLL_BASE_S = float(os.environ.get("JARVIS_IAC_POLL_BASE_S", "3"))
+_DEFAULT_POLL_CAP_S = float(os.environ.get("JARVIS_IAC_POLL_CAP_S", "30"))
+_DEFAULT_POLL_JITTER_S = float(os.environ.get("JARVIS_IAC_POLL_JITTER_S", "2"))
+# A single disposable SSH probe is SHORT -- it reads a small file or a byte range.
+_DEFAULT_PROBE_TIMEOUT_S = float(os.environ.get("JARVIS_IAC_PROBE_TIMEOUT_S", "45"))
+# Liveness deadline: N CONSECUTIVE failed probes whose elapsed wall exceeds this
+# bound == the node is genuinely unreachable (terminate + reap). Generous so a
+# transient WAN blip during pip install (the run-#15 class) never trips it.
+_DEFAULT_LIVENESS_DEADLINE_S = float(
+    os.environ.get("JARVIS_IAC_LIVENESS_DEADLINE_S", "900")
+)
+# Absolute wall ceiling for the whole detached poll loop (hard stop -> reap).
+# 0/unset -> falls back to the surgery timeout (--surgery-timeout-s).
+_DEFAULT_MAX_WALL_S = float(os.environ.get("JARVIS_IAC_MAX_WALL_SECONDS", "0"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1311,28 +1367,23 @@ def sync_repos_to_node(
 # --------------------------------------------------------------------------- #
 # Phase 3: Remote Execution & Terminal Tunnelling (streamed).
 # --------------------------------------------------------------------------- #
-def _remote_surgery_shell(args: argparse.Namespace) -> str:
-    """The remote shell command: set the trinity env so PRIME/REACTOR repo paths
-    point at the synced /opt/trinity/*, enable prebake + cross-repo mutation +
-    chaos, run the surgery, then ALWAYS touch the completion-sentinel (the burn
-    fires immediately on surgery-done)."""
-    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+def _surgery_env_exports() -> str:
+    """The trinity env exports shared by the legacy + daemon surgery shells."""
     pr = f"{_REMOTE_TRINITY_ROOT}/prime"
     rr = f"{_REMOTE_TRINITY_ROOT}/reactor"
-    env = (
+    return (
         f"export JARVIS_PRIME_REPO_PATH={shlex.quote(pr)}; "
         f"export JARVIS_REACTOR_REPO_PATH={shlex.quote(rr)}; "
         "export JARVIS_TRINITY_PREBAKE_ENABLED=1; "
         "export JARVIS_CROSS_REPO_MUTATION_ENABLED=1; "
         "export JARVIS_CHAOS_INJECTOR_ENABLED=1; "
     )
-    # The surgery harness imports the full JARVIS ouroboros stack (oracle ->
-    # engine -> aiohttp + ...). Install jarvis's deps on the host python BEFORE
-    # the surgery -- but FILTER the multi-GB ML libs (torch/transformers/...) the
-    # controlled harness never exercises (no inference), so the install is fast.
-    # pip skips already-satisfied on a resume (cheap re-run). WAN-connected (the
-    # HOST node, not the air-gapped container). Override via JARVIS_IAC_SURGERY_DEP_INSTALL.
-    dep_install = os.environ.get(
+
+
+def _surgery_dep_install() -> str:
+    """The host-python dep install (heavy pip -- the run-#15 SSH-drop locus).
+    Shared verbatim by the legacy single-stream + the detached daemon paths."""
+    return os.environ.get(
         "JARVIS_IAC_SURGERY_DEP_INSTALL",
         "echo '[deps] installing jarvis host deps (pip from boot; ML libs filtered)'; "
         # pip is installed at BOOT (startup-script). Fallback-bootstrap if missing.
@@ -1366,36 +1417,172 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         "pytest pytest-asyncio pyyaml requests anyio sniffio fastapi uvicorn orjson uuid6 2>&1 | tail -1; "
         "python3 -c 'import aiohttp; print(\"[deps] aiohttp ok\", aiohttp.__version__)' 2>&1 | tail -1",
     )
+
+
+def _surgery_synchronous_tail() -> str:
+    """The SYNCHRONOUS TAIL block (raw verdict + A1Trace + FAILURE LOCUS -> stdout).
+    Identical in the legacy + daemon paths -- preserves the redundant telemetry
+    that physically reaches the operator even if the Black-Box scp fails."""
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    return (
+        "echo '===== SYNCHRONOUS TAIL (raw verdict + A1Trace -> stdout) ====='; "
+        "echo '--- a1_verdict.json ---'; cat a1_runs/*/a1_verdict.json 2>/dev/null | tail -40 || echo '(no verdict file)'; "
+        "echo '--- [A1Trace] hops (O+V debug.log) ---'; grep -hE '\\[A1Trace\\]' .ouroboros/sessions/*/debug.log 2>/dev/null | tail -20 || echo '(no A1Trace lines emitted)'; "
+        f"echo '--- FAILURE LOCUS / final O+V state ---'; grep -hE 'FAILURE LOCUS|A1_DISPATCH_PROVEN|VERDICT:|state=applied|SOVEREIGN YIELD|Traceback' {out_q} 2>/dev/null | tail -15; "
+        "echo '===== END SYNCHRONOUS TAIL ====='; "
+    )
+
+
+def _surgery_sentinel_drop(args: argparse.Namespace) -> str:
+    """Verdict-conditional completion-sentinel drop (only burn on a SUCCESS
+    verdict; a FAILED verdict keeps the node warm for the Black Box). Shared."""
+    sentinel_q2 = shlex.quote(args.completion_sentinel)
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    return (
+        f"if grep -qE 'A1_DISPATCH_PROVEN|VERDICT: PASS|ROLLBACK VERIFIED' {out_q}; then "
+        f"sudo touch {sentinel_q2} 2>/dev/null || touch {sentinel_q2} 2>/dev/null || true; "
+        "echo '[iac] verdict reached -- completion-sentinel dropped (dead-man will burn)'; "
+        "else echo '[iac] no verdict (resumable) -- sentinel NOT dropped, node stays warm'; fi; "
+    )
+
+
+def _remote_surgery_shell(args: argparse.Namespace) -> str:
+    """The LEGACY remote shell command (single long-lived streaming SSH): set the
+    trinity env, install deps, run the surgery, emit the synchronous tail, then
+    verdict-conditionally touch the completion-sentinel. Used when the detached
+    daemon path is OFF (JARVIS_IAC_DETACHED_SURGERY_ENABLED=false) -- byte-identical."""
+    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+    env = _surgery_env_exports()
+    dep_install = _surgery_dep_install()
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
     # cd into the synced jarvis repo, install deps, run the surgery. The completion
     # sentinel (which arms the node-side dead-man to burn IMMEDIATELY) is dropped
     # ONLY when the surgery reached a real VERDICT (PASS/FRACTURE) -- NOT on a
     # resumable failure (e.g. a missing dep), so keep-warm actually keeps the node
     # alive for a resume instead of the dead-man burning it out from under us.
-    sentinel_q2 = shlex.quote(args.completion_sentinel)
     return (
         f"cd {shlex.quote(jr)} && {env} "
         f"{dep_install}; "
-        f"({args.surgery_cmd}) 2>&1 | tee /tmp/surgery.out; rc=${{PIPESTATUS[0]}}; "
-        # ---- SYNCHRONOUS TAIL (redundant telemetry) -- dump the raw verdict + the
-        # [A1Trace] hops + the FAILURE LOCUS straight to stdout BEFORE any teardown,
-        # so the trace physically reaches the local terminal even if the Black-Box
-        # scp fails or hangs. Runs on EVERY exit (success or FAILED), unconditionally.
-        "echo '===== SYNCHRONOUS TAIL (raw verdict + A1Trace -> stdout) ====='; "
-        "echo '--- a1_verdict.json ---'; cat a1_runs/*/a1_verdict.json 2>/dev/null | tail -40 || echo '(no verdict file)'; "
-        "echo '--- [A1Trace] hops (O+V debug.log) ---'; grep -hE '\\[A1Trace\\]' .ouroboros/sessions/*/debug.log 2>/dev/null | tail -20 || echo '(no A1Trace lines emitted)'; "
-        "echo '--- FAILURE LOCUS / final O+V state ---'; grep -hE 'FAILURE LOCUS|A1_DISPATCH_PROVEN|VERDICT:|state=applied|SOVEREIGN YIELD|Traceback' /tmp/surgery.out 2>/dev/null | tail -15; "
-        "echo '===== END SYNCHRONOUS TAIL ====='; "
-        # verdict-conditional sentinel: only burn on a terminal verdict.
-        # Drop the burn-sentinel ONLY on a SUCCESS verdict -- a FAILED A1 verdict
-        # ('STEP audit VERDICT: FAILED') must KEEP the node warm so the Black Box
-        # can be pulled + inspected before teardown (the dead-man + max-run-duration
-        # remain the no-orphan backstop). Run #7 burned on FAILED + lost the box.
-        "if grep -qE 'A1_DISPATCH_PROVEN|VERDICT: PASS|ROLLBACK VERIFIED' /tmp/surgery.out; then "
-        f"sudo touch {sentinel_q2} 2>/dev/null || touch {sentinel_q2} 2>/dev/null || true; "
-        "echo '[iac] verdict reached -- completion-sentinel dropped (dead-man will burn)'; "
-        "else echo '[iac] no verdict (resumable) -- sentinel NOT dropped, node stays warm'; fi; "
-        "exit $rc"
+        f"({args.surgery_cmd}) 2>&1 | tee {out_q}; rc=${{PIPESTATUS[0]}}; "
+        # ---- SYNCHRONOUS TAIL (redundant telemetry) runs on EVERY exit.
+        + _surgery_synchronous_tail()
+        + _surgery_sentinel_drop(args)
+        + "exit $rc"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Detached daemon surgery shell -- the PRIMARY path. The surgery body runs the
+# SAME deps/surgery/tail/sentinel work as the legacy path, but is wrapped so it:
+#   * writes structured JSON to soak_state.json at each phase boundary (deps ->
+#     inject/surgery -> done|failed) via an ATOMIC temp+mv;
+#   * maintains soak_in_progress.lock (the PID), REMOVED in a trap on ANY exit;
+#   * runs the chaos-revert-ALWAYS trap (folded into the surgery_cmd itself).
+# This script is what setsid/nohup launches detached -- it survives the launching
+# SSH closing. The local harness polls soak_state.json + tails surgery.out.
+# --------------------------------------------------------------------------- #
+def _remote_surgery_body_script(args: argparse.Namespace) -> str:
+    """Render the node-side detached `surgery.sh` body (a self-contained bash
+    program). Writes soak_state.json at phase boundaries + a PID lock removed in a
+    trap. ASCII only, no f-string brace conflicts in the JSON (built via printf)."""
+    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+    env = _surgery_env_exports()
+    dep_install = _surgery_dep_install()
+    state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
+    lock_q = shlex.quote(_DEFAULT_SOAK_LOCK_PATH)
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    # State writer: atomic temp+mv. Args: phase status rc verdict. Pure printf JSON.
+    # We keep it ASCII and brace-safe by assembling the JSON with printf %s.
+    writer = (
+        "_write_state() { "
+        "_p=\"$1\"; _s=\"$2\"; _rc=\"$3\"; _v=\"$4\"; "
+        f"_tmp={state_q}.tmp.$$; "
+        "printf '{\"phase\":\"%s\",\"status\":\"%s\",\"rc\":%s,\"ts\":%s,\"verdict\":\"%s\"}\\n' "
+        "\"$_p\" \"$_s\" \"${_rc:-null}\" \"$(date +%s)\" \"$_v\" > \"$_tmp\" 2>/dev/null "
+        f"&& mv -f \"$_tmp\" {state_q} 2>/dev/null || true; }}; "
+    )
+    # Lock: write our PID; trap removes it on EXIT (success OR failure). The
+    # surgery_cmd carries its OWN chaos-revert-ALWAYS trap; this lock-clear trap is
+    # additive (bash runs all EXIT traps -- we chain via a single handler).
+    lock_trap = (
+        f"echo \"$$\" > {lock_q} 2>/dev/null || true; "
+        f"_cleanup() {{ rm -f {lock_q} 2>/dev/null || true; }}; "
+        "trap _cleanup EXIT INT TERM; "
+    )
+    parts: List[str] = [
+        "#!/usr/bin/env bash\n",
+        "set -uo pipefail\n",
+        "export HOME=${HOME:-/root}\n",
+        f"cd {shlex.quote(jr)} || exit 91\n",
+        f"{env}\n",
+        f"{writer}\n",
+        f"{lock_trap}\n",
+        # ---- PHASE: deps (the run-#15 SSH-drop locus -- now detached) ------ #
+        "_write_state deps running null running\n",
+        f"{dep_install}\n",
+        # ---- PHASE: surgery (inject -> soak -> audit folded in surgery_cmd) #
+        "_write_state inject running null running\n",
+        f"({args.surgery_cmd}) 2>&1 | tee {out_q}; rc=${{PIPESTATUS[0]}}\n",
+        "_write_state soak done \"$rc\" running\n",
+        # ---- SYNCHRONOUS TAIL (redundant telemetry) ----------------------- #
+        _surgery_synchronous_tail(),
+        "\n",
+        # ---- PHASE: audit -> sentinel ------------------------------------- #
+        "_write_state audit running \"$rc\" running\n",
+        _surgery_sentinel_drop(args),
+        # Terminal state: failed iff a non-zero rc, else done. Verdict parsed from
+        # the surgery.out markers so the local poll can read it from state.
+        f"if grep -qE 'SOVEREIGN YIELD: CROSS-REPO FRACTURE' {out_q} 2>/dev/null; then _verd=FRACTURE; ",
+        f"elif grep -qE 'VERDICT: PASS|A1_DISPATCH_PROVEN|ROLLBACK VERIFIED' {out_q} 2>/dev/null; then _verd=PASS; ",
+        "else _verd=UNKNOWN; fi\n",
+        "if [ \"${rc:-1}\" -eq 0 ]; then _write_state done done \"$rc\" \"$_verd\"; ",
+        "else _write_state failed failed \"$rc\" \"$_verd\"; fi\n",
+        "exit ${rc:-1}\n",
+    ]
+    return "".join(parts)
+
+
+def _remote_surgery_launch_shell(args: argparse.Namespace) -> str:
+    """The SHORT remote shell the launching SSH runs: write surgery.sh to the node,
+    then LAUNCH it DETACHED (setsid/nohup, or systemd-run --scope if available) and
+    RETURN IMMEDIATELY. The detached surgery survives this SSH closing. Prefers
+    systemd-run when present (cgroup-scoped + --collect auto-clean); else falls
+    back to setsid+nohup (never hard-requires systemd)."""
+    jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
+    script_path = f"{jr}/surgery.sh"
+    script_q = shlex.quote(script_path)
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    body = _remote_surgery_body_script(args)
+    # Heredoc-write the body (quoted EOF -> no expansion on the node), chmod, then
+    # detach. The launcher itself returns the moment the background fork is spawned.
+    b64 = _b64(body)
+    return (
+        f"mkdir -p {shlex.quote(jr)} 2>/dev/null || true; "
+        # decode the base64 body to surgery.sh (robust against quoting/heredoc edge
+        # cases over the SSH --command boundary).
+        f"echo {shlex.quote(b64)} | base64 -d > {script_q} && chmod +x {script_q}; "
+        # truncate the prior out (idempotent relaunch starts a fresh log).
+        f": > {out_q} 2>/dev/null || true; "
+        # DETACH: prefer systemd-run --scope --collect; else setsid nohup.
+        "if command -v systemd-run >/dev/null 2>&1; then "
+        f"systemd-run --scope --collect --unit=sovereign-surgery-$$ bash {script_q} "
+        f">{out_q} 2>&1 </dev/null & "
+        "echo '[iac] surgery launched detached (systemd-run --scope)'; "
+        "else "
+        f"setsid nohup bash {script_q} >{out_q} 2>&1 </dev/null & "
+        "echo '[iac] surgery launched detached (setsid nohup)'; "
+        "fi; "
+        # return immediately -- do NOT wait on the surgery body.
+        "echo '[iac] launcher returning (surgery detached, SSH may now close)'; "
+        "exit 0"
+    )
+
+
+def _b64(s: str) -> str:
+    """base64-encode a string for safe transport over the SSH --command boundary."""
+    import base64
+
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
 def parse_verdict(captured: List[str]) -> str:
@@ -1484,22 +1671,296 @@ def run_remote_boot(
 def run_remote_surgery(
     args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
 ) -> Tuple[int, List[str], str]:
-    """SSH-exec the Trinity surgery remotely, STREAMING stdout/stderr to the local
-    terminal in real-time (prefixed `[surgery] ...`). Returns (rc, captured_lines,
-    verdict). Fail-soft.
+    """Run the Trinity surgery remotely. Returns (rc, captured_lines, verdict).
+    Fail-soft.
 
-    The WAN prebake happens ON the node before the air-gap compose -- the surgery
-    command drives the full prebake -> air-gap flow locally on the node (when no
-    separate JARVIS_IAC_PREBAKE_CMD ran the prebake as its own checkpointed phase).
+    PRIMARY (JARVIS_IAC_DETACHED_SURGERY_ENABLED, default true): launch the surgery
+    DETACHED (setsid/nohup/systemd-run) over a SHORT SSH that returns immediately,
+    then POLL the node (exp-backoff + jitter, short disposable probes) for
+    soak_state.json + soak_in_progress.lock and TAIL surgery.out by byte-offset --
+    a dropped SSH during pip install is a NON-EVENT (the run-#15 rc=255 fix).
+
+    LEGACY (master OFF): the byte-identical single long-lived streaming SSH session.
     """
-    remote = _remote_surgery_shell(args)
+    if not _detached_surgery_enabled(args):
+        # ---- LEGACY single-stream path (byte-identical) -------------------- #
+        remote = _remote_surgery_shell(args)
+        cmd = _ssh_cmd(args, node, remote)
+        _log("running remote surgery (streaming to local terminal in real-time)...")
+        rc, captured = _run_streaming_labeled(
+            cmd, label="surgery", log_path=log_path,
+            timeout_s=float(args.surgery_timeout_s),
+        )
+        verdict = parse_verdict(captured)
+        _log(f"remote surgery finished rc={rc} verdict={verdict}")
+        return rc, captured, verdict
+    # ---- PRIMARY detached daemon + poll/reconnect path --------------------- #
+    return run_remote_surgery_detached(args, node, log_path=log_path)
+
+
+def _detached_surgery_enabled(args: argparse.Namespace) -> bool:
+    """Resolve the detached-surgery master gate from args (if present) else env.
+    Default-ON. OFF -> legacy single-stream path."""
+    val = getattr(args, "detached_surgery", None)
+    if val is not None:
+        return bool(val)
+    return _env_truthy("JARVIS_IAC_DETACHED_SURGERY_ENABLED", "true")
+
+
+def launch_detached_surgery(
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[int, List[str]]:
+    """Run the SHORT launching SSH that writes surgery.sh + spawns it DETACHED and
+    RETURNS IMMEDIATELY. Uses the non-streaming `_run` boundary (a short call --
+    NOT a long stream). Fail-soft: a launch failure returns its rc for the caller."""
+    remote = _remote_surgery_launch_shell(args)
     cmd = _ssh_cmd(args, node, remote)
-    _log("running remote surgery (streaming to local terminal in real-time)...")
-    rc, captured = _run_streaming_labeled(
-        cmd, label="surgery", log_path=log_path, timeout_s=float(args.surgery_timeout_s),
+    sink = _make_labeled_sink("launch", log_path)
+    _log("launching detached surgery (short SSH, returns immediately)...")
+    rc, out = _run(cmd, timeout_s=float(args.probe_timeout_s))
+    for ln in (out or "").splitlines():
+        sink(ln + "\n")
+    return rc, [out or ""]
+
+
+def run_remote_surgery_detached(
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[int, List[str], str]:
+    """Launch the detached surgery, then drive the async poll/reconnect loop +
+    byte-offset tailer to terminal. Returns (rc, captured_lines, verdict).
+
+    Async-safe entry: runs the asyncio loop via asyncio.run (Python 3.9+ -- no
+    asyncio.timeout; bounded with asyncio.wait_for inside)."""
+    # Launch detached first (short SSH). A launch failure is itself resumable --
+    # the poll loop will simply find no state and trip the liveness deadline.
+    lrc, lcap = launch_detached_surgery(args, node, log_path=log_path)
+    if lrc != 0:
+        _log(f"detached launch rc={lrc} (poll loop will still probe -- node may be live)")
+    try:
+        return asyncio.run(_poll_surgery_to_terminal(args, node, log_path=log_path))
+    except Exception as exc:  # noqa: BLE001 -- the poll loop must never crash the run
+        _log(f"detached poll loop raised (swallowed): {exc!r}")
+        return 1, [f"[surgery] poll loop error: {exc!r}\n"], "UNKNOWN"
+
+
+# --------------------------------------------------------------------------- #
+# Async helpers -- run a (blocking) short SSH probe off the event loop.
+# --------------------------------------------------------------------------- #
+async def _probe(cmd: List[str], *, timeout_s: float) -> Tuple[int, str]:
+    """Run a short disposable SSH probe off-thread, bounded by asyncio.wait_for.
+    NEVER raises -- a broken pipe / 255 / timeout surfaces as (rc!=0, detail) which
+    the caller SWALLOWS + retries. This is the whole point: a dropped probe is a
+    NON-EVENT."""
+    try:
+        loop = asyncio.get_event_loop()
+        # _run is already fail-soft (returns (1, detail) on any exception). Bound
+        # it again here so a wedged SSH can't hang the tick.
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _run(cmd, timeout_s=timeout_s)),
+            timeout=timeout_s + 5.0,
+        )
+    except Exception as exc:  # noqa: BLE001 -- swallow EVERYTHING; the tick retries
+        return 1, f"[probe failed: {exc!r}]"
+
+
+def _is_transport_drop(rc: int, detail: str) -> bool:
+    """True iff the probe failure looks like a transport drop (the run-#15 class):
+    broken pipe / connection closed / rc=255 / timeout. Such failures are SWALLOWED
+    + retried; they count only against the generous liveness deadline."""
+    if rc == 255:
+        return True
+    low = (detail or "").lower()
+    return any(
+        m in low
+        for m in (
+            "broken pipe", "connection closed", "connection reset",
+            "connection refused", "timed out", "timeout", "rc=255",
+            "failed to send all data", "remote host", "probe failed",
+        )
     )
-    verdict = parse_verdict(captured)
-    _log(f"remote surgery finished rc={rc} verdict={verdict}")
+
+
+def _read_state_cmd(args: argparse.Namespace, node: str) -> List[str]:
+    """A SHORT SSH that cats soak_state.json (small JSON)."""
+    state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
+    remote = f"cat {state_q} 2>/dev/null || true"
+    return _ssh_cmd(args, node, remote)
+
+
+def _liveness_probe_cmd(args: argparse.Namespace, node: str) -> List[str]:
+    """A SHORT SSH that checks soak_in_progress.lock + its PID liveness. Prints
+    `ALIVE <pid>` if the lock exists AND the PID is running, `GONE` otherwise."""
+    lock_q = shlex.quote(_DEFAULT_SOAK_LOCK_PATH)
+    remote = (
+        f"if [ -f {lock_q} ]; then _p=$(cat {lock_q} 2>/dev/null); "
+        "if [ -n \"$_p\" ] && kill -0 \"$_p\" 2>/dev/null; then echo \"ALIVE $_p\"; "
+        "else echo \"STALE $_p\"; fi; else echo GONE; fi"
+    )
+    return _ssh_cmd(args, node, remote)
+
+
+def _tail_cmd(args: argparse.Namespace, node: str, offset: int) -> List[str]:
+    """A SHORT SSH that fetches ONLY the bytes of surgery.out at >= offset+1
+    (`tail -c +N` is 1-indexed -> +offset+1 == bytes after `offset`). Zero-loss /
+    zero-dup byte-offset tailing: the local side advances `offset` by what arrived."""
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    start = max(0, int(offset)) + 1
+    remote = f"tail -c +{start} {out_q} 2>/dev/null || true"
+    return _ssh_cmd(args, node, remote)
+
+
+def _parse_state_blob(blob: str) -> Dict[str, Any]:
+    """Parse soak_state.json text -> dict (fail-soft -> {} on garbage/partial)."""
+    try:
+        blob = (blob or "").strip()
+        if not blob:
+            return {}
+        data = json.loads(blob)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 -- a partial/garbage read is just "no state yet"
+        return {}
+
+
+def _backoff_delay(attempt: int, *, base: float, cap: float, jitter: float) -> float:
+    """Exponential backoff base*2**attempt capped at `cap`, plus uniform jitter."""
+    grow = base * (2 ** max(0, attempt))
+    return min(grow, cap) + random.uniform(0.0, max(0.0, jitter))
+
+
+async def _tail_once(
+    args: argparse.Namespace, node: str, offset: int, sink: Callable[[str], None],
+) -> int:
+    """One byte-offset tail tick: fetch bytes after `offset`, stream them, return
+    the NEW offset (advanced by bytes received). Fail-soft: a failed tail leaves
+    the offset UNCHANGED (next tick retries -> zero loss, zero dup)."""
+    rc, out = await _probe(_tail_cmd(args, node, offset), timeout_s=float(args.probe_timeout_s))
+    if rc != 0:
+        return offset  # transport drop -> retry next tick, offset unchanged
+    if not out:
+        return offset
+    # advance by the byte length actually received (utf-8) -- this is the seam that
+    # guarantees no-dup on reconnect: we only ever ask for bytes AFTER `offset`.
+    for ln in out.splitlines(keepends=True):
+        sink(ln if ln.endswith("\n") else ln + "\n")
+    return offset + len(out.encode("utf-8"))
+
+
+async def _poll_surgery_to_terminal(
+    args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
+) -> Tuple[int, List[str], str]:
+    """The idempotent poll/reconnect loop. Each tick (exp-backoff + jitter):
+        (a) tail surgery.out by byte-offset -> stream new bytes locally (no dup/loss);
+        (b) read soak_state.json -> terminal on status in (done, failed);
+        (c) check soak_in_progress.lock liveness -> GONE+terminal-state == done.
+    TERMINATES on: state done/failed; OR lock gone AND state done/failed; OR the
+    absolute wall ceiling (reap); OR N consecutive failed probes beyond the liveness
+    deadline (node genuinely unreachable -> reap). A broken-pipe probe is SWALLOWED."""
+    sink = _make_labeled_sink("surgery", log_path)
+    captured: List[str] = []
+
+    def _emit(line: str) -> None:
+        captured.append(line)
+        sink(line)
+
+    base = float(getattr(args, "poll_base_s", _DEFAULT_POLL_BASE_S))
+    cap = float(getattr(args, "poll_cap_s", _DEFAULT_POLL_CAP_S))
+    jitter = float(getattr(args, "poll_jitter_s", _DEFAULT_POLL_JITTER_S))
+    liveness_deadline = float(getattr(args, "liveness_deadline_s", _DEFAULT_LIVENESS_DEADLINE_S))
+    max_wall = float(getattr(args, "max_wall_seconds", _DEFAULT_MAX_WALL_S) or 0.0)
+    if max_wall <= 0.0:
+        max_wall = float(args.surgery_timeout_s)
+
+    offset = 0
+    attempt = 0
+    consecutive_fail = 0
+    first_fail_mono: Optional[float] = None
+    start_mono = time.monotonic()
+    verdict = "UNKNOWN"
+    rc = 1
+
+    _emit("[iac] detached poll/reconnect loop engaged "
+          f"(base={base}s cap={cap}s liveness={liveness_deadline}s wall={max_wall}s)\n")
+
+    while True:
+        now = time.monotonic()
+        # --- absolute wall ceiling (hard stop -> reap) --------------------- #
+        if now - start_mono > max_wall:
+            _emit(f"[iac] absolute wall ceiling {max_wall}s exceeded -- reaping\n")
+            rc, verdict = 124, parse_verdict(captured)
+            break
+
+        tick_ok = True
+
+        # --- (a) byte-offset tail ----------------------------------------- #
+        new_offset = await _tail_once(args, node, offset, _emit)
+        if new_offset == offset:
+            # no new bytes -- could be a transport drop OR genuinely no output yet.
+            pass
+        offset = new_offset
+
+        # --- (b) read structured state ------------------------------------ #
+        sr: int
+        sout: str
+        src_rc, sout = await _probe(
+            _read_state_cmd(args, node), timeout_s=float(args.probe_timeout_s)
+        )
+        state = _parse_state_blob(sout)
+        if src_rc != 0 and _is_transport_drop(src_rc, sout):
+            tick_ok = False
+        status = str(state.get("status") or "")
+        phase = str(state.get("phase") or "")
+        state_verdict = str(state.get("verdict") or "")
+        state_rc = state.get("rc")
+
+        if status in ("done", "failed"):
+            verdict = state_verdict if state_verdict in ("PASS", "FRACTURE") else parse_verdict(captured)
+            try:
+                rc = int(state_rc) if state_rc is not None else (0 if status == "done" else 1)
+            except (TypeError, ValueError):
+                rc = 0 if status == "done" else 1
+            _emit(f"[iac] terminal state status={status} phase={phase} "
+                  f"rc={rc} verdict={verdict}\n")
+            # one final tail to drain any trailing bytes written before the flush.
+            offset = await _tail_once(args, node, offset, _emit)
+            break
+
+        # --- (c) lock liveness -------------------------------------------- #
+        lrc, lout = await _probe(
+            _liveness_probe_cmd(args, node), timeout_s=float(args.probe_timeout_s)
+        )
+        lout = (lout or "").strip()
+        if lrc != 0 and _is_transport_drop(lrc, lout):
+            tick_ok = False
+        elif lout.startswith("GONE") and status not in ("running", ""):
+            # lock gone AND a terminal-ish state seen -> treat as done/failed.
+            verdict = state_verdict if state_verdict in ("PASS", "FRACTURE") else parse_verdict(captured)
+            rc = 0 if status == "done" else 1
+            _emit(f"[iac] lock GONE with state={status} -- terminal\n")
+            break
+
+        # --- liveness accounting ------------------------------------------ #
+        if tick_ok:
+            consecutive_fail = 0
+            first_fail_mono = None
+            attempt = 0  # a good tick resets the backoff (fast next poll)
+        else:
+            consecutive_fail += 1
+            if first_fail_mono is None:
+                first_fail_mono = now
+            elapsed_fail = now - first_fail_mono
+            if elapsed_fail > liveness_deadline:
+                _emit(f"[iac] liveness deadline {liveness_deadline}s exceeded over "
+                      f"{consecutive_fail} consecutive failed probes -- node unreachable, reaping\n")
+                rc, verdict = 125, parse_verdict(captured)
+                break
+            attempt += 1
+            _emit(f"[iac] probe drop #{consecutive_fail} swallowed "
+                  f"(elapsed {elapsed_fail:.0f}s / {liveness_deadline}s) -- retrying\n")
+
+        delay = _backoff_delay(attempt, base=base, cap=cap, jitter=jitter)
+        await asyncio.sleep(delay)
+
+    _log(f"remote surgery (detached) finished rc={rc} verdict={verdict}")
     return rc, captured, verdict
 
 
@@ -1987,6 +2448,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sync-timeout-s", type=int, default=int(os.environ.get("JARVIS_IAC_SYNC_TIMEOUT_S", "900")))
     p.add_argument("--surgery-timeout-s", type=int, default=int(os.environ.get("JARVIS_IAC_SURGERY_TIMEOUT_S", "2400")))
     p.add_argument("--surgery-cmd", default=_DEFAULT_SURGERY_CMD, help="remote surgery command (env JARVIS_IAC_SURGERY_CMD)")
+    # Detached surgery daemon + poll/reconnect loop (the run-#15 SSH-drop fix).
+    # Default-ON; --no-detached-surgery falls back to the legacy single-stream path.
+    p.add_argument(
+        "--detached-surgery", dest="detached_surgery", action="store_true",
+        default=_env_truthy("JARVIS_IAC_DETACHED_SURGERY_ENABLED", "true"),
+        help="detach the surgery (setsid/nohup/systemd-run) + poll/reconnect (default ON)",
+    )
+    p.add_argument(
+        "--no-detached-surgery", dest="detached_surgery", action="store_false",
+        help="legacy single long-lived streaming SSH session (byte-identical OFF path)",
+    )
+    p.add_argument("--poll-base-s", type=float, default=_DEFAULT_POLL_BASE_S,
+                   help="poll backoff base seconds (env JARVIS_IAC_POLL_BASE_S)")
+    p.add_argument("--poll-cap-s", type=float, default=_DEFAULT_POLL_CAP_S,
+                   help="poll backoff cap seconds (env JARVIS_IAC_POLL_CAP_S)")
+    p.add_argument("--poll-jitter-s", type=float, default=_DEFAULT_POLL_JITTER_S,
+                   help="poll backoff jitter seconds (env JARVIS_IAC_POLL_JITTER_S)")
+    p.add_argument("--probe-timeout-s", type=float, default=_DEFAULT_PROBE_TIMEOUT_S,
+                   help="single SSH probe timeout (env JARVIS_IAC_PROBE_TIMEOUT_S)")
+    p.add_argument("--liveness-deadline-s", type=float, default=_DEFAULT_LIVENESS_DEADLINE_S,
+                   help="consecutive-failed-probe liveness bound (env JARVIS_IAC_LIVENESS_DEADLINE_S)")
+    p.add_argument("--max-wall-seconds", type=float, default=_DEFAULT_MAX_WALL_S,
+                   help="absolute poll-loop wall ceiling, 0=use surgery-timeout (env JARVIS_IAC_MAX_WALL_SECONDS)")
     p.add_argument("--completion-sentinel", default=_COMPLETION_SENTINEL)
     p.add_argument("--prime-repo-path", default=None, help="prime repo (env JARVIS_PRIME_REPO_PATH)")
     p.add_argument("--reactor-repo-path", default=None, help="reactor repo (env JARVIS_REACTOR_REPO_PATH)")
