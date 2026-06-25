@@ -168,13 +168,21 @@ def _resolve_runtime_repo_root(
     for anc in here.parents:
         if _repo_root_plausible(anc):
             return anc
-    # 3. .git anchor walk-up (last resort).
-    for anc in (here, *here.parents):
-        try:
-            if (anc / ".git").exists():
-                return anc
-        except Exception:  # noqa: BLE001
-            continue
+    # 3. .git anchor walk-up (last resort) -- delegate to the SINGLE
+    #    authoritative ``.git``-anchored resolver (no duplicate walk). It is
+    #    cwd-independent, honors ``JARVIS_REPO_PATH``, and is fail-soft. We
+    #    accept its result ONLY when it actually anchored a ``.git`` here, so
+    #    the loud ``RuntimeError`` below still fires for a truly rootless tree.
+    try:
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_repo_root,
+        )
+
+        anchored = resolve_repo_root(start=here)
+        if (anchored / ".git").exists():
+            return anchored
+    except Exception:  # noqa: BLE001 -- resolver failed; fall through to raise
+        pass
     raise RuntimeError(
         "cannot resolve repo root in this runtime: JARVIS_REPO_PATH="
         f"{_env!r} is not a valid repo and no backend/core/ouroboros "
@@ -232,7 +240,7 @@ class HarnessConfig:
         Directory for the generated notebook.  Defaults to ``"notebooks"``.
     """
 
-    repo_path: Path = field(default_factory=lambda: Path("."))
+    repo_path: Path = field(default_factory=_resolve_runtime_repo_root)
     cost_cap_usd: float = 0.50
     idle_timeout_s: float = 600.0
     max_wall_seconds_s: Optional[float] = None
@@ -250,6 +258,42 @@ class HarnessConfig:
     # interactive sessions never inject synthetic load — the operator's
     # real workload IS the workload.
     seed_intents: int = 0
+
+    def __post_init__(self) -> None:
+        """Anchor ``repo_path`` to the authoritative ``.git`` root.
+
+        SOURCE fix for the run-#14 bug: the CLI builds ``HarnessConfig(
+        repo_path=Path(args.repo_path))`` where ``args.repo_path`` defaults to
+        ``JARVIS_REPO_PATH`` (a stale host path inside the container) or a
+        cwd-style value. On the Linux node ``cwd != /opt/trinity/jarvis`` so
+        every downstream consumer reading ``self._config.repo_path`` normalized
+        scoped-test paths against the wrong root -> 45 ``outside repo root``
+        rejections -> the chaos test was never scoped-detected. This normalizes
+        a bare/cwd-style ``repo_path`` to the real root via the same
+        container-aware resolver ``from_env`` uses (which itself falls through
+        to the authoritative ``.git``-anchored ``resolve_repo_root``). An
+        explicit, already-plausible repo root (e.g. a worktree or a hermetic
+        fixture) is honored verbatim. NEVER raises -- fail-soft to the value
+        the caller passed.
+        """
+        try:
+            raw = Path(self.repo_path)
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            resolved = raw.expanduser().resolve()
+        except OSError:
+            return
+        # Already a plausible, real repo root (worktree / fixture / explicit
+        # node path) -> honor verbatim. Only cwd-style / non-repo values get
+        # re-anchored, so we never override a deliberate isolation root.
+        if _repo_root_plausible(resolved):
+            self.repo_path = resolved
+            return
+        try:
+            self.repo_path = _resolve_runtime_repo_root(start=raw)
+        except Exception:  # noqa: BLE001 -- fail-soft: keep caller value
+            pass
 
     @classmethod
     def from_env(cls) -> HarnessConfig:
@@ -1990,7 +2034,7 @@ class BattleTestHarness:
                 from backend.core.ouroboros.governance import mutation_gate as _mg
                 if _mg.gate_enabled() and _mg.prewarm_enabled():
                     _summary = _mg.prewarm_allowlist(
-                        project_root=Path("."),
+                        project_root=self._config.repo_path,
                     )
                     logger.info(
                         "[MutationGate] prewarm_at_boot mode=%s summary=%s",
