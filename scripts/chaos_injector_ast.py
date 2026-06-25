@@ -1148,6 +1148,39 @@ def do_revert(cfg: InjectConfig) -> int:
     if not manifest:
         _log("no active chaos manifest; nothing to revert.")
         return 0
+
+    # schema_version 2 (decomposable): restore EVERY target in the list,
+    # byte-identically. The manifest is cleared only if ALL restores succeed, so
+    # a partial revert failure stays auditable (manifest retained).
+    if manifest.get("schema_version") == DECOMPOSABLE_SCHEMA_VERSION:
+        entries = manifest.get("targets") or []
+        if not entries:
+            _log("decomposable manifest has no targets; clearing.")
+            _delete_manifest(cfg.repo_root)
+            return 0
+        all_ok = True
+        for entry in entries:
+            abs_path = entry.get("target_file_abs") or os.path.join(
+                cfg.repo_root, entry.get("target_file", ""),
+            )
+            original = entry.get("original_source")
+            if original is None:
+                _log("decomposable revert: entry missing original_source for "
+                     "%s; skipping (cannot restore safely)." % (abs_path,))
+                all_ok = False
+                continue
+            if not _restore_target(abs_path, original):
+                all_ok = False
+        if not all_ok:
+            _log("decomposable revert: one or more targets FAILED to restore; "
+                 "retaining manifest for audit.")
+            return 6
+        _delete_manifest(cfg.repo_root)
+        _log("REVERTED %d decomposable target(s) to byte-identical originals. "
+             "Manifest cleared." % (len(entries),))
+        return 0
+
+    # schema_version 1 (legacy single-target) -- unchanged behavior.
     abs_path = manifest.get("target_file_abs") or os.path.join(
         cfg.repo_root, manifest.get("target_file", ""),
     )
@@ -1155,12 +1188,7 @@ def do_revert(cfg: InjectConfig) -> int:
     if original is None:
         _log("manifest missing original_source; cannot revert safely. Aborting.")
         return 6
-    try:
-        with open(abs_path, "w", encoding="utf-8") as fh:
-            fh.write(original)
-        _bump_mtime(abs_path)
-    except OSError as exc:
-        _log(f"revert FAILED writing {abs_path}: {exc}")
+    if not _restore_target(abs_path, original):
         return 6
     _delete_manifest(cfg.repo_root)
     _log(
@@ -1464,6 +1492,430 @@ def _build_readiness_check(cfg: "InjectConfig") -> Optional[ReadinessCheck]:
 
 
 # --------------------------------------------------------------------------- #
+# DecomposableChaosInjector -- N MUTUALLY-ISOLATED pure-leaf targets.
+# --------------------------------------------------------------------------- #
+#
+# THE POINT: O+V's L3 AST Collision Matrix fans a set of work units out into
+# parallel subagents ONLY when their target files are pairwise import-disjoint
+# (no two files import each other / share an interface<->impl coupling). A
+# single-target chaos op can never exercise that fan-out. This mode acquires N
+# pure-leaf functions in N DIFFERENT files, PROVES pairwise import isolation via
+# a bounded AST import scan (the same shape oracle.py uses), mutates each so its
+# OWN test goes red, and records ALL N in one manifest (schema_version 2).
+#
+# Zero-trust: if N mutually-isolated, green-tested leaves cannot be found we
+# return FEWER and log honestly -- never fabricate a target. Any one target that
+# fails to go red is reverted + dropped (shrink); the inject NEVER leaves a
+# half-mutated tree (partial-failure cleanup reverts every already-applied
+# target). REVERT iterates the manifest list and restores ALL N byte-identically.
+#
+# Reuse-first: purity (_PurityVisitor / _analyze_function), candidate scan
+# (acquire_candidates), mutation planning (_iter_mutations), green/red
+# verification (_run_pytest_node), manifest IO (_write/_read/_delete_manifest)
+# and the byte-identical revert primitive are ALL reused unchanged. This mode
+# only adds the import-isolation predicate + the N-target orchestration.
+
+DECOMPOSABLE_SCHEMA_VERSION = 2
+
+
+@dataclass
+class ChaosTarget:
+    """One acquired, mutation-ready isolated target within a decomposable set."""
+    target_file: str               # absolute path (alias of candidate.target_file)
+    function: str
+    lineno: int
+    end_lineno: int
+    test_node: str                 # the green test node confirmed pre-injection
+    test_nodes: List[str] = field(default_factory=list)
+    dotted_name: str = ""          # module dotted name (for the import graph)
+
+
+def _module_dotted_name(repo_root: str, abs_file: str) -> str:
+    """Map an absolute .py path to its dotted module name relative to the repo
+    root (e.g. <repo>/backend/utils/calc0.py -> backend.utils.calc0). Mirrors the
+    package-path math oracle.py uses for its import graph. ``__init__.py`` maps
+    to the package dotted name. Returns "" for paths outside the repo."""
+    try:
+        rel = os.path.relpath(os.path.abspath(abs_file), os.path.abspath(repo_root))
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    rel = rel[:-3] if rel.endswith(".py") else rel
+    parts = [p for p in rel.split(os.sep) if p and p != "."]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _file_import_targets(abs_file: str) -> set:
+    """Return the set of dotted import targets a file references, via a bounded
+    AST scan (NO import execution). Covers both ``import a.b.c`` and
+    ``from a.b import name`` (the module is ``a.b``; relative imports keep their
+    leading-dot prefix so a sibling resolve can match). Best-effort: an
+    unparseable / unreadable file yields an empty set (treated as importing
+    nothing -- conservative for the *coupling* test, which only adds edges)."""
+    out: set = set()
+    try:
+        with open(abs_file, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return out
+    try:
+        tree = ast.parse(src, filename=abs_file)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    out.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level and node.level > 0:
+                # Relative import: preserve dots so the caller can resolve it
+                # against the importer's own package.
+                out.add("." * node.level + mod)
+            elif mod:
+                out.add(mod)
+                # ``from a.b import c`` may name a submodule a.b.c -- record both
+                # the package and each fully-qualified candidate so a direct
+                # sibling-module import is detected.
+                for alias in node.names:
+                    if alias.name:
+                        out.add(mod + "." + alias.name)
+    return out
+
+
+def _resolve_relative(importer_dotted: str, rel_target: str) -> str:
+    """Resolve a relative import token (leading dots + module) against the
+    importer's dotted module name. ``importer=backend.utils.coupled_b`` +
+    ``rel=.coupled_a`` -> ``backend.utils.coupled_a``."""
+    level = len(rel_target) - len(rel_target.lstrip("."))
+    suffix = rel_target.lstrip(".")
+    base_parts = importer_dotted.split(".") if importer_dotted else []
+    # ``from . import x`` (level=1) is relative to the importer's package, so we
+    # drop the module's own name (one component) per extra level beyond the pkg.
+    drop = level
+    anchor = base_parts[: max(0, len(base_parts) - drop)]
+    if suffix:
+        anchor = anchor + suffix.split(".")
+    return ".".join(anchor)
+
+
+def _files_are_import_coupled(repo_root: str, file_a: str, file_b: str) -> bool:
+    """SYMMETRIC predicate: do these two files import-couple (does either import
+    the other's module)? Bounded AST scan against the real dotted-name graph --
+    no import execution, no hardcoding. The Collision Matrix marks a pair
+    DISJOINT iff this returns False.
+
+    Coupling exists iff A imports B's module (or a submodule under it), or vice
+    versa. Resolves both absolute (``backend.utils.x``) and relative
+    (``.x`` / ``..pkg.x``) import forms."""
+    a_abs, b_abs = os.path.abspath(file_a), os.path.abspath(file_b)
+    if a_abs == b_abs:
+        return True  # same file -> can never be two parallel units
+    a_dotted = _module_dotted_name(repo_root, a_abs)
+    b_dotted = _module_dotted_name(repo_root, b_abs)
+
+    def _imports_other(importer_abs: str, importer_dotted: str, other_dotted: str) -> bool:
+        if not other_dotted:
+            return False
+        for tok in _file_import_targets(importer_abs):
+            resolved = (
+                _resolve_relative(importer_dotted, tok)
+                if tok.startswith(".")
+                else tok
+            )
+            if not resolved:
+                continue
+            # Exact module hit, or other_dotted is a package prefix of the import
+            # (importer pulls a submodule of other), or other pulls a submodule
+            # under the import token.
+            if (
+                resolved == other_dotted
+                or resolved.startswith(other_dotted + ".")
+                or other_dotted.startswith(resolved + ".")
+            ):
+                return True
+        return False
+
+    return (
+        _imports_other(a_abs, a_dotted, b_dotted)
+        or _imports_other(b_abs, b_dotted, a_dotted)
+    )
+
+
+def _candidate_to_target(repo_root: str, cand: Candidate) -> ChaosTarget:
+    return ChaosTarget(
+        target_file=cand.target_file,
+        function=cand.function,
+        lineno=cand.lineno,
+        end_lineno=cand.end_lineno,
+        test_node=cand.test_node,
+        test_nodes=list(cand.test_nodes or [cand.test_node]),
+        dotted_name=_module_dotted_name(repo_root, cand.target_file),
+    )
+
+
+def _confirm_green(cfg: InjectConfig, cand: Candidate) -> Optional[str]:
+    """Return the FIRST plausible test node confirmed GREEN pre-injection, or
+    None. Reuses _run_pytest_node. When verify_green is off, trusts the primary
+    node (mirrors do_inject's --no-verify path)."""
+    if not cfg.verify_green:
+        return cand.test_node
+    for tn in (cand.test_nodes or [cand.test_node]):
+        if _run_pytest_node(cfg.repo_root, tn, cfg.test_timeout_s) is True:
+            return tn
+    return None
+
+
+def acquire_isolated_targets(cfg: InjectConfig, n: int = 3) -> List[ChaosTarget]:
+    """Acquire up to ``n`` pure-leaf targets, each in a DIFFERENT file, such that
+    every pair is import-DISJOINT (verified via the real AST import graph) AND
+    each independently has a GREEN test.
+
+    Greedy maximal-independent-set: scan candidates (one per file, deterministic
+    order), and add a candidate to the chosen set iff its file is pairwise
+    uncoupled with every file already chosen. Stops at ``n``. Zero-trust: if
+    fewer than ``n`` mutually-isolated green leaves exist, returns FEWER -- never
+    fabricates. Reuses acquire_candidates + the green-test confirmation."""
+    if n <= 0:
+        return []
+    candidates = acquire_candidates(cfg)
+    # Collapse to one candidate per file (the Collision Matrix is file-grained;
+    # two functions in one file can never fan out as two parallel units).
+    by_file: List[Candidate] = []
+    seen_files = set()
+    for cand in _seed_order(candidates, cfg.seed):
+        if cand.target_file in seen_files:
+            continue
+        seen_files.add(cand.target_file)
+        by_file.append(cand)
+
+    chosen: List[ChaosTarget] = []
+    chosen_files: List[str] = []
+    for cand in by_file:
+        if len(chosen) >= n:
+            break
+        # Pairwise import-isolation against every already-chosen file.
+        if any(
+            _files_are_import_coupled(cfg.repo_root, cand.target_file, picked)
+            for picked in chosen_files
+        ):
+            continue
+        # Independently green-tested (reuse the existing confirmation).
+        green = _confirm_green(cfg, cand)
+        if green is None:
+            continue
+        cand.test_node = green
+        chosen.append(_candidate_to_target(cfg.repo_root, cand))
+        chosen_files.append(cand.target_file)
+
+    if len(chosen) < n:
+        _log(
+            "acquire_isolated_targets: requested %d but only %d mutually-isolated "
+            "green-tested pure-leaf target(s) available (honest: fewer, NOT "
+            "fabricated)." % (n, len(chosen))
+        )
+    return chosen
+
+
+def _mutate_one_target_red(
+    cfg: InjectConfig, tgt: ChaosTarget,
+) -> Optional[Tuple[dict, str]]:
+    """Apply the existing single-mutation logic to ONE target and confirm its OWN
+    test goes red. On success returns ``(entry, original_src)`` where ``entry`` is
+    the per-target manifest dict; the file is left MUTATED on disk. On failure
+    (no viable site / nothing turns red) the file is restored byte-identically
+    and None is returned. Reuses _iter_mutations + _apply_mutation +
+    _run_pytest_node entirely."""
+    try:
+        with open(tgt.target_file, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    func = _select_function_node(src, tgt.function, tgt.lineno)
+    if func is None:
+        return None
+    muts = _iter_mutations(src, func)
+    if not muts:
+        _log("decomposable: %s has no viable mutation site." % (tgt.function,))
+        return None
+
+    for mut in muts:
+        try:
+            mutated_src = _apply_mutation(src, mut)
+        except ValueError as exc:
+            _log("  decomposable site skip (%s L%d): %s" % (tgt.function, mut.lineno, exc))
+            continue
+        try:
+            with open(tgt.target_file, "w", encoding="utf-8") as fh:
+                fh.write(mutated_src)
+            _bump_mtime(tgt.target_file)
+        except OSError as exc:
+            _log("decomposable write failed for %s: %s" % (tgt.target_file, exc))
+            return None
+
+        if cfg.verify_green:
+            post = _run_pytest_node(cfg.repo_root, tgt.test_node, cfg.test_timeout_s)
+            went_red = post is False
+        else:
+            went_red = True  # trust (no verification requested)
+
+        if went_red:
+            entry = {
+                "target_file": os.path.relpath(tgt.target_file, cfg.repo_root),
+                "target_file_abs": tgt.target_file,
+                "function": tgt.function,
+                "line": mut.lineno,
+                "dotted_name": tgt.dotted_name,
+                "original_source": src,
+                "mutated_source": mutated_src,
+                "mutation_kind": mut.kind,
+                "mutation_detail": {
+                    "lineno": mut.lineno,
+                    "col_offset": mut.col_offset,
+                    "end_col_offset": mut.end_col_offset,
+                    "original_segment": mut.original_segment,
+                    "mutated_segment": mut.mutated_segment,
+                },
+                "test_node": tgt.test_node,
+                "test_was_green_pre": bool(cfg.verify_green),
+                "test_red_post": bool(cfg.verify_green) or None,
+            }
+            return entry, src
+
+        # Inert site -> restore + try next site.
+        try:
+            with open(tgt.target_file, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            _bump_mtime(tgt.target_file)
+        except OSError:
+            _log("WARNING: decomposable site-revert write failed for %s" % (tgt.target_file,))
+
+    return None
+
+
+def _restore_target(target_file_abs: str, original_source: str) -> bool:
+    """Byte-identical restore of one target (reused by partial-failure cleanup
+    and do_revert). Returns True on success."""
+    try:
+        with open(target_file_abs, "w", encoding="utf-8") as fh:
+            fh.write(original_source)
+        _bump_mtime(target_file_abs)
+        return True
+    except OSError as exc:
+        _log("restore FAILED for %s: %s" % (target_file_abs, exc))
+        return False
+
+
+def do_inject_decomposable(
+    cfg: InjectConfig, n: int = 3, *, require_exact: bool = False,
+) -> int:
+    """Acquire + mutate up to ``n`` MUTUALLY-ISOLATED pure-leaf targets so each
+    turns its OWN test red, then write ONE schema_version-2 manifest carrying the
+    full target list.
+
+    ``require_exact=True`` -> refuse (no mutation) unless exactly ``n`` isolated
+    green targets both exist AND go red. Default (False) -> inject as many as can
+    be turned red and report honestly (zero-trust: fewer over fabricate).
+
+    PARTIAL-FAILURE CLEANUP: any target that cannot be turned red is dropped and
+    every already-mutated target is restored if the final set is unacceptable, so
+    the tree is NEVER left half-injected.
+
+    Returns 0 on success (>=1 target red, or exactly n when require_exact), non-0
+    otherwise (with the tree restored byte-identically)."""
+    existing = _read_manifest(cfg.repo_root)
+    if existing and not cfg.force:
+        _log(
+            "REFUSING: an active chaos manifest already exists. Use --revert "
+            "first, or --force to override."
+        )
+        return 3
+    if existing and cfg.force:
+        _log("--force: reverting prior active mutation before decomposable inject.")
+        do_revert(cfg)
+
+    targets = acquire_isolated_targets(cfg, n=n)
+    if require_exact and len(targets) < n:
+        _log(
+            "require_exact: only %d/%d isolated targets acquired -- refusing to "
+            "inject a partial set. No mutation performed." % (len(targets), n)
+        )
+        return 4
+    if not targets:
+        _log("decomposable: no isolated pure-leaf targets acquired. Nothing to do.")
+        return 4
+
+    applied: List[dict] = []  # successfully-reddened per-target manifest entries
+
+    def _rollback_all() -> None:
+        for entry in applied:
+            _restore_target(entry["target_file_abs"], entry["original_source"])
+        applied.clear()
+
+    for tgt in targets:
+        result = _mutate_one_target_red(cfg, tgt)
+        if result is None:
+            _log(
+                "decomposable: target %s::%s could not be turned red; dropping it "
+                "(no half-state)." % (tgt.dotted_name or tgt.target_file, tgt.function)
+            )
+            continue
+        entry, _orig = result
+        applied.append(entry)
+
+    # Acceptance check.
+    if require_exact and len(applied) < n:
+        _log(
+            "require_exact: only %d/%d targets turned red -- rolling back ALL "
+            "(no half-injected tree)." % (len(applied), n)
+        )
+        _rollback_all()
+        return 5
+    if not applied:
+        _log("decomposable: NO target turned red -- nothing injected (tree clean).")
+        _rollback_all()  # no-op; defensive
+        return 5
+
+    manifest = {
+        "schema_version": DECOMPOSABLE_SCHEMA_VERSION,
+        "injector_version": INJECTOR_VERSION,
+        "mode": "decomposable",
+        "requested_n": n,
+        "targets": applied,
+        "injected_at_iso": cfg.now_iso,
+        "seed": cfg.seed,
+    }
+    _write_manifest(cfg.repo_root, manifest)
+    _log(
+        "INJECTED decomposable chaos: %d MUTUALLY-ISOLATED target(s) red in %d "
+        "distinct file(s). Manifest (schema 2) written." % (
+            len(applied), len({e["target_file_abs"] for e in applied}),
+        )
+    )
+    print(json.dumps({
+        "status": "injected_decomposable",
+        "count": len(applied),
+        "requested_n": n,
+        "targets": [
+            {
+                "target_file": e["target_file"],
+                "function": e["function"],
+                "line": e["line"],
+                "mutation_kind": e["mutation_kind"],
+                "test_node": e["test_node"],
+                "test_red_post": e["test_red_post"],
+            }
+            for e in applied
+        ],
+    }, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
 
@@ -1477,6 +1929,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--inject", action="store_true",
                       help="Acquire a target, mutate, verify the test goes red, write manifest.")
+    mode.add_argument("--inject-decomposable", action="store_true",
+                      help="Acquire + mutate N MUTUALLY-ISOLATED pure-leaf functions "
+                           "(N different files, import-disjoint via the AST graph) so "
+                           "they fan out into N parallel L3 subagents. N-entry manifest, "
+                           "revert-ALL byte-identical.")
     mode.add_argument("--revert", action="store_true",
                       help="Restore the original source from the active manifest.")
     mode.add_argument("--status", action="store_true",
@@ -1486,6 +1943,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mode.add_argument("--list-candidates", action="store_true",
                       help="List all viable pure-leaf + green-test targets found.")
 
+    p.add_argument("-n", "--num-targets", type=int, default=3,
+                   help="Number of mutually-isolated targets for --inject-decomposable.")
+    p.add_argument("--require-exact", action="store_true",
+                   help="--inject-decomposable: refuse (no mutation) unless exactly N "
+                        "isolated targets are acquired AND turn red.")
     p.add_argument("--seed", type=int, default=0,
                    help="Deterministic candidate selection rotation (NOT random).")
     p.add_argument("--now", dest="now_iso", default="",
@@ -1526,6 +1988,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.inject:
         return do_inject(cfg)
+    if args.inject_decomposable:
+        return do_inject_decomposable(
+            cfg, n=int(args.num_targets), require_exact=bool(args.require_exact),
+        )
     if args.revert:
         return do_revert(cfg)
     if args.status:
