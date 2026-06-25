@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .signals import IntentSignal
+from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,13 @@ class TestWatcher:
     ) -> None:
         self.repo = repo
         self.test_dir = os.environ.get("JARVIS_INTENT_TEST_DIR", test_dir)
-        self.repo_path = repo_path or os.environ.get("JARVIS_REPO_PATH", ".")
+        # Single authoritative repo root (run-#12 path-mismatch fix):
+        # an explicit *repo_path* wins, else the ``.git``-anchored resolver
+        # (which itself honors ``JARVIS_REPO_PATH`` then walks from ``__file__``
+        # then the CWD). NEVER defaults to bare ``"."`` — the CWD-vs-anchor
+        # disagreement was the live foil that fell the boot-hydration diff back
+        # to the 180s whole-suite sweep. ``str(...)`` keeps the public type.
+        self.repo_path = repo_path or str(resolve_repo_root())
         # Repair Context Bridge (Slice 1): injectable Oracle line->node resolver.
         # ``None`` → lazily resolved from the global Oracle backend at enrich time
         # (fail-soft). Tests inject a fake. Only consulted when the bridge is on.
