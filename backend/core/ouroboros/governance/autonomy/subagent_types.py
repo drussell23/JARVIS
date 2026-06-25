@@ -228,6 +228,14 @@ class WorkUnitResult:
     failure_class: str = ""
     error: str = ""
     causal_parent_id: str = ""
+    # --- L3 per-subagent telemetry (optional, back-compat default None) ---
+    # Worktree lifespan in seconds measured create()->reap (monotonic). None
+    # when no worktree manager was active for this unit (nothing to report).
+    worktree_lifespan_s: Optional[float] = None
+    # DoubleWord inference cost in USD summed across this unit's generation
+    # calls, threaded from the provider's reported ``cost_usd``. Honest-null
+    # (None) when the generation result carried no cost — never fabricated.
+    dw_cost_usd: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.finished_at_ns < self.started_at_ns:
@@ -354,6 +362,9 @@ def work_unit_result_to_dict(result: WorkUnitResult) -> Dict[str, Any]:
         "failure_class": result.failure_class,
         "error": result.error,
         "causal_parent_id": result.causal_parent_id,
+        # L3 telemetry — additive; absent/None for legacy persisted results.
+        "worktree_lifespan_s": result.worktree_lifespan_s,
+        "dw_cost_usd": result.dw_cost_usd,
     }
 
 
@@ -372,6 +383,14 @@ def work_unit_result_from_dict(data: Dict[str, Any]) -> WorkUnitResult:
         failure_class=str(data.get("failure_class", "")),
         error=str(data.get("error", "")),
         causal_parent_id=str(data.get("causal_parent_id", "")),
+        worktree_lifespan_s=(
+            None
+            if data.get("worktree_lifespan_s") is None
+            else float(data["worktree_lifespan_s"])
+        ),
+        dw_cost_usd=(
+            None if data.get("dw_cost_usd") is None else float(data["dw_cost_usd"])
+        ),
     )
 
 
