@@ -886,7 +886,10 @@ def _git_clone_remote_shell(origin_url: str, commit_sha: str, remote_dir: str) -
         f"rm -rf {rd} && "
         f"git clone {url} {rd} && "
         f"git -C {rd} checkout {sha} && "
-        f"git -C {rd} rev-parse HEAD"
+        # Emit the node HEAD behind a UNIQUE MARKER so the parity probe extracts it
+        # reliably -- NOT 'the last streamed line' (a clone/checkout stderr advice
+        # line can land last -> empty -> false parity burn, the run #8 wall).
+        f"echo \"__NODE_HEAD__$(git -C {rd} rev-parse HEAD)\""
     )
 
 
@@ -913,18 +916,27 @@ def git_clone_on_node(
     )
     if rc != 0:
         return False, f"git clone of {origin_url} failed rc={rc}: {''.join(captured).strip()[:300]}"
-    # Parity probe: the LAST non-empty captured line is the node's `rev-parse HEAD`.
+    # Parity probe: extract the node HEAD from behind the unique marker (robust to
+    # interleaved clone/checkout stderr). Burn ONLY on a CONFIRMED real mismatch (a
+    # non-empty DIFFERENT sha). An UNREADABLE probe (empty) with clone rc==0 is a
+    # tooling read-failure, NOT a stale-commit soak -- warn + proceed (the exact-sha
+    # clone succeeded). Burning on an empty read falsely killed run #8.
     node_head = ""
-    for ln in reversed(captured):
+    for ln in captured:
         s = ln.strip()
-        if s:
-            node_head = s
+        if "__NODE_HEAD__" in s:
+            tail = s.split("__NODE_HEAD__", 1)[1].strip().split()
+            node_head = tail[0] if tail else ""
             break
-    if node_head != commit_sha:
+    if node_head and node_head != commit_sha:
         raise GitTransportError(
-            f"node {node} HEAD parity FAILED: node checked out {node_head[:12] or '<none>'} "
+            f"node {node} HEAD parity FAILED: node checked out {node_head[:12]} "
             f"but local soak commit is {commit_sha[:12]} -- mismatch, burn (no stale-commit soak)"
         )
+    if not node_head:
+        _log(f"[parity] WARN: node HEAD probe unreadable (clone rc=0) -- proceeding; "
+             f"the exact-sha clone @ {commit_sha[:12]} succeeded")
+        return True, f"cloned (parity-probe-unreadable, clone ok) @ {commit_sha[:12]}"
     return True, f"cloned + parity-verified @ {commit_sha[:12]}"
 
 
@@ -1347,8 +1359,11 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         # pytest-asyncio is LOAD-BEARING: the repo's conftest has an autouse ASYNC
         # fixture -- without the plugin EVERY test ERRORS at setup -> the chaos
         # injector can never confirm a green test (the runs #4-6 wall).
+        # uuid6 is UNDECLARED in requirements.txt but imported by core governance
+        # (operation_id.py) -- O+V crashes at boot without it (the run #8 wall: the
+        # soak never produced a debug.log, no A1Trace, because the import died).
         "sudo python3 -m pip install --break-system-packages -q aiohttp httpx pydantic "
-        "pytest pytest-asyncio pyyaml requests anyio sniffio fastapi uvicorn orjson 2>&1 | tail -1; "
+        "pytest pytest-asyncio pyyaml requests anyio sniffio fastapi uvicorn orjson uuid6 2>&1 | tail -1; "
         "python3 -c 'import aiohttp; print(\"[deps] aiohttp ok\", aiohttp.__version__)' 2>&1 | tail -1",
     )
     # cd into the synced jarvis repo, install deps, run the surgery. The completion
@@ -1361,6 +1376,15 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
         f"cd {shlex.quote(jr)} && {env} "
         f"{dep_install}; "
         f"({args.surgery_cmd}) 2>&1 | tee /tmp/surgery.out; rc=${{PIPESTATUS[0]}}; "
+        # ---- SYNCHRONOUS TAIL (redundant telemetry) -- dump the raw verdict + the
+        # [A1Trace] hops + the FAILURE LOCUS straight to stdout BEFORE any teardown,
+        # so the trace physically reaches the local terminal even if the Black-Box
+        # scp fails or hangs. Runs on EVERY exit (success or FAILED), unconditionally.
+        "echo '===== SYNCHRONOUS TAIL (raw verdict + A1Trace -> stdout) ====='; "
+        "echo '--- a1_verdict.json ---'; cat a1_runs/*/a1_verdict.json 2>/dev/null | tail -40 || echo '(no verdict file)'; "
+        "echo '--- [A1Trace] hops (O+V debug.log) ---'; grep -hE '\\[A1Trace\\]' .ouroboros/sessions/*/debug.log 2>/dev/null | tail -20 || echo '(no A1Trace lines emitted)'; "
+        "echo '--- FAILURE LOCUS / final O+V state ---'; grep -hE 'FAILURE LOCUS|A1_DISPATCH_PROVEN|VERDICT:|state=applied|SOVEREIGN YIELD|Traceback' /tmp/surgery.out 2>/dev/null | tail -15; "
+        "echo '===== END SYNCHRONOUS TAIL ====='; "
         # verdict-conditional sentinel: only burn on a terminal verdict.
         # Drop the burn-sentinel ONLY on a SUCCESS verdict -- a FAILED A1 verdict
         # ('STEP audit VERDICT: FAILED') must KEEP the node warm so the Black Box
