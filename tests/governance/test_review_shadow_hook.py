@@ -167,7 +167,14 @@ async def test_shadow_on_dispatches_and_emits(
             _candidate_single(path="foo.py", content="# new\npass\n"),
         )
 
-    assert result is None, "observer hook must never return a value"
+    # Post shadow->enforce promotion: the hook now RETURNS the worst-of-N
+    # ReviewAggregate so an OPT-IN enforce branch (JARVIS_REVIEW_SUBAGENT_
+    # ENFORCE, default off) can gate the FSM. The observer itself still
+    # mutates no FSM state — returning a pure data object is not a mutation,
+    # and the caller ignores it when enforce is off (byte-identical shadow).
+    from backend.core.ouroboros.governance.shadow_enforce import ReviewAggregate
+    assert isinstance(result, ReviewAggregate)
+    assert result.aggregate == "APPROVE"
     assert len(spy.calls) == 1
     call = spy.calls[0]
     assert call["file_path"] == "foo.py"
@@ -232,7 +239,11 @@ async def test_shadow_every_verdict_yields_no_fsm_mutation(
     with caplog.at_level(logging.INFO):
         result = await orch._run_review_shadow(_ctx(), _candidate_single())
 
-    assert result is None
+    # The hook now returns a ReviewAggregate (consumed only by the opt-in
+    # enforce branch); the observer mutates NO orchestrator/FSM state, which
+    # is the real contract this test pins.
+    from backend.core.ouroboros.governance.shadow_enforce import ReviewAggregate
+    assert isinstance(result, ReviewAggregate)
     assert orch.__dict__ == pre_state, (
         f"observer mutated orchestrator state under {verdict} verdict"
     )

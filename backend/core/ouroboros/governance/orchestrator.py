@@ -1700,7 +1700,7 @@ class GovernedOrchestrator:
         """
         self._subagent_orchestrator = orch
 
-    async def _run_review_shadow(self, ctx: Any, best_candidate: Any) -> None:
+    async def _run_review_shadow(self, ctx: Any, best_candidate: Any) -> Any:
         """Phase B — post-VALIDATE REVIEW subagent in OBSERVER MODE.
 
         Gated by ``JARVIS_REVIEW_SUBAGENT_SHADOW`` (default **``true``**,
@@ -1731,15 +1731,29 @@ class GovernedOrchestrator:
 
         Must not raise under any condition — the observer contract forbids
         the shadow from breaking the main generation loop.
+
+        Returns a ``shadow_enforce.ReviewAggregate`` describing the worst-of-N
+        verdict (or ``None`` when there was nothing to review / the shadow was
+        skipped). The enforce branch at the call site consumes this to gate
+        the FSM via the EXISTING risk-tier escalation; when REVIEW-enforce is
+        OFF (default) the caller ignores the return and behavior is
+        byte-identical to the legacy shadow. The method itself NEVER gates —
+        it stays a pure observer; gating is the caller's job.
         """
+        from backend.core.ouroboros.governance.shadow_enforce import ReviewAggregate
+
         if best_candidate is None:
-            return
+            return None
         if self._subagent_orchestrator is None:
-            return
+            return None
+        # NOTE: the shadow flag must stay enabled for the REVIEW subagent to
+        # run at all (it is the dispatch gate). REVIEW-enforce composes ON TOP
+        # of the shadow dispatch — it consumes the verdict the shadow already
+        # computes. When the shadow is off there is no verdict to enforce.
         if os.environ.get(
             "JARVIS_REVIEW_SUBAGENT_SHADOW", "true"
         ).lower() not in ("true", "1"):
-            return
+            return None
 
         try:
             _files = best_candidate.get("files") if isinstance(
@@ -1851,12 +1865,32 @@ class GovernedOrchestrator:
                 _counts["failed"],
                 _duration_ms,
             )
+
+            # Build the aggregate the enforce branch consumes. This is a pure
+            # restatement of the telemetry counts already computed above — the
+            # shadow log line and the returned aggregate are the SAME verdict.
+            return ReviewAggregate(
+                aggregate=_aggregate,
+                files_reviewed=len(_verdicts),
+                rejected=_counts["rejected"],
+                reservations=_counts["reservations"],
+                approved=_counts["approved"],
+                failed=_counts["failed"],
+                had_failure=_counts["failed"] > 0,
+            )
         except Exception:
-            # Observer contract: shadow must never break the FSM.
+            # Observer contract: shadow must never break the FSM. A whole-
+            # dispatch crash is a SUBSYSTEM failure -> fail-SOFT to the legacy
+            # shadow behavior: return None so the enforce branch does NOT gate
+            # (never block the op on a telemetry/subsystem failure). This is
+            # distinct from an ambiguous *verdict* (a per-file review that
+            # completes with FAILED status -> had_failure=True -> escalate):
+            # fail-CLOSED is on the verdict, fail-SOFT is on the subsystem.
             logger.debug(
                 "[Orchestrator] REVIEW shadow dispatch skipped",
                 exc_info=True,
             )
+            return None
 
     async def _run_plan_shadow(self, ctx: Any) -> Any:
         """Phase B PLAN-shadow — AgenticPlanSubagent dispatch running
@@ -8761,10 +8795,48 @@ class GovernedOrchestrator:
                         exc_info=True,
                     )
 
-            # ---- REVIEW subagent (Slice 1a — SHADOW MODE observer only) ----
-            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry
-            # only; FSM proceeds to GATE unchanged. See _run_review_shadow.
-            await self._run_review_shadow(ctx, best_candidate)
+            # ---- REVIEW subagent (Slice 1a SHADOW + enforce promotion) ----
+            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW (dispatch) + optionally
+            # JARVIS_REVIEW_SUBAGENT_ENFORCE (default false — gating). The
+            # shadow always emits verdict telemetry; when enforce is OFF the
+            # FSM proceeds to GATE unchanged (byte-identical observer). When
+            # enforce is ON the worst-of-N verdict becomes a HARD risk-tier
+            # gate via the SAME stricter-wins escalation SemanticGuardian uses
+            # (REJECT / ambiguous -> APPROVAL_REQUIRED, reservations ->
+            # NOTIFY_APPLY). Fail-CLOSED on the verdict; fail-SOFT on the
+            # subsystem (a dispatch crash returns None -> no gating, op alive).
+            _review_aggregate = await self._run_review_shadow(ctx, best_candidate)
+            try:
+                from backend.core.ouroboros.governance.shadow_enforce import (
+                    aggregate_to_tier_floor as _agg_to_floor,
+                    escalate_risk_tier as _escalate_tier,
+                    review_enforce_enabled as _review_enforce_on,
+                )
+                if (
+                    _review_enforce_on()
+                    and _review_aggregate is not None
+                    and best_candidate is not None
+                ):
+                    _rv_floor = _agg_to_floor(_review_aggregate)
+                    _rv_before = risk_tier.name
+                    risk_tier = _escalate_tier(risk_tier, _rv_floor)
+                    logger.info(
+                        "[REVIEW-ENFORCE] op=%s aggregate=%s floor=%s "
+                        "risk_before=%s risk_after=%s "
+                        "(verdict gates FSM via existing risk-tier escalation)",
+                        getattr(ctx, "op_id", "?"),
+                        _review_aggregate.aggregate,
+                        _rv_floor or "<none>",
+                        _rv_before,
+                        risk_tier.name,
+                    )
+            except Exception:
+                # Fail-SOFT: an enforce-wiring error must never break the op.
+                # Conservative: leave risk_tier unchanged + log.
+                logger.debug(
+                    "[Orchestrator] REVIEW-enforce gating skipped (fail-soft)",
+                    exc_info=True,
+                )
 
             # ---- MutationGate: APPLY-phase execution boundary (cached) ----
             #

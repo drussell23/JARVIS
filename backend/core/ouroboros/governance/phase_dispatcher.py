@@ -1078,7 +1078,23 @@ async def dispatch_pipeline(
                 parallel_dispatch_enforce_enabled as _enforce_on,
                 parallel_dispatch_shadow_enabled as _shadow_on,
             )
-            if _master_on() and _enforce_on():
+            # PLAN-enforce (JARVIS_PLAN_SUBAGENT_ENFORCE): when the PLAN
+            # subagent produced a genuinely multi-node parallelizable DAG and
+            # PLAN-enforce is ON, the PLAN DAG becomes authoritative and DRIVES
+            # this exact post-GENERATE fan-out path -- even when the
+            # independent parallel_dispatch flags are off. Fail-CLOSED: a
+            # malformed / single-node / empty DAG -> _plan_drives is False ->
+            # the legacy flat-plan GENERATE path proceeds unchanged. The
+            # probe is exception-safe (never raises).
+            try:
+                from backend.core.ouroboros.governance.shadow_enforce import (
+                    plan_enforce_should_fanout as _plan_enforce_should_fanout,
+                )
+                _plan_drives = _plan_enforce_should_fanout(ctx)
+            except Exception:  # noqa: BLE001 -- probe failure -> legacy.
+                _plan_drives = False
+            _legacy_enforce = _master_on() and _enforce_on()
+            if _legacy_enforce or _plan_drives:
                 # Enforce path — fail loud on unexpected errors
                 # (operator directive: narrow catches only on hot
                 # path). asyncio.CancelledError cooperates with
@@ -1099,10 +1115,15 @@ async def dispatch_pipeline(
                         "orchestrator has no _subagent_scheduler reference"
                     )
                 else:
+                    # force bypasses ONLY the parallel_dispatch flag guards
+                    # when the PLAN DAG is the authoritative driver (legacy
+                    # enforce flags off). When the legacy enforce flags ARE on,
+                    # force stays False so behavior is byte-identical to today.
                     _fanout_result = await _enforce_evaluate_fanout(
                         op_id=ctx.op_id,
                         generation=pctx.generation,
                         scheduler=_scheduler,
+                        force=(_plan_drives and not _legacy_enforce),
                     )
                     # Slice 4 ships the submit + await primitive with
                     # loud-fail error handling. The result is ALWAYS

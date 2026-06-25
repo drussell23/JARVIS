@@ -310,6 +310,7 @@ def is_fanout_eligible(
         Callable[[], Tuple[Optional[Posture], Optional[float]]]
     ] = None,
     emit_log: bool = True,
+    force: bool = False,
 ) -> FanoutEligibility:
     """Decide whether (and how aggressively) to fan out a multi-file op.
 
@@ -369,8 +370,10 @@ def is_fanout_eligible(
     n_requested = int(n_candidate_files)
     max_units_cap = parallel_dispatch_max_units()
 
-    # 1. Master flag gate.
-    if not parallel_dispatch_enabled():
+    # 1. Master flag gate. ``force=True`` (the PLAN-enforce driver) bypasses
+    # ONLY this flag check — all downstream clamps (single-file, posture,
+    # memory CRITICAL, max-units, sovereignty) stay fully authoritative.
+    if not force and not parallel_dispatch_enabled():
         result = FanoutEligibility(
             allowed=False,
             n_requested=n_requested,
@@ -1236,6 +1239,7 @@ async def enforce_evaluate_fanout(
         Callable[[], Tuple[Optional[Posture], Optional[float]]]
     ] = None,
     wait_timeout_s: Optional[float] = None,
+    force: bool = False,
 ) -> FanoutResult:
     """Slice 4 — enforce-mode fan-out evaluation + scheduler submit.
 
@@ -1310,21 +1314,27 @@ async def enforce_evaluate_fanout(
         else parallel_dispatch_wait_timeout_s()
     )
 
-    # Guard 1: master flag.
-    if not parallel_dispatch_enabled():
-        logger.debug(
-            "[ParallelDispatch enforce_skipped] op=%s reason=master_off",
-            op_id[:16],
-        )
-        return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="master_off")
+    # Guard 1 + 2: master + enforce sub-flag. ``force=True`` bypasses ONLY
+    # these two FLAG guards (it does NOT relax eligibility, sovereignty, or
+    # graph-build validation below). The PLAN-enforce driver passes force=True
+    # so a genuinely multi-node PLAN DAG can authoritatively engage this exact
+    # fan-out path WITHOUT also flipping the independent JARVIS_WAVE3_PARALLEL_
+    # DISPATCH_* flags. When force is False (every legacy caller) the flag
+    # guards are unchanged -> byte-identical.
+    if not force:
+        if not parallel_dispatch_enabled():
+            logger.debug(
+                "[ParallelDispatch enforce_skipped] op=%s reason=master_off",
+                op_id[:16],
+            )
+            return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="master_off")
 
-    # Guard 2: enforce sub-flag.
-    if not parallel_dispatch_enforce_enabled():
-        logger.debug(
-            "[ParallelDispatch enforce_skipped] op=%s reason=enforce_off",
-            op_id[:16],
-        )
-        return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="enforce_off")
+        if not parallel_dispatch_enforce_enabled():
+            logger.debug(
+                "[ParallelDispatch enforce_skipped] op=%s reason=enforce_off",
+                op_id[:16],
+            )
+            return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="enforce_off")
 
     # Guard 3: candidate extraction.
     files = extract_candidate_files(generation)
@@ -1341,12 +1351,15 @@ async def enforce_evaluate_fanout(
     n_files = len(files)
 
     # Guard 4: eligibility (single-file / empty / memory-critical / posture).
+    # force threads through so the PLAN-enforce driver bypasses ONLY the
+    # master-flag check; all real eligibility clamps remain authoritative.
     eligibility = is_fanout_eligible(
         op_id=op_id,
         n_candidate_files=n_files,
         gate=gate,
         posture_fn=posture_fn,
         emit_log=True,
+        force=force,
     )
     if not eligibility.allowed:
         return FanoutResult(
