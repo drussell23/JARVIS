@@ -1152,6 +1152,15 @@ class GovernedLoopService:
         # background loops so the bidirectional DW->J-Prime->DW failover RUNS.
         self._failover_task: Optional[asyncio.Task] = None
         self._failover_controller: Any = None
+        # Meta-Goal aggregator wiring (the built-but-no-caller fix). The
+        # aggregator (meta_goal_aggregator.py) bundles N disjoint single-file
+        # ops into ONE fan-outable Meta-Goal DAG, but had no live caller — so
+        # this drain loop ticks it alongside the failover loop and routes each
+        # ready Meta-Goal into the EXISTING swarm fan-out path. Gated on
+        # JARVIS_META_GOAL_AGGREGATOR_ENABLED (default OFF -> no task, no
+        # aggregator wired, byte-identical).
+        self._meta_goal_aggregator: Any = None
+        self._meta_goal_drain_task: Optional[asyncio.Task] = None
         self._exhaustion_watcher: Any = None
         self._hibernation_prober: Any = None
         self._hibernate_bridge: Any = None
@@ -1560,6 +1569,15 @@ class GovernedLoopService:
             # Gated on JARVIS_FAILOVER_LIFECYCLE_ENABLED (OFF -> no task,
             # byte-identical). Fail-soft: never blocks/raises into boot.
             self._start_failover_loop()
+
+            # Built-but-no-caller fix — start the Meta-Goal aggregator drain
+            # loop alongside the failover loop. The aggregator bundles N
+            # disjoint pooled single-file ops into ONE fan-outable Meta-Goal
+            # DAG, but nothing fed it / dispatched its output, so isolated
+            # single-file ops dispatched serially (single_file_op, no fan-out).
+            # Gated on JARVIS_META_GOAL_AGGREGATOR_ENABLED (OFF -> no task,
+            # byte-identical). Fail-soft: never blocks/raises into boot.
+            self._start_meta_goal_drain_loop()
 
             # Slice 5 Arc A — start PostureObserver so SensorGovernor's
             # default_posture_fn sees live readings. Without this, posture
@@ -2299,6 +2317,10 @@ class GovernedLoopService:
         # task). Fail-soft; never blocks shutdown.
         await self._stop_failover_loop()
 
+        # Built-but-no-caller fix — cancel the Meta-Goal aggregator drain loop
+        # cleanly (no orphan task). Fail-soft; never blocks shutdown.
+        await self._stop_meta_goal_drain_loop()
+
         # YM-T10 SEAM 1 — cancel the operator-presence watcher daemon
         # alongside the other background tasks. Fail-soft.
         _op_pres_task = getattr(self, "_operator_presence_task", None)
@@ -2889,6 +2911,30 @@ class GovernedLoopService:
 
         Falls back to synchronous submit() if BackgroundAgentPool is not available.
         """
+        # Built-but-no-caller fix — route clean single-file ops through the
+        # Meta-Goal aggregator's intake (when JARVIS_META_GOAL_AGGREGATOR_
+        # ENABLED). The drain loop owns their dispatch: it bundles disjoint
+        # siblings into ONE fan-outable Meta-Goal (swarm fan-out) or flushes
+        # an aged-out single to _bg_pool.submit. OFF / non-single-file / any
+        # error -> offer_ctx returns False and the legacy submit below runs,
+        # byte-identical. The op is never lost.
+        try:
+            from backend.core.ouroboros.governance.meta_goal_wiring import (
+                offer_ctx as _mg_offer_ctx,
+            )
+            if _mg_offer_ctx(self, ctx):
+                _pooled_id = str(getattr(ctx, "op_id", "") or "")
+                logger.info(
+                    "[GovernedLoop] op %s pooled for Meta-Goal aggregation "
+                    "(trigger=%s)", _pooled_id, trigger_source,
+                )
+                return _pooled_id
+        except Exception:  # noqa: BLE001 -- never block the legacy dispatch
+            logger.debug(
+                "[GovernedLoop] meta-goal intake skipped (non-fatal)",
+                exc_info=True,
+            )
+
         if self._bg_pool is not None:
             try:
                 op_id = await self._bg_pool.submit(ctx)
@@ -6721,6 +6767,37 @@ class GovernedLoopService:
             except Exception:  # noqa: BLE001
                 pass
         self._failover_task = None
+
+    def _start_meta_goal_drain_loop(self) -> None:
+        """Start the Meta-Goal aggregator drain loop as a peer background task
+        (the built-but-no-caller fix). Pure delegation to the wiring module —
+        gated on ``JARVIS_META_GOAL_AGGREGATOR_ENABLED`` (default OFF ->
+        byte-identical: no task, no aggregator). Fail-soft; never blocks boot.
+        """
+        try:
+            from backend.core.ouroboros.governance.meta_goal_wiring import (
+                start_meta_goal_drain_loop as _start,
+            )
+            _start(self)
+        except Exception as exc:  # noqa: BLE001 -- never block boot
+            logger.debug(
+                "[GovernedLoop] meta-goal drain loop start skipped: %r", exc,
+            )
+
+    async def _stop_meta_goal_drain_loop(self) -> None:
+        """Cancel the Meta-Goal drain loop cleanly on shutdown. Fail-soft;
+        idempotent; never raises into the shutdown path."""
+        try:
+            from backend.core.ouroboros.governance.meta_goal_wiring import (
+                stop_meta_goal_drain_loop as _stop,
+            )
+            await _stop(self)
+        except Exception:  # noqa: BLE001 -- never block shutdown
+            logger.debug(
+                "[GovernedLoop] meta-goal drain loop stop swallowed",
+                exc_info=True,
+            )
+            self._meta_goal_drain_task = None
 
     async def _curriculum_loop(self) -> None:
         """Publish curriculum signal every interval. Never crashes the service."""

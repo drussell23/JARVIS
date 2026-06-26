@@ -329,6 +329,22 @@ class MetaGoalAggregator:
         """The currently-pooled ops (legacy single-file path consumes these)."""
         return tuple(self._pool)
 
+    def drop_ops(self, op_ids: Sequence[str]) -> int:
+        """Remove the given op-ids from the pool; return how many were dropped.
+
+        Pool bookkeeping (NOT aggregation logic) -- the live wiring calls this
+        when an un-bundled op has aged out of the coalescing window and been
+        flushed to the legacy single-file dispatch, so it does not linger in
+        the pool forever. Mirrors the drain-path drop on the same ``_pool``
+        list. Idempotent -- dropping an absent id is a no-op.
+        """
+        drop = {str(o) for o in op_ids}
+        if not drop:
+            return 0
+        before = len(self._pool)
+        self._pool = [p for p in self._pool if p.op_id not in drop]
+        return before - len(self._pool)
+
     # -- capacity -----------------------------------------------------------
 
     def _effective_worker_cap(self) -> int:
