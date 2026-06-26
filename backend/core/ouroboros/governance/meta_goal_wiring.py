@@ -364,6 +364,20 @@ async def dispatch_ready_bundles(
     """
     if scheduler is None:
         return []
+    # Self-Warming Oracle JIT seam (Omni-Soak v5 fix): async-warm the Oracle for
+    # the window-of-ops the partition is about to probe BEFORE the (sync)
+    # disjointness check, so a cold-node Oracle is JIT-indexed -> disjoint ops
+    # actually bundle instead of all-COLLIDE. No-op when self-warming is OFF
+    # (byte-identical); fail-soft -- a warm error never blocks the drain.
+    try:
+        await aggregator.prewarm_window()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- warm is advisory; drain proceeds cold
+        logger.debug(
+            "[MetaGoalWiring] prewarm_window failed (fail-soft -> cold drain)",
+            exc_info=True,
+        )
     try:
         bundles = aggregator.drain_ready_bundles()
     except Exception:  # noqa: BLE001 -- aggregator error -> legacy fallthrough
