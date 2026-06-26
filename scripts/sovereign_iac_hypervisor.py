@@ -376,6 +376,19 @@ _DEFAULT_HEARTBEAT_IONICE_PRIO = os.environ.get("JARVIS_IAC_HEARTBEAT_IONICE_PRI
 _DEFAULT_HEARTBEAT_STALE_S = float(
     os.environ.get("JARVIS_IAC_HEARTBEAT_STALE_S", "120")
 )
+# Heartbeat DAEMON PID file (the double-forked daemon writes its own PID here so
+# the surgery EXIT trap can reap it on a NORMAL exit -- while the daemon survives
+# the battle_test process-group reaper DURING the soak). Env-tunable; defaults
+# alongside the soak_state path. The `.hb.pid` suffix mirrors the writer's shape.
+_DEFAULT_HEARTBEAT_PID_PATH = os.environ.get(
+    "JARVIS_IAC_HEARTBEAT_PID_PATH", f"{_DEFAULT_SOAK_STATE_PATH}.hb.pid"
+)
+# The DEATH RATTLE phase the daemon writes (atomically) to soak_state.json the
+# instant it is signalled (SIGINT/SIGTERM/EXIT) -- so a kill is INSTANTLY
+# observable to the local poll instead of a 100-min silent stale-out. Env-tunable.
+_DEFAULT_HEARTBEAT_ASSASSINATED_PHASE = os.environ.get(
+    "JARVIS_IAC_HEARTBEAT_ASSASSINATED_PHASE", "HEARTBEAT_ASSASSINATED_BY_SIGNAL"
+)
 
 # Per-phase wall allowances (env-tunable). deps gets a tight budget; the swarm
 # fanout / soak a wider one. Active (advancing heartbeat) extends WITHIN the per-
@@ -1795,17 +1808,66 @@ def _fault_tolerant_obs_enabled(args: argparse.Namespace) -> bool:
     return _env_truthy_off("JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED")
 
 
+def _heartbeat_daemon_inner_program(loop_body: str) -> str:
+    """Build the inner DAEMON program (the SECOND fork's bash -c arg): set the
+    rattle phase var, install the DEATH RATTLE trap (SIGINT/SIGTERM/EXIT), write
+    OUR OWN pid (`$$` of this `bash -c`, the second-fork daemon) to the dedicated PID
+    file, then run the (caller-supplied, reused) writer loop.
+
+    The DEATH RATTLE atomically (temp+mv, reusing the writer's shape) stamps
+    phase=<assassinated_phase> + a fresh ts into soak_state.json BEFORE exiting --
+    so a kill is INSTANTLY observable to the local poll, not a 100-min silent
+    stale-out. Held in a var so the phase string stays ASCII + brace-safe under
+    printf. POSIX-portable -- no Linux-only binaries -- so a test can launch this
+    core directly (via os.setsid) on a host lacking `setsid`/`ionice`."""
+    state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
+    pid_q = shlex.quote(_DEFAULT_HEARTBEAT_PID_PATH)
+    rattle_phase_q = shlex.quote(_DEFAULT_HEARTBEAT_ASSASSINATED_PHASE)
+    rattle = (
+        f"_rattle() {{ _rt={state_q}.rattle.$$; "
+        "printf '{\"phase\":\"%s\",\"status\":\"running\",\"rc\":null,\"ts\":%s,"
+        "\"verdict\":\"running\",\"last_active\":%s,\"step_seq\":-1}\\n' "
+        f"\"$_RATTLE_PHASE\" \"$(date +%s)\" \"$(date +%s)\" "
+        f"> \"$_rt\" 2>/dev/null && mv -f \"$_rt\" {state_q} 2>/dev/null || true; "
+        "exit 0; }; "
+    )
+    # We record `$$` -- the pid of THIS `bash -c '<inner>'` process. Under the
+    # production wrapper the inner runs as `( bash -c '<inner>' & )`, so this bash
+    # IS the second-fork daemon and `$$` is its own pid (portable to bash 3.2,
+    # unlike $BASHPID which is bash >=4.0 only -- macOS /bin/bash is 3.2).
+    return (
+        f"_RATTLE_PHASE={rattle_phase_q}; "
+        f"{rattle}"
+        "trap _rattle SIGINT SIGTERM EXIT; "
+        f"echo $$ > {pid_q} 2>/dev/null || true; "
+        f"{loop_body}"
+    )
+
+
 def _heartbeat_block(args: argparse.Namespace) -> str:
-    """Render the node-side anti-starvation HEARTBEAT (CONSTRAINT 1): a setsid
-    background loop that ATOMICALLY (temp+mv) ticks soak_state.json.last_active +
-    step_seq every ~interval seconds -- even during a long quiet step (deps).
+    """Render the node-side anti-starvation HEARTBEAT (CONSTRAINT 1): a background
+    loop that ATOMICALLY (temp+mv) ticks soak_state.json.last_active + step_seq
+    every ~interval seconds -- even during a long quiet step (deps).
 
     Launched at ELEVATED OS priority (`nice -n -20 ionice -c1 -n0`, realtime IO)
     so a swarm redlining CPU/IO at 100%% can NEVER starve/OOM-kill it -> no false
     heartbeat freeze. `ionice -c1` falls back to `-c2 -n0` (best-effort highest)
     at RUNTIME if -c1 is denied (it needs root/CAP_SYS_ADMIN). The heartbeat reads
     the current phase from the marker file the writer drops, so its ticks carry
-    the live phase. Its PID is exported (_HB_PID) so the EXIT trap can kill it."""
+    the live phase.
+
+    GATING (JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED):
+      OFF -> the LEGACY `setsid ... & _HB_PID=$!` snippet, byte-identical.
+      ON  -> a TRUE DOUBLE-FORK DAEMON: setsid (new session, no controlling TTY)
+             -> fork again (cannot reacquire a TTY, immune to session-group
+             signals) -> writes its own dedicated PID file -> the daemon loop
+             installs a DEATH RATTLE trap (SIGINT/SIGTERM/EXIT) that atomically
+             writes phase=<assassinated> to soak_state.json BEFORE exiting. This
+             survives the battle_test process-group reaper (kill -- -<pgid> /
+             pkill -g) that DETERMINISTICALLY killed the weak setsid loop at
+             soak-launch (the 1815s freeze in Omni-Soak v4/v5/v6), and -- if ever
+             killed -- makes the kill INSTANTLY observable instead of a 100-min
+             silent stale-out."""
     state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
     phase_marker_q = f"{state_q}.phase"
     interval = float(getattr(args, "heartbeat_interval_s", _DEFAULT_HEARTBEAT_INTERVAL_S))
@@ -1831,26 +1893,87 @@ def _heartbeat_block(args: argparse.Namespace) -> str:
         f"sleep {interval}; "
         "done"
     )
-    loop_q = shlex.quote(loop_body)
     nice_q = shlex.quote(nice)
     ioc_q = shlex.quote(ioc)
     iop_q = shlex.quote(iop)
-    # Launch at REALTIME io class -c1 (preferred); on EPERM fall back to the
-    # best-effort highest -c2 -n0. setsid detaches it from the surgery TTY. The
-    # priority prefix is applied to the launched child; the loop body is a single
-    # `bash -c '<program>'` arg so it runs intact in the elevated child.
+
+    # ---- LEGACY path (FT-obs OFF): byte-identical setsid background loop ----- #
+    if not _fault_tolerant_obs_enabled(args):
+        loop_q = shlex.quote(loop_body)
+        # Launch at REALTIME io class -c1 (preferred); on EPERM fall back to the
+        # best-effort highest -c2 -n0. setsid detaches it from the surgery TTY. The
+        # priority prefix is applied to the launched child; the loop body is a single
+        # `bash -c '<program>'` arg so it runs intact in the elevated child.
+        return (
+            "# ---- CONSTRAINT 1: anti-starvation heartbeat (elevated nice/ionice) ----\n"
+            f"if ionice -c{ioc_q} -n{iop_q} true 2>/dev/null; then "
+            f"setsid nice -n {nice_q} ionice -c{ioc_q} -n{iop_q} "
+            f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+            "else "
+            f"setsid nice -n {nice_q} ionice -c2 -n0 "
+            f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+            "fi; "
+            "export _HB_PID; "
+            "echo \"[iac] heartbeat launched pid=$_HB_PID "
+            f"(nice {nice} ionice -c{ioc} -n{iop} realtime, fallback -c2 -n0)\";\n"
+        )
+
+    # ---- DAEMON path (FT-obs ON): double-fork + PID file + DEATH RATTLE ------ #
+    pid_q = shlex.quote(_DEFAULT_HEARTBEAT_PID_PATH)
+    rattle_phase = _DEFAULT_HEARTBEAT_ASSASSINATED_PHASE
+    # The inner daemon program (loop + PID file + death-rattle trap) is built by a
+    # standalone helper so a test can launch JUST that POSIX core (portably, via
+    # os.setsid in a preexec_fn) on a host that lacks the Linux-only `setsid`/
+    # `ionice` binaries the rendered wrapper uses.
+    inner_daemon = _heartbeat_daemon_inner_program(loop_body)
+    inner_q = shlex.quote(inner_daemon)
+    # The SESSION-LEADER program (fork #1, under setsid): it forks the loop into a
+    # backgrounded child subshell (fork #2) and EXITS immediately. The child is a
+    # NON session-leader -> can NEVER reacquire a controlling TTY, and it is
+    # reparented to init when its session-leader parent exits.
+    session_program = (
+        f"( bash -c {inner_q} </dev/null >/dev/null 2>&1 & ) ; exit 0"
+    )
+    daemon_q = shlex.quote(session_program)
+    # TRUE DOUBLE-FORK: `setsid bash -c '( bash -c <loop> & ) ; exit 0'`:
+    #   fork #1 + setsid -> a NEW SESSION leader, no controlling TTY;
+    #   the inner `( ... & )` is fork #2 -> a NON session-leader child in its OWN
+    #     process group, IMMUNE to `kill -- -<pgid>` / `pkill -g` sweeps targeting
+    #     the surgery's process group (the battle_test reaper's weapon);
+    #   the session leader EXITS at once -> the loop child is reparented to init.
+    # </dev/null + full redirection severs all std streams. The OUTER setsid launch
+    # is trailing-`&`+`disown`ed so it is NOT in the surgery's process group either.
+    # The loop child writes ITS OWN `$$` to the PID file; we read it back so the
+    # surgery EXIT trap can reap the real daemon on a NORMAL exit. Priority prefix
+    # wraps the setsid.
+    def _launch(ioc_eff: str, iop_eff: str) -> str:
+        return (
+            f"setsid nice -n {nice_q} ionice -c{ioc_eff} -n{iop_eff} "
+            f"bash -c {daemon_q} </dev/null >/dev/null 2>&1 & "
+        )
+    launch_pref = _launch(ioc_q, iop_q)
+    launch_fallback = _launch("2", "0")
     return (
-        "# ---- CONSTRAINT 1: anti-starvation heartbeat (elevated nice/ionice) ----\n"
+        "# ---- CONSTRAINT 1: anti-starvation heartbeat DAEMON "
+        "(double-fork + PID file + death-rattle) ----\n"
+        # fresh PID file each launch (idempotent relaunch).
+        f": > {pid_q} 2>/dev/null || true; "
         f"if ionice -c{ioc_q} -n{iop_q} true 2>/dev/null; then "
-        f"setsid nice -n {nice_q} ionice -c{ioc_q} -n{iop_q} "
-        f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+        f"{launch_pref}"
         "else "
-        f"setsid nice -n {nice_q} ionice -c2 -n0 "
-        f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+        f"{launch_fallback}"
         "fi; "
-        "export _HB_PID; "
-        "echo \"[iac] heartbeat launched pid=$_HB_PID "
-        f"(nice {nice} ionice -c{ioc} -n{iop} realtime, fallback -c2 -n0)\";\n"
+        # the OUTER setsid bash is disowned so it is NOT in the surgery's process
+        # group; the daemon it forked is reparented to init and writes its own PID.
+        "disown 2>/dev/null || true; "
+        # give the double-fork a brief moment to land its PID file, then read it.
+        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
+        f"[ -s {pid_q} ] && break; sleep 0.2; done; "
+        f"_HB_PID=$(cat {pid_q} 2>/dev/null || true); export _HB_PID; "
+        "echo \"[iac] heartbeat DAEMON launched pid=$_HB_PID "
+        f"(double-fork, pidfile {_DEFAULT_HEARTBEAT_PID_PATH}, death-rattle "
+        f"{rattle_phase}, nice {nice} ionice -c{ioc} -n{iop} realtime, "
+        "fallback -c2 -n0)\";\n"
     )
 
 
@@ -1899,10 +2022,20 @@ def _remote_surgery_body_script(args: argparse.Namespace) -> str:
     # additive (bash runs all EXIT traps -- we chain via a single handler).
     # When the heartbeat is armed the trap ALSO kills the heartbeat PID.
     if ft_obs:
+        # NORMAL-surgery-exit cleanup reaps the heartbeat DAEMON: kill the exported
+        # _HB_PID AND (belt-and-suspenders) the pid recorded in the dedicated PID
+        # file -- so even if _HB_PID was not captured (double-fork race) the daemon
+        # is still reaped on a clean surgery exit. The daemon SURVIVES the
+        # battle_test process-group reaper DURING the soak (different session/pgroup);
+        # only THIS explicit, targeted kill on normal exit takes it down.
+        pid_q = shlex.quote(_DEFAULT_HEARTBEAT_PID_PATH)
         lock_trap = (
             f"echo \"$$\" > {lock_q} 2>/dev/null || true; "
             f"_cleanup() {{ rm -f {lock_q} 2>/dev/null || true; "
-            "[ -n \"${_HB_PID:-}\" ] && kill \"$_HB_PID\" 2>/dev/null || true; }; "
+            "[ -n \"${_HB_PID:-}\" ] && kill \"$_HB_PID\" 2>/dev/null || true; "
+            f"_hbf=$(cat {pid_q} 2>/dev/null || true); "
+            "[ -n \"$_hbf\" ] && kill \"$_hbf\" 2>/dev/null || true; "
+            f"rm -f {pid_q} 2>/dev/null || true; }}; "
             "trap _cleanup EXIT INT TERM; "
         )
     else:
@@ -2502,6 +2635,17 @@ async def _poll_surgery_to_terminal(
         # EXTEND, but CAPPED by MAX_PHASE_CEILING (a zombie ticking-but-stuck
         # swarm is still reaped, no infinite extend).
         if ft_obs:
+            # DEATH RATTLE: the daemon stamps phase=<assassinated_phase> the instant
+            # it is signalled (SIGINT/SIGTERM/EXIT). Treat it as an IMMEDIATE
+            # reap-with-cause -- do NOT wait the full stale allowance; the kill is
+            # already known, so a 100-min silent stale-out is replaced by an
+            # instant, attributed reap.
+            if phase == _DEFAULT_HEARTBEAT_ASSASSINATED_PHASE:
+                _emit(f"[iac] heartbeat DEATH RATTLE: phase='{phase}' -- the daemon "
+                      "was assassinated by a signal -- IMMEDIATE reap-with-cause "
+                      "(no stale-allowance wait)\n")
+                rc, verdict = 137, parse_verdict(captured)
+                break
             cur_active = state.get("last_active")
             try:
                 cur_active_i = int(cur_active) if cur_active is not None else None
@@ -3244,6 +3388,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="heartbeat ionice priority (env JARVIS_IAC_HEARTBEAT_IONICE_PRIO)")
     p.add_argument("--heartbeat-stale-s", type=float, default=_DEFAULT_HEARTBEAT_STALE_S,
                    help="last_active staleness -> heartbeat FROZEN (env JARVIS_IAC_HEARTBEAT_STALE_S)")
+    p.add_argument("--heartbeat-pid-path", default=_DEFAULT_HEARTBEAT_PID_PATH,
+                   help="heartbeat DAEMON pid file (env JARVIS_IAC_HEARTBEAT_PID_PATH)")
+    p.add_argument("--heartbeat-assassinated-phase", default=_DEFAULT_HEARTBEAT_ASSASSINATED_PHASE,
+                   help="death-rattle phase string (env JARVIS_IAC_HEARTBEAT_ASSASSINATED_PHASE)")
     p.add_argument("--global-ceiling-s", type=float, default=_DEFAULT_GLOBAL_CEILING_S,
                    help="global hard wall ceiling, 0=use max-wall (env JARVIS_IAC_GLOBAL_CEILING_SECONDS)")
     p.add_argument("--rescue-retries", type=int, default=_DEFAULT_RESCUE_RETRIES,

@@ -1570,6 +1570,21 @@ class GovernedLoopService:
             # byte-identical). Fail-soft: never blocks/raises into boot.
             self._start_failover_loop()
 
+            # Pre-Flight Init Barrier (Omni-Soak v5/v6 fix) — INGEST the
+            # SHA256-validated oracle_prewarm.json and WARM the shared Oracle
+            # handle BEFORE the drain/flush loops below are scheduled. This is
+            # an ABSOLUTE BLOCKING boot step: the JIT pre-warm was wired into
+            # the drain path (dispatch_ready_bundles -> prewarm_window) but ops
+            # exit via the OTHER path (_flush_aged_ops), which ran its OWN COLD
+            # disjointness check and flushed them to legacy ("no disjoint
+            # sibling found") BEFORE the drain's pre-warm fired. Pre-warming is
+            # an INITIALIZATION event, not a runtime-loop event -> warm the
+            # Oracle here so BOTH _flush_aged_ops AND drain see DISJOINT on the
+            # first tick. Gated on JARVIS_ORACLE_SELF_WARMING_ENABLED (OFF ->
+            # no-op, byte-identical). Fail-soft: missing/mismatch payload logs
+            # + boot proceeds (runtime JIT remains the cold-miss fallback).
+            await self._prewarm_oracle_barrier()
+
             # Built-but-no-caller fix — start the Meta-Goal aggregator drain
             # loop alongside the failover loop. The aggregator bundles N
             # disjoint pooled single-file ops into ONE fan-outable Meta-Goal
@@ -6767,6 +6782,30 @@ class GovernedLoopService:
             except Exception:  # noqa: BLE001
                 pass
         self._failover_task = None
+
+    async def _prewarm_oracle_barrier(self) -> int:
+        """ABSOLUTE PRE-FLIGHT INITIALIZATION BARRIER (Omni-Soak v5/v6 fix).
+
+        Ingest the SHA256-validated ``oracle_prewarm.json`` and warm the
+        shared Oracle handle's ``_file_index`` for the known chaos targets as a
+        **blocking** boot step BEFORE the Meta-Goal drain/flush loops are
+        scheduled. Pure delegation to the wiring module's
+        :func:`ingest_prewarm_barrier` (which REUSES the Oracle's existing
+        ``ingest_prewarm_payload`` -- no new ingester). Gated on
+        ``JARVIS_ORACLE_SELF_WARMING_ENABLED`` (OFF -> no-op, byte-identical).
+        Fail-soft: a missing payload / mismatch / error logs and boot proceeds
+        (the runtime JIT remains the cold-miss fallback). Returns warmed count.
+        """
+        try:
+            from backend.core.ouroboros.governance.meta_goal_wiring import (
+                ingest_prewarm_barrier as _barrier,
+            )
+            return await _barrier(self)
+        except Exception as exc:  # noqa: BLE001 -- never block boot
+            logger.debug(
+                "[GovernedLoop] oracle pre-warm barrier skipped: %r", exc,
+            )
+            return 0
 
     def _start_meta_goal_drain_loop(self) -> None:
         """Start the Meta-Goal aggregator drain loop as a peer background task

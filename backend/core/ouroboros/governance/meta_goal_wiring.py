@@ -67,6 +67,101 @@ logger = logging.getLogger("Ouroboros.MetaGoalWiring")
 _TICK_INTERVAL_FLAG = "JARVIS_META_GOAL_TICK_INTERVAL_S"
 _DEFAULT_TICK_INTERVAL_S = 5.0
 
+# Pre-Flight Init Barrier (Omni-Soak v5/v6 fix) -- the ChaosInjector writes a
+# SHA256-validated pre-warm payload; the Oracle ingests it as a BLOCKING boot
+# step BEFORE the drain/flush loops are ever scheduled, so the disjointness
+# check is never cold at runtime. Env-overridable, never hardcoded.
+_PREWARM_PAYLOAD_FLAG = "JARVIS_ORACLE_PREWARM_PAYLOAD_PATH"
+_DEFAULT_PREWARM_REL_PATH = os.path.join(".jarvis", "oracle_prewarm.json")
+
+
+def oracle_prewarm_payload_path() -> str:
+    """Absolute/relative path to the Oracle pre-warm payload the boot barrier
+    ingests. ``JARVIS_ORACLE_PREWARM_PAYLOAD_PATH`` overrides; default is
+    ``.jarvis/oracle_prewarm.json`` (the path the ChaosInjector writes, mirror
+    of ``scripts/chaos_injector_ast.py::PREWARM_REL_PATH``). Never hardcoded
+    at a call site."""
+    raw = os.environ.get(_PREWARM_PAYLOAD_FLAG, "").strip()
+    return raw or _DEFAULT_PREWARM_REL_PATH
+
+
+async def ingest_prewarm_barrier(host: Any) -> int:
+    """ABSOLUTE PRE-FLIGHT INITIALIZATION BARRIER (Omni-Soak v5/v6 fix).
+
+    Ingest the SHA256-validated ``oracle_prewarm.json`` and WARM the Oracle's
+    ``_file_index`` for the known chaos targets as a **blocking** boot step --
+    called from the GovernedLoopService ``start()`` sequence BEFORE the
+    Meta-Goal drain/flush loops are scheduled (``asyncio.create_task``). The
+    timers literally cannot start until this returns: "the timer cannot start
+    until the brain is fully loaded."
+
+    THE BUG THIS CLOSES: the JIT pre-warm was wired into the *drain* path
+    (``dispatch_ready_bundles -> prewarm_window``), but ops exit via the OTHER
+    path -- ``_flush_aged_ops`` -- which runs its OWN cold disjointness check
+    and flushes them to legacy ("no disjoint sibling found") BEFORE the drain's
+    pre-warm ever fires. Pre-warming is an INITIALIZATION event, not a runtime-
+    loop event. The barrier warms the SHARED Oracle handle that BOTH
+    ``_flush_aged_ops`` AND ``drain_ready_bundles`` partition against, so both
+    see DISJOINT on the very first tick.
+
+    REUSE-only: the Oracle's existing :meth:`ingest_prewarm_payload` (the
+    injector WRITES, the Oracle READS -- no new ingester) is run off the event
+    loop via :func:`asyncio.to_thread` (it is sync blocking IO + AST parse),
+    so the boot coroutine never blocks the loop. The runtime JIT
+    (``ensure_file_indexed`` / ``prewarm_collision_files``) REMAINS the cold-
+    miss fallback for files NOT in the payload -- the barrier is best-effort
+    warm, the JIT is the safety net.
+
+    Gating: a no-op (returns 0, byte-identical) when
+    ``JARVIS_ORACLE_SELF_WARMING_ENABLED`` is OFF, or when there is no Oracle.
+    Fully fail-soft -- a missing payload / sha256 mismatch / ingest error is
+    logged and boot PROCEEDS (the runtime JIT covers it). Returns the number of
+    target files warmed (0 on any no-op / error).
+    """
+    try:
+        from backend.core.ouroboros.governance.collision_matrix import (
+            self_warming_enabled,
+        )
+        if not self_warming_enabled():
+            return 0  # OFF -> no ingest, byte-identical.
+        oracle = getattr(host, "_oracle", None)
+        if oracle is None:
+            return 0
+        ingest = getattr(oracle, "ingest_prewarm_payload", None)
+        if ingest is None:
+            return 0
+        path = oracle_prewarm_payload_path()
+        # ``ingest_prewarm_payload`` is SYNC (blocking read + AST parse). Run it
+        # off the event loop so the barrier is awaited cleanly (async-clean),
+        # but is STILL blocking w.r.t. the boot sequence: create_task for the
+        # drain/flush loops cannot run until this await returns.
+        warmed = await asyncio.to_thread(ingest, path)
+        if warmed:
+            logger.info(
+                "[MetaGoalWiring] Pre-Flight Init Barrier: ingested oracle "
+                "pre-warm payload -> %d chaos target(s) warmed BEFORE the "
+                "drain/flush loops are scheduled (disjointness never cold at "
+                "runtime). path=%s",
+                warmed, path,
+            )
+        else:
+            logger.info(
+                "[MetaGoalWiring] Pre-Flight Init Barrier: no payload warmed "
+                "(missing / sha256 mismatch / empty) -> boot proceeds, runtime "
+                "JIT remains the cold-miss fallback. path=%s",
+                path,
+            )
+        return int(warmed or 0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- barrier is best-effort; never block boot
+        logger.warning(
+            "[MetaGoalWiring] Pre-Flight Init Barrier ingest failed (fail-soft "
+            "-> boot proceeds, runtime JIT fallback active)",
+            exc_info=True,
+        )
+        return 0
+
 # CONSTRAINT 4 -- absolute anti-zombie ceiling on a proof-in-flight hold.
 _PROOF_MAX_WAIT_FLAG = "JARVIS_META_GOAL_PROOF_MAX_WAIT_S"
 _DEFAULT_PROOF_MAX_WAIT_S = 15.0
@@ -618,8 +713,10 @@ async def stop_meta_goal_drain_loop(host: Any) -> None:
 __all__ = [
     "clear_proof_in_flight",
     "dispatch_ready_bundles",
+    "ingest_prewarm_barrier",
     "mark_proof_in_flight",
     "meta_goal_tick_interval_s",
+    "oracle_prewarm_payload_path",
     "pooled_op_from_ctx",
     "proof_max_wait_s",
     "start_meta_goal_drain_loop",
