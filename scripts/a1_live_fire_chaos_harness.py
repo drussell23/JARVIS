@@ -63,6 +63,10 @@ _AUDITOR_SCRIPT = os.path.join(_SCRIPTS_DIR, "a1_graduation_auditor.py")
 _HYPERVISOR_SCRIPT = os.path.join(_SCRIPTS_DIR, "sovereign_iac_hypervisor.py")
 _SENTINEL_SCRIPT = os.path.join(_SCRIPTS_DIR, "sovereign_sentinel.py")
 _LINUX_ENV_OVERLAY = os.path.join(_REPO_ROOT, "deploy", "ouroboros_linux_prod.env")
+# The Omni-Soak overlay: sources the linux base (superset) + flips the full
+# MAS / fan-out stack (WAVE3 parallel dispatch + DAG_COMPOSE + SWARM + the
+# REVIEW/PLAN enforce promotions + safe flags). Armed only under JARVIS_A1_OMNI_SOAK.
+_OMNI_ENV_OVERLAY = os.path.join(_REPO_ROOT, "deploy", "ouroboros_omni_prod.env")
 
 # Cost model for the remote node (e2-standard-8 Spot ~ $0.08/hr; see hypervisor).
 _NODE_COST_PER_HOUR = float(os.environ.get("JARVIS_A1_NODE_COST_PER_HOUR", "0.08"))
@@ -87,6 +91,24 @@ GraduationFailedException = _AUD.GraduationFailedException
 
 def _log(msg: str) -> None:
     print("[A1Harness] %s" % (msg,), flush=True)
+
+
+def _truthy(val: Optional[str]) -> bool:
+    """Standard env truthiness: 1/true/yes/on (case-insensitive)."""
+    return str(val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def omni_soak_enabled(env: Optional[Dict[str, str]] = None) -> bool:
+    """Whether the Omni-Soak is armed via ``JARVIS_A1_OMNI_SOAK`` (default off).
+    When OFF the normal A1 soak is byte-identical (linux overlay + single inject)."""
+    src = env if env is not None else os.environ
+    return _truthy(src.get("JARVIS_A1_OMNI_SOAK"))
+
+
+def _selected_overlay_path(env: Optional[Dict[str, str]] = None) -> str:
+    """The env overlay to compose: the omni overlay when armed, else linux prod.
+    The omni env ``source``s the linux base, so it is a strict superset."""
+    return _OMNI_ENV_OVERLAY if omni_soak_enabled(env) else _LINUX_ENV_OVERLAY
 
 
 # ===========================================================================
@@ -188,8 +210,17 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     caller. Precedence (lowest->highest): process env -> linux overlay -> derived
     cognitive flags -> orchestration-required flags."""
     env: Dict[str, str] = dict(base_env if base_env is not None else os.environ)
-    # 1. Linux production overlay (pytest 180s, AST pool, Claude-disabled autarky).
+    # 1. Production overlay. Always layer the linux base FIRST (pytest caps, AST
+    #    pool, Claude-disabled autarky) -- the omni env `source`s it in bash, which
+    #    the line-based parser cannot follow, so we compose the inheritance here.
+    #    Under JARVIS_A1_OMNI_SOAK we then layer the omni overlay ON TOP (the full
+    #    MAS / fan-out stack), making omni a strict superset. OFF -> linux only,
+    #    byte-identical to the normal A1 soak.
+    overlay_path = _selected_overlay_path(env)
     env.update(_parse_env_overlay(_LINUX_ENV_OVERLAY))
+    if overlay_path != _LINUX_ENV_OVERLAY:
+        env.update(_parse_env_overlay(overlay_path))
+    _log("overlay=%s" % ("omni" if overlay_path == _OMNI_ENV_OVERLAY else "linux_prod",))
     # 2. Every derived cognitive flag ON.
     flags = derive_cognitive_flags()
     for flag in flags:
@@ -300,6 +331,32 @@ class ChaosController:
             _log("chaos inject rc=%d stderr=%s" % (cp.returncode, (cp.stderr or "")[:200]))
         st = self.status()
         return bool(st.get("active")) and bool(st.get("test_red_post"))
+
+    def inject_decomposable(self, n: int = 3) -> "tuple":
+        """Inject N MUTUALLY-ISOLATED pure-leaf bugs (the DecomposableChaosInjector)
+        so the swarm fans out N-way into parallel L3 subagents. Subprocesses the
+        existing ``--inject-decomposable -n N`` CLI and parses its JSON status.
+
+        Returns ``(ok, count)`` where ``ok`` is True iff exactly N targets were
+        injected AND every one went RED (``test_red_post``). Reuses the same
+        ``_run`` / JSON plumbing as ``inject``; revert (the N-entry manifest) is
+        handled byte-identically by the existing ``--revert`` path."""
+        cp = self._run([
+            "--inject-decomposable", "-n", str(n), "--force",
+            "--repo-root", self.repo_root,
+            "--test-timeout", str(self.test_timeout_s),
+        ])
+        if cp.returncode != 0:
+            _log("chaos inject-decomposable rc=%d stderr=%s"
+                 % (cp.returncode, (cp.stderr or "")[:200]))
+        out = self._json_out(cp)
+        targets = out.get("targets") or []
+        count = int(out.get("count", len(targets)))
+        all_red = bool(targets) and all(
+            bool(t.get("test_red_post")) for t in targets
+        )
+        ok = (count == int(n)) and all_red
+        return (ok, count)
 
     def revert(self) -> bool:
         cp = self._run(["--revert", "--repo-root", self.repo_root])
@@ -784,6 +841,15 @@ class HarnessRun:
     autopsy_fn: Callable[..., Any] = local_autopsy
     stub_soak: bool = False
     stub_log_goal: str = "GOAL-A1-STUB"
+    # Omni-Soak: when True the inject step fans out a 3-way decomposable chaos set
+    # (3 mutually-isolated targets) so the MAS / swarm stack fans out 3-way. When
+    # False the inject step uses the single-target path (normal A1 soak, byte-
+    # identical). Set from JARVIS_A1_OMNI_SOAK at build time; default OFF.
+    omni_soak: bool = False
+    # The number of mutually-isolated targets to inject under the Omni-Soak. The 3
+    # targets themselves are DISCOVERED by the injector (not a literal list); this
+    # is only the fan-out width N.
+    omni_targets: int = 3
     env: Optional[Dict[str, str]] = None
     # Black Box Flight Recorder: when set (remote on-node runs), a FAILED verdict
     # runs the checksum-gated, fail-CLOSED teardown decision BEFORE any node burn.
@@ -821,9 +887,18 @@ class HarnessRun:
                 return 1
             _log("STEP preflight OK: %d candidate(s)" % (n,))
 
-            # b. INJECT (real bug, manifest, test confirmed RED).
-            _log("STEP inject: seed=%d" % (self.seed,))
-            red = self.chaos.inject(self.seed)
+            # b. INJECT (real bug, manifest, test confirmed RED). Under the Omni-
+            #    Soak the inject fans out a 3-way decomposable chaos set (3 mutually-
+            #    isolated targets) so the MAS / swarm stack actually fans out 3-way;
+            #    OFF -> the single-target path is byte-identical. Revert-ALWAYS (the
+            #    finally) covers BOTH the single + the N-entry manifest.
+            if self.omni_soak:
+                _log("STEP inject (omni): decomposable n=%d" % (self.omni_targets,))
+                red, decomp_count = self.chaos.inject_decomposable(self.omni_targets)
+            else:
+                _log("STEP inject: seed=%d" % (self.seed,))
+                red = self.chaos.inject(self.seed)
+                decomp_count = 0
             injected = True
             if not red:
                 if self.stub_soak:
@@ -837,6 +912,8 @@ class HarnessRun:
                     _log("STEP inject ABORT: test did not go RED post-injection")
                     verdict = {"proven": False, "failure_locus": "inject:not_red"}
                     return 1
+            elif self.omni_soak:
+                _log("STEP inject OK: %d decomposable targets RED" % (decomp_count,))
             else:
                 _log("STEP inject OK: bug live, test RED")
 
@@ -1131,6 +1208,7 @@ def build_dry_run_local(args: argparse.Namespace) -> HarnessRun:
         soak=None,
         auditor=auditor,
         stub_soak=bool(args.stub_soak),
+        omni_soak=omni_soak_enabled(),
     )
 
 
@@ -1156,6 +1234,7 @@ def build_live_run(args: argparse.Namespace) -> HarnessRun:
         soak=soak,
         auditor=auditor,
         env=env,
+        omni_soak=omni_soak_enabled(env),
     )
 
 
