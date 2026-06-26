@@ -1146,6 +1146,12 @@ class GovernedLoopService:
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._validation_runner: Optional[Any] = None
         self._health_probe_task: Optional[asyncio.Task] = None
+        # Failover (Omni-Soak #3 fix): the FailoverLifecycleController FSM was
+        # built + armed but NEVER ticked during the soak -> J-Prime never awoke
+        # when DW collapsed. This task ticks the controller alongside the other
+        # background loops so the bidirectional DW->J-Prime->DW failover RUNS.
+        self._failover_task: Optional[asyncio.Task] = None
+        self._failover_controller: Any = None
         self._exhaustion_watcher: Any = None
         self._hibernation_prober: Any = None
         self._hibernate_bridge: Any = None
@@ -1545,6 +1551,15 @@ class GovernedLoopService:
                     "[GovernedLoop] C2 transport breaker probe daemon "
                     "skipped (import/gate error): %r", _tcb_exc,
                 )
+
+            # Omni-Soak #3 fix — start the FailoverLifecycleController tick
+            # loop alongside the other background daemons. The FSM
+            # (DORMANT->AWAKENING->SERVING->handback) was BUILT + armed but
+            # NEVER ticked, so J-Prime never awoke when DW collapsed. This
+            # makes the bidirectional DW->J-Prime->DW failover actually RUN.
+            # Gated on JARVIS_FAILOVER_LIFECYCLE_ENABLED (OFF -> no task,
+            # byte-identical). Fail-soft: never blocks/raises into boot.
+            self._start_failover_loop()
 
             # Slice 5 Arc A — start PostureObserver so SensorGovernor's
             # default_posture_fn sees live readings. Without this, posture
@@ -2279,6 +2294,10 @@ class GovernedLoopService:
                     "[GovernedLoop] transport_breaker_probe_task cancel swallowed",
                     exc_info=True,
                 )
+
+        # Omni-Soak #3 — cancel the failover tick loop cleanly (no orphan
+        # task). Fail-soft; never blocks shutdown.
+        await self._stop_failover_loop()
 
         # YM-T10 SEAM 1 — cancel the operator-presence watcher daemon
         # alongside the other background tasks. Fail-soft.
@@ -6574,6 +6593,134 @@ class GovernedLoopService:
                 logger.debug(
                     "[GovernedLoop] transport_breaker_probe_loop error: %s", exc,
                 )
+
+    def _start_failover_loop(self) -> None:
+        """Launch the FailoverLifecycleController tick loop as a peer background
+        task (Omni-Soak #3 fix).
+
+        Gated on ``JARVIS_FAILOVER_LIFECYCLE_ENABLED`` (default OFF in code) --
+        OFF -> NO task is created, byte-identical to before. When ON, the
+        process-wide controller singleton is resolved (it lazily wires its own
+        real awaken / ready / delete boundaries + the ProviderHealthGradient +
+        heartbeat + recovery_forecaster) and an async loop ticks it so the FSM
+        can actually transition (DORMANT->AWAKENING on a real DW outage,
+        SERVING->handback on recovery). Fail-soft: a resolution / scheduling
+        error is logged and swallowed -- a failover bug NEVER blocks boot or
+        crashes the main loop (the op still drops into the Cryo-DLQ as today).
+        Idempotent -- a second call while a live task exists is a no-op.
+        """
+        try:
+            from backend.core.ouroboros.governance.failover_lifecycle import (
+                lifecycle_enabled as _failover_enabled,
+                get_failover_controller as _get_failover_controller,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[GovernedLoop] failover wiring import skipped: %r", exc,
+            )
+            return
+        if not _failover_enabled():
+            # OFF byte-identical: no task started, controller stays DORMANT.
+            return
+        if self._failover_task is not None and not self._failover_task.done():
+            return  # idempotent -- already running
+        try:
+            self._failover_controller = _get_failover_controller()
+            self._failover_task = asyncio.create_task(
+                self._failover_loop(), name="failover_lifecycle_loop",
+            )
+            logger.info(
+                "[GovernedLoop] FailoverLifecycleController tick loop started "
+                "(JARVIS_FAILOVER_LIFECYCLE_ENABLED=true) -- DW->J-Prime->DW "
+                "failover is now LIVE",
+            )
+        except Exception as exc:  # noqa: BLE001 -- never block boot
+            logger.warning(
+                "[GovernedLoop] failover loop start failed (non-fatal): %r", exc,
+            )
+            self._failover_task = None
+
+    async def _failover_loop(self) -> None:
+        """Tick the FailoverLifecycleController on a fixed interval until
+        shutdown. Reuses the controller's own ``tick()`` (NO new FSM / awaken /
+        delete logic) -- this is pure wiring of the existing FSM into the live
+        boot so it actually RUNS.
+
+        Cadence: ``JARVIS_FAILOVER_TICK_INTERVAL_S`` (default 25.0s; floor 1.0s).
+        Fully fail-soft -- a tick exception is logged at DEBUG and the loop
+        continues, so a failover bug never crashes the main loop. CancelledError
+        exits cleanly (uses ``asyncio.sleep``, Python 3.9+ safe).
+        """
+        try:
+            _interval_default = 25.0
+            while True:
+                try:
+                    interval = _interval_default
+                    try:
+                        # Floor 0.01s: guards against a misconfigured busy-loop
+                        # while still allowing fast ticks under test. Operators
+                        # tune the default upward (~25s); production never goes
+                        # sub-second.
+                        interval = max(
+                            0.01,
+                            float(
+                                os.environ.get(
+                                    "JARVIS_FAILOVER_TICK_INTERVAL_S",
+                                    _interval_default,
+                                )
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        interval = _interval_default
+                    ctrl = self._failover_controller
+                    if ctrl is not None:
+                        try:
+                            await ctrl.tick()
+                        except Exception as exc:  # noqa: BLE001 -- fail-soft
+                            logger.debug(
+                                "[GovernedLoop] failover tick fail-soft err=%r",
+                                exc,
+                            )
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- loop never dies
+                    logger.debug(
+                        "[GovernedLoop] failover loop iteration error: %r", exc,
+                    )
+                    try:
+                        await asyncio.sleep(_interval_default)
+                    except asyncio.CancelledError:
+                        raise
+        except asyncio.CancelledError:
+            return
+
+    async def _stop_failover_loop(self) -> None:
+        """Cancel the failover tick loop cleanly on shutdown. Fail-soft;
+        idempotent; never raises into the shutdown path."""
+        task = getattr(self, "_failover_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 -- never block shutdown
+                logger.debug(
+                    "[GovernedLoop] failover loop cancel swallowed",
+                    exc_info=True,
+                )
+        # Best-effort: tell the controller to stop its own internal run() loop
+        # if it happens to be driving one (harmless when it is not).
+        ctrl = getattr(self, "_failover_controller", None)
+        if ctrl is not None:
+            try:
+                stop_fn = getattr(ctrl, "stop", None)
+                if callable(stop_fn):
+                    stop_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        self._failover_task = None
 
     async def _curriculum_loop(self) -> None:
         """Publish curriculum signal every interval. Never crashes the service."""
