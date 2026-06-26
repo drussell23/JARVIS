@@ -1150,7 +1150,7 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
     # overlay (the full MAS/fan-out stack) + the inject step uses the decomposable
     # 3-target injector. Without this prefix the node's compose_env never sees the
     # flag and falls back to the linux_prod overlay (no fan-out).
-    _omni_prefix = "JARVIS_A1_OMNI_SOAK=1 " if _omni_soak_armed(os.environ) else ""
+    _omni_prefix = "JARVIS_A1_OMNI_SOAK=1 " if omni_soak_enabled(os.environ) else ""
     remote_cmd = (
         "JARVIS_IAC_HYPERVISOR_ENABLED=1 " + _omni_prefix
         + "python3 scripts/a1_live_fire_chaos_harness.py "
