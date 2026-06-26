@@ -56,10 +56,12 @@ collision matrix -- production is byte-identical to the pre-matrix path.
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.autonomy.subagent_types import (
     WorkUnitSpec,
@@ -72,6 +74,151 @@ from backend.core.ouroboros.governance.parallel_dispatch import (
 )
 
 logger = logging.getLogger("Ouroboros.CollisionMatrix")
+
+
+# ---------------------------------------------------------------------------
+# Autonomous Self-Warming Oracle (cold-cache fix) -- master gate + JIT walker
+# ---------------------------------------------------------------------------
+#
+# THE BUG (Omni-Soak v4): on a fresh node the Oracle has NO indexed data, so
+# ``_coupled_files`` reads an EMPTY ``find_nodes_in_file`` -> INDETERMINATE ->
+# COLLIDE (zero-trust). The Meta-Goal Aggregator then can never prove N chaos
+# targets disjoint -> ops age out -> ``single_file_op`` (no fan-out). The fix:
+# the Oracle WARMS ITSELF just-in-time on a miss by reusing the existing
+# ``_index_file`` AST indexer. The gate is UPGRADED, never bypassed -- a
+# genuinely coupled / unparseable file still resolves to COLLIDE post-warm.
+#
+# Gating: ``JARVIS_ORACLE_SELF_WARMING_ENABLED`` (default FALSE). OFF ->
+# ``_coupled_files`` behaves EXACTLY as before (miss -> indeterminate ->
+# COLLIDE, no JIT, byte-identical).
+
+_SELF_WARMING_FLAG = "JARVIS_ORACLE_SELF_WARMING_ENABLED"
+_JIT_MAX_DEPTH_FLAG = "JARVIS_ORACLE_JIT_MAX_DEPTH"
+# Hop budget for the JIT walk: depth N indexes the file itself (depth 0) plus
+# up to N import hops. Default 1 == the requested file + its 1-hop neighbours
+# (the spec's "1-hop + the file itself"); the autonomous-omni overlay can widen
+# it. The hard cap (any positive int) guarantees termination even on a deep
+# import chain; the ``visited`` set independently kills circular imports.
+_DEFAULT_JIT_MAX_DEPTH = 1
+
+
+def self_warming_enabled() -> bool:
+    """Master gate for the Autonomous Self-Warming Oracle (default FALSE)."""
+    return os.environ.get(_SELF_WARMING_FLAG, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _jit_max_depth() -> int:
+    """Hard recursion-depth cap for the JIT 1-hop walk (env-tunable, >=1)."""
+    raw = os.environ.get(_JIT_MAX_DEPTH_FLAG, "").strip()
+    if not raw:
+        return _DEFAULT_JIT_MAX_DEPTH
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_JIT_MAX_DEPTH
+
+
+async def _oracle_ensure_file_indexed(
+    oracle: Any,
+    file_path: str,
+    *,
+    _visited: Optional[Set[str]] = None,
+    _depth: int = 0,
+) -> bool:
+    """Shared JIT walker -- index ``file_path`` + its 1-hop import neighbourhood.
+
+    CONSTRAINT 2 (cycle detection + hard depth cap): a ``_visited`` set breaks
+    circular imports (A->B->A) instantly; ``JARVIS_ORACLE_JIT_MAX_DEPTH``
+    bounds the walk so a deep chain can never recurse without limit nor crash.
+
+    The actual single-file parse is delegated to ``oracle._jit_index_single``
+    (which REUSES ``_index_file`` on the real Oracle and is async-dedup'd via
+    in-flight futures -- CONSTRAINT 1). The neighbourhood is read from
+    ``oracle._jit_one_hop_neighbours`` (the existing graph -- no new mapper).
+
+    Returns ``True`` iff the requested file is now indexable. Fail-soft: any
+    error indexing a neighbour is swallowed (it just stays a future JIT miss);
+    only the requested file's own indexability is returned."""
+    if _visited is None:
+        _visited = set()
+    if file_path in _visited:
+        return True  # cycle broken -- already on the stack.
+    _visited.add(file_path)
+
+    max_depth = _jit_max_depth()
+
+    indexed = False
+    try:
+        indexed = bool(await oracle._jit_index_single(file_path))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- fail-soft: parse error -> not indexed
+        logger.debug("[CollisionMatrix.JIT] index failed for %s", file_path, exc_info=True)
+        return False
+
+    # Walk neighbours, depth-bounded. depth 0 = the requested file; we descend
+    # one hop per level and stop once we have spent the hop budget. With the
+    # default cap of 1 this indexes the file + its 1-hop neighbours, no further.
+    if _depth < max_depth:
+        try:
+            neighbours = oracle._jit_one_hop_neighbours(file_path)
+        except Exception:  # noqa: BLE001
+            neighbours = set()
+        for nb in neighbours or ():
+            if nb in _visited:
+                continue
+            try:
+                await _oracle_ensure_file_indexed(
+                    oracle, nb, _visited=_visited, _depth=_depth + 1,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- a neighbour miss never sinks the walk
+                logger.debug(
+                    "[CollisionMatrix.JIT] neighbour index failed for %s", nb,
+                    exc_info=True,
+                )
+    return indexed
+
+
+async def prewarm_collision_files(oracle: Any, files: Sequence[str]) -> int:
+    """Async pre-warm pass run BEFORE the (synchronous) collision partition.
+
+    For each file the Oracle has no data for, JIT-index it (+ its 1-hop
+    neighbourhood) by reusing ``ensure_file_indexed``. This is the seam the
+    Meta-Goal Aggregator calls so that the subsequent SYNC
+    ``build_collision_matrix`` / ``partition_parallel_safe`` see a warmed
+    index and can PROVE disjointness on a cold-boot node.
+
+    Gated OFF -> no-op (byte-identical). Fail-soft -- a JIT error for one file
+    never blocks the others. Returns the count of files warmed-attempted."""
+    if not self_warming_enabled() or oracle is None:
+        return 0
+    ensure = getattr(oracle, "ensure_file_indexed", None)
+    if ensure is None:
+        return 0
+    warmed = 0
+    seen: Set[str] = set()
+    for fp in files:
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        # Skip files already indexed -- no redundant JIT.
+        try:
+            if oracle.find_nodes_in_file(fp):
+                continue
+        except Exception:  # noqa: BLE001 -- probe failed -> attempt the warm
+            pass
+        try:
+            await ensure(fp)
+            warmed += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- fail-soft per file
+            logger.debug("[CollisionMatrix.prewarm] warm failed for %s", fp, exc_info=True)
+    return warmed
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +300,17 @@ def _coupled_files(oracle: Any, file_path: str) -> Optional[set]:
         )
         return None
     if not nodes:
-        # Oracle has no data for this file -> cannot prove disjoint.
-        return None
+        # MISS. Before falling through to indeterminate (-> COLLIDE), give the
+        # self-warming Oracle ONE chance to JIT-index this file + its 1-hop
+        # neighbourhood (reusing _index_file). Gated OFF -> behaves EXACTLY as
+        # before (byte-identical: indeterminate). The gate is UPGRADED, not
+        # bypassed: a genuinely unindexable (parse-error) file still returns
+        # None here -> COLLIDE.
+        if self_warming_enabled():
+            nodes = _sync_warm_and_requery(oracle, file_path)
+        if not nodes:
+            # Oracle has no data for this file -> cannot prove disjoint.
+            return None
 
     coupled: set = set()
     for node in nodes:
@@ -177,6 +333,47 @@ def _coupled_files(oracle: Any, file_path: str) -> Optional[set]:
                 if nf and nf != file_path:
                     coupled.add(nf)
     return coupled
+
+
+def _sync_warm_and_requery(oracle: Any, file_path: str) -> Any:
+    """Self-warming bridge for the SYNC ``_coupled_files`` probe.
+
+    The JIT (``ensure_file_indexed``) is async, but ``_coupled_files`` is sync.
+    When there is NO running event loop (the synchronous partition path) we
+    drive the JIT coroutine to completion and re-query ONCE. When a loop IS
+    already running (the file should have been warmed by the async
+    :func:`prewarm_collision_files` pass), we simply re-query -- we never block
+    a running loop. Fail-soft -> empty on any error (-> indeterminate ->
+    COLLIDE; the gate stays fail-closed)."""
+    ensure = getattr(oracle, "ensure_file_indexed", None)
+    if ensure is None:
+        return []
+    try:
+        running = asyncio.get_event_loop().is_running()
+    except RuntimeError:
+        running = False
+    if not running:
+        loop = None
+        own_loop = False
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            own_loop = True
+        try:
+            loop.run_until_complete(ensure(file_path))
+        except Exception:  # noqa: BLE001 -- JIT error -> stays indeterminate
+            logger.debug("[CollisionMatrix] sync JIT warm failed for %s", file_path, exc_info=True)
+        finally:
+            if own_loop:
+                loop.close()
+    # Re-query ONCE (warmed by either the sync JIT above or the async pre-pass).
+    try:
+        return oracle.find_nodes_in_file(file_path)
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ---------------------------------------------------------------------------

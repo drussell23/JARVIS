@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -58,6 +59,13 @@ if _REPO_ROOT not in sys.path:
 
 INJECTOR_VERSION = "1.0.0"
 MANIFEST_REL_PATH = os.path.join(".jarvis", "chaos_manifest.json")
+# Autonomous Self-Warming Oracle (Component 2) -- the injector serializes its
+# already-computed isolation graph here so the Oracle (backend/) can warm its
+# index for the known targets with ZERO JIT compute during the soak. STRICT
+# separation: the injector WRITES this JSON; the Oracle READS it. No
+# backend->scripts import. SHA256-validated on ingest (discard on mismatch).
+PREWARM_REL_PATH = os.path.join(".jarvis", "oracle_prewarm.json")
+PREWARM_SCHEMA_VERSION = 1
 
 
 def _log(msg: str) -> None:
@@ -1099,6 +1107,91 @@ def _delete_manifest(repo_root: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Autonomous Self-Warming Oracle -- pre-warm payload (Component 2).
+# --------------------------------------------------------------------------- #
+
+def _prewarm_path(repo_root: str) -> str:
+    return os.path.join(repo_root, PREWARM_REL_PATH)
+
+
+def _sha256_of_file(abs_path: str) -> Optional[str]:
+    """SHA256 of a file's bytes (CONSTRAINT 3 -- cryptographic invalidation).
+    ``None`` if unreadable (the target is dropped from the payload)."""
+    try:
+        with open(abs_path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _build_prewarm_payload(repo_root: str, target_abs_paths: Sequence[str]) -> dict:
+    """Serialize the injector's already-computed isolation graph into a payload
+    the Oracle can ingest to warm its index for the known targets.
+
+    REUSES ``_files_are_import_coupled`` (the SAME import-graph math the
+    Collision Matrix proves disjointness with) to record each target's coupled
+    siblings -- no new dependency mapper. The SHA256 of each LIVE target file
+    is recorded so a stale payload (file changed post-inject) is discarded on
+    ingest -> JIT fallback. The hash is taken AT WRITE TIME against the
+    mutated-on-disk file, which is exactly what the Oracle will re-hash."""
+    uniq = []
+    seen = set()
+    for p in target_abs_paths:
+        ap = os.path.abspath(p)
+        if ap not in seen:
+            seen.add(ap)
+            uniq.append(ap)
+    targets = []
+    for ap in uniq:
+        sha = _sha256_of_file(ap)
+        if sha is None:
+            continue  # unreadable -> drop (Oracle would discard anyway)
+        coupled = [
+            other for other in uniq
+            if other != ap and _files_are_import_coupled(repo_root, ap, other)
+        ]
+        targets.append({
+            "file_path": ap,
+            "sha256": sha,
+            "coupled": coupled,
+        })
+    return {
+        "schema_version": PREWARM_SCHEMA_VERSION,
+        "injector_version": INJECTOR_VERSION,
+        "targets": targets,
+    }
+
+
+def _write_prewarm_payload(repo_root: str, target_abs_paths: Sequence[str]) -> None:
+    """Atomically write the pre-warm payload. Fail-soft -- a write failure
+    NEVER fails the inject (the Oracle simply falls back to the JIT)."""
+    try:
+        payload = _build_prewarm_payload(repo_root, target_abs_paths)
+        path = _prewarm_path(repo_root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        _log(
+            "pre-warm payload written: %d target(s) -> %s (Oracle warms its "
+            "index without JIT compute during the soak)" % (
+                len(payload["targets"]), PREWARM_REL_PATH,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- never fail the inject
+        _log("pre-warm payload write skipped (non-fatal): %s" % (exc,))
+
+
+def _delete_prewarm_payload(repo_root: str) -> None:
+    try:
+        os.remove(_prewarm_path(repo_root))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Core operations.
 # --------------------------------------------------------------------------- #
 
@@ -1373,6 +1466,10 @@ def do_revert(cfg: InjectConfig) -> int:
                  "retaining manifest for audit.")
             return 6
         _delete_manifest(cfg.repo_root)
+        # Self-Warming Oracle: the targets are restored, so the pre-warm
+        # payload's hashes are now stale -> remove it (the Oracle would
+        # discard a mismatch anyway, but a clean revert leaves no artifact).
+        _delete_prewarm_payload(cfg.repo_root)
         _log("REVERTED %d decomposable target(s) to byte-identical originals. "
              "Manifest cleared." % (len(entries),))
         return 0
@@ -2510,6 +2607,12 @@ def do_inject_decomposable(
         }
         _write_manifest(cfg.repo_root, manifest)
         accepted = True
+        # Autonomous Self-Warming Oracle (Component 2): serialize the isolation
+        # graph for the accepted targets so the Oracle can warm its index
+        # without JIT compute during the soak. Fail-soft -- never fails inject.
+        _write_prewarm_payload(
+            cfg.repo_root, [e["target_file_abs"] for e in applied],
+        )
         _log(
             "INJECTED decomposable chaos: %d MUTUALLY-ISOLATED target(s) red in %d "
             "distinct file(s). Manifest (schema 2) written." % (
