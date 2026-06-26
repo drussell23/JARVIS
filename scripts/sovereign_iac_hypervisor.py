@@ -280,6 +280,87 @@ def _env_truthy_off(name: str) -> bool:
 
 _FAULT_TOLERANT_OBS_ENABLED = _env_truthy_off("JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED")
 
+
+# --------------------------------------------------------------------------- #
+# SOAK GOLDEN IMAGE (kills the ~20-min pip-install sink).
+#
+# Master gate default-OFF -> the CURRENT debian-12 + full-pip path is byte-
+# identical. When armed AND the jarvis-soak-golden image exists, node-create
+# boots from the golden image (deps pre-installed) and the surgery's deps step
+# DETECTS pre-installed deps and SKIPS the pip install. Staleness: if the
+# image's requirements.txt sha label != the current sha, the deps step
+# DELTA-ensures (pip the missing/changed only) -- never silently runs stale.
+#
+# CONSTRAINT 3 -- INDESTRUCTIBLE bootstrapper: if the golden image fails to boot
+# OR the deps-present probe fails within the verify timeout, the surgery logs a
+# LOUD warning and FALLS BACK to the raw Debian + full pip-install path. A
+# corrupt/missing image NEVER hard-blocks a run (completion > speed).
+# --------------------------------------------------------------------------- #
+_SOAK_GOLDEN_ENABLED = _env_truthy_off("JARVIS_IAC_SOAK_GOLDEN_ENABLED")
+_DEFAULT_SOAK_GOLDEN_IMAGE_FAMILY = os.environ.get(
+    "JARVIS_IAC_SOAK_GOLDEN_IMAGE_FAMILY", "jarvis-soak-golden"
+)
+# The label key the baker stamps the requirements.txt sha into.
+_GOLDEN_REQ_SHA_LABEL = os.environ.get(
+    "JARVIS_IAC_GOLDEN_REQ_SHA_LABEL", "jarvis_req_sha"
+)
+# How long the deps-present probe gets before the indestructible fallback fires.
+_DEFAULT_GOLDEN_VERIFY_TIMEOUT_S = int(
+    os.environ.get("JARVIS_IAC_GOLDEN_VERIFY_TIMEOUT_S", "120")
+)
+# The repo requirements.txt (for the local-side staleness sha compute).
+_DEFAULT_REQUIREMENTS_PATH = os.environ.get(
+    "JARVIS_IAC_REQUIREMENTS_PATH", "requirements.txt"
+)
+# The node-side file the baker stamps the baked requirements sha into (read by
+# the surgery's staleness check). Absent on a non-golden node -> mismatch.
+_GOLDEN_BAKED_SHA_PATH = os.environ.get(
+    "JARVIS_IAC_GOLDEN_BAKED_SHA_PATH", "/etc/jarvis_soak_golden_sha"
+)
+
+
+def _soak_golden_enabled(args: Optional["argparse.Namespace"] = None) -> bool:
+    """Resolve the soak-golden master gate from args (if present) else env.
+    Default-OFF -> the current debian-12 + full-pip behavior (byte-identical)."""
+    if args is not None:
+        val = getattr(args, "soak_golden", None)
+        if val is not None:
+            return bool(val)
+    return _env_truthy_off("JARVIS_IAC_SOAK_GOLDEN_ENABLED")
+
+
+def requirements_sha(req_path: str) -> str:
+    """sha256[:16] of requirements.txt -- the staleness stamp (matches the baker).
+
+    Fail-soft: a missing file yields 'norequirements' so the staleness check
+    treats it as a guaranteed mismatch (delta-ensure / full path), never a crash.
+    """
+    try:
+        data = pathlib.Path(req_path).read_bytes()
+    except Exception:  # noqa: BLE001
+        return "norequirements"
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def golden_image_status(
+    args: argparse.Namespace,
+) -> Tuple[bool, Optional[str]]:
+    """Describe the golden image: (exists, req_sha_label_or_None). Fail-soft.
+
+    Reads the most-recent image in the family + its req-sha label via gcloud.
+    Any failure -> (False, None) so the caller uses the debian-12 + pip path.
+    """
+    family = getattr(args, "soak_golden_image_family", _DEFAULT_SOAK_GOLDEN_IMAGE_FAMILY)
+    rc, out = _run([
+        "gcloud", "compute", "images", "describe-from-family", family,
+        f"--project={args.project}",
+        f"--format=value(labels.{_GOLDEN_REQ_SHA_LABEL})",
+    ])
+    if rc != 0:
+        return False, None
+    label = (out or "").strip() or None
+    return True, label
+
 # Heartbeat: node-side setsid loop interval + elevated OS priority (so a swarm
 # redlining CPU/IO at 100% can NEVER starve/OOM-kill it -> no false freeze).
 _DEFAULT_HEARTBEAT_INTERVAL_S = float(
@@ -860,24 +941,54 @@ def build_startup_script(
 # --------------------------------------------------------------------------- #
 # gcloud / ssh / rsync command builders (pure -- so dry-run can print them).
 # --------------------------------------------------------------------------- #
+def _resolve_node_image(args: argparse.Namespace) -> Tuple[str, str]:
+    """Resolve the (image_family, image_project) the node boots from.
+
+    SOAK GOLDEN (gated default-OFF, byte-identical when off): when
+    JARVIS_IAC_SOAK_GOLDEN_ENABLED AND the jarvis-soak-golden image EXISTS, boot
+    from the golden family in THIS project (deps pre-installed). Otherwise (gate
+    off OR no image) use the configured debian-12 family/project -- byte-identical
+    to the legacy path. Fail-soft: any describe error falls back to debian-12.
+    """
+    if _soak_golden_enabled(args):
+        try:
+            exists, _label = golden_image_status(args)
+        except Exception:  # noqa: BLE001 -- never crash node-create on a probe
+            exists = False
+        if exists:
+            family = getattr(
+                args, "soak_golden_image_family", _DEFAULT_SOAK_GOLDEN_IMAGE_FAMILY
+            )
+            _log(f"[golden] booting from soak golden image family '{family}' "
+                 "(deps pre-installed)")
+            # The golden image lives in THIS project, not debian-cloud.
+            return family, args.project
+        _log("[golden] soak-golden enabled but image absent -- using debian-12 + pip")
+    return args.source_image_family, args.source_image_project
+
+
 def _create_node_cmd(
     args: argparse.Namespace, node: str, startup_script_path: str
 ) -> List[str]:
     """e2-standard-8 (32GB) node, max_run_duration + DELETE (cost ceiling),
     cloud-platform scope (the dead-man needs it). SPOT by default (cheapest);
     --on-demand uses STANDARD for an UNINTERRUPTED window (no preemption) when a
-    multi-stage run needs to complete without a Spot reclaim mid-surgery."""
+    multi-stage run needs to complete without a Spot reclaim mid-surgery.
+
+    Image family/project resolved via _resolve_node_image (soak-golden when
+    enabled+present, else debian-12 -- byte-identical when the gate is off)."""
     on_demand = bool(getattr(args, "on_demand", False))
     sched = (
         ["--provisioning-model=STANDARD"] if on_demand
         else ["--provisioning-model=SPOT"]
     )
+    image_family, image_project = _resolve_node_image(args)
     return [
         "gcloud", "compute", "instances", "create", node,
         f"--project={args.project}", f"--zone={args.zone}",
         f"--machine-type={args.machine_type}",
-        f"--image-family={args.source_image_family}",
-        f"--image-project={args.source_image_project}",
+        f"--image-family={image_family}",
+        f"--image-project={image_project}",
         f"--boot-disk-size={args.boot_disk_size}",
         "--boot-disk-type=pd-balanced",
         *sched,
@@ -1470,9 +1581,36 @@ def _surgery_env_exports() -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# HARD-ENSURE core deps -- the single source of truth (no literal duplication).
+#
+# These are the A1-critical packages the code-repair loop is DEAD without. The
+# surgery's dep-install hard-ensures them after the requirements.txt batch; the
+# golden-image baker bakes EXACTLY this set + requirements.txt so a golden node
+# can SKIP the pip install entirely; and the golden deps-present probe imports a
+# representative subset of these to verify the image is good. Env-overridable so
+# the set is never hardcoded in two places.
+# --------------------------------------------------------------------------- #
+_HARD_ENSURE_DEPS: List[str] = (
+    os.environ.get(
+        "JARVIS_IAC_HARD_ENSURE_DEPS",
+        "aiohttp httpx pydantic pytest pytest-asyncio pyyaml requests anyio "
+        "sniffio fastapi uvicorn orjson uuid6",
+    )
+    .strip()
+    .split()
+)
+
+
+def hard_ensure_deps() -> List[str]:
+    """Return the hard-ensure core dep list (single source of truth)."""
+    return list(_HARD_ENSURE_DEPS)
+
+
 def _surgery_dep_install() -> str:
     """The host-python dep install (heavy pip -- the run-#15 SSH-drop locus).
     Shared verbatim by the legacy single-stream + the detached daemon paths."""
+    _hard_ensure = " ".join(_HARD_ENSURE_DEPS)
     return os.environ.get(
         "JARVIS_IAC_SURGERY_DEP_INSTALL",
         "echo '[deps] installing jarvis host deps (pip from boot; ML libs filtered)'; "
@@ -1503,9 +1641,71 @@ def _surgery_dep_install() -> str:
         # uuid6 is UNDECLARED in requirements.txt but imported by core governance
         # (operation_id.py) -- O+V crashes at boot without it (the run #8 wall: the
         # soak never produced a debug.log, no A1Trace, because the import died).
-        "sudo python3 -m pip install --break-system-packages -q aiohttp httpx pydantic "
-        "pytest pytest-asyncio pyyaml requests anyio sniffio fastapi uvicorn orjson uuid6 2>&1 | tail -1; "
+        "sudo python3 -m pip install --break-system-packages -q " + _hard_ensure + " 2>&1 | tail -1; "
         "python3 -c 'import aiohttp; print(\"[deps] aiohttp ok\", aiohttp.__version__)' 2>&1 | tail -1",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Golden-image-aware deps step (CONSTRAINT 2 + CONSTRAINT 3).
+#
+# When the soak-golden gate is OFF -> returns the legacy full-pip body verbatim
+# (byte-identical). When ON, returns a node-side bash program that:
+#   * probes for the pre-installed deps within the verify timeout;
+#   * deps PRESENT + sha MATCHES   -> SKIP pip (logs the skip line);
+#   * deps PRESENT + sha MISMATCH  -> DELTA-ENSURE (hard-ensure only the core,
+#                                     never silently run stale);
+#   * deps ABSENT / probe FAILS    -> INDESTRUCTIBLE FALLBACK: loud warning +
+#                                     the FULL pip-install path (never blocks).
+# `expected_sha` is computed LOCALLY (the repo requirements.txt) and embedded;
+# the node reads the baked sha from /etc/jarvis_soak_golden_sha (stamped by the
+# baker's image -- absent on a non-golden node -> treated as a mismatch).
+# --------------------------------------------------------------------------- #
+def _surgery_dep_step(args: argparse.Namespace) -> str:
+    """Dispatch the deps step: golden-aware when enabled, else legacy (byte-id)."""
+    if not _soak_golden_enabled(args):
+        return _surgery_dep_install()
+    return _golden_dep_install(args)
+
+
+def _golden_dep_install(args: argparse.Namespace) -> str:
+    """Golden-aware deps body: probe -> skip / delta-ensure / fallback-to-pip."""
+    full_pip = _surgery_dep_install()  # the indestructible fallback path
+    hard_ensure = " ".join(shlex.quote(d) for d in _HARD_ENSURE_DEPS)
+    # Local-side expected sha of THIS checkout's requirements.txt.
+    req_path = getattr(args, "requirements_path", _DEFAULT_REQUIREMENTS_PATH)
+    expected_sha = requirements_sha(req_path)
+    verify_to = int(getattr(args, "golden_verify_timeout_s",
+                            _DEFAULT_GOLDEN_VERIFY_TIMEOUT_S))
+    baked_sha_file = shlex.quote(_GOLDEN_BAKED_SHA_PATH)
+    # The deps-present probe: a representative import of the hard-ensure core. We
+    # wrap it in `timeout` so a hung interpreter can't exceed the verify budget ->
+    # CONSTRAINT 3 fires (fall back to pip) instead of stalling the run.
+    probe = (
+        f"timeout {verify_to} python3 -c "
+        "'import aiohttp, uuid6, fastapi, pydantic, pytest_asyncio' "
+        "2>/tmp/golden_probe_err"
+    )
+    return (
+        "echo '[deps] soak-golden enabled -- probing pre-installed deps'; "
+        f"if {probe}; then "
+        # Deps present. Compare the baked sha to the expected sha for staleness.
+        f"_baked_sha=$(cat {baked_sha_file} 2>/dev/null || echo ''); "
+        f"if [ \"$_baked_sha\" = {shlex.quote(expected_sha)} ]; then "
+        "echo '[deps] golden image -- deps present, skipping install'; "
+        "else "
+        "echo \"[deps] golden image STALE (baked=$_baked_sha "
+        f"expected={expected_sha}) -- delta-ensuring core deps\"; "
+        f"sudo python3 -m pip install --break-system-packages -q {hard_ensure} 2>&1 | tail -1 || true; "
+        "fi; "
+        "else "
+        # CONSTRAINT 3: probe failed within the verify timeout (corrupt/missing
+        # image OR a deps interpreter that won't import). LOUD warning + FULL pip.
+        "echo '[bootstrap] golden image unavailable/unverified -- FALLING BACK "
+        "to raw Debian + full pip install'; "
+        "echo \"[bootstrap] probe stderr: $(tail -3 /tmp/golden_probe_err 2>/dev/null)\"; "
+        f"{full_pip}; "
+        "fi"
     )
 
 
@@ -1543,7 +1743,7 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
     daemon path is OFF (JARVIS_IAC_DETACHED_SURGERY_ENABLED=false) -- byte-identical."""
     jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
     env = _surgery_env_exports()
-    dep_install = _surgery_dep_install()
+    dep_install = _surgery_dep_step(args)
     out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
     # cd into the synced jarvis repo, install deps, run the surgery. The completion
     # sentinel (which arms the node-side dead-man to burn IMMEDIATELY) is dropped
@@ -1646,7 +1846,7 @@ def _remote_surgery_body_script(args: argparse.Namespace) -> str:
     trap. ASCII only, no f-string brace conflicts in the JSON (built via printf)."""
     jr = f"{_REMOTE_TRINITY_ROOT}/jarvis"
     env = _surgery_env_exports()
-    dep_install = _surgery_dep_install()
+    dep_install = _surgery_dep_step(args)
     state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
     lock_q = shlex.quote(_DEFAULT_SOAK_LOCK_PATH)
     out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
@@ -2960,6 +3160,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--boot-disk-size", default=_DEFAULT_BOOT_DISK)
     p.add_argument("--source-image-family", default=_DEFAULT_DEBIAN_IMAGE_FAMILY)
     p.add_argument("--source-image-project", default=_DEFAULT_DEBIAN_IMAGE_PROJECT)
+    # ---- Soak golden image (kills the ~20-min pip-install sink). Default-OFF --- #
+    p.add_argument(
+        "--soak-golden", dest="soak_golden", action="store_true",
+        default=_env_truthy_off("JARVIS_IAC_SOAK_GOLDEN_ENABLED"),
+        help="boot from the jarvis-soak-golden image (deps pre-installed) when it "
+             "exists + skip pip; INDESTRUCTIBLE fallback to debian-12+pip on any "
+             "golden failure (default OFF -> byte-identical debian-12+pip)",
+    )
+    p.add_argument(
+        "--no-soak-golden", dest="soak_golden", action="store_false",
+        help="force the legacy debian-12 + full-pip path (byte-identical OFF path)",
+    )
+    p.add_argument("--soak-golden-image-family", default=_DEFAULT_SOAK_GOLDEN_IMAGE_FAMILY,
+                   help="soak golden image family (env JARVIS_IAC_SOAK_GOLDEN_IMAGE_FAMILY)")
+    p.add_argument("--golden-verify-timeout-s", type=int,
+                   default=_DEFAULT_GOLDEN_VERIFY_TIMEOUT_S,
+                   help="deps-present probe budget before the indestructible "
+                        "fallback fires (env JARVIS_IAC_GOLDEN_VERIFY_TIMEOUT_S)")
+    p.add_argument("--requirements-path", default=_DEFAULT_REQUIREMENTS_PATH,
+                   help="requirements.txt for the staleness sha (env JARVIS_IAC_REQUIREMENTS_PATH)")
     p.add_argument("--max-run-duration-s", type=int, default=_DEFAULT_MAX_RUN_DURATION_S,
                    help="GCP hard ceiling (env JARVIS_IAC_MAX_RUN_DURATION_S)")
     p.add_argument("--ready-timeout-s", type=int, default=_DEFAULT_READY_TIMEOUT_S)
