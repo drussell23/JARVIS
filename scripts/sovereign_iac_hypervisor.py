@@ -977,7 +977,15 @@ def _create_node_cmd(
 
     Image family/project resolved via _resolve_node_image (soak-golden when
     enabled+present, else debian-12 -- byte-identical when the gate is off)."""
-    on_demand = bool(getattr(args, "on_demand", False))
+    # on-demand (STANDARD, no Spot preemption) when the CLI flag is set OR the
+    # JARVIS_IAC_ON_DEMAND env override is truthy -- the env path is what lets a
+    # programmatic caller (the harness builds the args Namespace, not the CLI)
+    # force a non-preemptible node for a long multi-stage soak that must not be
+    # reclaimed mid-feast.
+    on_demand = bool(getattr(args, "on_demand", False)) or (
+        os.environ.get("JARVIS_IAC_ON_DEMAND", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     sched = (
         ["--provisioning-model=STANDARD"] if on_demand
         else ["--provisioning-model=SPOT"]
@@ -1438,7 +1446,13 @@ def provision_sandbox_node(
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(startup_script)
-        _log(f"provisioning {node} (e2-standard-8 SPOT, 32GB, DELETE-on-preempt)")
+        _prov_mode = (
+            "ON-DEMAND/STANDARD"
+            if os.environ.get("JARVIS_IAC_ON_DEMAND", "").strip().lower()
+            in ("1", "true", "yes", "on")
+            else "SPOT, DELETE-on-preempt"
+        )
+        _log(f"provisioning {node} (e2-standard-8 {_prov_mode}, 32GB)")
         rc, captured = _run_streaming_labeled(
             _create_node_cmd(args, node, sp_path),
             label="provision", log_path=log_path, timeout_s=300.0,
