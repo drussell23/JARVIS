@@ -62,6 +62,7 @@ Constraints honoured
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -383,6 +384,72 @@ class MetaGoalAggregator:
             target_files=(op.file_path,),
             owned_paths=(op.file_path,),
         )
+
+    async def prewarm_window(self) -> int:
+        """Self-Warming Oracle JIT seam -- async-warm the Oracle for the ops in
+        the coalescing window BEFORE the (sync) disjointness partition.
+
+        The bug this closes (Omni-Soak v5): ``drain_ready_bundles`` is SYNC and
+        runs the zero-trust collision partition against ``self._oracle``. On a
+        fresh node the Oracle has NO data for the pooled files, so every
+        cross-file pair is INDETERMINATE -> COLLIDE and nothing bundles
+        ("aged out ... no disjoint sibling found"). ``prewarm_collision_files``
+        (built, but never AWAITED from the live bundle path) JIT-indexes those
+        files so the subsequent ``_coupled_files`` probe finds them indexed ->
+        DISJOINT -> the disjoint set BUNDLES.
+
+        REUSE-only: warms the SAME window ``drain_ready_bundles`` will partition,
+        via the SAME injected ``self._oracle`` handle and the existing
+        ``prewarm_collision_files`` (which itself reuses ``ensure_file_indexed``).
+        No new Oracle is constructed; no new logic.
+
+        Gating: a no-op (returns 0, byte-identical) when the Meta-Goal master is
+        OFF, when ``JARVIS_ORACLE_SELF_WARMING_ENABLED`` is OFF (the
+        ``prewarm_collision_files`` gate), or when there is no Oracle. Fully
+        fail-soft -- a warm error is swallowed and the drain falls through to
+        the existing COLD behaviour (COLLIDE), never crashing the drain.
+
+        Returns the count of files warmed-attempted (0 on any no-op / error).
+        """
+        if not meta_goal_aggregator_enabled():
+            return 0
+        try:
+            from backend.core.ouroboros.governance.collision_matrix import (
+                prewarm_collision_files,
+                self_warming_enabled,
+            )
+
+            if not self_warming_enabled() or self._oracle is None:
+                return 0
+            now = time.monotonic()
+            window = self._window_ops(now, meta_goal_coalesce_window_s())
+            if len(window) < meta_goal_min_ops():
+                return 0
+            # De-duped file set the partition will probe -- same notion as the
+            # drain (each pooled op owns a single target file).
+            files: List[str] = []
+            seen: set = set()
+            for op in window:
+                fp = getattr(op, "file_path", None)
+                if fp and fp not in seen:
+                    seen.add(fp)
+                    files.append(fp)
+            if not files:
+                return 0
+            logger.info(
+                "[MetaGoal] pre-warming oracle for %d files before "
+                "disjointness check (self-warming JIT)",
+                len(files),
+            )
+            return await prewarm_collision_files(self._oracle, files)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- warm is advisory; never sink the drain
+            logger.debug(
+                "[MetaGoal] prewarm_window failed (fail-soft -> cold partition)",
+                exc_info=True,
+            )
+            return 0
 
     def drain_ready_bundles(self) -> List[MetaGoalBundle]:
         """Form + return all ready Meta-Goal bundles; drain bundled ops.
