@@ -101,6 +101,18 @@ _ARM_FLAGS = (
 )
 _GOLDEN_FLAG = "JARVIS_IAC_SOAK_GOLDEN_ENABLED"
 
+# Node-lifetime env the soak inherits so the IAC node is ON-DEMAND (NOT Spot --
+# a preempted Spot node vanishes mid-soak and kills the run) with a long
+# dead-man / max-run / idle horizon that outlives the ~1.5h pipeline. Applied
+# with setdefault semantics: an explicit operator env value always wins.
+_NODE_LIFETIME_ENV = {
+    "JARVIS_IAC_ON_DEMAND": os.environ.get("JARVIS_LAUNCHER_IAC_ON_DEMAND", "1"),
+    "JARVIS_IAC_MAX_RUN_DURATION_S": os.environ.get("JARVIS_LAUNCHER_IAC_MAX_RUN_DURATION_S", "7200"),
+    "JARVIS_IAC_NODE_IDLE_TIMEOUT_S": os.environ.get("JARVIS_LAUNCHER_IAC_NODE_IDLE_TIMEOUT_S", "7200"),
+    "JARVIS_IAC_DEADMAN_IDLE_TIMEOUT_S": os.environ.get("JARVIS_LAUNCHER_IAC_DEADMAN_IDLE_TIMEOUT_S", "7200"),
+    "JARVIS_IAC_MAX_WALL_SECONDS": os.environ.get("JARVIS_LAUNCHER_IAC_MAX_WALL_SECONDS", "6000"),
+}
+
 
 # --------------------------------------------------------------------------- #
 # Reuse the baker's requirements_sha (single source of truth, NO dup). Fail-soft:
@@ -396,6 +408,10 @@ def _compose_soak_env(golden_armed: bool) -> Dict[str, str]:
     env = dict(os.environ)
     for flag in _ARM_FLAGS:
         env[flag] = "1"
+    # Node-lifetime: on-demand + long horizon so the soak node never gets
+    # Spot-preempted or dead-man-reaped mid-feast. setdefault -> explicit env wins.
+    for key, val in _NODE_LIFETIME_ENV.items():
+        env.setdefault(key, val)
     if golden_armed:
         env[_GOLDEN_FLAG] = "1"
     else:
