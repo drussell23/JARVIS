@@ -84,6 +84,8 @@ _DEFAULT_REQUIREMENTS = os.environ.get(
 )
 _DEFAULT_BAKE_TIMEOUT_S = int(os.environ.get("JARVIS_LAUNCHER_BAKE_TIMEOUT_S", "2700"))
 _DEFAULT_SOAK_TIMEOUT_S = int(os.environ.get("JARVIS_LAUNCHER_SOAK_TIMEOUT_S", "0"))  # 0 = no harness-side cap
+_DEFAULT_COST_CAP = float(os.environ.get("JARVIS_LAUNCHER_COST_CAP", "12.0"))  # USD money guardrail forwarded to the harness
+_DEFAULT_MAX_WALL_S = int(os.environ.get("JARVIS_LAUNCHER_MAX_WALL_S", "3000"))  # harness --max-wall-seconds
 _DEFAULT_SWEEP_TIMEOUT_S = float(os.environ.get("JARVIS_LAUNCHER_SWEEP_TIMEOUT_S", "300"))
 
 # The stray-instance name prefixes the sweep reaps (env-tunable, comma-list).
@@ -149,6 +151,7 @@ class Config:
         "project", "zone", "image_family", "req_sha_label", "requirements",
         "bake_timeout_s", "soak_timeout_s", "sweep_timeout_s",
         "bake_prefix", "soak_prefix", "dry_run", "money_gate",
+        "cost_cap", "max_wall_s",
     )
 
     def __init__(self, **kw):
@@ -164,6 +167,8 @@ class Config:
         self.soak_prefix = kw.get("soak_prefix", _SOAK_NODE_PREFIX)
         self.dry_run = kw.get("dry_run", False)
         self.money_gate = kw.get("money_gate", False)
+        self.cost_cap = kw.get("cost_cap", _DEFAULT_COST_CAP)
+        self.max_wall_s = kw.get("max_wall_s", _DEFAULT_MAX_WALL_S)
 
 
 def build_config(args: Optional[argparse.Namespace] = None) -> Config:
@@ -174,6 +179,8 @@ def build_config(args: Optional[argparse.Namespace] = None) -> Config:
         requirements=args.requirements, bake_timeout_s=args.bake_timeout_s,
         dry_run=getattr(args, "dry_run", False),
         money_gate=getattr(args, "money_gate", False),
+        cost_cap=getattr(args, "cost_cap", _DEFAULT_COST_CAP),
+        max_wall_s=getattr(args, "max_wall_s", _DEFAULT_MAX_WALL_S),
     )
 
 
@@ -273,6 +280,8 @@ def run_soak(cfg: Config, env: Dict[str, str]) -> int:
     argv = [
         sys.executable, _HARNESS_SCRIPT,
         "--remote", "--i-understand-this-spends-money",
+        "--cost-cap", str(cfg.cost_cap),
+        "--max-wall-seconds", str(cfg.max_wall_s),
     ]
     _log("STEP soak: transitioning to the Omni-Soak (--remote)")
     _log("  " + " ".join(argv))
@@ -482,6 +491,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="golden image family (env JARVIS_IAC_SOAK_GOLDEN_IMAGE_FAMILY)")
     p.add_argument("--requirements", default=_DEFAULT_REQUIREMENTS,
                    help="requirements.txt path (env JARVIS_SOAK_BAKE_REQUIREMENTS)")
+    p.add_argument("--cost-cap", dest="cost_cap", type=float, default=_DEFAULT_COST_CAP,
+                   help="USD money guardrail forwarded to the harness (env JARVIS_LAUNCHER_COST_CAP)")
+    p.add_argument("--max-wall-seconds", dest="max_wall_s", type=int, default=_DEFAULT_MAX_WALL_S,
+                   help="harness --max-wall-seconds (env JARVIS_LAUNCHER_MAX_WALL_S)")
     p.add_argument("--bake-timeout-s", type=int, default=_DEFAULT_BAKE_TIMEOUT_S,
                    help="bake readiness timeout (env JARVIS_LAUNCHER_BAKE_TIMEOUT_S)")
     mode = p.add_mutually_exclusive_group()
