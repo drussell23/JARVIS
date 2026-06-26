@@ -3736,6 +3736,264 @@ class TheOracle:
                     pass
 
     # =========================================================================
+    # SELF-WARMING JIT (Autonomous Self-Warming Oracle) -- COLD-CACHE FIX
+    # =========================================================================
+    #
+    # On a fresh node the graph is EMPTY, so ``find_nodes_in_file`` returns
+    # ``[]`` -> the CollisionMatrix reads INDETERMINATE -> COLLIDE (zero-trust)
+    # -> the Meta-Goal Aggregator can never prove N chaos targets disjoint ->
+    # ops age out -> ``single_file_op`` (no fan-out). These methods let the
+    # Oracle WARM ITSELF just-in-time on a miss by REUSING the existing
+    # ``_index_file`` single-file AST indexer (NO new parser). The safety gate
+    # is UPGRADED, never bypassed: a genuinely import-coupled / unparseable
+    # file still resolves to COLLIDE after warming.
+
+    def find_nodes_in_file(self, file_path: str) -> "List[NodeID]":
+        """Proxy to the graph's per-file node lookup (the CollisionMatrix
+        probe surface). Reads warmed + JIT-indexed state transparently."""
+        return self._graph.find_nodes_in_file(file_path)
+
+    def _jit_one_hop_neighbours(self, file_path: str) -> "Set[str]":
+        """One-hop import/call neighbours of ``file_path`` from the EXISTING
+        graph (no new dependency mapper). Used by the JIT to decide the small
+        neighbourhood to warm. Fail-soft -> empty set on any graph error."""
+        out: Set[str] = set()
+        try:
+            nodes = self._graph.find_nodes_in_file(file_path)
+        except Exception:  # noqa: BLE001
+            return out
+        for node in nodes:
+            for probe in ("get_dependencies", "get_dependents"):
+                fn = getattr(self._graph, probe, None)
+                if fn is None:
+                    continue
+                try:
+                    neighbours = fn(node)
+                except Exception:  # noqa: BLE001
+                    continue
+                for nb in neighbours or ():
+                    nf = getattr(nb, "file_path", None)
+                    if isinstance(nf, str) and nf and nf != file_path:
+                        out.add(nf)
+        return out
+
+    def _resolve_repo_for_file(self, file_path: str) -> "Optional[Tuple[str, Path]]":
+        """Map an absolute/relative file path to its (repo_name, repo_path).
+        Returns ``None`` when the file lives outside every known repo."""
+        try:
+            p = Path(file_path).resolve()
+        except Exception:  # noqa: BLE001
+            return None
+        best: "Optional[Tuple[str, Path]]" = None
+        best_len = -1
+        for repo_name, repo_path in self._repos.items():
+            try:
+                rp = Path(repo_path).resolve()
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                p.relative_to(rp)
+            except ValueError:
+                continue
+            n = len(str(rp))
+            if n > best_len:
+                best = (repo_name, rp)
+                best_len = n
+        return best
+
+    async def _jit_index_single(self, file_path: str) -> bool:
+        """JIT-index ONE file by REUSING ``_index_file`` (no new parser).
+
+        Async-dedup (CONSTRAINT 1): concurrent calls for the same path AWAIT
+        the single in-flight future; the underlying parse runs ONCE. The
+        in-flight entry is removed in a ``finally`` so a failed parse never
+        wedges a path. Returns ``True`` iff the file ended up with >=1 node
+        in the graph (i.e. it was indexable)."""
+        in_flight = getattr(self, "_in_flight_indexes", None)
+        if in_flight is None:
+            in_flight = {}
+            self._in_flight_indexes = in_flight
+        existing = in_flight.get(file_path)
+        if existing is not None:
+            return await existing
+        fut = asyncio.ensure_future(self._jit_index_single_inner(file_path))
+        in_flight[file_path] = fut
+        try:
+            return await fut
+        finally:
+            in_flight.pop(file_path, None)
+
+    async def _jit_index_single_inner(self, file_path: str) -> bool:
+        resolved = self._resolve_repo_for_file(file_path)
+        if resolved is None:
+            return False
+        repo_name, repo_path = resolved
+        try:
+            await self._index_file(repo_name, repo_path, Path(file_path))
+        except Exception:  # noqa: BLE001 -- JIT is fail-soft (parse error etc.)
+            logger.debug("[Oracle.JIT] _index_file raised for %s", file_path, exc_info=True)
+            return False
+        # When the async graph-write queue is enabled, the node may still be
+        # in flight; drain it so the index reflects the parse synchronously.
+        try:
+            await self._drain_graph_write_queue_if_any()
+        except Exception:  # noqa: BLE001
+            pass
+        # Alias the absolute path so the collision probe resolves either form.
+        try:
+            self._alias_file_index(Path(file_path), repo_path)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return bool(self._graph.find_nodes_in_file(file_path))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _drain_graph_write_queue_if_any(self) -> None:
+        """Best-effort flush of any pending async graph-write batch so a JIT
+        index is observable immediately. No-op when the queue is unused."""
+        q = getattr(self, "_graph_write_queue", None)
+        if q is None:
+            return
+        # Yield once so the consumer task can drain what we enqueued.
+        try:
+            await asyncio.sleep(0)
+            if hasattr(q, "join"):
+                # Bounded wait: never hang the JIT on a stuck consumer.
+                await asyncio.wait_for(q.join(), timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def ensure_file_indexed(
+        self,
+        file_path: str,
+        *,
+        _visited: "Optional[Set[str]]" = None,
+        _depth: int = 0,
+    ) -> bool:
+        """JIT-index ``file_path`` + its 1-hop import neighbourhood on a miss.
+
+        Delegates to the shared JIT walker (cycle-detect via ``_visited`` +
+        a hard depth cap ``JARVIS_ORACLE_JIT_MAX_DEPTH``). REUSES
+        ``_index_file`` for the actual parse -- no new AST parser. Returns
+        ``True`` iff the requested file is now indexed. Fail-soft."""
+        from backend.core.ouroboros.governance.collision_matrix import (
+            _oracle_ensure_file_indexed,
+        )
+        return await _oracle_ensure_file_indexed(
+            self, file_path, _visited=_visited, _depth=_depth,
+        )
+
+    def ingest_prewarm_payload(self, path: str) -> int:
+        """Warm ``_file_index`` from a ChaosInjector pre-warm payload.
+
+        STRICT separation: the injector (``scripts/``) WRITES the JSON; the
+        Oracle (``backend/``) READS it -- no backend->scripts import.
+
+        CONSTRAINT 3 (cryptographic invalidation): each target carries the
+        SHA256 of its source. We hash the LIVE file; if ANY target's hash
+        mismatches (or a target file is unreadable), the ENTIRE payload is
+        DISCARDED and we return 0 -> the caller falls back to the JIT. A
+        missing / corrupt / schema-bad payload also returns 0 (graceful).
+
+        Returns the number of target files warmed (0 on any discard)."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return 0
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 -- missing / corrupt -> graceful no-op
+            logger.debug("[Oracle.prewarm] payload unreadable: %s", path, exc_info=True)
+            return 0
+        targets = data.get("targets") if isinstance(data, dict) else None
+        if not isinstance(targets, list) or not targets:
+            return 0
+
+        # CONSTRAINT 3 -- verify EVERY target's live hash BEFORE warming any.
+        verified: List[Tuple[str, list]] = []
+        for entry in targets:
+            try:
+                fp = str(entry.get("file_path") or "").strip()
+                want_sha = str(entry.get("sha256") or "").strip().lower()
+                coupled = entry.get("coupled") or []
+                if not fp or not want_sha:
+                    return 0
+                live = Path(fp)
+                if not live.exists():
+                    return 0
+                got_sha = hashlib.sha256(live.read_bytes()).hexdigest()
+                if got_sha != want_sha:
+                    logger.info(
+                        "[Oracle.prewarm] sha256 mismatch for %s -> DISCARD "
+                        "entire payload, fall back to JIT", fp,
+                    )
+                    return 0
+                verified.append((fp, list(coupled)))
+            except Exception:  # noqa: BLE001 -- any error -> discard payload
+                logger.debug("[Oracle.prewarm] entry validation error", exc_info=True)
+                return 0
+
+        # All hashes matched -> warm by REUSING the real AST indexer so the
+        # graph carries real nodes/edges (not synthetic markers). Index is
+        # populated lazily on first query; here we eagerly index each target.
+        warmed = 0
+        for fp, _coupled in verified:
+            resolved = self._resolve_repo_for_file(fp)
+            if resolved is None:
+                # File outside every known repo (e.g. an operator-staged or
+                # test fixture path). Warm it under a synthetic repo rooted at
+                # its parent so the existing indexer still produces real nodes.
+                fp_path = Path(fp)
+                resolved = ("_prewarm", fp_path.parent)
+            repo_name, repo_path = resolved
+            try:
+                # Synchronous, fail-soft warm via the existing single-file
+                # indexer. We run it to completion off any event loop concern
+                # by reusing the read+parse+visit blocking worker directly.
+                self._warm_one_blocking(repo_name, repo_path, Path(fp))
+                warmed += 1
+            except Exception:  # noqa: BLE001
+                logger.debug("[Oracle.prewarm] warm failed for %s", fp, exc_info=True)
+        return warmed
+
+    def _warm_one_blocking(self, repo_name: str, repo_path: Path, file_path: Path) -> None:
+        """Synchronously parse+index ONE file into the graph by REUSING the
+        existing blocking read/parse/visit worker (``_read_parse_visit_blocking``)
+        -- the SAME logic ``_index_file`` drives, no new parser. Used by the
+        pre-warm path so a payload warm needs no event loop."""
+        parse_result = self._read_parse_visit_blocking(repo_name, repo_path, file_path)
+        if parse_result is None:
+            return
+        nodes, edges, cache_key, content_hash = parse_result
+        self._file_hashes[cache_key] = content_hash
+        for node_data in nodes:
+            self._graph.add_node(node_data)
+        for source, target, edge_data in edges:
+            self._graph.add_edge(source, target, edge_data)
+        # The graph keys nodes by their relative ``file_path``. The collision
+        # probe may query by the absolute path the payload/op carries, so add a
+        # lookup alias from the absolute path to the same node keys -> a warm
+        # is observable regardless of which path form the probe uses.
+        self._alias_file_index(file_path, repo_path)
+
+    def _alias_file_index(self, file_path: Path, repo_path: Path) -> None:
+        """Mirror a file's node-keys under its ABSOLUTE path in the graph's
+        ``_file_index`` so ``find_nodes_in_file`` resolves either path form.
+        Fail-soft -- a missing relative entry is a no-op."""
+        try:
+            rel = str(file_path.relative_to(repo_path))
+        except ValueError:
+            rel = str(file_path)
+        abs_str = str(file_path)
+        try:
+            idx = self._graph._file_index
+            keys = idx.get(rel)
+            if keys and abs_str != rel:
+                idx[abs_str].update(keys)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # =========================================================================
     # QUERY INTERFACE
     # =========================================================================
 

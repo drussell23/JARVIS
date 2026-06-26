@@ -67,6 +67,46 @@ logger = logging.getLogger("Ouroboros.MetaGoalWiring")
 _TICK_INTERVAL_FLAG = "JARVIS_META_GOAL_TICK_INTERVAL_S"
 _DEFAULT_TICK_INTERVAL_S = 5.0
 
+# CONSTRAINT 4 -- absolute anti-zombie ceiling on a proof-in-flight hold.
+_PROOF_MAX_WAIT_FLAG = "JARVIS_META_GOAL_PROOF_MAX_WAIT_S"
+_DEFAULT_PROOF_MAX_WAIT_S = 15.0
+
+
+def proof_max_wait_s() -> float:
+    """Absolute ceiling (seconds) on how long an op may pause the coalescing
+    window while its disjointness proof is in-flight. Default 15.0; ``0`` ->
+    no hold at all (immediate fail-closed). Env-tunable, never hardcoded."""
+    raw = os.environ.get(_PROOF_MAX_WAIT_FLAG, "").strip()
+    if not raw:
+        return _DEFAULT_PROOF_MAX_WAIT_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_PROOF_MAX_WAIT_S
+
+
+def mark_proof_in_flight(host: Any, op_id: str) -> None:
+    """Record that a disjointness proof (a CollisionMatrix JIT build) is
+    in-flight for ``op_id`` -- the coalescing window PAUSES its age-out
+    countdown for this op until the proof resolves OR the absolute ceiling
+    (:func:`proof_max_wait_s`) elapses. Stamped when the self-warming JIT is
+    triggered for the op's files. Idempotent."""
+    state = getattr(host, "_meta_goal_proof_in_flight", None)
+    if state is None:
+        state = {}
+        host._meta_goal_proof_in_flight = state
+    if op_id not in state:
+        state[op_id] = time.monotonic()
+
+
+def clear_proof_in_flight(host: Any, op_id: str) -> None:
+    """Clear the in-flight proof marker for ``op_id`` (proof resolved). The op
+    can then bundle (if disjoint) or fall through (genuinely single/coupled).
+    Idempotent."""
+    state = getattr(host, "_meta_goal_proof_in_flight", None)
+    if state is not None:
+        state.pop(op_id, None)
+
 
 # ---------------------------------------------------------------------------
 # Feed: OperationContext -> PooledOp
@@ -189,6 +229,41 @@ async def _flush_aged_ops(host: Any, aggregator: MetaGoalAggregator) -> None:
     now = time.monotonic()
     window_s = meta_goal_coalesce_window_s()
     aged = [op for op in pooled if (now - op.offered_at) > window_s]
+    if not aged:
+        return
+
+    # CONSTRAINT 4 -- state-aware window: an op whose disjointness proof is
+    # in-flight PAUSES its age-out until the proof resolves OR the absolute
+    # anti-zombie ceiling elapses (a hung JIT must not pause forever). When the
+    # ceiling is exceeded we FAIL-CLOSED: release the hold + flush to legacy
+    # single-file (COLLIDE / single_file_op), never an infinite zombie hold.
+    proof_state = getattr(host, "_meta_goal_proof_in_flight", None) or {}
+    ceiling = proof_max_wait_s()
+    held: List[str] = []
+    releasable_aged = []
+    for op in aged:
+        started = proof_state.get(op.op_id)
+        if started is not None and ceiling > 0.0 and (now - started) < ceiling:
+            # Proof still building within the ceiling -> hold (do NOT age out).
+            held.append(op.op_id)
+            continue
+        if started is not None:
+            # Ceiling exceeded -> fail-closed: drop the hold, let it flush.
+            logger.warning(
+                "[MetaGoalWiring] op=%s proof in-flight exceeded ceiling "
+                "%.1fs -> fail-closed release -> legacy single-file dispatch",
+                op.op_id, ceiling,
+            )
+            proof_state.pop(op.op_id, None)
+        releasable_aged.append(op)
+
+    if held:
+        logger.debug(
+            "[MetaGoalWiring] %d op(s) held (proof in-flight, within ceiling)",
+            len(held),
+        )
+
+    aged = releasable_aged
     if not aged:
         return
 
@@ -415,6 +490,52 @@ def start_meta_goal_drain_loop(host: Any) -> None:
         host._meta_goal_drain_task = None
 
 
+async def _prewarm_and_mark_proofs(host: Any, aggregator: Any) -> None:
+    """Async self-warming pass run before the (sync) disjointness partition.
+
+    For every pooled op, mark its disjointness proof in-flight (so the
+    coalescing window pauses) and JIT-warm the Oracle for the op's file via
+    :func:`prewarm_collision_files` (reuses ``ensure_file_indexed``). This
+    moves the JIT off the sync ``_coupled_files`` path onto the async loop --
+    the partition that follows then reads a warmed index. Gated OFF -> no-op
+    (no proofs marked, no warm). Fully fail-soft."""
+    try:
+        from backend.core.ouroboros.governance.collision_matrix import (
+            prewarm_collision_files,
+            self_warming_enabled,
+        )
+        if not self_warming_enabled():
+            return
+        oracle = getattr(aggregator, "_oracle", None) or getattr(host, "_oracle", None)
+        if oracle is None:
+            return
+        try:
+            pooled = aggregator.pending_ops()
+        except Exception:  # noqa: BLE001
+            return
+        if not pooled:
+            return
+        files = []
+        for op in pooled:
+            mark_proof_in_flight(host, op.op_id)
+            if getattr(op, "file_path", None):
+                files.append(op.file_path)
+        if files:
+            await prewarm_collision_files(oracle, files)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- never break the drain loop
+        logger.debug("[MetaGoalWiring] prewarm/mark proofs failed", exc_info=True)
+
+
+def _clear_all_proofs(host: Any) -> None:
+    """Clear every in-flight proof marker after a drain tick (proofs resolved
+    synchronously during the partition). Fail-soft; idempotent."""
+    state = getattr(host, "_meta_goal_proof_in_flight", None)
+    if isinstance(state, dict):
+        state.clear()
+
+
 async def _meta_goal_drain_loop(host: Any) -> None:
     """Tick :func:`dispatch_ready_bundles` until shutdown. Fully fail-soft;
     CancelledError exits cleanly (uses ``asyncio.sleep``, Python 3.9+ safe)."""
@@ -424,6 +545,13 @@ async def _meta_goal_drain_loop(host: Any) -> None:
                 interval = meta_goal_tick_interval_s()
                 agg = getattr(host, "_meta_goal_aggregator", None)
                 scheduler = getattr(host, "_subagent_scheduler", None)
+                if agg is not None:
+                    # Self-Warming Oracle seam: async-JIT-warm the Oracle for
+                    # the pooled ops' files BEFORE the (sync) disjointness
+                    # partition, marking each op's proof in-flight so the
+                    # coalescing window pauses during the warm (bounded by the
+                    # absolute ceiling). No-op when self-warming is OFF.
+                    await _prewarm_and_mark_proofs(host, agg)
                 if agg is not None and scheduler is not None:
                     await dispatch_ready_bundles(
                         agg,
@@ -431,6 +559,10 @@ async def _meta_goal_drain_loop(host: Any) -> None:
                         gate=_resolve_gate(host),
                         posture_fn=_resolve_posture_fn(host),
                     )
+                if agg is not None:
+                    # Proofs resolved this tick -> clear the holds so resolved
+                    # ops can bundle or genuinely fall through next pass.
+                    _clear_all_proofs(host)
                 if agg is not None:
                     # Flush genuinely-single / coupled ops that aged past the
                     # coalescing window to the legacy single-file path so they
@@ -470,9 +602,12 @@ async def stop_meta_goal_drain_loop(host: Any) -> None:
 
 
 __all__ = [
+    "clear_proof_in_flight",
     "dispatch_ready_bundles",
+    "mark_proof_in_flight",
     "meta_goal_tick_interval_s",
     "pooled_op_from_ctx",
+    "proof_max_wait_s",
     "start_meta_goal_drain_loop",
     "stop_meta_goal_drain_loop",
     "synthetic_generation_for_bundle",
