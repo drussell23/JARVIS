@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
+import hashlib
 import json
 import os
 import pathlib
@@ -253,6 +254,95 @@ _DEFAULT_LIVENESS_DEADLINE_S = float(
 # Absolute wall ceiling for the whole detached poll loop (hard stop -> reap).
 # 0/unset -> falls back to the surgery timeout (--surgery-timeout-s).
 _DEFAULT_MAX_WALL_S = float(os.environ.get("JARVIS_IAC_MAX_WALL_SECONDS", "0"))
+
+
+# --------------------------------------------------------------------------- #
+# Fault-tolerant observability (Omni-Soak #2 reaped-completing-surgery fix).
+#
+# Master gate default-OFF -> the CURRENT byte-offset tail + dumb-wall behavior is
+# byte-identical. When armed it swaps in four decoupled mechanisms:
+#   (1) a node-side anti-starvation HEARTBEAT (nice/ionice elevated) that ticks
+#       soak_state.json.last_active even during a long-quiet step -> liveness is
+#       judged by last_active ADVANCING, not by log output;
+#   (2) a line-safe SIZE-AWARE delta sync replacing the byte-offset tail (resumes
+#       on drop from last_synced_size, never emits a half line / split utf-8);
+#   (3) a MANDATORY artifact-rescue phase (scp + sha256 verify) before ANY
+#       teardown, with a dead-SSH OUT-OF-BAND gcloud fallback (serial console +
+#       disk snapshot) -> we NEVER burn a node before its data is local;
+#   (4) a dual-boundary phase-adaptive wall (extend on advancing heartbeat,
+#       capped HARD by MAX_PHASE_CEILING -> a zombie ticking-but-stuck swarm is
+#       still reaped, no infinite extend).
+# --------------------------------------------------------------------------- #
+def _env_truthy_off(name: str) -> bool:
+    """Master-gate resolver defaulting to OFF (byte-identical legacy behavior)."""
+    return _env_truthy(name, "false")
+
+
+_FAULT_TOLERANT_OBS_ENABLED = _env_truthy_off("JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED")
+
+# Heartbeat: node-side setsid loop interval + elevated OS priority (so a swarm
+# redlining CPU/IO at 100% can NEVER starve/OOM-kill it -> no false freeze).
+_DEFAULT_HEARTBEAT_INTERVAL_S = float(
+    os.environ.get("JARVIS_IAC_HEARTBEAT_INTERVAL_S", "10")
+)
+_DEFAULT_HEARTBEAT_NICE = os.environ.get("JARVIS_IAC_HEARTBEAT_NICE", "-20")
+# ionice realtime class (-c1) preferred; falls back to best-effort highest (-c2 -n0)
+# at runtime if -c1 is denied (needs CAP_SYS_ADMIN / root).
+_DEFAULT_HEARTBEAT_IONICE_CLASS = os.environ.get("JARVIS_IAC_HEARTBEAT_IONICE_CLASS", "1")
+_DEFAULT_HEARTBEAT_IONICE_PRIO = os.environ.get("JARVIS_IAC_HEARTBEAT_IONICE_PRIO", "0")
+# Liveness staleness: last_active must advance within this bound or the heartbeat
+# is judged FROZEN (a true hang, not a quiet step). Generous default.
+_DEFAULT_HEARTBEAT_STALE_S = float(
+    os.environ.get("JARVIS_IAC_HEARTBEAT_STALE_S", "120")
+)
+
+# Per-phase wall allowances (env-tunable). deps gets a tight budget; the swarm
+# fanout / soak a wider one. Active (advancing heartbeat) extends WITHIN the per-
+# phase MAX_PHASE_CEILING -- never past it (CONSTRAINT 4: trust but bound).
+def _phase_allowance(phase: str) -> float:
+    key = "JARVIS_IAC_PHASE_ALLOWANCE_" + re.sub(r"[^A-Z0-9]", "_", (phase or "").upper())
+    default = _PHASE_ALLOWANCE_DEFAULTS.get((phase or "").lower(), 1800.0)
+    return float(os.environ.get(key, str(default)))
+
+
+def _phase_ceiling(phase: str) -> float:
+    key = "JARVIS_IAC_PHASE_CEILING_" + re.sub(r"[^A-Z0-9]", "_", (phase or "").upper())
+    default = _PHASE_CEILING_DEFAULTS.get((phase or "").lower(), 5400.0)
+    return float(os.environ.get(key, str(default)))
+
+
+_PHASE_ALLOWANCE_DEFAULTS: Dict[str, float] = {
+    "deps": float(os.environ.get("JARVIS_IAC_PHASE_ALLOWANCE_DEPS", "900")),
+    "inject": float(os.environ.get("JARVIS_IAC_PHASE_ALLOWANCE_INJECT", "1800")),
+    "soak": float(os.environ.get("JARVIS_IAC_PHASE_ALLOWANCE_SOAK", "3600")),
+    "audit": float(os.environ.get("JARVIS_IAC_PHASE_ALLOWANCE_AUDIT", "900")),
+}
+# Absolute per-phase ceiling: the dynamic heartbeat extension is CAPPED here so a
+# `while True` that still ticks the heartbeat is reaped, never extended forever.
+_PHASE_CEILING_DEFAULTS: Dict[str, float] = {
+    "deps": float(os.environ.get("JARVIS_IAC_PHASE_CEILING_DEPS", "2700")),
+    "inject": float(os.environ.get("JARVIS_IAC_PHASE_CEILING_INJECT", "5400")),
+    "soak": float(os.environ.get("JARVIS_IAC_PHASE_CEILING_SOAK", "10800")),
+    "audit": float(os.environ.get("JARVIS_IAC_PHASE_CEILING_AUDIT", "2700")),
+}
+# Global hard absolute ceiling across ALL phases (the non-negotiable backstop --
+# 0/unset -> falls back to max_wall / surgery timeout).
+_DEFAULT_GLOBAL_CEILING_S = float(
+    os.environ.get("JARVIS_IAC_GLOBAL_CEILING_SECONDS", "0")
+)
+
+# Artifact rescue: where the pulled black-box lands locally, the per-pull retry
+# count, and the artifact manifest (env-tunable). Rescue runs BEFORE every burn.
+_DEFAULT_RESCUE_DIR = os.environ.get("JARVIS_IAC_RESCUE_DIR", "rescue_artifacts")
+_DEFAULT_RESCUE_RETRIES = int(os.environ.get("JARVIS_IAC_RESCUE_RETRIES", "3"))
+_DEFAULT_RESCUE_TIMEOUT_S = float(os.environ.get("JARVIS_IAC_RESCUE_TIMEOUT_S", "120"))
+# The remote artifacts pulled before burn (relative to the jarvis repo unless abs).
+_RESCUE_ARTIFACTS: List[str] = [
+    _DEFAULT_SOAK_STATE_PATH,
+    _DEFAULT_SURGERY_OUT_PATH,
+    f"{_REMOTE_JARVIS_DIR}/.ouroboros/sessions",
+    f"{_REMOTE_JARVIS_DIR}/a1_runs",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -1481,6 +1571,75 @@ def _remote_surgery_shell(args: argparse.Namespace) -> str:
 # This script is what setsid/nohup launches detached -- it survives the launching
 # SSH closing. The local harness polls soak_state.json + tails surgery.out.
 # --------------------------------------------------------------------------- #
+def _fault_tolerant_obs_enabled(args: argparse.Namespace) -> bool:
+    """Resolve the fault-tolerant-observability master gate from args (if present)
+    else env. Default-OFF -> the legacy byte-offset/dumb-wall behavior (byte-
+    identical). The omni-soak arms it via JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED."""
+    val = getattr(args, "fault_tolerant_obs", None)
+    if val is not None:
+        return bool(val)
+    return _env_truthy_off("JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED")
+
+
+def _heartbeat_block(args: argparse.Namespace) -> str:
+    """Render the node-side anti-starvation HEARTBEAT (CONSTRAINT 1): a setsid
+    background loop that ATOMICALLY (temp+mv) ticks soak_state.json.last_active +
+    step_seq every ~interval seconds -- even during a long quiet step (deps).
+
+    Launched at ELEVATED OS priority (`nice -n -20 ionice -c1 -n0`, realtime IO)
+    so a swarm redlining CPU/IO at 100%% can NEVER starve/OOM-kill it -> no false
+    heartbeat freeze. `ionice -c1` falls back to `-c2 -n0` (best-effort highest)
+    at RUNTIME if -c1 is denied (it needs root/CAP_SYS_ADMIN). The heartbeat reads
+    the current phase from the marker file the writer drops, so its ticks carry
+    the live phase. Its PID is exported (_HB_PID) so the EXIT trap can kill it."""
+    state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
+    phase_marker_q = f"{state_q}.phase"
+    interval = float(getattr(args, "heartbeat_interval_s", _DEFAULT_HEARTBEAT_INTERVAL_S))
+    nice = str(getattr(args, "heartbeat_nice", _DEFAULT_HEARTBEAT_NICE))
+    ioc = str(getattr(args, "heartbeat_ionice_class", _DEFAULT_HEARTBEAT_IONICE_CLASS))
+    iop = str(getattr(args, "heartbeat_ionice_prio", _DEFAULT_HEARTBEAT_IONICE_PRIO))
+    # The inner loop body (a self-contained bash -c program string): read phase
+    # marker, atomically rewrite soak_state.json with a fresh last_active +
+    # monotonically-incrementing step_seq. Pure printf JSON. It NEVER parses the
+    # existing JSON (avoids half-read races) -- it re-emits the known fields with
+    # the heartbeat's own advancing counters. Passed as a single bash -c arg so it
+    # runs in the freshly-priority-elevated child (no exported-function reliance).
+    loop_body = (
+        "_seq=0; "
+        "while true; do "
+        f"_ph=$(cat {phase_marker_q} 2>/dev/null || echo running); "
+        "_seq=$((_seq+1)); "
+        f"_tmp={state_q}.hb.$$; "
+        "printf '{\"phase\":\"%s\",\"status\":\"running\",\"rc\":null,\"ts\":%s,"
+        "\"verdict\":\"running\",\"last_active\":%s,\"step_seq\":%s}\\n' "
+        "\"$_ph\" \"$(date +%s)\" \"$(date +%s)\" \"$_seq\" "
+        f"> \"$_tmp\" 2>/dev/null && mv -f \"$_tmp\" {state_q} 2>/dev/null || true; "
+        f"sleep {interval}; "
+        "done"
+    )
+    loop_q = shlex.quote(loop_body)
+    nice_q = shlex.quote(nice)
+    ioc_q = shlex.quote(ioc)
+    iop_q = shlex.quote(iop)
+    # Launch at REALTIME io class -c1 (preferred); on EPERM fall back to the
+    # best-effort highest -c2 -n0. setsid detaches it from the surgery TTY. The
+    # priority prefix is applied to the launched child; the loop body is a single
+    # `bash -c '<program>'` arg so it runs intact in the elevated child.
+    return (
+        "# ---- CONSTRAINT 1: anti-starvation heartbeat (elevated nice/ionice) ----\n"
+        f"if ionice -c{ioc_q} -n{iop_q} true 2>/dev/null; then "
+        f"setsid nice -n {nice_q} ionice -c{ioc_q} -n{iop_q} "
+        f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+        "else "
+        f"setsid nice -n {nice_q} ionice -c2 -n0 "
+        f"bash -c {loop_q} </dev/null >/dev/null 2>&1 & _HB_PID=$!; "
+        "fi; "
+        "export _HB_PID; "
+        "echo \"[iac] heartbeat launched pid=$_HB_PID "
+        f"(nice {nice} ionice -c{ioc} -n{iop} realtime, fallback -c2 -n0)\";\n"
+    )
+
+
 def _remote_surgery_body_script(args: argparse.Namespace) -> str:
     """Render the node-side detached `surgery.sh` body (a self-contained bash
     program). Writes soak_state.json at phase boundaries + a PID lock removed in a
@@ -1491,24 +1650,53 @@ def _remote_surgery_body_script(args: argparse.Namespace) -> str:
     state_q = shlex.quote(_DEFAULT_SOAK_STATE_PATH)
     lock_q = shlex.quote(_DEFAULT_SOAK_LOCK_PATH)
     out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    ft_obs = _fault_tolerant_obs_enabled(args)
     # State writer: atomic temp+mv. Args: phase status rc verdict. Pure printf JSON.
     # We keep it ASCII and brace-safe by assembling the JSON with printf %s.
-    writer = (
-        "_write_state() { "
-        "_p=\"$1\"; _s=\"$2\"; _rc=\"$3\"; _v=\"$4\"; "
-        f"_tmp={state_q}.tmp.$$; "
-        "printf '{\"phase\":\"%s\",\"status\":\"%s\",\"rc\":%s,\"ts\":%s,\"verdict\":\"%s\"}\\n' "
-        "\"$_p\" \"$_s\" \"${_rc:-null}\" \"$(date +%s)\" \"$_v\" > \"$_tmp\" 2>/dev/null "
-        f"&& mv -f \"$_tmp\" {state_q} 2>/dev/null || true; }}; "
-    )
+    #
+    # FAULT-TOLERANT OBS (CONSTRAINT 1): when armed, the writer ALSO records
+    # last_active (epoch) + step_seq, and the CURRENT phase into a small marker
+    # file (_PHASE) the independent heartbeat reads -- so even a long-quiet step
+    # (deps) keeps last_active ADVANCING. Liveness decouples from the log stream.
+    if ft_obs:
+        phase_marker_q = f"{state_q}.phase"
+        writer = (
+            "_write_state() { "
+            "_p=\"$1\"; _s=\"$2\"; _rc=\"$3\"; _v=\"$4\"; "
+            f"_tmp={state_q}.tmp.$$; "
+            f"printf '%s' \"$_p\" > {phase_marker_q} 2>/dev/null || true; "
+            "printf '{\"phase\":\"%s\",\"status\":\"%s\",\"rc\":%s,\"ts\":%s,"
+            "\"verdict\":\"%s\",\"last_active\":%s,\"step_seq\":%s}\\n' "
+            "\"$_p\" \"$_s\" \"${_rc:-null}\" \"$(date +%s)\" \"$_v\" "
+            "\"$(date +%s)\" \"${_HB_SEQ:-0}\" > \"$_tmp\" 2>/dev/null "
+            f"&& mv -f \"$_tmp\" {state_q} 2>/dev/null || true; }}; "
+        )
+    else:
+        writer = (
+            "_write_state() { "
+            "_p=\"$1\"; _s=\"$2\"; _rc=\"$3\"; _v=\"$4\"; "
+            f"_tmp={state_q}.tmp.$$; "
+            "printf '{\"phase\":\"%s\",\"status\":\"%s\",\"rc\":%s,\"ts\":%s,\"verdict\":\"%s\"}\\n' "
+            "\"$_p\" \"$_s\" \"${_rc:-null}\" \"$(date +%s)\" \"$_v\" > \"$_tmp\" 2>/dev/null "
+            f"&& mv -f \"$_tmp\" {state_q} 2>/dev/null || true; }}; "
+        )
     # Lock: write our PID; trap removes it on EXIT (success OR failure). The
     # surgery_cmd carries its OWN chaos-revert-ALWAYS trap; this lock-clear trap is
     # additive (bash runs all EXIT traps -- we chain via a single handler).
-    lock_trap = (
-        f"echo \"$$\" > {lock_q} 2>/dev/null || true; "
-        f"_cleanup() {{ rm -f {lock_q} 2>/dev/null || true; }}; "
-        "trap _cleanup EXIT INT TERM; "
-    )
+    # When the heartbeat is armed the trap ALSO kills the heartbeat PID.
+    if ft_obs:
+        lock_trap = (
+            f"echo \"$$\" > {lock_q} 2>/dev/null || true; "
+            f"_cleanup() {{ rm -f {lock_q} 2>/dev/null || true; "
+            "[ -n \"${_HB_PID:-}\" ] && kill \"$_HB_PID\" 2>/dev/null || true; }; "
+            "trap _cleanup EXIT INT TERM; "
+        )
+    else:
+        lock_trap = (
+            f"echo \"$$\" > {lock_q} 2>/dev/null || true; "
+            f"_cleanup() {{ rm -f {lock_q} 2>/dev/null || true; }}; "
+            "trap _cleanup EXIT INT TERM; "
+        )
     parts: List[str] = [
         "#!/usr/bin/env bash\n",
         "set -uo pipefail\n",
@@ -1517,6 +1705,12 @@ def _remote_surgery_body_script(args: argparse.Namespace) -> str:
         f"{env}\n",
         f"{writer}\n",
         f"{lock_trap}\n",
+    ]
+    # ---- CONSTRAINT 1: anti-starvation HEARTBEAT (elevated OS priority) ----- #
+    # Launched BEFORE deps so a long-quiet pip install keeps last_active advancing.
+    if ft_obs:
+        parts.append(_heartbeat_block(args))
+    parts += [
         # ---- PHASE: deps (the run-#15 SSH-drop locus -- now detached) ------ #
         "_write_state deps running null running\n",
         f"{dep_install}\n",
@@ -1849,6 +2043,118 @@ async def _tail_once(
     return offset + len(out.encode("utf-8"))
 
 
+# --------------------------------------------------------------------------- #
+# CONSTRAINT 2: line-safe SIZE-AWARE delta sync (replaces the byte-offset tail).
+#
+# `stat` the remote surgery.out size, pull the byte-range [last_synced_size,
+# current_size]. Commit ONLY up to the LAST COMPLETE newline in the pulled delta;
+# buffer the trailing partial line locally and prepend it to the next sync. On an
+# SSH drop -> resume from last_synced_size (zero missed lines, never a half line /
+# mid-utf-8 char / half-JSON). Reuses the short-SSH probe boundary -- NO new
+# transport. The delta tracker carries (last_synced_size, partial-byte-buffer).
+# --------------------------------------------------------------------------- #
+class _DeltaSyncState:
+    """Mutable delta-sync cursor: the last committed remote byte size + the
+    trailing partial-line bytes buffered locally (prepended to the next pull)."""
+
+    __slots__ = ("last_synced_size", "partial")
+
+    def __init__(self) -> None:
+        self.last_synced_size: int = 0
+        self.partial: bytes = b""
+
+
+def _stat_size_cmd(args: argparse.Namespace, node: str) -> List[str]:
+    """A SHORT SSH that prints the byte size of surgery.out (`stat -c %s`, GNU;
+    BSD `stat -f %z` fallback chained). 0 when the file is absent."""
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    remote = (
+        f"stat -c %s {out_q} 2>/dev/null "
+        f"|| stat -f %z {out_q} 2>/dev/null "
+        f"|| echo 0"
+    )
+    return _ssh_cmd(args, node, remote)
+
+
+def _delta_range_cmd(args: argparse.Namespace, node: str, start: int, length: int) -> List[str]:
+    """A SHORT SSH that pulls the byte-range [start, start+length) of surgery.out:
+    `tail -c +<start+1>` (1-indexed) piped into `head -c <length>`. Pulling a
+    bounded range (not the open tail) keeps each delta sync size-bounded + lets the
+    line-safe buffer reason about an exact window."""
+    out_q = shlex.quote(_DEFAULT_SURGERY_OUT_PATH)
+    s1 = max(0, int(start)) + 1
+    n = max(0, int(length))
+    remote = f"tail -c +{s1} {out_q} 2>/dev/null | head -c {n} 2>/dev/null || true"
+    return _ssh_cmd(args, node, remote)
+
+
+def _split_line_safe(buf: bytes) -> Tuple[bytes, bytes]:
+    """Split *buf* at the LAST complete newline: returns (committable, trailing
+    partial). The committable bytes end on a `\\n`; the trailing partial (an
+    incomplete line, possibly mid-utf-8) is buffered for the next sync. If there
+    is no newline yet, NOTHING is committable -- the whole buffer is held."""
+    idx = buf.rfind(b"\n")
+    if idx < 0:
+        return b"", buf
+    return buf[: idx + 1], buf[idx + 1:]
+
+
+async def _delta_sync_once(
+    args: argparse.Namespace, node: str, state: "_DeltaSyncState",
+    sink: Callable[[str], None],
+) -> bool:
+    """One line-safe delta-sync tick. Returns True iff the transport tick was OK
+    (a drop -> False so the caller counts it against liveness). Fail-soft: a failed
+    stat/pull leaves last_synced_size + the partial buffer UNCHANGED (resume on the
+    next tick from exactly where we left off -> zero missed lines, no half line)."""
+    # 1. stat the remote size.
+    src, sout = await _probe(_stat_size_cmd(args, node), timeout_s=float(args.probe_timeout_s))
+    if src != 0 and _is_transport_drop(src, sout):
+        return False  # transport drop -> resume next tick, cursor unchanged
+    try:
+        current = int((sout or "0").strip().split()[0])
+    except (ValueError, IndexError):
+        current = state.last_synced_size  # garbage stat -> treat as no growth
+    if current < state.last_synced_size:
+        # surgery.out was truncated/rotated (idempotent relaunch `: > out`) -> reset.
+        state.last_synced_size = 0
+        state.partial = b""
+    if current <= state.last_synced_size:
+        return True  # no new bytes (a quiet step) -- NOT a drop
+    # 2. pull ONLY the new byte-range [last_synced_size, current).
+    length = current - state.last_synced_size
+    drc, dout = await _probe(
+        _delta_range_cmd(args, node, state.last_synced_size, length),
+        timeout_s=float(args.probe_timeout_s),
+    )
+    if drc != 0 and _is_transport_drop(drc, dout):
+        return False  # drop mid-pull -> cursor unchanged, retry the SAME range
+    delta = (dout or "").encode("utf-8")
+    if not delta:
+        return True
+    # 3. LINE-SAFE commit: prepend the buffered partial, split at the last newline,
+    #    emit only complete lines, re-buffer the trailing partial.
+    combined = state.partial + delta
+    committable, state.partial = _split_line_safe(combined)
+    # advance the cursor by the RAW delta bytes actually pulled (the partial buffer
+    # carries the un-emitted remainder across ticks -- never re-pulled).
+    state.last_synced_size += len(delta)
+    if committable:
+        text = committable.decode("utf-8", errors="replace")
+        for ln in text.splitlines(keepends=True):
+            sink(ln)
+    return True
+
+
+def _delta_flush_partial(state: "_DeltaSyncState", sink: Callable[[str], None]) -> None:
+    """Flush any buffered trailing partial at terminal (the surgery wrote a final
+    line without a newline before exit). Emits it once, line-terminated."""
+    if state.partial:
+        text = state.partial.decode("utf-8", errors="replace")
+        sink(text if text.endswith("\n") else text + "\n")
+        state.partial = b""
+
+
 async def _poll_surgery_to_terminal(
     args: argparse.Namespace, node: str, log_path: Optional[pathlib.Path] = None,
 ) -> Tuple[int, List[str], str]:
@@ -1874,6 +2180,17 @@ async def _poll_surgery_to_terminal(
     if max_wall <= 0.0:
         max_wall = float(args.surgery_timeout_s)
 
+    # --- FAULT-TOLERANT OBS (gated): delta-sync + last_active liveness + dual --
+    #     boundary phase-adaptive wall. OFF -> the legacy byte-offset/dumb-wall.
+    ft_obs = _fault_tolerant_obs_enabled(args)
+    global_ceiling = float(getattr(args, "global_ceiling_s", _DEFAULT_GLOBAL_CEILING_S) or 0.0)
+    if global_ceiling <= 0.0:
+        global_ceiling = max_wall
+    stale_s = float(getattr(args, "heartbeat_stale_s", _DEFAULT_HEARTBEAT_STALE_S))
+    delta = _DeltaSyncState()
+    last_seen_active: Optional[int] = None
+    last_active_change_mono = time.monotonic()
+
     offset = 0
     attempt = 0
     consecutive_fail = 0
@@ -1882,25 +2199,43 @@ async def _poll_surgery_to_terminal(
     verdict = "UNKNOWN"
     rc = 1
 
-    _emit("[iac] detached poll/reconnect loop engaged "
-          f"(base={base}s cap={cap}s liveness={liveness_deadline}s wall={max_wall}s)\n")
+    if ft_obs:
+        _emit("[iac] fault-tolerant poll/reconnect loop engaged "
+              f"(delta-sync + last_active liveness + dual-boundary wall; "
+              f"global_ceiling={global_ceiling}s stale={stale_s}s)\n")
+    else:
+        _emit("[iac] detached poll/reconnect loop engaged "
+              f"(base={base}s cap={cap}s liveness={liveness_deadline}s wall={max_wall}s)\n")
 
     while True:
         now = time.monotonic()
         # --- absolute wall ceiling (hard stop -> reap) --------------------- #
-        if now - start_mono > max_wall:
+        # Legacy: a single dumb wall. FT-obs (CONSTRAINT 4): the GLOBAL hard
+        # ceiling is the non-negotiable backstop; the per-phase dual-boundary
+        # decision (below, after we know the phase) handles extend-vs-reap.
+        if not ft_obs and now - start_mono > max_wall:
             _emit(f"[iac] absolute wall ceiling {max_wall}s exceeded -- reaping\n")
+            rc, verdict = 124, parse_verdict(captured)
+            break
+        if ft_obs and now - start_mono > global_ceiling:
+            _emit(f"[iac] GLOBAL hard ceiling {global_ceiling}s exceeded -- reaping "
+                  "(dual-boundary backstop)\n")
             rc, verdict = 124, parse_verdict(captured)
             break
 
         tick_ok = True
 
-        # --- (a) byte-offset tail ----------------------------------------- #
-        new_offset = await _tail_once(args, node, offset, _emit)
-        if new_offset == offset:
-            # no new bytes -- could be a transport drop OR genuinely no output yet.
-            pass
-        offset = new_offset
+        # --- (a) log sync: delta-sync (ft) OR byte-offset tail (legacy) ---- #
+        if ft_obs:
+            sync_ok = await _delta_sync_once(args, node, delta, _emit)
+            if not sync_ok:
+                tick_ok = False
+        else:
+            new_offset = await _tail_once(args, node, offset, _emit)
+            if new_offset == offset:
+                # no new bytes -- a transport drop OR genuinely no output yet.
+                pass
+            offset = new_offset
 
         # --- (b) read structured state ------------------------------------ #
         sr: int
@@ -1924,8 +2259,12 @@ async def _poll_surgery_to_terminal(
                 rc = 0 if status == "done" else 1
             _emit(f"[iac] terminal state status={status} phase={phase} "
                   f"rc={rc} verdict={verdict}\n")
-            # one final tail to drain any trailing bytes written before the flush.
-            offset = await _tail_once(args, node, offset, _emit)
+            # one final drain of any trailing bytes written before the flush.
+            if ft_obs:
+                await _delta_sync_once(args, node, delta, _emit)
+                _delta_flush_partial(delta, _emit)
+            else:
+                offset = await _tail_once(args, node, offset, _emit)
             break
 
         # --- (c) lock liveness -------------------------------------------- #
@@ -1941,6 +2280,45 @@ async def _poll_surgery_to_terminal(
             rc = 0 if status == "done" else 1
             _emit(f"[iac] lock GONE with state={status} -- terminal\n")
             break
+
+        # --- CONSTRAINT 1+4: heartbeat-driven liveness + dual-boundary wall - #
+        # Liveness is judged by last_active ADVANCING (NOT by log output) -- a
+        # paused surgery.out during a long quiet step is NO LONGER 'dead'. The
+        # wall reads phase + the advancing heartbeat: active in a heavy phase ->
+        # EXTEND, but CAPPED by MAX_PHASE_CEILING (a zombie ticking-but-stuck
+        # swarm is still reaped, no infinite extend).
+        if ft_obs:
+            cur_active = state.get("last_active")
+            try:
+                cur_active_i = int(cur_active) if cur_active is not None else None
+            except (TypeError, ValueError):
+                cur_active_i = None
+            if cur_active_i is not None and cur_active_i != last_seen_active:
+                last_seen_active = cur_active_i
+                last_active_change_mono = now  # heartbeat advanced -> alive
+            heartbeat_stale = (now - last_active_change_mono) > stale_s
+            elapsed = now - start_mono
+            allowance = _phase_allowance(phase)
+            ceiling = _phase_ceiling(phase)
+            if elapsed > ceiling:
+                # CONSTRAINT 4: past MAX_PHASE_CEILING -> REAP even if ticking.
+                _emit(f"[iac] phase '{phase}' MAX_PHASE_CEILING {ceiling}s exceeded "
+                      f"(elapsed {elapsed:.0f}s) -- reaping (no infinite extend)\n")
+                rc, verdict = 124, parse_verdict(captured)
+                break
+            if elapsed > allowance:
+                if heartbeat_stale:
+                    # past the soft allowance AND the heartbeat froze -> a true
+                    # hang (not a quiet step) -> reap (no zombie burning budget).
+                    _emit(f"[iac] phase '{phase}' allowance {allowance}s exceeded AND "
+                          f"heartbeat FROZEN ({now - last_active_change_mono:.0f}s "
+                          f"> {stale_s}s) -- reaping\n")
+                    rc, verdict = 125, parse_verdict(captured)
+                    break
+                # past the soft allowance but heartbeat ADVANCING -> EXTEND (bounded
+                # by the ceiling, checked above).
+                _emit(f"[iac] phase '{phase}' active (heartbeat advancing) past "
+                      f"allowance {allowance}s -- EXTENDING toward ceiling {ceiling}s\n")
 
         # --- liveness accounting ------------------------------------------ #
         if tick_ok:
@@ -2025,6 +2403,138 @@ def run_autopsy(
     except Exception as exc:  # noqa: BLE001 -- autopsy NEVER blocks the burn
         _log(f"autopsy FAILED (proceeding to burn): {exc!r}")
         return None
+
+
+# --------------------------------------------------------------------------- #
+# CONSTRAINT 3: MANDATORY artifact-rescue phase BEFORE any teardown.
+#
+# Generalizes the Black-Box checksum-gated teardown to EVERY reap path: scp-pull
+# (with retries) soak_state.json + surgery.out + the session debug.log + a1_runs/
+# to a local rescue dir, sha256-VERIFY they landed, and ONLY THEN issue the GCP
+# delete. If scp fails after max retries (sshd crashed / NIC dropped) the ultimate
+# fallback BEFORE deletion is OUT-OF-BAND gcloud: capture the serial console
+# (`get-serial-port-output`) + best-effort `disks snapshot` -> we NEVER burn a
+# node without capturing serial/disk. Reuses _scp_cmd (the IAP pull transport) +
+# _run -- NO new transport.
+# --------------------------------------------------------------------------- #
+def _scp_pull_cmd(
+    args: argparse.Namespace, node: str, remote_path: str, local_dir: str,
+) -> List[str]:
+    """`gcloud compute scp --recurse <node>:<remote> <local>` over IAP -- the PULL
+    direction of the established _scp_cmd transport (node -> local rescue dir)."""
+    return [
+        "gcloud", "compute", "scp", "--recurse",
+        f"--project={args.project}", f"--zone={args.zone}",
+        "--tunnel-through-iap",
+        f"{node}:{remote_path}", local_dir,
+    ]
+
+
+def _serial_port_oob_cmd(args: argparse.Namespace, node: str) -> List[str]:
+    """OUT-OF-BAND serial console capture (no SSH -- survives a dead sshd / NIC).
+    The control-plane API streams the boot/console buffer."""
+    return [
+        "gcloud", "compute", "instances", "get-serial-port-output", node,
+        f"--project={args.project}", f"--zone={args.zone}", "--port=1",
+    ]
+
+
+def _disk_snapshot_oob_cmd(
+    args: argparse.Namespace, node: str, snapshot_name: str,
+) -> List[str]:
+    """OUT-OF-BAND best-effort disk snapshot (control-plane, no SSH) -- captures
+    the boot disk so a dead-SSH node's state survives the burn. The boot disk
+    shares the node name on these single-disk soak instances."""
+    return [
+        "gcloud", "compute", "disks", "snapshot", node,
+        f"--project={args.project}", f"--zone={args.zone}",
+        f"--snapshot-names={snapshot_name}",
+    ]
+
+
+def _sha256_file(path: pathlib.Path) -> Optional[str]:
+    """sha256 of a file (None if unreadable). Used to VERIFY a rescued artifact
+    actually landed locally before the node is burned."""
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:  # noqa: BLE001 -- a missing/unreadable rescue artifact == not landed
+        return None
+
+
+def rescue_artifacts_before_teardown(
+    args: argparse.Namespace, node: str, reason: str,
+) -> Dict[str, Any]:
+    """Pull + sha256-VERIFY the black-box artifacts BEFORE any burn. Returns a
+    manifest dict {artifact: sha256|None, oob: {...}, verified: bool}. Bounded +
+    fail-soft: NEVER raises, NEVER blocks the burn -- but ALWAYS runs first.
+
+    Order (load-bearing): scp-pull (retries) -> sha256-verify -> [if any pull
+    failed] OUT-OF-BAND serial + snapshot. The CALLER issues the GCP delete only
+    AFTER this returns. Gated: when fault-tolerant-obs is OFF this is a no-op
+    (legacy autopsy-only behavior, byte-identical)."""
+    manifest: Dict[str, Any] = {"reason": reason, "artifacts": {}, "oob": {}, "verified": False}
+    if not _fault_tolerant_obs_enabled(args):
+        return manifest  # OFF -> legacy behavior (autopsy only), byte-identical
+    try:
+        stamp = _now_stamp()
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]", "_", node)[:60]
+        rescue_root = pathlib.Path(_DEFAULT_RESCUE_DIR) / f"{safe_node}_{stamp}"
+        rescue_root.mkdir(parents=True, exist_ok=True)
+        retries = int(getattr(args, "rescue_retries", _DEFAULT_RESCUE_RETRIES))
+        timeout_s = float(getattr(args, "rescue_timeout_s", _DEFAULT_RESCUE_TIMEOUT_S))
+        any_pull_failed = False
+        _log(f"RESCUE: pulling black-box artifacts BEFORE burn -> {rescue_root}")
+        for remote_path in _RESCUE_ARTIFACTS:
+            landed = False
+            for attempt in range(max(1, retries)):
+                rc, out = _run(
+                    _scp_pull_cmd(args, node, remote_path, str(rescue_root)),
+                    timeout_s=timeout_s,
+                )
+                if rc == 0:
+                    landed = True
+                    break
+                _log(f"RESCUE: pull {remote_path} attempt {attempt + 1}/{retries} "
+                     f"rc={rc} ({(out or '').strip()[:120]})")
+            # sha256-verify the landed copy (the basename under rescue_root).
+            local_copy = rescue_root / pathlib.PurePosixPath(remote_path).name
+            digest = _sha256_file(local_copy) if landed and local_copy.is_file() else None
+            # a directory artifact (sessions/a1_runs) lands as a tree -> mark present.
+            if landed and digest is None and local_copy.is_dir():
+                digest = "dir:present"
+            manifest["artifacts"][remote_path] = digest
+            if not landed or digest is None:
+                any_pull_failed = True
+        # CONSTRAINT 3: dead-SSH fallback -> OUT-OF-BAND serial + snapshot BEFORE burn.
+        if any_pull_failed:
+            _log("RESCUE: scp pulls incomplete (dead-SSH?) -- OUT-OF-BAND serial + snapshot")
+            src, sout = _run(_serial_port_oob_cmd(args, node), timeout_s=timeout_s)
+            serial_path = rescue_root / "serial_console.log"
+            try:
+                serial_path.write_text(sout or "(empty serial output)", encoding="utf-8")
+                manifest["oob"]["serial"] = _sha256_file(serial_path)
+            except Exception as exc:  # noqa: BLE001
+                manifest["oob"]["serial"] = f"[write failed: {exc!r}]"
+            snap_name = f"rescue-{safe_node}-{stamp}"[:62]
+            drc, dout = _run(_disk_snapshot_oob_cmd(args, node, snap_name), timeout_s=timeout_s)
+            manifest["oob"]["snapshot"] = snap_name if drc == 0 else f"[snapshot rc={drc}]"
+        manifest["verified"] = not any_pull_failed
+        try:
+            (rescue_root / "rescue_manifest.json").write_text(
+                json.dumps(manifest, indent=2), encoding="utf-8"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"RESCUE: complete verified={manifest['verified']} -> {rescue_root}")
+        return manifest
+    except Exception as exc:  # noqa: BLE001 -- rescue NEVER blocks the burn
+        _log(f"RESCUE: FAILED (proceeding to burn): {exc!r}")
+        manifest["error"] = repr(exc)
+        return manifest
 
 
 # --------------------------------------------------------------------------- #
@@ -2376,6 +2886,10 @@ def _execute(
             # Terminal verdict / exception / --burn-on-failure -> BURN ALWAYS.
             if not terminal:
                 run_autopsy(args, node, abort_reason or f"verdict={verdict}", surgery_output)
+            # CONSTRAINT 3: MANDATORY artifact rescue + sha256 verify (+ dead-SSH
+            # OOB fallback) BEFORE the delete is issued -- NEVER burn a node before
+            # its data is local. No-op (legacy) when fault-tolerant-obs is OFF.
+            rescue_artifacts_before_teardown(args, node, abort_reason or f"verdict={verdict}")
             burn_node(args, node)
             verify_node_gone(args, node)
             # Surgery reached a verdict -> the run is DONE, clear the checkpoint.
@@ -2475,6 +2989,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="consecutive-failed-probe liveness bound (env JARVIS_IAC_LIVENESS_DEADLINE_S)")
     p.add_argument("--max-wall-seconds", type=float, default=_DEFAULT_MAX_WALL_S,
                    help="absolute poll-loop wall ceiling, 0=use surgery-timeout (env JARVIS_IAC_MAX_WALL_SECONDS)")
+    # ---- Fault-tolerant observability (Omni-Soak #2 fix). Default-OFF -------- #
+    p.add_argument(
+        "--fault-tolerant-obs", dest="fault_tolerant_obs", action="store_true",
+        default=_env_truthy_off("JARVIS_IAC_FAULT_TOLERANT_OBS_ENABLED"),
+        help="anti-starvation heartbeat + line-safe delta-sync + artifact-rescue + "
+             "dual-boundary wall (default OFF -> byte-identical legacy)",
+    )
+    p.add_argument(
+        "--no-fault-tolerant-obs", dest="fault_tolerant_obs", action="store_false",
+        help="legacy byte-offset tail + dumb wall (byte-identical OFF path)",
+    )
+    p.add_argument("--heartbeat-interval-s", type=float, default=_DEFAULT_HEARTBEAT_INTERVAL_S,
+                   help="node-side heartbeat tick interval (env JARVIS_IAC_HEARTBEAT_INTERVAL_S)")
+    p.add_argument("--heartbeat-nice", default=_DEFAULT_HEARTBEAT_NICE,
+                   help="heartbeat nice level (env JARVIS_IAC_HEARTBEAT_NICE)")
+    p.add_argument("--heartbeat-ionice-class", default=_DEFAULT_HEARTBEAT_IONICE_CLASS,
+                   help="heartbeat ionice class, 1=realtime (env JARVIS_IAC_HEARTBEAT_IONICE_CLASS)")
+    p.add_argument("--heartbeat-ionice-prio", default=_DEFAULT_HEARTBEAT_IONICE_PRIO,
+                   help="heartbeat ionice priority (env JARVIS_IAC_HEARTBEAT_IONICE_PRIO)")
+    p.add_argument("--heartbeat-stale-s", type=float, default=_DEFAULT_HEARTBEAT_STALE_S,
+                   help="last_active staleness -> heartbeat FROZEN (env JARVIS_IAC_HEARTBEAT_STALE_S)")
+    p.add_argument("--global-ceiling-s", type=float, default=_DEFAULT_GLOBAL_CEILING_S,
+                   help="global hard wall ceiling, 0=use max-wall (env JARVIS_IAC_GLOBAL_CEILING_SECONDS)")
+    p.add_argument("--rescue-retries", type=int, default=_DEFAULT_RESCUE_RETRIES,
+                   help="artifact-rescue scp pull retries (env JARVIS_IAC_RESCUE_RETRIES)")
+    p.add_argument("--rescue-timeout-s", type=float, default=_DEFAULT_RESCUE_TIMEOUT_S,
+                   help="artifact-rescue per-pull timeout (env JARVIS_IAC_RESCUE_TIMEOUT_S)")
     p.add_argument("--completion-sentinel", default=_COMPLETION_SENTINEL)
     p.add_argument("--prime-repo-path", default=None, help="prime repo (env JARVIS_PRIME_REPO_PATH)")
     p.add_argument("--reactor-repo-path", default=None, help="reactor repo (env JARVIS_REACTOR_REPO_PATH)")
