@@ -65,6 +65,30 @@ def _log(msg: str) -> None:
     print(f"[ChaosInjector] {msg}", file=sys.stderr)
 
 
+# Process-global verbose flag for the evaluate-and-guarantee pipeline's
+# hyper-observability traces (CONSTRAINT 4). Default ON for the injector's own
+# logs; can be forced off via env. The async generator sets this from its cfg.
+_VERBOSE: bool = True
+
+
+def _verbose_enabled() -> bool:
+    """Whether hyper-observability trace lines are emitted. Honors the
+    process-global flag (set from InjectConfig.verbose) gated behind the env
+    ``JARVIS_CHAOS_VERBOSE`` (default true) so an operator can silence it."""
+    env = os.environ.get("JARVIS_CHAOS_VERBOSE", "")
+    if env.strip():
+        return env.strip().lower() in ("true", "1", "yes")
+    return _VERBOSE
+
+
+def _trace(channel: str, msg: str) -> None:
+    """Structured hyper-observability trace line, e.g.
+    ``[ChaosInjector][prevalidate] node=... reason=...``. Only emits when
+    verbose is enabled."""
+    if _verbose_enabled():
+        print(f"[ChaosInjector][{channel}] {msg}", file=sys.stderr)
+
+
 # --------------------------------------------------------------------------- #
 # Denylist -- ABSOLUTE. These path fragments are never selected, period.
 # --------------------------------------------------------------------------- #
@@ -569,6 +593,16 @@ def _scan_one_file(
         fi = _analyze_function(node)
         if not fi.pure:
             continue
+        # SEMANTIC PRE-VALIDATION (TASK 2): a function enters the pool ONLY if it
+        # has a proven TYPE-SAFE mutation site. Zero-site functions (e.g. a
+        # strictly-typed object-returner with no comparator/binop/bool/if/assign)
+        # are disqualified HERE, at selection -- never dropped mid-inject. This
+        # is the structural cure for the Omni-Soak ``inject:not_red``.
+        if not has_viable_mutation(src, node):
+            if _verbose_enabled():
+                _trace("prevalidate", f"node={fi.name} file={abs_file} "
+                                      "reason=no_mutation_site")
+            continue
         nodes = _test_nodes_for_function(repo_root, abs_file, fi.name, test_files)
         if not nodes:
             continue
@@ -666,12 +700,65 @@ def _line_col_to_segment_edit(
     )
 
 
+def _annotation_permits_return_none(func: ast.FunctionDef) -> bool:
+    """Decide whether replacing a non-None return value with ``None`` is
+    TYPE-SAFE (i.e. will NOT raise a fatal TypeError before the unit test's
+    assertion can even run).
+
+    Rule (CONSTRAINT 1, type-safe):
+      * NO return annotation         -> permitted (we cannot prove a fatal type).
+      * annotation is ``Optional[X]`` -> permitted (None is a legal value).
+      * annotation is ``Any``         -> permitted.
+      * annotation names ``None``     -> permitted (the function already returns None).
+      * ANY OTHER annotation (a concrete required object type, e.g. ``-> Renderer``
+        / ``-> StreamRenderer`` / ``-> dict``) -> BANNED, because returning None
+        where a concrete non-Optional object is declared raises a fatal TypeError
+        (Pydantic/runtime) before the assertion runs. We test the swarm's
+        REASONING, not its crash-fixing.
+
+    Conservative default: when the annotation cannot be confidently classified as
+    Optional/Any/None, treat it as a concrete required type -> BANNED.
+    """
+    ann = func.returns
+    if ann is None:
+        return True
+
+    def _ann_text(node: ast.AST) -> str:
+        # Best-effort textual rendering for string-form and dotted annotations.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        try:
+            return ast.unparse(node)  # py3.9+
+        except Exception:  # pragma: no cover - extremely defensive
+            return ""
+
+    text = _ann_text(ann).strip()
+    if not text:
+        return False  # opaque -> conservative ban
+    low = text.replace(" ", "")
+    if low in ("None", "Any", "typing.Any"):
+        return True
+    # Optional[...] in any qualified form, or a "X | None" / "None | X" union.
+    if low.startswith("Optional[") or low.startswith("typing.Optional["):
+        return True
+    if "|None" in low or "None|" in low:
+        return True
+    return False
+
+
 def _iter_mutations(src: str, func: ast.FunctionDef) -> List[Mutation]:
     """Enumerate ALL viable minimal mutation sites for the function in a fixed,
-    deterministic scan order: comparison-op flips, then arithmetic-op flips,
-    then boolean-op flips, then return-literal alterations. The caller tries
-    them in order until one turns a green test red (some sites may be inert
-    against a given assertion)."""
+    deterministic scan order: comparison-op flips, arithmetic-op flips,
+    boolean-op flips, if-condition negation, assign-RHS literal/operator flips,
+    return-literal alterations (string/bool/numeric), then -- LAST RESORT, only
+    when TYPE-SAFE -- return-None. The caller tries them in order until one turns
+    a green test red (some sites may be inert against a given assertion).
+
+    CONSTRAINT 1 (type-safe): every emitted mutation yields a syntactically +
+    type valid program that produces a WRONG-VALUE *logical* failure the unit test
+    catches via assertion -- NOT a crash. return-None is offered ONLY when the
+    return annotation does not declare a concrete required object type (see
+    ``_annotation_permits_return_none``)."""
     lines = src.splitlines(keepends=False)
     muts: List[Mutation] = []
     seen = set()
@@ -733,12 +820,60 @@ def _iter_mutations(src: str, func: ast.FunctionDef) -> List[Mutation]:
                 seg.kind = f"boolop:{_from}->{_to}"
                 _push(seg)
 
-    # --- 4) Return-literal alteration -------------------------------------- #
+    # --- 4) If-condition negation (if cond: -> if not (cond):) ------------- #
+    # Wrap the WHOLE test expression in ``not (...)`` so the branch flips. This is
+    # a single-line, span-based edit over the test expression's source extent.
+    for node in ast.walk(func):
+        if isinstance(node, ast.If):
+            _push(_negate_if_test(lines, node.test))
+
+    # --- 5) Assign-RHS literal / operator flip ----------------------------- #
+    # Mutate the right-hand side of an assignment (``x = <literal>`` or
+    # ``x = a <op> b``) so a downstream return computed from it is wrong. Reuses
+    # the constant-alteration + operator-flip primitives on the RHS.
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign):
+            continue
+        rhs = node.value
+        if isinstance(rhs, ast.Constant):
+            m = _alter_constant(lines, rhs)
+            if m:
+                m.kind = "assign-literal:" + m.kind.split(":", 1)[-1]
+                _push(m)
+        elif isinstance(rhs, ast.BinOp):
+            flip = _BINOP_FLIP.get(type(rhs.op))
+            if flip:
+                _from, _to, old_tok, new_tok = flip
+                seg = _locate_op_token(
+                    lines, rhs.left.end_lineno, rhs.left.end_col_offset,
+                    rhs.right.lineno, rhs.right.col_offset, old_tok, new_tok,
+                )
+                if seg:
+                    seg.kind = f"assign-binop:{_from}->{_to}"
+                    _push(seg)
+
+    # --- 6) Return-literal alteration (string / bool / numeric) ------------ #
     for node in ast.walk(func):
         if not (isinstance(node, ast.Return) and node.value is not None):
             continue
         if isinstance(node.value, ast.Constant):
             _push(_alter_constant(lines, node.value))
+
+    # --- 7) Return-None (LAST RESORT, type-guarded) ------------------------ #
+    # Only offered when (a) NO earlier vector produced any site AND (b) replacing
+    # the value with None is TYPE-SAFE (no concrete required-object annotation).
+    # This keeps a non-Optional object-returner from emitting a fatal-TypeError
+    # vector while still covering the genuinely-untyped tail case.
+    if not muts and _annotation_permits_return_none(func):
+        for node in ast.walk(func):
+            if not (isinstance(node, ast.Return) and node.value is not None):
+                continue
+            # Skip a return that is already a bare constant None or a simple
+            # literal we would rather mutate in-place (handled above).
+            if isinstance(node.value, ast.Constant) and node.value.value is None:
+                continue
+            _push(_return_none(lines, node.value))
+
     return muts
 
 
@@ -814,6 +949,66 @@ def _alter_constant(lines: List[str], val: ast.Constant) -> Optional[Mutation]:
             mut.kind = "return-literal:str-append"
         return mut
     return None
+
+
+def _negate_if_test(lines: List[str], test: ast.expr) -> Optional[Mutation]:
+    """Wrap an ``if`` test expression in ``not (...)`` so the branch flips. The
+    whole test span is replaced in place; single-line spans only (the test of an
+    ``if`` is on its header line). Produces a WRONG-BRANCH logical failure the
+    unit test catches -- always syntactically + type valid."""
+    lineno = getattr(test, "lineno", None)
+    end_lineno = getattr(test, "end_lineno", None)
+    col = getattr(test, "col_offset", None)
+    end_col = getattr(test, "end_col_offset", None)
+    if None in (lineno, end_lineno, col, end_col):
+        return None
+    if lineno != end_lineno:
+        return None  # multi-line test -> conservative skip
+    if lineno < 1 or lineno > len(lines):
+        return None
+    line = lines[lineno - 1]
+    if end_col > len(line):
+        return None
+    seg = line[col:end_col]
+    new = f"not ({seg})"
+    mut = _line_col_to_segment_edit(lines, lineno, col, end_col, seg, new)
+    if mut:
+        mut.kind = "if-negate"
+    return mut
+
+
+def _return_none(lines: List[str], val: ast.expr) -> Optional[Mutation]:
+    """Replace a non-None return EXPRESSION with ``None`` (last-resort, only used
+    when TYPE-SAFE per ``_annotation_permits_return_none``). Single-line span."""
+    lineno = getattr(val, "lineno", None)
+    end_lineno = getattr(val, "end_lineno", None)
+    col = getattr(val, "col_offset", None)
+    end_col = getattr(val, "end_col_offset", None)
+    if None in (lineno, end_lineno, col, end_col):
+        return None
+    if lineno != end_lineno:
+        return None
+    if lineno < 1 or lineno > len(lines):
+        return None
+    line = lines[lineno - 1]
+    if end_col > len(line):
+        return None
+    seg = line[col:end_col]
+    if seg == "None":
+        return None
+    mut = _line_col_to_segment_edit(lines, lineno, col, end_col, seg, "None")
+    if mut:
+        mut.kind = "return-none"
+    return mut
+
+
+def has_viable_mutation(src: str, func: ast.FunctionDef) -> bool:
+    """Semantic pre-validation (TASK 2): True iff the expanded ``_iter_mutations``
+    yields >=1 TYPE-SAFE mutation site for this function. A function enters the
+    candidate pool ONLY if this returns True -- a zero-site function is
+    disqualified at SELECTION (not dropped mid-inject), killing ``inject:not_red``
+    at its root. Reuses the single mutation engine; no parallel logic."""
+    return bool(_iter_mutations(src, func))
 
 
 def _apply_mutation(src: str, mut: Mutation) -> str:
@@ -921,6 +1116,8 @@ class InjectConfig:
     # usage). Env fallbacks: JARVIS_CHAOS_READINESS_URL / _LOG.
     readiness_url: str = ""
     readiness_log: str = ""
+    # CONSTRAINT 4: hyper-observability. Default ON for the injector's own logs.
+    verbose: bool = True
 
 
 def _select_function_node(src: str, func_name: str, lineno: int) -> Optional[ast.FunctionDef]:
@@ -1528,6 +1725,11 @@ class ChaosTarget:
     test_node: str                 # the green test node confirmed pre-injection
     test_nodes: List[str] = field(default_factory=list)
     dotted_name: str = ""          # module dotted name (for the import graph)
+    depth: int = 0                 # 0 = pure leaf, 1 = one-level-deep node
+    # The EXACT mutation proven (during pre-validation) to turn ``test_node`` red,
+    # non-destructively. The inject path RE-APPLIES this proven site, so a yielded
+    # target is GUARANTEED reddenable -- no select-then-drop, no inject:not_red.
+    proven_mutation: Optional[Mutation] = field(default=None)
 
 
 def _module_dotted_name(repo_root: str, abs_file: str) -> str:
@@ -1670,53 +1872,447 @@ def _confirm_green(cfg: InjectConfig, cand: Candidate) -> Optional[str]:
     return None
 
 
-def acquire_isolated_targets(cfg: InjectConfig, n: int = 3) -> List[ChaosTarget]:
-    """Acquire up to ``n`` pure-leaf targets, each in a DIFFERENT file, such that
-    every pair is import-DISJOINT (verified via the real AST import graph) AND
-    each independently has a GREEN test.
+def _prove_reddenable(
+    cfg: InjectConfig, abs_file: str, func_name: str, lineno: int, test_node: str,
+) -> Optional[Mutation]:
+    """NON-DESTRUCTIVE red-proof: find a mutation site that ACTUALLY turns
+    ``test_node`` red, restoring the file byte-identically afterward. Returns the
+    proven Mutation (so the inject path re-applies the exact site) or None if NO
+    site reddens this test.
 
-    Greedy maximal-independent-set: scan candidates (one per file, deterministic
-    order), and add a candidate to the chosen set iff its file is pairwise
-    uncoupled with every file already chosen. Stops at ``n``. Zero-trust: if
-    fewer than ``n`` mutually-isolated green leaves exist, returns FEWER -- never
-    fabricates. Reuses acquire_candidates + the green-test confirmation."""
-    if n <= 0:
-        return []
-    candidates = acquire_candidates(cfg)
-    # Collapse to one candidate per file (the Collision Matrix is file-grained;
-    # two functions in one file can never fan out as two parallel units).
+    This is the structural cure for ``inject:not_red``: ``has_viable_mutation``
+    proves a TYPE-SAFE site EXISTS, but a site can be semantically INERT for a
+    given assertion (e.g. ``return None`` when the global is already None). By
+    proving red-ness BEFORE a target enters the pool, a yielded target is
+    GUARANTEED reddenable -- no select-then-drop. Reuses _iter_mutations +
+    _apply_mutation + _run_pytest_node; the file is always restored (revert-ALWAYS
+    via try/finally)."""
+    try:
+        with open(abs_file, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    func = _select_function_node(src, func_name, lineno)
+    if func is None:
+        return None
+    muts = _iter_mutations(src, func)
+    if not muts:
+        return None
+    # When verification is off we cannot prove red-ness; trust the first site.
+    if not cfg.verify_green:
+        return muts[0]
+
+    proven: Optional[Mutation] = None
+    try:
+        for mut in muts:
+            try:
+                mutated_src = _apply_mutation(src, mut)
+            except ValueError:
+                continue
+            try:
+                with open(abs_file, "w", encoding="utf-8") as fh:
+                    fh.write(mutated_src)
+                _bump_mtime(abs_file)
+            except OSError:
+                break
+            post = _run_pytest_node(cfg.repo_root, test_node, cfg.test_timeout_s)
+            # Restore immediately (non-destructive) before judging.
+            try:
+                with open(abs_file, "w", encoding="utf-8") as fh:
+                    fh.write(src)
+                _bump_mtime(abs_file)
+            except OSError:
+                _log("WARNING: red-proof restore failed for %s" % (abs_file,))
+            if post is False:
+                proven = mut
+                break
+    finally:
+        # Revert-ALWAYS: guarantee the original source is on disk no matter what.
+        try:
+            with open(abs_file, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            _bump_mtime(abs_file)
+        except OSError:
+            _log("WARNING: red-proof final restore failed for %s" % (abs_file,))
+    return proven
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive depth analysis (depth-0 pure leaves -> depth-1 one-level-deep nodes).
+# --------------------------------------------------------------------------- #
+#
+# Reuse-first: depth-0 candidates ARE the existing acquire_candidates() output
+# (purity rejects any function calling a non-allowlisted name, so a depth-0
+# candidate is a true leaf). Depth-1 candidates RELAX that single rule: a
+# function may call helper functions PROVIDED every such helper is itself a
+# depth-0 pure leaf in the SAME repo. CONSTRAINT 2: two depth-1 candidates are
+# co-selectable only if their depth-0 dependency SETS are disjoint.
+
+
+def _depth1_relaxed_purity(node: ast.FunctionDef, leaf_names: set) -> bool:
+    """Is ``node`` a DEPTH-1 candidate? Reuses _PurityVisitor with a single
+    relaxation: a bare-name call to a name in ``leaf_names`` (a proven depth-0
+    pure leaf) is allowed. Everything else _PurityVisitor rejects still rejects.
+    Conservative: only ONE level deep -- the helper must be a known pure leaf."""
+    arg_names = [a.arg for a in node.args.args]
+    visitor = _PurityVisitor(arg_names)
+    # Relax: pre-seed the allowlist with the known depth-0 leaf names so a bare
+    # call to one of them does not flip purity. We do this by monkeypatching the
+    # visit_Call to consult leaf_names first (no fork of the visitor class).
+    base_visit_call = visitor.visit_Call
+
+    def _relaxed_call(call: ast.Call) -> None:
+        func = call.func
+        if isinstance(func, ast.Name) and func.id in leaf_names:
+            # Allowed depth-0 helper call; still recurse into its arguments.
+            for a in call.args:
+                visitor.visit(a)
+            for kw in call.keywords:
+                visitor.visit(kw.value)
+            return
+        base_visit_call(call)
+
+    visitor.visit_Call = _relaxed_call  # type: ignore[assignment]
+    if not node.body:
+        return False
+    has_return_value = any(
+        isinstance(n, ast.Return) and n.value is not None for n in ast.walk(node)
+    )
+    if not has_return_value:
+        return False
+    for stmt in node.body:
+        visitor.visit(stmt)
+        if not visitor.pure:
+            return False
+    return True
+
+
+def _depth0_dependency_set(repo_root: str, abs_file: str, func_name: str) -> set:
+    """The set of depth-0 dependency identities a function depends on: the dotted
+    names of the pure-leaf helpers it calls (resolved against the file's imports +
+    same-module defs). For a pure depth-0 leaf this is EMPTY. For a depth-1 node
+    it carries the leaves it fans into. Two depth-1 targets are co-selectable only
+    if these sets are disjoint (CONSTRAINT 2). Bounded AST scan; no execution."""
+    out: set = set()
+    try:
+        with open(abs_file, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename=abs_file)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return out
+    func = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            func = node
+            break
+    if func is None:
+        return out
+    # Map locally-imported names -> dotted source. ``from a.b import c`` => c -> a.b.c
+    name_to_dotted: dict = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                local = alias.asname or alias.name
+                name_to_dotted[local] = node.module + "." + alias.name
+    same_mod = _module_dotted_name(repo_root, abs_file)
+    # Same-module helper defs resolve to <module>.<name>.
+    local_defs = {
+        n.name for n in tree.body if isinstance(n, ast.FunctionDef)
+    }
+    for call in ast.walk(func):
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+            nm = call.func.id
+            if nm in _PURE_BUILTIN_CALLS:
+                continue
+            if nm in name_to_dotted:
+                out.add(name_to_dotted[nm])
+            elif nm in local_defs and nm != func_name:
+                out.add(f"{same_mod}.{nm}" if same_mod else nm)
+    return out
+
+
+def _depth1_scan_dirs(repo_root: str) -> List[str]:
+    """The broadened file surface for the ADAPTIVE depth-1 gear-shift. When the
+    narrow pure-util SAFE-token surface (depth-0) is exhausted, depth-1 reaches
+    one level deeper into the tree -- so it scans all of ``backend/`` (still
+    DENYLIST-ABSOLUTE, still purity-gated, still reddenable-gated). Env
+    ``JARVIS_CHAOS_TARGET_DIRS`` overrides the surface entirely (operator choice).
+    """
+    env = (os.environ.get("JARVIS_CHAOS_TARGET_DIRS", "") or "").strip()
+    if env:
+        return _default_target_dirs(repo_root)
+    backend = os.path.join(repo_root, "backend")
+    return [backend] if os.path.isdir(backend) else _default_target_dirs(repo_root)
+
+
+def _scan_depth1_candidates(cfg: InjectConfig) -> List[Candidate]:
+    """Scan for DEPTH-1 candidates: functions one level deep (calling only proven
+    depth-0 pure leaves) that ALSO have a viable type-safe mutation site and a
+    plausible test. Reuses the file walk + test discovery + has_viable_mutation;
+    only the purity bound is relaxed via _depth1_relaxed_purity. The file surface
+    is BROADENED (``_depth1_scan_dirs``) since depth-1 is the adaptive widening."""
+    repo_root = cfg.repo_root
+    target_dirs = _depth1_scan_dirs(repo_root)
+    test_files = _find_test_files(repo_root)
+
+    # 1) Collect the set of all depth-0 pure-leaf function NAMES across the surface
+    #    (the allowlist of helpers a depth-1 node may call).
+    leaf_names: set = set()
+    files: List[str] = []
+    seen = set()
+
+    def _add_file(abs_file: str) -> None:
+        if abs_file in seen or _is_denied(abs_file):
+            return
+        seen.add(abs_file)
+        files.append(abs_file)
+
+    for tdir in target_dirs:
+        for dirpath, dirnames, fns in os.walk(tdir):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ("__pycache__", "tests", "test", "migrations", "node_modules")
+            ]
+            for f in sorted(fns):
+                if f.endswith(".py"):
+                    _add_file(os.path.join(dirpath, f))
+
+    parsed: dict = {}
+    for abs_file in files:
+        try:
+            with open(abs_file, "r", encoding="utf-8") as fh:
+                src = fh.read()
+            tree = ast.parse(src, filename=abs_file)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        parsed[abs_file] = (src, tree)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and _analyze_function(node).pure:
+                leaf_names.add(node.name)
+
+    # The NARROW (SAFE-token) surface already covered by acquire_candidates -- so
+    # the gear-shift does not re-offer those exact (file, function) pairs.
+    narrow_seen = {
+        (c.target_file, c.function) for c in acquire_candidates(cfg)
+    }
+
+    # 2) Scan the BROADENED surface for two flavours of newly-reachable target:
+    #    (a) genuine depth-0 pure leaves that the narrow SAFE-token surface missed
+    #        (empty dep-set -> trivially disjoint), and
+    #    (b) true depth-1 nodes (one level deep, calling only proven leaves).
+    out: List[Candidate] = []
+    for abs_file, (src, tree) in parsed.items():
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            is_leaf = _analyze_function(node).pure
+            if is_leaf:
+                # A broadened depth-0 leaf is a legitimate gear-shift target ONLY
+                # if the narrow pass did not already surface it.
+                if (abs_file, node.name) in narrow_seen:
+                    continue
+            elif not _depth1_relaxed_purity(node, leaf_names):
+                continue
+            if not has_viable_mutation(src, node):
+                continue
+            nodes = _test_nodes_for_function(repo_root, abs_file, node.name, test_files)
+            if not nodes:
+                continue
+            nodes = sorted(set(nodes))
+            out.append(Candidate(
+                target_file=abs_file,
+                function=node.name,
+                lineno=node.lineno,
+                end_lineno=getattr(node, "end_lineno", node.lineno),
+                test_node=nodes[0],
+                test_nodes=nodes,
+            ))
+    out.sort(key=lambda c: (c.target_file, c.function, c.test_node))
+    return out
+
+
+async def generate_verified_targets(cfg: InjectConfig, n: int):
+    """ASYNC dynamic pool generator (TASK 3): yield exactly ``n`` verified targets
+    one at a time, stopping at N. Each yield passes, IN ORDER:
+      1) pure-leaf (depth-0) -- from acquire_candidates;
+      2) has_viable_mutation (TASK 2) -- a proven type-safe site;
+      3) mutually-isolated from ALL prior yields (import-disjoint files);
+      4) green test (_run_pytest_node off-loop via run_in_executor -- non-blocking).
+
+    ADAPTIVE SCOPE: when depth-0 pure-leaves are EXHAUSTED before N, shift to
+    DEPTH-1 nodes (functions one level deep), reusing the purity analysis with a
+    relaxed depth bound. CONSTRAINT 2: two selected depth-1 functions must have
+    pairwise-DISJOINT depth-0 dependency sub-graphs (else the swarm agents collide
+    fixing a shared dep).
+
+    Hyper-observability (CONSTRAINT 4): a ``[prevalidate]`` line per rejected node
+    with the exact reason, a loud ``[adaptive]`` line on the depth gear-shift, and
+    a ``[yield]`` line per accepted target."""
+    global _VERBOSE
+    _VERBOSE = bool(cfg.verbose)
+    loop = asyncio.get_event_loop()
+    yielded = 0
+    chosen_files: List[str] = []
+    chosen_dep_sets: List[set] = []
+
+    async def _is_green(cand: Candidate) -> Optional[str]:
+        if not cfg.verify_green:
+            return cand.test_node
+        for tn in (cand.test_nodes or [cand.test_node]):
+            res = await loop.run_in_executor(
+                None, _run_pytest_node, cfg.repo_root, tn, cfg.test_timeout_s,
+            )
+            if res is True:
+                return tn
+        return None
+
+    def _isolated(cand: Candidate) -> bool:
+        return not any(
+            _files_are_import_coupled(cfg.repo_root, cand.target_file, picked)
+            for picked in chosen_files
+        )
+
+    # ---- Depth-0 pass ----------------------------------------------------- #
+    depth0 = acquire_candidates(cfg)
     by_file: List[Candidate] = []
     seen_files = set()
-    for cand in _seed_order(candidates, cfg.seed):
+    for cand in _seed_order(depth0, cfg.seed):
         if cand.target_file in seen_files:
             continue
         seen_files.add(cand.target_file)
         by_file.append(cand)
 
-    chosen: List[ChaosTarget] = []
-    chosen_files: List[str] = []
     for cand in by_file:
-        if len(chosen) >= n:
-            break
-        # Pairwise import-isolation against every already-chosen file.
-        if any(
-            _files_are_import_coupled(cfg.repo_root, cand.target_file, picked)
-            for picked in chosen_files
-        ):
+        if yielded >= n:
+            return
+        # (2) has_viable_mutation is already guaranteed by acquire_candidates'
+        # pre-validation gate, but re-affirm against the live source.
+        if not _isolated(cand):
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=coupled:prior")
             continue
-        # Independently green-tested (reuse the existing confirmation).
-        green = _confirm_green(cfg, cand)
+        green = await _is_green(cand)
         if green is None:
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=test_not_green")
             continue
         cand.test_node = green
-        chosen.append(_candidate_to_target(cfg.repo_root, cand))
+        # GUARANTEE reddenable (non-destructive proof) BEFORE entering the pool --
+        # this is what kills the Omni-Soak ``inject:not_red`` (a type-safe site can
+        # still be semantically inert for THIS assertion).
+        proven = await loop.run_in_executor(
+            None, _prove_reddenable, cfg, cand.target_file, cand.function,
+            cand.lineno, green,
+        )
+        if proven is None:
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=not_reddenable")
+            continue
+        tgt = _candidate_to_target(cfg.repo_root, cand)
+        tgt.depth = 0
+        tgt.proven_mutation = proven
         chosen_files.append(cand.target_file)
+        chosen_dep_sets.append(set())  # depth-0 leaf has no depth-0 deps
+        yielded += 1
+        _trace("yield", f"target={cand.function} file={cand.target_file} "
+                        f"mutation={proven.kind} depth=0")
+        yield tgt
 
+    if yielded >= n:
+        return
+
+    # ---- Adaptive depth-1 expansion --------------------------------------- #
+    _log(
+        f"[ChaosInjector][adaptive] depth-0 leaves exhausted (found {yielded}/{n}) "
+        "-> expanding to depth-1"
+    )
+    depth1 = _scan_depth1_candidates(cfg)
+    by_file_d1: List[Candidate] = []
+    seen_d1 = set(chosen_files)
+    for cand in _seed_order(depth1, cfg.seed):
+        if cand.target_file in seen_d1:
+            continue
+        seen_d1.add(cand.target_file)
+        by_file_d1.append(cand)
+
+    for cand in by_file_d1:
+        if yielded >= n:
+            return
+        if not _isolated(cand):
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=coupled:prior")
+            continue
+        dep_set = _depth0_dependency_set(cfg.repo_root, cand.target_file, cand.function)
+        # CONSTRAINT 2: pairwise-disjoint depth-0 dependency sub-graphs.
+        shared = None
+        for prior in chosen_dep_sets:
+            inter = dep_set & prior
+            if inter:
+                shared = sorted(inter)[0]
+                break
+        if shared is not None:
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  f"reason=shared_depth0_dep:{shared}")
+            continue
+        green = await _is_green(cand)
+        if green is None:
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=test_not_green")
+            continue
+        cand.test_node = green
+        proven = await loop.run_in_executor(
+            None, _prove_reddenable, cfg, cand.target_file, cand.function,
+            cand.lineno, green,
+        )
+        if proven is None:
+            _trace("prevalidate", f"node={cand.function} file={cand.target_file} "
+                                  "reason=not_reddenable")
+            continue
+        tgt = _candidate_to_target(cfg.repo_root, cand)
+        tgt.depth = 1
+        tgt.proven_mutation = proven
+        chosen_files.append(cand.target_file)
+        chosen_dep_sets.append(dep_set)
+        yielded += 1
+        _trace("yield", f"target={cand.function} file={cand.target_file} "
+                        f"mutation={proven.kind} depth=1")
+        yield tgt
+
+
+def acquire_isolated_targets(cfg: InjectConfig, n: int = 3) -> List[ChaosTarget]:
+    """Acquire up to ``n`` pure-leaf targets, each in a DIFFERENT file, such that
+    every pair is import-DISJOINT (verified via the real AST import graph) AND
+    each independently has a GREEN test.
+
+    Now backed by the async ``generate_verified_targets`` pipeline (TASK 4): it
+    requests N and is GUARANTEED N pre-validated, mutatable, mutually-isolated,
+    green-tested targets (depth-0 leaves first, then disjoint-subgraph depth-1
+    nodes). Zero-trust: if fewer than ``n`` exist even after depth-1 expansion,
+    returns FEWER -- never fabricates. Reuses acquire_candidates + the green-test
+    confirmation. Kept synchronous for the existing call sites by driving the
+    async generator to completion."""
+    if n <= 0:
+        return []
+
+    async def _collect() -> List[ChaosTarget]:
+        out: List[ChaosTarget] = []
+        gen = generate_verified_targets(cfg, n)
+        try:
+            async for tgt in gen:
+                out.append(tgt)
+        finally:
+            # CONSTRAINT 3: the generator's failure/interrupt path cleans up. The
+            # generator itself only READS (it never mutates), so closing it here
+            # leaves no disk state; aclose() runs its finally blocks.
+            await gen.aclose()
+        return out
+
+    chosen = asyncio.run(_collect())
     if len(chosen) < n:
         _log(
             "acquire_isolated_targets: requested %d but only %d mutually-isolated "
-            "green-tested pure-leaf target(s) available (honest: fewer, NOT "
-            "fabricated)." % (n, len(chosen))
+            "green-tested pure-leaf target(s) available even after depth-1 "
+            "expansion (honest: fewer, NOT fabricated)." % (n, len(chosen))
         )
     return chosen
 
@@ -1742,6 +2338,17 @@ def _mutate_one_target_red(
     if not muts:
         _log("decomposable: %s has no viable mutation site." % (tgt.function,))
         return None
+
+    # Prefer the mutation the generator already PROVED reddens this target's test
+    # (non-destructive pre-validation) -- so the inject is guaranteed, not a
+    # re-search. Fall back to the full ordered scan only if no proof was carried.
+    if tgt.proven_mutation is not None:
+        muts = [tgt.proven_mutation] + [
+            m for m in muts
+            if (m.lineno, m.col_offset, m.end_col_offset, m.mutated_segment)
+            != (tgt.proven_mutation.lineno, tgt.proven_mutation.col_offset,
+                tgt.proven_mutation.end_col_offset, tgt.proven_mutation.mutated_segment)
+        ]
 
     for mut in muts:
         try:
@@ -1827,6 +2434,8 @@ def do_inject_decomposable(
 
     Returns 0 on success (>=1 target red, or exactly n when require_exact), non-0
     otherwise (with the tree restored byte-identically)."""
+    global _VERBOSE
+    _VERBOSE = bool(cfg.verbose)
     existing = _read_manifest(cfg.repo_root)
     if existing and not cfg.force:
         _log(
@@ -1850,69 +2459,86 @@ def do_inject_decomposable(
         return 4
 
     applied: List[dict] = []  # successfully-reddened per-target manifest entries
+    accepted = False  # set True only once the manifest is durably written
 
     def _rollback_all() -> None:
         for entry in applied:
             _restore_target(entry["target_file_abs"], entry["original_source"])
         applied.clear()
 
-    for tgt in targets:
-        result = _mutate_one_target_red(cfg, tgt)
-        if result is None:
+    # CONSTRAINT 3 (clean teardown / immutable state): the multi-target inject is
+    # wrapped in try/finally so if we CANNOT find/redden the Nth target -- or any
+    # unexpected exception fires mid-loop -- the N-1 already-mutated targets are
+    # reverted byte-identically (reusing _restore_target) BEFORE control leaves,
+    # leaving NO dangling mutated state. The finally only rolls back when the set
+    # was NOT accepted (manifest not written).
+    try:
+        for tgt in targets:
+            result = _mutate_one_target_red(cfg, tgt)
+            if result is None:
+                _log(
+                    "decomposable: target %s::%s could not be turned red; dropping "
+                    "it (no half-state)." % (
+                        tgt.dotted_name or tgt.target_file, tgt.function,
+                    )
+                )
+                continue
+            entry, _orig = result
+            applied.append(entry)
+
+        # Acceptance check.
+        if require_exact and len(applied) < n:
             _log(
-                "decomposable: target %s::%s could not be turned red; dropping it "
-                "(no half-state)." % (tgt.dotted_name or tgt.target_file, tgt.function)
+                "require_exact: only %d/%d targets turned red -- rolling back ALL "
+                "(no half-injected tree)." % (len(applied), n)
             )
-            continue
-        entry, _orig = result
-        applied.append(entry)
+            return 5
+        if not applied:
+            _log("decomposable: NO target turned red -- nothing injected (tree clean).")
+            return 5
 
-    # Acceptance check.
-    if require_exact and len(applied) < n:
+        # ACCEPTED: write the durable manifest INSIDE the try so the finally's
+        # revert only fires on the NON-accepted paths.
+        manifest = {
+            "schema_version": DECOMPOSABLE_SCHEMA_VERSION,
+            "injector_version": INJECTOR_VERSION,
+            "mode": "decomposable",
+            "requested_n": n,
+            "targets": applied,
+            "injected_at_iso": cfg.now_iso,
+            "seed": cfg.seed,
+        }
+        _write_manifest(cfg.repo_root, manifest)
+        accepted = True
         _log(
-            "require_exact: only %d/%d targets turned red -- rolling back ALL "
-            "(no half-injected tree)." % (len(applied), n)
+            "INJECTED decomposable chaos: %d MUTUALLY-ISOLATED target(s) red in %d "
+            "distinct file(s). Manifest (schema 2) written." % (
+                len(applied), len({e["target_file_abs"] for e in applied}),
+            )
         )
-        _rollback_all()
-        return 5
-    if not applied:
-        _log("decomposable: NO target turned red -- nothing injected (tree clean).")
-        _rollback_all()  # no-op; defensive
-        return 5
-
-    manifest = {
-        "schema_version": DECOMPOSABLE_SCHEMA_VERSION,
-        "injector_version": INJECTOR_VERSION,
-        "mode": "decomposable",
-        "requested_n": n,
-        "targets": applied,
-        "injected_at_iso": cfg.now_iso,
-        "seed": cfg.seed,
-    }
-    _write_manifest(cfg.repo_root, manifest)
-    _log(
-        "INJECTED decomposable chaos: %d MUTUALLY-ISOLATED target(s) red in %d "
-        "distinct file(s). Manifest (schema 2) written." % (
-            len(applied), len({e["target_file_abs"] for e in applied}),
-        )
-    )
-    print(json.dumps({
-        "status": "injected_decomposable",
-        "count": len(applied),
-        "requested_n": n,
-        "targets": [
-            {
-                "target_file": e["target_file"],
-                "function": e["function"],
-                "line": e["line"],
-                "mutation_kind": e["mutation_kind"],
-                "test_node": e["test_node"],
-                "test_red_post": e["test_red_post"],
-            }
-            for e in applied
-        ],
-    }, indent=2))
-    return 0
+        print(json.dumps({
+            "status": "injected_decomposable",
+            "count": len(applied),
+            "requested_n": n,
+            "targets": [
+                {
+                    "target_file": e["target_file"],
+                    "function": e["function"],
+                    "line": e["line"],
+                    "mutation_kind": e["mutation_kind"],
+                    "test_node": e["test_node"],
+                    "test_red_post": e["test_red_post"],
+                }
+                for e in applied
+            ],
+        }, indent=2))
+        return 0
+    finally:
+        if not accepted and applied:
+            # Reached on every NON-accepted exit (return 5, or a raised exception
+            # propagating through the loop) -- guarantees the N-1 byte-identical
+            # revert (CONSTRAINT 3). On the accepted path this is a no-op.
+            _rollback_all()
 
 
 # --------------------------------------------------------------------------- #
@@ -1968,6 +2594,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Log/stdout file to scan for the TestWatcher READY "
                         "boot-marker before mutating. Env: "
                         "JARVIS_CHAOS_READINESS_LOG.")
+    p.add_argument("--verbose", dest="verbose", action="store_true", default=True,
+                   help="Emit hyper-observability [prevalidate]/[adaptive]/[yield] "
+                        "trace lines (default ON).")
+    p.add_argument("--quiet", dest="verbose", action="store_false",
+                   help="Suppress the hyper-observability trace lines.")
     return p
 
 
@@ -1984,6 +2615,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         verify_green=not bool(args.no_verify),
         readiness_url=str(args.readiness_url or ""),
         readiness_log=str(args.readiness_log or ""),
+        verbose=bool(getattr(args, "verbose", True)),
     )
 
     if args.inject:
