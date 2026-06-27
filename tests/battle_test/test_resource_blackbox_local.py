@@ -8,6 +8,6 @@ rbl = importlib.util.module_from_spec(spec); spec.loader.exec_module(rbl)
 def test_sample_has_required_keys():
     s = rbl.sample()
     for k in ("rss_tree_mb", "free_pct", "cpu_pct", "ctx_rate",
-              "swap_used_mb", "disk_free_pct", "ts"):
+              "swap_used_mb", "swap_pageouts", "disk_free_pct", "ts"):
         assert k in s
     assert isinstance(s["ts"], float)

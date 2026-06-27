@@ -7,7 +7,7 @@ operator's terminal + a tee log, every ~1s. Avoids psutil.swap_memory()
 from __future__ import annotations
 import argparse, os, subprocess, sys, time
 
-_LAST_CTX = {"n": None, "ts": None}
+_LAST_CTX: dict[str, int | float | None] = {"n": None, "ts": None}
 
 
 def _vm_swapusage():
@@ -17,9 +17,6 @@ def _vm_swapusage():
         out = subprocess.check_output(
             ["sysctl", "-n", "vm.swapusage"], text=True, timeout=2)
         # e.g. "total = 2048.00M  used = 512.00M  free = 1536.00M ..."
-        for tok in out.replace("=", " ").split():
-            if tok.endswith("M"):
-                pass
         parts = out.split("used")
         if len(parts) > 1:
             used_mb = float(parts[1].split("=")[1].split("M")[0].strip())
