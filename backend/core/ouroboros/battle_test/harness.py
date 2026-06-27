@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import faulthandler
 import logging
 import os
 import re
@@ -6562,7 +6563,6 @@ class BattleTestHarness:
         try:
             os.write(fd, _RG_RATTLE_HDR)                      # guaranteed
             os.write(fd, _RG_RATTLE_STACKS)
-            import faulthandler
             faulthandler.dump_traceback(file=fd, all_threads=True)  # alloc-free
         except Exception:  # noqa: BLE001
             pass

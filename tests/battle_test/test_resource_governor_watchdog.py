@@ -46,7 +46,6 @@ async def _drive_once(h):
 
 
 def test_death_rattle_writes_allocation_free_dump(tmp_path, monkeypatch):
-    import os
     monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "true")
     h = H.BattleTestHarness.__new__(H.BattleTestHarness)
     h._session_dir = tmp_path
