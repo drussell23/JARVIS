@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
+from backend.core.ouroboros.governance.semantic_guardian import SemanticGuardian
 
 
 # ---------------------------------------------------------------------------
@@ -2590,7 +2591,43 @@ class ToolExecutor:
         if ast_err is not None:
             return f"(edit_file: AST validation failed — {ast_err})"
 
-        # --- Layer 7: write with rollback guarantee ------------------
+        # --- Layer 7: in-loop SemanticGuardian content gate ----------
+        # On-disk baseline: read actual file content so pre-existing
+        # subprocess/importlib do NOT false-positive (the chokepoint lesson).
+        _sg_old = content  # already read above — the real on-disk baseline
+        _sg_advisory_notes: List[str] = []
+        try:
+            _sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=_sg_old,
+                new_content=new_content,
+            )
+            for _sg_d in _sg_findings:
+                if _sg_d.severity == "hard":
+                    _lines_str = (
+                        f":{','.join(str(l) for l in _sg_d.lines)}"
+                        if _sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this write — "
+                        f"{_sg_d.pattern} at {rel_path}{_lines_str}: "
+                        f"{_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _sg_d.severity == "soft":
+                    _sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_sg_d.pattern}: {_sg_d.message}"
+                    )
+        except Exception as _sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _edit_file for %s: %s",
+                rel_path, _sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed; "
+                "guardian evaluation failed; revise and retry."
+            )
+
+        # --- Layer 8: write with rollback guarantee ------------------
         snapshot = content  # pre-captured, in-memory
         snapshot_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
         try:
@@ -2642,11 +2679,14 @@ class ToolExecutor:
 
         added = new_text.count("\n") + 1
         removed = old_text.count("\n") + 1
-        return (
+        ok_msg = (
             f"OK: edited {rel_path}\n"
             f"  -{removed} lines, +{added} lines\n"
             f"  sha256 {snapshot_hash[:12]} -> {expected_hash[:12]}"
         )
+        if _sg_advisory_notes:
+            ok_msg += "\n" + "\n".join(_sg_advisory_notes)
+        return ok_msg
 
     def _write_file(self, args: Dict[str, Any]) -> str:
         """Create or overwrite a file — hardened edition.
@@ -2734,7 +2774,43 @@ class ToolExecutor:
         if ast_err is not None:
             return f"(write_file: AST validation failed — {ast_err})"
 
-        # --- Layer 6: write with rollback guarantee ------------------
+        # --- Layer 6: in-loop SemanticGuardian content gate ----------
+        # On-disk baseline: use actual on-disk content (or "" for new files)
+        # so pre-existing subprocess/importlib do NOT false-positive.
+        _wf_sg_old = prior_content if prior_content is not None else ""
+        _wf_sg_advisory_notes: List[str] = []
+        try:
+            _wf_sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=_wf_sg_old,
+                new_content=file_content,
+            )
+            for _wf_sg_d in _wf_sg_findings:
+                if _wf_sg_d.severity == "hard":
+                    _wf_lines_str = (
+                        f":{','.join(str(l) for l in _wf_sg_d.lines)}"
+                        if _wf_sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this write — "
+                        f"{_wf_sg_d.pattern} at {rel_path}{_wf_lines_str}: "
+                        f"{_wf_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _wf_sg_d.severity == "soft":
+                    _wf_sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_wf_sg_d.pattern}: {_wf_sg_d.message}"
+                    )
+        except Exception as _wf_sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _write_file for %s: %s",
+                rel_path, _wf_sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed; "
+                "guardian evaluation failed; revise and retry."
+            )
+
+        # --- Layer 7: write with rollback guarantee ------------------
         snapshot_hash: Optional[str] = None
         if prior_content is not None:
             snapshot_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
@@ -2778,10 +2854,13 @@ class ToolExecutor:
 
         n_lines = file_content.count("\n") + 1
         before_hash_disp = (snapshot_hash[:12] + " -> ") if snapshot_hash else "(new) -> "
-        return (
+        ok_msg = (
             f"OK: {action} {rel_path} ({n_lines} lines)\n"
             f"  sha256 {before_hash_disp}{expected_hash[:12]}"
         )
+        if _wf_sg_advisory_notes:
+            ok_msg += "\n" + "\n".join(_wf_sg_advisory_notes)
+        return ok_msg
 
     def _rollback_write(
         self,
