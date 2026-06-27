@@ -185,6 +185,32 @@ def process_critical_frac() -> float:
     )
 
 
+# Resource Governor — CPU + context-switch dimension. Master sub-flag
+# default-FALSE; off -> _cpu_ctx_dim returns OK -> strictest no-op ->
+# byte-identical legacy path. ctx-switch RATE vs rolling EWMA baseline
+# is the PRIMARY swap-thrash signal (no hardcoded N); cpu_pct is a
+# best-effort secondary (psutil.cpu_percent is noisy/0.0 on macOS).
+def cpu_dim_enabled() -> bool:
+    return _env_bool("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", False)
+
+
+def cpu_critical_pct() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_CPU_CRITICAL_PCT", 95.0, minimum=1.0)
+
+
+def cpu_high_pct() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_CPU_HIGH_PCT", 80.0, minimum=1.0)
+
+
+def ctx_spike_mult() -> float:
+    """ctx_rate > baseline * this -> CRITICAL. Default 3.0."""
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_CTX_SPIKE_MULT", 3.0, minimum=1.1)
+
+
+def ctx_baseline_halflife_s() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_CTX_BASELINE_HALFLIFE_S", 30.0, minimum=1.0)
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -222,6 +248,25 @@ class MemoryProbe:
     source: str
     ok: bool = True
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CpuCtxSample:
+    cpu_pct: float       # best-effort (0.0 on macOS idle)
+    ctx_switches: int    # monotonic counter
+    ts: float            # time.monotonic()
+    ok: bool = True
+
+
+def _sample_cpu_ctx() -> CpuCtxSample:
+    import time as _t
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=None)          # non-blocking
+        ctx = int(psutil.cpu_stats().ctx_switches)       # reliable on macOS
+        return CpuCtxSample(cpu_pct=float(cpu), ctx_switches=ctx, ts=_t.monotonic())
+    except Exception:  # noqa: BLE001 — fail-open, this dim only advises
+        return CpuCtxSample(cpu_pct=0.0, ctx_switches=0, ts=_t.monotonic(), ok=False)
 
 
 @dataclass(frozen=True)
@@ -429,6 +474,9 @@ class MemoryPressureGate:
         # Tests inject a custom probe_fn; production uses the cascade
         self._probe_fn = probe_fn or self._cascaded_probe
         self._lock = threading.Lock()
+        self._cpu_ctx_sampler: Callable[[], "CpuCtxSample"] = _sample_cpu_ctx
+        self._last_ctx: Optional[Tuple[int, float]] = None   # (ctx_switches, ts)
+        self._ctx_baseline: Optional[float] = None           # EWMA rate /s
 
     # -- probe --------------------------------------------------------------
 
@@ -535,6 +583,56 @@ class MemoryPressureGate:
                 "[MemoryPressureGate] process-dim probe raised",
                 exc_info=True,
             )
+            return PressureLevel.OK, None, None
+
+    def _cpu_ctx_dim(
+        self,
+    ) -> Tuple[PressureLevel, Optional[float], Optional[float]]:
+        """Advisory CPU + context-switch pressure dimension.
+
+        ctx-switch RATE (Δctx/Δt) vs a rolling EWMA baseline is the
+        PRIMARY swap-thrash signal: a violent spike -> CRITICAL even
+        when RAM free% is comfortable (the 60%-RAM swap-storm). cpu_pct
+        is a best-effort secondary only. DISABLED/unavailable ->
+        (OK, None, None) so the strictest-wins compose is a no-op and
+        the legacy path stays byte-identical. Fail-open on any error.
+        """
+        if not cpu_dim_enabled():
+            return PressureLevel.OK, None, None
+        try:
+            s = self._cpu_ctx_sampler()
+            if not s.ok:
+                return PressureLevel.OK, None, None
+            level = PressureLevel.OK
+            ctx_rate: Optional[float] = None
+            with self._lock:
+                prev = self._last_ctx
+                self._last_ctx = (s.ctx_switches, s.ts)
+                if prev is not None:
+                    dt = s.ts - prev[1]
+                    if dt > 0:
+                        ctx_rate = max(0.0, (s.ctx_switches - prev[0]) / dt)
+                if ctx_rate is not None:
+                    if self._ctx_baseline is None:
+                        self._ctx_baseline = ctx_rate          # establish
+                    else:
+                        # Detect spike BEFORE folding it into the baseline
+                        # (else the spike inflates the baseline and hides).
+                        if ctx_rate > self._ctx_baseline * ctx_spike_mult():
+                            level = PressureLevel.CRITICAL
+                        dt2 = max(1e-6, s.ts - prev[1])
+                        alpha = 1.0 - 0.5 ** (dt2 / max(1e-6, ctx_baseline_halflife_s()))
+                        self._ctx_baseline = (
+                            (1.0 - alpha) * self._ctx_baseline + alpha * ctx_rate
+                        )
+            # Best-effort secondary cpu_pct (never the sole trigger).
+            if s.cpu_pct >= cpu_critical_pct():
+                level = _strictest(level, PressureLevel.CRITICAL)
+            elif s.cpu_pct >= cpu_high_pct():
+                level = _strictest(level, PressureLevel.HIGH)
+            return level, s.cpu_pct, ctx_rate
+        except Exception:  # noqa: BLE001 — fail-open
+            logger.debug("[MemoryPressureGate] cpu_ctx_dim raised", exc_info=True)
             return PressureLevel.OK, None, None
 
     def can_fanout(self, n_requested: int) -> FanoutDecision:
