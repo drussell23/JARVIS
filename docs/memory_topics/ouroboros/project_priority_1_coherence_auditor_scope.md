@@ -1,6 +1,6 @@
 ---
 title: Project Priority 1 Coherence Auditor Scope
-modules: []
+modules: [backend/core/ouroboros/governance/verification/coherence_auditor.py, backend/core/ouroboros/governance/verification/coherence_window_store.py, backend/core/ouroboros/governance/verification/coherence_observer.py, backend/core/ouroboros/governance/verification/coherence_action_bridge.py, backend/core/ouroboros/governance/verification/coherence_observability.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/urgency_router.py]
 status: merged
 source: project_priority_1_coherence_auditor_scope.md
 ---

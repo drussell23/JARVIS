@@ -1,6 +1,6 @@
 ---
 title: Project Followup Battle Test Post Summary Hang
-modules: [docs/runbooks/battle_test.md, scripts/ouroboros_battle_test.py, docs/architecture/...]
+modules: [scripts/ouroboros_battle_test.py]
 status: historical
 source: project_followup_battle_test_post_summary_hang.md
 ---

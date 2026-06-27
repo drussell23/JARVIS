@@ -1,6 +1,6 @@
 ---
 title: Project V2 91 Venom V2 Slice 3 Sse Event
-modules: [tests/governance/test_permission_decision_sse.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/permission_decision_archive.py]
+modules: [tests/governance/test_permission_decision_sse.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/permission_decision_archive.py, tests/governance/test_ide_observability_stream.py, tests/governance/test_section_37_tier1_2_posture_health_wiring.py, tests/governance/test_permission_decision_archive.py, tests/governance/test_tool_permissions_repl.py]
 status: merged
 source: project_v2_91_venom_v2_slice_3_sse_event.md
 ---

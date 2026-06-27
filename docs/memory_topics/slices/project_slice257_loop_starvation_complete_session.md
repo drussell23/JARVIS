@@ -1,6 +1,6 @@
 ---
 title: Project Slice257 Loop Starvation Complete Session
-modules: [backend/vision, scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, scripts/telemetry_harvester.py]
 status: historical
 source: project_slice257_loop_starvation_complete_session.md
 ---

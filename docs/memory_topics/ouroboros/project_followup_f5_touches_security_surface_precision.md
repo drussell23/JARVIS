@@ -1,6 +1,6 @@
 ---
 title: Project Followup F5 Touches Security Surface Precision
-modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/cancellation_token.py, backend/core/ouroboros/governance/risk_engine.py]
+modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/cancellation_token.py, backend/core/ouroboros/governance/risk_engine.py, token_bucket.py, authoring_helpers.py, credentials_format.py, secret_santa_generator.py, encryption_format_detector.py, secret_store.py]
 status: historical
 source: project_followup_f5_touches_security_surface_precision.md
 ---

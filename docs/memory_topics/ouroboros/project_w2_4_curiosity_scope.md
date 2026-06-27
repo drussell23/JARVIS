@@ -1,6 +1,6 @@
 ---
 title: Project W2 4 Curiosity Scope
-modules: [backend/core/ouroboros/governance/curiosity_engine.py, backend/core/ouroboros/governance/tool_executor.py, docs/operations/]
+modules: [backend/core/ouroboros/governance/curiosity_engine.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/cancel_token.py, backend/core/ouroboros/governance/posture_observer.py]
 status: merged
 source: project_w2_4_curiosity_scope.md
 ---

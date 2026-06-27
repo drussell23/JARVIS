@@ -1,6 +1,6 @@
 ---
 title: Project Slice244 Priority Dispatch Audit
-modules: [tests/governance/test_slice244_priority_dispatch.py]
+modules: [tests/governance/test_slice244_priority_dispatch.py, backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/intake/wal.py, backend/core/ouroboros/governance/providers.py]
 status: merged
 source: project_slice244_priority_dispatch_audit.md
 ---

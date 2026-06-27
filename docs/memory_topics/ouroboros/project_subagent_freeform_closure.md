@@ -1,6 +1,6 @@
 ---
 title: Project Subagent Freeform Closure
-modules: [backend/foo.py]
+modules: [backend/foo.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/tool_executor.py]
 status: historical
 source: project_subagent_freeform_closure.md
 ---

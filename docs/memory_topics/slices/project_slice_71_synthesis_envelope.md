@@ -1,6 +1,6 @@
 ---
 title: Project Slice 71 Synthesis Envelope
-modules: [tests/unit/misc/test_guiprocess.py, backend/core/process_manager.py]
+modules: [tests/unit/misc/test_guiprocess.py, backend/core/process_manager.py, orchestrator.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/op_context.py]
 status: historical
 source: project_slice_71_synthesis_envelope.md
 ---

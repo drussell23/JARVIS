@@ -1,6 +1,6 @@
 ---
 title: Project Section 37 Tier1 3 Ledger Flock
-modules: [backend/core/ouroboros/governance, tests/governance/test_section_37_tier1_3_ledger_flock.py]
+modules: [backend/core/ouroboros/governance, tests/governance/test_section_37_tier1_3_ledger_flock.py, backend/core/ouroboros/governance/posture_store.py, backend/core/ouroboros/governance/mutation_gate.py, backend/core/ouroboros/governance/metrics_history.py, backend/core/ouroboros/governance/auto_action_router.py, backend/core/ouroboros/governance/cross_process_jsonl.py, tests/governance/test_item_4_graduation_cadences.py]
 status: historical
 source: project_section_37_tier1_3_ledger_flock.md
 ---

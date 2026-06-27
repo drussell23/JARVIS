@@ -1,6 +1,6 @@
 ---
 title: Project Serpent Split Layout
-modules: [scripts/livefire_serpent_layout.py, backend/core/ouroboros/battle_test/layout_controller.py, backend/core/ouroboros/battle_test/split_layout.py, backend/core/ouroboros/battle_test/layout_repl.py, backend/core/ouroboros/battle_test/serpent_flow_app.py, tests/governance/test_layout_controller.py, tests/governance/test_split_layout.py, tests/governance/test_layout_repl.py, tests/governance/test_serpent_flow_app.py, tests/governance/test_layout_graduation.py]
+modules: [scripts/livefire_serpent_layout.py, backend/core/ouroboros/battle_test/layout_controller.py, backend/core/ouroboros/battle_test/split_layout.py, backend/core/ouroboros/battle_test/layout_repl.py, backend/core/ouroboros/battle_test/serpent_flow_app.py, tests/governance/test_layout_controller.py, tests/governance/test_split_layout.py, tests/governance/test_layout_repl.py, tests/governance/test_serpent_flow_app.py, tests/governance/test_layout_graduation.py, backend/core/ouroboros/battle_test/serpent_flow.py, live_dashboard.py]
 status: historical
 source: project_serpent_split_layout.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project V57 Hybrid Soak
-modules: [backend/core/]
+modules: [backend/core/ouroboros/governance/tool_executor.py]
 status: historical
 source: project_v57_hybrid_soak.md
 ---

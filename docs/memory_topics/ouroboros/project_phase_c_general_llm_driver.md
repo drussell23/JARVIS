@@ -1,6 +1,6 @@
 ---
 title: Phase C Slice 1a+1b — GENERAL LLM driver graduation (2026-04-20)
-modules: []
+modules: [backend/core/ouroboros/governance/general_driver.py, tests/governance/test_general_driver.py, backend/core/ouroboros/governance/governed_loop_service.py, tests/governance/test_general_gls_wire_in.py]
 status: historical
 source: project_phase_c_general_llm_driver.md
 ---

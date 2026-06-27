@@ -1,6 +1,6 @@
 ---
 title: Project Ov Devmemory Rust Ingestion
-modules: [tests/governance/test_strategic_dev_memory.py, tests/governance/test_strategic_rust_map.py]
+modules: [tests/governance/test_strategic_dev_memory.py, tests/governance/test_strategic_rust_map.py, backend/core/ouroboros/oracle.py, orchestrator.py, backend/core/ouroboros/governance/strategic_direction.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/roadmap/source_crawlers.py, backend/core/ouroboros/roadmap/snapshot.py, tests/core/ouroboros/roadmap/test_snapshot.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/providers.py]
 status: merged
 source: project_ov_devmemory_rust_ingestion.md
 ---

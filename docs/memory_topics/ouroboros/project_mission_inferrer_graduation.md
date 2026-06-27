@@ -1,6 +1,6 @@
 ---
 title: MissionInferrer (GoalInferenceEngine) Graduation — CLOSED 2026-05-03
-modules: [scripts/mission_inferrer_closure_verdict.py, backend/core/ouroboros/governance/goal_inference.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_goal_inference.py, tests/governance/test_mission_inferrer_graduation.py, tests/governance/intake/test_mission_inferrer_priority_wire_up.py]
+modules: [scripts/mission_inferrer_closure_verdict.py, backend/core/ouroboros/governance/goal_inference.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_goal_inference.py, tests/governance/test_mission_inferrer_graduation.py, tests/governance/intake/test_mission_inferrer_priority_wire_up.py, orchestrator.py]
 status: historical
 source: project_mission_inferrer_graduation.md
 ---

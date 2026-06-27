@@ -1,6 +1,6 @@
 ---
 title: Project A1 Completion Writeback
-modules: [tests/governance/test_subgoal_completion_writeback.py]
+modules: [tests/governance/test_subgoal_completion_writeback.py, orchestrator.py]
 status: historical
 source: project_a1_completion_writeback.md
 ---

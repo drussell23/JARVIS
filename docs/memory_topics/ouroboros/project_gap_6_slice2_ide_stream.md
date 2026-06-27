@@ -1,6 +1,6 @@
 ---
 title: Project Gap 6 Slice2 Ide Stream
-modules: [backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_ide_observability_stream.py]
+modules: [backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_ide_observability_stream.py, backend/core/ouroboros/governance/task_tool.py]
 status: historical
 source: project_gap_6_slice2_ide_stream.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Move 5 Closure
-modules: []
+modules: [backend/core/ouroboros/governance/verification/probe_environment_executor.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/tool_executor.py]
 status: merged
 source: project_move_5_closure.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Section 37 Tier1 2 Posture Health Wiring
-modules: [tests/governance/test_section_37_tier1_2_posture_health_wiring.py]
+modules: [tests/governance/test_section_37_tier1_2_posture_health_wiring.py, backend/core/ouroboros/governance/posture_health.py, backend/core/ouroboros/governance/posture_observer.py, backend/core/ouroboros/governance/invariant_drift_observer.py, tests/governance/test_posture_health.py, backend/core/ouroboros/governance/posture_repl.py, backend/core/ouroboros/governance/ide_observability.py]
 status: historical
 source: project_section_37_tier1_2_posture_health_wiring.md
 ---

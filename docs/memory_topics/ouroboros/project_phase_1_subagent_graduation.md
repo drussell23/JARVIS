@@ -1,6 +1,6 @@
 ---
 title: Phase 1 Subagent Graduation — POSTMORTEM (2026-04-18)
-modules: [tests/governance/test_read_only_advisor_bypass.py, tests/governance/test_bg_readonly_cascade.py, tests/governance/test_read_only_schema_swap.py, tests/governance/test_read_only_graduation_polish.py, tests/governance/test_claude_stream_hard_kill.py]
+modules: [tests/governance/test_read_only_advisor_bypass.py, tests/governance/test_bg_readonly_cascade.py, tests/governance/test_read_only_schema_swap.py, tests/governance/test_read_only_graduation_polish.py, tests/governance/test_claude_stream_hard_kill.py, backend/core/ouroboros/governance/plan_generator.py, backend/core/ouroboros/consciousness/memory_engine.py, backend/core/ouroboros/governance/semantic_guardian.py, ledger.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/providers.py]
 status: historical
 source: project_phase_1_subagent_graduation.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Autonomous Convergence Watchdog (2026-06-22, MERGED PR #69660)
-modules: []
+modules: [backend/core/ouroboros/governance/convergence_watchdog.py, backend/core/ouroboros/governance/epistemic_shedder.py]
 status: merged
 source: project_convergence_watchdog.md
 ---

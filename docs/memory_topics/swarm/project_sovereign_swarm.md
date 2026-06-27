@@ -1,6 +1,6 @@
 ---
 title: Sovereign Multi-Agent Swarm — Fleet Commander (2026-06-24)
-modules: [docs/superpowers/specs/2026-06-24-sovereign-swarm-orchestrator.md, backend/core/ouroboros/governance/autonomy/, extensions/command-node/]
+modules: [backend/core/ouroboros/governance/autonomy/, backend/core/ouroboros/governance/autonomy/worker_synthesizer.py, backend/core/ouroboros/governance/scoped_tool_access.py, backend/core/ouroboros/governance/autonomy/subagent_factory.py, backend/core/ouroboros/governance/autonomy/swarm_orchestrator.py, backend/core/ouroboros/governance/autonomy/elastic_fanout.py, backend/core/ouroboros/governance/autonomy/iron_return.py, backend/core/ouroboros/governance/autonomy/stagnation_detector.py, backend/core/ouroboros/governance/autonomy/deadlock_breaker.py]
 status: merged
 source: project_sovereign_swarm.md
 ---

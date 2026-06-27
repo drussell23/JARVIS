@@ -1,6 +1,6 @@
 ---
 title: Project Admission Gate Closure
-modules: [backend/core/ouroboros/governance/admission_gate.py, backend/core/ouroboros/governance/admission_estimator.py]
+modules: [backend/core/ouroboros/governance/admission_gate.py, backend/core/ouroboros/governance/admission_estimator.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py]
 status: historical
 source: project_admission_gate_closure.md
 ---

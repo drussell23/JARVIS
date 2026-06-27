@@ -1,6 +1,6 @@
 ---
 title: Project Section 39 Tier4 Story Crystallization
-modules: []
+modules: [backend/core/ouroboros/governance/story_repl.py]
 status: historical
 source: project_section_39_tier4_story_crystallization.md
 ---

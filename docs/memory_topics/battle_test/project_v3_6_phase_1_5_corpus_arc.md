@@ -1,6 +1,6 @@
 ---
 title: Project V3 6 Phase 1 5 Corpus Arc
-modules: [scripts/validate_l2_exercise_corpus_hardness.py, tests/governance/test_l2_exercise_corpus_hardness_validator.py, backend/core/ouroboros/governance/l2_exercise_seed.py, backend/core/ouroboros/battle_test/harness.py, docs/architecture/OUROBOROS_VENOM_PRD.md, tests/governance/fixtures/l2_exercise_corpus/_hardness_report.json]
+modules: [scripts/validate_l2_exercise_corpus_hardness.py, tests/governance/test_l2_exercise_corpus_hardness_validator.py, backend/core/ouroboros/governance/l2_exercise_seed.py, backend/core/ouroboros/battle_test/harness.py]
 status: historical
 source: project_v3_6_phase_1_5_corpus_arc.md
 ---

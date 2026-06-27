@@ -1,6 +1,6 @@
 ---
 title: Project Followup Seed Exploration Arc
-modules: [tests/fixtures/wave3_forced_reach_seed.json, backend/core/ouroboros/governance/plan_exploit.py, tests/governance/test_plan_exploit_ledger_merge.py, backend/core/ouroboros/governance/candidate_generator.py]
+modules: [backend/core/ouroboros/governance/plan_exploit.py, tests/governance/test_plan_exploit_ledger_merge.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/exploration_envelope_factory.py, tests/governance/test_plan_exploit_per_stream_timeout.py]
 status: merged
 source: project_followup_seed_exploration_arc.md
 ---

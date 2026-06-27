@@ -1,6 +1,6 @@
 ---
 title: Project Slice 54 Reasoning Unlock
-modules: []
+modules: [backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_slice_54_reasoning_unlock.md
 ---

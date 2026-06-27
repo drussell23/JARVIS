@@ -1,6 +1,6 @@
 ---
 title: Reverse Russian Doll — Pass B Design Draft (2026-04-26)
-modules: [backend/core/ouroboros/governance/multi_repo/registry.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/phase_runner.py, backend/core/ouroboros/governance/semantic_firewall.py, backend/core/ouroboros/governance/semantic_guardian.py, backend/core/ouroboros/governance/scoped_tool_backend.py, backend/core/ouroboros/governance/risk_tier_floor.py, backend/core/ouroboros/governance/change_engine.py, backend/core/ouroboros/governance/meta/ast_phase_runner_validator.py, docs/architecture/OUROBOROS.md]
+modules: [backend/core/ouroboros/governance/multi_repo/registry.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/phase_runner.py, backend/core/ouroboros/governance/semantic_firewall.py, backend/core/ouroboros/governance/semantic_guardian.py, backend/core/ouroboros/governance/scoped_tool_backend.py, backend/core/ouroboros/governance/risk_tier_floor.py, backend/core/ouroboros/governance/change_engine.py, backend/core/ouroboros/governance/meta/ast_phase_runner_validator.py, backend/core/ouroboros/governance/phase_runners/gate_runner.py, backend/core/ouroboros/governance/meta/meta_phase_runner.py]
 status: merged
 source: project_reverse_russian_doll_pass_b.md
 ---

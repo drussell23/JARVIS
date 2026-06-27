@@ -1,6 +1,6 @@
 ---
 title: Project Swe Bench Closed Loop Gap
-modules: [scripts/swe_bench_pro_soak.sh]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/evaluator.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/swe_bench_pro/harness_inject.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/swe_bench_pro/scorer.py, scripts/ouroboros_battle_test.py, test_runner.py, backend/core/ouroboros/governance/swe_bench_pro/container_engine.py, backend/core/ouroboros/governance/phase_runners/slice4b_runner.py, test_guiprocess.py, guiprocess.py]
 status: merged
 source: project_swe_bench_closed_loop_gap.md
 ---

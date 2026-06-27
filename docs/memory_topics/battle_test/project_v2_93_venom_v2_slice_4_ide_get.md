@@ -1,6 +1,6 @@
 ---
 title: Project V2 93 Venom V2 Slice 4 Ide Get
-modules: [tests/governance/test_ide_observability_tool_permissions.py, backend/core/ouroboros/governance/ide_observability.py]
+modules: [tests/governance/test_ide_observability_tool_permissions.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_ide_observability.py, tests/governance/test_permission_decision_archive.py, tests/governance/test_tool_permissions_repl.py, tests/governance/test_permission_decision_sse.py]
 status: merged
 source: project_v2_93_venom_v2_slice_4_ide_get.md
 ---

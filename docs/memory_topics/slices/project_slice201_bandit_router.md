@@ -1,6 +1,6 @@
 ---
 title: Project Slice201 Bandit Router
-modules: []
+modules: [backend/core/ouroboros/governance/bandit_router.py]
 status: historical
 source: project_slice201_bandit_router.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: DW Autonomy Completion Arc — Slices 231–234b (banked 2026-06-12)
-modules: []
+modules: [backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/goal_inference.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/brain_selector.py, backend/core/ouroboros/governance/governed_loop_service.py, orchestrator.py, backend/core/ouroboros/governance/auto_action_router.py, backend/core/ouroboros/governance/memory_crystallization.py, backend/core/ouroboros/governance/hybrid_teammate_executor.py, backend/core/ouroboros/governance/agent_memory.py]
 status: historical
 source: project_dw_completion_onion_231_234b.md
 ---

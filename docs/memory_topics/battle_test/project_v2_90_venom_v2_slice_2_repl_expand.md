@@ -1,6 +1,6 @@
 ---
 title: Project V2 90 Venom V2 Slice 2 Repl Expand
-modules: [tests/governance/test_tool_permissions_repl.py, backend/core/ouroboros/governance/tool_permissions_repl.py, backend/core/ouroboros/battle_test/serpent_flow.py]
+modules: [tests/governance/test_tool_permissions_repl.py, backend/core/ouroboros/governance/tool_permissions_repl.py, backend/core/ouroboros/battle_test/serpent_flow.py, backend/core/ouroboros/governance/permission_decision_archive.py, backend/core/ouroboros/governance/decisions_repl.py, tests/governance/test_venom_v2_slice_1_tool_permission.py, tests/governance/test_section_31_u2_slice4_repl_observability.py, tests/governance/test_section_37_tier2_10_replay_repl.py, tests/governance/test_slice_5b_e_repls.py, tests/governance/test_repl_dispatch_registry.py, backend/core/ouroboros/battle_test/repl_dispatch_registry.py]
 status: historical
 source: project_v2_90_venom_v2_slice_2_repl_expand.md
 ---

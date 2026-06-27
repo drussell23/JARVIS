@@ -1,6 +1,6 @@
 ---
 title: Project Priority 2 Postmortem Recall Scope
-modules: []
+modules: [backend/core/ouroboros/governance/episodic_memory.py, backend/core/ouroboros/governance/last_session_summary.py, backend/core/ouroboros/governance/governed_loop_service.py, helper.py, brainstem/auth.py, postmortem_recall.py, backend/core/ouroboros/governance/verification/postmortem_recall_index.py, backend/core/ouroboros/governance/verification/postmortem_recall_injector.py, backend/core/ouroboros/governance/verification/postmortem_recall_consumer.py]
 status: merged
 source: project_priority_2_postmortem_recall_scope.md
 ---

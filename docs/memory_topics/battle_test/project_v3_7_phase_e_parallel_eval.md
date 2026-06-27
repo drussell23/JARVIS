@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase E Parallel Eval
-modules: [backend/core/ouroboros/governance/swe_bench_pro/parallel_eval.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_parallel_eval.py]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/parallel_eval.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_parallel_eval.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_e_parallel_eval.md
 ---

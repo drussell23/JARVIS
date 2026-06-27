@@ -1,6 +1,6 @@
 ---
 title: DirectionInferrer Arc — CLOSED
-modules: []
+modules: [backend/core/ouroboros/governance/direction_inferrer.py, backend/core/ouroboros/governance/posture.py, backend/core/ouroboros/governance/strategic_direction.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/posture_observer.py]
 status: merged
 source: project_direction_inferrer_graduation.md
 ---

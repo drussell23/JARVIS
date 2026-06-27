@@ -1,6 +1,6 @@
 ---
 title: Project Slice251 Durable Steering
-modules: [tests/governance/test_slice251_durable_steering.py]
+modules: [tests/governance/test_slice251_durable_steering.py, backend/core/ouroboros/governance/user_preference_memory.py, backend/core/ouroboros/governance/steering.py, backend/core/ouroboros/governance/tool_executor.py, tests/battle_test/test_plan_and_memory_cmds.py]
 status: merged
 source: project_slice251_durable_steering.md
 ---

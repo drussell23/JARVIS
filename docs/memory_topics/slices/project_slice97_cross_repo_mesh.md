@@ -1,6 +1,6 @@
 ---
 title: Project Slice97 Cross Repo Mesh
-modules: [backend/core/ouroboros/cross_repo_mesh/, tests/architecture/test_slice97_e2e_multirepo.py]
+modules: [backend/core/ouroboros/cross_repo_mesh/, tests/architecture/test_slice97_e2e_multirepo.py, backend/core/ouroboros/governance/cross_repo_causal_mirror.py, backend/core/ouroboros/cross_repo.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/cross_repo_mesh/ripple_contract.py, backend/core/ouroboros/cross_repo_mesh/ripple_emitter.py]
 status: historical
 source: project_slice97_cross_repo_mesh.md
 ---

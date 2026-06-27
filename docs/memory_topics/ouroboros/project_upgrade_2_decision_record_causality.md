@@ -1,6 +1,6 @@
 ---
 title: Project Upgrade 2 Decision Record Causality
-modules: [scripts/replay_determinism.py]
+modules: [scripts/replay_determinism.py, backend/core/ouroboros/governance/verification/dag_navigation.py, backend/core/ouroboros/governance/flag_registry_seed.py, tests/governance/test_upgrade_2_graduation.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/decisions_observability.py, backend/core/ouroboros/governance/decisions_repl.py, scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/determinism/decisions_reader.py, backend/core/ouroboros/governance/determinism/decision_runtime.py]
 status: merged
 source: project_upgrade_2_decision_record_causality.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice122 Sovereign Keys
-modules: [backend/core/ouroboros/governance/sovereign_keys.py, tests/architecture/test_slice122_sovereign_keys.py]
+modules: [backend/core/ouroboros/governance/sovereign_keys.py, tests/architecture/test_slice122_sovereign_keys.py, backend/core/ouroboros/governance/roadmap_synthesizer.py, backend/api/observability_gateway.py]
 status: merged
 source: project_slice122_sovereign_keys.md
 ---

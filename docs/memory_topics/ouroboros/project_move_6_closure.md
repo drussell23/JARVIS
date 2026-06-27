@@ -1,6 +1,6 @@
 ---
 title: Project Move 6 Closure
-modules: [tests/governance/test_generative_quorum_graduation.py]
+modules: [tests/governance/test_generative_quorum_graduation.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/battle_test/serpent_flow.py, orchestrator.py]
 status: merged
 source: project_move_6_closure.md
 ---

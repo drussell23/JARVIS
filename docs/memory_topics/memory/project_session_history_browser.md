@@ -1,6 +1,6 @@
 ---
 title: Project Session History Browser
-modules: [scripts/livefire_session_browser.py, tests/REPL]
+modules: [scripts/livefire_session_browser.py, backend/core/ouroboros/governance/session_record.py, backend/core/ouroboros/governance/session_browser.py, tests/governance/test_session_graduation.py]
 status: historical
 source: project_session_history_browser.md
 ---

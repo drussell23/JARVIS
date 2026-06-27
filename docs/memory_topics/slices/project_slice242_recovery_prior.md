@@ -1,6 +1,6 @@
 ---
 title: Project Slice242 Recovery Prior
-modules: []
+modules: [backend/core/ouroboros/governance/dw_transport_recovery.py, backend/core/ouroboros/governance/hibernation_prober.py, tests/governance/test_slice242_resurrection_soak.py, tests/governance/test_slice242_recovery_prior.py, tests/governance/test_slice243_stability_gate.py, tests/governance/test_slice243_dw_stream_probe.py]
 status: merged
 source: project_slice242_recovery_prior.md
 ---

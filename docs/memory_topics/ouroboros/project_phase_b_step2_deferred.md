@@ -1,6 +1,6 @@
 ---
 title: Phase B Step-2 Deferred Work (2026-04-20)
-modules: []
+modules: [backend/core/ouroboros/governance/general_driver.py, backend/core/ouroboros/governance/governed_loop_service.py, tests/governance/test_general_driver.py, tests/governance/test_general_gls_wire_in.py, orchestrator.py, backend/core/ouroboros/governance/providers.py]
 status: merged
 source: project_phase_b_step2_deferred.md
 ---

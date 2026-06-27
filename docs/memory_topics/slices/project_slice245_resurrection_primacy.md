@@ -1,6 +1,6 @@
 ---
 title: Project Slice245 Resurrection Primacy
-modules: [tests/governance/test_slice245_resurrection_primacy.py]
+modules: [tests/governance/test_slice245_resurrection_primacy.py, backend/core/ouroboros/governance/op_context.py, backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: merged
 source: project_slice245_resurrection_primacy.md
 ---

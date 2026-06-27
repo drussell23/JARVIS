@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Loader Enumeration Union
-modules: [tests/test_smoke.py, backend/core/ouroboros/governance/swe_bench_pro/dataset_loader.py, tests/governance/test_swe_bench_pro_dataset_loader.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [tests/test_smoke.py, backend/core/ouroboros/governance/swe_bench_pro/dataset_loader.py, tests/governance/test_swe_bench_pro_dataset_loader.py]
 status: historical
 source: project_v3_7_loader_enumeration_union.md
 ---

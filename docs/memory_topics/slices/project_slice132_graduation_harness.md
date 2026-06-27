@@ -1,6 +1,6 @@
 ---
 title: Project Slice132 Graduation Harness
-modules: []
+modules: [backend/core/ouroboros/governance/graduation_orchestrator.py]
 status: merged
 source: project_slice132_graduation_harness.md
 ---

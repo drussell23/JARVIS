@@ -1,6 +1,6 @@
 ---
 title: Sovereign State-Propagation Bridge (2026-06-22, MERGED PR #69662)
-modules: []
+modules: [backend/core/ouroboros/governance/semantic_index.py, orchestrator.py]
 status: merged
 source: project_sovereign_state_propagation_bridge.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Ticket A1 — idle_timeout hijacked by provider retry storm (SHIPPED)
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_followup_idle_timeout_retry_hijack.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Gap #7 — Presentation Restraint CLOSED (2026-05-04)
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/battle_test/presentation_restraint.py, backend/core/ouroboros/battle_test/repl_completion.py, backend/core/ouroboros/battle_test/repl_input_polish.py]
 status: historical
 source: project_gap_7_presentation_restraint.md
 ---

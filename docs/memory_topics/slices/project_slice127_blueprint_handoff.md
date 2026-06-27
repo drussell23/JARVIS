@@ -1,6 +1,6 @@
 ---
 title: Project Slice127 Blueprint Handoff
-modules: [docs/superpowers/plans/2026-06-06-slice-127-economic-sovereign-matrix.md, tests/governance/test_provider_retry_classifier.py]
+modules: [tests/governance/test_provider_retry_classifier.py, backend/core/ouroboros/governance/provider_retry_classifier.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/claude_circuit_breaker.py, circuit_breaker.py, backend/core/ouroboros/governance/dual_lane_breaker.py, backend/core/ouroboros/governance/dw_transport_recovery.py, backend/core/ouroboros/battle_test/stream_renderer.py]
 status: historical
 source: project_slice127_blueprint_handoff.md
 ---

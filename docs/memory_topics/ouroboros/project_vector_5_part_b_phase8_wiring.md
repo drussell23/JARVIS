@@ -1,6 +1,6 @@
 ---
 title: Project Vector 5 Part B Phase8 Wiring
-modules: [backend/core/ouroboros/governance/observability/phase8_producers.py, tests/governance/test_vector_5_part_b_phase8_wiring.py]
+modules: [backend/core/ouroboros/governance/observability/phase8_producers.py, tests/governance/test_vector_5_part_b_phase8_wiring.py, backend/core/ouroboros/governance/semantic_triage.py, backend/core/ouroboros/governance/phase_dispatcher.py]
 status: merged
 source: project_vector_5_part_b_phase8_wiring.md
 ---

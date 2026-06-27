@@ -1,6 +1,6 @@
 ---
 title: Project North Star Galaxy Audit
-modules: [docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/cognitive_bus.py, backend/core/ouroboros/governance/cognitive_subscribers.py]
 status: historical
 source: project_north_star_galaxy_audit.md
 ---

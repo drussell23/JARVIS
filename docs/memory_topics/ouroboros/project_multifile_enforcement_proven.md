@@ -1,6 +1,6 @@
 ---
 title: Project Multifile Enforcement Proven
-modules: [docs/architecture/OUROBOROS.md]
+modules: [backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/multi_file_coverage_gate.py, backend/core/ouroboros/governance/provider_exhaustion_watcher.py, tests/governance/intake/sensors/test_test_failure_sensor_dedup.py, dedup.py, orchestrator.py, backend/core/ouroboros/governance/interactive_repair.py]
 status: historical
 source: project_multifile_enforcement_proven.md
 ---

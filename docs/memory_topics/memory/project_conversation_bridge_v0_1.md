@@ -1,6 +1,6 @@
 ---
 title: Project Conversation Bridge V0 1
-modules: [backend/core/ouroboros/governance/conversation_bridge.py, backend/voice/]
+modules: [backend/core/ouroboros/governance/conversation_bridge.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/comm_protocol.py, tests/governance/test_conversation_bridge_e2e.py]
 status: historical
 source: project_conversation_bridge_v0_1.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice 49 External Sentinel
-modules: []
+modules: [backend/core/resilience/file_watch_guard.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/governance/intake/sensors/opportunity_miner_sensor.py, backend/core/ouroboros/governance/external_watchdog.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/phase_runners/classify_runner.py]
 status: historical
 source: project_slice_49_external_sentinel.md
 ---

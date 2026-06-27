@@ -1,6 +1,6 @@
 ---
 title: Project Section 39 Tier7 Phase Orchestra
-modules: []
+modules: [backend/core/ouroboros/governance/phase_orchestra.py, backend/core/ouroboros/governance/orchestra_repl.py]
 status: historical
 source: project_section_39_tier7_phase_orchestra.md
 ---

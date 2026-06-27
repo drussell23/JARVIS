@@ -1,6 +1,6 @@
 ---
 title: Project Venom Hardening
-modules: [backend/core/ouroboros/governance/tool_executor.py, tests/test_ouroboros_governance/test_venom_edit_tools.py, backend/core/ouroboros/governance/live_work_sensor.py]
+modules: [backend/core/ouroboros/governance/tool_executor.py, tests/test_ouroboros_governance/test_venom_edit_tools.py, backend/core/ouroboros/governance/live_work_sensor.py, orchestrator.py, tests/test_ouroboros_governance/test_live_work_sensor.py]
 status: historical
 source: project_venom_hardening.md
 ---

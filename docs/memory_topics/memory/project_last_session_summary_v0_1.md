@@ -1,6 +1,6 @@
 ---
 title: Project Last Session Summary V0 1
-modules: [backend/core/ouroboros/governance/last_session_summary.py]
+modules: [backend/core/ouroboros/governance/last_session_summary.py, backend/core/ouroboros/governance/ops_digest_observer.py]
 status: historical
 source: project_last_session_summary_v0_1.md
 ---

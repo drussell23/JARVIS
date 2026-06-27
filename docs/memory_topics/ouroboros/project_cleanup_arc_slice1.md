@@ -1,6 +1,6 @@
 ---
 title: Project Cleanup Arc Slice1
-modules: [backend/core/ouroboros/governance/graduation_orchestrator.py, backend/core/ouroboros/governance/graduation_tracker.py, tests/governance/test_graduation_orchestrator.py, backend/core/ouroboros/governance/cleanup_invariants.py, tests/governance/test_cleanup_arc_slice1.py]
+modules: [backend/core/ouroboros/governance/graduation_orchestrator.py, backend/core/ouroboros/governance/graduation_tracker.py, tests/governance/test_graduation_orchestrator.py, backend/core/ouroboros/governance/cleanup_invariants.py, tests/governance/test_cleanup_arc_slice1.py, backend/core/runtime_task_orchestrator.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/jarvis_intelligence.py, backend/core/ouroboros/governance/observability_route_registry.py, backend/core/ouroboros/battle_test/repl_dispatch_registry.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_cleanup_arc_slice1.md
 ---

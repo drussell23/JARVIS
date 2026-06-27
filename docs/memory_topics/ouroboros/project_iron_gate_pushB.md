@@ -1,6 +1,6 @@
 ---
 title: Project Iron Gate Pushb
-modules: [docs/architecture/OUROBOROS.md]
+modules: [orchestrator.py, backend/core/ouroboros/governance/repair_engine.py, tests/test_ouroboros_governance/test_repair_engine.py, tests/test_ouroboros_governance/test_governed_loop_l2.py]
 status: historical
 source: project_iron_gate_pushB.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice 53 Dual Lane Breaker
-modules: []
+modules: [backend/core/ouroboros/governance/dual_lane_breaker.py]
 status: historical
 source: project_slice_53_dual_lane_breaker.md
 ---

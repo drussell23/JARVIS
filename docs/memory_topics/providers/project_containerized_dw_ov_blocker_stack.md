@@ -1,6 +1,6 @@
 ---
 title: Project Containerized Dw Ov Blocker Stack
-modules: [scripts/migrate_to_host.sh, backend/core/gcp_vm_manager.py, scripts/ignite_sovereign_cloud_node.py, tests/seed/test_seed_defect.py]
+modules: [backend/core/gcp_vm_manager.py, scripts/ignite_sovereign_cloud_node.py, tests/seed/test_seed_defect.py, backend/core/ouroboros/aegis/forwarding.py, backend/core/ouroboros/aegis/passthrough.py, backend/core/ouroboros/governance/model_pinning_heuristic.py, unified_supervisor.py, backend/core/ouroboros/governance/calibration_context.py, backend/core/ouroboros/governance/silent_boot.py, backend/core/ouroboros/governance/payload_transport_heuristic.py]
 status: open
 source: project_containerized_dw_ov_blocker_stack.md
 ---

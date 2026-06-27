@@ -1,6 +1,6 @@
 ---
 title: A1 Live-Fire Chaos Harness (2026-06-24, MERGED PR #69694) — the O+V base-autonomy proof rig
-modules: [scripts/chaos_injector_ast.py, scripts/a1_graduation_auditor.py, scripts/a1_live_fire_chaos_harness.py]
+modules: [scripts/chaos_injector_ast.py, scripts/a1_graduation_auditor.py, scripts/a1_live_fire_chaos_harness.py, backend/core/ouroboros/governance/a1_trace.py, scripts/live_fire_graduation_soak.py]
 status: merged
 source: project_a1_chaos_harness.md
 ---

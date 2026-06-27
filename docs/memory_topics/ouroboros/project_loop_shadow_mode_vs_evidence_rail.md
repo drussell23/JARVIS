@@ -1,6 +1,6 @@
 ---
 title: Project Loop Shadow Mode Vs Evidence Rail
-modules: []
+modules: [backend/core/cybernetic_reanimation.py, unified_supervisor.py, orchestrator.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_loop_shadow_mode_vs_evidence_rail.md
 ---

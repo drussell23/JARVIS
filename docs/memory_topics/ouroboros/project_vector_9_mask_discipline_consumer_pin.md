@@ -1,6 +1,6 @@
 ---
 title: Project Vector 9 Mask Discipline Consumer Pin
-modules: [tests/governance/test_wave3_hygiene_2026_05_05.py]
+modules: [tests/governance/test_wave3_hygiene_2026_05_05.py, backend/core/ouroboros/governance/observability/flag_change_emitter.py, backend/core/ouroboros/governance/observability/ide_routes.py, backend/core/ouroboros/governance/observability/sse_bridge.py]
 status: historical
 source: project_vector_9_mask_discipline_consumer_pin.md
 ---

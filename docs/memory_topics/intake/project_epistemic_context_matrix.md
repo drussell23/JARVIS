@@ -1,6 +1,6 @@
 ---
 title: Sovereign Epistemological Context Matrix — Phase 1 (2026-06-21, branch `fleet/sovereign-epistemic-context-matrix`, NOT merged — built via subagent-driven-development)
-modules: [docs/superpowers/specs/2026-06-21-sovereign-epistemic-context-matrix-design.md, docs/superpowers/plans/2026-06-21-sovereign-epistemic-context-matrix-phase1.md, backend/core/ouroboros/governance/]
+modules: [backend/core/ouroboros/governance/, backend/core/ouroboros/oracle.py, backend/core/ouroboros/governance/state_drift.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/epistemic_quarantine.py, backend/core/ouroboros/governance/epistemic_prefetch.py, backend/core/ouroboros/governance/context_governor.py, backend/core/ouroboros/governance/op_context.py, orchestrator.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: historical
 source: project_epistemic_context_matrix.md
 ---

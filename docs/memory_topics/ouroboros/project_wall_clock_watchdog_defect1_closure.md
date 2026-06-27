@@ -1,6 +1,6 @@
 ---
 title: WallClockWatchdog Defect #1 — CLOSED 2026-05-03
-modules: [scripts/wall_clock_watchdog_defect1_verdict.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/flag_registry_seed.py]
+modules: [scripts/wall_clock_watchdog_defect1_verdict.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/battle_test/shutdown_watchdog.py]
 status: historical
 source: project_wall_clock_watchdog_defect1_closure.md
 ---

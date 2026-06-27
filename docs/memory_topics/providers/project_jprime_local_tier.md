@@ -1,6 +1,6 @@
 ---
 title: Project Jprime Local Tier
-modules: [backend/core/prime_client.py, backend/core/ouroboros/governance/, scripts/smoke_jprime_local.py, scripts/smoke_jprime_exhaustion.py]
+modules: [backend/core/prime_client.py, backend/core/ouroboros/governance/, scripts/smoke_jprime_local.py, scripts/smoke_jprime_exhaustion.py, backend/core/ouroboros/governance/local_inference_director.py, backend/core/ouroboros/governance/tiered_prime_client.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/exhaustion_interceptor.py, backend/core/ouroboros/governance/topological_file_pruner.py, backend/core/ouroboros/governance/local_daemon_governor.py, tests/governance/chaos_simulation_fabric.py]
 status: historical
 source: project_jprime_local_tier.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice197 Autonomous Graduation
-modules: []
+modules: [backend/core/ouroboros/governance/m10_autonomous_graduation.py]
 status: historical
 source: project_slice197_autonomous_graduation.md
 ---

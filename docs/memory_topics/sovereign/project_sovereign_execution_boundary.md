@@ -1,6 +1,6 @@
 ---
 title: Project Sovereign Execution Boundary
-modules: [scripts/verify_file_isolation.py]
+modules: [scripts/verify_file_isolation.py, backend/core/ouroboros/governance/governed_loop_service.py, execution_context.py, tests/governance/test_quarantine_reap_pin.py, backend/core/ouroboros/battle_test/harness.py, orchestrator.py]
 status: open
 source: project_sovereign_execution_boundary.md
 ---

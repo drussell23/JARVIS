@@ -1,6 +1,6 @@
 ---
 title: Stale test_sensor_start_stop in test_backlog_sensor.py
-modules: [tests/governance/intake/sensors/test_backlog_sensor.py]
+modules: [tests/governance/intake/sensors/test_backlog_sensor.py, backend/core/ouroboros/governance/intake/sensors/backlog_sensor.py]
 status: historical
 source: project_followup_stale_test_backlog_sensor_start_stop.md
 ---

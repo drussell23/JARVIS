@@ -1,6 +1,6 @@
 ---
 title: Project Move 4 Closure
-modules: []
+modules: [backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/governance/invariant_drift_observability.py]
 status: merged
 source: project_move_4_closure.md
 ---

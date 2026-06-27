@@ -1,6 +1,6 @@
 ---
 title: Anti-Venom Hardening (2026-06-26/27, PR #69733 OPEN — branch `feature/anti-venom-hardening` off main e46a79a, 20 commits, 153 tests green; NOT merged — gated on human line-by-line brain-stem review)
-modules: [docs/superpowers/specs/2026-06-26-anti-venom-hardening-verified.md]
+modules: [backend/core/ouroboros/governance/change_engine.py, backend/core/ouroboros/governance/phase_runners/gate_runner.py, orchestrator.py, sandbox_exec.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/phase_runners/slice4b_runner.py]
 status: open
 source: project_anti_venom_hardening.md
 ---

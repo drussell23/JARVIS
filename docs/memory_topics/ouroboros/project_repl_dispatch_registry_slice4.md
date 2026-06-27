@@ -1,6 +1,6 @@
 ---
 title: Project Repl Dispatch Registry Slice4
-modules: [backend/core/ouroboros/battle_test/repl_dispatch_registry.py, tests/governance/test_repl_dispatch_registry.py]
+modules: [backend/core/ouroboros/battle_test/repl_dispatch_registry.py, tests/governance/test_repl_dispatch_registry.py, X_repl.py, backend/core/ouroboros/governance/decisions_repl.py, backend/core/ouroboros/battle_test/serpent_flow.py, backend/core/ouroboros/governance/cleanup_invariants.py, tests/governance/test_slice_5b_e_repls.py, backend/core/ouroboros/governance/event_channel.py]
 status: historical
 source: project_repl_dispatch_registry_slice4.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice120 Layer4 Authority
-modules: [backend/core/ouroboros/governance/layer4_roadmap_authority.py, tests/architecture/test_slice120_layer4_roadmap.py]
+modules: [backend/core/ouroboros/governance/layer4_roadmap_authority.py, tests/architecture/test_slice120_layer4_roadmap.py, orchestrator.py]
 status: merged
 source: project_slice120_layer4_authority.md
 ---

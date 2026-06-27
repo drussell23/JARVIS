@@ -1,6 +1,6 @@
 ---
 title: Project Slice253 Shadow Endorsement
-modules: []
+modules: [backend/core/cybernetic_reanimation.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_slice253_shadow_endorsement.py, tests/governance/test_reanimation_kernel_wiring.py]
 status: merged
 source: project_slice253_shadow_endorsement.md
 ---

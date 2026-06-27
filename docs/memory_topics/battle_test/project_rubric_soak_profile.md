@@ -1,6 +1,6 @@
 ---
 title: Project Rubric Soak Profile
-modules: []
+modules: [backend/core/ouroboros/governance/swe_bench_pro/harness_inject.py]
 status: historical
 source: project_rubric_soak_profile.md
 ---

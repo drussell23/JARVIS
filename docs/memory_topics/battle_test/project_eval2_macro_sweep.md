@@ -1,6 +1,6 @@
 ---
 title: Project Eval2 Macro Sweep
-modules: [scripts/swe_bench_pro_report.py, scripts/utils/async_pr_janitor.py, scripts/swe_bench_pro_provider_spend.py]
+modules: [scripts/swe_bench_pro_report.py, scripts/utils/async_pr_janitor.py, scripts/swe_bench_pro_provider_spend.py, backend/core/ouroboros/governance/swe_bench_pro/per_problem_harness.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/swe_bench_pro/result_store.py, backend/core/ouroboros/governance/patch_domain_guard.py, backend/core/ouroboros/aegis/forwarding.py, backend/core/ouroboros/governance/adaptive_gen_budget.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/providers.py]
 status: merged
 source: project_eval2_macro_sweep.md
 ---

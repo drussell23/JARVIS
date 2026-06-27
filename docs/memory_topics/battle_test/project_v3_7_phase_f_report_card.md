@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase F Report Card
-modules: [backend/core/ouroboros/governance/swe_bench_pro/report_card.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_report_card.py]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/report_card.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_report_card.py, backend/core/ouroboros/governance/repair_engine.py]
 status: merged
 source: project_v3_7_phase_f_report_card.md
 ---

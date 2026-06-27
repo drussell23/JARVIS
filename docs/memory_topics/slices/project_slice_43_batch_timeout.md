@@ -1,6 +1,6 @@
 ---
 title: Project Slice 43 Batch Timeout
-modules: []
+modules: [backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_slice_43_batch_timeout.md
 ---

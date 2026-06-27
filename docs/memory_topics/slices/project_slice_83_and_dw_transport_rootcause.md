@@ -1,6 +1,6 @@
 ---
 title: Slice 83 + the DW-transport root-cause correction (2026-06-03/04)
-modules: [tests/governance/test_slice83_priority_dispatch.py, scripts/swe_bench_pro_soak.sh, tests/aegis/test_slice85_concurrent_forwarding.py, scripts/swe_bench_pro_provider_spend.py]
+modules: [tests/governance/test_slice83_priority_dispatch.py, tests/aegis/test_slice85_concurrent_forwarding.py, scripts/swe_bench_pro_provider_spend.py, backend/core/ouroboros/governance/provider_topology.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/context_compaction.py]
 status: historical
 source: project_slice_83_and_dw_transport_rootcause.md
 ---

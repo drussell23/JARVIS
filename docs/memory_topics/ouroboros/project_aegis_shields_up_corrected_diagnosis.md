@@ -1,6 +1,6 @@
 ---
 title: Project Aegis Shields Up Corrected Diagnosis
-modules: [tests/governance/test_payload_transport_heuristic.py]
+modules: [tests/governance/test_payload_transport_heuristic.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/aegis/request_body.py, backend/core/ouroboros/aegis/passthrough.py, daemon.py]
 status: historical
 source: project_aegis_shields_up_corrected_diagnosis.md
 ---

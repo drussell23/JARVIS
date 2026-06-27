@@ -1,6 +1,6 @@
 ---
 title: Display past session timeline (existing, untouched)
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/determinism/decision_runtime.py, backend/core/ouroboros/governance/phase_runners/classify_runner.py, tests/governance/test_convergence_governor.py]
 status: merged
 source: project_phase_1_closure.md
 ---

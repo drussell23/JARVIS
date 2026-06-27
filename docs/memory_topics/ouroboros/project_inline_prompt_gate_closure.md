@@ -1,6 +1,6 @@
 ---
 title: Project Inline Prompt Gate Closure
-modules: []
+modules: [backend/core/ouroboros/governance/inline_prompt_gate.py, backend/core/ouroboros/governance/inline_prompt_gate_runner.py, backend/core/ouroboros/governance/inline_prompt_gate_http.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/inline_prompt_gate_renderer.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: historical
 source: project_inline_prompt_gate_closure.md
 ---

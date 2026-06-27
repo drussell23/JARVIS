@@ -1,6 +1,6 @@
 ---
 title: Project Slice 52 Posture Cache
-modules: []
+modules: [backend/core/ouroboros/governance/posture_observer.py]
 status: historical
 source: project_slice_52_posture_cache.md
 ---

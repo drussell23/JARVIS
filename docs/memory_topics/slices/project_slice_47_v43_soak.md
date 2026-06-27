@@ -1,6 +1,6 @@
 ---
 title: Project Slice 47 V43 Soak
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/battle_test/harness.py, tests/test_ouroboros_governance/test_todo_scanner_trigger_tag.py]
 status: historical
 source: project_slice_47_v43_soak.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project User Preference Memory
-modules: [backend/core/ouroboros/governance/user_preference_memory.py, tests/test_ouroboros_governance/test_user_preference_memory.py]
+modules: [backend/core/ouroboros/governance/user_preference_memory.py, tests/test_ouroboros_governance/test_user_preference_memory.py, orchestrator.py, backend/core/ouroboros/governance/tool_executor.py]
 status: historical
 source: project_user_preference_memory.md
 ---

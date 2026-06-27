@@ -1,6 +1,6 @@
 ---
 title: Project Slice247 State Drift
-modules: [tests/governance/test_slice247_state_drift.py, backend/core, tests/unit/core]
+modules: [tests/governance/test_slice247_state_drift.py, backend/core/ouroboros/governance/state_drift.py, orchestrator.py, target_file.py]
 status: merged
 source: project_slice247_state_drift.md
 ---

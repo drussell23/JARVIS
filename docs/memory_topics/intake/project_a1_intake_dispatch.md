@@ -1,6 +1,6 @@
 ---
 title: Milestone A1 — Sovereign Event-Driven Intake & DLQ (2026-06-21) — CHECKPOINT (DLQ merged, T2-T5 pending)
-modules: [scripts/ignite_sovereign_cloud_node.py, scripts/cleanup_orphaned_vms.sh, docs/superpowers/specs/2026-06-21-a1-event-driven-intake-dlq-design.md, backend/core/ouroboros/governance/intake_dlq.py, docs/superpowers/plans/2026-06-21-a1-event-driven-intake-dlq-plan.md]
+modules: [scripts/ignite_sovereign_cloud_node.py, backend/core/ouroboros/governance/intake_dlq.py, backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/goal_inference.py, backend/core/ouroboros/governance/intake/intake_layer_service.py, backend/core/ouroboros/governance/a1_trace.py, backend/core/ouroboros/governance/epistemic_prefetch.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: open
 source: project_a1_intake_dispatch.md
 ---

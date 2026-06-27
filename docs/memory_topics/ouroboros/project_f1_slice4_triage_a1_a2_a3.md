@@ -1,6 +1,6 @@
 ---
 title: Rule 2: Security surface is unconditionally off-limits
-modules: [backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/risk_engine.py, backend/core/ouroboros/cancellation_token.py]
+modules: [backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/risk_engine.py, backend/core/ouroboros/cancellation_token.py, backend/core/ouroboros/battle_test/harness.py, authoring_helpers.py, credentials_format.py, secret_santa_sensor.py, token_bucket.py, encryption_stub.py]
 status: historical
 source: project_f1_slice4_triage_a1_a2_a3.md
 ---

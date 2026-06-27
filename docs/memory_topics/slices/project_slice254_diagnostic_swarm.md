@@ -1,6 +1,6 @@
 ---
 title: Project Slice254 Diagnostic Swarm
-modules: [backend/core/diagnostic_swarm.py]
+modules: [backend/core/diagnostic_swarm.py, backend/core/cybernetic_reanimation.py, tests/governance/test_slice254_diagnostic_swarm.py, tests/governance/test_reanimation_kernel_wiring.py]
 status: merged
 source: project_slice254_diagnostic_swarm.md
 ---

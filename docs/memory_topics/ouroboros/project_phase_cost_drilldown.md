@@ -1,6 +1,6 @@
 ---
 title: Project Phase Cost Drilldown
-modules: [scripts/livefire_phase_cost.py, backend/core/ouroboros/governance/phase_cost.py, backend/core/ouroboros/governance/cost_repl.py, backend/core/ouroboros/governance/cost_governor.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/battle_test/session_recorder.py, backend/core/ouroboros/governance/session_record.py, tests/governance/test_phase_cost.py, tests/test_ouroboros_governance/test_cost_governor.py, tests/governance/]
+modules: [scripts/livefire_phase_cost.py, backend/core/ouroboros/governance/phase_cost.py, backend/core/ouroboros/governance/cost_repl.py, backend/core/ouroboros/governance/cost_governor.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/battle_test/session_recorder.py, backend/core/ouroboros/governance/session_record.py, tests/governance/test_phase_cost.py, tests/test_ouroboros_governance/test_cost_governor.py, tests/governance/test_phase_cost_graduation.py, tests/governance/test_cost_governor_phase.py, tests/governance/test_phase_cost_persistence.py]
 status: historical
 source: project_phase_cost_drilldown.md
 ---

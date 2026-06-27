@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Phase-Runner Graduation Matrix
-modules: [backend/core/ouroboros/governance/phase_runners/, backend/core/ouroboros/governance/tests/test_phase_runner_slice5b.py, scripts/ouroboros_battle_test.py, backend/core/ouroboros/architect/__init__.py]
+modules: [backend/core/ouroboros/governance/phase_runners/, backend/core/ouroboros/governance/tests/test_phase_runner_slice5b.py, scripts/ouroboros_battle_test.py, backend/core/ouroboros/architect/__init__.py, backend/core/ouroboros/governance/phase_dispatcher.py, orchestrator.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/persistent_intelligence_manager.py, backend/core/ouroboros/governance/phase_runners/slice4b_runner.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py]
 status: merged
 source: project_wave2_graduation_matrix.md
 ---

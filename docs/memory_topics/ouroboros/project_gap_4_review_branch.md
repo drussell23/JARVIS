@@ -1,6 +1,6 @@
 ---
 title: Gap #4 — IDE-native ReviewBranch closure (2026-05-04)
-modules: [extensions/vscode-jarvis/]
+modules: [backend/core/ouroboros/battle_test/diff_archive.py, backend/core/ouroboros/governance/review_branch_manager.py, backend/core/ouroboros/governance/review_coordinator.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_gap_4_review_branch.md
 ---

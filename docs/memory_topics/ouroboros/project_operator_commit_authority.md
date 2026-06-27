@@ -1,6 +1,6 @@
 ---
 title: Project Operator Commit Authority
-modules: [scripts/hooks/pre-commit, scripts/hooks/pre-commit.project, backend/core/ouroboros/governance/operator_commit_authority.py, tests/governance/test_operator_commit_authority.py, scripts/install_hooks.py]
+modules: [backend/core/ouroboros/governance/operator_commit_authority.py, tests/governance/test_operator_commit_authority.py, scripts/install_hooks.py, backend/core/ouroboros/governance/commit_authority_cli.py, backend/core/ouroboros/governance/persistent_master.py, backend/core/ouroboros/governance/commit_repl.py, backend/core/ouroboros/governance/commit_authority_archive.py, backend/core/ouroboros/governance/harness_sovereignty_pin.py, backend/core/ouroboros/governance/commit_authority_daemon.py, commit_authority_repl.py, tests/governance/test_meta_phase_runner.py, tests/governance/test_opp_miner_merkle.py]
 status: open
 source: project_operator_commit_authority.md
 ---

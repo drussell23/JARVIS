@@ -1,6 +1,6 @@
 ---
 title: FlagRegistry + /help Arc — CLOSED
-modules: [scripts/audit_env_flags.py]
+modules: [scripts/audit_env_flags.py, backend/core/ouroboros/governance/flag_registry.py, backend/core/ouroboros/governance/ide_observability.py]
 status: merged
 source: project_flag_registry_graduation.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Gap #2 — ToolRenderRegistry closure (2026-05-04)
-modules: [tests/battle_test/]
+modules: [backend/core/ouroboros/battle_test/tool_render_registry.py, backend/core/ouroboros/battle_test/tool_render_policy.py, backend/core/ouroboros/battle_test/tool_render_store.py, backend/core/ouroboros/battle_test/tool_render_view.py]
 status: historical
 source: project_gap_2_tool_render_registry.md
 ---

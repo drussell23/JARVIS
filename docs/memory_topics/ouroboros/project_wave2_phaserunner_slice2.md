@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 2 — Result
-modules: [backend/core/ouroboros/governance/phase_runners/classify_runner.py, backend/core/ouroboros/governance/phase_runners/__init__.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/phase_runner/test_classify_runner_parity.py]
+modules: [backend/core/ouroboros/governance/phase_runners/classify_runner.py, backend/core/ouroboros/governance/phase_runners/__init__.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/phase_runner/test_classify_runner_parity.py, test_orchestrator.py]
 status: historical
 source: project_wave2_phaserunner_slice2.md
 ---

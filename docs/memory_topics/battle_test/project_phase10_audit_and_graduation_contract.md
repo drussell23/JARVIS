@@ -1,6 +1,6 @@
 ---
 title: Project Phase10 Audit And Graduation Contract
-modules: [backend/core/ouroboros/governance/phase10_graduation_contract.py, tests/governance/test_phase10_graduation_contract.py]
+modules: [backend/core/ouroboros/governance/phase10_graduation_contract.py, tests/governance/test_phase10_graduation_contract.py, backend/core/ouroboros/governance/topology_sentinel.py, backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_phase10_audit_and_graduation_contract.md
 ---

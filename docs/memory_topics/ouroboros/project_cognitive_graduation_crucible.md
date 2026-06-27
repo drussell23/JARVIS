@@ -1,6 +1,6 @@
 ---
 title: Project Cognitive Graduation Crucible
-modules: [backend/core/ouroboros/governance/, scripts/install_live_fire_soak_cron.sh, scripts/crucible_cadence.sh, tests/governance/test_ttft_zeroshot_decay.py, docs/superpowers/specs/2026-06-20-sovereign-transport-profiler-matrix.md, scripts/ignite_sovereign_cloud_node.py]
+modules: [backend/core/ouroboros/governance/, tests/governance/test_ttft_zeroshot_decay.py, scripts/ignite_sovereign_cloud_node.py, backend/core/ouroboros/governance/autonomous_graduation_engine.py, backend/core/ouroboros/governance/sleep_daemon.py, backend/core/ouroboros/governance/exploration_engine.py, exploration_ledger.py, backend/core/ouroboros/aegis/forwarding.py, backend/core/ouroboros/governance/dw_ttft_observer.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/event_channel.py]
 status: open
 source: project_cognitive_graduation_crucible.md
 ---

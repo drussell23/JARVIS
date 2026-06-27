@@ -1,6 +1,6 @@
 ---
 title: 4 Phases
-modules: []
+modules: [backend/core/ouroboros/governance/preflight_probe.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: historical
 source: project_slice_25b_preflight_boot_wiring.md
 ---

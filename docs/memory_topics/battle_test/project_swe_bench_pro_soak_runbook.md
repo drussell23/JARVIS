@@ -1,6 +1,6 @@
 ---
 title: Project Swe Bench Pro Soak Runbook
-modules: [backend/core/ouroboros/governance/swe_bench_pro/, tests/fixtures/swe_bench_pro/problems.jsonl]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/]
 status: historical
 source: project_swe_bench_pro_soak_runbook.md
 ---

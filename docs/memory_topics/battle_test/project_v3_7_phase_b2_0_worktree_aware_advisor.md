@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase B2 0 Worktree Aware Advisor
-modules: [backend/core/ouroboros/governance/operation_advisor.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/test_operation_advisor_worktree_aware.py, tests/governance/test_read_only_advisor_bypass.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/operation_advisor.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/test_operation_advisor_worktree_aware.py, tests/governance/test_read_only_advisor_bypass.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_b2_0_worktree_aware_advisor.md
 ---

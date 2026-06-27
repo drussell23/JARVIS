@@ -1,6 +1,6 @@
 ---
 title: Project Slice235 Validation Sixth Layer
-modules: []
+modules: [backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/goal_inference.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/intelligence_hooks.py, backend/core/ouroboros/governance/dw_transport_hedge.py]
 status: merged
 source: project_slice235_validation_sixth_layer.md
 ---

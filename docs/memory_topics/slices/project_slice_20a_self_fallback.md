@@ -1,6 +1,6 @@
 ---
 title: Project Slice 20A Self Fallback
-modules: [tests/governance/test_slice20a_self_fallback_elimination.py]
+modules: [tests/governance/test_slice20a_self_fallback_elimination.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: historical
 source: project_slice_20a_self_fallback.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Session History Browser Ext
-modules: [scripts/livefire_session_browser_ext.py, backend/core/ouroboros/governance/session_diff.py, backend/core/ouroboros/governance/session_stream_bridge.py, backend/core/ouroboros/governance/session_browser.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_session_diff.py]
+modules: [scripts/livefire_session_browser_ext.py, backend/core/ouroboros/governance/session_diff.py, backend/core/ouroboros/governance/session_stream_bridge.py, backend/core/ouroboros/governance/session_browser.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_session_diff.py, tests/governance/test_session_browser_ext_graduation.py, tests/governance/test_session_stream_bridge.py, tests/governance/test_session_browser_pinned.py, tests/governance/test_session_observability.py]
 status: merged
 source: project_session_history_browser_ext.md
 ---

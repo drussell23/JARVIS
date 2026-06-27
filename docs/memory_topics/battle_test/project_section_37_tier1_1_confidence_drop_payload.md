@@ -1,6 +1,6 @@
 ---
 title: Project Section 37 Tier1 1 Confidence Drop Payload
-modules: [tests/governance/test_section_37_tier1_1_confidence_drop_payload.py]
+modules: [tests/governance/test_section_37_tier1_1_confidence_drop_payload.py, backend/core/ouroboros/governance/doubleword_provider.py, tests/governance/test_confidence_sse_producer.py]
 status: historical
 source: project_section_37_tier1_1_confidence_drop_payload.md
 ---

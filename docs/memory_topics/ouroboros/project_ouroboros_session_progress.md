@@ -1,6 +1,6 @@
 ---
 title: Project Ouroboros Session Progress
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, orchestrator.py, tests/test_ouroboros_governance/test_orchestrator_multi_file.py, backend/core/ouroboros/governance/intake/sensors/proactive_exploration_sensor.py, backend/core/ouroboros/governance/strategic_direction.py, tests/test_ouroboros_governance/test_strategic_direction_git.py, backend/core/ouroboros/governance/orange_pr_reviewer.py, tests/test_ouroboros_governance/test_orange_pr_reviewer.py]
 status: historical
 source: project_ouroboros_session_progress.md
 ---

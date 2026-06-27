@@ -1,6 +1,6 @@
 ---
 title: DW reasoning_effort=none fix + adaptive Reasoning-Capability Profiler (PR #69633 MERGED, main ae1e1d2009, 2026-06-21)
-modules: []
+modules: [backend/core/ouroboros/governance/dw_reasoning_profile.py]
 status: merged
 source: project_dw_reasoning_capability_profiler.md
 ---

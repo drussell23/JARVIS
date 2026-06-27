@@ -1,6 +1,6 @@
 ---
 title: Project Slice204 Chronos Continuity
-modules: []
+modules: [backend/core/ouroboros/governance/chronos_ledger.py]
 status: historical
 source: project_slice204_chronos_continuity.md
 ---

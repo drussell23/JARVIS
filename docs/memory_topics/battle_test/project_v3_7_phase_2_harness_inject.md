@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase 2 Harness Inject
-modules: [tests/fixtures/swe_bench_pro/problems.jsonl, backend/core/ouroboros/governance/swe_bench_pro/harness_inject.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/fixtures/swe_bench_pro/README.md, tests/governance/test_swe_bench_pro_harness_inject.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/harness_inject.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_harness_inject.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_2_harness_inject.md
 ---

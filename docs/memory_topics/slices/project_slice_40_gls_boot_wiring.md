@@ -1,6 +1,6 @@
 ---
 title: Project Slice 40 Gls Boot Wiring
-modules: []
+modules: [backend/core/ouroboros/governance/topology_sentinel.py]
 status: merged
 source: project_slice_40_gls_boot_wiring.md
 ---

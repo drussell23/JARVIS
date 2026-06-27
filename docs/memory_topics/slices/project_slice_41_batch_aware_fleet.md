@@ -1,6 +1,6 @@
 ---
 title: Project Slice 41 Batch Aware Fleet
-modules: []
+modules: [backend/core/ouroboros/governance/preflight_probe.py, backend/core/ouroboros/governance/doubleword_provider.py, tests/governance/test_dw_heavy_probe.py]
 status: historical
 source: project_slice_41_batch_aware_fleet.md
 ---

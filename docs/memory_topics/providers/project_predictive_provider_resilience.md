@@ -1,6 +1,6 @@
 ---
 title: Project Predictive Provider Resilience
-modules: [scripts/run_provider_sonar.py]
+modules: [scripts/run_provider_sonar.py, provider_health_sonar.py, backend/core/ouroboros/governance/providers.py]
 status: historical
 source: project_predictive_provider_resilience.md
 ---

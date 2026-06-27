@@ -1,6 +1,6 @@
 ---
 title: SkillRegistry-AutonomousReach — CLOSED 2026-05-02
-modules: []
+modules: [backend/core/ouroboros/governance/skill_manifest.py, backend/core/ouroboros/governance/skill_catalog.py, tests/governance/test_skill_manifest.py, tests/governance/test_skill_catalog.py, tests/governance/test_skill_graduation.py, backend/core/ouroboros/governance/skill_trigger.py, backend/core/ouroboros/governance/skill_observer.py, backend/core/ouroboros/governance/skill_venom_bridge.py, backend/core/ouroboros/governance/tool_executor.py]
 status: merged
 source: project_skill_registry_autonomous_reach_closure.md
 ---

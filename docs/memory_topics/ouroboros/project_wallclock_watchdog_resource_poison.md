@@ -1,6 +1,6 @@
 ---
 title: Project Wallclock Watchdog Resource Poison
-modules: []
+modules: [backend/core/ouroboros/battle_test/harness.py]
 status: historical
 source: project_wallclock_watchdog_resource_poison.md
 ---

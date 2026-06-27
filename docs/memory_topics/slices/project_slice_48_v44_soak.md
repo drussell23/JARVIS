@@ -1,6 +1,6 @@
 ---
 title: Project Slice 48 V44 Soak
-modules: []
+modules: [backend/core/ouroboros/governance/target_stratification.py, scripts/ouroboros_battle_test.py]
 status: historical
 source: project_slice_48_v44_soak.md
 ---

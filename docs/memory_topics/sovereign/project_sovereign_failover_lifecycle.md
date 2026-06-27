@@ -1,6 +1,6 @@
 ---
 title: Sovereign Provider Failover Lifecycle + Recovery Forecaster (2026-06-23)
-modules: [docs/superpowers/specs/2026-06-23-sovereign-provider-failover-lifecycle.md, scripts/bake_jprime_golden_image.py, scripts/chaos_injector.py, scripts/adversarial_cognitive_soak.py, docs/superpowers/specs/2026-06-23-sovereign-rsi-flywheel-phase4.md]
+modules: [scripts/bake_jprime_golden_image.py, scripts/chaos_injector.py, scripts/adversarial_cognitive_soak.py, backend/run_server.py, backend/core/ouroboros/governance/outage_ledger.py, backend/core/ouroboros/governance/recovery_forecaster.py, backend/core/ouroboros/governance/recovery_throttle.py, backend/core/ouroboros/governance/failover_deadman.py, backend/core/ouroboros/governance/sovereign_self_termination.py, backend/core/ouroboros/governance/failover_lifecycle.py, backend/core/ouroboros/governance/dpo_synthesizer.py, rsi_training_hypervisor.py]
 status: merged
 source: project_sovereign_failover_lifecycle.md
 ---

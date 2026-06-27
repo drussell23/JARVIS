@@ -1,6 +1,6 @@
 ---
 title: A1 Live-Fire Result — O+V base autonomy PROVEN; A1 gate infra-blocked (2026-06-24/25)
-modules: [scripts/bake_jprime_golden_image.py]
+modules: [scripts/bake_jprime_golden_image.py, backend/core/ouroboros/governance/operation_id.py, backend/core/ouroboros/governance/provider_heartbeat.py]
 status: historical
 source: project_a1_live_fire_result.md
 ---

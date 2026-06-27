@@ -1,6 +1,6 @@
 ---
 title: Project V45 Preflight Soak
-modules: [scripts/ouroboros_battle_test.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/roadmap/hypothesis_envelope_factory.py]
 status: historical
 source: project_v45_preflight_soak.md
 ---

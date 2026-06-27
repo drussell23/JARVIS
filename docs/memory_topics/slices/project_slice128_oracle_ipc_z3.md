@@ -1,6 +1,6 @@
 ---
 title: Project Slice128 Oracle Ipc Z3
-modules: [backend/core/ouroboros/oracle_ipc.py, backend/core/ouroboros/governance/smt_invariant_prover.py]
+modules: [backend/core/ouroboros/oracle_ipc.py, backend/core/ouroboros/governance/smt_invariant_prover.py, backend/core/ouroboros/governance/ast_compile_helper.py, backend/core/ouroboros/governance/smt_encodings.py, tests/architecture/test_slice128_smt_prover.py, backend/core/ouroboros/governance/ast_to_smt_extractor.py]
 status: merged
 source: project_slice128_oracle_ipc_z3.md
 ---

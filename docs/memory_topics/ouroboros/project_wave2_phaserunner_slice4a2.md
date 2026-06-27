@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 4a.2 — Result
-modules: []
+modules: [orchestrator.py, tests/governance/phase_runner/test_gate_runner_parity.py]
 status: historical
 source: project_wave2_phaserunner_slice4a2.md
 ---

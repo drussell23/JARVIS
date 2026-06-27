@@ -1,6 +1,6 @@
 ---
 title: Project Wave3 Hygiene 2026 05 05
-modules: [tests/governance/test_wave3_hygiene_2026_05_05.py]
+modules: [tests/governance/test_wave3_hygiene_2026_05_05.py, backend/core/ouroboros/governance/agentic_general_subagent.py, backend/core/ouroboros/governance/exploration_fleet.py, backend/core/ouroboros/governance/mutation_tester.py, backend/core/ouroboros/governance/mutation_gate.py, backend/core/ouroboros/governance/unlimited_agents.py, backend/core/ouroboros/governance/scheduled_agents.py, backend/core/ouroboros/governance/observability/flag_change_emitter.py]
 status: merged
 source: project_wave3_hygiene_2026_05_05.md
 ---

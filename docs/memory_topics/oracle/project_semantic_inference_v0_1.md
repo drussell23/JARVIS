@@ -1,6 +1,6 @@
 ---
 title: Project Semantic Inference V0 1
-modules: [backend/core/ouroboros/governance/semantic_index.py]
+modules: [backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, orchestrator.py]
 status: historical
 source: project_semantic_inference_v0_1.md
 ---

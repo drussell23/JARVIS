@@ -1,6 +1,6 @@
 ---
 title: Phase C Slice 3a — Semantic Index v1.0 cluster math + telemetry (2026-04-20)
-modules: []
+modules: [backend/core/ouroboros/governance/semantic_index.py]
 status: merged
 source: project_phase_c_semantic_index_v1.md
 ---

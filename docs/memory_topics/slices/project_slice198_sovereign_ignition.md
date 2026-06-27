@@ -1,6 +1,6 @@
 ---
 title: Project Slice198 Sovereign Ignition
-modules: []
+modules: [backend/core/ouroboros/governance/m10_autonomous_graduation.py]
 status: merged
 source: project_slice198_sovereign_ignition.md
 ---

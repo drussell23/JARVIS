@@ -1,6 +1,6 @@
 ---
 title: Project Vision Sensor Verify Arc
-modules: [docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md, docs/superpowers/plans/2026-04-18-vision-sensor-verify.md, tests/governance/test_attachment_export_ban.py, backend/vision/frame_server.py]
+modules: [tests/governance/test_attachment_export_ban.py, backend/vision/frame_server.py, backend/core/ouroboros/governance/visual_verify.py, backend/core/ouroboros/governance/risk_tier_floor.py, backend/vision/vision_reflex.py, backend/core/ouroboros/governance/vision_repl.py]
 status: historical
 source: project_vision_sensor_verify_arc.md
 ---

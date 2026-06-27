@@ -1,6 +1,6 @@
 ---
 title: Project V2 94 Venom V2 Slice 5 Flag Seed
-modules: [tests/governance/test_permission_decision_archive_flags.py, backend/core/ouroboros/governance/permission_decision_archive.py]
+modules: [tests/governance/test_permission_decision_archive_flags.py, backend/core/ouroboros/governance/permission_decision_archive.py, tests/governance/test_permission_decision_archive.py, tests/governance/test_tool_permissions_repl.py, tests/governance/test_permission_decision_sse.py, tests/governance/test_ide_observability_tool_permissions.py, tests/governance/test_flag_registry.py]
 status: historical
 source: project_v2_94_venom_v2_slice_5_flag_seed.md
 ---

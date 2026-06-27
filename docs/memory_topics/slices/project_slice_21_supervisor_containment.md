@@ -1,6 +1,6 @@
 ---
 title: What it does
-modules: []
+modules: [backend/core/ouroboros/governance/phase_runner.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/phase_dispatcher.py, orchestrator.py]
 status: historical
 source: project_slice_21_supervisor_containment.md
 ---

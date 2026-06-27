@@ -1,6 +1,6 @@
 ---
 title: Project Lifecycle Hooks Closure
-modules: []
+modules: [backend/core/ouroboros/governance/lifecycle_hook.py, backend/core/ouroboros/governance/lifecycle_hook_registry.py, backend/core/ouroboros/governance/lifecycle_hook_executor.py, backend/core/ouroboros/governance/lifecycle_hook_orchestrator_bridge.py, orchestrator.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: historical
 source: project_lifecycle_hooks_closure.md
 ---

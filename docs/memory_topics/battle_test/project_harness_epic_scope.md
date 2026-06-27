@@ -1,6 +1,6 @@
 ---
 title: Project Harness Epic Scope
-modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/battle_test/shutdown_watchdog.py, backend/core/ouroboros/governance/intake/intake_layer_service.py, docs/runbooks/battle_test.md]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/battle_test/shutdown_watchdog.py, backend/core/ouroboros/governance/intake/intake_layer_service.py, backend/core/ouroboros/battle_test/harness.py]
 status: merged
 source: project_harness_epic_scope.md
 ---

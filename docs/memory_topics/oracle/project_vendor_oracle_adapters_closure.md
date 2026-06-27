@@ -1,6 +1,6 @@
 ---
 title: Sentry + Datadog Vendor Oracle Adapters — CLOSED 2026-05-03
-modules: [scripts/vendor_oracle_adapters_closure_verdict.py, tests/manual, backend/core/ouroboros/governance/sentry_oracle.py, backend/core/ouroboros/governance/datadog_oracle.py, backend/core/ouroboros/governance/production_oracle_observer.py]
+modules: [scripts/vendor_oracle_adapters_closure_verdict.py, backend/core/ouroboros/governance/sentry_oracle.py, backend/core/ouroboros/governance/datadog_oracle.py, backend/core/ouroboros/governance/production_oracle_observer.py]
 status: historical
 source: project_vendor_oracle_adapters_closure.md
 ---

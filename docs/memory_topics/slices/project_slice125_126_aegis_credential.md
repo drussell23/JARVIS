@@ -1,6 +1,6 @@
 ---
 title: Project Slice125 126 Aegis Credential
-modules: []
+modules: [daemon.py, backend/core/ouroboros/aegis/forwarding.py, backend/core/ouroboros/aegis/passthrough.py]
 status: merged
 source: project_slice125_126_aegis_credential.md
 ---

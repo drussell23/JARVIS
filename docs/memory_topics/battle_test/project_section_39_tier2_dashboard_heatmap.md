@@ -1,6 +1,6 @@
 ---
 title: Project Section 39 Tier2 Dashboard Heatmap
-modules: []
+modules: [backend/core/ouroboros/governance/dashboard_repl.py]
 status: historical
 source: project_section_39_tier2_dashboard_heatmap.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice131 Cost Sovereign
-modules: [backend/intelligence/context_awareness_intelligence.py, backend/intelligence/model_selector.py, backend/core/ouroboros/governance/route_decision_service.py]
+modules: [backend/intelligence/context_awareness_intelligence.py, backend/intelligence/model_selector.py, backend/core/ouroboros/governance/route_decision_service.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/provider_response_cache.py, backend/core/ouroboros/governance/economic_router.py, tests/architecture/test_slice131_cost_sovereign_p1.py, tests/architecture/test_slice124_economic_router.py]
 status: merged
 source: project_slice131_cost_sovereign.md
 ---

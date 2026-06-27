@@ -1,6 +1,6 @@
 ---
 title: Project Sbt Probe Escalation Closure
-modules: []
+modules: [backend/core/ouroboros/governance/verification/sbt_escalation_bridge.py, backend/core/ouroboros/governance/verification/sbt_escalation_runner.py, backend/core/ouroboros/governance/verification/sbt_branch_prober_adapter.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: merged
 source: project_sbt_probe_escalation_closure.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Spec2 Cybernetic Reanimation
-modules: [tests/governance/test_reanimation_kernel_wiring.py, scripts/_distillation_surgeon.py, backend/core/cybernetic_reanimation.py, tests/governance/test_cybernetic_reanimation.py]
+modules: [tests/governance/test_reanimation_kernel_wiring.py, scripts/_distillation_surgeon.py, backend/core/cybernetic_reanimation.py, tests/governance/test_cybernetic_reanimation.py, unified_supervisor.py]
 status: historical
 source: project_spec2_cybernetic_reanimation.md
 ---

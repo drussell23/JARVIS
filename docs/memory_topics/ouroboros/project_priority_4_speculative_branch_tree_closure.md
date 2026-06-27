@@ -1,6 +1,6 @@
 ---
 title: Project Priority 4 Speculative Branch Tree Closure
-modules: []
+modules: [backend/core/ouroboros/governance/verification/speculative_branch.py, backend/core/ouroboros/governance/verification/speculative_branch_runner.py, backend/core/ouroboros/governance/verification/speculative_branch_comparator.py, backend/core/ouroboros/governance/verification/speculative_branch_observer.py]
 status: merged
 source: project_priority_4_speculative_branch_tree_closure.md
 ---

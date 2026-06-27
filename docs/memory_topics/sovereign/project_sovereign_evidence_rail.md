@@ -1,6 +1,6 @@
 ---
 title: Project Sovereign Evidence Rail
-modules: [tests/governance/autonomy/]
+modules: [tests/governance/autonomy/, backend/core/ouroboros/governance/autonomy/subagent_scheduler.py, tests/governance/autonomy/test_subagent_scheduler.py, shadow_evaluator.py, shadow_telemetry_store.py, shadow_graduation_gate.py, backend/core/ouroboros/governance/ide_observability_stream.py, orchestrator.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_sovereign_evidence_rail.md
 ---

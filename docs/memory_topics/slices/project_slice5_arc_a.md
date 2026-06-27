@@ -1,6 +1,6 @@
 ---
 title: Slice 5 Arc A — Closed
-modules: [tests/governance/test_slice5_arc_a_wiring.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/posture_observer.py]
+modules: [tests/governance/test_slice5_arc_a_wiring.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/posture_observer.py, unified_supervisor.py, backend/core/ouroboros/governance/autonomy/subagent_scheduler.py]
 status: merged
 source: project_slice5_arc_a.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Manifesto V5
-modules: []
+modules: [unified_supervisor.py]
 status: historical
 source: project_manifesto_v5.md
 ---

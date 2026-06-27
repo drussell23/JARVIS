@@ -1,6 +1,6 @@
 ---
 title: Project Priority 3 Counterfactual Replay Closure
-modules: []
+modules: [backend/core/ouroboros/governance/verification/counterfactual_replay.py, backend/core/ouroboros/governance/verification/counterfactual_replay_engine.py, backend/core/ouroboros/governance/verification/counterfactual_replay_comparator.py, backend/core/ouroboros/governance/verification/counterfactual_replay_observer.py]
 status: merged
 source: project_priority_3_counterfactual_replay_closure.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project M9 Curiosity Gradient
-modules: []
+modules: [backend/core/ouroboros/governance/curiosity_gradient.py, backend/core/ouroboros/governance/curiosity_collector.py, backend/core/ouroboros/governance/sensor_governor.py, backend/core/ouroboros/governance/sensor_governor_seed.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/curiosity_observability.py, backend/core/ouroboros/governance/curiosity_repl.py, backend/core/ouroboros/governance/curiosity_producer_bridge.py]
 status: merged
 source: project_m9_curiosity_gradient.md
 ---

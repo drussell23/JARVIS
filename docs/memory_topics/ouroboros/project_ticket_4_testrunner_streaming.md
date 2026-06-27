@@ -1,6 +1,6 @@
 ---
 title: Ticket #4 Slice 3 — TestRunner streaming migration (2026-04-20)
-modules: []
+modules: [test_runner.py, backend/core/ouroboros/governance/background_monitor.py, backend/core/ouroboros/governance/monitor_tool.py]
 status: historical
 source: project_ticket_4_testrunner_streaming.md
 ---

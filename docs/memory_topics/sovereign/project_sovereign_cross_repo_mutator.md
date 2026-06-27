@@ -1,6 +1,6 @@
 ---
 title: Sovereign Cross-Repo Mutator — Multi-Repo Blast Radius Quarantine (2026-06-23, MERGED PR #69678)
-modules: [docs/superpowers/specs/2026-06-23-sovereign-cross-repo-mutator.md, scripts/trinity_sandbox_egress_mock.py, scripts/cross_repo_first_surgery.py, scripts/sovereign_iac_hypervisor.py]
+modules: [scripts/trinity_sandbox_egress_mock.py, scripts/cross_repo_first_surgery.py, scripts/sovereign_iac_hypervisor.py, backend/core/ouroboros/governance/critical_elevation.py, backend/core/ouroboros/governance/cross_repo_trust_ledger.py, backend/core/ouroboros/governance/cross_repo_master_flag.py, orchestrator.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/saga/trinity_handshake_suite.py, backend/core/ouroboros/governance/saga/trinity_docker_runner.py, metrics_caller.py]
 status: merged
 source: project_sovereign_cross_repo_mutator.md
 ---

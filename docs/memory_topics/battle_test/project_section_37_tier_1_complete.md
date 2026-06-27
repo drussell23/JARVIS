@@ -1,6 +1,6 @@
 ---
 title: Project Section 37 Tier 1 Complete
-modules: []
+modules: [backend/core/ouroboros/battle_test/repl_dispatch_registry.py, backend/core/ouroboros/governance/determinism/decision_runtime.py, backend/core/ouroboros/governance/verification/causality_dag.py, backend/core/ouroboros/governance/verification/replay_from_record.py]
 status: historical
 source: project_section_37_tier_1_complete.md
 ---

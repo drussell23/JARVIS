@@ -1,6 +1,6 @@
 ---
 title: Project Section 28 5 1 Phase Extraction Closure
-modules: [tests/governance/test_phase_runner_extraction_closure.py]
+modules: [tests/governance/test_phase_runner_extraction_closure.py, orchestrator.py]
 status: historical
 source: project_section_28_5_1_phase_extraction_closure.md
 ---

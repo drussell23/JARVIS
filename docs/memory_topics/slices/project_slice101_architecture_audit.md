@@ -1,6 +1,6 @@
 ---
 title: Project Slice101 Architecture Audit
-modules: [backend/core/trinity_event_bus.py, tests/architecture/test_slice101_synthetic_soul.py, tests/architecture/test_slice101_curiosity_engine.py]
+modules: [backend/core/trinity_event_bus.py, tests/architecture/test_slice101_synthetic_soul.py, tests/architecture/test_slice101_curiosity_engine.py, backend/core/ouroboros/governance/governance_boundary_gate.py, backend/core/ouroboros/governance/governance_manifest.py, orchestrator.py, backend/core/ouroboros/governance/second_order_doll_metric.py, backend/core/ouroboros/governance/autonomous_graduation_engine.py, backend/core/ouroboros/governance/mcp_output_scanner.py, backend/core/ouroboros/governance/counterfactual_rehearsal_mode.py, backend/core/ouroboros/governance/proof_carrier_transport.py, backend/core/ouroboros/governance/cognitive_load_shedding.py]
 status: merged
 source: project_slice101_architecture_audit.md
 ---

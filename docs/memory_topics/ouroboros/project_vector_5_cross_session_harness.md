@@ -1,6 +1,6 @@
 ---
 title: Project Vector 5 Cross Session Harness
-modules: []
+modules: [backend/core/ouroboros/governance/cross_session_harness.py, tests/governance/test_vector_5_cross_session_coherence.py]
 status: historical
 source: project_vector_5_cross_session_harness.md
 ---

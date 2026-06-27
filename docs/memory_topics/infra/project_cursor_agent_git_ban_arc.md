@@ -1,6 +1,6 @@
 ---
 title: Project Cursor Agent Git Ban Arc
-modules: [scripts/verify_oca.py]
+modules: [scripts/verify_oca.py, backend/core/ouroboros/governance/cursor_rule_guard.py, backend/core/ouroboros/governance/agent_fingerprint.py]
 status: merged
 source: project_cursor_agent_git_ban_arc.md
 ---

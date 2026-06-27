@@ -1,6 +1,6 @@
 ---
 title: Project Slice206 Warmup Lifecycle
-modules: []
+modules: [backend/core/ouroboros/governance/init_lifecycle.py]
 status: historical
 source: project_slice206_warmup_lifecycle.md
 ---

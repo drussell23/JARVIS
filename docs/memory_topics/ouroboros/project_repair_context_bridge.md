@@ -1,6 +1,6 @@
 ---
 title: Project Repair Context Bridge
-modules: [docs/architecture/REPAIR_CONTEXT_BRIDGE_ADD.md, tests/governance]
+modules: [backend/core/ouroboros/governance/repair_engine.py, backend/core/ouroboros/governance/oracle_prescorer.py, backend/core/ouroboros/governance/context_expander.py, signals.py, backend/core/ouroboros/governance/repair_context_bridge.py, backend/core/ouroboros/governance/structural_validation_gate.py, file.py, backend/core/ouroboros/governance/intent/test_watcher.py, backend/core/ouroboros/governance/op_context.py, backend/core/ouroboros/governance/repair_multifile.py, backend/core/ouroboros/governance/repair_progress.py, backend/core/ouroboros/governance/vision_vlm_adapter.py]
 status: open
 source: project_repair_context_bridge.md
 ---

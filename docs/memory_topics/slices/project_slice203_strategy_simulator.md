@@ -1,6 +1,6 @@
 ---
 title: Project Slice203 Strategy Simulator
-modules: []
+modules: [backend/core/ouroboros/governance/strategy_simulator.py]
 status: historical
 source: project_slice203_strategy_simulator.md
 ---

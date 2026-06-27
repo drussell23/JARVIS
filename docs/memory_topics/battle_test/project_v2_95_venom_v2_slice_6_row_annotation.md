@@ -1,6 +1,6 @@
 ---
 title: Project V2 95 Venom V2 Slice 6 Row Annotation
-modules: [docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/permission_decision_archive.py]
 status: historical
 source: project_v2_95_venom_v2_slice_6_row_annotation.md
 ---

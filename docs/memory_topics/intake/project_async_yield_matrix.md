@@ -1,6 +1,6 @@
 ---
 title: Sovereign Asynchronous Yield Matrix (2026-06-21, MERGED to main — PR #69638 Layer 1 + #69639 Layer 2; main 06e587fc5c)
-modules: [docs/superpowers/specs/2026-06-21-sovereign-async-yield-matrix-design.md, docs/superpowers/plans/2026-06-21-sovereign-async-yield-matrix-plan.md]
+modules: [backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/mutation_critical_section.py, backend/core/ouroboros/governance/operator_presence.py, backend/core/ouroboros/governance/operator_yield_bridge.py]
 status: historical
 source: project_async_yield_matrix.md
 ---

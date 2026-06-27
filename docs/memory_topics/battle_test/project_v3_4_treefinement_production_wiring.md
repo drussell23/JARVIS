@@ -1,6 +1,6 @@
 ---
 title: Project V3 4 Treefinement Production Wiring
-modules: [backend/core/ouroboros/governance/repair_tree_production.py, backend/core/ouroboros/governance/repair_engine.py, tests/governance/test_repair_engine_generate_primitive.py, tests/governance/test_repair_tree_production_diff_applier.py, tests/governance/test_repair_tree_production_generator.py, tests/governance/test_repair_tree_production_factory.py, tests/governance/test_repair_tree_production_hardening.py]
+modules: [backend/core/ouroboros/governance/repair_tree_production.py, backend/core/ouroboros/governance/repair_engine.py, tests/governance/test_repair_engine_generate_primitive.py, tests/governance/test_repair_tree_production_diff_applier.py, tests/governance/test_repair_tree_production_generator.py, tests/governance/test_repair_tree_production_factory.py, tests/governance/test_repair_tree_production_hardening.py, backend/core/ouroboros/governance/repair_tree.py, backend/core/ouroboros/governance/repair_tree_archive.py]
 status: merged
 source: project_v3_4_treefinement_production_wiring.md
 ---

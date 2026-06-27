@@ -1,6 +1,6 @@
 ---
 title: Project Section 38 11D Introspective Voice
-modules: []
+modules: [backend/core/ouroboros/battle_test/narrative_channel.py]
 status: historical
 source: project_section_38_11d_introspective_voice.md
 ---

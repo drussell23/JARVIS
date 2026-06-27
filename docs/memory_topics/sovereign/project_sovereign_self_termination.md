@@ -1,6 +1,6 @@
 ---
 title: Sovereign Ephemeral Self-Termination Matrix (PR #69636 MERGED, main ee0e5d8de5, 2026-06-21)
-modules: []
+modules: [backend/core/ouroboros/governance/sovereign_self_termination.py]
 status: merged
 source: project_sovereign_self_termination.md
 ---

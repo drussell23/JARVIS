@@ -1,6 +1,6 @@
 ---
 title: Gap #5 Slice 3 — Advisory prompt injection + ctx shutdown hook (2026-04-20)
-modules: []
+modules: [orchestrator.py, tests/governance/test_task_tool.py]
 status: merged
 source: project_gap_5_slice3_prompt_injection.md
 ---

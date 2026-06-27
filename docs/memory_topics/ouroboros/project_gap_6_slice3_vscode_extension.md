@@ -1,6 +1,6 @@
 ---
 title: Project Gap 6 Slice3 Vscode Extension
-modules: [extensions/vscode-jarvis/]
+modules: [extensions/vscode-jarvis/src/extension.ts, config.ts, extensions/vscode-jarvis/src/logger.ts, types.ts, client.ts, stream.ts, extensions/vscode-jarvis/src/panel/renderers.ts, extensions/vscode-jarvis/src/panel/opDetailPanel.ts]
 status: historical
 source: project_gap_6_slice3_vscode_extension.md
 ---

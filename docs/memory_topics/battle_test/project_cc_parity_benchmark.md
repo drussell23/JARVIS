@@ -1,6 +1,6 @@
 ---
 title: Project Cc Parity Benchmark
-modules: [scripts/security/run_cc_parity_calibration.py]
+modules: [scripts/security/run_cc_parity_calibration.py, backend/core/ouroboros/governance/self_immunization.py, backend/core/ouroboros/governance/governance_boundary_gate.py]
 status: merged
 source: project_cc_parity_benchmark.md
 ---

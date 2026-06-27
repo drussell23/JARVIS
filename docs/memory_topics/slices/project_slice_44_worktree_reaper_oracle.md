@@ -1,6 +1,6 @@
 ---
 title: Project Slice 44 Worktree Reaper Oracle
-modules: []
+modules: [threading.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/governance/worktree_manager.py]
 status: historical
 source: project_slice_44_worktree_reaper_oracle.md
 ---

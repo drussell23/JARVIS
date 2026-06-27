@@ -1,6 +1,6 @@
 ---
 title: Decision matrix (closed, first-match-wins) in `_slice23_should_activate_sentinel(provider_route)`
-modules: []
+modules: [backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_slice_23_sentinel_activation.md
 ---

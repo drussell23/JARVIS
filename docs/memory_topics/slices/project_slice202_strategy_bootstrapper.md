@@ -1,6 +1,6 @@
 ---
 title: Project Slice202 Strategy Bootstrapper
-modules: []
+modules: [backend/core/ouroboros/governance/strategy_bootstrapper.py, backend/core/ouroboros/governance/strategy_signer.py, backend/core/ouroboros/governance/progress_ledger.py]
 status: merged
 source: project_slice202_strategy_bootstrapper.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice104 Tier2 Containment
-modules: [tests/architecture/test_slice104_containment.py, tests/architecture/test_slice106_live_containment.py, docs/operations/shadow_soak_runbook.md, scripts/launch_shadow_soak.sh]
+modules: [tests/architecture/test_slice104_containment.py, tests/architecture/test_slice106_live_containment.py, backend/core/ouroboros/governance/recursion_depth_gate.py, backend/core/ouroboros/governance/runtime_sandbox.py, backend/core/ouroboros/governance/container_sandbox.py, backend/core/ouroboros/governance/image_provisioner.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_slice104_tier2_containment.md
 ---

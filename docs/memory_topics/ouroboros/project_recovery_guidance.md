@@ -1,6 +1,6 @@
 ---
 title: Operator flips the two flags
-modules: [scripts/livefire_recovery.py, backend/core/ouroboros/governance/recovery_advisor.py, backend/core/ouroboros/governance/recovery_formatter.py, backend/core/ouroboros/governance/recovery_announcer.py, backend/core/ouroboros/governance/recovery_repl.py, backend/core/ouroboros/governance/recovery_store.py]
+modules: [scripts/livefire_recovery.py, backend/core/ouroboros/governance/recovery_advisor.py, backend/core/ouroboros/governance/recovery_formatter.py, backend/core/ouroboros/governance/recovery_announcer.py, backend/core/ouroboros/governance/recovery_repl.py, backend/core/ouroboros/governance/recovery_store.py, backend/core/ouroboros/governance/comms/karen_voice.py, tests/governance/test_recovery_graduation.py]
 status: historical
 source: project_recovery_guidance.md
 ---

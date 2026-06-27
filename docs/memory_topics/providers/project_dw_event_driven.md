@@ -1,6 +1,6 @@
 ---
 title: Project Dw Event Driven
-modules: []
+modules: [backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_dw_event_driven.md
 ---

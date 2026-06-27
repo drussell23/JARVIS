@@ -1,6 +1,6 @@
 ---
 title: Reverse Russian Doll — Pass C Design Draft (2026-04-26)
-modules: [backend/core/ouroboros/governance/adaptation/ledger.py]
+modules: [backend/core/ouroboros/governance/adaptation/ledger.py, backend/core/ouroboros/governance/adaptation/per_order_mutation_budget.py, backend/core/ouroboros/governance/adaptation/risk_tier_extender.py, backend/core/ouroboros/governance/semantic_guardian.py, backend/core/ouroboros/governance/risk_tier_floor.py, backend/core/ouroboros/governance/adaptation/meta_governor.py]
 status: merged
 source: project_reverse_russian_doll_pass_c.md
 ---

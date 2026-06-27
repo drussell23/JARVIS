@@ -1,6 +1,6 @@
 ---
 title: Project Slice200 Genesis Proposal
-modules: [docs/architecture/OUROBOROS_RESILIENCE_200.md]
+modules: [backend/core/ouroboros/governance/genesis_proposal.py]
 status: historical
 source: project_slice200_genesis_proposal.md
 ---

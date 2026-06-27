@@ -1,6 +1,6 @@
 ---
 title: Project Section 39 Tier3 Trajectory Preview
-modules: []
+modules: [backend/core/ouroboros/governance/forecast_repl.py]
 status: historical
 source: project_section_39_tier3_trajectory_preview.md
 ---

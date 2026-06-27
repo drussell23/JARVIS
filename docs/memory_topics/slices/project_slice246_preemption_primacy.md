@@ -1,6 +1,6 @@
 ---
 title: Project Slice246 Preemption Primacy
-modules: [tests/governance/test_slice246_preemption_primacy.py]
+modules: [tests/governance/test_slice246_preemption_primacy.py, backend/core/ouroboros/governance/preemption.py]
 status: merged
 source: project_slice246_preemption_primacy.md
 ---

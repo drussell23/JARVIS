@@ -1,6 +1,6 @@
 ---
 title: Project Slice258 Soak Warnings And Rust Memory
-modules: [backend/ml_memory_manager.py, backend/rust_extensions]
+modules: [backend/ml_memory_manager.py, daemon.py]
 status: historical
 source: project_slice258_soak_warnings_and_rust_memory.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 6a — Result
-modules: [backend/core/ouroboros/governance/phase_dispatcher.py]
+modules: [backend/core/ouroboros/governance/phase_dispatcher.py, orchestrator.py, tests/governance/phase_runner/test_phase_dispatcher.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py]
 status: historical
 source: project_wave2_phaserunner_slice6a.md
 ---

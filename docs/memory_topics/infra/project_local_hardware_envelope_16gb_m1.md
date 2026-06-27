@@ -1,6 +1,6 @@
 ---
 title: Project Local Hardware Envelope 16Gb M1
-modules: []
+modules: [backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_local_hardware_envelope_16gb_m1.md
 ---

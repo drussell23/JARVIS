@@ -1,6 +1,6 @@
 ---
 title: Project Section 35 4 Artifact Contract
-modules: []
+modules: [backend/core/ouroboros/governance/phase_dispatcher.py]
 status: historical
 source: project_section_35_4_artifact_contract.md
 ---

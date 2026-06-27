@@ -1,6 +1,6 @@
 ---
 title: Project Slice123 Isolation Quarantine
-modules: [backend/core/ouroboros/governance/boot_recovery_quarantine.py, scripts/ouroboros_battle_test.py, tests/architecture/test_slice123_quarantine.py]
+modules: [backend/core/ouroboros/governance/boot_recovery_quarantine.py, scripts/ouroboros_battle_test.py, tests/architecture/test_slice123_quarantine.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: merged
 source: project_slice123_isolation_quarantine.md
 ---

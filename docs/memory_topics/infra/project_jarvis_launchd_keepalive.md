@@ -1,6 +1,6 @@
 ---
 title: Project Jarvis Launchd Keepalive
-modules: [backend/loading_server.py, scripts/run_supervisor.sh]
+modules: [backend/loading_server.py, unified_supervisor.py]
 status: historical
 source: project_jarvis_launchd_keepalive.md
 ---

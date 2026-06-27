@@ -1,6 +1,6 @@
 ---
 title: Project Slice 50 Teardown Batch Floor
-modules: []
+modules: [backend/core/resilience/file_watch_guard.py, backend/core/ouroboros/governance/candidate_generator.py, orchestrator.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py]
 status: historical
 source: project_slice_50_teardown_batch_floor.md
 ---

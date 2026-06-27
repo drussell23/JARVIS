@@ -1,6 +1,6 @@
 ---
 title: Project Slice 42 Aegis Multipart
-modules: [backend/core/ouroboros/aegis/request_body.py]
+modules: [backend/core/ouroboros/aegis/request_body.py, backend/core/ouroboros/aegis/passthrough.py, backend/core/ouroboros/aegis/forwarding.py, tests/aegis/test_request_body.py, tests/aegis/test_passthrough.py]
 status: historical
 source: project_slice_42_aegis_multipart.md
 ---

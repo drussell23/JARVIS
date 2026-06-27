@@ -1,6 +1,6 @@
 ---
 title: Project Section40 Open Items
-modules: []
+modules: [backend/core/ouroboros/governance/governance_manifest.py, backend/core/ouroboros/governance/auto_committer.py, backend/core/ouroboros/governance/governance_boundary_gate.py, backend/core/ouroboros/governance/m10_arch_proposer_graduation_contract.py, backend/core/ouroboros/governance/unified_graduation_dashboard.py, backend/core/ouroboros/governance/cross_session_coherence_rig.py, backend/core/ouroboros/governance/mirror_self_spec_drift.py, backend/core/ouroboros/governance/mirror_self_test.py, backend/core/ouroboros/governance/conversation_bridge.py, backend/core/ouroboros/governance/meta_prior_learning.py, backend/core/ouroboros/governance/autonomous_graduation_engine.py, backend/core/ouroboros/governance/graduation_override_ledger.py]
 status: historical
 source: project_section40_open_items.md
 ---

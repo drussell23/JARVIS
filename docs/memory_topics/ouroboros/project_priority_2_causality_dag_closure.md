@@ -1,6 +1,6 @@
 ---
 title: Project Priority 2 Causality Dag Closure
-modules: []
+modules: [tests/governance/test_causality_dag_replay_from_record.py, tests/governance/test_causality_dag_graduation.py, backend/core/ouroboros/governance/worktree_manager.py, backend/core/ouroboros/governance/cost_contract_assertion.py]
 status: merged
 source: project_priority_2_causality_dag_closure.md
 ---

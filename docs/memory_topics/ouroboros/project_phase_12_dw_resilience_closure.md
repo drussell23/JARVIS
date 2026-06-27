@@ -1,6 +1,6 @@
 ---
 title: Project Phase 12 Dw Resilience Closure
-modules: []
+modules: [backend/core/ouroboros/governance/pricing_oracle.py, tests/governance/test_sentinel_pacemaker_handshake.py]
 status: merged
 source: project_phase_12_dw_resilience_closure.md
 ---

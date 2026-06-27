@@ -1,6 +1,6 @@
 ---
 title: The Omni-Integration — wiring O+V's dormant MAS into the live loop (2026-06-25)
-modules: []
+modules: [backend/core/ouroboros/governance/collision_matrix.py, scripts/chaos_injector_ast.py, backend/core/ouroboros/governance/dag_composer.py, backend/core/ouroboros/governance/autonomy/swarm_invoker.py, backend/core/ouroboros/governance/shadow_enforce.py, backend/core/ouroboros/governance/meta_goal_aggregator.py, backend/core/ouroboros/governance/meta_goal_wiring.py, scripts/autonomous_omni_launcher.py, scripts/sovereign_iac_hypervisor.py]
 status: historical
 source: project_omni_integration_mas.md
 ---

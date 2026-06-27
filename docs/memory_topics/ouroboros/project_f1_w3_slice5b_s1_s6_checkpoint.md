@@ -1,6 +1,6 @@
 ---
 title: Project F1 W3 Slice5B S1 S6 Checkpoint
-modules: [backend/core/ouroboros/governance/phase_dispatcher.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/governed_loop_service.py]
+modules: [backend/core/ouroboros/governance/phase_dispatcher.py, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/cancellation_token.py, backend/core/ouroboros/governance/context_memory_loader.py, tests/governance/phase_runner/test_phase_dispatcher.py, backend/core/ouroboros/governance/plan_exploit.py, backend/core/ouroboros/governance/parallel_dispatch.py]
 status: historical
 source: project_f1_w3_slice5b_s1_s6_checkpoint.md
 ---

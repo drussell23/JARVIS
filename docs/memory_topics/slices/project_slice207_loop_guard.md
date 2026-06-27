@@ -1,6 +1,6 @@
 ---
 title: Project Slice207 Loop Guard
-modules: []
+modules: [backend/core/ouroboros/governance/semantic_index.py]
 status: historical
 source: project_slice207_loop_guard.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project V2 88 Layer6 Watchdog Summary
-modules: [tests/battle_test/test_layer6_watchdog_layer4_summary.py, backend/core/ouroboros/battle_test/harness.py]
+modules: [tests/battle_test/test_layer6_watchdog_layer4_summary.py, backend/core/ouroboros/battle_test/harness.py, tests/battle_test/test_ephemeral_streaming_spinner.py]
 status: historical
 source: project_v2_88_layer6_watchdog_summary.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Gap #6 — NarrativeChannel (proactive narrative) — CLOSED 2026-05-04
-modules: []
+modules: [backend/core/ouroboros/battle_test/narrative_channel.py, backend/core/ouroboros/governance/tool_preamble_synthesizer.py, backend/core/ouroboros/governance/intent_prompter.py, backend/core/ouroboros/battle_test/narrative_renderer.py, backend/core/ouroboros/governance/providers.py]
 status: historical
 source: project_gap_6_narrative_channel.md
 ---

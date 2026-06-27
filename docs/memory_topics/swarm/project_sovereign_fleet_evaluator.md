@@ -1,6 +1,6 @@
 ---
 title: Sovereign Fleet Evaluator (2026-06-19, branch `fleet/sovereign-evaluator`, NOT merged)
-modules: [backend/core/ouroboros/governance/, scripts/fleet_soak_multicycle.py, scripts/fleet_first_calibration.py]
+modules: [backend/core/ouroboros/governance/, scripts/fleet_soak_multicycle.py, scripts/fleet_first_calibration.py, backend/core/ouroboros/governance/dw_catalog_client.py, backend/core/ouroboros/governance/fleet_quality_battery.py, backend/core/ouroboros/governance/fleet_calibration_store.py, backend/core/ouroboros/governance/fleet_evaluator.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/ide_observability_stream.py]
 status: merged
 source: project_sovereign_fleet_evaluator.md
 ---

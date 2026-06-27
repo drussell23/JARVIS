@@ -1,6 +1,6 @@
 ---
 title: Project Slice 5B Consolidation Closure
-modules: [tests/governance/test_slice_5b_consolidation_graduation.py, backend/core/ouroboros/]
+modules: [tests/governance/test_slice_5b_consolidation_graduation.py, backend/core/ouroboros/, backend/core/ouroboros/governance/cleanup_invariants.py, backend/core/ouroboros/governance/observability_route_registry.py, backend/core/ouroboros/battle_test/repl_dispatch_registry.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_slice_5b_consolidation_closure.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Zero Waste Predictive Routing Arc
-modules: [scripts/ouroboros_battle_test.py, docs/architecture/ZERO_WASTE_PREDICTIVE_ROUTING.md]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/prompt_cache.py, backend/core/ouroboros/governance/admission_gate.py, backend/core/ouroboros/governance/admission_estimator.py, backend/core/ouroboros/governance/sensor_governor.py, backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/provider_response_cache.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: merged
 source: project_zero_waste_predictive_routing_arc.md
 ---

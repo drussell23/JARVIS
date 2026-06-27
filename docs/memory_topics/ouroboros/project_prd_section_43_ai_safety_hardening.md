@@ -1,6 +1,6 @@
 ---
 title: Project Prd Section 43 Ai Safety Hardening
-modules: [docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/sensor_governor.py, backend/core/ouroboros/governance/repair_engine.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/governance/risk_tier_floor.py]
 status: historical
 source: project_prd_section_43_ai_safety_hardening.md
 ---

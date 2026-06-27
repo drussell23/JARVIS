@@ -1,6 +1,6 @@
 ---
 title: The bug
-modules: []
+modules: [tests/governance/test_topology_sentinel.py]
 status: historical
 source: project_slice_24_sentinel_transition_schema.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase B2 2 Evaluator
-modules: [backend/core/ouroboros/governance/swe_bench_pro/evaluator.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_evaluator.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/evaluator.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_evaluator.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_b2_2_evaluator.md
 ---

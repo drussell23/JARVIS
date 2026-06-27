@@ -1,6 +1,6 @@
 ---
 title: Project Slice225 226 Autarky Gate Alignment
-modules: []
+modules: [backend/core/ouroboros/governance/provider_retry_classifier.py, orchestrator.py, backend/core/ouroboros/governance/semantic_index.py, backend/core/ouroboros/governance/exploration_engine.py, backend/core/ouroboros/governance/dw_transport_hedge.py, backend/core/ouroboros/governance/dw_catalog_client.py, backend/core/ouroboros/governance/provider_topology.py]
 status: historical
 source: project_slice225_226_autarky_gate_alignment.md
 ---

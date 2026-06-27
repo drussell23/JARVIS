@@ -1,6 +1,6 @@
 ---
 title: Project Phase 12 2 Closure
-modules: []
+modules: [backend/core/ouroboros/governance/providers.py, scripts/ouroboros_battle_test.py]
 status: merged
 source: project_phase_12_2_closure.md
 ---

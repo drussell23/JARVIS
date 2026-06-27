@@ -1,6 +1,6 @@
 ---
 title: Project M10 Architecture Proposer
-modules: []
+modules: [backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/m10/proposal_synthesizer.py, backend/core/ouroboros/governance/m10/lifecycle.py, backend/core/ouroboros/governance/event_channel.py]
 status: merged
 source: project_m10_architecture_proposer.md
 ---

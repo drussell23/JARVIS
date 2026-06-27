@@ -1,6 +1,6 @@
 ---
 title: Project Json Extractor Hardening
-modules: [backend/core/ouroboros/governance/providers.py]
+modules: [backend/core/ouroboros/governance/providers.py, tests/test_ouroboros_governance/test_self_critique.py, tests/test_ouroboros_governance/test_parser_multi_object.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_json_extractor_hardening.md
 ---

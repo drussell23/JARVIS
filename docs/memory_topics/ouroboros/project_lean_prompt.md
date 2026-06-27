@@ -1,6 +1,6 @@
 ---
 title: Project Lean Prompt
-modules: []
+modules: [backend/core/ouroboros/governance/providers.py]
 status: historical
 source: project_lean_prompt.md
 ---

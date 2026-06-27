@@ -1,6 +1,6 @@
 ---
 title: Project Exploration Ledger Validated
-modules: []
+modules: [backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/complexity_classifier.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/tool_executor.py]
 status: historical
 source: project_exploration_ledger_validated.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Sovereign Egress Interceptor Mesh (2026-06-22, MERGED PR #69659) — DW API-citizenship guard
-modules: []
+modules: [backend/core/ouroboros/governance/dw_egress_interceptor.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py]
 status: merged
 source: project_sovereign_egress_interceptor.md
 ---

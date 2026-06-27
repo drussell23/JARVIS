@@ -1,6 +1,6 @@
 ---
 title: Project Pass C Graduation Closure
-modules: []
+modules: [backend/core/ouroboros/governance/adaptation/semantic_guardian_miner.py, backend/core/ouroboros/governance/adaptation/exploration_floor_tightener.py, backend/core/ouroboros/governance/adaptation/per_order_mutation_budget.py, backend/core/ouroboros/governance/adaptation/risk_tier_extender.py, backend/core/ouroboros/governance/adaptation/category_weight_rebalancer.py, backend/core/ouroboros/governance/adaptation/meta_governor.py, backend/core/ouroboros/governance/flag_registry_seed.py, ledger.py, backend/core/ouroboros/governance/auto_action_router.py]
 status: merged
 source: project_pass_c_graduation_closure.md
 ---

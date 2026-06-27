@@ -1,6 +1,6 @@
 ---
 title: Stage 1.6 — BG release / op park during LLM wait — feasibility spike (2026-05-13)
-modules: [backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/op_park_store.py, backend/core/ouroboros/governance/park_signal.py, tests/governance/test_op_park_store.py, tests/governance/test_bg_park_integration.py, docs/architecture/OUROBOROS_VENOM_PRD.md, backend/core/ouroboros/governance/ledger.py, backend/core/ouroboros/governance/flag_registry_seed.py]
+modules: [backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/op_park_store.py, backend/core/ouroboros/governance/park_signal.py, tests/governance/test_op_park_store.py, tests/governance/test_bg_park_integration.py, backend/core/ouroboros/governance/ledger.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/op_context.py, backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/candidate_generator.py]
 status: historical
 source: project_stage_1_6_park_spike.md
 ---

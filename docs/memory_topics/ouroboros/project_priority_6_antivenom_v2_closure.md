@@ -1,6 +1,6 @@
 ---
 title: Project Priority 6 Antivenom V2 Closure
-modules: []
+modules: [backend/core/ouroboros/governance/verification/generative_quorum_gate.py, backend/core/ouroboros/governance/semantic_firewall.py, backend/core/ouroboros/governance/verification/postmortem_recall_consumer.py, backend/core/ouroboros/governance/verification/counterfactual_replay.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: historical
 source: project_priority_6_antivenom_v2_closure.md
 ---

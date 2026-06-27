@@ -1,6 +1,6 @@
 ---
 title: Project Gap 6 Slice4 Graduation
-modules: []
+modules: [tests/governance/test_ide_observability.py, tests/governance/test_ide_observability_stream.py]
 status: merged
 source: project_gap_6_slice4_graduation.md
 ---

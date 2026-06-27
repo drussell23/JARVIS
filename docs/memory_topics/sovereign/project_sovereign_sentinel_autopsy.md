@@ -1,6 +1,6 @@
 ---
 title: Sovereign Telemetry Sentinel + Autopsy Protocol (2026-06-22, MERGED PR #69661)
-modules: [scripts/sovereign_sentinel.py]
+modules: [scripts/sovereign_sentinel.py, scripts/ignite_sovereign_cloud_node.py, backend/core/ouroboros/governance/semantic_index.py]
 status: merged
 source: project_sovereign_sentinel_autopsy.md
 ---

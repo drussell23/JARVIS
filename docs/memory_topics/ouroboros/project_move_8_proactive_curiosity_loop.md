@@ -1,6 +1,6 @@
 ---
 title: Project Move 8 Proactive Curiosity Loop
-modules: []
+modules: [backend/core/ouroboros/governance/proactive_curiosity_reader.py, backend/core/ouroboros/governance/proactive_curiosity_loop_graduation_contract.py]
 status: historical
 source: project_move_8_proactive_curiosity_loop.md
 ---

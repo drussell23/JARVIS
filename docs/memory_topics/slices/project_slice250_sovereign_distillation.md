@@ -1,6 +1,6 @@
 ---
 title: Project Slice250 Sovereign Distillation
-modules: [docs/superpowers/specs/2026-06-14-sovereign-distillation-design.md, backend/core/, scripts/_distillation_surgeon.py, tests/unit/core/test_no_shadowed_definitions.py, backend/core/model_management/unified_engine.py, backend/vision/, backend/core/system_primitives.py, tests/unit/supervisor/test_higher_functions_protocol.py, tests/unit/backend/test_enterprise_organ_governance.py]
+modules: [scripts/_distillation_surgeon.py, tests/unit/core/test_no_shadowed_definitions.py, backend/core/model_management/unified_engine.py, backend/core/system_primitives.py, tests/unit/supervisor/test_higher_functions_protocol.py, tests/unit/backend/test_enterprise_organ_governance.py, unified_supervisor.py]
 status: merged
 source: project_slice250_sovereign_distillation.md
 ---

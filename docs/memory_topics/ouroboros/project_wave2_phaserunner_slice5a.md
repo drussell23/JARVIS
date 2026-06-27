@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 5a — Result
-modules: []
+modules: [orchestrator.py, tests/governance/phase_runner/test_generate_runner_parity.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py]
 status: historical
 source: project_wave2_phaserunner_slice5a.md
 ---

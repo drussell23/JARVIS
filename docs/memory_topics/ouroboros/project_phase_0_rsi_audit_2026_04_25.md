@@ -1,6 +1,6 @@
 ---
 title: Project Phase 0 Rsi Audit 2026 04 25
-modules: [docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/composite_score.py, backend/core/ouroboros/governance/convergence_tracker.py, backend/core/ouroboros/governance/graduation_orchestrator.py, backend/core/ouroboros/governance/oracle_prescorer.py, backend/core/ouroboros/governance/transition_tracker.py, backend/core/ouroboros/governance/vindication_reflector.py, postmortem_recall.py, tests/test_ouroboros_governance/test_composite_score.py, tests/test_ouroboros_governance/test_convergence_tracker.py, tests/test_ouroboros_governance/test_oracle_prescorer.py, tests/test_ouroboros_governance/test_transition_tracker.py, tests/test_ouroboros_governance/test_vindication_reflector.py]
 status: historical
 source: project_phase_0_rsi_audit_2026_04_25.md
 ---

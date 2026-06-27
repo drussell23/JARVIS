@@ -1,6 +1,6 @@
 ---
 title: What shipped on main (5 PRs)
-modules: []
+modules: [backend/core/ouroboros/governance/providers.py]
 status: merged
 source: project_aegis_zero_trust_arc_closed.md
 ---

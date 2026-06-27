@@ -1,6 +1,6 @@
 ---
 title: Project Slice 55 Dynamic Effort
-modules: []
+modules: [backend/core/ouroboros/governance/dw_heavy_probe.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_slice_55_dynamic_effort.md
 ---

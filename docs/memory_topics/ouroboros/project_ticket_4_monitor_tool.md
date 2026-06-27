@@ -1,6 +1,6 @@
 ---
 title: Ticket #4 Slice 2 — Venom monitor tool (2026-04-20)
-modules: [backend/core/ouroboros/governance/monitor_tool.py, backend/core/ouroboros/governance/tool_executor.py, tests/governance/test_monitor_tool.py]
+modules: [backend/core/ouroboros/governance/monitor_tool.py, backend/core/ouroboros/governance/tool_executor.py, tests/governance/test_monitor_tool.py, test_runner.py, backend/core/ouroboros/governance/background_monitor.py]
 status: historical
 source: project_ticket_4_monitor_tool.md
 ---

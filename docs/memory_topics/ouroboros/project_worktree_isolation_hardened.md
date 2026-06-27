@@ -1,6 +1,6 @@
 ---
 title: Project Worktree Isolation Hardened
-modules: []
+modules: [backend/core/ouroboros/governance/autonomy/subagent_scheduler.py, tests/governance/test_worktree_isolation.py, tests/governance/autonomy/test_subagent_executor_worktree.py]
 status: historical
 source: project_worktree_isolation_hardened.md
 ---

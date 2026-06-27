@@ -1,6 +1,6 @@
 ---
 title: Composition discipline (operator-mandated, AST-pinned)
-modules: []
+modules: [tests/governance/test_topology_sentinel.py, tests/governance/test_dw_promotion_ledger.py]
 status: historical
 source: project_slice_25_preflight_probe.md
 ---

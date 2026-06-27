@@ -1,6 +1,6 @@
 ---
 title: Project Slice 39 Multi Surface Health
-modules: [docs/architecture/OUROBOROS_VENOM_PRD.md, tests/governance/test_dw_heavy_probe.py]
+modules: [tests/governance/test_dw_heavy_probe.py, backend/core/ouroboros/governance/dw_surface_health.py, backend/core/ouroboros/governance/dw_transport_disambiguator.py, backend/core/ouroboros/governance/dw_client_lifecycle.py, backend/core/ouroboros/governance/dw_surface_probes.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/dw_heavy_probe.py]
 status: historical
 source: project_slice_39_multi_surface_health.md
 ---

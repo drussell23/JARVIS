@@ -1,6 +1,6 @@
 ---
 title: What shipped on main
-modules: []
+modules: [backend/core/ouroboros/governance/operation_advisor.py, backend/core/ouroboros/governance/urgency_router.py]
 status: historical
 source: project_swe_bench_pro_wiring_validation_closure.md
 ---

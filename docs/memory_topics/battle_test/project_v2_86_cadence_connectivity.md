@@ -1,6 +1,6 @@
 ---
 title: Project V2 86 Cadence Connectivity
-modules: [scripts/run_live_fire_graduation_soak.sh, scripts/install_live_fire_soak_cron.sh]
+modules: [backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/graduation/live_fire_soak.py]
 status: historical
 source: project_v2_86_cadence_connectivity.md
 ---

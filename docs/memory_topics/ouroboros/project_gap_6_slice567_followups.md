@@ -1,6 +1,6 @@
 ---
 title: Project Gap 6 Slice567 Followups
-modules: [extensions/sublime-jarvis/, tests/test_jarvis_api.py, extensions/jetbrains-jarvis/, scripts/livefire_gap6.py, extensions/jetbrains-jarvis/run_tests.sh, scripts/livefire_gap6_clients.py, extensions/vscode-jarvis/dist/api/stream.js]
+modules: [tests/test_jarvis_api.py, scripts/livefire_gap6.py, scripts/livefire_gap6_clients.py, extensions/vscode-jarvis/dist/api/stream.js, extensions/sublime-jarvis/jarvis_api.py, extensions/sublime-jarvis/jarvis_observability.py, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/ApiTypes.kt, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/JsonMini.kt, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/SseParser.kt, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/Backoff.kt, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/ObservabilityClient.kt, extensions/jetbrains-jarvis/src/main/kotlin/com/drussell23/jarvis/StreamConsumer.kt]
 status: merged
 source: project_gap_6_slice567_followups.md
 ---

@@ -312,3 +312,41 @@ class TestMigrateFileE2E:
         domain, dest_path, _ = result2
         content = Path(dest_path).read_text(encoding="utf-8")
         assert content.startswith("---\n")
+
+
+# ---------------------------------------------------------------------------
+# M-1 + M-2: bare source filenames captured, .md paths filtered
+# ---------------------------------------------------------------------------
+class TestExtractModulesM1M2:
+    """M-1: bare source filenames; M-2: .md noise filtered."""
+
+    def test_m1_bare_py_filename_captured(self):
+        """M-1: bare 'orchestrator.py' in backticks must be captured."""
+        body = "The `orchestrator.py` manages the 11-phase FSM. See also `repair_engine.py`."
+        mods = mmt.extract_modules(body)
+        assert any("orchestrator.py" in m for m in mods), (
+            f"Expected orchestrator.py in modules, got: {mods}"
+        )
+
+    def test_m1_bare_ts_filename_captured(self):
+        """M-1: bare TypeScript filenames should be captured."""
+        body = "The extension entry is `extension.ts` and `sidebar.tsx` for the panel."
+        mods = mmt.extract_modules(body)
+        assert any("extension.ts" in m for m in mods) or any("sidebar.tsx" in m for m in mods), (
+            f"Expected TS/TSX filename in modules, got: {mods}"
+        )
+
+    def test_m2_md_files_filtered(self):
+        """M-2: paths ending in .md must be filtered out; source paths retained."""
+        body = (
+            "See `backend/docs/OUROBOROS.md` for the spec. "
+            "Implementation is in `backend/core/ouroboros/governance/orchestrator.py`."
+        )
+        mods = mmt.extract_modules(body)
+        assert not any(m.endswith(".md") for m in mods), (
+            f"Found .md path in modules (should be filtered): {mods}"
+        )
+        # Source path must still be present
+        assert any("orchestrator.py" in m for m in mods), (
+            f"Expected orchestrator.py in modules after .md filter, got: {mods}"
+        )

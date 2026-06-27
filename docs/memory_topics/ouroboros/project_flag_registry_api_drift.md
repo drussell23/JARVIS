@@ -1,6 +1,6 @@
 ---
 title: Project Flag Registry Api Drift
-modules: [backend/core/ouroboros/governance/flag_registry.py]
+modules: [backend/core/ouroboros/governance/flag_registry.py, backend/core/ouroboros/governance/autonomy_command_bus_bridge.py, backend/core/ouroboros/governance/component_tool_scope.py, backend/core/ouroboros/governance/error_classifier.py, backend/core/ouroboros/governance/execution_graph_progress_bridge.py, backend/core/ouroboros/governance/execution_monitor_bridge.py, backend/core/ouroboros/governance/operation_mode.py]
 status: historical
 source: project_flag_registry_api_drift.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Swebench Task 21 22 Teardown Coherence
-modules: [tests/governance/test_swebench_eval_timeout_coherence.py]
+modules: [tests/governance/test_swebench_eval_timeout_coherence.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/governance/swe_bench_pro/evaluator.py, test_swe_bench_pro_wiring_validation.py]
 status: historical
 source: project_swebench_task_21_22_teardown_coherence.md
 ---

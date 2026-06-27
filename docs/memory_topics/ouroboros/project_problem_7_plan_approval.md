@@ -1,6 +1,6 @@
 ---
 title: Project Problem 7 Plan Approval
-modules: [backend/core/ouroboros/governance/plan_approval.py, scripts/livefire_plan_approval.py]
+modules: [backend/core/ouroboros/governance/plan_approval.py, scripts/livefire_plan_approval.py, backend/core/ouroboros/governance/plan_mode.py, backend/core/ouroboros/governance/plan_approval_repl.py, tests/governance/test_plan_approval.py, tests/governance/test_plan_approval_adapter.py, tests/governance/test_plan_approval_repl.py, tests/governance/test_plan_approval_ide.py, tests/governance/test_plan_approval_graduation.py]
 status: merged
 source: project_problem_7_plan_approval.md
 ---

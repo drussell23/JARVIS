@@ -1,6 +1,6 @@
 ---
 title: Mechanism
-modules: []
+modules: [backend/core/ouroboros/governance/urgency_router.py]
 status: historical
 source: project_slice_22_tier_decay.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Slice102 Graduation Soak
-modules: [tests/architecture/test_slice102_graduation_soak.py]
+modules: [tests/architecture/test_slice102_graduation_soak.py, tests/architecture/test_slice103_shadow_mode.py]
 status: historical
 source: project_slice102_graduation_soak.md
 ---

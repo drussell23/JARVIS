@@ -1,6 +1,6 @@
 ---
 title: Phase B Subagent Roadmap (2026-04-18)
-modules: []
+modules: [backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/mutation_gate.py, backend/core/ouroboros/governance/mutation_tester.py, backend/core/ouroboros/governance/plan_generator.py, backend/core/ouroboros/governance/op_context.py, orchestrator.py, backend/core/ouroboros/governance/general_driver.py, backend/core/ouroboros/governance/governed_loop_service.py]
 status: merged
 source: project_phase_b_subagent_roadmap.md
 ---

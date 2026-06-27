@@ -1,6 +1,6 @@
 ---
 title: Project Slice193 Observability Registry
-modules: [tests/governance/test_observability_registry.py]
+modules: [tests/governance/test_observability_registry.py, backend/core/ouroboros/governance/observability_registry.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/event_channel.py]
 status: historical
 source: project_slice193_observability_registry.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: SensorGovernor + MemoryPressureGate — 5-Slice Arc
-modules: [backend/core/ouroboros/governance/]
+modules: [backend/core/ouroboros/governance/, backend/core/ouroboros/governance/autonomy/subagent_scheduler.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/sensor_governor.py, backend/core/ouroboros/governance/sensor_governor_seed.py, backend/core/ouroboros/governance/memory_pressure_gate.py, backend/core/ouroboros/governance/governor_repl.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/ide_observability_stream.py]
 status: historical
 source: project_sensor_governor_plan.md
 ---

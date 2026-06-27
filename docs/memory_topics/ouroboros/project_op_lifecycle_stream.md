@@ -1,6 +1,6 @@
 ---
 title: Project Op Lifecycle Stream
-modules: [backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/test_op_lifecycle_stream.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/orchestrator.py, tests/governance/test_op_lifecycle_stream.py, backend/core/ouroboros/governance/task_tool.py, backend/core/ouroboros/governance/op_context.py, ledger.py, backend/core/ouroboros/governance/repair_engine.py, backend/core/ouroboros/governance/operation_advisor.py, backend/core/ouroboros/governance/intake/unified_intake_router.py]
 status: historical
 source: project_op_lifecycle_stream.md
 ---

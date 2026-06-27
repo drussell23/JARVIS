@@ -1,6 +1,6 @@
 ---
 title: Project Swebp Worktree Advisor Prefix
-modules: []
+modules: [backend/core/ouroboros/governance/operation_advisor.py]
 status: historical
 source: project_swebp_worktree_advisor_prefix.md
 ---

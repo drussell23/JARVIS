@@ -1,6 +1,6 @@
 ---
 title: Project Slice121 Temporal Matrix
-modules: [backend/core/ouroboros/governance/temporal_matrix.py, scripts/launch_simulation_matrix.sh, tests/architecture/test_slice121_temporal_matrix.py]
+modules: [backend/core/ouroboros/governance/temporal_matrix.py, tests/architecture/test_slice121_temporal_matrix.py]
 status: merged
 source: project_slice121_temporal_matrix.md
 ---

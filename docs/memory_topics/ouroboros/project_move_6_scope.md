@@ -1,6 +1,6 @@
 ---
 title: Project Move 6 Scope
-modules: []
+modules: [backend/core/ouroboros/governance/autonomy/subagent_scheduler.py, backend/core/ouroboros/governance/worktree_manager.py, orchestrator.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/cost_contract_assertion.py, backend/core/ouroboros/governance/verification/generative_quorum.py, backend/core/ouroboros/governance/verification/ast_canonical.py, backend/core/ouroboros/governance/verification/generative_quorum_runner.py, backend/core/ouroboros/governance/verification/generative_quorum_gate.py, backend/core/ouroboros/governance/verification/generative_quorum_observability.py]
 status: merged
 source: project_move_6_scope.md
 ---

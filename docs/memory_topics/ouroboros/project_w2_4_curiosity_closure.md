@@ -1,6 +1,6 @@
 ---
 title: Project W2 4 Curiosity Closure
-modules: [docs/operations/curiosity-graduation.md, backend/core/ouroboros/governance/curiosity_engine.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_curiosity_engine_slice1.py, tests/governance/test_curiosity_tool_policy_slice2.py, tests/governance/test_curiosity_sse_ide_get_slice3.py, tests/governance/test_w2_4_graduation_pins_slice4.py, scripts/livefire_w2_4_curiosity.py]
+modules: [backend/core/ouroboros/governance/curiosity_engine.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/phase_runners/generate_runner.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, tests/governance/test_curiosity_engine_slice1.py, tests/governance/test_curiosity_tool_policy_slice2.py, tests/governance/test_curiosity_sse_ide_get_slice3.py, tests/governance/test_w2_4_graduation_pins_slice4.py, scripts/livefire_w2_4_curiosity.py]
 status: historical
 source: project_w2_4_curiosity_closure.md
 ---

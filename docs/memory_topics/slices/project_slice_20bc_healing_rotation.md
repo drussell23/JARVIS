@@ -1,6 +1,6 @@
 ---
 title: What it adds
-modules: []
+modules: [backend/core/ouroboros/governance/json_healer.py, backend/core/ouroboros/governance/schema_drift_tracker.py, backend/core/ouroboros/governance/providers.py]
 status: historical
 source: project_slice_20bc_healing_rotation.md
 ---

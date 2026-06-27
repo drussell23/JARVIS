@@ -1,6 +1,6 @@
 ---
 title: Root cause
-modules: []
+modules: [backend/core/ouroboros/governance/aegis_provider_bridge.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_slice_31_aegis_session_bearer.md
 ---

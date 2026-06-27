@@ -1,6 +1,6 @@
 ---
 title: Wave 3 (6) — Parallel L3 fan-out — Graduation ledger
-modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/phase_runners/, backend/core/ouroboros/governance/parallel_dispatch.py, backend/core/ouroboros/governance/worktree_manager.py, tests/governance/test_parallel_dispatch_reachability_supplement.py, backend/core/ouroboros/architect/__init__.py, backend/core/tui/__init__.py, backend/core/umf/__init__.py, docs/operations/wave3-parallel-dispatch-graduation.md, tests/governance/test_w3_6_slice5a_structural_pins.py, scripts/livefire_w3_6_parallel_dispatch.py]
+modules: [scripts/ouroboros_battle_test.py, backend/core/ouroboros/governance/phase_runners/, backend/core/ouroboros/governance/parallel_dispatch.py, backend/core/ouroboros/governance/worktree_manager.py, tests/governance/test_parallel_dispatch_reachability_supplement.py, backend/core/ouroboros/architect/__init__.py, backend/core/tui/__init__.py, backend/core/umf/__init__.py, tests/governance/test_w3_6_slice5a_structural_pins.py, scripts/livefire_w3_6_parallel_dispatch.py, backend/core/ouroboros/governance/phase_dispatcher.py, backend/core/persistent_intelligence_manager.py]
 status: merged
 source: project_wave3_item6_graduation_matrix.md
 ---

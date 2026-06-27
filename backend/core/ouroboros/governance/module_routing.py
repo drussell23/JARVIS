@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -237,6 +238,193 @@ def _get_oracle_related_modules(target_files: List[str]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Module-level embedding cache: content_hash → vector
+# Keyed by content_hash (str, 16-hex chars) → list[float].
+# Persisted to .jarvis/memory_topics_emb.npz; loaded lazily on first use
+# per project_root.  Fail-soft: any I/O error → skip cache, embed live.
+# ---------------------------------------------------------------------------
+
+_emb_cache: dict[str, List[float]] = {}
+_emb_cache_loaded_roots: set[str] = set()
+_PREFILTER_K = 24  # lexical fallback candidate count
+
+
+def _emb_cache_path(project_root: Path) -> Path:
+    return project_root / ".jarvis" / "memory_topics_emb.npz"
+
+
+def _load_emb_cache_from_disk(project_root: Path) -> None:
+    """Populate _emb_cache from .jarvis/memory_topics_emb.npz. Fail-soft."""
+    try:
+        import numpy as np  # noqa: PLC0415 — optional dep
+    except Exception:  # noqa: BLE001
+        return
+    path = _emb_cache_path(project_root)
+    if not path.exists():
+        return
+    try:
+        # SECURITY: allow_pickle is required only because _persist_emb_cache
+        # writes hashes as an object-dtype string array.  This .npz is a
+        # HOST-LOCAL, SELF-WRITTEN cache under the repo's own .jarvis/
+        # (written exclusively by this process) — NOT an untrusted external
+        # source.  An attacker who could overwrite it would already have local
+        # write/code-exec on the host, so this adds no new attack surface.
+        # Mirrors the identical justification in semantic_index._load_from_cache.
+        data = np.load(path, allow_pickle=True)
+        hashes = list(data["hashes"])
+        vectors = data["vectors"]
+        for i, h in enumerate(hashes):
+            key = str(h)
+            if key not in _emb_cache:
+                _emb_cache[key] = [float(x) for x in vectors[i]]
+    except Exception:  # noqa: BLE001
+        logger.debug("[ModuleRouter] emb cache load failed", exc_info=True)
+
+
+def _persist_emb_cache(project_root: Path) -> None:
+    """Write _emb_cache to .jarvis/memory_topics_emb.npz. Fail-soft."""
+    if not _emb_cache:
+        return
+    try:
+        import numpy as np  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        cache_dir = project_root / ".jarvis"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = _emb_cache_path(project_root)
+        hashes = list(_emb_cache.keys())
+        vecs = [_emb_cache[h] for h in hashes]
+        vectors = np.array(vecs, dtype="float32")
+        np.savez(path, hashes=np.array(hashes, dtype=object), vectors=vectors)
+    except Exception:  # noqa: BLE001
+        logger.debug("[ModuleRouter] emb cache persist failed", exc_info=True)
+
+
+def _embed_texts_cached(
+    texts_with_hashes: List[Tuple[str, str]],
+    project_root: Path,
+) -> Optional[List[List[float]]]:
+    """Embed texts using the module-level cache; persist new embeddings.
+
+    Parameters
+    ----------
+    texts_with_hashes:
+        List of (text, content_hash) pairs.  Hashes are used as cache keys.
+    project_root:
+        Used to locate the .jarvis/memory_topics_emb.npz cache file.
+
+    Returns
+    -------
+    List of vectors (one per input text), or None on total failure.
+    Fail-soft: returns None if any live embedding call fails.
+    """
+    global _emb_cache, _emb_cache_loaded_roots  # noqa: PLW0603
+
+    root_key = str(project_root)
+    if root_key not in _emb_cache_loaded_roots:
+        _load_emb_cache_from_disk(project_root)
+        _emb_cache_loaded_roots.add(root_key)
+
+    results: List[Optional[List[float]]] = [None] * len(texts_with_hashes)
+    uncached_indices: List[int] = []
+    uncached_texts: List[str] = []
+
+    for i, (text, hash_) in enumerate(texts_with_hashes):
+        if hash_ in _emb_cache:
+            results[i] = _emb_cache[hash_]
+        else:
+            uncached_indices.append(i)
+            uncached_texts.append(text)
+
+    if uncached_texts:
+        new_vecs = _embed_texts(uncached_texts)
+        if new_vecs is None:
+            return None  # fail-soft: don't return partial
+        for j, idx in enumerate(uncached_indices):
+            vec = new_vecs[j]
+            results[idx] = vec
+            _, hash_ = texts_with_hashes[idx]
+            _emb_cache[hash_] = vec
+        _persist_emb_cache(project_root)
+
+    if any(r is None for r in results):
+        return None
+    return results  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Candidate-first narrowing: path-tail intersection → lexical pre-filter
+# ---------------------------------------------------------------------------
+
+_TOKEN_SPLIT_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _lexical_prefilter(
+    query: str,
+    topics: List["TopicFragment"],
+    k: int,
+) -> List["TopicFragment"]:
+    """Return top-k topics ranked by token-overlap with *query*.
+
+    Splits query and topic (title + summary) on non-alphanumeric boundaries,
+    lower-cases, and counts intersection size.  O(N) — no embedding required.
+    Falls back to the first-k topics when the query is empty.
+    """
+    if not topics:
+        return []
+    query_tokens = set(_TOKEN_SPLIT_RE.split(query.lower())) - {""}
+    if not query_tokens:
+        return topics[:k]
+    scored: List[Tuple[int, "TopicFragment"]] = []
+    for topic in topics:
+        text = (topic.title + " " + topic.summary).lower()
+        topic_tokens = set(_TOKEN_SPLIT_RE.split(text)) - {""}
+        overlap = len(query_tokens & topic_tokens)
+        scored.append((overlap, topic))
+    scored.sort(key=lambda x: -x[0])
+    return [t for _, t in scored[:k]]
+
+
+def _candidate_topics(
+    all_topics: List["TopicFragment"],
+    target_files: Sequence[str],
+    related_modules: Sequence[str],
+    query: str,
+    prefilter_k: int = _PREFILTER_K,
+) -> List["TopicFragment"]:
+    """Return the narrowed topic set for semantic embedding.
+
+    Two-stage narrowing:
+
+    1. **Path-tail intersection**: topics whose ``modules:`` path-tails overlap
+       with any target-file tail or Oracle-derived related-module tail.  If
+       non-empty, return only those candidates (precise + cheap).
+
+    2. **Lexical pre-filter** (fallback): if no path-tail match, pick the top
+       ``prefilter_k`` topics by query-vs-(title+summary) token overlap.
+       Guarantees at most ``prefilter_k`` topics reach the embedder.
+
+    In both cases the number of topics embedded is O(candidates), NOT O(all).
+    """
+    target_tails = {_path_tail(f) for f in target_files}
+    related_tails = {_path_tail(m) for m in related_modules}
+    all_tails = target_tails | related_tails
+
+    candidates: List["TopicFragment"] = []
+    for topic in all_topics:
+        topic_tails = {_path_tail(m) for m in topic.modules}
+        if topic_tails & all_tails:
+            candidates.append(topic)
+
+    if candidates:
+        return candidates
+
+    # Lexical fallback — no path match
+    return _lexical_prefilter(query, all_topics, prefilter_k)
+
+
+# ---------------------------------------------------------------------------
 # Structural boost: topic × related-module overlap (path-tail match)
 # ---------------------------------------------------------------------------
 
@@ -433,31 +621,44 @@ class ModuleContextRouter:
         # 2. AST-bound candidate set via Oracle (fail-soft → empty)
         related_modules = _get_oracle_related_modules(target_files)
 
-        # 3. Compute structural scores
-        structural: List[Tuple[float, TopicFragment]] = [
-            (_structural_score(t, related_modules, target_files), t)
+        # 3. Compute structural scores (cheap — over ALL topics)
+        structural_map: dict[str, float] = {
+            t.source_id: _structural_score(t, related_modules, target_files)
             for t in all_topics
-        ]
+        }
 
-        # 4. Semantic ranking via embedder
-        sem_scores: List[float] = self._semantic_scores(query, all_topics)
+        # 4. Candidate-first narrowing: only embed the relevant subset.
+        #    Path-tail intersection → candidates; fallback to lexical prefilter.
+        #    This bounds the embedder to O(candidates), NOT O(all_topics).
+        embed_topics = _candidate_topics(
+            all_topics, target_files, related_modules, query
+        )
 
-        # 5. Combine structural + semantic: structural_boost * 0.5 + cosine * 0.5
-        #    (structural dominates when present; semantic is the tiebreaker)
+        # 5. Semantic ranking via embedder + persisted cache (only on candidates)
+        sem_scores_list: List[float] = self._semantic_scores(query, embed_topics)
+        sem_map: dict[str, float] = {
+            embed_topics[i].source_id: sem_scores_list[i]
+            for i in range(len(embed_topics))
+        }
+
+        # 6. Combine structural + semantic.
+        #    Topics outside the candidate set receive sem_score = 0.0 but
+        #    retain their structural score — strong structural matches still
+        #    surface even when the embedder was not run on them.
         _STRUCT_WEIGHT = 0.5
         _SEM_WEIGHT = 0.5
 
         combined: List[Tuple[float, TopicFragment]] = []
-        for i, topic in enumerate(all_topics):
-            struct_s = structural[i][0]
-            sem_s = sem_scores[i] if i < len(sem_scores) else 0.0
+        for topic in all_topics:
+            struct_s = structural_map.get(topic.source_id, 0.0)
+            sem_s = sem_map.get(topic.source_id, 0.0)
             score = struct_s * _STRUCT_WEIGHT + sem_s * _SEM_WEIGHT
             combined.append((score, topic))
 
         # Sort descending by score, then by title for determinism
         combined.sort(key=lambda x: (-x[0], x[1].title))
 
-        # 6. Apply max_topics + token_budget
+        # 7. Apply max_topics + token_budget
         selected: List[TopicFragment] = []
         char_used = 0
         for score, topic in combined:
@@ -484,17 +685,22 @@ class ModuleContextRouter:
     ) -> List[float]:
         """Return per-topic cosine scores against the query.
 
-        Falls back to uniform 0.0 scores if the embedder is unavailable so
-        only the structural signal governs ranking.
+        Uses the module-level embedding cache (keyed on content_hash) so
+        repeated calls with the same topics embed zero new texts.  Falls back
+        to uniform 0.0 scores if the embedder is unavailable so only the
+        structural signal governs ranking.
         """
         zero = [0.0] * len(topics)
         if not topics or not query.strip():
             return zero
 
         try:
-            summaries = [t.summary for t in topics]
-            texts = [query] + summaries
-            vecs = _embed_texts(texts)
+            query_hash = _hash_content(query)
+            texts_with_hashes: List[Tuple[str, str]] = (
+                [(query, query_hash)]
+                + [(t.summary, t.content_hash) for t in topics]
+            )
+            vecs = _embed_texts_cached(texts_with_hashes, self._project_root)
             if vecs is None or len(vecs) < 2:
                 return zero
 

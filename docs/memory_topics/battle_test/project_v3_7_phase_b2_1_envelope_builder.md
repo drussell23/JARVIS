@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase B2 1 Envelope Builder
-modules: [backend/core/ouroboros/governance/swe_bench_pro/envelope_builder.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, backend/core/ouroboros/governance/intake/intent_envelope.py, tests/governance/test_swe_bench_pro_envelope_builder.py]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/envelope_builder.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, backend/core/ouroboros/governance/intake/intent_envelope.py, tests/governance/test_swe_bench_pro_envelope_builder.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_b2_1_envelope_builder.md
 ---

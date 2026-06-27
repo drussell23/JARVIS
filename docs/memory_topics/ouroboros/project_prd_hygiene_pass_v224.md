@@ -1,6 +1,6 @@
 ---
 title: Project Prd Hygiene Pass V224
-modules: []
+modules: [backend/core/ouroboros/governance/phase10_graduation_contract.py, backend/core/ouroboros/governance/curiosity_producer_bridge.py, backend/core/ouroboros/governance/observability/phase8_producers.py, backend/core/ouroboros/governance/verification/confidence_probe_bridge.py, backend/core/ouroboros/governance/cross_process_jsonl.py, backend/core/ouroboros/governance/agentic_general_subagent.py]
 status: merged
 source: project_prd_hygiene_pass_v224.md
 ---

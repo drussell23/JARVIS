@@ -1,6 +1,6 @@
 ---
 title: Project Move 5 Scope
-modules: []
+modules: [backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/verification/hypothesis_consumers.py, backend/core/ouroboros/governance/cross_process_jsonl.py, backend/core/ouroboros/governance/verification/confidence_probe_bridge.py, backend/core/ouroboros/governance/verification/readonly_evidence_prober.py, backend/core/ouroboros/governance/verification/confidence_probe_observability.py]
 status: merged
 source: project_move_5_scope.md
 ---

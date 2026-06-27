@@ -1,6 +1,6 @@
 ---
 title: Project Slice199 Dual Tooling
-modules: []
+modules: [backend/core/ouroboros/governance/m10_autonomous_graduation.py, backend/core/ouroboros/governance/auto_committer.py, tests/governance/test_auto_committer_ignore_guard_graduation.py]
 status: historical
 source: project_slice199_dual_tooling.md
 ---

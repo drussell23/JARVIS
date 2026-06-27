@@ -1,6 +1,6 @@
 ---
 title: FlagRegistry + /help Dispatcher — 5-Slice Arc
-modules: [backend/core/ouroboros/governance/]
+modules: [backend/core/ouroboros/governance/, backend/core/ouroboros/governance/flag_registry.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/help_dispatcher.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/ide_observability_stream.py]
 status: merged
 source: project_flag_registry_plan.md
 ---

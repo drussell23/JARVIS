@@ -1,6 +1,6 @@
 ---
 title: Project Slice194 Race Triage
-modules: []
+modules: [backend/core/ouroboros/governance/race_triage.py, tests/governance/test_slice194_race_triage.py, tests/governance/test_slice12af_universal_route_taxonomy.py]
 status: historical
 source: project_slice194_race_triage.md
 ---

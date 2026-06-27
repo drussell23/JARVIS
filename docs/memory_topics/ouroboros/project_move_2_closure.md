@@ -1,6 +1,6 @@
 ---
 title: Project Move 2 Closure
-modules: [tests/test_ouroboros_governance/test_candidate_generator.py]
+modules: [tests/test_ouroboros_governance/test_candidate_generator.py, backend/core/ouroboros/governance/stream_rupture.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/candidate_generator.py, tests/governance/test_stream_rupture_breaker.py, tests/governance/test_transport_resilience.py, tests/governance/test_phase_aware_heartbeats.py, tests/governance/test_unified_observability_bg.py, tests/governance/test_dynamic_provider_fallback.py, backend/core/ouroboros/governance/claude_circuit_breaker.py, tests/governance/test_claude_circuit_breaker.py]
 status: merged
 source: project_move_2_closure.md
 ---

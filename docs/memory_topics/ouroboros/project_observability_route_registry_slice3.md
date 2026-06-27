@@ -1,6 +1,6 @@
 ---
 title: Project Observability Route Registry Slice3
-modules: [backend/core/ouroboros/governance/observability_route_registry.py, tests/governance/test_observability_route_registry.py]
+modules: [backend/core/ouroboros/governance/observability_route_registry.py, tests/governance/test_observability_route_registry.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/battle_test/repl_dispatch_registry.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_observability_route_registry_slice3.md
 ---

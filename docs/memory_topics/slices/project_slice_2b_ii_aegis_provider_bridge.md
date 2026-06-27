@@ -1,6 +1,6 @@
 ---
 title: Architectural pattern (single canonical seam — AST-pinned)
-modules: [backend/core/ouroboros/governance/aegis_provider_bridge.py, backend/core/ouroboros/, backend/core/ouroboros/aegis/upstream_registry.py]
+modules: [backend/core/ouroboros/governance/aegis_provider_bridge.py, backend/core/ouroboros/, backend/core/ouroboros/aegis/upstream_registry.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/claude_fallback.py, backend/core/ouroboros/governance/self_critique.py, backend/core/ouroboros/governance/general_driver.py, backend/core/ouroboros/governance/fast_path_qa.py, backend/core/ouroboros/governance/visual_comprehension.py]
 status: historical
 source: project_slice_2b_ii_aegis_provider_bridge.md
 ---

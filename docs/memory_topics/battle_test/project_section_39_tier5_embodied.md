@@ -1,6 +1,6 @@
 ---
 title: Project Section 39 Tier5 Embodied
-modules: []
+modules: [backend/core/ouroboros/governance/architecture_viz.py, backend/core/ouroboros/governance/confidence_aura.py, backend/core/ouroboros/governance/attention_mirror.py, backend/core/ouroboros/governance/procedural_portrait.py, backend/core/ouroboros/governance/embodied_repl.py]
 status: historical
 source: project_section_39_tier5_embodied.md
 ---

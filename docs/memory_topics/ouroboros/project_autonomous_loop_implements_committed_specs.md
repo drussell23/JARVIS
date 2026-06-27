@@ -1,6 +1,6 @@
 ---
 title: Project Autonomous Loop Implements Committed Specs
-modules: [docs/superpowers/specs/, docs/superpowers/specs/2026-06-14-sovereign-distillation-design.md, backend/core/cybernetic_reanimation.py, tests/battle_test/synthetic_pressure_injector.py, backend/core/remediation_arsenal.py, backend/core/ouroboros/governance/live_kernel_validator.py, scripts/deploy_live_validator_fsm.py, scripts/deploy_tier2_consolidation.py, tests/governance/test_live_fire_dogfood_integration.py]
+modules: [docs/superpowers/specs/, backend/core/cybernetic_reanimation.py, tests/battle_test/synthetic_pressure_injector.py, backend/core/remediation_arsenal.py, backend/core/ouroboros/governance/live_kernel_validator.py, scripts/deploy_live_validator_fsm.py, scripts/deploy_tier2_consolidation.py, tests/governance/test_live_fire_dogfood_integration.py, unified_supervisor.py, backend/core/ouroboros/governance/semantic_guardian_blindspots.py, backend/core/ouroboros/governance/semantic_consolidation.py]
 status: merged
 source: project_autonomous_loop_implements_committed_specs.md
 ---

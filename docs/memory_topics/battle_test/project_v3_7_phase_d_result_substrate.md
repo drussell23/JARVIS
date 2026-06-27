@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase D Result Substrate
-modules: [backend/core/ouroboros/governance/swe_bench_pro/result_store.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_result_store.py]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/result_store.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_result_store.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_d_result_substrate.md
 ---

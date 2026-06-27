@@ -1,6 +1,6 @@
 ---
 title: SensorGovernor + MemoryPressureGate Arc — CLOSED
-modules: []
+modules: [backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/autonomy/subagent_scheduler.py]
 status: merged
 source: project_sensor_governor_graduation.md
 ---

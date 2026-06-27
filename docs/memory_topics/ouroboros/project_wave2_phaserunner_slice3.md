@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 3 — Result
-modules: [backend/core/ouroboros/governance/phase_runners/route_runner.py]
+modules: [backend/core/ouroboros/governance/phase_runners/route_runner.py, orchestrator.py, test_orchestrator.py]
 status: historical
 source: project_wave2_phaserunner_slice3.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Dw Economic Sovereignty
-modules: []
+modules: [backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/economic_telemetry.py, backend/core/ouroboros/governance/dw_failure_predictor.py, backend/core/ouroboros/governance/discord_gateway.py, discord.py]
 status: historical
 source: project_dw_economic_sovereignty.md
 ---

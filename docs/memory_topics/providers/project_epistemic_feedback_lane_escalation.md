@@ -1,6 +1,6 @@
 ---
 title: Adaptive Epistemic Feedback Matrix + Dynamic Lane Escalation (2026-06-22, MERGED PR #69664)
-modules: [scripts/extract_sovereign_pr.py]
+modules: [scripts/extract_sovereign_pr.py, backend/core/ouroboros/governance/epistemic_feedback.py]
 status: merged
 source: project_epistemic_feedback_lane_escalation.md
 ---

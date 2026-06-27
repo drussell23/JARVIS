@@ -1,6 +1,6 @@
 ---
 title: Project Upgrade 1 Bounded Epistemic Loop
-modules: []
+modules: [backend/core/ouroboros/governance/epistemic_budget.py, backend/core/ouroboros/governance/epistemic_budget_executor_hook.py, backend/core/ouroboros/governance/epistemic_budget_observability.py, backend/core/ouroboros/governance/budget_repl.py, backend/core/ouroboros/governance/epistemic_budget_provider_bridge.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: merged
 source: project_upgrade_1_bounded_epistemic_loop.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project V2 96 Layer8 Atexit Marker Discrimination
-modules: [tests/battle_test/test_layer8_atexit_marker_discrimination.py, backend/core/ouroboros/battle_test/termination_hook_default_adapters.py, backend/core/ouroboros/governance/graduation/live_fire_soak.py, tests/battle_test/test_termination_hook_slice3_wiring.py, tests/governance/test_phase_9_slice_7c_composite_stop_reason.py]
+modules: [tests/battle_test/test_layer8_atexit_marker_discrimination.py, backend/core/ouroboros/battle_test/termination_hook_default_adapters.py, backend/core/ouroboros/governance/graduation/live_fire_soak.py, tests/battle_test/test_termination_hook_slice3_wiring.py, tests/governance/test_phase_9_slice_7c_composite_stop_reason.py, backend/core/ouroboros/governance/last_session_summary.py]
 status: historical
 source: project_v2_96_layer8_atexit_marker_discrimination.md
 ---

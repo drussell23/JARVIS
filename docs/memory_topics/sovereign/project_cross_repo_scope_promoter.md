@@ -1,6 +1,6 @@
 ---
 title: Project Cross Repo Scope Promoter
-modules: [scripts/trinity_bringup.py, backend/core/reactor_daemon_supervisor.py, scripts/soaks/l2_graduation_soak_runner.py, tests/governance/chaos_simulation_fabric.py]
+modules: [scripts/trinity_bringup.py, backend/core/reactor_daemon_supervisor.py, scripts/soaks/l2_graduation_soak_runner.py, tests/governance/chaos_simulation_fabric.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/op_context.py, registry.py, run_reactor.py, backend/clients/reactor_core_client.py, backend/core/trinity_bridge.py, backend/loading_server/cross_repo_health.py]
 status: open
 source: project_cross_repo_scope_promoter.md
 ---

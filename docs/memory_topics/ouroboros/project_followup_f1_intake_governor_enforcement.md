@@ -1,6 +1,6 @@
 ---
 title: Project Followup F1 Intake Governor Enforcement
-modules: [backend/core/ouroboros/governance/intake/intake_priority_queue.py, tests/governance/intake/test_intake_priority_queue.py, tests/governance/intake/test_unified_intake_router_f1.py, tests/governance/test_parallel_dispatch_reachability_supplement.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, tests/governance/intake/test_unified_intake_router_f1_integration.py]
+modules: [backend/core/ouroboros/governance/intake/intake_priority_queue.py, tests/governance/intake/test_intake_priority_queue.py, tests/governance/intake/test_unified_intake_router_f1.py, tests/governance/test_parallel_dispatch_reachability_supplement.py, backend/core/ouroboros/governance/flag_registry_seed.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, tests/governance/intake/test_unified_intake_router_f1_integration.py, backend/core/ouroboros/governance/parallel_dispatch.py, backend/core/ouroboros/governance/worktree_manager.py, backend/core/ouroboros/governance/phase_dispatcher.py]
 status: historical
 source: project_followup_f1_intake_governor_enforcement.md
 ---

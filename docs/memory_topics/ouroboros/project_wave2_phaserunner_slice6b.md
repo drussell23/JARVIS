@@ -1,6 +1,6 @@
 ---
 title: Wave 2 (5) Slice 6b — Result
-modules: [tests/governance/phase_runner/test_phase_dispatcher_terminals.py]
+modules: [tests/governance/phase_runner/test_phase_dispatcher_terminals.py, backend/core/ouroboros/governance/phase_dispatcher.py]
 status: historical
 source: project_wave2_phaserunner_slice6b.md
 ---

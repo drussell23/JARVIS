@@ -1,6 +1,6 @@
 ---
 title: Before
-modules: [tests/test_smoke.py, backend/core/ouroboros/governance/swe_bench_pro/per_problem_harness.py, tests/governance/test_swe_bench_pro_per_problem_harness.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [tests/test_smoke.py, backend/core/ouroboros/governance/swe_bench_pro/per_problem_harness.py, tests/governance/test_swe_bench_pro_per_problem_harness.py, backend/core/ouroboros/governance/swe_bench_pro/harness_inject.py]
 status: historical
 source: project_v3_7_clone_template_bypass.md
 ---

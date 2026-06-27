@@ -1,6 +1,6 @@
 ---
 title: Project Slice252 Shadow Telemetry
-modules: [tests/governance/test_slice252_shadow_telemetry.py]
+modules: [tests/governance/test_slice252_shadow_telemetry.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/cybernetic_reanimation.py, unified_supervisor.py, tests/governance/test_reanimation_kernel_wiring.py]
 status: merged
 source: project_slice252_shadow_telemetry.md
 ---

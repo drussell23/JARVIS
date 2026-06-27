@@ -1,6 +1,6 @@
 ---
 title: Project V2 89 Venom V2 Observability Substrate
-modules: [tests/governance/test_permission_decision_archive.py, backend/core/ouroboros/governance/permission_decision_archive.py, backend/core/ouroboros/governance/tool_executor.py]
+modules: [tests/governance/test_permission_decision_archive.py, backend/core/ouroboros/governance/permission_decision_archive.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/tool_permission.py, backend/core/ouroboros/governance/inline_permission_observability.py, backend/core/ouroboros/battle_test/tool_render_store.py, tests/governance/test_venom_v2_slice_1_tool_permission.py]
 status: historical
 source: project_v2_89_venom_v2_observability_substrate.md
 ---

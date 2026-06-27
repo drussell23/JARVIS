@@ -1,6 +1,6 @@
 ---
 title: Project Sovereign Telemetry Unification
-modules: [scripts/telemetry_harvester.py, docs/superpowers/specs/2026-06-15-sovereign-telemetry-unification-design.md, backend/core/ouroboros/governance/graduation/telemetry_parse.py]
+modules: [scripts/telemetry_harvester.py, backend/core/ouroboros/governance/graduation/telemetry_parse.py, tests/governance/test_telemetry_parse_extraction.py, backend/core/ouroboros/governance/graduation/graduation_contract.py, tests/governance/test_graduation_arbiter.py, backend/core/ouroboros/governance/graduation/live_fire_soak.py, tests/governance/test_live_fire_telemetry_wiring.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: historical
 source: project_sovereign_telemetry_unification.md
 ---

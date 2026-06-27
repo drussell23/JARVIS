@@ -1,6 +1,6 @@
 ---
 title: Project Deep Analysis Sensor
-modules: []
+modules: [backend/core/ouroboros/governance/intake/unified_intake_router.py]
 status: historical
 source: project_deep_analysis_sensor.md
 ---

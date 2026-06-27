@@ -1,6 +1,6 @@
 ---
 title: Sovereign Execution Engine (2026-06-19, PR #69580, branch `fleet/sovereign-exec-engine`, NOT merged)
-modules: [scripts/launch_linux_prod.sh, scripts/dw_ov_repair_demo.py]
+modules: [scripts/dw_ov_repair_demo.py, backend/core/ouroboros/governance/session_budget_authority.py, backend/core/ouroboros/governance/background_agent_pool.py, backend/core/ouroboros/governance/candidate_generator.py, circuit_breaker.py, backend/core/ouroboros/governance/intent/test_watcher.py]
 status: merged
 source: project_sovereign_exec_engine.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Sovereign GitOps Identity Matrix (PR #69635 MERGED, main fff687091a, 2026-06-21)
-modules: []
+modules: [backend/core/ouroboros/governance/graduation/graduation_workspace.py]
 status: merged
 source: project_gitops_identity_matrix.md
 ---

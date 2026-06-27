@@ -29,6 +29,9 @@ _DEFAULT_DEST = str(
     Path(__file__).resolve().parent.parent / "docs" / "memory_topics"
 )
 
+# Project root (used by extract_modules for canonical path lookup)
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
 # ---------------------------------------------------------------------------
 # Domain classifier — ordered rules, FIRST MATCH wins.
 # Each entry: (match_fn, domain_str)
@@ -201,37 +204,130 @@ _PATH_RE = re.compile(
     re.MULTILINE,
 )
 _PATH_CLEAN_RE = re.compile(r"[`',\)\]>:]+$")
-# Only keep paths that look like real source files or meaningful dirs
-_PATH_VALID_SUFFIX_RE = re.compile(
-    r"(\.py|\.ts|\.js|\.yaml|\.yml|\.json|\.sh|\.md)$"
-    r"|/[a-zA-Z_][a-zA-Z0-9_]*$"  # ends on a module/package name
-    r"|/[a-zA-Z_][a-zA-Z0-9_\-]*\.[a-zA-Z]{2,4}$"  # ends on a file
+
+# M-2: only keep source code extensions; .md, .yaml, .json, etc. are filtered.
+_SOURCE_SUFFIX_RE = re.compile(r"\.(py|ts|tsx|kt|rs|js)$")
+
+# M-1: bare source filenames not preceded by a path separator.
+# Matches e.g. `orchestrator.py`, `extension.ts`, `sidebar.tsx`
+# in backtick spans, after spaces, parens, quotes, etc.
+_BARE_FILE_RE = re.compile(
+    r"(?:^|[ \t(`'\",])"
+    r"([a-zA-Z][a-zA-Z0-9_\-]*\.(?:py|ts|tsx|kt|rs|js))"
+    r"(?=[ \t\n`'\",:)\]>]|$)",
+    re.MULTILINE,
 )
 
+# Directories whose contents to skip during canonical path lookup
+_SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".git", ".venv", "venv"})
 
-def extract_modules(body: str, cap: int = 12) -> list[str]:
-    """Extract unique backend/scripts/extensions/tests paths from body text."""
-    raw = _PATH_RE.findall(body)
+# Pre-built file index: project_root_str -> {basename -> [relpath, ...]}.
+# Built ONCE per project_root (expensive rglob), then reused for all lookups.
+_file_index_cache: dict[str, dict[str, list[str]]] = {}
+
+
+def _build_file_index(project_root: Path) -> dict[str, list[str]]:
+    """Return a {basename: [rel_path, ...]} index for all source files.
+
+    Built once per project_root and memoised in _file_index_cache.
+    """
+    root_key = str(project_root)
+    if root_key in _file_index_cache:
+        return _file_index_cache[root_key]
+    index: dict[str, list[str]] = {}
+    try:
+        for p in project_root.rglob("*"):
+            if not p.is_file():
+                continue
+            if not _SOURCE_SUFFIX_RE.search(p.name):
+                continue
+            try:
+                rel_parts = p.relative_to(project_root).parts
+            except ValueError:
+                continue
+            if any(part in _SKIP_DIRS or part.startswith(".") for part in rel_parts):
+                continue
+            rel = str(p.relative_to(project_root))
+            index.setdefault(p.name, []).append(rel)
+    except Exception:  # noqa: BLE001 — fail-soft
+        pass
+    _file_index_cache[root_key] = index
+    return index
+
+
+def _find_canonical_path(bare_name: str, project_root: Optional[Path]) -> Optional[str]:
+    """Return the unambiguous repo-relative path for *bare_name*, or None.
+
+    Uses the pre-built file index (built once, then O(1) lookups).
+    """
+    if project_root is None:
+        return None
+    index = _build_file_index(project_root)
+    matches = index.get(bare_name, [])
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def extract_modules(
+    body: str,
+    cap: int = 12,
+    project_root: Optional[Path] = None,
+) -> list[str]:
+    """Extract unique source-file paths from body text.
+
+    Two-pass extraction:
+
+    1. **Prefixed paths** (``backend/``, ``scripts/``, ``extensions/``,
+       ``tests/``, ``docs/``): captured by ``_PATH_RE``.  Filtered to real
+       source extensions only (M-2: ``.md`` and other non-code extensions
+       are dropped).  Directory paths (no extension) require ≥4 segments.
+
+    2. **Bare source filenames** (M-1): ``word.py``, ``word.ts``, etc. that
+       appear in the text but lack a path prefix.  De-duplicated against pass
+       1.  If *project_root* is supplied and the filename is unambiguous, the
+       canonical repo-relative path is substituted.
+    """
     seen: list[str] = []
     seen_set: set[str] = set()
+
+    # Pass 1 — prefixed paths
+    raw = _PATH_RE.findall(body)
     for p in raw:
         p = _PATH_CLEAN_RE.sub("", p).strip()
-        # Skip very short or obviously partial matches
         if len(p) < 8 or "/" not in p:
             continue
-        # Must look like a real file or meaningful directory endpoint
-        if not _PATH_VALID_SUFFIX_RE.search(p):
-            # Allow paths that have at least 2 segments
-            parts = p.split("/")
-            if len(parts) < 3:
+        last = p.split("/")[-1]
+        if "." in last:
+            # Has an explicit extension — must be a real source extension (M-2)
+            if not _SOURCE_SUFFIX_RE.search(last):
                 continue
-        # Normalise: strip leading ./
+        else:
+            # Directory path — require ≥4 segments to avoid noisy short dirs
+            if len(p.split("/")) < 4:
+                continue
         p = p.lstrip("./")
         if p not in seen_set:
             seen_set.add(p)
             seen.append(p)
         if len(seen) >= cap:
             break
+
+    # Pass 2 — bare source filenames (M-1)
+    if len(seen) < cap:
+        for m in _BARE_FILE_RE.finditer(body):
+            bare = m.group(1)
+            # Skip if already covered by a prefixed path
+            if any(e == bare or e.endswith("/" + bare) for e in seen):
+                continue
+            canonical = _find_canonical_path(bare, project_root)
+            entry = canonical if (canonical and canonical not in seen_set) else bare
+            if entry not in seen_set:
+                seen_set.add(entry)
+                seen.append(entry)
+            if len(seen) >= cap:
+                break
+
     return seen
 
 
@@ -350,7 +446,7 @@ def migrate_file(
 
     stem = src_path.stem  # without .md
     domain = classify_domain(stem, body_no_fm)
-    modules = extract_modules(body_no_fm)
+    modules = extract_modules(body_no_fm, project_root=_PROJECT_ROOT)
     title = derive_title(body_no_fm, stem)
     status = derive_status(body_no_fm)
     source = filename

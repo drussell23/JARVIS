@@ -1,6 +1,6 @@
 ---
 title: DirectionInferrer + StrategicPosture — 5-Slice Arc
-modules: [tests/rollback, backend/core/ouroboros/governance/, scripts/livefire_direction_inferrer.py]
+modules: [backend/core/ouroboros/governance/, scripts/livefire_direction_inferrer.py, backend/core/ouroboros/governance/strategic_direction.py, backend/core/ouroboros/battle_test/stream_renderer.py, backend/core/ouroboros/governance/direction_inferrer.py, backend/core/ouroboros/governance/posture.py, backend/core/ouroboros/governance/posture_observer.py, backend/core/ouroboros/governance/posture_store.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/battle_test/serpent_flow.py, backend/core/ouroboros/governance/ide_observability.py, backend/core/ouroboros/governance/ide_observability_stream.py]
 status: historical
 source: project_direction_inferrer_plan.md
 ---

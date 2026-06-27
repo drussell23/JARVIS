@@ -1,6 +1,6 @@
 ---
 title: Project Slice213 Lifecycle Kernel
-modules: []
+modules: [backend/core/ouroboros/governance/lifecycle_kernel.py]
 status: historical
 source: project_slice213_lifecycle_kernel.md
 ---

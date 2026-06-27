@@ -1,6 +1,6 @@
 ---
 title: Project Tier1 Capability Closures
-modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/jarvis_intelligence.py, backend/core/ouroboros/governance/observability/trajectory_auditor_observer.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_trajectory_auditor_observer.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
+modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/jarvis_intelligence.py, backend/core/ouroboros/governance/observability/trajectory_auditor_observer.py, backend/core/ouroboros/governance/governed_loop_service.py, backend/core/ouroboros/governance/ide_observability_stream.py, tests/governance/test_trajectory_auditor_observer.py, backend/core/ouroboros/governance/verification/confidence_capture.py, backend/core/ouroboros/governance/verification/causality_dag.py, backend/core/ouroboros/governance/determinism/decision_runtime.py, backend/core/ouroboros/governance/determinism/phase_capture.py, backend/core/ouroboros/governance/auto_action_router.py]
 status: merged
 source: project_tier1_capability_closures.md
 ---

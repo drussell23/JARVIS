@@ -547,6 +547,171 @@ class TestRoutedContextEmpty:
 
 
 # ---------------------------------------------------------------------------
+# Test 12 — I-1: candidate-first narrowing + persisted embedding cache
+# ---------------------------------------------------------------------------
+
+class TestCandidateFirstNarrowing:
+    """I-1: candidate-first narrowing — embedder must NOT be called with all topics."""
+
+    def _make_topics(self, topics_dir: Path, n_total: int, n_matching: int) -> None:
+        """Write n_total topic files; n_matching have modules: [orchestrator.py]."""
+        for i in range(n_total):
+            mod_line = "orchestrator.py" if i < n_matching else f"unrelated_{i}.py"
+            content = textwrap.dedent(f"""\
+                ---
+                title: Topic {i}
+                modules:
+                  - {mod_line}
+                status: active
+                ---
+
+                # Topic {i}
+
+                Summary text for topic number {i}.
+            """)
+            (topics_dir / f"topic_{i:03d}.md").write_text(content, encoding="utf-8")
+
+    def test_bounded_embedding_with_module_match(self, tmp_path, monkeypatch):
+        """When 2 topics match via modules:, embedder gets ≤ 3 texts (query + 2), not 41."""
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
+
+        topics_dir = tmp_path / "memory_topics"
+        topics_dir.mkdir()
+        self._make_topics(topics_dir, n_total=40, n_matching=2)
+
+        # Clear module-level cache so disk/previous state doesn't interfere
+        import backend.core.ouroboros.governance.module_routing as _mr
+        if hasattr(_mr, "_emb_cache"):
+            _mr._emb_cache.clear()
+        if hasattr(_mr, "_emb_cache_loaded_roots"):
+            _mr._emb_cache_loaded_roots.clear()
+
+        embed_call_sizes: List[int] = []
+
+        def _mock_embed(texts):
+            embed_call_sizes.append(len(texts))
+            return [[0.1 * j for j in range(4)] for _ in texts]
+
+        with (
+            patch(
+                "backend.core.ouroboros.governance.module_routing._get_oracle_related_modules",
+                return_value=[],
+            ),
+            patch(
+                "backend.core.ouroboros.governance.module_routing._embed_texts",
+                side_effect=_mock_embed,
+            ),
+        ):
+            from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
+            router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
+            router.route(
+                target_files=["orchestrator.py"],
+                query="orchestrator plan phase",
+                max_topics=2,
+            )
+
+        total_embedded = sum(embed_call_sizes)
+        # Must NOT embed all 40 topics; only the 2 matching + 1 query = ≤ 3
+        assert total_embedded <= 3, (
+            f"Expected ≤ 3 embedded texts (query + 2 matching topics), "
+            f"got {total_embedded}. Candidate-first narrowing is not implemented."
+        )
+
+    def test_lexical_fallback_bounded(self, tmp_path, monkeypatch):
+        """When no topics match via modules:, embedder gets ≤ prefilter_k+1 texts."""
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
+
+        topics_dir = tmp_path / "memory_topics"
+        topics_dir.mkdir()
+        # No topic matches orchestrator.py (all have unrelated modules)
+        self._make_topics(topics_dir, n_total=40, n_matching=0)
+
+        import backend.core.ouroboros.governance.module_routing as _mr
+        if hasattr(_mr, "_emb_cache"):
+            _mr._emb_cache.clear()
+        if hasattr(_mr, "_emb_cache_loaded_roots"):
+            _mr._emb_cache_loaded_roots.clear()
+
+        embed_call_sizes: List[int] = []
+
+        def _mock_embed(texts):
+            embed_call_sizes.append(len(texts))
+            return [[0.1 * j for j in range(4)] for _ in texts]
+
+        with (
+            patch(
+                "backend.core.ouroboros.governance.module_routing._get_oracle_related_modules",
+                return_value=[],
+            ),
+            patch(
+                "backend.core.ouroboros.governance.module_routing._embed_texts",
+                side_effect=_mock_embed,
+            ),
+        ):
+            from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
+            router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
+            router.route(
+                target_files=["orchestrator.py"],
+                query="orchestrator plan phase",
+                max_topics=2,
+            )
+
+        total_embedded = sum(embed_call_sizes)
+        # prefilter_k=24 topics + 1 query = 25 max; MUST NOT embed all 40
+        assert total_embedded <= 25, (
+            f"Expected ≤ 25 embedded texts (query + prefilter_k), "
+            f"got {total_embedded}. Lexical prefilter is not implemented."
+        )
+
+    def test_cache_reuse_no_reembedding_on_second_call(self, tmp_path, monkeypatch):
+        """Second route() call with same topics must not re-embed (all cached)."""
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
+
+        topics_dir = tmp_path / "memory_topics"
+        topics_dir.mkdir()
+        _write_topic(topics_dir, "orchestrator.md", TOPIC_ORCHESTRATOR)
+        _write_topic(topics_dir, "providers.md", TOPIC_PROVIDERS)
+
+        import backend.core.ouroboros.governance.module_routing as _mr
+        if hasattr(_mr, "_emb_cache"):
+            _mr._emb_cache.clear()
+        if hasattr(_mr, "_emb_cache_loaded_roots"):
+            _mr._emb_cache_loaded_roots.clear()
+
+        embed_call_sizes_by_call: List[List[int]] = [[], []]
+        call_index = [0]
+
+        def _mock_embed(texts):
+            embed_call_sizes_by_call[call_index[0]].append(len(texts))
+            return [[float(j) * 0.1 for j in range(4)] for _ in texts]
+
+        with (
+            patch(
+                "backend.core.ouroboros.governance.module_routing._get_oracle_related_modules",
+                return_value=[],
+            ),
+            patch(
+                "backend.core.ouroboros.governance.module_routing._embed_texts",
+                side_effect=_mock_embed,
+            ),
+        ):
+            from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
+            router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
+
+            # First call — embeds fresh
+            router.route(target_files=["orchestrator.py"], query="plan phase")
+            call_index[0] = 1
+            # Second call — same topics, same query: cache should be hit
+            router.route(target_files=["orchestrator.py"], query="plan phase")
+
+        second_call_total = sum(embed_call_sizes_by_call[1])
+        assert second_call_total == 0, (
+            f"Expected 0 embeddings on 2nd call (all cache hits), "
+            f"got {second_call_total}. Embedding cache is not implemented."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test 11 — integration-path: real get_oracle() import resolves, no crash
 # ---------------------------------------------------------------------------
 

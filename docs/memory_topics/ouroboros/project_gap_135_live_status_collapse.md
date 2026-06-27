@@ -1,6 +1,6 @@
 ---
 title: Gap #1+3+5 — Live Status Line + Collapsible Op Blocks (2026-05-04)
-modules: []
+modules: [backend/core/ouroboros/battle_test/live_status_line.py, backend/core/ouroboros/battle_test/serpent_flow.py, backend/core/ouroboros/battle_test/harness.py, backend/core/ouroboros/battle_test/op_block_buffer.py, backend/core/ouroboros/battle_test/status_line.py]
 status: historical
 source: project_gap_135_live_status_collapse.md
 ---

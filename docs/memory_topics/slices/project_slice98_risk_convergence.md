@@ -1,6 +1,6 @@
 ---
 title: Project Slice98 Risk Convergence
-modules: []
+modules: [backend/core/ouroboros/governance/schelling_consensus_prior.py, backend/core/ouroboros/governance/dynamic_risk_convergence.py, backend/core/ouroboros/governance/ambiguity_sensor_mesh.py, backend/core/ouroboros/cross_repo_mesh/ripple_emitter.py, orchestrator.py]
 status: historical
 source: project_slice98_risk_convergence.md
 ---

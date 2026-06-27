@@ -1,6 +1,6 @@
 ---
 title: Project Slice249 Observability Steering
-modules: [tests/governance/test_slice249_observability_steering.py]
+modules: [tests/governance/test_slice249_observability_steering.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/steering.py, backend/core/ouroboros/governance/preemption.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/state_drift.py]
 status: merged
 source: project_slice249_observability_steering.md
 ---

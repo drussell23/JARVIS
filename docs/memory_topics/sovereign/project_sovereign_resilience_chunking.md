@@ -1,6 +1,6 @@
 ---
 title: Sovereign Resilience & Chunking Matrix (2026-06-21, branch `worktree-sovereign-resilience-chunking`, NOT yet merged)
-modules: [scripts/ignite_sovereign_cloud_node.py]
+modules: [scripts/ignite_sovereign_cloud_node.py, backend/core/ouroboros/governance/transport_circuit_breaker.py, backend/core/ouroboros/governance/ast_symbol_scoper.py, backend/core/ouroboros/governance/adaptive_recursion_governor.py, backend/core/ouroboros/governance/recursion_dedup.py, backend/core/ouroboros/governance/call_graph_blast.py, orchestrator.py, backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_sovereign_resilience_chunking.md
 ---

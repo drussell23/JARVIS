@@ -1,6 +1,6 @@
 ---
 title: Project Artifact Janitor Hygiene
-modules: [backend/logs, scripts/launch_dw_cortex_soak.sh, scripts/dw_cortex_monitor.sh, docs/architecture/DW_CORTEX_SOAK.md, scripts/launch_shadow_soak.sh]
+modules: [backend/core/ouroboros/governance/artifact_janitor.py, discord.py]
 status: historical
 source: project_artifact_janitor_hygiene.md
 ---

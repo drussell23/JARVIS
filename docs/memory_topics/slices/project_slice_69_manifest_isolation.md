@@ -1,6 +1,6 @@
 ---
 title: Project Slice 69 Manifest Isolation
-modules: [tests/governance/test_slice69_diff_isolation.py]
+modules: [tests/governance/test_slice69_diff_isolation.py, backend/core/ouroboros/governance/swe_bench_pro/per_problem_harness.py, backend/core/ouroboros/governance/swe_bench_pro/container_engine.py, tests/governance/test_swe_bench_pro_autoscore_wiring.py]
 status: historical
 source: project_slice_69_manifest_isolation.md
 ---

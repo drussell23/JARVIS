@@ -1,6 +1,6 @@
 ---
 title: Ticket #4 Slice 4 — two-flag graduation (2026-04-20)
-modules: [tests/governance/test_ticket4_slice4_graduation.py]
+modules: [tests/governance/test_ticket4_slice4_graduation.py, backend/core/ouroboros/governance/monitor_tool.py, backend/core/ouroboros/governance/background_monitor.py, test_runner.py]
 status: merged
 source: project_ticket_4_slice4_graduation.md
 ---

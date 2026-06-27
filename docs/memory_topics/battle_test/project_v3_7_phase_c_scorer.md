@@ -1,6 +1,6 @@
 ---
 title: Project V3 7 Phase C Scorer
-modules: [backend/core/ouroboros/governance/swe_bench_pro/scorer.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_scorer.py]
+modules: [backend/core/ouroboros/governance/swe_bench_pro/scorer.py, backend/core/ouroboros/governance/swe_bench_pro/__init__.py, tests/governance/test_swe_bench_pro_scorer.py, backend/core/ouroboros/governance/repair_engine.py]
 status: historical
 source: project_v3_7_phase_c_scorer.md
 ---

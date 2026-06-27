@@ -1,6 +1,6 @@
 ---
 title: Reverse Russian Doll — Pass A Reconciliation (2026-04-26)
-modules: [backend/core/ouroboros/intake/sensors/, backend/core/ouroboros/intake/, backend/core/ouroboros/governance/orchestrator.py]
+modules: [backend/core/ouroboros/intake/sensors/, backend/core/ouroboros/intake/, backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/candidate_generator.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/doubleword_provider.py, backend/core/ouroboros/governance/tool_executor.py, backend/core/ouroboros/governance/auto_committer.py, backend/core/ouroboros/governance/direction_inferrer.py, backend/core/ouroboros/governance/flag_registry.py, backend/core/ouroboros/governance/sensor_governor.py, agentic_explore_subagent.py]
 status: merged
 source: project_reverse_russian_doll_pass_a.md
 ---

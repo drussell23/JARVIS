@@ -1,6 +1,6 @@
 ---
 title: Project Dw Phantom Eradication
-modules: []
+modules: [backend/core/ouroboros/governance/doubleword_provider.py]
 status: historical
 source: project_dw_phantom_eradication.md
 ---

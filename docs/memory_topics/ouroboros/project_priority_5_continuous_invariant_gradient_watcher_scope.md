@@ -1,6 +1,6 @@
 ---
 title: Project Priority 5 Continuous Invariant Gradient Watcher Scope
-modules: []
+modules: [backend/core/ouroboros/governance/verification/gradient_watcher.py, backend/core/ouroboros/governance/verification/gradient_collector.py, backend/core/ouroboros/governance/verification/gradient_comparator.py, backend/core/ouroboros/governance/verification/gradient_observer.py]
 status: historical
 source: project_priority_5_continuous_invariant_gradient_watcher_scope.md
 ---

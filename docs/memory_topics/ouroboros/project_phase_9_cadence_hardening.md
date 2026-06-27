@@ -1,6 +1,6 @@
 ---
 title: Each soak takes ~40min wall-clock. Run repeatedly:
-modules: [backend/core/ouroboros/governance/graduation/live_fire_soak.py, scripts/live_fire_graduation_soak.py, tests/governance/test_phase_9_cadence_hardening.py, scripts/run_live_fire_graduation_soak.sh]
+modules: [backend/core/ouroboros/governance/graduation/live_fire_soak.py, scripts/live_fire_graduation_soak.py, tests/governance/test_phase_9_cadence_hardening.py, backend/core/ouroboros/governance/flag_registry_seed.py]
 status: historical
 source: project_phase_9_cadence_hardening.md
 ---

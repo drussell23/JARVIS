@@ -1,6 +1,6 @@
 ---
 title: ClusterIntelligence-CrossSession — CLOSED 2026-05-03
-modules: [scripts/cluster_coverage_e2e_probe.py, scripts/empirical_closure_verdict.py]
+modules: [scripts/cluster_coverage_e2e_probe.py, scripts/empirical_closure_verdict.py, backend/core/ouroboros/governance/domain_map_memory.py, backend/core/ouroboros/governance/cluster_exploration_cascade_observer.py, backend/core/ouroboros/governance/semantic_index.py, tests/governance/test_semantic_adaptive_embedder.py]
 status: merged
 source: project_cluster_intelligence_cross_session_closure.md
 ---

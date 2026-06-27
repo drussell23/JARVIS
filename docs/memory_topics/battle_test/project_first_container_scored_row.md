@@ -1,6 +1,6 @@
 ---
 title: Project First Container Scored Row
-modules: []
+modules: [backend/core/ouroboros/governance/target_existence_guard.py, guiprocess.py, process_manager.py]
 status: historical
 source: project_first_container_scored_row.md
 ---

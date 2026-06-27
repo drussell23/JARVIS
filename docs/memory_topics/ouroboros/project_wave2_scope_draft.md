@@ -1,6 +1,6 @@
 ---
 title: Wave 2 + Wave 3 — Scope Draft
-modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/phase_runner.py, backend/core/ouroboros/governance/phase_runners/__init__.py, backend/core/ouroboros/governance/phase_runners/complete_runner.py, tests/governance/phase_runner/__init__.py, tests/governance/phase_runner/test_contract.py, tests/governance/phase_runner/test_complete_runner_parity.py, scripts/soak_logs/wave2_phaserunner_post_full_extraction.md]
+modules: [backend/core/ouroboros/governance/orchestrator.py, backend/core/ouroboros/governance/phase_runner.py, backend/core/ouroboros/governance/phase_runners/__init__.py, backend/core/ouroboros/governance/phase_runners/complete_runner.py, tests/governance/phase_runner/__init__.py, tests/governance/phase_runner/test_contract.py, tests/governance/phase_runner/test_complete_runner_parity.py]
 status: merged
 source: project_wave2_scope_draft.md
 ---

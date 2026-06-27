@@ -1,6 +1,6 @@
 ---
 title: Project Goal Relevance Scoring
-modules: []
+modules: [backend/core/ouroboros/governance/strategic_direction.py, backend/core/ouroboros/governance/intake/unified_intake_router.py, backend/core/ouroboros/governance/intake/intent_envelope.py]
 status: historical
 source: project_goal_relevance_scoring.md
 ---

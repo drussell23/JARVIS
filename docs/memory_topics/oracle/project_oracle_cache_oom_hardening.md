@@ -1,6 +1,6 @@
 ---
 title: Project Oracle Cache Oom Hardening
-modules: [tests/battle_test/test_oracle_cache_symmetry.py, tests/battle_test/test_process_memory_watchdog.py, tests/battle_test/test_oracle_cache_atomic.py]
+modules: [tests/battle_test/test_oracle_cache_symmetry.py, tests/battle_test/test_process_memory_watchdog.py, tests/battle_test/test_oracle_cache_atomic.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/battle_test/harness.py]
 status: historical
 source: project_oracle_cache_oom_hardening.md
 ---

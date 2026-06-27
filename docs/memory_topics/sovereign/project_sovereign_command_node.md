@@ -1,6 +1,6 @@
 ---
 title: Sovereign Command Node — Biometric Mission Control (2026-06-23)
-modules: [docs/superpowers/specs/2026-06-23-sovereign-command-node.md, backend/voice_unlock/voice_biometric_intelligence.py, extensions/vscode-jarvis/src/api/, extensions/command-node/, backend/voice_unlock/jarvis_proximity_integration.py]
+modules: [backend/voice_unlock/voice_biometric_intelligence.py, extensions/vscode-jarvis/src/api/, backend/voice_unlock/jarvis_proximity_integration.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/ide_observability.py, backend/voice_unlock/voice_biometric_cache.py, backend/core/ouroboros/governance/critical_elevation.py, backend/core/ouroboros/governance/cross_repo_trust_ledger.py, Next.js, config.py, backend/core/ouroboros/governance/command_node/biometric_audit_ledger.py, backend/core/ouroboros/governance/command_node/command_node_router.py]
 status: merged
 source: project_sovereign_command_node.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Module Discovery Slice2
-modules: [backend/core/ouroboros/governance/meta/module_discovery.py, tests/governance/test_module_discovery.py]
+modules: [backend/core/ouroboros/governance/meta/module_discovery.py, tests/governance/test_module_discovery.py, backend/core/ouroboros/governance/observability_route_registry.py, backend/core/ouroboros/governance/event_channel.py, backend/core/ouroboros/battle_test/repl_dispatch_registry.py, backend/core/ouroboros/battle_test/serpent_flow.py]
 status: historical
 source: project_module_discovery_slice2.md
 ---
