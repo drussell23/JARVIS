@@ -409,6 +409,70 @@ class GATERunner(PhaseRunner):
                     _sg_duration_ms,
                     len(_pairs),
                 )
+
+                # ---- Anti-Venom T11: second pass — non-candidate venom paths ---
+                # Venom may have written files (in-loop edit_file/write_file) that
+                # are NOT part of the candidate's proposed changes. Those helper
+                # writes bypass the first-pass candidate inspection. We re-gate
+                # every venom-touched path not already in _pairs so the guardian
+                # sees original→modified for ALL disk mutations, not just the
+                # declared candidate surface. Covered by the same fail-closed
+                # except handler below — crashes escalate to APPROVAL_REQUIRED.
+                _candidate_path_set = {p for p, _, _ in _pairs}
+                _noncandidate_pairs: list = []
+                for _vp in _venom_paths:
+                    if _vp in _candidate_path_set:
+                        continue  # already inspected in the first pass
+                    # Baseline from git HEAD (original before any in-loop write)
+                    _vp_old = ""
+                    try:
+                        _vp_proc = subprocess.run(
+                            ["git", "show", f"HEAD:{_vp}"],
+                            cwd=str(orch._config.project_root),
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        _vp_old = _vp_proc.stdout if _vp_proc.returncode == 0 else ""
+                    except Exception:
+                        _vp_old = ""
+                    # Current on-disk content (post-Venom-write state)
+                    _vp_new = ""
+                    try:
+                        _vp_abs = (
+                            orch._config.project_root / _vp
+                            if not Path(_vp).is_absolute()
+                            else Path(_vp)
+                        )
+                        if _vp_abs.is_file():
+                            _vp_new = _vp_abs.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        _vp_new = ""
+                    _noncandidate_pairs.append((_vp, _vp_old, _vp_new))
+
+                if _noncandidate_pairs:
+                    _nc_findings = _guardian.inspect_batch(_noncandidate_pairs)
+                    _guardian_findings = _guardian_findings + _nc_findings
+                    # Apply same tier-escalation logic as the candidate pass.
+                    _nc_floor_name = recommend_tier_floor(_nc_findings)
+                    if _nc_floor_name is not None:
+                        _nc_upgrade_map = {
+                            "notify_apply": RiskTier.NOTIFY_APPLY,
+                            "approval_required": RiskTier.APPROVAL_REQUIRED,
+                        }
+                        _nc_upgrade = _nc_upgrade_map.get(_nc_floor_name)
+                        if _nc_upgrade is not None and risk_tier.value < _nc_upgrade.value:
+                            risk_tier = _nc_upgrade
+                    _nc_hard = sum(1 for f in _nc_findings if f.severity == "hard")
+                    logger.info(
+                        "[SemanticGuard] op=%s noncandidate_pass files=%d "
+                        "findings=%d hard=%d risk_after=%s",
+                        ctx.op_id,
+                        len(_noncandidate_pairs),
+                        len(_nc_findings),
+                        _nc_hard,
+                        risk_tier.name,
+                    )
             except Exception:
                 # Anti-Venom Lock A — FAIL CLOSED (live phase-runner path).
                 # Mirror orchestrator.py: a guardian crash used to be swallowed

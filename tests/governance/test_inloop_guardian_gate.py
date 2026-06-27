@@ -1,4 +1,4 @@
-"""Anti-Venom Task 10 — in-loop SemanticGuardian content-gate regression spine.
+"""Anti-Venom Task 10/11 — in-loop SemanticGuardian content-gate regression spine.
 
 Covers:
   1. edit_file introducing os.system → ToolError returned, file NOT written.
@@ -7,6 +7,12 @@ Covers:
      adding only a comment (delta=0) → succeeds (proves on-disk baseline).
   4. Guardian crash (monkeypatch) → fail-closed ToolError, file NOT written.
   5. Soft finding → writes + advisory note appended to success result.
+
+Task 11 additions (Vector 1 + Vector 2):
+  6. delete_file — hard guardian finding → ToolError, file NOT deleted.
+  7. delete_file — benign file → deletes successfully.
+  8. delete_file — guardian crash → fail-closed ToolError, file NOT deleted.
+  9. bash sandbox — sandbox_run_bash is called with read_only=True (Vector 2).
 """
 from __future__ import annotations
 
@@ -247,4 +253,141 @@ def test_soft_finding_allows_write_with_advisory(tmp_path: Path, monkeypatch) ->
     on_disk = (tmp_path / "soft_target.py").read_text(encoding="utf-8")
     assert '"""Compute something important."""' not in on_disk, (
         "Docstring should have been removed by the edit."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 11 / Vector 1 — _delete_file SemanticGuardian gate
+# ---------------------------------------------------------------------------
+
+
+def test_delete_file_hard_finding_blocked(tmp_path: Path, monkeypatch) -> None:
+    """delete_file must return ToolError and NOT delete the file when the
+    guardian fires a hard finding against the (old_content, new_content="")
+    pair.
+
+    A file containing os.system trips 'shell_exec_introduced' when compared
+    against new_content="" because the call disappears — the guardian detects
+    a removal that looks suspicious under removed_import_still_referenced or
+    function_body_collapsed patterns.  To guarantee a hit we monkeypatch
+    inspect() to return one hard finding directly.
+    """
+    monkeypatch.setenv("JARVIS_SEMANTIC_GUARD_ENABLED", "1")
+
+    te = _make_executor(tmp_path)
+    content = "import os\nos.system('id')\n"
+    p = _write_and_seed(te, tmp_path, "dangerous.py", content)
+
+    # Inject a guaranteed hard finding via monkeypatch so the test is not
+    # coupled to which specific pattern fires on this content/empty delta.
+    from backend.core.ouroboros.governance.semantic_guardian import Detection
+
+    def _hard_inspect(self, **kwargs):
+        return [
+            Detection(
+                pattern="shell_exec_introduced",
+                severity="hard",
+                message="os.system call detected",
+                lines=(2,),
+                file_path=kwargs.get("file_path", ""),
+            )
+        ]
+
+    monkeypatch.setattr(te_mod.SemanticGuardian, "inspect", _hard_inspect)
+
+    result = te._delete_file({"path": "dangerous.py"})
+
+    assert result.startswith("ToolError:"), (
+        f"Expected ToolError from guardian block on delete, got: {result!r}"
+    )
+    assert "SemanticGuardian blocked" in result, (
+        f"Expected 'SemanticGuardian blocked' in error, got: {result!r}"
+    )
+    # File must NOT have been deleted
+    assert p.exists(), "File must still exist — guardian blocked the delete."
+
+
+def test_delete_file_benign_deletes(tmp_path: Path, monkeypatch) -> None:
+    """delete_file on a benign file must succeed (no false block)."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_GUARD_ENABLED", "1")
+
+    te = _make_executor(tmp_path)
+    p = _write_and_seed(te, tmp_path, "benign_del.py", "x = 1\n")
+
+    result = te._delete_file({"path": "benign_del.py"})
+
+    assert result.startswith("OK:"), (
+        f"Expected OK: for benign delete, got: {result!r}"
+    )
+    assert not p.exists(), "File must have been deleted."
+
+
+def test_delete_file_guardian_crash_fail_closed(tmp_path: Path, monkeypatch) -> None:
+    """If SemanticGuardian.inspect raises during delete_file, the tool must
+    fail closed: ToolError returned, file NOT deleted.
+    """
+    monkeypatch.setenv("JARVIS_SEMANTIC_GUARD_ENABLED", "1")
+
+    te = _make_executor(tmp_path)
+    p = _write_and_seed(te, tmp_path, "crash_del.py", "y = 2\n")
+
+    def _raising_inspect(self, **kwargs):
+        raise RuntimeError("simulated guardian crash in delete")
+
+    monkeypatch.setattr(te_mod.SemanticGuardian, "inspect", _raising_inspect)
+
+    result = te._delete_file({"path": "crash_del.py"})
+
+    assert "ToolError" in result, (
+        f"Expected ToolError on guardian crash during delete, got: {result!r}"
+    )
+    assert "evaluation failed" in result.lower(), (
+        f"Expected 'evaluation failed' in error, got: {result!r}"
+    )
+    # File must NOT have been deleted
+    assert p.exists(), "File must still exist after guardian crash (fail-closed)."
+
+
+# ---------------------------------------------------------------------------
+# Task 11 / Vector 2 — bash sandbox read-only proof
+# ---------------------------------------------------------------------------
+
+
+def test_bash_sandbox_readonly_prevents_repo_writes(monkeypatch) -> None:
+    """sandbox_exec.sandbox_run_bash must be called with read_only=True.
+
+    This is the structural proof that the bash tool cannot write to the repo
+    even inside the air-gapped container (the bash vector is CLOSED).
+
+    We monkeypatch run_in_container and assert read_only=True is forwarded.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Build a fake container result so sandbox_run_bash returns cleanly.
+    from backend.core.ouroboros.governance import container_sandbox as _cs
+
+    fake_result = MagicMock()
+    fake_result.breach = _cs.ContainmentBreach.NONE  # type: ignore[attr-defined]
+    fake_result.ok = True
+    fake_result.stdout = "ok"
+    fake_result.stderr = ""
+    fake_result.returncode = 0
+    fake_result.diagnostic = ""
+
+    captured: dict = {}
+
+    async def _fake_run_in_container(cmd, *, worktree=None, docker_run=None, read_only=False, **kw):
+        captured["read_only"] = read_only
+        return fake_result
+
+    with patch.object(_cs, "run_in_container", side_effect=_fake_run_in_container):
+        from backend.core.ouroboros.governance import sandbox_exec as _se
+        result = asyncio.get_event_loop().run_until_complete(
+            _se.sandbox_run_bash("echo hello", worktree="/tmp")
+        )
+
+    assert captured.get("read_only") is True, (
+        f"sandbox_run_bash must forward read_only=True to run_in_container, "
+        f"got read_only={captured.get('read_only')!r}"
     )

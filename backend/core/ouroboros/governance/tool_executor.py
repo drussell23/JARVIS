@@ -2937,6 +2937,41 @@ class ToolExecutor:
         except OSError as exc:
             return f"(delete_file: cannot read {rel_path} for audit: {exc})"
 
+        # --- Layer 3.5: in-loop SemanticGuardian content gate -------
+        # Deletion is modelled as old_content=prior_content, new_content="".
+        # Mirror _edit_file exactly: hard → ToolError (no unlink), soft →
+        # advisory note appended to success, guardian raises → fail-closed.
+        _df_sg_advisory_notes: List[str] = []
+        try:
+            _df_sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=prior_content,
+                new_content="",
+            )
+            for _df_sg_d in _df_sg_findings:
+                if _df_sg_d.severity == "hard":
+                    _df_lines_str = (
+                        f":{','.join(str(l) for l in _df_sg_d.lines)}"
+                        if _df_sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this delete — "
+                        f"{_df_sg_d.pattern} at {rel_path}{_df_lines_str}: "
+                        f"{_df_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _df_sg_d.severity == "soft":
+                    _df_sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_df_sg_d.pattern}: {_df_sg_d.message}"
+                    )
+        except Exception as _df_sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _delete_file for %s: %s",
+                rel_path, _df_sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
+            )
+
         # --- Layer 4: delete -----------------------------------------
         try:
             resolved.unlink()
@@ -2965,9 +3000,12 @@ class ToolExecutor:
 
         prior_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
         n_lines = prior_content.count("\n") + 1
-        return (
+        success_msg = (
             f"OK: deleted {rel_path} ({n_lines} lines, sha256 {prior_hash[:12]})"
         )
+        if _df_sg_advisory_notes:
+            success_msg += "\n" + "\n".join(_df_sg_advisory_notes)
+        return success_msg
 
     def _type_check(self, args: Dict[str, Any]) -> str:
         """Run pyright/mypy on specific files — returns diagnostics.
