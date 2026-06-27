@@ -6592,6 +6592,10 @@ class BattleTestHarness:
         """Graceful CAP fire path — idempotent (``set()`` on an
         already-set event is a no-op and the FIRST_COMPLETED race has
         already chosen a winner if another waiter fired first)."""
+        # Resource Governor: guaranteed allocation-free autopsy FIRST —
+        # before the oracle checkpoint (which allocates and can hang under
+        # OOM). No-op when the flag is off.
+        self._fire_death_rattle()
         if self._stop_reason in ("unknown", "", None):
             self._stop_reason = "process_memory_cap"
         # Partial summary BEFORE the bounded watchdog can os._exit
@@ -6700,6 +6704,24 @@ class BattleTestHarness:
                     "rss=%.0fMB warn=%.0fMB cap=%.0fMB",
                     _tick, rss_mb, warn_mb, cap_mb,
                 )
+            # Redline fast-trip: system free% below the redline fires the
+            # rattle+stop BEFORE the RSS cap (catches a fast swap-storm).
+            if rg_death_rattle_enabled():
+                try:
+                    from backend.core.ouroboros.governance.memory_pressure_gate import (  # noqa: E501
+                        get_default_gate as _rg_gate2,
+                    )
+                    _probe = _rg_gate2().probe()
+                    if _probe.ok and _probe.free_pct < rg_redline_free_pct():
+                        logger.warning(
+                            "[ResourceGovernor] REDLINE free=%.1f%% < %.1f%% "
+                            "— firing Death Rattle + graceful stop.",
+                            _probe.free_pct, rg_redline_free_pct(),
+                        )
+                        await self._fire_process_memory_cap(rss_mb, cap_mb)
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
             if rss_mb >= cap_mb:
                 logger.warning(
                     "[ProcessMemoryWatchdog] CAP exceeded: rss=%.0fMB "
@@ -6756,6 +6778,7 @@ class BattleTestHarness:
                 rss_mb = self._probe_process_tree_rss_mb()
                 if rss_mb is None or rss_mb < cap_mb:
                     continue
+                self._fire_death_rattle()  # alloc-free; safe off-loop thread
                 try:
                     from backend.core.ouroboros.battle_test.shutdown_watchdog import (  # noqa: E501
                         default_deadline_s as _bsw_deadline_s,

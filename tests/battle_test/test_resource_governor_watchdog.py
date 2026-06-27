@@ -66,3 +66,25 @@ def test_death_rattle_off_is_noop(tmp_path, monkeypatch):
     h._fire_death_rattle()         # but writes nothing when off
     p = tmp_path / "pre_oom_autopsy.log"
     assert (not p.exists()) or p.read_text() == ""
+
+
+def test_cap_fire_dumps_before_oracle_checkpoint(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "true")
+    h = H.BattleTestHarness.__new__(H.BattleTestHarness)
+    h._session_dir = tmp_path
+    h._stop_reason = "unknown"
+    h._started_at = 0.0
+    h._process_memory_event = asyncio.Event()
+    order = []
+    h._open_autopsy_fd()
+    orig = h._fire_death_rattle
+    h._fire_death_rattle = lambda: (order.append("rattle"), orig())[1]
+
+    async def fake_ckpt():
+        order.append("oracle")
+
+    h._checkpoint_oracle_best_effort = fake_ckpt
+    asyncio.run(h._fire_process_memory_cap(99999.0, 1.0))
+    assert order[0] == "rattle"            # rattle BEFORE oracle checkpoint
+    assert "oracle" in order
