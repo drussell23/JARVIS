@@ -471,19 +471,23 @@ class Slice4bRunner(PhaseRunner):
                 artifacts={"t_apply": _t_apply},
             )
 
-        # ── Stale-exploration guard ──
+        # ── Stale-exploration guard (Anti-Venom C1) ──
+        # Slice 248 — APPLY-time verification pass.  Call the canonical
+        # should_block_apply() instead of duplicating the hash loop inline.
+        # When JARVIS_STATE_DRIFT_VERIFY_ENABLED=true (default) AND drift is
+        # detected, refuse the apply and fail safe to POSTMORTEM rather than
+        # corrupting the file.  When the env gate is off, we degrade to
+        # log-only (byte-identical to the pre-C1 behaviour).
         _stale_files: list = []
+        _block_apply: bool = False
         if ctx.generate_file_hashes:
-            for _ghf, _ghash in ctx.generate_file_hashes:
-                if not _ghash:
-                    continue
-                _ghf_path = orch._config.project_root / _ghf
-                try:
-                    _now_hash = hashlib.sha256(_ghf_path.read_bytes()).hexdigest()
-                except (OSError, IOError):
-                    continue
-                if _now_hash != _ghash:
-                    _stale_files.append(_ghf)
+            from backend.core.ouroboros.governance.state_drift import (
+                should_block_apply as _should_block_apply,
+                STATE_DRIFT_UNRECONCILED as _STATE_DRIFT_UNRECONCILED,
+            )
+            _block_apply, _stale_files = _should_block_apply(
+                ctx.generate_file_hashes, orch._config.project_root,
+            )
             if _stale_files:
                 logger.warning(
                     "[Orchestrator] Stale-exploration: %d file(s) changed between GENERATE and APPLY: %s [%s]",
@@ -493,6 +497,31 @@ class Slice4bRunner(PhaseRunner):
                     "event": "stale_exploration_detected",
                     "stale_files": _stale_files,
                 })
+            if _block_apply:
+                # Slice 248 — drift NOT reconciled; refusing the apply is the
+                # only safe action (a full-content overwrite against drifted
+                # disk = data loss).  Mirror the LiveWorkSensor abort pattern.
+                logger.warning(
+                    "[Orchestrator] STATE DRIFT UNRECONCILED — blocking APPLY "
+                    "of stale candidate on %s — failing safe (no corruption) "
+                    "[%s]", _stale_files[:3], ctx.op_id[:12],
+                )
+                await orch._record_ledger(ctx, OperationState.FAILED, {
+                    "reason": _STATE_DRIFT_UNRECONCILED,
+                    "stale_files": _stale_files,
+                })
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code=_STATE_DRIFT_UNRECONCILED,
+                )
+                await orch._publish_outcome(
+                    ctx, OperationState.FAILED, _STATE_DRIFT_UNRECONCILED,
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason=_STATE_DRIFT_UNRECONCILED,
+                    artifacts={"t_apply": _t_apply},
+                )
 
         # ── LiveWorkSensor ──
         try:
@@ -928,7 +957,10 @@ class Slice4bRunner(PhaseRunner):
                         _l2_candidate = directive[1]
                         _l2_change = orch._build_change_request(ctx, _l2_candidate)
                         try:
-                            _l2_result = await orch._stack.change_engine.execute(_l2_change)
+                            # Anti-Venom C2 — shield L2 VERIFY repair apply.
+                            _l2_result = await asyncio.shield(
+                                orch._stack.change_engine.execute(_l2_change)
+                            )
                             if _l2_result.success:
                                 _verify_test_passed = True
                                 _verify_test_failures = 0
@@ -1313,8 +1345,11 @@ class Slice4bRunner(PhaseRunner):
                                 ctx, _vv_l2_candidate,
                             )
                             try:
-                                _vv_l2_result = (
-                                    await orch._stack.change_engine.execute(
+                                # Anti-Venom C2 — shield Visual VERIFY L2
+                                # repair apply (cancel-safe, same as
+                                # primary apply + VERIFY L2 above).
+                                _vv_l2_result = await asyncio.shield(
+                                    orch._stack.change_engine.execute(
                                         _vv_l2_change
                                     )
                                 )
