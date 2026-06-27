@@ -6591,9 +6591,21 @@ class BattleTestHarness:
         )
         _warned = False
         _tick = 0
+        _next_interval = interval_s
         while True:
+            # Adaptive cadence: accelerate as pressure rises (off -> fixed).
+            if rg_adaptive_polling_enabled():
+                try:
+                    from backend.core.ouroboros.governance.memory_pressure_gate import (  # noqa: E501
+                        get_default_gate as _rg_gate,
+                    )
+                    _next_interval = self._resolve_adaptive_pm_interval(
+                        _rg_gate().pressure(), interval_s,
+                    )
+                except Exception:  # noqa: BLE001
+                    _next_interval = interval_s
             try:
-                await asyncio.sleep(interval_s)
+                await asyncio.sleep(_next_interval)
             except asyncio.CancelledError:
                 logger.info(
                     "[ProcessMemoryWatchdog] async monitor cancelled "
@@ -6655,7 +6667,11 @@ class BattleTestHarness:
         self._process_memory_hard_deadline_stop = stop_event
         # Slower than the async path so the graceful async fire wins
         # under normal conditions (no double-stop).
-        thread_interval = max(interval_s * 2.0, 10.0)
+        thread_interval = (
+            rg_backstop_interval_s()
+            if rg_adaptive_polling_enabled()
+            else max(interval_s * 2.0, 10.0)
+        )
 
         def _run() -> None:
             while not stop_event.wait(thread_interval):
