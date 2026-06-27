@@ -88,3 +88,51 @@ def test_cap_fire_dumps_before_oracle_checkpoint(tmp_path, monkeypatch):
     asyncio.run(h._fire_process_memory_cap(99999.0, 1.0))
     assert order[0] == "rattle"            # rattle BEFORE oracle checkpoint
     assert "oracle" in order
+
+
+def test_redline_trips_on_critical_pressure_not_just_free_pct(monkeypatch, tmp_path):
+    """FIX 3: Redline fires when gate.pressure() == CRITICAL even with high free_pct."""
+    import asyncio
+    from backend.core.ouroboros.governance import memory_pressure_gate as mpg
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "true")
+
+    h = H.BattleTestHarness.__new__(H.BattleTestHarness)
+    h._session_dir = tmp_path
+    h._stop_reason = "unknown"
+    h._started_at = 0.0
+    h._process_memory_event = asyncio.Event()
+    h._open_autopsy_fd()
+
+    # Stub gate: pressure() = CRITICAL, probe returns healthy free_pct=60
+    monkeypatch.setattr(mpg.MemoryPressureGate, "pressure",
+                        lambda self: mpg.PressureLevel.CRITICAL)
+    monkeypatch.setattr(mpg.MemoryPressureGate, "probe",
+                        lambda self: mpg.MemoryProbe(
+                            free_pct=60.0, total_bytes=1, available_bytes=1,
+                            source="test"))
+
+    cap_fired = []
+
+    async def fake_fire(rss_mb, cap_mb):
+        cap_fired.append((rss_mb, cap_mb))
+
+    h._fire_process_memory_cap = fake_fire
+    h._probe_process_tree_rss_mb = lambda: 100.0
+
+    # fake_sleep returns normally — lets the loop body run (where the
+    # redline check lives). The monitor then calls fake_fire + returns
+    # naturally without needing CancelledError.
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(H.asyncio, "sleep", fake_sleep)
+    # Disable adaptive polling so first sleep is the fixed interval
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_ADAPTIVE_POLLING_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_ENABLED", raising=False)
+
+    async def _drive():
+        await h._monitor_process_memory(warn_mb=1e9, cap_mb=1e9, interval_s=0.001)
+
+    asyncio.run(_drive())
+    assert cap_fired, "cap fire not invoked on CRITICAL pressure with high free_pct"
+    assert h._stop_reason == "resource_governor_redline"

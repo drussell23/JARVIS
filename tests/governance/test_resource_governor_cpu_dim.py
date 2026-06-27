@@ -52,3 +52,60 @@ def test_pressure_escalates_on_ctx_spike(monkeypatch):
     g._cpu_ctx_sampler = lambda: next(it)
     g.pressure(); g.pressure()
     assert g.pressure() == mpg.PressureLevel.CRITICAL
+
+
+def test_master_umbrella_enables_cpu_dim(monkeypatch):
+    """FIX 1: JARVIS_RESOURCE_GOVERNOR_ENABLED=1 alone makes cpu_dim_enabled() true."""
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_ENABLED", "1")
+    # _env_bool reads os.environ at call time — no module reload needed.
+    assert mpg.cpu_dim_enabled() is True
+
+
+def test_master_umbrella_drives_pressure_escalation(monkeypatch):
+    """FIX 1: Master flag alone drives pressure() CRITICAL via ctx-spike."""
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_CTX_SPIKE_MULT", "3.0")
+    S = mpg.CpuCtxSample
+    it = iter([S(0.0, 0, 0.0), S(0.0, 1000, 1.0), S(0.0, 11000, 2.0)])
+    g = mpg.MemoryPressureGate(probe_fn=lambda: mpg.MemoryProbe(
+        free_pct=60.0, total_bytes=1, available_bytes=1, source="test"))
+    g._cpu_ctx_sampler = lambda: next(it)
+    g.pressure(); g.pressure()
+    assert g.pressure() == mpg.PressureLevel.CRITICAL
+
+
+def test_can_fanout_composes_cpu_dim(monkeypatch):
+    """FIX 2: can_fanout with cpu_dim active + ctx-spike -> CRITICAL level, clamped."""
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_CTX_SPIKE_MULT", "3.0")
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP", "1")
+    S = mpg.CpuCtxSample
+    samples = [S(0.0, 0, 0.0), S(0.0, 1000, 1.0), S(0.0, 11000, 2.0)]
+    it = iter(samples)
+    g = mpg.MemoryPressureGate(probe_fn=lambda: mpg.MemoryProbe(
+        free_pct=60.0, total_bytes=1, available_bytes=1, source="test"))
+    g._cpu_ctx_sampler = lambda: next(it)
+    # Advance baseline: two calls set baseline
+    g._cpu_ctx_dim()
+    g._cpu_ctx_dim()
+    # Now can_fanout calls _cpu_ctx_dim again -> spike -> CRITICAL
+    decision = g.can_fanout(8)
+    assert decision.level == mpg.PressureLevel.CRITICAL
+    assert decision.n_allowed == 1   # clamped to critical cap
+
+
+def test_can_fanout_off_parity(monkeypatch):
+    """FIX 2 OFF: master+sub unset -> can_fanout uses free-% only (byte-identical)."""
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_MEMORY_PRESSURE_PROCESS_DIM_ENABLED", raising=False)
+    g = mpg.MemoryPressureGate(probe_fn=lambda: mpg.MemoryProbe(
+        free_pct=60.0, total_bytes=1, available_bytes=1, source="test"))
+    decision = g.can_fanout(8)
+    assert decision.level == mpg.PressureLevel.OK
+    assert decision.n_allowed == 8

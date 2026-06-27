@@ -352,7 +352,10 @@ class HarnessConfig:
 
 
 def rg_adaptive_polling_enabled() -> bool:
-    return os.environ.get(
+    from backend.core.ouroboros.governance.memory_pressure_gate import (
+        resource_governor_master_enabled,
+    )
+    return resource_governor_master_enabled() or os.environ.get(
         "JARVIS_RESOURCE_GOVERNOR_ADAPTIVE_POLLING_ENABLED", "false",
     ).strip().lower() in ("1", "true", "yes")
 
@@ -396,7 +399,10 @@ _RG_RATTLE_FTR = b"=== END DEATH RATTLE ===\n\n"
 
 
 def rg_death_rattle_enabled() -> bool:
-    return os.environ.get(
+    from backend.core.ouroboros.governance.memory_pressure_gate import (
+        resource_governor_master_enabled,
+    )
+    return resource_governor_master_enabled() or os.environ.get(
         "JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "false",
     ).strip().lower() in ("1", "true", "yes")
 
@@ -6539,6 +6545,8 @@ class BattleTestHarness:
     def _open_autopsy_fd(self) -> None:
         """Pre-open a raw fd at boot so the redline dump never needs to
         allocate/open a file when memory is already exhausted."""
+        if not rg_death_rattle_enabled():
+            return
         if getattr(self, "_autopsy_fd", None) is not None:
             return
         self._autopsy_fd = None
@@ -6709,14 +6717,17 @@ class BattleTestHarness:
             if rg_death_rattle_enabled():
                 try:
                     from backend.core.ouroboros.governance.memory_pressure_gate import (  # noqa: E501
-                        get_default_gate as _rg_gate2,
+                        get_default_gate as _rg_gate2, PressureLevel,
                     )
-                    _probe = _rg_gate2().probe()
-                    if _probe.ok and _probe.free_pct < rg_redline_free_pct():
+                    _gate = _rg_gate2()
+                    _probe = _gate.probe()
+                    _crit = (_gate.pressure() == PressureLevel.CRITICAL)
+                    if _crit or (_probe.ok and _probe.free_pct < rg_redline_free_pct()):
+                        self._stop_reason = "resource_governor_redline"
                         logger.warning(
-                            "[ResourceGovernor] REDLINE free=%.1f%% < %.1f%% "
+                            "[ResourceGovernor] REDLINE crit=%s free=%.1f%% < %.1f%% "
                             "— firing Death Rattle + graceful stop.",
-                            _probe.free_pct, rg_redline_free_pct(),
+                            _crit, _probe.free_pct, rg_redline_free_pct(),
                         )
                         await self._fire_process_memory_cap(rss_mb, cap_mb)
                         return

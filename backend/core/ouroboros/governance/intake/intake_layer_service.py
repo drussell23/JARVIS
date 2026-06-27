@@ -65,7 +65,10 @@ def apply_benchmark_isolation(sensors: List[Any]) -> Tuple[List[Any], int]:
 
 def rg_stagger_enabled() -> bool:
     import os
-    return os.environ.get(
+    from backend.core.ouroboros.governance.memory_pressure_gate import (
+        resource_governor_master_enabled,
+    )
+    return resource_governor_master_enabled() or os.environ.get(
         "JARVIS_RESOURCE_GOVERNOR_STAGGER_ENABLED", "false",
     ).strip().lower() in ("1", "true", "yes")
 
@@ -78,11 +81,13 @@ def _rg_stagger_params():
             return float(raw) if raw else default
         except ValueError:
             return default
+    hold_poll_s = max(0.05, _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_POLL_S", 0.5))
+    hold_max_s = max(hold_poll_s, _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_MAX_S", 60.0))
     return (
         _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_BASE_MS", 250.0) / 1000.0,
         _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_JITTER_MS", 250.0) / 1000.0,
-        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_POLL_S", 0.5),
-        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_MAX_S", 60.0),
+        hold_poll_s,
+        hold_max_s,
     )
 
 

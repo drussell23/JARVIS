@@ -190,8 +190,14 @@ def process_critical_frac() -> float:
 # byte-identical legacy path. ctx-switch RATE vs rolling EWMA baseline
 # is the PRIMARY swap-thrash signal (no hardcoded N); cpu_pct is a
 # best-effort secondary (psutil.cpu_percent is noisy/0.0 on macOS).
+def resource_governor_master_enabled() -> bool:
+    """Umbrella switch — when true, enables ALL Resource Governor pieces.
+    Each piece's own sub-flag can independently enable it too (OR)."""
+    return _env_bool("JARVIS_RESOURCE_GOVERNOR_ENABLED", False)
+
+
 def cpu_dim_enabled() -> bool:
-    return _env_bool("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", False)
+    return resource_governor_master_enabled() or _env_bool("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", False)
 
 
 def cpu_critical_pct() -> float:
@@ -677,6 +683,8 @@ class MemoryPressureGate:
         # suffix, additive fields None → byte-identical legacy path.
         proc_level, proc_rss_mb, proc_cap_mb = self._process_tree_dim()
         level = _strictest(free_level, proc_level)
+        cpu_level, _cpu_pct, _ctx_rate = self._cpu_ctx_dim()
+        level = _strictest(level, cpu_level)
         proc_dominant = _LEVEL_RANK[proc_level] > _LEVEL_RANK[free_level]
         cap = self._cap_for_level(level)
         if cap is None:
@@ -958,6 +966,7 @@ __all__ = [
     "high_threshold_pct",
     "is_enabled",
     "reset_default_gate",
+    "resource_governor_master_enabled",
     "warn_fanout_cap",
     "warn_threshold_pct",
 ]
