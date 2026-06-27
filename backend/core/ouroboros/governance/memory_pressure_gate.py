@@ -612,19 +612,17 @@ class MemoryPressureGate:
                     dt = s.ts - prev[1]
                     if dt > 0:
                         ctx_rate = max(0.0, (s.ctx_switches - prev[0]) / dt)
-                if ctx_rate is not None:
-                    if self._ctx_baseline is None:
-                        self._ctx_baseline = ctx_rate          # establish
-                    else:
-                        # Detect spike BEFORE folding it into the baseline
-                        # (else the spike inflates the baseline and hides).
-                        if ctx_rate > self._ctx_baseline * ctx_spike_mult():
-                            level = PressureLevel.CRITICAL
-                        dt2 = max(1e-6, s.ts - prev[1])
-                        alpha = 1.0 - 0.5 ** (dt2 / max(1e-6, ctx_baseline_halflife_s()))
-                        self._ctx_baseline = (
-                            (1.0 - alpha) * self._ctx_baseline + alpha * ctx_rate
-                        )
+                        if self._ctx_baseline is None:
+                            self._ctx_baseline = ctx_rate      # establish
+                        else:
+                            # Detect spike BEFORE folding it into the baseline
+                            # (else the spike inflates the baseline and hides).
+                            if ctx_rate > self._ctx_baseline * ctx_spike_mult():
+                                level = PressureLevel.CRITICAL
+                            alpha = 1.0 - 0.5 ** (dt / max(1e-6, ctx_baseline_halflife_s()))
+                            self._ctx_baseline = (
+                                (1.0 - alpha) * self._ctx_baseline + alpha * ctx_rate
+                            )
             # Best-effort secondary cpu_pct (never the sole trigger).
             if s.cpu_pct >= cpu_critical_pct():
                 level = _strictest(level, PressureLevel.CRITICAL)
