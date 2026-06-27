@@ -27,6 +27,8 @@ from backend.core.ouroboros.governance.change_engine import (
     ChangeEngine,
     ChangeRequest,
     _IMMUTABLE_GOVERNANCE_SENTINELS,
+    _sentinel_matches_path,
+    assert_write_path_allowed,
 )
 from backend.core.ouroboros.governance.ledger import OperationLedger
 from backend.core.ouroboros.governance.risk_engine import (
@@ -111,3 +113,63 @@ def test_legitimate_body_edit_still_applies(tmp_path):
     assert res.success is True
     assert target.exists()
     assert "x = 1" in target.read_text()
+
+
+# ---------------------------------------------------------------------------
+# assert_write_path_allowed unit tests (review wave)
+# ---------------------------------------------------------------------------
+
+
+def test_assert_write_path_allowed_blocks_governance(tmp_path):
+    """assert_write_path_allowed raises on an immutable-governance sentinel."""
+    target = (
+        tmp_path
+        / "backend" / "core" / "ouroboros" / "governance"
+        / "risk_engine.py"
+    )
+    with pytest.raises(BlockedPathError, match="immutable governance"):
+        assert_write_path_allowed(target, tmp_path)
+
+
+def test_assert_write_path_allowed_blocks_traversal(tmp_path):
+    """assert_write_path_allowed raises on a ../ path-traversal attempt."""
+    target = tmp_path / ".." / ".." / "etc" / "x"
+    with pytest.raises(BlockedPathError, match="escapes write_root"):
+        assert_write_path_allowed(target, tmp_path)
+
+
+def test_assert_write_path_allowed_allows_src(tmp_path):
+    """assert_write_path_allowed passes for a legitimate src/ target."""
+    target = tmp_path / "src" / "app.py"
+    # Should not raise — src/app.py is not a governance sentinel or protected path
+    assert_write_path_allowed(target, tmp_path)
+
+
+def test_sentinel_boundary_anchor_no_false_positive():
+    """_sentinel_matches_path: risk_engine_helpers.py must NOT match the risk_engine sentinel.
+
+    The char after the sentinel is '_' — NOT a component boundary — so the
+    function must return False.  The broader protected-path check may still
+    block the file, but that is a separate concern; the SENTINEL alone must
+    be boundary-safe.
+    """
+    sentinel = "backend/core/ouroboros/governance/risk_engine"
+    helpers_path = "backend/core/ouroboros/governance/risk_engine_helpers.py"
+    assert not _sentinel_matches_path(helpers_path, sentinel)
+
+
+def test_sentinel_boundary_anchor_exact_match():
+    """_sentinel_matches_path: risk_engine.py MUST match the risk_engine sentinel.
+
+    The char after the sentinel is '.' — a valid component boundary.
+    """
+    sentinel = "backend/core/ouroboros/governance/risk_engine"
+    exact_path = "backend/core/ouroboros/governance/risk_engine.py"
+    assert _sentinel_matches_path(exact_path, sentinel)
+
+
+def test_sentinel_boundary_anchor_subdir_match():
+    """_sentinel_matches_path: risk_engine/sub.py MUST match — '/' is a valid boundary."""
+    sentinel = "backend/core/ouroboros/governance/risk_engine"
+    subdir_path = "backend/core/ouroboros/governance/risk_engine/sub.py"
+    assert _sentinel_matches_path(subdir_path, sentinel)

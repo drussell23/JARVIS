@@ -373,3 +373,92 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
     statuses = {s.repo: s for s in result.saga_state}
     assert statuses["prime"].status == SagaStepStatus.COMPENSATED
     assert statuses["jarvis"].status == SagaStepStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Anti-Venom gate tests (review wave)
+# ---------------------------------------------------------------------------
+
+
+async def test_saga_write_blocked_on_governance_sentinel(tmp_path):
+    """SagaApplyStrategy._apply_patch raises BlockedPathError on a governance-sentinel path.
+
+    The Anti-Venom _gate_path wrapper must fire before write_bytes, routing
+    the BlockedPathError through the existing saga apply-failure path.
+    """
+    import pytest
+    from backend.core.ouroboros.governance.change_engine import BlockedPathError
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    # Build a patch targeting an immutable-governance sentinel
+    sentinel_rel = "backend/core/ouroboros/governance/risk_engine.py"
+    sentinel_full = repo_root / sentinel_rel
+    sentinel_full.parent.mkdir(parents=True, exist_ok=True)
+    sentinel_full.write_bytes(b"original risk engine")
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=sentinel_rel, op=FileOp.MODIFY, preimage=b"original risk engine"),),
+        new_content=((sentinel_rel, b"pwned"),),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    # _apply_patch should raise BlockedPathError before touching the file
+    with pytest.raises(BlockedPathError, match="immutable governance"):
+        await strategy._apply_patch("jarvis", patch_obj)
+
+    # The file must remain unmodified — gate fired before write_bytes
+    assert sentinel_full.read_bytes() == b"original risk engine"
+
+
+async def test_saga_apply_patch_calls_gate_before_write(tmp_path):
+    """_gate_path is invoked for each write_bytes site (verifiable via mock)."""
+    from unittest.mock import call
+    import backend.core.ouroboros.governance.saga.saga_apply_strategy as _mod
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    target_rel = "src/app.py"
+    target_full = repo_root / target_rel
+    target_full.parent.mkdir(parents=True, exist_ok=True)
+    target_full.write_bytes(b"old")
+
+    # Initialize a git repo so `git add` inside _apply_patch won't fail
+    import subprocess
+    subprocess.run(["git", "init"], cwd=repo_root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=target_rel, op=FileOp.MODIFY, preimage=b"old"),),
+        new_content=((target_rel, b"new"),),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    gate_calls: list = []
+
+    original_gate = _mod._gate_path
+
+    def recording_gate(full_path, rr):
+        gate_calls.append(full_path)
+        return original_gate(full_path, rr)
+
+    with patch.object(_mod, "_gate_path", side_effect=recording_gate):
+        await strategy._apply_patch("jarvis", patch_obj)
+
+    # Gate must have fired exactly once (for the MODIFY write)
+    assert len(gate_calls) == 1
+    assert gate_calls[0].name == "app.py"

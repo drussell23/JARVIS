@@ -98,6 +98,109 @@ _IMMUTABLE_GOVERNANCE_SENTINELS: frozenset = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Anti-Venom module-level helpers (reused by ChangeEngine + SagaApplyStrategy)
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_matches_path(path: str, sentinel: str) -> bool:
+    """Return True when *sentinel* appears in *path* at a path-component boundary.
+
+    The character immediately following the sentinel match must be ``'.'``,
+    ``'/'``, or end-of-string.  This prevents ``risk_engine`` from matching
+    ``risk_engine_helpers.py`` (char after = ``'_'``) while still blocking
+    ``risk_engine.py`` (char after = ``'.'``) and ``risk_engine/sub.py``
+    (char after = ``'/'``).  Security-safe: when in doubt, always block
+    ``governance/`` — a non-matching suffix never defeats the sentinel for
+    the real governance files.
+    """
+    idx = path.find(sentinel)
+    while idx != -1:
+        after = idx + len(sentinel)
+        if after >= len(path) or path[after] in (".", "/"):
+            return True
+        idx = path.find(sentinel, idx + 1)
+    return False
+
+
+def assert_write_path_allowed(target: Path, write_root: Path) -> None:
+    """PATH-only pre-write safety check. FAIL-CLOSED.
+
+    Shared chokepoint used by :meth:`ChangeEngine._pre_write_gate` (steps
+    1-4) and by ``SagaApplyStrategy`` write sites so that cross-repo saga
+    writes receive the same containment + immutable-governance +
+    protected-path gates as governed single-repo changes.
+
+    Enforces, in order:
+
+      1. **Canonicalize** — ``realpath(abspath)`` defeats ``../`` traversal
+         and symlink redirection.
+      2. **Containment** — ``target`` must live under ``write_root``.
+      3. **Immutable governance** (FIRST authority; no env off-switch) —
+         boundary-anchored sentinel match so ``risk_engine_helpers.py`` is
+         NOT blocked while ``risk_engine.py`` IS.
+      4. **Protected-path** — reuses Venom's ``_is_protected_path`` registry
+         (``.git``, secrets, ``.env``, governance core, …).
+
+    Does **not** run the SemanticGuardian (content-aware; stays in
+    :meth:`ChangeEngine._pre_write_gate`).
+
+    Raises
+    ------
+    BlockedPathError
+        On any violation OR any internal error (fail-closed: every failure
+        mode raises this rather than allowing the write).
+    """
+    try:
+        real = os.path.realpath(os.path.abspath(str(target)))
+        root = os.path.realpath(os.path.abspath(str(write_root)))
+
+        # 1. Containment
+        if not (real == root or real.startswith(root + os.sep)):
+            raise BlockedPathError(
+                f"path escapes write_root: {real} not under {root}"
+            )
+
+        rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
+        real_posix = real.replace(os.sep, "/")
+
+        # 2. Immutable governance (FIRST authority; no env off-switch).
+        #    Boundary-anchored: char after sentinel match must be '.', '/',
+        #    or end-of-string — prevents suffix false-positives while still
+        #    blocking all real governance files.  Both rel_norm and
+        #    real_posix are checked for robustness in deep/worktree roots.
+        for sentinel in _IMMUTABLE_GOVERNANCE_SENTINELS:
+            if (
+                _sentinel_matches_path(rel_norm, sentinel)
+                or _sentinel_matches_path(real_posix, sentinel)
+            ):
+                raise BlockedPathError(
+                    f"immutable governance write blocked: {rel_norm}"
+                )
+
+        # 3. Protected-path (fail closed on import failure)
+        try:
+            from backend.core.ouroboros.governance.tool_executor import (
+                _is_protected_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            raise BlockedPathError(
+                f"protected-path check unavailable (import failed): {exc}"
+            )
+        prot = _is_protected_path(rel_norm)
+        if prot:
+            raise BlockedPathError(
+                f"protected path write blocked: {rel_norm} ({prot})"
+            )
+    except BlockedPathError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BlockedPathError(
+            f"assert_write_path_allowed internal error — fail-closed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Ouroboros code signature (Manifesto §7 — Absolute Observability)
 # ---------------------------------------------------------------------------
 
@@ -510,16 +613,16 @@ class ChangeEngine:
         (orchestrator ``_apply_multi_file_candidate``) both funnel per-file
         through :meth:`execute`, this is the universal mutation chokepoint.
 
+        Steps 1-4 (path-only) are delegated to the module-level
+        :func:`assert_write_path_allowed` so that the same checks can be
+        reused by the cross-repo :class:`SagaApplyStrategy` write sites
+        without duplication.
+
         Checks, in order (first violation wins):
-          1. canonicalize the true destination (realpath/abspath — defeats
-             ``../`` traversal + symlink redirection)
-          2. containment — reject unless ``real`` lives under the effective
-             write root
-          3. immutable governance (FIRST authority) — reject if the
-             repo-relative path matches any hardcoded sentinel; NO env switch
-          4. protected-path — reuse Venom's ``_is_protected_path`` registry
-             (.git, secrets, .env, governance core, ...)
-          5. SemanticGuardian — reject on any ``severity == "hard"`` finding
+          1-4. Path checks — see :func:`assert_write_path_allowed`:
+               canonicalize → containment → immutable-governance (boundary-
+               anchored sentinel, no env switch) → protected-path.
+          5.   SemanticGuardian — reject on any ``severity == "hard"`` finding.
 
         Raises
         ------
@@ -528,51 +631,16 @@ class ChangeEngine:
             bypass via an internal exception — every failure mode fails closed.
         """
         try:
-            # 1. canonical true destination (defeats ../ + symlinks)
+            write_root = self._effective_write_root(getattr(request, "write_root", None))
+
+            # Steps 1-4: path-only checks (shared with SagaApplyStrategy)
+            assert_write_path_allowed(target, write_root)
+
+            # Step 5: guardian — needs content; runs after path checks pass.
             real = os.path.realpath(os.path.abspath(str(target)))
-            root = os.path.realpath(os.path.abspath(str(
-                self._effective_write_root(getattr(request, "write_root", None))
-            )))
-
-            # 2. containment — must live under the effective write root
-            if not (real == root or real.startswith(root + os.sep)):
-                raise BlockedPathError(
-                    f"path escapes write_root: {real} not under {root}"
-                )
-
-            # repo-relative POSIX path of the canonical target
+            root = os.path.realpath(os.path.abspath(str(write_root)))
             rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
-            real_posix = real.replace(os.sep, "/")
 
-            # 3. immutable governance (FIRST authority; no env off-switch)
-            #    The sentinels are full repo-relative governance substrings, so
-            #    they match directly against the repo-relative target path. We
-            #    also test the absolute path as a robustness backstop for
-            #    deep/worktree write-roots (where rel_norm still carries the
-            #    full backend/.../governance/... tail anyway).
-            for sentinel in _IMMUTABLE_GOVERNANCE_SENTINELS:
-                if sentinel in rel_norm or sentinel in real_posix:
-                    raise BlockedPathError(
-                        f"immutable governance write blocked: {rel_norm}"
-                    )
-
-            # 4. protected-path (reuse the Venom registry — fail closed on
-            #    import failure so a broken import can't open the gate)
-            try:
-                from backend.core.ouroboros.governance.tool_executor import (
-                    _is_protected_path,
-                )
-            except Exception as exc:  # noqa: BLE001 — fail closed
-                raise BlockedPathError(
-                    f"protected-path check unavailable (import failed): {exc}"
-                )
-            prot = _is_protected_path(rel_norm)
-            if prot:
-                raise BlockedPathError(
-                    f"protected path write blocked: {rel_norm} ({prot})"
-                )
-
-            # 5. guardian — hard findings block; guardian crash fails closed
             try:
                 from backend.core.ouroboros.governance.semantic_guardian import (
                     SemanticGuardian,
