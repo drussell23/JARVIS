@@ -58,3 +58,75 @@ def test_run_tests_in_container_via_injected_runner(monkeypatch, tmp_path):
         sx.sandbox_run_tests(["tests/"], worktree=str(tmp_path), docker_run=fake_docker)
     )
     assert r.ok and not r.denied
+
+
+def test_bash_fail_closed_on_spawn_failed_breach(monkeypatch, tmp_path):
+    """Verify sandbox_run_bash denies when breach=SPAWN_FAILED (fail-closed)."""
+    from backend.core.ouroboros.governance.container_sandbox import ContainmentBreach
+    from dataclasses import dataclass
+
+    monkeypatch.setenv("JARVIS_RUNTIME_SANDBOX_ENABLED", "true")
+
+    @dataclass(frozen=True)
+    class FakeContainerResult:
+        breach: ContainmentBreach
+        ok: bool
+        stdout: str
+        stderr: str
+        returncode: int
+        diagnostic: str
+
+    async def fake_run_in_container(*args, **kwargs):
+        # Return a result with breach=SPAWN_FAILED to trigger deny path
+        return FakeContainerResult(
+            breach=ContainmentBreach.SPAWN_FAILED,
+            ok=False,
+            stdout="",
+            stderr="Docker spawn failed",
+            returncode=None,
+            diagnostic="Docker spawn failed",
+        )
+
+    monkeypatch.setattr(
+        "backend.core.ouroboros.governance.container_sandbox.run_in_container",
+        fake_run_in_container,
+    )
+
+    r = asyncio.run(
+        sx.sandbox_run_bash("ls", worktree=str(tmp_path))
+    )
+    assert r.denied and not r.ok  # SPAWN_FAILED → deny
+
+
+def test_run_tests_fail_closed_on_spawn_failed_breach(monkeypatch, tmp_path):
+    """Verify sandbox_run_tests denies when breach=SPAWN_FAILED (fail-closed)."""
+    from backend.core.ouroboros.governance.container_sandbox import ContainmentBreach
+    from dataclasses import dataclass
+
+    monkeypatch.setenv("JARVIS_RUNTIME_SANDBOX_ENABLED", "true")
+
+    @dataclass(frozen=True)
+    class FakePytestResult:
+        breach: ContainmentBreach
+        ok: bool
+        diagnostic: str
+        returncode: int
+
+    async def fake_run_pytest_in_container(*args, **kwargs):
+        # Return a result with breach=SPAWN_FAILED to trigger deny path
+        return FakePytestResult(
+            breach=ContainmentBreach.SPAWN_FAILED,
+            ok=False,
+            diagnostic="Docker spawn failed",
+            returncode=None,
+        )
+
+    monkeypatch.setattr(
+        "backend.core.ouroboros.governance.container_sandbox.run_pytest_in_container",
+        fake_run_pytest_in_container,
+    )
+
+    r = asyncio.run(
+        sx.sandbox_run_tests(["tests/"], worktree=str(tmp_path))
+    )
+    assert r.denied and not r.ok  # SPAWN_FAILED → deny

@@ -58,10 +58,11 @@ async def sandbox_run_bash(
 
     res = await run_in_container(command, worktree=worktree, docker_run=docker_run)
 
-    if res.breach in (ContainmentBreach.DISABLED, ContainmentBreach.SPAWN_FAILED):
+    breach = getattr(res, "breach", ContainmentBreach.SPAWN_FAILED)
+    if breach in (ContainmentBreach.DISABLED, ContainmentBreach.SPAWN_FAILED):
         logger.warning(
             "[SandboxExec] bash DENIED — sandbox unavailable (%s); fail-closed",
-            res.breach,
+            breach,
         )
         return SandboxResult(
             ok=False,
@@ -69,7 +70,7 @@ async def sandbox_run_bash(
             stderr=res.diagnostic,
             returncode=None,
             denied=True,
-            reason=f"sandbox_unavailable:{res.breach}",
+            reason=f"sandbox_unavailable:{breach}",
         )
 
     return SandboxResult(
@@ -105,7 +106,7 @@ async def sandbox_run_tests(
         test_targets, worktree=worktree, docker_run=docker_run
     )
 
-    breach = getattr(res, "breach", None)
+    breach = getattr(res, "breach", ContainmentBreach.SPAWN_FAILED)
     if breach in (ContainmentBreach.DISABLED, ContainmentBreach.SPAWN_FAILED):
         logger.warning(
             "[SandboxExec] run_tests DENIED — sandbox unavailable (%s); fail-closed",
