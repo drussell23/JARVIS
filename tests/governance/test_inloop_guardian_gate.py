@@ -193,8 +193,8 @@ def test_guardian_crash_is_fail_closed(tmp_path: Path, monkeypatch) -> None:
     assert "ToolError" in result, (
         f"Expected ToolError on guardian crash, got: {result!r}"
     )
-    assert "guardian evaluation failed" in result, (
-        f"Expected 'guardian evaluation failed' in error, got: {result!r}"
+    assert result.startswith("ToolError:") and "evaluation failed" in result.lower(), (
+        f"Expected ToolError with 'evaluation failed' in error, got: {result!r}"
     )
     # File must NOT have been written
     assert p.read_text(encoding="utf-8") == original, (
