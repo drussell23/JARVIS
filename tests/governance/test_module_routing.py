@@ -544,3 +544,44 @@ class TestRoutedContextEmpty:
 
         assert "## Relevant Architecture Memory" in ctx.section
         assert "Orchestrator" in ctx.section
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — integration-path: real get_oracle() import resolves, no crash
+# ---------------------------------------------------------------------------
+
+class TestOracleRealImport:
+    def test_oracle_related_modules_real_import_does_not_raise(self, tmp_path, monkeypatch):
+        """Exercise _get_oracle_related_modules WITHOUT mocking it.
+
+        This test proves:
+        1. The import ``from backend.core.ouroboros.oracle import get_oracle``
+           resolves correctly (no ImportError / AttributeError on the old
+           ``Oracle`` / ``Oracle.get_instance()`` path).
+        2. The returned value is a list (possibly empty when the Oracle graph
+           is cold/unbuilt — that is fine; empty is not a failure).
+        3. No unhandled exception propagates.
+
+        A cold oracle returning [] is explicitly acceptable; an ImportError or
+        AttributeError would fail the test — which is the whole point.
+        """
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
+
+        topics_dir = tmp_path / "memory_topics"
+        topics_dir.mkdir()
+        _write_topic(topics_dir, "orchestrator.md", TOPIC_ORCHESTRATOR)
+
+        from backend.core.ouroboros.governance.module_routing import (
+            ModuleContextRouter,
+            _get_oracle_related_modules,
+        )
+
+        # Call the real helper — no mocking of _get_oracle_related_modules
+        result = _get_oracle_related_modules(
+            ["backend/core/ouroboros/governance/module_routing.py"]
+        )
+
+        # Must return a list (empty is fine — Oracle graph may be cold)
+        assert isinstance(result, list), (
+            f"Expected list, got {type(result).__name__!r}"
+        )

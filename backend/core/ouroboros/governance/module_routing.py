@@ -194,42 +194,42 @@ def _load_topic_fragments(topics_dir: Path, project_root: Path) -> List[TopicFra
 # ---------------------------------------------------------------------------
 
 def _get_oracle_related_modules(target_files: List[str]) -> List[str]:
-    """Lazy-import Oracle and extract related module file-paths.
+    """Lazy-import TheOracle and extract related module file-paths via the
+    real AST dependency graph (find_nodes_in_file → get_dependents).
 
     Returns an empty list on any error (fail-soft).  The Oracle is resolved
-    via the global singleton pattern used throughout the codebase.
+    via the ``get_oracle()`` factory — the canonical singleton accessor used
+    throughout the codebase.  (The previous implementation erroneously
+    imported ``Oracle`` / called ``Oracle.get_instance()`` /
+    ``compute_blast_radius`` — none of which exist on the real API; the
+    ImportError was swallowed, silently defeating the AST signal.)
     """
     related: List[str] = []
     try:
-        from backend.core.ouroboros.oracle import Oracle  # lazy import
-        oracle = Oracle.get_instance()
+        from backend.core.ouroboros.oracle import get_oracle  # lazy import — real factory
+
+        oracle = get_oracle()
         if oracle is None:
             return []
 
         seen: set = set()
         for target in target_files:
-            # Normalise to the path tail for Oracle lookup
-            node_id_str = target
             try:
-                blast = oracle.compute_blast_radius(node_id_str, max_depth=2)
-                for node in list(blast.directly_affected) + list(blast.transitively_affected):
-                    fp = getattr(node, "file_path", None)
-                    if fp and fp not in seen:
-                        seen.add(fp)
-                        related.append(fp)
+                nodes = oracle.find_nodes_in_file(target)
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[ModuleRouter] blast_radius failed for %s", node_id_str, exc_info=True
+                    "[ModuleRouter] find_nodes_in_file failed for %s", target, exc_info=True
                 )
-                # fallback: try get_dependencies
+                continue
+            for node in nodes:
                 try:
-                    for dep_node in oracle.get_dependencies(node_id_str):
-                        fp = getattr(dep_node, "file_path", None)
+                    for dep in oracle.get_dependents(str(node)):
+                        fp = getattr(dep, "file_path", None)
                         if fp and fp not in seen:
                             seen.add(fp)
                             related.append(fp)
                 except Exception:  # noqa: BLE001
-                    pass
+                    continue
     except Exception:  # noqa: BLE001
         logger.debug("[ModuleRouter] Oracle unavailable — skipping AST signal", exc_info=True)
 
