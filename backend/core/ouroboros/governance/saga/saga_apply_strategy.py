@@ -437,6 +437,7 @@ class SagaApplyStrategy:
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.DELETE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate DELETE — phantom-file deletion vector
                     full_path.unlink()
                 else:
                     # File doesn't exist; nothing to restore. Don't add to written list.
@@ -508,6 +509,7 @@ class SagaApplyStrategy:
             full_path = repo_root / pf.path
             if pf.op == FileOp.CREATE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate compensation unlink — phantom-file deletion vector
                     full_path.unlink()
             elif pf.op in (FileOp.MODIFY, FileOp.DELETE):
                 # preimage is guaranteed non-None for MODIFY/DELETE by PatchedFile.__post_init__
@@ -778,6 +780,7 @@ class SagaApplyStrategy:
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.DELETE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate DELETE — phantom-file deletion vector
                     full_path.unlink()
                 else:
                     continue
