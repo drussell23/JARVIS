@@ -219,6 +219,15 @@ class RiskEngine:
         "ouroboros/governance/risk_engine",
         "ouroboros/governance/orchestrator",
         "ouroboros/governance/governed_loop",
+        # Anti-Venom Task 2: defense-in-depth Lock C sentinels
+        "ouroboros/governance/semantic_guardian",
+        "ouroboros/governance/tool_executor",
+        "ouroboros/governance/semantic_firewall",
+        "ouroboros/governance/scoped_tool_access",
+        "ouroboros/governance/risk_tier_floor",
+        "ouroboros/governance/change_engine",
+        "ouroboros/governance/sandbox_exec",
+        "ouroboros/governance/intake/unified_intake_router",
     )
     _EXPLORATION_SECURITY_SENTINELS: tuple = (
         "auth/",
