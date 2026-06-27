@@ -346,6 +346,47 @@ class HarnessConfig:
 
 
 # ---------------------------------------------------------------------------
+# Resource Governor Watchdog Interval Resolver
+# ---------------------------------------------------------------------------
+
+
+def rg_adaptive_polling_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_RESOURCE_GOVERNOR_ADAPTIVE_POLLING_ENABLED", "false",
+    ).strip().lower() in ("1", "true", "yes")
+
+
+def _rg_envf(name: str, default: float, minimum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        v = float(raw) if raw else default
+    except ValueError:
+        v = default
+    return max(minimum, v)
+
+
+def rg_poll_interval_for(level: str) -> float:
+    """Adaptive watchdog interval — inversely proportional to pressure.
+    As the system nears the event horizon, situational awareness
+    accelerates. All env-tunable; no hardcoded constants survive."""
+    lvl = (level or "ok").strip().lower()
+    if lvl == "critical":
+        return _rg_envf("JARVIS_RESOURCE_GOVERNOR_POLL_CRITICAL_S", 0.2, 0.05)
+    if lvl == "high":
+        return _rg_envf("JARVIS_RESOURCE_GOVERNOR_POLL_HIGH_S", 0.5, 0.05)
+    if lvl == "warn":
+        return _rg_envf("JARVIS_RESOURCE_GOVERNOR_POLL_WARN_S", 3.0, 0.1)
+    return _rg_envf("JARVIS_RESOURCE_GOVERNOR_POLL_OK_S", 10.0, 0.1)
+
+
+def rg_backstop_interval_s() -> float:
+    """Fixed aggressive floor for the starvation-immune thread backstop —
+    deliberately NOT adaptive (the immune layer must not depend on the
+    state it guards). Mirrors the Watchdog Isolation Invariant."""
+    return _rg_envf("JARVIS_RESOURCE_GOVERNOR_BACKSTOP_INTERVAL_S", 1.0, 0.1)
+
+
+# ---------------------------------------------------------------------------
 # BattleTestHarness
 # ---------------------------------------------------------------------------
 
@@ -6522,6 +6563,15 @@ class BattleTestHarness:
                 stop_evt.set()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _resolve_adaptive_pm_interval(self, level, fallback: float) -> float:
+        """Map a PressureLevel (or None) to an adaptive sleep. Off -> fallback
+        (the legacy fixed interval) so the loop is byte-identical when the
+        adaptive flag is unset."""
+        if not rg_adaptive_polling_enabled():
+            return fallback
+        lvl = getattr(level, "value", level) if level is not None else "ok"
+        return rg_poll_interval_for(str(lvl))
 
     async def _monitor_process_memory(
         self, warn_mb: float, cap_mb: float, interval_s: float,
