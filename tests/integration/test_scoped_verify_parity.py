@@ -593,3 +593,82 @@ def test_no_unanchored_project_root_reaches_config_or_testrunner() -> None:
         "unanchored cwd-relative project_root/repo_path site(s) found -- "
         "route through resolve_repo_root():\n  " + "\n  ".join(violations)
     )
+
+
+# ===========================================================================
+# (8) IsomorphicEnv integration — Task 2 TDD harness
+#
+#     The parity_repo fixture above (tests 1–6) uses a manually-constructed
+#     tmp fixture repo to reproduce the cwd≠root + no-/tmp-whitelist condition.
+#     This block closes the loop between the Task-1 IsomorphicEnv context
+#     manager and the Task-2 fix: it proves that GovernedLoopConfig() with
+#     NO explicit project_root resolves to the .git-anchored repo root — NOT
+#     os.getcwd() — when the process runs under full isomorphic conditions
+#     (cwd=disjoint-sibling, /tmp allowlist removed, node env vars injected).
+#
+#     RED pre-fix (if _default_project_root used os.getcwd()):
+#         cfg.project_root == cwd (disjoint) -> _is_safe_path rejects the
+#         valid in-repo test file -> assertion fails.
+#     GREEN post-fix (_default_project_root routes through resolve_repo_root):
+#         cfg.project_root == real_root -> _is_safe_path accepts the test file.
+#
+#     This is the first live-fidelity bug that is now provable locally for $0.
+# ===========================================================================
+
+
+def test_default_project_root_is_git_anchored_under_isomorphic_env() -> None:
+    """Task 2 / IsomorphicEnv TDD: under full isomorphic conditions (cwd≠repo,
+    no /tmp allowlist, node env vars), ``GovernedLoopConfig()`` with NO explicit
+    project_root must resolve to the ``.git``-anchored repo root, never
+    ``os.getcwd()`` -- the cwd-derived root that caused the 45 'outside repo
+    root' rejections that killed A1 soak runs #12 and #13.
+
+    Regression contract: if ``_default_project_root`` is ever changed back to a
+    cwd-derived strategy, this test fails immediately and locally, before the
+    next cloud run.
+    """
+    from backend.core.ouroboros.battle_test.isomorphic_env import IsomorphicEnv
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+    )
+
+    real_root = resolve_repo_root()
+
+    with IsomorphicEnv(repo_root=real_root, mode="process") as _env:
+        # --- Precondition: IsomorphicEnv condition 2 is active (cwd≠root) ---
+        cwd_inside = Path(os.getcwd()).resolve()
+        assert cwd_inside != real_root, (
+            "IsomorphicEnv precondition failed: cwd must differ from repo_root "
+            f"inside the context; got cwd={cwd_inside} real_root={real_root}"
+        )
+
+        # Flush the resolver memo so the call below re-resolves from scratch
+        # with JARVIS_REPO_PATH now set by IsomorphicEnv to the live-shaped root.
+        clear_cache()
+
+        # GovernedLoopConfig with NO explicit project_root — exercises the
+        # _default_project_root() default factory.
+        cfg = GovernedLoopConfig()
+
+        # THE CORE ASSERTION: project_root must be the .git-anchored root,
+        # never the (disjoint) cwd the un-fixed code would have returned.
+        assert cfg.project_root.resolve() == real_root, (
+            f"project_root ({cfg.project_root!r}) did not resolve to the "
+            f".git-anchored root ({real_root!r}); cwd={cwd_inside!r} -- "
+            "cwd-relative root leaked (the run-#12/#13 failure mode)"
+        )
+
+        # SCOPED-VERIFY ACCEPTANCE: a valid in-repo test file must pass the
+        # _is_safe_path / _normalize gate that caused the live rejection.
+        in_repo_test = real_root / "tests" / "integration" / "test_scoped_verify_parity.py"
+        assert in_repo_test.exists(), (
+            f"expected in-repo test sentinel not found: {in_repo_test}"
+        )
+        assert _is_safe_path(in_repo_test, cfg.project_root), (
+            "scoped-verify rejected a valid in-repo test file under the "
+            f"fixed config root ({cfg.project_root!r}) -- the 'outside repo "
+            "root' degradation is still active (run-#12/#13 regression)"
+        )
+
+    # Restore cache state cleanly after exit so later tests are not poisoned.
+    clear_cache()
