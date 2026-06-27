@@ -85,8 +85,14 @@ def _build_node_env(remote_root: str, effective_root: Path) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 class IsomorphicEnv:
-    """Context manager that forces local conditions mathematically isomorphic
-    to the GCP A1 soak node; restores everything on exit (fail-soft).
+    """Context manager that forces local conditions isomorphic to the GCP A1
+    soak node; restores everything on exit (fail-soft).
+
+    **Fidelity note**: Parity is mode-dependent. ``mode="process"`` reproduces
+    cwd≠repo_root and the sandbox-prefix rejection policy, but does NOT catch
+    code that hardcodes literal path comparisons (symlinks resolve to tmpdir).
+    ``mode="container"`` uses a genuine bind-mount at ``/opt/trinity/jarvis``,
+    providing full path-literal parity; use this for strict final local confirm.
 
     Four conditions forced on ``__enter__``:
 
@@ -312,6 +318,8 @@ class IsomorphicEnv:
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--pids-limit", "256",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
             # Mount the real repo_root at the live path (read-only — inspection only).
             "-v", f"{self._repo_root}:{live_path}:ro",
             "-w", live_path,
@@ -357,7 +365,7 @@ class IsomorphicEnv:
 
     def _restore_sandbox_prefixes(self) -> None:
         """Restore the original ``_ALLOWED_SANDBOX_PREFIXES`` (fail-soft)."""
-        if self._tr_module is not None and self._saved_prefixes is not None:
+        if self._tr_module is not None:
             try:
                 setattr(self._tr_module, _TR_PREFIXES_ATTR, self._saved_prefixes)
             except Exception:  # noqa: BLE001
