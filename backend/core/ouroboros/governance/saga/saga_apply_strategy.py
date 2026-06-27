@@ -51,6 +51,36 @@ try:
 except ImportError:
     _BUS_IMPORTS_OK = False
 
+# ---------------------------------------------------------------------------
+# Anti-Venom gate (Task 6 review) — shared path-only pre-write check.
+# Fail-closed: if the gate module cannot be imported the saga write is
+# aborted (RuntimeError → existing compensation path).
+# ---------------------------------------------------------------------------
+try:
+    from backend.core.ouroboros.governance.change_engine import (
+        assert_write_path_allowed as _assert_write_path_allowed,
+    )
+    _ANTI_VENOM_GATE_AVAILABLE = True
+except ImportError:
+    _assert_write_path_allowed = None  # type: ignore[assignment]
+    _ANTI_VENOM_GATE_AVAILABLE = False
+
+
+def _gate_path(full_path: Path, repo_root: Path) -> None:
+    """Anti-Venom pre-write gate for saga write sites. FAIL-CLOSED.
+
+    Calls :func:`assert_write_path_allowed` (containment + immutable-
+    governance + protected-path) before any raw ``write_bytes`` in a saga
+    apply or compensation step.  Raises ``RuntimeError`` if the gate module
+    is unavailable so that an import failure never silently opens the gate.
+    """
+    if not _ANTI_VENOM_GATE_AVAILABLE or _assert_write_path_allowed is None:
+        raise RuntimeError(
+            f"Anti-Venom gate unavailable — fail-closed write to {full_path}"
+        )
+    _assert_write_path_allowed(full_path, repo_root)
+
+
 logger = logging.getLogger("Ouroboros.SagaApply")
 
 
@@ -400,11 +430,14 @@ class SagaApplyStrategy:
 
             if pf.op == FileOp.CREATE:
                 full_path.parent.mkdir(parents=True, exist_ok=True)
+                _gate_path(full_path, repo_root)  # Anti-Venom: containment + governance + protected-path
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.MODIFY:
+                _gate_path(full_path, repo_root)  # Anti-Venom: containment + governance + protected-path
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.DELETE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate DELETE — phantom-file deletion vector
                     full_path.unlink()
                 else:
                     # File doesn't exist; nothing to restore. Don't add to written list.
@@ -476,10 +509,12 @@ class SagaApplyStrategy:
             full_path = repo_root / pf.path
             if pf.op == FileOp.CREATE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate compensation unlink — phantom-file deletion vector
                     full_path.unlink()
             elif pf.op in (FileOp.MODIFY, FileOp.DELETE):
                 # preimage is guaranteed non-None for MODIFY/DELETE by PatchedFile.__post_init__
                 full_path.parent.mkdir(parents=True, exist_ok=True)
+                _gate_path(full_path, repo_root)  # Anti-Venom: gate compensation write too
                 full_path.write_bytes(pf.preimage)  # type: ignore[arg-type]
             to_unstage.append(pf.path)
 
@@ -738,11 +773,14 @@ class SagaApplyStrategy:
             new_bytes = content_map.get(pf.path, b"")
             if pf.op == FileOp.CREATE:
                 full_path.parent.mkdir(parents=True, exist_ok=True)
+                _gate_path(full_path, repo_root)  # Anti-Venom: containment + governance + protected-path
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.MODIFY:
+                _gate_path(full_path, repo_root)  # Anti-Venom: containment + governance + protected-path
                 full_path.write_bytes(new_bytes)
             elif pf.op == FileOp.DELETE:
                 if full_path.exists():
+                    _gate_path(full_path, repo_root)  # Anti-Venom: gate DELETE — phantom-file deletion vector
                     full_path.unlink()
                 else:
                     continue

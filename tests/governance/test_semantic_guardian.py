@@ -96,8 +96,9 @@ def test_all_pattern_names_is_exhaustive():
     # (self_signing_attempt / metric_counter_suppressed /
     # chronos_continuity_laundering) + 5 Tier-0 Anticipatory Edge-Case Armor
     # blindspot detectors (frozen_dataclass_mutation / namedtuple_attr_assignment /
-    # pydantic_immutable_set / type_coercion_blindspot / loop_var_rebind_lost).
-    assert len(all_pattern_names()) == 20
+    # pydantic_immutable_set / type_coercion_blindspot / loop_var_rebind_lost)
+    # + 1 S6-closure regex pattern (shell_exec_introduced).
+    assert len(all_pattern_names()) == 21
 
 
 # ---------------------------------------------------------------------------

@@ -373,3 +373,270 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
     statuses = {s.repo: s for s in result.saga_state}
     assert statuses["prime"].status == SagaStepStatus.COMPENSATED
     assert statuses["jarvis"].status == SagaStepStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Anti-Venom gate tests (review wave)
+# ---------------------------------------------------------------------------
+
+
+async def test_saga_write_blocked_on_governance_sentinel(tmp_path):
+    """SagaApplyStrategy._apply_patch raises BlockedPathError on a governance-sentinel path.
+
+    The Anti-Venom _gate_path wrapper must fire before write_bytes, routing
+    the BlockedPathError through the existing saga apply-failure path.
+    """
+    import pytest
+    from backend.core.ouroboros.governance.change_engine import BlockedPathError
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    # Build a patch targeting an immutable-governance sentinel
+    sentinel_rel = "backend/core/ouroboros/governance/risk_engine.py"
+    sentinel_full = repo_root / sentinel_rel
+    sentinel_full.parent.mkdir(parents=True, exist_ok=True)
+    sentinel_full.write_bytes(b"original risk engine")
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=sentinel_rel, op=FileOp.MODIFY, preimage=b"original risk engine"),),
+        new_content=((sentinel_rel, b"pwned"),),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    # _apply_patch should raise BlockedPathError before touching the file
+    with pytest.raises(BlockedPathError, match="immutable governance"):
+        await strategy._apply_patch("jarvis", patch_obj)
+
+    # The file must remain unmodified — gate fired before write_bytes
+    assert sentinel_full.read_bytes() == b"original risk engine"
+
+
+async def test_saga_apply_patch_calls_gate_before_write(tmp_path):
+    """_gate_path is invoked for each write_bytes site (verifiable via mock)."""
+    from unittest.mock import call
+    import backend.core.ouroboros.governance.saga.saga_apply_strategy as _mod
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    target_rel = "src/app.py"
+    target_full = repo_root / target_rel
+    target_full.parent.mkdir(parents=True, exist_ok=True)
+    target_full.write_bytes(b"old")
+
+    # Initialize a git repo so `git add` inside _apply_patch won't fail
+    import subprocess
+    subprocess.run(["git", "init"], cwd=repo_root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=target_rel, op=FileOp.MODIFY, preimage=b"old"),),
+        new_content=((target_rel, b"new"),),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    gate_calls: list = []
+
+    original_gate = _mod._gate_path
+
+    def recording_gate(full_path, rr):
+        gate_calls.append(full_path)
+        return original_gate(full_path, rr)
+
+    with patch.object(_mod, "_gate_path", side_effect=recording_gate):
+        await strategy._apply_patch("jarvis", patch_obj)
+
+    # Gate must have fired exactly once (for the MODIFY write)
+    assert len(gate_calls) == 1
+    assert gate_calls[0].name == "app.py"
+
+
+# ---------------------------------------------------------------------------
+# Anti-Venom: DELETE gate tests (wave 2 — phantom-file deletion vector)
+# ---------------------------------------------------------------------------
+
+async def test_delete_of_governance_path_is_blocked(tmp_path):
+    """FileOp.DELETE targeting a governance/immune path is blocked by _gate_path.
+
+    The gate must fire before unlink(), the file must NOT be deleted, and the
+    saga must route to compensation (SAGA_ROLLED_BACK or SAGA_STUCK).
+    """
+    import backend.core.ouroboros.governance.saga.saga_apply_strategy as _mod
+    from backend.core.ouroboros.governance.change_engine import BlockedPathError
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    # Simulate a governance file that must never be deleted
+    immune_rel = "backend/core/ouroboros/governance/risk_engine.py"
+    immune_full = repo_root / immune_rel
+    immune_full.parent.mkdir(parents=True, exist_ok=True)
+    immune_full.write_bytes(b"# immune governance file")
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=immune_rel, op=FileOp.DELETE, preimage=b"# immune governance file"),),
+        new_content=(),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    # Inject a gate that blocks governance paths (mirrors real assert_write_path_allowed logic)
+    def blocking_gate(full_path, rr):
+        if "governance" in str(full_path) or "risk_engine" in str(full_path):
+            raise BlockedPathError(f"Blocked governance path: {full_path}")
+
+    with patch.object(_mod, "_gate_path", side_effect=blocking_gate):
+        # _apply_patch must raise — gate fires before unlink
+        import pytest
+        with pytest.raises(BlockedPathError):
+            await strategy._apply_patch("jarvis", patch_obj)
+
+    # Critical invariant: the governance file must still exist — NOT deleted
+    assert immune_full.exists(), "Governance file was deleted despite the gate — phantom-file vector not closed"
+
+
+async def test_delete_of_governance_path_routes_to_compensation_via_execute(tmp_path):
+    """Full execute() path: DELETE targeting immune path → gate blocks → saga compensates.
+
+    Uses a two-repo patch so the DELETE failure in repo_b triggers compensation
+    of repo_a (SAGA_ROLLED_BACK) rather than a raw exception.
+    """
+    import backend.core.ouroboros.governance.saga.saga_apply_strategy as _mod
+    from backend.core.ouroboros.governance.change_engine import BlockedPathError
+
+    repo_root = tmp_path / "repos"
+    repo_root.mkdir()
+
+    subprocess.run(["git", "init"], cwd=repo_root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+
+    normal_file = repo_root / "src" / "normal.py"
+    normal_file.parent.mkdir(parents=True, exist_ok=True)
+    normal_file.write_bytes(b"normal")
+
+    immune_rel = "backend/core/ouroboros/governance/risk_engine.py"
+    immune_full = repo_root / immune_rel
+    immune_full.parent.mkdir(parents=True, exist_ok=True)
+    immune_full.write_bytes(b"# immune")
+
+    patch_map = {
+        "jarvis": RepoPatch(
+            repo="jarvis",
+            files=(
+                PatchedFile(path="src/normal.py", op=FileOp.MODIFY, preimage=b"normal"),
+                PatchedFile(path=immune_rel, op=FileOp.DELETE, preimage=b"# immune"),
+            ),
+            new_content=(("src/normal.py", b"modified"),),
+        ),
+    }
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    def blocking_gate(full_path, rr):
+        if "risk_engine" in str(full_path):
+            raise BlockedPathError(f"Blocked: {full_path}")
+        # Allow all other paths through the real gate
+        import backend.core.ouroboros.governance.saga.saga_apply_strategy as _m
+        # call original — but we replaced it so just allow the rest
+        return None
+
+    ctx = OperationContext.create(
+        target_files=("src/normal.py", immune_rel),
+        description="delete gate test",
+        primary_repo="jarvis",
+        repo_scope=("jarvis",),
+        apply_plan=("jarvis",),
+        repo_snapshots=(),
+        saga_id="delete-gate-001",
+    )
+
+    with patch.object(_mod, "_gate_path", side_effect=blocking_gate):
+        result = await strategy.execute(ctx, patch_map)
+
+    # The DELETE was blocked → apply failed → saga compensated or rolled back
+    assert result.terminal_state in (
+        SagaTerminalState.SAGA_ROLLED_BACK,
+        SagaTerminalState.SAGA_STUCK,
+    ), f"Expected rollback/stuck, got {result.terminal_state}"
+
+    # The governance file must still be present
+    assert immune_full.exists(), "Immune file was deleted despite the gate"
+
+
+async def test_legit_delete_is_allowed_and_gate_fires(tmp_path):
+    """FileOp.DELETE on a normal (non-immune) file: gate is called AND unlink proceeds.
+
+    Ensures the gate does not over-block legitimate deletes.
+    """
+    import backend.core.ouroboros.governance.saga.saga_apply_strategy as _mod
+
+    repo_root = tmp_path / "jarvis"
+    repo_root.mkdir()
+
+    subprocess.run(["git", "init"], cwd=repo_root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+
+    target_rel = "src/old_module.py"
+    target_full = repo_root / target_rel
+    target_full.parent.mkdir(parents=True, exist_ok=True)
+    target_full.write_bytes(b"to be deleted")
+    # Track the file so `git add -- src/old_module.py` (staged delete) succeeds
+    subprocess.run(["git", "add", target_rel], cwd=repo_root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "-m", "add file"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(path=target_rel, op=FileOp.DELETE, preimage=b"to be deleted"),),
+        new_content=(),
+    )
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+    strategy = SagaApplyStrategy(repo_roots={"jarvis": repo_root}, ledger=ledger)
+
+    gate_calls: list = []
+
+    # Patch gate to record calls but NOT block (allow the delete through)
+    def recording_gate(full_path, rr):
+        gate_calls.append(full_path)
+        # No raise → gate passes
+
+    with patch.object(_mod, "_gate_path", side_effect=recording_gate):
+        await strategy._apply_patch("jarvis", patch_obj)
+
+    # Gate must have fired for the DELETE site
+    assert len(gate_calls) == 1, f"Expected 1 gate call, got {len(gate_calls)}"
+    assert gate_calls[0].name == "old_module.py"
+
+    # File must actually be gone — delete was not suppressed
+    assert not target_full.exists(), "File still exists — gate blocked a legit delete"

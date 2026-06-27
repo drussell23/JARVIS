@@ -96,7 +96,9 @@ _MUTATING_TOOLS: FrozenSet[str] = frozenset({
     "write_file",
     "delete_file",
     "bash",
-    "apply_patch",
+    # "apply_patch" removed (Anti-Venom Task 5): no handler; re-add only
+    # when it is routed through ChangeEngine.execute and a real handler
+    # enforces the full safety chain.
 })
 
 # Every tool the firewall knows about. Anything outside this set is

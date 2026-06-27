@@ -116,6 +116,7 @@ def build_container_argv(
     image: Optional[str] = None,
     policy: Optional[ContainmentPolicy] = None,
     seccomp_profile: Optional[str] = None,
+    read_only: bool = False,
 ) -> List[str]:
     """PURE: the hardened ``docker run`` argv that injects ``code`` into a locked-
     down container. Composes Slice 92's zero-trust profile verbatim. The worktree
@@ -151,8 +152,10 @@ def build_container_argv(
     prof = seccomp_profile if seccomp_profile is not None else os.environ.get(_ENV_SECCOMP, "").strip()
     if prof:
         argv += ["--security-opt", f"seccomp={prof}"]
-    # The L3 worktree is the sole writable host mount; cwd locked to it.
-    argv += ["-v", f"{worktree}:/work:rw", "-w", "/work"]
+    # Mount mode: read-only for inspection-only callers (bash); writable for L3
+    # code-exec callers that legitimately write to a DISPOSABLE worktree.
+    mount_mode = "ro" if read_only else "rw"
+    argv += ["-v", f"{worktree}:/work:{mount_mode}", "-w", "/work"]
     # Inject the payload: isolated python, no env inheritance (-I + docker's
     # default empty env), code passed inline.
     argv += ["--entrypoint", "python3", img, "-I", "-c", code]
@@ -167,6 +170,7 @@ async def run_in_container(
     policy: Optional[ContainmentPolicy] = None,
     seccomp_profile: Optional[str] = None,
     docker_run: Any = None,
+    read_only: bool = False,
 ) -> ContainmentResult:
     """Execute ``code`` in a hardened, ephemeral Docker container; pull back
     stdout/stderr across the (async subprocess) IPC bridge. NEVER raises — every
@@ -207,7 +211,8 @@ async def run_in_container(
             )
 
     argv = build_container_argv(
-        code, worktree=str(wt), image=image, policy=pol, seccomp_profile=seccomp_profile,
+        code, worktree=str(wt), image=image, policy=pol,
+        seccomp_profile=seccomp_profile, read_only=read_only,
     )
     try:
         rc, out, err = await docker_run(argv, float(pol.timeout_s))

@@ -76,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -124,6 +125,7 @@ class GATERunner(PhaseRunner):
         # Resolve _human_is_watching through the orchestrator module
         # namespace so env overrides remain test-patchable.
         from backend.core.ouroboros.governance.orchestrator import (
+            _SENTINEL_GUARDIAN_CRASH,
             _human_is_watching,
         )
 
@@ -305,20 +307,65 @@ class GATERunner(PhaseRunner):
                         best_candidate.get("file_path", ""),
                         best_candidate.get("full_content", ""),
                     )]
+                # Anti-Venom S2 — guardian git-HEAD baseline (live path).
+                # Mirror orchestrator.py: Venom may have written files DURING
+                # generation (in-loop edit_file/write_file). For those paths the
+                # on-disk content is the *post-write* state, so an on-disk read
+                # compares candidate→candidate and the guardian sees no change.
+                # For any path Venom touched in this op we read the ORIGINAL
+                # from ``git show HEAD:<path>`` so the guardian compares
+                # original→candidate. Fail-SOFT: a new file (not in HEAD) or
+                # any git error yields _old="" (treated as creation). The venom
+                # history lives on ``ctx.generation`` (GenerationResult), which
+                # GENERATE stamps before GATE runs.
+                _venom_paths: set = set()
+                try:
+                    _gen = getattr(ctx, "generation", None)
+                    _vhist = getattr(_gen, "venom_edit_history", ()) or ()
+                    _venom_paths = {
+                        e.get("path", "")
+                        for e in _vhist
+                        if isinstance(e, dict) and e.get("path")
+                    }
+                except Exception:
+                    _venom_paths = set()
+
                 for _path, _new in _iter:
                     if not _path or not isinstance(_new, str):
                         continue
                     _old = ""
+                    # Repo-relative form for venom-history matching + git show.
+                    _rel = _path
                     try:
-                        _abs = (
-                            orch._config.project_root / _path
-                            if not Path(_path).is_absolute()
-                            else Path(_path)
-                        )
-                        if _abs.is_file():
-                            _old = _abs.read_text(encoding="utf-8", errors="replace")
+                        _pp = Path(_path)
+                        if _pp.is_absolute():
+                            _rel = str(_pp.relative_to(orch._config.project_root))
                     except Exception:
-                        _old = ""
+                        _rel = _path
+                    if _rel in _venom_paths or _path in _venom_paths:
+                        # In-loop write landed → baseline from git HEAD.
+                        try:
+                            _proc = subprocess.run(
+                                ["git", "show", f"HEAD:{_rel}"],
+                                cwd=str(orch._config.project_root),
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
+                            _old = _proc.stdout if _proc.returncode == 0 else ""
+                        except Exception:
+                            _old = ""
+                    else:
+                        try:
+                            _abs = (
+                                orch._config.project_root / _path
+                                if not Path(_path).is_absolute()
+                                else Path(_path)
+                            )
+                            if _abs.is_file():
+                                _old = _abs.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            _old = ""
                     _pairs.append((_path, _old, _new))
 
                 _sg_t0 = time.monotonic()
@@ -362,11 +409,89 @@ class GATERunner(PhaseRunner):
                     _sg_duration_ms,
                     len(_pairs),
                 )
+
+                # ---- Anti-Venom T11: second pass — non-candidate venom paths ---
+                # Venom may have written files (in-loop edit_file/write_file) that
+                # are NOT part of the candidate's proposed changes. Those helper
+                # writes bypass the first-pass candidate inspection. We re-gate
+                # every venom-touched path not already in _pairs so the guardian
+                # sees original→modified for ALL disk mutations, not just the
+                # declared candidate surface. Covered by the same fail-closed
+                # except handler below — crashes escalate to APPROVAL_REQUIRED.
+                _candidate_path_set = {p for p, _, _ in _pairs}
+                _noncandidate_pairs: list = []
+                for _vp in _venom_paths:
+                    if _vp in _candidate_path_set:
+                        continue  # already inspected in the first pass
+                    # Baseline from git HEAD (original before any in-loop write)
+                    _vp_old = ""
+                    try:
+                        _vp_proc = subprocess.run(
+                            ["git", "show", f"HEAD:{_vp}"],
+                            cwd=str(orch._config.project_root),
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        _vp_old = _vp_proc.stdout if _vp_proc.returncode == 0 else ""
+                    except Exception:
+                        _vp_old = ""
+                    # Current on-disk content (post-Venom-write state)
+                    _vp_new = ""
+                    try:
+                        _vp_abs = (
+                            orch._config.project_root / _vp
+                            if not Path(_vp).is_absolute()
+                            else Path(_vp)
+                        )
+                        if _vp_abs.is_file():
+                            _vp_new = _vp_abs.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        _vp_new = ""
+                    _noncandidate_pairs.append((_vp, _vp_old, _vp_new))
+
+                if _noncandidate_pairs:
+                    _nc_findings = _guardian.inspect_batch(_noncandidate_pairs)
+                    _guardian_findings = _guardian_findings + _nc_findings
+                    # Apply same tier-escalation logic as the candidate pass.
+                    _nc_floor_name = recommend_tier_floor(_nc_findings)
+                    if _nc_floor_name is not None:
+                        _nc_upgrade_map = {
+                            "notify_apply": RiskTier.NOTIFY_APPLY,
+                            "approval_required": RiskTier.APPROVAL_REQUIRED,
+                        }
+                        _nc_upgrade = _nc_upgrade_map.get(_nc_floor_name)
+                        if _nc_upgrade is not None and risk_tier.value < _nc_upgrade.value:
+                            risk_tier = _nc_upgrade
+                    _nc_hard = sum(1 for f in _nc_findings if f.severity == "hard")
+                    logger.info(
+                        "[SemanticGuard] op=%s noncandidate_pass files=%d "
+                        "findings=%d hard=%d risk_after=%s",
+                        ctx.op_id,
+                        len(_noncandidate_pairs),
+                        len(_nc_findings),
+                        _nc_hard,
+                        risk_tier.name,
+                    )
             except Exception:
-                logger.debug(
-                    "[Orchestrator] SemanticGuardian skipped",
+                # Anti-Venom Lock A — FAIL CLOSED (live phase-runner path).
+                # Mirror orchestrator.py: a guardian crash used to be swallowed
+                # at DEBUG (fail-OPEN): empty findings → no tier floor → a
+                # SAFE_AUTO candidate auto-applied with the semantic net
+                # silently down. Now: inject one hard sentinel finding and force
+                # APPROVAL_REQUIRED so the op parks at GATE for a human (reuses
+                # the existing approval branch — no new FSM phase). risk_tier is
+                # set directly (the authoritative arm); _guardian_findings
+                # carries the sentinel for observability. The guardian crash
+                # must NEVER leave risk_tier below APPROVAL_REQUIRED.
+                logger.warning(
+                    "[Orchestrator] SemanticGuardian raised — FAILING "
+                    "CLOSED; APPROVAL_REQUIRED op=%s",
+                    ctx.op_id,
                     exc_info=True,
                 )
+                risk_tier = RiskTier.APPROVAL_REQUIRED
+                _guardian_findings = [_SENTINEL_GUARDIAN_CRASH]
 
         # ---- REVIEW subagent (shadow observer) ----
         await orch._run_review_shadow(ctx, best_candidate)

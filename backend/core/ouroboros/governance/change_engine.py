@@ -61,6 +61,146 @@ logger = logging.getLogger("Ouroboros.ChangeEngine")
 
 
 # ---------------------------------------------------------------------------
+# Anti-Venom (Task 6) — the universal mutation chokepoint
+# ---------------------------------------------------------------------------
+
+
+class BlockedPathError(Exception):
+    """A write target failed containment / protected-path / immutable-governance.
+
+    Raised exclusively by :meth:`ChangeEngine._pre_write_gate`. The gate is
+    fail-closed: ANY internal error (canonicalization failure, import failure,
+    guardian crash) raises this rather than allowing the write. The outer
+    ``execute`` try/except records the op FAILED and the bytes never reach disk.
+    """
+
+
+# Hardcoded — NO env off-switch. The immovability IS the security property
+# (mirrors the Immutable-Orange protocol). These are the governance files that
+# enforce safety; a compromised or hallucinating model must never be able to
+# clobber the very machinery that gates it. Self-protecting: ``change_engine``
+# and ``sandbox_exec`` are themselves listed. Each entry is the repo-relative
+# POSIX substring of a governance module — matched against the repo-relative
+# path of the (canonicalized) write target.
+_IMMUTABLE_GOVERNANCE_SENTINELS: frozenset = frozenset({
+    "backend/core/ouroboros/governance/change_engine",       # the enforcer
+    "backend/core/ouroboros/governance/sandbox_exec",        # the isolation enforcer
+    "backend/core/ouroboros/governance/semantic_guardian",
+    "backend/core/ouroboros/governance/tool_executor",
+    "backend/core/ouroboros/governance/risk_engine",
+    "backend/core/ouroboros/governance/risk_tier_floor",
+    "backend/core/ouroboros/governance/semantic_firewall",
+    "backend/core/ouroboros/governance/scoped_tool_access",
+    "backend/core/ouroboros/governance/orchestrator",
+    "backend/core/ouroboros/governance/governed_loop_service",
+    "backend/core/ouroboros/governance/intake/unified_intake_router",
+})
+
+
+# ---------------------------------------------------------------------------
+# Anti-Venom module-level helpers (reused by ChangeEngine + SagaApplyStrategy)
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_matches_path(path: str, sentinel: str) -> bool:
+    """Return True when *sentinel* appears in *path* at a path-component boundary.
+
+    The character immediately following the sentinel match must be ``'.'``,
+    ``'/'``, or end-of-string.  This prevents ``risk_engine`` from matching
+    ``risk_engine_helpers.py`` (char after = ``'_'``) while still blocking
+    ``risk_engine.py`` (char after = ``'.'``) and ``risk_engine/sub.py``
+    (char after = ``'/'``).  Security-safe: when in doubt, always block
+    ``governance/`` — a non-matching suffix never defeats the sentinel for
+    the real governance files.
+    """
+    idx = path.find(sentinel)
+    while idx != -1:
+        after = idx + len(sentinel)
+        if after >= len(path) or path[after] in (".", "/"):
+            return True
+        idx = path.find(sentinel, idx + 1)
+    return False
+
+
+def assert_write_path_allowed(target: Path, write_root: Path) -> None:
+    """PATH-only pre-write safety check. FAIL-CLOSED.
+
+    Shared chokepoint used by :meth:`ChangeEngine._pre_write_gate` (steps
+    1-4) and by ``SagaApplyStrategy`` write sites so that cross-repo saga
+    writes receive the same containment + immutable-governance +
+    protected-path gates as governed single-repo changes.
+
+    Enforces, in order:
+
+      1. **Canonicalize** — ``realpath(abspath)`` defeats ``../`` traversal
+         and symlink redirection.
+      2. **Containment** — ``target`` must live under ``write_root``.
+      3. **Immutable governance** (FIRST authority; no env off-switch) —
+         boundary-anchored sentinel match so ``risk_engine_helpers.py`` is
+         NOT blocked while ``risk_engine.py`` IS.
+      4. **Protected-path** — reuses Venom's ``_is_protected_path`` registry
+         (``.git``, secrets, ``.env``, governance core, …).
+
+    Does **not** run the SemanticGuardian (content-aware; stays in
+    :meth:`ChangeEngine._pre_write_gate`).
+
+    Raises
+    ------
+    BlockedPathError
+        On any violation OR any internal error (fail-closed: every failure
+        mode raises this rather than allowing the write).
+    """
+    try:
+        real = os.path.realpath(os.path.abspath(str(target)))
+        root = os.path.realpath(os.path.abspath(str(write_root)))
+
+        # 1. Containment
+        if not (real == root or real.startswith(root + os.sep)):
+            raise BlockedPathError(
+                f"path escapes write_root: {real} not under {root}"
+            )
+
+        rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
+        real_posix = real.replace(os.sep, "/")
+
+        # 2. Immutable governance (FIRST authority; no env off-switch).
+        #    Boundary-anchored: char after sentinel match must be '.', '/',
+        #    or end-of-string — prevents suffix false-positives while still
+        #    blocking all real governance files.  Both rel_norm and
+        #    real_posix are checked for robustness in deep/worktree roots.
+        for sentinel in _IMMUTABLE_GOVERNANCE_SENTINELS:
+            if (
+                _sentinel_matches_path(rel_norm, sentinel)
+                or _sentinel_matches_path(real_posix, sentinel)
+            ):
+                raise BlockedPathError(
+                    f"immutable governance write blocked: {rel_norm}"
+                )
+
+        # 3. Protected-path (fail closed on import failure)
+        try:
+            from backend.core.ouroboros.governance.tool_executor import (
+                _is_protected_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            raise BlockedPathError(
+                f"protected-path check unavailable (import failed): {exc}"
+            )
+        prot = _is_protected_path(rel_norm)
+        if prot:
+            raise BlockedPathError(
+                f"protected path write blocked: {rel_norm} ({prot})"
+            )
+    except BlockedPathError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BlockedPathError(
+            f"assert_write_path_allowed internal error — fail-closed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Ouroboros code signature (Manifesto §7 — Absolute Observability)
 # ---------------------------------------------------------------------------
 
@@ -459,6 +599,87 @@ class ChangeEngine:
             # Not under project_root (or unresolvable) — leave as-is.
             return target
 
+    # ------------------------------------------------------------------
+    # Anti-Venom (Task 6) — universal pre-write gate
+    # ------------------------------------------------------------------
+
+    def _pre_write_gate(
+        self, target: Path, content: str, request: ChangeRequest,
+    ) -> None:
+        """The last line of defence before bytes hit disk. FAIL-CLOSED.
+
+        Runs immediately before every ``target.write_text`` in APPLY. Because
+        the single-file path AND the multi-file coordinated path
+        (orchestrator ``_apply_multi_file_candidate``) both funnel per-file
+        through :meth:`execute`, this is the universal mutation chokepoint.
+
+        Steps 1-4 (path-only) are delegated to the module-level
+        :func:`assert_write_path_allowed` so that the same checks can be
+        reused by the cross-repo :class:`SagaApplyStrategy` write sites
+        without duplication.
+
+        Checks, in order (first violation wins):
+          1-4. Path checks — see :func:`assert_write_path_allowed`:
+               canonicalize → containment → immutable-governance (boundary-
+               anchored sentinel, no env switch) → protected-path.
+          5.   SemanticGuardian — reject on any ``severity == "hard"`` finding.
+
+        Raises
+        ------
+        BlockedPathError
+            On any violation OR any internal error. The gate is impossible to
+            bypass via an internal exception — every failure mode fails closed.
+        """
+        try:
+            write_root = self._effective_write_root(getattr(request, "write_root", None))
+
+            # Steps 1-4: path-only checks (shared with SagaApplyStrategy)
+            assert_write_path_allowed(target, write_root)
+
+            # Step 5: guardian — needs content; runs after path checks pass.
+            real = os.path.realpath(os.path.abspath(str(target)))
+            root = os.path.realpath(os.path.abspath(str(write_root)))
+            rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
+
+            # Baseline the guardian against REALITY: the on-disk pre-image is
+            # the correct MODIFY baseline so the delta is (on-disk → candidate),
+            # not (∅ → candidate). An empty baseline turns every MODIFY into a
+            # synthetic creation and makes delta-gated patterns fire on
+            # PRE-EXISTING legitimate code (e.g. a file that already imports
+            # subprocess), BlockedPathError'ing legit self-development edits.
+            try:
+                if target.exists():
+                    old_content = target.read_text(errors="replace")
+                else:
+                    old_content = ""  # genuinely new file
+            except Exception:  # noqa: BLE001 — read failure ⇒ fall back to ""
+                # Rare; re-introduces the create-baseline for this one file
+                # (acceptable). Do NOT crash the gate.
+                old_content = ""
+
+            try:
+                from backend.core.ouroboros.governance.semantic_guardian import (
+                    SemanticGuardian,
+                )
+                findings = SemanticGuardian().inspect(
+                    file_path=rel_norm, old_content=old_content, new_content=content,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail closed
+                raise BlockedPathError(
+                    f"guardian raised on {rel_norm} — fail-closed: {exc}"
+                )
+            if any(getattr(f, "severity", "") == "hard" for f in findings):
+                raise BlockedPathError(
+                    f"guardian hard finding on {rel_norm}"
+                )
+        except BlockedPathError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — ANY internal error fails closed
+            raise BlockedPathError(
+                f"pre-write gate internal error — fail-closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     async def execute(self, request: ChangeRequest) -> ChangeResult:
         """Execute the 8-phase transactional change pipeline.
 
@@ -682,6 +903,14 @@ class ChangeEngine:
                 goal=request.goal,
                 target_path=str(target),
             )
+
+            # Anti-Venom (Task 6) — UNIVERSAL MUTATION CHOKEPOINT.
+            # Runs immediately before the only governed disk write. Fail-closed:
+            # any violation OR internal error raises BlockedPathError, caught by
+            # the outer try/except → op recorded FAILED, bytes never reach disk.
+            # Covers the multi-file path too: _apply_multi_file_candidate calls
+            # execute() per file, so every per-file write funnels through here.
+            self._pre_write_gate(target, signed_content, request)
 
             # Acquire file lock for the write
             async with self._lock_manager.acquire(

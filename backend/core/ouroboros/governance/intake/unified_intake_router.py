@@ -1409,6 +1409,12 @@ class UnifiedIntakeRouter:
         )
         # Use the first envelope as base, replace merged fields
         base = envelopes[0]
+        for _absorbed in envelopes[1:]:
+            try:
+                self._wal.update_status(_absorbed.lease_id, "acked")
+            except Exception:  # noqa: BLE001 — ack is best-effort; never block the flush
+                logger.warning("[Intake] absorbed-lease ack failed lease=%s",
+                               getattr(_absorbed, "lease_id", "?"))
         return IntentEnvelope(
             schema_version=base.schema_version,
             source=base.source,

@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
+from backend.core.ouroboros.governance.semantic_guardian import SemanticGuardian
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +515,20 @@ _PROTECTED_PATH_SUBSTRINGS: Tuple[str, ...] = (
     ".netrc",           # HTTP basic-auth creds
     ".jarvis/",         # JARVIS internal state (ops logs, intake lock, ...)
     ".ouroboros/",      # Ouroboros session state / ledger / parse failures
+    # Anti-Venom (Task 5): governance core files Venom may never self-modify.
+    # A compromised or hallucinating model cannot clobber the very machinery
+    # that enforces safety — these sentinels are the last line of defence.
+    "ouroboros/governance/semantic_guardian",
+    "ouroboros/governance/tool_executor",
+    "ouroboros/governance/change_engine",
+    "ouroboros/governance/sandbox_exec",
+    "ouroboros/governance/risk_engine",
+    "ouroboros/governance/risk_tier_floor",
+    "ouroboros/governance/semantic_firewall",
+    "ouroboros/governance/scoped_tool_access",
+    "ouroboros/governance/orchestrator",            # the 11-phase FSM
+    "ouroboros/governance/governed_loop_service",   # the main loop
+    "ouroboros/governance/intake/unified_intake_router",
 )
 
 
@@ -1295,6 +1310,46 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
 
 
 # ---------------------------------------------------------------------------
+# Anti-Venom: bash hardening constants + sync/async bridge
+# ---------------------------------------------------------------------------
+
+#: Allowlisted bash verbs — only these may be the first real token in a
+#: bash command passed to Venom's _bash handler.  Any other verb (rm, curl,
+#: nc, python -c exec tricks, …) is rejected at Gate 1 before the command
+#: reaches the sandbox.
+_BASH_ALLOWED_VERBS: FrozenSet[str] = frozenset({
+    "ls", "cat", "grep", "rg", "find", "git", "wc", "head", "tail",
+    "sed", "awk", "echo", "python", "python3", "pytest", "pwd", "which",
+})
+
+
+def _run_coroutine_sync(coro):
+    """Bridge a coroutine into a synchronous caller.
+
+    Tool handlers in ToolExecutor are synchronous but the sandbox execution
+    layer (sandbox_exec) is async.  This helper runs the coroutine without
+    blocking an existing event loop:
+
+    - No running loop (typical pytest / sync call-site): delegates to
+      ``asyncio.run()``.
+    - Running loop (call from within an async context): spawns a fresh
+      event loop in a ``ThreadPoolExecutor`` worker thread to avoid
+      ``run_until_complete`` nested-loop errors.
+    """
+    try:
+        asyncio.get_running_loop()
+        # Inside an async context — create a new event loop in a worker
+        # thread to avoid blocking the caller's loop.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        # No running event loop — safe to call asyncio.run directly.
+        return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
 
@@ -2001,12 +2056,13 @@ class ToolExecutor:
         return "\n".join(head) + f"\n\n... [{n_extra} more matches truncated] ...\n\n" + "\n".join(tail)
 
     def _run_tests(self, args: Dict[str, Any]) -> str:
-        """Slice 9 — sync legacy path routes through the canonical
-        ``run_pytest_subprocess_sync`` helper. Discipline + provenance
-        + process-group isolation centralized; behaviour preserved."""
-        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
-            run_pytest_subprocess_sync,
-        )
+        """Anti-Venom (Task 5): routes pytest through the Trinity Docker sandbox.
+
+        Fail-closed: if the sandbox is DISABLED or Docker is unavailable the
+        call returns a denial string — pytest is never executed unsandboxed on
+        the host.  The path-safety / containment checks from Slice 9 are
+        retained before the sandbox call.
+        """
         paths_arg = args.get("paths", [])
         if isinstance(paths_arg, str):
             paths_arg = [paths_arg]
@@ -2019,16 +2075,18 @@ class ToolExecutor:
             except BlockedPathError:
                 return f"(blocked path: {p!r})"
 
-        result = run_pytest_subprocess_sync(
-            ["python3", "-m", "pytest", "--tb=short", "-q"] + safe_paths,
-            cwd=str(self._repo_root),
-            timeout_s=30.0,
-            caller="tool_executor.ToolExecutor._run_tests",
-            output_cap_chars=_MAX_TOOL_OUTPUT_CHARS,
+        from backend.core.ouroboros.governance import sandbox_exec as _sandbox_mod
+        sandbox_result = _run_coroutine_sync(
+            _sandbox_mod.sandbox_run_tests(safe_paths, worktree=str(self._repo_root))
         )
-        if result.timed_out:
-            return "(pytest timed out after 30s)"
-        return result.stdout
+        if sandbox_result.denied:
+            return f"(run_tests: sandbox denied — {sandbox_result.reason})"
+        output = sandbox_result.stdout or ""
+        if sandbox_result.stderr:
+            output += f"\nstderr: {sandbox_result.stderr}"
+        if sandbox_result.returncode not in (None, 0):
+            output = f"exit={sandbox_result.returncode}\n{output}"
+        return output.strip() or "(no test output)"
 
     def _get_callers(self, args: Dict[str, Any]) -> str:
         function_name: str = args["function_name"]
@@ -2262,44 +2320,81 @@ class ToolExecutor:
             return "(git blame timed out)"
 
     def _bash(self, args: Dict[str, Any]) -> str:
-        """Sandboxed shell execution with Iron Gate (Manifesto §6).
+        """Allowlist-gated, redirect-checked, Trinity-Docker-sandboxed shell.
 
-        Blocks known destructive patterns. Timeout-enforced.
-        Requires JARVIS_TOOL_BASH_ALLOWED=true.
+        Anti-Venom hardening (Task 5, Manifesto §6):
+          Gate 1 — verb allowlist: only _BASH_ALLOWED_VERBS pass.
+          Gate 2 — redirect target check: protected paths and out-of-repo
+                   redirects are rejected before the command runs.
+          Gate 3 — blocked patterns: defence-in-depth denylist.
+          Gate 4 — Trinity Docker sandbox (fail-closed): delegates to
+                   sandbox_exec.sandbox_run_bash; denied when Docker
+                   unavailable or JARVIS_RUNTIME_SANDBOX_ENABLED=false.
         """
         command: str = args["command"]
-        timeout: float = min(float(args.get("timeout", 30)), 60)
 
-        # Iron Gate: block destructive command patterns
+        # --- Gate 1: verb allowlist ------------------------------------------
+        # Strip leading VAR=val environment assignments to find the real verb.
+        tokens = command.strip().split()
+        verb: Optional[str] = None
+        for tok in tokens:
+            # A bare VAR=val assignment has no path separator before the '='.
+            if "=" in tok and "/" not in tok.split("=", 1)[0]:
+                continue
+            verb = tok
+            break
+        if verb is None:
+            return "(bash: empty command)"
+        if verb not in _BASH_ALLOWED_VERBS:
+            return (
+                f"(Iron Gate: bash verb {verb!r} is not in the allowed set; "
+                f"allowed: {', '.join(sorted(_BASH_ALLOWED_VERBS))})"
+            )
+
+        # --- Gate 2: redirect target check -----------------------------------
+        for _m in re.finditer(r">>?\s*(\S+)", command):
+            _redir = _m.group(1)
+            _prot = _is_protected_path(_redir)
+            if _prot is not None:
+                return (
+                    f"(Iron Gate: redirect target {_redir!r} is a protected "
+                    f"path — {_prot})"
+                )
+            try:
+                _redir_resolved = (self._repo_root / _redir).resolve()
+                _redir_resolved.relative_to(self._repo_root.resolve())
+            except (ValueError, OSError):
+                return (
+                    f"(Iron Gate: redirect target {_redir!r} escapes repo root)"
+                )
+
+        # --- Gate 3: blocked patterns (defence-in-depth) ---------------------
         _blocked_patterns = [
             "rm -rf /", "rm -rf ~", "rm -rf .", "mkfs.", "dd if=",
             ":(){ :", "git push", "git reset --hard",
             "> /dev/sd", "chmod -R 777", "curl|sh", "curl|bash",
             "wget|sh", "pip install", "npm install -g",
             "sudo ", "su -", "passwd",
+            "-delete", "truncate -s", "dd of=", "shred",
         ]
         cmd_lower = command.lower().strip()
         for blocked in _blocked_patterns:
             if blocked in cmd_lower:
                 return f"(Iron Gate: blocked destructive command pattern: {blocked!r})"
 
-        try:
-            proc = subprocess.run(
-                ["bash", "-c", command],
-                cwd=self._repo_root,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            )
-            output = proc.stdout or ""
-            if proc.stderr:
-                output += f"\nstderr: {proc.stderr}"
-            if proc.returncode != 0:
-                output = f"exit={proc.returncode}\n{output}"
-            return output.strip() or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"(command timed out after {timeout:.0f}s)"
+        # --- Gate 4: Trinity Docker sandbox (fail-closed) --------------------
+        from backend.core.ouroboros.governance import sandbox_exec as _sandbox_mod
+        sandbox_result = _run_coroutine_sync(
+            _sandbox_mod.sandbox_run_bash(command, worktree=str(self._repo_root))
+        )
+        if sandbox_result.denied:
+            return f"(bash: sandbox denied — {sandbox_result.reason})"
+        output = sandbox_result.stdout or ""
+        if sandbox_result.stderr:
+            output += f"\nstderr: {sandbox_result.stderr}"
+        if sandbox_result.returncode not in (None, 0):
+            output = f"exit={sandbox_result.returncode}\n{output}"
+        return output.strip() or "(no output)"
 
     # ------------------------------------------------------------------
     # Venom edit / write — hardened handlers
@@ -2496,7 +2591,42 @@ class ToolExecutor:
         if ast_err is not None:
             return f"(edit_file: AST validation failed — {ast_err})"
 
-        # --- Layer 7: write with rollback guarantee ------------------
+        # --- Layer 7: in-loop SemanticGuardian content gate ----------
+        # On-disk baseline: read actual file content so pre-existing
+        # subprocess/importlib do NOT false-positive (the chokepoint lesson).
+        _sg_old = content  # already read above — the real on-disk baseline
+        _sg_advisory_notes: List[str] = []
+        try:
+            _sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=_sg_old,
+                new_content=new_content,
+            )
+            for _sg_d in _sg_findings:
+                if _sg_d.severity == "hard":
+                    _lines_str = (
+                        f":{','.join(str(l) for l in _sg_d.lines)}"
+                        if _sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this write — "
+                        f"{_sg_d.pattern} at {rel_path}{_lines_str}: "
+                        f"{_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _sg_d.severity == "soft":
+                    _sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_sg_d.pattern}: {_sg_d.message}"
+                    )
+        except Exception as _sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _edit_file for %s: %s",
+                rel_path, _sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
+            )
+
+        # --- Layer 8: write with rollback guarantee ------------------
         snapshot = content  # pre-captured, in-memory
         snapshot_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
         try:
@@ -2548,11 +2678,14 @@ class ToolExecutor:
 
         added = new_text.count("\n") + 1
         removed = old_text.count("\n") + 1
-        return (
+        ok_msg = (
             f"OK: edited {rel_path}\n"
             f"  -{removed} lines, +{added} lines\n"
             f"  sha256 {snapshot_hash[:12]} -> {expected_hash[:12]}"
         )
+        if _sg_advisory_notes:
+            ok_msg += "\n" + "\n".join(_sg_advisory_notes)
+        return ok_msg
 
     def _write_file(self, args: Dict[str, Any]) -> str:
         """Create or overwrite a file — hardened edition.
@@ -2640,7 +2773,42 @@ class ToolExecutor:
         if ast_err is not None:
             return f"(write_file: AST validation failed — {ast_err})"
 
-        # --- Layer 6: write with rollback guarantee ------------------
+        # --- Layer 6: in-loop SemanticGuardian content gate ----------
+        # On-disk baseline: use actual on-disk content (or "" for new files)
+        # so pre-existing subprocess/importlib do NOT false-positive.
+        _wf_sg_old = prior_content if prior_content is not None else ""
+        _wf_sg_advisory_notes: List[str] = []
+        try:
+            _wf_sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=_wf_sg_old,
+                new_content=file_content,
+            )
+            for _wf_sg_d in _wf_sg_findings:
+                if _wf_sg_d.severity == "hard":
+                    _wf_lines_str = (
+                        f":{','.join(str(l) for l in _wf_sg_d.lines)}"
+                        if _wf_sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this write — "
+                        f"{_wf_sg_d.pattern} at {rel_path}{_wf_lines_str}: "
+                        f"{_wf_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _wf_sg_d.severity == "soft":
+                    _wf_sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_wf_sg_d.pattern}: {_wf_sg_d.message}"
+                    )
+        except Exception as _wf_sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _write_file for %s: %s",
+                rel_path, _wf_sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
+            )
+
+        # --- Layer 7: write with rollback guarantee ------------------
         snapshot_hash: Optional[str] = None
         if prior_content is not None:
             snapshot_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
@@ -2684,10 +2852,13 @@ class ToolExecutor:
 
         n_lines = file_content.count("\n") + 1
         before_hash_disp = (snapshot_hash[:12] + " -> ") if snapshot_hash else "(new) -> "
-        return (
+        ok_msg = (
             f"OK: {action} {rel_path} ({n_lines} lines)\n"
             f"  sha256 {before_hash_disp}{expected_hash[:12]}"
         )
+        if _wf_sg_advisory_notes:
+            ok_msg += "\n" + "\n".join(_wf_sg_advisory_notes)
+        return ok_msg
 
     def _rollback_write(
         self,
@@ -2766,6 +2937,41 @@ class ToolExecutor:
         except OSError as exc:
             return f"(delete_file: cannot read {rel_path} for audit: {exc})"
 
+        # --- Layer 3.5: in-loop SemanticGuardian content gate -------
+        # Deletion is modelled as old_content=prior_content, new_content="".
+        # Mirror _edit_file exactly: hard → ToolError (no unlink), soft →
+        # advisory note appended to success, guardian raises → fail-closed.
+        _df_sg_advisory_notes: List[str] = []
+        try:
+            _df_sg_findings = SemanticGuardian().inspect(
+                file_path=rel_path,
+                old_content=prior_content,
+                new_content="",
+            )
+            for _df_sg_d in _df_sg_findings:
+                if _df_sg_d.severity == "hard":
+                    _df_lines_str = (
+                        f":{','.join(str(l) for l in _df_sg_d.lines)}"
+                        if _df_sg_d.lines else ""
+                    )
+                    return (
+                        f"ToolError: SemanticGuardian blocked this delete — "
+                        f"{_df_sg_d.pattern} at {rel_path}{_df_lines_str}: "
+                        f"{_df_sg_d.message}. Fix the flagged issue and retry."
+                    )
+                elif _df_sg_d.severity == "soft":
+                    _df_sg_advisory_notes.append(
+                        f"[SemanticGuard advisory] {_df_sg_d.pattern}: {_df_sg_d.message}"
+                    )
+        except Exception as _df_sg_exc:  # noqa: BLE001
+            logger.warning(
+                "[SemanticGuard] guardian evaluation raised in _delete_file for %s: %s",
+                rel_path, _df_sg_exc,
+            )
+            return (
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
+            )
+
         # --- Layer 4: delete -----------------------------------------
         try:
             resolved.unlink()
@@ -2794,9 +3000,12 @@ class ToolExecutor:
 
         prior_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
         n_lines = prior_content.count("\n") + 1
-        return (
+        success_msg = (
             f"OK: deleted {rel_path} ({n_lines} lines, sha256 {prior_hash[:12]})"
         )
+        if _df_sg_advisory_notes:
+            success_msg += "\n" + "\n".join(_df_sg_advisory_notes)
+        return success_msg
 
     def _type_check(self, args: Dict[str, Any]) -> str:
         """Run pyright/mypy on specific files — returns diagnostics.

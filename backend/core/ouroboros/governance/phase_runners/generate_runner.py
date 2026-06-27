@@ -2415,6 +2415,41 @@ class GENERATERunner(PhaseRunner):
         # Terminal reason code + ledger reason are aligned to the same
         # value so log, ledger, and comm-protocol all agree.
         if generation.is_noop:
+            # Anti-Venom S2 — noop + in-loop-write guard (live phase-runner
+            # path). Mirror orchestrator.py: if Venom wrote files DURING
+            # generation (edit_file/write_file landed on disk) and THEN the
+            # model reports a no-op, those mutations never passed the
+            # SemanticGuardian / GATE / risk-tier floor (the noop fast-path
+            # skips APPLY). That is a guardian-bypass: code is on disk that no
+            # gate ever saw. Fail-CLOSED by CANCELLING the op so the operator
+            # sees a terminal failure (the on-disk writes remain for inspection
+            # / next-op reconciliation) rather than a silent COMPLETE that hides
+            # the unreviewed mutation.
+            _inloop = getattr(generation, "venom_edit_history", ()) or ()
+            if _inloop:
+                logger.warning(
+                    "[Orchestrator] op=%s noop+%d in-loop writes never "
+                    "passed guardian — cancelling",
+                    ctx.op_id,
+                    len(_inloop),
+                )
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="noop_inloop_write_guard",
+                )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "noop_inloop_write_guard"},
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="noop_inloop_write_guard",
+                    artifacts={
+                        "generation": generation,
+                        "episodic_memory": _episodic_memory,
+                    },
+                )
             _is_read_only_terminal = bool(
                 getattr(ctx, "is_read_only", False)
             )
