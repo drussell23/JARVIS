@@ -386,6 +386,26 @@ def rg_backstop_interval_s() -> float:
     return _rg_envf("JARVIS_RESOURCE_GOVERNOR_BACKSTOP_INTERVAL_S", 1.0, 0.1)
 
 
+# Pre-encoded at import — the guaranteed Death-Rattle path must allocate
+# NOTHING (an f-string under hard OOM raises MemoryError and dies silent).
+_RG_RATTLE_HDR = b"\n=== RESOURCE-GOVERNOR PRE-OOM DEATH RATTLE ===\n"
+_RG_RATTLE_STACKS = b"--- thread stacks (faulthandler, allocation-free) ---\n"
+_RG_RATTLE_RSS = b"--- process-tree RSS (best-effort, may fail under OOM) ---\n"
+_RG_RATTLE_FTR = b"=== END DEATH RATTLE ===\n\n"
+
+
+def rg_death_rattle_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "false",
+    ).strip().lower() in ("1", "true", "yes")
+
+
+def rg_redline_free_pct() -> float:
+    """Fire the rattle+stop when system free% drops below this — tighter
+    than the existing 0.75 RSS cap so we dump BEFORE the kernel OOM-kills."""
+    return _rg_envf("JARVIS_RESOURCE_GOVERNOR_REDLINE_FREE_PCT", 8.0, 0.5)
+
+
 # ---------------------------------------------------------------------------
 # BattleTestHarness
 # ---------------------------------------------------------------------------
@@ -826,6 +846,13 @@ class BattleTestHarness:
     async def run(self) -> None:
         """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
+
+        # Resource Governor: pre-open the autopsy fd at the very start of
+        # boot so a later redline dump is allocation-free.
+        try:
+            self._open_autopsy_fd()
+        except Exception:  # noqa: BLE001
+            pass
 
         # D1 silent boot — route INFO/DEBUG to session_dir/debug.log,
         # leave terminal clean for the banner. Must be the FIRST thing
@@ -6507,6 +6534,57 @@ class BattleTestHarness:
                 "[ProcessMemoryWatchdog] Oracle checkpoint degraded: %s",
                 exc,
             )
+
+    def _open_autopsy_fd(self) -> None:
+        """Pre-open a raw fd at boot so the redline dump never needs to
+        allocate/open a file when memory is already exhausted."""
+        if getattr(self, "_autopsy_fd", None) is not None:
+            return
+        self._autopsy_fd = None
+        try:
+            path = self._session_dir / "pre_oom_autopsy.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._autopsy_fd = os.open(
+                str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
+            )
+        except Exception:  # noqa: BLE001 — never block boot
+            self._autopsy_fd = None
+
+    def _fire_death_rattle(self) -> None:
+        """Allocation-free guaranteed dump (header bytes + faulthandler to
+        the raw fd) then a best-effort RSS table. Thread-safe: only os.write
+        + faulthandler. Off / no-fd -> no-op."""
+        if not rg_death_rattle_enabled():
+            return
+        fd = getattr(self, "_autopsy_fd", None)
+        if fd is None:
+            return
+        try:
+            os.write(fd, _RG_RATTLE_HDR)                      # guaranteed
+            os.write(fd, _RG_RATTLE_STACKS)
+            import faulthandler
+            faulthandler.dump_traceback(file=fd, all_threads=True)  # alloc-free
+        except Exception:  # noqa: BLE001
+            pass
+        try:                                                  # best-effort tier
+            os.write(fd, _RG_RATTLE_RSS)
+            import psutil
+            me = psutil.Process()
+            for p in [me] + me.children(recursive=True):
+                try:
+                    rss_mb = int(p.memory_info().rss / 1048576)
+                    line = (str(p.pid) + " " + str(rss_mb) + "MB "
+                            + (p.name() or "?") + "\n")
+                    os.write(fd, line.encode("ascii", "replace"))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.write(fd, _RG_RATTLE_FTR)
+            os.fsync(fd)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _fire_process_memory_cap(
         self, rss_mb: float, cap_mb: float,

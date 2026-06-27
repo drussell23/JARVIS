@@ -43,3 +43,27 @@ async def _drive_once(h):
         await h._monitor_process_memory(warn_mb=1e9, cap_mb=1e9, interval_s=15.0)
     except asyncio.CancelledError:
         pass
+
+
+def test_death_rattle_writes_allocation_free_dump(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "true")
+    h = H.BattleTestHarness.__new__(H.BattleTestHarness)
+    h._session_dir = tmp_path
+    h._open_autopsy_fd()
+    assert getattr(h, "_autopsy_fd", None) is not None
+    h._fire_death_rattle()
+    body = (tmp_path / "pre_oom_autopsy.log").read_text()
+    assert "PRE-OOM DEATH RATTLE" in body
+    assert "END DEATH RATTLE" in body
+    assert ("File" in body or "Thread" in body)  # faulthandler stack present
+
+
+def test_death_rattle_off_is_noop(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", raising=False)
+    h = H.BattleTestHarness.__new__(H.BattleTestHarness)
+    h._session_dir = tmp_path
+    h._open_autopsy_fd()           # still pre-opens (cheap, boot-time)
+    h._fire_death_rattle()         # but writes nothing when off
+    p = tmp_path / "pre_oom_autopsy.log"
+    assert (not p.exists()) or p.read_text() == ""
