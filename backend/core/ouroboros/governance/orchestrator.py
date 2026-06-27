@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -423,6 +424,35 @@ _CONSOLIDATION_THRESHOLD: int = 10
 # overhead + asyncio cancellation propagation delay on streaming responses.
 _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Anti-Venom Lock A — fail-CLOSED guardian sentinel
+# ──────────────────────────────────────────────────────────────────────────
+#
+# When the SemanticGuardian invocation itself raises (import error, detector
+# regression, OOM mid-batch …) the historical behavior was to fail OPEN:
+# swallow the exception, leave ``_guardian_findings`` empty, and let the
+# classifier's tier stand — so a SAFE_AUTO candidate auto-applied with the
+# semantic safety net silently down. This sentinel is the fail-CLOSED
+# replacement: on guardian crash we inject ONE hard finding and force
+# APPROVAL_REQUIRED so the op parks at GATE for a human instead of
+# auto-applying. ``severity="hard"`` makes ``recommend_tier_floor`` (and any
+# other findings consumer) treat a guardian crash exactly like a fired hard
+# pattern. Defined at module scope so it is a single, grep-able, immutable
+# (frozen Detection) source of truth — never reconstructed per-op.
+from backend.core.ouroboros.governance.semantic_guardian import (  # noqa: E402
+    Detection as _GuardianDetection,
+)
+
+_SENTINEL_GUARDIAN_CRASH = _GuardianDetection(
+    pattern="guardian_crashed",
+    severity="hard",
+    message="guardian crashed — fail-closed",
+    file_path="",
+    lines=(),
+    snippet="",
+)
 
 
 # Contiguous, grep-discoverable terminal reason marker (single
@@ -7470,6 +7500,33 @@ class GovernedOrchestrator:
             # Terminal reason code + ledger reason are aligned to the same
             # value so log, ledger, and comm-protocol all agree.
             if generation.is_noop:
+                # Anti-Venom S2 — noop + in-loop-write guard. If Venom wrote
+                # files DURING generation (edit_file/write_file landed on disk)
+                # and THEN the model reports a no-op, those mutations never
+                # passed the SemanticGuardian / GATE / risk-tier floor (the noop
+                # fast-path skips APPLY). That is a guardian-bypass: code is on
+                # disk that no gate ever saw. Fail-CLOSED by CANCELLING the op
+                # so the operator sees a terminal failure (the on-disk writes
+                # remain for inspection / next-op reconciliation) rather than a
+                # silent COMPLETE that hides the unreviewed mutation.
+                _inloop = getattr(generation, "venom_edit_history", ()) or ()
+                if _inloop:
+                    logger.warning(
+                        "[Orchestrator] op=%s noop+%d in-loop writes never "
+                        "passed guardian — cancelling",
+                        ctx.op_id,
+                        len(_inloop),
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="noop_inloop_write_guard",
+                    )
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {"reason": "noop_inloop_write_guard"},
+                    )
+                    return ctx
                 _is_read_only_terminal = bool(
                     getattr(ctx, "is_read_only", False)
                 )
@@ -8721,20 +8778,62 @@ class GovernedOrchestrator:
                             best_candidate.get("file_path", ""),
                             best_candidate.get("full_content", ""),
                         )]
+                    # Anti-Venom S2 — guardian git-HEAD baseline. Venom may have
+                    # already written files DURING generation (in-loop edits via
+                    # edit_file/write_file). For those paths the on-disk content
+                    # is the *post-write* state, so an on-disk read would compare
+                    # candidate→candidate and the guardian would see no change.
+                    # For any path Venom touched in this op we read the ORIGINAL
+                    # from `git show HEAD:<path>` so the guardian compares
+                    # original→candidate. Fail-SOFT: a new file (not in HEAD) or
+                    # any git error yields _old="" (treated as creation).
+                    _venom_paths: set = set()
+                    try:
+                        _vhist = getattr(generation, "venom_edit_history", ()) or ()
+                        _venom_paths = {
+                            e.get("path", "")
+                            for e in _vhist
+                            if isinstance(e, dict) and e.get("path")
+                        }
+                    except Exception:
+                        _venom_paths = set()
+
                     for _path, _new in _iter:
                         if not _path or not isinstance(_new, str):
                             continue
                         _old = ""
+                        # Repo-relative form for venom-history matching + git show.
+                        _rel = _path
                         try:
-                            _abs = (
-                                self._config.project_root / _path
-                                if not Path(_path).is_absolute()
-                                else Path(_path)
-                            )
-                            if _abs.is_file():
-                                _old = _abs.read_text(encoding="utf-8", errors="replace")
+                            _pp = Path(_path)
+                            if _pp.is_absolute():
+                                _rel = str(_pp.relative_to(self._config.project_root))
                         except Exception:
-                            _old = ""
+                            _rel = _path
+                        if _rel in _venom_paths or _path in _venom_paths:
+                            # In-loop write landed → baseline from git HEAD.
+                            try:
+                                _proc = subprocess.run(
+                                    ["git", "show", f"HEAD:{_rel}"],
+                                    cwd=str(self._config.project_root),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
+                                )
+                                _old = _proc.stdout if _proc.returncode == 0 else ""
+                            except Exception:
+                                _old = ""
+                        else:
+                            try:
+                                _abs = (
+                                    self._config.project_root / _path
+                                    if not Path(_path).is_absolute()
+                                    else Path(_path)
+                                )
+                                if _abs.is_file():
+                                    _old = _abs.read_text(encoding="utf-8", errors="replace")
+                            except Exception:
+                                _old = ""
                         _pairs.append((_path, _old, _new))
 
                     # Time the whole batch so operators can detect a pattern
@@ -8790,10 +8889,23 @@ class GovernedOrchestrator:
                         len(_pairs),
                     )
                 except Exception:
-                    logger.debug(
-                        "[Orchestrator] SemanticGuardian skipped",
+                    # Anti-Venom Lock A — FAIL CLOSED. A guardian crash used to
+                    # be swallowed at DEBUG (fail-OPEN): empty findings → no
+                    # tier floor → a SAFE_AUTO candidate auto-applied with the
+                    # semantic net silently down. Now: inject one hard sentinel
+                    # finding and force APPROVAL_REQUIRED so the op parks at GATE
+                    # for a human (reuses the existing approval branch — no new
+                    # FSM phase). risk_tier is set directly (the authoritative
+                    # arm); _guardian_findings carries the sentinel for
+                    # observability + any downstream findings consumer.
+                    logger.warning(
+                        "[Orchestrator] SemanticGuardian raised — FAILING "
+                        "CLOSED; APPROVAL_REQUIRED op=%s",
+                        ctx.op_id,
                         exc_info=True,
                     )
+                    risk_tier = RiskTier.APPROVAL_REQUIRED
+                    _guardian_findings = [_SENTINEL_GUARDIAN_CRASH]
 
             # ---- REVIEW subagent (Slice 1a SHADOW + enforce promotion) ----
             # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW (dispatch) + optionally
@@ -9285,7 +9397,8 @@ class GovernedOrchestrator:
                         return ctx
 
         # Wave 2 (5) Slice 4b - combined APPROVE+APPLY+VERIFY delegation gate.
-        # Flag JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED (default false) routes
+        # Flag JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED (default true; explicit
+        # =false is the kill switch reverting to this inline block) routes
         # the ~1150-line APPROVE+APPLY+VERIFY block (including 7.5 INFRA +
         # 8a scoped tests + 8b auto-commit + 8b2 hot-reload + 8c self-critique
         # + 8d visual VERIFY) through Slice4bRunner. Single combined gate
@@ -9801,8 +9914,17 @@ class GovernedOrchestrator:
                     # critical mutation so the operator-yield drains before it
                     # can park the op mid-batch (no-op when the yield is off).
                     async with maybe_mutation_section(ctx.op_id):
-                        change_result = await self._apply_multi_file_candidate(
-                            ctx, best_candidate, _candidate_files, snapshots,
+                        # Anti-Venom C2 — shield the apply. If the op task is
+                        # cancelled mid-write the inner coroutine still runs to
+                        # completion (file-write + per-file APPLIED ledger commit
+                        # are atomic), closing the mutated-on-disk-but-ledger-
+                        # stuck-APPLYING split-brain. CancelledError still
+                        # propagates here at the shield boundary, so the stop is
+                        # honored once the write has finished.
+                        change_result = await asyncio.shield(
+                            self._apply_multi_file_candidate(
+                                ctx, best_candidate, _candidate_files, snapshots,
+                            )
                         )
                 except Exception as exc:
                     logger.error(
@@ -9830,7 +9952,13 @@ class GovernedOrchestrator:
                     # critical mutation so the operator-yield drains before it
                     # can park the op mid-write (no-op when the yield is off).
                     async with maybe_mutation_section(ctx.op_id):
-                        change_result = await self._stack.change_engine.execute(change_request)
+                        # Anti-Venom C2 — shield the apply (see multi-file path
+                        # above): cancellation mid-write cannot leave the file
+                        # written but the APPLIED ledger commit skipped.
+                        # CancelledError still propagates at the shield boundary.
+                        change_result = await asyncio.shield(
+                            self._stack.change_engine.execute(change_request)
+                        )
                 except Exception as exc:
                     logger.error(
                         "Change engine raised for %s: %s", ctx.op_id, exc
