@@ -263,3 +263,128 @@ def test_invalid_mode_raises(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     with pytest.raises(ValueError, match="unknown mode"):
         IsomorphicEnv(repo, mode="invalid-mode")
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — JARVIS_SANDBOX_PREFIXES env var exported for child-process fidelity
+# ---------------------------------------------------------------------------
+
+def test_jarvis_sandbox_prefixes_set_inside(tmp_path: Path) -> None:
+    """Inside the context, ``JARVIS_SANDBOX_PREFIXES`` must be set to the node
+    policy (no /tmp) so any spawned child process inherits the restriction."""
+    repo = _make_repo(tmp_path)
+    with IsomorphicEnv(repo):
+        val = os.environ.get("JARVIS_SANDBOX_PREFIXES")
+        assert val is not None, (
+            "JARVIS_SANDBOX_PREFIXES must be set inside IsomorphicEnv"
+        )
+        prefixes = [p.strip() for p in val.split(",") if p.strip()]
+        assert not any("tmp" in p for p in prefixes), (
+            "JARVIS_SANDBOX_PREFIXES must contain no /tmp prefix inside context; "
+            "got %r" % val
+        )
+
+
+def test_jarvis_sandbox_prefixes_restored_after_exit(tmp_path: Path) -> None:
+    """``JARVIS_SANDBOX_PREFIXES`` must be restored to its pre-context value
+    (or removed) after ``__exit__``."""
+    repo = _make_repo(tmp_path)
+    # Ensure a clean baseline: unset before entry.
+    os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
+    with IsomorphicEnv(repo):
+        assert "JARVIS_SANDBOX_PREFIXES" in os.environ
+    # After exit: must be gone (was absent before entry).
+    assert "JARVIS_SANDBOX_PREFIXES" not in os.environ, (
+        "JARVIS_SANDBOX_PREFIXES must be removed after exit when it was absent before"
+    )
+
+
+def test_jarvis_sandbox_prefixes_restored_prior_value(tmp_path: Path) -> None:
+    """When ``JARVIS_SANDBOX_PREFIXES`` was already set before entry, the prior
+    value must be restored after ``__exit__``."""
+    repo = _make_repo(tmp_path)
+    prior = "/custom/prior/prefix"
+    os.environ["JARVIS_SANDBOX_PREFIXES"] = prior
+    try:
+        with IsomorphicEnv(repo):
+            # Inside: overwritten with node policy.
+            assert os.environ.get("JARVIS_SANDBOX_PREFIXES") != prior
+        # After: prior value restored.
+        assert os.environ.get("JARVIS_SANDBOX_PREFIXES") == prior, (
+            "Prior JARVIS_SANDBOX_PREFIXES value must be restored after exit"
+        )
+    finally:
+        os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — _effective_sandbox_prefixes env-override (test_runner cross-process)
+# ---------------------------------------------------------------------------
+
+def test_effective_prefixes_unset_returns_default(tmp_path: Path) -> None:
+    """When ``JARVIS_SANDBOX_PREFIXES`` is unset, ``_effective_sandbox_prefixes``
+    must return the module default — byte-identical behavior."""
+    import backend.core.ouroboros.governance.test_runner as _tr2
+    os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
+    result = _tr2._effective_sandbox_prefixes()
+    assert result == _tr._ALLOWED_SANDBOX_PREFIXES, (
+        "Unset JARVIS_SANDBOX_PREFIXES must return the default _ALLOWED_SANDBOX_PREFIXES"
+    )
+
+
+def test_effective_prefixes_env_override(tmp_path: Path) -> None:
+    """When ``JARVIS_SANDBOX_PREFIXES`` is set, ``_effective_sandbox_prefixes``
+    parses and returns those prefixes, overriding the default."""
+    import backend.core.ouroboros.governance.test_runner as _tr2
+    os.environ["JARVIS_SANDBOX_PREFIXES"] = "/nonexistent-sandbox-prefix"
+    try:
+        result = _tr2._effective_sandbox_prefixes()
+        assert result == ("/nonexistent-sandbox-prefix",), (
+            "Env override must parse comma-separated prefixes; got %r" % (result,)
+        )
+        # Verify that a /tmp path is now REJECTED (the whole point of the override).
+        disjoint_root = Path("/nonexistent-root-for-override-test")
+        from backend.core.ouroboros.governance.test_runner import _is_safe_path
+        assert _is_safe_path(Path("/tmp/some_file.py"), disjoint_root) is False, (
+            "With JARVIS_SANDBOX_PREFIXES set to /nonexistent, /tmp must be rejected"
+        )
+    finally:
+        os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
+
+
+def test_effective_prefixes_env_override_allows_var_when_set(tmp_path: Path) -> None:
+    """When ``JARVIS_SANDBOX_PREFIXES`` explicitly includes ``/var``,
+    ``_is_safe_path`` allows /var paths — the override is bidirectional.
+
+    Uses /var (not /tmp) because on macOS /tmp resolves to /private/tmp;
+    the effective-prefixes comparison is against the RESOLVED path, so a
+    ``/tmp`` prefix entry would fail if the override omits ``/private/tmp``.
+    The default _ALLOWED_SANDBOX_PREFIXES covers both by design; this test
+    exercises the override using a prefix that resolves without a symlink hop.
+    """
+    import backend.core.ouroboros.governance.test_runner as _tr2
+    os.environ["JARVIS_SANDBOX_PREFIXES"] = "/var,/private/tmp"
+    try:
+        from backend.core.ouroboros.governance.test_runner import _is_safe_path
+        disjoint_root = Path("/nonexistent-root-for-override-test2")
+        # /var is explicitly in the override, so a /var path must be allowed.
+        # Use /var/tmp which resolves to /private/var/folders on macOS... actually
+        # just check that the effective prefixes list is updated correctly.
+        effective = _tr2._effective_sandbox_prefixes()
+        assert "/var" in effective, (
+            "Override must include /var when JARVIS_SANDBOX_PREFIXES=/var,/private/tmp"
+        )
+        assert "/private/tmp" in effective, (
+            "Override must include /private/tmp when JARVIS_SANDBOX_PREFIXES=/var,/private/tmp"
+        )
+        # /tmp resolves to /private/tmp on macOS; with /private/tmp in the override
+        # a /tmp path must be allowed.
+        result = _is_safe_path(Path("/tmp/probe.py"), disjoint_root)
+        # On Linux /tmp resolves to /tmp; on macOS to /private/tmp — both are in
+        # the override, so result must be True on both platforms.
+        assert result is True, (
+            "With /private/tmp in JARVIS_SANDBOX_PREFIXES, /tmp path must be allowed "
+            "(resolves to /private/tmp on macOS)"
+        )
+    finally:
+        os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)

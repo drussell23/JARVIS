@@ -669,6 +669,216 @@ class TestDriverWiring:
 
 
 # ===========================================================================
+# Group 4 -- Driver subprocess env/cwd propagation (final-review fix)
+# ===========================================================================
+
+
+class TestSubprocessIsomorphismPropagation:
+    """Verify that the driver propagates JARVIS_SANDBOX_PREFIXES + disjoint cwd
+    to the organism subprocess (process-boundary fidelity).
+
+    These tests verify the seams: env composition carries the restricted prefix
+    policy, and _launch_iso_soak threads the disjoint cwd into Popen.
+    """
+
+    # ------------------------------------------------------------------
+    # 4a. JARVIS_SANDBOX_PREFIXES propagates through compose_env
+    # ------------------------------------------------------------------
+
+    def test_jarvis_sandbox_prefixes_in_composed_env(self, tmp_path: Path) -> None:
+        """When JARVIS_SANDBOX_PREFIXES is set in os.environ (by IsomorphicEnv),
+        compose_env() must include it in the resulting dict — the critical
+        process-boundary propagation mechanism."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        import backend.core.ouroboros.governance.test_runner as _tr
+
+        # Simulate IsomorphicEnv having set the env var.
+        os.environ["JARVIS_SANDBOX_PREFIXES"] = "/nonexistent-sandbox-prefix"
+        try:
+            env = harness_mod.compose_env(base_env=dict(os.environ))
+            assert "JARVIS_SANDBOX_PREFIXES" in env, (
+                "compose_env must include JARVIS_SANDBOX_PREFIXES from os.environ"
+            )
+            assert env["JARVIS_SANDBOX_PREFIXES"] == "/nonexistent-sandbox-prefix", (
+                "JARVIS_SANDBOX_PREFIXES value must be the node policy"
+            )
+        finally:
+            os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
+
+    # ------------------------------------------------------------------
+    # 4b. _launch_iso_soak threads iso_cwd into subprocess.Popen
+    # ------------------------------------------------------------------
+
+    def test_launch_iso_soak_threads_disjoint_cwd(self, tmp_path: Path) -> None:
+        """_launch_iso_soak must patch subprocess.Popen so the child process
+        receives iso_cwd as its cwd, not the SoakRunner's repo_root."""
+        import subprocess as _sp
+
+        captured_cwd: List[str] = []
+        real_popen = _sp.Popen
+
+        class _CapturingPopen:
+            def __init__(self, argv: Any, **kwargs: Any) -> None:
+                captured_cwd.append(kwargs.get("cwd", ""))
+                # Immediately raise to avoid actually starting a process.
+                raise OSError("capture-only — no real process")
+
+        # Mock SoakRunner that would use repo_root as cwd.
+        class _MockSoakRunner:
+            repo_root = str(tmp_path / "real_repo")
+
+            def _sessions_root(self) -> str:
+                return str(tmp_path / "real_repo" / ".ouroboros" / "sessions")
+
+            def _snapshot_sessions(self) -> set:
+                return set()
+
+            def _await_session_debug_log(self, before: set, deadline_s: float) -> str:
+                return ""
+
+            def launch(self, env: Dict[str, str], run_dir: str) -> Any:
+                import subprocess
+                # This is what SoakRunner.launch does: Popen with cwd=self.repo_root
+                subprocess.Popen(
+                    ["echo", "stub"],
+                    cwd=self.repo_root,
+                    env=env,
+                )
+                raise AssertionError("Should never reach here")
+
+        iso_cwd = str(tmp_path / "disjoint_app")
+        Path(iso_cwd).mkdir(parents=True, exist_ok=True)
+
+        _sp.Popen = _CapturingPopen  # type: ignore[assignment]
+        try:
+            runner = _MockSoakRunner()
+            try:
+                _driver_mod._launch_iso_soak(
+                    runner, {"JARVIS_TEST": "1"}, str(tmp_path / "run"), iso_cwd
+                )
+            except OSError:
+                pass  # Expected: _CapturingPopen raises to avoid real process
+        finally:
+            _sp.Popen = real_popen
+
+        assert captured_cwd, "_CapturingPopen must have been called"
+        assert captured_cwd[0] == iso_cwd, (
+            "_launch_iso_soak must thread iso_cwd into Popen; "
+            "expected %r, got %r" % (iso_cwd, captured_cwd[0])
+        )
+
+    # ------------------------------------------------------------------
+    # 4c. subprocess.Popen is restored after _launch_iso_soak
+    # ------------------------------------------------------------------
+
+    def test_launch_iso_soak_restores_popen_on_exception(self, tmp_path: Path) -> None:
+        """_launch_iso_soak must restore subprocess.Popen even if launch raises."""
+        import subprocess as _sp
+
+        real_popen = _sp.Popen
+
+        class _RaisingRunner:
+            repo_root = str(tmp_path)
+
+            def launch(self, env: Dict[str, str], run_dir: str) -> Any:
+                raise RuntimeError("simulated launch failure")
+
+        try:
+            _driver_mod._launch_iso_soak(
+                _RaisingRunner(), {}, str(tmp_path), str(tmp_path / "cwd")
+            )
+        except RuntimeError:
+            pass
+
+        assert _sp.Popen is real_popen, (
+            "_launch_iso_soak must restore subprocess.Popen after an exception"
+        )
+
+    # ------------------------------------------------------------------
+    # 4d. Failover pinned off by default in child env
+    # ------------------------------------------------------------------
+
+    async def test_failover_pinned_off_by_default(self, tmp_path: Path) -> None:
+        """By default (enable_failover=False), the driver pins
+        JARVIS_FAILOVER_LIFECYCLE_ENABLED=false in the child env."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        captured_env: Dict[str, str] = {}
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19999/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _CapturingAuditor:
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                vpath = kwargs.get("verdict_out", "")
+                v: Dict[str, Any] = {"proven": False, "failure_locus": "test"}
+                if vpath:
+                    Path(vpath).parent.mkdir(parents=True, exist_ok=True)
+                    Path(vpath).write_text(json.dumps(v))
+                return v
+
+        original_compose = harness_mod.compose_env
+        # Capture the dict REFERENCE returned by compose_env so we see the
+        # driver's in-place mutations (env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "false")
+        # that happen AFTER compose_env returns.
+        env_ref: List[Dict[str, str]] = []
+
+        def _capturing_compose(**kwargs: Any) -> Dict[str, str]:
+            env = original_compose(**kwargs)
+            env_ref.append(env)  # store reference; driver mutates in-place
+            return env
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=True,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,  # default
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "compose_env", _capturing_compose),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "StubAuditorRunner", lambda **kw: _CapturingAuditor()),
+        ):
+            await driver.run()
+
+        assert env_ref, "compose_env must have been called"
+        # The driver mutates the dict in-place after compose_env returns.
+        final_env = env_ref[0]
+        assert final_env.get("JARVIS_FAILOVER_LIFECYCLE_ENABLED") == "false", (
+            "Driver must pin JARVIS_FAILOVER_LIFECYCLE_ENABLED=false when enable_failover=False; "
+            "got %r" % final_env.get("JARVIS_FAILOVER_LIFECYCLE_ENABLED")
+        )
+
+
+# ===========================================================================
 # Regression: load_chaos_target_files handles both rel + abs paths
 # ===========================================================================
 

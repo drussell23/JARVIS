@@ -226,7 +226,7 @@ def _normalize(path: Path, repo_root: Path) -> str:
         # Allow paths under known sandbox/temp prefixes — the
         # orchestrator writes files there for validation.
         resolved_str = str(path.resolve())
-        if any(resolved_str.startswith(p) for p in _ALLOWED_SANDBOX_PREFIXES):
+        if any(resolved_str.startswith(p) for p in _effective_sandbox_prefixes()):
             return path.name
         raise BlockedPathError(
             f"Path {path} resolves outside repo root {repo_root}. "
@@ -684,11 +684,31 @@ _ALLOWED_SANDBOX_PREFIXES: Tuple[str, ...] = (
 )
 
 
+def _effective_sandbox_prefixes() -> Tuple[str, ...]:
+    """Return the effective allowed sandbox prefixes.
+
+    If ``JARVIS_SANDBOX_PREFIXES`` is set (comma-separated), parse and return
+    those prefixes so any child process launched under ``IsomorphicEnv`` inherits
+    the restricted node policy (no ``/tmp`` passthrough) without requiring a
+    monkeypatch across the process boundary.
+
+    When unset, returns ``_ALLOWED_SANDBOX_PREFIXES`` unchanged — byte-identical
+    default behavior.
+    """
+    raw = os.environ.get("JARVIS_SANDBOX_PREFIXES")
+    if raw is None:
+        return _ALLOWED_SANDBOX_PREFIXES
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 def _is_safe_path(path: Path, repo_root: Path) -> bool:
     """Return True if *path* is inside *repo_root* or an allowed sandbox prefix.
 
     Symlinks that resolve outside repo_root (and outside sandbox prefixes)
-    are rejected.
+    are rejected.  The effective prefix set is resolved at call-time via
+    ``_effective_sandbox_prefixes()`` so that ``JARVIS_SANDBOX_PREFIXES``
+    env-overrides (set by ``IsomorphicEnv`` for child-process fidelity) are
+    honoured without any in-process monkeypatching.
     """
     try:
         resolved = path.resolve()
@@ -706,7 +726,7 @@ def _is_safe_path(path: Path, repo_root: Path) -> bool:
 
     # Inside allowed sandbox prefixes -- OK for test isolation
     resolved_str = str(resolved)
-    for prefix in _ALLOWED_SANDBOX_PREFIXES:
+    for prefix in _effective_sandbox_prefixes():
         if resolved_str.startswith(prefix):
             return True
 

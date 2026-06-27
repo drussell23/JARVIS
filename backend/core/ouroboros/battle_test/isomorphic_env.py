@@ -54,6 +54,12 @@ _TR_PREFIXES_ATTR = "_ALLOWED_SANDBOX_PREFIXES"
 # containment check — the identical condition that caused the run-#13 rejection.
 _NODE_SANDBOX_PREFIXES: Tuple[str, ...] = ("/nonexistent-sandbox-prefix",)
 
+# Env var that test_runner._effective_sandbox_prefixes() reads at call-time.
+# Setting this propagates the node policy across the process boundary so child
+# processes launched by the driver inherit the same restricted allowlist without
+# requiring a monkeypatch inside the child.
+_SANDBOX_PREFIXES_ENV = "JARVIS_SANDBOX_PREFIXES"
+
 
 # ---------------------------------------------------------------------------
 # Node env-var contract
@@ -114,7 +120,12 @@ class IsomorphicEnv:
     3. **Live sandbox-prefix policy** — ``test_runner._ALLOWED_SANDBOX_PREFIXES``
        is patched to ``("/nonexistent-sandbox-prefix",)`` for the duration,
        removing the ``/tmp`` passthrough that masks wrong-root rejections in
-       the hermetic harness.  Restored verbatim on exit.
+       the hermetic harness.  ALSO exports ``JARVIS_SANDBOX_PREFIXES`` env var
+       so any child process (e.g. the O+V organism subprocess) inherits the
+       same restricted policy without a monkeypatch.
+       ``test_runner._effective_sandbox_prefixes()`` reads this env var at
+       call-time, making fidelity cross the process boundary.
+       Both the module attribute and the env var are restored verbatim on exit.
 
     4. **Node env vars** — sets the vars that ``build_startup_script`` /
        ``_surgery_env_exports`` stamp on the live node (``JARVIS_IAC_REMOTE_ROOT``,
@@ -176,6 +187,7 @@ class IsomorphicEnv:
         self._saved_cwd: Optional[str] = None
         self._saved_env: Dict[str, Optional[str]] = {}
         self._saved_prefixes: Optional[Tuple[str, ...]] = None
+        self._saved_prefixes_env: Optional[str] = None  # prior JARVIS_SANDBOX_PREFIXES
         self._tr_module: Optional[Any] = None
 
     # ------------------------------------------------------------------
@@ -335,7 +347,14 @@ class IsomorphicEnv:
 
     def _patch_sandbox_prefixes(self) -> None:
         """Replace ``test_runner._ALLOWED_SANDBOX_PREFIXES`` with the node
-        reality (no ``/tmp`` passthrough).  Saves the original for restore."""
+        reality (no ``/tmp`` passthrough).  Saves the original for restore.
+
+        ALSO exports ``JARVIS_SANDBOX_PREFIXES`` env var so any child process
+        spawned under this context (e.g. the O+V organism launched by the A1
+        driver) inherits the restricted allowlist without requiring an in-process
+        monkeypatch.  ``test_runner._effective_sandbox_prefixes()`` reads this
+        env var at call-time, so the child's sandbox gate sees the node policy.
+        """
         try:
             self._tr_module = importlib.import_module(_TR_MODULE_NAME)
             self._saved_prefixes = getattr(self._tr_module, _TR_PREFIXES_ATTR)
@@ -343,6 +362,10 @@ class IsomorphicEnv:
         except Exception:  # noqa: BLE001 — fail-soft; leave module=None → skip restore
             self._saved_prefixes = None
             self._tr_module = None
+
+        # Export env var for child-process inheritance (process-boundary propagation).
+        self._saved_prefixes_env = os.environ.get(_SANDBOX_PREFIXES_ENV)
+        os.environ[_SANDBOX_PREFIXES_ENV] = ",".join(_NODE_SANDBOX_PREFIXES)
 
     def _apply_node_env(self) -> None:
         """Set node env vars; save prior values for restore."""
@@ -364,12 +387,21 @@ class IsomorphicEnv:
                 pass
 
     def _restore_sandbox_prefixes(self) -> None:
-        """Restore the original ``_ALLOWED_SANDBOX_PREFIXES`` (fail-soft)."""
+        """Restore the original ``_ALLOWED_SANDBOX_PREFIXES`` and the
+        ``JARVIS_SANDBOX_PREFIXES`` env var (fail-soft per step)."""
         if self._tr_module is not None:
             try:
                 setattr(self._tr_module, _TR_PREFIXES_ATTR, self._saved_prefixes)
             except Exception:  # noqa: BLE001
                 pass
+        # Restore the env var (or remove it if it was absent before entry).
+        try:
+            if self._saved_prefixes_env is None:
+                os.environ.pop(_SANDBOX_PREFIXES_ENV, None)
+            else:
+                os.environ[_SANDBOX_PREFIXES_ENV] = self._saved_prefixes_env
+        except Exception:  # noqa: BLE001
+            pass
 
     def _restore_cwd(self) -> None:
         """Restore the saved working directory (fail-soft)."""

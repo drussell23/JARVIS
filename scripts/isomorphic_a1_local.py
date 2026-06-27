@@ -8,6 +8,34 @@ Composes the Isomorphic Local Sandbox Tasks 1-5 into a single runnable proof:
   T4  failover trigger fix      -- already in candidate_generator (no new code)
   T5  capture_failure_telemetry -- fail-soft FSM/memory/causal dump on any failure
 
+Isomorphism across the process boundary (final-review fix)
+-----------------------------------------------------------
+The driver imposes isomorphism on the launched organism via env-propagated policy
+and disjoint cwd (process mode).  Two mechanisms work together:
+
+1. ``IsomorphicEnv`` sets ``JARVIS_SANDBOX_PREFIXES`` in ``os.environ`` before the
+   soak subprocess is spawned.  ``compose_env()`` copies ``os.environ``, so the
+   child process inherits the restricted node sandbox-prefix allowlist.
+   ``test_runner._effective_sandbox_prefixes()`` reads this env var at call-time,
+   so the child's sandbox gate sees the node policy — no in-process monkeypatch
+   needed across the process boundary.
+
+2. ``_launch_iso_soak()`` temporarily patches ``subprocess.Popen`` to force the
+   organism subprocess cwd to the ``IsomorphicEnv`` disjoint path (``<tmpdir>/app``)
+   instead of ``repo_root``.  Code that uses ``os.getcwd()`` as a proxy for the
+   repo root now fails in the child exactly as it does on the live GCP node.
+   ``JARVIS_REPO_PATH`` in the env tells the child the true repo location.
+
+Container mode achieves full path-literal parity via a genuine bind-mount at
+``/opt/trinity/jarvis``; process mode is fast (M1-native, zero Docker).
+
+Failover safety pin
+-------------------
+By default the driver pins ``JARVIS_FAILOVER_LIFECYCLE_ENABLED=false`` in the
+child env to prevent a local fidelity run from triggering a real GCE awaken
+attempt (the any-route window has no time-decay, so a partial outage window from
+a previous run can accumulate).  Pass ``--enable-failover`` to opt back in.
+
 Run-#12 fix (post-boot chaos injection)
 ---------------------------------------
 OLD: inject -> boot soak -> detect  [TestWatcher ran full pytest tests/]
@@ -32,6 +60,7 @@ Usage::
     python3 scripts/isomorphic_a1_local.py --stub-soak              # wiring proof
     python3 scripts/isomorphic_a1_local.py --stub-soak --mode container
     python3 scripts/isomorphic_a1_local.py                           # live soak
+    python3 scripts/isomorphic_a1_local.py --enable-failover         # opt in to real GCE
 """
 from __future__ import annotations
 
@@ -289,6 +318,45 @@ def _schedule_adversary_fault(
 
 
 # ---------------------------------------------------------------------------
+# Subprocess iso-cwd threading
+# ---------------------------------------------------------------------------
+
+def _launch_iso_soak(
+    soak_runner: Any,
+    env: Dict[str, str],
+    run_dir: str,
+    iso_cwd: str,
+) -> Any:
+    """Launch the O+V soak subprocess with the IsomorphicEnv disjoint cwd.
+
+    ``SoakRunner.launch`` uses ``self.repo_root`` as the subprocess cwd.
+    We need the child to run with the IsomorphicEnv disjoint path so that
+    code using ``os.getcwd()`` as a repo-root proxy fails — exactly as it
+    does on the GCP node.  Session discovery still uses the real repo_root
+    (``SoakRunner._sessions_root()`` is unaffected because ``repo_root`` is
+    not mutated).
+
+    Concurrency note: ``subprocess.Popen`` is patched for the duration of
+    this call only (thread-local concern; callers must not call this from
+    multiple threads simultaneously).
+    """
+    import subprocess as _sp
+
+    _orig_popen = _sp.Popen
+
+    def _iso_popen(argv: Any, **kwargs: Any) -> Any:
+        # Force the disjoint cwd regardless of what SoakRunner passes.
+        kwargs["cwd"] = iso_cwd
+        return _orig_popen(argv, **kwargs)
+
+    _sp.Popen = _iso_popen  # type: ignore[assignment]
+    try:
+        return soak_runner.launch(env, run_dir)
+    finally:
+        _sp.Popen = _orig_popen
+
+
+# ---------------------------------------------------------------------------
 # IsomorphicA1Driver -- the full-chain local E2E driver
 # ---------------------------------------------------------------------------
 
@@ -319,6 +387,7 @@ class IsomorphicA1Driver:
         run_root: Optional[str] = None,
         adversary_fault: Optional[str] = None,
         verbose: bool = False,
+        enable_failover: bool = False,
         # Injection seam for tests: a zero-arg callable that returns an adversary
         # instance.  None -> use the real SyntheticAdversary from adversary_mod.
         _adversary_factory: Optional[Any] = None,
@@ -332,6 +401,7 @@ class IsomorphicA1Driver:
         self.run_root: str = run_root or os.path.join(os.getcwd(), "a1_iso_runs")
         self.adversary_fault: Optional[str] = adversary_fault
         self.verbose: bool = verbose
+        self.enable_failover: bool = enable_failover
         self._adversary_factory: Optional[Any] = _adversary_factory
 
     async def run(self) -> int:
@@ -377,11 +447,27 @@ class IsomorphicA1Driver:
             with IsomorphicEnv(Path(self.repo_root), mode=self.mode) as env_ctx:
                 _log("IsomorphicEnv: root=%s cwd=%s" % (env_ctx.root, os.getcwd()))
 
-                # Compose env: node vars (from IsomorphicEnv via os.environ) +
-                # cognitive flags ON (from CADENCE_POLICY) + adversary overrides.
+                # Capture the disjoint cwd now (IsomorphicEnv chdir'd us here).
+                # Used later to run the organism subprocess under the same path.
+                iso_cwd: str = os.getcwd()
+
+                # Compose env: node vars (from IsomorphicEnv via os.environ, which
+                # now includes JARVIS_SANDBOX_PREFIXES) + cognitive flags ON (from
+                # CADENCE_POLICY) + adversary overrides.
                 env: Dict[str, str] = harness_mod.compose_env()
                 env.update(adversary.env_overrides())
-                _log("env composed: %d keys total, adversary overrides applied" % len(env))
+
+                # Safety pin: prevent a local fidelity run from triggering a real
+                # GCE awaken attempt.  The any-route outage window has no time-decay,
+                # so accumulated failures from a previous partial run can trigger the
+                # FSM.  Pass --enable-failover to opt back in.
+                # (Minor-5: no time-decay on the any-route window by design.)
+                if not self.enable_failover:
+                    env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "false"
+
+                _log("env composed: %d keys total, adversary overrides applied, "
+                     "failover=%s" % (len(env), "enabled" if self.enable_failover
+                                      else "pinned-off"))
 
                 chaos = harness_mod.ChaosController(
                     repo_root=self.repo_root,
@@ -418,13 +504,18 @@ class IsomorphicA1Driver:
                             debug_log, goal_id="GOAL-ISO-A1")
                         soak_proc = None
                     else:
-                        _log("STEP soak: launching production O+V (pre-inject boot)")
+                        _log("STEP soak: launching production O+V (pre-inject boot) "
+                             "iso_cwd=%s" % iso_cwd)
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
                             cost_cap=0.0,
                             wall_seconds=300,
                         )
-                        handle = soak_runner.launch(env, run_dir)
+                        # Thread IsomorphicEnv: launch child with disjoint cwd so
+                        # os.getcwd()-as-repo-root bugs surface in the real chain.
+                        # The env (composed above) carries JARVIS_SANDBOX_PREFIXES +
+                        # JARVIS_REPO_PATH so the child can locate the real repo.
+                        handle = _launch_iso_soak(soak_runner, env, run_dir, iso_cwd)
                         debug_log = handle.debug_log
                         soak_proc = handle.proc
                         _log("STEP await boot READY (TestWatcher fs.changed.* sub)")
@@ -589,6 +680,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "SyntheticAdversary (default: none = transparent passthrough).",
     )
     p.add_argument("--verbose", action="store_true", help="Verbose output.")
+    p.add_argument(
+        "--enable-failover", action="store_true", default=False,
+        help="Opt in to real GCE failover awaken during local fidelity run "
+             "(default: JARVIS_FAILOVER_LIFECYCLE_ENABLED=false is pinned in "
+             "child env to prevent accidental GCE spend).",
+    )
     return p
 
 
@@ -607,6 +704,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.adversary_fault if args.adversary_fault != "none" else None
         ),
         verbose=args.verbose,
+        enable_failover=args.enable_failover,
     )
     return asyncio.run(driver.run())
 

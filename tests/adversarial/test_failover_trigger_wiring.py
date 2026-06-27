@@ -473,3 +473,140 @@ class TestDormantSafe:
             f"got {state!r}"
         )
         assert awaken_calls == []
+
+
+# ---------------------------------------------------------------------------
+# INTEGRATION: adversary-class faults → gradient → awaken (run-#11 closure)
+# ---------------------------------------------------------------------------
+
+class TestAdversaryToFailoverIntegration:
+    """End-to-end proof (run-#11 closure): the SyntheticAdversary targets
+    ``/dw/chat/completions`` with LIVE_TRANSPORT faults while ``/dw/models``
+    stays healthy (as in run-#11).  The REAL gradient accumulates generation-
+    failure sweeps (as candidate_generator does) and the REAL FSM awakens —
+    no mocking of gradient logic or awaken decision.
+
+    This class simulates the ``record_sweep`` calls that the adversary's faults
+    WOULD produce in ``candidate_generator`` (route-level HTTP-layer failures
+    feed ``record_sweep("background", success=False)`` via the orchestrator's
+    GENERATE retry → dw_severed_queued path).  The adversary HTTP-level path
+    independence is already proven in
+    ``test_synthetic_adversary.py::TestIndependentPaths::
+    test_models_healthy_while_chat_fails_live_transport`` (Task 3).  This test
+    proves the gradient→FSM→awaken seam that the unit tests left inferred.
+
+    ZERO real GCE / network — all external boundaries are injected fakes.
+    """
+
+    async def test_adversary_class_background_fault_drives_awaken(
+        self, monkeypatch
+    ):
+        """Drive the gradient with the exact sweep pattern the SyntheticAdversary's
+        LIVE_TRANSPORT faults on /chat/completions would produce in
+        candidate_generator.record_sweep — full window, rate==0 → is_global_outage
+        True → any_route_in_outage True → FSM awakens.
+
+        Proves the seam: adversary HTTP fault → gradient accumulation →
+        ProviderHealthGradient.is_global_outage → FailoverLifecycleController.tick
+        → DORMANT→AWAKENING.
+        """
+        monkeypatch.setenv("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "true")
+        monkeypatch.setenv("JARVIS_QUARANTINE_WINDOW", str(_WINDOW))
+
+        gradient = _fresh_gradient()
+        clock = FakeClock(start=1000.0)
+        awaken_calls: list = []
+        ctrl = _make_ctrl(clock, awaken_calls, gradient)
+        monkeypatch.setattr(ctrl, "_get_forecast",
+                            lambda: _high_conf_forecast(p50=300.0))
+
+        # Step 1: Pre-conditions identical to run-#11.
+        # - HeavyProbe (GET /dw/models) is healthy → is_degrading() returns False.
+        # - Generation route (/dw/chat/completions) fails with LIVE_TRANSPORT.
+        assert ctrl._is_degrading() is False, (
+            "Pre-condition: HeavyProbe must report HEALTHY (GET /models OK)"
+        )
+        assert gradient.is_global_outage("background") is False, (
+            "Pre-condition: gradient window not yet full"
+        )
+
+        # Step 2: Simulate candidate_generator.record_sweep("background", success=False)
+        # × WINDOW calls — exactly what the adversary's LIVE_TRANSPORT faults produce
+        # in the real chain (dw_severed_queued → fallback_tolerance=queue → record_sweep).
+        _fill_gen_failures(gradient, "background", n=_WINDOW)
+
+        # Step 3: Assert the gradient signal the FSM reads.
+        assert gradient.is_global_outage("background") is True, (
+            "After full window of generation failures, is_global_outage('background') "
+            "must be True — the precondition for awaken"
+        )
+        assert gradient.is_global_outage("dw") is False, (
+            "The FSM's configured 'dw' route key (never written by candidate_generator) "
+            "must remain at is_global_outage=False — the run-#11 structural mismatch"
+        )
+
+        # Step 4: Tick the real FSM — must transition to AWAKENING.
+        state = await ctrl.tick()
+        assert state.name == FailoverState.AWAKENING.name, (
+            "Integration proof: adversary-class background-route failure → full "
+            "gradient window → any_route_in_outage=True → FSM must awaken J-Prime. "
+            f"Got state={state!r}"
+        )
+        assert awaken_calls == ["awaken"], (
+            "Awaken must have fired exactly once (the J-Prime GCE spawn)"
+        )
+
+    async def test_adversary_class_models_healthy_does_not_block_awaken(
+        self, monkeypatch
+    ):
+        """Prove that a healthy HeavyProbe (GET /dw/models) does NOT prevent
+        awaken when the generation route is at full outage.
+
+        This closes the run-#11 blindspot: the old code watched is_degrading()
+        (probe-based) instead of is_global_outage() (generation-based).  The
+        REAL fix: any_route_in_outage ignores the probe and reads only the
+        generation-failure gradient.
+        """
+        monkeypatch.setenv("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "true")
+        gradient = _fresh_gradient()
+        clock = FakeClock(start=1000.0)
+        awaken_calls: list = []
+        ctrl = _make_ctrl(clock, awaken_calls, gradient)
+        monkeypatch.setattr(ctrl, "_get_forecast",
+                            lambda: _high_conf_forecast(p50=300.0))
+
+        # Probe healthy (is_degrading_fn always returns False in _make_ctrl).
+        # Fill the generation route to outage.
+        _fill_gen_failures(gradient, "background", n=_WINDOW)
+
+        state = await ctrl.tick()
+        assert state.name == FailoverState.AWAKENING.name, (
+            "Probe-healthy + gen-route-outage must awaken (the run-#11 fix confirms "
+            "any_route_in_outage is independent of the probe); got %r" % (state,)
+        )
+
+    async def test_adversary_partial_fault_does_not_awaken(self, monkeypatch):
+        """Partial adversary fault (window not full, rate > 0) must NOT awaken.
+
+        A transient blip (e.g. 3 of 5 LIVE_TRANSPORT failures, then recovery)
+        must not spin up J-Prime — fail-CLOSED guarantee.
+        """
+        monkeypatch.setenv("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "true")
+        monkeypatch.setenv("JARVIS_QUARANTINE_WINDOW", str(_WINDOW))
+        gradient = _fresh_gradient()
+        clock = FakeClock(start=1000.0)
+        awaken_calls: list = []
+        ctrl = _make_ctrl(clock, awaken_calls, gradient)
+        monkeypatch.setattr(ctrl, "_get_forecast",
+                            lambda: _high_conf_forecast(p50=300.0))
+
+        # Partial window (3 of 5): adversary faults begin but don't fill the window.
+        _fill_gen_failures(gradient, "background", n=3)
+        assert gradient.is_global_outage("background") is False
+
+        state = await ctrl.tick()
+        assert state.name == FailoverState.DORMANT.name, (
+            "Partial adversary fault (3/5 window) must NOT awaken J-Prime; "
+            f"got {state!r}"
+        )
+        assert awaken_calls == []
