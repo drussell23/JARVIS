@@ -1,0 +1,10 @@
+---
+title: Project Slice203 Strategy Simulator
+modules: [backend/core/ouroboros/governance/strategy_simulator.py]
+status: historical
+source: project_slice203_strategy_simulator.md
+---
+
+**Slice 203 — Strategic Simulation Sandbox (MERGED #69443, main `3dbd2da9cb`, 2026-06-10).** The HONEST automation of goal-generation: respects the S202 operator-authority line (organism PROPOSES draft+PR, operator DISPOSES+signs). Better than S202 — goals from organism's OWN live telemetry, not stale prose.
+
+**How to apply:** `strategy_simulator.py` — `analyze_deficiencies(registry_snapshot)` flags deficiencies over floors from CURATED catalog (provider_exhaustion floor=1 effort=5; control_plane_starvation floor=5 effort=6; vendor_instability/abandoned floor=2 effort=4). `compute_fitness(metrics)` = severity×(1+frequency)÷(effort+1) — HEURISTIC prioritization, NOT predictive ROI (honest framing pinned). `synthesize_goals(snapshot, top_n=6)` → fitness-ranked roadmap goal dicts. `write_draft()` writes ONLY `.jarvis/roadmap.draft.yaml` (refuses non-draft paths). `propose_via_pr()` → ONE `[Ouroboros Strategic Proposal]` PR (APPROVAL_REQUIRED/DO-NOT-AUTO-MERGE) via orange create_review_pr, DEDUPED by deficiency-set fingerprint (marker `.jarvis/.strategy_proposal_marker`, bind-mounted → restart can't spam). NEVER signs, NEVER writes active roadmap.yaml (grep-pinned). Wired GLS.start deferred boot trigger (gated, fail-soft, mirrors genesis). compose `JARVIS_STRATEGY_SIMULATOR_ENABLED=1`. LIVE-PROVEN on real soak registry (15 exhaustions/42 starvation): top goal fitness=3.11 eliminate-starvation, 2.45 harden-provider, 0.55 abandoned-races. 18 tests; 115 regression. Also fixed S202 signer-no-boot-pin to be precise (import/call not prose-mention — blunt string pins trip on comments). NOTE: soak under REAL vendor stress (DW unstable: exhaustions/starvation climbing) — the simulator surfaces this as the organism's self-identified top priorities. See [[project-slice202-strategy-bootstrapper]], [[project-slice201-bandit-router]].

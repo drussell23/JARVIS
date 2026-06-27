@@ -1,0 +1,20 @@
+---
+title: Project Slice249 Observability Steering
+modules: [tests/governance/test_slice249_observability_steering.py, backend/core/ouroboros/governance/ide_observability_stream.py, backend/core/ouroboros/governance/steering.py, backend/core/ouroboros/governance/preemption.py, backend/core/ouroboros/governance/providers.py, backend/core/ouroboros/governance/state_drift.py]
+status: merged
+source: project_slice249_observability_steering.md
+---
+
+**Slice 249 — Asynchronous Observability Stream & Live Steering Protocol. MERGED PR #69494, main `795a73a1`.** Closes the observability/HITL deficit after the resurrection arc (242-248). DW-sovereignty arc.
+
+**VERIFY-FIRST corrected the brief:** the async non-blocking telemetry MESH ALREADY EXISTS — `ide_observability_stream.StreamEventBroker.publish` (sync fire-and-forget, bounded deque, drop-oldest) + SSE `GET /observability/stream` + phase transitions via `phase_orchestra.emit_cue`. `print()` is NOT in the hot path (0 in orchestrator/tool_executor — already logger/structured). So "eradicate blocking print()" was a non-goal.
+
+**Phase 1 (reuse broker, no parallel WebSocket):** added `EVENT_TYPE_{DRIFT_DETECTED,TOOL_EXPLORATION_START,GUIDANCE_ABSORBED}` to `ide_observability_stream.py` + `_VALID_EVENT_TYPES` + `publish_drift_detected`/`publish_tool_exploration_start`/`publish_guidance_absorbed` wrappers (mirror `publish_circuit_breaker_tripped`: non-blocking, NEVER raise, return None when `stream_enabled()` False).
+
+**Phase 2 (GENUINELY NEW — live mid-flight steering):** `steering.py` — op-id-keyed `GuidanceStore` (mirrors S246 `preemption.py`): `inject_guidance(op_id,text)` / `consume_guidance(op_id)` (drain-once, joined) / `has_guidance` / `format_guidance_block` (ASCII "## LIVE HUMAN GUIDANCE") + `live_steering_enabled()` gate (`JARVIS_LIVE_STEERING_ENABLED` default-TRUE) + `reset_guidance()`. `tool_executor` round boundary (right AFTER the S246 preemption check at ~6490, coherent state): drains guidance + folds `format_guidance_block` into `current_prompt` for the NEXT round WITHOUT suspending the lane (contrast S246 preemption which YIELDS) + publishes `guidance_absorbed`. Gated + fail-soft. `run()` has `op_id`+local `prompt` (no ctx), so absorption is on `current_prompt` keyed by op_id.
+
+**Phase 3 (NON-ISSUE, confirmed):** `OperationContext.with_steering_guidance(text)` (mirrors `with_expanded_files`: append `strategic_memory_prompt` + recompute `context_hash` chain via `_context_to_hash_dict`/`_compute_hash`). Updates `context_hash` but NEVER touches `generate_file_hashes` → the S248 file-drift guillotine (`should_block_apply`/`detect_drift` compare DISK FILE hashes, orthogonal to context_hash) cannot mistake steering for drift. PROVEN by `test_steering_does_not_trip_drift_guillotine`. (Note: the live tool-loop path injects into `current_prompt` not ctx, so there's no hash mutation there at all; `with_steering_guidance` is the durable/auditable context-level variant.)
+
+**Tests:** `tests/governance/test_slice249_observability_steering.py` 14 incl. Phase 4 (3 non-blocking telemetry events→distinct ids; inject→consume@boundary→fold into prompt, lane not suspended). 257 green across stream/op_context/245-249; zero regression. 1 pre-existing unrelated `providers.py` stale source-pin (`test_hard_kill_uses_asyncio_wait_not_wait_for`) proven via diff (never touched providers.py).
+
+**RECOVERY NOTE (important for future):** the SANDBOX blocks some `.git` writes — `git checkout -b ... origin/main` errored on `.git/config` AND my local `origin/main` ref was STALE (showed `6df5169c` pre-S248; the prior `git fetch` hadn't updated it), so the 249 branch was initially based on pre-248 code (state_drift.py missing should_block_apply). FIX: `git fetch origin main` (updated ref to `1e1bf058`) + `git reset --hard origin/main`. LESSON: after merging a PR, before branching the next slice, run `git fetch origin main` AND verify `git rev-parse origin/main` matches the merge sha; if a branch-create hits a `.git/config` permission error, re-verify HEAD/base.
