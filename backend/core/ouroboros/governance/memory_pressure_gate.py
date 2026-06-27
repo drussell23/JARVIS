@@ -217,6 +217,51 @@ def ctx_baseline_halflife_s() -> float:
     return _env_float("JARVIS_RESOURCE_GOVERNOR_CTX_BASELINE_HALFLIFE_S", 30.0, minimum=1.0)
 
 
+# Resource Governor — Disk I/O + Capacity dimension. Capacity free-% (and an
+# optional absolute-GB floor) + IOPS-thrash RATE vs a rolling EWMA baseline
+# (the ctx-switch-rate pattern). Off / umbrella-off -> _disk_dim returns OK ->
+# strictest no-op -> byte-identical.
+def disk_dim_enabled() -> bool:
+    return resource_governor_master_enabled() or _env_bool(
+        "JARVIS_RESOURCE_GOVERNOR_DISK_DIM_ENABLED", False)
+
+
+def disk_watch_path() -> str:
+    return os.environ.get("JARVIS_RESOURCE_GOVERNOR_DISK_PATH", ".").strip() or "."
+
+
+def disk_warn_free_pct() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_DISK_WARN_FREE_PCT", 20.0, minimum=0.5)
+
+
+def disk_high_free_pct() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_DISK_HIGH_FREE_PCT", 10.0, minimum=0.5)
+
+
+def disk_critical_free_pct() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_DISK_CRITICAL_FREE_PCT", 5.0, minimum=0.1)
+
+
+def disk_critical_free_gb() -> Optional[float]:
+    """Absolute free-GB floor (None=unset). Strictest wins vs the free-%."""
+    raw = os.environ.get("JARVIS_RESOURCE_GOVERNOR_DISK_CRITICAL_FREE_GB", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def disk_io_spike_mult() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_DISK_IO_SPIKE_MULT", 3.0, minimum=1.1)
+
+
+def disk_io_baseline_halflife_s() -> float:
+    return _env_float("JARVIS_RESOURCE_GOVERNOR_DISK_IO_BASELINE_HALFLIFE_S", 30.0, minimum=1.0)
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -273,6 +318,37 @@ def _sample_cpu_ctx() -> CpuCtxSample:
         return CpuCtxSample(cpu_pct=float(cpu), ctx_switches=ctx, ts=_t.monotonic())
     except Exception:  # noqa: BLE001 — fail-open, this dim only advises
         return CpuCtxSample(cpu_pct=0.0, ctx_switches=0, ts=_t.monotonic(), ok=False)
+
+
+@dataclass(frozen=True)
+class DiskSample:
+    free_pct: float          # % free on the watched path
+    free_gb: float
+    io_bytes: Optional[int]  # cumulative read+write; None when counters absent
+    ts: float
+    ok: bool = True
+
+
+def _sample_disk() -> DiskSample:
+    import time as _t
+    try:
+        import psutil
+        path = disk_watch_path()
+        du = psutil.disk_usage(path)
+        free_pct = max(0.0, 100.0 - float(du.percent))   # psutil.percent is USED%
+        free_gb = float(du.free) / (1024.0 ** 3)
+        io_bytes: Optional[int] = None
+        try:
+            io = psutil.disk_io_counters()
+            if io is not None:
+                io_bytes = int(io.read_bytes) + int(io.write_bytes)
+        except Exception:  # noqa: BLE001 — None-safe: counters unavailable on VM
+            io_bytes = None
+        return DiskSample(free_pct=free_pct, free_gb=free_gb,
+                          io_bytes=io_bytes, ts=_t.monotonic())
+    except Exception:  # noqa: BLE001 — fail-open
+        return DiskSample(free_pct=0.0, free_gb=0.0, io_bytes=None,
+                          ts=_t.monotonic(), ok=False)
 
 
 @dataclass(frozen=True)
@@ -483,6 +559,9 @@ class MemoryPressureGate:
         self._cpu_ctx_sampler: Callable[[], "CpuCtxSample"] = _sample_cpu_ctx
         self._last_ctx: Optional[Tuple[int, float]] = None   # (ctx_switches, ts)
         self._ctx_baseline: Optional[float] = None           # EWMA rate /s
+        self._disk_sampler: Callable[[], "DiskSample"] = _sample_disk
+        self._last_disk_io: Optional[Tuple[int, float]] = None  # (io_bytes, ts)
+        self._disk_io_baseline: Optional[float] = None          # EWMA bytes/s
 
     # -- probe --------------------------------------------------------------
 
@@ -526,7 +605,8 @@ class MemoryPressureGate:
         # level when every dim is off (byte-identical, AST-pinnable).
         proc_level, _rss, _cap = self._process_tree_dim()
         cpu_level, _cpu, _ctx = self._cpu_ctx_dim()
-        return _strictest(_strictest(free_level, proc_level), cpu_level)
+        disk_level, _dfree, _io = self._disk_dim()
+        return _strictest(_strictest(_strictest(free_level, proc_level), cpu_level), disk_level)
 
     # -- fanout decision ----------------------------------------------------
 
@@ -640,6 +720,56 @@ class MemoryPressureGate:
             logger.debug("[MemoryPressureGate] cpu_ctx_dim raised", exc_info=True)
             return PressureLevel.OK, None, None
 
+    def _disk_capacity_level(self, free_pct: float, free_gb: float) -> PressureLevel:
+        crit_gb = disk_critical_free_gb()
+        if crit_gb is not None and free_gb < crit_gb:
+            return PressureLevel.CRITICAL
+        if free_pct < disk_critical_free_pct():
+            return PressureLevel.CRITICAL
+        if free_pct < disk_high_free_pct():
+            return PressureLevel.HIGH
+        if free_pct < disk_warn_free_pct():
+            return PressureLevel.WARN
+        return PressureLevel.OK
+
+    def _disk_dim(
+        self,
+    ) -> Tuple[PressureLevel, Optional[float], Optional[float]]:
+        """Advisory disk pressure: capacity (free-% + optional GB floor) and
+        IOPS-thrash (bytes/sec RATE vs rolling EWMA baseline — the ctx-rate
+        pattern). DISABLED/unavailable -> (OK, None, None) so the strictest
+        compose is a no-op (byte-identical). Fail-open. IOPS is None-safe
+        (counters absent on many VMs -> only capacity contributes)."""
+        if not disk_dim_enabled():
+            return PressureLevel.OK, None, None
+        try:
+            s = self._disk_sampler()
+            if not s.ok:
+                return PressureLevel.OK, None, None
+            level = self._disk_capacity_level(s.free_pct, s.free_gb)
+            io_rate: Optional[float] = None
+            with self._lock:
+                prev = self._last_disk_io
+                if s.io_bytes is not None:
+                    self._last_disk_io = (s.io_bytes, s.ts)
+                    if prev is not None:
+                        dt = s.ts - prev[1]
+                        if dt > 0:
+                            io_rate = max(0.0, (s.io_bytes - prev[0]) / dt)
+                            if self._disk_io_baseline is None:
+                                self._disk_io_baseline = io_rate
+                            else:
+                                if io_rate > self._disk_io_baseline * disk_io_spike_mult():
+                                    level = _strictest(level, PressureLevel.CRITICAL)
+                                alpha = 1.0 - 0.5 ** (dt / max(1e-6, disk_io_baseline_halflife_s()))
+                                self._disk_io_baseline = (
+                                    (1.0 - alpha) * self._disk_io_baseline + alpha * io_rate
+                                )
+            return level, s.free_pct, io_rate
+        except Exception:  # noqa: BLE001 — fail-open
+            logger.debug("[MemoryPressureGate] disk_dim raised", exc_info=True)
+            return PressureLevel.OK, None, None
+
     def can_fanout(self, n_requested: int) -> FanoutDecision:
         """Advisory: may ``n_requested`` parallel units proceed?
 
@@ -685,6 +815,8 @@ class MemoryPressureGate:
         level = _strictest(free_level, proc_level)
         cpu_level, _cpu_pct, _ctx_rate = self._cpu_ctx_dim()
         level = _strictest(level, cpu_level)
+        disk_level, _dfree2, _io2 = self._disk_dim()
+        level = _strictest(level, disk_level)
         proc_dominant = _LEVEL_RANK[proc_level] > _LEVEL_RANK[free_level]
         cap = self._cap_for_level(level)
         if cap is None:
@@ -784,6 +916,10 @@ class MemoryPressureGate:
 # Singleton + FlagRegistry bridge
 # ---------------------------------------------------------------------------
 
+
+# "Unified System Pressure Gate" semantics without an API-breaking rename:
+# the gate now composes memory + process-tree + cpu/ctx + disk dimensions.
+SystemPressureGate = MemoryPressureGate
 
 _default_gate: Optional[MemoryPressureGate] = None
 _singleton_lock = threading.Lock()
@@ -953,13 +1089,17 @@ def _own_flag_specs() -> List[Any]:
 
 
 __all__ = [
+    "CpuCtxSample",
+    "DiskSample",
     "FanoutDecision",
     "MEMORY_PRESSURE_SCHEMA_VERSION",
     "MemoryProbe",
     "MemoryPressureGate",
     "PressureLevel",
+    "SystemPressureGate",
     "critical_fanout_cap",
     "critical_threshold_pct",
+    "disk_dim_enabled",
     "ensure_bridged",
     "get_default_gate",
     "high_fanout_cap",
