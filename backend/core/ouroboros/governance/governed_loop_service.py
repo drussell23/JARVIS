@@ -6659,8 +6659,14 @@ class GovernedLoopService:
         """Launch the FailoverLifecycleController tick loop as a peer background
         task (Omni-Soak #3 fix).
 
-        Gated on ``JARVIS_FAILOVER_LIFECYCLE_ENABLED`` (default OFF in code) --
-        OFF -> NO task is created, byte-identical to before. When ON, the
+        Gated on ``JARVIS_FAILOVER_LIFECYCLE_ENABLED`` (default ON — graduated
+        2026-06-23 after the Adversarial Cognitive Soak; hot-revert via
+        ``export JARVIS_FAILOVER_LIFECYCLE_ENABLED=false``) --
+        OFF -> NO task is created, byte-identical to before.  T4's any-route fix
+        (``JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED`` default true) means a genuine
+        route outage now triggers a real GCE awaken in baseline production; to run
+        without GCE awaken risk also set ``JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED=false``.
+        When ON, the
         process-wide controller singleton is resolved (it lazily wires its own
         real awaken / ready / delete boundaries + the ProviderHealthGradient +
         heartbeat + recovery_forecaster) and an async loop ticks it so the FSM

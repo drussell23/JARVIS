@@ -45,12 +45,13 @@ JARVIS_FAILOVER_LIFECYCLE_ENABLED   default "true" (GRADUATED 2026-06-23; hot-re
     OFF -> controller is inert: stays DORMANT, never awakens. Today's
     behavior exactly (quarantine -> Cryo-DLQ).
 JARVIS_FAILOVER_ROUTE                default "dw" (the quarantine route key)
-JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED default "false" (sub-gate). When ARMED
-    the reactive awaken fires on ANY tracked generation route reaching the SAME
-    full-window rate==0 ``is_global_outage`` -- the AUTHORITATIVE real-generation
-    -failure signal -- not only the single ``JARVIS_FAILOVER_ROUTE`` key. Closes
-    the run-#11 blindspot (DW's cheap probe passed while the BACKGROUND route
-    collapsed). OFF -> byte-identical single-route check.
+JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED default "true" (graduated 2026-06-27,
+    Task 4 Isomorphic Local Sandbox). The reactive awaken fires on ANY tracked
+    generation route reaching the SAME full-window rate==0 ``is_global_outage``
+    -- the AUTHORITATIVE real-generation-failure signal -- not only the single
+    ``JARVIS_FAILOVER_ROUTE`` key. Closes the run-#11 blindspot (DW's cheap probe
+    passed while the BACKGROUND route collapsed). Hot-revert: set to "false" ->
+    byte-identical single-route check (legacy).
 JARVIS_FAILOVER_OUTAGE_ROUTES        default "" (comma-separated explicit extra
     routes to fold into the any-route check; the gradient's tracked routes are
     authoritative -- this is an operator escape hatch only).
@@ -187,19 +188,25 @@ def _early_prewarm_enabled() -> bool:
 def _any_route_outage_enabled() -> bool:
     """Authoritative-signal sub-gate: awaken on ANY route's real-generation
     ``is_global_outage`` (the record_sweep-driven gradient), not only the single
-    configured ``JARVIS_FAILOVER_ROUTE`` key. Default FALSE -> byte-identical.
+    configured ``JARVIS_FAILOVER_ROUTE`` key.
 
-    Run-#11 blindspot: DW's cheap HeavyProbe passed (partial single-token OK)
-    while the BACKGROUND *generation* route collapsed to rate==0 over a full
-    window (``dw_severed_queued``). The reactive awaken checked only
-    ``is_global_outage("dw")`` -- a key that is NEVER the urgency-routing key
-    ``candidate_generator.record_sweep`` populates -- so it stayed False and
-    J-Prime never awoke. When ARMED, the FSM reacts to ANY tracked route hitting
-    the SAME full-window rate==0 outage threshold (fail-CLOSED: a transient
-    blip / not-yet-full window does NOT trip it -- identical threshold to the
-    quarantine seal). Composes UNDER the master gate; OFF -> reactive path is
-    byte-identical (single ``self._route`` check)."""
-    return _enabled("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "false")
+    **Default TRUE** (flipped from "false" by Task 4 of the Isomorphic Local
+    Sandbox, 2026-06-27). The fix closes the run-#11/#12 blindspot:
+
+      DW's cheap HeavyProbe (``GET /models``) passed (partial single-token OK)
+      while the BACKGROUND *generation* route collapsed to rate==0 over a full
+      window (``dw_severed_queued``). The reactive awaken checked only
+      ``is_global_outage("dw")`` -- a key that is NEVER the urgency-routing key
+      ``candidate_generator.record_sweep`` populates (it uses "background" /
+      "standard" / "complex" / "realtime") -- so ``_real_outage()`` always
+      returned False and J-Prime never awoke.
+
+    When TRUE (default), the FSM reacts to ANY tracked route hitting the SAME
+    full-window rate==0 outage threshold (fail-CLOSED: a transient blip /
+    not-yet-full window does NOT trip it -- identical threshold to the quarantine
+    seal). Hot-revert: ``export JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED=false``
+    -> byte-identical single-route check (legacy). Composes UNDER the master gate."""
+    return _enabled("JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED", "true")
 
 
 def _outage_extra_routes() -> List[str]:
