@@ -515,11 +515,12 @@ class MemoryPressureGate:
         if not probe.ok:
             return PressureLevel.OK
         free_level = self.level_for_free_pct(probe.free_pct)
-        # Strictest-wins compose with the advisory process-tree dim.
-        # Disabled → _process_tree_dim returns OK → result == free
-        # level (byte-identical legacy free-%-only path).
+        # Strictest-wins compose across all advisory dimensions. Each
+        # disabled dim returns OK so the result == the legacy free-%-only
+        # level when every dim is off (byte-identical, AST-pinnable).
         proc_level, _rss, _cap = self._process_tree_dim()
-        return _strictest(free_level, proc_level)
+        cpu_level, _cpu, _ctx = self._cpu_ctx_dim()
+        return _strictest(_strictest(free_level, proc_level), cpu_level)
 
     # -- fanout decision ----------------------------------------------------
 

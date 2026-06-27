@@ -31,3 +31,24 @@ def test_cpu_dim_off_is_inert(monkeypatch):
     S = mpg.CpuCtxSample
     g = _gate_with_samples([S(cpu_pct=99.0, ctx_switches=10**9, ts=9.0)])
     assert g._cpu_ctx_dim() == (mpg.PressureLevel.OK, None, None)
+
+
+def test_pressure_off_is_byte_identical(monkeypatch):
+    monkeypatch.delenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_MEMORY_PRESSURE_PROCESS_DIM_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+    g = mpg.MemoryPressureGate(probe_fn=lambda: mpg.MemoryProbe(
+        free_pct=55.0, total_bytes=1, available_bytes=1, source="test"))
+    assert g.pressure() == mpg.PressureLevel.OK   # free% only, dims off
+
+
+def test_pressure_escalates_on_ctx_spike(monkeypatch):
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_CPU_DIM_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "true")
+    S = mpg.CpuCtxSample
+    it = iter([S(0.0, 0, 0.0), S(0.0, 1000, 1.0), S(0.0, 11000, 2.0)])
+    g = mpg.MemoryPressureGate(probe_fn=lambda: mpg.MemoryProbe(
+        free_pct=60.0, total_bytes=1, available_bytes=1, source="test"))
+    g._cpu_ctx_sampler = lambda: next(it)
+    g.pressure(); g.pressure()
+    assert g.pressure() == mpg.PressureLevel.CRITICAL
