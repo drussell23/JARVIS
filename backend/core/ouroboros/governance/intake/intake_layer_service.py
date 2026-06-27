@@ -63,6 +63,29 @@ def apply_benchmark_isolation(sensors: List[Any]) -> Tuple[List[Any], int]:
     return sensors, 0
 
 
+def rg_stagger_enabled() -> bool:
+    import os
+    return os.environ.get(
+        "JARVIS_RESOURCE_GOVERNOR_STAGGER_ENABLED", "false",
+    ).strip().lower() in ("1", "true", "yes")
+
+
+def _rg_stagger_params():
+    import os
+    def _f(name, default):
+        raw = os.environ.get(name, "").strip()
+        try:
+            return float(raw) if raw else default
+        except ValueError:
+            return default
+    return (
+        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_BASE_MS", 250.0) / 1000.0,
+        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_JITTER_MS", 250.0) / 1000.0,
+        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_POLL_S", 0.5),
+        _f("JARVIS_RESOURCE_GOVERNOR_STAGGER_HOLD_MAX_S", 60.0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # IntakeServiceState
 # ---------------------------------------------------------------------------
@@ -1027,8 +1050,7 @@ class IntakeLayerService:
         except Exception as _a1_exc:  # noqa: BLE001 — readiness signal is fail-soft
             logger.debug("[IntakeLayer] router-ready mark skipped: %r", _a1_exc)
 
-        for sensor in self._sensors:
-            await sensor.start()
+        await self._gated_stagger_activate(self._sensors)
 
         # Start reactor consumer after sensors (non-critical, fire-and-forget)
         if self._reactor_consumer is not None:
@@ -1044,6 +1066,44 @@ class IntakeLayerService:
         # activation failure is logged and the intake layer continues
         # operating in poll-only mode (same behavior as before the slice).
         await self._maybe_start_event_channel_server()
+
+    async def _gated_stagger_activate(self, sensors) -> None:
+        """Ignite sensor poll-loops staggered + pressure-locked. Each sensor
+        awaits the MemoryPressureGate: HIGH/CRITICAL -> holding pattern until
+        pressure subsides to WARN/OK, then ignite with jittered spacing to
+        flatten the boot curve. Direction-safe: sensors PULL from the gate
+        (the authority invariant holds). Off -> legacy sequential loop."""
+        if not rg_stagger_enabled():
+            for sensor in sensors:
+                await sensor.start()
+            return
+        import asyncio as _a
+        import random as _r
+        from backend.core.ouroboros.governance.memory_pressure_gate import (
+            get_default_gate as _gate, PressureLevel as _PL,
+        )
+        base_s, jitter_s, hold_poll_s, hold_max_s = _rg_stagger_params()
+        gate = _gate()
+        for sensor in sensors:
+            waited = 0.0
+            while True:
+                try:
+                    lvl = gate.pressure()
+                except Exception:  # noqa: BLE001
+                    lvl = _PL.OK
+                if lvl in (_PL.OK, _PL.WARN):
+                    break
+                if waited >= hold_max_s:
+                    logger.warning(
+                        "[ResourceGovernor] stagger hold timeout %.0fs — "
+                        "igniting %s under pressure=%s (escape hatch).",
+                        waited, getattr(sensor, "name", "?"), lvl,
+                    )
+                    break
+                await _a.sleep(hold_poll_s)
+                waited += hold_poll_s
+            await sensor.start()
+            await _a.sleep(base_s + _r.random() * jitter_s)
 
     async def _maybe_start_event_channel_server(self) -> None:
         """Start the ``EventChannelServer`` when webhook-primary mode is on.
