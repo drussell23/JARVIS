@@ -581,8 +581,17 @@ class Slice4bRunner(PhaseRunner):
         if len(_candidate_files) > 1:
             _t_apply = time.monotonic()
             try:
-                change_result = await orch._apply_multi_file_candidate(
-                    ctx, best_candidate, _candidate_files, snapshots,
+                # Anti-Venom C2 — shield the apply (live phase-runner path).
+                # If the op task is cancelled mid-write the inner coroutine
+                # still runs to completion (file-write + per-file APPLIED ledger
+                # commit are atomic), closing the mutated-on-disk-but-ledger-
+                # stuck-APPLYING split-brain. CancelledError still propagates
+                # here at the shield boundary so the stop is honored once the
+                # write has finished.
+                change_result = await asyncio.shield(
+                    orch._apply_multi_file_candidate(
+                        ctx, best_candidate, _candidate_files, snapshots,
+                    )
                 )
             except Exception as exc:
                 logger.error(
@@ -624,7 +633,13 @@ class Slice4bRunner(PhaseRunner):
                     exc_info=True,
                 )
             try:
-                change_result = await orch._stack.change_engine.execute(change_request)
+                # Anti-Venom C2 — shield the apply (see multi-file path above):
+                # cancellation mid-write cannot leave the file written but the
+                # APPLIED ledger commit skipped. CancelledError still
+                # propagates at the shield boundary.
+                change_result = await asyncio.shield(
+                    orch._stack.change_engine.execute(change_request)
+                )
             except Exception as exc:
                 logger.error(
                     "Change engine raised for %s: %s", ctx.op_id, exc
