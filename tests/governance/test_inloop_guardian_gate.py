@@ -359,7 +359,8 @@ def test_bash_sandbox_readonly_prevents_repo_writes(monkeypatch) -> None:
     This is the structural proof that the bash tool cannot write to the repo
     even inside the air-gapped container (the bash vector is CLOSED).
 
-    We monkeypatch run_in_container and assert read_only=True is forwarded.
+    We monkeypatch run_in_container and assert read_only=True is forwarded,
+    and verify the :ro mount reaches the docker argv.
     """
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
@@ -390,4 +391,16 @@ def test_bash_sandbox_readonly_prevents_repo_writes(monkeypatch) -> None:
     assert captured.get("read_only") is True, (
         f"sandbox_run_bash must forward read_only=True to run_in_container, "
         f"got read_only={captured.get('read_only')!r}"
+    )
+
+    # Strengthen: verify the :ro mount actually reaches the docker argv
+    argv = _cs.build_container_argv(code="echo x > f", worktree="/some/repo", read_only=True)
+    argv_str = " ".join(argv)
+    assert "/some/repo:/work:ro" in argv_str, (
+        f"argv must contain '/some/repo:/work:ro' (read-only mount), "
+        f"got argv: {argv!r}"
+    )
+    assert ":/work:rw" not in argv_str, (
+        f"argv must NOT contain ':rw' mount (must be read-only), "
+        f"got argv: {argv!r}"
     )

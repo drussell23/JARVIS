@@ -157,6 +157,7 @@ async def test_noncandidate_clean_no_false_escalation(
       - candidate declares file_a.py
       - venom_edit_history also has file_b.py
       - guardian returns [] for all pairs
+      - Verify the second pass (non-candidate) actually ran
     """
     monkeypatch.setenv("JARVIS_NOTIFY_APPLY_DELAY_S", "0")
     monkeypatch.setenv("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "0")
@@ -171,6 +172,13 @@ async def test_noncandidate_clean_no_false_escalation(
     orch = _gp._orch(tmp_path)
     cand = {"candidate_id": "c0", "file_path": "file_a.py", "full_content": "x = 2\n"}
 
+    call_log: list = []
+
+    def _tracking_clean_inspect_batch(self, pairs):  # noqa: ANN001
+        """Track calls to inspect_batch and return no findings."""
+        call_log.append([p for p, _, _ in pairs])
+        return []
+
     _head = _subprocess.CompletedProcess(
         args=[], returncode=0, stdout="# head content\n", stderr="",
     )
@@ -178,7 +186,7 @@ async def test_noncandidate_clean_no_false_escalation(
     with patch(
         "backend.core.ouroboros.governance.semantic_guardian."
         "SemanticGuardian.inspect_batch",
-        _no_findings_inspect_batch,
+        _tracking_clean_inspect_batch,
     ), patch(
         "backend.core.ouroboros.governance.phase_runners.gate_runner."
         "subprocess.run",
@@ -191,4 +199,9 @@ async def test_noncandidate_clean_no_false_escalation(
     assert risk_after is RiskTier.SAFE_AUTO, (
         f"Expected SAFE_AUTO (no false escalation for clean non-candidate path), "
         f"got risk_tier={risk_after!r}"
+    )
+    # Strengthen: verify the second pass (non-candidate path) actually ran
+    assert len(call_log) >= 2, (
+        f"Expected ≥2 guardian calls (candidate pass + noncandidate pass), "
+        f"got {len(call_log)} calls: {call_log!r}"
     )
