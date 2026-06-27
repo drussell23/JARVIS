@@ -2623,8 +2623,7 @@ class ToolExecutor:
                 rel_path, _sg_exc,
             )
             return (
-                "ToolError: SemanticGuardian evaluation failed; "
-                "guardian evaluation failed; revise and retry."
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
             )
 
         # --- Layer 8: write with rollback guarantee ------------------
@@ -2806,8 +2805,7 @@ class ToolExecutor:
                 rel_path, _wf_sg_exc,
             )
             return (
-                "ToolError: SemanticGuardian evaluation failed; "
-                "guardian evaluation failed; revise and retry."
+                "ToolError: SemanticGuardian evaluation failed unexpectedly; revise and retry."
             )
 
         # --- Layer 7: write with rollback guarantee ------------------
