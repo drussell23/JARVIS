@@ -61,6 +61,43 @@ logger = logging.getLogger("Ouroboros.ChangeEngine")
 
 
 # ---------------------------------------------------------------------------
+# Anti-Venom (Task 6) — the universal mutation chokepoint
+# ---------------------------------------------------------------------------
+
+
+class BlockedPathError(Exception):
+    """A write target failed containment / protected-path / immutable-governance.
+
+    Raised exclusively by :meth:`ChangeEngine._pre_write_gate`. The gate is
+    fail-closed: ANY internal error (canonicalization failure, import failure,
+    guardian crash) raises this rather than allowing the write. The outer
+    ``execute`` try/except records the op FAILED and the bytes never reach disk.
+    """
+
+
+# Hardcoded — NO env off-switch. The immovability IS the security property
+# (mirrors the Immutable-Orange protocol). These are the governance files that
+# enforce safety; a compromised or hallucinating model must never be able to
+# clobber the very machinery that gates it. Self-protecting: ``change_engine``
+# and ``sandbox_exec`` are themselves listed. Each entry is the repo-relative
+# POSIX substring of a governance module — matched against the repo-relative
+# path of the (canonicalized) write target.
+_IMMUTABLE_GOVERNANCE_SENTINELS: frozenset = frozenset({
+    "backend/core/ouroboros/governance/change_engine",       # the enforcer
+    "backend/core/ouroboros/governance/sandbox_exec",        # the isolation enforcer
+    "backend/core/ouroboros/governance/semantic_guardian",
+    "backend/core/ouroboros/governance/tool_executor",
+    "backend/core/ouroboros/governance/risk_engine",
+    "backend/core/ouroboros/governance/risk_tier_floor",
+    "backend/core/ouroboros/governance/semantic_firewall",
+    "backend/core/ouroboros/governance/scoped_tool_access",
+    "backend/core/ouroboros/governance/orchestrator",
+    "backend/core/ouroboros/governance/governed_loop_service",
+    "backend/core/ouroboros/governance/intake/unified_intake_router",
+})
+
+
+# ---------------------------------------------------------------------------
 # Ouroboros code signature (Manifesto §7 — Absolute Observability)
 # ---------------------------------------------------------------------------
 
@@ -459,6 +496,106 @@ class ChangeEngine:
             # Not under project_root (or unresolvable) — leave as-is.
             return target
 
+    # ------------------------------------------------------------------
+    # Anti-Venom (Task 6) — universal pre-write gate
+    # ------------------------------------------------------------------
+
+    def _pre_write_gate(
+        self, target: Path, content: str, request: ChangeRequest,
+    ) -> None:
+        """The last line of defence before bytes hit disk. FAIL-CLOSED.
+
+        Runs immediately before every ``target.write_text`` in APPLY. Because
+        the single-file path AND the multi-file coordinated path
+        (orchestrator ``_apply_multi_file_candidate``) both funnel per-file
+        through :meth:`execute`, this is the universal mutation chokepoint.
+
+        Checks, in order (first violation wins):
+          1. canonicalize the true destination (realpath/abspath — defeats
+             ``../`` traversal + symlink redirection)
+          2. containment — reject unless ``real`` lives under the effective
+             write root
+          3. immutable governance (FIRST authority) — reject if the
+             repo-relative path matches any hardcoded sentinel; NO env switch
+          4. protected-path — reuse Venom's ``_is_protected_path`` registry
+             (.git, secrets, .env, governance core, ...)
+          5. SemanticGuardian — reject on any ``severity == "hard"`` finding
+
+        Raises
+        ------
+        BlockedPathError
+            On any violation OR any internal error. The gate is impossible to
+            bypass via an internal exception — every failure mode fails closed.
+        """
+        try:
+            # 1. canonical true destination (defeats ../ + symlinks)
+            real = os.path.realpath(os.path.abspath(str(target)))
+            root = os.path.realpath(os.path.abspath(str(
+                self._effective_write_root(getattr(request, "write_root", None))
+            )))
+
+            # 2. containment — must live under the effective write root
+            if not (real == root or real.startswith(root + os.sep)):
+                raise BlockedPathError(
+                    f"path escapes write_root: {real} not under {root}"
+                )
+
+            # repo-relative POSIX path of the canonical target
+            rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
+            real_posix = real.replace(os.sep, "/")
+
+            # 3. immutable governance (FIRST authority; no env off-switch)
+            #    The sentinels are full repo-relative governance substrings, so
+            #    they match directly against the repo-relative target path. We
+            #    also test the absolute path as a robustness backstop for
+            #    deep/worktree write-roots (where rel_norm still carries the
+            #    full backend/.../governance/... tail anyway).
+            for sentinel in _IMMUTABLE_GOVERNANCE_SENTINELS:
+                if sentinel in rel_norm or sentinel in real_posix:
+                    raise BlockedPathError(
+                        f"immutable governance write blocked: {rel_norm}"
+                    )
+
+            # 4. protected-path (reuse the Venom registry — fail closed on
+            #    import failure so a broken import can't open the gate)
+            try:
+                from backend.core.ouroboros.governance.tool_executor import (
+                    _is_protected_path,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail closed
+                raise BlockedPathError(
+                    f"protected-path check unavailable (import failed): {exc}"
+                )
+            prot = _is_protected_path(rel_norm)
+            if prot:
+                raise BlockedPathError(
+                    f"protected path write blocked: {rel_norm} ({prot})"
+                )
+
+            # 5. guardian — hard findings block; guardian crash fails closed
+            try:
+                from backend.core.ouroboros.governance.semantic_guardian import (
+                    SemanticGuardian,
+                )
+                findings = SemanticGuardian().inspect(
+                    file_path=rel_norm, old_content="", new_content=content,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail closed
+                raise BlockedPathError(
+                    f"guardian raised on {rel_norm} — fail-closed: {exc}"
+                )
+            if any(getattr(f, "severity", "") == "hard" for f in findings):
+                raise BlockedPathError(
+                    f"guardian hard finding on {rel_norm}"
+                )
+        except BlockedPathError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — ANY internal error fails closed
+            raise BlockedPathError(
+                f"pre-write gate internal error — fail-closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     async def execute(self, request: ChangeRequest) -> ChangeResult:
         """Execute the 8-phase transactional change pipeline.
 
@@ -682,6 +819,14 @@ class ChangeEngine:
                 goal=request.goal,
                 target_path=str(target),
             )
+
+            # Anti-Venom (Task 6) — UNIVERSAL MUTATION CHOKEPOINT.
+            # Runs immediately before the only governed disk write. Fail-closed:
+            # any violation OR internal error raises BlockedPathError, caught by
+            # the outer try/except → op recorded FAILED, bytes never reach disk.
+            # Covers the multi-file path too: _apply_multi_file_candidate calls
+            # execute() per file, so every per-file write funnels through here.
+            self._pre_write_gate(target, signed_content, request)
 
             # Acquire file lock for the write
             async with self._lock_manager.acquire(
