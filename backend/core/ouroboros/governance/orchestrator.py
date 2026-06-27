@@ -4312,6 +4312,38 @@ class GovernedOrchestrator:
                         ctx.op_id, exc,
                     )
 
+                # ---- ModuleContextRouter: architecture memory injection (MEM-2, inline path) ----
+                # Parity with ContextExpansionRunner. Gated default-OFF; fail-soft.
+                try:
+                    from backend.core.ouroboros.governance.module_routing import (  # lazy
+                        ModuleContextRouter as _MR,
+                        routing_enabled as _mr_enabled,
+                    )
+                    if _mr_enabled():
+                        _mr_router = _MR(self._config.project_root)
+                        _mr_result = _mr_router.route(
+                            list(ctx.target_files),
+                            ctx.description,
+                        )
+                        if _mr_result.section:
+                            _mr_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                            ctx = ctx.with_strategic_memory_context(
+                                strategic_intent_id=ctx.strategic_intent_id or "module-routing-v1",
+                                strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                                strategic_memory_prompt=(
+                                    _mr_existing + "\n\n" + _mr_result.section
+                                    if _mr_existing else _mr_result.section
+                                ),
+                                strategic_memory_digest=ctx.strategic_memory_digest,
+                            )
+                            logger.info(
+                                "[ModuleRouter] op=%s topics=%d inject_site=context_expansion_inline "
+                                "prompt_chars=%d",
+                                ctx.op_id, len(_mr_result.topics), len(_mr_result.section),
+                            )
+                except Exception:
+                    logger.debug("[ModuleRouter] inline injection skipped", exc_info=True)
+
                 ctx = ctx.advance(OperationPhase.PLAN)
             else:
                 # Expansion disabled: skip directly from ROUTE to PLAN
