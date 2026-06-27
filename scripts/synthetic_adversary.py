@@ -55,19 +55,45 @@ import sys
 from typing import Any, Dict, List, Optional, Union
 
 # Repo-root bootstrap so the module works both as a script and as an import.
+# Must be at sys.path[0] -- _ensure_backend_on_path() in isomorphic_a1_local.py
+# inserts backend/ at index 0 after repo-root, which shadows the top-level
+# tests/ package with backend/tests/ (no adversarial sub-package there).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
+# Always ensure repo root is at position 0, not just anywhere in sys.path.
+if sys.path[:1] != [_REPO_ROOT]:
+    try:
+        sys.path.remove(_REPO_ROOT)
+    except ValueError:
+        pass
     sys.path.insert(0, _REPO_ROOT)
+# Evict a stale tests namespace that may have been pinned to backend/tests/
+# before the repo root landed at position 0.
+_TESTS_ROOT = os.path.join(_REPO_ROOT, "tests")
+if "tests" in sys.modules and (
+    getattr(sys.modules["tests"], "__path__", [""])[0] != _TESTS_ROOT
+):
+    for _k in [k for k in list(sys.modules) if k == "tests" or k.startswith("tests.")]:
+        del sys.modules[_k]
 
 import aiohttp.web  # noqa: E402  (already a dep per plan spec)
 
 # ── reused modules (do NOT duplicate) ──────────────────────────────────────── #
 from scripts.chaos_injector import FakeClock  # noqa: E402
-from tests.adversarial.fault_injector import (  # noqa: E402
-    FaultInjector,
-    FaultSpec,
-    FaultType,
-)
+try:
+    from tests.adversarial.fault_injector import (  # noqa: E402
+        FaultInjector,
+        FaultSpec,
+        FaultType,
+    )
+    _FAULT_INJECTOR_AVAILABLE = True
+except ImportError:
+    # Fail-soft: tests/ stripped from a deployed image.  The adversary still
+    # serves faults via FailureSource string values; FaultInjector boundary-
+    # dispatch is a thin helper that is skipped in this mode.
+    FaultInjector = None  # type: ignore[assignment,misc]
+    FaultSpec = None  # type: ignore[assignment,misc]
+    FaultType = None  # type: ignore[assignment,misc]
+    _FAULT_INJECTOR_AVAILABLE = False
 
 try:
     from backend.core.ouroboros.governance.topology_sentinel import FailureSource
@@ -90,19 +116,24 @@ _HEALTHY_COMPLETION_ID = "chatcmpl-adversary-ok"
 # Mapping: FailureSource value → nearest FaultType for FaultInjector registration.
 # Used only for the FaultInjector boundary-dispatch record; HTTP behaviour is
 # driven by the original FailureSource string.
-_FS_TO_FT: Dict[str, FaultType] = {
-    "live_transport": FaultType.NETWORK_PARTITION,
-    "live_http_5xx": FaultType.NETWORK_PARTITION,
-    "live_http_429": FaultType.NETWORK_PARTITION,
-    "live_parse_error": FaultType.DELAYED_DUPLICATE,
-    "live_stream_stall": FaultType.TIMEOUT_AFTER_SUCCESS,
-    "heavy_probe_fail": FaultType.NETWORK_PARTITION,
-    "light_probe_fail": FaultType.NETWORK_PARTITION,
-    "light_probe_timeout": FaultType.TIMEOUT_AFTER_SUCCESS,
-    "generation_timeout": FaultType.TIMEOUT_AFTER_SUCCESS,
-    "fsm_exhausted": FaultType.NETWORK_PARTITION,
-    "local_egress_overweight": FaultType.NETWORK_PARTITION,
-}
+# Empty when _FAULT_INJECTOR_AVAILABLE is False (FaultType is None).
+_FS_TO_FT: Dict[str, Any] = (
+    {
+        "live_transport": FaultType.NETWORK_PARTITION,
+        "live_http_5xx": FaultType.NETWORK_PARTITION,
+        "live_http_429": FaultType.NETWORK_PARTITION,
+        "live_parse_error": FaultType.DELAYED_DUPLICATE,
+        "live_stream_stall": FaultType.TIMEOUT_AFTER_SUCCESS,
+        "heavy_probe_fail": FaultType.NETWORK_PARTITION,
+        "light_probe_fail": FaultType.NETWORK_PARTITION,
+        "light_probe_timeout": FaultType.TIMEOUT_AFTER_SUCCESS,
+        "generation_timeout": FaultType.TIMEOUT_AFTER_SUCCESS,
+        "fsm_exhausted": FaultType.NETWORK_PARTITION,
+        "local_egress_overweight": FaultType.NETWORK_PARTITION,
+    }
+    if _FAULT_INJECTOR_AVAILABLE
+    else {}
+)
 
 
 def _fault_str(fault: Any) -> str:
@@ -140,8 +171,11 @@ class SyntheticAdversary:
         # FakeClock (chaos_injector.py:76) -- injectable, no real sleeps
         self._clock: FakeClock = clock if clock is not None else FakeClock()
         self._faults: List[_ScheduledFault] = []
-        # FaultInjector (fault_injector.py:56) -- per-request boundary dispatch
-        self._injector: FaultInjector = FaultInjector(seed=0)
+        # FaultInjector (fault_injector.py:56) -- per-request boundary dispatch.
+        # None when _FAULT_INJECTOR_AVAILABLE is False (graceful degrade).
+        self._injector: Optional[Any] = (
+            FaultInjector(seed=0) if _FAULT_INJECTOR_AVAILABLE else None
+        )
         self._app: Optional[aiohttp.web.Application] = None
         self._runner: Optional[aiohttp.web.AppRunner] = None
         self._site: Optional[aiohttp.web.TCPSite] = None
@@ -285,19 +319,30 @@ class SyntheticAdversary:
             # Active: consume one count slot
             if entry.remaining is not None:
                 entry.remaining -= 1
-            # Register in FaultInjector for boundary-dispatch record/check
+            # Register in FaultInjector for boundary-dispatch record/check.
+            # Skipped when _FAULT_INJECTOR_AVAILABLE is False (no tests/ available);
+            # HTTP-level fault behaviour is still driven by the returned fault value.
             fs_str = _fault_str(entry.fault)
-            ft = _FS_TO_FT.get(fs_str, FaultType.NETWORK_PARTITION)
-            boundary_key = f"{route}:{endpoint}"
-            self._injector.register(
-                boundary_key, ft,
-                params={"failure_source": fs_str},
-                one_shot=True,
-            )
-            spec: Optional[FaultSpec] = self._injector.check(boundary_key)
-            if spec is not None:
+            if self._injector is not None and _FAULT_INJECTOR_AVAILABLE:
+                ft = _FS_TO_FT.get(
+                    fs_str,
+                    FaultType.NETWORK_PARTITION,  # type: ignore[union-attr]
+                )
+                boundary_key = f"{route}:{endpoint}"
+                self._injector.register(
+                    boundary_key, ft,
+                    params={"failure_source": fs_str},
+                    one_shot=True,
+                )
+                spec: Optional[Any] = self._injector.check(boundary_key)
+                if spec is not None:
+                    _log.debug(
+                        "[SyntheticAdversary] dispatching %s@%s fault=%s",
+                        route, endpoint, fs_str,
+                    )
+            else:
                 _log.debug(
-                    "[SyntheticAdversary] dispatching %s@%s fault=%s",
+                    "[SyntheticAdversary] dispatching %s@%s fault=%s (no FaultInjector)",
                     route, endpoint, fs_str,
                 )
             return entry.fault

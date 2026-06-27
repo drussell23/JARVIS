@@ -134,10 +134,17 @@ def _adversary_mod() -> Any:
 
 def _ensure_backend_on_path() -> None:
     """Add repo root and backend dir to sys.path so absolute backend imports work
-    regardless of the process cwd (IsomorphicEnv changes cwd to <tmpdir>/app)."""
-    for entry in (_REPO_ROOT, os.path.join(_REPO_ROOT, "backend")):
-        if entry not in sys.path:
-            sys.path.insert(0, entry)
+    regardless of the process cwd (IsomorphicEnv changes cwd to <tmpdir>/app).
+
+    Order matters: repo root must be inserted at position 0 FIRST so the top-level
+    tests/ package takes precedence over backend/tests/ (which has no adversarial/
+    sub-package).  backend/ is appended to the END so it never shadows tests/.
+    """
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    _backend = os.path.join(_REPO_ROOT, "backend")
+    if _backend not in sys.path:
+        sys.path.append(_backend)
 
 
 # ---------------------------------------------------------------------------

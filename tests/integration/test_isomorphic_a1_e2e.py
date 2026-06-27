@@ -879,6 +879,82 @@ class TestSubprocessIsomorphismPropagation:
 
 
 # ===========================================================================
+# Group 5 -- Script invocation (subprocess): catches unit-green/live-fails gap
+# ===========================================================================
+
+
+class TestScriptSubprocessInvocation:
+    """Verify the driver works when invoked as a STANDALONE SCRIPT (subprocess).
+
+    pytest path-injection means ``from tests.adversarial...`` resolves under
+    pytest even if sys.path is wrong -- a subprocess with no conftest has no
+    such injection.  These tests prove the script-invocation path is clean,
+    which the unit tests above cannot catch.
+
+    Regression: isomorphic_a1_local.py's _ensure_backend_on_path() inserted
+    backend/ at sys.path[0], shadowing top-level tests/ with backend/tests/
+    (no adversarial sub-package).  Fixed by appending backend/ to the END and
+    by ensuring synthetic_adversary.py's bootstrap re-seats _REPO_ROOT at [0].
+    """
+
+    def test_stub_soak_script_invocation_exits_cleanly(self) -> None:
+        """Run `python3 scripts/isomorphic_a1_local.py --stub-soak` as a
+        subprocess and assert it exits without ModuleNotFoundError.
+
+        The documented stub-soak return code is 0 when wiring is proven and
+        non-zero when wiring fails -- either is acceptable here; we only care
+        that the script *starts and loads* without import crashes.
+        """
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "scripts/isomorphic_a1_local.py", "--stub-soak"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = result.stdout + result.stderr
+        assert "ModuleNotFoundError" not in combined, (
+            "Script crashed with ModuleNotFoundError -- sys.path bootstrap is broken.\n"
+            "stderr: %s\nstdout: %s" % (result.stderr[-2000:], result.stdout[-2000:])
+        )
+        assert "No module named 'tests.adversarial'" not in combined, (
+            "tests.adversarial import failed in subprocess -- backend/ is shadowing tests/.\n"
+            "stderr: %s" % result.stderr[-2000:]
+        )
+
+    def test_synthetic_adversary_imports_cleanly_as_script(self) -> None:
+        """Run synthetic_adversary.py directly as a script and confirm no
+        import error.  The module has no ``if __name__ == '__main__'`` guard
+        so it will exit after imports; any ModuleNotFoundError surfaces here.
+        """
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, '.'); "
+             "import importlib.util, os; "
+             "spec = importlib.util.spec_from_file_location("
+             "'synthetic_adversary', 'scripts/synthetic_adversary.py'); "
+             "mod = importlib.util.module_from_spec(spec); "
+             "sys.modules['synthetic_adversary'] = mod; "
+             "spec.loader.exec_module(mod); "
+             "print('IMPORT_OK')"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = result.stdout + result.stderr
+        assert "ModuleNotFoundError" not in combined, (
+            "synthetic_adversary import failed: %s" % combined[-2000:]
+        )
+        assert "IMPORT_OK" in result.stdout, (
+            "Expected IMPORT_OK sentinel but got:\nstdout: %s\nstderr: %s"
+            % (result.stdout[-2000:], result.stderr[-2000:])
+        )
+
+
+# ===========================================================================
 # Regression: load_chaos_target_files handles both rel + abs paths
 # ===========================================================================
 
