@@ -173,3 +173,79 @@ def test_sentinel_boundary_anchor_subdir_match():
     sentinel = "backend/core/ouroboros/governance/risk_engine"
     subdir_path = "backend/core/ouroboros/governance/risk_engine/sub.py"
     assert _sentinel_matches_path(subdir_path, sentinel)
+
+
+# ---------------------------------------------------------------------------
+# Final-review CRITICAL 1 — guardian baselines on the on-disk pre-image, not ""
+#
+# The chokepoint guardian formerly inspected with ``old_content=""`` which turns
+# every MODIFY into a synthetic creation. Delta-gated patterns
+# (shell_exec_introduced, credential-shape, dynamic_import_chain, …) then fired
+# on PRE-EXISTING legitimate code — any candidate whose file already used
+# subprocess/os.system/etc. was BlockedPathError'd at APPLY even though it added
+# nothing. The fix baselines ``old`` against the on-disk pre-image so the delta
+# is (on-disk → candidate).
+# ---------------------------------------------------------------------------
+
+
+def test_legit_subprocess_edit_allowed_delta_zero(tmp_path):
+    """A MODIFY to a file that ALREADY uses subprocess (delta=0) must apply.
+
+    RED under the old ``old_content=""`` baseline (delta vs ∅ = 1 → blocked);
+    GREEN once the gate baselines against the on-disk pre-image.
+    """
+    (tmp_path / "src").mkdir()
+    eng = _engine(tmp_path)
+    target = tmp_path / "src" / "runner.py"
+
+    # On-disk pre-image already contains a legit subprocess call.
+    on_disk = (
+        "import subprocess\n\n\n"
+        "def run_it():\n"
+        "    subprocess.run(['ls'])\n"
+    )
+    target.write_text(on_disk)
+
+    # Candidate = same file + an added docstring. subprocess STILL present,
+    # so the delta against the on-disk baseline is 0 (nothing introduced).
+    candidate = (
+        "import subprocess\n\n\n"
+        "def run_it():\n"
+        "    \"\"\"Run ls.\"\"\"\n"
+        "    subprocess.run(['ls'])\n"
+    )
+    req = _request(target, candidate, "op-legit-subproc")
+    res = asyncio.run(eng.execute(req))
+    assert res.success is True, (
+        "legit subprocess-edit (delta=0) must NOT be blocked by the guardian"
+    )
+    assert "Run ls." in target.read_text()
+
+
+def test_introducing_os_system_still_blocked_delta_positive(tmp_path):
+    """True-positive guard: ADDING os.system to a file that had none → blocked.
+
+    Confirms the on-disk baseline does NOT disarm the guardian — a genuine new
+    hard finding (delta > 0) still fails closed.
+    """
+    (tmp_path / "src").mkdir()
+    eng = _engine(tmp_path)
+    target = tmp_path / "src" / "clean.py"
+
+    # On-disk pre-image has NO shell-exec at all.
+    target.write_text("def run_it():\n    return 1\n")
+
+    # Candidate ADDS os.system → delta = 1 → hard finding → blocked.
+    candidate = (
+        "import os\n\n\n"
+        "def run_it():\n"
+        "    os.system('ls')\n"
+        "    return 1\n"
+    )
+    req = _request(target, candidate, "op-add-os-system")
+    res = asyncio.run(eng.execute(req))
+    assert res.success is False, (
+        "introducing os.system (delta>0) must still be blocked"
+    )
+    # The original on-disk content must be untouched (no os.system written).
+    assert "os.system" not in target.read_text()

@@ -36,6 +36,9 @@ import pytest
 from backend.core.ouroboros.governance.change_engine import (
     _IMMUTABLE_GOVERNANCE_SENTINELS,
 )
+from backend.core.ouroboros.governance.tool_executor import (
+    _is_protected_path,
+)
 
 # ---------------------------------------------------------------------------
 # Expected immune-file sentinel substrings (source of truth for this pin)
@@ -204,4 +207,35 @@ class TestImmutableGovernancePin:
         assert isinstance(_IMMUTABLE_GOVERNANCE_SENTINELS, frozenset), (
             f"_IMMUTABLE_GOVERNANCE_SENTINELS must be a frozenset; "
             f"got {type(_IMMUTABLE_GOVERNANCE_SENTINELS).__name__}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # 6. Venom protection parity: every sentinel is Venom-blocked         #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.parametrize("sentinel", sorted(_EXPECTED_SENTINELS))
+    def test_venom_protected_paths_cover_immutable_sentinels(
+        self, sentinel: str
+    ) -> None:
+        """Anti-drift pin: Venom-blocked paths must cover all governance sentinels.
+
+        For each immutable governance sentinel, constructs a representative
+        file path (sentinel + ".py") and asserts that tool_executor's
+        _is_protected_path returns non-None (blocked). This ensures the two
+        lists can never silently drift — if a sentinel is added but Venom
+        protection is forgotten, this test catches it immediately.
+        """
+        # Convert sentinel path to a representative file path
+        # e.g., "backend/core/ouroboros/governance/orchestrator" ->
+        #       "backend/core/ouroboros/governance/orchestrator.py"
+        test_path = f"{sentinel}.py"
+
+        result = _is_protected_path(test_path)
+        assert result is not None, (
+            f"VENOM PROTECTION MISSING: sentinel {sentinel!r} is not covered "
+            f"by tool_executor._PROTECTED_PATH_SUBSTRINGS.\n"
+            f"Test path: {test_path}\n"
+            f"_is_protected_path returned None (not blocked).\n"
+            f"This means the immutable governance file could be modified by a "
+            f"hallucinating model — the anti-venom gate is incomplete."
         )

@@ -525,6 +525,8 @@ _PROTECTED_PATH_SUBSTRINGS: Tuple[str, ...] = (
     "ouroboros/governance/risk_tier_floor",
     "ouroboros/governance/semantic_firewall",
     "ouroboros/governance/scoped_tool_access",
+    "ouroboros/governance/orchestrator",            # the 11-phase FSM
+    "ouroboros/governance/governed_loop_service",   # the main loop
     "ouroboros/governance/intake/unified_intake_router",
 )
 

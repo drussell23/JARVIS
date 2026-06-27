@@ -31,6 +31,11 @@ GOVERNANCE_PROTECTED_PATHS = [
     "backend/core/ouroboros/governance/risk_tier_floor.py",
     "backend/core/ouroboros/governance/semantic_firewall.py",
     "backend/core/ouroboros/governance/scoped_tool_access.py",
+    # Final-review CRITICAL 2: the FSM + main loop. change_engine's immutable
+    # sentinels protect these, but Venom's in-loop edit/write/delete (which use
+    # _is_protected_path, NOT the chokepoint) must block them too.
+    "backend/core/ouroboros/governance/orchestrator.py",
+    "backend/core/ouroboros/governance/governed_loop_service.py",
     "backend/core/ouroboros/governance/intake/unified_intake_router.py",
 ]
 
@@ -48,7 +53,7 @@ def test_governance_path_is_protected(rel_path: str) -> None:
 
 
 def test_sentinels_in_tuple() -> None:
-    """All 9 new substrings must appear in _PROTECTED_PATH_SUBSTRINGS."""
+    """All 11 governance substrings must appear in _PROTECTED_PATH_SUBSTRINGS."""
     from backend.core.ouroboros.governance.tool_executor import _PROTECTED_PATH_SUBSTRINGS
 
     expected = {
@@ -60,6 +65,9 @@ def test_sentinels_in_tuple() -> None:
         "ouroboros/governance/risk_tier_floor",
         "ouroboros/governance/semantic_firewall",
         "ouroboros/governance/scoped_tool_access",
+        # Final-review CRITICAL 2 additions:
+        "ouroboros/governance/orchestrator",
+        "ouroboros/governance/governed_loop_service",
         "ouroboros/governance/intake/unified_intake_router",
     }
     missing = expected - set(_PROTECTED_PATH_SUBSTRINGS)

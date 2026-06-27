@@ -641,12 +641,28 @@ class ChangeEngine:
             root = os.path.realpath(os.path.abspath(str(write_root)))
             rel_norm = os.path.relpath(real, root).replace(os.sep, "/")
 
+            # Baseline the guardian against REALITY: the on-disk pre-image is
+            # the correct MODIFY baseline so the delta is (on-disk → candidate),
+            # not (∅ → candidate). An empty baseline turns every MODIFY into a
+            # synthetic creation and makes delta-gated patterns fire on
+            # PRE-EXISTING legitimate code (e.g. a file that already imports
+            # subprocess), BlockedPathError'ing legit self-development edits.
+            try:
+                if target.exists():
+                    old_content = target.read_text(errors="replace")
+                else:
+                    old_content = ""  # genuinely new file
+            except Exception:  # noqa: BLE001 — read failure ⇒ fall back to ""
+                # Rare; re-introduces the create-baseline for this one file
+                # (acceptable). Do NOT crash the gate.
+                old_content = ""
+
             try:
                 from backend.core.ouroboros.governance.semantic_guardian import (
                     SemanticGuardian,
                 )
                 findings = SemanticGuardian().inspect(
-                    file_path=rel_norm, old_content="", new_content=content,
+                    file_path=rel_norm, old_content=old_content, new_content=content,
                 )
             except Exception as exc:  # noqa: BLE001 — fail closed
                 raise BlockedPathError(
