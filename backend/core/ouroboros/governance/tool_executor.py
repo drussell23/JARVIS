@@ -514,6 +514,18 @@ _PROTECTED_PATH_SUBSTRINGS: Tuple[str, ...] = (
     ".netrc",           # HTTP basic-auth creds
     ".jarvis/",         # JARVIS internal state (ops logs, intake lock, ...)
     ".ouroboros/",      # Ouroboros session state / ledger / parse failures
+    # Anti-Venom (Task 5): governance core files Venom may never self-modify.
+    # A compromised or hallucinating model cannot clobber the very machinery
+    # that enforces safety — these sentinels are the last line of defence.
+    "ouroboros/governance/semantic_guardian",
+    "ouroboros/governance/tool_executor",
+    "ouroboros/governance/change_engine",
+    "ouroboros/governance/sandbox_exec",
+    "ouroboros/governance/risk_engine",
+    "ouroboros/governance/risk_tier_floor",
+    "ouroboros/governance/semantic_firewall",
+    "ouroboros/governance/scoped_tool_access",
+    "ouroboros/governance/intake/unified_intake_router",
 )
 
 
@@ -1295,6 +1307,46 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
 
 
 # ---------------------------------------------------------------------------
+# Anti-Venom: bash hardening constants + sync/async bridge
+# ---------------------------------------------------------------------------
+
+#: Allowlisted bash verbs — only these may be the first real token in a
+#: bash command passed to Venom's _bash handler.  Any other verb (rm, curl,
+#: nc, python -c exec tricks, …) is rejected at Gate 1 before the command
+#: reaches the sandbox.
+_BASH_ALLOWED_VERBS: FrozenSet[str] = frozenset({
+    "ls", "cat", "grep", "rg", "find", "git", "wc", "head", "tail",
+    "sed", "awk", "echo", "python", "python3", "pytest", "pwd", "which",
+})
+
+
+def _run_coroutine_sync(coro):
+    """Bridge a coroutine into a synchronous caller.
+
+    Tool handlers in ToolExecutor are synchronous but the sandbox execution
+    layer (sandbox_exec) is async.  This helper runs the coroutine without
+    blocking an existing event loop:
+
+    - No running loop (typical pytest / sync call-site): delegates to
+      ``asyncio.run()``.
+    - Running loop (call from within an async context): spawns a fresh
+      event loop in a ``ThreadPoolExecutor`` worker thread to avoid
+      ``run_until_complete`` nested-loop errors.
+    """
+    try:
+        asyncio.get_running_loop()
+        # Inside an async context — create a new event loop in a worker
+        # thread to avoid blocking the caller's loop.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        # No running event loop — safe to call asyncio.run directly.
+        return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
 
@@ -2001,12 +2053,13 @@ class ToolExecutor:
         return "\n".join(head) + f"\n\n... [{n_extra} more matches truncated] ...\n\n" + "\n".join(tail)
 
     def _run_tests(self, args: Dict[str, Any]) -> str:
-        """Slice 9 — sync legacy path routes through the canonical
-        ``run_pytest_subprocess_sync`` helper. Discipline + provenance
-        + process-group isolation centralized; behaviour preserved."""
-        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
-            run_pytest_subprocess_sync,
-        )
+        """Anti-Venom (Task 5): routes pytest through the Trinity Docker sandbox.
+
+        Fail-closed: if the sandbox is DISABLED or Docker is unavailable the
+        call returns a denial string — pytest is never executed unsandboxed on
+        the host.  The path-safety / containment checks from Slice 9 are
+        retained before the sandbox call.
+        """
         paths_arg = args.get("paths", [])
         if isinstance(paths_arg, str):
             paths_arg = [paths_arg]
@@ -2019,16 +2072,18 @@ class ToolExecutor:
             except BlockedPathError:
                 return f"(blocked path: {p!r})"
 
-        result = run_pytest_subprocess_sync(
-            ["python3", "-m", "pytest", "--tb=short", "-q"] + safe_paths,
-            cwd=str(self._repo_root),
-            timeout_s=30.0,
-            caller="tool_executor.ToolExecutor._run_tests",
-            output_cap_chars=_MAX_TOOL_OUTPUT_CHARS,
+        from backend.core.ouroboros.governance import sandbox_exec as _sandbox_mod
+        sandbox_result = _run_coroutine_sync(
+            _sandbox_mod.sandbox_run_tests(safe_paths, worktree=str(self._repo_root))
         )
-        if result.timed_out:
-            return "(pytest timed out after 30s)"
-        return result.stdout
+        if sandbox_result.denied:
+            return f"(run_tests: sandbox denied — {sandbox_result.reason})"
+        output = sandbox_result.stdout or ""
+        if sandbox_result.stderr:
+            output += f"\nstderr: {sandbox_result.stderr}"
+        if sandbox_result.returncode not in (None, 0):
+            output = f"exit={sandbox_result.returncode}\n{output}"
+        return output.strip() or "(no test output)"
 
     def _get_callers(self, args: Dict[str, Any]) -> str:
         function_name: str = args["function_name"]
@@ -2262,44 +2317,81 @@ class ToolExecutor:
             return "(git blame timed out)"
 
     def _bash(self, args: Dict[str, Any]) -> str:
-        """Sandboxed shell execution with Iron Gate (Manifesto §6).
+        """Allowlist-gated, redirect-checked, Trinity-Docker-sandboxed shell.
 
-        Blocks known destructive patterns. Timeout-enforced.
-        Requires JARVIS_TOOL_BASH_ALLOWED=true.
+        Anti-Venom hardening (Task 5, Manifesto §6):
+          Gate 1 — verb allowlist: only _BASH_ALLOWED_VERBS pass.
+          Gate 2 — redirect target check: protected paths and out-of-repo
+                   redirects are rejected before the command runs.
+          Gate 3 — blocked patterns: defence-in-depth denylist.
+          Gate 4 — Trinity Docker sandbox (fail-closed): delegates to
+                   sandbox_exec.sandbox_run_bash; denied when Docker
+                   unavailable or JARVIS_RUNTIME_SANDBOX_ENABLED=false.
         """
         command: str = args["command"]
-        timeout: float = min(float(args.get("timeout", 30)), 60)
 
-        # Iron Gate: block destructive command patterns
+        # --- Gate 1: verb allowlist ------------------------------------------
+        # Strip leading VAR=val environment assignments to find the real verb.
+        tokens = command.strip().split()
+        verb: Optional[str] = None
+        for tok in tokens:
+            # A bare VAR=val assignment has no path separator before the '='.
+            if "=" in tok and "/" not in tok.split("=", 1)[0]:
+                continue
+            verb = tok
+            break
+        if verb is None:
+            return "(bash: empty command)"
+        if verb not in _BASH_ALLOWED_VERBS:
+            return (
+                f"(Iron Gate: bash verb {verb!r} is not in the allowed set; "
+                f"allowed: {', '.join(sorted(_BASH_ALLOWED_VERBS))})"
+            )
+
+        # --- Gate 2: redirect target check -----------------------------------
+        for _m in re.finditer(r">>?\s*(\S+)", command):
+            _redir = _m.group(1)
+            _prot = _is_protected_path(_redir)
+            if _prot is not None:
+                return (
+                    f"(Iron Gate: redirect target {_redir!r} is a protected "
+                    f"path — {_prot})"
+                )
+            try:
+                _redir_resolved = (self._repo_root / _redir).resolve()
+                _redir_resolved.relative_to(self._repo_root.resolve())
+            except (ValueError, OSError):
+                return (
+                    f"(Iron Gate: redirect target {_redir!r} escapes repo root)"
+                )
+
+        # --- Gate 3: blocked patterns (defence-in-depth) ---------------------
         _blocked_patterns = [
             "rm -rf /", "rm -rf ~", "rm -rf .", "mkfs.", "dd if=",
             ":(){ :", "git push", "git reset --hard",
             "> /dev/sd", "chmod -R 777", "curl|sh", "curl|bash",
             "wget|sh", "pip install", "npm install -g",
             "sudo ", "su -", "passwd",
+            "-delete", "truncate -s", "dd of=", "shred",
         ]
         cmd_lower = command.lower().strip()
         for blocked in _blocked_patterns:
             if blocked in cmd_lower:
                 return f"(Iron Gate: blocked destructive command pattern: {blocked!r})"
 
-        try:
-            proc = subprocess.run(
-                ["bash", "-c", command],
-                cwd=self._repo_root,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            )
-            output = proc.stdout or ""
-            if proc.stderr:
-                output += f"\nstderr: {proc.stderr}"
-            if proc.returncode != 0:
-                output = f"exit={proc.returncode}\n{output}"
-            return output.strip() or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"(command timed out after {timeout:.0f}s)"
+        # --- Gate 4: Trinity Docker sandbox (fail-closed) --------------------
+        from backend.core.ouroboros.governance import sandbox_exec as _sandbox_mod
+        sandbox_result = _run_coroutine_sync(
+            _sandbox_mod.sandbox_run_bash(command, worktree=str(self._repo_root))
+        )
+        if sandbox_result.denied:
+            return f"(bash: sandbox denied — {sandbox_result.reason})"
+        output = sandbox_result.stdout or ""
+        if sandbox_result.stderr:
+            output += f"\nstderr: {sandbox_result.stderr}"
+        if sandbox_result.returncode not in (None, 0):
+            output = f"exit={sandbox_result.returncode}\n{output}"
+        return output.strip() or "(no output)"
 
     # ------------------------------------------------------------------
     # Venom edit / write — hardened handlers

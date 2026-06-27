@@ -32,8 +32,15 @@ _MUTATION_TOOLS: FrozenSet[str] = frozenset({
     "edit_file",
     "write_file",
     "bash",
+    # apply_patch: kept here so read-only scopes continue to block it even
+    # though no handler exists — removing it would regress
+    # test_scoped_tool_backend::test_readonly_scope_rejects_mutation_tools.
+    # (Anti-Venom Task 5 removes it from semantic_firewall._MUTATING_TOOLS only.)
     "apply_patch",
     "delete_file",
+    # run_tests added (Anti-Venom Task 5): sandbox pytest is a mutation-class
+    # operation — read-only / reviewer scopes must not be able to spawn it.
+    "run_tests",
 })
 
 
