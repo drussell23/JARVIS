@@ -1,0 +1,12 @@
+---
+title: Project Slice193 Observability Registry
+modules: [tests/governance/test_observability_registry.py]
+status: historical
+source: project_slice193_observability_registry.md
+---
+
+**Slice 193 — Sovereign Telemetry Registry (MERGED #69432, main `9eff300d0f`, 2026-06-09).**
+
+**Why:** The Slice 192 live verdict (hedge raced at T=0 for op-019eae3a in the `jarvis-dw-cortex-soak` container) was provable ONLY by cross-referencing the aegis proxy HTTP log (RT `/v1/chat/completions` at 21:12:29.587 + `/v1/files`→`/v1/batches` 201s within 1.5s of the `FORCE_BATCH=False` Slice-183 line). Root cause: the hedge's `racing`/`WON by`/`SWALLOWED` lines are `logger.info` — invisible at the soak container's WARNING console threshold — and the Slice 190 economic counters are in-memory only. Operator explicitly REJECTED promoting victory logs to WARNING ("we do not dilute our warning logs with standard operational victories") — structured metrics are the answer (Manifesto §7).
+
+**How to apply:** `observability_registry.py` — thread-safe atomic counters in a fixed-slot mmap file `.jarvis/observability_registry.bin` (magic `JOR1` v1, 256 × 64-byte-name/u64 slots, 18448 B). Increment = microsecond lock + page-cache write (no syscall on the dispatch throat); durability via daemon flusher thread (msync, env `JARVIS_OBSERVABILITY_REGISTRY_FLUSH_S` default 5 s). Corrupt/unwritable file → fail-soft in-memory (`backend_kind="memory"`), corrupt file left in place as evidence; public API NEVER raises. Master `JARVIS_OBSERVABILITY_REGISTRY_ENABLED` default TRUE (economic-telemetry precedent); path env `JARVIS_OBSERVABILITY_REGISTRY_PATH`. Four charter counters pre-registered at 0: `hedge_concurrency_dispatches`, `hedge_rt_victories`, `hedge_batch_victories`, `hedge_ruptures_swallowed`. Wiring: race site in `doubleword_provider.py` counts dispatches; `_s190_hedge_outcome` feeds BOTH economic ledger (171) and registry. Surface: `GET /observability/registry` (403 master-off / 429 / no-store), mounted in `event_channel.py` via the metrics_observability pattern. NOTE: `/observability/metrics` was already taken (P4 convergence metrics) — registry got its own sibling route. 26 tests (`tests/governance/test_observability_registry.py`) incl. 10-concurrent-victory exactness + 8×1000 hammer + reopen durability; 245 regression green. Soak audit: `curl localhost:<port>/observability/registry` or read the .bin — survives restarts via the `.jarvis` bind-mount.

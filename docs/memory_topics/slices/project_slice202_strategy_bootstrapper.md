@@ -1,0 +1,12 @@
+---
+title: Project Slice202 Strategy Bootstrapper
+modules: []
+status: merged
+source: project_slice202_strategy_bootstrapper.md
+---
+
+**Slice 202 — Autonomous Strategic Bootstrapper, HONEST variant (MERGED #69442, main `68348d66b4`, 2026-06-10).**
+
+**SECURITY LINE DRAWN (load-bearing precedent):** The plan asked the organism to mint its own HMAC secret + sign its own strategic roadmap headless. **REFUSED.** A signature the organism generates over its own goals is a FALSE authenticity claim — the RoadmapReader HMAC exists ONLY to attest OPERATOR authorship; self-signing = cage forging operator's signature = the self-authorization anti-pattern (§41.2 operator = zero-order doll; operator's defined Tier-D role IS "roadmap signer"). Same line as S197/S198/S199. **Key enabling fact: RoadmapReader is INTAKE-ONLY** (docstring-pinned: goals→IntentEnvelopes through full pipeline Iron Gate/SemanticGuardian/risk-tier/human-approval). So advisory goals = DIRECTION not AUTHORITY → unsigned advisory mode is honest + safe.
+
+**How to apply:** `strategy_bootstrapper.py` — seeds `.jarvis/roadmap.yaml` from PRD §41.6 north-star goals (4: 10 M10 proposals / 7 unsupervised days / 30 audited commits / 5 graduated flags), `signed:false authority:advisory source:prd_section_41.6`. NEVER overwrites operator file. Gated `JARVIS_STRATEGY_BOOTSTRAP_ENABLED` default-FALSE. Does NOT import/call signer (grep-pinned). `strategy_signer.py` — OPERATOR CLI (`python3 -m ...strategy_signer .jarvis/roadmap.yaml`) to ELEVATE advisory→signed; REUSES roadmap_reader `compute_signature`+`_build_signing_payload` (round-trip verified: reader's verifier accepts). NO boot auto-invoke (grep-pinned GLS+harness). `progress_ledger.py` — git-tracked human-readable `progress.txt` (Ralph legibility), gated default-FALSE. 14 tests; 300 regression green. ROADMAP schema: `{version, operator_id, signed_at, signature(hmac-sha256 hex over canonical {version,operator_id,signed_at,goals}), goals:[{id,title,description,priority:critical|high|medium|low,target_files,success_criteria,depends_on,max_duration_s}]}`. `require_signature()` default-TRUE (operator opt-out for advisory). HONEST CONCLUSION: auto-fabricating good goals from prose is unreliable (§41.9 stale/mostly-built); strategic vision stays operator's by design. See [[project-slice201-bandit-router]].

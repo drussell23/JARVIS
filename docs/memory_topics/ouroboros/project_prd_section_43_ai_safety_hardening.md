@@ -1,0 +1,18 @@
+---
+title: Project Prd Section 43 Ai Safety Hardening
+modules: [docs/architecture/OUROBOROS_VENOM_PRD.md]
+status: historical
+source: project_prd_section_43_ai_safety_hardening.md
+---
+
+PRD §43 "AI-Safety Hardening Architecture" landed in `docs/architecture/OUROBOROS_VENOM_PRD.md` 2026-05-17 via PR **#36747** (branch `docs/prd-section-43-ai-safety-hardening` → main; direct push to main is refused by repo branch protection — local+remote — always use a branch+PR). Doc-only, zero behavior change, header bumped to 3.0.
+
+**What it is:** the operator's binding deep-design answer to "what would it take for O+V to become AI safety so it can develop Trinity, given O+V is proactive + cybersecurity vulns." Synthesizes a four-agent file:line audit into **five structural gaps**: A advisory-not-enforced (`sensor_governor.py:98` — governor is honor-system, "Slice 5 deferred"); B no internal termination guarantee (only external `--cost-cap`/`--max-wall-seconds`); C self-amplification unbounded (30s coalesce, HIGH bypasses; `repair_engine.py:88` bounds one op not the chain); D untrusted-text→autonomous-code with no sanitizer (`semantic_firewall` only on GENERAL dispatch, NOT sensor intake; issue bodies → `event_channel.py:~1440` raw — the CRITICAL finding); E recursion boundary is a path predicate not semantic (`risk_tier_floor.py:366-391`).
+
+**The load-bearing principle (the spine):** every *guarantee* reduces to ONE out-of-process, pre-autonomy-minted chokepoint O+V consumes-but-cannot-mint (egress/budget proxy). All in-process layers (firewall tiering, schema gates, causal hashing, semantic manifest, Blue/Red, Chaos Monkey) are *defense* — raise cost, narrow probability — not guarantee. In-process `BudgetAuthority`/provider-lease = friction; the proxy = the actual ceiling. Build the proxy FIRST; it is the precondition for any "O+V develops Trinity" claim.
+
+**9-arc sequenced roadmap (§43.8), critical path:** #1 out-of-process egress/budget proxy → #2 Gap-D TrustTier quarantine-and-degrade firewall (signal/payload separation + deterministic non-generative digest extractor) → #3 Slice 5 immutable hard-reject `ImmutableBudgetStateMachine` in `UnifiedIntakeRouter.ingest()` + provider-lease (master default-TRUE safety-gate polarity, NOT §33.1 default-false) → #7 deterministic Safety Invariant Manifest (`.jarvis/safety_invariants.yaml`, decidable differential — never LLM intent-inference) → #8 Blue/Red Adversarial Falsification Pipeline (mandatory pre-GATE phase, separate dispatches no shared context) → #9 continuous shadow-only Anti-Venom Chaos Monkey. Parallelizable: #4 causal-lineage stamp + #6 MCP schema/manifest-pin after #3; #5 bash netns+seccomp+broker. ~10–14wk critical path at established cadence.
+
+**Status:** DESIGN-STAGE. No slice authorized, nothing built. It is the forward roadmap, not a closure. Per [[feedback-no-preresult-euphoria]] §43 explicitly refuses methodology-as-verdict — graduation only on a measured adversarial-soak verdict, never on the design existing.
+
+§43.12 carries a 14-entry elite-source bibliography (Greshake/CISPA, OWASP LLM Top-10, NIST AI 100-2 E2025, DeepMind+ETH CaMeL, Saltzer-Schroeder/MIT, Denning/Purdue IFC, AWS Firecracker, MIRI+Oxford Corrigibility, Amodei Concrete Problems, Hendrycks/Berkeley, DeepMind FSF + Anthropic RSP, DeepMind red-teaming, Constitutional AI, ETH AgentDojo) — reuse these citations for future safety-arc PRDs. §40/§41/§42 are reserved for other in-code/in-memory conceptual refs; §43 was chosen to avoid collision.

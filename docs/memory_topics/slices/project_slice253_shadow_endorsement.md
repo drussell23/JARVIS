@@ -1,0 +1,20 @@
+---
+title: Project Slice253 Shadow Endorsement
+modules: []
+status: merged
+source: project_slice253_shadow_endorsement.md
+---
+
+**Slice 253 — Active Shadow Endorsement & HITL Gateway. MERGED PR #69505, main `29904135`.** The bidirectional half of Shadow Mode: passive telemetry ([[project_slice252_shadow_telemetry]]) showed what the muscle WOULD do; this lets the Host ENDORSE one specific trapped action so it executes ONCE — bypassing the shadow block for that `action_id` only — WITHOUT dropping the global `JARVIS_RESILIENCE_SHADOW_MODE` shield.
+
+**Re-hydration is REAL (in-process), not fabricated:** `shadow_guard`/`shadow_guard_async` stash the original live closure keyed by a counter-id (`shadow-NNNNNN`) on trap; endorse awaits it. Honest bounds — in-process only (closures non-serializable → un-endorsed actions don't survive restart, by design), TTL'd (`JARVIS_SHADOW_PENDING_TTL_S` default 300s — stale kill must not fire late), capacity-capped FIFO (`JARVIS_SHADOW_PENDING_MAX` default 64), ONE-SHOT (entry popped on endorse).
+
+**Built (reuses Slice-249 broker — no parallel path):**
+- `cybernetic_reanimation.py`: `PendingShadowActionRegistry`+`_PENDING`; `PendingShadowAction`(mutable, holds execute callable+is_coro+created_monotonic); `EndorsementResult`(frozen, status∈executed|declined|not_found|expired|error); `endorse_shadow_action(action_id)` async/one-shot/TTL-checked/fail-soft (runs raw callable regardless of shadow flag — NEVER reads or mutates it; publishes audit); `endorsement_prompt_for(payload)`+`handle_endorsement_choice(action_id,choice)` (TTY-free CLI logic, 'y'→endorse else decline-leaves-pending); `reset_pending_shadow_actions`/`pending_shadow_action_count`/`pending_shadow_action_ids`; `_current_signal_repr()` helper. guards stash + thread action_id into emit_shadow_trap(...,action_id=).
+- `ide_observability_stream.py`: `EVENT_TYPE_ENDORSE_SHADOW_ACTION="endorse_shadow_action"`+`_VALID_EVENT_TYPES`; `publish_endorse_shadow_action(action_id,organ_name,intended_action,outcome)`; `publish_shadow_action_trapped` now carries `action_id` in payload.
+
+**SECURITY (load-bearing design decision):** the endorsement that EXECUTES a kill is an AUTHORITY action → must NOT ride the read-only/loopback/authority-free `/observability` surface (grep-enforced invariant in ide_observability.py: no orchestrator/policy imports). The return channel is an IN-PROCESS trusted command path (REPL verb / SerpentFlow), NOT an HTTP write on the observability mesh. The Phase-3 decision logic is that path's dispatch target. (Did NOT build a cross-process SSE-CLI-writeback — that would need an authenticated write channel; surfaced rather than fabricated.)
+
+**Tests:** `test_slice253_shadow_endorsement.py` 20 decoupled (in-sandbox): event type+publisher; stash-on-trap; endorse re-hydrates+executes sync+async; one-shot; unknown→not_found; expired→no-execute (age entry via `_PENDING.entries[aid].created_monotonic=0.0`); execute-error swallowed→status=error; registry bounded; shield-never-dropped; prompt+Y/N. +2 kernel-chain proofs in `test_reanimation_kernel_wiring.py` (sandbox-off, 8 total there): real ANOMALY→real SelfHealingOrchestrator→trap→read action_id off telemetry→endorse→REAL kill executes (killed==["proc-victim"])+shadow still TRUE+consumed+audited; and fresh anomaly still trapped after (no global bypass leaked). 57 green incl 249+252+foundation, zero regression.
+
+**Context:** main now carries the autonomous O+V loop's #69504 "Sovereign Fusion" (live pressure sampler + dispatcher wiring) merged on top of my 252 — the loop builds reanimation in parallel; my branches go off current main so I inherit its work. Patterns: OCA worktree `mark_owned`; kernel-import tests `dangerouslyDisableSandbox`.

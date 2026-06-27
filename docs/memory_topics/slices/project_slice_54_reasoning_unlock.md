@@ -1,0 +1,18 @@
+---
+title: Project Slice 54 Reasoning Unlock
+modules: []
+status: historical
+source: project_slice_54_reasoning_unlock.md
+---
+
+Slice 54 MERGED 2026-06-01 (PR #65640, squash 9bd6bf8eca). **The DoubleWord unlock — resolves the root cause of the entire v44→v53 "DW returns empty / done_before_content" arc, which was CLIENT-SIDE all along.** main synced.
+
+**Root cause (verified out-of-band, corrects my own earlier "100% DW server-side" claim):** Qwen3.5-35B/397B are REASONING models — chain-of-thought into `message.reasoning` (+`reasoning_details`), answer into `content` only after reasoning. Two client faults: (1) code sent `chat_template_kwargs={"enable_thinking":False}` to suppress thinking — **DW SILENTLY IGNORES it** (probe: still 62 reasoning tokens, empty content); (2) streaming parser read only `delta.content`, batch parser fell back to `reasoning_content` (WRONG field; actual is `reasoning`). Probe matrix (Qwen3.5-35B "Reply OK"): enable_thinking=False→length/empty/62; **reasoning_effort=none→stop/'OK'/0 (WORKS)**; max_tokens=2000→stop/'OK' (content appears once reasoning fits). `reasoning_effort` is OpenAI-standard + DW-honored.
+
+**Fix (doubleword_provider.py):** `_reasoning_request_params(effort="")` sends `reasoning_effort` (env JARVIS_DW_REASONING_EFFORT default "none" = straight-to-content; raise low/medium/high for CoT quality) — wired into all 3 GENERATE bodies (batch/streaming/sync) replacing the ignored flag. `_extract_completion_text(message)` reads content→correct `reasoning`/`reasoning_details[].text`. Streaming loop observes `delta.reasoning` as liveness. Phase 1: retracted erroneous vendor_doubleword_empty_stream_repro.md → diagnostics/doubleword_reasoning_integration_spec.md (verified layout+matrix). 9 tests + 2 wiring pins, 121 DW-transport regression green.
+
+**VALIDATION SOAK bt-2026-06-01-220823 = HISTORIC: FIRST DW CANDIDATE EVER THROUGH FULL PIPELINE TO APPLY.** `BACKGROUND: DW produced 1 candidates in 51.3s ($0.0042)` → Iron Gate (ascii heal 8 codepoints) → VALIDATE → L2 CONVERGED → GATE allowed → REVIEW APPROVE → **APPLY mode=single** on test_todo_scanner_trigger_tag.py. Applied diff COHERENT (provenance header + `-> None` type hints + em-dash→ASCII). Did NOT commit (`AutoCommitter: No changes detected` + wall_clock_cap@305s — v42 "applied-but-cut-before-commit" pattern; minor AutoCommitter timing quirk, follow-up). Reverted the working-tree apply to keep PR clean. WallClockWatchdog clean (305s zero skew); Slice 50 teardown bounded (exited ~14s). Cost $0.0042 — DW is ~700x cheaper than Claude AND now works.
+
+**This reframes the whole DW saga:** across 595 sessions DW produced ~0 candidates (per [[project_slice_51_disambiguation]]) NOT because DW was broken but because we never handled reasoning-model output. DW + Qwen reasoning models WORK. Slices 49-53 (teardown/batch-lease/breaker) were valid hardening but the actual blocker was this parsing/param gap.
+
+**Follow-ups (logged in PR, NOT in scope):** (1) wire reasoning_effort into HeavyProber/surface-health probe — boot probe still false-flags done_before_content (builds own minimal request); (2) reasoning_effort per-route tuning (none for cheap volume; low/medium for complex SWE-bench-Pro quality — reasoning_effort=none = no CoT = possibly lower first-pass patch quality → more L2 repair, as seen this soak); (3) AutoCommitter "no changes" vs APPLY-flush timing. **SWE-bench-Pro path: now genuinely viable DW-primary once HeavyProber probe fixed + a longer soak proves commit. Re-enable Claude as fallback for reliability.** See [[project_slice_53_dual_lane_breaker]] [[project_slice_51_disambiguation]]
