@@ -132,9 +132,17 @@ class SemanticGuardian:
                 )
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[SemanticGuard] pattern %s raised on %s — skipping",
+                    "[SemanticGuard] pattern %s raised on %s — failing closed",
                     name, file_path, exc_info=True,
                 )
+                results.append(Detection(
+                    pattern=f"{name}_eval_failed",
+                    severity="hard",
+                    message="pattern evaluator raised — failing closed",
+                    file_path=file_path,
+                    lines=(),
+                    snippet="",
+                ))
                 continue
             if hit is not None:
                 results.append(hit)
@@ -895,6 +903,15 @@ _DYNAMIC_ATTR_CALLS: frozenset = frozenset({
     ("builtins", "eval"),
     ("builtins", "exec"),
     ("builtins", "compile"),
+    # Shell-exec pairs — S6 closure: also tracked by shell_exec_introduced
+    # (regex) so non-Python files are covered even when _safe_parse → None.
+    ("os", "system"),
+    ("os", "popen"),
+    ("subprocess", "run"),
+    ("subprocess", "call"),
+    ("subprocess", "Popen"),
+    ("subprocess", "check_output"),
+    ("subprocess", "check_call"),
 })
 
 _DANGEROUS_GETATTR_TARGETS: frozenset = frozenset({
@@ -1318,6 +1335,50 @@ def _pat_chronos_continuity_laundering(
     return None
 
 
+# ---------------------------------------------------------------------------
+# PATTERN — shell_exec_introduced (S6 closure)
+# ---------------------------------------------------------------------------
+# HARD: new content introduces a shell-exec call not present in old content.
+# Regex-based so it fires on .sh / .yaml / .pth and any other non-Python file
+# where _safe_parse() returns None and all AST detectors early-return.
+# Delta-gated: only fires when new_count > old_count, preventing false-positives
+# when the existing content already contained the call.
+
+_SHELL_EXEC_RE: re.Pattern = re.compile(
+    r"(?:os\.(?:system|popen)|subprocess\.(?:run|call|Popen|check_output|check_call))\s*\("
+)
+
+
+def _pat_shell_exec_introduced(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    """HARD: detects new shell-exec calls in any file type (regex, delta-gated).
+
+    Covers non-Python files (.sh, .yaml, .pth …) where _safe_parse returns
+    None so Pattern 11 (dynamic_import_chain) cannot fire.  When applied to
+    Python files this acts as an additional defence-in-depth layer alongside
+    the AST-based _DYNAMIC_ATTR_CALLS entries.
+    """
+    old_count = len(_SHELL_EXEC_RE.findall(old_content))
+    new_count = len(_SHELL_EXEC_RE.findall(new_content))
+    delta = new_count - old_count
+    if delta <= 0:
+        return None
+    return Detection(
+        pattern="shell_exec_introduced",
+        severity="hard",
+        message=(
+            f"Shell-exec call introduced ({delta} new site"
+            f"{'s' if delta != 1 else ''}: os.system/os.popen/"
+            f"subprocess.run/call/Popen/check_output/check_call). "
+            f"Fires on all file types including non-Python."
+        ),
+        file_path=file_path,
+        lines=tuple(_line_numbers_for_pattern(new_content, _SHELL_EXEC_RE)),
+        snippet=f"old_count={old_count} new_count={new_count} delta={delta}",
+    )
+
+
 _ALL_PATTERNS: Tuple[str, ...] = (
     "removed_import_still_referenced",
     "function_body_collapsed",
@@ -1335,6 +1396,8 @@ _ALL_PATTERNS: Tuple[str, ...] = (
     "self_signing_attempt",
     "metric_counter_suppressed",
     "chronos_continuity_laundering",
+    # S6 closure — shell-exec in non-Python files
+    "shell_exec_introduced",
 )
 
 
@@ -1357,6 +1420,8 @@ _PATTERNS: dict = {
     "self_signing_attempt": _pat_self_signing_attempt,
     "metric_counter_suppressed": _pat_metric_counter_suppressed,
     "chronos_continuity_laundering": _pat_chronos_continuity_laundering,
+    # S6 closure — shell-exec in non-Python files
+    "shell_exec_introduced": _pat_shell_exec_introduced,
 }
 
 
