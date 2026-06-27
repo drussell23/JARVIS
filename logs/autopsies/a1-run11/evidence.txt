@@ -1,0 +1,17 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+### chaos test detection: did the full-suite pytest SIGKILL (never reporting the bug)? ###
+pytest SIGKILL/timeout lines: 7
+### did ANY op reach APPLY / state=applied(written=True) / a PR? ###
+2026-06-25T03:32:10 [Ouroboros.Orchestrator] INFO [Slice74Probe] LEDGER_TERMINAL op_id=op-019efcd5-5112-757f-b3a6-22dc1e04fb8c-cau state=blocked written=True
+2026-06-25T03:34:05 [Ouroboros.Orchestrator] INFO [Slice74Probe] LEDGER_TERMINAL op_id=op-019efcd7-7194-7d64-990d-58e2d7d54c47-cau state=failed written=True
+2026-06-25T03:35:42 [Ouroboros.Orchestrator] INFO [Slice74Probe] LEDGER_TERMINAL op_id=op-019efcd5-50fc-7e7a-a481-39a878112b23-cau state=applied written=False
+2026-06-25T03:48:18 [Ouroboros.Orchestrator] INFO [Slice74Probe] LEDGER_TERMINAL op_id=op-019efcdd-c88e-71d1-9f02-22fe90a76fa8-cau state=failed written=True
+### what happened to the 3 GENERATE ops (why no completion)? ###
+2026-06-25T03:48:18 [backend.core.ouroboros.governance.candidate_generator] WARNING [CandidateGenerator] Sentinel dispatch: route=background exhausted all 9 DW models [openai/gpt-oss-120b:failed:live_transport, lightonai/LightOnOCR-2-1B-bbox-soup:failed:live_transport, allenai/olmOCR-2-7B-1025-FP8:failed:live_transport] — applying fallback_tolerance=queue (op=op-019efcdd-c88e, last_failure=allenai/olmOCR-2-7B-1025-FP8:live_transport:RuntimeError)
+2026-06-25T03:48:18 [Ouroboros.PhaseDispatcher] DEBUG [PhaseDispatcher] runner returned next_phase=None (status=fail reason='background_accepted:background_dw_blocked_by_topology:dw_severed_queued:allenai/olmOCR-2-7B-1025-FP8') — terminal
+### failover dormant confirm (no awaken, DW healthy) ###
+failover-fire lines (expect 0): 0

@@ -136,3 +136,43 @@ def test_redline_trips_on_critical_pressure_not_just_free_pct(monkeypatch, tmp_p
     asyncio.run(_drive())
     assert cap_fired, "cap fire not invoked on CRITICAL pressure with high free_pct"
     assert h._stop_reason == "resource_governor_redline"
+
+
+def test_redline_trips_on_disk_critical_with_disk_label(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setenv("JARVIS_RESOURCE_GOVERNOR_DEATH_RATTLE_ENABLED", "1")
+    from backend.core.ouroboros.governance import memory_pressure_gate as mpg
+    # gate reports CRITICAL and a low disk free%; RAM probe is healthy
+    monkeypatch.setattr(mpg.MemoryPressureGate, "pressure",
+                        lambda self: mpg.PressureLevel.CRITICAL)
+    monkeypatch.setattr(mpg.MemoryPressureGate, "probe",
+                        lambda self: mpg.MemoryProbe(free_pct=60.0, total_bytes=1,
+                                                     available_bytes=1, source="test"))
+    monkeypatch.setattr(mpg.MemoryPressureGate, "_disk_dim",
+                        lambda self: (mpg.PressureLevel.CRITICAL, 3.0, None))
+    h = H.BattleTestHarness.__new__(H.BattleTestHarness)
+    h._session_dir = tmp_path
+    h._stop_reason = "unknown"
+    h._started_at = 0.0
+    h._process_memory_event = asyncio.Event()
+    h._open_autopsy_fd()
+    fired = {"cap": False}
+
+    async def fake_cap(rss, cap):
+        fired["cap"] = True
+    h._fire_process_memory_cap = fake_cap
+
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 1:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(H.asyncio, "sleep", fake_sleep)
+    h._probe_process_tree_rss_mb = lambda: 1.0
+    try:
+        asyncio.run(h._monitor_process_memory(1e9, 1e9, 15.0))
+    except asyncio.CancelledError:
+        pass
+    assert fired["cap"] is True
+    assert h._stop_reason == "resource_governor_disk_redline"

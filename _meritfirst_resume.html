@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: Letter; margin: 0.45in 0.6in; }
+  * { box-sizing: border-box; }
+  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1a1a1a; font-size: 10.2pt; line-height: 1.3; margin: 0; }
+  header { text-align: center; margin-bottom: 6px; }
+  h1 { font-size: 21pt; letter-spacing: 0.5px; margin: 0 0 3px 0; font-weight: 700; }
+  .contact { font-size: 9.4pt; color: #333; }
+  .contact a { color: #1a3e6e; text-decoration: none; }
+  .summary { font-style: italic; color: #2b2b2b; font-size: 9.8pt; margin: 7px 2px 4px 2px; text-align: center; line-height: 1.3; }
+  h2 { font-size: 10.4pt; text-transform: uppercase; letter-spacing: 1px; color: #1a3e6e; border-bottom: 1.3px solid #1a3e6e; padding-bottom: 2px; margin: 11px 0 5px 0; }
+  .skills p { margin: 0 0 2.5px 0; }
+  .skills b { color: #1a1a1a; }
+  .job { margin-bottom: 7px; }
+  .job-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .job-title { font-weight: 700; font-size: 10.4pt; }
+  .job-org { font-weight: 400; }
+  .job-date { font-size: 9.4pt; color: #444; white-space: nowrap; padding-left: 10px; }
+  ul { margin: 3px 0 0 0; padding-left: 16px; }
+  li { margin-bottom: 2px; }
+  .edu-line { display: flex; justify-content: space-between; align-items: baseline; }
+  .edu-line .school { font-weight: 700; }
+  .edu-line .date { font-size: 9.4pt; color: #444; }
+  .edu-sub { margin: 2px 0 0 0; }
+  .pub { margin: 3px 0 0 0; padding-left: 16px; }
+  .pub li { margin-bottom: 2px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Derek J. Russell</h1>
+    <div class="contact">
+      djamesr23@gmail.com &nbsp;|&nbsp;
+      <a href="https://linkedin.com/in/derek-j-russell">linkedin.com/in/derek-j-russell</a> &nbsp;|&nbsp;
+      <a href="https://github.com/drussell23">github.com/drussell23</a> &nbsp;|&nbsp;
+      San Francisco Bay Area, CA
+    </div>
+  </header>
+
+  <div class="summary">
+    AI engineer who ships production AI &mdash; agents, automation, and integrations &mdash; that solve real problems
+    end to end, not demos or slide decks. Strong in Python (plus TypeScript and SQL), comfortable in ambiguity, I map
+    workflows from end to end to find where AI creates leverage, and I communicate as easily with operators and
+    executives as with engineers.
+  </div>
+
+  <h2>Skills</h2>
+  <div class="skills">
+    <p><b>LLM &amp; Agentic AI:</b> OpenAI &amp; Anthropic APIs, multi-agent systems, tool-use / function calling, AI automation &amp; integrations, multi-provider LLM routing &amp; failover, RAG, prompt engineering, output validation</p>
+    <p><b>Languages:</b> Python (primary), TypeScript, SQL, Bash &mdash; FastAPI, Node.js, REST APIs</p>
+    <p><b>Infrastructure &amp; Data:</b> production inference pipelines, cost/latency optimization, PostgreSQL, data pipelines, AWS/GCP, Docker/Kubernetes, Terraform</p>
+    <p><b>Strengths:</b> end-to-end systems thinking, building under ambiguity, stakeholder communication (engineers &harr; operators)</p>
+  </div>
+
+  <h2>Experience</h2>
+
+  <div class="job">
+    <div class="job-head">
+      <div class="job-title">AI Systems Engineer <span class="job-org">&mdash; Independent Projects (JARVIS, Open Source), Remote</span></div>
+      <div class="job-date">Feb 2025 &ndash; Present</div>
+    </div>
+    <ul>
+      <li>Solo-designed and shipped a <b>production AI agent system from scratch</b>: autonomous agents that find work, write code, run tests, and open pull requests via multi-step tool-use loops &mdash; real automation, not pilots.</li>
+      <li>Built a <b>multi-provider LLM integration</b> with automatic failover across OpenAI/Anthropic and self-hosted models, <b>cutting inference cost ~30&times;</b> &mdash; a direct, measurable cost win.</li>
+      <li>Mapped the full software-development <b>workflow end to end</b> and automated it with AI, adding reliability and safety guardrails (validation, approval gates, human-in-the-loop) so it runs autonomously in production.</li>
+      <li>Collaborated directly with the <b>founding team of an LLM-inference company</b> on production reliability &mdash; translating technical findings into clear, business-facing recommendations. ~4M-line Python codebase, ~35K automated tests.</li>
+    </ul>
+  </div>
+
+  <div class="job">
+    <div class="job-head">
+      <div class="job-title">Software Engineer <span class="job-org">&mdash; Moody's Analytics, San Francisco, CA</span></div>
+      <div class="job-date">Jul 2023 &ndash; Feb 2025</div>
+    </div>
+    <ul>
+      <li>Built a compliant <b>RAG backend</b> in Python (data extraction &rarr; vectorized retrieval), integrating complex internal data sources for a regulated financial-services environment.</li>
+      <li>Shipped Python <b>automation tools and internal API integrations</b> (Slack bots, internal APIs), delivering working prototypes under tight 48-hour deadlines.</li>
+    </ul>
+  </div>
+
+  <div class="job">
+    <div class="job-head">
+      <div class="job-title">Software Engineer Intern <span class="job-org">&mdash; NASA Ames Research Center, Mountain View, CA</span></div>
+      <div class="job-date">Jun &ndash; Dec 2016</div>
+    </div>
+    <ul>
+      <li>Built and tested an autonomous rover in Python; managed Linux systems and RAID storage in a research environment.</li>
+    </ul>
+  </div>
+
+  <h2>Education</h2>
+  <div class="edu-line">
+    <div class="school">California Polytechnic State University, San Luis Obispo &mdash; B.S. in Computer Engineering</div>
+    <div class="date">Jun 2023</div>
+  </div>
+  <p class="edu-sub">Relevant coursework: AI, Machine Learning, Data Structures &amp; Algorithms, Operating Systems, Databases, Computer Architecture, Data Mining</p>
+
+  <h2>Recognition</h2>
+  <ul class="pub">
+    <li><b>&ldquo;10 Years in the Making&rdquo;</b> (Mustang News, 2023) &mdash; featured profile on my path to a Cal Poly engineering degree, with an endorsement from <b>Sam Altman</b>.</li>
+    <li>First-author <b>181-page paper</b> on the architecture and safety design of an autonomous AI system (2026).</li>
+  </ul>
+
+</body>
+</html>

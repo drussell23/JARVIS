@@ -1,0 +1,1433 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+### VERDICT ###
+{
+  "a1trace_timeline": {
+    "all_hops_in_order": false,
+    "ordered": [
+      {
+        "goal": "op-019efc63-5bc9-7686-b893-4db83b90e204-cau",
+        "hop": "ingest",
+        "ts": 1782350830.56714
+      },
+      {
+        "goal": "op-019efc63-5bcd-7110-8a3e-fdeab4066059-cau",
+        "hop": "ingest",
+        "ts": 1782350830.5672686
+      },
+      {
+        "goal": "op-019efc63-5bd0-7923-b9fc-b2eb1d3c001a-cau",
+        "hop": "ingest",
+        "ts": 1782350830.5673146
+      },
+      {
+        "goal": "op-019efc63-5bd3-7efa-ab40-37a684120afd-cau",
+        "hop": "ingest",
+        "ts": 1782350830.5673623
+      },
+      {
+        "goal": "op-019efc63-5bd6-70e6-9840-38fa77179891-cau",
+        "hop": "ingest",
+        "ts": 1782350830.5674107
+      },
+      {
+        "goal": "op-019efc63-5bc9-7686-b893-4db83b90e204-cau",
+        "hop": "dequeue",
+        "ts": 1782350830.8184268
+      },
+      {
+        "goal": "op-019efc63-5bc9-7686-b893-4db83b90e204-cau",
+        "hop": "submit",
+        "ts": 1782350830.8184695
+      },
+      {
+        "goal": "op-019efc63-5bc9-7686-b893-4db83b90e204-cau",
+        "hop": "accept",
+        "ts": 1782350830.8188026
+      },
+      {
+        "goal": "op-019efc63-836e-7940-a2b0-63993154adbb-cau",
+        "hop": "ingest",
+        "ts": 1782350840.8915339
+      },
+      {
+        "goal": "op-019efc63-5bd6-70e6-9840-38fa77179891-cau",
+        "hop": "dequeue",
+        "ts": 1782350860.9466522
+      },
+      {
+        "goal": "op-019efc63-5bd6-70e6-9840-38fa77179891-cau",
+        "hop": "submit",
+        "ts": 1782350860.946844
+      },
+      {
+        "goal": "op-019efc63-5bd6-70e6-9840-38fa77179891-cau",
+        "hop": "accept",
+        "ts": 1782350860.9472127
+      },
+      {
+        "goal": "op-019efc65-93ea-7921-ab43-62ad7b581efc-cau",
+        "hop": "ingest",
+        "ts": 1782350975.980202
+      },
+      {
+        "goal": "op-019efc65-93ed-743b-9906-9074ee4ecfe9-cau",
+        "hop": "ingest",
+        "ts": 1782350975.980344
+      },
+      {
+        "goal": "op-019efc65-93f0-73bd-881a-fb9c2fcdbdb9-cau",
+        "hop": "ingest",
+        "ts": 1782350975.9804137
+      },
+      {
+        "goal": "op-019efc65-93f3-7647-9e77-55831338ead5-cau",
+        "hop": "ingest",
+        "ts": 1782350975.9804718
+      },
+      {
+        "goal": "op-019efc65-93f6-70e6-82c8-b86ec8f78623-cau",
+        "hop": "ingest",
+        "ts": 1782350976.231154
+      },
+      {
+        "goal": "op-019efc65-93f9-72bf-8f31-7816775ec8aa-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2312775
+      },
+      {
+        "goal": "op-019efc65-93fc-7f21-b18d-f2db34c284f7-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2313466
+      },
+      {
+        "goal": "op-019efc65-9400-7c1e-898b-f05431a91b1a-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2314126
+      },
+      {
+        "goal": "op-019efc65-9403-7e26-bb9e-d070b085a930-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2315335
+      },
+      {
+        "goal": "op-019efc65-9406-71b7-937a-a792831e6212-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2316034
+      },
+      {
+        "goal": "op-019efc65-940a-7d2b-ba61-9d4eafdc93e2-cau",
+        "hop": "ingest",
+        "ts": 1782350976.231673
+      },
+      {
+        "goal": "op-019efc65-940d-7c5c-a97c-88db3f977999-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2317498
+      },
+      {
+        "goal": "op-019efc65-9410-77bb-83a4-9b53bbe9b755-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2318232
+      },
+      {
+        "goal": "op-019efc65-9413-794d-b3fe-867a0a2ca2b9-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2318985
+      },
+      {
+        "goal": "op-019efc65-9416-7a82-937a-b4551c65405b-cau",
+        "hop": "ingest",
+        "ts": 1782350976.231995
+      },
+      {
+        "goal": "op-019efc65-9419-758d-80c4-caedaccfb9e7-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2320755
+      },
+      {
+        "goal": "op-019efc65-941c-7363-a2df-40c4aeea2d57-cau",
+        "hop": "ingest",
+        "ts": 1782350976.232159
+      },
+      {
+        "goal": "op-019efc65-941f-7bbc-8124-f3239bea6776-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2322433
+      },
+      {
+        "goal": "op-019efc65-9422-7727-8289-389713e24aa4-cau",
+        "hop": "ingest",
+        "ts": 1782350976.232329
+      },
+      {
+        "goal": "op-019efc65-9425-7634-932f-40bd59c334a3-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2324173
+      },
+      {
+        "goal": "op-019efc65-9428-7375-a281-cb08835e38bd-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2325616
+      },
+      {
+        "goal": "op-019efc65-942b-721e-89d5-6519803030b1-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2326558
+      },
+      {
+        "goal": "op-019efc65-942e-78d5-b8c7-dcfc47736db6-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2327507
+      },
+      {
+        "goal": "op-019efc65-9431-760a-a044-94245f1d5177-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2328467
+      },
+      {
+        "goal": "op-019efc65-9434-7628-b228-c06e556895a0-cau",
+        "hop": "ingest",
+        "ts": 1782350976.232942
+      },
+      {
+        "goal": "op-019efc65-9437-7542-a594-381848873af6-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2330308
+      },
+      {
+        "goal": "op-019efc65-943a-7426-93d9-599fad00b9b6-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2331133
+      },
+      {
+        "goal": "op-019efc65-943d-74b6-8001-bc234a743f3b-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2332003
+      },
+      {
+        "goal": "op-019efc65-9440-71d7-bee4-67a64cfc62b0-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2332854
+      },
+      {
+        "goal": "op-019efc65-9443-7fd6-9f3c-4b961b7afc8b-cau",
+        "hop": "ingest",
+        "ts": 1782350976.233395
+      },
+      {
+        "goal": "op-019efc65-9447-78bf-a113-9baad87d4251-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2335403
+      },
+      {
+        "goal": "op-019efc65-944a-77d6-9aa9-0c345d304f4f-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2336335
+      },
+      {
+        "goal": "op-019efc65-944d-74df-a8fb-c4fa8c4f8b5f-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2337272
+      },
+      {
+        "goal": "op-019efc65-9450-7656-8ca5-01d8b4a30307-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2338212
+      },
+      {
+        "goal": "op-019efc65-9453-71d0-9ebf-390b47a06190-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2339156
+      },
+      {
+        "goal": "op-019efc65-9456-74f4-aa1a-be9fe6ac09a5-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2341893
+      },
+      {
+        "goal": "op-019efc65-9459-7d79-bb9e-31d44bfc562e-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2343278
+      },
+      {
+        "goal": "op-019efc65-945c-72d7-9420-029481c64942-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2344632
+      },
+      {
+        "goal": "op-019efc65-945f-7588-9cd4-1c72a700f5a8-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2346053
+      },
+      {
+        "goal": "op-019efc65-9462-73cb-bfd4-9e4516c2aa9c-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2347426
+      },
+      {
+        "goal": "op-019efc65-9465-7f70-bbbf-0d0984c71e4c-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2348864
+      },
+      {
+        "goal": "op-019efc65-9468-7b27-a6a4-fe5db4ef4b3f-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2350633
+      },
+      {
+        "goal": "op-019efc65-946b-78a3-a39d-89bf38c9c00f-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2351906
+      },
+      {
+        "goal": "op-019efc65-946e-715e-945b-ca3bc3cccfb2-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2353182
+      },
+      {
+        "goal": "op-019efc65-9471-78e6-93fd-64a6c1b42ebe-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2354484
+      },
+      {
+        "goal": "op-019efc65-9474-7295-b72b-cad9934cb4e9-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2355962
+      },
+      {
+        "goal": "op-019efc65-9477-7f09-905d-e0fbd40b4668-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2357397
+      },
+      {
+        "goal": "op-019efc65-947a-7262-bb00-a425b5a5d0c0-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2363417
+      },
+      {
+        "goal": "op-019efc65-947d-7f51-8200-0f5fef02e5b9-cau",
+        "hop": "ingest",
+        "ts": 1782350976.236476
+      },
+      {
+        "goal": "op-019efc65-9480-7e0c-a509-7343724d813c-cau",
+        "hop": "ingest",
+        "ts": 1782350976.236607
+      },
+      {
+        "goal": "op-019efc65-9483-7da5-b97c-734ae646eb0e-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2367408
+      },
+      {
+        "goal": "op-019efc65-9486-7b67-88d4-da075c5166e5-cau",
+        "hop": "ingest",
+        "ts": 1782350976.23687
+      },
+      {
+        "goal": "op-019efc65-9489-784a-8854-07490eb982c5-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2370038
+      },
+      {
+        "goal": "op-019efc65-948c-7346-88b4-05dcb2ff8f61-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2371416
+      },
+      {
+        "goal": "op-019efc65-948f-7d12-b9d6-445be3b65b58-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2372715
+      },
+      {
+        "goal": "op-019efc65-9492-78cd-8a12-013014d18d91-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2374027
+      },
+      {
+        "goal": "op-019efc65-9495-78c1-a67f-0243396827c0-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2375574
+      },
+      {
+        "goal": "op-019efc65-9498-7640-b648-ccd9797ca60f-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2376964
+      },
+      {
+        "goal": "op-019efc65-949b-7c7c-b4f2-549b4963ca8b-cau",
+        "hop": "ingest",
+        "ts": 1782350976.237833
+      },
+      {
+        "goal": "op-019efc65-949e-73e6-b387-54829ae5d917-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2380106
+      },
+      {
+        "goal": "op-019efc65-94a1-7375-ad19-41c8771b7ab8-cau",
+        "hop": "ingest",
+        "ts": 1782350976.238183
+      },
+      {
+        "goal": "op-019efc65-94a4-7a10-9bbf-b00b35695b10-cau",
+        "hop": "ingest",
+        "ts": 1782350976.238327
+      },
+      {
+        "goal": "op-019efc65-94a7-7740-b425-2e7565dc7067-cau",
+        "hop": "ingest",
+        "ts": 1782350976.238475
+      },
+      {
+        "goal": "op-019efc65-94aa-75e5-b1ec-4da06f2ba531-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2386196
+      },
+      {
+        "goal": "op-019efc65-94ad-7f01-ae21-daa5974360cf-cau",
+        "hop": "ingest",
+        "ts": 1782350976.2387655
+      },
+      {
+        "goal": "op-019efc65-94b0-7cac-bd8c-dcdb6fab16df-cau",
+        "hop": "ingest",
+        "ts": 1782350976.238923
+      },
+      {
+        "goal": "op-019efc65-93fc-7f21-b18d-f2db34c284f7-cau",
+        "hop": "dequeue",
+        "ts": 1782350976.2392795
+      },
+      {
+        "goal": "op-019efc65-93fc-7f21-b18d-f2db34c284f7-cau",
+        "hop": "submit",
+        "ts": 1782350976.2394416
+      },
+      {
+        "goal": "op-019efc65-93fc-7f21-b18d-f2db34c284f7-cau",
+        "hop": "accept",
+        "ts": 1782350976.240513
+      },
+      {
+        "goal": "op-019efc65-9406-71b7-937a-a792831e6212-cau",
+        "hop": "dequeue",
+        "ts": 1782350976.4923544
+      },
+      {
+        "goal": "op-019efc65-9406-71b7-937a-a792831e6212-cau",
+        "hop": "submit",
+        "ts": 1782350976.4925666
+      },
+      {
+        "goal": "op-019efc65-9406-71b7-937a-a792831e6212-cau",
+        "hop": "accept",
+        "ts": 1782350976.493702
+      },
+      {
+        "goal": "op-019efc65-9443-7fd6-9f3c-4b961b7afc8b-cau",
+        "hop": "dequeue",
+        "ts": 1782350976.7456405
+      },
+      {
+        "goal": "op-019efc65-9443-7fd6-9f3c-4b961b7afc8b-cau",
+        "hop": "submit",
+        "ts": 1782350976.7458322
+      },
+      {
+        "goal": "op-019efc65-9443-7fd6-9f3c-4b961b7afc8b-cau",
+        "hop": "accept",
+        "ts": 1782350976.7481215
+      },
+      {
+        "goal": "op-019efc67-b2fd-740e-8d06-ff19d276bbba-cau",
+        "hop": "ingest",
+        "ts": 1782351115.1990347
+      },
+      {
+        "goal": "op-019efc67-b301-7f53-9c1e-3040fe26a84b-cau",
+        "hop": "ingest",
+        "ts": 1782351115.1993945
+      },
+      {
+        "goal": "op-019efc67-b305-7f17-85eb-ebb1d7fe9358-cau",
+        "hop": "ingest",
+        "ts": 1782351115.1996355
+      },
+      {
+        "goal": "op-019efc67-b309-777a-8256-31f97b3adec4-cau",
+        "hop": "ingest",
+        "ts": 1782351115.200151
+      },
+      {
+        "goal": "op-019efc67-b30d-7f29-a3f2-91f3290699bd-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2005641
+      },
+      {
+        "goal": "op-019efc67-b311-7815-954a-2753d0da4449-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2009447
+      },
+      {
+        "goal": "op-019efc67-b315-76fd-9be2-b33ecc543c52-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2013278
+      },
+      {
+        "goal": "op-019efc67-b319-7aa1-a2bf-ed29dd7829f7-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2016938
+      },
+      {
+        "goal": "op-019efc67-b31d-75da-ae39-545bf82903d3-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2020874
+      },
+      {
+        "goal": "op-019efc67-b321-7157-9577-5b11345746c4-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2024667
+      },
+      {
+        "goal": "op-019efc67-b325-7183-be51-216d1014e07c-cau",
+        "hop": "ingest",
+        "ts": 1782351115.202848
+      },
+      {
+        "goal": "op-019efc67-b328-7637-a494-5b9602b3ce85-cau",
+        "hop": "ingest",
+        "ts": 1782351115.203027
+      },
+      {
+        "goal": "op-019efc67-b32b-7e9b-a9b1-1d11a03e5be2-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2032084
+      },
+      {
+        "goal": "op-019efc67-b32e-78b8-9a62-bd7e4c268a76-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2034016
+      },
+      {
+        "goal": "op-019efc67-b331-7ebd-ab43-6b72bfb5f3c6-cau",
+        "hop": "ingest",
+        "ts": 1782351115.203593
+      },
+      {
+        "goal": "op-019efc67-b334-771f-8f71-1f3c1e22b673-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2037764
+      },
+      {
+        "goal": "op-019efc67-b337-71ca-a171-6a79d74ebddc-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2039614
+      },
+      {
+        "goal": "op-019efc67-b33a-73f6-9714-74d32f0e64f6-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2041671
+      },
+      {
+        "goal": "op-019efc67-b33d-70d7-9615-43d16df458ab-cau",
+        "hop": "ingest",
+        "ts": 1782351115.204364
+      },
+      {
+        "goal": "op-019efc67-b340-7905-8369-9d526028d47c-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2046423
+      },
+      {
+        "goal": "op-019efc67-b343-7965-8bf7-667be27f8915-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2049918
+      },
+      {
+        "goal": "op-019efc67-b346-7a16-acf1-e6f8da70db36-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2053287
+      },
+      {
+        "goal": "op-019efc67-b349-7b2e-a031-4fb2e2af77f9-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2055368
+      },
+      {
+        "goal": "op-019efc67-b34c-7b13-959c-00b4f50fed3a-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2057366
+      },
+      {
+        "goal": "op-019efc67-b34f-7031-bc3b-44fb3aea8fc2-cau",
+        "hop": "ingest",
+        "ts": 1782351115.205942
+      },
+      {
+        "goal": "op-019efc67-b352-7880-ad9c-cd1b8e51e1ae-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2061918
+      },
+      {
+        "goal": "op-019efc67-b355-76fd-8d8a-f3164b95522a-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2064903
+      },
+      {
+        "goal": "op-019efc67-b358-763b-92d6-483ad79e8f75-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2067044
+      },
+      {
+        "goal": "op-019efc67-b35b-74d0-8f41-037d17cccf54-cau",
+        "hop": "ingest",
+        "ts": 1782351115.206918
+      },
+      {
+        "goal": "op-019efc67-b35e-7918-852b-3c8a845b625f-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2071278
+      },
+      {
+        "goal": "op-019efc67-b361-789d-b8d3-5451708811db-cau",
+        "hop": "ingest",
+        "ts": 1782351115.207357
+      },
+      {
+        "goal": "op-019efc67-b364-72f9-bd63-9d8256ef9eb0-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2076738
+      },
+      {
+        "goal": "op-019efc67-b367-78ea-a030-dad8f35946b4-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2079103
+      },
+      {
+        "goal": "op-019efc67-b36a-78f6-b2a9-41371eef5f9b-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2081304
+      },
+      {
+        "goal": "op-019efc67-b36d-7587-953a-7ee1d0f5878f-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2083554
+      },
+      {
+        "goal": "op-019efc67-b370-7e82-a1f1-15efcffae19d-cau",
+        "hop": "ingest",
+        "ts": 1782351115.208575
+      },
+      {
+        "goal": "op-019efc67-b373-7ecd-a73a-bb4b80e1810a-cau",
+        "hop": "ingest",
+        "ts": 1782351115.208867
+      },
+      {
+        "goal": "op-019efc67-b376-7095-a5a5-78ed7395a892-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2090971
+      },
+      {
+        "goal": "op-019efc67-b379-748c-9f6b-f5af6baa41e0-cau",
+        "hop": "ingest",
+        "ts": 1782351115.20933
+      },
+      {
+        "goal": "op-019efc67-b37c-7e1b-b3fa-9e66b00ef4fd-cau",
+        "hop": "ingest",
+        "ts": 1782351115.209567
+      },
+      {
+        "goal": "op-019efc67-b37f-7ca3-89c6-5baba8e956a6-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2097995
+      },
+      {
+        "goal": "op-019efc67-b382-7e5a-994a-aad6d64ff36c-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2101645
+      },
+      {
+        "goal": "op-019efc67-b385-7269-9c0d-df02d1063370-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2104297
+      },
+      {
+        "goal": "op-019efc67-b388-765d-b04f-331e6d12122e-cau",
+        "hop": "ingest",
+        "ts": 1782351115.210667
+      },
+      {
+        "goal": "op-019efc67-b38b-7755-9348-d2d379b0e971-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2109072
+      },
+      {
+        "goal": "op-019efc67-b38e-7427-80fc-6c34841a6532-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2112393
+      },
+      {
+        "goal": "op-019efc67-b391-7e52-9681-10712d84658f-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2115061
+      },
+      {
+        "goal": "op-019efc67-b394-7651-b36b-24ded58b68cc-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2117496
+      },
+      {
+        "goal": "op-019efc67-b397-7476-b5a7-a522d61dd2a4-cau",
+        "hop": "ingest",
+        "ts": 1782351115.211995
+      },
+      {
+        "goal": "op-019efc67-b39a-7f1e-81d0-491d1a0bbc31-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2123063
+      },
+      {
+        "goal": "op-019efc67-b39d-7987-8745-22b89eac3987-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2125685
+      },
+      {
+        "goal": "op-019efc67-b3a0-77d1-9d57-410bdb4f2819-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2128208
+      },
+      {
+        "goal": "op-019efc67-b3a3-73c1-b407-433b5cd639d9-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2130787
+      },
+      {
+        "goal": "op-019efc67-b3a6-723e-96c2-855e753f0440-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2133355
+      },
+      {
+        "goal": "op-019efc67-b3a9-7c80-8a88-36c3f1cf2a33-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2136867
+      },
+      {
+        "goal": "op-019efc67-b3ac-7690-bd3a-81875dd6ad0c-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2139523
+      },
+      {
+        "goal": "op-019efc67-b3af-77e5-aa23-d66b5c81a457-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2142534
+      },
+      {
+        "goal": "op-019efc67-b3b2-7009-83b3-b873bb1181b1-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2145276
+      },
+      {
+        "goal": "op-019efc67-b3b5-7c8a-8887-aedfe5ea64ee-cau",
+        "hop": "ingest",
+        "ts": 1782351115.214891
+      },
+      {
+        "goal": "op-019efc67-b3b8-7fb5-9882-b697db88a67f-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2151582
+      },
+      {
+        "goal": "op-019efc67-b3bb-7174-b1b5-45376f896703-cau",
+        "hop": "ingest",
+        "ts": 1782351115.2154324
+      },
+      {
+        "goal": "op-019efc67-b301-7f53-9c1e-3040fe26a84b-cau",
+        "hop": "dequeue",
+        "ts": 1782351145.1051424
+      },
+      {
+        "goal": "op-019efc67-b301-7f53-9c1e-3040fe26a84b-cau",
+        "hop": "submit",
+        "ts": 1782351145.105451
+      },
+      {
+        "goal": "op-019efc67-b311-7815-954a-2753d0da4449-cau",
+        "hop": "dequeue",
+        "ts": 1782351145.1063347
+      },
+      {
+        "goal": "op-019efc67-b311-7815-954a-2753d0da4449-cau",
+        "hop": "submit",
+        "ts": 1782351145.1066012
+      },
+      {
+        "goal": "op-019efc67-b301-7f53-9c1e-3040fe26a84b-cau",
+        "hop": "accept",
+        "ts": 1782351145.1083875
+      },
+      {
+        "goal": "op-019efc67-b309-777a-8256-31f97b3adec4-cau",
+        "hop": "dequeue",
+        "ts": 1782351145.3615692
+      },
+      {
+        "goal": "op-019efc67-b309-777a-8256-31f97b3adec4-cau",
+        "hop": "submit",
+        "ts": 1782351145.3620005
+      },
+      {
+        "goal": "op-019efc67-b311-7815-954a-2753d0da4449-cau",
+        "hop": "accept",
+        "ts": 1782351145.3641331
+      },
+      {
+        "goal": "op-019efc67-b30d-7f29-a3f2-91f3290699bd-cau",
+        "hop": "dequeue",
+        "ts": 1782351145.616958
+      },
+      {
+        "goal": "op-019efc67-b30d-7f29-a3f2-91f3290699bd-cau",
+        "hop": "submit",
+        "ts": 1782351145.617353
+      },
+      {
+        "goal": "op-019efc67-b309-777a-8256-31f97b3adec4-cau",
+        "hop": "accept",
+        "ts": 1782351145.6200824
+      },
+      {
+        "goal": "op-019efc67-b315-76fd-9be2-b33ecc543c52-cau",
+        "hop": "dequeue",
+        "ts": 1782351145.8736367
+      },
+      {
+        "goal": "op-019efc67-b315-76fd-9be2-b33ecc543c52-cau",
+        "hop": "submit",
+        "ts": 1782351145.8739254
+      },
+      {
+        "goal": "op-019efc67-b30d-7f29-a3f2-91f3290699bd-cau",
+        "hop": "accept",
+        "ts": 1782351145.8765917
+      },
+      {
+        "goal": "op-019efc67-b319-7aa1-a2bf-ed29dd7829f7-cau",
+        "hop": "dequeue",
+        "ts": 1782351146.1307492
+      },
+      {
+        "goal": "op-019efc67-b319-7aa1-a2bf-ed29dd7829f7-cau",
+        "hop": "submit",
+        "ts": 1782351146.1312377
+      },
+      {
+        "goal": "op-019efc67-b315-76fd-9be2-b33ecc543c52-cau",
+        "hop": "accept",
+        "ts": 1782351146.135368
+      },
+      {
+        "goal": "op-019efc67-b31d-75da-ae39-545bf82903d3-cau",
+        "hop": "dequeue",
+        "ts": 1782351146.3892388
+      },
+      {
+        "goal": "op-019efc67-b31d-75da-ae39-545bf82903d3-cau",
+        "hop": "submit",
+        "ts": 1782351146.3896673
+      },
+      {
+        "goal": "op-019efc67-b319-7aa1-a2bf-ed29dd7829f7-cau",
+        "hop": "accept",
+        "ts": 1782351146.392476
+      },
+      {
+        "goal": "op-019efc67-b321-7157-9577-5b11345746c4-cau",
+        "hop": "dequeue",
+        "ts": 1782351146.6461377
+      },
+      {
+        "goal": "op-019efc67-b321-7157-9577-5b11345746c4-cau",
+        "hop": "submit",
+        "ts": 1782351146.6464658
+      },
+      {
+        "goal": "op-019efc67-b31d-75da-ae39-545bf82903d3-cau",
+        "hop": "accept",
+        "ts": 1782351146.648501
+      },
+      {
+        "goal": "op-019efc67-b2fd-740e-8d06-ff19d276bbba-cau",
+        "hop": "dequeue",
+        "ts": 1782351146.9014273
+      },
+      {
+        "goal": "op-019efc67-b2fd-740e-8d06-ff19d276bbba-cau",
+        "hop": "submit",
+        "ts": 1782351146.901756
+      },
+      {
+        "goal": "op-019efc67-b321-7157-9577-5b11345746c4-cau",
+        "hop": "accept",
+        "ts": 1782351146.9049578
+      },
+      {
+        "goal": "op-019efc67-b305-7f17-85eb-ebb1d7fe9358-cau",
+        "hop": "dequeue",
+        "ts": 1782351147.1586535
+      },
+      {
+        "goal": "op-019efc67-b305-7f17-85eb-ebb1d7fe9358-cau",
+        "hop": "submit",
+        "ts": 1782351147.1589437
+      },
+      {
+        "goal": "op-019efc67-b2fd-740e-8d06-ff19d276bbba-cau",
+        "hop": "accept",
+        "ts": 1782351147.161577
+      },
+      {
+        "goal": "op-019efc67-b305-7f17-85eb-ebb1d7fe9358-cau",
+        "hop": "accept",
+        "ts": 1782351147.4182146
+      },
+      {
+        "goal": "op-019efc68-ddac-7088-92b7-7edde3322bc7-cau",
+        "hop": "ingest",
+        "ts": 1782351191.482415
+      },
+      {
+        "goal": "op-019efc6b-f03f-7a6b-84ca-8756c57d8d9b-cau",
+        "hop": "ingest",
+        "ts": 1782351392.9623132
+      },
+      {
+        "goal": "op-019efc6b-f045-7a81-8672-b8d941f1a0e7-cau",
+        "hop": "ingest",
+        "ts": 1782351392.9631848
+      },
+      {
+        "goal": "op-019efc6b-f03f-7a6b-84ca-8756c57d8d9b-cau",
+        "hop": "dequeue",
+        "ts": 1782351423.0346708
+      },
+      {
+        "goal": "op-019efc6b-f03f-7a6b-84ca-8756c57d8d9b-cau",
+        "hop": "submit",
+        "ts": 1782351423.0356696
+      },
+      {
+        "goal": "op-019efc6b-f045-7a81-8672-b8d941f1a0e7-cau",
+        "hop": "dequeue",
+        "ts": 1782351423.0367937
+      },
+      {
+        "goal": "op-019efc6b-f045-7a81-8672-b8d941f1a0e7-cau",
+        "hop": "submit",
+        "ts": 1782351423.0370836
+      },
+      {
+        "goal": "op-019efc6b-f03f-7a6b-84ca-8756c57d8d9b-cau",
+        "hop": "accept",
+        "ts": 1782351423.038969
+      },
+      {
+        "goal": "op-019efc6b-f045-7a81-8672-b8d941f1a0e7-cau",
+        "hop": "accept",
+        "ts": 1782351424.5462844
+      },
+      {
+        "goal": "op-019efc6e-9982-736e-953b-a40d489fae70-cau",
+        "hop": "ingest",
+        "ts": 1782351567.4833314
+      },
+      {
+        "goal": "op-019efc73-e26f-703a-a99e-c8a531a8830f-cau",
+        "hop": "ingest",
+        "ts": 1782351913.7942712
+      },
+      {
+        "goal": "op-019efc79-30c1-7553-87a9-cb3601cde791-cau",
+        "hop": "ingest",
+        "ts": 1782352261.3410497
+      },
+      {
+        "goal": "op-019efc7e-756f-7003-949d-22d3f5193a74-cau",
+        "hop": "ingest",
+        "ts": 1782352606.715048
+      },
+      {
+        "goal": "op-019efc83-bd49-7579-bc34-6555e7235cd1-cau",
+        "hop": "ingest",
+        "ts": 1782352952.8173912
+      }
+    ],
+    "winning_goal": null
+  },
+  "criteria": {
+    "a1trace_5_hops_in_order": false,
+    "autonomous_pr_observed": true,
+    "fsm_classify_to_applied": false,
+    "intervention_lock_clean": true,
+    "twelve_flag_audit_passed": false
+  },
+  "failure_locus": "a1trace:missing_or_out_of_order:emit",
+  "flags": [
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:31:16 [Ouroboros.Orchestrator] INFO [SemanticGuard] op=op-019efc63-5bc9-7686-b893-4db83b90e204-cau finding"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "semantic_guardian",
+      "flag": "JARVIS_SEMANTIC_GUARDIAN_LOAD_ADAPTED_PATTERNS",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:15 [Ouroboros.IntakeLayer] INFO [IntakeLayer] IntentDiscoverySensor added (Manifesto-driven exploration",
+        "EVAL:2026-06-25T01:26:15 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:29:36 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING [Orchestrator] Iron Gate \u2014 exploration_insufficient: 0/1 (attempt=1",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING Generation attempt 1/2 failed for op-019efc65-9443-7fd6-9f3c-4b961b",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-30335971ddbc (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.BackgroundAgentPool] INFO Worker 3: bgop-30335971ddbc ceiling=1800s reason=adaptive(compl",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-bfc22f180a0c (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.BackgroundAgentPool] INFO Worker 0: bgop-bfc22f180a0c ceiling=416s reason=adaptive(base;s",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc6b-f045-7a8",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Orchestrator] \ud83d\udee4\ufe0f  Route: background (background_source:exploration:lo",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] DECISION op=op-019efc6b-f045-7",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro"
+      ],
+      "expected": true,
+      "false_positive_rejected": true,
+      "family": "iron_gate",
+      "flag": "JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_FLOORS",
+      "observed_evaluated": true,
+      "verdict": "rejected"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "scoped_tool_backend",
+      "flag": "JARVIS_SCOPED_TOOL_BACKEND_LOAD_ADAPTED_BUDGETS",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:27:10 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc63-5bc9-768",
+        "REJECT:2026-06-25T01:29:36 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:29:36 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "EVAL:2026-06-25T01:29:36 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc65-9443-7fd",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.adaptation.adapted_risk_tier_loader] DEBUG [AdaptedRiskTierLoader",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.adaptation.adapted_risk_tier_loader] DEBUG [AdaptedRiskTierLoader",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc63-5bc9-768",
+        "REJECT:2026-06-25T01:32:25 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:25 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:26 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:26 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:37:04 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc6b-f045-7a8"
+      ],
+      "expected": true,
+      "false_positive_rejected": true,
+      "family": "risk_tier",
+      "flag": "JARVIS_RISK_TIER_FLOOR_LOAD_ADAPTED_TIERS",
+      "observed_evaluated": true,
+      "verdict": "rejected"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:15 [Ouroboros.IntakeLayer] INFO [IntakeLayer] IntentDiscoverySensor added (Manifesto-driven exploration",
+        "EVAL:2026-06-25T01:26:15 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:29:36 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING [Orchestrator] Iron Gate \u2014 exploration_insufficient: 0/1 (attempt=1",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING Generation attempt 1/2 failed for op-019efc65-9443-7fd6-9f3c-4b961b",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-30335971ddbc (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.BackgroundAgentPool] INFO Worker 3: bgop-30335971ddbc ceiling=1800s reason=adaptive(compl",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-bfc22f180a0c (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.BackgroundAgentPool] INFO Worker 0: bgop-bfc22f180a0c ceiling=416s reason=adaptive(base;s",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc6b-f045-7a8",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Orchestrator] \ud83d\udee4\ufe0f  Route: background (background_source:exploration:lo",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] DECISION op=op-019efc6b-f045-7",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro"
+      ],
+      "expected": true,
+      "false_positive_rejected": true,
+      "family": "iron_gate",
+      "flag": "JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS",
+      "observed_evaluated": true,
+      "verdict": "rejected"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "hypothesis_probe",
+      "flag": "JARVIS_HYPOTHESIS_PROBE_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "stale_pattern",
+      "flag": "JARVIS_ADAPTIVE_STALE_PATTERN_DETECTOR_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "meta_governor",
+      "flag": "JARVIS_META_GOVERNOR_YAML_WRITER_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "hypothesis_probe",
+      "flag": "JARVIS_HYPOTHESIS_PROBE_PRODUCTION_PROBER_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "hypothesis_probe",
+      "flag": "JARVIS_HYPOTHESIS_PROBE_BRIDGES_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:31:16 [Ouroboros.Orchestrator] INFO [SemanticGuard] op=op-019efc63-5bc9-7686-b893-4db83b90e204-cau finding"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "semantic_guardian",
+      "flag": "JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:15 [Ouroboros.IntakeLayer] INFO [IntakeLayer] IntentDiscoverySensor added (Manifesto-driven exploration",
+        "EVAL:2026-06-25T01:26:15 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:29:36 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING [Orchestrator] Iron Gate \u2014 exploration_insufficient: 0/1 (attempt=1",
+        "REJECT:2026-06-25T01:29:42 [Ouroboros.Orchestrator] WARNING Generation attempt 1/2 failed for op-019efc65-9443-7fd6-9f3c-4b961b",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:36:32 [backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor] INFO [ExplorationSen",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-30335971ddbc (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.BackgroundAgentPool] INFO Worker 3: bgop-30335971ddbc ceiling=1800s reason=adaptive(compl",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.GovernedLoop] INFO [GovernedLoop] Background op submitted: bgop-bfc22f180a0c (trigger=exp",
+        "EVAL:2026-06-25T01:37:02 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.BackgroundAgentPool] INFO Worker 0: bgop-bfc22f180a0c ceiling=416s reason=adaptive(base;s",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Advisor] background_tier_skip signal_source=exploration op=op-019efc6",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc6b-f045-7a8",
+        "EVAL:2026-06-25T01:37:04 [Ouroboros.Orchestrator] INFO [Orchestrator] \ud83d\udee4\ufe0f  Route: background (background_source:exploration:lo",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] DECISION op=op-019efc6b-f045-7",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.candidate_generator] INFO [CandidateGenerator] BACKGROUND route: ",
+        "EVAL:2026-06-25T01:40:04 [backend.core.ouroboros.governance.doubleword_provider] INFO [Cortex] \u26a1 HEDGE GOVERNOR: op needs Iro"
+      ],
+      "expected": true,
+      "false_positive_rejected": true,
+      "family": "iron_gate",
+      "flag": "JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "rejected"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "scoped_tool_backend",
+      "flag": "JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:27:10 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc63-5bc9-768",
+        "REJECT:2026-06-25T01:29:36 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:29:36 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "EVAL:2026-06-25T01:29:36 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc65-9443-7fd",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.adaptation.adapted_risk_tier_loader] DEBUG [AdaptedRiskTierLoader",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.adaptation.adapted_risk_tier_loader] DEBUG [AdaptedRiskTierLoader",
+        "EVAL:2026-06-25T01:31:16 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc63-5bc9-768",
+        "REJECT:2026-06-25T01:32:25 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:25 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:26 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:26 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:32:27 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "REJECT:2026-06-25T01:37:04 [Ouroboros.Orchestrator] WARNING [Orchestrator] Advisor BLOCKED operation: High blast radius: 50 fil",
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.comm_protocol] INFO [CommProtocol] INTENT op=op-019efc6b-f045-7a8"
+      ],
+      "expected": true,
+      "false_positive_rejected": true,
+      "family": "risk_tier",
+      "flag": "JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "rejected"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": null,
+      "flag": "JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:13 [backend.core.ouroboros.governance.autonomy.event_emitter] DEBUG EventEmitter: subscribed handler _o",
+        "EVAL:2026-06-25T01:43:57 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "decision_trace",
+      "flag": "JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "confidence_ring",
+      "flag": "JARVIS_LATENT_CONFIDENCE_RING_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "timeline",
+      "flag": "JARVIS_MULTI_OP_TIMELINE_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "flag_change",
+      "flag": "JARVIS_FLAG_CHANGE_EMITTER_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "latency_slo",
+      "flag": "JARVIS_LATENCY_SLO_DETECTOR_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:13 [backend.core.ouroboros.governance.autonomy.event_emitter] DEBUG EventEmitter: subscribed handler _o"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "phase8",
+      "flag": "JARVIS_PHASE8_IDE_OBSERVABILITY_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:13 [backend.core.ouroboros.governance.autonomy.event_emitter] DEBUG EventEmitter: subscribed handler _o"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "phase8",
+      "flag": "JARVIS_PHASE8_SSE_BRIDGE_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:13 [backend.core.ouroboros.governance.autonomy.event_emitter] DEBUG EventEmitter: subscribed handler _o"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "phase8",
+      "flag": "JARVIS_PHASE8_MULTI_OP_RENDERER_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "curiosity",
+      "flag": "JARVIS_CURIOSITY_ENGINE_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "multi_prior",
+      "flag": "JARVIS_MULTI_PRIOR_PLANNING_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "multi_prior",
+      "flag": "JARVIS_MULTI_PRIOR_RUNNER_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "multi_prior",
+      "flag": "JARVIS_MULTI_PRIOR_DISPATCH_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "multi_prior",
+      "flag": "JARVIS_MULTI_PRIOR_OBSERVER_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:37:04 [backend.core.ouroboros.governance.cross_process_jsonl] WARNING [CrossProcessJSONL] stale_lock_detec"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "multi_prior",
+      "flag": "JARVIS_MULTI_PRIOR_CANVAS_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [
+        "EVAL:2026-06-25T01:26:13 [backend.core.ouroboros.governance.autonomy.execution_graph_progress] DEBUG ExecutionGraphProgressTr"
+      ],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": "execution_monitor",
+      "flag": "JARVIS_EXECUTION_MONITOR_BRIDGE_ENABLED",
+      "observed_evaluated": true,
+      "verdict": "observed_evaluated"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": null,
+      "flag": "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": null,
+      "flag": "JARVIS_COMMAND_BUS_BRIDGE_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    },
+    {
+      "evidence": [],
+      "expected": true,
+      "false_positive_rejected": false,
+      "family": null,
+      "flag": "JARVIS_LIVE_KERNEL_VALIDATOR_ENABLED",
+      "observed_evaluated": false,
+      "verdict": "unverifiable"
+    }
+  ],
+  "graduation_exception": null,
+  "proven": false,
+  "verdict": "failed"
+}### A1TRACE HOP COUNTS (proof of dispatch) ###
+     17 [A1Trace] accept
+     17 [A1Trace] dequeue
+    141 [A1Trace] ingest
+     17 [A1Trace] submit
+### DEEPEST FSM PHASE REACHED ###
+      1 phase=C
+     20 phase=CLASSIFY
+      3 phase=GENERATE
+     17 phase=N
+      3 phase=VALIDATE
+### CHAOS BUG (format_age) DETECTED/DISPATCHED? ###
+2026-06-25T01:26:15 [backend.core.ouroboros.governance.intake.sensors.test_failure_sensor] INFO TestFailureSensor: subscribed to fs.changed.* — FS events now PRIMARY (poll demoted to 600s fallback)
+2026-06-25T01:26:15 [backend.core.ouroboros.governance.intake.sensors.test_failure_sensor] INFO TestFailureSensor: FS-events primary mode — poll demoted to 600s fallback (JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED=true)
+2026-06-25T01:26:32 [Ouroboros.PytestHelper] INFO [PytestHelper] spawn caller=intent.test_watcher.TestWatcher.run_pytest timeout=180.0s grace=5.0s cwd=/opt/trinity/jarvis argv=python3 -m pytest tests/ --tb=short -q --no-header --color=no
+2026-06-25T01:26:32 [Ouroboros.PytestHelper] INFO [PytestHelper] spawned caller=intent.test_watcher.TestWatcher.run_pytest pid=7604
+2026-06-25T01:29:32 [Ouroboros.PytestHelper] WARNING [PytestHelper] TIMEOUT caller=intent.test_watcher.TestWatcher.run_pytest pid=7604 after 180.0s — SIGTERM → grace=5.0s → SIGKILL escalation
+2026-06-25T01:29:37 [Ouroboros.PytestHelper] WARNING [PytestHelper] grace expired — SIGKILL pgrp caller=intent.test_watcher.TestWatcher.run_pytest pid=7604
+### DW FAILURE SUMMARY ###
+DW-failure log lines: 6
+### ANY state=applied / APPLY / PR ? ###
+2026-06-25T01:31:16 [Ouroboros.Orchestrator] INFO [Slice74Probe] LEDGER_TERMINAL op_id=op-019efc63-5bc9-7686-b893-4db83b90e204-cau state=applied written=False
