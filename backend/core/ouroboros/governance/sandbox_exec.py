@@ -56,7 +56,13 @@ async def sandbox_run_bash(
         run_in_container,
     )
 
-    res = await run_in_container(command, worktree=worktree, docker_run=docker_run)
+    # Bash is inspection-only (ls/cat/grep/…); all mutations go through
+    # edit_file/write_file → ChangeEngine.  Mount read-only so a chained
+    # destructive command (e.g. ls && rm -rf …) cannot destroy the repo even
+    # inside the air-gapped container.
+    res = await run_in_container(
+        command, worktree=worktree, docker_run=docker_run, read_only=True
+    )
 
     breach = getattr(res, "breach", ContainmentBreach.SPAWN_FAILED)
     if breach in (ContainmentBreach.DISABLED, ContainmentBreach.SPAWN_FAILED):

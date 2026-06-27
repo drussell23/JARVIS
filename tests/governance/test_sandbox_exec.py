@@ -98,6 +98,57 @@ def test_bash_fail_closed_on_spawn_failed_breach(monkeypatch, tmp_path):
     assert r.denied and not r.ok  # SPAWN_FAILED → deny
 
 
+def test_sandbox_run_bash_mounts_read_only(monkeypatch, tmp_path):
+    """sandbox_run_bash MUST mount /work:ro — never :rw — so chained destructive
+    commands (e.g. ls && rm -rf …) cannot destroy the repo inside the air-gap."""
+    monkeypatch.setenv("JARVIS_RUNTIME_SANDBOX_ENABLED", "true")
+
+    captured: list[list[str]] = []
+
+    async def fake_docker(argv, timeout):
+        captured.append(list(argv))
+        return (0, "ok", "")
+
+    asyncio.run(
+        sx.sandbox_run_bash("ls", worktree=str(tmp_path), docker_run=fake_docker)
+    )
+    assert captured, "fake_docker was never called — test is inert"
+    argv = captured[0]
+    # The mount entry must contain :ro, never :rw.
+    mount_flags = [a for a in argv if ":/work" in a]
+    assert mount_flags, f"No :/work mount found in argv: {argv}"
+    assert all(":/work:ro" in f for f in mount_flags), (
+        f"bash sandbox mounted writable — SECURITY BUG: {mount_flags}"
+    )
+    assert not any(":/work:rw" in f for f in mount_flags), (
+        f":rw found in bash mount — SECURITY BUG: {mount_flags}"
+    )
+
+
+def test_build_container_argv_read_only_true_produces_ro(tmp_path):
+    """build_container_argv(read_only=True) → :/work:ro in argv."""
+    from backend.core.ouroboros.governance.container_sandbox import build_container_argv
+    argv = build_container_argv("pass", worktree=str(tmp_path), read_only=True)
+    mount_flags = [a for a in argv if ":/work" in a]
+    assert mount_flags, f"No :/work mount in argv: {argv}"
+    assert any(":/work:ro" in f for f in mount_flags), (
+        f"read_only=True did not produce :ro — got: {mount_flags}"
+    )
+    assert not any(":/work:rw" in f for f in mount_flags)
+
+
+def test_build_container_argv_default_produces_rw(tmp_path):
+    """build_container_argv() default (read_only=False) → :/work:rw — existing callers unaffected."""
+    from backend.core.ouroboros.governance.container_sandbox import build_container_argv
+    argv = build_container_argv("pass", worktree=str(tmp_path))
+    mount_flags = [a for a in argv if ":/work" in a]
+    assert mount_flags, f"No :/work mount in argv: {argv}"
+    assert any(":/work:rw" in f for f in mount_flags), (
+        f"Default read_only=False did not produce :rw — got: {mount_flags}"
+    )
+    assert not any(":/work:ro" in f for f in mount_flags)
+
+
 def test_run_tests_fail_closed_on_spawn_failed_breach(monkeypatch, tmp_path):
     """Verify sandbox_run_tests denies when breach=SPAWN_FAILED (fail-closed)."""
     from backend.core.ouroboros.governance.container_sandbox import ContainmentBreach
