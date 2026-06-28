@@ -235,6 +235,25 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env["JARVIS_IDE_STREAM_ENABLED"] = "1"
     env["JARVIS_A1_TRACE_ENABLED"] = "1"
     env["JARVIS_IDE_OBSERVABILITY_ENABLED"] = "1"
+    # 4. A1-harness explicit opt-ins (root cause: the GCP node never saw these
+    #    from the operator shell — they are not in the linux_prod overlay and are
+    #    default-OFF in production to avoid cost surprises).
+    #    * NATIVE_TOOL_FORCING: tells DW to use native tool-call format instead of
+    #      text-mode CoT -- required for the Iron Gate exploration-first check to
+    #      see proper tool calls in the Venom loop, not raw JSON snippets.
+    #    * EPISTEMIC_FEEDBACK: enables the gradient-deduced DW global-outage
+    #      escalation path (Provider Quarantine / Cryo-DLQ) so provider health
+    #      signals flow through the full feedback lane during A1 soaks.
+    env["JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED"] = "true"
+    env["JARVIS_EPISTEMIC_FEEDBACK_ENABLED"] = "true"
+    # 5. Topology-native Qwen3.5-397B-A17B-FP8 as the DW primary pin.
+    #    The linux_prod overlay pins openai/gpt-oss-120b (correct for production
+    #    where the operator wants the gpt-oss coder). For A1 soaks we want the
+    #    Qwen default so repair/background routes resolve to Qwen (the model whose
+    #    reasoning keepalives prevent SSE stream stalls on long generations).
+    #    The overlay's value is deliberately overridden here at the harness layer;
+    #    assert_dw_primary() still passes (non-empty value).
+    env["JARVIS_DW_PRIMARY_OVERRIDE"] = "Qwen/Qwen3.5-397B-A17B-FP8"
     return env
 
 
