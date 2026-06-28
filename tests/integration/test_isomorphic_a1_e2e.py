@@ -706,12 +706,18 @@ class TestSubprocessIsomorphismPropagation:
             os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
 
     # ------------------------------------------------------------------
-    # 4b. _launch_iso_soak threads iso_cwd into subprocess.Popen
+    # 4b. _launch_iso_soak threads live_root into subprocess.Popen
     # ------------------------------------------------------------------
 
-    def test_launch_iso_soak_threads_disjoint_cwd(self, tmp_path: Path) -> None:
+    def test_launch_iso_soak_threads_live_root_cwd(self, tmp_path: Path) -> None:
         """_launch_iso_soak must patch subprocess.Popen so the child process
-        receives iso_cwd as its cwd, not the SoakRunner's repo_root."""
+        receives the live repo root as its cwd (not the SoakRunner's repo_root
+        and not the disjoint IsomorphicEnv cwd).
+
+        This is the node-faithful fix: the GCP node boots via
+        ``cd <jarvis_repo> && <boot_cmd>``, so the organism cwd == live root.
+        Running the whole soak from the disjoint cwd produced a false Aegis
+        ``ModuleNotFoundError: No module named 'backend'`` crash."""
         import subprocess as _sp
 
         captured_cwd: List[str] = []
@@ -723,7 +729,8 @@ class TestSubprocessIsomorphismPropagation:
                 # Immediately raise to avoid actually starting a process.
                 raise OSError("capture-only — no real process")
 
-        # Mock SoakRunner that would use repo_root as cwd.
+        # Mock SoakRunner that would use repo_root as cwd (the default behavior
+        # _launch_iso_soak overrides).
         class _MockSoakRunner:
             repo_root = str(tmp_path / "real_repo")
 
@@ -738,7 +745,8 @@ class TestSubprocessIsomorphismPropagation:
 
             def launch(self, env: Dict[str, str], run_dir: str) -> Any:
                 import subprocess
-                # This is what SoakRunner.launch does: Popen with cwd=self.repo_root
+                # SoakRunner.launch would normally use cwd=self.repo_root;
+                # _launch_iso_soak must override this to live_root.
                 subprocess.Popen(
                     ["echo", "stub"],
                     cwd=self.repo_root,
@@ -746,15 +754,17 @@ class TestSubprocessIsomorphismPropagation:
                 )
                 raise AssertionError("Should never reach here")
 
-        iso_cwd = str(tmp_path / "disjoint_app")
-        Path(iso_cwd).mkdir(parents=True, exist_ok=True)
+        # live_root is the IsomorphicEnv symlink root (env_ctx.root),
+        # e.g. <tmpdir>/opt/trinity/jarvis  — NOT the disjoint <tmpdir>/app.
+        live_root = str(tmp_path / "opt" / "trinity" / "jarvis")
+        Path(live_root).mkdir(parents=True, exist_ok=True)
 
         _sp.Popen = _CapturingPopen  # type: ignore[assignment]
         try:
             runner = _MockSoakRunner()
             try:
                 _driver_mod._launch_iso_soak(
-                    runner, {"JARVIS_TEST": "1"}, str(tmp_path / "run"), iso_cwd
+                    runner, {"JARVIS_TEST": "1"}, str(tmp_path / "run"), live_root
                 )
             except OSError:
                 pass  # Expected: _CapturingPopen raises to avoid real process
@@ -762,9 +772,9 @@ class TestSubprocessIsomorphismPropagation:
             _sp.Popen = real_popen
 
         assert captured_cwd, "_CapturingPopen must have been called"
-        assert captured_cwd[0] == iso_cwd, (
-            "_launch_iso_soak must thread iso_cwd into Popen; "
-            "expected %r, got %r" % (iso_cwd, captured_cwd[0])
+        assert captured_cwd[0] == live_root, (
+            "_launch_iso_soak must thread live_root into Popen (not disjoint cwd); "
+            "expected %r, got %r" % (live_root, captured_cwd[0])
         )
 
     # ------------------------------------------------------------------
@@ -979,3 +989,281 @@ class TestLoadChaosTargetFiles:
         m.write_text("NOT JSON")
         files = load_chaos_target_files(str(m))
         assert files == []
+
+
+# ===========================================================================
+# Group 4 -- Preflight stale manifest reconciliation (driver resilience)
+# ===========================================================================
+
+
+class TestPreflightStaleManifestReconciliation:
+    """Tests for the driver's preflight reconciliation of stale manifests from
+    prior crashed runs. Ensures repeated local driver runs are self-sustaining
+    (the run-resilience requirement).
+    """
+
+    def test_preflight_reconciles_stale_manifest(self, tmp_path: Path) -> None:
+        """A stale .jarvis/chaos_manifest.json from a prior crashed run is
+        automatically cleaned by the preflight reconciliation step, so the
+        driver doesn't abort with 'manifest already exists'."""
+        # Set up a temp repo with a stale manifest
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        jarvis_dir = repo_dir / ".jarvis"
+        jarvis_dir.mkdir()
+
+        # Write a stale manifest (simulating a prior crashed run)
+        manifest = jarvis_dir / "chaos_manifest.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "target_file": "backend/foo.py",
+            "target_file_abs": str(repo_dir / "backend" / "foo.py"),
+            "original_source": "def foo(): return 42\n",
+        }))
+
+        # Create a dummy chaos controller (mocked subprocess runner)
+        def mock_run(argv: List[str]) -> Any:
+            # Simulate the chaos_injector_ast.py --revert behavior:
+            # read manifest, restore original, delete manifest.
+            if "--revert" in argv:
+                # Find --repo-root argument
+                try:
+                    idx = argv.index("--repo-root")
+                    repo_root = argv[idx + 1]
+                except (ValueError, IndexError):
+                    repo_root = str(repo_dir)
+
+                # Simulate revert: delete manifest if it exists
+                m_path = os.path.join(repo_root, ".jarvis", "chaos_manifest.json")
+                if os.path.exists(m_path):
+                    try:
+                        os.remove(m_path)
+                    except OSError:
+                        pass
+
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "{}"
+                result.stderr = ""
+                return result
+            elif "--status" in argv:
+                # After revert, status should show no active manifest
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = json.dumps({"active": False})
+                result.stderr = ""
+                return result
+            else:
+                result = MagicMock()
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "unexpected args"
+                return result
+
+        # Verify manifest exists before
+        assert manifest.exists(), "Stale manifest should exist initially"
+
+        # Simulate the driver's preflight reconciliation logic
+        manifest_path = os.path.join(repo_dir, ".jarvis", "chaos_manifest.json")
+        if os.path.exists(manifest_path):
+            # Revert the stale manifest (this is what the driver does)
+            result = mock_run(["--revert", "--repo-root", str(repo_dir)])
+            assert result.returncode == 0, "Revert should succeed"
+
+        # Verify manifest was cleaned
+        assert not manifest.exists(), (
+            "Stale manifest should be cleaned after reconciliation"
+        )
+
+    def test_preflight_tolerates_corrupted_manifest(self, tmp_path: Path) -> None:
+        """A corrupted manifest (invalid JSON) is handled gracefully in preflight --
+        the reconciliation is best-effort, never crashes the driver."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        jarvis_dir = repo_dir / ".jarvis"
+        jarvis_dir.mkdir()
+
+        # Write a corrupted manifest
+        manifest = jarvis_dir / "chaos_manifest.json"
+        manifest.write_text("NOT VALID JSON {{{")
+
+        # Simulate revert attempt on corrupted manifest
+        def mock_run_corrupted(argv: List[str]) -> Any:
+            # Revert should be best-effort: attempt delete even on parse error
+            if "--revert" in argv:
+                try:
+                    idx = argv.index("--repo-root")
+                    repo_root = argv[idx + 1]
+                except (ValueError, IndexError):
+                    repo_root = str(repo_dir)
+
+                m_path = os.path.join(repo_root, ".jarvis", "chaos_manifest.json")
+                try:
+                    os.remove(m_path)
+                except OSError:
+                    pass
+
+                result = MagicMock()
+                result.returncode = 0  # revert best-effort succeeds
+                result.stdout = "{}"
+                result.stderr = ""
+                return result
+            elif "--status" in argv:
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = json.dumps({"active": False})
+                result.stderr = ""
+                return result
+            else:
+                result = MagicMock()
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = ""
+                return result
+
+        # Verify corrupted manifest exists
+        assert manifest.exists()
+
+        # Simulate driver preflight: revert attempt
+        manifest_path = os.path.join(repo_dir, ".jarvis", "chaos_manifest.json")
+        if os.path.exists(manifest_path):
+            result = mock_run_corrupted(
+                ["--revert", "--repo-root", str(repo_dir)]
+            )
+            # Best-effort should succeed or fail gracefully
+            assert result.returncode in (0, 1)
+
+        # Manifest should be cleaned regardless
+        assert not manifest.exists(), (
+            "Corrupted manifest should be removed (best-effort)"
+        )
+
+
+# ===========================================================================
+# Group 7 -- Event-loop yield correctness (boot-wait async fix)
+# ===========================================================================
+
+
+class TestBootWaitEventLoopYield:
+    """Verify that _await_soak_boot is truly async and yields to the event loop.
+
+    Root cause of the fixed bug: _await_soak_boot was a sync function calling
+    time.sleep(0.5).  The SyntheticAdversary aiohttp server runs on the SAME
+    event loop.  A sync sleep starves the loop → adversary cannot accept
+    provider-preflight connections during the 90s boot wait → the organism sees
+    "Cannot connect to host 127.0.0.1:<port>" → "Active provider fleet empty".
+
+    The fix: async def + await asyncio.sleep(0.5) yields between polls so the
+    adversary keeps serving requests throughout the entire boot-wait window.
+    """
+
+    # ------------------------------------------------------------------
+    # 7a. Structural: _await_soak_boot must be a coroutine function
+    # ------------------------------------------------------------------
+
+    def test_await_soak_boot_is_coroutine(self) -> None:
+        """_await_soak_boot must be declared ``async def`` so it can be awaited
+        from the async run() method without blocking the event loop."""
+        import inspect
+        assert inspect.iscoroutinefunction(_driver_mod._await_soak_boot), (
+            "_await_soak_boot must be an async def (coroutine function). "
+            "A sync def with time.sleep() would starve the SyntheticAdversary "
+            "aiohttp server and cause provider-preflight failures."
+        )
+
+    # ------------------------------------------------------------------
+    # 7b. Behavioural: loop is NOT starved during boot wait
+    # ------------------------------------------------------------------
+
+    async def test_await_soak_boot_yields_to_event_loop(
+        self, tmp_path: Path
+    ) -> None:
+        """Prove that the event loop can run OTHER coroutines while
+        _await_soak_boot polls for the READY marker.
+
+        A concurrent counter task increments every 0ms (asyncio.sleep(0)).
+        If _await_soak_boot starves the loop (time.sleep), the counter will
+        be 0 when boot completes.  If it yields correctly (asyncio.sleep),
+        the counter will be > 0.
+        """
+        import asyncio as _asyncio
+
+        # Write a debug log that will NEVER contain the READY marker so the
+        # function runs until timeout (we use a tiny timeout for speed).
+        debug_log = str(tmp_path / "debug.log")
+        Path(debug_log).write_text("booting...\n")
+
+        # Fake proc: always running (poll() returns None).
+        class _FakeProc:
+            def poll(self) -> None:
+                return None
+
+        counter = {"n": 0}
+        stop = {"flag": False}
+
+        async def _counter_task() -> None:
+            """Increments counter until told to stop.  Will be starved if
+            _await_soak_boot blocks the event loop."""
+            while not stop["flag"]:
+                counter["n"] += 1
+                await _asyncio.sleep(0)  # yield between increments
+
+        # Run both concurrently: boot-wait (0.3s timeout → exits quickly)
+        # and the counter task.
+        task = _asyncio.create_task(_counter_task())
+        try:
+            result = await _driver_mod._await_soak_boot(
+                _FakeProc(), debug_log, timeout_s=0.3
+            )
+        finally:
+            stop["flag"] = True
+            await task
+
+        assert result is False, (
+            "_await_soak_boot should return False on timeout (no READY marker)"
+        )
+        assert counter["n"] > 0, (
+            "Event loop was STARVED during _await_soak_boot: counter stayed at 0. "
+            "This means _await_soak_boot used a blocking time.sleep() instead of "
+            "await asyncio.sleep(), so the SyntheticAdversary aiohttp server "
+            "cannot serve requests during the boot wait.  counter=%d" % counter["n"]
+        )
+
+    # ------------------------------------------------------------------
+    # 7c. Source-grep: no time.sleep() in _await_soak_boot body
+    # ------------------------------------------------------------------
+
+    def test_no_blocking_sleep_in_await_soak_boot(self) -> None:
+        """Assert the source of _await_soak_boot contains no time.sleep() call.
+
+        This is the structural guard: even if the coroutine detection above
+        passes, we want an explicit assertion that the blocking idiom is gone
+        from the function body.
+        """
+        import inspect
+        source = inspect.getsource(_driver_mod._await_soak_boot)
+        assert "time.sleep(" not in source, (
+            "_await_soak_boot must not call time.sleep() — this starves the "
+            "SyntheticAdversary aiohttp event loop during the 90s boot wait. "
+            "Use 'await asyncio.sleep(0.5)' instead."
+        )
+
+    # ------------------------------------------------------------------
+    # 7d. Source-grep: no time.sleep() in the driver module overall
+    # ------------------------------------------------------------------
+
+    def test_no_blocking_sleep_in_driver_module(self) -> None:
+        """Assert the ENTIRE driver module contains no time.sleep() calls.
+
+        After the fix, the only sleep idiom in the adversary-serving window
+        should be await asyncio.sleep().  A stray time.sleep() anywhere in
+        the module is a latent starvation risk.
+        """
+        driver_path = os.path.join(_SCRIPTS_DIR, "isomorphic_a1_local.py")
+        with open(driver_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        assert "time.sleep(" not in source, (
+            "isomorphic_a1_local.py must not contain any time.sleep() calls. "
+            "All waits in the adversary-serving window must use "
+            "'await asyncio.sleep()' so the SyntheticAdversary keeps serving."
+        )

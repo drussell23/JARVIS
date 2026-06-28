@@ -352,6 +352,72 @@ def test_effective_prefixes_env_override(tmp_path: Path) -> None:
         os.environ.pop("JARVIS_SANDBOX_PREFIXES", None)
 
 
+# ---------------------------------------------------------------------------
+# Test 10 — PYTHONPATH includes the live root inside the context (node-faithful)
+# ---------------------------------------------------------------------------
+
+def test_pythonpath_includes_live_root_inside(tmp_path: Path) -> None:
+    """Inside the context, ``os.environ['PYTHONPATH']`` must start with
+    ``str(env.root)`` so child subprocesses can resolve ``-m backend`` imports
+    the same way the GCP node can (via cwd==repo_root on the node)."""
+    repo = _make_repo(tmp_path)
+    with IsomorphicEnv(repo) as env:
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        assert pythonpath, "PYTHONPATH must be set inside IsomorphicEnv"
+        live_root = str(env.root)
+        entries = pythonpath.split(os.pathsep)
+        assert entries[0] == live_root, (
+            "First PYTHONPATH entry must be the live root %r; "
+            "got PYTHONPATH=%r" % (live_root, pythonpath)
+        )
+
+
+def test_pythonpath_restored_after_exit(tmp_path: Path) -> None:
+    """After exit, ``PYTHONPATH`` is restored to its pre-context value
+    (or removed if it was absent before entry)."""
+    repo = _make_repo(tmp_path)
+    # Ensure a clean baseline: unset before entry.
+    prior = os.environ.pop("PYTHONPATH", None)
+    try:
+        with IsomorphicEnv(repo):
+            assert "PYTHONPATH" in os.environ  # set inside
+        # After exit: must be gone (was absent before entry).
+        assert "PYTHONPATH" not in os.environ, (
+            "PYTHONPATH must be removed after exit when it was absent before entry"
+        )
+    finally:
+        # Restore original test-runner PYTHONPATH so we don't pollute other tests.
+        if prior is not None:
+            os.environ["PYTHONPATH"] = prior
+        else:
+            os.environ.pop("PYTHONPATH", None)
+
+
+def test_pythonpath_prior_value_preserved_after_exit(tmp_path: Path) -> None:
+    """When PYTHONPATH was already set before entry, the prior value is
+    restored (not the prepended live-root value)."""
+    repo = _make_repo(tmp_path)
+    prior = "/some/prior/pythonpath"
+    os.environ["PYTHONPATH"] = prior
+    try:
+        with IsomorphicEnv(repo) as env:
+            # Inside: live root prepended.
+            inside = os.environ.get("PYTHONPATH", "")
+            assert inside.startswith(str(env.root)), (
+                "Inside context, PYTHONPATH must start with live root"
+            )
+            assert prior in inside, (
+                "Prior PYTHONPATH must be preserved (appended) inside context"
+            )
+        # After exit: original prior value restored exactly.
+        assert os.environ.get("PYTHONPATH") == prior, (
+            "After exit, PYTHONPATH must be restored to prior value %r; "
+            "got %r" % (prior, os.environ.get("PYTHONPATH"))
+        )
+    finally:
+        os.environ.pop("PYTHONPATH", None)
+
+
 def test_effective_prefixes_env_override_allows_var_when_set(tmp_path: Path) -> None:
     """When ``JARVIS_SANDBOX_PREFIXES`` explicitly includes ``/var``,
     ``_is_safe_path`` allows /var paths — the override is bidirectional.
