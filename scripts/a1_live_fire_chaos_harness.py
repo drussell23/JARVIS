@@ -277,6 +277,7 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         native_tool_forcing=True,
         epistemic_feedback=True,
         failover_lifecycle=False,
+        file_isolation=False,
     )
     apply_manifest(_a1_manifest, env)
     return env
@@ -1240,6 +1241,7 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
         native_tool_forcing=True,
         epistemic_feedback=True,
         failover_lifecycle=False,
+        file_isolation=False,
         seed=seed,
         cost_cap=cost_cap,
         max_wall_seconds=wall_seconds,

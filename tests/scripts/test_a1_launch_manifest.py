@@ -309,6 +309,110 @@ def test_apply_manifest_failover_always_written():
 # ===========================================================================
 
 
+# ===========================================================================
+# file_isolation: required key, apply writes BOTH isolation flags
+# ===========================================================================
+
+
+def test_build_manifest_file_isolation_default_false():
+    """build_manifest includes file_isolation=False by default."""
+    m = build_manifest(model="x", native_tool_forcing=True, epistemic_feedback=True)
+    assert "file_isolation" in m
+    assert m["file_isolation"] is False
+
+
+def test_build_manifest_file_isolation_explicit_false():
+    """build_manifest(file_isolation=False) is explicit and present."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        file_isolation=False,
+    )
+    assert m["file_isolation"] is False
+
+
+def test_build_manifest_file_isolation_true():
+    """build_manifest(file_isolation=True) round-trips correctly."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        file_isolation=True,
+    )
+    assert m["file_isolation"] is True
+
+
+def test_apply_manifest_file_isolation_false_sets_both_flags_false():
+    """apply_manifest(file_isolation=False) writes BOTH isolation flags as 'false'."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        file_isolation=False,
+    )
+    env: dict = {}
+    apply_manifest(m, env)
+    assert env["JARVIS_FILE_ISOLATION_ENABLED"] == "false"
+    assert env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] == "false"
+
+
+def test_apply_manifest_file_isolation_true_sets_both_flags_true():
+    """apply_manifest(file_isolation=True) writes BOTH isolation flags as 'true'."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        file_isolation=True,
+    )
+    env: dict = {}
+    apply_manifest(m, env)
+    assert env["JARVIS_FILE_ISOLATION_ENABLED"] == "true"
+    assert env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] == "true"
+
+
+def test_apply_manifest_file_isolation_always_written():
+    """apply_manifest writes BOTH isolation env vars whether True or False
+    (never absent -- prevents the force-arm gap on an ephemeral cloud node)."""
+    for flag_val in (True, False):
+        m = build_manifest(
+            model="x", native_tool_forcing=False, epistemic_feedback=False,
+            file_isolation=flag_val,
+        )
+        env: dict = {}
+        apply_manifest(m, env)
+        assert "JARVIS_FILE_ISOLATION_ENABLED" in env, (
+            "JARVIS_FILE_ISOLATION_ENABLED must always be present in env "
+            "(prevents cloud-node force-arm gap)"
+        )
+        assert "JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED" in env, (
+            "JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED must always be present in env "
+            "(prevents cloud-node force-arm gap)"
+        )
+
+
+def test_load_and_validate_requires_file_isolation(tmp_path):
+    """Manifest missing file_isolation -> A1ManifestError (missing required keys)."""
+    p = tmp_path / "no_file_isolation.json"
+    p.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "model": "x",
+        "native_tool_forcing": True,
+        "epistemic_feedback": True,
+        "failover_lifecycle": False,
+        # file_isolation intentionally omitted
+    }))
+    with pytest.raises(A1ManifestError, match="missing required keys"):
+        load_and_validate(p)
+
+
+def test_round_trip_includes_file_isolation(tmp_path):
+    """build -> write -> load_and_validate preserves file_isolation."""
+    m = build_manifest(
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        native_tool_forcing=True,
+        epistemic_feedback=True,
+        failover_lifecycle=False,
+        file_isolation=False,
+    )
+    p = tmp_path / "A1_LAUNCH_MANIFEST.json"
+    write_manifest(p, m)
+    loaded = load_and_validate(p)
+    assert loaded["file_isolation"] is False
+
+
 def test_compose_env_compat():
     """compose_env output contains the 3 flag keys injected via apply_manifest
     (byte-compatible with the A1 launch spec)."""
@@ -334,6 +438,15 @@ def test_compose_env_compat():
         assert env.get("JARVIS_FAILOVER_LIFECYCLE_ENABLED") == "false", (
             "compose_env must pin JARVIS_FAILOVER_LIFECYCLE_ENABLED=false via apply_manifest "
             "(prevents J-Prime spawn mid-soak when the shell var does not propagate)"
+        )
+        # File-isolation must be deterministically pinned OFF on the cloud node.
+        assert env.get("JARVIS_FILE_ISOLATION_ENABLED") == "false", (
+            "compose_env must pin JARVIS_FILE_ISOLATION_ENABLED=false via apply_manifest "
+            "(ephemeral cloud node has no operator checkout; isolation worktree is unusable)"
+        )
+        assert env.get("JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED") == "false", (
+            "compose_env must pin JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED=false via apply_manifest "
+            "(prevents force-arm of file-isolation that routes writes to a broken worktree)"
         )
     except Exception as exc:
         pytest.skip("compose_env import requires full harness setup: %s" % exc)
