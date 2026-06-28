@@ -248,7 +248,28 @@ class AutoCommitter:
         """
         override = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE")
         if override:
-            return Path(override)
+            override_path = Path(override)
+            # A1 dead-cwd fix: a stale / never-created worktree override (e.g.
+            # a branch-named path ``.worktrees/ouroboros/auto/...`` the producer
+            # never materialized, or whose on-disk dir is the ``__``-mangled
+            # form) makes EVERY git subprocess in this class fail with
+            # ``fatal: cannot change to '<path>'`` (exit 128). The op then
+            # reaches APPLIED in memory but never durably commits -> ledger
+            # ``written=False`` -> the A1 auditor's ``fsm_classify_to_applied``
+            # stays False. Validate the override is a real, usable git working
+            # tree before adopting it; otherwise fall back to the main checkout
+            # so the commit still lands durably rather than dying on a dead
+            # cwd. Fail-safe, never raises.
+            try:
+                if override_path.is_dir() and (override_path / ".git").exists():
+                    return override_path
+            except OSError:  # noqa: BLE001 — unreadable path -> fall back
+                pass
+            logger.warning(
+                "[AutoCommitter] workspace override invalid (%s) -- falling "
+                "back to repo_root (commit lands durably in the main checkout)",
+                override,
+            )
         return self._repo_root
 
     def _assert_commit_target_sovereign(self) -> None:
