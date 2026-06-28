@@ -107,8 +107,13 @@ async def _default_instance_lister(
     warning -- the caller will simply find nothing to reap this pass.
     """
     # One regex alternation covers all prefixes in a single API call.
-    alt = "|".join(f"^{p}" for p in prefixes)
-    filter_str = f"name~({alt})"
+    # gcloud --filter wants the regex as a single QUOTED operand; a bare
+    # ``name~(^a|^b)`` makes its expression parser choke ("Term operand
+    # expected") because it reads ``(`` as a filter-grouping operator. Anchor
+    # ONCE at the front of a quoted group instead. The quotes are gcloud-filter
+    # syntax (parsed by gcloud, not the shell — we exec, never shell=True).
+    alt = "|".join(prefixes)
+    filter_str = f'name~"^({alt})"'
     cmd: List[str] = [
         "gcloud", "compute", "instances", "list",
         f"--project={project}",
