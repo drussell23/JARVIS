@@ -368,6 +368,131 @@ _DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "10
 _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
 
 
+_NATIVE_TC_SENTINEL = "\n__NTC__:"  # appended to content string when DW returns native tool_calls
+
+
+# NOTE: JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED is INERT without
+# JARVIS_EPISTEMIC_FEEDBACK_ENABLED=true. The DW_EXPLORATION_STATE_VAR
+# ContextVar (topology_sentinel.py) is only stamped by tool_executor.py's
+# epistemic producer when JARVIS_EPISTEMIC_FEEDBACK_ENABLED is ON. When
+# the ContextVar is None (its default), _generate_raw skips tool injection
+# entirely — both flags must be ON for native tool-forcing to have any effect.
+
+def _dw_native_tool_forcing_enabled() -> bool:
+    """Master flag: inject tools/tool_choice into DW requests for exploration.
+    NEVER raises. Default OFF — pilot only, not yet graduated.
+    """
+    try:
+        return os.environ.get("JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED", "").lower() in ("1", "true", "yes")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dw_exploration_only_tool_schemas() -> list:
+    """OpenAI-format tool schemas for the 3 core exploration tools.
+
+    These schemas MUST match the REAL handler arg names in tool_executor.py:
+      - _search_code reads args["pattern"] (required) + args.get("file_glob")
+      - _get_callers reads args["function_name"] (required) + args.get("file_path")
+      - _read_file reads args["path"] (required)
+
+    NEVER raises — returns [] on any error.
+    """
+    try:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read the full content of a source file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or repo-relative path to the file.",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_code",
+                    "description": "Search for a pattern in the codebase using grep.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "The regex/string pattern to search for.",
+                            },
+                            "file_glob": {
+                                "type": "string",
+                                "description": "Optional glob pattern to restrict search (e.g. '*.py').",
+                            },
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_callers",
+                    "description": "Find all call sites of a function in the codebase.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "function_name": {
+                                "type": "string",
+                                "description": "Name of the function to find callers of.",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Optional file to restrict search.",
+                            },
+                        },
+                        "required": ["function_name"],
+                    },
+                },
+            },
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# Per-process cache: model IDs that returned HTTP 400 when tools were injected.
+# Prevents re-injecting tools into a model/endpoint that rejects them.
+# Process-global set — shared across all DoublewordProvider instances.
+_DW_TOOL_FORCING_REJECTED: set = set()
+
+
+def _dw_mark_tool_forcing_unsupported(model_id: str) -> None:
+    """Cache that this model/endpoint rejects native tool schemas. NEVER raises."""
+    try:
+        _DW_TOOL_FORCING_REJECTED.add(model_id or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dw_tool_forcing_known_unsupported(model_id: str) -> bool:
+    """True if this model/endpoint previously rejected native tool schemas. NEVER raises."""
+    try:
+        return (model_id or "") in _DW_TOOL_FORCING_REJECTED
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _DWToolForcingRejectedError(Exception):
+    """Private sentinel: endpoint returned HTTP 400 rejecting native tool schemas.
+    Raised inside _generate_raw's streaming/non-streaming paths; caught at the
+    _generate_raw call-site to retry WITHOUT tools (fail-soft).
+    """
+
+
 # ============================================================================
 # Slice 36 — Adaptive Transport Selector
 # ============================================================================
@@ -3274,631 +3399,696 @@ class DoublewordProvider:
                 except Exception:  # noqa: BLE001
                     pass  # I2: sanitize/estimate bug never blocks valid request
 
-            if _stream_callback is not None:
-                # Streaming path: SSE for token-by-token output.
-                # Use a generous per-chunk timeout (30s between chunks)
-                # to detect stalled streams without killing slow generation.
-                body["stream"] = True
-                content = ""
-                input_tokens = 0
-                output_tokens = 0
-                _PER_CHUNK_TIMEOUT = 30.0  # seconds between SSE chunks
-
-                # Priority 1 Slice 1 — confidence capture (PRD §26.5.1).
-                # Master-flag-gated; when enabled, request OpenAI-compat
-                # per-token logprobs from the provider so the streaming
-                # parse below can capture the top-1/top-2 margin signal
-                # into ctx.artifacts["confidence_capturer"]. Capture is
-                # purely additive on the response; the request shape
-                # only changes when the flag is on (byte-for-byte
-                # preserved when off).
-                from backend.core.ouroboros.governance.verification.confidence_capture import (
-                    ConfidenceCapturer,
-                    confidence_capture_enabled,
-                    confidence_capture_top_k,
-                    extract_openai_compat_logprobs_from_chunk,
-                )
-                # Priority 1 Slice 2 — confidence monitor + circuit-breaker.
-                # When ENABLED, the monitor consumes the per-token margin
-                # signal alongside the capturer and produces a verdict;
-                # ENFORCE sub-flag governs whether BELOW_FLOOR raises
-                # ConfidenceCollapseError mid-stream. Slice 2 ships
-                # SHADOW only — both flags default false; ENFORCE flips
-                # in Slice 5 graduation.
-                from backend.core.ouroboros.governance.verification.confidence_monitor import (
-                    ConfidenceMonitor,
-                    ConfidenceVerdict,
-                    confidence_monitor_enabled,
-                    confidence_monitor_enforce,
-                )
-                _confidence_capturer: Optional[ConfidenceCapturer] = None
-                _confidence_monitor: Optional[ConfidenceMonitor] = None
-                _monitor_enforce_active: bool = False
-                if confidence_capture_enabled():
-                    body["logprobs"] = True
-                    body["top_logprobs"] = confidence_capture_top_k()
-                    _confidence_capturer = ConfidenceCapturer(
-                        provider="doubleword",
-                        model_id=str(_effective_model or ""),
+            # PR D — Native tool forcing (JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED).
+            # Read the epistemic exploration state stamped by tool_executor.py's
+            # producer. If the model still needs to call exploration tools, inject
+            # tools + tool_choice so the endpoint FORCES a tool call rather than
+            # letting the model skip to a final answer.
+            # Gated: both flags must be ON; endpoint 400-rejection cached per model.
+            _tool_forced = False
+            if _dw_native_tool_forcing_enabled() and not _dw_tool_forcing_known_unsupported(_effective_model):
+                try:
+                    from backend.core.ouroboros.governance.topology_sentinel import (
+                        get_exploration_state as _get_expl_state,
                     )
-                    # Slice 2 monitor wakes only when its own master flag
-                    # is on. Capture without monitor remains valid (Slice 1
-                    # observation-only mode for ledger/replay use).
-                    if confidence_monitor_enabled():
-                        _confidence_monitor = ConfidenceMonitor(
-                            provider="doubleword",
-                            model_id=str(_effective_model or ""),
-                            op_id=str(
-                                getattr(context, "op_id", "") or "",
-                            ),
-                        )
-                        _monitor_enforce_active = (
-                            confidence_monitor_enforce()
-                        )
-                    # Stash on ctx.artifacts so downstream phase runners
-                    # (Slice 2 monitor) can read the trace post-stream.
-                    try:
-                        _artifacts = getattr(context, "artifacts", None)
-                        if isinstance(_artifacts, dict):
-                            _artifacts["confidence_capturer"] = (
-                                _confidence_capturer
+                    _expl_state = _get_expl_state()
+                    if (
+                        isinstance(_expl_state, dict)
+                        and _expl_state.get("explore_count", 0) < _expl_state.get("floor", 0)
+                    ):
+                        _schemas = _dw_exploration_only_tool_schemas()
+                        if _schemas:
+                            body["tools"] = _schemas
+                            body["tool_choice"] = "required"
+                            _tool_forced = True
+                            logger.debug(
+                                "[DWToolForcing] injecting tools op=%s "
+                                "explore_count=%d floor=%d",
+                                getattr(context, "op_id", "-"),
+                                _expl_state["explore_count"],
+                                _expl_state["floor"],
                             )
-                            if _confidence_monitor is not None:
-                                _artifacts["confidence_monitor"] = (
-                                    _confidence_monitor
-                                )
-                    except Exception:  # noqa: BLE001 — capture must
-                        pass        # never break the stream loop
-                    # §37 Tier 2 #13 Slice 2 (2026-05-07) — propagate the
-                    # capturer to tool_executor via async-safe ContextVar
-                    # (PolicyContext doesn't carry artifacts dict). Each
-                    # op runs in its own asyncio.Task so the var is
-                    # task-local; new GENERATE rounds re-stamp the var
-                    # with their own capturer. Defensive: set failure
-                    # NEVER breaks the stream loop.
-                    try:
-                        from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
-                            set_active_capturer as _toolconf_set_var,
-                        )
-                        _toolconf_set_var(_confidence_capturer)
-                    except Exception:  # noqa: BLE001 — defensive
-                        pass
-                # Phase 12.2 Slice C — TTFT measurement window opens
-                # the moment we issue the request and closes on first
-                # non-empty content chunk. monotonic() is jump-proof
-                # under wall-clock corrections.
-                _ttft_request_start_monotonic = time.monotonic()
-                # Slice 187 — precision TTFT: a perf_counter anchor for PURE network latency
-                # (separated from local async lag), recorded only if the loop wasn't starved.
-                from backend.core.ouroboros.governance.dw_precision_telemetry import (
-                    now_perf as _s187_now,
-                )
-                _ttft_request_start_perf = _s187_now()
-                _ttft_first_chunk_seen = False
+                except Exception:  # noqa: BLE001 — never breaks generation
+                    pass
 
-                # Slice 35 Phase 1 — STAGE_RT_AEGIS_AUTH timer.
-                _s35_auth_t0 = time.monotonic()
-                # Slice 31 — Aegis session bearer (closes v24
-                # missing_session_bearer 401 wedge on RT streaming).
-                _call_auth = await _aegis_dw_session_auth_header()
-                _call_auth["Content-Type"] = "application/json"
-                # Slice 2B-ii — per-call Aegis lease (None when disabled
-                # → header is skipped via merge helper).
-                _aegis_lease = await _aegis_acquire_call_lease(
-                    op_id=context.op_id,
-                    route="standard",
-                    estimated_cost_usd=0.05,
-                )
-                _s35_dp.record_stage(
-                    "STAGE_RT_AEGIS_AUTH",
-                    op_id=_s35_op_id, model_id=_s35_model,
-                    duration_ms=(time.monotonic() - _s35_auth_t0) * 1000.0,
-                )
-                # Slice 35 Phase 1 — STAGE_RT_HTTP_POST + STAGE_RT_STREAM_CONSUME
-                # timers. The post() context manager handle is the
-                # HTTP handshake; the chunk loop INSIDE the `async
-                # with` is the stream consumption. We capture the
-                # handshake-only time by measuring up to the first
-                # chunk arrival via _ttft_first_chunk_seen.
-                _s35_post_t0 = time.monotonic()
-                async with session.post(
-                    f"{self._base_url}/chat/completions",
-                    json=body,
-                    headers=_aegis_merge_lease_headers(
-                        _call_auth, _aegis_lease,
-                    ),
-                    timeout=self._request_timeout(),
-                ) as resp:
-                    if resp.status >= 300:
-                        self._last_error_status = resp.status
-                        err_body = await resp.text()
-                        # Sovereign Reasoning-Capability Profiler — ADAPTIVE learn:
-                        # if DW rejected our reasoning knob, remember this model needs
-                        # a floor so we never send the rejected effort again (Meryem @
-                        # DW, 2026-06-21: gpt-oss-120b can't disable reasoning).
-                        try:
-                            from backend.core.ouroboros.governance.dw_reasoning_profile import (  # noqa: E501
-                                maybe_learn_from_error as _rp_learn,
-                            )
-                            _rp_learn(_effective_model, body.get("reasoning_effort", ""), err_body)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # Phase 12 Slice F — Substrate Error Unmasking.
-                        # Preserve full response body + model_id so
-                        # downstream classifier can distinguish modality
-                        # 4xx from transient 5xx without regex on str(exc).
-                        raise DoublewordInfraError(
-                            f"Chat completions (stream) failed: "
-                            f"{resp.status} {err_body[:200]}",
-                            status_code=resp.status,
-                            response_body=err_body,
-                            model_id=_effective_model,
-                        )
+            for _attempt in range(2):  # 0=with tools (if injected), 1=without (400 fallback)
+                if _attempt == 1:
+                    body.pop("tools", None)
+                    body.pop("tool_choice", None)
+                    _tool_forced = False
+                try:
+                    if _stream_callback is not None:
+                        # Streaming path: SSE for token-by-token output.
+                        # Use a generous per-chunk timeout (30s between chunks)
+                        # to detect stalled streams without killing slow generation.
+                        body["stream"] = True
+                        content = ""
+                        input_tokens = 0
+                        output_tokens = 0
+                        _PER_CHUNK_TIMEOUT = 30.0  # seconds between SSE chunks
 
-                    # Two-Phase Stream Rupture Breaker.
-                    # Phase 1 (TTFT): generous timeout for first token.
-                    # Phase 2 (Inter-Chunk): tight timeout once streaming.
-                    _rupture_ttft = _stream_rupture_timeout_s()
-                    # CD-1 — lag-aware inter-chunk timeout: credit back
-                    # any accumulated event-loop lag so a starved loop
-                    # cannot false-rupture a flowing network stream.
-                    _rupture_ic = _lag_compensated_inter_chunk_timeout_s(
-                        base_s=_stream_inter_chunk_timeout_s(),
-                        lag_credit_s=_recent_lag_ms() / 1000.0,
-                    )
-                    _chunk_phase_timeout = _rupture_ttft  # Phase 1
-                    _sse_has_tokens = False
-                    # Phase-Aware Heartbeat — pulse the harness
-                    # ActivityMonitor every Nth content chunk so a long
-                    # DW stream stays observably fresh (Move 2 v4).
-                    _stream_op_id = str(getattr(context, "op_id", "") or "")
-                    _stream_chunk_count = 0
-                    # Slice 87 — cognitive-stall watchdog state. The inter-chunk
-                    # rupture watchdog above sees reasoning deltas and stays
-                    # alive, so a model stuck reasoning with no content runs the
-                    # FULL primary budget (the 240s/0-content capability stalls).
-                    # Track elapsed-since-first-progress while content is empty;
-                    # cascade to Tier 1 once it crosses the stall threshold.
-                    _reasoning_seen = False
-                    _content_seen = False
-                    _first_progress_at = 0.0
-                    _cognitive_stall_s = _cognitive_stall_timeout_s()
-                    # CD-2 — mark this SSE stream active so the load-shed latch
-                    # can engage SensorGovernor emergency-brake when event-loop
-                    # lag is critical. Wrapped defensively: a missing module or
-                    # broken import NEVER interrupts streaming. stream_end() is
-                    # called after the loop regardless of exit path.
-                    _cd2_ls = None
-                    try:
-                        from backend.core.ouroboros.governance import (
-                            control_plane_load_shed as _cd2_ls,
+                        # Priority 1 Slice 1 — confidence capture (PRD §26.5.1).
+                        # Master-flag-gated; when enabled, request OpenAI-compat
+                        # per-token logprobs from the provider so the streaming
+                        # parse below can capture the top-1/top-2 margin signal
+                        # into ctx.artifacts["confidence_capturer"]. Capture is
+                        # purely additive on the response; the request shape
+                        # only changes when the flag is on (byte-for-byte
+                        # preserved when off).
+                        from backend.core.ouroboros.governance.verification.confidence_capture import (
+                            ConfidenceCapturer,
+                            confidence_capture_enabled,
+                            confidence_capture_top_k,
+                            extract_openai_compat_logprobs_from_chunk,
                         )
-                        _cd2_ls.stream_begin()
-                    except Exception:  # noqa: BLE001
-                        _cd2_ls = None
-                    # Parse SSE stream with per-chunk timeout to detect stalled streams
-                    while True:
-                        try:
-                            line = await asyncio.wait_for(
-                                resp.content.readline(), timeout=_chunk_phase_timeout,
-                            )
-                        except asyncio.TimeoutError:
-                            _rupt_elapsed = time.monotonic() - _ttft_request_start_monotonic
-                            _rupt_phase = "ttft" if not _sse_has_tokens else "inter_chunk"
-                            logger.error(
-                                "[DoublewordProvider] STREAM RUPTURE "
-                                "(phase=%s): no chunk for %.0fs "
-                                "(elapsed=%.1fs, bytes=%d)",
-                                _rupt_phase,
-                                _chunk_phase_timeout,
-                                _rupt_elapsed,
-                                len(content),
-                            )
-                            raise StreamRuptureError(
+                        # Priority 1 Slice 2 — confidence monitor + circuit-breaker.
+                        # When ENABLED, the monitor consumes the per-token margin
+                        # signal alongside the capturer and produces a verdict;
+                        # ENFORCE sub-flag governs whether BELOW_FLOOR raises
+                        # ConfidenceCollapseError mid-stream. Slice 2 ships
+                        # SHADOW only — both flags default false; ENFORCE flips
+                        # in Slice 5 graduation.
+                        from backend.core.ouroboros.governance.verification.confidence_monitor import (
+                            ConfidenceMonitor,
+                            ConfidenceVerdict,
+                            confidence_monitor_enabled,
+                            confidence_monitor_enforce,
+                        )
+                        _confidence_capturer: Optional[ConfidenceCapturer] = None
+                        _confidence_monitor: Optional[ConfidenceMonitor] = None
+                        _monitor_enforce_active: bool = False
+                        if confidence_capture_enabled():
+                            body["logprobs"] = True
+                            body["top_logprobs"] = confidence_capture_top_k()
+                            _confidence_capturer = ConfidenceCapturer(
                                 provider="doubleword",
-                                elapsed_s=_rupt_elapsed,
-                                bytes_received=len(content),
-                                rupture_timeout_s=_chunk_phase_timeout,
-                                phase=_rupt_phase,
+                                model_id=str(_effective_model or ""),
                             )
-                        if not line:
-                            break
-                        line_str = line.decode("utf-8", errors="replace").strip()
-                        if not line_str or not line_str.startswith("data: "):
-                            continue
-                        data_str = line_str[6:]  # Remove "data: " prefix
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            token = delta.get("content", "")
-                            # Slice 54 — reasoning liveness. When reasoning is
-                            # enabled, Qwen3.5 streams `reasoning` deltas before
-                            # any `content`. Observing them marks affirmative
-                            # progress so the long think phase is NOT misread as
-                            # done_before_content / live_transport silence. The
-                            # reasoning text itself is telemetry only — the
-                            # candidate still comes from `content`.
-                            _reasoning_delta = delta.get("reasoning", "") or ""
-                            if _reasoning_delta and not token:
-                                _reasoning_seen = True  # liveness marker
-                            # Slice 87 — cognitive-stall watchdog. Mark first
-                            # progress (any reasoning OR content byte), flip
-                            # content_seen on the first real content token, and
-                            # cascade if content stays empty past the threshold
-                            # while the stream is otherwise alive.
-                            if (_reasoning_delta or token) and _first_progress_at == 0.0:
-                                _first_progress_at = time.monotonic()
-                            if token:
-                                _content_seen = True
-                            if (
-                                _cognitive_stall_s > 0
-                                and not _content_seen
-                                and _reasoning_seen
-                                and _first_progress_at > 0.0
-                                and (time.monotonic() - _first_progress_at)
-                                > _cognitive_stall_s
-                            ):
-                                _stall_elapsed = (
-                                    time.monotonic()
-                                    - _ttft_request_start_monotonic
-                                )
-                                logger.warning(
-                                    "[DoublewordProvider] COGNITIVE STALL: "
-                                    "model=%s reasoned %.0fs with 0 content — "
-                                    "cascading to Tier-1 fallback (op=%s)",
-                                    _effective_model, _stall_elapsed,
-                                    _stream_op_id[:24],
-                                )
-                                raise CognitiveStallError(
+                            # Slice 2 monitor wakes only when its own master flag
+                            # is on. Capture without monitor remains valid (Slice 1
+                            # observation-only mode for ledger/replay use).
+                            if confidence_monitor_enabled():
+                                _confidence_monitor = ConfidenceMonitor(
                                     provider="doubleword",
-                                    elapsed_s=_stall_elapsed,
-                                    bytes_received=len(content),
-                                    stall_timeout_s=_cognitive_stall_s,
-                                    reasoning_seen=_reasoning_seen,
+                                    model_id=str(_effective_model or ""),
+                                    op_id=str(
+                                        getattr(context, "op_id", "") or "",
+                                    ),
                                 )
-                            # Priority 1 Slice 1 + Slice 2 — capture +
-                            # monitor. Reads chunk's logprobs structure;
-                            # feeds capturer (always when capture enabled)
-                            # and monitor (when monitor enabled). Master-
-                            # flag-gated upstream; when off, both are None.
-                            # NEVER raises into the SSE loop EXCEPT for
-                            # the explicit ConfidenceCollapseError path
-                            # under ENFORCE — which propagates as a
-                            # structured RuntimeError that the caller
-                            # already handles via "background_dw_error" /
-                            # GENERATE_RETRY routing.
-                            if _confidence_capturer is not None:
+                                _monitor_enforce_active = (
+                                    confidence_monitor_enforce()
+                                )
+                            # Stash on ctx.artifacts so downstream phase runners
+                            # (Slice 2 monitor) can read the trace post-stream.
+                            try:
+                                _artifacts = getattr(context, "artifacts", None)
+                                if isinstance(_artifacts, dict):
+                                    _artifacts["confidence_capturer"] = (
+                                        _confidence_capturer
+                                    )
+                                    if _confidence_monitor is not None:
+                                        _artifacts["confidence_monitor"] = (
+                                            _confidence_monitor
+                                        )
+                            except Exception:  # noqa: BLE001 — capture must
+                                pass        # never break the stream loop
+                            # §37 Tier 2 #13 Slice 2 (2026-05-07) — propagate the
+                            # capturer to tool_executor via async-safe ContextVar
+                            # (PolicyContext doesn't carry artifacts dict). Each
+                            # op runs in its own asyncio.Task so the var is
+                            # task-local; new GENERATE rounds re-stamp the var
+                            # with their own capturer. Defensive: set failure
+                            # NEVER breaks the stream loop.
+                            try:
+                                from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+                                    set_active_capturer as _toolconf_set_var,
+                                )
+                                _toolconf_set_var(_confidence_capturer)
+                            except Exception:  # noqa: BLE001 — defensive
+                                pass
+                        # Phase 12.2 Slice C — TTFT measurement window opens
+                        # the moment we issue the request and closes on first
+                        # non-empty content chunk. monotonic() is jump-proof
+                        # under wall-clock corrections.
+                        _ttft_request_start_monotonic = time.monotonic()
+                        # Slice 187 — precision TTFT: a perf_counter anchor for PURE network latency
+                        # (separated from local async lag), recorded only if the loop wasn't starved.
+                        from backend.core.ouroboros.governance.dw_precision_telemetry import (
+                            now_perf as _s187_now,
+                        )
+                        _ttft_request_start_perf = _s187_now()
+                        _ttft_first_chunk_seen = False
+
+                        # Slice 35 Phase 1 — STAGE_RT_AEGIS_AUTH timer.
+                        _s35_auth_t0 = time.monotonic()
+                        # Slice 31 — Aegis session bearer (closes v24
+                        # missing_session_bearer 401 wedge on RT streaming).
+                        _call_auth = await _aegis_dw_session_auth_header()
+                        _call_auth["Content-Type"] = "application/json"
+                        # Slice 2B-ii — per-call Aegis lease (None when disabled
+                        # → header is skipped via merge helper).
+                        _aegis_lease = await _aegis_acquire_call_lease(
+                            op_id=context.op_id,
+                            route="standard",
+                            estimated_cost_usd=0.05,
+                        )
+                        _s35_dp.record_stage(
+                            "STAGE_RT_AEGIS_AUTH",
+                            op_id=_s35_op_id, model_id=_s35_model,
+                            duration_ms=(time.monotonic() - _s35_auth_t0) * 1000.0,
+                        )
+                        # Slice 35 Phase 1 — STAGE_RT_HTTP_POST + STAGE_RT_STREAM_CONSUME
+                        # timers. The post() context manager handle is the
+                        # HTTP handshake; the chunk loop INSIDE the `async
+                        # with` is the stream consumption. We capture the
+                        # handshake-only time by measuring up to the first
+                        # chunk arrival via _ttft_first_chunk_seen.
+                        _s35_post_t0 = time.monotonic()
+                        async with session.post(
+                            f"{self._base_url}/chat/completions",
+                            json=body,
+                            headers=_aegis_merge_lease_headers(
+                                _call_auth, _aegis_lease,
+                            ),
+                            timeout=self._request_timeout(),
+                        ) as resp:
+                            if resp.status >= 300:
+                                self._last_error_status = resp.status
+                                err_body = await resp.text()
+                                # Sovereign Reasoning-Capability Profiler — ADAPTIVE learn:
+                                # if DW rejected our reasoning knob, remember this model needs
+                                # a floor so we never send the rejected effort again (Meryem @
+                                # DW, 2026-06-21: gpt-oss-120b can't disable reasoning).
                                 try:
-                                    for _t, _lp, _top in (
-                                        extract_openai_compat_logprobs_from_chunk(
-                                            chunk,
-                                        )
-                                    ):
-                                        _confidence_capturer.append(
-                                            token=_t,
-                                            logprob=_lp,
-                                            top_logprobs=_top,
-                                        )
-                                        # Slice 2 monitor: feed the
-                                        # top-1/top-2 margin if there
-                                        # are at least 2 alternatives.
-                                        if _confidence_monitor is not None:
-                                            try:
-                                                if (
-                                                    isinstance(_top, list)
-                                                    and len(_top) >= 2
-                                                ):
-                                                    _entry0 = _top[0]
-                                                    _entry1 = _top[1]
-                                                    _lp0 = (
-                                                        _entry0.get(
-                                                            "logprob"
-                                                        ) if isinstance(
-                                                            _entry0, dict
-                                                        ) else None
-                                                    )
-                                                    _lp1 = (
-                                                        _entry1.get(
-                                                            "logprob"
-                                                        ) if isinstance(
-                                                            _entry1, dict
-                                                        ) else None
-                                                    )
-                                                    if (
-                                                        _lp0 is not None
-                                                        and _lp1 is not None
-                                                    ):
-                                                        _confidence_monitor.observe(
-                                                            float(_lp0)
-                                                            - float(_lp1)
-                                                        )
-                                            except Exception:  # noqa: BLE001
-                                                pass
+                                    from backend.core.ouroboros.governance.dw_reasoning_profile import (  # noqa: E501
+                                        maybe_learn_from_error as _rp_learn,
+                                    )
+                                    _rp_learn(_effective_model, body.get("reasoning_effort", ""), err_body)
                                 except Exception:  # noqa: BLE001
                                     pass
+                                # PR D C2 — fail-soft on 400 rejection of native tool schemas.
+                                # Cache and re-raise private sentinel; caller strips tools + retries.
+                                if resp.status == 400 and _tool_forced:
+                                    _dw_mark_tool_forcing_unsupported(_effective_model)
+                                    logger.warning(
+                                        "[DWToolForcing] endpoint rejected native tools "
+                                        "— falling back to legacy (op=%s model=%s)",
+                                        getattr(context, "op_id", "-"),
+                                        _effective_model,
+                                    )
+                                    raise _DWToolForcingRejectedError()
+                                # Phase 12 Slice F — Substrate Error Unmasking.
+                                # Preserve full response body + model_id so
+                                # downstream classifier can distinguish modality
+                                # 4xx from transient 5xx without regex on str(exc).
+                                raise DoublewordInfraError(
+                                    f"Chat completions (stream) failed: "
+                                    f"{resp.status} {err_body[:200]}",
+                                    status_code=resp.status,
+                                    response_body=err_body,
+                                    model_id=_effective_model,
+                                )
 
-                                # Slice 2 mid-stream verdict check. Cheap
-                                # (O(K)). Slice 5 graduation flips ENFORCE
-                                # on; until then, the verdict is observed
-                                # but never aborts. SHADOW mode tags
-                                # ctx.artifacts only; ENFORCE mode raises
-                                # ConfidenceCollapseError.
-                                if _confidence_monitor is not None:
-                                    try:
-                                        _posture: Optional[str] = None
-                                        try:
-                                            _posture = (
-                                                getattr(
-                                                    context,
-                                                    "current_posture", None,
-                                                )
-                                                or getattr(
-                                                    context,
-                                                    "posture", None,
-                                                )
-                                            )
-                                        except Exception:  # noqa: BLE001
-                                            _posture = None
-                                        _verdict = (
-                                            _confidence_monitor.evaluate(
-                                                posture=(
-                                                    str(_posture)
-                                                    if _posture else None
-                                                ),
-                                            )
+                            # Two-Phase Stream Rupture Breaker.
+                            # Phase 1 (TTFT): generous timeout for first token.
+                            # Phase 2 (Inter-Chunk): tight timeout once streaming.
+                            _rupture_ttft = _stream_rupture_timeout_s()
+                            # CD-1 — lag-aware inter-chunk timeout: credit back
+                            # any accumulated event-loop lag so a starved loop
+                            # cannot false-rupture a flowing network stream.
+                            _rupture_ic = _lag_compensated_inter_chunk_timeout_s(
+                                base_s=_stream_inter_chunk_timeout_s(),
+                                lag_credit_s=_recent_lag_ms() / 1000.0,
+                            )
+                            _chunk_phase_timeout = _rupture_ttft  # Phase 1
+                            _sse_has_tokens = False
+                            # Phase-Aware Heartbeat — pulse the harness
+                            # ActivityMonitor every Nth content chunk so a long
+                            # DW stream stays observably fresh (Move 2 v4).
+                            _stream_op_id = str(getattr(context, "op_id", "") or "")
+                            _stream_chunk_count = 0
+                            # Slice 87 — cognitive-stall watchdog state. The inter-chunk
+                            # rupture watchdog above sees reasoning deltas and stays
+                            # alive, so a model stuck reasoning with no content runs the
+                            # FULL primary budget (the 240s/0-content capability stalls).
+                            # Track elapsed-since-first-progress while content is empty;
+                            # cascade to Tier 1 once it crosses the stall threshold.
+                            _reasoning_seen = False
+                            _content_seen = False
+                            _first_progress_at = 0.0
+                            _cognitive_stall_s = _cognitive_stall_timeout_s()
+                            # CD-2 — mark this SSE stream active so the load-shed latch
+                            # can engage SensorGovernor emergency-brake when event-loop
+                            # lag is critical. Wrapped defensively: a missing module or
+                            # broken import NEVER interrupts streaming. stream_end() is
+                            # called after the loop regardless of exit path.
+                            _cd2_ls = None
+                            try:
+                                from backend.core.ouroboros.governance import (
+                                    control_plane_load_shed as _cd2_ls,
+                                )
+                                _cd2_ls.stream_begin()
+                            except Exception:  # noqa: BLE001
+                                _cd2_ls = None
+                            # Parse SSE stream with per-chunk timeout to detect stalled streams
+                            while True:
+                                try:
+                                    line = await asyncio.wait_for(
+                                        resp.content.readline(), timeout=_chunk_phase_timeout,
+                                    )
+                                except asyncio.TimeoutError:
+                                    _rupt_elapsed = time.monotonic() - _ttft_request_start_monotonic
+                                    _rupt_phase = "ttft" if not _sse_has_tokens else "inter_chunk"
+                                    logger.error(
+                                        "[DoublewordProvider] STREAM RUPTURE "
+                                        "(phase=%s): no chunk for %.0fs "
+                                        "(elapsed=%.1fs, bytes=%d)",
+                                        _rupt_phase,
+                                        _chunk_phase_timeout,
+                                        _rupt_elapsed,
+                                        len(content),
+                                    )
+                                    raise StreamRuptureError(
+                                        provider="doubleword",
+                                        elapsed_s=_rupt_elapsed,
+                                        bytes_received=len(content),
+                                        rupture_timeout_s=_chunk_phase_timeout,
+                                        phase=_rupt_phase,
+                                    )
+                                if not line:
+                                    break
+                                line_str = line.decode("utf-8", errors="replace").strip()
+                                if not line_str or not line_str.startswith("data: "):
+                                    continue
+                                data_str = line_str[6:]  # Remove "data: " prefix
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                    token = delta.get("content", "")
+                                    # Slice 54 — reasoning liveness. When reasoning is
+                                    # enabled, Qwen3.5 streams `reasoning` deltas before
+                                    # any `content`. Observing them marks affirmative
+                                    # progress so the long think phase is NOT misread as
+                                    # done_before_content / live_transport silence. The
+                                    # reasoning text itself is telemetry only — the
+                                    # candidate still comes from `content`.
+                                    _reasoning_delta = delta.get("reasoning", "") or ""
+                                    if _reasoning_delta and not token:
+                                        _reasoning_seen = True  # liveness marker
+                                    # Slice 87 — cognitive-stall watchdog. Mark first
+                                    # progress (any reasoning OR content byte), flip
+                                    # content_seen on the first real content token, and
+                                    # cascade if content stays empty past the threshold
+                                    # while the stream is otherwise alive.
+                                    if (_reasoning_delta or token) and _first_progress_at == 0.0:
+                                        _first_progress_at = time.monotonic()
+                                    if token:
+                                        _content_seen = True
+                                    if (
+                                        _cognitive_stall_s > 0
+                                        and not _content_seen
+                                        and _reasoning_seen
+                                        and _first_progress_at > 0.0
+                                        and (time.monotonic() - _first_progress_at)
+                                        > _cognitive_stall_s
+                                    ):
+                                        _stall_elapsed = (
+                                            time.monotonic()
+                                            - _ttft_request_start_monotonic
                                         )
-                                        # Tier 1 #1 — fire SSE on
-                                        # verdict state transitions.
-                                        # Best-effort, defensive,
-                                        # never raises. Master-flag-
-                                        # gated by
-                                        # JARVIS_CONFIDENCE_SSE_PRODUCER_ENABLED.
+                                        logger.warning(
+                                            "[DoublewordProvider] COGNITIVE STALL: "
+                                            "model=%s reasoned %.0fs with 0 content — "
+                                            "cascading to Tier-1 fallback (op=%s)",
+                                            _effective_model, _stall_elapsed,
+                                            _stream_op_id[:24],
+                                        )
+                                        raise CognitiveStallError(
+                                            provider="doubleword",
+                                            elapsed_s=_stall_elapsed,
+                                            bytes_received=len(content),
+                                            stall_timeout_s=_cognitive_stall_s,
+                                            reasoning_seen=_reasoning_seen,
+                                        )
+                                    # Priority 1 Slice 1 + Slice 2 — capture +
+                                    # monitor. Reads chunk's logprobs structure;
+                                    # feeds capturer (always when capture enabled)
+                                    # and monitor (when monitor enabled). Master-
+                                    # flag-gated upstream; when off, both are None.
+                                    # NEVER raises into the SSE loop EXCEPT for
+                                    # the explicit ConfidenceCollapseError path
+                                    # under ENFORCE — which propagates as a
+                                    # structured RuntimeError that the caller
+                                    # already handles via "background_dw_error" /
+                                    # GENERATE_RETRY routing.
+                                    if _confidence_capturer is not None:
                                         try:
-                                            from backend.core.ouroboros.governance.verification.confidence_sse_producer import (  # noqa: E501
-                                                observe_streaming_verdict,
-                                            )
-                                            _snap = (
-                                                _confidence_monitor
-                                                .snapshot()
-                                            )
-                                            observe_streaming_verdict(
-                                                op_id=getattr(
-                                                    context,
-                                                    "op_id", "",
-                                                ),
-                                                verdict=_verdict,
-                                                rolling_margin=(
-                                                    _snap.rolling_margin
-                                                ),
-                                                window_size=(
-                                                    _snap.window_size
-                                                ),
-                                                observations_count=(
-                                                    _snap.observations_count
-                                                ),
-                                                posture=(
-                                                    str(_posture)
-                                                    if _posture
-                                                    else None
-                                                ),
-                                                provider="doubleword",
-                                                model_id=getattr(
-                                                    _confidence_monitor,
-                                                    "model_id", "",
-                                                ),
-                                            )
+                                            for _t, _lp, _top in (
+                                                extract_openai_compat_logprobs_from_chunk(
+                                                    chunk,
+                                                )
+                                            ):
+                                                _confidence_capturer.append(
+                                                    token=_t,
+                                                    logprob=_lp,
+                                                    top_logprobs=_top,
+                                                )
+                                                # Slice 2 monitor: feed the
+                                                # top-1/top-2 margin if there
+                                                # are at least 2 alternatives.
+                                                if _confidence_monitor is not None:
+                                                    try:
+                                                        if (
+                                                            isinstance(_top, list)
+                                                            and len(_top) >= 2
+                                                        ):
+                                                            _entry0 = _top[0]
+                                                            _entry1 = _top[1]
+                                                            _lp0 = (
+                                                                _entry0.get(
+                                                                    "logprob"
+                                                                ) if isinstance(
+                                                                    _entry0, dict
+                                                                ) else None
+                                                            )
+                                                            _lp1 = (
+                                                                _entry1.get(
+                                                                    "logprob"
+                                                                ) if isinstance(
+                                                                    _entry1, dict
+                                                                ) else None
+                                                            )
+                                                            if (
+                                                                _lp0 is not None
+                                                                and _lp1 is not None
+                                                            ):
+                                                                _confidence_monitor.observe(
+                                                                    float(_lp0)
+                                                                    - float(_lp1)
+                                                                )
+                                                    except Exception:  # noqa: BLE001
+                                                        pass
                                         except Exception:  # noqa: BLE001
                                             pass
-                                        if _verdict != ConfidenceVerdict.OK:
+
+                                        # Slice 2 mid-stream verdict check. Cheap
+                                        # (O(K)). Slice 5 graduation flips ENFORCE
+                                        # on; until then, the verdict is observed
+                                        # but never aborts. SHADOW mode tags
+                                        # ctx.artifacts only; ENFORCE mode raises
+                                        # ConfidenceCollapseError.
+                                        if _confidence_monitor is not None:
                                             try:
-                                                _arts = getattr(
-                                                    context,
-                                                    "artifacts", None,
-                                                )
-                                                if isinstance(
-                                                    _arts, dict,
-                                                ):
-                                                    _arts[
-                                                        "confidence_verdict"
-                                                    ] = _verdict.value
-                                                    _arts[
-                                                        "confidence_margin"
-                                                    ] = (
-                                                        _confidence_monitor
-                                                        .current_margin()
+                                                _posture: Optional[str] = None
+                                                try:
+                                                    _posture = (
+                                                        getattr(
+                                                            context,
+                                                            "current_posture", None,
+                                                        )
+                                                        or getattr(
+                                                            context,
+                                                            "posture", None,
+                                                        )
                                                     )
-                                            except Exception:  # noqa: BLE001
-                                                pass
-                                            if (
-                                                _monitor_enforce_active
-                                                and _verdict
-                                                == ConfidenceVerdict.BELOW_FLOOR
-                                            ):
-                                                raise (
-                                                    _confidence_monitor
-                                                    .to_collapse_error(
+                                                except Exception:  # noqa: BLE001
+                                                    _posture = None
+                                                _verdict = (
+                                                    _confidence_monitor.evaluate(
+                                                        posture=(
+                                                            str(_posture)
+                                                            if _posture else None
+                                                        ),
+                                                    )
+                                                )
+                                                # Tier 1 #1 — fire SSE on
+                                                # verdict state transitions.
+                                                # Best-effort, defensive,
+                                                # never raises. Master-flag-
+                                                # gated by
+                                                # JARVIS_CONFIDENCE_SSE_PRODUCER_ENABLED.
+                                                try:
+                                                    from backend.core.ouroboros.governance.verification.confidence_sse_producer import (  # noqa: E501
+                                                        observe_streaming_verdict,
+                                                    )
+                                                    _snap = (
+                                                        _confidence_monitor
+                                                        .snapshot()
+                                                    )
+                                                    observe_streaming_verdict(
+                                                        op_id=getattr(
+                                                            context,
+                                                            "op_id", "",
+                                                        ),
                                                         verdict=_verdict,
+                                                        rolling_margin=(
+                                                            _snap.rolling_margin
+                                                        ),
+                                                        window_size=(
+                                                            _snap.window_size
+                                                        ),
+                                                        observations_count=(
+                                                            _snap.observations_count
+                                                        ),
                                                         posture=(
                                                             str(_posture)
                                                             if _posture
                                                             else None
                                                         ),
+                                                        provider="doubleword",
+                                                        model_id=getattr(
+                                                            _confidence_monitor,
+                                                            "model_id", "",
+                                                        ),
                                                     )
+                                                except Exception:  # noqa: BLE001
+                                                    pass
+                                                if _verdict != ConfidenceVerdict.OK:
+                                                    try:
+                                                        _arts = getattr(
+                                                            context,
+                                                            "artifacts", None,
+                                                        )
+                                                        if isinstance(
+                                                            _arts, dict,
+                                                        ):
+                                                            _arts[
+                                                                "confidence_verdict"
+                                                            ] = _verdict.value
+                                                            _arts[
+                                                                "confidence_margin"
+                                                            ] = (
+                                                                _confidence_monitor
+                                                                .current_margin()
+                                                            )
+                                                    except Exception:  # noqa: BLE001
+                                                        pass
+                                                    if (
+                                                        _monitor_enforce_active
+                                                        and _verdict
+                                                        == ConfidenceVerdict.BELOW_FLOOR
+                                                    ):
+                                                        raise (
+                                                            _confidence_monitor
+                                                            .to_collapse_error(
+                                                                verdict=_verdict,
+                                                                posture=(
+                                                                    str(_posture)
+                                                                    if _posture
+                                                                    else None
+                                                                ),
+                                                            )
+                                                        )
+                                            except (
+                                                Exception
+                                            ) as _conf_exc:  # noqa: BLE001
+                                                # Re-raise ConfidenceCollapseError
+                                                # so caller's retry path engages.
+                                                # Other exceptions from the verdict
+                                                # path are swallowed defensively.
+                                                from backend.core.ouroboros.governance.verification.confidence_monitor import (
+                                                    ConfidenceCollapseError,
                                                 )
-                                    except (
-                                        Exception
-                                    ) as _conf_exc:  # noqa: BLE001
-                                        # Re-raise ConfidenceCollapseError
-                                        # so caller's retry path engages.
-                                        # Other exceptions from the verdict
-                                        # path are swallowed defensively.
-                                        from backend.core.ouroboros.governance.verification.confidence_monitor import (
-                                            ConfidenceCollapseError,
-                                        )
-                                        if isinstance(
-                                            _conf_exc,
-                                            ConfidenceCollapseError,
+                                                if isinstance(
+                                                    _conf_exc,
+                                                    ConfidenceCollapseError,
+                                                ):
+                                                    raise
+                                    if token:
+                                        content += token
+                                        self._last_chunk_at = time.monotonic()
+                                        # Stream Rupture Breaker: Phase 2 step-down.
+                                        # Once first token arrives, tighten the
+                                        # watchdog to inter-chunk timeout.
+                                        if not _sse_has_tokens:
+                                            _sse_has_tokens = True
+                                            _chunk_phase_timeout = _rupture_ic
+                                            # Phase-Aware Heartbeat: pulse activity
+                                            # on first token (TTFT → producing).
+                                            try:
+                                                from backend.core.ouroboros.governance.providers import (
+                                                    _emit_stream_activity as _activity_pulse,
+                                                )
+                                                _activity_pulse(_stream_op_id)
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        _stream_chunk_count += 1
+                                        # Phase-Aware Heartbeat — every Nth content
+                                        # chunk pulses ActivityMonitor so a long DW
+                                        # stream stays fresh between phase transitions.
+                                        if (
+                                            _stream_chunk_count > 0
+                                            and _stream_chunk_count % 8 == 0
                                         ):
-                                            raise
-                            if token:
-                                content += token
-                                self._last_chunk_at = time.monotonic()
-                                # Stream Rupture Breaker: Phase 2 step-down.
-                                # Once first token arrives, tighten the
-                                # watchdog to inter-chunk timeout.
-                                if not _sse_has_tokens:
-                                    _sse_has_tokens = True
-                                    _chunk_phase_timeout = _rupture_ic
-                                    # Phase-Aware Heartbeat: pulse activity
-                                    # on first token (TTFT → producing).
-                                    try:
-                                        from backend.core.ouroboros.governance.providers import (
-                                            _emit_stream_activity as _activity_pulse,
-                                        )
-                                        _activity_pulse(_stream_op_id)
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                _stream_chunk_count += 1
-                                # Phase-Aware Heartbeat — every Nth content
-                                # chunk pulses ActivityMonitor so a long DW
-                                # stream stays fresh between phase transitions.
-                                if (
-                                    _stream_chunk_count > 0
-                                    and _stream_chunk_count % 8 == 0
-                                ):
-                                    try:
-                                        from backend.core.ouroboros.governance.providers import (
-                                            _emit_stream_activity as _activity_pulse,
-                                        )
-                                        _activity_pulse(_stream_op_id)
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                    # CD-2 — evaluate lag every 8 chunks (same
-                                    # cadence as the heartbeat) and update the
-                                    # shed latch. Defensive: NEVER raises into
-                                    # the SSE loop.
-                                    try:
-                                        if _cd2_ls is not None:
-                                            _cd2_ls.evaluate(_recent_lag_ms())
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                # Phase 12.2 Slice C — record TTFT once
-                                # per request on first non-empty content
-                                # chunk. NEVER raises into the SSE loop:
-                                # observer faults are swallowed so a
-                                # broken observer can't kill generation.
-                                if not _ttft_first_chunk_seen:
-                                    _ttft_first_chunk_seen = True
-                                    try:
-                                        # Slice 187 — PURE network TTFT (perf_counter,
-                                        # request-sent → first-byte) separated from LOCAL ASYNC
-                                        # LAG. A loop-starved sample is EXCLUDED from the latency
-                                        # tracker so the routing governor never trains on a
-                                        # broken stopwatch.
-                                        from backend.core.ouroboros.governance.dw_precision_telemetry import (  # noqa: E501
-                                            network_ttft_ms as _s187_ttft,
-                                            measure_loop_lag_ms as _s187_lag,
-                                            ttft_sample_is_clean as _s187_clean,
-                                            now_perf as _s187_np,
-                                        )
-                                        _pure_ttft_ms = _s187_ttft(
-                                            _ttft_request_start_perf, _s187_np(),
-                                        )
-                                        _loop_lag_ms = await _s187_lag()
-                                        _ttft_clean = _s187_clean(_loop_lag_ms)
-                                        logger.info(
-                                            "[Slice187] TTFT pure_network=%.0fms loop_lag=%.0fms "
-                                            "clean=%s (model=%s) — %s",
-                                            _pure_ttft_ms, _loop_lag_ms, _ttft_clean,
-                                            _effective_model,
-                                            "RECORDED" if _ttft_clean
-                                            else "EXCLUDED (loop starved)",
-                                        )
-                                        if _ttft_clean:
-                                            self._record_ttft_safely(
-                                                model_id=_effective_model,
-                                                ttft_ms=int(_pure_ttft_ms),
-                                                op_id=getattr(
-                                                    context, "op_id", "",
-                                                ) or "",
-                                            )
-                                        # Slice 35 Phase 1 — record
-                                        # STAGE_RT_HTTP_POST at first-chunk
-                                        # arrival (TTFT closes the HTTP
-                                        # handshake stage).
-                                        _s35_dp.record_stage(
-                                            "STAGE_RT_HTTP_POST",
-                                            op_id=_s35_op_id,
-                                            model_id=_s35_model,
-                                            duration_ms=float(_ttft_ms),
-                                        )
-                                        # Reset stream-consume timer
-                                        # to start AT first chunk.
-                                        _s35_stream_t0 = time.monotonic()
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                try:
-                                    _stream_callback(token)
-                                except Exception:
-                                    pass
-                            # Capture usage from final chunk
-                            _usage = chunk.get("usage")
-                            if _usage:
-                                input_tokens = _usage.get("prompt_tokens", 0)
-                                output_tokens = _usage.get("completion_tokens", 0)
-                        except json.JSONDecodeError:
-                            continue
-                    # CD-2 — clear stream-active latch now that the SSE loop
-                    # has exited (normal completion, rupture, or stall).
-                    try:
-                        if _cd2_ls is not None:
-                            _cd2_ls.stream_end()
-                    except Exception:  # noqa: BLE001
-                        pass
-            else:
-                # Non-streaming path
-                # Slice 31 — Aegis session bearer (closes v24
-                # missing_session_bearer 401 wedge).
-                _call_auth = await _aegis_dw_session_auth_header()
-                _call_auth["Content-Type"] = "application/json"
-                # Slice 2B-ii — per-call Aegis lease.
-                _aegis_lease = await _aegis_acquire_call_lease(
-                    op_id=context.op_id,
-                    route="standard",
-                    estimated_cost_usd=0.05,
-                )
-                async with session.post(
-                    f"{self._base_url}/chat/completions",
-                    json=body,
-                    headers=_aegis_merge_lease_headers(
-                        _call_auth, _aegis_lease,
-                    ),
-                    timeout=self._request_timeout(),
-                ) as resp:
-                    if resp.status >= 300:
-                        self._last_error_status = resp.status
-                        err_body = await resp.text()
-                        # Slice F — preserve full body + model_id
-                        raise DoublewordInfraError(
-                            f"Chat completions failed: "
-                            f"{resp.status} {err_body[:200]}",
-                            status_code=resp.status,
-                            response_body=err_body,
-                            model_id=_effective_model,
+                                            try:
+                                                from backend.core.ouroboros.governance.providers import (
+                                                    _emit_stream_activity as _activity_pulse,
+                                                )
+                                                _activity_pulse(_stream_op_id)
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                            # CD-2 — evaluate lag every 8 chunks (same
+                                            # cadence as the heartbeat) and update the
+                                            # shed latch. Defensive: NEVER raises into
+                                            # the SSE loop.
+                                            try:
+                                                if _cd2_ls is not None:
+                                                    _cd2_ls.evaluate(_recent_lag_ms())
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        # Phase 12.2 Slice C — record TTFT once
+                                        # per request on first non-empty content
+                                        # chunk. NEVER raises into the SSE loop:
+                                        # observer faults are swallowed so a
+                                        # broken observer can't kill generation.
+                                        if not _ttft_first_chunk_seen:
+                                            _ttft_first_chunk_seen = True
+                                            try:
+                                                # Slice 187 — PURE network TTFT (perf_counter,
+                                                # request-sent → first-byte) separated from LOCAL ASYNC
+                                                # LAG. A loop-starved sample is EXCLUDED from the latency
+                                                # tracker so the routing governor never trains on a
+                                                # broken stopwatch.
+                                                from backend.core.ouroboros.governance.dw_precision_telemetry import (  # noqa: E501
+                                                    network_ttft_ms as _s187_ttft,
+                                                    measure_loop_lag_ms as _s187_lag,
+                                                    ttft_sample_is_clean as _s187_clean,
+                                                    now_perf as _s187_np,
+                                                )
+                                                _pure_ttft_ms = _s187_ttft(
+                                                    _ttft_request_start_perf, _s187_np(),
+                                                )
+                                                _loop_lag_ms = await _s187_lag()
+                                                _ttft_clean = _s187_clean(_loop_lag_ms)
+                                                logger.info(
+                                                    "[Slice187] TTFT pure_network=%.0fms loop_lag=%.0fms "
+                                                    "clean=%s (model=%s) — %s",
+                                                    _pure_ttft_ms, _loop_lag_ms, _ttft_clean,
+                                                    _effective_model,
+                                                    "RECORDED" if _ttft_clean
+                                                    else "EXCLUDED (loop starved)",
+                                                )
+                                                if _ttft_clean:
+                                                    self._record_ttft_safely(
+                                                        model_id=_effective_model,
+                                                        ttft_ms=int(_pure_ttft_ms),
+                                                        op_id=getattr(
+                                                            context, "op_id", "",
+                                                        ) or "",
+                                                    )
+                                                # Slice 35 Phase 1 — record
+                                                # STAGE_RT_HTTP_POST at first-chunk
+                                                # arrival (TTFT closes the HTTP
+                                                # handshake stage).
+                                                _s35_dp.record_stage(
+                                                    "STAGE_RT_HTTP_POST",
+                                                    op_id=_s35_op_id,
+                                                    model_id=_s35_model,
+                                                    duration_ms=float(_ttft_ms),
+                                                )
+                                                # Reset stream-consume timer
+                                                # to start AT first chunk.
+                                                _s35_stream_t0 = time.monotonic()
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        try:
+                                            _stream_callback(token)
+                                        except Exception:
+                                            pass
+                                    # Capture usage from final chunk
+                                    _usage = chunk.get("usage")
+                                    if _usage:
+                                        input_tokens = _usage.get("prompt_tokens", 0)
+                                        output_tokens = _usage.get("completion_tokens", 0)
+                                except json.JSONDecodeError:
+                                    continue
+                            # CD-2 — clear stream-active latch now that the SSE loop
+                            # has exited (normal completion, rupture, or stall).
+                            try:
+                                if _cd2_ls is not None:
+                                    _cd2_ls.stream_end()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    else:
+                        # Non-streaming path
+                        # Slice 31 — Aegis session bearer (closes v24
+                        # missing_session_bearer 401 wedge).
+                        _call_auth = await _aegis_dw_session_auth_header()
+                        _call_auth["Content-Type"] = "application/json"
+                        # Slice 2B-ii — per-call Aegis lease.
+                        _aegis_lease = await _aegis_acquire_call_lease(
+                            op_id=context.op_id,
+                            route="standard",
+                            estimated_cost_usd=0.05,
                         )
+                        async with session.post(
+                            f"{self._base_url}/chat/completions",
+                            json=body,
+                            headers=_aegis_merge_lease_headers(
+                                _call_auth, _aegis_lease,
+                            ),
+                            timeout=self._request_timeout(),
+                        ) as resp:
+                            if resp.status >= 300:
+                                self._last_error_status = resp.status
+                                err_body = await resp.text()
+                                # PR D C2 — fail-soft on 400 rejection of native tool schemas.
+                                if resp.status == 400 and _tool_forced:
+                                    _dw_mark_tool_forcing_unsupported(_effective_model)
+                                    logger.warning(
+                                        "[DWToolForcing] endpoint rejected native tools "
+                                        "— falling back to legacy non-streaming (op=%s model=%s)",
+                                        getattr(context, "op_id", "-"),
+                                        _effective_model,
+                                    )
+                                    raise _DWToolForcingRejectedError()
+                                # Slice F — preserve full body + model_id
+                                raise DoublewordInfraError(
+                                    f"Chat completions failed: "
+                                    f"{resp.status} {err_body[:200]}",
+                                    status_code=resp.status,
+                                    response_body=err_body,
+                                    model_id=_effective_model,
+                                )
 
-                    data = await resp.json()
-                    choices = data.get("choices", [])
-                    usage = data.get("usage", {})
+                            data = await resp.json()
+                            choices = data.get("choices", [])
+                            usage = data.get("usage", {})
 
-                    if not choices:
-                        raise DoublewordInfraError("No choices in response", status_code=0)
+                            if not choices:
+                                raise DoublewordInfraError("No choices in response", status_code=0)
 
-                    content = choices[0].get("message", {}).get("content", "")
-                    input_tokens = usage.get("prompt_tokens", 0)
-                    output_tokens = usage.get("completion_tokens", 0)
+                            content = choices[0].get("message", {}).get("content", "")
+                            input_tokens = usage.get("prompt_tokens", 0)
+                            output_tokens = usage.get("completion_tokens", 0)
+
+                except _DWToolForcingRejectedError:
+                    if _attempt == 0:
+                        continue  # retry without tools
+                    raise  # second attempt should not hit this
+                break  # success — don't retry
 
             # Accumulate token usage for outer scope
             _token_usage["input"] += input_tokens

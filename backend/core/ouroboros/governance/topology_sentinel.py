@@ -172,6 +172,52 @@ def reset_dw_model_override(token: Any) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# PR D — ContextVar for per-generate DW exploration state
+# ---------------------------------------------------------------------------
+#
+# Stamped by tool_executor.py's epistemic producer BEFORE each _generate_fn
+# call so _generate_raw in doubleword_provider.py can read how many
+# exploration tool calls have already fired (and what floor is required)
+# and inject tools/tool_choice ONLY when exploration is still needed.
+#
+# Shape: Optional[dict] — {"explore_count": int, "floor": int}
+#        None  → native tool forcing is off or no state stamped (default)
+#
+# NOTE: JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED is INERT without
+# JARVIS_EPISTEMIC_FEEDBACK_ENABLED=true. The ContextVar is only stamped
+# when the epistemic feedback producer is active. When the var is None,
+# _generate_raw skips tool injection entirely — both flags must be ON.
+
+DW_EXPLORATION_STATE_VAR: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("dw_exploration_state", default=None)
+)
+
+
+def get_exploration_state() -> Optional[dict]:
+    """Read the per-task DW exploration state set by the epistemic producer.
+
+    Returns dict with 'explore_count' + 'floor' keys, or None when not set.
+    NEVER raises.
+    """
+    try:
+        return DW_EXPLORATION_STATE_VAR.get()
+    except LookupError:
+        return None
+
+
+def set_exploration_state(state: Optional[dict]) -> None:
+    """Set (or clear) the per-task DW exploration state.
+
+    Call with None to reset (cleanup in finally blocks).
+    NEVER raises — ContextVar.set() is infallible.
+    """
+    try:
+        DW_EXPLORATION_STATE_VAR.set(state)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 SCHEMA_VERSION = "topology_sentinel.1"
 
 

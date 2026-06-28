@@ -4892,6 +4892,56 @@ _READONLY_EXPLORATION_TOOLS: frozenset = frozenset({
 })
 
 
+# PR D I1 — BROAD-6 exploration tool set (shared with Iron Gate via exploration_floor.py).
+# Must match IRON_GATE_EXPLORATION_TOOLS in exploration_floor.py exactly.
+_EPISTEMIC_GATE_TOOLS: frozenset = frozenset({
+    "read_file",
+    "search_code",
+    "get_callers",
+    "list_symbols",
+    "glob_files",
+    "list_dir",
+})
+
+
+def _epistemic_exploration_floor() -> int:
+    """Epistemic feedback loop exploration floor.
+
+    Delegates to exploration_floor.iron_gate_exploration_floor() — the shared
+    helper that reads JARVIS_MIN_EXPLORATION_CALLS (same env var as Iron Gate)
+    with complexity-scaled defaults (2 for moderate/complex when no complexity
+    context is available). Falls back to JARVIS_TOOL_LOOP_MIN_EXPLORATION for
+    backward compat with existing tests and configs. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.exploration_floor import (
+            iron_gate_exploration_floor as _ef_floor,
+        )
+        return _ef_floor()  # no complexity available here → defaults to 2
+    except Exception:  # noqa: BLE001
+        # Backward compat fallback
+        raw = os.environ.get("JARVIS_TOOL_LOOP_MIN_EXPLORATION", "").strip()
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 2
+
+
+def _dw_native_tool_forcing_enabled_for_loop() -> bool:
+    """Whether to stamp DW_EXPLORATION_STATE_VAR before each generate call.
+    Both JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED and JARVIS_EPISTEMIC_FEEDBACK_ENABLED
+    must be ON for stamping to be meaningful. NEVER raises.
+    """
+    try:
+        env = os.environ.get
+        return (
+            env("JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED", "").lower() in ("1", "true", "yes")
+            and env("JARVIS_EPISTEMIC_FEEDBACK_ENABLED", "").lower() in ("1", "true", "yes")
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _final_write_nudge_text() -> str:
     """The imperative final-write nudge appended when convergence is forced
     (Slice 3E time/round/context axes — and the Sovereign Epistemic Governor's
@@ -5761,6 +5811,17 @@ class ToolLoopCoordinator:
                     self._last_edit_history = list(history)
         except Exception:
             pass
+        # I2 — reset epistemic exploration ContextVar so it does not leak into
+        # subsequent ops running on the same asyncio task. _finalize_run is
+        # called before every intentional raise path in run() per its docstring
+        # invariant. Truly unexpected exceptions that bypass _finalize_run are
+        # not covered here; a full try/finally around the while loop would be
+        # needed for complete coverage (larger refactor, deferred).
+        try:
+            from backend.core.ouroboros.governance import topology_sentinel as _ts_fin
+            _ts_fin.set_exploration_state(None)
+        except Exception:  # noqa: BLE001 — cleanup never raises
+            pass
 
     def get_last_edit_history(self) -> List[Dict[str, Any]]:
         """Return the edit history captured from the most recent run().
@@ -6204,6 +6265,19 @@ class ToolLoopCoordinator:
 
             # Signal to provider: use lower max_tokens for tool rounds
             self.is_tool_round = (round_index > 0)
+
+            # PR D — stamp exploration state for DW native tool-forcing.
+            # Count how many BROAD-6 tool calls have already fired this op.
+            if _dw_native_tool_forcing_enabled_for_loop():
+                try:
+                    from backend.core.ouroboros.governance import topology_sentinel as _ts_loop
+                    _ts_loop.set_exploration_state({
+                        "explore_count": _cumulative_explore_calls,
+                        "floor": _epistemic_exploration_floor(),
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+
             raw = await generate_fn(current_prompt)
             tool_calls = parse_fn(raw)
             if tool_calls is None:
