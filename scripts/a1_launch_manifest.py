@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 SCHEMA_VERSION = "a1-launch.1"
-REQUIRED_KEYS = {"schema_version", "model", "native_tool_forcing", "epistemic_feedback", "failover_lifecycle"}
+REQUIRED_KEYS = {"schema_version", "model", "native_tool_forcing", "epistemic_feedback", "failover_lifecycle", "file_isolation"}
 
 
 class A1ManifestError(Exception):
@@ -35,6 +35,7 @@ def build_manifest(
     native_tool_forcing: bool,
     epistemic_feedback: bool,
     failover_lifecycle: bool = False,
+    file_isolation: bool = False,
     seed: Optional[int] = None,
     cost_cap: Optional[float] = None,
     max_wall_seconds: Optional[int] = None,
@@ -47,6 +48,7 @@ def build_manifest(
         "native_tool_forcing": native_tool_forcing,
         "epistemic_feedback": epistemic_feedback,
         "failover_lifecycle": failover_lifecycle,
+        "file_isolation": file_isolation,
     }
     if seed is not None:
         core["seed"] = seed
@@ -102,6 +104,13 @@ def apply_manifest(manifest: Dict[str, Any], env: Dict[str, str]) -> Dict[str, s
     # Prevents the shell-var-propagation gap that let JARVIS_FAILOVER_LIFECYCLE_ENABLED
     # default to "true" on the node and spawn J-Prime mid-soak.
     env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "true" if manifest.get("failover_lifecycle") else "false"
+    # Deterministic file-isolation pin: always written (true/false), never absent.
+    # On an ephemeral cloud node there is no operator checkout to protect, so both
+    # isolation flags MUST be false -> autonomous writes land in repo_root ->
+    # durable commit (written=True), fixing the fsm_classify_to_applied A1 blocker.
+    # Mirrors the failover_lifecycle pin: BOTH flags written deterministically.
+    env["JARVIS_FILE_ISOLATION_ENABLED"] = "true" if manifest.get("file_isolation") else "false"
+    env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] = "true" if manifest.get("file_isolation") else "false"
     if manifest.get("seed") is not None:
         env["JARVIS_CHAOS_SEED"] = str(manifest["seed"])
     if manifest.get("cost_cap") is not None:
