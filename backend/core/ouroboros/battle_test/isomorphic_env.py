@@ -371,6 +371,17 @@ class IsomorphicEnv:
         """Set node env vars; save prior values for restore."""
         assert self._effective_root is not None  # always set before this call
         node_env = _build_node_env(self._remote_root, self._effective_root)
+        # Add PYTHONPATH: prepend the live root so subprocess ``-m backend``
+        # imports resolve exactly as on the GCP node (which boots via
+        # ``cd <jarvis_repo>`` in _remote_boot_shell — cwd == repo satisfies
+        # the same need as an explicit PYTHONPATH).  This matches the pattern
+        # in bake_soak_golden_image.py:345 and chaos_injector_ast.py:554.
+        # The existing save/restore loop handles PYTHONPATH like any other key.
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        node_env["PYTHONPATH"] = (
+            str(self._effective_root)
+            + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        )
         for key, val in node_env.items():
             self._saved_env[key] = os.environ.get(key)
             os.environ[key] = val

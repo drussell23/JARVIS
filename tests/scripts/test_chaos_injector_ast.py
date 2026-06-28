@@ -516,3 +516,88 @@ def test_status_reports_active_and_inactive(tmp_path):
     m = cia._read_manifest(str(repo))
     assert m is not None
     cia.do_revert(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# Blanket ASCII filter REMOVED — docstring-emoji files now eligible.
+#
+# The _is_ascii_clean helper was a WORKAROUND for the Iron Gate bug that
+# rejected non-ASCII anywhere in generated content (including string literals).
+# That function and its callers have been deleted; the tests below verify the
+# CORRECT post-fix behaviour: files with Unicode ONLY in docstrings/strings are
+# valid chaos targets because the fixed gate (token-aware scan) allows them.
+# --------------------------------------------------------------------------- #
+
+def test_py_with_docstring_emoji_included_in_candidates(tmp_path):
+    """_scan_one_file must now INCLUDE a .py file whose only non-ASCII lives
+    in a docstring.  The fixed Iron Gate (token-aware scan) allows Unicode in
+    string literals, so the repair (= original source) will pass the gate.
+    """
+    repo = tmp_path / "repo"
+    utils_dir = repo / "backend" / "utils"
+    utils_dir.mkdir(parents=True)
+    (repo / "backend" / "__init__.py").write_text("")
+    (utils_dir / "__init__.py").write_text("")
+    # Pure-leaf function with emoji ONLY in the docstring — all code tokens
+    # are ASCII.  The fixed gate allows this; the blanket filter must be gone.
+    emoji_src = (
+        'def add(a, b):\n'
+        '    """📁 Adds two numbers."""\n'
+        '    return a + b\n'
+    )
+    emoji_mod = utils_dir / "emoji_mod.py"
+    emoji_mod.write_text(emoji_src, encoding="utf-8")
+    # Plain ASCII file — must also remain eligible as a sanity check.
+    ascii_src = "def mul(a, b):\n    return a * b\n"
+    ascii_mod = utils_dir / "ascii_mod.py"
+    ascii_mod.write_text(ascii_src)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("")
+    (tests_dir / "test_mods.py").write_text(
+        "from backend.utils.emoji_mod import add\n"
+        "from backend.utils.ascii_mod import mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n"
+    )
+    cands = cia._scan_pure_leaf_functions(str(repo), [str(utils_dir)])
+    candidate_files = {c.target_file for c in cands}
+    # The docstring-emoji file must now be a valid candidate (blanket filter gone).
+    assert str(emoji_mod) in candidate_files, (
+        "emoji_mod.py (emoji only in docstring) must be included in candidates "
+        "now that the blanket ASCII filter is removed"
+    )
+    # The ASCII file must remain eligible.
+    assert str(ascii_mod) in candidate_files, (
+        "ascii_mod.py must remain a valid candidate"
+    )
+
+
+def test_acquire_candidates_excludes_no_mutation_site_file(tmp_path):
+    """acquire_candidates excludes files/functions that have no viable mutation
+    site — this is the correct structural reason to exclude, NOT non-ASCII.
+    A function that merely returns a string literal has no BinOp/Comparator
+    to mutate, so it is excluded regardless of whether it contains Unicode."""
+    repo = tmp_path / "repo"
+    utils_dir = repo / "backend" / "utils"
+    utils_dir.mkdir(parents=True)
+    (repo / "backend" / "__init__.py").write_text("")
+    (utils_dir / "__init__.py").write_text("")
+    # Function with emoji in a STRING return but NO viable mutation site —
+    # still excluded because has_viable_mutation returns False, not because of
+    # the (now-removed) ASCII filter.
+    no_mut_src = "def greet():\n    return 'Hello \U0001f4c4'\n"
+    (utils_dir / "greeter.py").write_text(no_mut_src, encoding="utf-8")
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("")
+    (tests_dir / "test_greeter.py").write_text(
+        "from backend.utils.greeter import greet\n\n"
+        "def test_greet():\n    assert 'Hello' in greet()\n"
+    )
+    cfg = cia.InjectConfig(repo_root=str(repo))
+    cands = cia.acquire_candidates(cfg)
+    assert all(c.target_file != str(utils_dir / "greeter.py") for c in cands), (
+        "greeter.py (no viable mutation site) must be excluded — "
+        "not because of ASCII content but because has_viable_mutation is False"
+    )
