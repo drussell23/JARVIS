@@ -208,3 +208,24 @@ class FixtureGenerator:
             provider_name=FIXTURE_PROVIDER_NAME,
             generation_duration_s=0.0,
         )
+
+
+def apply_fixture_generator_overlay(
+    holder: Any,
+    *,
+    env=None,
+    read_file: Optional[Callable[[str], str]] = None,
+) -> bool:
+    """Factory-level DI swap: when fixture mode is active, wrap
+    ``holder._generator`` with :class:`FixtureGenerator` in place and return
+    ``True``. Default-off and a no-op when the generator is not yet built ->
+    the production path stays byte-identical. Called at the GovernedLoopService
+    generator-construction seam; production ``CandidateGenerator`` is untouched."""
+    env = env if env is not None else os.environ
+    if not _truthy(env.get("JARVIS_A1_FIXTURE_MODE", "")):
+        return False
+    inner = getattr(holder, "_generator", None)
+    if inner is None:
+        return False
+    holder._generator = FixtureGenerator(inner, env=env, read_file=read_file)
+    return True

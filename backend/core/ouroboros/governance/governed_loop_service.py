@@ -4798,6 +4798,39 @@ class GovernedLoopService:
             except Exception:
                 logger.debug("[GovernedLoop] graph backend wiring skipped", exc_info=True)
 
+            # A1 deterministic-fixture DI overlay (Factory-level interception).
+            # Default-OFF: when JARVIS_A1_FIXTURE_MODE is inactive this is a
+            # byte-identical no-op. When active (the Fast-Forward harness) it
+            # swaps self._generator for a FixtureGenerator returning a
+            # deterministic AST-mutated candidate with ZERO provider calls, so
+            # the REAL VALIDATE -> APPLY -> AutoCommitter path proves the
+            # written=True git plumbing decoupled from DW. The production
+            # CandidateGenerator constructed above is never modified, and
+            # scripts/ is imported ONLY on the fixture path (never in prod).
+            try:
+                if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() in {
+                    "1", "true", "yes", "on",
+                }:
+                    import sys as _sys
+                    from pathlib import Path as _Path
+
+                    _scripts = str(_Path(__file__).resolve().parents[4] / "scripts")
+                    if _scripts not in _sys.path:
+                        _sys.path.insert(0, _scripts)
+                    from a1_deterministic_fixture import (  # noqa: E501
+                        apply_fixture_generator_overlay,
+                    )
+
+                    if apply_fixture_generator_overlay(self):
+                        logger.warning(
+                            "[GovernedLoop] A1 fixture generator overlay ACTIVE — "
+                            "deterministic AST candidate, zero-DW (written=True proof path)"
+                        )
+            except Exception:
+                logger.exception(
+                    "[GovernedLoop] A1 fixture overlay failed; using real generator"
+                )
+
             # HIBERNATION_MODE step 6: construct a HibernationProber over the
             # real provider handles and attach it to the watcher so that
             # entering HIBERNATION automatically arms a wake loop. Sequencing:

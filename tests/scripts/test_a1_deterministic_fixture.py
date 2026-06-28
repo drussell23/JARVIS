@@ -249,3 +249,54 @@ def test_fixture_generator_failsafes_to_inner_when_mode_off():
     out = asyncio.run(fg.generate(context=object(), deadline=None))
     assert inner.called is True
     assert out == "real-generation-result"
+
+
+# ---------------------------------------------------------------------------
+# Factory-level DI overlay — swap holder._generator for FixtureGenerator IN
+# PLACE when fixture mode is active. Applied at the GovernedLoopService
+# generator-construction seam; default-off => byte-identical.
+# ---------------------------------------------------------------------------
+
+
+class _Holder:
+    def __init__(self, gen):
+        self._generator = gen
+
+
+def test_overlay_wraps_generator_when_fixture_active():
+    from a1_deterministic_fixture import FixtureGenerator, apply_fixture_generator_overlay
+
+    inner = _FakeInner()
+    h = _Holder(inner)
+
+    applied = apply_fixture_generator_overlay(
+        h, env=_FIXTURE_ENV, read_file=lambda p: _TARGET_SRC
+    )
+
+    assert applied is True
+    assert isinstance(h._generator, FixtureGenerator)
+    # The wrapper still delegates unknown attrs to the real generator.
+    assert h._generator.provider_name == "real-dw"
+
+
+def test_overlay_is_noop_when_fixture_off():
+    from a1_deterministic_fixture import apply_fixture_generator_overlay
+
+    inner = _FakeInner()
+    h = _Holder(inner)
+
+    applied = apply_fixture_generator_overlay(h, env={}, read_file=lambda p: _TARGET_SRC)
+
+    assert applied is False
+    assert h._generator is inner  # untouched -> byte-identical production path
+
+
+def test_overlay_is_noop_when_generator_not_built():
+    from a1_deterministic_fixture import apply_fixture_generator_overlay
+
+    h = _Holder(None)
+    applied = apply_fixture_generator_overlay(
+        h, env=_FIXTURE_ENV, read_file=lambda p: _TARGET_SRC
+    )
+    assert applied is False
+    assert h._generator is None
