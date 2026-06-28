@@ -117,6 +117,65 @@ def test_fatal_airgap_exception_is_distinct_error_type():
     assert issubclass(FatalAirgapException, Exception)
 
 
+def test_default_hosts_block_vertex_and_openai_allow_gcs():
+    from a1_deterministic_fixture import DEFAULT_LLM_HOSTS, is_llm_provider_host
+
+    assert is_llm_provider_host(
+        "https://aiplatform.googleapis.com/v1/projects/x", DEFAULT_LLM_HOSTS
+    )
+    assert is_llm_provider_host("https://api.openai.com/v1/chat", DEFAULT_LLM_HOSTS)
+    # GCS sibling under googleapis.com must stay reachable (telemetry).
+    assert not is_llm_provider_host(
+        "https://storage.googleapis.com/bucket/obj", DEFAULT_LLM_HOSTS
+    )
+
+
+def test_airgapped_send_blocks_llm_delegates_others():
+    from a1_deterministic_fixture import (
+        DEFAULT_LLM_HOSTS,
+        FatalAirgapException,
+        _make_airgapped_send,
+    )
+
+    calls = []
+
+    def orig(self, request, *a, **k):
+        calls.append(request)
+        return "sent"
+
+    class _Req:
+        def __init__(self, url):
+            self.url = url
+
+    send = _make_airgapped_send(orig, DEFAULT_LLM_HOSTS)
+
+    with pytest.raises(FatalAirgapException):
+        send(object(), _Req("https://api.anthropic.com/v1/messages"))
+    assert calls == []  # real transport never reached
+
+    assert send(object(), _Req("https://storage.googleapis.com/x")) == "sent"
+    assert len(calls) == 1
+
+
+def test_install_httpx_airgap_patches_and_restores():
+    import httpx
+
+    from a1_deterministic_fixture import install_httpx_airgap
+
+    before_sync = httpx.Client.send
+    before_async = httpx.AsyncClient.send
+
+    uninstall = install_httpx_airgap()
+    try:
+        assert httpx.Client.send is not before_sync
+        assert httpx.AsyncClient.send is not before_async
+    finally:
+        uninstall()
+
+    assert httpx.Client.send is before_sync
+    assert httpx.AsyncClient.send is before_async
+
+
 # ---------------------------------------------------------------------------
 # Fixture candidate payload — the no-DW APPLY-path injection core.
 # When fixture mode is active, produce a deterministic candidate (target file +
@@ -300,3 +359,75 @@ def test_overlay_is_noop_when_generator_not_built():
     )
     assert applied is False
     assert h._generator is None
+
+
+# ---------------------------------------------------------------------------
+# Strict Subprocess Contract — fail-fast on a mangled fixture config BEFORE the
+# node boots, so we never burn a node window on a misconfigured run.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_fixture_config_passes_when_mode_off():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    validate_fixture_config({})  # nothing required when fixture is inactive
+
+
+def test_validate_fixture_config_requires_target_and_seed():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    with pytest.raises(ValueError):
+        validate_fixture_config({"JARVIS_A1_FIXTURE_MODE": "1"})
+
+
+def test_validate_fixture_config_rejects_non_py_target():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    with pytest.raises(ValueError):
+        validate_fixture_config(
+            {
+                "JARVIS_A1_FIXTURE_MODE": "1",
+                "JARVIS_A1_FIXTURE_TARGET": "not_a_python_file",
+                "JARVIS_A1_FIXTURE_SEED": "7",
+            }
+        )
+
+
+def test_validate_fixture_config_rejects_non_integer_seed():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    with pytest.raises(ValueError):
+        validate_fixture_config(
+            {
+                "JARVIS_A1_FIXTURE_MODE": "1",
+                "JARVIS_A1_FIXTURE_TARGET": "a/b.py",
+                "JARVIS_A1_FIXTURE_SEED": "not-an-int",
+            }
+        )
+
+
+def test_validate_fixture_config_rejects_bad_gcs_uri():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    with pytest.raises(ValueError):
+        validate_fixture_config(
+            {
+                "JARVIS_A1_FIXTURE_MODE": "1",
+                "JARVIS_A1_FIXTURE_TARGET": "a/b.py",
+                "JARVIS_A1_FIXTURE_SEED": "7",
+                "JARVIS_A1_GCS_TELEMETRY_TARGET": "/not/a/gs/uri",
+            }
+        )
+
+
+def test_validate_fixture_config_accepts_full_valid_config():
+    from a1_deterministic_fixture import validate_fixture_config
+
+    validate_fixture_config(
+        {
+            "JARVIS_A1_FIXTURE_MODE": "1",
+            "JARVIS_A1_FIXTURE_TARGET": "backend/util/math_util.py",
+            "JARVIS_A1_FIXTURE_SEED": "7",
+            "JARVIS_A1_GCS_TELEMETRY_TARGET": "gs://bucket/a1/logs",
+        }
+    )

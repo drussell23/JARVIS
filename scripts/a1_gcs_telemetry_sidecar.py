@@ -116,6 +116,49 @@ async def run_sidecar(
     flush_tick(path, streamer)  # final flush — the dying node's last bytes
 
 
+class ManagedSidecar:
+    """Managed async daemon bound to the caller's lifecycle.
+
+    ``start()`` launches ``run_sidecar`` as a task; ``aclose()`` signals stop and
+    AWAITS the task, which performs a guaranteed final flush -- so the terminal
+    'APPLIED' chunk is never lost to a teardown race. ``aclose()`` before
+    ``start()`` is a safe no-op."""
+
+    def __init__(
+        self,
+        path: str,
+        streamer: AppendOnlyChunkStreamer,
+        *,
+        interval_s: float,
+    ) -> None:
+        self._path = path
+        self._streamer = streamer
+        self._interval_s = interval_s
+        self._stop = asyncio.Event()
+        self._task: "Optional[asyncio.Task]" = None
+
+    def start(self) -> "ManagedSidecar":
+        self._task = asyncio.ensure_future(
+            run_sidecar(
+                self._path,
+                self._streamer,
+                interval_s=self._interval_s,
+                stop_event=self._stop,
+            )
+        )
+        return self
+
+    async def aclose(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await self._task
+            except Exception as exc:  # noqa: BLE001 — teardown must never raise
+                logger.warning("[a1-sidecar] managed task close error: %s", exc)
+            finally:
+                self._task = None
+
+
 class AppendOnlyChunkStreamer:
     """Splits an append-only byte stream into immutable, monotonically-indexed
     chunks and pushes each through ``sink`` exactly once. Never overwrites an

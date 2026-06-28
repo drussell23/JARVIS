@@ -49,6 +49,11 @@ DEFAULT_LLM_HOSTS: FrozenSet[str] = frozenset(
     {
         "api.anthropic.com",
         "api.doubleword.ai",
+        "api.openai.com",
+        # GCP Vertex / Gemini LLM surfaces — DISTINCT from storage.googleapis.com
+        # (the GCS telemetry host), which is deliberately NOT severed.
+        "aiplatform.googleapis.com",
+        "generativelanguage.googleapis.com",
     }
 )
 
@@ -90,6 +95,53 @@ class LLMAirgap:
             return send(url, *args, **kwargs)
 
         return guarded
+
+
+def _make_airgapped_send(orig_send: Callable, hosts: FrozenSet[str]) -> Callable:
+    """Wrap an httpx-style ``send(self, request, ...)`` so a request whose URL
+    host is an LLM provider raises ``FatalAirgapException`` before the transport
+    is reached; all other hosts (including GCS) delegate to ``orig_send``."""
+
+    def send(self, request, *args, **kwargs):
+        url = str(getattr(request, "url", ""))
+        if is_llm_provider_host(url, hosts):
+            raise FatalAirgapException(
+                "fixture airgap: LLM provider call severed -> %s" % (url,)
+            )
+        return orig_send(self, request, *args, **kwargs)
+
+    return send
+
+
+def install_httpx_airgap(*, hosts: Optional[FrozenSet[str]] = None) -> Callable[[], None]:
+    """Universal Transport Interceptor: patch ``httpx.Client.send`` and
+    ``httpx.AsyncClient.send`` so any LLM-provider request raises
+    ``FatalAirgapException`` while GCS / other hosts pass through. Returns an
+    ``uninstall()`` callable that restores the originals."""
+    import httpx
+
+    resolved = hosts if hosts is not None else llm_hosts_from_env()
+    orig_sync = httpx.Client.send
+    orig_async = httpx.AsyncClient.send
+
+    sync_send = _make_airgapped_send(orig_sync, resolved)
+
+    async def async_send(self, request, *args, **kwargs):
+        url = str(getattr(request, "url", ""))
+        if is_llm_provider_host(url, resolved):
+            raise FatalAirgapException(
+                "fixture airgap: LLM provider call severed -> %s" % (url,)
+            )
+        return await orig_async(self, request, *args, **kwargs)
+
+    httpx.Client.send = sync_send  # type: ignore[assignment]
+    httpx.AsyncClient.send = async_send  # type: ignore[assignment]
+
+    def uninstall() -> None:
+        httpx.Client.send = orig_sync  # type: ignore[assignment]
+        httpx.AsyncClient.send = orig_async  # type: ignore[assignment]
+
+    return uninstall
 
 
 def _seed_value(seed: int) -> int:
@@ -229,3 +281,29 @@ def apply_fixture_generator_overlay(
         return False
     holder._generator = FixtureGenerator(inner, env=env, read_file=read_file)
     return True
+
+
+def validate_fixture_config(env) -> None:
+    """Strict Subprocess Contract: fail-fast (``ValueError``) on a mangled fixture
+    config BEFORE a node is provisioned. No-op when fixture mode is inactive."""
+    if not _truthy(env.get("JARVIS_A1_FIXTURE_MODE", "")):
+        return
+    target = (env.get("JARVIS_A1_FIXTURE_TARGET", "") or "").strip()
+    if not target:
+        raise ValueError(
+            "JARVIS_A1_FIXTURE_TARGET is required when JARVIS_A1_FIXTURE_MODE is set"
+        )
+    if not target.endswith(".py"):
+        raise ValueError("JARVIS_A1_FIXTURE_TARGET must be a .py path: %r" % (target,))
+    seed = env.get("JARVIS_A1_FIXTURE_SEED", "")
+    try:
+        int(seed)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "JARVIS_A1_FIXTURE_SEED must be an integer: %r" % (seed,)
+        ) from None
+    gcs = (env.get("JARVIS_A1_GCS_TELEMETRY_TARGET", "") or "").strip()
+    if gcs and not gcs.startswith("gs://"):
+        raise ValueError(
+            "JARVIS_A1_GCS_TELEMETRY_TARGET must be a gs:// URI: %r" % (gcs,)
+        )

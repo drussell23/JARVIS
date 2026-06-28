@@ -184,3 +184,41 @@ def test_run_sidecar_does_a_final_flush_on_stop(tmp_path):
     asyncio.run(drive())
     # Even though stop was pre-set, the dying node's last bytes are captured.
     assert b"".join(got) == b"hello"
+
+
+# ---------------------------------------------------------------------------
+# Managed Async Daemon Lifecycle — bound to the caller's lifecycle; aclose()
+# awaits a guaranteed final flush so the last 'APPLIED' chunk is never lost.
+# ---------------------------------------------------------------------------
+
+
+def test_managed_sidecar_awaits_final_flush_on_aclose(tmp_path):
+    import asyncio
+
+    from a1_gcs_telemetry_sidecar import AppendOnlyChunkStreamer, ManagedSidecar
+
+    p = tmp_path / "debug.log"
+    p.write_bytes(b"boot")
+    got = []
+    s = AppendOnlyChunkStreamer(session_id="x", sink=lambda n, d: got.append(d))
+
+    async def drive():
+        m = ManagedSidecar(str(p), s, interval_s=0.01).start()
+        await asyncio.sleep(0.03)  # let it tick at least once
+        p.write_bytes(b"bootAPPLIED")  # the final critical chunk lands late
+        await m.aclose()  # MUST await the final flush before returning
+
+    asyncio.run(drive())
+    # The terminal APPLIED bytes were captured despite the late write + teardown.
+    assert b"".join(got) == b"bootAPPLIED"
+
+
+def test_managed_sidecar_aclose_is_safe_without_start():
+    import asyncio
+
+    from a1_gcs_telemetry_sidecar import AppendOnlyChunkStreamer, ManagedSidecar
+
+    s = AppendOnlyChunkStreamer(session_id="x", sink=lambda n, d: None)
+    m = ManagedSidecar("/no/such.log", s, interval_s=0.01)
+    # aclose() before start() must not raise.
+    asyncio.run(m.aclose())
