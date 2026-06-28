@@ -84,6 +84,59 @@ def test_startup_script_sentinel_after_install(bake):
     assert script.index("hard-ensuring core deps") < script.index("hard-ensure install complete")
 
 
+def test_startup_script_bakes_docker(bake):
+    """Golden image must bake the Docker engine so the IaC boot's 'installing
+    Docker' + 'docker info' ready-probe are instant (the Confirm-4 fix)."""
+    deps = bake._load_hard_ensure_deps()
+    script = bake.build_startup_script(deps)
+    # Docker package install is in the startup-script.
+    assert "docker.io" in script
+    assert "docker-compose-plugin" in script
+    # Daemon is enabled so it auto-starts on every golden boot.
+    assert "systemctl enable docker" in script
+    # Fail-closed guard: script verifies docker binary is present.
+    assert "command -v docker" in script
+
+
+def test_startup_script_no_docker_pull_logged(bake):
+    """Soak is pure-python -- no docker pull at runtime. The script must log
+    this explicitly so operators know no pre-pull step is missing."""
+    deps = bake._load_hard_ensure_deps()
+    script = bake.build_startup_script(deps)
+    assert "no docker pull required" in script
+
+
+def test_startup_script_sentinel_after_docker(bake):
+    """Sentinel must appear AFTER the Docker install + verify block (all-or-nothing)."""
+    deps = bake._load_hard_ensure_deps()
+    script = bake.build_startup_script(deps)
+    docker_install_pos = script.index("docker.io")
+    sentinel_pos = script.index(bake._SENTINEL_PATH)
+    # sentinel_path appears in the 'rm -f' guard AND the write -- use the LAST
+    # occurrence (the actual write) for the ordering check.
+    sentinel_write_pos = script.rindex(bake._SENTINEL_PATH)
+    assert docker_install_pos < sentinel_write_pos, (
+        "sentinel write must come AFTER the Docker install step"
+    )
+
+
+def test_startup_script_fail_closed_docker(bake):
+    """If Docker is not found after install, the script must exit 1 and NOT
+    write the sentinel (fail-closed: no broken golden image)."""
+    deps = bake._load_hard_ensure_deps()
+    script = bake.build_startup_script(deps)
+    # The fail-closed exit must appear before the sentinel write.
+    docker_fail_exit_pos = script.index(
+        "docker not found after install -- NOT writing sentinel"
+    )
+    sentinel_write_pos = script.rindex(bake._SENTINEL_PATH)
+    assert docker_fail_exit_pos < sentinel_write_pos, (
+        "docker fail-closed exit must appear before the sentinel write"
+    )
+    # And the exit statement must be present.
+    assert "exit 1" in script[docker_fail_exit_pos:sentinel_write_pos]
+
+
 # --------------------------------------------------------------------------- #
 # requirements sha (the staleness stamp).
 # --------------------------------------------------------------------------- #
