@@ -425,3 +425,8 @@ _preview*.png
 _meritfirst_resume.html
 logs/autopsies/
 proof_telemetry/
+
+# IaC / A1 runtime artifacts (regenerated each launch — never version-controlled)
+.hypervisor_state.json
+A1_LAUNCH_MANIFEST.json
+autopsy_reports/

@@ -88,6 +88,12 @@ _DEFAULT_DEADMAN_IDLE_TIMEOUT_S = int(os.environ.get("JARVIS_IAC_DEADMAN_IDLE_TI
 _DEFAULT_DEADMAN_CHECK_INTERVAL_S = int(os.environ.get("JARVIS_IAC_DEADMAN_CHECK_INTERVAL_S", "120"))
 _DEFAULT_DEADMAN_BOOT_GRACE_S = int(os.environ.get("JARVIS_IAC_DEADMAN_BOOT_GRACE_S", "300"))
 
+# Autonomous Healing Loop -- transient boot-flake auto-recovery.
+# Env-var names (values read at _execute() call time, NOT import time, so tests can override).
+_HEAL_MAX_ENV = "JARVIS_IAC_HEAL_MAX_ATTEMPTS"       # default 3 attempts
+_HEAL_BACKOFF_BASE_ENV = "JARVIS_IAC_HEAL_BACKOFF_BASE_S"  # default 20s base
+_HEAL_BACKOFF_CAP_S = 120.0                           # hard ceiling for exp-backoff + jitter
+
 # The remote root the 3 repos sync into.
 _REMOTE_TRINITY_ROOT = os.environ.get("JARVIS_IAC_REMOTE_ROOT", "/opt/trinity")
 
@@ -3127,36 +3133,116 @@ def _execute(
     succeeded = False
     resumable_failure = False  # set True when a phase fails recoverably
 
+    # Healing loop env vars -- read at call time so tests can override via monkeypatch.setenv.
+    _heal_max = int(os.environ.get(_HEAL_MAX_ENV, "3"))
+    _heal_backoff_base = float(os.environ.get(_HEAL_BACKOFF_BASE_ENV, "20"))
+
     def _done(phase: str) -> bool:
         return CheckpointLedger.phase_complete(data, phase)
 
     try:
-        # PHASE 1: PROVISION. (skip if already provisioned on a warm resume)
-        if not _done("provisioned"):
-            ok, detail = provision_sandbox_node(args, node, startup_script, log_path=log_path)
-            if not ok:
-                _abort(detail)
-                abort_reason = detail
-                resumable_failure = True
-                return 4
-            node_exists = True
-            data = ledger.mark_phase(data, "provisioned")
-            _log(f"node {node} created; startup-script installing Docker + burn watchdog")
-        else:
-            _log("[resume] phase provisioned already complete -- skipping create")
-        node_exists = True
+        # ------------------------------------------------------------------ #
+        # Autonomous Healing Loop: wraps PHASE 1 (PROVISION) + PHASE 1b
+        # (DOCKER READY) so a transient boot flake (ready_timeout, provision
+        # transient) auto-recovers WITHOUT human re-fire.
+        #
+        # Policy:
+        #   READY          -> break, proceed to surgery phases (existing path).
+        #   TRANSIENT fail -> reap degraded node (if alive), exp-backoff with
+        #                     jitter (base*2^(attempt-1)*[1..1.3], cap 120s),
+        #                     spin a FRESH node with a NEW name, continue loop.
+        #   FINAL attempt  -> fall through to existing keep-warm / abort path
+        #                     (return 4 or 5 as before -- no behavior change).
+        #   SECRET fail    -> non-resumable; abort immediately at PHASE 2
+        #                     (not wrapped here -- that path already BURNS).
+        #
+        # Invariant: NEVER more than one node alive at a time.  The degraded
+        # node is reaped (burn_node) BEFORE the replacement is spun up.
+        # ------------------------------------------------------------------ #
+        for _heal_attempt in range(1, _heal_max + 1):
+            _is_last = (_heal_attempt == _heal_max)
 
-        # PHASE 1b: DOCKER READY (poll for the ready sentinel).
-        if not _done("docker_ready"):
-            ready, reason = poll_node_ready(args, node)
-            if not ready:
-                _abort(f"readiness abort: {reason}")
-                abort_reason = reason
-                resumable_failure = True
-                return 5
-            data = ledger.mark_phase(data, "docker_ready")
-        else:
-            _log("[resume] phase docker_ready already complete -- skipping poll")
+            # PHASE 1: PROVISION. (skip if already provisioned on a warm resume)
+            if not _done("provisioned"):
+                ok, detail = provision_sandbox_node(args, node, startup_script, log_path=log_path)
+                if not ok:
+                    if not _is_last:
+                        # Provision failed: node likely does not exist (rc!=0 from
+                        # gcloud create), but call burn defensively (fail-soft).
+                        _backoff_s = min(
+                            _heal_backoff_base * (2 ** (_heal_attempt - 1))
+                            * (1.0 + random.uniform(0.0, 0.3)),
+                            _HEAL_BACKOFF_CAP_S,
+                        )
+                        _log(
+                            f"[IAC Heal] attempt {_heal_attempt}/{_heal_max} failed "
+                            f"({detail}) — reaped + backoff {_backoff_s:.0f}s"
+                            f" — spinning replacement"
+                        )
+                        if node_exists:
+                            burn_node(args, node)
+                            node_exists = False
+                        time.sleep(_backoff_s)
+                        # Append heal-attempt suffix so node names are unique
+                        # even when two retries land in the same clock second.
+                        node = f"{default_node_name(_now_stamp())}-h{_heal_attempt}"
+                        data = ledger.init_run(
+                            run_id=data.get("run_id") or _now_stamp(),
+                            node_name=node, zone=args.zone, project=args.project,
+                        )
+                        continue
+                    # Final attempt exhausted -> existing abort behavior.
+                    _abort(detail)
+                    abort_reason = detail
+                    resumable_failure = True
+                    return 4
+                node_exists = True
+                data = ledger.mark_phase(data, "provisioned")
+                _log(f"node {node} created; startup-script installing Docker + burn watchdog")
+            else:
+                _log("[resume] phase provisioned already complete -- skipping create")
+            node_exists = True
+
+            # PHASE 1b: DOCKER READY (poll for the ready sentinel).
+            if not _done("docker_ready"):
+                ready, reason = poll_node_ready(args, node)
+                if not ready:
+                    if not _is_last:
+                        # Node EXISTS (was provisioned) but never became ready.
+                        # MUST reap it before spinning the replacement to uphold
+                        # the never->1-node-alive invariant.
+                        _backoff_s = min(
+                            _heal_backoff_base * (2 ** (_heal_attempt - 1))
+                            * (1.0 + random.uniform(0.0, 0.3)),
+                            _HEAL_BACKOFF_CAP_S,
+                        )
+                        _log(
+                            f"[IAC Heal] attempt {_heal_attempt}/{_heal_max} failed "
+                            f"({reason}) — reaped + backoff {_backoff_s:.0f}s"
+                            f" — spinning replacement"
+                        )
+                        burn_node(args, node)
+                        node_exists = False
+                        time.sleep(_backoff_s)
+                        # Append heal-attempt suffix so node names are unique
+                        # even when two retries land in the same clock second.
+                        node = f"{default_node_name(_now_stamp())}-h{_heal_attempt}"
+                        data = ledger.init_run(
+                            run_id=data.get("run_id") or _now_stamp(),
+                            node_name=node, zone=args.zone, project=args.project,
+                        )
+                        continue
+                    # Final attempt exhausted -> existing abort behavior.
+                    _abort(f"readiness abort: {reason}")
+                    abort_reason = reason
+                    resumable_failure = True
+                    return 5
+                data = ledger.mark_phase(data, "docker_ready")
+            else:
+                _log("[resume] phase docker_ready already complete -- skipping poll")
+
+            break  # Both PROVISION + DOCKER_READY succeeded; proceed to surgery.
+        # ------------------------------------------------------------------ #
 
         # PHASE 2: SYNC BRIDGE.
         if not _done("synced"):
