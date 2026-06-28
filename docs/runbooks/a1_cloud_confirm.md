@@ -27,13 +27,31 @@ python3 scripts/a1_zero_state_lock.py || { echo "NODE NOT PRISTINE — ABORT"; e
 #    multiplexes [A1Trace] (cyan) / [Cortex]+HEDGE GOVERNOR (yellow) / LEDGER_TERMINAL
 #    (green=applied, red=else) into one color-coded local stream. Read-only — a local
 #    Ctrl-C never touches the remote soak.
-python3 scripts/a1_telemetry_bridge.py --node "$A1_NODE" --session-id "$A1_SESSION"
+#
+#    GCP_ZONE / GCP_PROJECT must be set (or pass --zone / --project explicitly).
+#    Use --remote-log with the absolute node path (mirrors sovereign_iac_hypervisor
+#    _REMOTE_JARVIS_DIR = /opt/trinity/jarvis); --session-id produces a RELATIVE path
+#    that resolves against SSH $HOME and streams zero bytes silently.
+export GCP_ZONE="us-central1-a"        # set to your node's zone
+export GCP_PROJECT="your-gcp-project"  # set to your GCP project ID
+python3 scripts/a1_telemetry_bridge.py \
+    --node "$A1_NODE" \
+    --zone "$GCP_ZONE" \
+    --project "$GCP_PROJECT" \
+    --remote-log "/opt/trinity/jarvis/.ouroboros/sessions/${A1_SESSION}/debug.log"
 
 # 2. The real cloud confirm (zero invented flags — all verified in source)
+#
+# NOTE: every comment is on its OWN line so the backslash-continuation chain
+# is unbroken — inline # after \ silently drops the rest of the env block.
+#
+# DW-primary safety gate #1: prevents Claude from becoming primary on a real-money run
+# DW-primary safety gate #2: forces DoubleWord as primary provider for this run
+# Boot the pristine golden image instead of a live working-tree snapshot
 JARVIS_IAC_HYPERVISOR_ENABLED=1 \
-JARVIS_PROVIDER_CLAUDE_DISABLED=true \          # DW-primary safety gate #1
-JARVIS_DW_PRIMARY_OVERRIDE=a1-cloud-confirm \   # DW-primary safety gate #2
-JARVIS_IAC_SOAK_GOLDEN_ENABLED=true \           # boot the pristine golden image
+JARVIS_PROVIDER_CLAUDE_DISABLED=true \
+JARVIS_DW_PRIMARY_OVERRIDE=a1-cloud-confirm \
+JARVIS_IAC_SOAK_GOLDEN_ENABLED=true \
 python3 scripts/a1_live_fire_chaos_harness.py \
   --remote --i-understand-this-spends-money \
   --cost-cap 2.00 --max-wall-seconds 2400 --seed 42 --strict

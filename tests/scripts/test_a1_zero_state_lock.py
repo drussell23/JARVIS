@@ -140,20 +140,36 @@ class TestOrphanWorktreeDir:
         assert result.pristine is False
         assert any("ouroboros__auto__bt-sess42" in d for d in result.deviations)
 
-    def test_unrelated_dir_under_worktrees_is_ignored(self, tmp_path):
-        """A non-orphan-prefix directory under .worktrees/ does NOT trigger."""
+    def test_unregistered_dir_under_worktrees_is_orphan(self, tmp_path):
+        """I4: any dir under .worktrees/ not in git worktree list is an orphan.
+
+        The old prefix-based filter let non-prefix dirs slip through pristine.
+        The set-difference approach catches ALL unregistered dirs regardless of
+        naming convention.
+        """
         repo = _init_repo(tmp_path)
-        legit = repo / ".worktrees" / "myproject-checkout"
-        legit.mkdir(parents=True)
+        unregistered = repo / ".worktrees" / "myproject-checkout"
+        unregistered.mkdir(parents=True)
         result = assert_pristine(repo, sweep=False)
-        # .worktrees/myproject-checkout is untracked by git → shows in status
-        # but is NOT in orphan_dirs.  It may or may not appear in status
-        # depending on git config, but the deviation list must not say
-        # "orphan_dir: myproject-checkout".
-        assert not any(
+        # myproject-checkout is not a registered worktree → it IS an orphan now.
+        assert result.pristine is False
+        assert any(
             "orphan_dir" in d and "myproject-checkout" in d
             for d in result.deviations
-        )
+        ), f"Expected orphan_dir deviation for myproject-checkout, got: {result.deviations}"
+
+    def test_i4_non_prefix_orphan_caught(self, tmp_path):
+        """I4: an orphan dir with no known prefix is caught by set-difference."""
+        repo = _init_repo(tmp_path)
+        # A dir name that would NOT match any of _ORPHAN_DIR_PREFIXES
+        orphan = repo / ".worktrees" / "completely-arbitrary-name-xyz"
+        orphan.mkdir(parents=True)
+        result = assert_pristine(repo, sweep=False)
+        assert result.pristine is False
+        assert any(
+            "orphan_dir" in d and "completely-arbitrary-name-xyz" in d
+            for d in result.deviations
+        ), f"Expected orphan_dir deviation but got: {result.deviations}"
 
 
 # ---------------------------------------------------------------------------

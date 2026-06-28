@@ -395,6 +395,118 @@ async def test_terminal_sentinel_applied_ends_loop() -> None:
 
 
 # ===========================================================================
+# Test M3-I1 — Split-line buffer: sentinel split across connections is detected
+# ===========================================================================
+
+async def test_split_line_buffer_sentinel_across_reconnects() -> None:
+    """I1: LEDGER_TERMINAL line split mid-word across two connections is
+    reassembled by the pending buffer and detected exactly once.
+
+    Connection 1 ends with a partial line (no newline).
+    Connection 2 starts with the completion of that line.
+    The bridge must stop cleanly after detecting the sentinel exactly once —
+    not miss it (old bug: each chunk classified independently so the sentinel
+    regex never matched a fragment) and not emit it twice.
+    """
+    call_count = 0
+
+    async def split_runner(cmd: List[str]) -> AsyncGenerator[bytes, None]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First connection: partial sentinel — no trailing newline.
+            yield b"[A1Trace] x LEDGER_TER"
+        elif call_count == 2:
+            # Second connection: remainder of sentinel, completing the line.
+            yield b"MINAL op=o1 state=applied\n"
+
+    collected: List[str] = []
+
+    await stream_telemetry(
+        node="test-node",
+        zone="us-central1-a",
+        project="test-project",
+        remote_log_path="/tmp/debug.log",
+        on_line=collected.append,
+        no_color=True,
+        max_reconnects=10,
+        _cmd_runner=split_runner,
+        _sleep=_instant_sleep,
+    )
+
+    # Bridge must have made exactly 2 connections.
+    assert call_count == 2, f"expected 2 connections, got {call_count}"
+
+    # The reassembled line contains LEDGER_TERMINAL state=applied; is_terminal_sentinel
+    # fires, bridge exits.  The line is classified as A1TRACE (first match wins) so it
+    # appears in collected as an A1T entry — but sentinel detection is independent of
+    # channel classification, so exactly one line is emitted and the bridge stops.
+    assert len(collected) == 1, (
+        f"expected exactly 1 emitted line (the reassembled sentinel line), got: {collected}"
+    )
+    assert "LEDGER_TERMINAL" in collected[0] or "A1T" in collected[0], (
+        f"emitted line missing expected content: {collected[0]!r}"
+    )
+
+
+# ===========================================================================
+# Test M3-I2 — Consecutive-failure semantics: progress resets reconnect_count
+# ===========================================================================
+
+async def test_consecutive_failure_semantics_progress_resets_count() -> None:
+    """I2: reconnect_count resets on progress so idle polls between failures
+    don't exhaust max_reconnects.
+
+    Sequence:
+      conn 1 → no data (idle)    → reconnect_count becomes 1
+      conn 2 → data (progress)   → reconnect_count resets to 0  ← I2 fix
+      conn 3 → no data (idle)    → reconnect_count becomes 1
+      conn 4 → terminal sentinel → done
+
+    With max_reconnects=2, the bridge must survive all 4 connections.
+    Without the I2 fix, conn 3's idle would push count to 2, hitting the cap
+    and exiting before conn 4.
+    """
+    call_count = 0
+
+    async def runner(cmd: List[str]) -> AsyncGenerator[bytes, None]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # idle: empty generator (no data, no error)
+            return
+        if call_count == 2:
+            # progress: yield real data
+            yield b"[A1Trace] first hop\n"
+        if call_count == 3:
+            # idle again: empty
+            return
+        if call_count >= 4:
+            # terminal
+            yield b"[Slice74Probe] LEDGER_TERMINAL op_id=x state=applied written=True\n"
+
+    collected: List[str] = []
+
+    await stream_telemetry(
+        node="n",
+        zone="z",
+        project="p",
+        remote_log_path="/tmp/debug.log",
+        on_line=collected.append,
+        no_color=True,
+        max_reconnects=2,  # without I2, would exit after conn 3 (count hits 2)
+        _cmd_runner=runner,
+        _sleep=_instant_sleep,
+    )
+
+    assert call_count == 4, (
+        f"expected 4 connections (I2 fix allows progress to reset count), got {call_count}"
+    )
+    assert any("A1T" in l for l in collected), "A1Trace line missing from progress conn"
+    assert any("LED" in l for l in collected), "LEDGER terminal line missing"
+
+
+# ===========================================================================
 # Test 6 — _build_tail_cmd: IAP-SSH command shape matches hypervisor
 # ===========================================================================
 

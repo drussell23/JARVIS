@@ -218,7 +218,7 @@ async def stream_telemetry(
     remote_log_path: str,
     *,
     channels: Optional[Set[str]] = None,
-    on_line: Optional[Callable[[str], None]] = None,
+    on_line: Optional[Callable[[str], object]] = None,
     no_color: bool = False,
     max_reconnects: int = _DEFAULT_MAX_RECONNECTS,
     deadline_s: float = _DEFAULT_DEADLINE_S,
@@ -253,7 +253,8 @@ async def stream_telemetry(
         _sleep: Test injection for asyncio.sleep.
     """
     mux = TelemetryMultiplexer(channels=channels, no_color=no_color)
-    emit: Callable[[str], None] = (
+    # M1: widened to object so sys.stdout.write (→int) satisfies the type.
+    emit: Callable[[str], object] = (
         on_line if on_line is not None else sys.stdout.write
     )
     do_sleep = _sleep if _sleep is not None else asyncio.sleep
@@ -262,6 +263,10 @@ async def stream_telemetry(
     last_offset: int = 0
     reconnect_count: int = 0
     backoff: float = _DEFAULT_BACKOFF_BASE_S
+    # I1: cross-reconnect line buffer — carries partial (no-newline) tail of
+    # the last chunk into the next chunk / reconnect so lines split at chunk
+    # boundaries are reassembled before classification / sentinel detection.
+    pending: str = ""
 
     # ------------------------------------------------------------------
     # _run_once: one transport connection
@@ -269,6 +274,7 @@ async def stream_telemetry(
     # Raises on connection failure so the outer loop can do backoff+retry.
     # ------------------------------------------------------------------
     async def _run_once(offset: int) -> Tuple[int, bool]:
+        nonlocal pending
         cmd = _build_tail_cmd(node, zone, project, remote_log_path, offset)
         new_offset = offset
         terminal_seen = False
@@ -280,13 +286,23 @@ async def stream_telemetry(
                 if stop_event is not None and stop_event.is_set():
                     return new_offset, terminal_seen
                 new_offset += len(chunk)
+                # I1: merge pending partial line with new decoded bytes, then
+                # split into COMPLETE lines only; retain trailing partial.
+                raw = pending + chunk.decode(errors="replace")
+                lines = raw.splitlines(keepends=True)
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    pending = lines.pop()
+                else:
+                    pending = ""
                 ts = time.monotonic() - start_wall
-                for line in chunk.decode(errors="replace").splitlines(keepends=True):
+                for line in lines:
                     formatted = mux.format_line(line, ts)
                     if formatted:
                         emit(formatted)
                     if mux.is_terminal_sentinel(line):
                         terminal_seen = True
+                if terminal_seen:
+                    break
             return new_offset, terminal_seen
 
         # Production path: real asyncio subprocess (IAP-SSH tail).
@@ -309,10 +325,26 @@ async def stream_telemetry(
                     # No new data for read_timeout — break and reconnect.
                     break
                 if not chunk:
+                    # Clean EOF: flush any pending partial line before breaking.
+                    if pending:
+                        ts = time.monotonic() - start_wall
+                        formatted = mux.format_line(pending, ts)
+                        if formatted:
+                            emit(formatted)
+                        if mux.is_terminal_sentinel(pending):
+                            terminal_seen = True
+                        pending = ""
                     break  # clean EOF from ssh
                 new_offset += len(chunk)
+                # I1: merge pending partial with new bytes; split complete lines.
+                raw = pending + chunk.decode(errors="replace")
+                lines = raw.splitlines(keepends=True)
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    pending = lines.pop()
+                else:
+                    pending = ""
                 ts = time.monotonic() - start_wall
-                for line in chunk.decode(errors="replace").splitlines(keepends=True):
+                for line in lines:
                     formatted = mux.format_line(line, ts)
                     if formatted:
                         emit(formatted)
@@ -386,9 +418,12 @@ async def stream_telemetry(
             break
 
         if new_offset > last_offset:
-            # Progress: reset backoff, poll after brief interval.
+            # Progress: reset backoff AND reconnect_count (I2: consecutive-failure
+            # semantics — only unbroken runs of failures count toward the cap;
+            # a healthy-but-quiet soak must not exhaust max_reconnects).
             last_offset = new_offset
             backoff = _DEFAULT_BACKOFF_BASE_S
+            reconnect_count = 0
             await do_sleep(_DEFAULT_POLL_INTERVAL_S)
         else:
             # No new data: back off before retrying.

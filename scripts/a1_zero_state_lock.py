@@ -24,7 +24,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import FrozenSet, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -81,14 +81,24 @@ def _parse_worktree_paths(porcelain: str) -> List[str]:
 # Orphan directory detection
 # ---------------------------------------------------------------------------
 
-# Prefixes that signal campaign-debris / L3-isolation orphan directories.
-# Mirrors the default set in worktree_manager._DEFAULT_REAP_EXTRA_PREFIXES plus
-# the primary L3 isolation prefix.
+# Legacy prefix list — kept for reference / backward-compat callers that lack
+# worktree-list data.  The primary code path now uses set-difference (I4).
 _ORPHAN_DIR_PREFIXES = ("unit-", "ouroboros__auto__bt-", "soak-")
 
 
-def _get_orphan_dirs(worktrees_dir: Path) -> List[str]:
-    """Return a sorted list of orphan-prefix directory NAMES under ``.worktrees/``.
+def _get_orphan_dirs(
+    worktrees_dir: Path,
+    registered_basenames: Optional[FrozenSet[str]] = None,
+) -> List[str]:
+    """Return sorted list of orphan directory NAMES under ``.worktrees/``.
+
+    I4 fix: when *registered_basenames* is provided (the set of basenames from
+    ``git worktree list --porcelain``), returns ALL child directory names that
+    are NOT in that set — a true set-difference, independent of naming prefix.
+    An unregistered orphan dir with any name is caught.
+
+    When *registered_basenames* is None (legacy / backward-compat callers),
+    falls back to the prefix-based filter.
 
     Only directory names (not full paths) are returned for stable serialization
     regardless of repo location.
@@ -97,10 +107,16 @@ def _get_orphan_dirs(worktrees_dir: Path) -> List[str]:
         return []
     dirs: List[str] = []
     for child in worktrees_dir.iterdir():
-        if child.is_dir() and any(
-            child.name.startswith(p) for p in _ORPHAN_DIR_PREFIXES
-        ):
-            dirs.append(child.name)
+        if not child.is_dir():
+            continue
+        if registered_basenames is not None:
+            # Set-difference: any on-disk dir NOT in the registered set is orphan.
+            if child.name not in registered_basenames:
+                dirs.append(child.name)
+        else:
+            # Fallback: prefix-based filter.
+            if any(child.name.startswith(p) for p in _ORPHAN_DIR_PREFIXES):
+                dirs.append(child.name)
     return sorted(dirs)
 
 
@@ -160,7 +176,11 @@ def compute_state_digest(repo_root: "str | Path") -> str:
     worktree_paths = _parse_worktree_paths(worktree_porcelain)
 
     worktrees_dir = repo_root / ".worktrees"
-    orphan_dirs = _get_orphan_dirs(worktrees_dir)
+    # I4: pass registered basenames so ALL unregistered dirs are caught.
+    registered_wt_basenames: FrozenSet[str] = frozenset(
+        Path(p).name for p in worktree_paths
+    )
+    orphan_dirs = _get_orphan_dirs(worktrees_dir, registered_wt_basenames)
 
     chaos_manifest = (repo_root / ".jarvis" / "chaos_manifest.json").exists()
 
@@ -224,7 +244,12 @@ def assert_pristine(
 
     if sweep:
         try:
-            asyncio.run(_sweep(repo_root))
+            reaped = asyncio.run(_sweep(repo_root))
+            # M2: always surface the count — a money-gate must be observable.
+            print(
+                f"swept {reaped} orphan worktree(s) before assertion",
+                file=sys.stderr,
+            )
         except Exception as exc:  # pragma: no cover
             # Sweep failure is non-fatal: log a warning and proceed to assert.
             # If orphans survive they will be caught by the digest mismatch.
@@ -246,7 +271,11 @@ def assert_pristine(
     worktree_paths = _parse_worktree_paths(worktree_porcelain)
 
     worktrees_dir = repo_root / ".worktrees"
-    orphan_dirs = _get_orphan_dirs(worktrees_dir)
+    # I4: set-difference — any dir in .worktrees/ not in registered set is orphan.
+    registered_wt_basenames: FrozenSet[str] = frozenset(
+        Path(p).name for p in worktree_paths
+    )
+    orphan_dirs = _get_orphan_dirs(worktrees_dir, registered_wt_basenames)
 
     chaos_manifest = (repo_root / ".jarvis" / "chaos_manifest.json").exists()
 
