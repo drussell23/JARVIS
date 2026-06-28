@@ -44,14 +44,16 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
+import importlib.util as _importlib_util
 import os
 import pathlib
+import random
 import re
 import shlex
 import subprocess
 import sys
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # Reuse the IaC hypervisor's single-source-of-truth dep list + requirements
@@ -60,6 +62,40 @@ from typing import List, Optional, Tuple
 # inline default so the baker still works.
 # --------------------------------------------------------------------------- #
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# --------------------------------------------------------------------------- #
+# Shared lease module (iac_lease.py owns the JSON shape -- no duplication).
+# --------------------------------------------------------------------------- #
+def _load_iac_lease_module():
+    """Load scripts/iac_lease.py via importlib (fail-soft)."""
+    _p = pathlib.Path(__file__).resolve().parent / "iac_lease.py"
+    try:
+        spec = _importlib_util.spec_from_file_location("iac_lease", str(_p))
+        if spec and spec.loader:
+            mod = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            return mod
+    except Exception:  # noqa: BLE001 -- never crash the baker on an import edge
+        pass
+    return None
+
+_iac_lease = _load_iac_lease_module()
+
+# Lease TTL for bake nodes (extend by the same TTL on each heartbeat).
+_BAKE_LEASE_TTL_S: int = int(os.environ.get("JARVIS_BAKE_LEASE_TTL_S", "1800"))
+
+# SSH transport-retry tuning (all tunable via env, no hardcoding).
+_BAKE_SSH_MAX_RETRIES: int = int(os.environ.get("JARVIS_BAKE_SSH_MAX_RETRIES", "3"))
+_BAKE_SSH_BACKOFF_BASE_S: float = float(os.environ.get("JARVIS_BAKE_SSH_BACKOFF_BASE_S", "10"))
+_BAKE_SSH_BACKOFF_CAP_S: float = float(os.environ.get("JARVIS_BAKE_SSH_BACKOFF_CAP_S", "120"))
+
+# Connection-error patterns that indicate a transport-layer SSH flake (safe to
+# retry).  These never appear in legitimate validation verdict output.
+_TRANSPORT_ERROR_RE: re.Pattern = re.compile(
+    r"Connection reset|Connection refused|Connection timed out|"
+    r"kex_exchange|Broken pipe|port 22|ssh: connect",
+    re.IGNORECASE,
+)
 
 
 def _load_hard_ensure_deps() -> List[str]:
@@ -182,6 +218,93 @@ def _run(cmd: List[str], *, timeout_s: float = 120.0) -> Tuple[int, str]:
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:  # noqa: BLE001 -- the bake never crashes on a call
         return 1, f"[run failed: {exc!r}]"
+
+
+# --------------------------------------------------------------------------- #
+# Transport-vs-payload SSH classifier (the load-bearing retry gate).
+# --------------------------------------------------------------------------- #
+def _is_ssh_transport_failure(rc: int, out: str) -> bool:
+    """True iff this SSH result is a transport-layer flake (safe to retry).
+
+    Priority rules (first match wins):
+      1. FAIL marker present  -> payload failure -> NOT transport (fail-closed)
+      2. rc == 255            -> SSH own exit code for connection failures -> transport
+      3. connection-error pattern in output -> transport
+      4. no verdict marker at all -> remote never completed output -> transport
+      5. otherwise (OK marker present, rc=0) -> not transport (success or clean)
+    """
+    # Payload: FAIL marker explicitly present -- never retry, fail-closed.
+    if _VALIDATION_FAIL_MARKER in out:
+        return False
+    # SSH own exit code for connection-level failures.
+    if rc == 255:
+        return True
+    # Connection-level error pattern in the combined output.
+    if _TRANSPORT_ERROR_RE.search(out):
+        return True
+    # Remote never produced a verdict marker (died mid-stream or before the
+    # validation script ran).
+    if _VALIDATION_OK_MARKER not in out:
+        return True
+    # OK marker present -- clean success path, not a transport issue.
+    return False
+
+
+def _run_ssh_with_transport_retry(
+    cmd: List[str],
+    *,
+    timeout_s: float = 300.0,
+    max_retries: Optional[int] = None,
+    backoff_base: Optional[float] = None,
+    backoff_cap: Optional[float] = None,
+    heartbeat_fn: Optional[Callable[[], None]] = None,
+) -> Tuple[int, str]:
+    """Run an SSH validation command, retrying on transport-layer flakes.
+
+    Transport failure (retry with exponential backoff + jitter):
+      - SSH rc == 255 (SSH's own connection-failed exit code)
+      - Connection-error patterns in output (Connection reset / refused / etc.)
+      - Remote produced no validation verdict marker (died before completion)
+
+    Payload failure (fail-closed immediately, no retry):
+      - SOAK_BAKE_VALIDATION_FAIL marker present in output
+      - Any other non-transport result (OK marker present, or clean non-zero exit)
+
+    All tunable params default from env vars:
+      JARVIS_BAKE_SSH_MAX_RETRIES   (default 3)
+      JARVIS_BAKE_SSH_BACKOFF_BASE_S (default 10)
+      JARVIS_BAKE_SSH_BACKOFF_CAP_S  (default 120)
+    """
+    _max = max_retries if max_retries is not None else _BAKE_SSH_MAX_RETRIES
+    _base = backoff_base if backoff_base is not None else _BAKE_SSH_BACKOFF_BASE_S
+    _cap = backoff_cap if backoff_cap is not None else _BAKE_SSH_BACKOFF_CAP_S
+
+    last_rc, last_out = 255, ""
+    for attempt in range(1, _max + 1):
+        last_rc, last_out = _run(cmd, timeout_s=timeout_s)
+
+        if not _is_ssh_transport_failure(last_rc, last_out):
+            # Either a clean pass (OK marker), payload fail (FAIL marker), or
+            # other non-transport result -- return immediately, no retry.
+            return last_rc, last_out
+
+        # Transport flake detected.
+        if attempt < _max:
+            jitter = random.uniform(0.8, 1.2)
+            delay = min(_base * (2 ** (attempt - 1)) * jitter, _cap)
+            _log(
+                f"[soak-bake] validation transport flake "
+                f"(attempt {attempt}/{_max}, rc={last_rc}) -- backoff {int(delay)}s"
+            )
+            if heartbeat_fn is not None:
+                try:
+                    heartbeat_fn()
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(delay)
+
+    # All retries exhausted -- return the last result.
+    return last_rc, last_out
 
 
 # --------------------------------------------------------------------------- #
@@ -427,6 +550,29 @@ def _cleanup_node(args: argparse.Namespace, node: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Bake-lease helpers (thin wrappers around iac_lease -- fail-soft if absent).
+# --------------------------------------------------------------------------- #
+def _bake_write_lease(node: str, zone: str) -> None:
+    """Write (or refresh) the bake lease for *node*.  Fail-soft."""
+    if _iac_lease is None:
+        return
+    try:
+        _iac_lease.write_lease(node, zone, os.getpid(), _BAKE_LEASE_TTL_S)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bake_delete_lease(node: str) -> None:
+    """Delete the bake lease for *node*.  Fail-soft."""
+    if _iac_lease is None:
+        return
+    try:
+        _iac_lease.delete_lease(node)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Poll loop.
 # --------------------------------------------------------------------------- #
 _EARLY_FAIL_PATTERNS: List[re.Pattern] = [
@@ -460,10 +606,16 @@ def _check_bake_log(args: argparse.Namespace, node: str
         return None, None
 
 
-def _poll_readiness(args: argparse.Namespace, node: str) -> Tuple[bool, str]:
+def _poll_readiness(
+    args: argparse.Namespace,
+    node: str,
+    heartbeat_fn: Optional[Callable[[], None]] = None,
+) -> Tuple[bool, str]:
     """Poll the node (via SSH) for the readiness sentinel.
 
     Exponential-ish backoff, bounded by --bake-timeout-s. Returns (ready, reason).
+    heartbeat_fn is called each iteration so bake leases are refreshed and
+    never expire mid-bake.
     """
     deadline = time.monotonic() + float(args.bake_timeout_s)
     delay = 15.0
@@ -486,6 +638,13 @@ def _poll_readiness(args: argparse.Namespace, node: str) -> Tuple[bool, str]:
             _log(f"readiness: EARLY ABORT -- {fail_reason}")
             return False, f"early_failure: {fail_reason}"
 
+        # Heartbeat: refresh the lease so the reaper does not expire it mid-bake.
+        if heartbeat_fn is not None:
+            try:
+                heartbeat_fn()
+            except Exception:  # noqa: BLE001
+                pass
+
         remaining = int(deadline - time.monotonic())
         _log(
             f"readiness: not ready (attempt {attempt}, rc={rc}); "
@@ -502,11 +661,24 @@ def _poll_readiness(args: argparse.Namespace, node: str) -> Tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 # Validation (the load-bearing lock -- run the 3 checks before snapshot).
 # --------------------------------------------------------------------------- #
-def _validate_deps(args: argparse.Namespace, node: str) -> Tuple[bool, str]:
-    """SSH-run the validation program (deps import + pytest-collect + O+V core)."""
+def _validate_deps(
+    args: argparse.Namespace,
+    node: str,
+    heartbeat_fn: Optional[Callable[[], None]] = None,
+) -> Tuple[bool, str]:
+    """SSH-run the validation program (deps import + pytest-collect + O+V core).
+
+    Uses _run_ssh_with_transport_retry to survive transient SSH flakes while
+    failing closed immediately on a genuine VALIDATION_FAIL verdict.
+    heartbeat_fn is called in each retry backoff so bake leases stay fresh.
+    """
     remote = build_validation_remote()
     _log("validation: running deps-import + pytest-collect + O+V-core checks")
-    rc, out = _run(_ssh_cmd(args, node, remote), timeout_s=300.0)
+    rc, out = _run_ssh_with_transport_retry(
+        _ssh_cmd(args, node, remote),
+        timeout_s=300.0,
+        heartbeat_fn=heartbeat_fn,
+    )
     return parse_validation_verdict(rc, out)
 
 
@@ -601,14 +773,27 @@ def _execute_bake(
         node_exists = True
         _log(f"node {node} created; startup-script installing soak deps")
 
-        # 2. POLL READINESS.
-        ready, poll_reason = _poll_readiness(args, node)
+        # Write the initial bake lease so the OrphanReaper knows this node is
+        # actively managed.  A crashed baker leaves a dead-pid lease -> reaper
+        # reaps.  A live baker keeps refreshing the lease -> reaper spares it.
+        _bake_write_lease(node, args.zone)
+        _log(
+            f"lease written for {node} (pid={os.getpid()}, ttl={_BAKE_LEASE_TTL_S}s)"
+        )
+
+        def _heartbeat() -> None:
+            """Refresh the bake lease so it never expires mid-bake."""
+            _bake_write_lease(node, args.zone)
+
+        # 2. POLL READINESS (with lease heartbeat on each iteration).
+        ready, poll_reason = _poll_readiness(args, node, heartbeat_fn=_heartbeat)
         if not ready:
             _abort(f"readiness abort: {poll_reason}")
             return 5
 
         # 3. VALIDATION LOCK -- never snapshot a broken image.
-        passed, sample = _validate_deps(args, node)
+        #    Uses _run_ssh_with_transport_retry internally; heartbeat in backoff.
+        passed, sample = _validate_deps(args, node, heartbeat_fn=_heartbeat)
         if not passed:
             _abort(f"validation failed: {sample}")
             return 6
@@ -658,6 +843,9 @@ def _execute_bake(
         # created) is the durable artifact; the VM must never linger.
         if node_exists:
             _cleanup_node(args, node)
+        # Delete the bake lease on every exit path (success or abort).
+        # A missing iac_lease module is silently tolerated (fail-soft).
+        _bake_delete_lease(node)
 
 
 def _report_success(

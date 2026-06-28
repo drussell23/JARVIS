@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
+import importlib.util as _importlib_util
 import json
 import logging
 import os
@@ -49,6 +50,25 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # Repo root.
 # --------------------------------------------------------------------------- #
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# --------------------------------------------------------------------------- #
+# Shared lease primitives (iac_lease.py is the single source of truth for the
+# lease JSON shape -- neither consumer duplicates it).
+# --------------------------------------------------------------------------- #
+def _load_iac_lease():
+    """Load scripts/iac_lease.py via importlib (fail-soft)."""
+    _p = pathlib.Path(__file__).resolve().parent / "iac_lease.py"
+    try:
+        spec = _importlib_util.spec_from_file_location("iac_lease", str(_p))
+        if spec and spec.loader:
+            mod = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            return mod
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+_iac_lease = _load_iac_lease()
 
 # --------------------------------------------------------------------------- #
 # Node-name prefixes -- ONE canonical definition, never duplicated.
@@ -76,7 +96,10 @@ _DEFAULT_BOOT_GRACE_S: int = int(os.environ.get("JARVIS_ORPHAN_REAPER_BOOT_GRACE
 _DEFAULT_LEASE_TTL_S: int = int(os.environ.get("JARVIS_ORPHAN_REAPER_LEASE_TTL_S", "600"))
 _GCLOUD_TIMEOUT_S: float = float(os.environ.get("JARVIS_ORPHAN_REAPER_GCLOUD_TIMEOUT_S", "60"))
 
-_DEFAULT_LEASE_DIR: pathlib.Path = _REPO_ROOT / ".jarvis" / "iac_leases"
+_DEFAULT_LEASE_DIR: pathlib.Path = (
+    _iac_lease.DEFAULT_LEASE_DIR if _iac_lease is not None
+    else _REPO_ROOT / ".jarvis" / "iac_leases"
+)
 
 # --------------------------------------------------------------------------- #
 # Logging -- a module-level logger; caller can configure level/handler.
@@ -107,8 +130,13 @@ async def _default_instance_lister(
     warning -- the caller will simply find nothing to reap this pass.
     """
     # One regex alternation covers all prefixes in a single API call.
-    alt = "|".join(f"^{p}" for p in prefixes)
-    filter_str = f"name~({alt})"
+    # gcloud --filter wants the regex as a single QUOTED operand; a bare
+    # ``name~(^a|^b)`` makes its expression parser choke ("Term operand
+    # expected") because it reads ``(`` as a filter-grouping operator. Anchor
+    # ONCE at the front of a quoted group instead. The quotes are gcloud-filter
+    # syntax (parsed by gcloud, not the shell -- we exec, never shell=True).
+    alt = "|".join(prefixes)
+    filter_str = f'name~"^({alt})"'
     cmd: List[str] = [
         "gcloud", "compute", "instances", "list",
         f"--project={project}",
@@ -195,11 +223,13 @@ async def _default_instance_deleter(project: str, node: str, zone: str) -> None:
 # Lease helpers (pure functions -- no class dependency).
 # --------------------------------------------------------------------------- #
 def _lease_path(lease_dir: pathlib.Path, node: str) -> pathlib.Path:
-    """Return the lease file path for *node*.
+    """Return the lease file path for *node*.  Delegates to iac_lease (single source).
 
-    Sanitises the node name to prevent path traversal (only alnum + hyphen +
-    underscore + dot are allowed in a GCP instance name anyway).
+    Falls back to an inline implementation if iac_lease failed to load so the
+    reaper remains self-contained.
     """
+    if _iac_lease is not None:
+        return _iac_lease.lease_path(node, lease_dir)
     safe = "".join(c for c in node if c.isalnum() or c in "-_.")
     return lease_dir / f"{safe}.lease"
 
@@ -265,7 +295,12 @@ class OrphanReaper:
         Atomic write: temp file + os.replace so readers never see a partial
         JSON. Creates the lease directory on first call.
         Fail-soft: a filesystem error is logged and swallowed.
+        Delegates to iac_lease (single source of truth for the JSON shape).
         """
+        if _iac_lease is not None:
+            _iac_lease.write_lease(node, zone, pid, ttl_s, self.lease_dir)
+            return
+        # Fallback: inline implementation (keeps the reaper self-contained).
         try:
             self.lease_dir.mkdir(parents=True, exist_ok=True)
             payload: Dict[str, Any] = {
@@ -289,22 +324,22 @@ class OrphanReaper:
           valid=False, reason='no-lease' -- file absent or unreadable
           valid=False, reason='expired'  -- file present but expires_ts < now()
           valid=False, reason='dead-pid' -- pid does not exist
+
+        Delegates to iac_lease (single source of truth for the JSON shape).
         """
+        if _iac_lease is not None:
+            return _iac_lease.is_lease_valid(node, self.lease_dir)
+        # Fallback: inline implementation (keeps the reaper self-contained).
         path = _lease_path(self.lease_dir, node)
         if not path.exists():
             return False, "no-lease"
-
         try:
             data: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             return False, "no-lease"
-
-        # Check expiry first (cheapest).
         expires_ts = float(data.get("expires_ts", 0.0))
         if time.time() > expires_ts:
             return False, "expired"
-
-        # Check pid liveness via signal 0 (probe-only, never kills).
         pid = int(data.get("pid", 0))
         if pid <= 0:
             return False, "dead-pid"
@@ -313,7 +348,6 @@ class OrphanReaper:
         except ProcessLookupError:
             return False, "dead-pid"
         except PermissionError:
-            # EPERM: pid exists but belongs to a different user -> still alive.
             return True, "ok"
         return True, "ok"
 
