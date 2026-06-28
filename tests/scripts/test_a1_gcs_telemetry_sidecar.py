@@ -222,3 +222,39 @@ def test_managed_sidecar_aclose_is_safe_without_start():
     m = ManagedSidecar("/no/such.log", s, interval_s=0.01)
     # aclose() before start() must not raise.
     asyncio.run(m.aclose())
+
+
+def test_managed_sidecar_flush_now_is_synchronous(tmp_path):
+    from a1_gcs_telemetry_sidecar import AppendOnlyChunkStreamer, ManagedSidecar
+
+    p = tmp_path / "debug.log"
+    p.write_bytes(b"...APPLIED written=True")
+    got = []
+    s = AppendOnlyChunkStreamer(session_id="x", sink=lambda n, d: got.append(d))
+    m = ManagedSidecar(str(p), s, interval_s=0.01)
+
+    # Callable from a signal handler / exception path with NO running loop.
+    m.flush_now()
+
+    assert b"".join(got) == b"...APPLIED written=True"
+
+
+def test_managed_sidecar_install_signal_handlers_registers_and_chains(tmp_path):
+    import signal
+
+    from a1_gcs_telemetry_sidecar import AppendOnlyChunkStreamer, ManagedSidecar
+
+    s = AppendOnlyChunkStreamer(session_id="x", sink=lambda n, d: None)
+    m = ManagedSidecar("/no/such.log", s, interval_s=0.01)
+
+    prev_term = signal.getsignal(signal.SIGTERM)
+    prev_int = signal.getsignal(signal.SIGINT)
+    try:
+        m.install_signal_handlers()
+        # Our flush-on-termination handler is now installed (not the prior one).
+        assert signal.getsignal(signal.SIGTERM) is not prev_term
+        assert signal.getsignal(signal.SIGINT) is not prev_int
+        assert callable(signal.getsignal(signal.SIGTERM))
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+        signal.signal(signal.SIGINT, prev_int)

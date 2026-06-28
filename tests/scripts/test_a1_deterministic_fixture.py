@@ -238,6 +238,16 @@ def test_fixture_payload_is_deterministic():
     assert a.full_content == b.full_content
 
 
+def test_fixture_payload_full_content_is_compile_valid():
+    # Pre-Flight AST Compilation Check (constraint #3): enforced in
+    # build_deterministic_mutation (single source), so every fixture candidate
+    # is guaranteed valid Python -> VERIFY never fails on a fixture syntax error.
+    from a1_deterministic_fixture import fixture_candidate_payload
+
+    pc = fixture_candidate_payload(env=_FIXTURE_ENV, read_file=lambda p: _TARGET_SRC)
+    compile(pc.full_content, "<preflight>", "exec")
+
+
 # ---------------------------------------------------------------------------
 # FixtureGenerator — Decorator/DI drop-in. Wraps the real generator, delegates
 # everything via __getattr__, overrides ONLY generate(). Production

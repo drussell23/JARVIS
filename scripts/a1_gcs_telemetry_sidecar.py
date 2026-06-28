@@ -158,6 +158,38 @@ class ManagedSidecar:
             finally:
                 self._task = None
 
+    def flush_now(self) -> None:
+        """Synchronous final flush -- safe from a signal handler or an exception
+        path at termination (no running event loop required). Reads the remaining
+        bytes and pushes them so the terminal 'APPLIED' chunk is never truncated."""
+        flush_tick(self._path, self._streamer)
+
+    def install_signal_handlers(self) -> "ManagedSidecar":
+        """Intercept SIGINT/SIGTERM: flush_now() before chaining to the prior
+        handler. Idempotent; must be called from the main thread. Returns self."""
+        import signal
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            prev = signal.getsignal(sig)
+
+            def handler(signum, frame, _prev=prev):
+                try:
+                    self.flush_now()
+                except Exception as exc:  # noqa: BLE001 — never block teardown
+                    logger.warning("[a1-sidecar] signal flush error: %s", exc)
+                finally:
+                    if callable(_prev) and _prev not in (
+                        signal.SIG_DFL,
+                        signal.SIG_IGN,
+                    ):
+                        _prev(signum, frame)
+
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError) as exc:  # not main thread / unsupported
+                logger.warning("[a1-sidecar] signal handler install skipped: %s", exc)
+        return self
+
 
 class AppendOnlyChunkStreamer:
     """Splits an append-only byte stream into immutable, monotonically-indexed
