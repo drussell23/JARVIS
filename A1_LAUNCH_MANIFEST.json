@@ -1,0 +1,10 @@
+{
+  "schema_version": "a1-launch.1",
+  "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "native_tool_forcing": true,
+  "epistemic_feedback": true,
+  "seed": 42,
+  "cost_cap": 2.0,
+  "max_wall_seconds": 2400,
+  "generated_for": "2026-06-28T10:08:04.624905Z"
+}

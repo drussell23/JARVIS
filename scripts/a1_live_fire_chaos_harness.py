@@ -84,6 +84,13 @@ _OMNI_ENV_OVERLAY = os.path.join(_REPO_ROOT, "deploy", "ouroboros_omni_prod.env"
 # Cost model for the remote node (e2-standard-8 Spot ~ $0.08/hr; see hypervisor).
 _NODE_COST_PER_HOUR = float(os.environ.get("JARVIS_A1_NODE_COST_PER_HOUR", "0.08"))
 
+# Grace added to the soak wall when computing the GCP --max-run-duration ceiling
+# (infra-level, GIL-immune hard stop: GCP kills the VM when soak_wall + grace elapses).
+# Shared by both the --surgery-timeout-s and --max-run-duration-s so they stay
+# consistent (surgery timeout = Python soft bound; max-run-duration = GCP hard kill).
+# Respects the Slice-47 watchdog-isolation invariant: reads only time, no op-ledger.
+_WALL_CLOCK_GRACE_S = int(os.environ.get("JARVIS_A1_WALL_GRACE_S", "600"))
+
 
 def _load_auditor_module():
     """Import the auditor as a module (reuse its CADENCE_POLICY flag loader,
@@ -269,6 +276,7 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         model="Qwen/Qwen3.5-397B-A17B-FP8",
         native_tool_forcing=True,
         epistemic_feedback=True,
+        failover_lifecycle=False,
     )
     apply_manifest(_a1_manifest, env)
     return env
@@ -1197,7 +1205,14 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
         sys.executable, _HYPERVISOR_SCRIPT,
         "--execute", "--i-understand-this-spends-money",
         "--surgery-cmd", remote_cmd,
-        "--surgery-timeout-s", str(wall_seconds + 600),
+        "--surgery-timeout-s", str(wall_seconds + _WALL_CLOCK_GRACE_S),
+        # GCP hard ceiling: soak wall + grace. Infra-level, GIL-immune.
+        # The Python watchdog thread can be starved; GCP kills the VM regardless.
+        # Grace matches --surgery-timeout-s so the Python soft bound fires first
+        # (clean summary.json), then GCP hard-stops if the process refuses to die.
+        # Respects Slice-47 watchdog-isolation: GCP reads only the clock, never
+        # the orchestrator op-ledger.
+        "--max-run-duration-s", str(wall_seconds + _WALL_CLOCK_GRACE_S),
     ]
     # --on-demand pass-through (env-gated): provision a STANDARD (no Spot
     # preemption) node for an uninterrupted multi-stage run when the operator
@@ -1224,6 +1239,7 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
         model="Qwen/Qwen3.5-397B-A17B-FP8",
         native_tool_forcing=True,
         epistemic_feedback=True,
+        failover_lifecycle=False,
         seed=seed,
         cost_cap=cost_cap,
         max_wall_seconds=wall_seconds,
