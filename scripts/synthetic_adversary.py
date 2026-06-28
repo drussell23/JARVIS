@@ -15,6 +15,27 @@ REWORK 2026-06-26 (Layer A fix — faithful DW mock):
       JARVIS_AEGIS_UPSTREAM_DOUBLEWORD_URL (Aegis upstream).
   Legacy /dw/* routes kept byte-identical for backward compat.
 
+ZERO-SHOT ("cocky") PROFILE (2026-06-28):
+  Reproduces the gpt-oss-120b failure mode: model returns a final repair
+  candidate with ZERO exploration tool calls — bypassing the Iron Gate
+  exploration requirement.
+
+  Toggle:
+    * env  JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT=1  (any truthy string: "1","true","yes")
+    * API  adv.set_simulate_zero_shot(True)        (thread-safe, same lock as set_state)
+
+  Behaviour when active (is_repair=True branch only):
+    * Request body has tools + NO tool_choice="required" → returns a FINAL 2b.1
+      candidates response immediately (0 exploration tool calls).  This reproduces
+      the "cocky model bypasses Iron Gate" failure.  response_kind = "zero_shot_bypass".
+    * Request body has tool_choice="required" → returns a NATIVE OpenAI-compat
+      tool_calls delta (read_file) in the SSE stream.  Models "endpoint honors
+      forcing — even a cocky model is forced to call a tool."
+      response_kind = "zero_shot_forced_tool_calls".
+
+  Probe requests (is_repair=False) are unaffected regardless of the flag.
+  Existing explore-first behaviour is byte-identical when the profile is OFF.
+
 REUSE (per plan spec -- no duplication)
 -----------------------------------------
 * FakeClock  (scripts/chaos_injector.py:76)    -- injectable deterministic clock,
@@ -123,6 +144,13 @@ _log = logging.getLogger(__name__)
 # How long (seconds) the LIVE_STREAM_STALL handler holds the SSE connection open.
 # Set JARVIS_ADVERSARY_STALL_S to a small value in tests to avoid blocking.
 _STALL_S: float = float(os.environ.get("JARVIS_ADVERSARY_STALL_S", "30.0"))
+
+# Zero-shot ("cocky") profile: env-level default.
+# Set JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT=1 (or "true"/"yes") to enable globally.
+# The per-instance flag (set_simulate_zero_shot) always wins once the server starts.
+_ZERO_SHOT_ENV_DEFAULT: bool = os.environ.get(
+    "JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT", ""
+).lower() in ("1", "true", "yes")
 
 
 # ── Per-request diagnostic logging for soak debugging ────────────────────────── #
@@ -499,8 +527,20 @@ def build_repair_completion(
     messages: List[Dict[str, Any]],
     manifest: Dict[str, Any],
     has_tools: bool = True,
+    simulate_zero_shot: bool = False,
 ) -> str:
     """Build the scripted assistant content string for the chaos-repair path.
+
+    **Zero-shot ("cocky") path** (``simulate_zero_shot=True``):
+      Reproduces the gpt-oss-120b failure mode: returns a FINAL 2b.1 repair
+      candidate immediately with ZERO exploration tool calls — bypassing the
+      Iron Gate requirement.  The candidate content is ``original_source`` (a
+      valid repair) so the only failing dimension is the missing exploration.
+      Note: this path is entered for both has_tools=True and has_tools=False
+      when simulate_zero_shot=True, because a "cocky" model skips exploration
+      regardless of whether tools are available.  The caller is responsible for
+      the ``tool_choice="required"`` branch (native tool_calls SSE) — that
+      case never reaches this function.
 
     **No-tools path** (``has_tools=False``):
       The Venom tool loop is skipped for ``complexity=trivial/simple`` ops.
@@ -538,6 +578,26 @@ def build_repair_completion(
     target_file = manifest.get("target_file", "")
     original_source = manifest.get("original_source", "")
     function_name = str(manifest.get("function", "repaired_function"))
+
+    # ── Zero-shot ("cocky") path: skip ALL exploration, return final candidate ─ #
+    # Reproduces gpt-oss-120b: model submits a patch on turn 0 with zero
+    # read_file/search_code → Iron Gate exploration_insufficient.
+    # The tool_choice="required" branch is handled in the HTTP handler (not here).
+    if simulate_zero_shot:
+        return json.dumps({
+            "schema_version": _DW_CANDIDATES_SCHEMA_VERSION,
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "file_path": target_file,
+                    "full_content": original_source,
+                    "rationale": (
+                        "Zero-shot bypass: returning candidate without prior exploration "
+                        "(simulates cocky gpt-oss-120b behaviour — no read_file/search_code)."
+                    ),
+                }
+            ],
+        })
 
     # ── No-tools path: trivial single-completion → direct 2b.1 candidates ─── #
     # The Venom tool loop is skipped; Iron Gate exploration does not apply.
@@ -658,10 +718,56 @@ def _build_repair_sse_chunks(content: str, model: str) -> List[bytes]:
     ]
 
 
+def _build_forced_tool_call_sse_chunks(target_file: str, model: str) -> List[bytes]:
+    """Build SSE byte frames for a native tool_calls response (tool_choice=required honored).
+
+    When the zero-shot profile is active AND the request has ``tool_choice="required"``,
+    the endpoint MUST return a native OpenAI-compat ``tool_calls`` delta — it cannot
+    return a bare content string (tool_choice=required makes non-tool messages
+    protocol-invalid on a conformant endpoint).  This models "the endpoint honors
+    forcing; even a cocky model is forced to call a tool."
+
+    Emits one SSE chunk with ``choices[0].delta.tool_calls`` (native format) containing
+    a ``read_file`` call on the chaos ``target_file``, then ``data: [DONE]``.
+
+    Pure — no I/O.  Thread-safe.
+    """
+    created = int(time.time())
+    tool_call_chunk = {
+        "id": "adv-forced",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_adv_forced_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": target_file}),
+                        },
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    return [
+        f"data: {json.dumps(tool_call_chunk)}\n\n".encode(),
+        b"data: [DONE]\n\n",
+    ]
+
+
 def build_batch_output_line(
     custom_id: str,
     input_line_json: str,
     manifest: Optional[Dict[str, Any]],
+    simulate_zero_shot: bool = False,
 ) -> str:
     """Build one JSONL output line for a /v1/files batch output (Stage 4 retrieve).
 
@@ -671,6 +777,11 @@ def build_batch_output_line(
     marker, emit a ``2b.1`` candidate JSON with
     ``full_content = manifest["original_source"]``.  Otherwise emit a generic
     valid completion string.
+
+    ``simulate_zero_shot``: when True the zero-shot profile is active.  In the
+    batch path there is no tool loop and no ``tool_choice`` header, so zero-shot
+    means the same as the no-tools branch: return the 2b.1 candidate directly.
+    The ``simulate_zero_shot`` flag is forwarded to ``build_repair_completion``.
 
     Output shape matches ``doubleword_provider._retrieve_result`` parse
     (lines 4974-5007):
@@ -696,11 +807,15 @@ def build_batch_output_line(
     if is_repair:
         # batch path = single-completion (no Venom tool loop); has_tools=False
         # forces the trivial 2b.1 direct-candidates branch of build_repair_completion.
+        # simulate_zero_shot is forwarded so the zero-shot profile also exercises
+        # the batch path (though in batch the effect is the same as has_tools=False
+        # since there is no tool loop to bypass).
         content = build_repair_completion(
             prompt=input_line_json,
             messages=[],
             manifest=manifest,  # type: ignore[arg-type]
             has_tools=False,
+            simulate_zero_shot=simulate_zero_shot,
         )
     else:
         content = "adversary batch stub"
@@ -782,6 +897,10 @@ class SyntheticAdversary:
         # State machine (thread-safe via _state_lock)
         self._state_lock: threading.Lock = threading.Lock()
         self._state: AdversaryState = AdversaryState.HEALTHY
+        # Zero-shot ("cocky") profile flag — guarded by _state_lock.
+        # Initialised from JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT env; togglable at
+        # runtime via set_simulate_zero_shot() (same pattern as set_state()).
+        self._simulate_zero_shot: bool = _ZERO_SHOT_ENV_DEFAULT
 
         # Dedicated server thread + port (set once the thread is up)
         self._port: Optional[int] = None
@@ -820,6 +939,26 @@ class SyntheticAdversary:
             self._state = state
         _log.info(
             "[SyntheticAdversary] state %s → %s", old.value, state.value,
+        )
+
+    def set_simulate_zero_shot(self, enabled: bool) -> None:
+        """Enable or disable the zero-shot ("cocky") adversary profile.
+
+        When enabled: the repair branch skips all exploration tool calls and
+        returns a final 2b.1 candidate immediately (0 read_file/search_code
+        rounds), unless the request carries ``tool_choice="required"`` — in
+        that case a native ``tool_calls`` SSE response is returned instead
+        (models "endpoint honors forcing").
+
+        Thread-safe; can be called at any time, including after ``start()``.
+        Consistent with ``set_state()``: guarded by the same ``_state_lock``.
+        """
+        with self._state_lock:
+            old = self._simulate_zero_shot
+            self._simulate_zero_shot = bool(enabled)
+        _log.info(
+            "[SyntheticAdversary] simulate_zero_shot %s → %s",
+            old, bool(enabled),
         )
 
     def schedule(
@@ -1307,6 +1446,16 @@ class SyntheticAdversary:
         model = body.get("model", _HEALTHY_MODEL_ID)
         messages: List[Dict[str, Any]] = body.get("messages", [])
 
+        # Read tool_choice for zero-shot forcing-honored branch.
+        # tool_choice="required" (OpenAI-compat) means the endpoint MUST return
+        # a tool_calls response — even a "cocky" model cannot bypass it.
+        tool_choice = body.get("tool_choice")
+        tool_choice_required = (tool_choice == "required")
+
+        # Read zero-shot flag under lock (same lock as _state, consistent).
+        with self._state_lock:
+            simulate_zero_shot = self._simulate_zero_shot
+
         # Early diagnostic fields for logging
         has_tools = bool(body.get("tools"))
         _manifest = _load_chaos_manifest()
@@ -1345,22 +1494,68 @@ class SyntheticAdversary:
             target_file = _manifest.get("target_file", "")
 
             if is_repair:
+                # ── Zero-shot ("cocky") profile — repair branch ────────────────── #
+                # When active, the model bypasses Iron Gate by submitting a patch
+                # with zero exploration tool calls.  BUT: if the request carries
+                # tool_choice="required" (OpenAI-compat forcing), a conformant
+                # endpoint CANNOT return a non-tool message — so we emit a native
+                # tool_calls response instead (models "forcing honored").
+                if simulate_zero_shot and tool_choice_required:
+                    # Forcing honored: return a native tool_calls SSE delta.
+                    # Even a "cocky" model is forced to call a tool by the endpoint.
+                    response_kind = "zero_shot_forced_tool_calls"
+                    _log_adversary_request(
+                        path="/v1/chat/completions",
+                        state=state_str,
+                        has_tools=has_tools,
+                        manifest_present=True,
+                        is_repair=True,
+                        is_2b1=is_2b1,
+                        target_file=target_file,
+                        prompt_len=prompt_len,
+                        prompt_head=prompt_head,
+                        response_kind=response_kind,
+                    )
+                    _forced_resp = aiohttp.web.StreamResponse(
+                        status=200,
+                        headers={
+                            "Content-Type": "text/event-stream",
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                            "X-Adversary-Profile": "zero_shot_forced",
+                        }
+                    )
+                    await _forced_resp.prepare(request)
+                    for _chunk_bytes in _build_forced_tool_call_sse_chunks(
+                        target_file, model
+                    ):
+                        await _forced_resp.write(_chunk_bytes)
+                    await _forced_resp.write_eof()
+                    return _forced_resp
+
                 # has_tools=True only when the request includes a non-empty
                 # tools array (Venom multi-turn path).  Trivial/simple ops
                 # send no tools → single-completion 2b.1 candidates direct.
+                # simulate_zero_shot is forwarded: when True, build_repair_completion
+                # skips exploration and returns a bare 2b.1 candidate on turn 0.
                 _repair_content = build_repair_completion(
-                    prompt_str, messages, _manifest, has_tools=has_tools,
+                    prompt_str, messages, _manifest,
+                    has_tools=has_tools,
+                    simulate_zero_shot=simulate_zero_shot,
                 )
                 _log.debug(
-                    "[SyntheticAdversary] repair-branch step=%d content_len=%d",
+                    "[SyntheticAdversary] repair-branch step=%d content_len=%d zero_shot=%s",
                     _count_prior_tool_results(messages),
                     len(_repair_content),
+                    simulate_zero_shot,
                 )
 
                 # Determine response_kind based on what build_repair_completion returned.
-                # Mirrors the new explore-first logic: tools present → explore steps
-                # first (read_file/search_code); 2b.1 only selects final-step format.
-                if not has_tools:
+                if simulate_zero_shot:
+                    # Zero-shot bypass: bare 2b.1 candidate with 0 exploration calls.
+                    response_kind = "zero_shot_bypass"
+                elif not has_tools:
                     response_kind = "repair_candidates_2b1"
                 else:
                     prior = _count_prior_tool_results(messages)
@@ -1616,6 +1811,10 @@ class SyntheticAdversary:
         batch_id = request.match_info.get("batch_id", "unknown")
         output_file_id = f"v1_out_{batch_id}"
 
+        # Read zero-shot flag for the batch synthesis path.
+        with self._state_lock:
+            _batch_simulate_zero_shot = self._simulate_zero_shot
+
         # Synthesise and cache the output JSONL the first time this batch is polled.
         with self._files_lock:
             if output_file_id not in self._uploaded_files:
@@ -1632,7 +1831,10 @@ class SyntheticAdversary:
                     except (json.JSONDecodeError, AttributeError):
                         custom_id = "unknown"
                     output_lines.append(
-                        build_batch_output_line(custom_id, raw_line, manifest)
+                        build_batch_output_line(
+                            custom_id, raw_line, manifest,
+                            simulate_zero_shot=_batch_simulate_zero_shot,
+                        )
                     )
                 if not output_lines:
                     # No stored input (e.g. legacy /dw/* batch IDs): emit one generic line.

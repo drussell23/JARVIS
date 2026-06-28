@@ -133,6 +133,90 @@ def test_compose_env_sources_linux_overlay(monkeypatch):
 
 
 # ===========================================================================
+# 1b. compose_env: A1-harness opt-in flags (Fix #1 + Fix #2 regression spine)
+# ===========================================================================
+
+
+def test_compose_env_sets_native_tool_forcing(monkeypatch):
+    """compose_env must set JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED=true.
+
+    Root cause: the GCP node never received this flag because it is default-OFF
+    in production and not present in the linux_prod overlay.  The harness is the
+    correct injection site (it owns the full env composition for A1 soaks).
+    """
+    monkeypatch.delenv("JARVIS_A1_AUDIT_FLAGS", raising=False)
+    env = harness.compose_env()
+    assert env.get("JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED") == "true", (
+        "JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED must be forced ON by compose_env "
+        "so the DW Venom loop uses native tool-call format (Iron Gate requirement)"
+    )
+
+
+def test_compose_env_sets_epistemic_feedback(monkeypatch):
+    """compose_env must set JARVIS_EPISTEMIC_FEEDBACK_ENABLED=true.
+
+    Root cause: same as native-forcing — not in the linux_prod overlay, so the
+    Provider Quarantine / Cryo-DLQ gradient-deduced escalation path was never
+    exercised during A1 soaks, hiding the feedback lane gap.
+    """
+    monkeypatch.delenv("JARVIS_A1_AUDIT_FLAGS", raising=False)
+    env = harness.compose_env()
+    assert env.get("JARVIS_EPISTEMIC_FEEDBACK_ENABLED") == "true", (
+        "JARVIS_EPISTEMIC_FEEDBACK_ENABLED must be forced ON by compose_env "
+        "so provider health signals traverse the full feedback lane during soaks"
+    )
+
+
+def test_compose_env_overrides_dw_primary_to_qwen(monkeypatch):
+    """compose_env must pin JARVIS_DW_PRIMARY_OVERRIDE to Qwen3.5-397B.
+
+    Root cause: ouroboros_linux_prod.env pins openai/gpt-oss-120b for production
+    use.  compose_env applies the overlay, then deliberately overrides the pin to
+    Qwen/Qwen3.5-397B-A17B-FP8.  This ensures repair and background routes
+    resolve to Qwen (reasoning keepalives prevent SSE stream stalls) rather than
+    gpt-oss-120b which triggered the logged 'topology override' during A1 soaks.
+    The value must be non-empty so assert_dw_primary() still passes.
+    """
+    monkeypatch.delenv("JARVIS_A1_AUDIT_FLAGS", raising=False)
+    env = harness.compose_env()
+    pin = env.get("JARVIS_DW_PRIMARY_OVERRIDE", "")
+    assert pin == "Qwen/Qwen3.5-397B-A17B-FP8", (
+        "compose_env must override the linux_prod gpt-oss-120b pin to Qwen for A1 soaks; "
+        f"got {pin!r}"
+    )
+    # assert_dw_primary must still pass (non-empty pin + claude disabled).
+    ok, reason = harness.assert_dw_primary(env)
+    assert ok, f"assert_dw_primary failed after Qwen pin: {reason}"
+
+
+def test_topology_background_resolves_to_qwen_via_pin(monkeypatch):
+    """model_pinning_heuristic.apply_model_pin promotes Qwen to rank-1 for
+    the background route when JARVIS_DW_PRIMARY_OVERRIDE=Qwen/Qwen3.5-397B-A17B-FP8.
+
+    This validates the end-to-end topology: compose_env sets the pin -> the pin
+    env var is read by apply_model_pin -> background route model tuple is
+    re-ranked so Qwen leads, not gpt-oss-120b.
+    """
+    import importlib
+    try:
+        from backend.core.ouroboros.governance import model_pinning_heuristic as mph
+    except ImportError:
+        pytest.skip("model_pinning_heuristic not importable in this env")
+
+    _QWEN = "Qwen/Qwen3.5-397B-A17B-FP8"
+    monkeypatch.setenv("JARVIS_DW_PRIMARY_OVERRIDE", _QWEN)
+    # Reset any accumulated failure state from other tests.
+    mph.get_pin_ledger().reset()
+
+    result = mph.apply_model_pin("background", ("openai/gpt-oss-120b", "deepseek-v4-pro"))
+    assert result[0] == _QWEN, (
+        f"background route must resolve to {_QWEN!r} when pin is set; got {result[0]!r}"
+    )
+    # gpt-oss must be demoted, not removed — the pin only promotes, does not drop.
+    assert "openai/gpt-oss-120b" in result, "gpt-oss-120b must remain in the pool (demoted)"
+
+
+# ===========================================================================
 # 2. The orchestration sequence runs in order.
 # ===========================================================================
 

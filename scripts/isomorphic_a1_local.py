@@ -439,6 +439,17 @@ class IsomorphicA1Driver:
             adversary = self._adversary_factory()
         else:
             adversary = adv_mod.SyntheticAdversary()
+        # Belt-and-suspenders zero-shot propagation: synthetic_adversary reads
+        # JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT at module-load time into the
+        # module-level _ZERO_SHOT_ENV_DEFAULT constant.  When the module was
+        # already cached in sys.modules before the env var was set (e.g. in
+        # tests or when the caller imports isomorphic_a1_local early), the
+        # cached constant is stale.  Explicitly call set_simulate_zero_shot()
+        # here so the runtime flag always reflects the current env, regardless
+        # of import order.
+        _zs_raw = os.environ.get("JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT", "")
+        if _zs_raw.lower() in ("1", "true", "yes"):
+            adversary.set_simulate_zero_shot(True)
         if self.adversary_fault:
             _schedule_adversary_fault(adversary, adv_mod, self.adversary_fault)
         adversary_urls: Dict[str, str] = await adversary.start()

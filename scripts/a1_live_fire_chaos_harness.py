@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 
@@ -57,6 +58,18 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPTS_DIR)
+
+# A1 launch manifest: deterministic, schema-validated, fail-closed config artifact.
+# Provides the single authoritative apply point for model/forcing/epistemic flags.
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from a1_launch_manifest import (  # noqa: E402
+    A1ManifestError,
+    apply_manifest,
+    build_manifest,
+    load_and_validate,
+    write_manifest,
+)
 _CHAOS_SCRIPT = os.path.join(_SCRIPTS_DIR, "chaos_injector_ast.py")
 _SOAK_SCRIPT = os.path.join(_SCRIPTS_DIR, "ouroboros_battle_test.py")
 _AUDITOR_SCRIPT = os.path.join(_SCRIPTS_DIR, "a1_graduation_auditor.py")
@@ -235,6 +248,29 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env["JARVIS_IDE_STREAM_ENABLED"] = "1"
     env["JARVIS_A1_TRACE_ENABLED"] = "1"
     env["JARVIS_IDE_OBSERVABILITY_ENABLED"] = "1"
+    # 4. A1-harness explicit opt-ins (not in the linux_prod overlay; default-OFF in
+    #    production to avoid cost surprises). Applied via the A1 launch manifest so
+    #    the values have a single authoritative apply point (apply_manifest()).
+    #    * NATIVE_TOOL_FORCING: tells DW to use native tool-call format instead of
+    #      text-mode CoT -- required for the Iron Gate exploration-first check to
+    #      see proper tool calls in the Venom loop, not raw JSON snippets.
+    #    * EPISTEMIC_FEEDBACK: enables the gradient-deduced DW global-outage
+    #      escalation path (Provider Quarantine / Cryo-DLQ) so provider health
+    #      signals flow through the full feedback lane during A1 soaks.
+    # 5. Topology-native Qwen3.5-397B-A17B-FP8 as the DW primary pin.
+    #    The linux_prod overlay may pin a different model. For A1 soaks we want the
+    #    Qwen default so repair/background routes resolve to Qwen (the model whose
+    #    reasoning keepalives prevent SSE stream stalls on long generations).
+    #    The overlay's value is deliberately overridden here at the harness layer;
+    #    assert_dw_primary() still passes (non-empty value).
+    #    apply_manifest() is the SINGLE authoritative apply point for these three
+    #    flags -- do NOT set them individually outside this call.
+    _a1_manifest = build_manifest(
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        native_tool_forcing=True,
+        epistemic_feedback=True,
+    )
+    apply_manifest(_a1_manifest, env)
     return env
 
 
@@ -1180,6 +1216,24 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
     # Signal the on-node run to fail-CLOSED on a failed verdict: HOLD the Black Box
     # (do not drop the completion-sentinel) until the local checksum verification.
     env.setdefault("JARVIS_A1_BLACKBOX_HOLD_ON_FAILURE", "1")
+    # Write the A1 launch manifest locally alongside .env and inject it into the
+    # hypervisor's secret-files list so it gets SCP'd to the SAME node directory.
+    # The on-node boot path validates this manifest (fail-CLOSED) before the soak.
+    _local_manifest_path = os.path.join(_REPO_ROOT, "A1_LAUNCH_MANIFEST.json")
+    _remote_manifest = build_manifest(
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        native_tool_forcing=True,
+        epistemic_feedback=True,
+        seed=seed,
+        cost_cap=cost_cap,
+        max_wall_seconds=wall_seconds,
+    )
+    write_manifest(_local_manifest_path, _remote_manifest)
+    _log("[A1Manifest] wrote local manifest -> %s" % _local_manifest_path)
+    # Append to JARVIS_IAC_SECRET_FILES so the hypervisor SCPs it with .env.
+    _existing_secrets = env.get("JARVIS_IAC_SECRET_FILES", ".env")
+    if "A1_LAUNCH_MANIFEST.json" not in _existing_secrets:
+        env["JARVIS_IAC_SECRET_FILES"] = _existing_secrets + ",A1_LAUNCH_MANIFEST.json"
     _log("STEP remote: provisioning node + remote surgery (dead-man armed, "
          "Black Box checksum-gate active)")
     cp = subprocess.run(argv, env=env, check=False)
@@ -1367,6 +1421,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not ok:
             _log("REFUSED: DW-primary not pinned -- %s" % (reason,))
             return 2
+        # A1 launch manifest validation -- FAIL-CLOSED: the manifest must be
+        # present and schema-valid before the soak may proceed.  The --remote path
+        # writes it locally and SCPs it alongside .env via JARVIS_IAC_SECRET_FILES.
+        _node_manifest_path = Path(_REPO_ROOT) / "A1_LAUNCH_MANIFEST.json"
+        try:
+            _node_manifest = load_and_validate(_node_manifest_path)
+        except A1ManifestError as exc:
+            print("[A1Manifest] FATAL: %s" % exc, file=sys.stderr)
+            return 1
+        apply_manifest(_node_manifest, dict())  # validate apply path is reachable
+        _log("[A1Manifest] applied model=%s forcing=%s epistemic=%s" % (
+            _node_manifest["model"],
+            _node_manifest["native_tool_forcing"],
+            _node_manifest["epistemic_feedback"],
+        ))
         run = build_live_run(args)
         _ACTIVE_CHAOS.append(run.chaos)
         _install_revert_signal_handlers()
