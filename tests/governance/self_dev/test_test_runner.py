@@ -24,8 +24,14 @@ from typing import Dict
 
 from backend.core.ouroboros.governance.test_runner import (
     TestRunner,
+    _TEST_DIR_NAMES,
+    _ast_import_cache,
+    _build_test_import_map,
     _find_test_recursive,
+    _find_tests_by_ast_import,
+    _find_tests_suffix_aware,
     _is_safe_path,
+    _path_to_module,
     _resolve_original_path,
 )
 
@@ -441,3 +447,155 @@ class TestRetryToggle:
         result = await runner.run(test_files=(fail_path,))
         assert result.passed is False
         assert "--- RETRY ---" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# 17. test_suffix_aware_recursive  (new Strategy 2)
+# ---------------------------------------------------------------------------
+
+class TestSuffixAwareRecursive:
+    """Suffix-aware recursive search finds test_<stem>_*.py variants."""
+
+    async def test_finds_exact_name(self) -> None:
+        """Exact-name match still works via suffix-aware helper."""
+        results = await _find_tests_suffix_aware("calculator", REPO_ROOT)
+        assert any(p.name == "test_calculator.py" for p in results), (
+            f"Expected test_calculator.py in suffix-aware results: {results}"
+        )
+
+    async def test_finds_suffix_named_test(self) -> None:
+        """test_repl_input_polish_slice4.py is found via the _* suffix pattern."""
+        results = await _find_tests_suffix_aware("repl_input_polish", REPO_ROOT)
+        names = [p.name for p in results]
+        assert "test_repl_input_polish_slice4.py" in names, (
+            f"Expected test_repl_input_polish_slice4.py in {names}"
+        )
+
+    async def test_returns_empty_for_no_match(self) -> None:
+        """A stem with no test anywhere returns an empty list."""
+        results = await _find_tests_suffix_aware(
+            "zzz_no_test_exists_qwerty_12345", REPO_ROOT,
+        )
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# 18. test_ast_import_map  (new Strategy 3)
+# ---------------------------------------------------------------------------
+
+class TestASTImportMap:
+    """AST import map correctly indexes module→test_file relationships."""
+
+    def test_build_map_finds_repl_input_polish(self) -> None:
+        """_build_test_import_map maps repl_input_polish → test_repl_input_polish_slice4.py."""
+        import_map = _build_test_import_map(REPO_ROOT, _TEST_DIR_NAMES)
+        key = "backend.core.ouroboros.battle_test.repl_input_polish"
+        matches = import_map.get(key, [])
+        names = [p.name for p in matches]
+        assert "test_repl_input_polish_slice4.py" in names, (
+            f"AST import map for '{key}': {names}"
+        )
+
+    def test_path_to_module_conversion(self) -> None:
+        """_path_to_module converts source path to dotted module string."""
+        source = REPO_ROOT / "backend/core/ouroboros/battle_test/repl_input_polish.py"
+        result = _path_to_module(source, REPO_ROOT)
+        assert result == "backend.core.ouroboros.battle_test.repl_input_polish"
+
+    def test_path_to_module_outside_repo_returns_none(self) -> None:
+        """_path_to_module returns None for paths outside repo_root."""
+        outside = Path("/etc/passwd")
+        assert _path_to_module(outside, REPO_ROOT) is None
+
+    def test_find_tests_by_ast_import_exact(self) -> None:
+        """_find_tests_by_ast_import returns only tests that import the exact module."""
+        import_map = _build_test_import_map(REPO_ROOT, _TEST_DIR_NAMES)
+        key = "backend.core.ouroboros.battle_test.repl_input_polish"
+        matches = _find_tests_by_ast_import(key, import_map, seen=set())
+        names = [p.name for p in matches]
+        assert "test_repl_input_polish_slice4.py" in names
+
+    def test_find_tests_by_ast_import_no_false_positives(self) -> None:
+        """_find_tests_by_ast_import does NOT return tests for an unimported module."""
+        import_map = _build_test_import_map(REPO_ROOT, _TEST_DIR_NAMES)
+        key = "zzz_no_test_exists_qwerty_module_path"
+        matches = _find_tests_by_ast_import(key, import_map, seen=set())
+        assert matches == []
+
+    async def test_get_ast_import_map_caches(self) -> None:
+        """_get_ast_import_map is cached per repo_root after the first build."""
+        # Clear cache for this repo_root to start clean
+        repo_resolved = REPO_ROOT.resolve()
+        _ast_import_cache.pop(repo_resolved, None)
+
+        runner = TestRunner(repo_root=REPO_ROOT)
+        map1 = await runner._get_ast_import_map()
+        map2 = await runner._get_ast_import_map()
+        assert map1 is map2, "Second call should return the exact same dict object"
+
+
+# ---------------------------------------------------------------------------
+# 19. test_regression_repl_input_polish  (THE bug fix)
+# ---------------------------------------------------------------------------
+
+class TestRegressionReplInputPolish:
+    """Regression: repl_input_polish.py must resolve to test_repl_input_polish_slice4.py,
+    NOT test_cross_repo_resolution.py."""
+
+    async def test_resolves_to_correct_suffix_test(self) -> None:
+        """Strategy 2 (suffix-aware recursive) must find test_repl_input_polish_slice4.py."""
+        runner = TestRunner(repo_root=REPO_ROOT)
+        source = REPO_ROOT / "backend/core/ouroboros/battle_test/repl_input_polish.py"
+        result = await runner.resolve_affected_tests(changed_files=(source,))
+
+        names = [p.name for p in result]
+        assert "test_repl_input_polish_slice4.py" in names, (
+            f"Expected test_repl_input_polish_slice4.py in resolved tests; got: {names}"
+        )
+
+    async def test_does_not_return_coincidental_near_dir_test(self) -> None:
+        """The near-source-sibling package glob (old Strategy 3) must NOT fire.
+
+        test_cross_repo_resolution.py lives in backend/core/ouroboros/tests/ —
+        it's a coincidental near-dir match, not a real test for repl_input_polish.
+        """
+        runner = TestRunner(repo_root=REPO_ROOT)
+        source = REPO_ROOT / "backend/core/ouroboros/battle_test/repl_input_polish.py"
+        result = await runner.resolve_affected_tests(changed_files=(source,))
+
+        names = [p.name for p in result]
+        assert "test_cross_repo_resolution.py" not in names, (
+            f"Got coincidental near-dir test in result — near-dir glob was NOT demoted: {names}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 20. test_no_false_match  (Synthesizer-fallback hook)
+# ---------------------------------------------------------------------------
+
+class TestNoFalseMatch:
+    """A source file with no real test must NOT pick up a coincidental near-dir test.
+
+    This is the Synthesizer-fallback contract: the result should be empty or
+    only the repo-level tests/ directory (last resort), never an unrelated test
+    from a coincidentally nearby tests/ dir.
+    """
+
+    async def test_no_test_does_not_return_unrelated_file(self) -> None:
+        """A unique, non-existent source file in battle_test/ should NOT resolve to
+        test_cross_repo_resolution.py (the only file in the near ouroboros/tests/ dir).
+        """
+        runner = TestRunner(repo_root=REPO_ROOT)
+        # Use a stem guaranteed to have no matching test anywhere
+        source = REPO_ROOT / "backend/core/ouroboros/battle_test/zzz_synthetic_untested_99.py"
+        result = await runner.resolve_affected_tests(changed_files=(source,))
+
+        names = [p.name for p in result]
+        assert "test_cross_repo_resolution.py" not in names, (
+            f"Coincidental near-dir test leaked into resolution: {names}"
+        )
+        # May contain repo-level tests/ directory (Strategy 4 last resort) — that's OK
+        for p in result:
+            assert p.is_dir() or p.name.startswith("test_"), (
+                f"Unexpected non-test file in fallback result: {p}"
+            )

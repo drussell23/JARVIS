@@ -117,4 +117,57 @@ def _is_cloud_container() -> bool:
         return False
 
 
-__all__ = ["_is_cloud_container", "is_autonomous", "is_primary_checkout"]
+def authoritative_repo_root(path: "Path | str") -> Path:
+    """Translate a path inside a ``.worktrees/<name>`` directory to the
+    authoritative parent repository root.
+
+    When the orchestrator is running with file isolation enabled, it uses a
+    linked worktree under ``<repo>/.worktrees/<session>/`` as its
+    ``project_root``.  Coverage lookups, blast-radius scans, and test
+    discovery MUST read from the authoritative tree (where test files
+    actually exist), not from the worktree which may be empty or partially
+    cleaned.  WRITES continue to target the worktree — this function is
+    READ-path only.
+
+    Algorithm: walk *path* upward; if any ancestor is named ``.worktrees``,
+    return its parent (the repo root).  If no ``.worktrees`` component is
+    found the path is not an isolation worktree and is returned unchanged.
+
+    Examples
+    --------
+    >>> authoritative_repo_root('/repo/.worktrees/foo')
+    PosixPath('/repo')
+    >>> authoritative_repo_root('/repo/.worktrees/foo/backend/bar.py')
+    PosixPath('/repo')
+    >>> authoritative_repo_root('/repo/backend/bar.py')
+    PosixPath('/repo/backend/bar.py')
+
+    NEVER raises — any failure returns ``Path(path)`` unchanged (fail-soft).
+    Authority posture: pure path math, zero I/O, zero git calls.
+    """
+    try:
+        p = Path(path).resolve()
+        current = p
+        while True:
+            parent = current.parent
+            if parent == current:
+                # Reached filesystem root without finding .worktrees
+                break
+            if current.name == ".worktrees":
+                # parent is the repo root that OWNS .worktrees/
+                return parent
+            current = parent
+        return p
+    except Exception:  # noqa: BLE001 — defensive
+        try:
+            return Path(path)
+        except Exception:
+            return Path(".")
+
+
+__all__ = [
+    "_is_cloud_container",
+    "authoritative_repo_root",
+    "is_autonomous",
+    "is_primary_checkout",
+]

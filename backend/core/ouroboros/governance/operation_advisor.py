@@ -2126,8 +2126,23 @@ class OperationAdvisor:
 
         ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
         ``None`` (pre-B.2.0 behavior).
+
+        The scan root is translated via
+        :func:`execution_context.authoritative_repo_root` so that a
+        ``.worktrees/<name>/`` path (L3 isolation worktree) never returns 0%
+        coverage due to an empty or partially-cleaned worktree.
         """
         scan_root = root if root is not None else self._project_root
+        # Defense-in-depth: if scan_root is inside a .worktrees/<name> path,
+        # translate to the parent repo root for READ operations so test
+        # discovery succeeds even when the worktree is empty.
+        try:
+            from backend.core.ouroboros.governance.execution_context import (
+                authoritative_repo_root as _auth_root,
+            )
+            scan_root = _auth_root(scan_root)
+        except Exception:  # noqa: BLE001 — fail-soft
+            pass
         if not target_files:
             return 1.0
         py_files = [f for f in target_files if f.endswith(".py") and "test_" not in f]
