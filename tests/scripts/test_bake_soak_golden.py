@@ -8,8 +8,12 @@ requirements sha label, and execute deletes the bake node on every exit path.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import os
+import time
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pytest
 
@@ -347,3 +351,331 @@ def test_hard_ensure_deps_match_iac(bake):
     iac = _u.module_from_spec(spec)
     spec.loader.exec_module(iac)
     assert deps == iac.hard_ensure_deps()
+
+
+# --------------------------------------------------------------------------- #
+# Loader helpers for iac_lease and a1_orphan_reaper.
+# --------------------------------------------------------------------------- #
+_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+
+
+def _load_iac_lease():
+    spec = importlib.util.spec_from_file_location(
+        "iac_lease", str(_SCRIPTS / "iac_lease.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_reaper():
+    spec = importlib.util.spec_from_file_location(
+        "a1_orphan_reaper", str(_SCRIPTS / "a1_orphan_reaper.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------- #
+# Fix #1 -- SSH transport-retry wrapper.
+# --------------------------------------------------------------------------- #
+
+def test_ssh_transport_retry_succeeds_after_flakes(bake, monkeypatch):
+    """Transport flakes (rc=255, then conn-error with no marker) then SUCCESS.
+
+    Assert:
+      - 3 calls to _run (2 flakes + 1 success)
+      - time.sleep called twice (backoff after each flake)
+      - final result contains the OK marker
+    """
+    call_count: List[int] = [0]
+
+    def fake_run(cmd, *, timeout_s=120.0):
+        call_count[0] += 1
+        n = call_count[0]
+        if n == 1:
+            # Transport flake: SSH own exit code.
+            return 255, "ssh: connect to host node port 22: Connection timed out"
+        if n == 2:
+            # Transport flake: connection-error pattern in output, no marker.
+            return 0, "Connection reset by peer"
+        # Third attempt succeeds.
+        return 0, f"output {bake._VALIDATION_OK_MARKER}"
+
+    sleep_calls: List[float] = []
+    monkeypatch.setattr(bake, "_run", fake_run)
+    monkeypatch.setattr(bake.time, "sleep", lambda s: sleep_calls.append(s))
+
+    rc, out = bake._run_ssh_with_transport_retry(
+        ["gcloud", "compute", "ssh", "node", "--command", "validate"],
+        timeout_s=300.0,
+        max_retries=3,
+        backoff_base=1.0,
+        backoff_cap=10.0,
+    )
+
+    assert call_count[0] == 3, f"expected 3 attempts, got {call_count[0]}"
+    assert len(sleep_calls) == 2, (
+        f"expected 2 backoff sleeps (after flakes 1 and 2), got {len(sleep_calls)}"
+    )
+    assert all(s > 0 for s in sleep_calls), "backoff delays must be positive"
+    assert bake._VALIDATION_OK_MARKER in out
+
+
+def test_ssh_transport_retry_no_marker_retries(bake, monkeypatch):
+    """No verdict marker in output (remote died mid-stream) -> treated as transport -> retry."""
+    call_count: List[int] = [0]
+
+    def fake_run(cmd, *, timeout_s=120.0):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            # No marker, rc=0: remote output truncated (transport flake).
+            return 0, "partial output no marker here"
+        return 0, f"full output {bake._VALIDATION_OK_MARKER}"
+
+    monkeypatch.setattr(bake, "_run", fake_run)
+    monkeypatch.setattr(bake.time, "sleep", lambda s: None)
+
+    rc, out = bake._run_ssh_with_transport_retry(
+        ["ssh", "node"],
+        max_retries=3,
+        backoff_base=0.001,
+        backoff_cap=0.01,
+    )
+
+    assert call_count[0] == 3
+    assert bake._VALIDATION_OK_MARKER in out
+
+
+def test_ssh_payload_fail_no_retry(bake, monkeypatch):
+    """FAIL marker present -> fail-closed immediately, exactly 1 attempt, no sleep."""
+    call_count: List[int] = [0]
+    sleep_calls: List[float] = []
+
+    def fake_run(cmd, *, timeout_s=120.0):
+        call_count[0] += 1
+        return 0, f"{bake._VALIDATION_FAIL_MARKER} deps-import: No module named 'uuid6'"
+
+    monkeypatch.setattr(bake, "_run", fake_run)
+    monkeypatch.setattr(bake.time, "sleep", lambda s: sleep_calls.append(s))
+
+    rc, out = bake._run_ssh_with_transport_retry(
+        ["gcloud", "compute", "ssh", "node", "--command", "validate"],
+        timeout_s=300.0,
+        max_retries=3,
+        backoff_base=1.0,
+        backoff_cap=10.0,
+    )
+
+    assert call_count[0] == 1, (
+        f"payload fail must be fail-closed (1 attempt), got {call_count[0]}"
+    )
+    assert sleep_calls == [], "no backoff sleep must occur on payload failure"
+    assert bake._VALIDATION_FAIL_MARKER in out
+
+
+def test_ssh_transport_all_retries_exhausted(bake, monkeypatch):
+    """All retries exhausted on transport flakes -> return last result (non-zero)."""
+    call_count: List[int] = [0]
+
+    def fake_run(cmd, *, timeout_s=120.0):
+        call_count[0] += 1
+        return 255, "ssh: connect to host: Connection refused"
+
+    monkeypatch.setattr(bake, "_run", fake_run)
+    monkeypatch.setattr(bake.time, "sleep", lambda s: None)
+
+    rc, out = bake._run_ssh_with_transport_retry(
+        ["ssh", "node"],
+        max_retries=3,
+        backoff_base=0.001,
+        backoff_cap=0.01,
+    )
+
+    assert call_count[0] == 3, "all retries must be exhausted"
+    assert rc == 255
+
+
+# --------------------------------------------------------------------------- #
+# Fix #2 -- Lease lifecycle.
+# --------------------------------------------------------------------------- #
+
+class _FakeIacLease:
+    """Captures write_lease / delete_lease calls without touching the filesystem."""
+
+    def __init__(self):
+        self.written: List[Dict[str, Any]] = []
+        self.deleted: List[str] = []
+
+    def write_lease(self, node, zone, pid, ttl_s, lease_dir=None):
+        self.written.append({"node": node, "zone": zone, "pid": pid, "ttl_s": ttl_s})
+
+    def delete_lease(self, node, lease_dir=None):
+        self.deleted.append(node)
+
+
+def test_lease_written_after_node_creation(bake, monkeypatch):
+    """Baker writes lease immediately after node creation (before readiness poll)."""
+    fake_lease = _FakeIacLease()
+    monkeypatch.setattr(bake, "_iac_lease", fake_lease)
+
+    rec = _Recorder(responses=[
+        (lambda j: "images describe" in j, (1, "NOT_FOUND")),
+        (lambda j: "instances create" in j, (0, "created")),
+        (lambda j: "test -f " in j, (0, "SOAK_READY")),
+        (lambda j: "import aiohttp" in j, (0, bake._VALIDATION_OK_MARKER)),
+    ])
+    monkeypatch.setattr(bake, "_run", rec)
+    args = bake.build_parser().parse_args(["--execute"])
+    rc = bake._execute_bake(args, "soak-bake-lease-test", "<startup>")
+
+    assert rc == 0
+    # Lease must have been written at least once (initial write + heartbeats).
+    written_nodes = [w["node"] for w in fake_lease.written]
+    assert "soak-bake-lease-test" in written_nodes, (
+        "lease must be written for the bake node after creation"
+    )
+    # The lease must carry the baker's own pid.
+    for entry in fake_lease.written:
+        if entry["node"] == "soak-bake-lease-test":
+            assert entry["pid"] == os.getpid(), "lease pid must match baker process"
+            break
+
+
+def test_lease_deleted_on_success(bake, monkeypatch):
+    """Lease is deleted in the finally block on the success path."""
+    fake_lease = _FakeIacLease()
+    monkeypatch.setattr(bake, "_iac_lease", fake_lease)
+
+    rec = _Recorder(responses=[
+        (lambda j: "images describe" in j, (1, "NOT_FOUND")),
+        (lambda j: "instances create" in j, (0, "created")),
+        (lambda j: "test -f " in j, (0, "SOAK_READY")),
+        (lambda j: "import aiohttp" in j, (0, bake._VALIDATION_OK_MARKER)),
+    ])
+    monkeypatch.setattr(bake, "_run", rec)
+    args = bake.build_parser().parse_args(["--execute"])
+    bake._execute_bake(args, "soak-bake-del-success", "<startup>")
+
+    assert "soak-bake-del-success" in fake_lease.deleted, (
+        "lease must be deleted on the success exit path"
+    )
+
+
+def test_lease_deleted_on_validation_abort(bake, monkeypatch):
+    """Lease is deleted in the finally block even when validation aborts."""
+    fake_lease = _FakeIacLease()
+    monkeypatch.setattr(bake, "_iac_lease", fake_lease)
+
+    rec = _Recorder(responses=[
+        (lambda j: "images describe" in j, (1, "NOT_FOUND")),
+        (lambda j: "instances create" in j, (0, "created")),
+        (lambda j: "test -f " in j, (0, "SOAK_READY")),
+        (lambda j: "import aiohttp" in j,
+         (0, f"{bake._VALIDATION_FAIL_MARKER} broken")),
+    ])
+    monkeypatch.setattr(bake, "_run", rec)
+    args = bake.build_parser().parse_args(["--execute"])
+    rc = bake._execute_bake(args, "soak-bake-del-abort", "<startup>")
+
+    assert rc == 6, "validation abort must return exit code 6"
+    assert "soak-bake-del-abort" in fake_lease.deleted, (
+        "lease must be deleted on the abort/failure exit path"
+    )
+
+
+def test_lease_heartbeat_called_during_poll(bake, monkeypatch):
+    """Heartbeat (lease refresh) is called each readiness-poll iteration."""
+    fake_lease = _FakeIacLease()
+    monkeypatch.setattr(bake, "_iac_lease", fake_lease)
+
+    # Node not ready on attempt 1, ready on attempt 2.
+    call_count: List[int] = [0]
+
+    def fake_run(cmd, *, timeout_s=120.0):
+        joined = " ".join(cmd)
+        if "images describe" in joined:
+            return 1, "NOT_FOUND"
+        if "instances create" in joined:
+            return 0, "created"
+        if "test -f " in joined:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 0, "SOAK_NOT_READY"
+            return 0, "SOAK_READY"
+        if "tail -n 5" in joined:
+            return 0, "[soak-bake] still installing"
+        if "import aiohttp" in joined:
+            return 0, bake._VALIDATION_OK_MARKER
+        return 0, ""
+
+    monkeypatch.setattr(bake, "_run", fake_run)
+    monkeypatch.setattr(bake.time, "sleep", lambda s: None)
+    args = bake.build_parser().parse_args(["--execute"])
+    rc = bake._execute_bake(args, "soak-bake-heartbeat", "<startup>")
+
+    assert rc == 0
+    # At least two writes: the initial lease write + at least one heartbeat.
+    writes_for_node = [
+        w for w in fake_lease.written if w["node"] == "soak-bake-heartbeat"
+    ]
+    assert len(writes_for_node) >= 2, (
+        f"expected >=2 lease writes (initial + at least 1 heartbeat), "
+        f"got {len(writes_for_node)}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reaper-spares-leased-node integration test.
+# --------------------------------------------------------------------------- #
+
+def test_reaper_spares_node_with_valid_baker_lease(tmp_path):
+    """A node with a valid baker lease (pid=live, not expired) is NOT reaped.
+
+    Integration test: uses the real iac_lease and a1_orphan_reaper modules
+    loaded via importlib (no real gcloud calls -- injected fake lister/deleter).
+    """
+    iac_lease_mod = _load_iac_lease()
+    reaper_mod = _load_reaper()
+
+    node = "jarvis-soak-bake-live-lease-test"
+    lease_dir = tmp_path / "leases"
+    lease_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a valid lease owned by the current (live) process.
+    iac_lease_mod.write_lease(node, "us-central1-a", os.getpid(), 3600, lease_dir)
+
+    # Verify the lease is seen as valid by the sync helper.
+    valid, reason = iac_lease_mod.is_lease_valid(node, lease_dir)
+    assert valid, f"freshly written lease must be valid; got reason={reason!r}"
+
+    reaped: List[str] = []
+
+    import datetime as _dt
+
+    def _make_old_instance(name):
+        created = _dt.datetime.utcnow() - _dt.timedelta(seconds=1000)
+        ts = created.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+        return {"name": name, "zone": "us-central1-a", "creationTimestamp": ts}
+
+    async def fake_lister(project, prefixes):
+        return [_make_old_instance(node)]
+
+    async def fake_deleter(project, node_name, zone):
+        reaped.append(node_name)
+
+    reaper = reaper_mod.OrphanReaper(
+        lease_dir=lease_dir,
+        project="test-project",
+        zone="us-central1-a",
+        boot_grace_s=0,  # no grace -- node is old enough
+        dry_run=False,
+        instance_lister=fake_lister,
+        instance_deleter=fake_deleter,
+    )
+    asyncio.run(reaper.run_once())
+
+    assert node not in reaped, (
+        "OrphanReaper must NOT reap a node that has a valid live baker lease"
+    )
