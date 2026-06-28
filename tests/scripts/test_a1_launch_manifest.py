@@ -209,6 +209,102 @@ def test_apply_manifest_returns_mutated_env():
 
 
 # ===========================================================================
+# failover_lifecycle: required key, apply writes JARVIS_FAILOVER_LIFECYCLE_ENABLED
+# ===========================================================================
+
+
+def test_build_manifest_failover_lifecycle_default_false():
+    """build_manifest includes failover_lifecycle=False by default."""
+    m = build_manifest(model="x", native_tool_forcing=True, epistemic_feedback=True)
+    assert "failover_lifecycle" in m
+    assert m["failover_lifecycle"] is False
+
+
+def test_build_manifest_failover_lifecycle_explicit_false():
+    """build_manifest(failover_lifecycle=False) is explicit and present."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        failover_lifecycle=False,
+    )
+    assert m["failover_lifecycle"] is False
+
+
+def test_build_manifest_failover_lifecycle_true():
+    """build_manifest(failover_lifecycle=True) round-trips correctly."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        failover_lifecycle=True,
+    )
+    assert m["failover_lifecycle"] is True
+
+
+def test_apply_manifest_failover_lifecycle_false():
+    """apply_manifest sets JARVIS_FAILOVER_LIFECYCLE_ENABLED=false when flag is False."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        failover_lifecycle=False,
+    )
+    env: dict = {}
+    apply_manifest(m, env)
+    assert env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] == "false"
+
+
+def test_apply_manifest_failover_lifecycle_true():
+    """apply_manifest sets JARVIS_FAILOVER_LIFECYCLE_ENABLED=true when flag is True."""
+    m = build_manifest(
+        model="x", native_tool_forcing=True, epistemic_feedback=True,
+        failover_lifecycle=True,
+    )
+    env: dict = {}
+    apply_manifest(m, env)
+    assert env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] == "true"
+
+
+def test_load_and_validate_requires_failover_lifecycle(tmp_path):
+    """Manifest missing failover_lifecycle -> A1ManifestError (missing required keys)."""
+    p = tmp_path / "no_failover.json"
+    p.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "model": "x",
+        "native_tool_forcing": True,
+        "epistemic_feedback": True,
+        # failover_lifecycle intentionally omitted
+    }))
+    with pytest.raises(A1ManifestError, match="missing required keys"):
+        load_and_validate(p)
+
+
+def test_round_trip_includes_failover_lifecycle(tmp_path):
+    """build -> write -> load_and_validate preserves failover_lifecycle."""
+    m = build_manifest(
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        native_tool_forcing=True,
+        epistemic_feedback=True,
+        failover_lifecycle=False,
+    )
+    p = tmp_path / "A1_LAUNCH_MANIFEST.json"
+    write_manifest(p, m)
+    loaded = load_and_validate(p)
+    assert loaded["failover_lifecycle"] is False
+
+
+def test_apply_manifest_failover_always_written():
+    """apply_manifest writes JARVIS_FAILOVER_LIFECYCLE_ENABLED whether True or False
+    (never absent -- prevents the default=true node gap)."""
+    for flag_val in (True, False):
+        m = build_manifest(
+            model="x", native_tool_forcing=False, epistemic_feedback=False,
+            failover_lifecycle=flag_val,
+        )
+        env: dict = {}
+        apply_manifest(m, env)
+        assert "JARVIS_FAILOVER_LIFECYCLE_ENABLED" in env, (
+            "JARVIS_FAILOVER_LIFECYCLE_ENABLED must always be present in env "
+            "(prevents node default=true gap)"
+        )
+
+
+# ===========================================================================
 # compose_env compat: the 3 flag keys must appear via apply_manifest
 # ===========================================================================
 
@@ -233,6 +329,11 @@ def test_compose_env_compat():
         )
         assert "JARVIS_EPISTEMIC_FEEDBACK_ENABLED" in env, (
             "compose_env must set JARVIS_EPISTEMIC_FEEDBACK_ENABLED via apply_manifest"
+        )
+        # Failover must be deterministically pinned OFF by the A1 manifest.
+        assert env.get("JARVIS_FAILOVER_LIFECYCLE_ENABLED") == "false", (
+            "compose_env must pin JARVIS_FAILOVER_LIFECYCLE_ENABLED=false via apply_manifest "
+            "(prevents J-Prime spawn mid-soak when the shell var does not propagate)"
         )
     except Exception as exc:
         pytest.skip("compose_env import requires full harness setup: %s" % exc)

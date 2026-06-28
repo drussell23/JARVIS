@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 SCHEMA_VERSION = "a1-launch.1"
-REQUIRED_KEYS = {"schema_version", "model", "native_tool_forcing", "epistemic_feedback"}
+REQUIRED_KEYS = {"schema_version", "model", "native_tool_forcing", "epistemic_feedback", "failover_lifecycle"}
 
 
 class A1ManifestError(Exception):
@@ -34,6 +34,7 @@ def build_manifest(
     model: str,
     native_tool_forcing: bool,
     epistemic_feedback: bool,
+    failover_lifecycle: bool = False,
     seed: Optional[int] = None,
     cost_cap: Optional[float] = None,
     max_wall_seconds: Optional[int] = None,
@@ -45,6 +46,7 @@ def build_manifest(
         "model": model,
         "native_tool_forcing": native_tool_forcing,
         "epistemic_feedback": epistemic_feedback,
+        "failover_lifecycle": failover_lifecycle,
     }
     if seed is not None:
         core["seed"] = seed
@@ -96,6 +98,10 @@ def apply_manifest(manifest: Dict[str, Any], env: Dict[str, str]) -> Dict[str, s
         env["JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED"] = "true"
     if manifest.get("epistemic_feedback"):
         env["JARVIS_EPISTEMIC_FEEDBACK_ENABLED"] = "true"
+    # Deterministic failover-lifecycle pin: always written (true/false), never absent.
+    # Prevents the shell-var-propagation gap that let JARVIS_FAILOVER_LIFECYCLE_ENABLED
+    # default to "true" on the node and spawn J-Prime mid-soak.
+    env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "true" if manifest.get("failover_lifecycle") else "false"
     if manifest.get("seed") is not None:
         env["JARVIS_CHAOS_SEED"] = str(manifest["seed"])
     if manifest.get("cost_cap") is not None:
