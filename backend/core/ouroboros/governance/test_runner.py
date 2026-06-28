@@ -11,6 +11,7 @@ Provides deterministic test scoping and async pytest execution with:
 """
 from __future__ import annotations
 
+import ast as _ast
 import asyncio
 import json
 import logging
@@ -792,6 +793,146 @@ async def _find_test_recursive(
     return await loop.run_in_executor(None, _scan)
 
 
+async def _find_tests_suffix_aware(
+    source_stem: str,
+    repo_root: Path,
+    dir_names: FrozenSet[str] = _TEST_DIR_NAMES,
+) -> List[Path]:
+    """Recursively search for ``test_<stem>.py`` AND ``test_<stem>_*.py`` under
+    all top-level test directories.
+
+    This catches suffix-named test variants such as ``test_foo_slice4.py`` that
+    the exact-name :func:`_find_test_recursive` misses.  Results are returned in
+    stable sorted order.
+    """
+    exact_name = f"test_{source_stem}.py"
+    suffix_prefix = f"test_{source_stem}_"
+    loop = asyncio.get_running_loop()
+
+    def _scan() -> List[Path]:
+        results: List[Path] = []
+        for tdn in sorted(dir_names):
+            top_tests = repo_root / tdn
+            if not top_tests.is_dir():
+                continue
+            for match in sorted(top_tests.rglob("test_*.py")):
+                if not match.is_file():
+                    continue
+                name = match.name
+                if name == exact_name or (
+                    name.startswith(suffix_prefix) and name.endswith(".py")
+                ):
+                    results.append(match)
+        return results
+
+    return await loop.run_in_executor(None, _scan)
+
+
+def _path_to_module(source_file: Path, repo_root: Path) -> Optional[str]:
+    """Convert a repo-relative source file path to a dotted module string.
+
+    Example::
+
+        repo/backend/core/ouroboros/battle_test/repl_input_polish.py
+        → "backend.core.ouroboros.battle_test.repl_input_polish"
+
+    Returns ``None`` when *source_file* is outside *repo_root*.
+    """
+    try:
+        rel = source_file.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    parts = list(rel.parts)
+    if not parts:
+        return None
+    if parts[-1].endswith(".py"):
+        parts[-1] = parts[-1][:-3]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) if parts else None
+
+
+def _register_import(
+    import_map: Dict[str, List[Path]],
+    key: str,
+    test_file: Path,
+) -> None:
+    """Append *test_file* to *import_map[key]* (deduplicated)."""
+    if not key:
+        return
+    lst = import_map.setdefault(key, [])
+    if test_file not in lst:
+        lst.append(test_file)
+
+
+def _build_test_import_map(
+    repo_root: Path,
+    dir_names: FrozenSet[str],
+) -> Dict[str, List[Path]]:
+    """Scan every ``test_*.py`` under *dir_names* and build a map of
+    ``dotted_module_path → [test_files that import it]``.
+
+    Parsing is done with :mod:`ast` — no import side-effects, no pytest run.
+    Syntax-invalid or unreadable files are silently skipped.
+
+    This map lets :meth:`TestRunner.resolve_affected_tests` Strategy 3 answer
+    "which tests directly import the changed module?" in O(1) after the
+    one-time build (cached per ``repo_root`` at module level).
+    """
+    import_map: Dict[str, List[Path]] = {}
+
+    for tdn in sorted(dir_names):
+        top_tests = repo_root / tdn
+        if not top_tests.is_dir():
+            continue
+        for test_file in sorted(top_tests.rglob("test_*.py")):
+            if not test_file.is_file():
+                continue
+            try:
+                source = test_file.read_text(encoding="utf-8", errors="replace")
+                tree = _ast.parse(source, filename=str(test_file))
+            except (SyntaxError, OSError, UnicodeDecodeError):
+                continue
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Import):
+                    for alias in node.names:
+                        _register_import(import_map, alias.name, test_file)
+                elif isinstance(node, _ast.ImportFrom):
+                    module = node.module or ""
+                    if module:
+                        _register_import(import_map, module, test_file)
+                    for alias in node.names:
+                        full = f"{module}.{alias.name}" if module else alias.name
+                        _register_import(import_map, full, test_file)
+
+    return import_map
+
+
+def _find_tests_by_ast_import(
+    module_path: str,
+    import_map: Dict[str, List[Path]],
+    seen: set,
+) -> List[Path]:
+    """Return test files whose AST directly imports *module_path*.
+
+    Performs an exact lookup — partial/parent-module matches are intentionally
+    excluded to avoid false positives (e.g. a test importing ``backend.core``
+    would otherwise match every source file under that package).
+    """
+    result: List[Path] = []
+    for test_file in import_map.get(module_path, []):
+        if test_file not in seen and test_file not in result:
+            result.append(test_file)
+    return sorted(result)
+
+
+# AST import map cache: repo_root → {module_path: [test_files]}
+# Populated lazily on the first resolve_affected_tests call; valid for the
+# process lifetime.  Thread-safe for reads; built exactly once per repo_root
+# (the executor call is idempotent and cheap races are benign).
+_ast_import_cache: Dict[Path, Dict[str, List[Path]]] = {}
+
+
 # ---------------------------------------------------------------------------
 # TestRunner
 # ---------------------------------------------------------------------------
@@ -828,6 +969,29 @@ class TestRunner:
         self._timeout = timeout
         self._event_callback = event_callback
 
+    # -- internal helpers ---------------------------------------------------
+
+    async def _get_ast_import_map(self) -> Dict[str, List[Path]]:
+        """Return the AST import map for this repo, building and caching if needed.
+
+        The map is built once in a thread executor (non-blocking) and cached at
+        module level keyed by ``self._repo_root``.  Subsequent calls are O(1).
+        """
+        if self._repo_root not in _ast_import_cache:
+            loop = asyncio.get_running_loop()
+            import_map = await loop.run_in_executor(
+                None,
+                _build_test_import_map,
+                self._repo_root,
+                _TEST_DIR_NAMES,
+            )
+            _ast_import_cache[self._repo_root] = import_map
+            logger.debug(
+                "[TestRunner] AST import map built: %d module keys indexed",
+                len(import_map),
+            )
+        return _ast_import_cache[self._repo_root]
+
     # -- public API ---------------------------------------------------------
 
     async def resolve_affected_tests(
@@ -849,13 +1013,24 @@ class TestRunner:
             repo path to locate sibling ``tests/`` directories.
 
         Strategy (evaluated per changed file, first match wins):
-        1. **Name convention** — ``foo.py`` → ``test_foo.py`` in nearest
-           sibling ``tests/`` directory (using original path).
-        2. **Recursive search** — ``test_foo.py`` anywhere under repo
-           test directories (async, off-main-thread).
-        3. **Package fallback** — all ``test_*.py`` files in the nearest
-           sibling ``tests/`` directory.
-        4. **Repo fallback** — repo-level ``tests/`` directory.
+
+        0. **Self** — if the changed file is already a test file, use it directly.
+           Prevents double-resolving when a candidate edits both ``foo.py`` and
+           ``test_foo.py``.
+        1. **Name convention** — ``foo.py`` → ``test_foo.py`` in nearest sibling
+           ``tests/`` directory (using original path).
+        2. **Suffix-aware recursive** — search ALL repo test directories for
+           ``test_<stem>.py`` AND ``test_<stem>_*.py`` (catches ``_slice4``-style
+           suffixed names that the old exact-match missed).
+        3. **AST-import** — scan ALL test files in repo test trees for those whose
+           AST directly imports the changed module.  Results cached per repo_root.
+        4. **Repo fallback** — repo-level ``tests/`` directory (last resort; signals
+           to the Synthesizer that no specific test was located).
+
+        **Removed (was Strategy 3):** the near-source-sibling package glob
+        ``test_*.py`` in the nearest ``tests/`` directory.  That strategy returned
+        unrelated tests from coincidentally nearby directories (e.g.
+        ``test_cross_repo_resolution.py`` for ``repl_input_polish.py``).
 
         Results are capped at ``JARVIS_TEST_MAX_FILES`` (default 50).
         Symlinks resolving outside ``repo_root`` (and outside /tmp, /var)
@@ -864,10 +1039,29 @@ class TestRunner:
         matched: List[Path] = []
         seen: set = set()
 
+        # Build (or retrieve from cache) the AST import map for Strategy 3.
+        import_map = await self._get_ast_import_map()
+
+        # Defense-in-depth: translate .worktrees/<name> paths to the real repo
+        # root for test DISCOVERY so tests are found even when the isolation
+        # worktree is empty or partially cleaned. READS come from the
+        # authoritative tree; WRITES still target the worktree. Safety checks
+        # accept both the worktree and real-repo paths since the worktree lives
+        # physically inside the real repo (under .worktrees/).
+        try:
+            from backend.core.ouroboros.governance.execution_context import (
+                authoritative_repo_root as _auth_root,
+            )
+            _discovery_root = _auth_root(self._repo_root)
+        except Exception:  # noqa: BLE001 — fail-soft, never breaks discovery
+            _discovery_root = self._repo_root
+
         for changed in changed_files:
             effective = _resolve_original_path(changed, original_paths)
 
-            if not _is_safe_path(effective, self._repo_root):
+            if not _is_safe_path(effective, self._repo_root) and not _is_safe_path(
+                effective, _discovery_root
+            ):
                 logger.warning(
                     "[TestRunner] Skipping path outside repo_root: %s (original: %s)",
                     changed, effective,
@@ -879,8 +1073,6 @@ class TestRunner:
             tests_dir = _find_sibling_tests_dir(effective)
 
             # Strategy 0: if the changed file is already a test file, use it directly.
-            # Prevents double-resolving (e.g. candidate edits both foo.py and test_foo.py
-            # → test_foo.py would otherwise fall through to the 44-file package fallback).
             if effective.name.startswith("test_") and effective.suffix == ".py" and effective.is_file():
                 if effective not in seen:
                     seen.add(effective)
@@ -891,7 +1083,7 @@ class TestRunner:
                     )
                 continue
 
-            # Strategy 1: name convention in sibling tests/
+            # Strategy 1: exact name convention in nearest sibling tests/
             if tests_dir is not None:
                 candidate = tests_dir / test_name
                 if candidate.is_file() and candidate not in seen:
@@ -903,36 +1095,41 @@ class TestRunner:
                     )
                     continue
 
-            # Strategy 2: recursive search under all test directories
-            recursive_match = await _find_test_recursive(
-                stem, self._repo_root,
-            )
-            if recursive_match is not None and recursive_match not in seen:
-                seen.add(recursive_match)
-                matched.append(recursive_match)
+            # Strategy 2: suffix-aware recursive search across ALL test roots.
+            # Finds test_<stem>.py (exact) AND test_<stem>_*.py (suffix variants).
+            # Uses _discovery_root (authoritative) so tests are found even
+            # when self._repo_root is an empty isolation worktree.
+            recursive_matches = await _find_tests_suffix_aware(stem, _discovery_root)
+            if recursive_matches:
+                for m in recursive_matches:
+                    if m not in seen:
+                        seen.add(m)
+                        matched.append(m)
                 logger.debug(
-                    "[TestRunner] Strategy 2 (recursive): %s → %s",
-                    effective.name, recursive_match,
+                    "[TestRunner] Strategy 2 (suffix-aware recursive): %s → %d file(s)",
+                    effective.name, len(recursive_matches),
                 )
                 continue
 
-            # Strategy 3: package fallback — all test files in tests_dir
-            if tests_dir is not None and tests_dir not in seen:
-                test_files = sorted(tests_dir.glob("test_*.py"))
-                for tf in test_files:
-                    if tf not in seen:
-                        seen.add(tf)
-                        matched.append(tf)
-                if test_files:
+            # Strategy 3: AST-import — tests that directly import this module.
+            module_path = _path_to_module(effective, self._repo_root)
+            if module_path:
+                ast_matches = _find_tests_by_ast_import(module_path, import_map, seen)
+                if ast_matches:
+                    for m in ast_matches:
+                        seen.add(m)
+                        matched.append(m)
                     logger.debug(
-                        "[TestRunner] Strategy 3 (package fallback): %s → %d files in %s",
-                        effective.name, len(test_files), tests_dir,
+                        "[TestRunner] Strategy 3 (AST import): %s → %d file(s) via module '%s'",
+                        effective.name, len(ast_matches), module_path,
                     )
                     continue
 
-            # Strategy 4: repo fallback
+            # Strategy 4: repo fallback — signals "no specific test found".
+            # Uses _discovery_root so tests/ is found even when self._repo_root
+            # is an empty isolation worktree.
             for tdn in sorted(_TEST_DIR_NAMES):
-                repo_tests = self._repo_root / tdn
+                repo_tests = _discovery_root / tdn
                 if repo_tests.is_dir() and repo_tests not in seen:
                     seen.add(repo_tests)
                     matched.append(repo_tests)
@@ -945,7 +1142,7 @@ class TestRunner:
         # Last resort: repo-level test dir if nothing matched at all
         if not matched:
             for tdn in sorted(_TEST_DIR_NAMES):
-                repo_tests = self._repo_root / tdn
+                repo_tests = _discovery_root / tdn
                 if repo_tests.is_dir():
                     matched.append(repo_tests)
                     logger.info(

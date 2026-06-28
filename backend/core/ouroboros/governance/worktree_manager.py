@@ -158,9 +158,13 @@ class WorktreeManager:
         repo_root: Path,
         worktree_base: Optional[Path] = None,
     ) -> None:
-        self._repo_root = Path(repo_root)
+        # Resolve to an absolute, symlink-free path so all git operations and
+        # path comparisons use a canonical form regardless of caller CWD or
+        # symlinked mount points (the "isomorphic" worktree-in-worktree case
+        # where '.' in a Claude-Code worktree resolves to the wrong git root).
+        self._repo_root = Path(os.path.realpath(repo_root))
         self._worktree_base: Path = (
-            Path(worktree_base) if worktree_base is not None
+            Path(os.path.realpath(worktree_base)) if worktree_base is not None
             else self._repo_root / ".worktrees"
         )
 
@@ -215,6 +219,41 @@ class WorktreeManager:
             raise RuntimeError(
                 f"git worktree add failed (rc={proc.returncode}) "
                 f"for branch '{branch_name}': {stderr.decode().strip()}"
+            )
+
+        # Isomorphic Worktree Hydration post-condition (2026-06-27):
+        # Verify the checkout is populated for every sentinel directory that
+        # exists in the real repo root. An empty worktree (only .jarvis/ present)
+        # causes Advisor 0%-coverage blocks. We mirror the repo's own structure:
+        # if the repo has 'backend/' it must exist in the worktree too; likewise
+        # for 'tests/'. Synthetic repos used by unit tests (no backend/ or tests/)
+        # bypass the check entirely — no directories to verify → no assertion.
+        _sentinels = ("backend", "tests")
+        _missing = [
+            d for d in _sentinels
+            if (self._repo_root / d).is_dir() and not (wt_path / d).is_dir()
+        ]
+        if _missing:
+            # Attempt best-effort cleanup before raising so we don't leak a
+            # partially-constructed worktree entry in git's registry.
+            try:
+                _cleanup_proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(self._repo_root),
+                    "worktree", "remove", "--force", str(wt_path),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await _cleanup_proc.communicate()
+            except Exception:  # noqa: BLE001 — best-effort only
+                pass
+            raise RuntimeError(
+                f"git worktree add for branch '{branch_name}' succeeded "
+                f"(rc=0) but the checkout is incomplete — "
+                f"{_missing} present in repo but absent from {wt_path}. "
+                f"The repo_root used was '{self._repo_root}'. "
+                "This usually means the repo root was wrong (symlink / "
+                "relative-path CWD mismatch). Check JARVIS_REPO_ROOT or "
+                "the WorktreeManager constructor call site."
             )
 
         # P1 Slice 2 — Ledger Sovereignty marker. Stamps a typed

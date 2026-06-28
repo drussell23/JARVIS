@@ -27,6 +27,7 @@ from backend.core.ouroboros.governance.ascii_strict_gate import (
     reset_rejection_count,
     scan_candidate,
     scan_content,
+    scan_content_token_aware,
 )
 
 
@@ -520,3 +521,210 @@ class TestRegressionBattleTest:
         assert ok is True
         assert reason is None
         assert samples == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Token-aware scan: scan_content_token_aware
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestTokenAwareScan:
+    """Verify the token-aware scan honours the gate's stated policy:
+    Unicode in string literals / comments is ALLOWED; Unicode in identifier
+    positions is REJECTED (``rapidفuzz`` protection preserved).
+    """
+
+    def test_emoji_only_in_docstring_is_allowed(self):
+        """📁 emoji in a module / function docstring must NOT be flagged.
+
+        This is the repl_input_polish.py regression case: the file has emoji
+        characters inside docstrings (U+1F4C1, U+1F517 etc.), which are
+        meaningful Unicode in a *string literal* and cannot be a homoglyph
+        attack. The whole-content scan incorrectly rejected them.
+        """
+        content = (
+            'def show_files():\n'
+            '    """📁 Show a list of files. 🔗 Click to open."""\n'
+            '    return []\n'
+        )
+        offenders = scan_content_token_aware(content, "repl_input_polish.py")
+        assert offenders == [], (
+            "emoji in a docstring string literal must be allowed "
+            f"(got {offenders})"
+        )
+
+    def test_cyrillic_in_identifier_is_rejected(self):
+        """Cyrillic 'а' (U+0430) in an identifier must still be caught.
+
+        This is the core ``rapidفuzz``-class threat: a Unicode letter that
+        looks like an ASCII letter slips into an identifier position. The
+        token-aware scan must flag it regardless of what surrounds it.
+        """
+        # 'lаunch' — Latin 'l', Cyrillic 'а' (U+0430), rest ASCII.
+        content = "def lаunch():\n    pass\n"
+        offenders = scan_content_token_aware(content, "launcher.py")
+        assert len(offenders) == 1
+        assert offenders[0].codepoint == 0x0430
+        assert offenders[0].file_path == "launcher.py"
+
+    def test_arabic_in_identifier_is_rejected(self):
+        """Arabic ف (U+0641) in a name token must be flagged — the canonical
+        ``rapidفuzz`` case."""
+        content = "import rapidفuzz\n"
+        offenders = scan_content_token_aware(content, "requirements.py")
+        assert len(offenders) == 1
+        assert offenders[0].codepoint == 0x0641
+
+    def test_unicode_in_comment_is_allowed(self):
+        """Unicode in a ``#`` comment must not be flagged.
+
+        Comments are ``COMMENT`` tokens and cannot occupy identifier positions.
+        """
+        content = "x = 1  # résumé 📎 done\n"
+        offenders = scan_content_token_aware(content, "foo.py")
+        assert offenders == [], (
+            f"Unicode in comment must be allowed (got {offenders})"
+        )
+
+    def test_unicode_in_string_literal_is_allowed(self):
+        """Emoji inside a regular string literal must be allowed."""
+        content = "msg = '🚀 launch complete'\n"
+        offenders = scan_content_token_aware(content, "status.py")
+        assert offenders == [], (
+            f"emoji in string literal must be allowed (got {offenders})"
+        )
+
+    def test_unparseable_python_falls_back_to_whole_content_scan(self):
+        """Unclosed string → TokenError → falls back to conservative
+        whole-content scan, which still rejects the non-ASCII character.
+
+        This is the critical safety invariant: a syntactically broken file
+        cannot smuggle homoglyphs past the gate by triggering a parse error.
+        """
+        # Unclosed string literal — tokenize will raise TokenError.
+        content = "x = 'unclosed\nfubar = rapidفuzz\n"
+        offenders = scan_content_token_aware(content, "broken.py")
+        # Falls back to whole-content scan → Arabic ف must still be found.
+        assert any(bc.codepoint == 0x0641 for bc in offenders), (
+            "unparseable Python must fall back to whole-content scan (rejected)"
+        )
+
+    def test_ascii_only_content_returns_empty(self):
+        """Pure ASCII content fast-paths and returns empty list."""
+        content = "def add(a, b):\n    return a + b\n"
+        assert scan_content_token_aware(content, "math.py") == []
+
+    def test_non_ascii_only_in_docstring_multi_line(self):
+        """Multi-line docstring with emoji on several lines — all allowed."""
+        content = (
+            'class Foo:\n'
+            '    """Bar.\n\n'
+            '    📌 Note: see §6 for details.\n'
+            '    Arrows: → left, ← right.\n'
+            '    """\n'
+            '    pass\n'
+        )
+        offenders = scan_content_token_aware(content, "foo.py")
+        assert offenders == [], (
+            f"multi-line docstring Unicode must be allowed (got {offenders})"
+        )
+
+    def test_max_samples_respected(self):
+        """max_samples cap applies to token-aware scan too."""
+        # Three identifiers each with non-ASCII: only 2 should be returned.
+        content = "а = 1\nб = 2\nв = 3\n"  # Cyrillic variable names
+        offenders = scan_content_token_aware(content, "vars.py", max_samples=2)
+        assert len(offenders) == 2
+
+    def test_line_column_accuracy_in_identifier(self):
+        """Offender line / column must be correct for identifier position."""
+        content = "x = 1\ny = rаpid\n"  # 'а' is Cyrillic, on line 2
+        offenders = scan_content_token_aware(content, "x.py")
+        assert len(offenders) == 1
+        bc = offenders[0]
+        assert bc.line == 2
+        # 'r' is col 5 (1-based), 'а' is at index 1 within token 'rаpid' → col 6
+        assert bc.column == 6
+        assert bc.codepoint == 0x0430
+
+
+# ─────────────────────────────────────────────────────────────────────
+# scan_candidate token-aware routing
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestScanCandidateTokenAware:
+    """scan_candidate must route .py files through the token-aware scan and
+    non-.py files through the conservative whole-content scan."""
+
+    def test_py_file_with_docstring_emoji_passes(self):
+        """A .py file whose only non-ASCII is emoji in a docstring → clean."""
+        candidate = {
+            "file_path": "src/ui.py",
+            "full_content": (
+                'def render():\n'
+                '    """📁 Render the UI."""\n'
+                '    return ""\n'
+            ),
+        }
+        offenders = scan_candidate(candidate)
+        assert offenders == [], (
+            "scan_candidate must allow emoji in .py docstrings "
+            f"(got {offenders})"
+        )
+
+    def test_py_file_with_identifier_unicode_rejected(self):
+        """A .py file with Cyrillic in an identifier must still be rejected."""
+        candidate = {
+            "file_path": "src/core.py",
+            "full_content": "def rаpid():\n    pass\n",
+        }
+        offenders = scan_candidate(candidate)
+        assert len(offenders) == 1
+        assert offenders[0].codepoint == 0x0430
+
+    def test_non_py_file_whole_content_scan(self):
+        """A non-.py file with any non-ASCII is rejected by whole-content scan."""
+        candidate = {
+            "file_path": "config.yaml",
+            "full_content": "# résumé\nname: foo\n",
+        }
+        offenders = scan_candidate(candidate)
+        # 'é' (U+00E9) must be flagged via whole-content scan.
+        assert any(bc.codepoint == 0x00E9 for bc in offenders)
+
+    def test_multi_file_py_docstring_allowed_txt_identifier_rejected(self):
+        """Multi-file candidate: .py docstring passes, .txt Arabic fails."""
+        candidate = {
+            "files": [
+                {
+                    "file_path": "src/app.py",
+                    "full_content": 'def go():\n    """🚀 Launch."""\n    pass\n',
+                },
+                {
+                    "file_path": "requirements.txt",
+                    "full_content": "rapidفuzz==3.5.0\n",
+                },
+            ],
+        }
+        offenders = scan_candidate(candidate)
+        # Only the .txt file's Arabic fa must be flagged.
+        assert len(offenders) == 1
+        assert offenders[0].file_path == "requirements.txt"
+        assert offenders[0].codepoint == 0x0641
+
+    def test_gate_check_py_docstring_emoji_passes(self):
+        """AsciiStrictGate.check passes a .py file with emoji in docstring."""
+        gate = AsciiStrictGate(auto_repair=False)
+        candidate = {
+            "file_path": "src/repl.py",
+            "full_content": (
+                'def polish():\n'
+                '    """📌 Polishes the REPL input. 🔗"""\n'
+                '    return True\n'
+            ),
+        }
+        ok, reason, samples = gate.check(candidate)
+        assert ok is True, (
+            f"gate.check must pass .py with docstring emoji (reason={reason!r})"
+        )

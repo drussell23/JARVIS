@@ -50,7 +50,9 @@ because they can occupy identifier positions. Gated by
 """
 from __future__ import annotations
 
+import io
 import os
+import tokenize
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -410,6 +412,138 @@ def scan_content(
     return offenders
 
 
+def scan_content_token_aware(
+    content: str,
+    file_path: str = "?",
+    max_samples: int = _DEFAULT_MAX_SAMPLES,
+) -> List[BadCodepoint]:
+    """Token-aware scan for Python source content.
+
+    Uses stdlib :mod:`tokenize` to classify every token and flags non-ASCII
+    codepoints ONLY in *code-token* positions:
+
+    **Allowed** (non-ASCII permitted — per policy):
+      - ``STRING`` tokens  (string literals, docstrings)
+      - ``COMMENT`` tokens
+      - ``NL``, ``NEWLINE``, ``INDENT``, ``DEDENT``, ``ENCODING``, ``ENDMARKER``
+      - ``FSTRING_START`` / ``FSTRING_MIDDLE`` / ``FSTRING_END`` (Python 3.12+)
+
+    **Rejected** (non-ASCII flagged — the ``rapidفuzz`` threat):
+      - ``NAME`` tokens (identifier positions)
+      - ``OP``, ``NUMBER``, and any other code token
+
+    On ``tokenize.TokenError`` or ``IndentationError`` (unparseable Python) the
+    function falls back conservatively to :func:`scan_content` (whole-content
+    scan) so a broken file cannot smuggle homoglyphs past the gate.
+    """
+    if not isinstance(content, str) or not content:
+        return []
+
+    # Fast path — common case where content is already clean ASCII.
+    if content.isascii():
+        return []
+
+    # Token types where non-ASCII is allowed (string literals, comments,
+    # whitespace structural tokens).  Built once per call — cheap set lookup.
+    _allowed_token_types = {
+        tokenize.STRING,
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
+    }
+    # Python 3.12+ splits f-strings into FSTRING_START / FSTRING_MIDDLE /
+    # FSTRING_END.  The *literal* parts (MIDDLE) carry the user-visible text
+    # and should be allowed; START/END are delimiters.  Add them all to the
+    # allow set so emoji in f-string text is never rejected.
+    for _attr in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        _v = getattr(tokenize, _attr, None)
+        if _v is not None:
+            _allowed_token_types.add(_v)
+    _allowed_token_types = frozenset(_allowed_token_types)
+
+    # Build a zero-indexed line → absolute-character-offset map so each
+    # BadCodepoint carries accurate (offset, line, column) even in multi-line
+    # tokens (NAME tokens are always single-line; we compute it generically).
+    line_start: List[int] = []
+    pos = 0
+    for _ln in content.splitlines(keepends=True):
+        line_start.append(pos)
+        pos += len(_ln)
+    # Safety entry so _abs_offset never goes out of bounds on the last line.
+    line_start.append(pos)
+
+    def _abs_offset(srow: int, scol: int) -> int:
+        """Convert tokenize (1-based row, 0-based col) to absolute offset."""
+        idx = srow - 1
+        if 0 <= idx < len(line_start):
+            return line_start[idx] + scol
+        return len(content)
+
+    offenders: List[BadCodepoint] = []
+
+    try:
+        _tokens = tokenize.generate_tokens(io.StringIO(content).readline)
+        for tok_type, tok_string, tok_start, _tok_end, _line_text in _tokens:
+            if tok_type in _allowed_token_types:
+                # Unicode allowed inside string literals, comments, whitespace.
+                continue
+            if not tok_string or tok_string.isascii():
+                # No non-ASCII in this code token — fast path.
+                continue
+            # Scan this code token character by character.
+            srow, scol = tok_start
+            base_offset = _abs_offset(srow, scol)
+            cur_line = srow      # 1-based
+            cur_col = scol       # 0-based; report as cur_col + 1
+            for i, ch in enumerate(tok_string):
+                cp = ord(ch)
+                if cp > 127:
+                    offenders.append(BadCodepoint(
+                        file_path=file_path,
+                        offset=base_offset + i,
+                        char=ch,
+                        codepoint=cp,
+                        line=cur_line,
+                        column=cur_col + 1,  # 1-based output
+                    ))
+                    if max_samples > 0 and len(offenders) >= max_samples:
+                        return offenders
+                if ch == "\n":
+                    cur_line += 1
+                    cur_col = 0
+                else:
+                    cur_col += 1
+    except (tokenize.TokenError, IndentationError):
+        # Unparseable Python — conservative fallback ensures broken content
+        # never bypasses the gate by hiding homoglyphs behind a syntax error.
+        return scan_content(content, file_path, max_samples)
+
+    return offenders
+
+
+def _scan_content_for_path(
+    content: str,
+    file_path: str,
+    max_samples: int = _DEFAULT_MAX_SAMPLES,
+) -> List[BadCodepoint]:
+    """Dispatch to the right scan based on file extension.
+
+    * ``.py`` files → :func:`scan_content_token_aware` (allows Unicode in
+      string literals / comments, rejects it in identifier positions).
+    * All other files → :func:`scan_content` (conservative whole-content scan).
+
+    Falls back to :func:`scan_content` automatically if token-aware parsing
+    fails (via the error handling inside :func:`scan_content_token_aware`).
+    """
+    if isinstance(file_path, str) and file_path.endswith(".py"):
+        return scan_content_token_aware(content, file_path, max_samples)
+    return scan_content(content, file_path, max_samples)
+
+
 def scan_candidate(
     candidate: Dict[str, Any],
     max_samples: int = _DEFAULT_MAX_SAMPLES,
@@ -455,7 +589,7 @@ def scan_candidate(
                 fc = entry.get("raw_content", "") or ""
             if not isinstance(fc, str):
                 continue
-            found = scan_content(fc, fp, max_samples=remaining)
+            found = _scan_content_for_path(fc, fp, max_samples=remaining)
             offenders.extend(found)
             if max_samples > 0:
                 remaining = max_samples - len(offenders)
@@ -472,7 +606,9 @@ def scan_candidate(
         primary_content = candidate.get("raw_content", "") or ""
     if isinstance(primary_content, str) and primary_content:
         fp = str(candidate.get("file_path", "") or "?")
-        offenders.extend(scan_content(primary_content, fp, max_samples=remaining))
+        offenders.extend(
+            _scan_content_for_path(primary_content, fp, max_samples=remaining)
+        )
 
     return offenders
 

@@ -417,3 +417,11 @@ autopsy_reports/
 # A1 Live-Fire Chaos Harness run outputs (transient)
 a1_runs/
 a1_autopsy/
+
+# Agentic scratch / SDD working dirs — never version-controlled (enforced)
+.superpowers/
+_preview*.html
+_preview*.png
+_meritfirst_resume.html
+logs/autopsies/
+proof_telemetry/
