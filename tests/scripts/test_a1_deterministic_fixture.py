@@ -176,6 +176,41 @@ def test_install_httpx_airgap_patches_and_restores():
     assert httpx.AsyncClient.send is before_async
 
 
+def test_scoped_httpx_airgap_installs_only_within_scope():
+    import asyncio
+
+    import httpx
+
+    from a1_deterministic_fixture import ScopedHttpxAirgap
+
+    before = httpx.Client.send
+
+    async def go():
+        async with ScopedHttpxAirgap():
+            # Severed ONLY inside the scope (boot probes outside are untouched).
+            assert httpx.Client.send is not before
+
+    asyncio.run(go())
+    assert httpx.Client.send is before  # restored on exit
+
+
+def test_scoped_httpx_airgap_severs_llm_inside_scope():
+    import asyncio
+
+    import httpx
+
+    from a1_deterministic_fixture import FatalAirgapException, ScopedHttpxAirgap
+
+    async def go():
+        async with ScopedHttpxAirgap():
+            c = httpx.Client()
+            req = c.build_request("POST", "https://api.anthropic.com/v1/messages")
+            with pytest.raises(FatalAirgapException):
+                c.send(req)
+
+    asyncio.run(go())
+
+
 # ---------------------------------------------------------------------------
 # Fixture candidate payload — the no-DW APPLY-path injection core.
 # When fixture mode is active, produce a deterministic candidate (target file +

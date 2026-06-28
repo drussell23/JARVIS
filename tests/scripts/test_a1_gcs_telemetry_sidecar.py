@@ -258,3 +258,45 @@ def test_managed_sidecar_install_signal_handlers_registers_and_chains(tmp_path):
     finally:
         signal.signal(signal.SIGTERM, prev_term)
         signal.signal(signal.SIGINT, prev_int)
+
+
+# ---------------------------------------------------------------------------
+# Decoupled sidecar daemon — discovers the active session's debug.log so it can
+# be spawned BEFORE O+V boots (passed only the sessions root), fully decoupled.
+# ---------------------------------------------------------------------------
+
+
+def test_discover_latest_debug_log_picks_newest_session(tmp_path):
+    import os
+
+    from a1_gcs_telemetry_sidecar import discover_latest_debug_log
+
+    older = tmp_path / "bt-2026-06-28-0001"
+    newer = tmp_path / "bt-2026-06-28-0002"
+    older.mkdir()
+    newer.mkdir()
+    (older / "debug.log").write_bytes(b"old")
+    (newer / "debug.log").write_bytes(b"new")
+    # Make 'newer' genuinely newer by mtime.
+    os.utime(newer / "debug.log", (2_000_000_000, 2_000_000_000))
+    os.utime(older / "debug.log", (1_000_000_000, 1_000_000_000))
+
+    found = discover_latest_debug_log(str(tmp_path))
+    assert found == str(newer / "debug.log")
+
+
+def test_discover_latest_debug_log_none_when_absent(tmp_path):
+    from a1_gcs_telemetry_sidecar import discover_latest_debug_log
+
+    assert discover_latest_debug_log(str(tmp_path)) is None
+
+
+def test_daemon_arg_parser_parses_required_args():
+    from a1_gcs_telemetry_sidecar import build_daemon_arg_parser
+
+    args = build_daemon_arg_parser().parse_args(
+        ["--sessions-root", "/r", "--gcs-target", "gs://b/p"]
+    )
+    assert args.sessions_root == "/r"
+    assert args.gcs_target == "gs://b/p"
+    assert args.interval == 5.0  # default streaming cadence

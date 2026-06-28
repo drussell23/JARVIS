@@ -144,6 +144,27 @@ def install_httpx_airgap(*, hosts: Optional[FrozenSet[str]] = None) -> Callable[
     return uninstall
 
 
+class ScopedHttpxAirgap:
+    """Async context manager that installs the httpx LLM airgap on entry and
+    restores it on exit. Scopes the severance to EXACTLY the wrapped block (the
+    generation phase) so boot-time provider health probes outside the scope are
+    untouched -- the clean answer to the airgap/boot-probe timing conflict."""
+
+    def __init__(self, *, hosts: Optional[FrozenSet[str]] = None) -> None:
+        self._hosts = hosts
+        self._uninstall: Optional[Callable[[], None]] = None
+
+    async def __aenter__(self) -> "ScopedHttpxAirgap":
+        self._uninstall = install_httpx_airgap(hosts=self._hosts)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if self._uninstall is not None:
+            self._uninstall()
+            self._uninstall = None
+        return False  # never suppress (a real FatalAirgapException must surface)
+
+
 def _seed_value(seed: int) -> int:
     """Deterministic, seed-varying integer (stable across processes/runs)."""
     digest = hashlib.sha256(str(int(seed)).encode("utf-8")).hexdigest()
@@ -245,21 +266,27 @@ class FixtureGenerator:
     async def generate(self, context, deadline):
         payload = fixture_candidate_payload(env=self._env, read_file=self._read_file)
         if payload is None:
-            # Fixture inactive -> never fabricate; defer to the real generator.
+            # Fixture inactive -> never fabricate; defer to the real generator
+            # OUTSIDE any airgap so real generation is never severed.
             return await self._inner.generate(context, deadline)
         from backend.core.ouroboros.governance.op_context import GenerationResult
 
-        return GenerationResult(
-            candidates=(
-                {
-                    "file_path": payload.file_path,
-                    "full_content": payload.full_content,
-                    "rationale": payload.rationale,
-                },
-            ),
-            provider_name=FIXTURE_PROVIDER_NAME,
-            generation_duration_s=0.0,
-        )
+        # Cryptographic proof: the airgap is active for EXACTLY this generation
+        # scope. Boot probes (outside) succeed; any DW call here raises
+        # FatalAirgapException -> logged -> the decoupled sidecar streams the
+        # stack trace to GCS (Telemetry-Aware Airgap).
+        async with ScopedHttpxAirgap():
+            return GenerationResult(
+                candidates=(
+                    {
+                        "file_path": payload.file_path,
+                        "full_content": payload.full_content,
+                        "rationale": payload.rationale,
+                    },
+                ),
+                provider_name=FIXTURE_PROVIDER_NAME,
+                generation_duration_s=0.0,
+            )
 
 
 def apply_fixture_generator_overlay(

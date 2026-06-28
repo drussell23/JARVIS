@@ -22,7 +22,9 @@ units and compose this streamer.
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
+import os
 from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,91 @@ async def run_sidecar(
         except asyncio.TimeoutError:
             pass
     flush_tick(path, streamer)  # final flush — the dying node's last bytes
+
+
+def discover_latest_debug_log(sessions_root: str) -> Optional[str]:
+    """Return the newest ``bt-*/debug.log`` under ``sessions_root`` (by mtime),
+    or ``None``. Lets the decoupled sidecar daemon be spawned BEFORE O+V boots
+    with only the sessions root, then attach to the session O+V creates."""
+    candidates = glob.glob(os.path.join(sessions_root, "bt-*", "debug.log"))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+# --------------------------------------------------------------------------- #
+# Decoupled daemon entrypoint -- spawned detached by the chaos harness BEFORE
+# O+V boots, fully decoupled from the O+V lifecycle.
+# --------------------------------------------------------------------------- #
+
+
+def build_daemon_arg_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="a1_gcs_telemetry_sidecar",
+        description="Decoupled append-only GCS telemetry sidecar daemon.",
+    )
+    p.add_argument("--sessions-root", required=True,
+                   help="Root dir holding bt-*/ session dirs to discover the debug.log.")
+    p.add_argument("--gcs-target", required=True,
+                   help="gs://bucket/prefix destination for immutable chunks.")
+    p.add_argument("--interval", type=float, default=5.0,
+                   help="Streaming cadence in seconds (default 5).")
+    p.add_argument("--discover-timeout", type=float, default=180.0,
+                   help="Seconds to wait for the session debug.log to appear.")
+    return p
+
+
+def run_daemon(argv: Optional[List[str]] = None) -> int:
+    """Discover the active session debug.log under --sessions-root and stream it
+    to GCS as immutable chunks until terminated. Fail-soft + signal-flushing."""
+    import sys
+    import time
+
+    # Run-as-script bootstrap: ensure the repo root is importable so the reused
+    # state_persistence_daemon GCS Vault (`backend.core...`) resolves. Under
+    # pytest the root is already on sys.path; as a detached daemon it is NOT.
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
+    args = build_daemon_arg_parser().parse_args(argv)
+    sink = make_gcs_chunk_sink(args.gcs_target)
+    if sink is None:
+        logger.warning("[a1-sidecar] no valid gs:// target -> daemon idle exit")
+        return 0
+
+    deadline = time.monotonic() + args.discover_timeout
+    path = None
+    while time.monotonic() < deadline:
+        path = discover_latest_debug_log(args.sessions_root)
+        if path:
+            break
+        time.sleep(1.0)
+    if not path:
+        logger.warning("[a1-sidecar] no session debug.log discovered -> exit")
+        return 0
+
+    session_id = os.path.basename(os.path.dirname(path))
+    streamer = AppendOnlyChunkStreamer(session_id=session_id, sink=sink)
+    sidecar = ManagedSidecar(path, streamer, interval_s=args.interval)
+    sidecar.install_signal_handlers()
+
+    async def _go() -> None:
+        sidecar.start()
+        if sidecar._task is not None:
+            await sidecar._task
+
+    try:
+        asyncio.run(_go())
+    except KeyboardInterrupt:
+        sidecar.flush_now()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(run_daemon())
 
 
 class ManagedSidecar:

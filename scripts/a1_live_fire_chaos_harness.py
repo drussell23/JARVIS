@@ -1422,6 +1422,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _maybe_spawn_sidecar_daemon() -> "Optional[subprocess.Popen]":
+    """Spawn the DECOUPLED GCS telemetry sidecar daemon (detached, own session)
+    when fixture mode + a gs:// target are set -- BEFORE O+V boots, fully
+    decoupled from its lifecycle. Fail-soft: a spawn error never blocks the soak."""
+    if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return None
+    gcs = (os.environ.get("JARVIS_A1_GCS_TELEMETRY_TARGET", "") or "").strip()
+    if not gcs:
+        return None
+    sessions_root = os.path.join(_REPO_ROOT, ".ouroboros", "sessions")
+    interval = os.environ.get("JARVIS_GCS_STREAM_INTERVAL_S", "5")
+    argv = [
+        sys.executable,
+        os.path.join(_SCRIPTS_DIR, "a1_gcs_telemetry_sidecar.py"),
+        "--sessions-root", sessions_root,
+        "--gcs-target", gcs,
+        "--interval", str(interval),
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detached: survives O+V teardown
+        )
+        _log("[a1-sidecar] decoupled telemetry daemon spawned pid=%s -> %s"
+             % (proc.pid, gcs))
+        return proc
+    except Exception as exc:  # noqa: BLE001 — fail-soft
+        _log("[a1-sidecar] daemon spawn failed (fail-soft): %r" % (exc,))
+        return None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
@@ -1524,6 +1559,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _node_manifest["native_tool_forcing"],
             _node_manifest["epistemic_feedback"],
         ))
+        # Decoupled telemetry: spawn the GCS sidecar daemon BEFORE the soak so it
+        # streams debug.log to GCS independently of the O+V lifecycle (survives a
+        # node hard-kill / preemption). No-op unless fixture mode + gs:// target.
+        _maybe_spawn_sidecar_daemon()
         run = build_live_run(args)
         _ACTIVE_CHAOS.append(run.chaos)
         _install_revert_signal_handlers()
