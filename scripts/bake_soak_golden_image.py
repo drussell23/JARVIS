@@ -272,17 +272,39 @@ done < /tmp/req_light.txt
 
 # 5. HARD-ENSURE the A1-critical core (the loop is dead without these).
 echo "[soak-bake] hard-ensuring core deps"
-if sudo python3 -m pip install --break-system-packages -q {hard_ensure} 2>&1 | tail -1; then
-    echo "[soak-bake] hard-ensure install complete -- stamping baked sha + sentinel"
-    # Stamp the baked requirements sha into the image (IaC staleness check reads it).
-    echo {baked_sha_q} | sudo tee {baked_sha_path_q} >/dev/null 2>&1 \\
-        || echo {baked_sha_q} > {baked_sha_path_q} 2>/dev/null || true
-    echo "ready ts=$(date -u +%FT%TZ)" > {sentinel_q}
-    echo "[soak-bake] startup-script done $(date -u +%FT%TZ)"
-else
+if ! sudo python3 -m pip install --break-system-packages -q {hard_ensure} 2>&1 | tail -1; then
     echo "[soak-bake] ERROR: hard-ensure pip install failed -- NOT writing sentinel"
     exit 1
 fi
+echo "[soak-bake] hard-ensure install complete"
+
+# 6. Docker engine: pre-bake into the golden image so the IaC boot's
+#    'installing Docker' step finds it present and finishes in seconds, and
+#    'docker info' at the IaC ready-probe (poll_node_ready) passes immediately
+#    instead of timing out (the Confirm-4 ready_timeout root cause).
+#    The soak itself runs python3 directly -- no docker run / docker pull at
+#    runtime (pure-python O+V); no image pre-pull is required.
+echo "[soak-bake] baking Docker engine (apt-get docker.io + docker-compose-plugin)"
+apt-get install -y docker.io docker-compose-plugin rsync 2>&1 \\
+    || curl -fsSL https://get.docker.com | sh 2>&1 || true
+# Enable the daemon so it auto-starts on every boot: when the golden image
+# node boots, 'systemctl enable --now docker' in the IaC startup-script is
+# instant (already enabled) and 'docker info' at the ready-probe passes fast.
+systemctl enable docker 2>/dev/null || true
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[soak-bake] ERROR: docker not found after install -- NOT writing sentinel (fail-closed)"
+    exit 1
+fi
+echo "[soak-bake] Docker engine baked + daemon enabled for instant boot"
+echo "[soak-bake] no docker pull required (soak is pure-python, no runtime containers)"
+
+# ALL bake steps succeeded: stamp the baked sha + write the readiness sentinel.
+# Sentinel is written ONLY here -- after deps + Docker both verified (fail-closed).
+echo "[soak-bake] all steps complete -- stamping baked sha + writing sentinel"
+echo {baked_sha_q} | sudo tee {baked_sha_path_q} >/dev/null 2>&1 \\
+    || echo {baked_sha_q} > {baked_sha_path_q} 2>/dev/null || true
+echo "ready ts=$(date -u +%FT%TZ)" > {sentinel_q}
+echo "[soak-bake] startup-script done $(date -u +%FT%TZ)"
 """
 
 
