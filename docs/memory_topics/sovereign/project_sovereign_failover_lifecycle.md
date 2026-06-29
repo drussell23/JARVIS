@@ -99,3 +99,27 @@ The Safety Law + fidelity fix (commit 67725fc) turned the false 401 into a REAL 
 **Safety Law is PROVEN both ways:** the 401 path freezes+DLQ+no-awaken (8s harness test `test_auth_401_freezes_heartbeat_and_never_awakens` + live), the real-timeout path awakens. A config error can never provision; a real outage does.
 
 **NEXT GAP — hybrid node-ready over the EXTERNAL IP.** AWAKENING never reached SERVING: `AWAKENING node endpoint=http://jarvis-prime-failover:11434` — the node-ready probe + endpoint publish use the INTERNAL GCE hostname, unreachable from the local-Mac orchestrator. Gap-B fixed `await_running_ip` (natIP resolution) but `_default_node_ready_fn` / `_resolve_node_ip` / `_build_endpoint` still emit the internal hostname. The hybrid handoff needs those to resolve the external natIP (like `_select_reachable_ip` does) so the local orchestrator can confirm readiness → SERVING → route GENERATE to the cloud node. Node torn down (deleted:200, zero instances) — controller would also have self-torn-down at the 600s AWAKENING timeout. Commits: ef723ac, 085db11, 67725fc.
+
+## FINAL soak — full orchestration mesh proven E2E; golden-image service is the last mile (2026-06-29, bt-2026-06-29-071731)
+
+The Reachability Racer + IaC ephemeral firewall closed every ORCHESTRATION gap. Proven live against real GCP (jarvis-473803), all driven by the committed fixes:
+- Faithful Aegis probe (auth healthy) -> real DW data-plane TIMEOUT -> Gap-2 hard escalation -> FORCED AWAKEN.
+- ADC IAM bridge -> `instances.insert ok SPOT 200` -> node RUNNING natIP 34.31.224.10.
+- Dynamic public-IP self-discovery (24.130.247.31) -> REST-native /32 ephemeral firewall `jarvis-ephemeral-failover-allow src=24.130.247.31/32 tcp:11434` OPEN (verified; node reachable through it — curl got fast RST not timeout = firewall works, service absent).
+- Gap-3 async intake prewarm WORKED: op stream flowed (real INTENT goals, no circuit breaker).
+- Reachability Racer ran, probing the reachable external IP every tick.
+
+**THE LAST MILE (not orchestrator): the J-Prime INFERENCE SERVICE never came up on the golden image.** `:11434` RST'd (fast refusal) for 6+ min on a RUNNING, reachable node. The golden image `jarvis-prime-coder-golden-20260623` either doesn't auto-start Ollama/the model server on boot, lacks the model, or serves a different port (.env.gcp has `JARVIS_PRIME_PORT=8000` vs failover default 11434). Every orchestration layer did its job; the node just isn't serving inference. SERVING handoff is blocked by the golden-image bake, a separate concern (the GCP J-Prime golden-image repo).
+
+**Race fix (commit 6515f02):** the guaranteed PARALLEL teardown gather exposed a real `_ensure_token` mint race (set minted=True before the await -> 2nd coroutine read None token -> orphan firewall hole). Fixed with an asyncio.Lock (double-checked, flag set AFTER mint). Now node+firewall delete cleanly together. Verified: zero orphan nodes, zero orphan firewall holes.
+
+Commits this arc: ef723ac (round1+Gap1) · 085db11 (Gaps2-3) · 67725fc (Safety Law+fidelity) · 0b9a4ce (racer+handoff+teardown) · 022bf2d (IaC firewall) · 6515f02 (lock race). NEXT: golden-image bake must auto-start the inference service on the failover port (or align failover port to 8000).
+
+## ✅✅ COMPLETE END-TO-END SOVEREIGN FAILOVER — SERVING HANDOFF PROVEN LIVE (2026-06-29, bt-2026-06-29-074457)
+
+THE FULL CHAIN COMPLETED against real GCP for the first time ever (unproven across 13+ prior cloud runs):
+DW data-plane outage → faithful Aegis-authed deep probe (2s timeout) → Gap-2 hard escalation → FORCED AWAKEN → ADC IAM bridge provision (transient `Connection reset` insert flake → fail-soft RETRY → `instances.insert ok SPOT 200`) → dynamic public-IP discovery (24.130.247.31) → REST /32 ephemeral firewall micro-perimeter OPEN → node RUNNING (natIP 136.116.101.128) → **dynamic cloud-init forced Ollama to bind 0.0.0.0:11434** → `:11434 -> HTTP 200` → **Reachability Racer L7 backoff picked the EXTERNAL natIP as WINNER** → endpoint WIRED (`JARVIS_PRIME_URL=http://136.116.101.128:11434`) → **`SERVING via J-Prime`** → `on_serving: Cryo-DLQ re-entry drained=2 ops → re-routes to J-Prime Tier-2` → `[PrimeProvider] background route` actively serving. Node has `qwen2.5-coder:7b` (4.6GB, baked). Cold 7B-on-CPU generation is slow (>90s first token — known trait), but the HANDOFF is conclusively proven: SERVING + endpoint wired + DLQ drain + PrimeProvider routing live.
+
+Every layer this arc built fired: Safety Law (401 never provisions), config-driven port, cloud-init bind, L7 readiness backoff, Reachability Racer, IaC /32 firewall, ADC provisioning, async intake prewarm, hard escalation, faithful probe. **Guaranteed PARALLEL teardown worked clean (lock-race fixed): `node deleted:200 | firewall deleted:200` together — zero orphan nodes, zero orphan firewall holes.** Total spend: minutes of Spot e2 across the arc.
+
+Final commits: ef723ac · 085db11 · 67725fc · 0b9a4ce · 022bf2d · 6515f02 · 02371c1. The Sovereign Failover Mesh is COMPLETE and PROVEN E2E. Remaining (perf, not correctness): J-Prime 7B CPU cold-start latency — a golden-image/machine-type tuning concern, not an orchestration gap.
