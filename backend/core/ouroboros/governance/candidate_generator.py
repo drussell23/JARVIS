@@ -3407,6 +3407,22 @@ class CandidateGenerator:
                             "[CandidateGenerator] force_refresh "
                             "request failed", exc_info=True,
                         )
+                # Run-#13 UNMASK: this topology pre-block raises BEFORE the
+                # model-walk loop's record_sweep, so the outage gradient never
+                # saw the DW collapse and is_global_outage(route) never tripped
+                # (J-Prime never awoke for a 20-min real outage). Feed the raw
+                # failed sweep through the single chokepoint so the gradient
+                # gets the truth -- the op still fails gracefully downstream.
+                try:
+                    from backend.core.ouroboros.governance.provider_quarantine import (
+                        record_terminal_exhaustion as _rec_exhaustion,
+                    )
+                    _rec_exhaustion(
+                        _provider_route,
+                        reason=f"dw_severed_queued:topology_block:{_block_reason[:60]}",
+                    )
+                except Exception:  # noqa: BLE001 -- never block the raise path
+                    pass
                 if _provider_route == "speculative":
                     raise RuntimeError(
                         f"speculative_deferred:blocked_by_topology:"

@@ -83,6 +83,86 @@ _COMPUTE_GRANT_SCOPES = (
     "https://www.googleapis.com/auth/compute",
 )
 
+# ---------------------------------------------------------------------------
+# Dynamic IAM Credential Bridge (Hybrid Execution Mesh, 2026-06-28)
+# ---------------------------------------------------------------------------
+#
+# When the orchestrator runs OFF-GCE (a local Mac bridged to real GCP), the
+# metadata server is unreachable. If GOOGLE_APPLICATION_CREDENTIALS points at a
+# Service Account JSON, mint the Compute OAuth token via the native google-auth
+# SDK -- ZERO gcloud CLI, ZERO metadata. Identity (token + project) flows from
+# the SA JSON; zone from GCP_ZONE. The SA's IAM role is enforced server-side at
+# instances.insert (a 403 surfaces there -- fail-CLOSED preserved).
+
+def _sa_credentials_path() -> str:
+    """The Service Account JSON path from GOOGLE_APPLICATION_CREDENTIALS, or ""
+    when unset (legacy metadata-only mode). NEVER raises."""
+    return (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+
+
+def mint_sa_access_token(sa_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Mint a Compute OAuth access token from a Service Account JSON via the
+    native google-auth SDK. Returns ``(access_token, project_id)``.
+
+    Fail-soft: a missing file / missing SDK / refresh error returns
+    ``(None, None)`` so the caller degrades to a graceful IAM-denied abort (the
+    cognitive loop is NEVER crashed). Injectable -- tests monkeypatch this so no
+    real google-auth / network is touched."""
+    try:
+        from google.oauth2 import service_account  # noqa: PLC0415
+        from google.auth.transport.requests import Request  # noqa: PLC0415
+
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=[_COMPUTE_GRANT_SCOPES[0]]  # cloud-platform
+        )
+        creds.refresh(Request())
+        token = getattr(creds, "token", None)
+        project = getattr(creds, "project_id", None)
+        return (token or None, project or None)
+    except Exception as exc:  # noqa: BLE001 -- a mint failure is a graceful denial
+        logger.warning("[GCPComputeRest] SA token mint fail-soft err=%r", exc)
+        return (None, None)
+
+
+def _adc_available() -> bool:
+    """True when gcloud Application Default Credentials are usable (the operator
+    has run ``gcloud auth application-default login`` -- an authorized_user
+    refresh-token, NOT a SA JSON). Detected via the well-known ADC file or an
+    explicit ``JARVIS_FAILOVER_USE_ADC`` opt-in. NEVER raises."""
+    val = (os.environ.get("JARVIS_FAILOVER_USE_ADC", "") or "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    try:
+        cfg = os.environ.get("CLOUDSDK_CONFIG", "") or os.path.expanduser(
+            "~/.config/gcloud"
+        )
+        return os.path.isfile(os.path.join(cfg, "application_default_credentials.json"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def mint_adc_access_token() -> Tuple[Optional[str], Optional[str]]:
+    """Mint a Compute OAuth token from gcloud Application Default Credentials via
+    ``google.auth.default`` (authorized_user refresh flow). Returns
+    ``(access_token, project)``. Fail-soft -> (None, None). Injectable -- tests
+    monkeypatch this so no real google-auth / network is touched."""
+    try:
+        import google.auth  # noqa: PLC0415
+        from google.auth.transport.requests import Request  # noqa: PLC0415
+
+        creds, project = google.auth.default(scopes=[_COMPUTE_GRANT_SCOPES[0]])
+        creds.refresh(Request())
+        token = getattr(creds, "token", None)
+        # Env project override wins over the ADC-resolved project.
+        env_proj = _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
+        return (token or None, (env_proj or project) or None)
+    except Exception as exc:  # noqa: BLE001 -- a mint failure is a graceful denial
+        logger.warning("[GCPComputeRest] ADC token mint fail-soft err=%r", exc)
+        return (None, None)
+
+
 # Env-var names.
 _ENV_IMAGE_FAMILY = "JPRIME_IMAGE_FAMILY"
 _ENV_NODE_NAME = "JARVIS_FAILOVER_NODE_NAME"
@@ -221,6 +301,48 @@ class GCPComputeRest:
             _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
         ) or None
         self._zone_override = zone or (_env_str("GCP_ZONE", "") or None)
+        # Hybrid Execution Mesh -- ADAPTIVE auth resolution (off-GCE). Priority:
+        # an explicit SA JSON (GOOGLE_APPLICATION_CREDENTIALS) wins; else gcloud
+        # ADC (authorized_user) when present; else the legacy metadata path.
+        self._sa_path = _sa_credentials_path()
+        if self._sa_path:
+            self._auth_mode = "sa"
+        elif _adc_available():
+            self._auth_mode = "adc"
+        else:
+            self._auth_mode = "metadata"
+        # Off-GCE iff a local credential source drives auth (SA or ADC).
+        self._off_gce = self._auth_mode in ("sa", "adc")
+        # The minted token + project are cached on first use (one mint per
+        # awaken -- tokens last ~1h, far longer than a soak).
+        self._cred_token: Optional[str] = None
+        self._cred_project: Optional[str] = None
+        self._cred_minted = False
+
+    # -- adaptive credential bridge (off-GCE auth) -----------------------
+
+    async def _ensure_token(self) -> Tuple[Optional[str], Optional[str]]:
+        """Lazily mint + cache the (token, project) for the resolved off-GCE auth
+        mode (SA JSON or ADC). Off-loaded to a thread so the blocking google-auth
+        refresh never stalls the event loop. Fail-soft -> (None, None)."""
+        if self._cred_minted:
+            return (self._cred_token, self._cred_project)
+        self._cred_minted = True
+        try:
+            loop = asyncio.get_event_loop()
+            if self._auth_mode == "sa":
+                token, project = await loop.run_in_executor(
+                    None, mint_sa_access_token, self._sa_path
+                )
+            else:  # adc
+                token, project = await loop.run_in_executor(
+                    None, mint_adc_access_token
+                )
+            self._cred_token, self._cred_project = token, project
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[GCPComputeRest] ensure-token fail-soft err=%r", exc)
+            self._cred_token, self._cred_project = None, None
+        return (self._cred_token, self._cred_project)
 
     # -- metadata fetch --------------------------------------------------
 
@@ -237,8 +359,12 @@ class GCPComputeRest:
         return text.strip()
 
     async def access_token(self) -> Optional[str]:
-        """The instance default service-account OAuth token from metadata. None
-        on error. NEVER raises."""
+        """The Compute OAuth token. SA-JSON bridge (off-GCE) when
+        GOOGLE_APPLICATION_CREDENTIALS is set; else the instance default SA token
+        from metadata. None on error. NEVER raises."""
+        if self._off_gce:
+            token, _ = await self._ensure_token()
+            return token
         raw = await self._metadata("instance/service-accounts/default/token")
         if not raw:
             return None
@@ -266,9 +392,14 @@ class GCPComputeRest:
         return raw.rsplit("/", 1)[-1]
 
     async def project(self) -> Optional[str]:
-        """The current project id. Honors an explicit override else metadata."""
+        """The current project id. Explicit override wins; then the SA JSON's
+        project_id (off-GCE); else metadata."""
         if self._project_override:
             return self._project_override
+        if self._off_gce:
+            _, project = await self._ensure_token()
+            if project:
+                return project
         return await self._metadata("project/project-id")
 
     # -- dynamic IAM self-verification -----------------------------------
@@ -278,7 +409,17 @@ class GCPComputeRest:
         Compute. OK iff the scopes list contains cloud-platform OR a compute
         scope. Missing -> (False, "IAM_PERMISSION_DENIED:missing_compute_scope:
         <scopes>"). Metadata-unreachable -> (False, "IAM_PERMISSION_DENIED:
-        metadata_unreachable"). NEVER raises."""
+        metadata_unreachable"). NEVER raises.
+
+        SA-JSON bridge (off-GCE): we request cloud-platform when minting, so a
+        successful mint satisfies the structural scope check; the SA's actual
+        IAM role is enforced server-side at instances.insert (a 403 surfaces
+        there as a real create failure). A failed mint -> graceful IAM-denied."""
+        if self._off_gce:
+            token, _ = await self._ensure_token()
+            if token:
+                return (True, "{}_credentials:compute_scope_requested".format(self._auth_mode))
+            return (False, "IAM_PERMISSION_DENIED:{}_token_mint_failed".format(self._auth_mode))
         scopes = await self.scopes()
         if not scopes:
             # Could not read scopes at all -> fail-CLOSED (do NOT assume grant).
@@ -478,7 +619,7 @@ class GCPComputeRest:
                 except Exception:  # noqa: BLE001
                     doc = {}
                 if str(doc.get("status", "")).upper() == "RUNNING":
-                    ip = self._extract_internal_ip(doc)
+                    ip = self._select_reachable_ip(doc)
                     if ip:
                         logger.info(
                             "[GCPComputeRest] node=%s RUNNING internal_ip=%s",
@@ -513,6 +654,40 @@ class GCPComputeRest:
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    @staticmethod
+    def _extract_external_ip(doc: Dict[str, Any]) -> Optional[str]:
+        """Pull networkInterfaces[0].accessConfigs[0].natIP (the EXTERNAL
+        ephemeral IP) from an instances.get response. None when the node has no
+        external access config yet. NEVER raises."""
+        try:
+            nics = doc.get("networkInterfaces") or []
+            if nics:
+                acs = (nics[0] or {}).get("accessConfigs") or []
+                if acs:
+                    nat = (acs[0] or {}).get("natIP")
+                    if nat:
+                        return str(nat).strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _hybrid_mesh(self) -> bool:
+        """True when the orchestrator is OFF-GCE and must reach J-Prime over its
+        EXTERNAL IP -- SA-credential auth implies hybrid; an explicit
+        JARVIS_FAILOVER_HYBRID_MESH flag forces it. NEVER raises."""
+        if self._off_gce:
+            return True
+        val = (os.environ.get("JARVIS_FAILOVER_HYBRID_MESH", "") or "").strip().lower()
+        return val in ("1", "true", "yes", "on")
+
+    def _select_reachable_ip(self, doc: Dict[str, Any]) -> Optional[str]:
+        """The IP the orchestrator should route GENERATE traffic to. Hybrid
+        (off-GCE) -> the EXTERNAL natIP, falling back to internal if the external
+        is not assigned yet. On-VPC -> the internal IP (byte-identical legacy)."""
+        if self._hybrid_mesh():
+            return self._extract_external_ip(doc) or self._extract_internal_ip(doc)
+        return self._extract_internal_ip(doc)
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 

@@ -78,7 +78,7 @@ import enum
 import logging
 import os
 import subprocess
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # Phase 3c -- Cryo-DLQ re-entry. Imported at module level (bound as a module
 # attribute) so tests can monkeypatch ``fl.replay_dlq``. intake_dlq is a
@@ -600,6 +600,7 @@ class FailoverLifecycleController:
         warmup_fn: Optional[Callable[[], Awaitable[bool]]] = None,
         is_degrading_fn: Optional[Callable[[], bool]] = None,
         endpoint_publish_fn: Optional[Callable[[str], Any]] = None,
+        flare_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -631,6 +632,10 @@ class FailoverLifecycleController:
         # Injectable for testability. Fail-soft -- a hook error never blocks
         # the SERVING transition.
         self._on_serving_fn = on_serving_fn or self._default_on_serving
+
+        # Immutable Trigger-Attribution Flare sink. Default: a high-priority
+        # WARNING to the WAL (debug.log). Injectable for tests / a GCS sidecar.
+        self._flare_fn = flare_fn or self._default_flare
 
         self._state = FailoverState.DORMANT
         self._endpoint: Optional[str] = None
@@ -1052,7 +1057,9 @@ class FailoverLifecycleController:
             # Observed full outage. Apply the cryo-trigger cost gate (reactive).
             if not self._should_awaken(now=now):
                 return
-            await self._enter_awakening(now=now)
+            await self._enter_awakening(
+                now=now, trigger="reactive_outage", route=self._first_outage_route(),
+            )
             return
 
         # Gap 2 -- EARLY pre-warm path. NOT yet a full outage, but the heartbeat
@@ -1068,7 +1075,9 @@ class FailoverLifecycleController:
                 "forecast (R>C*margin) -> awakening J-Prime ahead of formal "
                 "outage (route=%s)", self._route,
             )
-            await self._enter_awakening(now=now)
+            await self._enter_awakening(
+                now=now, trigger="heartbeat_early_prewarm", route=self._route,
+            )
             return
 
     def _real_outage(self) -> bool:
@@ -1172,8 +1181,55 @@ class FailoverLifecycleController:
             logger.debug("[FailoverLifecycle] is_degrading fail-soft err=%r", exc)
             return False
 
-    async def _enter_awakening(self, *, now: float) -> None:
-        """Shared DORMANT -> AWAKENING transition (reactive + early-prewarm)."""
+    def _default_flare(self, payload: Dict[str, Any]) -> None:
+        """Default Trigger-Attribution Flare sink: a high-priority WARNING to the
+        WAL (debug.log). The ``[FailoverFlare]`` prefix is grep-stable for the
+        flight recorder. Fail-soft -- a logging error never blocks the awaken."""
+        try:
+            import json  # noqa: PLC0415
+            logger.warning("[FailoverFlare] %s", json.dumps(payload, sort_keys=True))
+        except Exception:  # noqa: BLE001
+            logger.warning("[FailoverFlare] %r", payload)
+
+    def _emit_flare(self, *, trigger: str, route: str, now: float) -> None:
+        """Synchronously flush the immutable trigger-attribution payload at the
+        DORMANT -> AWAKENING instant -- BEFORE the GCE boot is attempted, so the
+        attribution survives even a fail-soft awaken. Fail-soft."""
+        payload = {
+            "event": "awaken_trigger",
+            "trigger": trigger,
+            "route": route,
+            "state_from": "DORMANT",
+            "state_to": "AWAKENING",
+            "ts": now,
+            "node": _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME),
+        }
+        try:
+            self._flare_fn(payload)
+        except Exception as exc:  # noqa: BLE001 -- telemetry never blocks failover
+            logger.debug("[FailoverLifecycle] flare fail-soft err=%r", exc)
+
+    def _first_outage_route(self) -> str:
+        """The first tracked route in a full outage (for flare attribution).
+        Falls back to the configured route. NEVER raises."""
+        try:
+            grad = self._gradient()
+            for r in list(grad.tracked_routes()) + [self._route] + _outage_extra_routes():
+                if r and grad.is_global_outage(r):
+                    return str(r)
+        except Exception:  # noqa: BLE001
+            pass
+        return self._route
+
+    async def _enter_awakening(
+        self, *, now: float, trigger: str = "unknown", route: str = "",
+    ) -> None:
+        """Shared DORMANT -> AWAKENING transition (reactive + early-prewarm).
+
+        Emits the immutable Trigger-Attribution Flare FIRST so the flight
+        recorder captures which signal initiated the failover, regardless of the
+        GCE boot outcome."""
+        self._emit_flare(trigger=trigger, route=route, now=now)
         self._state = FailoverState.AWAKENING
         self._awakening_started_at = now
         self._recovered_streak = 0

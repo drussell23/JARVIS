@@ -1152,6 +1152,10 @@ class GovernedLoopService:
         # background loops so the bidirectional DW->J-Prime->DW failover RUNS.
         self._failover_task: Optional[asyncio.Task] = None
         self._failover_controller: Any = None
+        # Layer 1 (Hybrid soak fix): the DWHeartbeat deep-probe loop, started as a
+        # peer of the failover tick loop so is_degrading() is actually fed.
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._dw_heartbeat: Any = None
         # Meta-Goal aggregator wiring (the built-but-no-caller fix). The
         # aggregator (meta_goal_aggregator.py) bundles N disjoint single-file
         # ops into ONE fan-outable Meta-Goal DAG, but had no live caller — so
@@ -6771,6 +6775,32 @@ class GovernedLoopService:
                 "[GovernedLoop] failover loop start failed (non-fatal): %r", exc,
             )
             self._failover_task = None
+        # Layer 1 -- start the DWHeartbeat deep-probe loop as a PEER task so
+        # is_degrading() is actually fed (the run-#13 wiring gap: the probe was
+        # built + flag ON, but nothing started the loop -> Layer 1 was inert).
+        try:
+            from backend.core.ouroboros.governance.provider_heartbeat import (
+                heartbeat_enabled as _hb_enabled,
+                deep_probe_enabled as _deep_enabled,
+                get_dw_heartbeat as _get_hb,
+            )
+            if _hb_enabled() and (
+                self._heartbeat_task is None or self._heartbeat_task.done()
+            ):
+                self._dw_heartbeat = _get_hb()
+                self._heartbeat_task = asyncio.create_task(
+                    self._dw_heartbeat.run(), name="dw_heartbeat_loop",
+                )
+                logger.info(
+                    "[GovernedLoop] DWHeartbeat probe loop started "
+                    "(deep_probe=%s) -- Layer 1 (early-prewarm signal) is LIVE",
+                    _deep_enabled(),
+                )
+        except Exception as exc:  # noqa: BLE001 -- never block boot
+            logger.warning(
+                "[GovernedLoop] heartbeat loop start failed (non-fatal): %r", exc,
+            )
+            self._heartbeat_task = None
 
     async def _failover_loop(self) -> None:
         """Tick the FailoverLifecycleController on a fixed interval until
@@ -6853,6 +6883,28 @@ class GovernedLoopService:
             except Exception:  # noqa: BLE001
                 pass
         self._failover_task = None
+        # Layer 1 -- cancel the DWHeartbeat probe loop as a peer of the failover
+        # task (stop() flips its internal flag; cancel() unblocks the sleep).
+        hb = getattr(self, "_dw_heartbeat", None)
+        if hb is not None:
+            try:
+                stop_fn = getattr(hb, "stop", None)
+                if callable(stop_fn):
+                    stop_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        hb_task = getattr(self, "_heartbeat_task", None)
+        if hb_task is not None and not hb_task.done():
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 -- never block shutdown
+                logger.debug(
+                    "[GovernedLoop] heartbeat loop cancel swallowed", exc_info=True,
+                )
+        self._heartbeat_task = None
 
     async def _prewarm_oracle_barrier(self) -> int:
         """ABSOLUTE PRE-FLIGHT INITIALIZATION BARRIER (Omni-Soak v5/v6 fix).

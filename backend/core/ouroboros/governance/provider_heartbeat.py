@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from backend.core.ouroboros.governance.dw_surface_health import (
@@ -111,6 +112,148 @@ def _dw_base_url() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deep Inference Probe (data-plane heartbeat) -- Run-#13 fix (2026-06-28)
+# ---------------------------------------------------------------------------
+#
+# The legacy ``_default_dw_probe`` does ``GET /models`` -- a CONTROL-PLANE
+# reachability check. In soak bt-2026-06-29-032526 DW's control plane answered
+# 200 the whole session while the *data plane* (batch/generation) deadlocked at
+# 180s per op -- so the probe stayed green and the early signal never fired.
+# The Deep Inference Probe dispatches a deterministic ``max_tokens=1`` generation
+# straight at the data plane and bounds it with a DYNAMICALLY-resolved
+# ``asyncio.wait_for`` deadline. A wedged inference queue times the probe out in
+# a fraction of a second and flips ``is_degrading()`` long before 180s.
+
+def deep_probe_enabled() -> bool:
+    """Use the deep INFERENCE probe (data plane) instead of the legacy
+    GET /models reachability probe. DEFAULT-ON, but composes UNDER the
+    heartbeat master gate (which is itself default-OFF) -- so unset env is
+    byte-identical legacy. Rollback: ``JARVIS_DW_DEEP_PROBE_ENABLED=false``
+    restores the control-plane probe."""
+    return _enabled("JARVIS_DW_DEEP_PROBE_ENABLED", "true")
+
+
+def _resolve_deep_probe_timeout(baseline_s: Optional[float] = None) -> float:
+    """Resolve the deep-probe ``asyncio.wait_for`` deadline DYNAMICALLY.
+
+    Resolution order (NEVER a hardcoded literal):
+      1. Explicit operator pin ``JARVIS_DW_DEEP_PROBE_TIMEOUT_S`` (if > 0) wins.
+      2. Otherwise a BASELINE-LATENCY metric: ``mult x baseline`` where
+         *baseline* is the heartbeat's observed healthy-probe EWMA (passed in)
+         or ``JARVIS_DW_DEEP_PROBE_BASELINE_S`` when no sample exists yet.
+    Always clamped to ``[floor, ceil]`` so it is never 0 and never unbounded.
+    A slower-but-healthy DW gets a proportionally larger deadline (no false
+    degrade); a fast DW a tight one. Fail-soft: any parse error -> the metric
+    path with defaults."""
+    override = (os.environ.get("JARVIS_DW_DEEP_PROBE_TIMEOUT_S", "") or "").strip()
+    if override:
+        try:
+            v = float(override)
+            if v > 0:
+                return v
+        except (ValueError, TypeError):
+            pass
+    base = (
+        baseline_s
+        if (baseline_s is not None and baseline_s > 0)
+        else _env_float("JARVIS_DW_DEEP_PROBE_BASELINE_S", 0.5)
+    )
+    mult = max(1.0, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_MULT", 4.0))
+    floor = max(0.1, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_FLOOR_S", 1.0))
+    ceil = max(floor, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_CEIL_S", 15.0))
+    return max(floor, min(ceil, mult * base))
+
+
+def _deep_probe_prompt() -> str:
+    """The deterministic, ultra-low-latency probe prompt. Env-tunable so an
+    operator can swap it for a model-specific minimal prompt; never raises."""
+    return (
+        os.environ.get("JARVIS_DW_DEEP_PROBE_PROMPT", "Return the digit 1")
+        or "Return the digit 1"
+    )
+
+
+def _http_post_json(url: str, headers: dict, payload: bytes, timeout: float) -> str:
+    """Injectable sync POST boundary (stdlib urllib). Returns the response body.
+    Raises on transport/HTTP failure. Tests monkeypatch this -- ZERO real net."""
+    import urllib.request  # noqa: PLC0415
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return resp.read().decode("utf-8", errors="replace")
+
+
+async def _resolve_dw_probe_transport():
+    """Gap 1 -- resolve the probe's ``(url, headers)`` from the SAME aegis bridge
+    the real DW provider uses, so the probe impersonates real traffic at the
+    protocol level (Aegis base URL + SESSION BEARER -- NOT the confiscated DW API
+    key, which 401'd in soak bt-2026-06-29-055555).
+
+    Fail-soft: an aegis base-URL resolve error falls back to the direct DW base.
+    The session-header fetch is best-effort -- a failure yields no Authorization
+    rather than crashing the probe. NEVER raises."""
+    headers = {"Content-Type": "application/json"}
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            aegis_provider_bridge as _apb,
+        )
+        base = _apb.dw_aegis_base_url()
+    except Exception as exc:  # noqa: BLE001 -- fall back to direct DW
+        logger.debug("[DWHeartbeat] aegis base resolve fail-soft err=%r", exc)
+        return (_dw_base_url() + "/chat/completions", headers)
+    url = base.rstrip("/") + "/chat/completions"
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            aegis_provider_bridge as _apb,
+        )
+        auth = await _apb.dw_session_auth_header()
+        if isinstance(auth, dict):
+            headers.update(auth)
+    except Exception as exc:  # noqa: BLE001 -- best-effort bearer
+        logger.debug("[DWHeartbeat] aegis session header fail-soft err=%r", exc)
+    return (url, headers)
+
+
+async def _default_dw_inference_dispatch() -> str:
+    """Default deep-probe boundary: a real ``max_tokens=1`` generation against
+    the DW data plane, routed through the SAME (Aegis-aware) transport + auth the
+    real DW provider uses (Gap 1 -- faithful impersonation, no false 401).
+
+    Returns the (possibly empty) content string. Raises on any transport/HTTP
+    failure -- the caller treats BOTH an exception and an empty string as a
+    degrade signal."""
+    import json  # noqa: PLC0415
+
+    url, headers = await _resolve_dw_probe_transport()
+    model = (
+        os.environ.get("JARVIS_DW_DEEP_PROBE_MODEL", "")
+        or os.environ.get("DOUBLEWORD_MODEL", "")
+        or "Qwen/Qwen3.5-397B-A17B-FP8"
+    )
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": _deep_probe_prompt()}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    # Per-request timeout is a belt-and-braces backstop; the authoritative bound
+    # is the caller's asyncio.wait_for (dynamic). Off-loaded so the blocking POST
+    # never stalls the event loop.
+    loop = asyncio.get_event_loop()
+    body = await loop.run_in_executor(
+        None, _http_post_json, url, headers, payload, _resolve_deep_probe_timeout(),
+    )
+    data = json.loads(body)
+    try:
+        return str(data["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Default probe boundary (stdlib urllib -- injectable for tests)
 # ---------------------------------------------------------------------------
 
@@ -159,8 +302,26 @@ class DWHeartbeat:
         *,
         probe_fn: Optional[Callable[[], Any]] = None,
         ledger: Optional[SurfaceHealthLedger] = None,
+        inference_dispatch_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
-        self._probe_fn = probe_fn or _default_dw_probe
+        # The deep-probe inference boundary (data plane). Injectable for tests;
+        # default is a real max_tokens=1 DW generation.
+        self._inference_dispatch_fn = (
+            inference_dispatch_fn or _default_dw_inference_dispatch
+        )
+        # Baseline healthy-probe latency metric (EWMA) -- drives the DYNAMIC
+        # deep-probe timeout. Seeded from env; updated on each healthy probe.
+        self._baseline_latency_s: float = _env_float(
+            "JARVIS_DW_DEEP_PROBE_BASELINE_S", 0.5
+        )
+        # Default probe selection: the deep INFERENCE probe (data plane) when
+        # armed, else the legacy GET /models reachability probe (rollback).
+        if probe_fn is not None:
+            self._probe_fn: Callable[[], Any] = probe_fn
+        elif deep_probe_enabled():
+            self._probe_fn = self._deep_inference_probe
+        else:
+            self._probe_fn = _default_dw_probe
         # Reuse the shared ledger by default (the same on-disk file the rest of
         # the surface-health stack reads). Tests inject an in-memory ledger.
         self._ledger = ledger if ledger is not None else SurfaceHealthLedger()
@@ -215,6 +376,57 @@ class DWHeartbeat:
             return int(rec.consecutive_failures) if rec is not None else 0
         except Exception:  # noqa: BLE001
             return 0
+
+    # ------------------------------------------------------------------
+    # Deep Inference Probe (data plane) -- the testable core of the Run-#13 fix
+    # ------------------------------------------------------------------
+
+    def _record_baseline_latency(self, sample_s: float) -> None:
+        """EWMA-update the healthy-probe baseline latency metric. Fail-soft."""
+        try:
+            if sample_s <= 0:
+                return
+            alpha = max(0.0, min(1.0, _env_float("JARVIS_DW_DEEP_PROBE_EWMA_ALPHA", 0.3)))
+            cur = self._baseline_latency_s
+            self._baseline_latency_s = (
+                sample_s if cur <= 0 else alpha * sample_s + (1.0 - alpha) * cur
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _deep_inference_probe(self) -> bool:
+        """Dispatch a deterministic ``max_tokens=1`` generation at the DW data
+        plane, bounded by a DYNAMICALLY-resolved ``asyncio.wait_for`` deadline.
+
+        Returns True iff a NON-EMPTY token comes back inside the deadline. A
+        timeout (wedged inference queue), a transport error, OR an empty/blank
+        result are all degrade signals (False). NEVER raises -- the caller
+        (``beat``) records the verdict. A healthy probe updates the baseline
+        latency metric so the deadline self-tunes to real DW speed."""
+        timeout = _resolve_deep_probe_timeout(self._baseline_latency_s)
+
+        async def _invoke() -> Any:
+            res = self._inference_dispatch_fn()
+            if asyncio.iscoroutine(res):
+                res = await res
+            return res
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.wait_for(_invoke(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[DWHeartbeat] deep probe TIMEOUT after %.3fs (data-plane "
+                "deadlock) -> degrade signal", timeout,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 -- a dispatch error IS a degrade
+            logger.debug("[DWHeartbeat] deep probe dispatch err=%r -> degrade", exc)
+            return False
+        ok = bool(result) and bool(str(result).strip())
+        if ok:
+            self._record_baseline_latency(time.monotonic() - t0)
+        return ok
 
     # ------------------------------------------------------------------
     # One probe + record (the testable core)
@@ -315,4 +527,5 @@ __all__ = [
     "DWHeartbeat",
     "get_dw_heartbeat",
     "heartbeat_enabled",
+    "deep_probe_enabled",
 ]
