@@ -6097,6 +6097,16 @@ class ToolLoopCoordinator:
         # generation deadline.
         round_index = -1
         _explore_only_rounds = 0
+        # Cognitive armor (Venom): semantic loop breaker -- snaps the circuit when
+        # a (small) model is stuck hallucinating the SAME tool call across rounds.
+        try:
+            from backend.core.ouroboros.governance.cognitive_loop_breaker import (  # noqa: PLC0415
+                SemanticLoopBreaker,
+            )
+            _loop_breaker = SemanticLoopBreaker()
+        except Exception:  # noqa: BLE001 -- never block the loop on the armor
+            _loop_breaker = None
+        _breaker_nudged = False
         # Slice 85 Phase 3 — cumulative read-only-call counter (evasion-proof
         # convergence axis; mixed-tool wandering still accrues here).
         _cumulative_explore_calls = 0
@@ -6283,6 +6293,33 @@ class ToolLoopCoordinator:
             if tool_calls is None:
                 self._finalize_run(op_id)
                 return raw, records   # Final non-tool response
+
+            # Cognitive armor: SEMANTIC LOOP BREAKER. A stuck (small) model emits
+            # the same broken tool call(s) round after round. First trip -> one
+            # forced synthesis nudge ("stop, answer now with what you have").
+            # Persisting -> HARD EJECT with the best context already gathered,
+            # rather than burning tokens/deadline on the hallucination. Fail-soft.
+            if _loop_breaker is not None and _loop_breaker.observe(tool_calls):
+                if not _breaker_nudged:
+                    _breaker_nudged = True
+                    current_prompt += (
+                        "\n\n[SYSTEM] You are REPEATING the same tool call(s) -- "
+                        "this is a loop and the result will not change. STOP calling "
+                        "tools. Emit your FINAL answer NOW, synthesizing the context "
+                        "you have already gathered.\n"
+                    )
+                    logger.warning(
+                        "[ToolLoop] op=%s semantic repetition -> forced synthesis "
+                        "nudge (one chance before hard eject)", op_id,
+                    )
+                    continue
+                logger.warning(
+                    "[ToolLoop] op=%s semantic repetition PERSISTS after nudge -> "
+                    "HARD EJECT with best gathered context (%d record(s))",
+                    op_id, len(records),
+                )
+                self._finalize_run(op_id)
+                return raw, records   # best-available context, not blind burn
 
             # Slice 233 — parse-gate enforcement of convergence. Once the
             # final-write nudge has fired we promised the model "further tool
