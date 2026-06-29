@@ -41,11 +41,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from backend.core.ouroboros.governance.cloud_build_baker import (  # noqa: E402
     CloudBuildBaker,
+    CrossRepoDependencyError,
     build_status_is_success,
-)
-
-_DEFAULT_SPEC = str(
-    _REPO_ROOT / "docs" / "superpowers" / "specs" / "jprime_gpu_golden_image.pkr.hcl"
+    verify_cross_repo_spec,
 )
 
 
@@ -59,7 +57,9 @@ def _parse_args(argv):
                    help="Ollama model to pre-pull into the image.")
     p.add_argument("--image-family", default=os.environ.get("JARVIS_FAILOVER_QUALITY_IMAGE", "jarvis-prime-coder-32b"),
                    help="Published image family (must equal the quality tier's image).")
-    p.add_argument("--spec", default=_DEFAULT_SPEC, help="Path to the Packer .hcl spec.")
+    p.add_argument("--spec", default=None,
+                   help="Path to the Packer .hcl spec (default: the SOVEREIGN jarvis-prime spec "
+                        "$JARVIS_PRIME_PATH/infra/packer/jprime_gpu_golden_image.pkr.hcl).")
     p.add_argument("--timeout", type=int, default=int(os.environ.get("JARVIS_BAKE_TIMEOUT_S", "5400")),
                    help="Cloud Build timeout seconds (GPU bake + 32B pull is slow; default 90min).")
     p.add_argument("--poll-interval", type=int, default=15, help="Status poll cadence seconds.")
@@ -112,8 +112,8 @@ def _print_plan(args, baker: CloudBuildBaker) -> None:
     print(f"  project      : {project}")
     print(f"  image family : {args.image_family}")
     print(f"  model        : {args.model}")
-    print(f"  zone         : {args.zone}")
-    print(f"  spec         : {args.spec}")
+    print(f"  zone         : {args.zone} (+ multi-zonal fallback on STOCKOUT)")
+    print(f"  spec (sovereign jarvis-prime): {baker.resolved_spec_path()}")
     print(f"  timeout      : {args.timeout}s")
     print("-" * 72)
     print("Cloud Build resource that WOULD be POSTed:")
@@ -142,10 +142,14 @@ async def _execute(args, baker: CloudBuildBaker) -> int:
 
 def main(argv=None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    if not Path(args.spec).exists():
-        print(f"ERROR: spec not found: {args.spec}", file=sys.stderr)
-        return 2
     baker = _baker(args)
+    # Cross-Repo Verification Lock: fail FAST if the sovereign jarvis-prime spec
+    # is missing/unreadable -- never bake a stale or absent copy.
+    try:
+        verify_cross_repo_spec(baker.resolved_spec_path())
+    except CrossRepoDependencyError as exc:
+        print(f"CrossRepoDependencyError: {exc}", file=sys.stderr)
+        return 2
     if args.dry_run:
         _print_plan(args, baker)
         return 0

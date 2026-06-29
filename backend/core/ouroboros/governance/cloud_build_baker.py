@@ -54,6 +54,48 @@ _DEFAULT_BAKER_ROLES = (
 )
 
 
+class CrossRepoDependencyError(RuntimeError):
+    """The sovereign jarvis-prime IaC spec is missing/unreadable -- fail fast
+    rather than bake a stale forked copy."""
+
+
+_DEFAULT_JPRIME_SPEC_REL = "infra/packer/jprime_gpu_golden_image.pkr.hcl"
+
+
+def jprime_repo_root() -> Path:
+    """Local jarvis-prime repo root (sovereign owner of the golden-image IaC).
+    Same env (`JARVIS_PRIME_PATH`) the Trinity bridge uses."""
+    return Path(os.environ.get(
+        "JARVIS_PRIME_PATH", str(Path.home() / "Documents" / "repos" / "jarvis-prime")
+    )).expanduser()
+
+
+def resolve_jprime_spec_path(explicit: Optional[str] = None) -> Path:
+    """Resolve the GPU Packer spec path. Explicit arg wins; otherwise the
+    jarvis-prime repo's canonical location (rel overridable via
+    `JARVIS_PRIME_GPU_SPEC_REL`). NEVER reads -- pure path resolution."""
+    if explicit:
+        return Path(explicit).expanduser()
+    rel = os.environ.get("JARVIS_PRIME_GPU_SPEC_REL", _DEFAULT_JPRIME_SPEC_REL)
+    return jprime_repo_root() / rel
+
+
+def verify_cross_repo_spec(path) -> Path:
+    """Cross-Repo Verification Lock: the sovereign spec MUST exist, be a readable
+    file, and be non-empty -- else CrossRepoDependencyError (descriptive)."""
+    p = Path(path)
+    if not p.exists():
+        raise CrossRepoDependencyError(
+            "jarvis-prime GPU spec not found: {} -- the sovereign IaC owner must "
+            "provide it (set JARVIS_PRIME_PATH / JARVIS_PRIME_GPU_SPEC_REL)".format(p)
+        )
+    if not p.is_file() or not os.access(p, os.R_OK):
+        raise CrossRepoDependencyError("jarvis-prime GPU spec not readable: {}".format(p))
+    if p.stat().st_size == 0:
+        raise CrossRepoDependencyError("jarvis-prime GPU spec is empty: {}".format(p))
+    return p
+
+
 def baker_sa_roles() -> List[str]:
     """Least-privilege roles bound to the ephemeral baker SA. Env-overridable
     (``JARVIS_BAKE_SA_ROLES``, comma-separated) -- no hardcoded blast radius."""
@@ -171,7 +213,7 @@ class CloudBuildBaker:
     def __init__(
         self,
         *,
-        spec_path: str,
+        spec_path: Optional[str] = None,
         project: Optional[str] = None,
         image_family: str = "jarvis-prime-coder-32b",
         model: Optional[str] = None,
@@ -201,8 +243,15 @@ class CloudBuildBaker:
         project = self._project or await client.project() or os.environ.get("GCP_PROJECT")
         return token, project
 
+    def resolved_spec_path(self) -> Path:
+        """The sovereign jarvis-prime spec path (cross-repo). Explicit spec_path
+        wins; else the jarvis-prime canonical location."""
+        return resolve_jprime_spec_path(self.spec_path)
+
     def _read_spec(self) -> str:
-        return Path(self.spec_path).read_text(encoding="utf-8")
+        # Cross-Repo Verification Lock: fail fast if the sovereign spec is absent.
+        path = verify_cross_repo_spec(self.resolved_spec_path())
+        return path.read_text(encoding="utf-8")
 
     def build_config(self, project: str) -> Dict[str, Any]:
         extra = {}
@@ -397,6 +446,36 @@ class CloudBuildBaker:
         )
         return status == 200
 
+    async def _build_failed_with_stockout(self, build_id: str) -> bool:
+        """Inspect a failed build's Cloud Logging output for a transient GPU
+        STOCKOUT (retryable in another zone). Fail-soft -> False (a non-stockout
+        failure must NOT trigger a blind multi-zone retry storm)."""
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
+        try:
+            token, project = await self._auth()
+            if not token or not project:
+                return False
+            flt = ('resource.type="build" AND resource.labels.build_id="{}"'.format(build_id))
+            body = json.dumps({
+                "resourceNames": ["projects/{}".format(project)],
+                "filter": flt, "orderBy": "timestamp desc", "pageSize": 50,
+            }).encode("utf-8")
+            status, resp = await _http_request(
+                "https://logging.googleapis.com/v2/entries:list", method="POST",
+                headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
+                body=body, timeout_s=30.0,
+            )
+            if status != 200:
+                return False
+            text = " ".join(
+                e.get("textPayload", "") for e in json.loads(resp).get("entries", [])
+            )
+            return is_stockout_error(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
+            return False
+
     async def bake_with_ephemeral_iam(self) -> bool:
         """The Zero-Trust bake: create a DEDICATED temp SA -> bind least-privilege
         roles -> run the build AS that SA -> GUARANTEE teardown (delete the SA the
@@ -421,18 +500,32 @@ class CloudBuildBaker:
             self._write_flare("LEAST-PRIV ROLES BOUND roles={}".format(",".join(baker_sa_roles())))
             await asyncio.sleep(self._iam_settle_s)  # IAM propagation settle
             self.service_account = "projects/{}/serviceAccounts/{}".format(project, sa_email)
-            build_id = await self.submit()
-            if not build_id:
-                self._write_flare("BAKE FAILED: submit rejected")
-                return False
-            self._write_flare("BAKE SUBMITTED build={} sa={}".format(build_id, sa_email))
-            status = await self.poll(build_id)
-            ok = build_status_is_success(status)
-            self._write_flare(
-                "GOLDEN IMAGE READY image_family={} build={}".format(self.image_family, build_id)
-                if ok else "BAKE FAILED status={} build={}".format(status, build_id)
+            # MULTI-ZONAL FALLBACK: reuse the ONE ephemeral SA across zones; on a
+            # STOCKOUT (transient GPU capacity) autonomously retry the next zone.
+            from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+                zone_fallback_chain,
             )
-            return ok
+            chain = zone_fallback_chain(self.zone)
+            for zone in chain:
+                self.zone = zone
+                build_id = await self.submit()
+                if not build_id:
+                    self._write_flare("BAKE FAILED: submit rejected zone={}".format(zone))
+                    return False
+                self._write_flare("BAKE SUBMITTED build={} zone={} sa={}".format(build_id, zone, sa_email))
+                status = await self.poll(build_id)
+                if build_status_is_success(status):
+                    self._write_flare("GOLDEN IMAGE READY image_family={} build={} zone={}".format(
+                        self.image_family, build_id, zone))
+                    return True
+                if await self._build_failed_with_stockout(build_id):
+                    self._write_flare("STOCKOUT zone={} build={} -> failover to next zone".format(zone, build_id))
+                    continue
+                self._write_flare("BAKE FAILED status={} build={} zone={} (non-stockout -> stop)".format(
+                    status, build_id, zone))
+                return False
+            self._write_flare("BAKE FAILED: all {} zones stocked out ({})".format(len(chain), ",".join(chain)))
+            return False
         finally:
             if sa_email:
                 try:

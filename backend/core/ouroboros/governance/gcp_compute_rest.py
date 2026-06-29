@@ -246,6 +246,12 @@ def _rest_timeout() -> float:
     return _env_float(_ENV_REST_TIMEOUT, 30.0, lo=1.0, hi=600.0)
 
 
+def _insert_op_poll_cap_s() -> float:
+    """Max seconds to poll a zonal insert operation for a STOCKOUT before letting
+    the readiness racer take over. A GPU stockout errors within a few seconds."""
+    return _env_float("JARVIS_INSERT_OP_POLL_CAP_S", 25.0, lo=0.0, hi=120.0)
+
+
 def _running_timeout() -> float:
     return _env_float(_ENV_RUNNING_TIMEOUT, 180.0, lo=1.0, hi=3600.0)
 
@@ -608,48 +614,107 @@ class GCPComputeRest:
         node = name or _node_name()
         machine = machine_type or _machine_type()
         family = image_family or _image_family()
-        url = "{}/projects/{}/zones/{}/instances".format(_COMPUTE_BASE, project, zone)
         headers = {
             "Authorization": "Bearer {}".format(token),
             "Content-Type": "application/json",
         }
 
-        # Spot-first.
+        # MULTI-ZONAL FALLBACK: a GPU STOCKOUT in one zone is transient -- retry
+        # the SAME request in the next zone (cross-region) autonomously. A
+        # non-stockout rejection stops the chain (no blind retry storm).
+        from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+            zone_fallback_chain,
+        )
+        chain = zone_fallback_chain(zone)
+        last = ""
+        for z in chain:
+            verdict, detail = await self._insert_in_zone(
+                zone=z, project=project, token=token, headers=headers, node=node,
+                machine=machine, family=family, startup_script=startup_script,
+                accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+            )
+            last = detail
+            if verdict == "created":
+                return (True, "created:{}".format(detail))
+            if verdict == "stockout":
+                logger.warning("[GCPComputeRest] STOCKOUT zone=%s -> failover to next zone", z)
+                continue
+            return (False, "INSERT_FAILED:{}".format(detail))  # non-stockout -> stop
+        return (False, "INSERT_FAILED:all_zones_stockout:{}".format(last))
+
+    async def _insert_in_zone(
+        self, *, zone, project, token, headers, node, machine, family,
+        startup_script, accelerator_type, accelerator_count,
+    ) -> Tuple[str, str]:
+        """Insert in ONE zone (Spot-first, on-demand fallback). Returns a verdict:
+        'created' | 'stockout' (retry next zone) | 'failed' (stop). NEVER raises."""
+        from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+            is_stockout_error,
+        )
+        url = "{}/projects/{}/zones/{}/instances".format(_COMPUTE_BASE, project, zone)
         for spot in (True, False):
             payload = self._build_insert_payload(
-                name=node,
-                zone=zone,
-                project=project,
-                machine_type=machine,
-                image_family=family,
-                startup_script=startup_script,
-                spot=spot,
-                accelerator_type=accelerator_type,
-                accelerator_count=accelerator_count,
+                name=node, zone=zone, project=project, machine_type=machine,
+                image_family=family, startup_script=startup_script, spot=spot,
+                accelerator_type=accelerator_type, accelerator_count=accelerator_count,
             )
-            body = json.dumps(payload).encode("utf-8")
             status, text = await _http_request(
-                url,
-                method="POST",
-                headers=headers,
-                body=body,
-                timeout_s=_rest_timeout(),
+                url, method="POST", headers=headers,
+                body=json.dumps(payload).encode("utf-8"), timeout_s=_rest_timeout(),
             )
+            mode = "SPOT" if spot else "on-demand"
             if 200 <= status < 300:
-                mode = "SPOT" if spot else "on-demand"
-                logger.info(
-                    "[GCPComputeRest] instances.insert ok node=%s zone=%s mode=%s "
-                    "(status=%s)", node, zone, mode, status,
-                )
-                return (True, "created:{}:{}".format(mode, status))
-            logger.warning(
-                "[GCPComputeRest] instances.insert %s failed node=%s status=%s "
-                "detail=%s", "SPOT" if spot else "on-demand", node, status,
-                (text or "")[-300:],
+                # The insert returns a PENDING operation; a GPU STOCKOUT surfaces
+                # when it runs. Track the operation to catch it (skip if untrackable).
+                op = None
+                try:
+                    op = json.loads(text or "{}").get("name")
+                except Exception:  # noqa: BLE001
+                    op = None
+                if op:
+                    verdict = await self._await_insert_operation(project, zone, op, token)
+                    if verdict == "stockout":
+                        return ("stockout", "zone={}:op_stockout".format(zone))
+                    if verdict == "error":
+                        logger.warning("[GCPComputeRest] insert op error zone=%s mode=%s", zone, mode)
+                        continue  # try on-demand
+                logger.info("[GCPComputeRest] instances.insert ok node=%s zone=%s mode=%s",
+                            node, zone, mode)
+                return ("created", "zone={}:mode={}".format(zone, mode))
+            # Synchronous rejection: a stockout here -> retry next zone.
+            if is_stockout_error(text):
+                return ("stockout", "zone={}:sync_stockout".format(zone))
+            logger.warning("[GCPComputeRest] insert %s failed zone=%s status=%s detail=%s",
+                           mode, zone, status, (text or "")[-200:])
+        return ("failed", "zone={}:spot_and_on_demand_rejected".format(zone))
+
+    async def _await_insert_operation(self, project, zone, op_name, token) -> str:
+        """Poll a zonal insert operation to DONE (bounded). Returns 'ok' |
+        'stockout' | 'error'. A timeout -> 'ok' (the readiness racer is the real
+        gate). NEVER raises."""
+        from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+            is_stockout_error,
+        )
+        url = "{}/projects/{}/zones/{}/operations/{}".format(_COMPUTE_BASE, project, zone, op_name)
+        cap = _insert_op_poll_cap_s()
+        waited = 0.0
+        while waited < cap:
+            status, text = await _http_request(
+                url, method="GET", headers={"Authorization": "Bearer {}".format(token)},
+                timeout_s=30.0,
             )
-            # Only retry on-demand after a Spot failure; an on-demand failure is
-            # terminal for this attempt.
-        return (False, "INSERT_FAILED:spot_and_on_demand_rejected")
+            try:
+                op = json.loads(text or "{}")
+            except Exception:  # noqa: BLE001
+                op = {}
+            if op.get("status") == "DONE":
+                err = op.get("error")
+                if not err:
+                    return "ok"
+                return "stockout" if is_stockout_error(json.dumps(err)) else "error"
+            await asyncio.sleep(3)
+            waited += 3
+        return "ok"  # still running at the cap -> let the readiness racer decide
 
     # -- poll-to-RUNNING + internal-IP extraction ------------------------
 
