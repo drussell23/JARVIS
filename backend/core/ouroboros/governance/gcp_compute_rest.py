@@ -276,6 +276,30 @@ def _machine_type() -> str:
 # Low-level async HTTP (aiohttp if present, else stdlib urllib on the executor)
 # ---------------------------------------------------------------------------
 
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+def is_retryable_status(status: int) -> bool:
+    """True iff an HTTP status is a transient, backoff-retryable failure (429 rate
+    limit + 5xx). A 4xx (other than 429) or a transport error (0) is NOT retried."""
+    return int(status or 0) in _RETRYABLE_STATUSES
+
+
+def _backoff_delay(attempt: int, *, base: float = 0.5, cap: float = 30.0) -> float:
+    """Exponential backoff with FULL JITTER: uniform(0, min(cap, base*2^attempt)).
+    Jitter de-synchronizes concurrent retriers (the cause of the 429 storm)."""
+    import random  # noqa: PLC0415
+    ceil = min(cap, base * (2 ** max(0, attempt)))
+    return random.uniform(0.0, ceil)
+
+
+def _http_max_retries() -> int:
+    try:
+        return max(0, min(8, int(os.environ.get("JARVIS_HTTP_MAX_RETRIES", "4"))))
+    except (ValueError, TypeError):
+        return 4
+
+
 async def _http_request(
     url: str,
     *,
@@ -284,8 +308,34 @@ async def _http_request(
     body: Optional[bytes] = None,
     timeout_s: float = 10.0,
 ) -> Tuple[int, str]:
-    """Async HTTP request. Returns (status_code, body_text). NEVER raises -- a
-    transport error is surfaced as (0, "<repr>") so callers stay fail-soft.
+    """Resilient async HTTP: wraps the single-shot request with exponential
+    backoff + full jitter on retryable statuses (429 + 5xx). NEVER raises -- a
+    transport error -> (0, "<repr>"); an exhausted retry budget surfaces the last
+    retryable response (never a crash). Bounded by ``JARVIS_HTTP_MAX_RETRIES``."""
+    attempts = _http_max_retries() + 1
+    result = (0, "")
+    for attempt in range(attempts):
+        result = await _http_request_once(
+            url, method=method, headers=headers, body=body, timeout_s=timeout_s,
+        )
+        if not is_retryable_status(result[0]):
+            return result
+        if attempt < attempts - 1:
+            await asyncio.sleep(_backoff_delay(attempt))
+    return result  # retry budget exhausted -> surface the last (retryable) response
+
+
+async def _http_request_once(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[bytes] = None,
+    timeout_s: float = 10.0,
+) -> Tuple[int, str]:
+    """Single-shot async HTTP request. Returns (status_code, body_text). NEVER
+    raises -- a transport error is surfaced as (0, "<repr>") so callers stay
+    fail-soft.
 
     Prefers aiohttp (truly async); else dispatches a bounded stdlib urllib call
     on the default executor so the event loop is never blocked.

@@ -28,8 +28,14 @@ def test_build_runs_as_custom_sa():
         service_account="projects/proj/serviceAccounts/baker@proj.iam.gserviceaccount.com",
     )
     assert cfg["serviceAccount"].endswith("baker@proj.iam.gserviceaccount.com")
-    # A custom build SA REQUIRES an explicit logging mode.
-    assert cfg["options"]["logging"] == "CLOUD_LOGGING_ONLY"
+    # logs_bucket (a dedicated bucket the SA can write) -> GCS logging.
+    cfg2 = build_packer_cloud_build(
+        spec_text=_SPEC, project="proj", image_family="f",
+        service_account="projects/proj/serviceAccounts/baker@proj.iam.gserviceaccount.com",
+        logs_bucket="gs://proj-jarvis-bake-logs",
+    )
+    assert cfg2["options"]["logging"] == "GCS_ONLY"
+    assert cfg2["logsBucket"] == "gs://proj-jarvis-bake-logs"
 
 
 def test_no_service_account_no_logging_override():

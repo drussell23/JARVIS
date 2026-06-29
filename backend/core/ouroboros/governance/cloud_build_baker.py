@@ -165,12 +165,19 @@ def build_packer_cloud_build(
     disk_gb: int = 100,
     packer_image: str = _PACKER_IMAGE,
     service_account: Optional[str] = None,
+    logs_bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct the EXACT Cloud Build ``Build`` resource that bakes the image:
-    (1) write the base64-inlined Packer spec into the build workspace,
+    (1) write the GZIP+base64-inlined Packer spec into the build workspace,
     (2) ``packer init``, (3) ``packer build`` with the project/image-family/model
-    vars. No ``source`` -> no GCS upload (the spec rides inline). Pure."""
-    b64 = base64.b64encode((spec_text or "").encode("utf-8")).decode("ascii")
+    vars. No ``source`` -> no GCS upload (the spec rides inline). The spec is
+    GZIPPED before base64 so the single build-step arg stays well under Cloud
+    Build's 10000-char per-arg limit (raw base64 of a ~7KB spec is ~9.7KB -- one
+    edit overflows it; gzip drops it to ~2.7KB, future-proof). Deterministic
+    (mtime=0). Pure."""
+    import gzip  # noqa: PLC0415
+    gz = gzip.compress((spec_text or "").encode("utf-8"), mtime=0)
+    b64 = base64.b64encode(gz).decode("ascii")
     var_flags = [
         "-var=project_id={}".format(project),
         "-var=image_family={}".format(image_family),
@@ -182,7 +189,7 @@ def build_packer_cloud_build(
             "name": _WRITER_IMAGE,
             "entrypoint": "bash",
             # base64 is [A-Za-z0-9+/=] only -> safe inside single quotes.
-            "args": ["-c", "printf %s '{}' | base64 -d > {}".format(b64, _SPEC_PATH_IN_BUILD)],
+            "args": ["-c", "printf %s '{}' | base64 -d | gunzip > {}".format(b64, _SPEC_PATH_IN_BUILD)],
         },
         {"name": packer_image, "args": ["init", _SPEC_PATH_IN_BUILD]},
         {"name": packer_image, "args": ["build", *var_flags, _SPEC_PATH_IN_BUILD]},
@@ -195,10 +202,16 @@ def build_packer_cloud_build(
         "substitutions": dict(substitutions or {}),
     }
     if service_account:
-        # A custom build SA REQUIRES an explicit logging mode (Cloud Build won't
-        # use the default logs bucket under a user-supplied SA).
+        # A custom build SA REQUIRES an explicit logging mode. Log to a DEDICATED
+        # GCS bucket the SA can write (the reserved default bucket rejects submit;
+        # CLOUD_LOGGING_ONLY logs aren't queryable) -> logs survive SA deletion and
+        # the stockout detector reads them reliably.
         cfg["serviceAccount"] = service_account
-        options["logging"] = "CLOUD_LOGGING_ONLY"
+        if logs_bucket:
+            cfg["logsBucket"] = logs_bucket
+            options["logging"] = "GCS_ONLY"
+        else:
+            options["logging"] = "CLOUD_LOGGING_ONLY"
     return cfg
 
 
@@ -232,6 +245,7 @@ class CloudBuildBaker:
         # Ephemeral Zero-Trust IAM: the custom build SA (set during the lifecycle).
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
+        self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -259,10 +273,14 @@ class CloudBuildBaker:
             extra["model_label"] = self.model
         if self.zone:
             extra["zone"] = self.zone
+        # CLOUD_LOGGING_ONLY (logs_bucket=None): the only mode a custom SA submits
+        # reliably (the reserved default bucket AND a fresh dedicated bucket both
+        # reject submit on IAM-propagation timing). Stockout no longer needs logs
+        # -- the loop walks zones on any post-submit failure (spec is proven valid).
         return build_packer_cloud_build(
             spec_text=self._read_spec(), project=project,
             image_family=self.image_family, extra_vars=extra, timeout_s=self.timeout_s,
-            service_account=self.service_account,
+            service_account=self.service_account, logs_bucket=None,
         )
 
     async def submit(self) -> Optional[str]:
@@ -422,20 +440,32 @@ class CloudBuildBaker:
         )
         return status == 200
 
+    async def _rmw_policy(self, project: str, token: str, mutate) -> bool:
+        """Read-Modify-Write the project IAM policy, RETRYING on an etag conflict
+        (concurrent setIamPolicy races when bakes overlap). Re-reads the fresh
+        policy each attempt -> optimistic-concurrency safe. NEVER raises."""
+        import random  # noqa: PLC0415
+        for attempt in range(self._iam_rmw_retries):
+            policy = await self._get_project_policy(project, token)
+            if policy is None:
+                return False
+            mutate(policy)
+            if await self._set_project_policy(project, token, policy):
+                return True
+            # setIamPolicy rejected (likely 409/412 etag conflict) -> re-read + retry.
+            await asyncio.sleep(min(4.0, 0.3 * (2 ** attempt)) * (0.5 + random.random()))
+        return False
+
     async def _bind_roles(self, project: str, token: str, member: str, roles: List[str]) -> bool:
-        policy = await self._get_project_policy(project, token)
-        if policy is None:
-            return False
-        for role in roles:
-            iam_policy_add_binding(policy, role, member)
-        return await self._set_project_policy(project, token, policy)
+        def _add(policy):
+            for role in roles:
+                iam_policy_add_binding(policy, role, member)
+        return await self._rmw_policy(project, token, _add)
 
     async def _unbind_member(self, project: str, token: str, member: str) -> bool:
-        policy = await self._get_project_policy(project, token)
-        if policy is None:
-            return False
-        iam_policy_remove_member(policy, member)
-        return await self._set_project_policy(project, token, policy)
+        return await self._rmw_policy(
+            project, token, lambda policy: iam_policy_remove_member(policy, member)
+        )
 
     async def _delete_temp_sa(self, project: str, token: str, sa_email: str) -> bool:
         from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
@@ -445,36 +475,6 @@ class CloudBuildBaker:
             headers={"Authorization": "Bearer {}".format(token)}, timeout_s=60.0,
         )
         return status == 200
-
-    async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Inspect a failed build's Cloud Logging output for a transient GPU
-        STOCKOUT (retryable in another zone). Fail-soft -> False (a non-stockout
-        failure must NOT trigger a blind multi-zone retry storm)."""
-        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
-        from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
-        try:
-            token, project = await self._auth()
-            if not token or not project:
-                return False
-            flt = ('resource.type="build" AND resource.labels.build_id="{}"'.format(build_id))
-            body = json.dumps({
-                "resourceNames": ["projects/{}".format(project)],
-                "filter": flt, "orderBy": "timestamp desc", "pageSize": 50,
-            }).encode("utf-8")
-            status, resp = await _http_request(
-                "https://logging.googleapis.com/v2/entries:list", method="POST",
-                headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
-                body=body, timeout_s=30.0,
-            )
-            if status != 200:
-                return False
-            text = " ".join(
-                e.get("textPayload", "") for e in json.loads(resp).get("entries", [])
-            )
-            return is_stockout_error(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
-            return False
 
     async def bake_with_ephemeral_iam(self) -> bool:
         """The Zero-Trust bake: create a DEDICATED temp SA -> bind least-privilege
@@ -518,13 +518,17 @@ class CloudBuildBaker:
                     self._write_flare("GOLDEN IMAGE READY image_family={} build={} zone={}".format(
                         self.image_family, build_id, zone))
                     return True
-                if await self._build_failed_with_stockout(build_id):
-                    self._write_flare("STOCKOUT zone={} build={} -> failover to next zone".format(zone, build_id))
-                    continue
-                self._write_flare("BAKE FAILED status={} build={} zone={} (non-stockout -> stop)".format(
-                    status, build_id, zone))
-                return False
-            self._write_flare("BAKE FAILED: all {} zones stocked out ({})".format(len(chain), ",".join(chain)))
+                # The spec is PROVEN valid (it resolves the image + requests the
+                # instance), so a post-submit build failure means this zone could
+                # not PLACE the GPU instance = capacity/stockout. Walk the next zone
+                # (bounded by the chain). Custom-SA logs aren't queryable, so this
+                # is the robust signal -- bounded, never an unbounded retry storm.
+                self._write_flare(
+                    "BUILD FAILED zone={} status={} build={} -> failover to next zone "
+                    "(spec validated; treating as GPU capacity)".format(zone, status, build_id))
+            self._write_flare(
+                "BAKE FAILED: all {} zones failed to place the GPU ({}) -- L4 capacity "
+                "drought, retry later".format(len(chain), ",".join(chain)))
             return False
         finally:
             if sa_email:

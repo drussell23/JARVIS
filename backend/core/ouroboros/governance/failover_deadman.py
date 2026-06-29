@@ -105,19 +105,25 @@ def _env_int(var: str, default: int, lo: int = 1, hi: int = 86400) -> int:
     return max(lo, min(v, hi))
 
 
-def build_inference_bind_block(*, port: int) -> str:
+def build_inference_bind_block(*, port: int, require_gpu: bool = False) -> str:
     """Cloud-init bash SNIPPET (no shebang) that forces the inference daemon to
     bind ``0.0.0.0:<port>`` (NOT 127.0.0.1) so the hybrid orchestrator can reach
     it through the /32 firewall, then restarts the daemon to apply the bind.
 
-    Handles the Ollama systemd path (the golden image's daemon): writes a
-    drop-in override setting ``OLLAMA_HOST=0.0.0.0:<port>``, daemon-reloads, and
-    restarts -- falling back to ``ollama serve`` if systemd isn't managing it.
-    Idempotent + fail-soft (``|| true``). Pure ASCII string assembly. NO
-    hardcoded port -- the resolved value is interpolated."""
+    ``require_gpu`` (quality 32B tier): runtime HARDWARE VALIDATION GATE. Because
+    the image is now baked on a CPU node (no bake-time GPU smoke test), the live
+    GPU node must prove its hardware HERE before serving: run ``nvidia-smi``; if it
+    fails (driver not attached / no GPU), REFUSE to bind/serve -- stop Ollama so
+    the Reachability Racer NEVER gets a 200, which trips the orchestrator's native
+    fail-soft recovery (awaken times out -> ops re-route to DW). The Dead-Man's
+    Switch (installed by the surrounding script) still self-deletes the
+    unserviceable node. For the survival CPU 7B tier (``require_gpu=False``) there
+    is NO gate -- it has no GPU and binds normally.
+
+    Idempotent + fail-soft (``|| true``). Pure ASCII string assembly. NO hardcoded
+    port -- the resolved value is interpolated."""
     p = int(port)
-    return (
-        "# --- JARVIS dynamic inference-bind (cloud-init) ---\n"
+    bind = (
         "export HOME=/root\n"
         "export OLLAMA_HOST=0.0.0.0:{port}\n"
         "mkdir -p /etc/systemd/system/ollama.service.d || true\n"
@@ -128,8 +134,31 @@ def build_inference_bind_block(*, port: int) -> str:
         "systemctl daemon-reload || true\n"
         "systemctl restart ollama 2>/dev/null || "
         "(nohup ollama serve >/var/log/jarvis-ollama.log 2>&1 &)\n"
-        "# --- end inference-bind ---\n"
     ).format(port=p)
+    if require_gpu:
+        # Hardware gate: serve ONLY if the GPU is real. On failure, crash the
+        # inference service (stop Ollama, drop the bind override) so the port
+        # never returns 200 -> orchestrator fail-soft. Script (Dead-Man's Switch)
+        # continues so the node still self-deletes.
+        gpu_indent = "  " + bind.replace("\n", "\n  ").rstrip() + "\n"
+        body = (
+            'if nvidia-smi >/dev/null 2>&1; then\n'
+            '  echo "JARVIS: GPU verified (nvidia-smi ok) -- binding inference"\n'
+            "{gpu_indent}"
+            "else\n"
+            '  echo "JARVIS FATAL: nvidia-smi failed -- no GPU/driver; REFUSING to '
+            'serve (fail-soft to DW)" >&2\n'
+            "  systemctl stop ollama 2>/dev/null || true\n"
+            "  rm -f /etc/systemd/system/ollama.service.d/10-jarvis-bind.conf 2>/dev/null || true\n"
+            "fi\n"
+        ).format(gpu_indent=gpu_indent)
+    else:
+        body = bind
+    return (
+        "# --- JARVIS dynamic inference-bind (cloud-init){gpu} ---\n"
+        "{body}"
+        "# --- end inference-bind ---\n"
+    ).format(body=body, gpu=" + GPU hardware gate" if require_gpu else "")
 
 
 # ---------------------------------------------------------------------------

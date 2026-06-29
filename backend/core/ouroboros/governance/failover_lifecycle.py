@@ -861,7 +861,7 @@ class FailoverLifecycleController:
             client = get_compute_rest()
             gpu_vm = node_name("gpu")
             ok, detail = await client.create_instance(
-                startup_script=self._build_startup_script(),
+                startup_script=self._build_startup_script(require_gpu=True),
                 name=gpu_vm,
                 machine_type=tier.machine_type,
                 image_family=tier.image_family,
@@ -1640,7 +1640,20 @@ class FailoverLifecycleController:
         Fail-soft: on any failure, revert to DORMANT (retry next tick). The op
         is never lost -- the quarantine Cryo-DLQ remains the backstop."""
         try:
-            startup_script = self._build_startup_script()
+            # The primary node's runtime GPU gate follows its resolved tier (the
+            # survival 7B/CPU tier has no GPU -> no gate; a quality GPU tier does).
+            _require_gpu = False
+            try:
+                from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+                    resolve_tier,
+                )
+                _require_gpu = resolve_tier(
+                    urgency=_env_str("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
+                    complexity=_env_str("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
+                ).is_gpu
+            except Exception:  # noqa: BLE001
+                _require_gpu = False
+            startup_script = self._build_startup_script(require_gpu=_require_gpu)
             ok = await self._maybe_await(
                 self._vm_awaken_fn, startup_script=startup_script
             )
@@ -1727,7 +1740,7 @@ class FailoverLifecycleController:
         finally:
             self._ephemeral_fw_rule = None
 
-    def _build_startup_script(self) -> str:
+    def _build_startup_script(self, *, require_gpu: bool = False) -> str:
         from backend.core.ouroboros.governance.failover_deadman import (  # noqa: PLC0415
             build_deadman_startup_script, build_inference_bind_block,
         )
@@ -1737,8 +1750,10 @@ class FailoverLifecycleController:
         # so the hybrid orchestrator can reach it through the /32 firewall. Gated
         # (default OFF -> byte-identical dead-man-only legacy). Injected right
         # after the dead-man shebang/HOME preamble so it runs early on boot.
+        # require_gpu adds a runtime nvidia-smi hardware gate (quality 32B tier --
+        # the image is baked on CPU, so the GPU is validated HERE at runtime).
         if _enabled("JARVIS_FAILOVER_INFERENCE_BIND_ENABLED", "false"):
-            bind = build_inference_bind_block(port=port)
+            bind = build_inference_bind_block(port=port, require_gpu=require_gpu)
             lines = script.split("\n", 1)
             if len(lines) == 2 and lines[0].startswith("#!"):
                 script = lines[0] + "\n" + bind + "\n" + lines[1]

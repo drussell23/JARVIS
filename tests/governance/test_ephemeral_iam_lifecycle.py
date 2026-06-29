@@ -9,6 +9,10 @@ import pytest
 from backend.core.ouroboros.governance.cloud_build_baker import CloudBuildBaker
 
 
+async def _nosleep(*_a, **_k):
+    return None
+
+
 def _baker(tmp_path):
     spec = tmp_path / "x.pkr.hcl"
     spec.write_text('source "googlecompute" "x" {}\n')
@@ -33,8 +37,6 @@ async def _wire(monkeypatch, b, *, calls, poll_status="SUCCESS", sa="baker@proj.
         calls.append("unbind"); return True
     async def delete_sa(project, token, email):
         calls.append("delete_sa"); return True
-    async def stockout(build_id):
-        calls.append("stockout_probe"); return False  # default: not a stockout
     monkeypatch.setattr(b, "_auth", auth)
     monkeypatch.setattr(b, "_create_temp_sa", create_sa)
     monkeypatch.setattr(b, "_bind_roles", bind)
@@ -42,7 +44,6 @@ async def _wire(monkeypatch, b, *, calls, poll_status="SUCCESS", sa="baker@proj.
     monkeypatch.setattr(b, "poll", poll)
     monkeypatch.setattr(b, "_unbind_member", unbind)
     monkeypatch.setattr(b, "_delete_temp_sa", delete_sa)
-    monkeypatch.setattr(b, "_build_failed_with_stockout", stockout)
 
 
 async def test_full_lifecycle_success(tmp_path, monkeypatch):
@@ -87,31 +88,41 @@ async def test_teardown_runs_even_if_poll_raises(tmp_path, monkeypatch):
     assert "EPHEMERAL SA TORN DOWN" in wal.read_text()
 
 
-async def test_multizonal_fallback_retries_next_zone_on_stockout(tmp_path, monkeypatch):
-    """Zone 1 STOCKOUT -> reuse the SAME SA, retry zone 2 -> SUCCESS."""
+async def test_multizonal_fallback_walks_next_zone_on_failure(tmp_path, monkeypatch):
+    """Zone A build FAILS (capacity) -> reuse the SAME SA, walk to zone B -> SUCCESS.
+    Spec is proven valid, so a post-submit failure = no GPU placement -> failover."""
     monkeypatch.setenv("JARVIS_BAKE_WAL", str(tmp_path / "wal.log"))
     monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "zoneA,zoneB,zoneC")
     b, wal = _baker(tmp_path)
     calls = []
     await _wire(monkeypatch, b, calls=calls)
 
-    # First build FAILS+stockout, second SUCCEEDS.
-    seq = ["FAILURE", "SUCCESS"]
+    seq = ["FAILURE", "SUCCESS"]  # zone A fails to place GPU, zone B succeeds
     async def poll(build_id, **kw):
         calls.append("poll"); return seq.pop(0)
-    async def stockout(build_id):
-        return True  # zone A was a stockout
     monkeypatch.setattr(b, "poll", poll)
-    monkeypatch.setattr(b, "_build_failed_with_stockout", stockout)
 
     ok = await b.bake_with_ephemeral_iam()
     assert ok is True
     assert calls.count("create_sa") == 1     # ONE SA reused across zones
-    assert calls.count("submit") == 2        # retried in zone B
+    assert calls.count("submit") == 2        # walked to zone B
     assert calls.count("delete_sa") == 1     # torn down once
     text = wal.read_text()
-    assert "STOCKOUT zone=zoneA" in text
+    assert "BUILD FAILED zone=zoneA" in text and "failover" in text
     assert "GOLDEN IMAGE READY" in text and "zone=zoneB" in text
+
+
+async def test_all_zones_failing_reports_capacity_drought(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BAKE_WAL", str(tmp_path / "wal.log"))
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "zoneA,zoneB")
+    b, wal = _baker(tmp_path)
+    calls = []
+    await _wire(monkeypatch, b, calls=calls, poll_status="FAILURE")  # every zone fails
+    ok = await b.bake_with_ephemeral_iam()
+    assert ok is False
+    assert calls.count("submit") == 2        # walked the whole 2-zone chain
+    assert calls.count("delete_sa") == 1     # SA still reaped
+    assert "all 2 zones failed to place the GPU" in wal.read_text()
 
 
 async def test_sa_create_denied_aborts_no_teardown(tmp_path, monkeypatch):
@@ -123,3 +134,29 @@ async def test_sa_create_denied_aborts_no_teardown(tmp_path, monkeypatch):
     assert ok is False
     assert "delete_sa" not in calls       # nothing to tear down (none created)
     assert "BAKE ABORT" in wal.read_text()
+
+
+async def test_bind_roles_retries_on_etag_conflict(tmp_path, monkeypatch):
+    """setIamPolicy etag race: re-read + retry until it sticks."""
+    b, _ = _baker(tmp_path)
+    monkeypatch.setenv("JARVIS_BAKE_IAM_RMW_RETRIES", "5")
+    reads = {"n": 0}
+
+    async def get_policy(project, token):
+        reads["n"] += 1
+        return {"bindings": [], "etag": f"e{reads['n']}"}
+
+    set_calls = {"n": 0}
+
+    async def set_policy(project, token, policy):
+        set_calls["n"] += 1
+        return set_calls["n"] >= 3   # first 2 setIamPolicy calls "conflict", 3rd wins
+
+    monkeypatch.setattr(b, "_get_project_policy", get_policy)
+    monkeypatch.setattr(b, "_set_project_policy", set_policy)
+    monkeypatch.setattr("backend.core.ouroboros.governance.cloud_build_baker.asyncio.sleep",
+                        _nosleep)
+    ok = await b._bind_roles("p", "tok", "serviceAccount:x@p.iam.gserviceaccount.com",
+                             ["roles/compute.instanceAdmin.v1"])
+    assert ok is True
+    assert reads["n"] == 3 and set_calls["n"] == 3   # re-read each retry
