@@ -12,6 +12,7 @@ import pytest
 
 from backend.core.ouroboros.governance.failover_tier import (
     FailoverTier,
+    quality_tier,
     resolve_tier,
 )
 
@@ -82,3 +83,30 @@ def test_failover_tier_is_frozen_value():
     assert isinstance(t, FailoverTier)
     with pytest.raises(Exception):
         t.machine_type = "x"  # type: ignore[misc]  -- frozen
+
+
+# -- quality_tier(): the bake-time source of truth ---------------------------
+def test_quality_tier_accessor_returns_quality_spec():
+    t = quality_tier()
+    assert t.name == "quality"
+    assert t.image_family == "jarvis-prime-coder-32b"
+    assert t.model_label == "qwen2.5-coder:32b"
+    assert t.is_gpu is True
+
+
+def test_quality_tier_bypasses_the_cost_gate(monkeypatch):
+    """The cost gate governs PROVISIONING, not BAKING. With the gate OFF (default)
+    resolve_tier returns survival -- but the bake-time accessor MUST still dictate
+    the quality spec, else the baker would manufacture the 7B survival image."""
+    monkeypatch.delenv("JARVIS_FAILOVER_QUALITY_TIER_ENABLED", raising=False)
+    assert resolve_tier(urgency="immediate", complexity="complex").name == "survival"
+    assert quality_tier().name == "quality"
+    assert "32b" in quality_tier().model_label.lower()
+
+
+def test_quality_tier_honors_env_override(monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_QUALITY_IMAGE", "fam-x")
+    monkeypatch.setenv("JARVIS_FAILOVER_QUALITY_MODEL", "model-x:7b")
+    t = quality_tier()
+    assert t.image_family == "fam-x"
+    assert t.model_label == "model-x:7b"

@@ -45,18 +45,25 @@ from backend.core.ouroboros.governance.cloud_build_baker import (  # noqa: E402
     build_status_is_success,
     verify_cross_repo_spec,
 )
+from backend.core.ouroboros.governance.failover_tier import quality_tier  # noqa: E402
 
 
 def _parse_args(argv):
-    p = argparse.ArgumentParser(description="Hands-off bake of the 32B GPU golden image via Cloud Build REST.")
+    # The QUALITY tier is the absolute dictator of model + image family: both
+    # defaults resolve from failover_tier.quality_tier() (env-overridable there),
+    # so the bake CLI can NEVER request an artifact that differs from what the
+    # provisioner awakens. Explicit --model/--image-family still override (the
+    # small-model validation bake path).
+    _qt = quality_tier()
+    p = argparse.ArgumentParser(description="Hands-off bake of the GPU golden image via Cloud Build REST.")
     p.add_argument("--project", default=os.environ.get("GCP_PROJECT"),
                    help="GCP project (default $GCP_PROJECT; else resolved from ADC at run).")
     p.add_argument("--zone", default=os.environ.get("GCP_ZONE", "us-central1-b"),
                    help="Build/bake zone (must have the accelerator available).")
-    p.add_argument("--model", default=os.environ.get("JARVIS_FAILOVER_QUALITY_MODEL", "qwen2.5-coder:32b"),
-                   help="Ollama model to pre-pull into the image.")
-    p.add_argument("--image-family", default=os.environ.get("JARVIS_FAILOVER_QUALITY_IMAGE", "jarvis-prime-coder-32b"),
-                   help="Published image family (must equal the quality tier's image).")
+    p.add_argument("--model", default=_qt.model_label,
+                   help="Ollama model to pre-pull into the image (default: the quality tier's model).")
+    p.add_argument("--image-family", default=_qt.image_family,
+                   help="Published image family (default: the quality tier's image -- the dictator).")
     p.add_argument("--spec", default=None,
                    help="Path to the Packer .hcl spec (default: the SOVEREIGN jarvis-prime spec "
                         "$JARVIS_PRIME_PATH/infra/packer/jprime_gpu_golden_image.pkr.hcl).")
