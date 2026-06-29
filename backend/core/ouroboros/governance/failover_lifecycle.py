@@ -403,11 +403,30 @@ async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
                 "DORMANT, op stays sealed in Cryo-DLQ (loop not crashed)", detail,
             )
             return False
-        ok_create, cdetail = await client.create_instance(startup_script=startup_script)
+        # Adaptive Workload Provisioning: resolve the tier (survival 7B-CPU by
+        # default; quality 32B-GPU only when the gate is ON for a high-priority
+        # op). Inject the tier's machine type, golden image (== baked model), and
+        # any GPU accelerator into the REST provision. Deterministic from env ->
+        # consistent with the controller's stored active model.
+        from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+            resolve_tier,
+        )
+        _tier = resolve_tier(
+            urgency=_env_str("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
+            complexity=_env_str("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
+        )
+        ok_create, cdetail = await client.create_instance(
+            startup_script=startup_script,
+            machine_type=_tier.machine_type,
+            image_family=_tier.image_family,
+            accelerator_type=_tier.accelerator_type,
+            accelerator_count=_tier.accelerator_count,
+        )
         if ok_create:
             logger.info(
-                "[FailoverLifecycle] awaken: node created via native Compute REST "
-                "(%s) -- zero gcloud", cdetail,
+                "[FailoverLifecycle] awaken: %s-tier node created via native "
+                "Compute REST (%s, model=%s, gpu=%s) -- zero gcloud",
+                _tier.name, cdetail, _tier.model_label, _tier.is_gpu,
             )
             return True
         logger.warning(
@@ -738,6 +757,9 @@ class FailoverLifecycleController:
         # IaC ephemeral firewall micro-perimeter: the rule name opened at AWAKEN,
         # torn down (alongside the node) on EVERY exit path. None == no hole open.
         self._ephemeral_fw_rule: Optional[str] = None
+        # The model label of the actively-provisioned tier (drives model-aware
+        # schema compaction). None until a tier is provisioned -> survival default.
+        self._active_model_label: Optional[str] = None
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
@@ -773,6 +795,20 @@ class FailoverLifecycleController:
         if self._state == FailoverState.SERVING:
             return self._endpoint
         return None
+
+    def active_jprime_model(self) -> str:
+        """The model label of the actively-provisioned tier (drives model-aware
+        compaction: a small model -> compact, a 32B GPU node -> full schema).
+        Falls back to the configured survival-tier model. NEVER raises."""
+        if self._active_model_label:
+            return self._active_model_label
+        try:
+            from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+                resolve_tier,
+            )
+            return resolve_tier().model_label  # default (survival) tier model
+        except Exception:  # noqa: BLE001
+            return "qwen2.5-coder:7b"
 
     # ------------------------------------------------------------------
     # Event hooks (gated, fail-soft)
@@ -1510,6 +1546,18 @@ class FailoverLifecycleController:
             return
         self._endpoint = self._build_endpoint()
         logger.info("[FailoverLifecycle] AWAKENING node endpoint=%s", self._endpoint)
+        # Record the active tier's model (drives model-aware schema compaction).
+        # Deterministic from the same env the awaken_fn resolved, so they agree.
+        try:
+            from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+                resolve_tier,
+            )
+            self._active_model_label = resolve_tier(
+                urgency=_env_str("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
+                complexity=_env_str("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
+            ).model_label
+        except Exception:  # noqa: BLE001
+            self._active_model_label = None
         # IaC ephemeral micro-perimeter: open a /32 hole for THIS orchestrator's
         # detected egress IP so the Reachability Racer's external path can reach
         # the node. Fail-soft -- a firewall miss never blocks awaken (the racer
