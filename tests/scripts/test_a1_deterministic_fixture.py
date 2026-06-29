@@ -449,6 +449,32 @@ def test_fatal_fixture_configuration_error_is_exception():
 
 
 # ---------------------------------------------------------------------------
+# OS-agnostic interceptor — logical parity, not blind string copy. Maps the
+# cloud node's /opt/trinity/jarvis repo prefix to the local root under
+# JARVIS_LOCAL_MODE so a composed cloud env runs faithfully on macOS.
+# ---------------------------------------------------------------------------
+
+
+def test_remap_cloud_paths_is_noop_when_disabled():
+    from a1_deterministic_fixture import remap_cloud_paths_for_local
+
+    env = {"X": "/opt/trinity/jarvis/foo"}
+    out = remap_cloud_paths_for_local(env, local_root="/Users/me/repo", enabled=False)
+    assert out["X"] == "/opt/trinity/jarvis/foo"  # untouched
+
+
+def test_remap_cloud_paths_maps_cloud_prefix_to_local_root():
+    from a1_deterministic_fixture import remap_cloud_paths_for_local
+
+    env = {"A": "/opt/trinity/jarvis/foo", "B": "/other/path", "C": "notapath", "N": 7}
+    out = remap_cloud_paths_for_local(env, local_root="/Users/me/repo", enabled=True)
+    assert out["A"] == "/Users/me/repo/foo"  # cloud repo prefix -> local root
+    assert out["B"] == "/other/path"  # unrelated abs path untouched
+    assert out["C"] == "notapath"
+    assert out["N"] == 7  # non-str values pass through
+
+
+# ---------------------------------------------------------------------------
 # Strict Subprocess Contract — fail-fast on a mangled fixture config BEFORE the
 # node boots, so we never burn a node window on a misconfigured run.
 # ---------------------------------------------------------------------------

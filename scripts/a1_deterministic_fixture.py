@@ -310,6 +310,26 @@ def apply_fixture_generator_overlay(
     return True
 
 
+# The cloud node's repo prefix; the local interceptor maps it to the local root.
+CLOUD_REPO_PREFIX = "/opt/trinity/jarvis"
+
+
+def remap_cloud_paths_for_local(env, *, local_root: str, enabled: bool) -> dict:
+    """OS-agnostic interceptor: when ``enabled`` (JARVIS_LOCAL_MODE), rewrite any
+    composed-env value carrying the cloud node's repo prefix to ``local_root`` so
+    a faithfully-composed CLOUD env runs on macOS -- logical parity, not a blind
+    string copy. No-op when disabled. Non-str values pass through untouched."""
+    if not enabled:
+        return dict(env)
+    out = {}
+    for key, value in env.items():
+        if isinstance(value, str) and CLOUD_REPO_PREFIX in value:
+            out[key] = value.replace(CLOUD_REPO_PREFIX, local_root)
+        else:
+            out[key] = value
+    return out
+
+
 class FatalFixtureConfigurationError(RuntimeError):
     """Fixture mode is ON but overlay activation failed. FAIL-CLOSED: the
     orchestrator hard-crashes instead of silently falling back to the live LLM
