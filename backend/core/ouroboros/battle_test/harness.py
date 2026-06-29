@@ -1050,6 +1050,26 @@ class BattleTestHarness:
             with _BootPhase("boot_governed_loop_service"):
                 await self.boot_governed_loop_service()
 
+            # Gap 3 — ASYNC INTAKE PRE-WARM. The roadmap_ignition_daemon (started
+            # inside boot_governance_stack) opens a 60s window for the
+            # UnifiedIntakeRouter to attach. Intake used to boot LAST (after the
+            # provider-readiness gate + jarvis tiers + branch creation), racing
+            # that window -> the soak bt-2026-06-29-055555 circuit breaker.
+            # Now that the GLS exists, kick intake off CONCURRENTLY so it warms
+            # in parallel with those serial steps and the router is ready well
+            # inside the window. Joined below where boot_intake was awaited.
+            # Gated (default ON) -> OFF falls back to the legacy serial boot.
+            self._intake_boot_task = None
+            if (os.environ.get("JARVIS_INTAKE_CONCURRENT_PREWARM", "true")
+                    or "true").strip().lower() not in ("false", "0", "no", "off"):
+                self._intake_boot_task = asyncio.create_task(
+                    self.boot_intake(), name="intake_concurrent_prewarm",
+                )
+                logger.info(
+                    "[harness] intake pre-warm started CONCURRENTLY (Gap 3) -- "
+                    "router warms in parallel with governance-tail boot",
+                )
+
             # ── Slice 156 — interactive Discord control gateway ──
             # GLS (+ its _approval_provider) is up → start the bidirectional bot as a
             # decoupled background task: it DMs the operator [APPROVE]/[REJECT]/[STEER]
@@ -1098,7 +1118,12 @@ class BattleTestHarness:
             with _BootPhase("create_branch"):
                 self._branch_name = await self.create_branch()
             with _BootPhase("boot_intake"):
-                await self.boot_intake()
+                if self._intake_boot_task is not None:
+                    # Gap 3 -- join the concurrent pre-warm (already warming since
+                    # right after the GLS came up). boot_intake runs exactly once.
+                    await self._intake_boot_task
+                else:
+                    await self.boot_intake()
             # Phase 9 Slice 2 — synthetic workload injection.
             # Composes the canonical UnifiedIntakeRouter pipeline via
             # IntakeLayerService.ingest_envelope. Headless-only +

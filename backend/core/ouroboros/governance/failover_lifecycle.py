@@ -222,6 +222,24 @@ def _outage_extra_routes() -> List[str]:
     return [r.strip() for r in raw.split(",") if r.strip()]
 
 
+def _hard_escalation_enabled() -> bool:
+    """Gap 2 -- a sustained deep-probe drop streak forcefully promotes to
+    AWAKENING (forecast/confirm-window BYPASS). Default ON. A DEAD data plane
+    must not wait for a slow-recovery forecast. Hot-revert:
+    ``JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED=false`` -> legacy (degrade only)."""
+    return _enabled("JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED", "true")
+
+
+def _hard_outage_streak() -> int:
+    """Consecutive deep-probe drops that constitute a CONFIRMED data-plane
+    outage (the mathematical confirmation that replaces the forecast wait).
+    Default 3; clamped >= 2 (strictly above a transient blip). Env-tunable."""
+    try:
+        return max(2, int(os.environ.get("JARVIS_DW_HARD_OUTAGE_STREAK", "3")))
+    except (ValueError, TypeError):
+        return 3
+
+
 def _gcloud_fallback_enabled() -> bool:
     """Last-resort gcloud-CLI fallback gate. Default FALSE.
 
@@ -601,6 +619,7 @@ class FailoverLifecycleController:
         is_degrading_fn: Optional[Callable[[], bool]] = None,
         endpoint_publish_fn: Optional[Callable[[str], Any]] = None,
         flare_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        degrade_streak_fn: Optional[Callable[[], int]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -614,6 +633,10 @@ class FailoverLifecycleController:
         # tests. Fail-soft: a missing/erroring source reads as "not degrading"
         # (fail-CLOSED -> reactive path only, no false pre-warm).
         self._is_degrading_fn = is_degrading_fn  # None -> lazy default
+        # Gap 2 (hard escalation) -- the deep-probe drop STREAK source. Default:
+        # the heartbeat singleton's consecutive_failures(). A sustained streak IS
+        # the outage confirmation (forecast bypass). Injectable + fail-soft.
+        self._degrade_streak_fn = degrade_streak_fn  # None -> lazy default
         # Gap 3a -- endpoint publish boundary. Default: resolve the node IP and
         # write JARVIS_PRIME_URL / JARVIS_PRIME_HOST (where PrimeClient reads
         # its endpoint) + best-effort hot-swap a live PrimeClient. Injectable
@@ -1062,6 +1085,21 @@ class FailoverLifecycleController:
             )
             return
 
+        # Gap 2 -- HARD escalation. A sustained streak of deep-probe drops IS the
+        # outage confirmation (the data plane is confirmed dead). Forcefully
+        # awaken WITHOUT waiting for a slow-recovery forecast / 120s confirm
+        # window -- the streak threshold already encodes that confirmation.
+        if self._hard_outage_confirmed():
+            logger.warning(
+                "[FailoverLifecycle] HARD OUTAGE escalation: deep-probe drop "
+                "streak=%d >= %d -> FORCED AWAKEN (forecast/confirm bypass)",
+                self._degrade_streak_value(), _hard_outage_streak(),
+            )
+            await self._enter_awakening(
+                now=now, trigger="heartbeat_hard_outage", route=self._route,
+            )
+            return
+
         # Gap 2 -- EARLY pre-warm path. NOT yet a full outage, but the heartbeat
         # reports DEGRADATION. If the forecast also says recovery is slow
         # (R > C*margin, HIGH confidence), pre-warm J-Prime NOW so the node is
@@ -1161,6 +1199,32 @@ class FailoverLifecycleController:
             "PRE-WARM" if decision else "BLIP-SKIP (hold; reactive backstop)",
         )
         return decision
+
+    def _degrade_streak_value(self) -> int:
+        """Resolve the deep-probe drop STREAK (Gap 2). Default: the DW heartbeat
+        singleton's consecutive_failures(). Injectable + fail-soft (0 on error)."""
+        fn = self._degrade_streak_fn
+        if fn is None:
+            try:
+                from backend.core.ouroboros.governance.provider_heartbeat import (  # noqa: PLC0415
+                    get_dw_heartbeat,
+                )
+                fn = get_dw_heartbeat().consecutive_failures
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] streak resolve fail-soft err=%r", exc)
+                return 0
+        try:
+            return int(fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] degrade_streak fail-soft err=%r", exc)
+            return 0
+
+    def _hard_outage_confirmed(self) -> bool:
+        """Gap 2 -- True iff the sustained deep-probe drop streak has reached the
+        hard-outage threshold (a CONFIRMED dead data plane). Fail-soft -> False."""
+        if not _hard_escalation_enabled():
+            return False
+        return self._degrade_streak_value() >= _hard_outage_streak()
 
     def _is_degrading(self) -> bool:
         """Resolve the early-degradation signal. Default: the DW heartbeat
