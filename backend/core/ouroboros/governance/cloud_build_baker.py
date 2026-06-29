@@ -51,10 +51,6 @@ _DEFAULT_BAKER_ROLES = (
     "roles/compute.storageAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
-    # Write build logs to GCS (GCS_ONLY) so they survive the SA's deletion ->
-    # stockout-detection + post-mortem stay readable. objectAdmin, not the
-    # bucket-mutating storage.admin (least privilege).
-    "roles/storage.objectAdmin",
 )
 
 
@@ -206,12 +202,15 @@ def build_packer_cloud_build(
         "substitutions": dict(substitutions or {}),
     }
     if service_account:
-        # A custom build SA REQUIRES an explicit logging mode. Use GCS (not
-        # CLOUD_LOGGING_ONLY) so the build log SURVIVES the ephemeral SA's
-        # deletion -- the stockout detector + post-mortem read it from GCS.
+        # A custom build SA REQUIRES an explicit logging mode. CLOUD_LOGGING_ONLY
+        # always submits (a custom SA can't write the reserved default GCS bucket).
+        # The stockout detector tolerates Cloud Logging's flush lag (wait+retry).
         cfg["serviceAccount"] = service_account
-        cfg["logsBucket"] = logs_bucket or "gs://{}_cloudbuild".format(project)
-        options["logging"] = "GCS_ONLY"
+        if logs_bucket:
+            cfg["logsBucket"] = logs_bucket
+            options["logging"] = "GCS_ONLY"
+        else:
+            options["logging"] = "CLOUD_LOGGING_ONLY"
     return cfg
 
 
@@ -246,6 +245,9 @@ class CloudBuildBaker:
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
         self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
+        # Stockout-probe tolerance for Cloud Logging flush lag (wait+retry).
+        self._stockout_log_retries = max(1, int(os.environ.get("JARVIS_BAKE_STOCKOUT_LOG_RETRIES", "5")))
+        self._stockout_log_wait_s = max(0, int(os.environ.get("JARVIS_BAKE_STOCKOUT_LOG_WAIT_S", "10")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -473,27 +475,34 @@ class CloudBuildBaker:
         return status == 200
 
     async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Inspect a failed build's GCS log for a transient GPU STOCKOUT (retryable
-        in another zone). Reads the build's ``logsBucket`` (GCS_ONLY) -> survives
-        the ephemeral SA's deletion (CLOUD_LOGGING vanished with the SA). Fail-soft
-        -> False (a non-stockout failure must NOT trigger a blind retry storm)."""
+        """Inspect a failed build's Cloud Logging output for a transient GPU
+        STOCKOUT (retryable in another zone). Cloud Logging LAGS the build's
+        terminal status by seconds, so this WAITS + RETRIES for the flush (the
+        prior miss queried before the log landed). Fail-soft -> False (a
+        non-stockout failure must NOT trigger a blind retry storm)."""
         from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
         from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
         try:
             token, project = await self._auth()
             if not token or not project:
                 return False
-            build = await self._get_build(project, token, build_id)
-            logs_bucket = str(build.get("logsBucket", "")).replace("gs://", "").split("/", 1)[0]
-            if not logs_bucket:
-                return False
-            obj = "log-{}.txt".format(build_id)
-            url = "{}/b/{}/o/{}?alt=media".format(_STORAGE_BASE, logs_bucket, obj)
-            status, text = await _http_request(
-                url, method="GET",
-                headers={"Authorization": "Bearer {}".format(token)}, timeout_s=30.0,
-            )
-            return is_stockout_error(text) if status == 200 else False
+            flt = 'resource.type="build" AND resource.labels.build_id="{}"'.format(build_id)
+            body = json.dumps({
+                "resourceNames": ["projects/{}".format(project)],
+                "filter": flt, "orderBy": "timestamp desc", "pageSize": 100,
+            }).encode("utf-8")
+            url = "https://logging.googleapis.com/v2/entries:list"
+            hdr = {"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"}
+            for attempt in range(self._stockout_log_retries):
+                status, resp = await _http_request(url, method="POST", headers=hdr, body=body, timeout_s=30.0)
+                if status == 200:
+                    text = " ".join(
+                        e.get("textPayload", "") for e in json.loads(resp).get("entries", [])
+                    )
+                    if text.strip():
+                        return is_stockout_error(text)  # log landed -> classify
+                await asyncio.sleep(self._stockout_log_wait_s)  # wait for the flush
+            return False  # log never materialized -> can't confirm -> don't retry-storm
         except Exception as exc:  # noqa: BLE001
             logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
             return False

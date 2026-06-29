@@ -28,9 +28,10 @@ def test_build_runs_as_custom_sa():
         service_account="projects/proj/serviceAccounts/baker@proj.iam.gserviceaccount.com",
     )
     assert cfg["serviceAccount"].endswith("baker@proj.iam.gserviceaccount.com")
-    # Custom SA -> GCS logging (survives SA deletion; stockout detector reads it).
-    assert cfg["options"]["logging"] == "GCS_ONLY"
-    assert cfg["logsBucket"].startswith("gs://")
+    # Custom SA -> CLOUD_LOGGING_ONLY by default (always submits; a custom SA
+    # can't write the reserved default GCS bucket). logs_bucket opts into GCS.
+    assert cfg["options"]["logging"] == "CLOUD_LOGGING_ONLY"
+    assert "logsBucket" not in cfg
 
 
 def test_no_service_account_no_logging_override():
