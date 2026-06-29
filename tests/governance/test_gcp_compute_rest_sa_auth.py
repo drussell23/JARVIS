@@ -132,6 +132,30 @@ async def test_sa_mint_exception_is_failsoft(monkeypatch):
 # No SA creds -> byte-identical legacy metadata path
 # ---------------------------------------------------------------------------
 
+async def test_ensure_token_concurrent_mints_exactly_once(monkeypatch):
+    """The parallel teardown gather (delete_instance + delete_firewall_rule on
+    ONE client) raced _ensure_token: it set _cred_minted=True BEFORE the await
+    completed, so the 2nd coroutine read the still-None cached token -> a bogus
+    AUTH_OR_PROJECT_UNRESOLVED (an orphan firewall hole). An asyncio.Lock must
+    serialize the mint so it runs EXACTLY once and every concurrent caller gets
+    the real token."""
+    import asyncio
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/sa.json")
+    calls = {"n": 0}
+
+    def _slow_mint(path):
+        import time
+        calls["n"] += 1
+        time.sleep(0.05)  # widen the race window
+        return ("tok-once", "proj-once")
+
+    monkeypatch.setattr(gcr, "mint_sa_access_token", _slow_mint)
+    client = gcr.GCPComputeRest()
+    results = await asyncio.gather(*[client.access_token() for _ in range(6)])
+    assert calls["n"] == 1                        # minted EXACTLY once (locked)
+    assert all(r == "tok-once" for r in results)   # every caller got the token
+
+
 async def test_no_sa_falls_back_to_metadata(monkeypatch):
     """Unset GOOGLE_APPLICATION_CREDENTIALS -> the metadata path is used exactly
     as before (the SA bridge composes ON TOP, never replaces)."""

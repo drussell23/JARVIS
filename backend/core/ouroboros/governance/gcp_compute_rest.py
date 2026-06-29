@@ -362,30 +362,45 @@ class GCPComputeRest:
         self._cred_token: Optional[str] = None
         self._cred_project: Optional[str] = None
         self._cred_minted = False
+        # Serializes the mint so concurrent callers (the parallel node+firewall
+        # teardown gather) never race: the mint runs EXACTLY once and every
+        # caller gets the real token. Created lazily to avoid loop-binding at
+        # construction (the client is built off the running loop in tests).
+        self._cred_lock: Optional["asyncio.Lock"] = None
 
     # -- adaptive credential bridge (off-GCE auth) -----------------------
 
     async def _ensure_token(self) -> Tuple[Optional[str], Optional[str]]:
         """Lazily mint + cache the (token, project) for the resolved off-GCE auth
-        mode (SA JSON or ADC). Off-loaded to a thread so the blocking google-auth
-        refresh never stalls the event loop. Fail-soft -> (None, None)."""
+        mode (SA JSON or ADC). asyncio.Lock-serialized so concurrent callers mint
+        EXACTLY once (the parallel-teardown race fix). Off-loaded to a thread so
+        the blocking google-auth refresh never stalls the loop. Fail-soft."""
         if self._cred_minted:
             return (self._cred_token, self._cred_project)
-        self._cred_minted = True
-        try:
-            loop = asyncio.get_event_loop()
-            if self._auth_mode == "sa":
-                token, project = await loop.run_in_executor(
-                    None, mint_sa_access_token, self._sa_path
-                )
-            else:  # adc
-                token, project = await loop.run_in_executor(
-                    None, mint_adc_access_token
-                )
-            self._cred_token, self._cred_project = token, project
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[GCPComputeRest] ensure-token fail-soft err=%r", exc)
-            self._cred_token, self._cred_project = None, None
+        if self._cred_lock is None:
+            self._cred_lock = asyncio.Lock()
+        async with self._cred_lock:
+            # Double-check inside the lock: a racer that won the lock first may
+            # have already minted while we waited.
+            if self._cred_minted:
+                return (self._cred_token, self._cred_project)
+            try:
+                loop = asyncio.get_event_loop()
+                if self._auth_mode == "sa":
+                    token, project = await loop.run_in_executor(
+                        None, mint_sa_access_token, self._sa_path
+                    )
+                else:  # adc
+                    token, project = await loop.run_in_executor(
+                        None, mint_adc_access_token
+                    )
+                self._cred_token, self._cred_project = token, project
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[GCPComputeRest] ensure-token fail-soft err=%r", exc)
+                self._cred_token, self._cred_project = None, None
+            # Set the flag AFTER the mint completes (not before) -- this is the
+            # race fix: a concurrent caller never sees minted=True with a None token.
+            self._cred_minted = True
         return (self._cred_token, self._cred_project)
 
     # -- metadata fetch --------------------------------------------------
