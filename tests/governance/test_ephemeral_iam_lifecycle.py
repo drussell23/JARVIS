@@ -108,7 +108,7 @@ async def test_multizonal_fallback_walks_next_zone_on_failure(tmp_path, monkeypa
     assert calls.count("submit") == 2        # walked to zone B
     assert calls.count("delete_sa") == 1     # torn down once
     text = wal.read_text()
-    assert "BUILD FAILED zone=zoneA" in text and "failover" in text
+    assert "STOCKOUT zone=zoneA" in text and "failover" in text
     assert "GOLDEN IMAGE READY" in text and "zone=zoneB" in text
 
 
@@ -122,7 +122,7 @@ async def test_all_zones_failing_reports_capacity_drought(tmp_path, monkeypatch)
     assert ok is False
     assert calls.count("submit") == 2        # walked the whole 2-zone chain
     assert calls.count("delete_sa") == 1     # SA still reaped
-    assert "all 2 zones failed to place the GPU" in wal.read_text()
+    assert "all 2 zones STOCKED OUT" in wal.read_text()
 
 
 async def test_sa_create_denied_aborts_no_teardown(tmp_path, monkeypatch):

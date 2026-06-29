@@ -246,6 +246,10 @@ class CloudBuildBaker:
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
         self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
+        # A build that fails FASTER than this (s) is a capacity stockout (rejected
+        # at instance creation) -> walk the next zone. A SLOWER failure means the
+        # instance was placed and a bake step failed -> STOP (real error).
+        self._stockout_max_s = max(30, int(os.environ.get("JARVIS_BAKE_STOCKOUT_MAX_S", "150")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -505,9 +509,11 @@ class CloudBuildBaker:
             from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
                 zone_fallback_chain,
             )
+            import time  # noqa: PLC0415
             chain = zone_fallback_chain(self.zone)
             for zone in chain:
                 self.zone = zone
+                _t0 = time.monotonic()
                 build_id = await self.submit()
                 if not build_id:
                     self._write_flare("BAKE FAILED: submit rejected zone={}".format(zone))
@@ -518,17 +524,25 @@ class CloudBuildBaker:
                     self._write_flare("GOLDEN IMAGE READY image_family={} build={} zone={}".format(
                         self.image_family, build_id, zone))
                     return True
-                # The spec is PROVEN valid (it resolves the image + requests the
-                # instance), so a post-submit build failure means this zone could
-                # not PLACE the GPU instance = capacity/stockout. Walk the next zone
-                # (bounded by the chain). Custom-SA logs aren't queryable, so this
-                # is the robust signal -- bounded, never an unbounded retry storm.
+                # DURATION-gated failover. A capacity STOCKOUT is rejected at
+                # instance creation -> FAST failure (~80s). A SLOW failure means the
+                # instance WAS placed and a later bake step (Ollama/pull) failed ->
+                # walking other zones is futile + wastes ~5min/zone. So: fast fail ->
+                # next zone; slow fail -> STOP (real error -- diagnose, don't storm).
+                _dur = time.monotonic() - _t0
+                if _dur < self._stockout_max_s:
+                    self._write_flare(
+                        "STOCKOUT zone={} ({:.0f}s fast fail) build={} -> failover to "
+                        "next zone".format(zone, _dur, build_id))
+                    continue
                 self._write_flare(
-                    "BUILD FAILED zone={} status={} build={} -> failover to next zone "
-                    "(spec validated; treating as GPU capacity)".format(zone, status, build_id))
+                    "BAKE FAILED zone={} status={} build={} ({:.0f}s -- past instance "
+                    "creation = REAL bake-step error, NOT capacity) -> STOP (diagnose)".format(
+                        zone, status, build_id, _dur))
+                return False
             self._write_flare(
-                "BAKE FAILED: all {} zones failed to place the GPU ({}) -- L4 capacity "
-                "drought, retry later".format(len(chain), ",".join(chain)))
+                "BAKE FAILED: all {} zones STOCKED OUT ({}) -- L4 capacity drought, "
+                "retry later".format(len(chain), ",".join(chain)))
             return False
         finally:
             if sa_email:
