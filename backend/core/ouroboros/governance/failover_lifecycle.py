@@ -760,6 +760,9 @@ class FailoverLifecycleController:
         # The model label of the actively-provisioned tier (drives model-aware
         # schema compaction). None until a tier is provisioned -> survival default.
         self._active_model_label: Optional[str] = None
+        # Elastic GPU escalation lane (lazily built on first demand). Manages the
+        # SECOND, concurrent GPU node lifecycle with crypto-namespaced assets.
+        self._gpu_lane: Optional[Any] = None
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
@@ -809,6 +812,113 @@ class FailoverLifecycleController:
             return resolve_tier().model_label  # default (survival) tier model
         except Exception:  # noqa: BLE001
             return "qwen2.5-coder:7b"
+
+    # ------------------------------------------------------------------
+    # Elastic GPU escalation lane (the SECOND, concurrent node)
+    # ------------------------------------------------------------------
+    @property
+    def gpu_lane(self):
+        """Lazily-built elastic GPU lane wired to REAL provision/reap boundaries.
+        Provisions a crypto-namespaced ``gpu``-class node (its own VM + /32
+        firewall, never colliding with the live CPU node), registers it in the
+        Fleet Registry, and reaps it the instant its in-flight drains. Returns
+        ``None`` if the lane module is unavailable (fail-soft)."""
+        if self._gpu_lane is None:
+            try:
+                from backend.core.ouroboros.governance.failover_gpu_lane import (  # noqa: PLC0415
+                    GpuEscalationLane,
+                )
+                self._gpu_lane = GpuEscalationLane(
+                    provision_fn=self._provision_gpu_node,
+                    reap_fn=self._reap_gpu_node,
+                    outage_confirmed_fn=self._hard_outage_confirmed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] gpu_lane build fail-soft err=%r", exc)
+                return None
+        return self._gpu_lane
+
+    async def _provision_gpu_node(self) -> Optional[str]:
+        """Provision the crypto-namespaced GPU node (quality tier): instances.insert
+        + its OWN /32 firewall rule + race readiness -> register the external
+        endpoint in the Fleet Registry. Returns the endpoint or None. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest, resolve_local_public_ip,
+            )
+            from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+                resolve_tier_for_op,
+            )
+            from backend.core.ouroboros.governance.failover_naming import (  # noqa: PLC0415
+                node_name, firewall_name,
+            )
+            from backend.core.ouroboros.governance.fleet_registry import (  # noqa: PLC0415
+                get_fleet_registry,
+            )
+            tier = resolve_tier_for_op(urgency="immediate", complexity="complex")
+            if not tier.is_gpu:
+                return None  # quality gate OFF -> never spend
+            client = get_compute_rest()
+            gpu_vm = node_name("gpu")
+            ok, detail = await client.create_instance(
+                startup_script=self._build_startup_script(),
+                name=gpu_vm,
+                machine_type=tier.machine_type,
+                image_family=tier.image_family,
+                accelerator_type=tier.accelerator_type,
+                accelerator_count=tier.accelerator_count,
+            )
+            if not ok:
+                logger.warning("[FailoverLifecycle] GPU provision insert failed: %s", detail)
+                return None
+            # Own /32 firewall rule (crypto-namespaced -> no collision with cpu).
+            if _ephemeral_fw_enabled():
+                ip = await resolve_local_public_ip()
+                if ip:
+                    await client.create_firewall_rule(
+                        name=firewall_name("gpu"), source_ip=ip, port=_failover_port(),
+                    )
+            internal_ip, external_ip = await client.get_node_endpoints(gpu_vm)
+            candidates = [
+                "http://{}:{}".format(h, _failover_port())
+                for h in (external_ip, internal_ip) if h
+            ]
+            winner = await self._race_node_ready(candidates) if candidates else None
+            if not winner:
+                logger.warning("[FailoverLifecycle] GPU node never became ready -> reap")
+                await self._reap_gpu_node()
+                return None
+            get_fleet_registry().register("gpu", winner)
+            logger.info("[FailoverLifecycle] GPU node SERVING endpoint=%s vm=%s", winner, gpu_vm)
+            return winner
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FailoverLifecycle] GPU provision fail-soft err=%r", exc)
+            return None
+
+    async def _reap_gpu_node(self) -> None:
+        """Reap the GPU node: delete the VM + its firewall rule (by reconstructed
+        crypto-namespaced names) + unregister from the Fleet Registry. The CPU
+        node is untouched. Idempotent + fail-soft. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            from backend.core.ouroboros.governance.failover_naming import (  # noqa: PLC0415
+                node_name, firewall_name,
+            )
+            from backend.core.ouroboros.governance.fleet_registry import (  # noqa: PLC0415
+                get_fleet_registry,
+            )
+            client = get_compute_rest()
+            await asyncio.gather(
+                client.delete_instance(node_name("gpu")),
+                client.delete_firewall_rule(firewall_name("gpu")),
+                return_exceptions=True,
+            )
+            get_fleet_registry().unregister("gpu")
+            logger.info("[FailoverLifecycle] GPU node REAPED (CPU survives)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FailoverLifecycle] GPU reap fail-soft err=%r", exc)
 
     # ------------------------------------------------------------------
     # Event hooks (gated, fail-soft)
@@ -1731,6 +1841,16 @@ class FailoverLifecycleController:
         self._serving_started_at = now
         self._last_probe_at = None
         self._recovered_streak = 0
+        # Fleet Registry: publish the CPU (survival) node's endpoint so the
+        # per-op router can resolve it independently of the elastic GPU node.
+        try:
+            from backend.core.ouroboros.governance.fleet_registry import (  # noqa: PLC0415
+                get_fleet_registry,
+            )
+            if self._endpoint:
+                get_fleet_registry().register("cpu", self._endpoint)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] fleet register(cpu) fail-soft err=%r", exc)
         logger.info("[FailoverLifecycle] SERVING via J-Prime endpoint=%s", self._endpoint)
         # ABSOLUTE HANDOFF PROOF: record the exact winning endpoint the GENERATE
         # queue is now routed to (the Reachability-Racer winner + the wired
@@ -1873,6 +1993,20 @@ class FailoverLifecycleController:
         #    is_jprime_serving()/jprime_endpoint() stop pointing at the node and
         #    ALL NEW ops route to DW instantly (T4 re-routes to DW).
         self._endpoint = None
+        # Fleet teardown: unpublish the CPU node + force-reap any elastic GPU node
+        # (both must vacate on handback so nothing keeps billing or routing).
+        try:
+            from backend.core.ouroboros.governance.fleet_registry import (  # noqa: PLC0415
+                get_fleet_registry,
+            )
+            get_fleet_registry().unregister("cpu")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] fleet unregister(cpu) fail-soft err=%r", exc)
+        try:
+            if self._gpu_lane is not None:
+                await self._gpu_lane.drain_and_reap()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] gpu lane reap fail-soft err=%r", exc)
 
         # 2.5 ZERO-DROP DRAIN: await any IN-FLIGHT J-Prime ops to finish before
         #     teardown so none is severed mid-generation. Bounded by a budget
