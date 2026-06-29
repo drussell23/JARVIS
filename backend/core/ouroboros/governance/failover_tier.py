@@ -99,6 +99,41 @@ def resolve_tier(*, urgency: str = "", complexity: str = "") -> FailoverTier:
     return _survival_tier()
 
 
+def op_exceeds_small_capacity(*, estimated_tokens: int) -> bool:
+    """Predictable cost-aware gate: True iff the op's estimated token budget
+    exceeds the small (7B) model's working capacity (env
+    ``JARVIS_FAILOVER_7B_TOKEN_CAPACITY`` default 24000 -- headroom under the 32K
+    window for the generation). 0/unknown -> False (never forces GPU on no info).
+    NEVER raises."""
+    try:
+        n = int(estimated_tokens or 0)
+        if n <= 0:
+            return False
+        return n > _env_int("JARVIS_FAILOVER_7B_TOKEN_CAPACITY", 24000)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def resolve_tier_for_op(
+    *, urgency: str = "", complexity: str = "", estimated_tokens: int = 0,
+) -> FailoverTier:
+    """Tier selection with the cost-aware gate folded in. The quality (GPU/32B)
+    tier is selected when the master gate is ON AND EITHER the op is high-priority
+    (urgency/complexity) OR its token budget mathematically overflows the 7B's
+    capacity (a strict guarantee -- the 7B literally cannot fit the context).
+    The master cost gate is absolute: disabled -> survival even on overflow
+    (degraded best-effort, never silent GPU spend). NEVER raises."""
+    try:
+        if quality_tier_enabled() and (
+            _is_high_priority(urgency, complexity)
+            or op_exceeds_small_capacity(estimated_tokens=estimated_tokens)
+        ):
+            return _quality_tier()
+    except Exception:  # noqa: BLE001
+        pass
+    return _survival_tier()
+
+
 def model_param_billions(model_label: str) -> float:
     """Parse the parameter size (in billions) from a model label, e.g.
     ``qwen2.5-coder:32b-instruct`` -> 32.0. Unknown -> 0.0. NEVER raises."""
@@ -121,6 +156,6 @@ def is_small_model(model_label: str, *, threshold_b: float = 0.0) -> bool:
 
 
 __all__ = [
-    "FailoverTier", "resolve_tier", "quality_tier_enabled",
-    "model_param_billions", "is_small_model",
+    "FailoverTier", "resolve_tier", "resolve_tier_for_op", "quality_tier_enabled",
+    "op_exceeds_small_capacity", "model_param_billions", "is_small_model",
 ]
