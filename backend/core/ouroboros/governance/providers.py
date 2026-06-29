@@ -2052,6 +2052,67 @@ def _route_stable_tail(
         parts.append(schema_section)
 
 
+import re as _re_compact
+
+# Verbose optional tool-section blocks a small (7B) model does not need and that
+# overflow its context. Matched by the START of their "### " header (substring).
+_COMPACT_DROP_HEADERS = ("parallel tool calls", "voice-first")
+
+
+def _compact_tool_budget() -> int:
+    try:
+        return max(100, int(os.environ.get("JARVIS_VENOM_COMPACT_TOOL_MAX_CHARS", "4000")))
+    except (ValueError, TypeError):
+        return 4000
+
+
+def compact_tool_section(section: str) -> str:
+    """Provider-aware cognitive armor: strip the verbose optional essays from the
+    tool section (keeping the essential envelope + tool list), collapse blank
+    lines, and hard-truncate to a char budget -- so a 7B model isn't drowned.
+    Marker-driven (no hardcoded content). Fail-soft -> the original on any error."""
+    try:
+        if not section or not isinstance(section, str):
+            return section
+        # Split into the leading content + ("### header", body) pairs.
+        chunks = _re_compact.split(r"(?m)^(### .+)$", section)
+        out = [chunks[0]]
+        i = 1
+        while i < len(chunks):
+            header = chunks[i]
+            body = chunks[i + 1] if i + 1 < len(chunks) else ""
+            drop = any(h in header.lower() for h in _COMPACT_DROP_HEADERS)
+            if not drop:
+                out.append(header)
+                out.append(body)
+            i += 2
+        result = _re_compact.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+        budget = _compact_tool_budget()
+        if len(result) > budget:
+            result = result[:budget].rstrip() + (
+                "\n... [tool list truncated for compact context] ...\n"
+            )
+        return result
+    except Exception:  # noqa: BLE001
+        return section
+
+
+def _should_compact_for_jprime() -> bool:
+    """Compact the tool section iff the failover FSM reports J-Prime is the active
+    generator. Dynamic + provider-aware with NO hardcoded provider check -- the
+    FSM IS the signal. Master-gated (default ON). Fail-soft -> False."""
+    val = (os.environ.get("JARVIS_VENOM_SCHEMA_SIMPLIFY_ENABLED", "true") or "true").strip().lower()
+    if val in ("false", "0", "no", "off"):
+        return False
+    try:
+        from backend.core.ouroboros.governance.failover_lifecycle import (  # noqa: PLC0415
+            get_failover_controller,
+        )
+        return bool(get_failover_controller().is_jprime_serving())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _build_tool_section(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -2518,7 +2579,13 @@ def _build_exploration_manifest_block(manifest: Any) -> str:
             if _extra_ft > 0:
                 lines.append(f"- _(+{_extra_ft} more)_")
 
-        return "\n".join(lines)
+        _section = "\n".join(lines)
+        # Cognitive armor: when the failover FSM reports J-Prime (7B) is the
+        # active generator, dynamically compact the section to cut cognitive load
+        # + context overflow. Fail-soft -> the full section.
+        if _should_compact_for_jprime():
+            _section = compact_tool_section(_section)
+        return _section
     except Exception:  # noqa: BLE001 — Slice 89 never-raises contract
         return ""
 
