@@ -383,6 +383,9 @@ class DWHeartbeat:
         # intake DLQ. Injectable for tests. A 401/403 FREEZES the loop here.
         self._dlq_emit_fn = dlq_emit_fn or _default_dlq_emit
         self._frozen = False  # set True on an auth/config error -> never awakens
+        # Recovery signal (Handback Protocol): consecutive HEALTHY probes. A
+        # streak of fast-healthy beats means DW recovered -> drives SERVING->HANDBACK.
+        self._healthy_streak = 0
         # Baseline healthy-probe latency metric (EWMA) -- drives the DYNAMIC
         # deep-probe timeout. Seeded from env; updated on each healthy probe.
         self._baseline_latency_s: float = _env_float(
@@ -447,6 +450,28 @@ class DWHeartbeat:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[DWHeartbeat] latest_verdict fail-soft err=%r", exc)
             return None
+
+    def consecutive_successes(self) -> int:
+        """Current HEALTHY streak (consecutive fast-healthy probes). Drives the
+        SERVING->HANDBACK recovery decision. 0 when OFF / frozen / degraded."""
+        if not heartbeat_enabled() or self._frozen:
+            return 0
+        return int(self._healthy_streak)
+
+    def dw_recovered(self, *, min_streak: int = 3, max_latency_s: float = 5.0) -> bool:
+        """Handback recovery predicate: DW has returned ``min_streak`` consecutive
+        HEALTHY probes AND the recent probe latency (baseline EWMA) is below
+        ``max_latency_s`` (a slow-but-healthy DW is NOT 'recovered'). Fail-soft
+        -> False (stay SERVING; conservative -- never a premature handback)."""
+        if not heartbeat_enabled() or self._frozen:
+            return False
+        try:
+            return (
+                int(self._healthy_streak) >= max(1, int(min_streak))
+                and float(self._baseline_latency_s) <= float(max_latency_s)
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     def consecutive_failures(self) -> int:
         """Current degrade streak for the DW SSE surface (0 when healthy).
@@ -559,6 +584,7 @@ class DWHeartbeat:
             # degrade streak. is_degrading()/consecutive_failures() now read 0 ->
             # a misconfiguration can NEVER provision infrastructure.
             self._frozen = True
+            self._healthy_streak = 0
             logger.critical(
                 "[DWHeartbeat] AEGIS CONFIG ERROR -- probe cannot authenticate "
                 "(401/403). FREEZING heartbeat; this is NOT a DW outage and will "
@@ -570,6 +596,8 @@ class DWHeartbeat:
             logger.debug("[DWHeartbeat] probe raised (outage degrade) err=%r", exc)
             ok = False
 
+        # Recovery streak: consecutive HEALTHY beats (reset on any degrade).
+        self._healthy_streak = (self._healthy_streak + 1) if ok else 0
         verdict = SurfaceVerdict.HEALTHY if ok else SurfaceVerdict.TRANSPORT_DEGRADED
         try:
             rec = self._ledger.record(

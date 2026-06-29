@@ -262,6 +262,27 @@ def _ready_backoff_cap_s() -> float:
     return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", 15.0))
 
 
+def _handback_drain_budget_s() -> float:
+    """Max seconds HANDBACK waits for in-flight J-Prime ops to drain to 0 before
+    tearing down anyway (bounded -- never deadlock the FSM; the Dead-Man's Switch
+    is the backstop). Default 120s (covers a slow CPU generation)."""
+    return max(0.0, _env_float("JARVIS_HANDBACK_DRAIN_BUDGET_S", 120.0))
+
+
+def _handback_drain_poll_s() -> float:
+    return max(0.01, _env_float("JARVIS_HANDBACK_DRAIN_POLL_S", 1.0))
+
+
+def _recovery_streak_n() -> int:
+    """Consecutive HEALTHY deep-probes that confirm DW recovery -> HANDBACK."""
+    return max(1, _env_int("JARVIS_DW_RECOVERY_STREAK", 3))
+
+
+def _recovery_max_latency_s() -> float:
+    """A healthy DW probe slower than this is NOT 'recovered' (still degraded)."""
+    return max(0.1, _env_float("JARVIS_DW_RECOVERY_MAX_LATENCY_S", 5.0))
+
+
 def _ready_backoff_budget_s() -> float:
     """Per-AWAKENING-tick L7-readiness poll budget (bounded so the tick stays
     responsive). The AWAKENING timeout (default 600s) is the hard outer bound
@@ -667,6 +688,7 @@ class FailoverLifecycleController:
         endpoint_publish_fn: Optional[Callable[[str], Any]] = None,
         flare_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
         degrade_streak_fn: Optional[Callable[[], int]] = None,
+        in_flight_fn: Optional[Callable[[], int]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -684,6 +706,10 @@ class FailoverLifecycleController:
         # the heartbeat singleton's consecutive_failures(). A sustained streak IS
         # the outage confirmation (forecast bypass). Injectable + fail-soft.
         self._degrade_streak_fn = degrade_streak_fn  # None -> lazy default
+        # Zero-Drop Drain: count of in-flight J-Prime ops (HANDBACK awaits this
+        # to reach 0 before teardown so no op is severed mid-generation).
+        # Injectable; default resolves the live count or 0 (immediate teardown).
+        self._in_flight_fn = in_flight_fn
         # Gap 3a -- endpoint publish boundary. Default: resolve the node IP and
         # write JARVIS_PRIME_URL / JARVIS_PRIME_HOST (where PrimeClient reads
         # its endpoint) + best-effort hot-swap a live PrimeClient. Injectable
@@ -1726,16 +1752,36 @@ class FailoverLifecycleController:
 
         hyst_ok = self._recovered_streak >= _hysteresis_cycles()
         uptime_ok = self._jprime_uptime(now=now) >= _min_uptime_s()
+        # #2 -- deep-probe recovery: the background DW heartbeat reporting N
+        # consecutive fast-healthy probes is an INDEPENDENT recovery signal
+        # (data-plane, faithful) that also satisfies the recovery gate.
+        deep_ok = self._deep_probe_recovered()
 
-        if hyst_ok and uptime_ok:
+        if (hyst_ok or deep_ok) and uptime_ok:
             logger.info(
-                "[FailoverLifecycle] HANDBACK gate passed: recovered_streak=%d (>=%d) "
-                "uptime=%.1fs (>=%.1fs)",
-                self._recovered_streak, _hysteresis_cycles(),
+                "[FailoverLifecycle] HANDBACK gate passed: gradient_streak=%d (>=%d) "
+                "deep_probe_recovered=%s uptime=%.1fs (>=%.1fs)",
+                self._recovered_streak, _hysteresis_cycles(), deep_ok,
                 self._jprime_uptime(now=now), _min_uptime_s(),
             )
             self._state = FailoverState.HANDBACK
             await self._tick_handback(now=now)
+
+    def _deep_probe_recovered(self) -> bool:
+        """True iff the DW heartbeat reports DW recovered (N consecutive
+        fast-healthy deep probes). Injectable-free (reads the singleton);
+        fail-soft -> False (stay SERVING; never a premature handback)."""
+        try:
+            from backend.core.ouroboros.governance.provider_heartbeat import (  # noqa: PLC0415
+                get_dw_heartbeat,
+            )
+            return bool(get_dw_heartbeat().dw_recovered(
+                min_streak=_recovery_streak_n(),
+                max_latency_s=_recovery_max_latency_s(),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] deep-probe recovery fail-soft err=%r", exc)
+            return False
 
     def _probe_interval(self, *, now: float) -> float:
         try:
@@ -1776,9 +1822,14 @@ class FailoverLifecycleController:
             logger.debug("[FailoverLifecycle] emit yield fail-soft err=%r", exc)
 
         # 2. Route generation back to DW: drop the J-Prime endpoint NOW so
-        #    is_jprime_serving()/jprime_endpoint() stop pointing at the node
-        #    before teardown (T4 re-routes to DW).
+        #    is_jprime_serving()/jprime_endpoint() stop pointing at the node and
+        #    ALL NEW ops route to DW instantly (T4 re-routes to DW).
         self._endpoint = None
+
+        # 2.5 ZERO-DROP DRAIN: await any IN-FLIGHT J-Prime ops to finish before
+        #     teardown so none is severed mid-generation. Bounded by a budget
+        #     (never deadlock; the Dead-Man's Switch is the cost backstop).
+        await self._drain_inflight_jprime()
 
         # 3. Delete-to-snapshot + PARALLEL ephemeral firewall close (zero orphan
         #    nodes AND zero orphan firewall holes on handback).
@@ -1807,8 +1858,52 @@ class FailoverLifecycleController:
         self._recovered_streak = 0
         self._probe_trajectory = []
         self._outage_started_at = None
-        self._last_handback_at = now
+        self._last_handback_at = now  # arm the anti-thrash cooldown anchor
         logger.info("[FailoverLifecycle] DORMANT (delete-to-snapshot complete)")
+
+    def _inflight_count(self) -> int:
+        """Count of in-flight J-Prime ops. Injected ``in_flight_fn`` or 0 (no
+        tracker -> immediate teardown). NEVER raises -> 0 on error (fail-open to
+        teardown; the Dead-Man's Switch backstops a wrong 0)."""
+        fn = self._in_flight_fn
+        if fn is None:
+            return 0
+        try:
+            return max(0, int(fn()))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] in_flight_fn fail-soft err=%r", exc)
+            return 0
+
+    async def _drain_inflight_jprime(self) -> None:
+        """Await in-flight J-Prime ops to drain to 0 before teardown (zero-drop).
+        Bounded by ``_handback_drain_budget_s`` so the FSM never deadlocks; on
+        budget exhaustion we proceed (the node Dead-Man's Switch is the backstop).
+        Fail-soft throughout."""
+        try:
+            n = self._inflight_count()
+            if n <= 0:
+                return
+            logger.info(
+                "[FailoverLifecycle] HANDBACK zero-drop: awaiting %d in-flight "
+                "J-Prime op(s) to finish before teardown", n,
+            )
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + _handback_drain_budget_s()
+            poll = _handback_drain_poll_s()
+            while self._inflight_count() > 0:
+                if loop.time() >= deadline:
+                    logger.warning(
+                        "[FailoverLifecycle] HANDBACK drain budget exhausted with "
+                        "%d op(s) still in flight -- proceeding to teardown "
+                        "(Dead-Man's Switch backstop)", self._inflight_count(),
+                    )
+                    return
+                await asyncio.sleep(poll)
+            logger.info("[FailoverLifecycle] HANDBACK zero-drop: J-Prime queue drained to 0")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- never block teardown
+            logger.debug("[FailoverLifecycle] drain fail-soft err=%r", exc)
 
     # ------------------------------------------------------------------
     # Await helper (boundaries may be sync or async)
