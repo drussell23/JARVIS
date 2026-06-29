@@ -94,3 +94,44 @@ def test_status_terminal(status, terminal):
 ])
 def test_status_success(status, ok):
     assert build_status_is_success(status) is ok
+
+
+def test_iso_duration_parsing():
+    from backend.core.ouroboros.governance.cloud_build_baker import _iso_duration_s
+    assert _iso_duration_s("2026-06-29T19:50:00Z", "2026-06-29T19:51:14Z") == 74.0
+    # nanosecond precision + Z tolerated
+    d = _iso_duration_s("2026-06-29T19:50:00.123456789Z", "2026-06-29T19:50:05.123456789Z")
+    assert abs(d - 5.0) < 0.001
+    assert _iso_duration_s(None, "x") is None
+
+
+async def test_stockout_probe_uses_step_duration(tmp_path, monkeypatch):
+    from backend.core.ouroboros.governance.cloud_build_baker import CloudBuildBaker
+    spec = tmp_path / "x.pkr.hcl"; spec.write_text('source "googlecompute" "x" {}\n')
+    b = CloudBuildBaker(spec_path=str(spec), project="p", image_family="f")
+
+    async def auth():
+        return "tok", "p"
+    monkeypatch.setattr(b, "_auth", auth)
+
+    def build_with_step(dur_s):
+        async def _g(project, token, bid):
+            return {"steps": [
+                {"status": "SUCCESS"},
+                {"status": "FAILURE", "timing": {
+                    "startTime": "2026-06-29T19:50:00Z",
+                    "endTime": f"2026-06-29T19:50:{dur_s:02d}Z"}},
+            ]}
+        return _g
+
+    # 74s failed step -> reached instance creation -> capacity/stockout -> True
+    monkeypatch.setattr(b, "_get_build", build_with_step(0))  # placeholder
+    async def slow(project, token, bid):
+        return {"steps": [{"status": "FAILURE", "timing": {
+            "startTime": "2026-06-29T19:50:00Z", "endTime": "2026-06-29T19:51:14Z"}}]}
+    monkeypatch.setattr(b, "_get_build", slow)
+    assert await b._build_failed_with_stockout("bid") is True
+
+    # 6s fast fail -> config/prepare -> NOT capacity -> False
+    monkeypatch.setattr(b, "_get_build", build_with_step(6))
+    assert await b._build_failed_with_stockout("bid") is False

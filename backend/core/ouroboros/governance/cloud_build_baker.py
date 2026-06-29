@@ -145,6 +145,28 @@ def iam_policy_remove_member(policy: Dict[str, Any], member: str) -> Dict[str, A
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested)
 # ---------------------------------------------------------------------------
+def _iso_duration_s(start: Optional[str], end: Optional[str]) -> Optional[float]:
+    """Seconds between two RFC3339 timestamps (Cloud Build step timing). Tolerates
+    a trailing 'Z' and nanosecond precision (truncated to micros). None on error."""
+    if not start or not end:
+        return None
+    try:
+        import datetime as _dt  # noqa: PLC0415
+        import re  # noqa: PLC0415
+
+        def _parse(x: str) -> "_dt.datetime":
+            x = x.replace("Z", "+00:00")
+            if "." in x:
+                head, frac = x.split(".", 1)
+                m = re.match(r"(\d+)(.*)", frac)
+                x = head + "." + m.group(1)[:6] + m.group(2)
+            return _dt.datetime.fromisoformat(x)
+
+        return (_parse(end) - _parse(start)).total_seconds()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_status_is_terminal(status: str) -> bool:
     return str(status or "").upper() in _TERMINAL_STATUSES
 
@@ -245,9 +267,9 @@ class CloudBuildBaker:
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
         self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
-        # Stockout-probe tolerance for Cloud Logging flush lag (wait+retry).
-        self._stockout_log_retries = max(1, int(os.environ.get("JARVIS_BAKE_STOCKOUT_LOG_RETRIES", "5")))
-        self._stockout_log_wait_s = max(0, int(os.environ.get("JARVIS_BAKE_STOCKOUT_LOG_WAIT_S", "10")))
+        # Failed-step duration (s) at/above which a build failure is treated as a
+        # capacity STOCKOUT (reached instance creation) vs a fast config fail.
+        self._stockout_min_step_s = max(1, int(os.environ.get("JARVIS_BAKE_STOCKOUT_MIN_STEP_S", "30")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -475,34 +497,30 @@ class CloudBuildBaker:
         return status == 200
 
     async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Inspect a failed build's Cloud Logging output for a transient GPU
-        STOCKOUT (retryable in another zone). Cloud Logging LAGS the build's
-        terminal status by seconds, so this WAITS + RETRIES for the flush (the
-        prior miss queried before the log landed). Fail-soft -> False (a
-        non-stockout failure must NOT trigger a blind retry storm)."""
-        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
-        from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
+        """Decide if a failed build is a capacity STOCKOUT (retryable in another
+        zone) using the failed STEP's DURATION from the build resource -- a signal
+        that needs NO logs (custom-SA CLOUD_LOGGING_ONLY logs are not queryable).
+        The spec is proven valid, so the packer step can no longer fail at PREPARE
+        (config, <~15s); a SLOW step-2 failure (~74s) means it reached instance
+        creation = capacity/stockout. Threshold env JARVIS_BAKE_STOCKOUT_MIN_STEP_S
+        (default 30). Fail-soft -> False (no blind retry storm)."""
         try:
             token, project = await self._auth()
             if not token or not project:
                 return False
-            flt = 'resource.type="build" AND resource.labels.build_id="{}"'.format(build_id)
-            body = json.dumps({
-                "resourceNames": ["projects/{}".format(project)],
-                "filter": flt, "orderBy": "timestamp desc", "pageSize": 100,
-            }).encode("utf-8")
-            url = "https://logging.googleapis.com/v2/entries:list"
-            hdr = {"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"}
-            for attempt in range(self._stockout_log_retries):
-                status, resp = await _http_request(url, method="POST", headers=hdr, body=body, timeout_s=30.0)
-                if status == 200:
-                    text = " ".join(
-                        e.get("textPayload", "") for e in json.loads(resp).get("entries", [])
-                    )
-                    if text.strip():
-                        return is_stockout_error(text)  # log landed -> classify
-                await asyncio.sleep(self._stockout_log_wait_s)  # wait for the flush
-            return False  # log never materialized -> can't confirm -> don't retry-storm
+            build = await self._get_build(project, token, build_id)
+            for s in build.get("steps", []):
+                if s.get("status") == "FAILURE":
+                    t = s.get("timing", {})
+                    dur = _iso_duration_s(t.get("startTime"), t.get("endTime"))
+                    if dur is not None and dur >= self._stockout_min_step_s:
+                        logger.info("[CloudBuildBaker] failed step ran %.0fs (>=%ss) "
+                                    "-> capacity/stockout, fail over", dur, self._stockout_min_step_s)
+                        return True
+                    logger.info("[CloudBuildBaker] failed step ran %ss -> fast fail "
+                                "(not capacity), stop", dur)
+                    return False
+            return False
         except Exception as exc:  # noqa: BLE001
             logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
             return False
