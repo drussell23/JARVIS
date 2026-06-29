@@ -230,6 +230,18 @@ def _hard_escalation_enabled() -> bool:
     return _enabled("JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED", "true")
 
 
+def _ephemeral_fw_enabled() -> bool:
+    """REST-native ephemeral firewall micro-perimeter at AWAKENING. Default OFF
+    (production may run in-VPC where it's unnecessary). The hybrid soak opts in
+    via ``JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED=true`` -- a /32 rule for the
+    orchestrator's OWN detected egress IP, torn down with the node."""
+    return _enabled("JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED", "false")
+
+
+def _ephemeral_fw_name() -> str:
+    return _env_str("JARVIS_FAILOVER_FW_RULE_NAME", "jarvis-ephemeral-failover-allow")
+
+
 def _hard_outage_streak() -> int:
     """Consecutive deep-probe drops that constitute a CONFIRMED data-plane
     outage (the mathematical confirmation that replaces the forecast wait).
@@ -667,6 +679,9 @@ class FailoverLifecycleController:
 
         self._state = FailoverState.DORMANT
         self._endpoint: Optional[str] = None
+        # IaC ephemeral firewall micro-perimeter: the rule name opened at AWAKEN,
+        # torn down (alongside the node) on EVERY exit path. None == no hole open.
+        self._ephemeral_fw_rule: Optional[str] = None
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
@@ -1411,6 +1426,64 @@ class FailoverLifecycleController:
             return
         self._endpoint = self._build_endpoint()
         logger.info("[FailoverLifecycle] AWAKENING node endpoint=%s", self._endpoint)
+        # IaC ephemeral micro-perimeter: open a /32 hole for THIS orchestrator's
+        # detected egress IP so the Reachability Racer's external path can reach
+        # the node. Fail-soft -- a firewall miss never blocks awaken (the racer
+        # simply won't win the external candidate; the node still self-reaps).
+        await self._open_ephemeral_perimeter()
+
+    async def _open_ephemeral_perimeter(self) -> None:
+        """Programmatically open a /32 ``tcp:PORT`` firewall rule bound to the
+        orchestrator's OWN dynamically-resolved public egress IP. Gated + fail-
+        soft. NEVER raises. NO hardcoded IP, NO 0.0.0.0/0."""
+        if not _ephemeral_fw_enabled():
+            return
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest, resolve_local_public_ip,
+            )
+            ip = await resolve_local_public_ip()
+            if not ip:
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral perimeter: public IP unresolved "
+                    "-- skipping (racer external path may be firewall-blocked)")
+                return
+            name = _ephemeral_fw_name()
+            ok, detail = await get_compute_rest().create_firewall_rule(
+                name=name, source_ip=ip, port=_failover_port(),
+            )
+            if ok:
+                self._ephemeral_fw_rule = name
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral micro-perimeter OPEN: %s "
+                    "src=%s/32 tcp:%s (%s) -- bound to node lifecycle",
+                    name, ip, _failover_port(), detail,
+                )
+            else:
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral perimeter create failed: %s", detail)
+        except Exception as exc:  # noqa: BLE001 -- never block awaken
+            logger.warning("[FailoverLifecycle] ephemeral perimeter fail-soft err=%r", exc)
+
+    async def _close_ephemeral_perimeter(self) -> None:
+        """Delete the ephemeral firewall rule (the IaC teardown half). Idempotent
+        + fail-soft. Clears the bound name so a re-awaken re-opens cleanly."""
+        name = self._ephemeral_fw_rule
+        if not name:
+            return
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            ok, detail = await get_compute_rest().delete_firewall_rule(name)
+            logger.warning(
+                "[FailoverLifecycle] ephemeral micro-perimeter CLOSED: %s (%s)",
+                name, detail,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FailoverLifecycle] ephemeral perimeter close fail-soft err=%r", exc)
+        finally:
+            self._ephemeral_fw_rule = None
 
     def _build_startup_script(self) -> str:
         from backend.core.ouroboros.governance.failover_deadman import (  # noqa: PLC0415
@@ -1431,12 +1504,17 @@ class FailoverLifecycleController:
                     "node never became ready, tearing down + reverting to DORMANT",
                     elapsed,
                 )
-                # Proactive teardown (fail-soft -- dead-man's switch is the backstop).
+                # PARALLEL teardown (fail-soft): node delete + ephemeral firewall
+                # close together -- zero orphan nodes AND zero orphan firewall holes.
                 try:
-                    await self._maybe_await(self._vm_delete_fn)
+                    await asyncio.gather(
+                        self._maybe_await(self._vm_delete_fn),
+                        self._close_ephemeral_perimeter(),
+                        return_exceptions=True,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        "[FailoverLifecycle] AWAKENING timeout vm_delete fail-soft "
+                        "[FailoverLifecycle] AWAKENING timeout teardown fail-soft "
                         "err=%r -- reverting DORMANT anyway (Dead-Man's Switch backstop)",
                         exc,
                     )
@@ -1628,18 +1706,23 @@ class FailoverLifecycleController:
         #    before teardown (T4 re-routes to DW).
         self._endpoint = None
 
-        # 3. Delete-to-snapshot.
+        # 3. Delete-to-snapshot + PARALLEL ephemeral firewall close (zero orphan
+        #    nodes AND zero orphan firewall holes on handback).
         try:
-            ok = await self._maybe_await(self._vm_delete_fn)
-            if not ok:
+            results = await asyncio.gather(
+                self._maybe_await(self._vm_delete_fn),
+                self._close_ephemeral_perimeter(),
+                return_exceptions=True,
+            )
+            if results and results[0] is False:
                 logger.warning(
                     "[FailoverLifecycle] delete returned falsy -- Dead-Man's Switch "
                     "remains the cost backstop"
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[FailoverLifecycle] delete raised -- Dead-Man's Switch backstop err=%r",
-                exc,
+                "[FailoverLifecycle] handback teardown raised -- Dead-Man's Switch "
+                "backstop err=%r", exc,
             )
 
         # 4. DORMANT + arm anti-thrash cooldown.

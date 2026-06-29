@@ -77,6 +77,10 @@ def main(argv: list) -> int:
     env["JARVIS_QUARANTINE_UNMASK_EXHAUSTION_ENABLED"] = "true"
     env["JARVIS_FAILOVER_ANY_ROUTE_OUTAGE_ENABLED"] = "true"
     env["JARVIS_FAILOVER_HYBRID_MESH"] = "true"
+    # IaC ephemeral micro-perimeter: open a /32 hole for THIS Mac's egress IP at
+    # AWAKEN (resolved dynamically), torn down with the node. Enables the
+    # Reachability Racer's external path to actually reach the cloud node.
+    env["JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED"] = "true"
 
     # Pass through the operator-exported GCP identity (compose_env may not carry it).
     for k in (
@@ -123,11 +127,19 @@ def _guaranteed_node_teardown(env: dict) -> None:
             if env.get(k):
                 os.environ[k] = env[k]
         node = os.environ.get("JARVIS_FAILOVER_NODE_NAME", "jarvis-prime-failover")
+        fw = os.environ.get("JARVIS_FAILOVER_FW_RULE_NAME", "jarvis-ephemeral-failover-allow")
 
         async def _del():
-            ok, detail = await get_compute_rest().delete_instance(node)
-            print(f"[hybrid-soak] GUARANTEED TEARDOWN: delete {node} -> ok={ok} {detail}",
-                  flush=True)
+            client = get_compute_rest()
+            # PARALLEL teardown: node + ephemeral firewall hole, together. Zero
+            # orphan nodes AND zero orphan firewall holes on ANY exit path.
+            node_res, fw_res = await asyncio.gather(
+                client.delete_instance(node),
+                client.delete_firewall_rule(fw),
+                return_exceptions=True,
+            )
+            print(f"[hybrid-soak] GUARANTEED TEARDOWN: node {node} -> {node_res} | "
+                  f"firewall {fw} -> {fw_res}", flush=True)
 
         asyncio.run(_del())
     except Exception as exc:  # noqa: BLE001 -- teardown must never raise

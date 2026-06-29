@@ -61,6 +61,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,6 +142,49 @@ def _adc_available() -> bool:
         return os.path.isfile(os.path.join(cfg, "application_default_credentials.json"))
     except Exception:  # noqa: BLE001
         return False
+
+
+_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+def _fetch_public_ip() -> str:
+    """Fetch the orchestrator's public egress IP from an external echo service
+    (stdlib urllib; env-tunable provider list). Raises on total failure -- the
+    async wrapper catches. NO hardcoded IP."""
+    providers = (
+        os.environ.get("JARVIS_PUBLIC_IP_ECHO_URLS", "")
+        or "https://checkip.amazonaws.com,https://api.ipify.org"
+    )
+    last_exc: Optional[BaseException] = None
+    for url in [u.strip() for u in providers.split(",") if u.strip()]:
+        try:
+            with urllib.request.urlopen(url, timeout=5.0) as resp:  # noqa: S310
+                return resp.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    return ""
+
+
+async def resolve_local_public_ip(
+    fetch_fn: Optional[Any] = None,
+) -> Optional[str]:
+    """Programmatically resolve the orchestrator's PUBLIC egress IP at runtime
+    (no hardcoded IP). Off-loaded to a thread (blocking HTTP). Validates a real
+    dotted-quad IPv4. Fail-soft -> None. Injectable for tests."""
+    fn = fetch_fn or _fetch_public_ip
+    try:
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, fn)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[GCPComputeRest] public IP fetch fail-soft err=%r", exc)
+        return None
+    ip = (str(raw) or "").strip()
+    m = _IPV4_RE.match(ip)
+    if not m or any(int(o) > 255 for o in m.groups()):
+        return None
+    return ip
 
 
 def mint_adc_access_token() -> Tuple[Optional[str], Optional[str]]:
@@ -756,6 +800,82 @@ class GCPComputeRest:
             node, status, (text or "")[-300:],
         )
         return (False, "DELETE_FAILED:{}".format(status))
+
+    # -- ephemeral firewall micro-perimeter (IaC, same REST bridge) -------
+
+    async def create_firewall_rule(
+        self, *, name: str, source_ip: str, port: int = 11434,
+    ) -> Tuple[bool, str]:
+        """Create a /32-scoped INGRESS firewall rule (``source_ip/32`` ->
+        ``tcp:port``) via native Compute REST. REFUSES an empty source IP -- NO
+        ``0.0.0.0/0`` fallback, ever (never open the port to the whole internet).
+        Returns (ok, detail). Fail-CLOSED. NEVER raises."""
+        if not source_ip:
+            return (False, "no_source_ip:refuse_open_internet")
+        token = await self.access_token()
+        project = await self.project()
+        if not token or not project:
+            return (False, "AUTH_OR_PROJECT_UNRESOLVED:token={}:project={!r}".format(
+                bool(token), project))
+        url = "{}/projects/{}/global/firewalls".format(_COMPUTE_BASE, project)
+        payload = {
+            "name": name,
+            "network": "global/networks/default",
+            "direction": "INGRESS",
+            "priority": 1000,
+            "sourceRanges": ["{}/32".format(source_ip)],
+            "allowed": [{"IPProtocol": "tcp", "ports": [str(port)]}],
+            "description": (
+                "JARVIS ephemeral failover micro-perimeter -- auto-managed, "
+                "bound to the failover node lifecycle; deleted on teardown."
+            ),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "application/json",
+        }
+        status, text = await _http_request(
+            url, method="POST", headers=headers, body=body, timeout_s=_rest_timeout(),
+        )
+        if 200 <= status < 300:
+            logger.info(
+                "[GCPComputeRest] firewall.insert ok name=%s src=%s/32 tcp:%s "
+                "(status=%s)", name, source_ip, port, status,
+            )
+            return (True, "created:{}".format(status))
+        # 409 == already exists (a prior awaken's rule) -> treat as present-OK.
+        if status == 409:
+            return (True, "exists:409")
+        logger.warning(
+            "[GCPComputeRest] firewall.insert failed name=%s status=%s detail=%s",
+            name, status, (text or "")[-200:],
+        )
+        return (False, "FW_CREATE_FAILED:{}:{}".format(status, (text or "")[:150]))
+
+    async def delete_firewall_rule(self, name: str) -> Tuple[bool, str]:
+        """DELETE the ephemeral firewall rule. 404 (already gone) is the desired
+        end-state -> success (no orphan-hole anxiety). Fail-CLOSED. NEVER raises."""
+        token = await self.access_token()
+        project = await self.project()
+        if not token or not project:
+            return (False, "AUTH_OR_PROJECT_UNRESOLVED")
+        url = "{}/projects/{}/global/firewalls/{}".format(_COMPUTE_BASE, project, name)
+        headers = {"Authorization": "Bearer {}".format(token)}
+        status, text = await _http_request(
+            url, method="DELETE", headers=headers, timeout_s=_rest_timeout(),
+        )
+        if 200 <= status < 300 or status in (404, 409):
+            logger.info(
+                "[GCPComputeRest] firewall.delete name=%s status=%s "
+                "(micro-perimeter closed)", name, status,
+            )
+            return (True, "deleted:{}".format(status))
+        logger.warning(
+            "[GCPComputeRest] firewall.delete failed name=%s status=%s detail=%s",
+            name, status, (text or "")[-200:],
+        )
+        return (False, "FW_DELETE_FAILED:{}".format(status))
 
 
 # ---------------------------------------------------------------------------
