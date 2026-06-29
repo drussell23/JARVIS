@@ -63,10 +63,37 @@ def _parse_args(argv):
     p.add_argument("--timeout", type=int, default=int(os.environ.get("JARVIS_BAKE_TIMEOUT_S", "5400")),
                    help="Cloud Build timeout seconds (GPU bake + 32B pull is slow; default 90min).")
     p.add_argument("--poll-interval", type=int, default=15, help="Status poll cadence seconds.")
+    p.add_argument("--ephemeral-iam", dest="ephemeral_iam", action="store_true", default=True,
+                   help="Create a dedicated least-privilege temp SA, run the build as it, and GUARANTEE teardown (default).")
+    p.add_argument("--default-sa", dest="ephemeral_iam", action="store_false",
+                   help="Run as the default Cloud Build SA (NOT recommended; needs a broad pre-grant).")
+    p.add_argument("--detach", action="store_true", default=False,
+                   help="Daemonize: return the terminal immediately; the background process bakes + flares to the WAL.")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dry-run", action="store_true", default=True, help="Print the build resource, submit nothing (default).")
     g.add_argument("--execute", dest="dry_run", action="store_false", help="Actually submit + poll the build.")
     return p.parse_args(argv)
+
+
+def _wal_path() -> str:
+    return os.environ.get("JARVIS_BAKE_WAL", str(_REPO_ROOT / ".jarvis" / "bake" / "bake_wal.log"))
+
+
+def _daemonize() -> None:
+    """Double-fork into a detached daemon so the terminal returns immediately.
+    The grandchild's stdio is redirected to the WAL (build logs land there)."""
+    if os.fork() > 0:
+        os._exit(0)          # original parent returns the terminal
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)          # session leader exits -> fully detached
+    wal = Path(_wal_path())
+    wal.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(wal), os.O_APPEND | os.O_CREAT | os.O_WRONLY)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
 
 
 def _baker(args) -> CloudBuildBaker:
@@ -96,17 +123,20 @@ def _print_plan(args, baker: CloudBuildBaker) -> None:
     print("Re-run with --execute to submit hands-off (ADC auth, no gcloud, no upload).")
 
 
-async def _execute(baker: CloudBuildBaker) -> int:
-    print("Submitting Cloud Build (ADC REST) ...", flush=True)
-    build_id = await baker.submit()
-    if not build_id:
-        print("ABORT: submit failed. If auth-denied, grant the Cloud Build SA:\n"
-              "  roles/compute.admin + roles/iam.serviceAccountUser", file=sys.stderr)
-        return 2
-    print(f"Build {build_id} submitted -- polling (logs stream below):", flush=True)
-    status = await baker.poll(build_id)
-    ok = build_status_is_success(status)
-    print(f"\n=== BUILD {build_id} -> {status} ({'image baked' if ok else 'NO image'}) ===")
+async def _execute(args, baker: CloudBuildBaker) -> int:
+    if args.ephemeral_iam:
+        print("Igniting Zero-Trust bake (dedicated temp SA -> build -> guaranteed teardown) ...", flush=True)
+        ok = await baker.bake_with_ephemeral_iam()
+    else:
+        print("Submitting Cloud Build (default SA) ...", flush=True)
+        build_id = await baker.submit()
+        if not build_id:
+            print("ABORT: submit failed (default SA likely lacks compute rights).", file=sys.stderr)
+            return 2
+        status = await baker.poll(build_id)
+        ok = build_status_is_success(status)
+    print(f"\n=== BAKE {'SUCCEEDED (image baked)' if ok else 'did NOT produce an image'} "
+          f"-- WAL: {_wal_path()} ===")
     return 0 if ok else 1
 
 
@@ -119,7 +149,13 @@ def main(argv=None) -> int:
     if args.dry_run:
         _print_plan(args, baker)
         return 0
-    return asyncio.run(_execute(baker))
+    if args.detach:
+        print(f"Dispatched detached bake -> watch the WAL: {_wal_path()}", flush=True)
+        _daemonize()  # terminal returns NOW; the daemon bakes + flares below
+    return asyncio.run(_execute(args, baker))
+
+
+__test_hooks__ = {"daemonize": _daemonize}  # exposed for import without forking
 
 
 if __name__ == "__main__":

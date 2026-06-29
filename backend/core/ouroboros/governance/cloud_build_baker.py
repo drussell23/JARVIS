@@ -23,13 +23,16 @@ import base64
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _CLOUD_BUILD_BASE = "https://cloudbuild.googleapis.com/v1"
 _STORAGE_BASE = "https://storage.googleapis.com/storage/v1"
+_IAM_BASE = "https://iam.googleapis.com/v1"
+_CRM_BASE = "https://cloudresourcemanager.googleapis.com/v1"
 _PACKER_IMAGE = "hashicorp/packer:latest"
 _WRITER_IMAGE = "gcr.io/cloud-builders/gcloud"
 _SPEC_PATH_IN_BUILD = "/workspace/main.pkr.hcl"
@@ -37,6 +40,64 @@ _SPEC_PATH_IN_BUILD = "/workspace/main.pkr.hcl"
 _TERMINAL_STATUSES = frozenset({
     "SUCCESS", "FAILURE", "TIMEOUT", "CANCELLED", "EXPIRED", "INTERNAL_ERROR",
 })
+
+# Least-privilege roles Packer needs to bake a GPU image + write build logs.
+# Deliberately NOT roles/compute.admin (the blast-radius role we refused to grant
+# the default SA): instanceAdmin can create/delete the build VM, storageAdmin can
+# create the image, serviceAccountUser lets the build act-as the runtime SA,
+# logWriter lets the custom-SA build emit logs to Cloud Logging.
+_DEFAULT_BAKER_ROLES = (
+    "roles/compute.instanceAdmin.v1",
+    "roles/compute.storageAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/logging.logWriter",
+)
+
+
+def baker_sa_roles() -> List[str]:
+    """Least-privilege roles bound to the ephemeral baker SA. Env-overridable
+    (``JARVIS_BAKE_SA_ROLES``, comma-separated) -- no hardcoded blast radius."""
+    raw = os.environ.get("JARVIS_BAKE_SA_ROLES", "").strip()
+    if raw:
+        return [r.strip() for r in raw.split(",") if r.strip()]
+    return list(_DEFAULT_BAKER_ROLES)
+
+
+def temp_sa_account_id() -> str:
+    """A unique, valid GCP SA accountId for an ephemeral baker
+    (``^[a-z][a-z0-9-]{4,28}[a-z0-9]$``). 6 hex of entropy -> collision-free."""
+    return "jarvis-gpu-baker-{}".format(secrets.token_hex(3))
+
+
+def create_sa_payload(account_id: str, display_name: str) -> Dict[str, Any]:
+    """serviceAccounts.create request body."""
+    return {"accountId": account_id, "serviceAccount": {"displayName": display_name}}
+
+
+def iam_policy_add_binding(policy: Dict[str, Any], role: str, member: str) -> Dict[str, Any]:
+    """Read-modify-write: add ``member`` to ``role``'s binding (creating the
+    binding if absent, never duplicating the member). Returns the policy."""
+    bindings = policy.setdefault("bindings", [])
+    for b in bindings:
+        if b.get("role") == role:
+            members = b.setdefault("members", [])
+            if member not in members:
+                members.append(member)
+            return policy
+    bindings.append({"role": role, "members": [member]})
+    return policy
+
+
+def iam_policy_remove_member(policy: Dict[str, Any], member: str) -> Dict[str, Any]:
+    """Strip ``member`` from EVERY binding; drop any binding left empty (no
+    lingering privilege residue). Returns the policy."""
+    kept = []
+    for b in policy.get("bindings", []):
+        members = [m for m in b.get("members", []) if m != member]
+        if members:
+            kept.append({**b, "members": members})
+    policy["bindings"] = kept
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +122,7 @@ def build_packer_cloud_build(
     machine_type: str = "E2_HIGHCPU_8",
     disk_gb: int = 100,
     packer_image: str = _PACKER_IMAGE,
+    service_account: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct the EXACT Cloud Build ``Build`` resource that bakes the image:
     (1) write the base64-inlined Packer spec into the build workspace,
@@ -83,12 +145,19 @@ def build_packer_cloud_build(
         {"name": packer_image, "args": ["init", _SPEC_PATH_IN_BUILD]},
         {"name": packer_image, "args": ["build", *var_flags, _SPEC_PATH_IN_BUILD]},
     ]
-    return {
+    options: Dict[str, Any] = {"machineType": machine_type, "diskSizeGb": int(disk_gb)}
+    cfg: Dict[str, Any] = {
         "steps": steps,
         "timeout": "{}s".format(int(timeout_s)),
-        "options": {"machineType": machine_type, "diskSizeGb": int(disk_gb)},
+        "options": options,
         "substitutions": dict(substitutions or {}),
     }
+    if service_account:
+        # A custom build SA REQUIRES an explicit logging mode (Cloud Build won't
+        # use the default logs bucket under a user-supplied SA).
+        cfg["serviceAccount"] = service_account
+        options["logging"] = "CLOUD_LOGGING_ONLY"
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +187,9 @@ class CloudBuildBaker:
         self.timeout_s = timeout_s
         self.poll_interval_s = poll_interval_s
         self._log_offset = 0
+        # Ephemeral Zero-Trust IAM: the custom build SA (set during the lifecycle).
+        self.service_account: Optional[str] = None
+        self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -141,6 +213,7 @@ class CloudBuildBaker:
         return build_packer_cloud_build(
             spec_text=self._read_spec(), project=project,
             image_family=self.image_family, extra_vars=extra, timeout_s=self.timeout_s,
+            service_account=self.service_account,
         )
 
     async def submit(self) -> Optional[str]:
@@ -239,8 +312,143 @@ class CloudBuildBaker:
         status = await self.poll(build_id)
         return build_status_is_success(status)
 
+    # -- Ephemeral Zero-Trust IAM lifecycle ----------------------------------
+    def _wal_path(self) -> Path:
+        p = Path(os.environ.get(
+            "JARVIS_BAKE_WAL", str(Path(".jarvis") / "bake" / "bake_wal.log")
+        ))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _write_flare(self, message: str) -> None:
+        """Append an immutable, timestamped flare to the bake WAL (never raises)."""
+        try:
+            import datetime as _dt  # noqa: PLC0415
+            stamp = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            with self._wal_path().open("a", encoding="utf-8") as fh:
+                fh.write("[{}] [bake] {}\n".format(stamp, message))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[CloudBuildBaker] flare write fail-soft err=%r", exc)
+        logger.info("[CloudBuildBaker][flare] %s", message)
+
+    async def _create_temp_sa(self, project: str, token: str, account_id: str) -> Optional[str]:
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        url = "{}/projects/{}/serviceAccounts".format(_IAM_BASE, project)
+        status, body = await _http_request(
+            url, method="POST",
+            headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
+            body=json.dumps(create_sa_payload(account_id, "JARVIS GPU baker (ephemeral)")).encode("utf-8"),
+            timeout_s=60.0,
+        )
+        if status not in (200, 201):
+            logger.error("[CloudBuildBaker] SA create failed status=%s body=%s", status, body[:300])
+            return None
+        try:
+            return json.loads(body).get("email")
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _get_project_policy(self, project: str, token: str) -> Optional[Dict[str, Any]]:
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        url = "{}/projects/{}:getIamPolicy".format(_CRM_BASE, project)
+        status, body = await _http_request(
+            url, method="POST",
+            headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
+            body=b"{}", timeout_s=60.0,
+        )
+        if status != 200:
+            return None
+        try:
+            return json.loads(body)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _set_project_policy(self, project: str, token: str, policy: Dict[str, Any]) -> bool:
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        url = "{}/projects/{}:setIamPolicy".format(_CRM_BASE, project)
+        status, _ = await _http_request(
+            url, method="POST",
+            headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
+            body=json.dumps({"policy": policy}).encode("utf-8"), timeout_s=60.0,
+        )
+        return status == 200
+
+    async def _bind_roles(self, project: str, token: str, member: str, roles: List[str]) -> bool:
+        policy = await self._get_project_policy(project, token)
+        if policy is None:
+            return False
+        for role in roles:
+            iam_policy_add_binding(policy, role, member)
+        return await self._set_project_policy(project, token, policy)
+
+    async def _unbind_member(self, project: str, token: str, member: str) -> bool:
+        policy = await self._get_project_policy(project, token)
+        if policy is None:
+            return False
+        iam_policy_remove_member(policy, member)
+        return await self._set_project_policy(project, token, policy)
+
+    async def _delete_temp_sa(self, project: str, token: str, sa_email: str) -> bool:
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        url = "{}/projects/{}/serviceAccounts/{}".format(_IAM_BASE, project, sa_email)
+        status, _ = await _http_request(
+            url, method="DELETE",
+            headers={"Authorization": "Bearer {}".format(token)}, timeout_s=60.0,
+        )
+        return status == 200
+
+    async def bake_with_ephemeral_iam(self) -> bool:
+        """The Zero-Trust bake: create a DEDICATED temp SA -> bind least-privilege
+        roles -> run the build AS that SA -> GUARANTEE teardown (delete the SA the
+        moment the build concludes, success or fail). The default Cloud Build SA is
+        never touched; zero lingering privilege. Drops WAL flares throughout."""
+        token, project = await self._auth()
+        if not token or not project:
+            self._write_flare("BAKE ABORT: auth/project unresolved")
+            return False
+        sa_email: Optional[str] = None
+        member: Optional[str] = None
+        try:
+            sa_email = await self._create_temp_sa(project, token, temp_sa_account_id())
+            if not sa_email:
+                self._write_flare("BAKE ABORT: temp SA create denied (need iam.serviceAccounts.create)")
+                return False
+            member = "serviceAccount:{}".format(sa_email)
+            self._write_flare("EPHEMERAL SA CREATED sa={}".format(sa_email))
+            if not await self._bind_roles(project, token, member, baker_sa_roles()):
+                self._write_flare("BAKE ABORT: role bind denied (need resourcemanager.projects.setIamPolicy)")
+                return False
+            self._write_flare("LEAST-PRIV ROLES BOUND roles={}".format(",".join(baker_sa_roles())))
+            await asyncio.sleep(self._iam_settle_s)  # IAM propagation settle
+            self.service_account = "projects/{}/serviceAccounts/{}".format(project, sa_email)
+            build_id = await self.submit()
+            if not build_id:
+                self._write_flare("BAKE FAILED: submit rejected")
+                return False
+            self._write_flare("BAKE SUBMITTED build={} sa={}".format(build_id, sa_email))
+            status = await self.poll(build_id)
+            ok = build_status_is_success(status)
+            self._write_flare(
+                "GOLDEN IMAGE READY image_family={} build={}".format(self.image_family, build_id)
+                if ok else "BAKE FAILED status={} build={}".format(status, build_id)
+            )
+            return ok
+        finally:
+            if sa_email:
+                try:
+                    t2, p2 = await self._auth()  # token may have rotated over a long bake
+                    proj, tok = (p2 or project), (t2 or token)
+                    if member:
+                        await self._unbind_member(proj, tok, member)
+                    await self._delete_temp_sa(proj, tok, sa_email)
+                    self._write_flare("EPHEMERAL SA TORN DOWN sa={} (zero lingering privilege)".format(sa_email))
+                except Exception as exc:  # noqa: BLE001
+                    self._write_flare("WARN teardown err={!r} sa={} -- MANUAL CHECK".format(exc, sa_email))
+
 
 __all__ = [
     "CloudBuildBaker", "build_packer_cloud_build",
     "build_status_is_terminal", "build_status_is_success",
+    "baker_sa_roles", "temp_sa_account_id", "create_sa_payload",
+    "iam_policy_add_binding", "iam_policy_remove_member",
 ]
