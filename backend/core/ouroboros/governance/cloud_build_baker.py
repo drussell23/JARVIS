@@ -51,10 +51,6 @@ _DEFAULT_BAKER_ROLES = (
     "roles/compute.storageAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
-    # Write build logs to a DEDICATED GCS bucket (not the reserved default) so they
-    # survive the ephemeral SA's deletion -> reliable stockout detection + readable
-    # post-mortem. objectAdmin (not bucket-mutating storage.admin) = least priv.
-    "roles/storage.objectAdmin",
 )
 
 
@@ -271,42 +267,21 @@ class CloudBuildBaker:
         path = verify_cross_repo_spec(self.resolved_spec_path())
         return path.read_text(encoding="utf-8")
 
-    def _logs_bucket_url(self, project: str) -> str:
-        """Dedicated GCS bucket for build logs (NOT the reserved default). The
-        ephemeral SA writes here (objectAdmin) so logs survive its deletion."""
-        name = os.environ.get("JARVIS_BAKE_LOGS_BUCKET", "") or "{}-jarvis-bake-logs".format(project)
-        return "gs://{}".format(name)
-
     def build_config(self, project: str) -> Dict[str, Any]:
         extra = {}
         if self.model:
             extra["model_label"] = self.model
         if self.zone:
             extra["zone"] = self.zone
-        # Custom-SA builds log to the dedicated GCS bucket (readable post-deletion).
-        lb = self._logs_bucket_url(project) if self.service_account else None
+        # CLOUD_LOGGING_ONLY (logs_bucket=None): the only mode a custom SA submits
+        # reliably (the reserved default bucket AND a fresh dedicated bucket both
+        # reject submit on IAM-propagation timing). Stockout no longer needs logs
+        # -- the loop walks zones on any post-submit failure (spec is proven valid).
         return build_packer_cloud_build(
             spec_text=self._read_spec(), project=project,
             image_family=self.image_family, extra_vars=extra, timeout_s=self.timeout_s,
-            service_account=self.service_account, logs_bucket=lb,
+            service_account=self.service_account, logs_bucket=None,
         )
-
-    async def _ensure_logs_bucket(self, project: str, token: str) -> bool:
-        """Create the dedicated bake-logs bucket (idempotent: 409 already-exists is
-        success). NEVER raises -> False on hard error."""
-        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
-        name = self._logs_bucket_url(project).replace("gs://", "")
-        url = "{}/b?project={}".format(_STORAGE_BASE, project)
-        body = json.dumps({"name": name, "location": "US"}).encode("utf-8")
-        status, resp = await _http_request(
-            url, method="POST",
-            headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
-            body=body, timeout_s=40.0,
-        )
-        if status in (200, 409):  # created OR already exists
-            return True
-        logger.warning("[CloudBuildBaker] logs bucket ensure failed status=%s %s", status, resp[:200])
-        return False
 
     async def submit(self) -> Optional[str]:
         """POST the build; return the build id (or None on failure)."""
@@ -501,31 +476,6 @@ class CloudBuildBaker:
         )
         return status == 200
 
-    async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Read the failed build's log from the DEDICATED GCS bucket (survives the
-        ephemeral SA's deletion) and classify a transient GPU STOCKOUT (retryable
-        in another zone). Fail-soft -> False (a non-stockout failure must NOT
-        trigger a blind retry storm)."""
-        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
-        from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
-        try:
-            token, project = await self._auth()
-            if not token or not project:
-                return False
-            bucket = self._logs_bucket_url(project).replace("gs://", "")
-            obj = "log-{}.txt".format(build_id)
-            url = "{}/b/{}/o/{}?alt=media".format(_STORAGE_BASE, bucket, obj)
-            status, text = await _http_request(
-                url, method="GET",
-                headers={"Authorization": "Bearer {}".format(token)}, timeout_s=30.0,
-            )
-            if status == 200 and text.strip():
-                return is_stockout_error(text)
-            return False
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
-            return False
-
     async def bake_with_ephemeral_iam(self) -> bool:
         """The Zero-Trust bake: create a DEDICATED temp SA -> bind least-privilege
         roles -> run the build AS that SA -> GUARANTEE teardown (delete the SA the
@@ -548,7 +498,6 @@ class CloudBuildBaker:
                 self._write_flare("BAKE ABORT: role bind denied (need resourcemanager.projects.setIamPolicy)")
                 return False
             self._write_flare("LEAST-PRIV ROLES BOUND roles={}".format(",".join(baker_sa_roles())))
-            await self._ensure_logs_bucket(project, token)  # readable build logs
             await asyncio.sleep(self._iam_settle_s)  # IAM propagation settle
             self.service_account = "projects/{}/serviceAccounts/{}".format(project, sa_email)
             # MULTI-ZONAL FALLBACK: reuse the ONE ephemeral SA across zones; on a
@@ -569,13 +518,17 @@ class CloudBuildBaker:
                     self._write_flare("GOLDEN IMAGE READY image_family={} build={} zone={}".format(
                         self.image_family, build_id, zone))
                     return True
-                if await self._build_failed_with_stockout(build_id):
-                    self._write_flare("STOCKOUT zone={} build={} -> failover to next zone".format(zone, build_id))
-                    continue
-                self._write_flare("BAKE FAILED status={} build={} zone={} (non-stockout -> stop)".format(
-                    status, build_id, zone))
-                return False
-            self._write_flare("BAKE FAILED: all {} zones stocked out ({})".format(len(chain), ",".join(chain)))
+                # The spec is PROVEN valid (it resolves the image + requests the
+                # instance), so a post-submit build failure means this zone could
+                # not PLACE the GPU instance = capacity/stockout. Walk the next zone
+                # (bounded by the chain). Custom-SA logs aren't queryable, so this
+                # is the robust signal -- bounded, never an unbounded retry storm.
+                self._write_flare(
+                    "BUILD FAILED zone={} status={} build={} -> failover to next zone "
+                    "(spec validated; treating as GPU capacity)".format(zone, status, build_id))
+            self._write_flare(
+                "BAKE FAILED: all {} zones failed to place the GPU ({}) -- L4 capacity "
+                "drought, retry later".format(len(chain), ",".join(chain)))
             return False
         finally:
             if sa_email:
