@@ -2108,7 +2108,15 @@ def _should_compact_for_jprime() -> bool:
         from backend.core.ouroboros.governance.failover_lifecycle import (  # noqa: PLC0415
             get_failover_controller,
         )
-        return bool(get_failover_controller().is_jprime_serving())
+        ctrl = get_failover_controller()
+        if not ctrl.is_jprime_serving():
+            return False
+        # MODEL-AWARE: a small (7B) node gets aggressive compaction; a 32B GPU
+        # node bypasses it and receives the FULL Claude-level schema.
+        from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+            is_small_model,
+        )
+        return bool(is_small_model(ctrl.active_jprime_model()))
     except Exception:  # noqa: BLE001
         return False
 

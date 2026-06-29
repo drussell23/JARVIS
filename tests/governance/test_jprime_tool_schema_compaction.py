@@ -79,6 +79,8 @@ def test_compact_gate_on_when_jprime_serving(monkeypatch):
     class _Ctrl:
         def is_jprime_serving(self):
             return True
+        def active_jprime_model(self):
+            return "qwen2.5-coder:7b"  # small -> compact
     monkeypatch.setattr(fl, "get_failover_controller", lambda: _Ctrl())
     assert providers._should_compact_for_jprime() is True
 
@@ -86,6 +88,7 @@ def test_compact_gate_on_when_jprime_serving(monkeypatch):
 def test_compact_gate_master_off(monkeypatch):
     monkeypatch.setenv("JARVIS_VENOM_SCHEMA_SIMPLIFY_ENABLED", "false")
     import backend.core.ouroboros.governance.failover_lifecycle as fl
-    monkeypatch.setattr(fl, "get_failover_controller",
-                        lambda: type("C", (), {"is_jprime_serving": lambda s: True})())
+    monkeypatch.setattr(fl, "get_failover_controller", lambda: type(
+        "C", (), {"is_jprime_serving": lambda s: True,
+                  "active_jprime_model": lambda s: "qwen2.5-coder:7b"})())
     assert providers._should_compact_for_jprime() is False  # master gate wins

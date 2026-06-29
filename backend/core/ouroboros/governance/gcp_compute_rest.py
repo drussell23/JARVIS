@@ -509,6 +509,8 @@ class GCPComputeRest:
         image_family: str,
         startup_script: str,
         spot: bool,
+        accelerator_type: str = "",
+        accelerator_count: int = 0,
     ) -> Dict[str, Any]:
         """Construct the EXACT instances.insert JSON payload. Dynamic zone +
         project from metadata; sourceImage = the golden-image family; Spot
@@ -557,6 +559,22 @@ class GCPComputeRest:
                 "automaticRestart": False,
                 "preemptible": True,
             }
+        # Dynamic IaC accelerator injection (quality tier). A GPU cannot live-
+        # migrate, so onHostMaintenance MUST be TERMINATE; the acceleratorType is
+        # a DYNAMIC zonal URL (never a hardcoded full path). count<=0 -> CPU
+        # payload (no accidental GPU spend).
+        if accelerator_type and accelerator_count > 0:
+            payload["guestAccelerators"] = [
+                {
+                    "acceleratorType": "zones/{}/acceleratorTypes/{}".format(
+                        zone, accelerator_type
+                    ),
+                    "acceleratorCount": int(accelerator_count),
+                }
+            ]
+            sched = payload.setdefault("scheduling", {})
+            sched["onHostMaintenance"] = "TERMINATE"
+            sched.setdefault("automaticRestart", False)
         return payload
 
     async def create_instance(
@@ -566,6 +584,8 @@ class GCPComputeRest:
         name: Optional[str] = None,
         machine_type: Optional[str] = None,
         image_family: Optional[str] = None,
+        accelerator_type: str = "",
+        accelerator_count: int = 0,
     ) -> Tuple[bool, str]:
         """Async REST bootstrapper: launch the golden image via instances.insert.
 
@@ -604,6 +624,8 @@ class GCPComputeRest:
                 image_family=family,
                 startup_script=startup_script,
                 spot=spot,
+                accelerator_type=accelerator_type,
+                accelerator_count=accelerator_count,
             )
             body = json.dumps(payload).encode("utf-8")
             status, text = await _http_request(
