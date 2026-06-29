@@ -311,6 +311,11 @@ class PrimeProviderState:
     """
 
     client: Any = None  # PrimeClient
+    # Generation-scoped in-flight counter -- the number of J-Prime generations
+    # currently crunching. The failover Zero-Drop Drain reads this to await
+    # in-flight ops before teardown. Hoisted here (not on the provider instance)
+    # so it survives importlib.reload(). GIL-safe int incr/decr.
+    inflight: int = 0
 
     @classmethod
     def fresh(cls) -> "PrimeProviderState":
