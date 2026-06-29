@@ -9,6 +9,10 @@ import pytest
 from backend.core.ouroboros.governance.cloud_build_baker import CloudBuildBaker
 
 
+async def _nosleep(*_a, **_k):
+    return None
+
+
 def _baker(tmp_path):
     spec = tmp_path / "x.pkr.hcl"
     spec.write_text('source "googlecompute" "x" {}\n')
@@ -123,3 +127,29 @@ async def test_sa_create_denied_aborts_no_teardown(tmp_path, monkeypatch):
     assert ok is False
     assert "delete_sa" not in calls       # nothing to tear down (none created)
     assert "BAKE ABORT" in wal.read_text()
+
+
+async def test_bind_roles_retries_on_etag_conflict(tmp_path, monkeypatch):
+    """setIamPolicy etag race: re-read + retry until it sticks."""
+    b, _ = _baker(tmp_path)
+    monkeypatch.setenv("JARVIS_BAKE_IAM_RMW_RETRIES", "5")
+    reads = {"n": 0}
+
+    async def get_policy(project, token):
+        reads["n"] += 1
+        return {"bindings": [], "etag": f"e{reads['n']}"}
+
+    set_calls = {"n": 0}
+
+    async def set_policy(project, token, policy):
+        set_calls["n"] += 1
+        return set_calls["n"] >= 3   # first 2 setIamPolicy calls "conflict", 3rd wins
+
+    monkeypatch.setattr(b, "_get_project_policy", get_policy)
+    monkeypatch.setattr(b, "_set_project_policy", set_policy)
+    monkeypatch.setattr("backend.core.ouroboros.governance.cloud_build_baker.asyncio.sleep",
+                        _nosleep)
+    ok = await b._bind_roles("p", "tok", "serviceAccount:x@p.iam.gserviceaccount.com",
+                             ["roles/compute.instanceAdmin.v1"])
+    assert ok is True
+    assert reads["n"] == 3 and set_calls["n"] == 3   # re-read each retry

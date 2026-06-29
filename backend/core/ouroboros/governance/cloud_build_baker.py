@@ -238,6 +238,7 @@ class CloudBuildBaker:
         # Ephemeral Zero-Trust IAM: the custom build SA (set during the lifecycle).
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
+        self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -428,20 +429,32 @@ class CloudBuildBaker:
         )
         return status == 200
 
+    async def _rmw_policy(self, project: str, token: str, mutate) -> bool:
+        """Read-Modify-Write the project IAM policy, RETRYING on an etag conflict
+        (concurrent setIamPolicy races when bakes overlap). Re-reads the fresh
+        policy each attempt -> optimistic-concurrency safe. NEVER raises."""
+        import random  # noqa: PLC0415
+        for attempt in range(self._iam_rmw_retries):
+            policy = await self._get_project_policy(project, token)
+            if policy is None:
+                return False
+            mutate(policy)
+            if await self._set_project_policy(project, token, policy):
+                return True
+            # setIamPolicy rejected (likely 409/412 etag conflict) -> re-read + retry.
+            await asyncio.sleep(min(4.0, 0.3 * (2 ** attempt)) * (0.5 + random.random()))
+        return False
+
     async def _bind_roles(self, project: str, token: str, member: str, roles: List[str]) -> bool:
-        policy = await self._get_project_policy(project, token)
-        if policy is None:
-            return False
-        for role in roles:
-            iam_policy_add_binding(policy, role, member)
-        return await self._set_project_policy(project, token, policy)
+        def _add(policy):
+            for role in roles:
+                iam_policy_add_binding(policy, role, member)
+        return await self._rmw_policy(project, token, _add)
 
     async def _unbind_member(self, project: str, token: str, member: str) -> bool:
-        policy = await self._get_project_policy(project, token)
-        if policy is None:
-            return False
-        iam_policy_remove_member(policy, member)
-        return await self._set_project_policy(project, token, policy)
+        return await self._rmw_policy(
+            project, token, lambda policy: iam_policy_remove_member(policy, member)
+        )
 
     async def _delete_temp_sa(self, project: str, token: str, sa_email: str) -> bool:
         from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
