@@ -81,6 +81,10 @@ def main(argv: list) -> int:
     # AWAKEN (resolved dynamically), torn down with the node. Enables the
     # Reachability Racer's external path to actually reach the cloud node.
     env["JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED"] = "true"
+    # Dynamic cloud-init: force the inference daemon to bind 0.0.0.0:<port> on
+    # boot (the golden-image last mile). Port is config-driven via _failover_port
+    # (JARVIS_PRIME_PORT / JARVIS_JPRIME_FAILOVER_PORT); default 11434 (Ollama).
+    env["JARVIS_FAILOVER_INFERENCE_BIND_ENABLED"] = "true"
 
     # Pass through the operator-exported GCP identity (compose_env may not carry it).
     for k in (

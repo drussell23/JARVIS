@@ -102,3 +102,47 @@ async def test_racer_failsoft_on_probe_error():
 async def test_empty_candidates_returns_none():
     ctrl = _ctrl(lambda ep: True)
     assert await ctrl._race_node_ready([]) is None
+
+
+# ---------------------------------------------------------------------------
+# L7 Readiness Poller -- a fast RST means 'still initializing', NOT failure.
+# Exponential backoff until a Layer-7 200, bounded by budget.
+# ---------------------------------------------------------------------------
+
+async def test_backoff_returns_winner_immediately_when_ready(monkeypatch):
+    ctrl = _ctrl(lambda ep: ep == EXTERNAL)
+    winner = await ctrl._l7_ready_backoff([INTERNAL, EXTERNAL], budget_s=1.0)
+    assert winner == EXTERNAL
+
+
+async def test_backoff_polls_through_rst_until_ready(monkeypatch):
+    """RST/refused (False) for the first few polls, then the daemon comes up
+    (200) -> the backoff keeps polling and eventually wins (does NOT hard-fail)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_READY_BACKOFF_BASE_S", "0.01")
+    monkeypatch.setenv("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", "0.05")
+    state = {"n": 0}
+
+    def ready(ep):
+        if ep != EXTERNAL:
+            return False
+        state["n"] += 1
+        return state["n"] >= 4  # RST x3, then 200
+
+    ctrl = _ctrl(ready)
+    winner = await ctrl._l7_ready_backoff([EXTERNAL], budget_s=2.0)
+    assert winner == EXTERNAL
+    assert state["n"] >= 4  # it kept polling through the refusals
+
+
+async def test_backoff_gives_up_at_budget(monkeypatch):
+    """Never ready within budget -> None (bounded; the AWAKENING deadline is the
+    hard outer bound)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_READY_BACKOFF_BASE_S", "0.01")
+    monkeypatch.setenv("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", "0.03")
+    import time
+    ctrl = _ctrl(lambda ep: False)
+    t0 = time.monotonic()
+    winner = await ctrl._l7_ready_backoff([INTERNAL, EXTERNAL], budget_s=0.2)
+    elapsed = time.monotonic() - t0
+    assert winner is None
+    assert elapsed < 2.0  # bounded by the budget, did not poll forever

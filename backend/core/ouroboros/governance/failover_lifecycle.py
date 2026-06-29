@@ -162,7 +162,19 @@ def _handback_cooldown_s() -> float:
 
 
 def _failover_port() -> int:
-    return _env_int("JARVIS_JPRIME_FAILOVER_PORT", 11434)
+    """The single config-driven inference port -- fed to the firewall rule, the
+    Reachability Racer's candidate endpoints, AND the endpoint publisher, so a
+    config change adapts the WHOLE mesh. Resolution: an explicit failover pin
+    (``JARVIS_JPRIME_FAILOVER_PORT``) wins; else the unified ``JARVIS_PRIME_PORT``
+    (what the inference daemon actually serves -- e.g. 8000 in .env.gcp); else
+    the legacy default. NO hardcoding past the final fallback."""
+    explicit = (os.environ.get("JARVIS_JPRIME_FAILOVER_PORT", "") or "").strip()
+    if explicit:
+        try:
+            return int(explicit)
+        except (ValueError, TypeError):
+            pass
+    return _env_int("JARVIS_PRIME_PORT", 11434)
 
 
 def _tick_s() -> float:
@@ -240,6 +252,22 @@ def _ephemeral_fw_enabled() -> bool:
 
 def _ephemeral_fw_name() -> str:
     return _env_str("JARVIS_FAILOVER_FW_RULE_NAME", "jarvis-ephemeral-failover-allow")
+
+
+def _ready_backoff_base_s() -> float:
+    return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_BASE_S", 1.0))
+
+
+def _ready_backoff_cap_s() -> float:
+    return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", 15.0))
+
+
+def _ready_backoff_budget_s() -> float:
+    """Per-AWAKENING-tick L7-readiness poll budget (bounded so the tick stays
+    responsive). The AWAKENING timeout (default 600s) is the hard outer bound
+    ACROSS ticks, so a short per-tick burst still gives the daemon minutes to
+    come up; operators raise it to poll harder within a single tick."""
+    return max(0.5, _env_float("JARVIS_FAILOVER_READY_BACKOFF_BUDGET_S", 5.0))
 
 
 def _hard_outage_streak() -> int:
@@ -544,7 +572,9 @@ def _default_node_ready_fn(endpoint: str) -> bool:
         import urllib.request  # noqa: PLC0415
 
         with urllib.request.urlopen(endpoint, timeout=3.0) as resp:  # noqa: S310
-            return 200 <= getattr(resp, "status", 200) < 500
+            # Strict Layer-7 success: a 2xx from the inference endpoint. A
+            # connection refused / RST / timeout raises -> False (keep polling).
+            return 200 <= getattr(resp, "status", 200) < 300
     except Exception:  # noqa: BLE001
         return False
 
@@ -960,6 +990,34 @@ class FailoverLifecycleController:
                 "%s (dynamically bound; no env flag)", len(cands), winner,
             )
         return winner
+
+    async def _l7_ready_backoff(
+        self, candidates: List[str], *, budget_s: float,
+    ) -> Optional[str]:
+        """L7 Readiness Poller. Race the candidates; on a connection refused / RST
+        (the VM is up but the inference daemon is still initializing -- NOT a
+        failure), keep polling with EXPONENTIAL BACKOFF until a candidate returns
+        a Layer-7 healthy 200, or the budget is exhausted. Bounded; the AWAKENING
+        deadline is the hard outer bound across ticks. Returns winner or None."""
+        try:
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + max(0.0, budget_s)
+        except Exception:  # noqa: BLE001
+            loop = None
+            deadline = None
+        delay = max(0.01, _ready_backoff_base_s())
+        cap = max(delay, _ready_backoff_cap_s())
+        while True:
+            winner = await self._race_node_ready(candidates)
+            if winner:
+                return winner
+            if deadline is not None and loop is not None and loop.time() >= deadline:
+                return None
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return None
+            delay = min(delay * 2.0, cap)  # exponential, capped
 
     async def _candidate_endpoints(self) -> List[str]:
         """Build the Reachability-Racer candidate set with NO env-flag branching:
@@ -1487,9 +1545,22 @@ class FailoverLifecycleController:
 
     def _build_startup_script(self) -> str:
         from backend.core.ouroboros.governance.failover_deadman import (  # noqa: PLC0415
-            build_deadman_startup_script,
+            build_deadman_startup_script, build_inference_bind_block,
         )
-        return build_deadman_startup_script(port=_failover_port())
+        port = _failover_port()
+        script = build_deadman_startup_script(port=port)
+        # Dynamic cloud-init: force the inference daemon to bind 0.0.0.0:<port>
+        # so the hybrid orchestrator can reach it through the /32 firewall. Gated
+        # (default OFF -> byte-identical dead-man-only legacy). Injected right
+        # after the dead-man shebang/HOME preamble so it runs early on boot.
+        if _enabled("JARVIS_FAILOVER_INFERENCE_BIND_ENABLED", "false"):
+            bind = build_inference_bind_block(port=port)
+            lines = script.split("\n", 1)
+            if len(lines) == 2 and lines[0].startswith("#!"):
+                script = lines[0] + "\n" + bind + "\n" + lines[1]
+            else:
+                script = bind + "\n" + script
+        return script
 
     async def _tick_awakening(self, *, now: float) -> None:
         # AWAKENING deadline: if the node never becomes ready within the timeout,
@@ -1532,7 +1603,10 @@ class FailoverLifecycleController:
         # no IS_LOCAL flag, no hardcoded host swap. Only -> SERVING once a
         # candidate answers; otherwise keep waiting (next tick re-races).
         try:
-            winner = await self._race_node_ready(await self._candidate_endpoints())
+            winner = await self._l7_ready_backoff(
+                await self._candidate_endpoints(),
+                budget_s=_ready_backoff_budget_s(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FailoverLifecycle] reachability race fail-soft err=%r", exc)
             winner = None
