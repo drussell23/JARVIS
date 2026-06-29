@@ -80,3 +80,32 @@ async def test_create_instance_threads_accelerator(monkeypatch):
     )
     assert ok is True
     assert seen["payload"]["guestAccelerators"][0]["acceleratorCount"] == 1
+
+
+async def test_create_instance_multizonal_fallback_on_stockout(monkeypatch):
+    """Zone 1 returns a synchronous STOCKOUT -> autonomously retry zone 2 -> created."""
+    zones_tried = []
+
+    async def fake_http(url, *, method, headers=None, body=None, timeout_s=30.0):
+        # The instance-insert URL carries the zone: .../zones/<zone>/instances
+        if "/instances" in url and method == "POST":
+            zone = url.split("/zones/")[1].split("/")[0]
+            zones_tried.append(zone)
+            if len(zones_tried) <= 1:   # zone 1 stocks out (sync 400 -> next zone)
+                return (400, '{"error":{"message":"does not have enough resources (STOCKOUT)"}}')
+            return (200, '{"status":"PENDING"}')   # zone 2 succeeds
+        return (200, "{}")
+
+    async def fake_token(self):
+        return "tok"
+    monkeypatch.setattr(gcr, "_http_request", fake_http)
+    monkeypatch.setattr(gcr.GCPComputeRest, "access_token", fake_token)
+    monkeypatch.setenv("GCP_PROJECT_ID", "p")
+    monkeypatch.setenv("GCP_ZONE", "us-central1-a")
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-west1-b")
+
+    ok, detail = await _client().create_instance(startup_script="x")
+    assert ok is True
+    assert zones_tried[0] == "us-central1-a"     # tried preferred first
+    assert "us-west1-b" in zones_tried           # failed over to the next zone
+    assert "us-west1-b" in detail
