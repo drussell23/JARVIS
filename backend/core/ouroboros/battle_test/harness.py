@@ -2944,7 +2944,13 @@ class BattleTestHarness:
             mgr = WorktreeManager(
                 repo_root=self._config.repo_path,
             )
-            branch_name = f"ouroboros/auto/{self._session_id}"
+            # Reuse the canonical (nonced, collision-proof) branch name so file +
+            # commit isolation converge on ONE worktree (Task 3 — kills the
+            # hardcoded duplicate that diverged from workspace_branch()).
+            from backend.core.ouroboros.governance.autonomous_workspace import (
+                workspace_branch,
+            )
+            branch_name = workspace_branch(self._session_id)
             wt_path = await mgr.create(branch_name)
         except Exception as wt_err:  # noqa: BLE001 — fail-open
             logger.warning(

@@ -2073,14 +2073,40 @@ class GovernedLoopService:
                                 )
                             except (TypeError, ValueError):
                                 _a1_timeout = 60.0
+                            # Task 2 — CIRCUIT BREAKER: capture the readiness
+                            # result. Fail-OPEN only on an UNEXPECTED valve error
+                            # (infra hiccup) so a transient bus glitch doesn't
+                            # abort; but on a clean not-ready-within-timeout, fail
+                            # LOUD (raise) instead of swallowing and looping a goal
+                            # into a never-ready void (the A1 run #15 silent-DLQ).
                             try:
                                 _a1_bus = _a1_get_bus() if _a1_get_bus else None
-                                await _a1_await_ready(_a1_bus, _a1_timeout)
+                                _a1_ready_ok = await _a1_await_ready(
+                                    _a1_bus, _a1_timeout
+                                )
                             except Exception as _a1_vex:  # noqa: BLE001
                                 logger.debug(
-                                    "[GovernedLoop] router-ready valve "
-                                    "swallowed: %r",
+                                    "[GovernedLoop] router-ready valve errored "
+                                    "(fail-open to legacy emit): %r",
                                     _a1_vex,
+                                )
+                                _a1_ready_ok = True
+                            if not _a1_ready_ok:
+                                from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                                    RouterInitializationTimeoutError,
+                                )
+
+                                logger.critical(
+                                    "[A1] roadmap daemon CIRCUIT BREAKER — intake "
+                                    "router not ready within %.0fs; aborting "
+                                    "roadmap ignition (fail-loud, no silent "
+                                    "DLQ-loop). Streamed to GCS sidecar via "
+                                    "debug.log.",
+                                    _a1_timeout,
+                                )
+                                raise RouterInitializationTimeoutError(
+                                    "intake router not ready within %.0fs"
+                                    % (_a1_timeout,)
                                 )
                         _a1_timeout_dlq_done = False
                         while True:

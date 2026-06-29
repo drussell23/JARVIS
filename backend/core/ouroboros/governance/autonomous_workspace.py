@@ -32,12 +32,36 @@ fallback can't silently corrupt the operator's tree).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Per-process cache: stable nonce per session_id so repeated workspace_branch()
+# calls within ONE boot converge on a single branch (file + commit isolation),
+# while different boots never collide.
+_BRANCH_NONCE_CACHE: Dict[str, str] = {}
+
+
+def compute_workspace_nonce(session_id: str, salt: str) -> str:
+    """Task 3 — a 6-char SHA-256 hex of ``session_id:salt``. Collision-proof
+    branch suffix that PRESERVES forensic evidence (it never resets or destroys
+    a prior crashed run's branch -- it just guarantees a fresh, distinct one)."""
+    return hashlib.sha256(
+        ("%s:%s" % (session_id, salt)).encode("utf-8")
+    ).hexdigest()[:6]
+
+
+def _session_branch_nonce(session_id: str) -> str:
+    nonce = _BRANCH_NONCE_CACHE.get(session_id)
+    if nonce is None:
+        nonce = compute_workspace_nonce(session_id, str(time.time()))
+        _BRANCH_NONCE_CACHE[session_id] = nonce
+    return nonce
 
 _TRUTHY = ("1", "true", "yes", "on")
 _ENV_FILE_ISOLATION = "JARVIS_FILE_ISOLATION_ENABLED"
@@ -98,8 +122,9 @@ def workspace_branch(session_id: str) -> str:
     """Quarantine branch name. Intentionally identical to the
     Ledger-Sovereignty commit-workspace branch so file + commit isolation
     converge on ONE worktree, swept by the existing ``ouroboros/auto/*``
-    reaper."""
-    return f"ouroboros/auto/{session_id}"
+    reaper. A per-boot cryptographic nonce (Task 3) makes the name collision-
+    proof across runs without resetting a prior crashed run's branch."""
+    return "ouroboros/auto/%s-%s" % (session_id, _session_branch_nonce(session_id))
 
 
 async def resolve_loop_project_root(
