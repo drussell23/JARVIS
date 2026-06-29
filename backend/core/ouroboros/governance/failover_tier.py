@@ -79,6 +79,21 @@ def _quality_tier() -> FailoverTier:
     )
 
 
+def quality_tier() -> FailoverTier:
+    """The QUALITY (GPU/32B) provisioning spec, resolved UNCONDITIONALLY -- the
+    single source of truth for what the golden image must contain.
+
+    Deliberately bypasses ``quality_tier_enabled()``: that cost gate governs
+    whether to PROVISION a GPU node at RUNTIME, not what to BAKE ahead of time. The
+    image is manufactured before any outage; the baker must always produce the 32B
+    image the provisioner WILL request once the gate is opened. Routing the baker
+    through ``resolve_tier`` would (gate-off, the default) bake the 7B SURVIVAL
+    image -- a silent drift bug. This accessor is that drift's structural cure: the
+    baker, the bake CLI, and the Packer default all derive from HERE. NEVER raises.
+    """
+    return _quality_tier()
+
+
 def _is_high_priority(urgency: str, complexity: str) -> bool:
     """A workload warrants the GPU tier iff it is IMMEDIATE urgency OR a COMPLEX /
     heavy-code op. BACKGROUND / STANDARD / simple never do (cost discipline)."""

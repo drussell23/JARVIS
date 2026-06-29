@@ -96,6 +96,22 @@ def verify_cross_repo_spec(path) -> Path:
     return p
 
 
+def _quality_tier_defaults() -> tuple:
+    """Resolve ``(image_family, model_label)`` from the SINGLE runtime source of
+    truth (:func:`failover_tier.quality_tier`), so a baked image can NEVER drift
+    from what the failover provisioner will request. Fail-soft to the legacy
+    literals if the import/resolution breaks -- baking must never crash on a
+    metadata lookup. Pure."""
+    try:
+        from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+            quality_tier,
+        )
+        t = quality_tier()
+        return t.image_family, t.model_label
+    except Exception:  # noqa: BLE001 -- any failure -> safe legacy defaults
+        return "jarvis-prime-coder-32b", "qwen2.5-coder:32b"
+
+
 def baker_sa_roles() -> List[str]:
     """Least-privilege roles bound to the ephemeral baker SA. Env-overridable
     (``JARVIS_BAKE_SA_ROLES``, comma-separated) -- no hardcoded blast radius."""
@@ -228,7 +244,7 @@ class CloudBuildBaker:
         *,
         spec_path: Optional[str] = None,
         project: Optional[str] = None,
-        image_family: str = "jarvis-prime-coder-32b",
+        image_family: Optional[str] = None,
         model: Optional[str] = None,
         zone: Optional[str] = None,
         timeout_s: int = 3600,
@@ -236,8 +252,13 @@ class CloudBuildBaker:
     ) -> None:
         self.spec_path = spec_path
         self._project = project
-        self.image_family = image_family
-        self.model = model
+        # Source-of-truth dictation: image_family + model are DERIVED from the
+        # quality tier (the same spec the provisioner requests) unless the caller
+        # explicitly overrides -- e.g. a small-model validation bake. This is the
+        # drift-kill: a bare CloudBuildBaker() can never bake the wrong artifact.
+        _fam, _model = _quality_tier_defaults()
+        self.image_family = image_family or _fam
+        self.model = model or _model
         self.zone = zone
         self.timeout_s = timeout_s
         self.poll_interval_s = poll_interval_s
