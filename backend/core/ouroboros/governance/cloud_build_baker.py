@@ -51,6 +51,10 @@ _DEFAULT_BAKER_ROLES = (
     "roles/compute.storageAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
+    # Write build logs to GCS (GCS_ONLY) so they survive the SA's deletion ->
+    # stockout-detection + post-mortem stay readable. objectAdmin, not the
+    # bucket-mutating storage.admin (least privilege).
+    "roles/storage.objectAdmin",
 )
 
 
@@ -165,6 +169,7 @@ def build_packer_cloud_build(
     disk_gb: int = 100,
     packer_image: str = _PACKER_IMAGE,
     service_account: Optional[str] = None,
+    logs_bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct the EXACT Cloud Build ``Build`` resource that bakes the image:
     (1) write the GZIP+base64-inlined Packer spec into the build workspace,
@@ -201,10 +206,12 @@ def build_packer_cloud_build(
         "substitutions": dict(substitutions or {}),
     }
     if service_account:
-        # A custom build SA REQUIRES an explicit logging mode (Cloud Build won't
-        # use the default logs bucket under a user-supplied SA).
+        # A custom build SA REQUIRES an explicit logging mode. Use GCS (not
+        # CLOUD_LOGGING_ONLY) so the build log SURVIVES the ephemeral SA's
+        # deletion -- the stockout detector + post-mortem read it from GCS.
         cfg["serviceAccount"] = service_account
-        options["logging"] = "CLOUD_LOGGING_ONLY"
+        cfg["logsBucket"] = logs_bucket or "gs://{}_cloudbuild".format(project)
+        options["logging"] = "GCS_ONLY"
     return cfg
 
 
@@ -466,31 +473,27 @@ class CloudBuildBaker:
         return status == 200
 
     async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Inspect a failed build's Cloud Logging output for a transient GPU
-        STOCKOUT (retryable in another zone). Fail-soft -> False (a non-stockout
-        failure must NOT trigger a blind multi-zone retry storm)."""
+        """Inspect a failed build's GCS log for a transient GPU STOCKOUT (retryable
+        in another zone). Reads the build's ``logsBucket`` (GCS_ONLY) -> survives
+        the ephemeral SA's deletion (CLOUD_LOGGING vanished with the SA). Fail-soft
+        -> False (a non-stockout failure must NOT trigger a blind retry storm)."""
         from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
         from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
         try:
             token, project = await self._auth()
             if not token or not project:
                 return False
-            flt = ('resource.type="build" AND resource.labels.build_id="{}"'.format(build_id))
-            body = json.dumps({
-                "resourceNames": ["projects/{}".format(project)],
-                "filter": flt, "orderBy": "timestamp desc", "pageSize": 50,
-            }).encode("utf-8")
-            status, resp = await _http_request(
-                "https://logging.googleapis.com/v2/entries:list", method="POST",
-                headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
-                body=body, timeout_s=30.0,
-            )
-            if status != 200:
+            build = await self._get_build(project, token, build_id)
+            logs_bucket = str(build.get("logsBucket", "")).replace("gs://", "").split("/", 1)[0]
+            if not logs_bucket:
                 return False
-            text = " ".join(
-                e.get("textPayload", "") for e in json.loads(resp).get("entries", [])
+            obj = "log-{}.txt".format(build_id)
+            url = "{}/b/{}/o/{}?alt=media".format(_STORAGE_BASE, logs_bucket, obj)
+            status, text = await _http_request(
+                url, method="GET",
+                headers={"Authorization": "Bearer {}".format(token)}, timeout_s=30.0,
             )
-            return is_stockout_error(text)
+            return is_stockout_error(text) if status == 200 else False
         except Exception as exc:  # noqa: BLE001
             logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
             return False

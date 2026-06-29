@@ -28,8 +28,9 @@ def test_build_runs_as_custom_sa():
         service_account="projects/proj/serviceAccounts/baker@proj.iam.gserviceaccount.com",
     )
     assert cfg["serviceAccount"].endswith("baker@proj.iam.gserviceaccount.com")
-    # A custom build SA REQUIRES an explicit logging mode.
-    assert cfg["options"]["logging"] == "CLOUD_LOGGING_ONLY"
+    # Custom SA -> GCS logging (survives SA deletion; stockout detector reads it).
+    assert cfg["options"]["logging"] == "GCS_ONLY"
+    assert cfg["logsBucket"].startswith("gs://")
 
 
 def test_no_service_account_no_logging_override():
