@@ -101,7 +101,38 @@ def main(argv: list) -> int:
         "--production-soak", "--headless",
         "--max-wall-seconds", wall, "--cost-cap", cost,
     ]
-    return subprocess.call(cmd, env=env)
+    # GUARANTEED EPHEMERAL TEARDOWN: an airtight finally that fires
+    # delete_instance whether the soak exits cleanly, errors, or is Ctrl-C'd.
+    # No orphan billed nodes -- ever. (The node-side Dead-Man's Switch is the
+    # second backstop; this is the first.)
+    try:
+        return subprocess.call(cmd, env=env)
+    finally:
+        _guaranteed_node_teardown(env)
+
+
+def _guaranteed_node_teardown(env: dict) -> None:
+    """Fail-safe delete of the failover node -- runs on EVERY exit path."""
+    try:
+        import asyncio  # noqa: PLC0415
+        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+            get_compute_rest,
+        )
+        for k in ("GCP_PROJECT_ID", "GCP_ZONE", "JARVIS_FAILOVER_USE_ADC",
+                  "GOOGLE_APPLICATION_CREDENTIALS"):
+            if env.get(k):
+                os.environ[k] = env[k]
+        node = os.environ.get("JARVIS_FAILOVER_NODE_NAME", "jarvis-prime-failover")
+
+        async def _del():
+            ok, detail = await get_compute_rest().delete_instance(node)
+            print(f"[hybrid-soak] GUARANTEED TEARDOWN: delete {node} -> ok={ok} {detail}",
+                  flush=True)
+
+        asyncio.run(_del())
+    except Exception as exc:  # noqa: BLE001 -- teardown must never raise
+        print("[hybrid-soak] teardown fail-soft (Dead-Man's Switch backstop): "
+              f"{exc!r}", flush=True)
 
 
 if __name__ == "__main__":

@@ -689,6 +689,35 @@ class GCPComputeRest:
             return self._extract_external_ip(doc) or self._extract_internal_ip(doc)
         return self._extract_internal_ip(doc)
 
+    async def get_node_endpoints(
+        self, name: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Single instances.get -> ``(internal_ip, external_ip)`` for the
+        Reachability Racer (which probes BOTH concurrently -- no env guessing).
+        Either may be None while the node is still booting. NEVER raises."""
+        try:
+            token = await self.access_token()
+            zone = await self.zone()
+            project = await self.project()
+            if not token or not zone or not project:
+                return (None, None)
+            node = name or _node_name()
+            url = "{}/projects/{}/zones/{}/instances/{}".format(
+                _COMPUTE_BASE, project, zone, node
+            )
+            status, text = await _http_request(
+                url, method="GET",
+                headers={"Authorization": "Bearer {}".format(token)},
+                timeout_s=_rest_timeout(),
+            )
+            if not (200 <= status < 300 and text):
+                return (None, None)
+            doc = json.loads(text)
+            return (self._extract_internal_ip(doc), self._extract_external_ip(doc))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[GCPComputeRest] get_node_endpoints fail-soft err=%r", exc)
+            return (None, None)
+
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 
     async def delete_instance(self, name: Optional[str] = None) -> Tuple[bool, str]:

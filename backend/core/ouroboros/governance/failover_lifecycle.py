@@ -266,6 +266,11 @@ def _warmup_timeout_s() -> float:
 # FailoverState
 # ---------------------------------------------------------------------------
 
+class _NodeNotReachable(RuntimeError):
+    """Internal sentinel: a Reachability-Racer candidate endpoint did not answer
+    a healthy 200. Used to lose the race without binding the endpoint."""
+
+
 class FailoverState(enum.Enum):
     """The four lifecycle states (spec section 2)."""
 
@@ -837,14 +842,26 @@ class FailoverLifecycleController:
 
         If a custom publish boundary was injected, defer to it entirely.
         """
+        # Prefer the Reachability-Racer WINNER (already a reachable http://ip:port
+        # bound on self._endpoint). Extract its host so we publish the SAME
+        # address the racer just proved healthy -- not a re-resolved guess.
+        won_ip = ""
+        won_ep = self._endpoint or ""
+        if won_ep.startswith("http://") or won_ep.startswith("https://"):
+            try:
+                host = won_ep.split("://", 1)[1].split("/", 1)[0]
+                won_ip = host.rsplit(":", 1)[0] if ":" in host else host
+            except Exception:  # noqa: BLE001
+                won_ip = ""
+
         publish_fn = self._endpoint_publish_fn
         if publish_fn is not None:
-            ip = await self._resolve_ip()
+            ip = won_ip or await self._resolve_ip()
             if ip:
                 publish_fn(ip)
             return
 
-        ip = await self._resolve_ip()
+        ip = won_ip or await self._resolve_ip()
         if not ip:
             logger.info(
                 "[FailoverLifecycle] endpoint publish: node IP unresolved "
@@ -881,6 +898,78 @@ class FailoverLifecycleController:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FailoverLifecycle] node IP resolve fail-soft err=%r", exc)
             return ""
+
+    async def _race_node_ready(self, candidates: List[str]) -> Optional[str]:
+        """The Asynchronous Reachability Racer -- dynamic topology resolution.
+
+        Concurrently probe ALL candidate endpoints (internal hostname/IP +
+        external natIP) and bind whichever returns a healthy 200 FIRST
+        (``asyncio.wait(FIRST_COMPLETED)``). ZERO environment guessing -- no
+        IS_LOCAL flag, no hardcoded host swap. Works identically on a local Mac
+        (external natIP wins), a GCP pod (internal IP wins), or anywhere else.
+
+        Returns the winning endpoint URL, or None if none answer this tick (the
+        AWAKENING deadline remains the hard bound). Fail-soft throughout: a probe
+        that raises is simply 'not reachable' and never wins."""
+        cands = [c for c in (candidates or []) if c]
+        if not cands:
+            return None
+
+        async def _probe(ep: str) -> str:
+            ok = await self._maybe_await(self._node_ready_fn, ep)
+            if ok:
+                return ep
+            raise _NodeNotReachable(ep)
+
+        pending = {asyncio.ensure_future(_probe(ep)) for ep in cands}
+        winner: Optional[str] = None
+        try:
+            while pending and winner is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for d in done:
+                    try:
+                        winner = d.result()
+                        break
+                    except Exception:  # noqa: BLE001 -- not-reachable / probe error
+                        continue
+        finally:
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        if winner is not None:
+            logger.info(
+                "[FailoverLifecycle] Reachability Racer: %d candidate(s) -> WINNER "
+                "%s (dynamically bound; no env flag)", len(cands), winner,
+            )
+        return winner
+
+    async def _candidate_endpoints(self) -> List[str]:
+        """Build the Reachability-Racer candidate set with NO env-flag branching:
+        the external natIP + the internal IP (single instances.get) PLUS the
+        configured hostname endpoint as a last resort. The racer probes them all
+        concurrently and binds whichever answers first. Fail-soft -> at minimum
+        the hostname candidate (early ticks before the node has IPs)."""
+        port = _failover_port()
+        cands: List[str] = []
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            internal, external = await get_compute_rest().get_node_endpoints()
+            for ip in (external, internal):  # external first (off-VPC most common)
+                if ip:
+                    ep = "http://{}:{}".format(ip, port)
+                    if ep not in cands:
+                        cands.append(ep)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] candidate-endpoint resolve fail-soft err=%r", exc)
+        host_ep = self._build_endpoint()
+        if host_ep not in cands:
+            cands.append(host_ep)
+        return cands
 
     @staticmethod
     def _hot_swap_prime_client(*, host: str, port: int) -> None:
@@ -1359,15 +1448,20 @@ class FailoverLifecycleController:
                 self._last_handback_at = now
                 return
 
-        # Observed ensure-ready gate: only -> SERVING when the node answers.
-        endpoint = self._endpoint or self._build_endpoint()
+        # Observed ensure-ready gate via the Reachability Racer: probe BOTH the
+        # external natIP and the internal IP/hostname concurrently and bind
+        # whichever answers a healthy 200 FIRST. Dynamic topology resolution --
+        # no IS_LOCAL flag, no hardcoded host swap. Only -> SERVING once a
+        # candidate answers; otherwise keep waiting (next tick re-races).
         try:
-            ready = await self._maybe_await(self._node_ready_fn, endpoint)
+            winner = await self._race_node_ready(await self._candidate_endpoints())
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[FailoverLifecycle] node_ready probe fail-soft err=%r", exc)
-            ready = False
-        if not ready:
+            logger.debug("[FailoverLifecycle] reachability race fail-soft err=%r", exc)
+            winner = None
+        if not winner:
             return  # keep waiting; next tick re-probes (fail-soft).
+        # Bind the winning reachable endpoint -- this is what gets published.
+        self._endpoint = winner
 
         # VRAM pre-warm gate (Phase 3b+): after the node transport is up but
         # BEFORE transitioning to SERVING, fire a lightweight dummy generation
@@ -1412,6 +1506,22 @@ class FailoverLifecycleController:
         self._last_probe_at = None
         self._recovered_streak = 0
         logger.info("[FailoverLifecycle] SERVING via J-Prime endpoint=%s", self._endpoint)
+        # ABSOLUTE HANDOFF PROOF: record the exact winning endpoint the GENERATE
+        # queue is now routed to (the Reachability-Racer winner + the wired
+        # JARVIS_PRIME_URL). The Cryo-DLQ drain below replays the sealed ops
+        # through this endpoint; their per-op generation results are the
+        # downstream cryptographic confirmation that J-Prime processed them.
+        try:
+            self._emit_flare(
+                trigger="serving_handoff", route=self._route, now=now,
+            )
+            logger.warning(
+                "[FailoverHandoff] queue ROUTED to J-Prime winner endpoint=%s "
+                "prime_url=%s -- draining Cryo-DLQ ops to the live cloud node",
+                self._endpoint, os.environ.get("JARVIS_PRIME_URL", "<unset>"),
+            )
+        except Exception as exc:  # noqa: BLE001 -- proof telemetry never blocks
+            logger.debug("[FailoverLifecycle] handoff proof fail-soft err=%r", exc)
 
         # Phase 3c -- Cryo-DLQ re-entry. Fire the on-serving hook so the ops
         # sealed during the outage drain back through intake and re-route to
