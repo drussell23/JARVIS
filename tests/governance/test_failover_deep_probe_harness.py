@@ -195,6 +195,48 @@ async def test_both_layers_together_awaken(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# THE SAFETY LAW: an auth 401 must NEVER provision infrastructure.
+# ---------------------------------------------------------------------------
+
+async def test_auth_401_freezes_heartbeat_and_never_awakens(monkeypatch):
+    """A probe that 401s (auth/config error, NOT a DW outage) FREEZES the
+    heartbeat -> is_degrading=False + streak=0 -> neither the early-prewarm NOR
+    the Gap-2 hard escalation fires -> J-Prime is NOT provisioned. (Reproduces +
+    kills the spurious awaken of soak bt-2026-06-29-061928.)"""
+    import urllib.error
+    monkeypatch.setenv("JARVIS_FAILOVER_EARLY_PREWARM_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_DW_HARD_OUTAGE_STREAK", "3")
+
+    async def _auth_401():
+        raise urllib.error.HTTPError(
+            "http://aegis/v1/chat/completions", 401, "x", {}, None
+        )
+
+    hb = ph.DWHeartbeat(
+        ledger=ph.SurfaceHealthLedger(autosave=False),
+        inference_dispatch_fn=_auth_401,
+    )
+    for _ in range(5):  # a real outage would build streak >= 3 and awaken
+        await hb.beat()
+    assert hb.is_frozen() is True
+    assert hb.is_degrading() is False
+    assert hb.consecutive_failures() == 0  # auth NEVER counts as outage
+
+    clock = FakeClock()
+    awaken_calls = []
+    ctrl = _make_ctrl(
+        clock, awaken_calls,
+        is_degrading_fn=hb.is_degrading, degrade_streak_fn=hb.consecutive_failures,
+    )
+    monkeypatch.setattr(ctrl, "_get_forecast", lambda: _fake_forecast("HIGH"))
+
+    await ctrl.tick()
+    assert ctrl.state.name == "DORMANT"   # a misconfig provisioned NOTHING
+    assert awaken_calls == []
+
+
+# ---------------------------------------------------------------------------
 # Pre-fix regression guard: with BOTH new gates OFF, the run-#13 blindspot
 # persists (no awaken) -- proves the fixes are load-bearing, not theatre.
 # ---------------------------------------------------------------------------

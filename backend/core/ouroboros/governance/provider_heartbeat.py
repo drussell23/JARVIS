@@ -133,6 +133,58 @@ def deep_probe_enabled() -> bool:
     return _enabled("JARVIS_DW_DEEP_PROBE_ENABLED", "true")
 
 
+# ---------------------------------------------------------------------------
+# The Safety Law -- strict semantic error classification (Run-#14 fix)
+# ---------------------------------------------------------------------------
+#
+# Soak bt-2026-06-29-061928 provisioned a real GCE node on a false 401: an AUTH
+# error was conflated with a DATA-PLANE OUTAGE, so the degrade streak climbed and
+# the hard-outage escalation forcefully awakened J-Prime. A configuration error
+# must NEVER trigger infrastructure. We classify:
+#   * timeout / 5xx / connection drop -> "outage" (the data plane is down)
+#   * 401 / 403                        -> "auth"   (the PROBE is misconfigured)
+
+class AegisConfigurationError(RuntimeError):
+    """The probe could not authenticate (401/403). A misconfiguration -- NOT a
+    DW outage. Freezes the heartbeat + routes to the DLQ; never awakens."""
+
+
+def _classify_probe_exception(exc: BaseException) -> str:
+    """Classify a probe failure as ``"auth"`` (401/403 -- config error, never an
+    outage) or ``"outage"`` (timeout / 5xx / connection drop -- a real data-plane
+    failure). NEVER raises -- an unknown error is conservatively an outage."""
+    try:
+        import urllib.error  # noqa: PLC0415
+        if isinstance(exc, urllib.error.HTTPError):
+            code = int(getattr(exc, "code", 0))
+            if code in (401, 403):
+                return "auth"
+            return "outage"
+    except Exception:  # noqa: BLE001
+        pass
+    return "outage"
+
+
+def _default_dlq_emit(payload: Any) -> None:
+    """Default sink for an Aegis config error: a CRITICAL structured record on
+    the WAL (debug.log -> GCS flight recorder) + best-effort intake-DLQ append.
+    Fail-soft -- telemetry never blocks. Tests inject their own sink."""
+    try:
+        import json  # noqa: PLC0415
+        logger.critical("[AegisConfigDLQ] %s", json.dumps(payload, sort_keys=True))
+    except Exception:  # noqa: BLE001
+        logger.critical("[AegisConfigDLQ] %r", payload)
+    # Best-effort persisted DLQ entry (reuse the existing intake_dlq surface;
+    # append_dlq serializes a dict envelope via its _to_serializable path).
+    try:
+        from backend.core.ouroboros.governance.intake_dlq import (  # noqa: PLC0415
+            append_dlq,
+        )
+        append_dlq(payload, reason="aegis_configuration_error")
+    except Exception:  # noqa: BLE001 -- the WAL record above is the durable floor
+        pass
+
+
 def _resolve_deep_probe_timeout(baseline_s: Optional[float] = None) -> float:
     """Resolve the deep-probe ``asyncio.wait_for`` deadline DYNAMICALLY.
 
@@ -206,11 +258,28 @@ async def _resolve_dw_probe_transport():
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             aegis_provider_bridge as _apb,
         )
+        # FIDELITY: the real DW call carries BOTH the session bearer AND a
+        # per-call lease (session + acquire_call_lease + merge). Use the SAME
+        # shared AegisClient vault + lease helpers -- no duplication. Both
+        # best-effort: a missing piece yields the daemon's own 401, which the
+        # Safety-Law classifier handles as a config error (freeze), never an outage.
         auth = await _apb.dw_session_auth_header()
-        if isinstance(auth, dict):
-            headers.update(auth)
-    except Exception as exc:  # noqa: BLE001 -- best-effort bearer
-        logger.debug("[DWHeartbeat] aegis session header fail-soft err=%r", exc)
+        if not isinstance(auth, dict):
+            auth = {}
+        lease = None
+        try:
+            lease = await _apb.acquire_call_lease(
+                op_id="dw-heartbeat-probe",
+                route="heartbeat",
+                estimated_cost_usd=_env_float("JARVIS_DW_DEEP_PROBE_COST_USD", 0.0001),
+            )
+        except Exception as exc:  # noqa: BLE001 -- no lease -> daemon 401 -> classified
+            logger.debug("[DWHeartbeat] probe lease acquire fail-soft err=%r", exc)
+        merged = _apb.merge_lease_into_session_headers(auth, lease)
+        if isinstance(merged, dict):
+            headers.update(merged)
+    except Exception as exc:  # noqa: BLE001 -- best-effort bearer/lease
+        logger.debug("[DWHeartbeat] aegis auth/lease fail-soft err=%r", exc)
     return (url, headers)
 
 
@@ -303,12 +372,17 @@ class DWHeartbeat:
         probe_fn: Optional[Callable[[], Any]] = None,
         ledger: Optional[SurfaceHealthLedger] = None,
         inference_dispatch_fn: Optional[Callable[[], Any]] = None,
+        dlq_emit_fn: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         # The deep-probe inference boundary (data plane). Injectable for tests;
         # default is a real max_tokens=1 DW generation.
         self._inference_dispatch_fn = (
             inference_dispatch_fn or _default_dw_inference_dispatch
         )
+        # The Safety Law -- where an AUTH (config) error is routed. Default: the
+        # intake DLQ. Injectable for tests. A 401/403 FREEZES the loop here.
+        self._dlq_emit_fn = dlq_emit_fn or _default_dlq_emit
+        self._frozen = False  # set True on an auth/config error -> never awakens
         # Baseline healthy-probe latency metric (EWMA) -- drives the DYNAMIC
         # deep-probe timeout. Seeded from env; updated on each healthy probe.
         self._baseline_latency_s: float = _env_float(
@@ -336,15 +410,22 @@ class DWHeartbeat:
     # Public read surface (consumed by the failover lifecycle pre-warm gate)
     # ------------------------------------------------------------------
 
+    def is_frozen(self) -> bool:
+        """True once an AUTH/config error froze the loop. A frozen heartbeat is
+        a NON-signal: is_degrading()=False, consecutive_failures()=0 -- a
+        misconfiguration can NEVER trigger an awaken."""
+        return self._frozen
+
     def is_degrading(self) -> bool:
         """True iff DW is DEGRADED but NOT yet a full outage.
 
         Reads the live ``consecutive_failures`` streak for the DIRECT_STREAMING
         surface from the shared ledger and compares against the degrade streak
         (default 2 < the outage window of 5). OFF -> always False (inert).
+        FROZEN (auth/config error) -> always False (the Safety Law).
         Fail-soft -> False on any error (conservative: no false pre-warm).
         """
-        if not heartbeat_enabled():
+        if not heartbeat_enabled() or self._frozen:
             return False
         try:
             rec = self._ledger.verdict_for(self._SURFACE)
@@ -368,8 +449,9 @@ class DWHeartbeat:
             return None
 
     def consecutive_failures(self) -> int:
-        """Current degrade streak for the DW SSE surface (0 when healthy)."""
-        if not heartbeat_enabled():
+        """Current degrade streak for the DW SSE surface (0 when healthy).
+        FROZEN (auth/config) -> 0 so the Gap-2 hard escalation can never fire."""
+        if not heartbeat_enabled() or self._frozen:
             return 0
         try:
             rec = self._ledger.verdict_for(self._SURFACE)
@@ -417,16 +499,40 @@ class DWHeartbeat:
         except asyncio.TimeoutError:
             logger.debug(
                 "[DWHeartbeat] deep probe TIMEOUT after %.3fs (data-plane "
-                "deadlock) -> degrade signal", timeout,
+                "deadlock) -> outage degrade signal", timeout,
             )
             return False
-        except Exception as exc:  # noqa: BLE001 -- a dispatch error IS a degrade
-            logger.debug("[DWHeartbeat] deep probe dispatch err=%r -> degrade", exc)
+        except AegisConfigurationError:
+            raise  # already classified -- propagate to beat() (the Safety Law)
+        except Exception as exc:  # noqa: BLE001 -- classify before treating as degrade
+            if _classify_probe_exception(exc) == "auth":
+                # A 401/403 is a PROBE misconfiguration, NOT a DW outage. Raise a
+                # typed error so beat() freezes the loop instead of degrading
+                # (which would conflate a config bug with an outage -> false awaken).
+                raise AegisConfigurationError(
+                    "deep probe auth failure (config error, NOT outage): %r" % (exc,)
+                ) from exc
+            logger.debug("[DWHeartbeat] deep probe dispatch err=%r -> outage degrade", exc)
             return False
         ok = bool(result) and bool(str(result).strip())
         if ok:
             self._record_baseline_latency(time.monotonic() - t0)
         return ok
+
+    def _emit_config_dlq(self, exc: BaseException) -> None:
+        """Route an Aegis config error to the DLQ sink. Fail-soft."""
+        payload = {
+            "event": "aegis_configuration_error",
+            "error_class": "AegisConfigurationError",
+            "surface": self._SURFACE.value,
+            "detail": str(exc)[:300],
+            "action": "heartbeat_frozen",
+            "note": "config error -- NOT a DW outage; never awakens J-Prime",
+        }
+        try:
+            self._dlq_emit_fn(payload)
+        except Exception as exc2:  # noqa: BLE001 -- telemetry never blocks
+            logger.debug("[DWHeartbeat] config DLQ emit fail-soft err=%r", exc2)
 
     # ------------------------------------------------------------------
     # One probe + record (the testable core)
@@ -439,7 +545,7 @@ class DWHeartbeat:
         A probe error is itself a degrade signal -- the verdict recorded is
         TRANSPORT_DEGRADED (never propagates the exception).
         """
-        if not heartbeat_enabled():
+        if not heartbeat_enabled() or self._frozen:
             return
         ok = False
         try:
@@ -447,8 +553,21 @@ class DWHeartbeat:
             if asyncio.iscoroutine(result):
                 result = await result
             ok = bool(result)
-        except Exception as exc:  # noqa: BLE001 -- a probe error IS a degrade
-            logger.debug("[DWHeartbeat] probe raised (degrade signal) err=%r", exc)
+        except AegisConfigurationError as exc:
+            # THE SAFETY LAW: an auth/config error is NOT a DW outage. FREEZE the
+            # loop (no proxy spam), route to the DLQ, and record NOTHING into the
+            # degrade streak. is_degrading()/consecutive_failures() now read 0 ->
+            # a misconfiguration can NEVER provision infrastructure.
+            self._frozen = True
+            logger.critical(
+                "[DWHeartbeat] AEGIS CONFIG ERROR -- probe cannot authenticate "
+                "(401/403). FREEZING heartbeat; this is NOT a DW outage and will "
+                "NOT awaken J-Prime. err=%r", exc,
+            )
+            self._emit_config_dlq(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- a non-auth probe error IS an outage
+            logger.debug("[DWHeartbeat] probe raised (outage degrade) err=%r", exc)
             ok = False
 
         verdict = SurfaceVerdict.HEALTHY if ok else SurfaceVerdict.TRANSPORT_DEGRADED
@@ -488,7 +607,7 @@ class DWHeartbeat:
             "[DWHeartbeat] run() loop started interval=%.1fs degrade_streak=%d",
             _interval_s(), _degrade_streak(),
         )
-        while not self._stopped:
+        while not self._stopped and not self._frozen:
             try:
                 await self.beat()
             except Exception as exc:  # noqa: BLE001 -- belt-and-braces
