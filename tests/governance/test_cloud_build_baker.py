@@ -34,13 +34,17 @@ def test_build_has_write_init_build_steps():
     assert "build" in joined               # packer build
 
 
-def test_spec_is_inlined_as_base64():
+def test_spec_is_inlined_as_gzip_base64_roundtrip():
+    import gzip
     cfg = build_packer_cloud_build(
         spec_text=_SPEC, project="proj", substitutions={}, image_family="fam",
     )
-    b64 = base64.b64encode(_SPEC.encode()).decode()
-    blob = repr(cfg["steps"])
-    assert b64 in blob                     # the exact spec rides inline (no GCS)
+    writer_arg = cfg["steps"][0]["args"][1]
+    assert "gunzip" in writer_arg          # gzip-compressed inline (stays under 10000)
+    # Extract the base64 blob and prove it round-trips back to the exact spec.
+    b64 = writer_arg.split("printf %s '")[1].split("'")[0]
+    assert gzip.decompress(base64.b64decode(b64)).decode() == _SPEC
+    assert len(writer_arg) < 10000         # Cloud Build per-arg limit respected
 
 
 def test_build_passes_project_and_image_family_vars():

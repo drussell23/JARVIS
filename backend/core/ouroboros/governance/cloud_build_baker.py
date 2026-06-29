@@ -167,10 +167,16 @@ def build_packer_cloud_build(
     service_account: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct the EXACT Cloud Build ``Build`` resource that bakes the image:
-    (1) write the base64-inlined Packer spec into the build workspace,
+    (1) write the GZIP+base64-inlined Packer spec into the build workspace,
     (2) ``packer init``, (3) ``packer build`` with the project/image-family/model
-    vars. No ``source`` -> no GCS upload (the spec rides inline). Pure."""
-    b64 = base64.b64encode((spec_text or "").encode("utf-8")).decode("ascii")
+    vars. No ``source`` -> no GCS upload (the spec rides inline). The spec is
+    GZIPPED before base64 so the single build-step arg stays well under Cloud
+    Build's 10000-char per-arg limit (raw base64 of a ~7KB spec is ~9.7KB -- one
+    edit overflows it; gzip drops it to ~2.7KB, future-proof). Deterministic
+    (mtime=0). Pure."""
+    import gzip  # noqa: PLC0415
+    gz = gzip.compress((spec_text or "").encode("utf-8"), mtime=0)
+    b64 = base64.b64encode(gz).decode("ascii")
     var_flags = [
         "-var=project_id={}".format(project),
         "-var=image_family={}".format(image_family),
@@ -182,7 +188,7 @@ def build_packer_cloud_build(
             "name": _WRITER_IMAGE,
             "entrypoint": "bash",
             # base64 is [A-Za-z0-9+/=] only -> safe inside single quotes.
-            "args": ["-c", "printf %s '{}' | base64 -d > {}".format(b64, _SPEC_PATH_IN_BUILD)],
+            "args": ["-c", "printf %s '{}' | base64 -d | gunzip > {}".format(b64, _SPEC_PATH_IN_BUILD)],
         },
         {"name": packer_image, "args": ["init", _SPEC_PATH_IN_BUILD]},
         {"name": packer_image, "args": ["build", *var_flags, _SPEC_PATH_IN_BUILD]},
