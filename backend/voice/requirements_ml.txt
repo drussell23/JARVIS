@@ -41,7 +41,7 @@ pyaudio>=0.2.11
 # Existing voice requirements
 SpeechRecognition>=3.10.0
 pyttsx3>=2.90
-pygame>=2.5.0
+pygame>=2.6.1
 
 # Anthropic API
 anthropic>=0.7.0
