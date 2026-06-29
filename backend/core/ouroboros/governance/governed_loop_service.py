@@ -4807,28 +4807,34 @@ class GovernedLoopService:
             # written=True git plumbing decoupled from DW. The production
             # CandidateGenerator constructed above is never modified, and
             # scripts/ is imported ONLY on the fixture path (never in prod).
-            try:
-                if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() in {
-                    "1", "true", "yes", "on",
-                }:
-                    import sys as _sys
-                    from pathlib import Path as _Path
+            #
+            # FAIL-CLOSED (A1 run #15 fix): NO try/except swallow here. Under
+            # fixture mode, an import or activation failure MUST hard-crash the
+            # orchestrator -- a prior `except Exception -> use real generator`
+            # silently fell back to DW autarky when the node PYTHONPATH differed,
+            # masking the bug as an inconclusive UNKNOWN. We instead normalize
+            # sys.path (repo root + scripts/) so the import resolves on macOS or
+            # /opt/trinity/jarvis, then apply_fixture_overlay_or_raise() crashes
+            # loud if it cannot.
+            if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }:
+                import sys as _sys
+                from pathlib import Path as _Path
 
-                    _scripts = str(_Path(__file__).resolve().parents[4] / "scripts")
-                    if _scripts not in _sys.path:
-                        _sys.path.insert(0, _scripts)
-                    from a1_deterministic_fixture import (  # noqa: E501
-                        apply_fixture_generator_overlay,
-                    )
+                _repo_root = _Path(__file__).resolve().parents[4]
+                for _p in (str(_repo_root), str(_repo_root / "scripts")):
+                    if _p not in _sys.path:
+                        _sys.path.insert(0, _p)
+                # No try/except: an import failure propagates = fail-closed crash.
+                from a1_deterministic_fixture import (  # noqa: E501
+                    apply_fixture_overlay_or_raise,
+                )
 
-                    if apply_fixture_generator_overlay(self):
-                        logger.warning(
-                            "[GovernedLoop] A1 fixture generator overlay ACTIVE — "
-                            "deterministic AST candidate, zero-DW (written=True proof path)"
-                        )
-            except Exception:
-                logger.exception(
-                    "[GovernedLoop] A1 fixture overlay failed; using real generator"
+                apply_fixture_overlay_or_raise(self)
+                logger.warning(
+                    "[GovernedLoop] A1 fixture generator overlay ACTIVE — "
+                    "deterministic AST candidate, zero-DW (written=True proof path)"
                 )
 
             # HIBERNATION_MODE step 6: construct a HibernationProber over the

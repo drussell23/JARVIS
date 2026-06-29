@@ -1491,6 +1491,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except ValueError as exc:
             _log("REFUSED: invalid A1 fixture config -- %s" % (exc,))
             return 2
+        # FAIL-CLOSED telemetry: a REMOTE fixture run MUST stream to GCS, else a
+        # node death takes the debug.log to the grave (A1 run #15). We never fly
+        # blind in the cloud again.
+        if getattr(args, "remote", False) and not os.environ.get(
+            "JARVIS_A1_GCS_TELEMETRY_TARGET", ""
+        ):
+            _log(
+                "REFUSED: --inject-deterministic-fixture --remote requires "
+                "--gcs-telemetry-target gs://... (fail-closed telemetry; a node "
+                "death must not lose the debug.log). Local runs are exempt."
+            )
+            return 2
         _log(
             "A1 Fast-Forward fixture ARMED: target=%s seed=%s gcs=%s"
             % (

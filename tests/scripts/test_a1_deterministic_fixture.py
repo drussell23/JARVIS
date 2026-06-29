@@ -407,6 +407,48 @@ def test_overlay_is_noop_when_generator_not_built():
 
 
 # ---------------------------------------------------------------------------
+# Fail-Closed overlay — under fixture mode, activation failure MUST hard-crash,
+# never silently fall back to the live LLM generator (the A1 run #15 bug).
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_or_raise_is_noop_when_fixture_off():
+    from a1_deterministic_fixture import apply_fixture_overlay_or_raise
+
+    h = _Holder(_FakeInner())
+    apply_fixture_overlay_or_raise(h, env={}, read_file=lambda p: _TARGET_SRC)
+    assert h._generator.__class__ is _FakeInner  # untouched, no raise
+
+
+def test_overlay_or_raise_applies_when_ok():
+    from a1_deterministic_fixture import FixtureGenerator, apply_fixture_overlay_or_raise
+
+    h = _Holder(_FakeInner())
+    apply_fixture_overlay_or_raise(h, env=_FIXTURE_ENV, read_file=lambda p: _TARGET_SRC)
+    assert isinstance(h._generator, FixtureGenerator)
+
+
+def test_overlay_or_raise_FAILS_CLOSED_when_unapplied():
+    from a1_deterministic_fixture import (
+        FatalFixtureConfigurationError,
+        apply_fixture_overlay_or_raise,
+    )
+
+    # Fixture mode ON but generator not built -> cannot apply -> MUST raise,
+    # never silently continue to the live generator.
+    with pytest.raises(FatalFixtureConfigurationError):
+        apply_fixture_overlay_or_raise(
+            _Holder(None), env=_FIXTURE_ENV, read_file=lambda p: _TARGET_SRC
+        )
+
+
+def test_fatal_fixture_configuration_error_is_exception():
+    from a1_deterministic_fixture import FatalFixtureConfigurationError
+
+    assert issubclass(FatalFixtureConfigurationError, Exception)
+
+
+# ---------------------------------------------------------------------------
 # Strict Subprocess Contract — fail-fast on a mangled fixture config BEFORE the
 # node boots, so we never burn a node window on a misconfigured run.
 # ---------------------------------------------------------------------------

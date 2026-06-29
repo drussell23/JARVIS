@@ -310,6 +310,34 @@ def apply_fixture_generator_overlay(
     return True
 
 
+class FatalFixtureConfigurationError(RuntimeError):
+    """Fixture mode is ON but overlay activation failed. FAIL-CLOSED: the
+    orchestrator hard-crashes instead of silently falling back to the live LLM
+    generator -- the exact silent-autarky-fallback that masked a node PYTHONPATH
+    bug as an inconclusive UNKNOWN in A1 run #15."""
+
+
+def apply_fixture_overlay_or_raise(
+    holder: Any,
+    *,
+    env=None,
+    read_file: Optional[Callable[[str], str]] = None,
+) -> None:
+    """Fail-closed wrapper over :func:`apply_fixture_generator_overlay`. When
+    fixture mode is active, the overlay MUST apply or this raises
+    ``FatalFixtureConfigurationError``. No-op when fixture mode is off (the
+    production default path is untouched)."""
+    env = env if env is not None else os.environ
+    if not _truthy(env.get("JARVIS_A1_FIXTURE_MODE", "")):
+        return
+    if not apply_fixture_generator_overlay(holder, env=env, read_file=read_file):
+        raise FatalFixtureConfigurationError(
+            "A1 fixture mode is ON but the generator overlay did not apply "
+            "(generator unbuilt or fixture payload None) -- refusing to fall back "
+            "to the live LLM generator (autarky)."
+        )
+
+
 def validate_fixture_config(env) -> None:
     """Strict Subprocess Contract: fail-fast (``ValueError``) on a mangled fixture
     config BEFORE a node is provisioned. No-op when fixture mode is inactive."""
