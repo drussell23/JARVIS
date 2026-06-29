@@ -1862,12 +1862,22 @@ class FailoverLifecycleController:
         logger.info("[FailoverLifecycle] DORMANT (delete-to-snapshot complete)")
 
     def _inflight_count(self) -> int:
-        """Count of in-flight J-Prime ops. Injected ``in_flight_fn`` or 0 (no
-        tracker -> immediate teardown). NEVER raises -> 0 on error (fail-open to
-        teardown; the Dead-Man's Switch backstops a wrong 0)."""
+        """Count of in-flight J-Prime ops. An explicit injected ``in_flight_fn``
+        wins; otherwise lazily resolves the LIVE generation count from the
+        providers module (``get_jprime_inflight_count`` -- the PrimeProvider
+        increments it for the duration of each J-Prime generation). Symmetric
+        with how ``_is_degrading`` resolves the heartbeat. NEVER raises -> 0
+        (fail-open to teardown; the Dead-Man's Switch backstops a wrong 0)."""
         fn = self._in_flight_fn
         if fn is None:
-            return 0
+            try:
+                from backend.core.ouroboros.governance.providers import (  # noqa: PLC0415
+                    get_jprime_inflight_count,
+                )
+                fn = get_jprime_inflight_count
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] inflight resolve fail-soft err=%r", exc)
+                return 0
         try:
             return max(0, int(fn()))
         except Exception as exc:  # noqa: BLE001

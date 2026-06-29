@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -5126,6 +5127,39 @@ def _parse_generation_response(
 # ---------------------------------------------------------------------------
 
 
+def get_jprime_inflight_count() -> int:
+    """The live count of J-Prime generations currently crunching. Read by the
+    failover Zero-Drop Drain to await in-flight ops before teardown. Fail-soft
+    -> 0 (fail-open to teardown; the node Dead-Man's Switch backstops a wrong 0)."""
+    try:
+        from ._governance_state import get_prime_provider_state  # noqa: PLC0415
+        return max(0, int(getattr(get_prime_provider_state(), "inflight", 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@contextlib.contextmanager
+def _jprime_inflight_guard():
+    """Bracket a single J-Prime generation: increment the hoisted in-flight
+    counter for its duration, decrement on EVERY exit (return OR exception) so a
+    failed generation never leaks a phantom in-flight op. GIL-safe int math."""
+    st = None
+    try:
+        from ._governance_state import get_prime_provider_state  # noqa: PLC0415
+        st = get_prime_provider_state()
+        st.inflight = int(getattr(st, "inflight", 0)) + 1
+    except Exception:  # noqa: BLE001
+        st = None
+    try:
+        yield
+    finally:
+        if st is not None:
+            try:
+                st.inflight = max(0, int(getattr(st, "inflight", 1)) - 1)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class PrimeProvider:
     """CandidateProvider adapter wrapping PrimeClient.generate().
 
@@ -5191,6 +5225,22 @@ class PrimeProvider:
         return "gcp-jprime"
 
     async def generate(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        repair_context: Optional[Any] = None,
+        *,
+        temperature: Optional[float] = None,
+    ) -> GenerationResult:
+        """Generation entrypoint. Brackets the J-Prime generation with the
+        in-flight guard (the failover Zero-Drop Drain awaits this count before
+        teardown -- no op severed mid-generation), then delegates to the impl."""
+        with _jprime_inflight_guard():
+            return await self._generate_impl(
+                context, deadline, repair_context, temperature=temperature,
+            )
+
+    async def _generate_impl(
         self,
         context: OperationContext,
         deadline: datetime,
