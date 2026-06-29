@@ -51,3 +51,75 @@ Flipped default-ON after the **Adversarial Cognitive Soak** proved the full cogn
 - **Phase 4 (later, budgeted):** Reactor-Core training flywheel ingests the exported outage + generation-outcome dataset (the Trinity bridge from Phase 1) → fine-tunes the coder model → redeploys to J-Prime. Heavier GPU cost → budgeted bursts. (Would lift the 7B's stochastic convergence ceiling exposed by the gauntlet.)
 
 See [[project_epistemic_feedback_lane_escalation]] (the quarantine that detects the outage this fails over from), [[project_jprime_local_tier]], [[project_sovereign_sentinel_autopsy]] (the autopsy principle reused in the bake).
+
+## Run-#13 fix — Layered awaken trigger (2026-06-28, soak bt-2026-06-29-032526)
+
+First live exercise of the armed mesh (failover ON, DW primary, J-Prime fallback, Claude disabled). DW was 100% down the whole 20-min wall-capped session (`background_dw_timeout:180s` x11, `dw_severed_queued`), yet `FailoverLifecycleController` **never awakened** J-Prime — ticked silently after boot, logged nothing. Two stacked blind spots, both the wired-but-inert pattern one layer deeper than run-#11:
+
+1. **Control-plane vs data-plane desync.** The heartbeat probed `GET /models` (control plane = 200 OK) while the *generation* data plane deadlocked at 180s/op. `is_degrading()` never fired. (Also: heartbeat defaulted OFF in the manifest.)
+2. **Outage-gradient masking.** BACKGROUND ops hit the topology pre-block (`background_dw_blocked_by_topology`) which raises BEFORE the model-walk loop's `record_sweep`, then the orchestrator swallowed it as `background_accepted`. So `is_global_outage("background")` never filled its 5-sweep window despite a total outage.
+
+**Fix (Option 3, layered defense, TDD-first):**
+- **Deep Inference Probe** (`provider_heartbeat.py`): default probe is now a deterministic `max_tokens=1` data-plane generation bounded by `asyncio.wait_for` with a DYNAMIC timeout (`_resolve_deep_probe_timeout`: env override OR `mult x` observed baseline-latency EWMA, clamped — never a hardcoded literal). A wedged inference queue times out in a blink and flips `is_degrading()` long before 180s. Gate `JARVIS_DW_DEEP_PROBE_ENABLED` default-ON (composes under heartbeat master, default-OFF → unset is byte-identical legacy; rollback restores `GET /models`).
+- **Unmasked Terminal Exhaustion** (`provider_quarantine.record_terminal_exhaustion` chokepoint, wired into the candidate_generator topology-block raise): every "zero usable DW candidate for this route" terminal exit now feeds the gradient `success=False` even when the op is gracefully accepted downstream. Gate `JARVIS_QUARANTINE_UNMASK_EXHAUSTION_ENABLED` default-ON.
+
+**Proof:** `tests/governance/test_failover_deep_probe_harness.py` — deterministic 8-second harness (runs in ~3.4s) with REAL gradient + REAL DWHeartbeat + REAL FailoverLifecycleController. Proves each layer INDEPENDENTLY drives the controller to AWAKENING, both together, AND a regression guard: with both gates OFF the controller stays DORMANT (reproduces the exact soak blindspot → fixes are load-bearing, not theatre). 21 new unit tests (`test_provider_heartbeat_deep_probe.py` 11, `test_terminal_exhaustion_unmask.py` 5, harness 5). All affected suites green in isolation; the soak-method lesson held — found + fixed + proven at $0/seconds, no second 20-min cloud soak needed yet.
+
+LESSON: a health probe must exercise the SAME plane the real traffic uses (data plane, not `GET /models`) — the classic distributed-systems control/data desync. And a "graceful accept" swallow (`background_accepted`) must still feed the telemetry the raw failure, or the outage signal silently never trips. Both are [[feedback_security_filter_must_be_wired]] siblings. NOT YET re-soaked live — next step is arming `JARVIS_DW_HEARTBEAT_ENABLED=true` in the soak manifest and confirming the real DW→J-Prime awaken fires.
+
+## Hybrid Execution Mesh — local orchestrator → real GCP J-Prime (2026-06-28)
+
+Built to bridge the local-Mac orchestrator (no gcloud/metadata) to the real GCP J-Prime golden image, so the awaken→serve round-trip can fire without running the orchestrator on GCE. Three TDD'd builds (all gated/fail-soft, 41 tests):
+
+1. **Dynamic IAM Credential Bridge** (`gcp_compute_rest.py`): when `GOOGLE_APPLICATION_CREDENTIALS` (SA JSON) is present, `access_token()`/`project()`/`verify_compute_scopes()` mint a Compute OAuth token via native `google-auth` (`mint_sa_access_token`, off-loaded to a thread so the blocking refresh never stalls the loop) — ZERO gcloud, ZERO metadata. Project from the SA JSON (env override wins), zone from `GCP_ZONE`. Unset creds → byte-identical metadata path. The SA's real IAM role is enforced server-side at `instances.insert` (a 403 surfaces there — fail-CLOSED preserved).
+2. **Hybrid external-IP resolution** (`gcp_compute_rest.py`): a LOCAL orchestrator must reach the node's EXTERNAL natIP, not the in-VPC internal IP. `_select_reachable_ip()` returns `accessConfigs[0].natIP` in hybrid mode (SA creds present OR `JARVIS_FAILOVER_HYBRID_MESH=true`), falling back to internal; on-VPC stays internal (byte-identical). `await_running_ip` now routes through it.
+3. **Immutable Trigger-Attribution Flare** (`failover_lifecycle.py`): at the DORMANT→AWAKENING instant, `_emit_flare()` synchronously flushes a payload (`trigger=heartbeat_early_prewarm | reactive_outage`, `route`, `ts`, state transition) BEFORE the GCE boot — so the attribution survives even a fail-soft awaken. Default sink = high-priority `[FailoverFlare]` WARNING to the WAL (debug.log); injectable for a GCS sidecar. `_enter_awakening(trigger, route)` threads it from both awaken paths.
+
+Ignition staged: `scripts/launch_hybrid_failover_soak.py` (composes the layered+hybrid env, HARD-GUARDS on SA+project+zone — refuses success-theatre) + `scripts/smoke_sa_token_mint.py` ($0 ~1s real-GCP auth proof, no node). NOT YET IGNITED — needs the operator's SA JSON + GCP_PROJECT_ID + GCP_ZONE exported. Sandbox caveat: real GCP calls hit oauth2.googleapis.com + compute.googleapis.com (not on the default sandbox allowlist) → run the launcher in the operator shell (`\!`) or with sandbox disabled. LESSON: a watchdog/probe must exercise the real plane; a local→cloud bridge must resolve the EXTERNAL IP (the internal IP is unreachable off-VPC — a silent dead-end if missed).
+
+## FIRST REAL END-TO-END AWAKEN — and the spurious-trigger safety lesson (2026-06-28, soak bt-2026-06-29-061928)
+
+**Milestone:** the full Hybrid Execution Mesh fired end-to-end against real GCP for the FIRST time (unproven across all prior soaks). Chain: deep probe → Gap 2 hard-escalation (streak 3) → immutable FailoverFlare (`trigger=heartbeat_hard_outage`) → ADC IAM bridge → `instances.insert ok ... mode=SPOT status=200` → real `jarvis-prime-failover` node AWAKENING. Every piece works: adaptive ADC auth, native Compute REST provision, escalation, flare attribution. Gap 3 (concurrent intake prewarm) also fired.
+
+**BUT it was a SPURIOUS awaken.** The deep probe STILL got HTTP 401: my Gap-1 "faithful transport" uses `dw_aegis_base_url()` + `dw_session_auth_header()`, but the Aegis SESSION BEARER is never established for the standalone heartbeat (the `/session/establish` is tied to the DW provider's first real generation call, which the op-starved/standalone probe never makes). So `dw_session_auth_header()` returns no/empty bearer → Aegis passthrough 401 → false degrade → streak → forced awaken on a NON-outage. Node deleted immediately via the ADC bridge (`delete_instance -> deleted:200`, verified zero instances). Cost: a few min of Spot.
+
+**THE SAFETY LAW (load-bearing):** Gap 2's auto-escalation is only as trustworthy as the probe. A false-positive probe + auto-provision = real GCP spend. TWO fixes required before re-arming the heartbeat in any soak:
+1. **Probe fidelity:** the heartbeat must establish (or share) the Aegis session so its probe gets DW's REAL verdict, not a 401.
+2. **Classify auth ≠ outage:** a 401/403 is a PROBE-CONFIG failure, NOT a data-plane outage — it must NOT count toward the hard-outage streak. Only timeouts / 5xx / connection drops are real outage signal. (This classification alone would have prevented the spurious awaken.)
+
+Baseline production is SAFE (JARVIS_DW_HEARTBEAT_ENABLED defaults OFF → no probe → no escalation); the risk is only when the heartbeat is explicitly armed (soak/opt-in). Committed: ef723ac (round 1 + Gap 1), 085db11 (Gaps 2-3).
+
+## LEGITIMATE E2E failover + Safety Law proven live (2026-06-28, soak bt-2026-06-29-063702)
+
+The Safety Law + fidelity fix (commit 67725fc) turned the false 401 into a REAL signal. This soak:
+- **Probe authenticated** (`auth_sync=healthy`) via the full faithful path: session bearer + per-call lease through the EXISTING shared `AegisClient` vault (asyncio.Lock single-establish) + `acquire_call_lease` + `merge_lease_into_session_headers`. No duplicate vault. The 401 is GONE.
+- **Real DW data-plane outage detected**: `deep probe TIMEOUT after 2.000s (data-plane deadlock)` — the genuine 180s batch deadlock caught in 2s by the dynamic timeout. Surface sweep: `direct_streaming=upstream_degraded auth_sync=healthy` (auth fine, data plane genuinely dead).
+- **LEGITIMATE awaken**: streak 3 → Gap-2 hard escalation → flare (`heartbeat_hard_outage`) → ADC IAM bridge → `instances.insert ok mode=SPOT 200` → real node RUNNING with external natIP 35.192.251.243. NOT spurious this time — a real outage justified it.
+
+**Safety Law is PROVEN both ways:** the 401 path freezes+DLQ+no-awaken (8s harness test `test_auth_401_freezes_heartbeat_and_never_awakens` + live), the real-timeout path awakens. A config error can never provision; a real outage does.
+
+**NEXT GAP — hybrid node-ready over the EXTERNAL IP.** AWAKENING never reached SERVING: `AWAKENING node endpoint=http://jarvis-prime-failover:11434` — the node-ready probe + endpoint publish use the INTERNAL GCE hostname, unreachable from the local-Mac orchestrator. Gap-B fixed `await_running_ip` (natIP resolution) but `_default_node_ready_fn` / `_resolve_node_ip` / `_build_endpoint` still emit the internal hostname. The hybrid handoff needs those to resolve the external natIP (like `_select_reachable_ip` does) so the local orchestrator can confirm readiness → SERVING → route GENERATE to the cloud node. Node torn down (deleted:200, zero instances) — controller would also have self-torn-down at the 600s AWAKENING timeout. Commits: ef723ac, 085db11, 67725fc.
+
+## FINAL soak — full orchestration mesh proven E2E; golden-image service is the last mile (2026-06-29, bt-2026-06-29-071731)
+
+The Reachability Racer + IaC ephemeral firewall closed every ORCHESTRATION gap. Proven live against real GCP (jarvis-473803), all driven by the committed fixes:
+- Faithful Aegis probe (auth healthy) -> real DW data-plane TIMEOUT -> Gap-2 hard escalation -> FORCED AWAKEN.
+- ADC IAM bridge -> `instances.insert ok SPOT 200` -> node RUNNING natIP 34.31.224.10.
+- Dynamic public-IP self-discovery (24.130.247.31) -> REST-native /32 ephemeral firewall `jarvis-ephemeral-failover-allow src=24.130.247.31/32 tcp:11434` OPEN (verified; node reachable through it — curl got fast RST not timeout = firewall works, service absent).
+- Gap-3 async intake prewarm WORKED: op stream flowed (real INTENT goals, no circuit breaker).
+- Reachability Racer ran, probing the reachable external IP every tick.
+
+**THE LAST MILE (not orchestrator): the J-Prime INFERENCE SERVICE never came up on the golden image.** `:11434` RST'd (fast refusal) for 6+ min on a RUNNING, reachable node. The golden image `jarvis-prime-coder-golden-20260623` either doesn't auto-start Ollama/the model server on boot, lacks the model, or serves a different port (.env.gcp has `JARVIS_PRIME_PORT=8000` vs failover default 11434). Every orchestration layer did its job; the node just isn't serving inference. SERVING handoff is blocked by the golden-image bake, a separate concern (the GCP J-Prime golden-image repo).
+
+**Race fix (commit 6515f02):** the guaranteed PARALLEL teardown gather exposed a real `_ensure_token` mint race (set minted=True before the await -> 2nd coroutine read None token -> orphan firewall hole). Fixed with an asyncio.Lock (double-checked, flag set AFTER mint). Now node+firewall delete cleanly together. Verified: zero orphan nodes, zero orphan firewall holes.
+
+Commits this arc: ef723ac (round1+Gap1) · 085db11 (Gaps2-3) · 67725fc (Safety Law+fidelity) · 0b9a4ce (racer+handoff+teardown) · 022bf2d (IaC firewall) · 6515f02 (lock race). NEXT: golden-image bake must auto-start the inference service on the failover port (or align failover port to 8000).
+
+## ✅✅ COMPLETE END-TO-END SOVEREIGN FAILOVER — SERVING HANDOFF PROVEN LIVE (2026-06-29, bt-2026-06-29-074457)
+
+THE FULL CHAIN COMPLETED against real GCP for the first time ever (unproven across 13+ prior cloud runs):
+DW data-plane outage → faithful Aegis-authed deep probe (2s timeout) → Gap-2 hard escalation → FORCED AWAKEN → ADC IAM bridge provision (transient `Connection reset` insert flake → fail-soft RETRY → `instances.insert ok SPOT 200`) → dynamic public-IP discovery (24.130.247.31) → REST /32 ephemeral firewall micro-perimeter OPEN → node RUNNING (natIP 136.116.101.128) → **dynamic cloud-init forced Ollama to bind 0.0.0.0:11434** → `:11434 -> HTTP 200` → **Reachability Racer L7 backoff picked the EXTERNAL natIP as WINNER** → endpoint WIRED (`JARVIS_PRIME_URL=http://136.116.101.128:11434`) → **`SERVING via J-Prime`** → `on_serving: Cryo-DLQ re-entry drained=2 ops → re-routes to J-Prime Tier-2` → `[PrimeProvider] background route` actively serving. Node has `qwen2.5-coder:7b` (4.6GB, baked). Cold 7B-on-CPU generation is slow (>90s first token — known trait), but the HANDOFF is conclusively proven: SERVING + endpoint wired + DLQ drain + PrimeProvider routing live.
+
+Every layer this arc built fired: Safety Law (401 never provisions), config-driven port, cloud-init bind, L7 readiness backoff, Reachability Racer, IaC /32 firewall, ADC provisioning, async intake prewarm, hard escalation, faithful probe. **Guaranteed PARALLEL teardown worked clean (lock-race fixed): `node deleted:200 | firewall deleted:200` together — zero orphan nodes, zero orphan firewall holes.** Total spend: minutes of Spot e2 across the arc.
+
+Final commits: ef723ac · 085db11 · 67725fc · 0b9a4ce · 022bf2d · 6515f02 · 02371c1. The Sovereign Failover Mesh is COMPLETE and PROVEN E2E. Remaining (perf, not correctness): J-Prime 7B CPU cold-start latency — a golden-image/machine-type tuning concern, not an orchestration gap.

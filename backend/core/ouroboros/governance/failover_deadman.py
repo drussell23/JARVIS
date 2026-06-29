@@ -105,6 +105,33 @@ def _env_int(var: str, default: int, lo: int = 1, hi: int = 86400) -> int:
     return max(lo, min(v, hi))
 
 
+def build_inference_bind_block(*, port: int) -> str:
+    """Cloud-init bash SNIPPET (no shebang) that forces the inference daemon to
+    bind ``0.0.0.0:<port>`` (NOT 127.0.0.1) so the hybrid orchestrator can reach
+    it through the /32 firewall, then restarts the daemon to apply the bind.
+
+    Handles the Ollama systemd path (the golden image's daemon): writes a
+    drop-in override setting ``OLLAMA_HOST=0.0.0.0:<port>``, daemon-reloads, and
+    restarts -- falling back to ``ollama serve`` if systemd isn't managing it.
+    Idempotent + fail-soft (``|| true``). Pure ASCII string assembly. NO
+    hardcoded port -- the resolved value is interpolated."""
+    p = int(port)
+    return (
+        "# --- JARVIS dynamic inference-bind (cloud-init) ---\n"
+        "export HOME=/root\n"
+        "export OLLAMA_HOST=0.0.0.0:{port}\n"
+        "mkdir -p /etc/systemd/system/ollama.service.d || true\n"
+        "cat > /etc/systemd/system/ollama.service.d/10-jarvis-bind.conf <<'JBIND'\n"
+        "[Service]\n"
+        'Environment="OLLAMA_HOST=0.0.0.0:{port}"\n'
+        "JBIND\n"
+        "systemctl daemon-reload || true\n"
+        "systemctl restart ollama 2>/dev/null || "
+        "(nohup ollama serve >/var/log/jarvis-ollama.log 2>&1 &)\n"
+        "# --- end inference-bind ---\n"
+    ).format(port=p)
+
+
 # ---------------------------------------------------------------------------
 # Script builder -- pure string assembly, no I/O.
 # ---------------------------------------------------------------------------

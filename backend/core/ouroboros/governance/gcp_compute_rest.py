@@ -61,6 +61,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,6 +83,129 @@ _COMPUTE_GRANT_SCOPES = (
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/compute",
 )
+
+# ---------------------------------------------------------------------------
+# Dynamic IAM Credential Bridge (Hybrid Execution Mesh, 2026-06-28)
+# ---------------------------------------------------------------------------
+#
+# When the orchestrator runs OFF-GCE (a local Mac bridged to real GCP), the
+# metadata server is unreachable. If GOOGLE_APPLICATION_CREDENTIALS points at a
+# Service Account JSON, mint the Compute OAuth token via the native google-auth
+# SDK -- ZERO gcloud CLI, ZERO metadata. Identity (token + project) flows from
+# the SA JSON; zone from GCP_ZONE. The SA's IAM role is enforced server-side at
+# instances.insert (a 403 surfaces there -- fail-CLOSED preserved).
+
+def _sa_credentials_path() -> str:
+    """The Service Account JSON path from GOOGLE_APPLICATION_CREDENTIALS, or ""
+    when unset (legacy metadata-only mode). NEVER raises."""
+    return (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+
+
+def mint_sa_access_token(sa_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Mint a Compute OAuth access token from a Service Account JSON via the
+    native google-auth SDK. Returns ``(access_token, project_id)``.
+
+    Fail-soft: a missing file / missing SDK / refresh error returns
+    ``(None, None)`` so the caller degrades to a graceful IAM-denied abort (the
+    cognitive loop is NEVER crashed). Injectable -- tests monkeypatch this so no
+    real google-auth / network is touched."""
+    try:
+        from google.oauth2 import service_account  # noqa: PLC0415
+        from google.auth.transport.requests import Request  # noqa: PLC0415
+
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=[_COMPUTE_GRANT_SCOPES[0]]  # cloud-platform
+        )
+        creds.refresh(Request())
+        token = getattr(creds, "token", None)
+        project = getattr(creds, "project_id", None)
+        return (token or None, project or None)
+    except Exception as exc:  # noqa: BLE001 -- a mint failure is a graceful denial
+        logger.warning("[GCPComputeRest] SA token mint fail-soft err=%r", exc)
+        return (None, None)
+
+
+def _adc_available() -> bool:
+    """True when gcloud Application Default Credentials are usable (the operator
+    has run ``gcloud auth application-default login`` -- an authorized_user
+    refresh-token, NOT a SA JSON). Detected via the well-known ADC file or an
+    explicit ``JARVIS_FAILOVER_USE_ADC`` opt-in. NEVER raises."""
+    val = (os.environ.get("JARVIS_FAILOVER_USE_ADC", "") or "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    try:
+        cfg = os.environ.get("CLOUDSDK_CONFIG", "") or os.path.expanduser(
+            "~/.config/gcloud"
+        )
+        return os.path.isfile(os.path.join(cfg, "application_default_credentials.json"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+def _fetch_public_ip() -> str:
+    """Fetch the orchestrator's public egress IP from an external echo service
+    (stdlib urllib; env-tunable provider list). Raises on total failure -- the
+    async wrapper catches. NO hardcoded IP."""
+    providers = (
+        os.environ.get("JARVIS_PUBLIC_IP_ECHO_URLS", "")
+        or "https://checkip.amazonaws.com,https://api.ipify.org"
+    )
+    last_exc: Optional[BaseException] = None
+    for url in [u.strip() for u in providers.split(",") if u.strip()]:
+        try:
+            with urllib.request.urlopen(url, timeout=5.0) as resp:  # noqa: S310
+                return resp.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    return ""
+
+
+async def resolve_local_public_ip(
+    fetch_fn: Optional[Any] = None,
+) -> Optional[str]:
+    """Programmatically resolve the orchestrator's PUBLIC egress IP at runtime
+    (no hardcoded IP). Off-loaded to a thread (blocking HTTP). Validates a real
+    dotted-quad IPv4. Fail-soft -> None. Injectable for tests."""
+    fn = fetch_fn or _fetch_public_ip
+    try:
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, fn)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[GCPComputeRest] public IP fetch fail-soft err=%r", exc)
+        return None
+    ip = (str(raw) or "").strip()
+    m = _IPV4_RE.match(ip)
+    if not m or any(int(o) > 255 for o in m.groups()):
+        return None
+    return ip
+
+
+def mint_adc_access_token() -> Tuple[Optional[str], Optional[str]]:
+    """Mint a Compute OAuth token from gcloud Application Default Credentials via
+    ``google.auth.default`` (authorized_user refresh flow). Returns
+    ``(access_token, project)``. Fail-soft -> (None, None). Injectable -- tests
+    monkeypatch this so no real google-auth / network is touched."""
+    try:
+        import google.auth  # noqa: PLC0415
+        from google.auth.transport.requests import Request  # noqa: PLC0415
+
+        creds, project = google.auth.default(scopes=[_COMPUTE_GRANT_SCOPES[0]])
+        creds.refresh(Request())
+        token = getattr(creds, "token", None)
+        # Env project override wins over the ADC-resolved project.
+        env_proj = _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
+        return (token or None, (env_proj or project) or None)
+    except Exception as exc:  # noqa: BLE001 -- a mint failure is a graceful denial
+        logger.warning("[GCPComputeRest] ADC token mint fail-soft err=%r", exc)
+        return (None, None)
+
 
 # Env-var names.
 _ENV_IMAGE_FAMILY = "JPRIME_IMAGE_FAMILY"
@@ -221,6 +345,63 @@ class GCPComputeRest:
             _env_str("GCP_PROJECT_ID", "") or _env_str("GOOGLE_CLOUD_PROJECT", "")
         ) or None
         self._zone_override = zone or (_env_str("GCP_ZONE", "") or None)
+        # Hybrid Execution Mesh -- ADAPTIVE auth resolution (off-GCE). Priority:
+        # an explicit SA JSON (GOOGLE_APPLICATION_CREDENTIALS) wins; else gcloud
+        # ADC (authorized_user) when present; else the legacy metadata path.
+        self._sa_path = _sa_credentials_path()
+        if self._sa_path:
+            self._auth_mode = "sa"
+        elif _adc_available():
+            self._auth_mode = "adc"
+        else:
+            self._auth_mode = "metadata"
+        # Off-GCE iff a local credential source drives auth (SA or ADC).
+        self._off_gce = self._auth_mode in ("sa", "adc")
+        # The minted token + project are cached on first use (one mint per
+        # awaken -- tokens last ~1h, far longer than a soak).
+        self._cred_token: Optional[str] = None
+        self._cred_project: Optional[str] = None
+        self._cred_minted = False
+        # Serializes the mint so concurrent callers (the parallel node+firewall
+        # teardown gather) never race: the mint runs EXACTLY once and every
+        # caller gets the real token. Created lazily to avoid loop-binding at
+        # construction (the client is built off the running loop in tests).
+        self._cred_lock: Optional["asyncio.Lock"] = None
+
+    # -- adaptive credential bridge (off-GCE auth) -----------------------
+
+    async def _ensure_token(self) -> Tuple[Optional[str], Optional[str]]:
+        """Lazily mint + cache the (token, project) for the resolved off-GCE auth
+        mode (SA JSON or ADC). asyncio.Lock-serialized so concurrent callers mint
+        EXACTLY once (the parallel-teardown race fix). Off-loaded to a thread so
+        the blocking google-auth refresh never stalls the loop. Fail-soft."""
+        if self._cred_minted:
+            return (self._cred_token, self._cred_project)
+        if self._cred_lock is None:
+            self._cred_lock = asyncio.Lock()
+        async with self._cred_lock:
+            # Double-check inside the lock: a racer that won the lock first may
+            # have already minted while we waited.
+            if self._cred_minted:
+                return (self._cred_token, self._cred_project)
+            try:
+                loop = asyncio.get_event_loop()
+                if self._auth_mode == "sa":
+                    token, project = await loop.run_in_executor(
+                        None, mint_sa_access_token, self._sa_path
+                    )
+                else:  # adc
+                    token, project = await loop.run_in_executor(
+                        None, mint_adc_access_token
+                    )
+                self._cred_token, self._cred_project = token, project
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[GCPComputeRest] ensure-token fail-soft err=%r", exc)
+                self._cred_token, self._cred_project = None, None
+            # Set the flag AFTER the mint completes (not before) -- this is the
+            # race fix: a concurrent caller never sees minted=True with a None token.
+            self._cred_minted = True
+        return (self._cred_token, self._cred_project)
 
     # -- metadata fetch --------------------------------------------------
 
@@ -237,8 +418,12 @@ class GCPComputeRest:
         return text.strip()
 
     async def access_token(self) -> Optional[str]:
-        """The instance default service-account OAuth token from metadata. None
-        on error. NEVER raises."""
+        """The Compute OAuth token. SA-JSON bridge (off-GCE) when
+        GOOGLE_APPLICATION_CREDENTIALS is set; else the instance default SA token
+        from metadata. None on error. NEVER raises."""
+        if self._off_gce:
+            token, _ = await self._ensure_token()
+            return token
         raw = await self._metadata("instance/service-accounts/default/token")
         if not raw:
             return None
@@ -266,9 +451,14 @@ class GCPComputeRest:
         return raw.rsplit("/", 1)[-1]
 
     async def project(self) -> Optional[str]:
-        """The current project id. Honors an explicit override else metadata."""
+        """The current project id. Explicit override wins; then the SA JSON's
+        project_id (off-GCE); else metadata."""
         if self._project_override:
             return self._project_override
+        if self._off_gce:
+            _, project = await self._ensure_token()
+            if project:
+                return project
         return await self._metadata("project/project-id")
 
     # -- dynamic IAM self-verification -----------------------------------
@@ -278,7 +468,17 @@ class GCPComputeRest:
         Compute. OK iff the scopes list contains cloud-platform OR a compute
         scope. Missing -> (False, "IAM_PERMISSION_DENIED:missing_compute_scope:
         <scopes>"). Metadata-unreachable -> (False, "IAM_PERMISSION_DENIED:
-        metadata_unreachable"). NEVER raises."""
+        metadata_unreachable"). NEVER raises.
+
+        SA-JSON bridge (off-GCE): we request cloud-platform when minting, so a
+        successful mint satisfies the structural scope check; the SA's actual
+        IAM role is enforced server-side at instances.insert (a 403 surfaces
+        there as a real create failure). A failed mint -> graceful IAM-denied."""
+        if self._off_gce:
+            token, _ = await self._ensure_token()
+            if token:
+                return (True, "{}_credentials:compute_scope_requested".format(self._auth_mode))
+            return (False, "IAM_PERMISSION_DENIED:{}_token_mint_failed".format(self._auth_mode))
         scopes = await self.scopes()
         if not scopes:
             # Could not read scopes at all -> fail-CLOSED (do NOT assume grant).
@@ -478,7 +678,7 @@ class GCPComputeRest:
                 except Exception:  # noqa: BLE001
                     doc = {}
                 if str(doc.get("status", "")).upper() == "RUNNING":
-                    ip = self._extract_internal_ip(doc)
+                    ip = self._select_reachable_ip(doc)
                     if ip:
                         logger.info(
                             "[GCPComputeRest] node=%s RUNNING internal_ip=%s",
@@ -513,6 +713,69 @@ class GCPComputeRest:
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    @staticmethod
+    def _extract_external_ip(doc: Dict[str, Any]) -> Optional[str]:
+        """Pull networkInterfaces[0].accessConfigs[0].natIP (the EXTERNAL
+        ephemeral IP) from an instances.get response. None when the node has no
+        external access config yet. NEVER raises."""
+        try:
+            nics = doc.get("networkInterfaces") or []
+            if nics:
+                acs = (nics[0] or {}).get("accessConfigs") or []
+                if acs:
+                    nat = (acs[0] or {}).get("natIP")
+                    if nat:
+                        return str(nat).strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _hybrid_mesh(self) -> bool:
+        """True when the orchestrator is OFF-GCE and must reach J-Prime over its
+        EXTERNAL IP -- SA-credential auth implies hybrid; an explicit
+        JARVIS_FAILOVER_HYBRID_MESH flag forces it. NEVER raises."""
+        if self._off_gce:
+            return True
+        val = (os.environ.get("JARVIS_FAILOVER_HYBRID_MESH", "") or "").strip().lower()
+        return val in ("1", "true", "yes", "on")
+
+    def _select_reachable_ip(self, doc: Dict[str, Any]) -> Optional[str]:
+        """The IP the orchestrator should route GENERATE traffic to. Hybrid
+        (off-GCE) -> the EXTERNAL natIP, falling back to internal if the external
+        is not assigned yet. On-VPC -> the internal IP (byte-identical legacy)."""
+        if self._hybrid_mesh():
+            return self._extract_external_ip(doc) or self._extract_internal_ip(doc)
+        return self._extract_internal_ip(doc)
+
+    async def get_node_endpoints(
+        self, name: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Single instances.get -> ``(internal_ip, external_ip)`` for the
+        Reachability Racer (which probes BOTH concurrently -- no env guessing).
+        Either may be None while the node is still booting. NEVER raises."""
+        try:
+            token = await self.access_token()
+            zone = await self.zone()
+            project = await self.project()
+            if not token or not zone or not project:
+                return (None, None)
+            node = name or _node_name()
+            url = "{}/projects/{}/zones/{}/instances/{}".format(
+                _COMPUTE_BASE, project, zone, node
+            )
+            status, text = await _http_request(
+                url, method="GET",
+                headers={"Authorization": "Bearer {}".format(token)},
+                timeout_s=_rest_timeout(),
+            )
+            if not (200 <= status < 300 and text):
+                return (None, None)
+            doc = json.loads(text)
+            return (self._extract_internal_ip(doc), self._extract_external_ip(doc))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[GCPComputeRest] get_node_endpoints fail-soft err=%r", exc)
+            return (None, None)
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 
@@ -552,6 +815,82 @@ class GCPComputeRest:
             node, status, (text or "")[-300:],
         )
         return (False, "DELETE_FAILED:{}".format(status))
+
+    # -- ephemeral firewall micro-perimeter (IaC, same REST bridge) -------
+
+    async def create_firewall_rule(
+        self, *, name: str, source_ip: str, port: int = 11434,
+    ) -> Tuple[bool, str]:
+        """Create a /32-scoped INGRESS firewall rule (``source_ip/32`` ->
+        ``tcp:port``) via native Compute REST. REFUSES an empty source IP -- NO
+        ``0.0.0.0/0`` fallback, ever (never open the port to the whole internet).
+        Returns (ok, detail). Fail-CLOSED. NEVER raises."""
+        if not source_ip:
+            return (False, "no_source_ip:refuse_open_internet")
+        token = await self.access_token()
+        project = await self.project()
+        if not token or not project:
+            return (False, "AUTH_OR_PROJECT_UNRESOLVED:token={}:project={!r}".format(
+                bool(token), project))
+        url = "{}/projects/{}/global/firewalls".format(_COMPUTE_BASE, project)
+        payload = {
+            "name": name,
+            "network": "global/networks/default",
+            "direction": "INGRESS",
+            "priority": 1000,
+            "sourceRanges": ["{}/32".format(source_ip)],
+            "allowed": [{"IPProtocol": "tcp", "ports": [str(port)]}],
+            "description": (
+                "JARVIS ephemeral failover micro-perimeter -- auto-managed, "
+                "bound to the failover node lifecycle; deleted on teardown."
+            ),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "application/json",
+        }
+        status, text = await _http_request(
+            url, method="POST", headers=headers, body=body, timeout_s=_rest_timeout(),
+        )
+        if 200 <= status < 300:
+            logger.info(
+                "[GCPComputeRest] firewall.insert ok name=%s src=%s/32 tcp:%s "
+                "(status=%s)", name, source_ip, port, status,
+            )
+            return (True, "created:{}".format(status))
+        # 409 == already exists (a prior awaken's rule) -> treat as present-OK.
+        if status == 409:
+            return (True, "exists:409")
+        logger.warning(
+            "[GCPComputeRest] firewall.insert failed name=%s status=%s detail=%s",
+            name, status, (text or "")[-200:],
+        )
+        return (False, "FW_CREATE_FAILED:{}:{}".format(status, (text or "")[:150]))
+
+    async def delete_firewall_rule(self, name: str) -> Tuple[bool, str]:
+        """DELETE the ephemeral firewall rule. 404 (already gone) is the desired
+        end-state -> success (no orphan-hole anxiety). Fail-CLOSED. NEVER raises."""
+        token = await self.access_token()
+        project = await self.project()
+        if not token or not project:
+            return (False, "AUTH_OR_PROJECT_UNRESOLVED")
+        url = "{}/projects/{}/global/firewalls/{}".format(_COMPUTE_BASE, project, name)
+        headers = {"Authorization": "Bearer {}".format(token)}
+        status, text = await _http_request(
+            url, method="DELETE", headers=headers, timeout_s=_rest_timeout(),
+        )
+        if 200 <= status < 300 or status in (404, 409):
+            logger.info(
+                "[GCPComputeRest] firewall.delete name=%s status=%s "
+                "(micro-perimeter closed)", name, status,
+            )
+            return (True, "deleted:{}".format(status))
+        logger.warning(
+            "[GCPComputeRest] firewall.delete failed name=%s status=%s detail=%s",
+            name, status, (text or "")[-200:],
+        )
+        return (False, "FW_DELETE_FAILED:{}".format(status))
 
 
 # ---------------------------------------------------------------------------

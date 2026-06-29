@@ -78,7 +78,7 @@ import enum
 import logging
 import os
 import subprocess
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # Phase 3c -- Cryo-DLQ re-entry. Imported at module level (bound as a module
 # attribute) so tests can monkeypatch ``fl.replay_dlq``. intake_dlq is a
@@ -162,7 +162,19 @@ def _handback_cooldown_s() -> float:
 
 
 def _failover_port() -> int:
-    return _env_int("JARVIS_JPRIME_FAILOVER_PORT", 11434)
+    """The single config-driven inference port -- fed to the firewall rule, the
+    Reachability Racer's candidate endpoints, AND the endpoint publisher, so a
+    config change adapts the WHOLE mesh. Resolution: an explicit failover pin
+    (``JARVIS_JPRIME_FAILOVER_PORT``) wins; else the unified ``JARVIS_PRIME_PORT``
+    (what the inference daemon actually serves -- e.g. 8000 in .env.gcp); else
+    the legacy default. NO hardcoding past the final fallback."""
+    explicit = (os.environ.get("JARVIS_JPRIME_FAILOVER_PORT", "") or "").strip()
+    if explicit:
+        try:
+            return int(explicit)
+        except (ValueError, TypeError):
+            pass
+    return _env_int("JARVIS_PRIME_PORT", 11434)
 
 
 def _tick_s() -> float:
@@ -222,6 +234,73 @@ def _outage_extra_routes() -> List[str]:
     return [r.strip() for r in raw.split(",") if r.strip()]
 
 
+def _hard_escalation_enabled() -> bool:
+    """Gap 2 -- a sustained deep-probe drop streak forcefully promotes to
+    AWAKENING (forecast/confirm-window BYPASS). Default ON. A DEAD data plane
+    must not wait for a slow-recovery forecast. Hot-revert:
+    ``JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED=false`` -> legacy (degrade only)."""
+    return _enabled("JARVIS_DW_HARD_OUTAGE_ESCALATION_ENABLED", "true")
+
+
+def _ephemeral_fw_enabled() -> bool:
+    """REST-native ephemeral firewall micro-perimeter at AWAKENING. Default OFF
+    (production may run in-VPC where it's unnecessary). The hybrid soak opts in
+    via ``JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED=true`` -- a /32 rule for the
+    orchestrator's OWN detected egress IP, torn down with the node."""
+    return _enabled("JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED", "false")
+
+
+def _ephemeral_fw_name() -> str:
+    return _env_str("JARVIS_FAILOVER_FW_RULE_NAME", "jarvis-ephemeral-failover-allow")
+
+
+def _ready_backoff_base_s() -> float:
+    return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_BASE_S", 1.0))
+
+
+def _ready_backoff_cap_s() -> float:
+    return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", 15.0))
+
+
+def _handback_drain_budget_s() -> float:
+    """Max seconds HANDBACK waits for in-flight J-Prime ops to drain to 0 before
+    tearing down anyway (bounded -- never deadlock the FSM; the Dead-Man's Switch
+    is the backstop). Default 120s (covers a slow CPU generation)."""
+    return max(0.0, _env_float("JARVIS_HANDBACK_DRAIN_BUDGET_S", 120.0))
+
+
+def _handback_drain_poll_s() -> float:
+    return max(0.01, _env_float("JARVIS_HANDBACK_DRAIN_POLL_S", 1.0))
+
+
+def _recovery_streak_n() -> int:
+    """Consecutive HEALTHY deep-probes that confirm DW recovery -> HANDBACK."""
+    return max(1, _env_int("JARVIS_DW_RECOVERY_STREAK", 3))
+
+
+def _recovery_max_latency_s() -> float:
+    """A healthy DW probe slower than this is NOT 'recovered' (still degraded)."""
+    return max(0.1, _env_float("JARVIS_DW_RECOVERY_MAX_LATENCY_S", 5.0))
+
+
+def _ready_backoff_budget_s() -> float:
+    """Per-AWAKENING-tick L7-readiness poll budget (bounded so the tick stays
+    responsive). The AWAKENING timeout (default 600s) is the hard outer bound
+    ACROSS ticks, so a short per-tick burst still gives the daemon minutes to
+    come up; operators raise it to poll harder within a single tick."""
+    return max(0.5, _env_float("JARVIS_FAILOVER_READY_BACKOFF_BUDGET_S", 5.0))
+
+
+def _hard_outage_streak() -> int:
+    """Consecutive deep-probe drops that constitute a CONFIRMED data-plane
+    outage (the mathematical confirmation that replaces the forecast wait).
+    Default 3; clamped >= 2 (strictly above a transient blip). Env-tunable."""
+    try:
+        return max(2, int(os.environ.get("JARVIS_DW_HARD_OUTAGE_STREAK", "3")))
+    except (ValueError, TypeError):
+        return 3
+
+
 def _gcloud_fallback_enabled() -> bool:
     """Last-resort gcloud-CLI fallback gate. Default FALSE.
 
@@ -247,6 +326,11 @@ def _warmup_timeout_s() -> float:
 # ---------------------------------------------------------------------------
 # FailoverState
 # ---------------------------------------------------------------------------
+
+class _NodeNotReachable(RuntimeError):
+    """Internal sentinel: a Reachability-Racer candidate endpoint did not answer
+    a healthy 200. Used to lose the race without binding the endpoint."""
+
 
 class FailoverState(enum.Enum):
     """The four lifecycle states (spec section 2)."""
@@ -509,7 +593,9 @@ def _default_node_ready_fn(endpoint: str) -> bool:
         import urllib.request  # noqa: PLC0415
 
         with urllib.request.urlopen(endpoint, timeout=3.0) as resp:  # noqa: S310
-            return 200 <= getattr(resp, "status", 200) < 500
+            # Strict Layer-7 success: a 2xx from the inference endpoint. A
+            # connection refused / RST / timeout raises -> False (keep polling).
+            return 200 <= getattr(resp, "status", 200) < 300
     except Exception:  # noqa: BLE001
         return False
 
@@ -600,6 +686,9 @@ class FailoverLifecycleController:
         warmup_fn: Optional[Callable[[], Awaitable[bool]]] = None,
         is_degrading_fn: Optional[Callable[[], bool]] = None,
         endpoint_publish_fn: Optional[Callable[[str], Any]] = None,
+        flare_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        degrade_streak_fn: Optional[Callable[[], int]] = None,
+        in_flight_fn: Optional[Callable[[], int]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
@@ -613,6 +702,14 @@ class FailoverLifecycleController:
         # tests. Fail-soft: a missing/erroring source reads as "not degrading"
         # (fail-CLOSED -> reactive path only, no false pre-warm).
         self._is_degrading_fn = is_degrading_fn  # None -> lazy default
+        # Gap 2 (hard escalation) -- the deep-probe drop STREAK source. Default:
+        # the heartbeat singleton's consecutive_failures(). A sustained streak IS
+        # the outage confirmation (forecast bypass). Injectable + fail-soft.
+        self._degrade_streak_fn = degrade_streak_fn  # None -> lazy default
+        # Zero-Drop Drain: count of in-flight J-Prime ops (HANDBACK awaits this
+        # to reach 0 before teardown so no op is severed mid-generation).
+        # Injectable; default resolves the live count or 0 (immediate teardown).
+        self._in_flight_fn = in_flight_fn
         # Gap 3a -- endpoint publish boundary. Default: resolve the node IP and
         # write JARVIS_PRIME_URL / JARVIS_PRIME_HOST (where PrimeClient reads
         # its endpoint) + best-effort hot-swap a live PrimeClient. Injectable
@@ -632,8 +729,15 @@ class FailoverLifecycleController:
         # the SERVING transition.
         self._on_serving_fn = on_serving_fn or self._default_on_serving
 
+        # Immutable Trigger-Attribution Flare sink. Default: a high-priority
+        # WARNING to the WAL (debug.log). Injectable for tests / a GCS sidecar.
+        self._flare_fn = flare_fn or self._default_flare
+
         self._state = FailoverState.DORMANT
         self._endpoint: Optional[str] = None
+        # IaC ephemeral firewall micro-perimeter: the rule name opened at AWAKEN,
+        # torn down (alongside the node) on EVERY exit path. None == no hole open.
+        self._ephemeral_fw_rule: Optional[str] = None
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
@@ -809,14 +913,26 @@ class FailoverLifecycleController:
 
         If a custom publish boundary was injected, defer to it entirely.
         """
+        # Prefer the Reachability-Racer WINNER (already a reachable http://ip:port
+        # bound on self._endpoint). Extract its host so we publish the SAME
+        # address the racer just proved healthy -- not a re-resolved guess.
+        won_ip = ""
+        won_ep = self._endpoint or ""
+        if won_ep.startswith("http://") or won_ep.startswith("https://"):
+            try:
+                host = won_ep.split("://", 1)[1].split("/", 1)[0]
+                won_ip = host.rsplit(":", 1)[0] if ":" in host else host
+            except Exception:  # noqa: BLE001
+                won_ip = ""
+
         publish_fn = self._endpoint_publish_fn
         if publish_fn is not None:
-            ip = await self._resolve_ip()
+            ip = won_ip or await self._resolve_ip()
             if ip:
                 publish_fn(ip)
             return
 
-        ip = await self._resolve_ip()
+        ip = won_ip or await self._resolve_ip()
         if not ip:
             logger.info(
                 "[FailoverLifecycle] endpoint publish: node IP unresolved "
@@ -853,6 +969,106 @@ class FailoverLifecycleController:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FailoverLifecycle] node IP resolve fail-soft err=%r", exc)
             return ""
+
+    async def _race_node_ready(self, candidates: List[str]) -> Optional[str]:
+        """The Asynchronous Reachability Racer -- dynamic topology resolution.
+
+        Concurrently probe ALL candidate endpoints (internal hostname/IP +
+        external natIP) and bind whichever returns a healthy 200 FIRST
+        (``asyncio.wait(FIRST_COMPLETED)``). ZERO environment guessing -- no
+        IS_LOCAL flag, no hardcoded host swap. Works identically on a local Mac
+        (external natIP wins), a GCP pod (internal IP wins), or anywhere else.
+
+        Returns the winning endpoint URL, or None if none answer this tick (the
+        AWAKENING deadline remains the hard bound). Fail-soft throughout: a probe
+        that raises is simply 'not reachable' and never wins."""
+        cands = [c for c in (candidates or []) if c]
+        if not cands:
+            return None
+
+        async def _probe(ep: str) -> str:
+            ok = await self._maybe_await(self._node_ready_fn, ep)
+            if ok:
+                return ep
+            raise _NodeNotReachable(ep)
+
+        pending = {asyncio.ensure_future(_probe(ep)) for ep in cands}
+        winner: Optional[str] = None
+        try:
+            while pending and winner is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for d in done:
+                    try:
+                        winner = d.result()
+                        break
+                    except Exception:  # noqa: BLE001 -- not-reachable / probe error
+                        continue
+        finally:
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        if winner is not None:
+            logger.info(
+                "[FailoverLifecycle] Reachability Racer: %d candidate(s) -> WINNER "
+                "%s (dynamically bound; no env flag)", len(cands), winner,
+            )
+        return winner
+
+    async def _l7_ready_backoff(
+        self, candidates: List[str], *, budget_s: float,
+    ) -> Optional[str]:
+        """L7 Readiness Poller. Race the candidates; on a connection refused / RST
+        (the VM is up but the inference daemon is still initializing -- NOT a
+        failure), keep polling with EXPONENTIAL BACKOFF until a candidate returns
+        a Layer-7 healthy 200, or the budget is exhausted. Bounded; the AWAKENING
+        deadline is the hard outer bound across ticks. Returns winner or None."""
+        try:
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + max(0.0, budget_s)
+        except Exception:  # noqa: BLE001
+            loop = None
+            deadline = None
+        delay = max(0.01, _ready_backoff_base_s())
+        cap = max(delay, _ready_backoff_cap_s())
+        while True:
+            winner = await self._race_node_ready(candidates)
+            if winner:
+                return winner
+            if deadline is not None and loop is not None and loop.time() >= deadline:
+                return None
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return None
+            delay = min(delay * 2.0, cap)  # exponential, capped
+
+    async def _candidate_endpoints(self) -> List[str]:
+        """Build the Reachability-Racer candidate set with NO env-flag branching:
+        the external natIP + the internal IP (single instances.get) PLUS the
+        configured hostname endpoint as a last resort. The racer probes them all
+        concurrently and binds whichever answers first. Fail-soft -> at minimum
+        the hostname candidate (early ticks before the node has IPs)."""
+        port = _failover_port()
+        cands: List[str] = []
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            internal, external = await get_compute_rest().get_node_endpoints()
+            for ip in (external, internal):  # external first (off-VPC most common)
+                if ip:
+                    ep = "http://{}:{}".format(ip, port)
+                    if ep not in cands:
+                        cands.append(ep)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] candidate-endpoint resolve fail-soft err=%r", exc)
+        host_ep = self._build_endpoint()
+        if host_ep not in cands:
+            cands.append(host_ep)
+        return cands
 
     @staticmethod
     def _hot_swap_prime_client(*, host: str, port: int) -> None:
@@ -1052,7 +1268,24 @@ class FailoverLifecycleController:
             # Observed full outage. Apply the cryo-trigger cost gate (reactive).
             if not self._should_awaken(now=now):
                 return
-            await self._enter_awakening(now=now)
+            await self._enter_awakening(
+                now=now, trigger="reactive_outage", route=self._first_outage_route(),
+            )
+            return
+
+        # Gap 2 -- HARD escalation. A sustained streak of deep-probe drops IS the
+        # outage confirmation (the data plane is confirmed dead). Forcefully
+        # awaken WITHOUT waiting for a slow-recovery forecast / 120s confirm
+        # window -- the streak threshold already encodes that confirmation.
+        if self._hard_outage_confirmed():
+            logger.warning(
+                "[FailoverLifecycle] HARD OUTAGE escalation: deep-probe drop "
+                "streak=%d >= %d -> FORCED AWAKEN (forecast/confirm bypass)",
+                self._degrade_streak_value(), _hard_outage_streak(),
+            )
+            await self._enter_awakening(
+                now=now, trigger="heartbeat_hard_outage", route=self._route,
+            )
             return
 
         # Gap 2 -- EARLY pre-warm path. NOT yet a full outage, but the heartbeat
@@ -1068,7 +1301,9 @@ class FailoverLifecycleController:
                 "forecast (R>C*margin) -> awakening J-Prime ahead of formal "
                 "outage (route=%s)", self._route,
             )
-            await self._enter_awakening(now=now)
+            await self._enter_awakening(
+                now=now, trigger="heartbeat_early_prewarm", route=self._route,
+            )
             return
 
     def _real_outage(self) -> bool:
@@ -1153,6 +1388,32 @@ class FailoverLifecycleController:
         )
         return decision
 
+    def _degrade_streak_value(self) -> int:
+        """Resolve the deep-probe drop STREAK (Gap 2). Default: the DW heartbeat
+        singleton's consecutive_failures(). Injectable + fail-soft (0 on error)."""
+        fn = self._degrade_streak_fn
+        if fn is None:
+            try:
+                from backend.core.ouroboros.governance.provider_heartbeat import (  # noqa: PLC0415
+                    get_dw_heartbeat,
+                )
+                fn = get_dw_heartbeat().consecutive_failures
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] streak resolve fail-soft err=%r", exc)
+                return 0
+        try:
+            return int(fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] degrade_streak fail-soft err=%r", exc)
+            return 0
+
+    def _hard_outage_confirmed(self) -> bool:
+        """Gap 2 -- True iff the sustained deep-probe drop streak has reached the
+        hard-outage threshold (a CONFIRMED dead data plane). Fail-soft -> False."""
+        if not _hard_escalation_enabled():
+            return False
+        return self._degrade_streak_value() >= _hard_outage_streak()
+
     def _is_degrading(self) -> bool:
         """Resolve the early-degradation signal. Default: the DW heartbeat
         singleton's is_degrading(). Injectable + fail-soft (False on error)."""
@@ -1172,8 +1433,55 @@ class FailoverLifecycleController:
             logger.debug("[FailoverLifecycle] is_degrading fail-soft err=%r", exc)
             return False
 
-    async def _enter_awakening(self, *, now: float) -> None:
-        """Shared DORMANT -> AWAKENING transition (reactive + early-prewarm)."""
+    def _default_flare(self, payload: Dict[str, Any]) -> None:
+        """Default Trigger-Attribution Flare sink: a high-priority WARNING to the
+        WAL (debug.log). The ``[FailoverFlare]`` prefix is grep-stable for the
+        flight recorder. Fail-soft -- a logging error never blocks the awaken."""
+        try:
+            import json  # noqa: PLC0415
+            logger.warning("[FailoverFlare] %s", json.dumps(payload, sort_keys=True))
+        except Exception:  # noqa: BLE001
+            logger.warning("[FailoverFlare] %r", payload)
+
+    def _emit_flare(self, *, trigger: str, route: str, now: float) -> None:
+        """Synchronously flush the immutable trigger-attribution payload at the
+        DORMANT -> AWAKENING instant -- BEFORE the GCE boot is attempted, so the
+        attribution survives even a fail-soft awaken. Fail-soft."""
+        payload = {
+            "event": "awaken_trigger",
+            "trigger": trigger,
+            "route": route,
+            "state_from": "DORMANT",
+            "state_to": "AWAKENING",
+            "ts": now,
+            "node": _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME),
+        }
+        try:
+            self._flare_fn(payload)
+        except Exception as exc:  # noqa: BLE001 -- telemetry never blocks failover
+            logger.debug("[FailoverLifecycle] flare fail-soft err=%r", exc)
+
+    def _first_outage_route(self) -> str:
+        """The first tracked route in a full outage (for flare attribution).
+        Falls back to the configured route. NEVER raises."""
+        try:
+            grad = self._gradient()
+            for r in list(grad.tracked_routes()) + [self._route] + _outage_extra_routes():
+                if r and grad.is_global_outage(r):
+                    return str(r)
+        except Exception:  # noqa: BLE001
+            pass
+        return self._route
+
+    async def _enter_awakening(
+        self, *, now: float, trigger: str = "unknown", route: str = "",
+    ) -> None:
+        """Shared DORMANT -> AWAKENING transition (reactive + early-prewarm).
+
+        Emits the immutable Trigger-Attribution Flare FIRST so the flight
+        recorder captures which signal initiated the failover, regardless of the
+        GCE boot outcome."""
+        self._emit_flare(trigger=trigger, route=route, now=now)
         self._state = FailoverState.AWAKENING
         self._awakening_started_at = now
         self._recovered_streak = 0
@@ -1202,12 +1510,83 @@ class FailoverLifecycleController:
             return
         self._endpoint = self._build_endpoint()
         logger.info("[FailoverLifecycle] AWAKENING node endpoint=%s", self._endpoint)
+        # IaC ephemeral micro-perimeter: open a /32 hole for THIS orchestrator's
+        # detected egress IP so the Reachability Racer's external path can reach
+        # the node. Fail-soft -- a firewall miss never blocks awaken (the racer
+        # simply won't win the external candidate; the node still self-reaps).
+        await self._open_ephemeral_perimeter()
+
+    async def _open_ephemeral_perimeter(self) -> None:
+        """Programmatically open a /32 ``tcp:PORT`` firewall rule bound to the
+        orchestrator's OWN dynamically-resolved public egress IP. Gated + fail-
+        soft. NEVER raises. NO hardcoded IP, NO 0.0.0.0/0."""
+        if not _ephemeral_fw_enabled():
+            return
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest, resolve_local_public_ip,
+            )
+            ip = await resolve_local_public_ip()
+            if not ip:
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral perimeter: public IP unresolved "
+                    "-- skipping (racer external path may be firewall-blocked)")
+                return
+            name = _ephemeral_fw_name()
+            ok, detail = await get_compute_rest().create_firewall_rule(
+                name=name, source_ip=ip, port=_failover_port(),
+            )
+            if ok:
+                self._ephemeral_fw_rule = name
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral micro-perimeter OPEN: %s "
+                    "src=%s/32 tcp:%s (%s) -- bound to node lifecycle",
+                    name, ip, _failover_port(), detail,
+                )
+            else:
+                logger.warning(
+                    "[FailoverLifecycle] ephemeral perimeter create failed: %s", detail)
+        except Exception as exc:  # noqa: BLE001 -- never block awaken
+            logger.warning("[FailoverLifecycle] ephemeral perimeter fail-soft err=%r", exc)
+
+    async def _close_ephemeral_perimeter(self) -> None:
+        """Delete the ephemeral firewall rule (the IaC teardown half). Idempotent
+        + fail-soft. Clears the bound name so a re-awaken re-opens cleanly."""
+        name = self._ephemeral_fw_rule
+        if not name:
+            return
+        try:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            ok, detail = await get_compute_rest().delete_firewall_rule(name)
+            logger.warning(
+                "[FailoverLifecycle] ephemeral micro-perimeter CLOSED: %s (%s)",
+                name, detail,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FailoverLifecycle] ephemeral perimeter close fail-soft err=%r", exc)
+        finally:
+            self._ephemeral_fw_rule = None
 
     def _build_startup_script(self) -> str:
         from backend.core.ouroboros.governance.failover_deadman import (  # noqa: PLC0415
-            build_deadman_startup_script,
+            build_deadman_startup_script, build_inference_bind_block,
         )
-        return build_deadman_startup_script(port=_failover_port())
+        port = _failover_port()
+        script = build_deadman_startup_script(port=port)
+        # Dynamic cloud-init: force the inference daemon to bind 0.0.0.0:<port>
+        # so the hybrid orchestrator can reach it through the /32 firewall. Gated
+        # (default OFF -> byte-identical dead-man-only legacy). Injected right
+        # after the dead-man shebang/HOME preamble so it runs early on boot.
+        if _enabled("JARVIS_FAILOVER_INFERENCE_BIND_ENABLED", "false"):
+            bind = build_inference_bind_block(port=port)
+            lines = script.split("\n", 1)
+            if len(lines) == 2 and lines[0].startswith("#!"):
+                script = lines[0] + "\n" + bind + "\n" + lines[1]
+            else:
+                script = bind + "\n" + script
+        return script
 
     async def _tick_awakening(self, *, now: float) -> None:
         # AWAKENING deadline: if the node never becomes ready within the timeout,
@@ -1222,12 +1601,17 @@ class FailoverLifecycleController:
                     "node never became ready, tearing down + reverting to DORMANT",
                     elapsed,
                 )
-                # Proactive teardown (fail-soft -- dead-man's switch is the backstop).
+                # PARALLEL teardown (fail-soft): node delete + ephemeral firewall
+                # close together -- zero orphan nodes AND zero orphan firewall holes.
                 try:
-                    await self._maybe_await(self._vm_delete_fn)
+                    await asyncio.gather(
+                        self._maybe_await(self._vm_delete_fn),
+                        self._close_ephemeral_perimeter(),
+                        return_exceptions=True,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        "[FailoverLifecycle] AWAKENING timeout vm_delete fail-soft "
+                        "[FailoverLifecycle] AWAKENING timeout teardown fail-soft "
                         "err=%r -- reverting DORMANT anyway (Dead-Man's Switch backstop)",
                         exc,
                     )
@@ -1239,15 +1623,23 @@ class FailoverLifecycleController:
                 self._last_handback_at = now
                 return
 
-        # Observed ensure-ready gate: only -> SERVING when the node answers.
-        endpoint = self._endpoint or self._build_endpoint()
+        # Observed ensure-ready gate via the Reachability Racer: probe BOTH the
+        # external natIP and the internal IP/hostname concurrently and bind
+        # whichever answers a healthy 200 FIRST. Dynamic topology resolution --
+        # no IS_LOCAL flag, no hardcoded host swap. Only -> SERVING once a
+        # candidate answers; otherwise keep waiting (next tick re-races).
         try:
-            ready = await self._maybe_await(self._node_ready_fn, endpoint)
+            winner = await self._l7_ready_backoff(
+                await self._candidate_endpoints(),
+                budget_s=_ready_backoff_budget_s(),
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[FailoverLifecycle] node_ready probe fail-soft err=%r", exc)
-            ready = False
-        if not ready:
+            logger.debug("[FailoverLifecycle] reachability race fail-soft err=%r", exc)
+            winner = None
+        if not winner:
             return  # keep waiting; next tick re-probes (fail-soft).
+        # Bind the winning reachable endpoint -- this is what gets published.
+        self._endpoint = winner
 
         # VRAM pre-warm gate (Phase 3b+): after the node transport is up but
         # BEFORE transitioning to SERVING, fire a lightweight dummy generation
@@ -1292,6 +1684,22 @@ class FailoverLifecycleController:
         self._last_probe_at = None
         self._recovered_streak = 0
         logger.info("[FailoverLifecycle] SERVING via J-Prime endpoint=%s", self._endpoint)
+        # ABSOLUTE HANDOFF PROOF: record the exact winning endpoint the GENERATE
+        # queue is now routed to (the Reachability-Racer winner + the wired
+        # JARVIS_PRIME_URL). The Cryo-DLQ drain below replays the sealed ops
+        # through this endpoint; their per-op generation results are the
+        # downstream cryptographic confirmation that J-Prime processed them.
+        try:
+            self._emit_flare(
+                trigger="serving_handoff", route=self._route, now=now,
+            )
+            logger.warning(
+                "[FailoverHandoff] queue ROUTED to J-Prime winner endpoint=%s "
+                "prime_url=%s -- draining Cryo-DLQ ops to the live cloud node",
+                self._endpoint, os.environ.get("JARVIS_PRIME_URL", "<unset>"),
+            )
+        except Exception as exc:  # noqa: BLE001 -- proof telemetry never blocks
+            logger.debug("[FailoverLifecycle] handoff proof fail-soft err=%r", exc)
 
         # Phase 3c -- Cryo-DLQ re-entry. Fire the on-serving hook so the ops
         # sealed during the outage drain back through intake and re-route to
@@ -1344,16 +1752,36 @@ class FailoverLifecycleController:
 
         hyst_ok = self._recovered_streak >= _hysteresis_cycles()
         uptime_ok = self._jprime_uptime(now=now) >= _min_uptime_s()
+        # #2 -- deep-probe recovery: the background DW heartbeat reporting N
+        # consecutive fast-healthy probes is an INDEPENDENT recovery signal
+        # (data-plane, faithful) that also satisfies the recovery gate.
+        deep_ok = self._deep_probe_recovered()
 
-        if hyst_ok and uptime_ok:
+        if (hyst_ok or deep_ok) and uptime_ok:
             logger.info(
-                "[FailoverLifecycle] HANDBACK gate passed: recovered_streak=%d (>=%d) "
-                "uptime=%.1fs (>=%.1fs)",
-                self._recovered_streak, _hysteresis_cycles(),
+                "[FailoverLifecycle] HANDBACK gate passed: gradient_streak=%d (>=%d) "
+                "deep_probe_recovered=%s uptime=%.1fs (>=%.1fs)",
+                self._recovered_streak, _hysteresis_cycles(), deep_ok,
                 self._jprime_uptime(now=now), _min_uptime_s(),
             )
             self._state = FailoverState.HANDBACK
             await self._tick_handback(now=now)
+
+    def _deep_probe_recovered(self) -> bool:
+        """True iff the DW heartbeat reports DW recovered (N consecutive
+        fast-healthy deep probes). Injectable-free (reads the singleton);
+        fail-soft -> False (stay SERVING; never a premature handback)."""
+        try:
+            from backend.core.ouroboros.governance.provider_heartbeat import (  # noqa: PLC0415
+                get_dw_heartbeat,
+            )
+            return bool(get_dw_heartbeat().dw_recovered(
+                min_streak=_recovery_streak_n(),
+                max_latency_s=_recovery_max_latency_s(),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] deep-probe recovery fail-soft err=%r", exc)
+            return False
 
     def _probe_interval(self, *, now: float) -> float:
         try:
@@ -1394,22 +1822,32 @@ class FailoverLifecycleController:
             logger.debug("[FailoverLifecycle] emit yield fail-soft err=%r", exc)
 
         # 2. Route generation back to DW: drop the J-Prime endpoint NOW so
-        #    is_jprime_serving()/jprime_endpoint() stop pointing at the node
-        #    before teardown (T4 re-routes to DW).
+        #    is_jprime_serving()/jprime_endpoint() stop pointing at the node and
+        #    ALL NEW ops route to DW instantly (T4 re-routes to DW).
         self._endpoint = None
 
-        # 3. Delete-to-snapshot.
+        # 2.5 ZERO-DROP DRAIN: await any IN-FLIGHT J-Prime ops to finish before
+        #     teardown so none is severed mid-generation. Bounded by a budget
+        #     (never deadlock; the Dead-Man's Switch is the cost backstop).
+        await self._drain_inflight_jprime()
+
+        # 3. Delete-to-snapshot + PARALLEL ephemeral firewall close (zero orphan
+        #    nodes AND zero orphan firewall holes on handback).
         try:
-            ok = await self._maybe_await(self._vm_delete_fn)
-            if not ok:
+            results = await asyncio.gather(
+                self._maybe_await(self._vm_delete_fn),
+                self._close_ephemeral_perimeter(),
+                return_exceptions=True,
+            )
+            if results and results[0] is False:
                 logger.warning(
                     "[FailoverLifecycle] delete returned falsy -- Dead-Man's Switch "
                     "remains the cost backstop"
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[FailoverLifecycle] delete raised -- Dead-Man's Switch backstop err=%r",
-                exc,
+                "[FailoverLifecycle] handback teardown raised -- Dead-Man's Switch "
+                "backstop err=%r", exc,
             )
 
         # 4. DORMANT + arm anti-thrash cooldown.
@@ -1420,8 +1858,52 @@ class FailoverLifecycleController:
         self._recovered_streak = 0
         self._probe_trajectory = []
         self._outage_started_at = None
-        self._last_handback_at = now
+        self._last_handback_at = now  # arm the anti-thrash cooldown anchor
         logger.info("[FailoverLifecycle] DORMANT (delete-to-snapshot complete)")
+
+    def _inflight_count(self) -> int:
+        """Count of in-flight J-Prime ops. Injected ``in_flight_fn`` or 0 (no
+        tracker -> immediate teardown). NEVER raises -> 0 on error (fail-open to
+        teardown; the Dead-Man's Switch backstops a wrong 0)."""
+        fn = self._in_flight_fn
+        if fn is None:
+            return 0
+        try:
+            return max(0, int(fn()))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] in_flight_fn fail-soft err=%r", exc)
+            return 0
+
+    async def _drain_inflight_jprime(self) -> None:
+        """Await in-flight J-Prime ops to drain to 0 before teardown (zero-drop).
+        Bounded by ``_handback_drain_budget_s`` so the FSM never deadlocks; on
+        budget exhaustion we proceed (the node Dead-Man's Switch is the backstop).
+        Fail-soft throughout."""
+        try:
+            n = self._inflight_count()
+            if n <= 0:
+                return
+            logger.info(
+                "[FailoverLifecycle] HANDBACK zero-drop: awaiting %d in-flight "
+                "J-Prime op(s) to finish before teardown", n,
+            )
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + _handback_drain_budget_s()
+            poll = _handback_drain_poll_s()
+            while self._inflight_count() > 0:
+                if loop.time() >= deadline:
+                    logger.warning(
+                        "[FailoverLifecycle] HANDBACK drain budget exhausted with "
+                        "%d op(s) still in flight -- proceeding to teardown "
+                        "(Dead-Man's Switch backstop)", self._inflight_count(),
+                    )
+                    return
+                await asyncio.sleep(poll)
+            logger.info("[FailoverLifecycle] HANDBACK zero-drop: J-Prime queue drained to 0")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- never block teardown
+            logger.debug("[FailoverLifecycle] drain fail-soft err=%r", exc)
 
     # ------------------------------------------------------------------
     # Await helper (boundaries may be sync or async)

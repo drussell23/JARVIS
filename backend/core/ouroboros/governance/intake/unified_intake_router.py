@@ -65,6 +65,12 @@ _ENV_READY_POLL_S = "JARVIS_A1_ROUTER_READY_POLL_S"
 _ROUTER_READY = threading.Event()
 
 
+class RouterInitializationTimeoutError(RuntimeError):
+    """Task 2 circuit breaker — the intake router did not signal readiness within
+    the bounded window, so the roadmap daemon fails LOUD (and abandons emission)
+    instead of silently DLQ-looping a goal into a never-ready void."""
+
+
 def mark_router_ready() -> None:
     """Signal that the intake router is attached + its dispatch loop is live.
 

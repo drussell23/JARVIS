@@ -241,6 +241,57 @@ def get_provider_health_gradient() -> ProviderHealthGradient:
 
 
 # ---------------------------------------------------------------------------
+# Terminal-exhaustion chokepoint -- UNMASK (Run-#13 fix, 2026-06-28)
+# ---------------------------------------------------------------------------
+
+_ENV_UNMASK = "JARVIS_QUARANTINE_UNMASK_EXHAUSTION_ENABLED"
+
+
+def unmask_exhaustion_enabled() -> bool:
+    """Feed EVERY terminal "zero usable DW candidate for this route" exit into
+    the outage gradient -- including the topology pre-block path that raises
+    before the model-walk loop's ``record_sweep``. DEFAULT-ON.
+
+    Rollback: ``JARVIS_QUARANTINE_UNMASK_EXHAUSTION_ENABLED=false`` restores the
+    legacy behaviour where the topology ``dw_severed_queued`` block was masked
+    (the run-#13 blindspot). Fail-soft: any parse error reads as enabled."""
+    val = os.environ.get(_ENV_UNMASK, "true").strip().lower()
+    return val not in ("false", "0", "no", "off")
+
+
+def record_terminal_exhaustion(route: str, *, reason: str = "") -> None:
+    """Strictly-enforced single chokepoint: record ONE raw failed sweep for
+    *route* on the global gradient, signalling that this op got zero usable DW
+    candidates for the route.
+
+    This is the UNMASK. The candidate generator's topology pre-block (and any
+    future terminal no-candidate exit that does not walk the model fleet) calls
+    this so the gradient receives the truth even when the op is then *gracefully
+    accepted* downstream (``background_accepted`` / ``speculative_deferred``).
+    Five of these across the rolling window trip ``is_global_outage(route)`` --
+    the exact signal the Failover FSM reads to awaken J-Prime.
+
+    Gated (default-ON) + fully fail-soft: a bad route / gradient error NEVER
+    perturbs the dispatch path (the op still fails gracefully)."""
+    try:
+        if not unmask_exhaustion_enabled():
+            return
+        if not route or not isinstance(route, str):
+            return
+        get_provider_health_gradient().record_sweep(route, success=False)
+        logger.warning(
+            "[ProviderQuarantine] terminal exhaustion route=%s reason=%s "
+            "-> UNMASKED failed sweep (gradient fed; op may still be accepted)",
+            route, (reason or "")[:120],
+        )
+    except Exception:  # noqa: BLE001 -- never block the dispatch path
+        logger.debug(
+            "[ProviderQuarantine] record_terminal_exhaustion fail-soft",
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Lazy import helpers — avoid circular import cycles
 # ---------------------------------------------------------------------------
 

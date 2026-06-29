@@ -1196,8 +1196,25 @@ def provision_and_run_remote(*, cost_cap: float, wall_seconds: int, seed: int,
     # 3-target injector. Without this prefix the node's compose_env never sees the
     # flag and falls back to the linux_prod overlay (no fan-out).
     _omni_prefix = "JARVIS_A1_OMNI_SOAK=1 " if omni_soak_enabled(os.environ) else ""
+    # Propagate the Fast-Forward fixture env to the NODE so its compose_env +
+    # GovernedLoopService overlay activate (deterministic written=True proof,
+    # zero DW). Mirrors _omni_prefix: env-prefix on the node command line.
+    _fixture_prefix = ""
+    if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        _fx_parts = ["JARVIS_A1_FIXTURE_MODE=1"]
+        for _k in (
+            "JARVIS_A1_FIXTURE_TARGET",
+            "JARVIS_A1_FIXTURE_SEED",
+            "JARVIS_A1_GCS_TELEMETRY_TARGET",
+        ):
+            _v = os.environ.get(_k, "")
+            if _v:
+                _fx_parts.append("%s=%s" % (_k, _v))
+        _fixture_prefix = " ".join(_fx_parts) + " "
     remote_cmd = (
-        "JARVIS_IAC_HYPERVISOR_ENABLED=1 " + _omni_prefix
+        "JARVIS_IAC_HYPERVISOR_ENABLED=1 " + _omni_prefix + _fixture_prefix
         + "python3 scripts/a1_live_fire_chaos_harness.py "
         "--execute-on-node --cost-cap %s --max-wall-seconds %d --seed %d"
         % (cost_cap, wall_seconds, seed)
@@ -1385,7 +1402,59 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--i-understand-this-spends-money", dest="money_gate",
                    action="store_true",
                    help="REAL-MONEY safety gate (required with --remote).")
+    # --- A1 Fast-Forward fixture (deterministic written=True proof, zero DW) ---
+    p.add_argument("--inject-deterministic-fixture", dest="fixture_mode",
+                   action="store_true",
+                   help="Fast-Forward mode: DI-swap the candidate generator for a "
+                        "deterministic AST fixture (zero DW) to prove the written=True "
+                        "git plumbing in <3min. See scripts/a1_deterministic_fixture.py.")
+    p.add_argument("--fixture-target",
+                   default=os.environ.get("JARVIS_A1_FIXTURE_TARGET", ""),
+                   help="Repo-relative .py file the fixture harmlessly AST-mutates "
+                        "(required with --inject-deterministic-fixture).")
+    p.add_argument("--fixture-seed", type=int,
+                   default=int(os.environ.get("JARVIS_A1_FIXTURE_SEED", "0") or "0"),
+                   help="Deterministic fixture mutation seed.")
+    p.add_argument("--gcs-telemetry-target",
+                   default=os.environ.get("JARVIS_A1_GCS_TELEMETRY_TARGET", ""),
+                   help="gs://bucket/prefix for the continuous append-only telemetry "
+                        "sidecar (optional; sidecar disabled if unset).")
     return p
+
+
+def _maybe_spawn_sidecar_daemon() -> "Optional[subprocess.Popen]":
+    """Spawn the DECOUPLED GCS telemetry sidecar daemon (detached, own session)
+    when fixture mode + a gs:// target are set -- BEFORE O+V boots, fully
+    decoupled from its lifecycle. Fail-soft: a spawn error never blocks the soak."""
+    if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return None
+    gcs = (os.environ.get("JARVIS_A1_GCS_TELEMETRY_TARGET", "") or "").strip()
+    if not gcs:
+        return None
+    sessions_root = os.path.join(_REPO_ROOT, ".ouroboros", "sessions")
+    interval = os.environ.get("JARVIS_GCS_STREAM_INTERVAL_S", "5")
+    argv = [
+        sys.executable,
+        os.path.join(_SCRIPTS_DIR, "a1_gcs_telemetry_sidecar.py"),
+        "--sessions-root", sessions_root,
+        "--gcs-target", gcs,
+        "--interval", str(interval),
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detached: survives O+V teardown
+        )
+        _log("[a1-sidecar] decoupled telemetry daemon spawned pid=%s -> %s"
+             % (proc.pid, gcs))
+        return proc
+    except Exception as exc:  # noqa: BLE001 — fail-soft
+        _log("[a1-sidecar] daemon spawn failed (fail-soft): %r" % (exc,))
+        return None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1394,6 +1463,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.print_env:
         _print_composed_env_for_audit()
         return 0
+
+    # --- A1 Fast-Forward fixture: stamp env + Strict Subprocess Contract -----
+    # Activate from the CLI flag OR an inherited env var (the --remote path
+    # propagates the fixture env to the node, where main() re-activates here).
+    # Fail-fast on a mangled config BEFORE any node is provisioned.
+    _fixture_on = bool(getattr(args, "fixture_mode", False)) or (
+        (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if _fixture_on:
+        os.environ["JARVIS_A1_FIXTURE_MODE"] = "1"
+        _ftgt = getattr(args, "fixture_target", "") or os.environ.get(
+            "JARVIS_A1_FIXTURE_TARGET", ""
+        )
+        if _ftgt:
+            os.environ["JARVIS_A1_FIXTURE_TARGET"] = _ftgt
+        os.environ["JARVIS_A1_FIXTURE_SEED"] = str(getattr(args, "fixture_seed", 0) or 0)
+        _fgcs = getattr(args, "gcs_telemetry_target", "") or os.environ.get(
+            "JARVIS_A1_GCS_TELEMETRY_TARGET", ""
+        )
+        if _fgcs:
+            os.environ["JARVIS_A1_GCS_TELEMETRY_TARGET"] = _fgcs
+        try:
+            from a1_deterministic_fixture import validate_fixture_config
+            validate_fixture_config(os.environ)
+        except ValueError as exc:
+            _log("REFUSED: invalid A1 fixture config -- %s" % (exc,))
+            return 2
+        # FAIL-CLOSED telemetry: a REMOTE fixture run MUST stream to GCS, else a
+        # node death takes the debug.log to the grave (A1 run #15). We never fly
+        # blind in the cloud again.
+        if getattr(args, "remote", False) and not os.environ.get(
+            "JARVIS_A1_GCS_TELEMETRY_TARGET", ""
+        ):
+            _log(
+                "REFUSED: --inject-deterministic-fixture --remote requires "
+                "--gcs-telemetry-target gs://... (fail-closed telemetry; a node "
+                "death must not lose the debug.log). Local runs are exempt."
+            )
+            return 2
+        _log(
+            "A1 Fast-Forward fixture ARMED: target=%s seed=%s gcs=%s"
+            % (
+                os.environ.get("JARVIS_A1_FIXTURE_TARGET", "(unset)"),
+                os.environ.get("JARVIS_A1_FIXTURE_SEED", "0"),
+                os.environ.get("JARVIS_A1_GCS_TELEMETRY_TARGET", "(none)"),
+            )
+        )
 
     # --- REMOTE: money-gated ------------------------------------------------
     if args.remote:
@@ -1454,6 +1571,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _node_manifest["native_tool_forcing"],
             _node_manifest["epistemic_feedback"],
         ))
+        # Decoupled telemetry: spawn the GCS sidecar daemon BEFORE the soak so it
+        # streams debug.log to GCS independently of the O+V lifecycle (survives a
+        # node hard-kill / preemption). No-op unless fixture mode + gs:// target.
+        _maybe_spawn_sidecar_daemon()
         run = build_live_run(args)
         _ACTIVE_CHAOS.append(run.chaos)
         _install_revert_signal_handlers()

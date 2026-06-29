@@ -65,6 +65,14 @@ logger = logging.getLogger("Ouroboros.ChangeEngine")
 # ---------------------------------------------------------------------------
 
 
+class PhantomWriteException(RuntimeError):
+    """The Absolute I/O Verification Gate physically re-read the just-written file
+    and the bytes on disk do NOT match what APPLY claims to have written. FAIL-
+    CLOSED: APPLY must never transition to written=True on a phantom (empty/stale)
+    disk -- this raises and crashes the op instead of asserting a false success.
+    Gated by ``JARVIS_CHANGE_ENGINE_IO_VERIFY`` (default ON)."""
+
+
 class BlockedPathError(Exception):
     """A write target failed containment / protected-path / immutable-governance.
 
@@ -918,6 +926,9 @@ class ChangeEngine:
                 resource=str(target),
                 mode=LockMode.EXCLUSIVE_WRITE,
             ) as handle:
+                # 2PC Phase 1 (PREPARE): stage the write. NO ledger entry / NO
+                # decision is emitted yet -- success is recorded only AFTER VERIFY
+                # passes (the phantom-success fix).
                 target.write_text(signed_content, encoding="utf-8")
 
             # Emit diff heartbeat so SerpentFlow can show colored inline diffs
@@ -961,30 +972,8 @@ class ChangeEngine:
                         "Post-hook error for op=%s target=%s (ignored)", op_id, target
                     )
 
-            # Phase 6: LEDGER -- record applied state
-            await self._comm.emit_heartbeat(
-                op_id=op_id, phase="ledger", progress_pct=85.0
-            )
-            await self._ledger.append(
-                LedgerEntry(
-                    op_id=op_id,
-                    state=OperationState.APPLIED,
-                    data={
-                        "target_file": str(target),
-                        "rollback_hash": rollback.snapshot_hash,
-                    },
-                )
-            )
-
-            # Phase 7: PUBLISH -- emit decision (outbox: ledger already committed)
-            await self._comm.emit_decision(
-                op_id=op_id,
-                outcome="applied",
-                reason_code="safe_auto_passed",
-                diff_summary=f"Applied change to {target}",
-            )
-
-            # Phase 8: VERIFY -- post-apply verification
+            # 2PC Phase 2 (VERIFY) -- post-apply verification. APPLIED is NOT yet
+            # recorded; a verify failure below rolls back with NO phantom success.
             await self._comm.emit_heartbeat(
                 op_id=op_id, phase="verify", progress_pct=95.0
             )
@@ -1085,6 +1074,51 @@ class ChangeEngine:
                     risk_tier=risk_tier,
                     rolled_back=True,
                 )
+
+            # ── 2PC Phase 3 (COMMIT) — VERIFY passed ──────────────────────────
+            # APPLIED is recorded ONLY here, after a clean VERIFY. Cryptographic
+            # Terminal Gate first: SHA-256 the in-memory expected bytes against the
+            # physical file. A hash mismatch while about to claim APPLIED is a
+            # Phantom Write -> raise (fail-closed); never commit a false success.
+            if (os.environ.get("JARVIS_CHANGE_ENGINE_IO_VERIFY", "true")
+                    or "true").strip().lower() not in {"0", "false", "no", "off"}:
+                import hashlib as _hl
+
+                _expected_sha = _hl.sha256(signed_content.encode("utf-8")).hexdigest()
+                try:
+                    _disk_bytes = target.read_text(encoding="utf-8")
+                except Exception as _rex:  # noqa: BLE001 — unreadable == phantom
+                    raise PhantomWriteException(
+                        "phantom write at %s: APPLIED but file unreadable off disk "
+                        "(%r)" % (target, _rex)
+                    ) from _rex
+                _actual_sha = _hl.sha256(_disk_bytes.encode("utf-8")).hexdigest()
+                if _actual_sha != _expected_sha:
+                    raise PhantomWriteException(
+                        "phantom write at %s: about to claim APPLIED but SHA-256 "
+                        "mismatch (expected=%s on-disk=%s)"
+                        % (target, _expected_sha[:12], _actual_sha[:12])
+                    )
+
+            await self._comm.emit_heartbeat(
+                op_id=op_id, phase="ledger", progress_pct=85.0
+            )
+            await self._ledger.append(
+                LedgerEntry(
+                    op_id=op_id,
+                    state=OperationState.APPLIED,
+                    data={
+                        "target_file": str(target),
+                        "rollback_hash": rollback.snapshot_hash,
+                    },
+                )
+            )
+            await self._comm.emit_decision(
+                op_id=op_id,
+                outcome="applied",
+                reason_code="safe_auto_passed",
+                diff_summary=f"Applied change to {target}",
+            )
 
             await self._comm.emit_postmortem(
                 op_id=op_id,

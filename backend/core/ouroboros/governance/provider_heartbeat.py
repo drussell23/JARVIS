@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from backend.core.ouroboros.governance.dw_surface_health import (
@@ -111,6 +112,217 @@ def _dw_base_url() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deep Inference Probe (data-plane heartbeat) -- Run-#13 fix (2026-06-28)
+# ---------------------------------------------------------------------------
+#
+# The legacy ``_default_dw_probe`` does ``GET /models`` -- a CONTROL-PLANE
+# reachability check. In soak bt-2026-06-29-032526 DW's control plane answered
+# 200 the whole session while the *data plane* (batch/generation) deadlocked at
+# 180s per op -- so the probe stayed green and the early signal never fired.
+# The Deep Inference Probe dispatches a deterministic ``max_tokens=1`` generation
+# straight at the data plane and bounds it with a DYNAMICALLY-resolved
+# ``asyncio.wait_for`` deadline. A wedged inference queue times the probe out in
+# a fraction of a second and flips ``is_degrading()`` long before 180s.
+
+def deep_probe_enabled() -> bool:
+    """Use the deep INFERENCE probe (data plane) instead of the legacy
+    GET /models reachability probe. DEFAULT-ON, but composes UNDER the
+    heartbeat master gate (which is itself default-OFF) -- so unset env is
+    byte-identical legacy. Rollback: ``JARVIS_DW_DEEP_PROBE_ENABLED=false``
+    restores the control-plane probe."""
+    return _enabled("JARVIS_DW_DEEP_PROBE_ENABLED", "true")
+
+
+# ---------------------------------------------------------------------------
+# The Safety Law -- strict semantic error classification (Run-#14 fix)
+# ---------------------------------------------------------------------------
+#
+# Soak bt-2026-06-29-061928 provisioned a real GCE node on a false 401: an AUTH
+# error was conflated with a DATA-PLANE OUTAGE, so the degrade streak climbed and
+# the hard-outage escalation forcefully awakened J-Prime. A configuration error
+# must NEVER trigger infrastructure. We classify:
+#   * timeout / 5xx / connection drop -> "outage" (the data plane is down)
+#   * 401 / 403                        -> "auth"   (the PROBE is misconfigured)
+
+class AegisConfigurationError(RuntimeError):
+    """The probe could not authenticate (401/403). A misconfiguration -- NOT a
+    DW outage. Freezes the heartbeat + routes to the DLQ; never awakens."""
+
+
+def _classify_probe_exception(exc: BaseException) -> str:
+    """Classify a probe failure as ``"auth"`` (401/403 -- config error, never an
+    outage) or ``"outage"`` (timeout / 5xx / connection drop -- a real data-plane
+    failure). NEVER raises -- an unknown error is conservatively an outage."""
+    try:
+        import urllib.error  # noqa: PLC0415
+        if isinstance(exc, urllib.error.HTTPError):
+            code = int(getattr(exc, "code", 0))
+            if code in (401, 403):
+                return "auth"
+            return "outage"
+    except Exception:  # noqa: BLE001
+        pass
+    return "outage"
+
+
+def _default_dlq_emit(payload: Any) -> None:
+    """Default sink for an Aegis config error: a CRITICAL structured record on
+    the WAL (debug.log -> GCS flight recorder) + best-effort intake-DLQ append.
+    Fail-soft -- telemetry never blocks. Tests inject their own sink."""
+    try:
+        import json  # noqa: PLC0415
+        logger.critical("[AegisConfigDLQ] %s", json.dumps(payload, sort_keys=True))
+    except Exception:  # noqa: BLE001
+        logger.critical("[AegisConfigDLQ] %r", payload)
+    # Best-effort persisted DLQ entry (reuse the existing intake_dlq surface;
+    # append_dlq serializes a dict envelope via its _to_serializable path).
+    try:
+        from backend.core.ouroboros.governance.intake_dlq import (  # noqa: PLC0415
+            append_dlq,
+        )
+        append_dlq(payload, reason="aegis_configuration_error")
+    except Exception:  # noqa: BLE001 -- the WAL record above is the durable floor
+        pass
+
+
+def _resolve_deep_probe_timeout(baseline_s: Optional[float] = None) -> float:
+    """Resolve the deep-probe ``asyncio.wait_for`` deadline DYNAMICALLY.
+
+    Resolution order (NEVER a hardcoded literal):
+      1. Explicit operator pin ``JARVIS_DW_DEEP_PROBE_TIMEOUT_S`` (if > 0) wins.
+      2. Otherwise a BASELINE-LATENCY metric: ``mult x baseline`` where
+         *baseline* is the heartbeat's observed healthy-probe EWMA (passed in)
+         or ``JARVIS_DW_DEEP_PROBE_BASELINE_S`` when no sample exists yet.
+    Always clamped to ``[floor, ceil]`` so it is never 0 and never unbounded.
+    A slower-but-healthy DW gets a proportionally larger deadline (no false
+    degrade); a fast DW a tight one. Fail-soft: any parse error -> the metric
+    path with defaults."""
+    override = (os.environ.get("JARVIS_DW_DEEP_PROBE_TIMEOUT_S", "") or "").strip()
+    if override:
+        try:
+            v = float(override)
+            if v > 0:
+                return v
+        except (ValueError, TypeError):
+            pass
+    base = (
+        baseline_s
+        if (baseline_s is not None and baseline_s > 0)
+        else _env_float("JARVIS_DW_DEEP_PROBE_BASELINE_S", 0.5)
+    )
+    mult = max(1.0, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_MULT", 4.0))
+    floor = max(0.1, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_FLOOR_S", 1.0))
+    ceil = max(floor, _env_float("JARVIS_DW_DEEP_PROBE_TIMEOUT_CEIL_S", 15.0))
+    return max(floor, min(ceil, mult * base))
+
+
+def _deep_probe_prompt() -> str:
+    """The deterministic, ultra-low-latency probe prompt. Env-tunable so an
+    operator can swap it for a model-specific minimal prompt; never raises."""
+    return (
+        os.environ.get("JARVIS_DW_DEEP_PROBE_PROMPT", "Return the digit 1")
+        or "Return the digit 1"
+    )
+
+
+def _http_post_json(url: str, headers: dict, payload: bytes, timeout: float) -> str:
+    """Injectable sync POST boundary (stdlib urllib). Returns the response body.
+    Raises on transport/HTTP failure. Tests monkeypatch this -- ZERO real net."""
+    import urllib.request  # noqa: PLC0415
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return resp.read().decode("utf-8", errors="replace")
+
+
+async def _resolve_dw_probe_transport():
+    """Gap 1 -- resolve the probe's ``(url, headers)`` from the SAME aegis bridge
+    the real DW provider uses, so the probe impersonates real traffic at the
+    protocol level (Aegis base URL + SESSION BEARER -- NOT the confiscated DW API
+    key, which 401'd in soak bt-2026-06-29-055555).
+
+    Fail-soft: an aegis base-URL resolve error falls back to the direct DW base.
+    The session-header fetch is best-effort -- a failure yields no Authorization
+    rather than crashing the probe. NEVER raises."""
+    headers = {"Content-Type": "application/json"}
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            aegis_provider_bridge as _apb,
+        )
+        base = _apb.dw_aegis_base_url()
+    except Exception as exc:  # noqa: BLE001 -- fall back to direct DW
+        logger.debug("[DWHeartbeat] aegis base resolve fail-soft err=%r", exc)
+        return (_dw_base_url() + "/chat/completions", headers)
+    url = base.rstrip("/") + "/chat/completions"
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            aegis_provider_bridge as _apb,
+        )
+        # FIDELITY: the real DW call carries BOTH the session bearer AND a
+        # per-call lease (session + acquire_call_lease + merge). Use the SAME
+        # shared AegisClient vault + lease helpers -- no duplication. Both
+        # best-effort: a missing piece yields the daemon's own 401, which the
+        # Safety-Law classifier handles as a config error (freeze), never an outage.
+        auth = await _apb.dw_session_auth_header()
+        if not isinstance(auth, dict):
+            auth = {}
+        lease = None
+        try:
+            lease = await _apb.acquire_call_lease(
+                op_id="dw-heartbeat-probe",
+                route="heartbeat",
+                estimated_cost_usd=_env_float("JARVIS_DW_DEEP_PROBE_COST_USD", 0.0001),
+            )
+        except Exception as exc:  # noqa: BLE001 -- no lease -> daemon 401 -> classified
+            logger.debug("[DWHeartbeat] probe lease acquire fail-soft err=%r", exc)
+        merged = _apb.merge_lease_into_session_headers(auth, lease)
+        if isinstance(merged, dict):
+            headers.update(merged)
+    except Exception as exc:  # noqa: BLE001 -- best-effort bearer/lease
+        logger.debug("[DWHeartbeat] aegis auth/lease fail-soft err=%r", exc)
+    return (url, headers)
+
+
+async def _default_dw_inference_dispatch() -> str:
+    """Default deep-probe boundary: a real ``max_tokens=1`` generation against
+    the DW data plane, routed through the SAME (Aegis-aware) transport + auth the
+    real DW provider uses (Gap 1 -- faithful impersonation, no false 401).
+
+    Returns the (possibly empty) content string. Raises on any transport/HTTP
+    failure -- the caller treats BOTH an exception and an empty string as a
+    degrade signal."""
+    import json  # noqa: PLC0415
+
+    url, headers = await _resolve_dw_probe_transport()
+    model = (
+        os.environ.get("JARVIS_DW_DEEP_PROBE_MODEL", "")
+        or os.environ.get("DOUBLEWORD_MODEL", "")
+        or "Qwen/Qwen3.5-397B-A17B-FP8"
+    )
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": _deep_probe_prompt()}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    # Per-request timeout is a belt-and-braces backstop; the authoritative bound
+    # is the caller's asyncio.wait_for (dynamic). Off-loaded so the blocking POST
+    # never stalls the event loop.
+    loop = asyncio.get_event_loop()
+    body = await loop.run_in_executor(
+        None, _http_post_json, url, headers, payload, _resolve_deep_probe_timeout(),
+    )
+    data = json.loads(body)
+    try:
+        return str(data["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Default probe boundary (stdlib urllib -- injectable for tests)
 # ---------------------------------------------------------------------------
 
@@ -159,8 +371,34 @@ class DWHeartbeat:
         *,
         probe_fn: Optional[Callable[[], Any]] = None,
         ledger: Optional[SurfaceHealthLedger] = None,
+        inference_dispatch_fn: Optional[Callable[[], Any]] = None,
+        dlq_emit_fn: Optional[Callable[[Any], Any]] = None,
     ) -> None:
-        self._probe_fn = probe_fn or _default_dw_probe
+        # The deep-probe inference boundary (data plane). Injectable for tests;
+        # default is a real max_tokens=1 DW generation.
+        self._inference_dispatch_fn = (
+            inference_dispatch_fn or _default_dw_inference_dispatch
+        )
+        # The Safety Law -- where an AUTH (config) error is routed. Default: the
+        # intake DLQ. Injectable for tests. A 401/403 FREEZES the loop here.
+        self._dlq_emit_fn = dlq_emit_fn or _default_dlq_emit
+        self._frozen = False  # set True on an auth/config error -> never awakens
+        # Recovery signal (Handback Protocol): consecutive HEALTHY probes. A
+        # streak of fast-healthy beats means DW recovered -> drives SERVING->HANDBACK.
+        self._healthy_streak = 0
+        # Baseline healthy-probe latency metric (EWMA) -- drives the DYNAMIC
+        # deep-probe timeout. Seeded from env; updated on each healthy probe.
+        self._baseline_latency_s: float = _env_float(
+            "JARVIS_DW_DEEP_PROBE_BASELINE_S", 0.5
+        )
+        # Default probe selection: the deep INFERENCE probe (data plane) when
+        # armed, else the legacy GET /models reachability probe (rollback).
+        if probe_fn is not None:
+            self._probe_fn: Callable[[], Any] = probe_fn
+        elif deep_probe_enabled():
+            self._probe_fn = self._deep_inference_probe
+        else:
+            self._probe_fn = _default_dw_probe
         # Reuse the shared ledger by default (the same on-disk file the rest of
         # the surface-health stack reads). Tests inject an in-memory ledger.
         self._ledger = ledger if ledger is not None else SurfaceHealthLedger()
@@ -175,15 +413,22 @@ class DWHeartbeat:
     # Public read surface (consumed by the failover lifecycle pre-warm gate)
     # ------------------------------------------------------------------
 
+    def is_frozen(self) -> bool:
+        """True once an AUTH/config error froze the loop. A frozen heartbeat is
+        a NON-signal: is_degrading()=False, consecutive_failures()=0 -- a
+        misconfiguration can NEVER trigger an awaken."""
+        return self._frozen
+
     def is_degrading(self) -> bool:
         """True iff DW is DEGRADED but NOT yet a full outage.
 
         Reads the live ``consecutive_failures`` streak for the DIRECT_STREAMING
         surface from the shared ledger and compares against the degrade streak
         (default 2 < the outage window of 5). OFF -> always False (inert).
+        FROZEN (auth/config error) -> always False (the Safety Law).
         Fail-soft -> False on any error (conservative: no false pre-warm).
         """
-        if not heartbeat_enabled():
+        if not heartbeat_enabled() or self._frozen:
             return False
         try:
             rec = self._ledger.verdict_for(self._SURFACE)
@@ -206,15 +451,113 @@ class DWHeartbeat:
             logger.debug("[DWHeartbeat] latest_verdict fail-soft err=%r", exc)
             return None
 
+    def consecutive_successes(self) -> int:
+        """Current HEALTHY streak (consecutive fast-healthy probes). Drives the
+        SERVING->HANDBACK recovery decision. 0 when OFF / frozen / degraded."""
+        if not heartbeat_enabled() or self._frozen:
+            return 0
+        return int(self._healthy_streak)
+
+    def dw_recovered(self, *, min_streak: int = 3, max_latency_s: float = 5.0) -> bool:
+        """Handback recovery predicate: DW has returned ``min_streak`` consecutive
+        HEALTHY probes AND the recent probe latency (baseline EWMA) is below
+        ``max_latency_s`` (a slow-but-healthy DW is NOT 'recovered'). Fail-soft
+        -> False (stay SERVING; conservative -- never a premature handback)."""
+        if not heartbeat_enabled() or self._frozen:
+            return False
+        try:
+            return (
+                int(self._healthy_streak) >= max(1, int(min_streak))
+                and float(self._baseline_latency_s) <= float(max_latency_s)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def consecutive_failures(self) -> int:
-        """Current degrade streak for the DW SSE surface (0 when healthy)."""
-        if not heartbeat_enabled():
+        """Current degrade streak for the DW SSE surface (0 when healthy).
+        FROZEN (auth/config) -> 0 so the Gap-2 hard escalation can never fire."""
+        if not heartbeat_enabled() or self._frozen:
             return 0
         try:
             rec = self._ledger.verdict_for(self._SURFACE)
             return int(rec.consecutive_failures) if rec is not None else 0
         except Exception:  # noqa: BLE001
             return 0
+
+    # ------------------------------------------------------------------
+    # Deep Inference Probe (data plane) -- the testable core of the Run-#13 fix
+    # ------------------------------------------------------------------
+
+    def _record_baseline_latency(self, sample_s: float) -> None:
+        """EWMA-update the healthy-probe baseline latency metric. Fail-soft."""
+        try:
+            if sample_s <= 0:
+                return
+            alpha = max(0.0, min(1.0, _env_float("JARVIS_DW_DEEP_PROBE_EWMA_ALPHA", 0.3)))
+            cur = self._baseline_latency_s
+            self._baseline_latency_s = (
+                sample_s if cur <= 0 else alpha * sample_s + (1.0 - alpha) * cur
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _deep_inference_probe(self) -> bool:
+        """Dispatch a deterministic ``max_tokens=1`` generation at the DW data
+        plane, bounded by a DYNAMICALLY-resolved ``asyncio.wait_for`` deadline.
+
+        Returns True iff a NON-EMPTY token comes back inside the deadline. A
+        timeout (wedged inference queue), a transport error, OR an empty/blank
+        result are all degrade signals (False). NEVER raises -- the caller
+        (``beat``) records the verdict. A healthy probe updates the baseline
+        latency metric so the deadline self-tunes to real DW speed."""
+        timeout = _resolve_deep_probe_timeout(self._baseline_latency_s)
+
+        async def _invoke() -> Any:
+            res = self._inference_dispatch_fn()
+            if asyncio.iscoroutine(res):
+                res = await res
+            return res
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.wait_for(_invoke(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[DWHeartbeat] deep probe TIMEOUT after %.3fs (data-plane "
+                "deadlock) -> outage degrade signal", timeout,
+            )
+            return False
+        except AegisConfigurationError:
+            raise  # already classified -- propagate to beat() (the Safety Law)
+        except Exception as exc:  # noqa: BLE001 -- classify before treating as degrade
+            if _classify_probe_exception(exc) == "auth":
+                # A 401/403 is a PROBE misconfiguration, NOT a DW outage. Raise a
+                # typed error so beat() freezes the loop instead of degrading
+                # (which would conflate a config bug with an outage -> false awaken).
+                raise AegisConfigurationError(
+                    "deep probe auth failure (config error, NOT outage): %r" % (exc,)
+                ) from exc
+            logger.debug("[DWHeartbeat] deep probe dispatch err=%r -> outage degrade", exc)
+            return False
+        ok = bool(result) and bool(str(result).strip())
+        if ok:
+            self._record_baseline_latency(time.monotonic() - t0)
+        return ok
+
+    def _emit_config_dlq(self, exc: BaseException) -> None:
+        """Route an Aegis config error to the DLQ sink. Fail-soft."""
+        payload = {
+            "event": "aegis_configuration_error",
+            "error_class": "AegisConfigurationError",
+            "surface": self._SURFACE.value,
+            "detail": str(exc)[:300],
+            "action": "heartbeat_frozen",
+            "note": "config error -- NOT a DW outage; never awakens J-Prime",
+        }
+        try:
+            self._dlq_emit_fn(payload)
+        except Exception as exc2:  # noqa: BLE001 -- telemetry never blocks
+            logger.debug("[DWHeartbeat] config DLQ emit fail-soft err=%r", exc2)
 
     # ------------------------------------------------------------------
     # One probe + record (the testable core)
@@ -227,7 +570,7 @@ class DWHeartbeat:
         A probe error is itself a degrade signal -- the verdict recorded is
         TRANSPORT_DEGRADED (never propagates the exception).
         """
-        if not heartbeat_enabled():
+        if not heartbeat_enabled() or self._frozen:
             return
         ok = False
         try:
@@ -235,10 +578,26 @@ class DWHeartbeat:
             if asyncio.iscoroutine(result):
                 result = await result
             ok = bool(result)
-        except Exception as exc:  # noqa: BLE001 -- a probe error IS a degrade
-            logger.debug("[DWHeartbeat] probe raised (degrade signal) err=%r", exc)
+        except AegisConfigurationError as exc:
+            # THE SAFETY LAW: an auth/config error is NOT a DW outage. FREEZE the
+            # loop (no proxy spam), route to the DLQ, and record NOTHING into the
+            # degrade streak. is_degrading()/consecutive_failures() now read 0 ->
+            # a misconfiguration can NEVER provision infrastructure.
+            self._frozen = True
+            self._healthy_streak = 0
+            logger.critical(
+                "[DWHeartbeat] AEGIS CONFIG ERROR -- probe cannot authenticate "
+                "(401/403). FREEZING heartbeat; this is NOT a DW outage and will "
+                "NOT awaken J-Prime. err=%r", exc,
+            )
+            self._emit_config_dlq(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- a non-auth probe error IS an outage
+            logger.debug("[DWHeartbeat] probe raised (outage degrade) err=%r", exc)
             ok = False
 
+        # Recovery streak: consecutive HEALTHY beats (reset on any degrade).
+        self._healthy_streak = (self._healthy_streak + 1) if ok else 0
         verdict = SurfaceVerdict.HEALTHY if ok else SurfaceVerdict.TRANSPORT_DEGRADED
         try:
             rec = self._ledger.record(
@@ -276,7 +635,7 @@ class DWHeartbeat:
             "[DWHeartbeat] run() loop started interval=%.1fs degrade_streak=%d",
             _interval_s(), _degrade_streak(),
         )
-        while not self._stopped:
+        while not self._stopped and not self._frozen:
             try:
                 await self.beat()
             except Exception as exc:  # noqa: BLE001 -- belt-and-braces
@@ -315,4 +674,5 @@ __all__ = [
     "DWHeartbeat",
     "get_dw_heartbeat",
     "heartbeat_enabled",
+    "deep_probe_enabled",
 ]

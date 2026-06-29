@@ -87,6 +87,22 @@ def _get_env_float(key: str, default: float) -> float:
         return default
 
 
+def resolve_aiohttp_timeout_kwargs(config: "PrimeClientConfig") -> dict:
+    """TTFT Armor: resolve the aiohttp.ClientTimeout kwargs for the J-Prime tier.
+
+    Decouples a SHORT ``connect`` (fail fast on an unreachable node) from a
+    MASSIVE ``sock_read`` (absorb the cold CPU time-to-first-token). A
+    ``total_timeout`` of 0 (or negative) -> ``total=None`` (NO hard cap), so a
+    long crunch is bounded by read-inactivity, never severed by a total ceiling.
+    An explicit positive total is honored (operators may re-impose a cap)."""
+    total = config.total_timeout
+    return {
+        "total": (total if total and total > 0 else None),
+        "connect": config.connect_timeout,
+        "sock_read": config.read_timeout,
+    }
+
+
 def _get_env_int(key: str, default: int) -> int:
     """Get int from environment with fallback."""
     try:
@@ -202,10 +218,14 @@ class PrimeClientConfig:
     pool_size: int = field(default_factory=lambda: _get_env_int("PRIME_POOL_SIZE", 10))
     pool_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_POOL_TIMEOUT", 30.0))
 
-    # Timeout settings
+    # Timeout settings -- TTFT Armor: a SHORT connect (fail fast if the node is
+    # unreachable) DECOUPLED from a MASSIVE read (absorb the cold 7B-on-CPU
+    # time-to-first-token, observed >90s). total_timeout=0 == NO hard cap, so a
+    # long crunch is never severed mid-flight by a total ceiling (the read-
+    # inactivity timeout is the real bound). All env-overridable, no hardcoding.
     connect_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_CONNECT_TIMEOUT", 5.0))
-    read_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_READ_TIMEOUT", 120.0))
-    total_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_TOTAL_TIMEOUT", 180.0))
+    read_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_READ_TIMEOUT", 300.0))
+    total_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_TOTAL_TIMEOUT", 0.0))
 
     # Retry settings
     max_retries: int = field(default_factory=lambda: _get_env_int("PRIME_MAX_RETRIES", 3))
@@ -512,12 +532,9 @@ class PrimeConnectionPool:
                     enable_cleanup_closed=True,
                 )
 
-                # Create timeout configuration
-                timeout = aiohttp.ClientTimeout(
-                    total=self._config.total_timeout,
-                    connect=self._config.connect_timeout,
-                    sock_read=self._config.read_timeout,
-                )
+                # Create timeout configuration (TTFT Armor: total=None drops the
+                # hard cap so a cold crunch is never severed; read bounds inactivity).
+                timeout = aiohttp.ClientTimeout(**resolve_aiohttp_timeout_kwargs(self._config))
 
                 self._session = aiohttp.ClientSession(
                     connector=connector,

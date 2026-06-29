@@ -1152,6 +1152,10 @@ class GovernedLoopService:
         # background loops so the bidirectional DW->J-Prime->DW failover RUNS.
         self._failover_task: Optional[asyncio.Task] = None
         self._failover_controller: Any = None
+        # Layer 1 (Hybrid soak fix): the DWHeartbeat deep-probe loop, started as a
+        # peer of the failover tick loop so is_degrading() is actually fed.
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._dw_heartbeat: Any = None
         # Meta-Goal aggregator wiring (the built-but-no-caller fix). The
         # aggregator (meta_goal_aggregator.py) bundles N disjoint single-file
         # ops into ONE fan-outable Meta-Goal DAG, but had no live caller — so
@@ -2073,14 +2077,40 @@ class GovernedLoopService:
                                 )
                             except (TypeError, ValueError):
                                 _a1_timeout = 60.0
+                            # Task 2 — CIRCUIT BREAKER: capture the readiness
+                            # result. Fail-OPEN only on an UNEXPECTED valve error
+                            # (infra hiccup) so a transient bus glitch doesn't
+                            # abort; but on a clean not-ready-within-timeout, fail
+                            # LOUD (raise) instead of swallowing and looping a goal
+                            # into a never-ready void (the A1 run #15 silent-DLQ).
                             try:
                                 _a1_bus = _a1_get_bus() if _a1_get_bus else None
-                                await _a1_await_ready(_a1_bus, _a1_timeout)
+                                _a1_ready_ok = await _a1_await_ready(
+                                    _a1_bus, _a1_timeout
+                                )
                             except Exception as _a1_vex:  # noqa: BLE001
                                 logger.debug(
-                                    "[GovernedLoop] router-ready valve "
-                                    "swallowed: %r",
+                                    "[GovernedLoop] router-ready valve errored "
+                                    "(fail-open to legacy emit): %r",
                                     _a1_vex,
+                                )
+                                _a1_ready_ok = True
+                            if not _a1_ready_ok:
+                                from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                                    RouterInitializationTimeoutError,
+                                )
+
+                                logger.critical(
+                                    "[A1] roadmap daemon CIRCUIT BREAKER — intake "
+                                    "router not ready within %.0fs; aborting "
+                                    "roadmap ignition (fail-loud, no silent "
+                                    "DLQ-loop). Streamed to GCS sidecar via "
+                                    "debug.log.",
+                                    _a1_timeout,
+                                )
+                                raise RouterInitializationTimeoutError(
+                                    "intake router not ready within %.0fs"
+                                    % (_a1_timeout,)
                                 )
                         _a1_timeout_dlq_done = False
                         while True:
@@ -4798,6 +4828,45 @@ class GovernedLoopService:
             except Exception:
                 logger.debug("[GovernedLoop] graph backend wiring skipped", exc_info=True)
 
+            # A1 deterministic-fixture DI overlay (Factory-level interception).
+            # Default-OFF: when JARVIS_A1_FIXTURE_MODE is inactive this is a
+            # byte-identical no-op. When active (the Fast-Forward harness) it
+            # swaps self._generator for a FixtureGenerator returning a
+            # deterministic AST-mutated candidate with ZERO provider calls, so
+            # the REAL VALIDATE -> APPLY -> AutoCommitter path proves the
+            # written=True git plumbing decoupled from DW. The production
+            # CandidateGenerator constructed above is never modified, and
+            # scripts/ is imported ONLY on the fixture path (never in prod).
+            #
+            # FAIL-CLOSED (A1 run #15 fix): NO try/except swallow here. Under
+            # fixture mode, an import or activation failure MUST hard-crash the
+            # orchestrator -- a prior `except Exception -> use real generator`
+            # silently fell back to DW autarky when the node PYTHONPATH differed,
+            # masking the bug as an inconclusive UNKNOWN. We instead normalize
+            # sys.path (repo root + scripts/) so the import resolves on macOS or
+            # /opt/trinity/jarvis, then apply_fixture_overlay_or_raise() crashes
+            # loud if it cannot.
+            if (os.environ.get("JARVIS_A1_FIXTURE_MODE", "") or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }:
+                import sys as _sys
+                from pathlib import Path as _Path
+
+                _repo_root = _Path(__file__).resolve().parents[4]
+                for _p in (str(_repo_root), str(_repo_root / "scripts")):
+                    if _p not in _sys.path:
+                        _sys.path.insert(0, _p)
+                # No try/except: an import failure propagates = fail-closed crash.
+                from a1_deterministic_fixture import (  # noqa: E501
+                    apply_fixture_overlay_or_raise,
+                )
+
+                apply_fixture_overlay_or_raise(self)
+                logger.warning(
+                    "[GovernedLoop] A1 fixture generator overlay ACTIVE — "
+                    "deterministic AST candidate, zero-DW (written=True proof path)"
+                )
+
             # HIBERNATION_MODE step 6: construct a HibernationProber over the
             # real provider handles and attach it to the watcher so that
             # entering HIBERNATION automatically arms a wake loop. Sequencing:
@@ -6706,6 +6775,32 @@ class GovernedLoopService:
                 "[GovernedLoop] failover loop start failed (non-fatal): %r", exc,
             )
             self._failover_task = None
+        # Layer 1 -- start the DWHeartbeat deep-probe loop as a PEER task so
+        # is_degrading() is actually fed (the run-#13 wiring gap: the probe was
+        # built + flag ON, but nothing started the loop -> Layer 1 was inert).
+        try:
+            from backend.core.ouroboros.governance.provider_heartbeat import (
+                heartbeat_enabled as _hb_enabled,
+                deep_probe_enabled as _deep_enabled,
+                get_dw_heartbeat as _get_hb,
+            )
+            if _hb_enabled() and (
+                self._heartbeat_task is None or self._heartbeat_task.done()
+            ):
+                self._dw_heartbeat = _get_hb()
+                self._heartbeat_task = asyncio.create_task(
+                    self._dw_heartbeat.run(), name="dw_heartbeat_loop",
+                )
+                logger.info(
+                    "[GovernedLoop] DWHeartbeat probe loop started "
+                    "(deep_probe=%s) -- Layer 1 (early-prewarm signal) is LIVE",
+                    _deep_enabled(),
+                )
+        except Exception as exc:  # noqa: BLE001 -- never block boot
+            logger.warning(
+                "[GovernedLoop] heartbeat loop start failed (non-fatal): %r", exc,
+            )
+            self._heartbeat_task = None
 
     async def _failover_loop(self) -> None:
         """Tick the FailoverLifecycleController on a fixed interval until
@@ -6788,6 +6883,28 @@ class GovernedLoopService:
             except Exception:  # noqa: BLE001
                 pass
         self._failover_task = None
+        # Layer 1 -- cancel the DWHeartbeat probe loop as a peer of the failover
+        # task (stop() flips its internal flag; cancel() unblocks the sleep).
+        hb = getattr(self, "_dw_heartbeat", None)
+        if hb is not None:
+            try:
+                stop_fn = getattr(hb, "stop", None)
+                if callable(stop_fn):
+                    stop_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        hb_task = getattr(self, "_heartbeat_task", None)
+        if hb_task is not None and not hb_task.done():
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 -- never block shutdown
+                logger.debug(
+                    "[GovernedLoop] heartbeat loop cancel swallowed", exc_info=True,
+                )
+        self._heartbeat_task = None
 
     async def _prewarm_oracle_barrier(self) -> int:
         """ABSOLUTE PRE-FLIGHT INITIALIZATION BARRIER (Omni-Soak v5/v6 fix).
