@@ -51,6 +51,10 @@ _DEFAULT_BAKER_ROLES = (
     "roles/compute.storageAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
+    # Write build logs to a DEDICATED GCS bucket (not the reserved default) so they
+    # survive the ephemeral SA's deletion -> reliable stockout detection + readable
+    # post-mortem. objectAdmin (not bucket-mutating storage.admin) = least priv.
+    "roles/storage.objectAdmin",
 )
 
 
@@ -145,28 +149,6 @@ def iam_policy_remove_member(policy: Dict[str, Any], member: str) -> Dict[str, A
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested)
 # ---------------------------------------------------------------------------
-def _iso_duration_s(start: Optional[str], end: Optional[str]) -> Optional[float]:
-    """Seconds between two RFC3339 timestamps (Cloud Build step timing). Tolerates
-    a trailing 'Z' and nanosecond precision (truncated to micros). None on error."""
-    if not start or not end:
-        return None
-    try:
-        import datetime as _dt  # noqa: PLC0415
-        import re  # noqa: PLC0415
-
-        def _parse(x: str) -> "_dt.datetime":
-            x = x.replace("Z", "+00:00")
-            if "." in x:
-                head, frac = x.split(".", 1)
-                m = re.match(r"(\d+)(.*)", frac)
-                x = head + "." + m.group(1)[:6] + m.group(2)
-            return _dt.datetime.fromisoformat(x)
-
-        return (_parse(end) - _parse(start)).total_seconds()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def build_status_is_terminal(status: str) -> bool:
     return str(status or "").upper() in _TERMINAL_STATUSES
 
@@ -224,9 +206,10 @@ def build_packer_cloud_build(
         "substitutions": dict(substitutions or {}),
     }
     if service_account:
-        # A custom build SA REQUIRES an explicit logging mode. CLOUD_LOGGING_ONLY
-        # always submits (a custom SA can't write the reserved default GCS bucket).
-        # The stockout detector tolerates Cloud Logging's flush lag (wait+retry).
+        # A custom build SA REQUIRES an explicit logging mode. Log to a DEDICATED
+        # GCS bucket the SA can write (the reserved default bucket rejects submit;
+        # CLOUD_LOGGING_ONLY logs aren't queryable) -> logs survive SA deletion and
+        # the stockout detector reads them reliably.
         cfg["serviceAccount"] = service_account
         if logs_bucket:
             cfg["logsBucket"] = logs_bucket
@@ -267,9 +250,6 @@ class CloudBuildBaker:
         self.service_account: Optional[str] = None
         self._iam_settle_s = int(os.environ.get("JARVIS_BAKE_IAM_SETTLE_S", "10"))
         self._iam_rmw_retries = max(1, int(os.environ.get("JARVIS_BAKE_IAM_RMW_RETRIES", "5")))
-        # Failed-step duration (s) at/above which a build failure is treated as a
-        # capacity STOCKOUT (reached instance creation) vs a fast config fail.
-        self._stockout_min_step_s = max(1, int(os.environ.get("JARVIS_BAKE_STOCKOUT_MIN_STEP_S", "30")))
 
     # -- auth/identity reused from the provisioner's ADC bridge ---------------
     async def _auth(self):
@@ -291,17 +271,42 @@ class CloudBuildBaker:
         path = verify_cross_repo_spec(self.resolved_spec_path())
         return path.read_text(encoding="utf-8")
 
+    def _logs_bucket_url(self, project: str) -> str:
+        """Dedicated GCS bucket for build logs (NOT the reserved default). The
+        ephemeral SA writes here (objectAdmin) so logs survive its deletion."""
+        name = os.environ.get("JARVIS_BAKE_LOGS_BUCKET", "") or "{}-jarvis-bake-logs".format(project)
+        return "gs://{}".format(name)
+
     def build_config(self, project: str) -> Dict[str, Any]:
         extra = {}
         if self.model:
             extra["model_label"] = self.model
         if self.zone:
             extra["zone"] = self.zone
+        # Custom-SA builds log to the dedicated GCS bucket (readable post-deletion).
+        lb = self._logs_bucket_url(project) if self.service_account else None
         return build_packer_cloud_build(
             spec_text=self._read_spec(), project=project,
             image_family=self.image_family, extra_vars=extra, timeout_s=self.timeout_s,
-            service_account=self.service_account,
+            service_account=self.service_account, logs_bucket=lb,
         )
+
+    async def _ensure_logs_bucket(self, project: str, token: str) -> bool:
+        """Create the dedicated bake-logs bucket (idempotent: 409 already-exists is
+        success). NEVER raises -> False on hard error."""
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        name = self._logs_bucket_url(project).replace("gs://", "")
+        url = "{}/b?project={}".format(_STORAGE_BASE, project)
+        body = json.dumps({"name": name, "location": "US"}).encode("utf-8")
+        status, resp = await _http_request(
+            url, method="POST",
+            headers={"Authorization": "Bearer {}".format(token), "Content-Type": "application/json"},
+            body=body, timeout_s=40.0,
+        )
+        if status in (200, 409):  # created OR already exists
+            return True
+        logger.warning("[CloudBuildBaker] logs bucket ensure failed status=%s %s", status, resp[:200])
+        return False
 
     async def submit(self) -> Optional[str]:
         """POST the build; return the build id (or None on failure)."""
@@ -497,29 +502,25 @@ class CloudBuildBaker:
         return status == 200
 
     async def _build_failed_with_stockout(self, build_id: str) -> bool:
-        """Decide if a failed build is a capacity STOCKOUT (retryable in another
-        zone) using the failed STEP's DURATION from the build resource -- a signal
-        that needs NO logs (custom-SA CLOUD_LOGGING_ONLY logs are not queryable).
-        The spec is proven valid, so the packer step can no longer fail at PREPARE
-        (config, <~15s); a SLOW step-2 failure (~74s) means it reached instance
-        creation = capacity/stockout. Threshold env JARVIS_BAKE_STOCKOUT_MIN_STEP_S
-        (default 30). Fail-soft -> False (no blind retry storm)."""
+        """Read the failed build's log from the DEDICATED GCS bucket (survives the
+        ephemeral SA's deletion) and classify a transient GPU STOCKOUT (retryable
+        in another zone). Fail-soft -> False (a non-stockout failure must NOT
+        trigger a blind retry storm)."""
+        from backend.core.ouroboros.governance.gcp_compute_rest import _http_request  # noqa: PLC0415
+        from backend.core.ouroboros.governance.zone_fallback import is_stockout_error  # noqa: PLC0415
         try:
             token, project = await self._auth()
             if not token or not project:
                 return False
-            build = await self._get_build(project, token, build_id)
-            for s in build.get("steps", []):
-                if s.get("status") == "FAILURE":
-                    t = s.get("timing", {})
-                    dur = _iso_duration_s(t.get("startTime"), t.get("endTime"))
-                    if dur is not None and dur >= self._stockout_min_step_s:
-                        logger.info("[CloudBuildBaker] failed step ran %.0fs (>=%ss) "
-                                    "-> capacity/stockout, fail over", dur, self._stockout_min_step_s)
-                        return True
-                    logger.info("[CloudBuildBaker] failed step ran %ss -> fast fail "
-                                "(not capacity), stop", dur)
-                    return False
+            bucket = self._logs_bucket_url(project).replace("gs://", "")
+            obj = "log-{}.txt".format(build_id)
+            url = "{}/b/{}/o/{}?alt=media".format(_STORAGE_BASE, bucket, obj)
+            status, text = await _http_request(
+                url, method="GET",
+                headers={"Authorization": "Bearer {}".format(token)}, timeout_s=30.0,
+            )
+            if status == 200 and text.strip():
+                return is_stockout_error(text)
             return False
         except Exception as exc:  # noqa: BLE001
             logger.debug("[CloudBuildBaker] stockout-probe fail-soft err=%r", exc)
@@ -547,6 +548,7 @@ class CloudBuildBaker:
                 self._write_flare("BAKE ABORT: role bind denied (need resourcemanager.projects.setIamPolicy)")
                 return False
             self._write_flare("LEAST-PRIV ROLES BOUND roles={}".format(",".join(baker_sa_roles())))
+            await self._ensure_logs_bucket(project, token)  # readable build logs
             await asyncio.sleep(self._iam_settle_s)  # IAM propagation settle
             self.service_account = "projects/{}/serviceAccounts/{}".format(project, sa_email)
             # MULTI-ZONAL FALLBACK: reuse the ONE ephemeral SA across zones; on a
