@@ -82,6 +82,7 @@ accessed via ``orch._stack.change_engine`` — same as inline).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
 import os
@@ -564,6 +565,47 @@ class Slice4bRunner(PhaseRunner):
                     )
         except Exception:
             logger.debug("[Orchestrator] LiveWorkSensor check skipped", exc_info=True)
+
+        # ---- Gate 1: Isomorphic Execution Lock (pre-write, strict L4) ----
+        # Runs AFTER execution_graph materialisation (best_candidate is final)
+        # and BEFORE any snapshot or write touches the real tree.
+        # Default-OFF: JARVIS_A1_SANDBOX_LOCK_ENABLED controls activation.
+        from backend.core.ouroboros.governance.pre_apply_exec_lock import (
+            acquire_sandbox_execution_token,
+            lock_enabled,
+            RequiresCloudExecution,
+            SandboxLockFailed,
+        )
+        from backend.core.ouroboros.governance.dag_capability_token import DAGProofChain
+        if lock_enabled():
+            _g1_chain = getattr(ctx, "proof_chain", None) or DAGProofChain()
+            _g1_cand_files = list(orch._iter_candidate_files(best_candidate))
+            try:
+                _g1_sbx_tok = await acquire_sandbox_execution_token(
+                    op_id=ctx.op_id,
+                    candidate_files=_g1_cand_files,
+                    repo_root=str(orch._config.project_root),
+                    chain=_g1_chain,
+                )
+            except (SandboxLockFailed, RequiresCloudExecution) as _g1_exc:
+                _g1_reason = (
+                    "requires_cloud_execution"
+                    if isinstance(_g1_exc, RequiresCloudExecution)
+                    else "sandbox_lock_failed"
+                )
+                logger.warning(
+                    "[Gate1] op=%s %s: %s", ctx.op_id, _g1_reason, _g1_exc,
+                )
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code=_g1_reason,
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason=_g1_reason,
+                    artifacts={"t_apply": _t_apply},
+                )
+            ctx = dataclasses.replace(ctx, proof_chain=_g1_chain, sandbox_token=_g1_sbx_tok)
 
         # Pre-apply snapshots
         snapshots: Dict[str, str] = {}

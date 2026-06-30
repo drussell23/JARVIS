@@ -1068,6 +1068,13 @@ class OperationContext:
     # a concurrent operation and the candidate is stale.
     generate_file_hashes: Tuple[Tuple[str, str], ...] = ()
 
+    # ---- Gate 1: Isomorphic Execution Lock (pre-write L4 proof chain) ----
+    # Set at APPLY-start by the Gate 1 block in slice4b_runner when
+    # JARVIS_A1_SANDBOX_LOCK_ENABLED=true.  Both fields are None (default-OFF)
+    # on every path that does not activate the gate — zero behavioural change.
+    proof_chain: object = None    # DAGProofChain (per-op accumulator)
+    sandbox_token: object = None  # SandboxExecutionToken minted at Gate 1
+
     # ---- Model-reasoned implementation plan (stamped at PLAN phase) ----
     # Structured JSON plan produced by PlanGenerator before GENERATE.
     # Contains: approach, file_changes (ordered with dependencies), risk_factors,
