@@ -8659,6 +8659,10 @@ class ClaudeProvider:
                     getattr(context, "signal_source", None)
                 ),
                 op_id=getattr(context, "op_id", None),
+                # Financial Context Decoupling (Task CR1) -- free local
+                # open-source ops bypass the wallet gate. Absent on billed
+                # cloud ops (default ""), so this is byte-identical for Claude.
+                compute_context=getattr(context, "compute_context", None),
             )
         except ImportError:
             # Module absent on this build (graceful) — fall through to

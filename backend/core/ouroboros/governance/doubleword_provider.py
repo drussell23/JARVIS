@@ -1810,11 +1810,18 @@ class DoublewordProvider:
             self._daily_spend = 0.0
             self._budget_reset_date = today
 
-    def _check_budget(self) -> None:
+    def _check_budget(self, compute_context: Optional[str] = None) -> None:
         """Raise if daily budget is exhausted OR session-budget preflight
         refuses. Called before each generation (including from
         ``complete_sync``, which means the DW heavy non-streaming lane
-        inherits the gate transparently)."""
+        inherits the gate transparently).
+
+        ``compute_context`` (Task CR1 -- Financial Context Decoupling): threaded
+        from the callers that hold an OperationContext (``_generate_realtime``,
+        ``submit_batch``). When it equals ``"Local_Open_Source"`` the session
+        preflight ALLOWS the op (free local compute). Cognition-layer callers
+        without a context (``prompt_only``, ``complete_sync``) pass ``None`` --
+        byte-identical to the legacy gate."""
         self._maybe_reset_daily_budget()
         if self._daily_spend >= self._daily_budget:
             raise DoublewordInfraError(
@@ -1847,6 +1854,11 @@ class DoublewordProvider:
                 provider_name="doubleword",
                 estimated_cost_usd=float(self._max_cost_per_op or 0.0),
                 signal_source=None,
+                # Financial Context Decoupling (Task CR1) -- threaded from the
+                # caller's OperationContext (None for context-free cognition
+                # callers). "Local_Open_Source" bypasses the wallet gate;
+                # absent on billed cloud ops, so this is byte-identical.
+                compute_context=compute_context,
             )
         except ImportError:
             # Module absent on this build — graceful fall-through to
@@ -1883,7 +1895,9 @@ class DoublewordProvider:
         """
         if not self.is_available:
             return None
-        self._check_budget()
+        self._check_budget(
+            compute_context=getattr(ctx, "compute_context", None),
+        )
 
         from backend.core.ouroboros.governance.providers import (
             _build_codegen_prompt,
@@ -3124,7 +3138,9 @@ class DoublewordProvider:
         )
         from datetime import datetime, timezone
 
-        self._check_budget()
+        self._check_budget(
+            compute_context=getattr(context, "compute_context", None),
+        )
         t0 = time.monotonic()
         total_cost = 0.0
         self._last_chunk_at = 0.0  # reset — prevents stale timestamps from prior generation

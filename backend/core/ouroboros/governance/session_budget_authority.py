@@ -500,6 +500,13 @@ _BACKGROUND_TIER_SIGNAL_SOURCES: frozenset = frozenset({
     "intent_discovery",
 })
 
+# Financial Context Decoupling (Task CR1) -- the compute_context tag value that
+# marks an op as free local open-source compute (e.g. local Ollama, $0.00).
+# When ``check_preflight`` sees this tag it ALLOWS the op unconditionally --
+# free local compute is not financially gated. Billed cloud providers (Claude,
+# DoubleWord) never set this tag, so their behavior is byte-identical.
+LOCAL_OPEN_SOURCE = "Local_Open_Source"
+
 
 def is_background_tier_source(signal_source: Optional[str]) -> bool:
     """Return True iff the signal_source identifies a
@@ -566,6 +573,7 @@ def check_preflight(
     estimated_cost_usd: float,
     signal_source: Optional[str] = None,
     op_id: Optional[str] = None,
+    compute_context: Optional[str] = None,
 ) -> None:
     """Hard wallet gate. Call BEFORE provider dispatch.
 
@@ -614,6 +622,19 @@ def check_preflight(
         return  # fail-OPEN on adapter fault
     if remaining is None:
         return  # no authority active
+
+    # -- Financial Context Decoupling (Task CR1) --
+    # Free local open-source compute ($0.00) is not financially gated.
+    # This early-return ALLOW wins over BOTH the background-spend ceiling
+    # and the generic est>remaining refusal below. Only the EXACT free-tier
+    # tag bypasses; billed cloud providers (Claude/DW) never set it, so this
+    # branch is inert (prod byte-identical) when compute_context is absent.
+    if compute_context == LOCAL_OPEN_SOURCE:
+        logger.info(
+            "[SBA] preflight ALLOWED: compute_context=%s (free local compute, "
+            "$0.00) provider=%s op_id=%s", compute_context, provider_name, op_id)
+        return  # free local open-source compute is not financially gated
+
     try:
         est = float(max(0.0, estimated_cost_usd or 0.0))
     except (TypeError, ValueError):
