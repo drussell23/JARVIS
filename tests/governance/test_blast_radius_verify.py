@@ -195,3 +195,41 @@ async def test_dlq_fn_exception_does_not_mask_primary_failure():
             rollback_fn=rollback_fn,
             dlq_fn=boom_dlq,
         )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_test_fn_error_rolls_back():
+    chain = DAGProofChain()
+    prev = _prev(chain)
+    calls: dict = {"rollback": 0, "dlq": []}
+
+    async def graph_fn(files):
+        return {"tests/test_x.py"}
+
+    async def test_fn(tests):
+        raise RuntimeError("pytest harness exploded")
+
+    async def rollback_fn(sha):
+        calls["rollback"] += 1
+
+    async def sha_pre():
+        return PRE
+
+    def dlq_fn(reason):
+        calls["dlq"].append(reason)
+
+    with pytest.raises(brv.BlastRadiusBreach):
+        await brv.acquire_blast_radius_token(
+            op_id="op-1",
+            scope_files=SCOPE,
+            pre_op_tree_sha=PRE,
+            chain=chain,
+            prev_token=prev,
+            graph_fn=graph_fn,
+            test_fn=test_fn,
+            current_tree_sha_fn=sha_pre,
+            rollback_fn=rollback_fn,
+            dlq_fn=dlq_fn,
+        )
+    assert calls["rollback"] == 1
+    assert calls["dlq"] == ["blast_radius_unexpected"]

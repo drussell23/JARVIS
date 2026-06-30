@@ -1142,6 +1142,12 @@ class Slice4bRunner(PhaseRunner):
         # Default-OFF: JARVIS_A1_BLAST_RADIUS_ENABLED controls activation.
         # Inline env check + all imports INSIDE the guard so the OFF path
         # imports NOTHING (byte-identical to pre-Gate-2 behavior — Task 4 lesson).
+        if os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+            if getattr(ctx, "sandbox_token", None) is None:
+                logger.warning(
+                    "[Gate2] op=%s armed but no sandbox_token (Gate 1 disabled?) -- skipping",
+                    ctx.op_id,
+                )
         if (os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
                 and getattr(ctx, "sandbox_token", None) is not None
                 and getattr(ctx, "proof_chain", None) is not None):

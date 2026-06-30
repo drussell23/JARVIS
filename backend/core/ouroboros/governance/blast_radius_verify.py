@@ -84,29 +84,35 @@ async def acquire_blast_radius_token(
         # rollback is the more alarming signal and intentionally takes priority.
         raise BlastRadiusGraphFailure(f"op={op_id}: {exc}") from exc
 
-    # Phase 2 -- run the closure; no retry
-    result: dict = await test_fn(set(tests))
-    failed = list(result.get("failed", []))
-    if failed:
-        logger.warning(
-            "[Gate2] op=%s blast-radius FAIL %d/%s",
-            op_id,
-            len(failed),
-            result.get("total"),
-        )
-        await _rollback_and_assert("blast_radius_breach")
-        raise BlastRadiusBreach(f"op={op_id} failed={failed}")
+    # Phase 2 + 3 -- wrapped so ANY unexpected crash forces rollback
+    try:
+        result: dict = await test_fn(set(tests))
+        failed = list(result.get("failed", []))
+        if failed:
+            logger.warning(
+                "[Gate2] op=%s blast-radius FAIL %d/%s",
+                op_id,
+                len(failed),
+                result.get("total"),
+            )
+            await _rollback_and_assert("blast_radius_breach")
+            raise BlastRadiusBreach(f"op={op_id} failed={failed}")
 
-    # Phase 3 -- all pass; read post-op SHA for the token payload
-    post_tree_sha = await current_tree_sha_fn()
-    token = chain.mint(
-        kind=TokenKind.BLAST_RADIUS_CLEARED,
-        op_id=op_id,
-        state_binding=pre_op_tree_sha,
-        payload={
-            "n_tests": str(result.get("total", len(tests))),
-            "post_tree_sha": post_tree_sha,
-        },
-        prev=prev_token,
-    )
-    return token  # type: ignore[return-value]
+        # Phase 3 -- all pass; read post-op SHA for the token payload
+        post_tree_sha = await current_tree_sha_fn()
+        token = chain.mint(
+            kind=TokenKind.BLAST_RADIUS_CLEARED,
+            op_id=op_id,
+            state_binding=pre_op_tree_sha,
+            payload={
+                "n_tests": str(result.get("total", len(tests))),
+                "post_tree_sha": post_tree_sha,
+            },
+            prev=prev_token,
+        )
+        return token  # type: ignore[return-value]
+    except (BlastRadiusBreach, BlastRadiusGraphFailure):
+        raise  # rollback already performed; do not double-roll
+    except Exception as exc:  # noqa: BLE001 -- any unexpected crash forces rollback
+        await _rollback_and_assert("blast_radius_unexpected")
+        raise BlastRadiusBreach(f"op={op_id} unexpected blast-radius error: {exc}") from exc

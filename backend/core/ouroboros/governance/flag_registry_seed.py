@@ -5247,6 +5247,51 @@ SEED_SPECS: list = [
         since="2026-06-29",
         posture_relevance=_ALL_POSTURES_CRITICAL,
     ),
+    # ====================================================================
+    # Iron Triad tuning + observability knobs (Task 14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_A1_PR_LINTER_THRESHOLD",
+        type=FlagType.INT, default=4,
+        description=(
+            "Minimum severity score (0-10) for the PR self-linter to "
+            "block a PR from being filed. Findings below this threshold "
+            "are logged as warnings only; at or above it the linter "
+            "returns a blocking verdict and the op routes to "
+            "APPROVAL_REQUIRED."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/pr_self_linter.py",
+        example="4",
+        since="2026-06-29",
+    ),
+    FlagSpec(
+        name="JARVIS_TOKEN_AUDIT_PATH",
+        type=FlagType.STR, default=".jarvis/token_audit.jsonl",
+        description=(
+            "Path to the immutable token-mint WAL file. Relative paths "
+            "are resolved against the project root. The file is "
+            "append-only; each line is a JSON record of one mint event."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file="backend/core/ouroboros/governance/token_audit.py",
+        example=".jarvis/token_audit.jsonl",
+        since="2026-06-29",
+    ),
+    FlagSpec(
+        name="JARVIS_TOKEN_AUDIT_MAX",
+        type=FlagType.INT, default=500,
+        description=(
+            "Maximum number of token-mint WAL records retained in memory "
+            "for the in-process bounded buffer. Records beyond this cap "
+            "are flushed to disk and evicted from the buffer. Does not "
+            "affect the on-disk WAL which is always append-only."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/token_audit.py",
+        example="500",
+        since="2026-06-29",
+    ),
 ]
 
 

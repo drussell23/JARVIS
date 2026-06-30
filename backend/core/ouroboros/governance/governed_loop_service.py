@@ -1381,13 +1381,13 @@ class GovernedLoopService:
 
             await self._build_components()
 
-            # Task 9 -- async Docker pre-flight: surfaces daemon absence BEFORE
-            # any op reaches APPLY.  Fail-soft: boot continues regardless.
-            try:
-                from .pre_apply_exec_lock import docker_preflight
-                self._docker_ready = await docker_preflight()
-            except Exception:  # noqa: BLE001
-                self._docker_ready = None
+            # Task 9 -- async Docker pre-flight (only when A1 is armed -> byte-identical OFF)
+            if os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+                try:
+                    from .pre_apply_exec_lock import docker_preflight
+                    self._docker_ready = await docker_preflight()
+                except Exception:  # noqa: BLE001
+                    self._docker_ready = None
 
             # Phase 4: initialize preemption FSM executor (ledger available after _build_components)
             self._fsm_engine = PreemptionFsmEngine()
