@@ -153,6 +153,7 @@ def _build_forward_import_graph(root: str) -> Dict[str, Set[str]]:
         module = _module_from_relpath(rel)
         if not module:
             continue
+        is_init = rel == "__init__.py" or rel.endswith("/__init__.py")
         try:
             source = py_file.read_text(encoding="utf-8", errors="replace")
             tree = _ast.parse(source, filename=str(py_file))
@@ -167,19 +168,67 @@ def _build_forward_import_graph(root: str) -> Dict[str, Set[str]]:
                     if alias.name:
                         imports.add(alias.name)
             elif isinstance(node, _ast.ImportFrom):
-                # Ignore relative imports (level > 0) -- they cannot be mapped
-                # to a stable dotted name without package context; the absolute
-                # forms below cover the synthetic + production flat cases.
-                mod = node.module or ""
                 if node.level and node.level > 0:
-                    continue
-                if mod:
-                    imports.add(mod)
-                    for alias in node.names:
-                        if alias.name:
-                            imports.add(f"{mod}.{alias.name}")
+                    # Relative import -- resolve against the importing module's
+                    # package using CPython's algorithm, so intra-package edges
+                    # (``from . import sib``) stay visible to the reverse graph.
+                    _add_relative_import_edges(imports, module, is_init, node)
+                else:
+                    mod = node.module or ""
+                    if mod:
+                        imports.add(mod)
+                        for alias in node.names:
+                            if alias.name:
+                                imports.add(f"{mod}.{alias.name}")
 
     return graph
+
+
+def _add_relative_import_edges(
+    imports: Set[str],
+    importing_module: str,
+    is_init: bool,
+    node: _ast.ImportFrom,
+) -> None:
+    """Resolve a relative ``ImportFrom`` to absolute dotted target(s) and add
+    the corresponding forward edges to *imports*.
+
+    Mirrors CPython's resolution: the importing module's package is the seed,
+    ``node.level`` walks upward. A relative import that escapes the tree (more
+    levels than the package is deep) is skipped safely -- never raises.
+    """
+    # Package of the importing module. ``_module_from_relpath`` already
+    # collapses ``pkg/__init__.py`` -> ``pkg``, so an __init__ module IS its
+    # own package; any other module's package drops its trailing leaf.
+    if is_init:
+        package = importing_module
+    elif "." in importing_module:
+        package = importing_module.rsplit(".", 1)[0]
+    else:
+        package = ""
+
+    pkg_parts = package.split(".") if package else []
+    drop = node.level - 1
+    if drop > len(pkg_parts):
+        # Escapes above the package tree -- not resolvable; skip safely.
+        return
+    base = ".".join(pkg_parts[: len(pkg_parts) - drop])
+
+    if node.module:
+        target_module = f"{base}.{node.module}" if base else node.module
+    else:
+        target_module = base
+
+    if target_module:
+        imports.add(target_module)
+    for alias in node.names:
+        if not alias.name:
+            continue
+        if target_module:
+            imports.add(f"{target_module}.{alias.name}")
+        elif not node.module:
+            # Top-level ``from . import x`` -> the top-level module ``x``.
+            imports.add(alias.name)
 
 
 def _invert(graph: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
@@ -351,8 +400,20 @@ async def resolve_reverse_dependency_tests(
         )
 
     # Fail-closed: at least one changed file must resolve to a module under root.
+    # Distinguish a config-only changeset (no ``.py`` at all -> nothing Python to
+    # analyze -> EMPTY result is correct) from a genuine build problem (``.py``
+    # present but unresolvable under root -> fail-closed raise). UNDER-inclusion
+    # of a real dependent test is the dangerous direction, so only the latter
+    # trips Gate (2)'s fail-closed guard.
     changed_modules = _changed_modules(changed_files, root)
     if not changed_modules:
+        has_py = any(
+            cf.replace("\\", "/").endswith(".py") for cf in changed_files
+        )
+        if not has_py:
+            # Config-only changeset (.yaml/.md/...): no Python changed -> no
+            # dependent tests. Empty set is the correct, valid answer.
+            return set()
         raise ReverseDepGraphError(
             "no changed file resolves to a module under repo_root "
             f"(changed_files={list(changed_files)!r})"
@@ -378,7 +439,7 @@ async def resolve_reverse_dependency_tests(
 
 async def _impacted_via_ast_async(changed_modules: Set[str], root: str) -> Set[str]:
     """Run the heavy AST build off the event loop via run_in_executor."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, _impacted_via_ast, changed_modules, root
     )

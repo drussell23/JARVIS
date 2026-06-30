@@ -263,3 +263,64 @@ async def test_oracle_error_falls_back_to_ast(tmp_path):
     )
 
     assert "tests/test_c.py" in result
+
+
+# ---------------------------------------------------------------------------
+# 11. Config-only changeset -> empty set, NOT a fail-closed raise
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_config_only_changeset_returns_empty_not_raise(tmp_path):
+    # A valid repo, but the changeset touches zero .py files. No Python changed
+    # -> no dependent tests -> EMPTY result is correct (not "graph broken").
+    _write(tmp_path, "config/app.yaml", "key: value\n")
+    _write(tmp_path, "README.md", "# readme\n")
+    _write(tmp_path, "a.py", "X = 1\n")
+    _write(tmp_path, "tests/test_a.py", "import a\n")
+
+    result = await resolve_reverse_dependency_tests(
+        ["config/app.yaml", "README.md"], repo_root=str(tmp_path)
+    )
+
+    assert result == set()
+
+
+# ---------------------------------------------------------------------------
+# 12. Relative import transitive (close the false-negative gap)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_relative_import_transitive(tmp_path):
+    # b imports a via a RELATIVE sibling import; the test imports b. Without
+    # relative-import resolution b's edge to a is invisible and test_b is MISSED.
+    _write(tmp_path, "pkg/__init__.py", "")
+    _write(tmp_path, "pkg/a.py", "X = 1\n")
+    _write(tmp_path, "pkg/b.py", "from . import a\n")
+    _write(tmp_path, "pkg/tests/__init__.py", "")
+    _write(tmp_path, "tests/test_b.py", "import pkg.b\n")
+
+    result = await resolve_reverse_dependency_tests(
+        ["pkg/a.py"], repo_root=str(tmp_path)
+    )
+
+    assert "tests/test_b.py" in result
+
+
+# ---------------------------------------------------------------------------
+# 13. Relative parent import (level 2: ``from .. import x``)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_relative_import_parent(tmp_path):
+    # pkg/sub/c reaches up to the parent package for ``a`` via ``from .. import a``.
+    _write(tmp_path, "pkg/__init__.py", "")
+    _write(tmp_path, "pkg/a.py", "X = 1\n")
+    _write(tmp_path, "pkg/sub/__init__.py", "")
+    _write(tmp_path, "pkg/sub/c.py", "from .. import a\n")
+    _write(tmp_path, "tests/test_c.py", "import pkg.sub.c\n")
+
+    result = await resolve_reverse_dependency_tests(
+        ["pkg/a.py"], repo_root=str(tmp_path)
+    )
+
+    assert "tests/test_c.py" in result
