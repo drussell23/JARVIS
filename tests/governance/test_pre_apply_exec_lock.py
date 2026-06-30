@@ -47,3 +47,23 @@ async def test_no_docker_raises_requires_cloud_execution_no_process_fallback():
         await lock.acquire_sandbox_execution_token(
             op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
             chain=chain, docker_available=lambda: False, runner=runner)
+
+@pytest.mark.asyncio
+async def test_containment_breach_raises_sandbox_lock_failed():
+    chain = DAGProofChain()
+    async def runner(**_):
+        return _FakeResult(0, breached=True)
+    with pytest.raises(lock.SandboxLockFailed):
+        await lock.acquire_sandbox_execution_token(
+            op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
+            chain=chain, docker_available=lambda: True, runner=runner)
+
+@pytest.mark.asyncio
+async def test_token_records_py_file_count():
+    chain = DAGProofChain()
+    async def runner(**_):
+        return _FakeResult(0)
+    tok = await lock.acquire_sandbox_execution_token(
+        op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
+        chain=chain, docker_available=lambda: True, runner=runner)
+    assert tok.payload["py_files"] == "1"

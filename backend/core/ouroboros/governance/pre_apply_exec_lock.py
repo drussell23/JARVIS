@@ -44,6 +44,7 @@ async def acquire_sandbox_execution_token(
     prev_token: Optional[CapabilityToken] = None,
     docker_available: Optional[Callable[[], bool]] = None,
     runner: Optional[Callable[..., Awaitable]] = None,
+    sandbox_image: Optional[Callable[[], str]] = None,
 ) -> SandboxExecutionToken:
     """Run the candidate in a hardened L4 container; mint a token iff exit==0.
 
@@ -58,6 +59,7 @@ async def acquire_sandbox_execution_token(
         raise RequiresCloudExecution(f"op={op_id} no local Docker daemon")
 
     _run = runner or container_sandbox.run_in_container
+    _image = sandbox_image or container_sandbox.sandbox_image
     # Build a compile+import probe over the candidate's changed modules.
     probe = _build_probe(candidate_files)
     result = await _run(code=probe, worktree=repo_root, op_id=op_id)
@@ -74,7 +76,11 @@ async def acquire_sandbox_execution_token(
         kind=TokenKind.SANDBOX_EXECUTION,
         op_id=op_id,
         state_binding=state_binding,
-        payload={"exit_code": "0", "image": container_sandbox.sandbox_image()},
+        payload={
+            "exit_code": "0",
+            "image": _image(),
+            "py_files": str(len([p for p, _ in candidate_files if p.endswith(".py")])),
+        },
         prev=prev_token,
     )
     return token  # type: ignore[return-value]  # mint() returns the typed subclass
