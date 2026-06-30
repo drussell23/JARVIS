@@ -279,8 +279,9 @@ class OrangePRReviewer:
             # SECOND cryptographic path (Task 16): a non-autonomous caller may
             # present a STANDALONE, signed HumanOverrideToken instead of the
             # full autonomous 3-token chain. This is NOT a bypass -- the override
-            # is itself an unforgeable HMAC artifact (same process secret, WAL
-            # audited) that the caller had to EXPLICITLY MINT, an auditable
+            # is itself an unforgeable HMAC artifact (same per-chain HMAC
+            # secret as the autonomous chain, WAL audited) that the caller had
+            # to EXPLICITLY MINT, an auditable
             # declaration of non-autonomous intent. There is still no code path
             # to a PR without SOME valid signed token.
             if override_token is not None:
