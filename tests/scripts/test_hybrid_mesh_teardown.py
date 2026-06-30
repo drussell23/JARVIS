@@ -237,6 +237,40 @@ def test_arm_registers_then_opens(monkeypatch: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fix B: _arm_failover_mesh arms an L4-capable zone list + on-demand-on-stockout
+# ---------------------------------------------------------------------------
+
+def test_arm_sets_l4_zone_list_and_ondemand(monkeypatch: Any) -> None:
+    """The mesh arming seeds the 3 L4-capable us-central1 zones + on-demand flag,
+    so the live ignition can actually land a node (drops non-L4 zones whose 400
+    halts the chain; Spot-stockout falls through to on-demand in the quota'd zone)."""
+    rec = _Recorder()
+    _install_recorder(monkeypatch, rec, ip="198.51.100.4")
+
+    env: Dict[str, str] = {}
+    asyncio.run(_driver._arm_failover_mesh(env))
+
+    assert env["JARVIS_GCP_ZONE_FALLBACK"] == "us-central1-a,us-central1-b,us-central1-c"
+    assert env["JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT"] == "true"
+
+
+def test_arm_respects_operator_zone_and_ondemand_overrides(monkeypatch: Any) -> None:
+    """setdefault: an operator-preset value in env (from os.environ via compose_env)
+    is NOT overridden by the mesh defaults."""
+    rec = _Recorder()
+    _install_recorder(monkeypatch, rec, ip="198.51.100.4")
+
+    env: Dict[str, str] = {
+        "JARVIS_GCP_ZONE_FALLBACK": "us-east1-b,us-east1-c",
+        "JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT": "false",
+    }
+    asyncio.run(_driver._arm_failover_mesh(env))
+
+    assert env["JARVIS_GCP_ZONE_FALLBACK"] == "us-east1-b,us-east1-c"
+    assert env["JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT"] == "false"
+
+
+# ---------------------------------------------------------------------------
 # Signal-handler teardown
 # ---------------------------------------------------------------------------
 
