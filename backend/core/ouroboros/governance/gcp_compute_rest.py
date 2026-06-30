@@ -930,15 +930,22 @@ class GCPComputeRest:
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 
-    async def delete_instance(self, name: Optional[str] = None) -> Tuple[bool, str]:
+    async def delete_instance(
+        self, name: Optional[str] = None, *, zone: Optional[str] = None
+    ) -> Tuple[bool, str]:
         """DELETE instances/<name> via the SAME REST contract as the bash
         dead-man. Deleting the instance does NOT touch the golden image. Returns
         (ok, detail). Fail-CLOSED -> (False, "<LOCUS>:..") on any error. NEVER
-        raises."""
+        raises.
+
+        ``zone`` overrides the resolved default zone -- REQUIRED to reap a node
+        that the multi-zonal awaken landed in a fallback zone (not ``GCP_ZONE``);
+        without it a node created in us-central1-c is orphaned when the reap only
+        looks in us-central1-a."""
         token = await self.access_token()
         if not token:
             return (False, "AUTH_TOKEN_UNAVAILABLE:metadata_unreachable")
-        zone = await self.zone()
+        zone = zone or await self.zone()
         project = await self.project()
         if not zone or not project:
             return (
