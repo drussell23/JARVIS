@@ -261,6 +261,26 @@ def _insert_op_poll_interval_s() -> float:
     return _env_float("JARVIS_INSERT_OP_POLL_INTERVAL_S", 3.0, lo=0.001, hi=60.0)
 
 
+def _reap_confirm_attempts() -> int:
+    """Max delete+recheck rounds in the strict pre-rollover confirmed reap (an
+    'unknown' insert op may materialize a node LATE -- a single blind delete races
+    it). Bounded so a wedged zone never blocks the rollover forever."""
+    return int(_env_float("JARVIS_REAP_CONFIRM_ATTEMPTS", 6, lo=1.0, hi=60.0))
+
+
+def _reap_confirm_settle_s() -> float:
+    """Delay between confirmed-reap rounds -- the window in which a late async
+    insert would surface so we catch + delete it. Env-tunable."""
+    return _env_float("JARVIS_REAP_CONFIRM_SETTLE_S", 5.0, lo=0.0, hi=120.0)
+
+
+def _reap_confirm_clean_streak() -> int:
+    """Consecutive 'already gone' (404) observations required to declare a zone
+    confirmed-clean. >1 so a node that materializes DURING the settle window
+    resets the streak and is deleted before we trust the zone is empty."""
+    return int(_env_float("JARVIS_REAP_CONFIRM_CLEAN_STREAK", 2, lo=1.0, hi=10.0))
+
+
 def _running_timeout() -> float:
     return _env_float(_ENV_RUNNING_TIMEOUT, 180.0, lo=1.0, hi=3600.0)
 
@@ -751,17 +771,15 @@ class GCPComputeRest:
                         continue
                     return ("stockout", "zone={}:op_stockout".format(zone))
                 if verdict == "unknown":
-                    # Fail-closed phantom protection: a node may have spawned late
-                    # even though we never saw DONE. Violently reap it BEFORE moving
-                    # on (idempotent; 404 == already gone), then roll the chain.
+                    # Fail-closed phantom protection: the op is still in-flight, so
+                    # a node may materialize LATE. Strictly CONFIRM the zone is clean
+                    # (delete + re-check until it stays gone) BEFORE rolling -- do not
+                    # rely on the global teardown to catch a late phantom.
                     logger.warning(
-                        "[GCPComputeRest] insert UNVERIFIED zone=%s mode=%s -> reaping "
-                        "any phantom node + rolling to next zone", zone, mode,
+                        "[GCPComputeRest] insert UNVERIFIED zone=%s mode=%s -> "
+                        "confirmed-reap (catch late phantom) + roll next zone", zone, mode,
                     )
-                    try:
-                        await self.delete_instance(node, zone=zone)
-                    except Exception as exc:  # noqa: BLE001 -- reap is best-effort
-                        logger.debug("[GCPComputeRest] phantom reap fail-soft err=%r", exc)
+                    await self._reap_zone_confirmed(node, zone)
                     if spot and _ondemand_on_stockout_enabled():
                         continue  # escalate to on-demand same zone first
                     return ("stockout", "zone={}:unknown_reaped".format(zone))
@@ -1004,6 +1022,53 @@ class GCPComputeRest:
             return (None, None)
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
+
+    async def _reap_zone_confirmed(self, node: str, zone: str) -> bool:
+        """Strict pre-rollover reap: delete ``node`` in ``zone`` and CONFIRM the
+        zone is clean before the caller rolls to the next zone. An 'unknown'
+        insert op is still in-flight, so a node may materialize AFTER the first
+        delete -- a single blind delete races it (the v3 transient double-node).
+        We therefore delete + re-check until we observe ``_reap_confirm_clean_streak``
+        consecutive 'already gone' (404) results; a node that surfaces mid-window
+        (200/202) RESETS the streak and is deleted. Bounded by
+        ``_reap_confirm_attempts`` so a wedged zone never blocks forever (the
+        global teardown remains the final backstop). Returns True iff confirmed
+        clean. NEVER raises."""
+        need = _reap_confirm_clean_streak()
+        attempts = _reap_confirm_attempts()
+        settle = _reap_confirm_settle_s()
+        clean = 0
+        for i in range(attempts):
+            try:
+                ok, detail = await self.delete_instance(node, zone=zone)
+            except Exception as exc:  # noqa: BLE001 -- reap must never raise
+                logger.debug("[GCPComputeRest] confirmed-reap delete err=%r", exc)
+                ok, detail = (False, "")
+            gone = ok and "404" in detail
+            if gone:
+                clean += 1
+                if clean >= need:
+                    logger.info(
+                        "[GCPComputeRest] confirmed-reap CLEAN zone=%s node=%s "
+                        "(%d consecutive gone)", zone, node, clean,
+                    )
+                    return True
+            else:
+                # A node was present (200/202) or the delete failed -> the zone is
+                # NOT clean yet (possibly a late-materialized phantom). Reset.
+                if clean:
+                    logger.warning(
+                        "[GCPComputeRest] confirmed-reap caught late node zone=%s "
+                        "node=%s (detail=%s) -- re-deleting", zone, node, detail,
+                    )
+                clean = 0
+            if i < attempts - 1 and settle > 0:
+                await asyncio.sleep(settle)
+        logger.warning(
+            "[GCPComputeRest] confirmed-reap UNCONFIRMED zone=%s node=%s after %d "
+            "rounds -- global teardown remains backstop", zone, node, attempts,
+        )
+        return clean >= need
 
     async def delete_instance(
         self, name: Optional[str] = None, *, zone: Optional[str] = None
