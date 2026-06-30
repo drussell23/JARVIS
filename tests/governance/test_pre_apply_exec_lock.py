@@ -67,3 +67,14 @@ async def test_token_records_py_file_count():
         op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
         chain=chain, docker_available=lambda: True, runner=runner)
     assert tok.payload["py_files"] == "1"
+
+@pytest.mark.asyncio
+async def test_branch_context_forwarded_to_token():
+    chain = DAGProofChain()
+    async def runner(**_):
+        return _FakeResult(0)
+    tok = await lock.acquire_sandbox_execution_token(
+        op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
+        chain=chain, docker_available=lambda: True, runner=runner,
+        branch_context="wt-1")
+    assert tok.branch_context == "wt-1"

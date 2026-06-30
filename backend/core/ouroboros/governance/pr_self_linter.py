@@ -60,6 +60,7 @@ async def acquire_lint_cleared_token(
     prev_token: CapabilityToken,
     critique_fn: Optional[Callable[[str], Awaitable[dict]]] = None,
     threshold: Optional[int] = None,
+    branch_context: str = "",
 ) -> LintClearedToken:
     _crit = critique_fn or default_critique_fn
     _thr = threshold if threshold is not None else _threshold()
@@ -77,5 +78,6 @@ async def acquire_lint_cleared_token(
         state_binding=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
         payload={"rating": str(rating)},
         prev=prev_token,
+        branch_context=branch_context,
     )
     return token  # type: ignore[return-value]

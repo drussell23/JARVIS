@@ -45,6 +45,7 @@ async def acquire_sandbox_execution_token(
     docker_available: Optional[Callable[[], bool]] = None,
     runner: Optional[Callable[..., Awaitable]] = None,
     sandbox_image: Optional[Callable[[], str]] = None,
+    branch_context: str = "",
 ) -> SandboxExecutionToken:
     """Run the candidate in a hardened L4 container; mint a token iff exit==0.
 
@@ -82,6 +83,7 @@ async def acquire_sandbox_execution_token(
             "py_files": str(len([p for p, _ in candidate_files if p.endswith(".py")])),
         },
         prev=prev_token,
+        branch_context=branch_context,
     )
     return token  # type: ignore[return-value]  # mint() returns the typed subclass
 

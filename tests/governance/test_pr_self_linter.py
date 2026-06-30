@@ -32,6 +32,15 @@ async def test_low_rating_raises_lint_rejected():
             op_id="op-1", diff=DIFF, chain=chain, prev_token=prev, critique_fn=critique_fn)
 
 @pytest.mark.asyncio
+async def test_branch_context_forwarded_to_token():
+    chain = DAGProofChain(); prev = _prev(chain)
+    async def critique_fn(diff): return {"rating": 5, "concerns": []}
+    tok = await lint.acquire_lint_cleared_token(
+        op_id="op-1", diff=DIFF, chain=chain, prev_token=prev,
+        critique_fn=critique_fn, branch_context="wt-1")
+    assert tok.branch_context == "wt-1"
+
+@pytest.mark.asyncio
 async def test_malformed_rating_fails_closed():
     chain = DAGProofChain(); prev = _prev(chain)
     async def critique_none(diff): return {"rating": None}

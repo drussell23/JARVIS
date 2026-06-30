@@ -198,6 +198,36 @@ async def test_dlq_fn_exception_does_not_mask_primary_failure():
 
 
 @pytest.mark.asyncio
+async def test_branch_context_forwarded_to_token():
+    chain = DAGProofChain()
+    prev = _prev(chain)
+
+    async def graph_fn(files):
+        return {"tests/test_x.py"}
+
+    async def test_fn(tests):
+        return {"failed": [], "total": 1}
+
+    async def sha_fn():
+        return PRE
+
+    tok = await brv.acquire_blast_radius_token(
+        op_id="op-1",
+        scope_files=SCOPE,
+        pre_op_tree_sha=PRE,
+        chain=chain,
+        prev_token=prev,
+        graph_fn=graph_fn,
+        test_fn=test_fn,
+        current_tree_sha_fn=sha_fn,
+        rollback_fn=None,
+        dlq_fn=None,
+        branch_context="wt-1",
+    )
+    assert tok.branch_context == "wt-1"
+
+
+@pytest.mark.asyncio
 async def test_unexpected_test_fn_error_rolls_back():
     chain = DAGProofChain()
     prev = _prev(chain)

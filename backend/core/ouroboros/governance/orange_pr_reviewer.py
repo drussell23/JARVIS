@@ -251,6 +251,7 @@ class OrangePRReviewer:
         sandbox_token: Any = None,
         blast_token: Any = None,
         lint_token: Any = None,
+        expected_branch_context: Optional[str] = None,
     ) -> Optional[PRReviewResult]:
         """Open an async-review PR for the given candidate.
 
@@ -299,6 +300,7 @@ class OrangePRReviewer:
                         diff=_diff,
                         chain=chain,
                         prev_token=blast_token,
+                        branch_context=expected_branch_context or "",
                     )
                 except LintRejected as _lr:
                     logger.warning("[Gate3] op=%s LINT_REJECTED: %s", op_id, _lr)
@@ -317,6 +319,21 @@ class OrangePRReviewer:
                 logger.warning(
                     "[Enforcer] op=%s missing/invalid token chain -> refuse PR",
                     op_id,
+                )
+                return None
+
+            # Branch-context assertion: verify_chain guarantees the chain is
+            # internally uniform; this asserts the chain is rooted in the EXPECTED
+            # isolated worktree, not merely self-consistent.
+            if (
+                expected_branch_context is not None
+                and sandbox_token is not None
+                and getattr(sandbox_token, "branch_context", "") != expected_branch_context
+            ):
+                logger.warning(
+                    "[Enforcer] op=%s token branch_context mismatch (expected=%s) -> refuse PR",
+                    op_id,
+                    expected_branch_context,
                 )
                 return None
 

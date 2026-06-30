@@ -41,6 +41,7 @@ async def acquire_blast_radius_token(
     current_tree_sha_fn: Callable[[], Awaitable[str]],
     rollback_fn: Optional[Callable[[str], Awaitable[None]]],
     dlq_fn: Optional[Callable[[str], None]],
+    branch_context: str = "",
 ) -> BlastRadiusClearedToken:
     """Run the full reverse-dependency closure of the modified AST.
 
@@ -109,6 +110,7 @@ async def acquire_blast_radius_token(
                 "post_tree_sha": post_tree_sha,
             },
             prev=prev_token,
+            branch_context=branch_context,
         )
         return token  # type: ignore[return-value]
     except (BlastRadiusBreach, BlastRadiusGraphFailure):
