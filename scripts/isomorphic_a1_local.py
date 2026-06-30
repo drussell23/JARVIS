@@ -482,6 +482,25 @@ class IsomorphicA1Driver:
                 # (Minor-5: no time-decay on the any-route window by design.)
                 if not self.enable_failover:
                     env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "false"
+                else:
+                    # Live-failover A1 run: compose_env()'s apply_manifest() pins
+                    # failover_lifecycle=False, so merely SKIPPING the false-pin above
+                    # is not enough -- the manifest already wrote "false" into env and
+                    # would keep the failover loop from ever starting. Override it here
+                    # (AFTER compose_env, exactly as the Iron Triad block does below) by
+                    # propagating the ignition harness's / operator's JARVIS_FAILOVER_*
+                    # and GCP_* env verbatim -- NO hardcoded tier/flag values; the
+                    # ignite_a1_soak.py --live-failover arming is the single source.
+                    for _k, _v in os.environ.items():
+                        if (
+                            _k.startswith("JARVIS_FAILOVER_")
+                            or _k.startswith("GCP_")
+                            or _k in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT")
+                        ):
+                            env[_k] = _v
+                    # The failover mesh is inert unless the lifecycle loop runs; ensure
+                    # it is ON even if the harness only passed --enable-failover.
+                    env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "true"
 
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).

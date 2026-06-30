@@ -5119,6 +5119,22 @@ class CandidateGenerator:
                     deadline=_imm_budget, now=_imm_now, claude_available=False,
                     attempt=_immortal_attempt, max_attempts=_imm_max(),
                 ):
+                    # CR2 (LIVE sentinel-cascade path): DW is exhausted with NO cloud
+                    # fallback -> wake the J-Prime golden-image fallback. This Immortal
+                    # re-attempt loop keeps the op alive (deadline-detached) until the
+                    # failover FSM reaches SERVING, after which the recursive
+                    # _dispatch_via_sentinel routes this very op to J-Prime via the
+                    # Phase-3c seam. Double-gated + fail-soft; idempotent anchor.
+                    try:
+                        from .failover_lifecycle import (
+                            lifecycle_enabled as _fo_on,
+                            budget_awaken_enabled as _fo_budget,
+                            get_failover_controller as _fo_ctrl,
+                        )
+                        if _fo_on() and _fo_budget():
+                            _fo_ctrl().note_budget_exhausted()
+                    except Exception:  # noqa: BLE001 -- never let the awaken signal break the op
+                        pass
                     _imm_delay = _imm_backoff(_immortal_attempt)
                     logger.warning(
                         "[Immortal] DW exhausted + NO fallback → QUEUE_ONLY (deadline-detached): "
