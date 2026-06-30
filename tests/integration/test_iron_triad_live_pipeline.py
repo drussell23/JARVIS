@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Adversarial real-infrastructure integration test -- Iron Triad (Task 15).
 
 Gate (1) container-exec + Gate (2) blast-radius / checkpoint + EXACT pre-op
@@ -11,6 +10,7 @@ Run:
     python3 -m pytest tests/integration/test_iron_triad_live_pipeline.py \\
         -q -p no:cacheprovider
 """
+from __future__ import annotations
 
 import subprocess
 from pathlib import Path
@@ -49,9 +49,7 @@ from backend.core.ouroboros.governance.workspace_checkpoint import (
 def _docker_daemon_running() -> bool:
     """Return True iff a Docker daemon is actually reachable (not just binary on PATH)."""
     try:
-        import subprocess as _sp
-
-        res = _sp.run(
+        res = subprocess.run(
             ["docker", "info"],
             capture_output=True,
             timeout=5,
@@ -77,34 +75,46 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 
 
+def _git_init_worktree(tmp_path: Path) -> None:
+    """Initialise a minimal valid git worktree the container can mount."""
+    for args in (
+        ("init",),
+        ("config", "user.email", "t@t"),
+        ("config", "user.name", "t"),
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+
 @requires_docker
 @pytest.mark.asyncio
 async def test_gate1_catches_syntax_error_in_live_container(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """REAL Docker: py_compile inside the hardened container must reject bad
     Python syntax and cause acquire_sandbox_execution_token to raise
     SandboxLockFailed (fail-closed: the DAG terminates, nothing written to the
     real tree).
 
+    The candidate file is written for real into a git-init'd temp worktree so
+    py_compile hits a genuine SyntaxError (not FileNotFoundError).
+
     No runner / docker_available injection -- the real run_in_container is
     exercised end-to-end.
-
-    PRODUCTION BUG NOTE: pre_apply_exec_lock.py line 66 forwards op_id=op_id
-    to run_in_container, which does NOT declare an op_id parameter in its
-    current signature.  If this test fails with TypeError rather than
-    SandboxLockFailed the root cause is that mismatch -- run_in_container
-    needs an **op_id** keyword argument (or the call site must stop forwarding
-    it).  Surface this finding before merging.
     """
     monkeypatch.setenv("JARVIS_RUNTIME_SANDBOX_ENABLED", "true")
+    _git_init_worktree(tmp_path)
+    rel = "backend/_a1_probe_broken.py"
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def f(:\n    return 1\n", encoding="utf-8")
     chain = DAGProofChain()
-    bad_files = [("backend/_a1_probe_broken.py", "def f(:\n    return 1\n")]
+    bad_files = [(rel, "def f(:\n    return 1\n")]
     with pytest.raises(SandboxLockFailed):
         await acquire_sandbox_execution_token(
             op_id="live-1",
             candidate_files=bad_files,
-            repo_root=str(REPO_ROOT),
+            repo_root=str(tmp_path),
             chain=chain,
         )
 
@@ -119,18 +129,28 @@ async def test_gate1_catches_syntax_error_in_live_container(
 @pytest.mark.asyncio
 async def test_gate1_passes_clean_candidate_live(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """REAL Docker: a valid Python module compiles clean in the container and
     acquire_sandbox_execution_token mints a SandboxExecutionToken with
     payload exit_code == '0'.
+
+    The candidate file is written for real into a git-init'd temp worktree so
+    py_compile finds it on disk and a returncode=0 / ok=True ContainmentResult
+    mints the token (the Gate (1) production-bug fix).
     """
     monkeypatch.setenv("JARVIS_RUNTIME_SANDBOX_ENABLED", "true")
+    _git_init_worktree(tmp_path)
+    rel = "backend/_a1_probe_ok.py"
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def f():\n    return 1\n", encoding="utf-8")
     chain = DAGProofChain()
-    good_files = [("backend/_a1_probe_ok.py", "def f():\n    return 1\n")]
+    good_files = [(rel, "def f():\n    return 1\n")]
     tok = await acquire_sandbox_execution_token(
         op_id="live-2",
         candidate_files=good_files,
-        repo_root=str(REPO_ROOT),
+        repo_root=str(tmp_path),
         chain=chain,
     )
     assert isinstance(tok, SandboxExecutionToken)
@@ -236,9 +256,8 @@ async def test_checkpoint_restores_exact_pre_op_tree_sha(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-@requires_docker
 @pytest.mark.asyncio
-async def test_gate2_catches_failing_test_raises_blast_radius_breach() -> None:
+async def test_gate2_injected_fsm_rejects_failing_test() -> None:
     """Gate (2) rejects a candidate whose reverse-dep test closure fails.
 
     This is the minimal adversarial fallback version of the full pipeline test.
