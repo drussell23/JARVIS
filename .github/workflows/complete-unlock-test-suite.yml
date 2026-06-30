@@ -160,11 +160,11 @@ jobs:
       # job; relocates into Track A in Slice 250.3.
       - name: Checkout (for ledger reporter)
         if: failure() && github.event_name == 'schedule'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python (for ledger reporter)
         if: failure() && github.event_name == 'schedule'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
