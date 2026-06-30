@@ -497,6 +497,18 @@ class IsomorphicA1Driver:
                 env["JARVIS_FILE_ISOLATION_ENABLED"] = "false"
                 env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] = "false"
 
+                # ---- Virtualized writable Trinity root (Blocker #4 structural fix) ----
+                # The isomorphic env makes the organism believe it lives at the
+                # literal /opt/trinity/jarvis (the production path) -- but that base
+                # is not writable off the GCE node (no admin on the dev host). Inject
+                # a writable, per-run state root so JARVIS_TRINITY_ROOT-aware storage
+                # (intake WAL/lock, ...) lands somewhere unprivileged. The code stays
+                # byte-identical in production: the env var is unset on the real node,
+                # where storage falls back to project_root exactly as before.
+                _trinity_root = os.path.join(run_dir, "trinity_root")
+                os.makedirs(_trinity_root, exist_ok=True)
+                env["JARVIS_TRINITY_ROOT"] = _trinity_root
+
                 _log("env composed: %d keys total, adversary overrides applied, "
                      "failover=%s" % (len(env), "enabled" if self.enable_failover
                                       else "pinned-off"))
