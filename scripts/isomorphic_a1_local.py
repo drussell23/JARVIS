@@ -423,6 +423,33 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _a1_audit_ceiling_s() -> float:
+    """Tier-aware audit ceiling (no hardcoded window). The auditor early-exits the
+    moment the verdict is proven; this is the SAFETY ceiling. It is derived from
+    the resolved failover tier: a heavy 32B/L4 op needs minutes to traverse
+    CLASSIFY->...->APPLY->terminal, so we scale the base by the SAME
+    JARVIS_JPRIME_HEAVY_COLDSTART_MULT used for the cold-start timeouts. Survival
+    (7B/CPU) -> base unchanged. Fail-soft -> base on any error."""
+    base = _env_float("JARVIS_A1_AUDIT_BASE_S", 120.0)
+    try:
+        from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+            resolve_tier,
+        )
+        from backend.core.ouroboros.governance.failover_lifecycle import (  # noqa: PLC0415
+            _heavy_coldstart_mult,
+            _tier_is_heavy,
+        )
+        tier = resolve_tier(
+            urgency=os.environ.get("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
+            complexity=os.environ.get("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
+        )
+        if _tier_is_heavy(tier):
+            return base * _heavy_coldstart_mult()
+    except Exception:  # noqa: BLE001
+        pass
+    return base
+
+
 # Soak-child wall budget: read at module load for logging; the helper re-reads
 # at call time so monkeypatch.setenv in tests takes effect.
 _ready_budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
@@ -1054,7 +1081,7 @@ class IsomorphicA1Driver:
                     verdict = aud_runner.watch(
                         base=self.sse_base,
                         log_file=debug_log,
-                        timeout_s=120.0,
+                        timeout_s=_a1_audit_ceiling_s(),
                         verdict_out=verdict_out,
                     )
 

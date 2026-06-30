@@ -4623,6 +4623,32 @@ def publish_fsm_phase(op_id: str, phase: str, route: str, risk_tier: str) -> Non
         pass
 
 
+def _fsm_phase_sse_enabled() -> bool:
+    """Master switch for FSM-phase SSE emission (default ON). The events are
+    pure observability (the A1 auditor's CLASSIFY->APPLY witness); fail-soft."""
+    return (
+        os.environ.get("JARVIS_FSM_PHASE_SSE_ENABLED", "true") or ""
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def publish_fsm_phase_for_ctx(ctx, phase: str) -> None:
+    """ctx-aware wrapper for :func:`publish_fsm_phase`: extracts op_id / route /
+    risk_tier from the OperationContext (best-effort) and emits the
+    ``fsm_phase_changed`` SSE event so the A1 auditor can witness the
+    CLASSIFY -> APPLY -> terminal progression. The base ``publish_fsm_phase`` had
+    ZERO call sites -- this is the seam the orchestrator phase-runners call.
+    Gated + fully fail-soft -- NEVER raises into the pipeline."""
+    try:
+        if not _fsm_phase_sse_enabled():
+            return
+        op_id = getattr(ctx, "op_id", "") or ""
+        route = str(getattr(ctx, "route", "") or "")
+        risk_tier = str(getattr(ctx, "risk_tier", "") or "")
+        publish_fsm_phase(op_id, phase, route, risk_tier)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def publish_elevation_pending(
     pr_id: str,
     target_repo: str,

@@ -1692,6 +1692,26 @@ class GovernedLoopService:
                     "(non-fatal)", exc_info=True,
                 )
 
+            # A1 graduation-flag boot telemetry (DRY): one centralized hook emits
+            # a structured [A1FlagAudit] block (CADENCE_POLICY flags + live state)
+            # so the A1 auditor credits each flag observed_evaluated. Lands in the
+            # session debug.log via the configured logger. Best-effort, never-raise.
+            try:
+                from backend.core.ouroboros.governance.flag_registry import (
+                    emit_a1_graduation_telemetry as _a1_flag_telemetry,
+                )
+                _n = _a1_flag_telemetry()
+                if _n:
+                    logger.info(
+                        "[GovernedLoop] A1 graduation-flag telemetry emitted "
+                        "(%d flags attested for the audit)", _n,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] A1 graduation-flag telemetry failed "
+                    "(non-fatal)", exc_info=True,
+                )
+
             # C+ L2/L3: CommandBus + EventEmitter + optional subagent scheduler
             if self._command_bus is None:
                 self._command_bus = CommandBus(maxsize=1000)
