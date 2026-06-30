@@ -339,11 +339,16 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
             str(repo_root / "scripts" / "isomorphic_a1_local.py"),
             "--mode", "container",
             "--run-root", str(run_root),
-            "--max-wall-seconds", str(args.max_wall_seconds),
         ]
+        # The isomorphic driver does NOT take --max-wall-seconds; the wall cap is
+        # read from the env by the battle-test harness the SoakRunner spawns
+        # (OUROBOROS_BATTLE_MAX_WALL_SECONDS). Headless too, since this is non-TTY.
+        _soak_env = dict(os.environ)
+        _soak_env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] = str(args.max_wall_seconds)
+        _soak_env.setdefault("OUROBOROS_BATTLE_HEADLESS", "1")
         _write_log_header(log_fh, argv=soak_argv, cwd=repo_root)
-        print(f"[>] Soak: {' '.join(soak_argv)}")
-        soak_rc = tee_run(soak_argv, log_fh, cwd=str(repo_root))
+        print(f"[>] Soak: {' '.join(soak_argv)}  (OUROBOROS_BATTLE_MAX_WALL_SECONDS={args.max_wall_seconds})")
+        soak_rc = tee_run(soak_argv, log_fh, cwd=str(repo_root), env=_soak_env)
 
         # ---------------------------------------------------------------- result
         if soak_rc == 0:

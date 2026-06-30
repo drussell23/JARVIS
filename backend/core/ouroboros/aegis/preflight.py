@@ -133,6 +133,19 @@ def _spawn_daemon(
     sub_env = dict(os.environ)
     sub_env.update(credentials)
 
+    # Make ``-m backend.core.ouroboros.aegis.daemon`` resolve regardless of the
+    # parent's cwd. Production runs the organism from the repo root (so cwd is on
+    # sys.path), but the isomorphic soak deliberately runs from a DISJOINT cwd to
+    # surface exactly this class of fragility -- without an explicit repo-root on
+    # PYTHONPATH the daemon dies with ModuleNotFoundError: No module named
+    # 'backend'. Prepend the repo root (the dir containing ``backend/``) so the
+    # spawn is cwd-independent in every environment.
+    _repo_root = str(Path(__file__).resolve().parents[4])
+    _existing_pp = sub_env.get("PYTHONPATH", "")
+    sub_env["PYTHONPATH"] = (
+        _repo_root + (os.pathsep + _existing_pp if _existing_pp else "")
+    )
+
     cmd = [
         sys.executable,
         "-m",
