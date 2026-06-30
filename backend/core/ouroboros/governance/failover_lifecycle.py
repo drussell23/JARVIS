@@ -78,6 +78,7 @@ import enum
 import logging
 import os
 import subprocess
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # Phase 3c -- Cryo-DLQ re-entry. Imported at module level (bound as a module
@@ -147,6 +148,20 @@ def budget_awaken_enabled() -> bool:
     with reason ``BUDGET_EXHAUSTED``."""
     return os.environ.get(
         "JARVIS_FAILOVER_BUDGET_AWAKEN_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes")
+
+
+def header_aware_recovery_enabled() -> bool:
+    """Master gate for header-aware DW-recovery sleep (Task CR5). Default OFF ->
+    byte-identical (the SERVING probe paces itself by the forecast-driven jitter
+    backoff, exactly as today). When ARMED, a DW 429 that carried a
+    ``Retry-After`` / ``x-ratelimit-reset`` header (anchored via
+    ``note_rate_limited``) makes the recovery probe suspend until the provider's
+    OWN reset deadline before falling through to the semantic deep probe. Reuses
+    the existing deep probe + jitter backoff -- it ONLY changes the next-probe
+    interval while the rate-limit anchor is live."""
+    return os.environ.get(
+        "JARVIS_FAILOVER_HEADER_AWARE_RECOVERY_ENABLED", "false"
     ).strip().lower() in ("1", "true", "yes")
 
 
@@ -805,6 +820,14 @@ class FailoverLifecycleController:
         # note_budget_exhausted(); consumed (single-shot) by the dormant tick's
         # budget branch when the budget-awaken master flag is armed.
         self._budget_exhausted_at: Optional[float] = None
+        # Rate-limit recovery anchor (Task CR5). An absolute WALL-CLOCK
+        # (time.time()) wake-up deadline parsed from the DW 429's own
+        # Retry-After / x-ratelimit-reset header. Set by note_rate_limited();
+        # consumed by _probe_interval's header-aware branch (master flag armed)
+        # to suspend the SERVING recovery probe until the provider's stated
+        # reset, then cleared once the deadline passes. None -> legacy blind
+        # forecast-driven interval.
+        self._rate_limit_reset_ts: Optional[float] = None
 
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
@@ -987,6 +1010,13 @@ class FailoverLifecycleController:
                 self._budget_exhausted_at = self._clock_fn()
             except Exception:  # noqa: BLE001
                 self._budget_exhausted_at = 0.0
+
+    def note_rate_limited(self, reset_ts: Optional[float] = None) -> None:
+        """Anchor a DW rate-limit (429) recovery deadline from the provider's own
+        Retry-After/x-ratelimit-reset. The SERVING probe sleeps until reset_ts
+        instead of a blind interval. Fail-soft; ignored if reset_ts is past/None."""
+        if reset_ts is not None and reset_ts > time.time():
+            self._rate_limit_reset_ts = reset_ts
 
     def note_dw_success(self) -> None:
         """A successful DW dispatch was observed -- clear the outage anchor."""
@@ -1703,10 +1733,18 @@ class FailoverLifecycleController:
             "reactive_outage": AWAKEN_REASON_DATA_PLANE,
             "heartbeat_hard_outage": AWAKEN_REASON_DATA_PLANE,
             "heartbeat_early_prewarm": AWAKEN_REASON_DATA_PLANE,
+            "rate_limited": AWAKEN_REASON_RATE_LIMIT,  # CR5
         }
         self._awaken_reason = _reason_by_trigger.get(
             trigger, AWAKEN_REASON_DATA_PLANE
         )
+        # CR5: a live rate-limit anchor (set by note_rate_limited from the DW
+        # 429's own Retry-After/x-ratelimit-reset header) means the recovery
+        # strategy is header-aware regardless of which trigger initiated the
+        # awaken. Override to RATE_LIMIT so _probe_interval's header-aware branch
+        # can suspend the SERVING probe until the provider's stated reset.
+        if self._rate_limit_reset_ts is not None:
+            self._awaken_reason = AWAKEN_REASON_RATE_LIMIT
         self._state = FailoverState.AWAKENING
         self._awakening_started_at = now
         self._recovered_streak = 0
@@ -2046,6 +2084,26 @@ class FailoverLifecycleController:
             return False
 
     def _probe_interval(self, *, now: float) -> float:
+        # CR5 -- Header-aware DW-recovery sleep. Default-OFF: when the master flag
+        # is unset this whole branch is skipped and the method is byte-identical
+        # to the legacy forecast-driven jitter backoff below. When ARMED and we
+        # awakened on a rate-limit (429) carrying the provider's own
+        # Retry-After/x-ratelimit-reset deadline, suspend the SERVING probe until
+        # that exact wall-clock reset instead of blind polling. The wait then
+        # falls through to the SAME semantic deep probe (_deep_probe_recovered),
+        # which still gates handback on real generation success.
+        if (
+            header_aware_recovery_enabled()
+            and self._awaken_reason == AWAKEN_REASON_RATE_LIMIT
+            and self._rate_limit_reset_ts is not None
+        ):
+            remaining = self._rate_limit_reset_ts - time.time()
+            if remaining > 0:
+                # Header-aware async sleep: suspend the probe until the provider's
+                # own reset deadline -- zero blind polling. (asyncio.sleep happens
+                # via the FSM tick gate; we just return the exact interval.)
+                return max(0.0, remaining)
+            self._rate_limit_reset_ts = None  # deadline passed -> resume normal probing
         try:
             from backend.core.ouroboros.governance.recovery_throttle import (  # noqa: PLC0415
                 probe_interval,
@@ -2303,6 +2361,7 @@ __all__ = [
     "lifecycle_enabled",
     "budget_awaken_enabled",
     "violent_teardown_enabled",
+    "header_aware_recovery_enabled",
     "AWAKEN_REASON_DATA_PLANE",
     "AWAKEN_REASON_BUDGET",
     "AWAKEN_REASON_RATE_LIMIT",

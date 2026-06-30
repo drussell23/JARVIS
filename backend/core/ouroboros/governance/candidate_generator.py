@@ -6087,6 +6087,29 @@ class CandidateGenerator:
                 )
             else:
                 self.fsm.record_primary_failure(mode=mode)
+            # CR5 -- header-aware DW recovery. When the primary failed on a DW
+            # rate-limit (429) that carried the provider's own Retry-After /
+            # x-ratelimit-reset header, signal the failover controller so the
+            # SERVING recovery probe can suspend until that exact reset deadline
+            # instead of blind polling. Gated default-OFF + fail-soft: never let
+            # the recovery signal perturb the existing fallback cascade.
+            if mode is FailureMode.RATE_LIMITED:
+                try:
+                    from .failover_lifecycle import (
+                        lifecycle_enabled,
+                        header_aware_recovery_enabled,
+                        get_failover_controller,
+                    )
+                    if lifecycle_enabled() and header_aware_recovery_enabled():
+                        _reset = None
+                        for _layer in _walk_exception_chain(exc):
+                            _reset = getattr(_layer, "ratelimit_reset_ts", None)
+                            if _reset is not None:
+                                break
+                        if _reset is not None:
+                            get_failover_controller().note_rate_limited(_reset)
+                except Exception:  # noqa: BLE001 -- signal must never break the op
+                    pass
             return await self._call_fallback(context, deadline)
 
     async def _slice28_phase3_classify_ttft_failure(
