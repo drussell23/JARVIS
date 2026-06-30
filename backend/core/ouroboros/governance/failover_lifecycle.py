@@ -89,6 +89,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Awaken-reason taxonomy (Task CR2 -- Multi-Vector Awaken Trigger)
+# ---------------------------------------------------------------------------
+# The controller REMEMBERS *why* it awakened so a later recovery strategy can
+# branch on the vector. DW stays primary; J-Prime is the fallback. A data-plane
+# outage and a cloud-budget exhaustion are BOTH valid awaken vectors.
+AWAKEN_REASON_DATA_PLANE = "DATA_PLANE_OUTAGE"
+AWAKEN_REASON_BUDGET = "BUDGET_EXHAUSTED"
+AWAKEN_REASON_RATE_LIMIT = "RATE_LIMITED"  # reserved for CR5 (set up now)
+
+
+# ---------------------------------------------------------------------------
 # Env helpers (fail-soft, never raise)
 # ---------------------------------------------------------------------------
 
@@ -127,6 +138,16 @@ def lifecycle_enabled() -> bool:
     Hot-revert: ``export JARVIS_FAILOVER_LIFECYCLE_ENABLED=false`` -> inert
     (stays DORMANT, today's behavior exactly)."""
     return _enabled("JARVIS_FAILOVER_LIFECYCLE_ENABLED", "true")
+
+
+def budget_awaken_enabled() -> bool:
+    """Master gate for the budget-exhaustion awaken vector (Task CR2). Default
+    OFF -> byte-identical (only a data-plane outage awakens). When ARMED, a
+    ``note_budget_exhausted()`` anchor awakens J-Prime on the next dormant tick
+    with reason ``BUDGET_EXHAUSTED``."""
+    return os.environ.get(
+        "JARVIS_FAILOVER_BUDGET_AWAKEN_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes")
 
 
 def _route() -> str:
@@ -764,6 +785,16 @@ class FailoverLifecycleController:
         # SECOND, concurrent GPU node lifecycle with crypto-namespaced assets.
         self._gpu_lane: Optional[Any] = None
 
+        # Multi-Vector Awaken (Task CR2). The controller remembers WHY it
+        # awakened (data-plane outage vs cloud-budget exhaustion) so a later
+        # recovery strategy can branch on the vector. Inert ("") until a
+        # transition stamps it; default-OFF keeps it byte-identical.
+        self._awaken_reason: str = ""
+        # Budget-exhaustion anchor (monotonic via clock_fn). Set by
+        # note_budget_exhausted(); consumed (single-shot) by the dormant tick's
+        # budget branch when the budget-awaken master flag is armed.
+        self._budget_exhausted_at: Optional[float] = None
+
         # Timestamps (monotonic via clock_fn).
         self._outage_started_at: Optional[float] = None  # set on note_outage
         self._awakening_started_at: Optional[float] = None  # set on -> AWAKENING
@@ -934,6 +965,17 @@ class FailoverLifecycleController:
                 self._outage_started_at = self._clock_fn()
             except Exception:  # noqa: BLE001
                 self._outage_started_at = 0.0
+
+    def note_budget_exhausted(self) -> None:
+        """Anchor a cloud-budget-exhaustion event (DW refused on budget, no cloud
+        fallback). The next dormant tick awakens J-Prime with reason
+        BUDGET_EXHAUSTED. Idempotent; gated by the budget-awaken master flag at
+        the tick."""
+        if self._budget_exhausted_at is None:
+            try:
+                self._budget_exhausted_at = self._clock_fn()
+            except Exception:  # noqa: BLE001
+                self._budget_exhausted_at = 0.0
 
     def note_dw_success(self) -> None:
         """A successful DW dispatch was observed -- clear the outage anchor."""
@@ -1452,6 +1494,20 @@ class FailoverLifecycleController:
             )
             return
 
+        # Multi-Vector Awaken (Task CR2) -- BUDGET-EXHAUSTION vector. The LAST
+        # branch so a REAL data-plane outage (the branches above) always takes
+        # precedence. The cloud primary refused on budget with NO cloud fallback
+        # (anchored by note_budget_exhausted from candidate_generator's
+        # no-fallback exhaustion exit). Gated default-OFF -> byte-identical.
+        # Single-shot: consume the anchor before awakening so it can't re-fire
+        # every tick.
+        if budget_awaken_enabled() and self._budget_exhausted_at is not None:
+            self._budget_exhausted_at = None
+            await self._enter_awakening(
+                now=now, trigger="session_budget_exhausted", route=self._route,
+            )
+            return
+
     def _real_outage(self) -> bool:
         """The AUTHORITATIVE real-generation-failure awaken signal.
 
@@ -1628,6 +1684,18 @@ class FailoverLifecycleController:
         recorder captures which signal initiated the failover, regardless of the
         GCE boot outcome."""
         self._emit_flare(trigger=trigger, route=route, now=now)
+        # Multi-Vector Awaken (Task CR2): remember WHY we awakened so a later
+        # recovery strategy can branch on the vector. Derive from the trigger;
+        # default to DATA_PLANE (the data-plane outage is the legacy vector).
+        _reason_by_trigger = {
+            "session_budget_exhausted": AWAKEN_REASON_BUDGET,
+            "reactive_outage": AWAKEN_REASON_DATA_PLANE,
+            "heartbeat_hard_outage": AWAKEN_REASON_DATA_PLANE,
+            "heartbeat_early_prewarm": AWAKEN_REASON_DATA_PLANE,
+        }
+        self._awaken_reason = _reason_by_trigger.get(
+            trigger, AWAKEN_REASON_DATA_PLANE
+        )
         self._state = FailoverState.AWAKENING
         self._awakening_started_at = now
         self._recovered_streak = 0
@@ -2177,4 +2245,8 @@ __all__ = [
     "FailoverLifecycleController",
     "get_failover_controller",
     "lifecycle_enabled",
+    "budget_awaken_enabled",
+    "AWAKEN_REASON_DATA_PLANE",
+    "AWAKEN_REASON_BUDGET",
+    "AWAKEN_REASON_RATE_LIMIT",
 ]

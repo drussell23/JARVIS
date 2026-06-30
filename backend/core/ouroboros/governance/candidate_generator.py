@@ -6694,6 +6694,17 @@ class CandidateGenerator:
                 "fallback_skipped sentinel (NOT counted toward "
                 "ExhaustionWatcher hibernation threshold)"
             )
+            # Multi-Vector Awaken (CR2): cloud primary exhausted with NO cloud
+            # fallback -> wake the J-Prime golden-image fallback (budget/credit
+            # exhaustion is a valid awaken vector, not just a data-plane outage).
+            try:
+                from .failover_lifecycle import (
+                    lifecycle_enabled, budget_awaken_enabled, get_failover_controller,
+                )
+                if lifecycle_enabled() and budget_awaken_enabled():
+                    get_failover_controller().note_budget_exhausted()
+            except Exception:  # noqa: BLE001 -- never let the signal break the exhaustion path
+                pass
             self._raise_exhausted(
                 "fallback_skipped:no_fallback_configured",
                 context=context,
