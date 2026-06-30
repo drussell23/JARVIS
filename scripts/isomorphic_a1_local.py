@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import importlib.util
 import json
 import os
@@ -166,11 +167,309 @@ def _truthy(val: Optional[str]) -> bool:
 _ACTIVE_CHAOS: List[Any] = []
 
 
+# ---------------------------------------------------------------------------
+# Hybrid Execution Mesh (Task HM-A) -- failover-resource registry + IRONCLAD
+# teardown.  The LOCAL driver owns the GCP failover node's networking (an
+# ephemeral, zero-trust /32 INGRESS firewall for THIS host's public IP) AND its
+# teardown, so a real GPU node can NEVER be orphaned: every awakened node + its
+# firewall is reaped on finally + atexit + signal -- whichever fires first.
+#
+# Each entry mirrors the _ACTIVE_CHAOS pattern:
+#   {"node": <name>, "zone": <zone>, "project": <proj>, "fw_rule": <fw|None>}
+# ---------------------------------------------------------------------------
+
+_ACTIVE_FAILOVER_RESOURCES: List[Dict[str, Optional[str]]] = []
+
+# Defaults match the failover lifecycle's node/firewall naming; overridable via
+# env so the driver and the organism agree on the same resource names.
+_FAILOVER_FW_RULE_DEFAULT: str = "jarvis-ephemeral-failover-allow"
+_FAILOVER_NODE_DEFAULT: str = "jarvis-prime-failover"
+_FAILOVER_INFERENCE_PORT: int = 11434
+
+# Hybrid Execution Mesh (Task HM-B) -- L7 semantic-readiness poller defaults. The
+# audit must SUSPEND until the awakened 32B node returns HTTP 200 on /api/tags
+# (proving the ~20GB model is loaded into L4 VRAM) -- NO hardcoded sleeps:
+# exponential backoff (capped) bounded by a budget. All env-tunable so the soak
+# operator and the tests can shrink them.  Read at CALL time (not module-load) so
+# monkeypatch.setenv in tests takes effect.
+_READY_PROBE_BASE_S: float = 3.0          # env JARVIS_HYBRID_MESH_READY_BASE_S
+_READY_PROBE_CAP_S: float = 30.0          # env JARVIS_HYBRID_MESH_READY_CAP_S
+_READY_PROBE_TIMEOUT_S: float = 5.0       # env JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S
+_READY_BUDGET_DEFAULT_S: float = 900.0    # env JARVIS_HYBRID_MESH_READY_BUDGET_S
+
+
+def _reap_failover_resources() -> None:
+    """Violently reap every awakened failover node + its ephemeral /32 firewall.
+
+    Idempotent (clears the registry so a second call is a no-op) + fail-soft
+    (NEVER raises) -- safe to call from a ``finally``, an ``atexit`` hook, AND a
+    signal handler.  The node's GCP REST delete is the process's last breath.
+
+    When invoked from inside a live event loop (e.g. a signal handler that
+    interrupted ``asyncio.run(driver.run())``), ``asyncio.run`` would raise, so
+    the reap is dispatched on a dedicated thread with its own loop and joined --
+    the node delete still completes even on Ctrl+C mid-soak.
+    """
+    if not _ACTIVE_FAILOVER_RESOURCES:
+        return
+    resources = list(_ACTIVE_FAILOVER_RESOURCES)
+    _ACTIVE_FAILOVER_RESOURCES.clear()
+
+    async def _del_all() -> None:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            get_compute_rest,
+        )
+
+        client = get_compute_rest()
+        tasks = []
+        for r in resources:
+            if r.get("node"):
+                tasks.append(client.delete_instance(r["node"]))
+            if r.get("fw_rule"):
+                tasks.append(client.delete_firewall_rule(r["fw_rule"]))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _run_blocking() -> None:
+        asyncio.run(_del_all())
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+            # running-loop -> daemon-thread branch
+            import threading
+            t = threading.Thread(
+                target=_run_blocking, name="failover-reap", daemon=True)
+            t.start()
+            t.join(timeout=float(os.environ.get("JARVIS_FAILOVER_REST_TIMEOUT_S", "30")) + 5.0)
+        except RuntimeError:
+            # no-loop -> asyncio.run branch
+            _run_blocking()
+        _log("[HybridMesh] reaped %d failover resource(s) -- "
+             "node(s)+firewall(s) deleted" % len(resources))
+    except Exception as exc:  # noqa: BLE001 -- teardown must NEVER raise
+        _log("[HybridMesh] reap error (continuing): %r" % (exc,))
+
+
+def _register_failover_resource(
+    *, node: Optional[str], fw_rule: Optional[str],
+) -> None:
+    """Register a failover node + its ephemeral firewall for teardown UP FRONT
+    (before the node even exists) so a crash mid-awaken still reaps whatever got
+    created.  Zone/project are recorded for the audit trail; the GCP REST client
+    resolves them lazily from metadata/env at delete time."""
+    _ACTIVE_FAILOVER_RESOURCES.append({
+        "node": node,
+        "zone": os.environ.get("GCP_ZONE"),
+        "project": (os.environ.get("GCP_PROJECT_ID")
+                    or os.environ.get("GCP_PROJECT")),
+        "fw_rule": fw_rule,
+    })
+
+
+async def _open_failover_firewall(fw_name: str) -> Optional[str]:
+    """Open the driver-owned ephemeral /32 INGRESS firewall for THIS host's
+    public IP -> the failover node's inference port.  Reuses the existing GCP
+    primitives (``resolve_local_public_ip`` + ``create_firewall_rule``) -- NO
+    ``0.0.0.0/0``, ever.  Returns ``fw_name`` on success, ``None`` on skip/fail;
+    the teardown stays armed regardless (the node was registered before this call)."""
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            get_compute_rest,
+            resolve_local_public_ip,
+        )
+
+        ip = await resolve_local_public_ip()
+        if not ip:
+            _log("[HybridMesh] WARN could not resolve local public IP -- "
+                 "firewall NOT opened; node may be unreachable")
+            return None
+        ok, detail = await get_compute_rest().create_firewall_rule(
+            name=fw_name, source_ip=ip, port=_FAILOVER_INFERENCE_PORT)
+        _log("[HybridMesh] ephemeral /32 firewall %s for %s/32:%d -> %s (%s)" % (
+            fw_name, ip, _FAILOVER_INFERENCE_PORT,
+            "OPEN" if ok else "FAILED", detail))
+        return fw_name if ok else None
+    except Exception as exc:  # noqa: BLE001
+        _log("[HybridMesh] firewall open error "
+             "(continuing -- teardown still armed): %r" % (exc,))
+        return None
+
+
+async def _arm_failover_mesh(env: Dict[str, str]) -> None:
+    """Arm the Hybrid Execution Mesh on the soak env, register the failover node
+    for teardown UP FRONT, then open the driver-owned /32 firewall.
+
+    - external-natIP routing so the Mac can reach the node's inference server;
+    - the node binds ``0.0.0.0`` (reachable from off-box);
+    - the DRIVER owns the firewall (NOT the organism -- we do NOT arm
+      ``JARVIS_FAILOVER_EPHEMERAL_FW_ENABLED``), so it is reaped on any exit.
+
+    Registration happens BEFORE the firewall open so a crash during firewall
+    setup still reaps whatever got created.
+    """
+    env["JARVIS_FAILOVER_HYBRID_MESH"] = "true"             # external-natIP route
+    env["JARVIS_FAILOVER_INFERENCE_BIND_ENABLED"] = "true"  # node binds 0.0.0.0
+    fw_name = os.environ.get(
+        "JARVIS_FAILOVER_FW_RULE_NAME", _FAILOVER_FW_RULE_DEFAULT)
+    node_name = os.environ.get(
+        "JARVIS_FAILOVER_NODE_NAME", _FAILOVER_NODE_DEFAULT)
+    # Register the node for teardown UP FRONT (orphan safety) with fw_rule=None;
+    # fw_rule is updated to the opened name only if the firewall was actually
+    # created -- so a reap never deletes a rule that was never opened.
+    _register_failover_resource(node=node_name, fw_rule=None)
+    opened_fw = await _open_failover_firewall(fw_name)
+    if _ACTIVE_FAILOVER_RESOURCES:
+        _ACTIVE_FAILOVER_RESOURCES[-1]["fw_rule"] = opened_fw
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Execution Mesh (Task HM-B) -- L7 semantic-readiness poller. The A1
+# audit must SUSPEND until the awakened 32B node's inference server returns HTTP
+# 200 on /api/tags (the ~20GB model is loaded into L4 VRAM). Without this gate
+# the audit fires FAILED before the node can serve -- the exact failure of the
+# last live run.  No hardcoded sleeps: exponential backoff (capped) + a budget.
+# ---------------------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var with a fail-soft fallback (NEVER raises)."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Soak-child wall budget: read at module load for logging; the helper re-reads
+# at call time so monkeypatch.setenv in tests takes effect.
+_ready_budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
+_failover_wall = _ready_budget + 600.0  # ~90s boot + audit + slack; READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
+
+
+def _failover_soak_wall(enable_failover: bool) -> int:
+    """Return the soak-child wall-clock budget in seconds.
+
+    enable_failover=False -> 300 (byte-identical default).
+    enable_failover=True  -> READY_BUDGET_S + 600 to accommodate 32B cold-start.
+    # READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
+    """
+    if not enable_failover:
+        return 300
+    budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
+    return int(budget + 600.0)
+
+
+def _probe_api_tags(url: str) -> int:
+    """Blocking HTTP GET of the inference server's ``/api/tags`` -> status code.
+
+    Factored out as a TINY testable seam (tests monkeypatch THIS, not the real
+    network).  Mirrors the failover ``_default_node_ready_fn`` urllib style.
+    Returns the HTTP status (200 == 32B served; a real non-2xx like 503 while the
+    model still loads is returned verbatim so the poller treats it as 'not ready
+    yet').  Transport errors (connection refused, timeout, DNS) PROPAGATE -- the
+    caller catches them as 'not ready' and keeps backing off.
+    """
+    import urllib.error
+    import urllib.request
+
+    timeout = _env_float(
+        "JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S", _READY_PROBE_TIMEOUT_S)
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return int(getattr(resp, "status", None) or resp.getcode() or 0)
+    except urllib.error.HTTPError as he:
+        # A genuine HTTP status (e.g. 503 while VRAM still loading) -> not a
+        # transport error; return the code so the caller backs off, not aborts.
+        return int(getattr(he, "code", 0) or 0)
+
+
+async def _await_jprime_serving(
+    node_name: str, *, budget_s: float, port: int = 11434,
+) -> bool:
+    """Suspend until the awakened GCP node's inference server returns HTTP 200 on
+    ``/api/tags`` (the 32B is loaded into VRAM). Exponential backoff (cap'd),
+    bounded by ``budget_s``. Returns True on first 200, False if the budget
+    elapses. Fail-soft: transport errors are just 'not ready yet' -> keep backing
+    off.  NEVER raises -- worst case returns False and the audit proceeds (and the
+    ironclad teardown reaps the node).
+    """
+    base = _env_float("JARVIS_HYBRID_MESH_READY_BASE_S", _READY_PROBE_BASE_S)
+    cap = _env_float("JARVIS_HYBRID_MESH_READY_CAP_S", _READY_PROBE_CAP_S)
+    probe_to = _env_float(
+        "JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S", _READY_PROBE_TIMEOUT_S)
+
+    delay = base
+    start = time.monotonic()
+    deadline = start + budget_s
+    no_ip_logged = False
+
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            get_compute_rest,
+        )
+    except Exception as exc:  # noqa: BLE001 -- import must never crash the run
+        _log("[HybridMesh] WARN readiness poller cannot import gcp_compute_rest "
+             "(%r) -- skipping gate" % (exc,))
+        return False
+
+    while time.monotonic() < deadline:
+        external: Optional[str] = None
+        try:
+            _internal, external = await get_compute_rest().get_node_endpoints(
+                node_name)
+        except Exception as exc:  # noqa: BLE001 -- treat as 'not ready yet'
+            _log("[HybridMesh] endpoint resolve fail-soft (%r) -- backing off"
+                 % (exc,))
+            external = None
+
+        if not external:
+            if not no_ip_logged:
+                _log("[HybridMesh] node %s not RUNNING yet (no external IP) -- "
+                     "backing off" % node_name)
+                no_ip_logged = True
+        else:
+            url = "http://%s:%d/api/tags" % (external, port)
+            status = 0
+            try:
+                loop = asyncio.get_running_loop()
+                status = await asyncio.wait_for(
+                    loop.run_in_executor(None, _probe_api_tags, url),
+                    timeout=probe_to + 1.0,
+                )
+            except Exception:  # noqa: BLE001 -- timeout/transport -> not ready
+                status = 0
+            if status == 200:
+                elapsed = time.monotonic() - start
+                _log("[HybridMesh] J-Prime SERVING: 32B ready at %s after %.0fs"
+                     % (url, elapsed))
+                return True
+
+        # Not ready -> exponential backoff, clamped to the remaining budget.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.sleep(min(delay, remaining))
+        except asyncio.CancelledError:
+            return False
+        delay = min(delay * 2.0, cap)
+
+    _log("[HybridMesh] WARN J-Prime NOT ready after %.0fs -- proceeding to audit "
+         "(will likely FAIL; teardown will reap)" % budget_s)
+    return False
+
+
 def _install_revert_signal_handlers() -> None:
     """Install SIGINT/SIGTERM handlers that revert any active chaos before exit.
     The repo must NEVER be left broken on any exit path."""
     def _handler(signum: int, _frame: Any) -> None:
-        _log("signal %d received -- reverting chaos before exit" % (signum,))
+        _log("signal %d received -- reaping failover + reverting chaos before "
+             "exit" % (signum,))
+        # The node REST-delete is the last breath even on Ctrl+C -- reap FIRST.
+        try:
+            _reap_failover_resources()
+        except Exception:  # noqa: BLE001 -- teardown must never block exit
+            pass
         for chaos in list(_ACTIVE_CHAOS):
             try:
                 chaos.revert()
@@ -502,6 +801,15 @@ class IsomorphicA1Driver:
                     # it is ON even if the harness only passed --enable-failover.
                     env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "true"
 
+                    # Hybrid Execution Mesh (Task HM-A): arm external-IP routing +
+                    # bind, and have the DRIVER (this local orchestrator) own the
+                    # ephemeral /32 firewall for its OWN public IP -- zero-trust,
+                    # no 0.0.0.0/0, reaped on any exit (finally+atexit+signal). The
+                    # node is registered for teardown UP FRONT, before it exists.
+                    # run() is already async -> await directly (NEVER asyncio.run
+                    # inside a live loop; only _reap_failover_resources uses run()).
+                    await _arm_failover_mesh(env)
+
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).
                 env["JARVIS_RUNTIME_SANDBOX_ENABLED"] = "true"   # L4 container backend
@@ -569,10 +877,16 @@ class IsomorphicA1Driver:
                     else:
                         _log("STEP soak: launching production O+V (pre-inject boot) "
                              "iso_cwd=%s" % iso_cwd)
+                        if self.enable_failover:
+                            _log("[HybridMesh] soak-child wall extended to %ds "
+                                 "(32B cold-start: readiness %ds + margin)" % (
+                                     _failover_soak_wall(True),
+                                     int(_env_float(
+                                         "JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0))))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
                             cost_cap=0.0,
-                            wall_seconds=300,
+                            wall_seconds=_failover_soak_wall(self.enable_failover),
                         )
                         # Thread IsomorphicEnv: launch child with disjoint cwd so
                         # os.getcwd()-as-repo-root bugs surface in the real chain.
@@ -610,6 +924,25 @@ class IsomorphicA1Driver:
                                 scoped[0] if scoped else "<none found locally>"))
                     else:
                         _log("run-#12: no chaos files in manifest (stub mode?)")
+
+                    # ── d.5 L7 SEMANTIC READINESS GATE (Task HM-B) ───────────
+                    # When failover is armed the audit MUST suspend until the
+                    # awakened 32B node returns HTTP 200 on /api/tags (model loaded
+                    # into VRAM) -- otherwise the audit fires FAILED before the node
+                    # can serve (the exact failure of the last live run). Default
+                    # path (no --enable-failover): skipped entirely -> byte-identical.
+                    if self.enable_failover:
+                        _node = os.environ.get(
+                            "JARVIS_FAILOVER_NODE_NAME", _FAILOVER_NODE_DEFAULT)
+                        _budget = _env_float(
+                            "JARVIS_HYBRID_MESH_READY_BUDGET_S",
+                            _READY_BUDGET_DEFAULT_S)
+                        _log("[HybridMesh] L7 readiness gate: awaiting 32B SERVING "
+                             "(budget=%.0fs) before audit ..." % _budget)
+                        _served = await _await_jprime_serving(
+                            _node, budget_s=_budget)
+                        _log("[HybridMesh] L7 readiness gate -> %s"
+                             % ("SERVING" if _served else "TIMEOUT"))
 
                     # ── e. LAUNCH AUDITOR ────────────────────────────────────
                     _log("STEP audit: sse=%s log=%s" % (self.sse_base, debug_log))
@@ -689,6 +1022,10 @@ class IsomorphicA1Driver:
                 _log("adversary stopped")
             except Exception as exc:  # noqa: BLE001
                 _log("adversary stop warning: %r" % (exc,))
+            # IRONCLAD teardown (Task HM-A): reap any awakened failover node + its
+            # firewall AFTER the soak completes/fails/cancels. No-op (registry
+            # empty) when failover was never armed -> default path byte-identical.
+            _reap_failover_resources()
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +1093,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     _install_revert_signal_handlers()
+    if args.enable_failover:
+        # IRONCLAD teardown (Task HM-A): a process-exit safety net in addition to
+        # run()'s finally + the signal handlers. Idempotent -> at most one real
+        # reap. Only registered when failover is opted in, so the default path is
+        # byte-identical (no atexit hook).
+        atexit.register(_reap_failover_resources)
     driver = IsomorphicA1Driver(
         mode=args.mode,
         seed=args.seed,
