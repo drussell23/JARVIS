@@ -952,30 +952,53 @@ class GCPComputeRest:
         return self._extract_internal_ip(doc)
 
     async def get_node_endpoints(
-        self, name: Optional[str] = None,
+        self, name: Optional[str] = None, *, zone: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
-        """Single instances.get -> ``(internal_ip, external_ip)`` for the
-        Reachability Racer (which probes BOTH concurrently -- no env guessing).
-        Either may be None while the node is still booting. NEVER raises."""
+        """instances.get -> ``(internal_ip, external_ip)`` for the Reachability
+        Racer (which probes BOTH concurrently -- no env guessing). Either may be
+        None while the node is still booting. NEVER raises.
+
+        ZONE-AWARE (A1 last-mile fix): the multi-zonal awaken lands the node in
+        ANY fallback zone (a Spot stockout in GCP_ZONE -> the node is created in
+        -b or -c). With no explicit ``zone`` we therefore search the SAME
+        ``zone_fallback_chain`` the teardown brute-forces (#69779) -- GCP_ZONE
+        first, then the fallbacks -- and return the endpoints from the FIRST zone
+        that actually holds the node. A node that is present-but-still-booting
+        (200, no natIP yet) IS found in that zone -> we return (internal, None)
+        and do NOT scan past it (it won't be in two zones). ``zone`` overrides the
+        search to a single zone (fast path for callers that know the landed zone).
+        404 in a zone == not here -> try the next."""
         try:
             token = await self.access_token()
-            zone = await self.zone()
             project = await self.project()
-            if not token or not zone or not project:
+            if not token or not project:
                 return (None, None)
             node = name or _node_name()
-            url = "{}/projects/{}/zones/{}/instances/{}".format(
-                _COMPUTE_BASE, project, zone, node
-            )
-            status, text = await _http_request(
-                url, method="GET",
-                headers={"Authorization": "Bearer {}".format(token)},
-                timeout_s=_rest_timeout(),
-            )
-            if not (200 <= status < 300 and text):
-                return (None, None)
-            doc = json.loads(text)
-            return (self._extract_internal_ip(doc), self._extract_external_ip(doc))
+            if zone:
+                zones = [zone]
+            else:
+                from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+                    zone_fallback_chain,
+                )
+                zones = zone_fallback_chain(await self.zone())
+            headers = {"Authorization": "Bearer {}".format(token)}
+            for z in zones:
+                url = "{}/projects/{}/zones/{}/instances/{}".format(
+                    _COMPUTE_BASE, project, z, node
+                )
+                status, text = await _http_request(
+                    url, method="GET", headers=headers, timeout_s=_rest_timeout(),
+                )
+                if not (200 <= status < 300 and text):
+                    continue  # 404 / non-2xx -> node not in this zone, try next
+                try:
+                    doc = json.loads(text)
+                except Exception:  # noqa: BLE001 -- malformed body -> try next zone
+                    continue
+                # Node found in THIS zone -> return its endpoints (external may be
+                # None if it is still acquiring its natIP). Do not scan further.
+                return (self._extract_internal_ip(doc), self._extract_external_ip(doc))
+            return (None, None)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[GCPComputeRest] get_node_endpoints fail-soft err=%r", exc)
             return (None, None)
