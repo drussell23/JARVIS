@@ -3959,6 +3959,27 @@ class GovernedLoopService:
             outcome_source="governed_loop",
         )
 
+        # CR4: Violent Ephemeral Teardown -- reap the GPU J-Prime node the instant
+        # the A1 DAG reaches terminal (PR opened OR fail-closed). Zero idle GPU.
+        # Double-gated (lifecycle + violent-teardown) + fail-soft; default-OFF
+        # stays byte-identical because force_teardown is never reached.
+        try:
+            from .failover_lifecycle import (  # noqa: PLC0415
+                lifecycle_enabled,
+                violent_teardown_enabled,
+                get_failover_controller,
+            )
+            if lifecycle_enabled() and violent_teardown_enabled():
+                _terminal_phase = getattr(
+                    getattr(result, "terminal_phase", None), "name",
+                    getattr(result, "terminal_phase", "?"),
+                )
+                await get_failover_controller().force_teardown(
+                    reason="a1_terminal:%s" % _terminal_phase,
+                )
+        except Exception:  # noqa: BLE001 -- teardown is best-effort; never break finalization
+            pass
+
     def health(self) -> Dict[str, Any]:
         """Return structured health report."""
         uptime = (

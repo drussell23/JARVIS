@@ -150,6 +150,17 @@ def budget_awaken_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes")
 
 
+def violent_teardown_enabled() -> bool:
+    """Master gate for the Violent Ephemeral Teardown (Task CR4). Default OFF ->
+    byte-identical (only the passive HANDBACK/dead-man reaps J-Prime). When ARMED,
+    the GPU node + node + both /32 firewalls vacate the INSTANT the A1 DAG hits a
+    terminal state (PR opened OR fail-closed at any gate) -- zero idle GPU while a
+    g2 sits waiting for human review."""
+    return os.environ.get(
+        "JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes")
+
+
 def _route() -> str:
     return _env_str("JARVIS_FAILOVER_ROUTE", "dw")
 
@@ -2181,6 +2192,51 @@ class FailoverLifecycleController:
             logger.debug("[FailoverLifecycle] drain fail-soft err=%r", exc)
 
     # ------------------------------------------------------------------
+    # Violent Ephemeral Teardown (Task CR4)
+    # ------------------------------------------------------------------
+
+    async def force_teardown(self, *, reason: str = "a1_terminal") -> None:
+        """Deterministically reap the J-Prime (GPU) node the instant the A1 DAG
+        hits a terminal state -- zero idle GPU while waiting for human review.
+
+        Reuses the proven parallel-teardown idiom (GPU node + GPU /32 firewall,
+        then node + ephemeral /32 firewall vacate together via ``asyncio.gather``)
+        so nothing keeps billing or routing. Idempotent + fail-soft: a no-op when
+        already DORMANT; NEVER raises. After reaping, drops to DORMANT and arms the
+        same anti-thrash cooldown anchor the HANDBACK path uses."""
+        if self._state == FailoverState.DORMANT:
+            return  # nothing to reap
+        logger.warning(
+            "[FailoverFlare] VIOLENT TEARDOWN reason=%s state=%s -- reaping GPU node now",
+            reason, self._state.name,
+        )
+        # 1. Reap the elastic GPU node + its /32 firewall (CPU node survives until
+        #    the node-delete below). Fail-soft -- never block the rest of teardown.
+        try:
+            await self._reap_gpu_node()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FailoverFlare] violent teardown gpu-reap error (continuing): %s", exc)
+        # 2. Delete-to-snapshot the node + close the ephemeral /32 perimeter -- the
+        #    SAME guaranteed-parallel gather the FSM teardowns use (zero orphan node
+        #    AND zero orphan firewall hole; the lock-race fix).
+        try:
+            await asyncio.gather(
+                self._maybe_await(self._vm_delete_fn),
+                self._close_ephemeral_perimeter(),
+                return_exceptions=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FailoverFlare] violent teardown node/fw error (continuing): %s", exc)
+        # 3. DORMANT + arm the anti-thrash cooldown anchor + drop the endpoint so
+        #    is_jprime_serving()/jprime_endpoint() stop pointing at the dead node.
+        self._state = FailoverState.DORMANT
+        self._last_handback_at = self._clock_fn()  # arm anti-thrash cooldown
+        self._endpoint = None
+        logger.info("[FailoverFlare] VIOLENT TEARDOWN complete -- DORMANT, cooldown armed")
+
+    # ------------------------------------------------------------------
     # Await helper (boundaries may be sync or async)
     # ------------------------------------------------------------------
 
@@ -2246,6 +2302,7 @@ __all__ = [
     "get_failover_controller",
     "lifecycle_enabled",
     "budget_awaken_enabled",
+    "violent_teardown_enabled",
     "AWAKEN_REASON_DATA_PLANE",
     "AWAKEN_REASON_BUDGET",
     "AWAKEN_REASON_RATE_LIMIT",
