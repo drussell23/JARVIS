@@ -370,6 +370,127 @@ def _warmup_timeout_s() -> float:
     return max(1.0, _env_float("JARVIS_FAILOVER_WARMUP_TIMEOUT_S", 180.0))
 
 
+def _heavy_coldstart_mult() -> float:
+    """Multiplier applied to cold-start timeouts when the awakened tier is HEAVY
+    (a large model on a GPU -- e.g. qwen2.5-coder:32b on an L4, which needs minutes
+    to load ~20GB into VRAM, vs seconds for a 7B CPU model). Default 4.0 -> the 180s
+    warmup becomes 720s, the 600s awaken deadline becomes 2400s. Env-tunable; set 1.0
+    to disable."""
+    return max(1.0, _env_float("JARVIS_JPRIME_HEAVY_COLDSTART_MULT", 4.0))
+
+
+def _tier_is_heavy(tier) -> bool:
+    """A tier is heavy if it requests a GPU OR a large (>= threshold-B) model.
+    Derived from the hardware request, not a static flag."""
+    if tier is None:
+        return False
+    try:
+        from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+            model_param_billions,
+        )
+        if getattr(tier, "is_gpu", False):
+            return True
+        thresh = _env_float("JARVIS_FAILOVER_HEAVY_MODEL_B", 14.0)
+        return model_param_billions(getattr(tier, "model_label", "")) >= thresh
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Task HW2 -- Autonomous Diagnostic Reaper
+#
+# When a cold-start node never becomes ready, the boot serial console is the
+# ONE artifact that explains WHY. The reaper reads it BEFORE the delete and
+# classifies the failure so the next ignition is informed, not blind.
+# ---------------------------------------------------------------------------
+
+def _diagnostic_reaper_enabled() -> bool:
+    """Master switch for the Autonomous Diagnostic Reaper. Default ON -- the
+    reaper is read-only + fully fail-soft (it never blocks a teardown), so the
+    only reason to disable it is to silence the extra serial-port REST call."""
+    return _env_str("JARVIS_FAILOVER_DIAGNOSTIC_REAPER_ENABLED", "true").lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+# Failure signatures, scanned in priority order. The FIRST family with a hit
+# wins -- on a GPU cold-start an NVIDIA fault is the actionable root cause even
+# when a downstream OOM/panic also appears, so it is checked first. Each entry
+# is (classification, [case-insensitive substrings]).
+_SERIAL_FAILURE_SIGNATURES = (
+    (
+        "nvidia_driver_fault",
+        (
+            "nvrm:",
+            "nvidia-smi has failed",
+            "failed to initialize nvml",
+            "rminitadapter failed",
+            "no devices were found",
+            "nvidia: probe of",
+        ),
+    ),
+    (
+        "kernel_panic",
+        (
+            "kernel panic",
+            "bug: unable to handle kernel",
+            "not syncing:",
+            "general protection fault",
+        ),
+    ),
+    (
+        "oom",
+        (
+            "out of memory",
+            "oom-killer",
+            "oom_kill",
+            "killed process",
+            "cannot allocate memory",
+        ),
+    ),
+    (
+        "disk_full",
+        (
+            "no space left on device",
+            "disk quota exceeded",
+        ),
+    ),
+)
+
+
+def _classify_serial_output(text: Optional[str]) -> str:
+    """Classify a boot serial console dump into a failure family.
+
+    Returns one of: ``nvidia_driver_fault`` / ``kernel_panic`` / ``oom`` /
+    ``disk_full`` (a matched signature, priority-ordered), ``empty`` (no
+    contents to inspect), or ``unknown`` (contents present, no signature hit).
+    Pure + total -- never raises."""
+    if not text or not text.strip():
+        return "empty"
+    haystack = text.lower()
+    for classification, needles in _SERIAL_FAILURE_SIGNATURES:
+        if any(n in haystack for n in needles):
+            return classification
+    return "unknown"
+
+
+async def _default_serial_port_fn() -> Optional[str]:
+    """Read the failover node's boot serial console via native Compute REST
+    (the same metadata-token bridge as the delete path). Returns the console
+    text, or None if unavailable. Fail-soft -- never raises."""
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+            get_compute_rest,
+        )
+        contents, detail = await get_compute_rest().get_serial_port_output()
+        if contents is None:
+            logger.debug("[FailoverLifecycle] serial read unavailable (%s)", detail)
+        return contents
+    except Exception as exc:  # noqa: BLE001 -- diagnosis must never crash the loop
+        logger.debug("[FailoverLifecycle] serial read fail-soft err=%r", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # FailoverState
 # ---------------------------------------------------------------------------
@@ -755,9 +876,14 @@ class FailoverLifecycleController:
         flare_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
         degrade_streak_fn: Optional[Callable[[], int]] = None,
         in_flight_fn: Optional[Callable[[], int]] = None,
+        serial_port_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._vm_awaken_fn = vm_awaken_fn or _default_vm_awaken_fn
         self._vm_delete_fn = vm_delete_fn or _default_vm_delete_fn
+        # Task HW2 -- serial console read boundary for the Autonomous Diagnostic
+        # Reaper. Default: native Compute REST get_serial_port_output. Injectable
+        # for tests (no real GCE touched). Fail-soft -> None on any error.
+        self._serial_port_fn = serial_port_fn or _default_serial_port_fn
         self._dw_probe_fn = dw_probe_fn or _default_dw_probe_fn
         self._node_ready_fn = node_ready_fn or _default_node_ready_fn
         self._clock_fn = clock_fn or _default_clock_fn
@@ -807,6 +933,11 @@ class FailoverLifecycleController:
         # The model label of the actively-provisioned tier (drives model-aware
         # schema compaction). None until a tier is provisioned -> survival default.
         self._active_model_label: Optional[str] = None
+        # The FULL awakened tier object (not just its label) -- drives the adaptive
+        # hardware-aware cold-start timeouts. A heavy 32B/GPU tier earns scaled
+        # awaken/warmup patience; the survival 7B/CPU tier stays byte-identical.
+        # None while DORMANT (no tier awakened) -> scaling never applies.
+        self._awakened_tier: Optional["FailoverTier"] = None
         # Elastic GPU escalation lane (lazily built on first demand). Manages the
         # SECOND, concurrent GPU node lifecycle with crypto-namespaced assets.
         self._gpu_lane: Optional[Any] = None
@@ -1328,6 +1459,75 @@ class FailoverLifecycleController:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FailoverLifecycle] prime client hot-swap fail-soft err=%r", exc)
 
+    def _adaptive_timeout(self, base_s: float) -> float:
+        """Scale a base cold-start timeout by the heavy multiplier when the tier
+        the FSM actually awakened is heavy (32B/GPU). Survival (7B/CPU) -> base
+        unchanged (byte-identical)."""
+        if _tier_is_heavy(self._awakened_tier):
+            return base_s * _heavy_coldstart_mult()
+        return base_s
+
+    async def _diagnose_before_reap(self) -> str:
+        """Task HW2 -- Autonomous Diagnostic Reaper.
+
+        Read the dying node's boot serial console, classify WHY the cold-start
+        failed (NVIDIA driver fault / kernel panic / OOM / disk-full), and seal
+        that classification into the Cryo-DLQ + a flare so the next ignition is
+        informed. Returns the classification string (``disabled`` if master-off,
+        ``unavailable`` if the serial read failed). FULLY fail-soft -- it MUST
+        NOT raise or block the teardown that follows it (a cost-leak guard)."""
+        if not _diagnostic_reaper_enabled():
+            return "disabled"
+        try:
+            raw = await self._maybe_await(self._serial_port_fn)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[DiagnosticReaper] serial read raised err=%r", exc)
+            raw = None
+            classification = "unavailable"
+        else:
+            classification = _classify_serial_output(raw)
+
+        # Resolve the node name the SAME way the delete path does (env-driven,
+        # not a hardcoded literal) so the diagnosis points at the real instance.
+        node = _env_str("JARVIS_FAILOVER_NODE_NAME", _GCLOUD_NODE_NAME)
+        excerpt = (raw or "")[-2000:]
+        envelope = {
+            "kind": "node_coldstart_diagnosis",
+            "schema_version": 1,
+            "classification": classification,
+            "instance": node,
+            "awakened_model": self._active_model_label or "",
+            "awakened_tier_heavy": _tier_is_heavy(self._awakened_tier),
+            "serial_excerpt": excerpt,
+        }
+        reason = "node_coldstart_failure:{}".format(classification)
+
+        # (a) Seal to the Cryo-DLQ -- the next boot can read WHY the last died.
+        try:
+            from backend.core.ouroboros.governance import intake_dlq  # noqa: PLC0415
+            intake_dlq.append_dlq(envelope, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[DiagnosticReaper] Cryo-DLQ append fail-soft err=%r", exc)
+
+        # (b) Emit an attribution flare for live observability.
+        try:
+            self._flare_fn(
+                {
+                    "event": "coldstart_diagnosis",
+                    "classification": classification,
+                    "reason": reason,
+                    "instance": node,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[DiagnosticReaper] flare fail-soft err=%r", exc)
+
+        logger.warning(
+            "[DiagnosticReaper] cold-start failure classified=%s instance=%s "
+            "-- sealed to Cryo-DLQ before reap", classification, node,
+        )
+        return classification
+
     def _build_default_warmup_fn(self) -> Callable[[], Awaitable[bool]]:
         """Build the default warmup callable: LocalPrimeClient pointed at
         the awakened endpoint, calling warmup(timeout_s=_warmup_timeout_s()).
@@ -1341,7 +1541,7 @@ class FailoverLifecycleController:
             LocalPrimeClient,
         )
         endpoint = self._endpoint or self._build_endpoint()
-        timeout = _warmup_timeout_s()
+        timeout = self._adaptive_timeout(_warmup_timeout_s())
 
         import dataclasses  # noqa: PLC0415
         # Build a config that targets the awakened node's base URL.
@@ -1792,11 +1992,14 @@ class FailoverLifecycleController:
             from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
                 resolve_tier,
             )
-            self._active_model_label = resolve_tier(
+            _tier = resolve_tier(
                 urgency=_env_str("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
                 complexity=_env_str("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
-            ).model_label
+            )
+            self._awakened_tier = _tier
+            self._active_model_label = _tier.model_label
         except Exception:  # noqa: BLE001
+            self._awakened_tier = None
             self._active_model_label = None
         # IaC ephemeral micro-perimeter: open a /32 hole for THIS orchestrator's
         # detected egress IP so the Reachability Racer's external path can reach
@@ -1885,12 +2088,24 @@ class FailoverLifecycleController:
         awakening_started = self._awakening_started_at
         if awakening_started is not None:
             elapsed = now - awakening_started
-            if elapsed > _awaken_timeout_s():
+            _awaken_deadline = self._adaptive_timeout(_awaken_timeout_s())
+            if elapsed > _awaken_deadline:
                 logger.warning(
-                    "[FailoverLifecycle] AWAKENING timed out after %.1fs -- "
-                    "node never became ready, tearing down + reverting to DORMANT",
+                    "[FailoverLifecycle] AWAKENING timed out after %.1fs "
+                    "(adaptive deadline %.1fs) -- node never became ready, "
+                    "tearing down + reverting to DORMANT",
                     elapsed,
+                    _awaken_deadline,
                 )
+                # Task HW2 -- Autonomous Diagnostic Reaper: read + classify the
+                # boot serial console BEFORE the delete destroys the evidence.
+                # Fail-soft -- a diagnosis error never blocks the reap below.
+                try:
+                    await self._diagnose_before_reap()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[FailoverLifecycle] diagnostic reaper fail-soft err=%r", exc
+                    )
                 # PARALLEL teardown (fail-soft): node delete + ephemeral firewall
                 # close together -- zero orphan nodes AND zero orphan firewall holes.
                 try:
@@ -1910,6 +2125,7 @@ class FailoverLifecycleController:
                 self._state = FailoverState.DORMANT
                 self._awakening_started_at = None
                 self._endpoint = None
+                self._awakened_tier = None  # drop the stale tier (no inflated re-awaken)
                 self._last_handback_at = now
                 return
 
@@ -1951,7 +2167,7 @@ class FailoverLifecycleController:
                 logger.warning(
                     "[FailoverLifecycle] warmup did not confirm within %.0fs "
                     "-- proceeding to SERVING (first op may be cold)",
-                    _warmup_timeout_s(),
+                    self._adaptive_timeout(_warmup_timeout_s()),
                 )
 
         # Gap 3a -- WIRE the awakened node's reachable endpoint to PrimeClient
@@ -2186,6 +2402,7 @@ class FailoverLifecycleController:
 
         # 4. DORMANT + arm anti-thrash cooldown.
         self._state = FailoverState.DORMANT
+        self._awakened_tier = None  # drop the awakened tier on handback
         self._awakening_started_at = None
         self._serving_started_at = None
         self._last_probe_at = None
@@ -2295,6 +2512,7 @@ class FailoverLifecycleController:
             # 3. DORMANT + arm the anti-thrash cooldown anchor + drop the endpoint so
             #    is_jprime_serving()/jprime_endpoint() stop pointing at the dead node.
             self._state = FailoverState.DORMANT
+            self._awakened_tier = None  # drop the awakened tier on violent teardown
             self._last_handback_at = self._clock_fn()  # arm anti-thrash cooldown
             self._endpoint = None
             logger.info("[FailoverFlare] VIOLENT TEARDOWN complete -- DORMANT, cooldown armed")

@@ -307,6 +307,45 @@ async def test_delete_instance_no_token_fails_closed(monkeypatch, http):
 
 
 # ---------------------------------------------------------------------------
+# Task HW2 -- serial console read for the Autonomous Diagnostic Reaper.
+# ---------------------------------------------------------------------------
+
+async def test_serial_port_output_reads_contents(http):
+    http.get_responses = [(200, json.dumps({"contents": "NVRM: RmInitAdapter failed!"}))]
+    c = GCPComputeRest()
+    contents, detail = await c.get_serial_port_output()
+    assert contents == "NVRM: RmInitAdapter failed!"
+    assert detail == "ok:200"
+    get = [call for call in http.calls
+           if call["method"] == "GET" and "serialPort" in call["url"]][0]
+    assert get["url"] == (
+        "https://compute.googleapis.com/compute/v1/projects/my-test-project"
+        "/zones/us-west2-b/instances/jarvis-prime-failover/serialPort?port=1"
+    )
+    assert get["headers"]["Authorization"] == "Bearer ya29.FAKE"
+
+
+async def test_serial_port_output_no_token_fails_closed(monkeypatch, http):
+    async def _no_token(url, **kw):
+        if url.endswith("/token"):
+            return (0, "")
+        return (200, "")
+    monkeypatch.setattr(gr, "_http_request", _no_token)
+    c = GCPComputeRest()
+    contents, detail = await c.get_serial_port_output()
+    assert contents is None
+    assert detail.startswith("AUTH_TOKEN_UNAVAILABLE")
+
+
+async def test_serial_port_output_5xx_fails_soft(http):
+    http.get_responses = [(503, "backend error")]
+    c = GCPComputeRest()
+    contents, detail = await c.get_serial_port_output()
+    assert contents is None
+    assert detail == "SERIAL_READ_FAILED:503"
+
+
+# ---------------------------------------------------------------------------
 # No hardcoding guard: identity is fully metadata-driven.
 # ---------------------------------------------------------------------------
 
