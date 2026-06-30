@@ -32,10 +32,13 @@ def test_typed_aliases_match_kind():
 
 def test_forged_hmac_rejected():
     chain = DAGProofChain()
-    t1, _, _ = _full_chain(chain)
+    t1, t2, t3 = _full_chain(chain)
     forged = dataclasses.replace(t1, sig="deadbeef" * 8)
+    # Isolates HMAC failure: recomputed HMAC over correct fields does not match forged sig.
     assert chain.verify(forged) is False
-    assert chain.verify_chain([forged, *_full_chain(chain)[1:]], op_id=OP) is False
+    # Defense-in-depth: forgery is rejected at the chain level (position-0 HMAC fails;
+    # t2/t3 are the originals from the same mint so their prev_hash links are intact).
+    assert chain.verify_chain([forged, t2, t3], op_id=OP) is False
 
 def test_replayed_state_binding_rejected():
     # A token signed for state A cannot be re-pointed at state B.
@@ -80,3 +83,10 @@ def test_wrong_terminal_kind_rejected():
     t1 = chain.mint(kind=TokenKind.SANDBOX_EXECUTION, op_id=OP, state_binding="a", payload={})
     t2 = chain.mint(kind=TokenKind.BLAST_RADIUS_CLEARED, op_id=OP, state_binding="b", payload={}, prev=t1)
     assert chain.verify_chain([t1, t2], op_id=OP) is False
+
+def test_tampered_timestamp_rejected():
+    # issued_monotonic is now inside the HMAC envelope; rolling it back to 0.0 must fail.
+    chain = DAGProofChain()
+    t1, _, _ = _full_chain(chain)
+    tampered = dataclasses.replace(t1, issued_monotonic=0.0)
+    assert chain.verify(tampered) is False

@@ -25,9 +25,11 @@ _CHAIN_ORDER = (
 
 
 def _canonical(kind: TokenKind, op_id: str, state_binding: str,
-               prev_hash: str, payload: Mapping[str, str]) -> bytes:
+               prev_hash: str, payload: Mapping[str, str],
+               issued_monotonic: float) -> bytes:
     return json.dumps(
         {
+            "issued_monotonic": format(issued_monotonic, ".9f"),
             "kind": kind.value,
             "op_id": op_id,
             "state_binding": state_binding,
@@ -52,7 +54,7 @@ class CapabilityToken:
     def digest(self) -> str:
         """Identity hash used as the next token's ``prev_hash`` (chain link)."""
         body = _canonical(self.kind, self.op_id, self.state_binding,
-                          self.prev_hash, self.payload)
+                          self.prev_hash, self.payload, self.issued_monotonic)
         return hashlib.sha256(body + self.sig.encode("utf-8")).hexdigest()
 
 
@@ -88,10 +90,11 @@ class DAGProofChain:
         self._secret = secret if secret is not None else secrets.token_bytes(32)
 
     def _sign(self, kind: TokenKind, op_id: str, state_binding: str,
-              prev_hash: str, payload: Mapping[str, str]) -> str:
+              prev_hash: str, payload: Mapping[str, str],
+              issued_monotonic: float) -> str:
         return hmac.new(
             self._secret,
-            _canonical(kind, op_id, state_binding, prev_hash, payload),
+            _canonical(kind, op_id, state_binding, prev_hash, payload, issued_monotonic),
             hashlib.sha256,
         ).hexdigest()
 
@@ -100,15 +103,15 @@ class DAGProofChain:
              prev: Optional[CapabilityToken] = None) -> CapabilityToken:
         prev_hash = prev.digest() if prev is not None else ""
         norm = {str(k): str(v) for k, v in payload.items()}
-        sig = self._sign(kind, op_id, state_binding, prev_hash, norm)
+        ts = time.monotonic()
+        sig = self._sign(kind, op_id, state_binding, prev_hash, norm, ts)
         cls = _KIND_CLS[kind]
-        token = cls(kind, op_id, state_binding, prev_hash, norm,
-                    time.monotonic(), sig)
+        token = cls(kind, op_id, state_binding, prev_hash, norm, ts, sig)
         return token
 
     def verify(self, token: CapabilityToken) -> bool:
         expected = self._sign(token.kind, token.op_id, token.state_binding,
-                              token.prev_hash, token.payload)
+                              token.prev_hash, token.payload, token.issued_monotonic)
         return hmac.compare_digest(expected, token.sig)
 
     def verify_chain(self, tokens: Sequence[CapabilityToken], *, op_id: str) -> bool:
