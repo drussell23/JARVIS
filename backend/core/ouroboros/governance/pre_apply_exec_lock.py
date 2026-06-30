@@ -63,7 +63,7 @@ async def acquire_sandbox_execution_token(
     _image = sandbox_image or container_sandbox.sandbox_image
     # Build a compile+import probe over the candidate's changed modules.
     probe = _build_probe(candidate_files)
-    result = await _run(code=probe, worktree=repo_root, op_id=op_id)
+    result = await _run(code=probe, worktree=repo_root)
 
     exit_code = getattr(result, "exit_code", 1)
     breached = bool(getattr(result, "breached", False))

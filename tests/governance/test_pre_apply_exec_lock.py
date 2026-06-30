@@ -78,3 +78,23 @@ async def test_branch_context_forwarded_to_token():
         chain=chain, docker_available=lambda: True, runner=runner,
         branch_context="wt-1")
     assert tok.branch_context == "wt-1"
+
+@pytest.mark.asyncio
+async def test_runner_called_with_real_run_in_container_signature():
+    """Pin the EXACT run_in_container signature -- no op_id, no **kwargs.
+
+    If the production call ever re-adds op_id (or any unknown kwarg) this
+    test TypeErrors, proving Gate 1 would crash on real Docker.
+    """
+    chain = DAGProofChain()
+    captured = {}
+    # Mirror container_sandbox.run_in_container's real signature exactly (no op_id).
+    async def runner(code, *, worktree, image=None, policy=None,
+                     seccomp_profile=None, docker_run=None, read_only=False):
+        captured["worktree"] = worktree
+        return _FakeResult(0)
+    tok = await lock.acquire_sandbox_execution_token(
+        op_id="op-sig", candidate_files=CANDIDATE, repo_root="/repo",
+        chain=chain, docker_available=lambda: True, runner=runner)
+    assert isinstance(tok, SandboxExecutionToken)
+    assert captured["worktree"] == "/repo"  # call used real-signature kwargs only
