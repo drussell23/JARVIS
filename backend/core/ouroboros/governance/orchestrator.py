@@ -3025,6 +3025,15 @@ class GovernedOrchestrator:
                 CLASSIFYRunner,
             )
             logger.info("[PhaseRunnerDelegate] CLASSIFY → runner op=%s", ctx.op_id[:16])
+            # Emit the CLASSIFY FSM-phase SSE so the A1 auditor witnesses the
+            # phase progression (publish_fsm_phase had zero call sites). Fail-soft.
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501,PLC0415
+                    publish_fsm_phase_for_ctx,
+                )
+                publish_fsm_phase_for_ctx(ctx, "CLASSIFY")
+            except Exception:  # noqa: BLE001
+                pass
             _classify_runner = CLASSIFYRunner(self, _serpent)
             # Task #98 (2026-05-14) — universal phase-local sub-budget
             # via shared kernel.  Wraps runner.run() in asyncio.wait_for
@@ -9441,6 +9450,14 @@ class GovernedOrchestrator:
                 Slice4bRunner,
             )
             logger.info("[PhaseRunnerDelegate] APPROVE+APPLY+VERIFY → Slice4bRunner op=%s", ctx.op_id[:16])
+            # Emit the APPLY FSM-phase SSE (auditor's CLASSIFY->APPLY witness). Fail-soft.
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501,PLC0415
+                    publish_fsm_phase_for_ctx,
+                )
+                publish_fsm_phase_for_ctx(ctx, "APPLY")
+            except Exception:  # noqa: BLE001
+                pass
             _slice4b_runner = Slice4bRunner(self, _serpent, best_candidate, risk_tier)
             _slice4b_result = await _slice4b_runner.run(ctx)
             # Rebind _t_apply (consumed by COMPLETERunner downstream).

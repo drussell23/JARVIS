@@ -1074,6 +1074,18 @@ class A1GraduationAuditor:
         (e.g. ``[SemanticGuard]``, ``[IronGate]``). May raise (intervention)."""
         if not line:
             return
+        # Centralized graduation-flag boot attestation (Part D): a single
+        # [A1FlagAudit] block names the evaluated flags. Credit each by NAME
+        # (DRY -- no family-marker duplication). Real gate false-rejections still
+        # dominate (REJECTED wins in FlagAuditState.verdict).
+        _fa = parse_flag_audit_line(line)
+        if _fa is not None:
+            for _name in _fa:
+                _st = self.flags.get(_name)
+                if _st is not None:
+                    _st.observed_evaluated = True
+                    _st.evidence.append("BOOT_EVAL:[A1FlagAudit]")
+            return
         # Provenance line (origin stamp) -- record the goal's origin class +
         # chain integrity so the trace check validates the ORIGIN-CORRECT
         # pipeline (Run #17 fix). Checked BEFORE the A1Trace hop parse because a
@@ -1516,6 +1528,21 @@ def _render_verdict(verdict: A1Verdict, log: Callable[[str], None] = print) -> N
             "[A1Auditor]   flag %-50s %s"
             % (f["flag"][:50], f["verdict"])
         )
+
+
+_A1_FLAG_AUDIT_NAME_RE = re.compile(r"(JARVIS_[A-Z0-9_]+)\s*=")
+
+
+def parse_flag_audit_line(line: str) -> Optional[List[str]]:
+    """Parse a centralized ``[A1FlagAudit]`` graduation boot-attestation block ->
+    the list of graduation flag names it evaluated, or None if the line is not an
+    [A1FlagAudit] block. The emitter (flag_registry.emit_a1_graduation_telemetry)
+    and this parser share the CADENCE_POLICY flag names as the single source of
+    truth -- no duplicated flag list, no family-marker guessing."""
+    if not line or "[A1FlagAudit]" not in line:
+        return None
+    names = _A1_FLAG_AUDIT_NAME_RE.findall(line)
+    return names or None
 
 
 def _resolve_log_file(arg_log_file: Optional[str]) -> Optional[str]:

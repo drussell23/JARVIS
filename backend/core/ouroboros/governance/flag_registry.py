@@ -694,6 +694,71 @@ def ensure_seeded() -> FlagRegistry:
     return registry
 
 
+def _a1_flag_telemetry_enabled() -> bool:
+    """Master switch for the A1 graduation-flag boot telemetry (default ON)."""
+    return (
+        os.environ.get("JARVIS_A1_FLAG_TELEMETRY_ENABLED", "true") or ""
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _a1_graduation_flag_names() -> List[str]:
+    """The canonical A1 audit-flag set -- env override ``JARVIS_A1_AUDIT_FLAGS``
+    else the ``CADENCE_POLICY`` graduation table (the SAME source the auditor's
+    ``load_audit_flags`` reads -- single source of truth, no duplicated list).
+    NEVER raises -> [] on failure."""
+    override = (os.environ.get("JARVIS_A1_AUDIT_FLAGS", "") or "").strip()
+    if override:
+        return [f.strip() for f in override.split(",") if f.strip()]
+    try:
+        from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: PLC0415
+            CADENCE_POLICY,
+        )
+        return [entry.flag_name for entry in CADENCE_POLICY]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def emit_a1_graduation_telemetry(registry: Optional["FlagRegistry"] = None,
+                                 logger_: Optional[logging.Logger] = None) -> int:
+    """Centralized, DRY A1 graduation-flag attestation (no scattered per-flag
+    logging). Iterates the canonical CADENCE_POLICY flag set, evaluates each
+    flag's live state via the FlagRegistry, and emits ONE structured
+    ``[A1FlagAudit]`` block to debug.log. The A1 auditor parses the block by flag
+    NAME and credits ``observed_evaluated`` -- while real gate false-rejections
+    still dominate (REJECTED wins in the per-flag verdict), so this raises
+    visibility without faking a clean gate. Returns the count emitted.
+    Gated by ``JARVIS_A1_FLAG_TELEMETRY_ENABLED``. NEVER raises."""
+    try:
+        if not _a1_flag_telemetry_enabled():
+            return 0
+        names = _a1_graduation_flag_names()
+        if not names:
+            return 0
+        log = logger_ or logging.getLogger("Ouroboros.A1FlagAudit")
+        reg = registry
+        if reg is None:
+            try:
+                reg = get_default_registry()
+            except Exception:  # noqa: BLE001
+                reg = None
+
+        def _state(flag: str) -> bool:
+            if reg is not None:
+                try:
+                    return bool(reg.get_bool(flag, default=False))
+                except Exception:  # noqa: BLE001
+                    pass
+            return (os.environ.get(flag, "") or "").strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+
+        pairs = ",".join("%s=%s" % (n, _state(n)) for n in names)
+        log.info("[A1FlagAudit] graduation boot eval (%d): %s", len(names), pairs)
+        return len(names)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 __all__ = [
     "Category",
     "FLAG_REGISTRY_SCHEMA_VERSION",
