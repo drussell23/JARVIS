@@ -1518,6 +1518,17 @@ def _render_verdict(verdict: A1Verdict, log: Callable[[str], None] = print) -> N
         )
 
 
+def _resolve_log_file(arg_log_file: Optional[str]) -> Optional[str]:
+    """Resolve which debug.log to tail for [A1Trace] lines. An explicit
+    ``--log-file`` wins; otherwise honor ``JARVIS_ACTIVE_SESSION_LOG`` (the
+    ignition driver's DICTATED absolute path) so the auditor reads EXACTLY where
+    the organism writes -- Dynamic Artifact Context Injection, no hardcoded
+    ``bt-<ts>`` and no ``pending`` placeholder. None if neither is set."""
+    if arg_log_file:
+        return arg_log_file
+    return (os.environ.get("JARVIS_ACTIVE_SESSION_LOG") or "").strip() or None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -1534,7 +1545,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--base", default=os.environ.get("JARVIS_OBSERVABILITY_BASE", "http://localhost:8099"),
         help="Observability base URL (default loopback / env JARVIS_OBSERVABILITY_BASE).",
     )
-    ap.add_argument("--log-file", default=None, help="Soak log file to tail for [A1Trace] lines.")
+    ap.add_argument(
+        "--log-file", default=None,
+        help="Soak log file to tail for [A1Trace] lines. If omitted, falls back to "
+             "the JARVIS_ACTIVE_SESSION_LOG env var (the driver's dictated path).",
+    )
     ap.add_argument(
         "--timeout", type=float,
         default=float(os.environ.get("JARVIS_A1_AUDIT_TIMEOUT_S", "3600") or 3600),
@@ -1601,7 +1616,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_watch(
                 auditor,
                 base=args.base,
-                log_file=args.log_file,
+                log_file=_resolve_log_file(args.log_file),
                 timeout_s=args.timeout,
             )
         )
