@@ -27,6 +27,21 @@ async def test_working_tree_content_sha_is_deterministic(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_clean_tree_resolves_to_head_tree(tmp_path):
+    _git(["init"], tmp_path)
+    _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n")
+    _git(["add", "."], tmp_path)
+    _git(["commit", "-m", "init"], tmp_path)
+    mgr = WorkspaceCheckpointManager(tmp_path)
+    # clean tree: git stash create is empty -> falls back to HEAD^{tree}
+    clean_sha = await mgr.working_tree_content_sha()
+    head_tree = await mgr.tree_sha_for_ref("")  # "" -> HEAD inside the helper
+    assert clean_sha and clean_sha == head_tree
+
+
+@pytest.mark.asyncio
 async def test_content_sha_changes_with_content(tmp_path):
     _git(["init"], tmp_path)
     _git(["config", "user.email", "t@t"], tmp_path)

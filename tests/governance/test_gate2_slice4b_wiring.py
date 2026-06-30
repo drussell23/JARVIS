@@ -13,8 +13,8 @@ def test_enabled_when_flagged(monkeypatch):
     assert brv.blast_radius_enabled() is True
 
 
-def test_blast_token_field_present_and_carried():
-    """op_context exposes ``blast_token`` (default None) and ``advance`` carries it."""
+def test_blast_token_field_present():
+    """op_context exposes ``blast_token`` (default None)."""
     import dataclasses
     from backend.core.ouroboros.governance.op_context import OperationContext
 

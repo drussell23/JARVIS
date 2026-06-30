@@ -1210,6 +1210,13 @@ class Slice4bRunner(PhaseRunner):
                     terminal_reason_code="blast_radius_graph_failure",
                     rollback_occurred=True,
                 )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "blast_radius_graph_failure", "rollback_occurred": True},
+                )
+                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_graph_failure")
                 return PhaseResult(
                     next_ctx=ctx, next_phase=None, status="fail",
                     reason="blast_radius_graph_failure",
@@ -1223,6 +1230,13 @@ class Slice4bRunner(PhaseRunner):
                     terminal_reason_code="blast_radius_breach",
                     rollback_occurred=True,
                 )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "blast_radius_breach", "rollback_occurred": True},
+                )
+                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_breach")
                 return PhaseResult(
                     next_ctx=ctx, next_phase=None, status="fail",
                     reason="blast_radius_breach",
