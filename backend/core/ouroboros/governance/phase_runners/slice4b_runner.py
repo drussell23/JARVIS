@@ -82,6 +82,7 @@ accessed via ``orch._stack.change_engine`` — same as inline).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
 import os
@@ -192,6 +193,57 @@ class Slice4bRunner(PhaseRunner):
             if _orange_pr_on:
                 try:
                     _files_for_pr = orch._iter_candidate_files(best_candidate)
+                    # Iron Triad (Task 13b): when the enforcer is armed, run
+                    # Gate (1) + Gate (2) inside an ISOLATED worktree so this
+                    # ONE op assembles the branch-bound chain that Gate (3) +
+                    # create_review_pr then verify. Default-OFF byte-identical:
+                    # all pipeline machinery imports inside the guard, tokens
+                    # come from ctx (None on the Orange path) exactly as today.
+                    _pr_chain = getattr(ctx, "proof_chain", None)
+                    _expected_branch = None
+                    _sbx_tok = getattr(ctx, "sandbox_token", None)
+                    _blast_tok = getattr(ctx, "blast_token", None)
+                    if os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+                        from backend.core.ouroboros.governance.autonomous_pr_pipeline import (
+                            run_pr_gate_pipeline,
+                            PRGatePipelineError,
+                        )
+                        from backend.core.ouroboros.governance.dag_capability_token import (
+                            DAGProofChain,
+                        )
+                        _pr_chain = _pr_chain or DAGProofChain()
+                        try:
+                            _pipe = await run_pr_gate_pipeline(
+                                op_id=ctx.op_id,
+                                candidate_files=list(_files_for_pr),
+                                repo_root=str(orch._config.project_root),
+                                chain=_pr_chain,
+                            )
+                            _sbx_tok, _blast_tok, _expected_branch = (
+                                _pipe.sandbox_token,
+                                _pipe.blast_token,
+                                _pipe.branch_context,
+                            )
+                        except PRGatePipelineError as _pe:
+                            logger.warning(
+                                "[A1-PR] op=%s gate pipeline rejected "
+                                "candidate: %s -> no PR",
+                                ctx.op_id, _pe,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.POSTMORTEM,
+                                terminal_reason_code="pr_gate_rejected",
+                            )
+                            await orch._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {"reason": "pr_gate_rejected"},
+                            )
+                            return PhaseResult(
+                                next_ctx=ctx, next_phase=None, status="fail",
+                                reason="pr_gate_rejected",
+                                artifacts={"t_apply": _t_apply},
+                            )
                     _reviewer = OrangePRReviewer(orch._config.project_root)
                     _pr_result = await _reviewer.create_review_pr(
                         op_id=ctx.op_id,
@@ -203,6 +255,10 @@ class Slice4bRunner(PhaseRunner):
                             "file_count": len(_files_for_pr),
                         },
                         risk_tier_name=risk_tier.name,
+                        chain=_pr_chain,
+                        sandbox_token=_sbx_tok,
+                        blast_token=_blast_tok,
+                        expected_branch_context=_expected_branch,
                     )
                 except Exception:
                     logger.exception(
@@ -564,6 +620,48 @@ class Slice4bRunner(PhaseRunner):
                     )
         except Exception:
             logger.debug("[Orchestrator] LiveWorkSensor check skipped", exc_info=True)
+
+        # ---- Gate 1: Isomorphic Execution Lock (pre-write, strict L4) ----
+        # Runs AFTER execution_graph materialisation (best_candidate is final)
+        # and BEFORE any snapshot or write touches the real tree.
+        # Default-OFF: JARVIS_A1_SANDBOX_LOCK_ENABLED controls activation.
+        # Inline env check mirrors pre_apply_exec_lock.lock_enabled() so the
+        # OFF path imports NOTHING (byte-identical to pre-Gate-1 behavior).
+        if os.environ.get("JARVIS_A1_SANDBOX_LOCK_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+            from ..pre_apply_exec_lock import (
+                acquire_sandbox_execution_token,
+                SandboxLockFailed,
+                RequiresCloudExecution,
+            )
+            from ..dag_capability_token import DAGProofChain
+            _g1_chain = getattr(ctx, "proof_chain", None) or DAGProofChain()
+            _g1_cand_files = list(orch._iter_candidate_files(best_candidate))
+            try:
+                _g1_sbx_tok = await acquire_sandbox_execution_token(
+                    op_id=ctx.op_id,
+                    candidate_files=_g1_cand_files,
+                    repo_root=str(orch._config.project_root),
+                    chain=_g1_chain,
+                )
+            except (SandboxLockFailed, RequiresCloudExecution) as _g1_exc:
+                _g1_reason = (
+                    "requires_cloud_execution"
+                    if isinstance(_g1_exc, RequiresCloudExecution)
+                    else "sandbox_lock_failed"
+                )
+                logger.warning(
+                    "[Gate1] op=%s %s: %s", ctx.op_id, _g1_reason, _g1_exc,
+                )
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code=_g1_reason,
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason=_g1_reason,
+                    artifacts={"t_apply": _t_apply},
+                )
+            ctx = dataclasses.replace(ctx, proof_chain=_g1_chain, sandbox_token=_g1_sbx_tok)
 
         # Pre-apply snapshots
         snapshots: Dict[str, str] = {}
@@ -1087,6 +1185,126 @@ class Slice4bRunner(PhaseRunner):
                 reason="verify_regression",
                 artifacts={"t_apply": _t_apply},
             )
+
+        # ---- Gate 2: Cryptographic Blast-Radius Verification ----
+        # Runs AFTER the scoped Phase-8a verify gate cleared (only reached
+        # when those tests passed) and BEFORE Phase 8b auto-commit. Chains
+        # onto Gate 1's sandbox_token: if Gate 1 didn't run there is no token
+        # to chain, so Gate 2 is skipped rather than broken.
+        # Default-OFF: JARVIS_A1_BLAST_RADIUS_ENABLED controls activation.
+        # Inline env check + all imports INSIDE the guard so the OFF path
+        # imports NOTHING (byte-identical to pre-Gate-2 behavior — Task 4 lesson).
+        _blast_armed = os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+        if _blast_armed:
+            if getattr(ctx, "sandbox_token", None) is None:
+                logger.warning(
+                    "[Gate2] op=%s armed but no sandbox_token (Gate 1 disabled?) -- skipping",
+                    ctx.op_id,
+                )
+        if (_blast_armed
+                and getattr(ctx, "sandbox_token", None) is not None
+                and getattr(ctx, "proof_chain", None) is not None):
+            from ..blast_radius_verify import (
+                acquire_blast_radius_token,
+                BlastRadiusBreach,
+                BlastRadiusGraphFailure,
+            )
+            from ..reverse_dep_resolver import resolve_reverse_dependency_tests
+            from .. import intake_dlq as _g2_dlq
+            from ..test_runner import TestRunner as _G2TestRunner
+
+            _g2_root = orch._config.project_root  # Path
+            _g2_scope = sorted(
+                set(ctx.target_files)
+                | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
+            )
+            # Reuse the APPLY-start checkpoint's content TREE SHA as the pre-op anchor.
+            # stash_ref is a timestamped COMMIT sha; ^{tree} is content-addressed and
+            # deterministic — identical content produces identical tree SHA.
+            _g2_pre_sha = await _ckpt_mgr.tree_sha_for_ref(
+                getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
+            )
+
+            async def _g2_graph_fn(files):
+                return await resolve_reverse_dependency_tests(
+                    files, repo_root=str(_g2_root), oracle=None,
+                )
+
+            async def _g2_test_fn(tests):
+                if not tests:
+                    return {"failed": [], "total": 0}
+                _paths = tuple((_g2_root / t) for t in tests)
+                _runner = _G2TestRunner(repo_root=_g2_root)
+                _tr = await _runner.run(test_files=_paths, sandbox_dir=None)
+                return {"failed": list(_tr.failed_tests), "total": _tr.total}
+
+            async def _g2_rollback(_sha):
+                # Non-destructive restore via the existing APPLY-start checkpoint.
+                if _checkpoint is not None and _ckpt_mgr is not None:
+                    await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
+
+            async def _g2_tree_sha():
+                if _ckpt_mgr is None:
+                    return ""
+                return await _ckpt_mgr.working_tree_content_sha()
+
+            def _g2_dlq_fn(reason):
+                _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
+
+            try:
+                _blast_tok = await acquire_blast_radius_token(
+                    op_id=ctx.op_id,
+                    scope_files=_g2_scope,
+                    pre_op_tree_sha=_g2_pre_sha,
+                    chain=ctx.proof_chain,
+                    prev_token=ctx.sandbox_token,
+                    graph_fn=_g2_graph_fn,
+                    test_fn=_g2_test_fn,
+                    current_tree_sha_fn=_g2_tree_sha,
+                    rollback_fn=_g2_rollback,
+                    dlq_fn=_g2_dlq_fn,
+                )
+            except BlastRadiusGraphFailure:
+                logger.warning("[Gate2] op=%s blast_radius_graph_failure", ctx.op_id)
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="blast_radius_graph_failure",
+                    rollback_occurred=True,
+                )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "blast_radius_graph_failure", "rollback_occurred": True},
+                )
+                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_graph_failure")
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="blast_radius_graph_failure",
+                    artifacts={"t_apply": _t_apply},
+                )
+            except BlastRadiusBreach:
+                logger.warning("[Gate2] op=%s blast_radius_breach", ctx.op_id)
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="blast_radius_breach",
+                    rollback_occurred=True,
+                )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "blast_radius_breach", "rollback_occurred": True},
+                )
+                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_breach")
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="blast_radius_breach",
+                    artifacts={"t_apply": _t_apply},
+                )
+            ctx = dataclasses.replace(ctx, blast_token=_blast_tok)
 
         # ---- Phase 8b: Auto-commit ----
         _committed_hash: Optional[str] = None

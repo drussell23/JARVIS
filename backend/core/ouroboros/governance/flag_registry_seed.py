@@ -5174,6 +5174,127 @@ SEED_SPECS: list = [
         example=".jarvis/fleet_calibration.json",
         since="2026-06-19",
     ),
+    # ====================================================================
+    # Iron Triad A1 gate flags (Task 10)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_A1_TOKEN_ENFORCER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Enable the A1 token-chain enforcer: PRs may only be merged "
+            "when a verified, cryptographically-signed token chain is "
+            "present. Off by default; turn on before A1 promotion."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/orange_pr_reviewer.py",
+        example="true",
+        since="2026-06-29",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_A1_SANDBOX_LOCK_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Gate 1 of the Iron Triad: requires an L4 container exec-lock "
+            "before any APPLY step proceeds. Prevents concurrent "
+            "out-of-sandbox mutations."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/pre_apply_exec_lock.py",
+        example="true",
+        since="2026-06-29",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_A1_BLAST_RADIUS_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Gate 2 of the Iron Triad: runs a reverse-dependency regression "
+            "check after APPLY to verify no callers of changed symbols "
+            "regress. Blocking — APPLY is rolled back on failure."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/blast_radius_verify.py",
+        example="true",
+        since="2026-06-29",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_A1_PR_LINTER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Gate 3 of the Iron Triad: runs a blocking LLM architectural-"
+            "rules critique on the PR diff before it is filed. Rejects "
+            "PRs that violate documented design invariants."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/pr_self_linter.py",
+        example="true",
+        since="2026-06-29",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_TOKEN_AUDIT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Enable the immutable token-mint Write-Ahead Log (WAL). "
+            "Every token minted by the A1 enforcer is durably recorded; "
+            "disabling this flag removes the audit trail."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file="backend/core/ouroboros/governance/token_audit.py",
+        example="true",
+        since="2026-06-29",
+        posture_relevance=_ALL_POSTURES_CRITICAL,
+    ),
+    # ====================================================================
+    # Iron Triad tuning + observability knobs (Task 14)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_A1_PR_LINTER_THRESHOLD",
+        type=FlagType.INT, default=4,
+        description=(
+            "Minimum severity score (0-10) for the PR self-linter to "
+            "block a PR from being filed. Findings below this threshold "
+            "are logged as warnings only; at or above it the linter "
+            "returns a blocking verdict and the op routes to "
+            "APPROVAL_REQUIRED."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/pr_self_linter.py",
+        example="4",
+        since="2026-06-29",
+        posture_relevance={},
+    ),
+    FlagSpec(
+        name="JARVIS_TOKEN_AUDIT_PATH",
+        type=FlagType.STR, default=".jarvis/token_audit.jsonl",
+        description=(
+            "Path to the immutable token-mint WAL file. Relative paths "
+            "are resolved against the project root. The file is "
+            "append-only; each line is a JSON record of one mint event."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file="backend/core/ouroboros/governance/token_audit.py",
+        example=".jarvis/token_audit.jsonl",
+        since="2026-06-29",
+        posture_relevance={},
+    ),
+    FlagSpec(
+        name="JARVIS_TOKEN_AUDIT_MAX",
+        type=FlagType.INT, default=500,
+        description=(
+            "Maximum number of token-mint WAL records retained in memory "
+            "for the in-process bounded buffer. Records beyond this cap "
+            "are flushed to disk and evicted from the buffer. Does not "
+            "affect the on-disk WAL which is always append-only."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/token_audit.py",
+        example="500",
+        since="2026-06-29",
+        posture_relevance={},
+    ),
 ]
 
 

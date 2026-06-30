@@ -9468,6 +9468,54 @@ class GovernedOrchestrator:
                 if _orange_pr_on:
                     try:
                         _files_for_pr = self._iter_candidate_files(best_candidate)
+                        # Iron Triad (Task 13b): when the enforcer is armed, run
+                        # Gate (1) + Gate (2) inside an ISOLATED worktree so this
+                        # ONE op assembles the branch-bound chain that Gate (3) +
+                        # create_review_pr then verify. Default-OFF byte-
+                        # identical: all pipeline machinery imports inside the
+                        # guard, tokens come from ctx (None on the Orange path)
+                        # exactly as today.
+                        _pr_chain = getattr(ctx, "proof_chain", None)
+                        _expected_branch = None
+                        _sbx_tok = getattr(ctx, "sandbox_token", None)
+                        _blast_tok = getattr(ctx, "blast_token", None)
+                        if os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+                            from backend.core.ouroboros.governance.autonomous_pr_pipeline import (
+                                run_pr_gate_pipeline,
+                                PRGatePipelineError,
+                            )
+                            from backend.core.ouroboros.governance.dag_capability_token import (
+                                DAGProofChain,
+                            )
+                            _pr_chain = _pr_chain or DAGProofChain()
+                            try:
+                                _pipe = await run_pr_gate_pipeline(
+                                    op_id=ctx.op_id,
+                                    candidate_files=list(_files_for_pr),
+                                    repo_root=str(self._config.project_root),
+                                    chain=_pr_chain,
+                                )
+                                _sbx_tok, _blast_tok, _expected_branch = (
+                                    _pipe.sandbox_token,
+                                    _pipe.blast_token,
+                                    _pipe.branch_context,
+                                )
+                            except PRGatePipelineError as _pe:
+                                logger.warning(
+                                    "[A1-PR] op=%s gate pipeline rejected "
+                                    "candidate: %s -> no PR",
+                                    ctx.op_id, _pe,
+                                )
+                                ctx = ctx.advance(
+                                    OperationPhase.POSTMORTEM,
+                                    terminal_reason_code="pr_gate_rejected",
+                                )
+                                await self._record_ledger(
+                                    ctx,
+                                    OperationState.FAILED,
+                                    {"reason": "pr_gate_rejected"},
+                                )
+                                return ctx
                         _reviewer = OrangePRReviewer(self._config.project_root)
                         _pr_result = await _reviewer.create_review_pr(
                             op_id=ctx.op_id,
@@ -9479,6 +9527,10 @@ class GovernedOrchestrator:
                                 "file_count": len(_files_for_pr),
                             },
                             risk_tier_name=risk_tier.name,
+                            chain=_pr_chain,
+                            sandbox_token=_sbx_tok,
+                            blast_token=_blast_tok,
+                            expected_branch_context=_expected_branch,
                         )
                     except Exception:
                         logger.exception(

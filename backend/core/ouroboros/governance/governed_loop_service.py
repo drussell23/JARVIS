@@ -1219,6 +1219,7 @@ class GovernedLoopService:
         self._graph_coalescer: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
         self._mcp_client: Optional[Any] = None  # Phase A: GovernanceMCPClient, wired in start()
+        self._docker_ready: Optional[bool] = None  # set in start() by docker_preflight; None = not yet run
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
@@ -1379,6 +1380,14 @@ class GovernedLoopService:
                 logger.debug("[GovernedLoop] DW ledger wipe swallowed: %r", _wipe_exc)
 
             await self._build_components()
+
+            # Task 9 -- async Docker pre-flight (only when A1 is armed -> byte-identical OFF)
+            if os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+                try:
+                    from .pre_apply_exec_lock import docker_preflight
+                    self._docker_ready = await docker_preflight()
+                except Exception:  # noqa: BLE001
+                    self._docker_ready = None
 
             # Phase 4: initialize preemption FSM executor (ledger available after _build_components)
             self._fsm_engine = PreemptionFsmEngine()
