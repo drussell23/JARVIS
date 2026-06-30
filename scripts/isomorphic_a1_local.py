@@ -166,6 +166,27 @@ def _truthy(val: Optional[str]) -> bool:
 
 _ACTIVE_CHAOS: List[Any] = []
 
+# Active soak runners (the organism subprocess + its process group). Reaped on
+# finally + atexit + signal -- whichever fires first -- via a full process-group
+# SIGTERM->SIGKILL cascade, so the multiprocessing worker pool NEVER orphans
+# (mirrors the _ACTIVE_FAILOVER_RESOURCES reaper pattern).
+_ACTIVE_SOAK_RUNNERS: List[Any] = []
+
+
+def _reap_soak_runners() -> None:
+    """Stop every active soak runner via its process-group teardown. Idempotent +
+    NEVER raises -- safe to call from a ``finally``, an ``atexit`` hook, AND a
+    signal handler (whichever fires first; the rest are no-ops once drained)."""
+    if not _ACTIVE_SOAK_RUNNERS:
+        return
+    runners = list(_ACTIVE_SOAK_RUNNERS)
+    _ACTIVE_SOAK_RUNNERS.clear()
+    for runner in runners:
+        try:
+            runner.stop()
+        except Exception:  # noqa: BLE001 -- teardown must never block exit
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Hybrid Execution Mesh (Task HM-A) -- failover-resource registry + IRONCLAD
@@ -580,6 +601,12 @@ def _install_revert_signal_handlers() -> None:
         try:
             _reap_failover_resources()
         except Exception:  # noqa: BLE001 -- teardown must never block exit
+            pass
+        # Process-group teardown of the soak organism + its worker pool -- zero
+        # orphaned multiprocessing workers on Ctrl+C / SIGTERM / crash.
+        try:
+            _reap_soak_runners()
+        except Exception:  # noqa: BLE001
             pass
         for chaos in list(_ACTIVE_CHAOS):
             try:
@@ -1014,6 +1041,9 @@ class IsomorphicA1Driver:
                             cost_cap=0.0,
                             wall_seconds=_failover_soak_wall(self.enable_failover),
                         )
+                        # Register for process-group teardown (finally+atexit+signal)
+                        # BEFORE launch so a crash mid-launch still reaps the group.
+                        _ACTIVE_SOAK_RUNNERS.append(soak_runner)
                         # Thread IsomorphicEnv: launch child with disjoint cwd so
                         # os.getcwd()-as-repo-root bugs surface in the real chain.
                         # The env (composed above) carries JARVIS_SANDBOX_PREFIXES +
@@ -1148,6 +1178,10 @@ class IsomorphicA1Driver:
                 _log("adversary stopped")
             except Exception as exc:  # noqa: BLE001
                 _log("adversary stop warning: %r" % (exc,))
+            # Process-group teardown of the soak organism + its worker pool, so no
+            # multiprocessing worker ever orphans (the PPID->1 OOM leak). Runs on
+            # completion/failure/cancel; no-op once drained by signal/atexit.
+            _reap_soak_runners()
             # IRONCLAD teardown (Task HM-A): reap any awakened failover node + its
             # firewall AFTER the soak completes/fails/cancels. No-op (registry
             # empty) when failover was never armed -> default path byte-identical.
@@ -1225,6 +1259,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # reap. Only registered when failover is opted in, so the default path is
         # byte-identical (no atexit hook).
         atexit.register(_reap_failover_resources)
+        atexit.register(_reap_soak_runners)
     driver = IsomorphicA1Driver(
         mode=args.mode,
         seed=args.seed,
