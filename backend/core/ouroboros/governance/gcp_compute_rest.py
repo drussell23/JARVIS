@@ -247,9 +247,18 @@ def _rest_timeout() -> float:
 
 
 def _insert_op_poll_cap_s() -> float:
-    """Max seconds to poll a zonal insert operation for a STOCKOUT before letting
-    the readiness racer take over. A GPU stockout errors within a few seconds."""
-    return _env_float("JARVIS_INSERT_OP_POLL_CAP_S", 25.0, lo=0.0, hi=120.0)
+    """ABSOLUTE safety ceiling (seconds) for polling a zonal insert operation to a
+    TERMINAL state. The control-plane operation reaches DONE within seconds-to-tens
+    normally (a GPU capacity failure surfaces AS the op completing with error), so a
+    generous ceiling makes a breach a genuine anomaly. On breach the verdict is
+    'unknown' (fail-closed phantom protection) -- NEVER an optimistic 'ok'."""
+    return _env_float("JARVIS_INSERT_OP_POLL_CAP_S", 90.0, lo=0.0, hi=600.0)
+
+
+def _insert_op_poll_interval_s() -> float:
+    """Delay between insert-operation status polls. Env-tunable (no hardcoded
+    cadence); floored > 0 so the poll loop always makes progress."""
+    return _env_float("JARVIS_INSERT_OP_POLL_INTERVAL_S", 3.0, lo=0.001, hi=60.0)
 
 
 def _running_timeout() -> float:
@@ -722,23 +731,43 @@ class GCPComputeRest:
             )
             mode = "SPOT" if spot else "on-demand"
             if 200 <= status < 300:
-                # The insert returns a PENDING operation; a GPU STOCKOUT surfaces
-                # when it runs. Track the operation to catch it (skip if untrackable).
+                # The insert returns a PENDING operation; a GPU STOCKOUT (or other
+                # async failure) surfaces only when the operation RUNS. We MUST poll
+                # it to a terminal state -- an accepted insert is NOT a created node.
                 op = None
                 try:
                     op = json.loads(text or "{}").get("name")
                 except Exception:  # noqa: BLE001
                     op = None
-                if op:
-                    verdict = await self._await_insert_operation(project, zone, op, token)
-                    if verdict == "stockout":
-                        if spot and _ondemand_on_stockout_enabled():
-                            logger.warning("[GCPComputeRest] SPOT stockout zone=%s -> trying ON-DEMAND same zone (quota'd region)", zone)
-                            continue
-                        return ("stockout", "zone={}:op_stockout".format(zone))
-                    if verdict == "error":
-                        logger.warning("[GCPComputeRest] insert op error zone=%s mode=%s", zone, mode)
-                        continue  # try on-demand
+                # No trackable operation name -> we cannot verify the outcome.
+                # Fail-closed: treat exactly like 'unknown' (reap + roll), never 'ok'.
+                verdict = (
+                    await self._await_insert_operation(project, zone, op, token)
+                    if op else "unknown"
+                )
+                if verdict == "stockout":
+                    if spot and _ondemand_on_stockout_enabled():
+                        logger.warning("[GCPComputeRest] SPOT stockout zone=%s -> trying ON-DEMAND same zone (quota'd region)", zone)
+                        continue
+                    return ("stockout", "zone={}:op_stockout".format(zone))
+                if verdict == "unknown":
+                    # Fail-closed phantom protection: a node may have spawned late
+                    # even though we never saw DONE. Violently reap it BEFORE moving
+                    # on (idempotent; 404 == already gone), then roll the chain.
+                    logger.warning(
+                        "[GCPComputeRest] insert UNVERIFIED zone=%s mode=%s -> reaping "
+                        "any phantom node + rolling to next zone", zone, mode,
+                    )
+                    try:
+                        await self.delete_instance(node, zone=zone)
+                    except Exception as exc:  # noqa: BLE001 -- reap is best-effort
+                        logger.debug("[GCPComputeRest] phantom reap fail-soft err=%r", exc)
+                    if spot and _ondemand_on_stockout_enabled():
+                        continue  # escalate to on-demand same zone first
+                    return ("stockout", "zone={}:unknown_reaped".format(zone))
+                if verdict == "error":
+                    logger.warning("[GCPComputeRest] insert op error zone=%s mode=%s", zone, mode)
+                    continue  # try on-demand
                 logger.info("[GCPComputeRest] instances.insert ok node=%s zone=%s mode=%s",
                             node, zone, mode)
                 return ("created", "zone={}:mode={}".format(zone, mode))
@@ -753,32 +782,55 @@ class GCPComputeRest:
         return ("failed", "zone={}:spot_and_on_demand_rejected".format(zone))
 
     async def _await_insert_operation(self, project, zone, op_name, token) -> str:
-        """Poll a zonal insert operation to DONE (bounded). Returns 'ok' |
-        'stockout' | 'error'. A timeout -> 'ok' (the readiness racer is the real
-        gate). NEVER raises."""
+        """Poll a zonal insert operation to a TERMINAL state. FAIL-CLOSED.
+
+        Returns:
+          'ok'       -- operations.get returned status=DONE with NO error object
+                        (the ONLY success path -- explicit terminal confirmation).
+          'stockout' -- DONE with a transient capacity error (retry the next zone).
+          'error'    -- DONE with a non-stockout error (stop the chain).
+          'unknown'  -- the absolute safety ceiling was breached WITHOUT a confirmed
+                        DONE, or operations.get was unreachable throughout. The
+                        operation's outcome is genuinely unverified -- the caller
+                        must assume a phantom node may exist (reap) and roll over.
+                        NEVER an optimistic 'ok'.
+
+        NEVER raises."""
         from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
             is_stockout_error,
         )
         url = "{}/projects/{}/zones/{}/operations/{}".format(_COMPUTE_BASE, project, zone, op_name)
         cap = _insert_op_poll_cap_s()
+        interval = _insert_op_poll_interval_s()
         waited = 0.0
         while waited < cap:
             status, text = await _http_request(
                 url, method="GET", headers={"Authorization": "Bearer {}".format(token)},
                 timeout_s=30.0,
             )
-            try:
-                op = json.loads(text or "{}")
-            except Exception:  # noqa: BLE001
-                op = {}
-            if op.get("status") == "DONE":
-                err = op.get("error")
-                if not err:
-                    return "ok"
-                return "stockout" if is_stockout_error(json.dumps(err)) else "error"
-            await asyncio.sleep(3)
-            waited += 3
-        return "ok"  # still running at the cap -> let the readiness racer decide
+            # Only a successfully-fetched, parseable, DONE response is terminal.
+            # A non-2xx fetch / unparseable body is NOT terminal -> keep polling
+            # (it may be transient); if it persists to the ceiling -> 'unknown'.
+            if 200 <= status < 300:
+                try:
+                    op = json.loads(text or "{}")
+                except Exception:  # noqa: BLE001
+                    op = {}
+                if op.get("status") == "DONE":
+                    err = op.get("error")
+                    if not err:
+                        return "ok"
+                    return "stockout" if is_stockout_error(json.dumps(err)) else "error"
+            await asyncio.sleep(interval)
+            waited += interval
+        # Ceiling breached without a confirmed terminal DONE. We do NOT know whether
+        # a node spawned -> fail-closed 'unknown' (the caller reaps + rolls over).
+        logger.warning(
+            "[GCPComputeRest] insert op UNVERIFIED after %.1fs (no terminal DONE) "
+            "zone=%s op=%s -> 'unknown' (fail-closed; will reap + roll zone)",
+            cap, zone, op_name,
+        )
+        return "unknown"
 
     # -- poll-to-RUNNING + internal-IP extraction ------------------------
 

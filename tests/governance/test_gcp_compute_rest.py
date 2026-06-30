@@ -51,6 +51,8 @@ class FakeHTTP:
         }))]
         self._get_idx = 0
         self.delete_response = (200, json.dumps({"name": "op-delete"}))
+        # Insert-operation poll: DONE + no error == insert succeeded (terminal).
+        self.operation_response = (200, json.dumps({"status": "DONE"}))
 
     async def __call__(self, url, *, method="GET", headers=None, body=None, timeout_s=10.0):
         self.calls.append({"url": url, "method": method, "headers": headers, "body": body})
@@ -71,6 +73,11 @@ class FakeHTTP:
                 resp = self.insert_responses[min(self._insert_idx, len(self.insert_responses) - 1)]
                 self._insert_idx += 1
                 return resp
+            # Zonal operation poll (insert-op terminal-state verification): a
+            # DONE-with-no-error operation == the insert succeeded. Distinct from
+            # the instances.get poll below (which returns RUNNING + the IP).
+            if method == "GET" and "/operations/" in url:
+                return self.operation_response
             if method == "GET":
                 resp = self.get_responses[min(self._get_idx, len(self.get_responses) - 1)]
                 self._get_idx += 1
@@ -162,7 +169,7 @@ async def test_create_instance_builds_correct_payload_and_url(http, monkeypatch)
     c = GCPComputeRest()
     ok, detail = await c.create_instance(startup_script="#!/bin/bash\necho hi")
     assert ok is True
-    assert detail.startswith("created:SPOT")
+    assert "mode=SPOT" in detail  # detail == "created:zone=us-west2-b:mode=SPOT"
 
     post = [call for call in http.calls if call["method"] == "POST"][0]
     # Zone-correct URL -- zone came from metadata (us-west2-b), NOT a literal.
@@ -195,7 +202,7 @@ async def test_create_instance_spot_fails_falls_back_to_on_demand(http):
     c = GCPComputeRest()
     ok, detail = await c.create_instance(startup_script="x")
     assert ok is True
-    assert detail.startswith("created:on-demand")
+    assert "mode=on-demand" in detail  # detail == "created:zone=...:mode=on-demand"
     posts = [call for call in http.calls if call["method"] == "POST"]
     assert len(posts) == 2
     # First was Spot, second on-demand (no scheduling block).
