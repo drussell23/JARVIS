@@ -107,6 +107,8 @@ class DAGProofChain:
         sig = self._sign(kind, op_id, state_binding, prev_hash, norm, ts)
         cls = _KIND_CLS[kind]
         token = cls(kind, op_id, state_binding, prev_hash, norm, ts, sig)
+        from . import token_audit  # local import avoids a module cycle
+        token_audit.append_mint(token)
         return token
 
     def verify(self, token: CapabilityToken) -> bool:
