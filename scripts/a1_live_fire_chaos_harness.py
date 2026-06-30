@@ -469,6 +469,11 @@ class SoakRunner:
         fh = open(stdout_path, "w", encoding="utf-8")
         self._proc = subprocess.Popen(
             argv, cwd=self.repo_root, env=env, stdout=fh, stderr=subprocess.STDOUT,
+            # Process Group Leader Isolation: the organism becomes its OWN
+            # session/group leader so teardown can SIGTERM/SIGKILL the WHOLE group
+            # (organism + multiprocessing worker pool + resource_trackers) -- zero
+            # orphaned workers (the PPID->1 leak that drove the OOM).
+            start_new_session=True,
         )
         return SoakHandle(
             debug_log=log_path, session_dir=os.path.dirname(log_path), proc=self._proc,
@@ -497,15 +502,46 @@ class SoakRunner:
         return os.path.join(root, "pending", "debug.log")
 
     def stop(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
+        """Autonomous SIGTERM cascade over the WHOLE process group -- guarantees
+        zero orphaned multiprocessing workers. The organism was launched as its
+        own session leader (start_new_session=True), so its pgid == its pid and
+        the group holds the organism + every worker/resource_tracker it spawned.
+        SIGTERM the group (lets atexit + pool.join cleanup run), wait a grace,
+        then escalate SIGKILL to the group. NEVER raises."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            grace = float(os.environ.get("JARVIS_A1_SOAK_STOP_GRACE_S", "15") or 15)
+        except (TypeError, ValueError):
+            grace = 15.0
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:  # noqa: BLE001
+            pgid = None
+
+        def _signal_group(sig: int) -> None:
             try:
-                self._proc.send_signal(signal.SIGTERM)
-                try:
-                    self._proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
+                if pgid is not None:
+                    os.killpg(pgid, sig)          # the ENTIRE group, not just parent
+                else:
+                    proc.send_signal(sig)         # fallback: parent only
+            except ProcessLookupError:
+                pass
             except Exception:  # noqa: BLE001
                 pass
+
+        _signal_group(signal.SIGTERM)
+        try:
+            proc.wait(timeout=grace)
+            return                                # group yielded gracefully
+        except Exception:  # noqa: BLE001 -- TimeoutExpired (or any) -> escalate
+            pass
+        _signal_group(signal.SIGKILL)             # workers refused to yield
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ===========================================================================
