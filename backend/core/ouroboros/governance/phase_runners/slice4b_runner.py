@@ -570,14 +570,15 @@ class Slice4bRunner(PhaseRunner):
         # Runs AFTER execution_graph materialisation (best_candidate is final)
         # and BEFORE any snapshot or write touches the real tree.
         # Default-OFF: JARVIS_A1_SANDBOX_LOCK_ENABLED controls activation.
-        from backend.core.ouroboros.governance.pre_apply_exec_lock import (
-            acquire_sandbox_execution_token,
-            lock_enabled,
-            RequiresCloudExecution,
-            SandboxLockFailed,
-        )
-        from backend.core.ouroboros.governance.dag_capability_token import DAGProofChain
-        if lock_enabled():
+        # Inline env check mirrors pre_apply_exec_lock.lock_enabled() so the
+        # OFF path imports NOTHING (byte-identical to pre-Gate-1 behavior).
+        if os.environ.get("JARVIS_A1_SANDBOX_LOCK_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+            from ..pre_apply_exec_lock import (
+                acquire_sandbox_execution_token,
+                SandboxLockFailed,
+                RequiresCloudExecution,
+            )
+            from ..dag_capability_token import DAGProofChain
             _g1_chain = getattr(ctx, "proof_chain", None) or DAGProofChain()
             _g1_cand_files = list(orch._iter_candidate_files(best_candidate))
             try:
