@@ -30,3 +30,13 @@ async def test_low_rating_raises_lint_rejected():
     with pytest.raises(lint.LintRejected):
         await lint.acquire_lint_cleared_token(
             op_id="op-1", diff=DIFF, chain=chain, prev_token=prev, critique_fn=critique_fn)
+
+@pytest.mark.asyncio
+async def test_malformed_rating_fails_closed():
+    chain = DAGProofChain(); prev = _prev(chain)
+    async def critique_none(diff): return {"rating": None}
+    async def critique_garbage(diff): return {"rating": "five"}
+    for cf in (critique_none, critique_garbage):
+        with pytest.raises(lint.LintRejected):
+            await lint.acquire_lint_cleared_token(
+                op_id="op-1", diff=DIFF, chain=chain, prev_token=prev, critique_fn=cf)

@@ -5,7 +5,7 @@ import os
 from typing import Awaitable, Callable, Optional
 
 from .dag_capability_token import (
-    BlastRadiusClearedToken, CapabilityToken, DAGProofChain, LintClearedToken, TokenKind,
+    CapabilityToken, DAGProofChain, LintClearedToken, TokenKind,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,10 @@ async def default_critique_fn(diff: str) -> dict:
         response_format={"type": "json_object"},
         max_tokens=512,
     )
-    parsed, _ok = parse_critique_json(raw, op_id="pr_self_linter")
+    parsed, ok = parse_critique_json(raw, op_id="pr_self_linter")
+    if not ok:
+        logger.warning("[Gate3] pr_self_linter: critique parse failed; fail-closed rating=0")
+        return {"rating": 0, "concerns": ["parse_failure"]}
     return parsed
 
 
@@ -61,7 +64,10 @@ async def acquire_lint_cleared_token(
     _crit = critique_fn or default_critique_fn
     _thr = threshold if threshold is not None else _threshold()
     verdict = await _crit(diff)
-    rating = int(verdict.get("rating", 0))
+    try:
+        rating = int(verdict.get("rating") or 0)
+    except (TypeError, ValueError):
+        rating = 0
     if rating < _thr:
         raise LintRejected(
             f"op={op_id} rating={rating}<{_thr} concerns={verdict.get('concerns')}")
