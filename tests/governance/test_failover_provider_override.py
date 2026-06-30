@@ -121,11 +121,39 @@ def _make_generator(jprime):
     return CandidateGenerator(primary=fake_primary, jprime=jprime)
 
 
-async def test_override_routes_to_jprime(monkeypatch):
-    """A pinned op routes straight to J-Prime and returns its result."""
+def _patch_discover(monkeypatch, gen, endpoint):
+    async def _fake_discover():
+        return endpoint
+    monkeypatch.setattr(gen, "_discover_jprime_endpoint", _fake_discover)
+
+
+async def test_override_routes_to_dynamic_endpoint(monkeypatch):
+    """THE A1-on-32B fix: no boot-wired PrimeProvider, but the node awakened at
+    RUNTIME -> discover the endpoint dynamically + dispatch GENERATE there."""
+    sentinel_result = SimpleNamespace(candidates=("patch",), provider_name="gcp-jprime")
+    gen = _make_generator(jprime=None)  # node awakens at runtime, NOT boot-wired
+    _patch_discover(monkeypatch, gen, "http://10.0.0.7:11434")
+
+    dispatched = {}
+
+    async def fake_local(context, deadline, endpoint):
+        dispatched["endpoint"] = endpoint
+        return sentinel_result
+
+    monkeypatch.setattr(gen, "_failover_local_dispatch", fake_local)
+
+    ctx = SimpleNamespace(op_id="op-dyn", provider_override="gcp-jprime")
+    result = await gen._honor_provider_override(ctx, _deadline())
+    assert result is sentinel_result
+    assert dispatched["endpoint"] == "http://10.0.0.7:11434"  # routed to the 32B
+
+
+async def test_override_routes_to_static_jprime_when_no_dynamic(monkeypatch):
+    """Legacy fast path: no dynamic endpoint, but a static PrimeProvider IS wired."""
     sentinel_result = SimpleNamespace(candidates=("patch",), provider_name="gcp-jprime")
     jprime = SimpleNamespace(provider_name="gcp-jprime")
     gen = _make_generator(jprime)
+    _patch_discover(monkeypatch, gen, None)  # no dynamic endpoint
 
     called = {}
 
@@ -151,22 +179,24 @@ async def test_no_override_returns_none(monkeypatch):
     assert result is None
 
 
-async def test_override_failclosed_no_prime_provider():
-    """Override set but NO Prime wired -> terminal raise (op stays sealed,
-    NEVER routed to dead DW)."""
-    gen = _make_generator(jprime=None)  # no Prime
+async def test_override_failclosed_no_endpoint_no_prime(monkeypatch):
+    """Override set, NO awakened endpoint discoverable AND no static Prime ->
+    terminal raise (op stays sealed, NEVER routed to dead DW)."""
+    gen = _make_generator(jprime=None)  # no static Prime
+    _patch_discover(monkeypatch, gen, None)  # no awakened node discoverable
     ctx = SimpleNamespace(op_id="op-r3", provider_override="gcp-jprime")
     with pytest.raises(RuntimeError) as exc:
         await gen._honor_provider_override(ctx, _deadline())
     assert "provider_override_unavailable:gcp-jprime" in str(exc.value)
-    assert "no_prime_provider" in str(exc.value)
+    assert "no_endpoint" in str(exc.value)
 
 
 async def test_override_failclosed_jprime_no_candidates(monkeypatch):
-    """Override set, Prime wired, but J-Prime declines -> terminal raise (NOT
-    a DW cascade). Op stays sealed."""
+    """Override set, static Prime wired but declines, no dynamic endpoint ->
+    terminal raise (NOT a DW cascade). Op stays sealed."""
     jprime = SimpleNamespace(provider_name="gcp-jprime")
     gen = _make_generator(jprime)
+    _patch_discover(monkeypatch, gen, None)  # no dynamic endpoint
 
     async def fake_primacy(context, deadline, *, route_label, force=False):
         return None  # J-Prime declined
@@ -175,7 +205,7 @@ async def test_override_failclosed_jprime_no_candidates(monkeypatch):
     ctx = SimpleNamespace(op_id="op-r4", provider_override="gcp-jprime")
     with pytest.raises(RuntimeError) as exc:
         await gen._honor_provider_override(ctx, _deadline())
-    assert "provider_override_unavailable:gcp-jprime:no_candidates" in str(exc.value)
+    assert "provider_override_unavailable:gcp-jprime:no_endpoint" in str(exc.value)
 
 
 async def test_unrecognized_override_falls_through(monkeypatch):
