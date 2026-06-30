@@ -14,6 +14,12 @@ class TokenKind(str, enum.Enum):
     SANDBOX_EXECUTION = "sandbox_execution"
     BLAST_RADIUS_CLEARED = "blast_radius_cleared"
     LINT_CLEARED = "lint_cleared"
+    # STANDALONE authority -- NOT part of the autonomous 3-token chain. A
+    # non-autonomous (human-initiated/operator-tooling) caller mints one of
+    # these to declare, with the same unforgeable HMAC + WAL audit, that it is
+    # opening a PR outside the autonomous gate chain. There is no bypass flag:
+    # the enforcer demands EITHER the full chain OR a signed HUMAN_OVERRIDE.
+    HUMAN_OVERRIDE = "human_override"
 
 
 # Canonical order of the gate chain. The terminal token MUST be LINT_CLEARED.
@@ -78,10 +84,19 @@ class LintClearedToken(CapabilityToken):
     pass
 
 
+# Standalone (NOT chain-linked). Minted with prev=None by a non-autonomous
+# caller as an auditable declaration of intent. Verified by chain.verify (HMAC)
+# -- it is deliberately absent from _CHAIN_ORDER so verify_chain never accepts
+# it as a substitute for an autonomous gate token.
+class HumanOverrideToken(CapabilityToken):
+    pass
+
+
 _KIND_CLS = {
     TokenKind.SANDBOX_EXECUTION: SandboxExecutionToken,
     TokenKind.BLAST_RADIUS_CLEARED: BlastRadiusClearedToken,
     TokenKind.LINT_CLEARED: LintClearedToken,
+    TokenKind.HUMAN_OVERRIDE: HumanOverrideToken,
 }
 
 

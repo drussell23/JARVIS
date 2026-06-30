@@ -339,7 +339,22 @@ async def _default_pr_creator(
     if not (root / ".git").exists():
         root = _P.cwd()
     reviewer = OrangePRReviewer(project_root=root)
+    # Non-autonomous strategic-proposal path: mint a signed HumanOverrideToken
+    # to declare the exemption explicitly (no bypass flag, WAL-audited).
+    from backend.core.ouroboros.governance.dag_capability_token import (
+        DAGProofChain,
+        TokenKind,
+    )
+    _override_chain = DAGProofChain()
+    _override_tok = _override_chain.mint(
+        kind=TokenKind.HUMAN_OVERRIDE,
+        op_id=op_id,
+        state_binding="non_autonomous",
+        payload={"caller": "strategy_simulator", "reason": "strategic_proposal_pr"},
+    )
     return await reviewer.create_review_pr(
         op_id=op_id, description=description, files=files,
         evidence=kwargs.get("evidence"), risk_tier_name="APPROVAL_REQUIRED",
+        chain=_override_chain,
+        override_token=_override_tok,
     )
