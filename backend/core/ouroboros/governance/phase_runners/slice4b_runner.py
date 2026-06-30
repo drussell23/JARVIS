@@ -1131,6 +1131,102 @@ class Slice4bRunner(PhaseRunner):
                 artifacts={"t_apply": _t_apply},
             )
 
+        # ---- Gate 2: Cryptographic Blast-Radius Verification ----
+        # Runs AFTER the scoped Phase-8a verify gate cleared (only reached
+        # when those tests passed) and BEFORE Phase 8b auto-commit. Chains
+        # onto Gate 1's sandbox_token: if Gate 1 didn't run there is no token
+        # to chain, so Gate 2 is skipped rather than broken.
+        # Default-OFF: JARVIS_A1_BLAST_RADIUS_ENABLED controls activation.
+        # Inline env check + all imports INSIDE the guard so the OFF path
+        # imports NOTHING (byte-identical to pre-Gate-2 behavior — Task 4 lesson).
+        if (os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+                and getattr(ctx, "sandbox_token", None) is not None
+                and getattr(ctx, "proof_chain", None) is not None):
+            from ..blast_radius_verify import (
+                acquire_blast_radius_token,
+                BlastRadiusBreach,
+                BlastRadiusGraphFailure,
+            )
+            from ..reverse_dep_resolver import resolve_reverse_dependency_tests
+            from .. import intake_dlq as _g2_dlq
+            from ..test_runner import TestRunner as _G2TestRunner
+
+            _g2_root = orch._config.project_root  # Path
+            _g2_scope = sorted(
+                set(ctx.target_files)
+                | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
+            )
+            # Reuse the APPLY-start checkpoint's tree SHA as the pre-op anchor.
+            _g2_pre_sha = getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
+
+            async def _g2_graph_fn(files):
+                return await resolve_reverse_dependency_tests(
+                    files, repo_root=str(_g2_root), oracle=None,
+                )
+
+            async def _g2_test_fn(tests):
+                if not tests:
+                    return {"failed": [], "total": 0}
+                _paths = tuple((_g2_root / t) for t in tests)
+                _runner = _G2TestRunner(repo_root=_g2_root)
+                _tr = await _runner.run(test_files=_paths, sandbox_dir=None)
+                return {"failed": list(_tr.failed_tests), "total": _tr.total}
+
+            async def _g2_rollback(_sha):
+                # Non-destructive restore via the existing APPLY-start checkpoint.
+                if _checkpoint is not None and _ckpt_mgr is not None:
+                    await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
+
+            async def _g2_tree_sha():
+                if _ckpt_mgr is None:
+                    return ""
+                _ck = await _ckpt_mgr.create_checkpoint(ctx.op_id, "blast-radius: current-tree")
+                return getattr(_ck, "stash_ref", "") if _ck is not None else ""
+
+            def _g2_dlq_fn(reason):
+                _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
+
+            try:
+                _blast_tok = await acquire_blast_radius_token(
+                    op_id=ctx.op_id,
+                    scope_files=_g2_scope,
+                    pre_op_tree_sha=_g2_pre_sha,
+                    chain=ctx.proof_chain,
+                    prev_token=ctx.sandbox_token,
+                    graph_fn=_g2_graph_fn,
+                    test_fn=_g2_test_fn,
+                    current_tree_sha_fn=_g2_tree_sha,
+                    rollback_fn=_g2_rollback,
+                    dlq_fn=_g2_dlq_fn,
+                )
+            except BlastRadiusGraphFailure:
+                logger.warning("[Gate2] op=%s blast_radius_graph_failure", ctx.op_id)
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="blast_radius_graph_failure",
+                    rollback_occurred=True,
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="blast_radius_graph_failure",
+                    artifacts={"t_apply": _t_apply},
+                )
+            except BlastRadiusBreach:
+                logger.warning("[Gate2] op=%s blast_radius_breach", ctx.op_id)
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="blast_radius_breach",
+                    rollback_occurred=True,
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="blast_radius_breach",
+                    artifacts={"t_apply": _t_apply},
+                )
+            ctx = dataclasses.replace(ctx, blast_token=_blast_tok)
+
         # ---- Phase 8b: Auto-commit ----
         _committed_hash: Optional[str] = None
         try:

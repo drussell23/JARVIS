@@ -1074,6 +1074,7 @@ class OperationContext:
     # on every path that does not activate the gate — zero behavioural change.
     proof_chain: object = None    # DAGProofChain (per-op accumulator)
     sandbox_token: object = None  # SandboxExecutionToken minted at Gate 1
+    blast_token: object = None    # BlastRadiusClearedToken minted at Gate 2
 
     # ---- Model-reasoned implementation plan (stamped at PLAN phase) ----
     # Structured JSON plan produced by PlanGenerator before GENERATE.
