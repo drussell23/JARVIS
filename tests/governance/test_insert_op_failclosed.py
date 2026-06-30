@@ -32,6 +32,8 @@ def _fast_poll(monkeypatch):
     # Tiny cap + interval so the poll loop is fast + deterministic.
     monkeypatch.setenv("JARVIS_INSERT_OP_POLL_CAP_S", "0.05")
     monkeypatch.setenv("JARVIS_INSERT_OP_POLL_INTERVAL_S", "0.001")
+    # Tiny confirmed-reap settle so the pre-rollover reap loop is fast.
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_SETTLE_S", "0.001")
 
 
 def _op(status, *, error=None):
@@ -151,7 +153,7 @@ def _patch_reap(monkeypatch):
 
     async def _fake_delete(self, name=None, *, zone=None):
         reaped.append((name, zone))
-        return (True, "deleted:200")
+        return (True, "deleted:404")  # nothing present -> confirmed-clean fast
 
     monkeypatch.setattr(GCPComputeRest, "delete_instance", _fake_delete)
     return reaped
@@ -170,7 +172,7 @@ async def test_unknown_ondemand_reaps_phantom_and_rolls_over(monkeypatch):
 
     assert verdict == "stockout"          # rolls the chain to the next zone
     assert "unknown" in detail
-    assert reaped == [("jarvis-prime-failover", "us-central1-a")]  # phantom reaped in-zone
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped  # phantom reaped in-zone
 
 
 async def test_unknown_spot_reaps_then_tries_ondemand_same_zone(monkeypatch):
@@ -186,7 +188,7 @@ async def test_unknown_spot_reaps_then_tries_ondemand_same_zone(monkeypatch):
     assert verdict == "created"
     assert "mode=on-demand" in detail
     assert http.posts == 2                # spot + on-demand
-    assert reaped == [("jarvis-prime-failover", "us-central1-a")]  # spot phantom reaped
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped  # spot phantom reaped
 
 
 async def test_missing_op_name_is_fail_closed_not_created(monkeypatch):
@@ -246,3 +248,71 @@ async def test_create_instance_rolls_zones_on_unknown(monkeypatch):
     assert "created" in detail
     # Reaped the zone-a phantom before rolling to zone-b.
     assert ("jarvis-prime-failover", "us-central1-a") in reaped
+
+
+# ---------------------------------------------------------------------------
+# _reap_zone_confirmed -- strict pre-rollover reap that CATCHES a late node
+# ---------------------------------------------------------------------------
+
+def _patch_delete_sequence(monkeypatch, details):
+    """Patch delete_instance to return scripted (ok, detail) in order; records."""
+    seq = list(details)
+    calls = {"n": 0}
+
+    async def _fake(self, name=None, *, zone=None):
+        d = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return (True, d)
+
+    monkeypatch.setattr(GCPComputeRest, "delete_instance", _fake)
+    return calls
+
+
+async def test_reap_confirmed_clean_when_already_gone(monkeypatch):
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_CLEAN_STREAK", "2")
+    calls = _patch_delete_sequence(monkeypatch, ["deleted:404"])
+    ok = await GCPComputeRest()._reap_zone_confirmed("node", "us-central1-a")
+    assert ok is True
+    assert calls["n"] >= 2  # required consecutive 404s to declare clean
+
+
+async def test_reap_confirmed_catches_late_materialization(monkeypatch):
+    # 404 (nothing yet) -> 200 (node materialized AFTER first delete!) -> 404,404.
+    # The 200 must RESET the clean streak so the late node is actually deleted.
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_CLEAN_STREAK", "2")
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_ATTEMPTS", "8")
+    calls = _patch_delete_sequence(
+        monkeypatch, ["deleted:404", "deleted:200", "deleted:404", "deleted:404"]
+    )
+    ok = await GCPComputeRest()._reap_zone_confirmed("node", "us-central1-a")
+    assert ok is True
+    # Must have continued PAST the late 200 (>= 4 deletes), not stopped at the
+    # first 404 -- that is the race fix.
+    assert calls["n"] >= 4
+
+
+async def test_reap_confirmed_gives_up_when_never_clears(monkeypatch):
+    # Node never deletes (always present) -> bounded give-up (False); the global
+    # teardown remains the backstop, but we never block forever.
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_ATTEMPTS", "3")
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_CLEAN_STREAK", "2")
+    calls = _patch_delete_sequence(monkeypatch, ["deleted:200"])
+    ok = await GCPComputeRest()._reap_zone_confirmed("node", "us-central1-a")
+    assert ok is False
+    assert calls["n"] == 3  # bounded by attempts
+
+
+async def test_insert_unknown_uses_confirmed_reap(monkeypatch):
+    # _insert_in_zone on 'unknown' must call the CONFIRMED reap (multiple deletes
+    # until clean), not a single blind delete.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_CLEAN_STREAK", "2")
+    http = _PostHTTP()
+    monkeypatch.setattr(gr, "_http_request", http)
+    _patch_await(monkeypatch, ["unknown"])
+    calls = _patch_delete_sequence(monkeypatch, ["deleted:404"])
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "stockout"
+    assert calls["n"] >= 2  # confirmed reap, not a single delete
