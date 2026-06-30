@@ -26,13 +26,14 @@ _CHAIN_ORDER = (
 
 def _canonical(kind: TokenKind, op_id: str, state_binding: str,
                prev_hash: str, payload: Mapping[str, str],
-               issued_monotonic: float) -> bytes:
+               issued_monotonic: float, branch_context: str) -> bytes:
     return json.dumps(
         {
             "issued_monotonic": format(issued_monotonic, ".9f"),
             "kind": kind.value,
             "op_id": op_id,
             "state_binding": state_binding,
+            "branch_context": branch_context,
             "prev_hash": prev_hash,
             "payload": {str(k): str(v) for k, v in payload.items()},
         },
@@ -50,11 +51,16 @@ class CapabilityToken:
     payload: Mapping[str, str]
     issued_monotonic: float
     sig: str
+    # Git branch/worktree context the token was minted in. Defaults to "" so
+    # pre-existing (unbound) callers and tokens stay valid; when set, it is
+    # folded into the signed envelope and enforced uniform across a chain.
+    branch_context: str = ""
 
     def digest(self) -> str:
         """Identity hash used as the next token's ``prev_hash`` (chain link)."""
         body = _canonical(self.kind, self.op_id, self.state_binding,
-                          self.prev_hash, self.payload, self.issued_monotonic)
+                          self.prev_hash, self.payload, self.issued_monotonic,
+                          self.branch_context)
         return hashlib.sha256(body + self.sig.encode("utf-8")).hexdigest()
 
 
@@ -91,34 +97,43 @@ class DAGProofChain:
 
     def _sign(self, kind: TokenKind, op_id: str, state_binding: str,
               prev_hash: str, payload: Mapping[str, str],
-              issued_monotonic: float) -> str:
+              issued_monotonic: float, branch_context: str) -> str:
         return hmac.new(
             self._secret,
-            _canonical(kind, op_id, state_binding, prev_hash, payload, issued_monotonic),
+            _canonical(kind, op_id, state_binding, prev_hash, payload,
+                       issued_monotonic, branch_context),
             hashlib.sha256,
         ).hexdigest()
 
     def mint(self, *, kind: TokenKind, op_id: str, state_binding: str,
              payload: Mapping[str, str],
-             prev: Optional[CapabilityToken] = None) -> CapabilityToken:
+             prev: Optional[CapabilityToken] = None,
+             branch_context: str = "") -> CapabilityToken:
         prev_hash = prev.digest() if prev is not None else ""
         norm = {str(k): str(v) for k, v in payload.items()}
         ts = time.monotonic()
-        sig = self._sign(kind, op_id, state_binding, prev_hash, norm, ts)
+        sig = self._sign(kind, op_id, state_binding, prev_hash, norm, ts,
+                         branch_context)
         cls = _KIND_CLS[kind]
-        token = cls(kind, op_id, state_binding, prev_hash, norm, ts, sig)
+        token = cls(kind, op_id, state_binding, prev_hash, norm, ts, sig,
+                    branch_context)
         from . import token_audit  # local import avoids a module cycle
         token_audit.append_mint(token)
         return token
 
     def verify(self, token: CapabilityToken) -> bool:
         expected = self._sign(token.kind, token.op_id, token.state_binding,
-                              token.prev_hash, token.payload, token.issued_monotonic)
+                              token.prev_hash, token.payload,
+                              token.issued_monotonic, token.branch_context)
         return hmac.compare_digest(expected, token.sig)
 
     def verify_chain(self, tokens: Sequence[CapabilityToken], *, op_id: str) -> bool:
         if len(tokens) != len(_CHAIN_ORDER):
             return False
+        # Anti-injection invariant: every token in the chain MUST have been
+        # minted in the SAME branch/worktree context. A token from worktree A
+        # cannot be spliced into a chain rooted in worktree B.
+        expected_ctx = tokens[0].branch_context
         prev_hash = ""
         for token, expected_kind in zip(tokens, _CHAIN_ORDER):
             if token.kind != expected_kind:
@@ -126,6 +141,8 @@ class DAGProofChain:
             if not isinstance(token, _KIND_CLS[expected_kind]):
                 return False
             if token.op_id != op_id:
+                return False
+            if token.branch_context != expected_ctx:
                 return False
             if token.prev_hash != prev_hash:
                 return False

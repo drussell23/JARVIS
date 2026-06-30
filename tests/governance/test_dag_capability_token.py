@@ -90,3 +90,61 @@ def test_tampered_timestamp_rejected():
     t1, _, _ = _full_chain(chain)
     tampered = dataclasses.replace(t1, issued_monotonic=0.0)
     assert chain.verify(tampered) is False
+
+
+def _full_chain_ctx(chain: DAGProofChain, ctx: str, op_id: str = OP):
+    """Mint a full SANDBOX -> BLAST -> LINT chain, every token bound to ``ctx``."""
+    t1 = chain.mint(kind=TokenKind.SANDBOX_EXECUTION, op_id=op_id,
+                    state_binding="cand-sha", payload={"exit_code": "0"},
+                    branch_context=ctx)
+    t2 = chain.mint(kind=TokenKind.BLAST_RADIUS_CLEARED, op_id=op_id,
+                    state_binding="tree-sha", payload={"n_tests": "7"}, prev=t1,
+                    branch_context=ctx)
+    t3 = chain.mint(kind=TokenKind.LINT_CLEARED, op_id=op_id,
+                    state_binding="diff-sha", payload={"rating": "5"}, prev=t2,
+                    branch_context=ctx)
+    return t1, t2, t3
+
+
+def test_branch_context_signed():
+    # branch_context is part of the HMAC envelope: re-pointing a token minted in
+    # worktree wt-1 at wt-2 breaks the signature (token-injection guard).
+    chain = DAGProofChain()
+    tok = chain.mint(kind=TokenKind.SANDBOX_EXECUTION, op_id=OP,
+                     state_binding="cand-sha", payload={"exit_code": "0"},
+                     branch_context="wt-1")
+    assert chain.verify(tok) is True
+    tampered = dataclasses.replace(tok, branch_context="wt-2")
+    assert chain.verify(tampered) is False
+
+
+def test_chain_rejects_mixed_branch_context():
+    # A chain whose tokens were minted in DIFFERENT worktrees must be rejected:
+    # a token from wt-2 cannot be spliced into a chain rooted in wt-1.
+    chain = DAGProofChain()
+    t1 = chain.mint(kind=TokenKind.SANDBOX_EXECUTION, op_id=OP,
+                    state_binding="cand-sha", payload={"exit_code": "0"},
+                    branch_context="wt-1")
+    t2 = chain.mint(kind=TokenKind.BLAST_RADIUS_CLEARED, op_id=OP,
+                    state_binding="tree-sha", payload={"n_tests": "7"}, prev=t1,
+                    branch_context="wt-2")
+    t3 = chain.mint(kind=TokenKind.LINT_CLEARED, op_id=OP,
+                    state_binding="diff-sha", payload={"rating": "5"}, prev=t2,
+                    branch_context="wt-1")
+    # prev-links are valid (real mint() chaining) but contexts are not uniform.
+    assert chain.verify_chain([t1, t2, t3], op_id=OP) is False
+
+
+def test_chain_accepts_uniform_branch_context():
+    chain = DAGProofChain()
+    t1, t2, t3 = _full_chain_ctx(chain, "wt-1")
+    assert chain.verify_chain([t1, t2, t3], op_id=OP) is True
+
+
+def test_empty_branch_context_backward_compatible():
+    # Existing-style tokens minted WITHOUT branch_context default to "" -- a
+    # uniform-"" chain stays valid (Tasks 1-11 auto-apply path is unbroken).
+    chain = DAGProofChain()
+    t1, t2, t3 = _full_chain(chain)
+    assert all(t.branch_context == "" for t in (t1, t2, t3))
+    assert chain.verify_chain([t1, t2, t3], op_id=OP) is True
