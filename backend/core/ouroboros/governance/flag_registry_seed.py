@@ -5264,6 +5264,7 @@ SEED_SPECS: list = [
         source_file="backend/core/ouroboros/governance/pr_self_linter.py",
         example="4",
         since="2026-06-29",
+        posture_relevance={},
     ),
     FlagSpec(
         name="JARVIS_TOKEN_AUDIT_PATH",
@@ -5277,6 +5278,7 @@ SEED_SPECS: list = [
         source_file="backend/core/ouroboros/governance/token_audit.py",
         example=".jarvis/token_audit.jsonl",
         since="2026-06-29",
+        posture_relevance={},
     ),
     FlagSpec(
         name="JARVIS_TOKEN_AUDIT_MAX",
@@ -5291,6 +5293,7 @@ SEED_SPECS: list = [
         source_file="backend/core/ouroboros/governance/token_audit.py",
         example="500",
         since="2026-06-29",
+        posture_relevance={},
     ),
 ]
 
