@@ -3165,40 +3165,44 @@ class CandidateGenerator:
             )
             return None
 
-        # Fail-CLOSED gate: J-Prime must be wired AND advertising an endpoint.
-        if self._jprime is None or not getattr(
-            self._jprime, "provider_name", ""
-        ):
-            logger.warning(
-                "[CandidateGenerator] provider_override=gcp-jprime but no "
-                "PrimeProvider wired -- op STAYS SEALED in Cryo-DLQ (NOT routed "
-                "to dead DW) [%s]", op_id_short,
+        # Dynamic state-driven routing: the failover node awakens at RUNTIME, so do
+        # NOT require a boot-wired self._jprime. DISCOVER the awakened endpoint and
+        # dispatch generation there (reusing the Phase 3c LocalPrimeClient seam).
+        endpoint = await self._discover_jprime_endpoint()
+        if endpoint:
+            logger.info(
+                "[CandidateGenerator] provider_override=gcp-jprime -> dynamically "
+                "discovered awakened endpoint=%s, dispatching GENERATE to the 32B "
+                "(DW lane bypassed) [%s]", endpoint, op_id_short,
             )
-            raise RuntimeError(
-                "provider_override_unavailable:gcp-jprime:no_prime_provider"
+            result = await self._failover_local_dispatch(context, deadline, endpoint)
+            if result is not None and len(
+                getattr(result, "candidates", ()) or ()
+            ) > 0:
+                return result
+
+        # Legacy fast path: a boot-wired static PrimeProvider (e.g. J-Prime primary).
+        if self._jprime is not None and getattr(self._jprime, "provider_name", ""):
+            logger.info(
+                "[CandidateGenerator] provider_override=gcp-jprime -> static "
+                "PrimeProvider primacy [%s]", op_id_short,
             )
+            result = await self._try_jprime_primacy(
+                context, deadline, route_label="failover_override", force=True,
+            )
+            if result is not None:
+                return result
 
-        logger.info(
-            "[CandidateGenerator] Cryo-DLQ replay: provider_override=gcp-jprime "
-            "-> routing straight to awakened J-Prime (DW lane bypassed) [%s]",
-            op_id_short,
-        )
-        result = await self._try_jprime_primacy(
-            context, deadline, route_label="failover_override", force=True,
-        )
-        if result is not None:
-            return result
-
-        # J-Prime declined (sem saturated / timeout / error / no candidates).
-        # FAIL-CLOSED: do NOT cascade to the dead DW lane. Raise terminal so the
-        # op stays sealed in the DLQ for a later replay (the op is never lost).
+        # FAIL-CLOSED: no awakened endpoint discoverable AND no static PrimeProvider
+        # yielded candidates -> do NOT cascade to the dead DW lane. Raise terminal
+        # so the op stays sealed in the DLQ for a later replay (op is never lost).
         logger.warning(
-            "[CandidateGenerator] provider_override=gcp-jprime but J-Prime "
-            "yielded no candidates -- op STAYS SEALED in Cryo-DLQ (NOT routed "
-            "to dead DW) [%s]", op_id_short,
+            "[CandidateGenerator] provider_override=gcp-jprime but no awakened "
+            "J-Prime endpoint is discoverable and no static PrimeProvider yielded "
+            "candidates -- op STAYS SEALED (NOT routed to dead DW) [%s]", op_id_short,
         )
         raise RuntimeError(
-            "provider_override_unavailable:gcp-jprime:no_candidates"
+            "provider_override_unavailable:gcp-jprime:no_endpoint"
         )
 
     async def _generate_dispatch(
@@ -3855,6 +3859,50 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
     # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
+
+    async def _discover_jprime_endpoint(self) -> Optional[str]:
+        """Dynamic state-driven discovery of the awakened J-Prime node's endpoint.
+
+        The failover node awakens at RUNTIME, so we do NOT rely on a boot-wired
+        ``self._jprime``. Two dynamic sources, in order:
+          (1) the failover controller's PUBLISHED endpoint when it is SERVING
+              (fast path -- same as the Phase 3c seam);
+          (2) a direct zone-aware GCP query (``get_node_endpoints``) -- works even
+              when THIS process's controller is not in SERVING state (e.g. the node
+              was awakened out-of-band by the ignition driver), composing
+              ``http://<ip>:<port>``.
+        Returns a full URL or None. Gated by ``lifecycle_enabled()`` (byte-identical
+        when failover is off). Fail-soft -- NEVER raises."""
+        try:
+            from .failover_lifecycle import (
+                lifecycle_enabled, get_failover_controller, _failover_port,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            if not lifecycle_enabled():
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        # (1) Controller-published endpoint (fast path).
+        try:
+            ctrl = get_failover_controller()
+            if ctrl.is_jprime_serving():
+                ep = ctrl.jprime_endpoint()
+                if ep:
+                    return ep
+        except Exception:  # noqa: BLE001
+            pass
+        # (2) Direct zone-aware GCP discovery (controller-state-independent).
+        try:
+            from .gcp_compute_rest import get_compute_rest
+            internal, external = await get_compute_rest().get_node_endpoints()
+            ip = external or internal
+            if ip:
+                return "http://%s:%d" % (ip, _failover_port())
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     async def _failover_local_dispatch(
         self,
@@ -6744,6 +6792,33 @@ class CandidateGenerator:
                     get_failover_controller().note_budget_exhausted()
             except Exception:  # noqa: BLE001 -- never let the signal break the exhaustion path
                 pass
+            # Dynamic state-driven routing (the live A1-on-32B seam): cloud primary
+            # exhausted + NO cloud fallback, but the failover FSM may have an awakened
+            # J-Prime node SERVING. Discover its endpoint and route THIS op there
+            # rather than dying -- so generation actually happens on the 32B instead
+            # of failing pre-generation. Fail-soft: any miss falls through to the
+            # terminal raise below (the op is never silently lost).
+            try:
+                _jp_ep = await self._discover_jprime_endpoint()
+                if _jp_ep:
+                    logger.info(
+                        "[CandidateGenerator] DW exhausted + no fallback, but "
+                        "J-Prime endpoint=%s discovered -> routing GENERATE to the "
+                        "awakened 32B (op=%s)", _jp_ep,
+                        (getattr(context, "op_id", "") or "?")[:16],
+                    )
+                    _jp_result = await self._failover_local_dispatch(
+                        context, deadline, _jp_ep,
+                    )
+                    if _jp_result is not None and len(
+                        getattr(_jp_result, "candidates", ()) or ()
+                    ) > 0:
+                        return _jp_result
+            except Exception as _jp_exc:  # noqa: BLE001 -- never break the exhaustion path
+                logger.debug(
+                    "[CandidateGenerator] J-Prime exhaustion-reroute fail-soft "
+                    "err=%r", _jp_exc,
+                )
             self._raise_exhausted(
                 "fallback_skipped:no_fallback_configured",
                 context=context,
