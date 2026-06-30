@@ -96,7 +96,7 @@ async def docker_preflight(*, probe=None) -> bool:
     """
     import asyncio
     from . import container_sandbox
-    _probe = probe or container_sandbox.docker_available
+    _probe = probe if probe is not None else container_sandbox.docker_available
     available = await asyncio.get_running_loop().run_in_executor(None, _probe)
     if not available and lock_enabled():
         logger.warning(
