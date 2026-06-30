@@ -216,6 +216,31 @@ async def test_unrecognized_override_falls_through(monkeypatch):
     assert result is None
 
 
+async def test_dispatch_model_name_is_awakened_tier_model(monkeypatch):
+    """The J-Prime dispatch must request the model the awakened node SERVES
+    (qwen2.5-coder:32b), not LocalConfig's small default -- else ollama returns an
+    error object with no 'choices' (the KeyError that severed the live GENERATE)."""
+    import backend.core.ouroboros.governance.failover_lifecycle as fl
+    gen = _make_generator(jprime=None)
+
+    monkeypatch.setattr(
+        fl, "get_failover_controller",
+        lambda: SimpleNamespace(active_jprime_model=lambda: "qwen2.5-coder:32b"),
+    )
+    assert gen._resolve_dispatch_model_name() == "qwen2.5-coder:32b"
+
+
+async def test_dispatch_model_name_fail_soft(monkeypatch):
+    import backend.core.ouroboros.governance.failover_lifecycle as fl
+    gen = _make_generator(jprime=None)
+
+    def _boom():
+        raise RuntimeError("no controller")
+
+    monkeypatch.setattr(fl, "get_failover_controller", _boom)
+    assert gen._resolve_dispatch_model_name() is None  # never raises
+
+
 async def test_override_field_on_operation_context_roundtrips():
     """The provider_override field is a real, replace-able field on the frozen
     OperationContext (so the seal stamp is durable)."""
