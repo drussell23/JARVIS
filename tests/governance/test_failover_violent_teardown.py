@@ -11,6 +11,8 @@ the seam call is skipped, so ``force_teardown`` is never reached.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 import backend.core.ouroboros.governance.failover_lifecycle as fl
@@ -157,3 +159,49 @@ def test_violent_teardown_flag_default_off(monkeypatch):
 
     monkeypatch.setenv("JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED", "true")
     assert violent_teardown_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Serialization: force_teardown waits for the lock held by a concurrent tick()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_force_teardown_serializes_under_lock(monkeypatch):
+    """force_teardown MUST acquire self._lock before mutating state, so it
+    cannot race an in-flight tick()/_do_awaken() that already holds the lock.
+
+    Proof: we hold the lock externally (simulating tick()) and confirm that
+    force_teardown blocks -- no reap, no state mutation -- until the lock is
+    released.
+    """
+    clock = FakeClock()
+    calls = []
+    ctrl = _make_ctrl(clock)
+    _stub_reaps(ctrl, monkeypatch, calls)
+
+    ctrl._state = FailoverState.SERVING
+    ctrl._endpoint = "http://10.0.0.2:8000"
+
+    # Simulate tick() holding the FSM lock mid-transition.
+    await ctrl._lock.acquire()
+    try:
+        task = asyncio.create_task(ctrl.force_teardown(reason="a1_terminal:COMPLETE"))
+
+        # Give the task a chance to run up to the lock acquisition point.
+        await asyncio.sleep(0.05)
+
+        # Must still be blocked -- lock is held, reap must NOT have fired yet.
+        assert not task.done(), "force_teardown ran without acquiring the lock"
+        assert calls == [], f"reap was called before lock was released: {calls}"
+        assert ctrl._state == FailoverState.SERVING, "state mutated before lock acquired"
+    finally:
+        ctrl._lock.release()
+
+    # Now the lock is free -- force_teardown should complete quickly.
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert task.done()
+    assert "reap_gpu" in calls, "reap_gpu not called after lock release"
+    assert "close_perimeter" in calls, "close_perimeter not called after lock release"
+    assert ctrl._state == FailoverState.DORMANT
+    assert ctrl._endpoint is None

@@ -2261,38 +2261,43 @@ class FailoverLifecycleController:
         then node + ephemeral /32 firewall vacate together via ``asyncio.gather``)
         so nothing keeps billing or routing. Idempotent + fail-soft: a no-op when
         already DORMANT; NEVER raises. After reaping, drops to DORMANT and arms the
-        same anti-thrash cooldown anchor the HANDBACK path uses."""
-        if self._state == FailoverState.DORMANT:
-            return  # nothing to reap
-        logger.warning(
-            "[FailoverFlare] VIOLENT TEARDOWN reason=%s state=%s -- reaping GPU node now",
-            reason, self._state.name,
-        )
-        # 1. Reap the elastic GPU node + its /32 firewall (CPU node survives until
-        #    the node-delete below). Fail-soft -- never block the rest of teardown.
-        try:
-            await self._reap_gpu_node()
-        except Exception as exc:  # noqa: BLE001
+        same anti-thrash cooldown anchor the HANDBACK path uses.
+
+        The body is wrapped in ``self._lock`` so that a concurrent ``tick()``
+        mid-transition (e.g. _do_awaken) cannot race the state + endpoint
+        mutations here -- matching every other FSM transition."""
+        async with self._lock:
+            if self._state == FailoverState.DORMANT:
+                return  # nothing to reap
             logger.warning(
-                "[FailoverFlare] violent teardown gpu-reap error (continuing): %s", exc)
-        # 2. Delete-to-snapshot the node + close the ephemeral /32 perimeter -- the
-        #    SAME guaranteed-parallel gather the FSM teardowns use (zero orphan node
-        #    AND zero orphan firewall hole; the lock-race fix).
-        try:
-            await asyncio.gather(
-                self._maybe_await(self._vm_delete_fn),
-                self._close_ephemeral_perimeter(),
-                return_exceptions=True,
+                "[FailoverFlare] VIOLENT TEARDOWN reason=%s state=%s -- reaping GPU node now",
+                reason, self._state.name,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[FailoverFlare] violent teardown node/fw error (continuing): %s", exc)
-        # 3. DORMANT + arm the anti-thrash cooldown anchor + drop the endpoint so
-        #    is_jprime_serving()/jprime_endpoint() stop pointing at the dead node.
-        self._state = FailoverState.DORMANT
-        self._last_handback_at = self._clock_fn()  # arm anti-thrash cooldown
-        self._endpoint = None
-        logger.info("[FailoverFlare] VIOLENT TEARDOWN complete -- DORMANT, cooldown armed")
+            # 1. Reap the elastic GPU node + its /32 firewall (CPU node survives until
+            #    the node-delete below). Fail-soft -- never block the rest of teardown.
+            try:
+                await self._reap_gpu_node()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[FailoverFlare] violent teardown gpu-reap error (continuing): %s", exc)
+            # 2. Delete-to-snapshot the node + close the ephemeral /32 perimeter -- the
+            #    SAME guaranteed-parallel gather the FSM teardowns use (zero orphan node
+            #    AND zero orphan firewall hole; the lock-race fix).
+            try:
+                await asyncio.gather(
+                    self._maybe_await(self._vm_delete_fn),
+                    self._close_ephemeral_perimeter(),
+                    return_exceptions=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[FailoverFlare] violent teardown node/fw error (continuing): %s", exc)
+            # 3. DORMANT + arm the anti-thrash cooldown anchor + drop the endpoint so
+            #    is_jprime_serving()/jprime_endpoint() stop pointing at the dead node.
+            self._state = FailoverState.DORMANT
+            self._last_handback_at = self._clock_fn()  # arm anti-thrash cooldown
+            self._endpoint = None
+            logger.info("[FailoverFlare] VIOLENT TEARDOWN complete -- DORMANT, cooldown armed")
 
     # ------------------------------------------------------------------
     # Await helper (boundaries may be sync or async)
