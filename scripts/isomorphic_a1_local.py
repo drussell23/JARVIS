@@ -220,11 +220,23 @@ def _reap_failover_resources() -> None:
             get_compute_rest,
         )
 
+        from backend.core.ouroboros.governance.zone_fallback import (
+            zone_fallback_chain,
+        )
+
         client = get_compute_rest()
+        # The multi-zonal awaken can land the node in ANY fallback zone (a Spot
+        # stockout in us-central1-a -> the node is created in -b or -c). The reap
+        # must therefore attempt the delete in EVERY candidate zone, not just
+        # GCP_ZONE -- otherwise a node in -c is orphaned (the exact cost-leak the
+        # 4th live ignition hit). delete_instance is 404-idempotent, so deleting
+        # in the zones that DON'T hold the node is a clean no-op.
+        _zones = zone_fallback_chain(os.environ.get("GCP_ZONE"))
         tasks = []
         for r in resources:
             if r.get("node"):
-                tasks.append(client.delete_instance(r["node"]))
+                for _z in _zones:
+                    tasks.append(client.delete_instance(r["node"], zone=_z))
             if r.get("fw_rule"):
                 tasks.append(client.delete_firewall_rule(r["fw_rule"]))
         if tasks:

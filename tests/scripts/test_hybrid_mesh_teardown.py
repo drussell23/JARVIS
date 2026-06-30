@@ -68,14 +68,18 @@ class _Recorder:
 
     def __init__(self, *, instance_raises: bool = False) -> None:
         self.deleted_instances: List[Optional[str]] = []
+        self.deleted_zones: List[Optional[str]] = []
         self.deleted_firewalls: List[str] = []
         self.created_firewalls: List[Dict[str, Any]] = []
         self._instance_raises = instance_raises
 
-    async def delete_instance(self, name: Optional[str] = None) -> Tuple[bool, str]:
+    async def delete_instance(
+        self, name: Optional[str] = None, *, zone: Optional[str] = None
+    ) -> Tuple[bool, str]:
         if self._instance_raises:
             raise RuntimeError("boom: instance delete blew up")
         self.deleted_instances.append(name)
+        self.deleted_zones.append(zone)
         return (True, "deleted:200")
 
     async def delete_firewall_rule(self, name: str) -> Tuple[bool, str]:
@@ -90,11 +94,22 @@ class _Recorder:
         return (True, "created:200")
 
 
+_TEST_ZONES = "us-central1-a,us-central1-b,us-central1-c"
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry() -> Any:
-    """Every test starts + ends with an empty failover registry."""
+    """Every test starts + ends with an empty failover registry, and pins a
+    deterministic 3-zone fallback chain so the multi-zonal reap sweep is
+    predictable (the reap deletes the node in EVERY candidate zone)."""
     _driver._ACTIVE_FAILOVER_RESOURCES.clear()
+    _prev = os.environ.get("JARVIS_GCP_ZONE_FALLBACK")
+    os.environ["JARVIS_GCP_ZONE_FALLBACK"] = _TEST_ZONES
     yield
+    if _prev is None:
+        os.environ.pop("JARVIS_GCP_ZONE_FALLBACK", None)
+    else:
+        os.environ["JARVIS_GCP_ZONE_FALLBACK"] = _prev
     _driver._ACTIVE_FAILOVER_RESOURCES.clear()
 
 
@@ -123,7 +138,10 @@ def test_reap_deletes_node_and_firewall(monkeypatch: Any) -> None:
 
     _driver._reap_failover_resources()
 
-    assert rec.deleted_instances == ["jarvis-prime-failover"]
+    # The node is deleted in EVERY candidate zone (zone-aware reap -- a node that
+    # landed in a fallback zone is never orphaned). 404-idempotent on empty zones.
+    assert set(rec.deleted_instances) == {"jarvis-prime-failover"}
+    assert rec.deleted_zones == ["us-central1-a", "us-central1-b", "us-central1-c"]
     assert rec.deleted_firewalls == ["jarvis-ephemeral-failover-allow"]
     # Registry cleared -> a second reap is a no-op.
     assert _driver._ACTIVE_FAILOVER_RESOURCES == []
@@ -139,7 +157,9 @@ def test_reap_idempotent(monkeypatch: Any) -> None:
     _driver._reap_failover_resources()
     _driver._reap_failover_resources()  # second call must be a pure no-op
 
-    assert rec.deleted_instances == ["node-1"]
+    # First reap swept all 3 zones once; the second was a pure no-op (not 6).
+    assert set(rec.deleted_instances) == {"node-1"}
+    assert len(rec.deleted_instances) == 3
     assert rec.deleted_firewalls == ["fw-1"]
 
 
