@@ -274,6 +274,12 @@ def _reap_confirm_settle_s() -> float:
     return _env_float("JARVIS_REAP_CONFIRM_SETTLE_S", 5.0, lo=0.0, hi=120.0)
 
 
+# GCE instance.status values that mean "the node is materializing or up" -- a
+# slow-but-real node, NOT a phantom. On an 'unknown' insert op we KEEP these and
+# hand patience to the L7 readiness gate; we reap ONLY genuinely-dead/absent nodes.
+_MATERIALIZING_STATES = ("PROVISIONING", "STAGING", "RUNNING", "REPAIRING")
+
+
 def _reap_confirm_clean_streak() -> int:
     """Consecutive 'already gone' (404) observations required to declare a zone
     confirmed-clean. >1 so a node that materializes DURING the settle window
@@ -771,13 +777,36 @@ class GCPComputeRest:
                         continue
                     return ("stockout", "zone={}:op_stockout".format(zone))
                 if verdict == "unknown":
-                    # Fail-closed phantom protection: the op is still in-flight, so
-                    # a node may materialize LATE. Strictly CONFIRM the zone is clean
-                    # (delete + re-check until it stays gone) BEFORE rolling -- do not
-                    # rely on the global teardown to catch a late phantom.
+                    # Intelligent state-inspection handoff: an 'unknown' op (no
+                    # terminal DONE within the ceiling) is EITHER a slow-but-real
+                    # node OR a phantom. Inspect the instance before acting -- do NOT
+                    # blindly reap (that kills a slow-but-valid L4 node) and do NOT
+                    # blindly trust (that leaves a phantom).
+                    inst_status, http_code = await self.get_instance_status(node, zone=zone)
+                    if (inst_status or "").upper() in _MATERIALIZING_STATES:
+                        # Slow-but-REAL: the node is materializing/up. KEEP it, do NOT
+                        # reap, do NOT advance -> route to AWAKENING and hand patience
+                        # to the L7 readiness gate/racer (the right owner of "wait for
+                        # SERVING"). This resolves the strict-reap-vs-slow-op tension.
+                        logger.info(
+                            "[GCPComputeRest] insert op unverified BUT node MATERIALIZING "
+                            "(status=%s) zone=%s mode=%s -> KEEP + hand to L7 readiness gate",
+                            inst_status, zone, mode,
+                        )
+                        return (
+                            "created",
+                            "zone={}:mode={}:materializing_{}".format(
+                                zone, mode, inst_status.lower()
+                            ),
+                        )
+                    # TERMINATED / absent (404) / errored / unknowable -> a genuine
+                    # phantom or hardware/quota failure. Strictly CONFIRM the zone is
+                    # clean (catch a late-materializing one) BEFORE rolling -- never
+                    # rely on the global teardown alone.
                     logger.warning(
-                        "[GCPComputeRest] insert UNVERIFIED zone=%s mode=%s -> "
-                        "confirmed-reap (catch late phantom) + roll next zone", zone, mode,
+                        "[GCPComputeRest] insert op unverified + node NOT materializing "
+                        "(status=%s http=%s) zone=%s mode=%s -> confirmed-reap + roll next zone",
+                        inst_status, http_code, zone, mode,
                     )
                     await self._reap_zone_confirmed(node, zone)
                     if spot and _ondemand_on_stockout_enabled():
@@ -1022,6 +1051,40 @@ class GCPComputeRest:
             return (None, None)
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
+
+    async def get_instance_status(
+        self, name: Optional[str] = None, *, zone: Optional[str] = None,
+    ) -> Tuple[Optional[str], int]:
+        """instances.get -> ``(status_string, http_status)``. ``status_string`` is
+        the GCE instance ``status`` field (PROVISIONING / STAGING / RUNNING /
+        STOPPING / TERMINATED / ...), or None if absent/unreadable. ``http_status``
+        is the raw GET code (404 == the instance does not exist in that zone). Used
+        by the intelligent state-inspection handoff to distinguish a slow-but-real
+        node from a phantom. NEVER raises."""
+        try:
+            token = await self.access_token()
+            project = await self.project()
+            zone = zone or await self.zone()
+            if not token or not project or not zone:
+                return (None, 0)
+            node = name or _node_name()
+            url = "{}/projects/{}/zones/{}/instances/{}".format(
+                _COMPUTE_BASE, project, zone, node
+            )
+            status, text = await _http_request(
+                url, method="GET",
+                headers={"Authorization": "Bearer {}".format(token)},
+                timeout_s=_rest_timeout(),
+            )
+            if 200 <= status < 300 and text:
+                try:
+                    return (json.loads(text).get("status"), status)
+                except Exception:  # noqa: BLE001
+                    return (None, status)
+            return (None, status)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[GCPComputeRest] get_instance_status fail-soft err=%r", exc)
+            return (None, 0)
 
     async def _reap_zone_confirmed(self, node: str, zone: str) -> bool:
         """Strict pre-rollover reap: delete ``node`` in ``zone`` and CONFIRM the

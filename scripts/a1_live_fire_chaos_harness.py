@@ -443,7 +443,21 @@ class SoakRunner:
             return set()
 
     def launch(self, env: Dict[str, str], run_dir: str) -> SoakHandle:
-        before = self._snapshot_sessions()
+        # Dynamic Artifact Context Injection: DICTATE the organism's debug.log path
+        # BEFORE launch and inject it into the child env, so the organism writes and
+        # the auditor reads the EXACT same file -- no post-boot discovery race, no
+        # 'pending' placeholder (the bug that made the auditor see 0 [A1Trace] hops
+        # while the chain fired). Honor a caller-preset override.
+        log_path = (env.get("JARVIS_ACTIVE_SESSION_LOG", "") or "").strip()
+        if not log_path:
+            log_path = os.path.join(
+                self._sessions_root(), "bt-iso-{}".format(int(time.time())), "debug.log"
+            )
+        env["JARVIS_ACTIVE_SESSION_LOG"] = log_path
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        except OSError:
+            pass
         argv = [
             sys.executable, _SOAK_SCRIPT,
             "--production-soak", "--headless",
@@ -456,9 +470,9 @@ class SoakRunner:
         self._proc = subprocess.Popen(
             argv, cwd=self.repo_root, env=env, stdout=fh, stderr=subprocess.STDOUT,
         )
-        debug_log = self._await_session_debug_log(before, deadline_s=60.0)
-        session_dir = os.path.dirname(debug_log) if debug_log else self._sessions_root()
-        return SoakHandle(debug_log=debug_log, session_dir=session_dir, proc=self._proc)
+        return SoakHandle(
+            debug_log=log_path, session_dir=os.path.dirname(log_path), proc=self._proc,
+        )
 
     def _await_session_debug_log(self, before: set, deadline_s: float) -> str:
         """Poll the sessions root for a NEW bt-* dir that the soak created, then
@@ -522,6 +536,9 @@ class AuditorRunner:
         # on the auditor's env from the already-derived flag set (no CADENCE import).
         env = dict(os.environ)
         env.setdefault("JARVIS_A1_AUDIT_FLAGS", ",".join(derive_cognitive_flags()))
+        # Same memory space: the auditor's env-fallback (_resolve_log_file) agrees
+        # with the explicit --log-file we pass -- both resolve to the dictated path.
+        env["JARVIS_ACTIVE_SESSION_LOG"] = log_file
         cp = subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
         if os.path.exists(verdict_out):
             try:

@@ -350,6 +350,19 @@ class HarnessConfig:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_active_session_dir(default_dir: Path) -> Path:
+    """Dynamic Artifact Context Injection: if the ignition driver dictated an
+    absolute debug.log path via ``JARVIS_ACTIVE_SESSION_LOG``, colocate ALL session
+    artifacts in its parent dir so the auditor reads EXACTLY where this organism
+    writes (no ``bt-<ts>`` vs ``pending`` split). Returns the injected log's parent
+    when set, else ``default_dir``. NEVER raises."""
+    try:
+        inj = (os.environ.get("JARVIS_ACTIVE_SESSION_LOG", "") or "").strip()
+        return Path(inj).parent if inj else default_dir
+    except Exception:  # noqa: BLE001
+        return default_dir
+
+
 class BattleTestHarness:
     """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
 
@@ -393,8 +406,16 @@ class BattleTestHarness:
         ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         self._session_id = f"bt-{ts}"
 
-        # Session directories
-        self._session_dir = config.session_dir or Path(f".ouroboros/sessions/{self._session_id}")
+        # Session directories. Honor a driver-dictated JARVIS_ACTIVE_SESSION_LOG so
+        # every artifact (summary.json, WAL, debug.log) colocates where the auditor
+        # reads -- single shared memory space (Dynamic Artifact Context Injection).
+        self._session_dir = _resolve_active_session_dir(
+            config.session_dir or Path(f".ouroboros/sessions/{self._session_id}")
+        )
+        # Keep the session id consistent with the (possibly injected) dir name so
+        # downstream id-keyed paths agree with the artifact dir.
+        if self._session_dir.name:
+            self._session_id = self._session_dir.name
         self._notebook_output_dir = config.notebook_output_dir or Path("notebooks")
 
         # Publish session dir for downstream non-streaming callers
@@ -798,7 +819,7 @@ class BattleTestHarness:
                 configure_silent_boot,
             )
             _silent_boot_handler = configure_silent_boot(
-                session_dir=(
+                session_dir=_resolve_active_session_dir(
                     self._config.repo_path / ".ouroboros"
                     / "sessions" / self._session_id
                 ),

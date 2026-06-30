@@ -302,6 +302,124 @@ async def test_reap_confirmed_gives_up_when_never_clears(monkeypatch):
     assert calls["n"] == 3  # bounded by attempts
 
 
+def _stub_identity(monkeypatch):
+    async def _tok(self):
+        return "ya29.FAKE"
+
+    async def _proj(self):
+        return "my-project"
+
+    async def _zone(self):
+        return "us-central1-a"
+
+    monkeypatch.setattr(GCPComputeRest, "access_token", _tok)
+    monkeypatch.setattr(GCPComputeRest, "project", _proj)
+    monkeypatch.setattr(GCPComputeRest, "zone", _zone)
+
+
+class _InsertAndStatusHTTP:
+    """POST insert -> 200 op-insert; GET instances/<node> -> scripted status."""
+
+    def __init__(self, inst_status, inst_http=200):
+        self.inst_status = inst_status
+        self.inst_http = inst_http
+        self.posts = 0
+        self.status_gets = 0
+
+    async def __call__(self, url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if method == "POST":
+            self.posts += 1
+            return (200, json.dumps({"name": "op-insert"}))
+        if method == "GET" and "/instances/" in url:
+            self.status_gets += 1
+            if self.inst_status is None:
+                return (self.inst_http, json.dumps({"error": {"code": self.inst_http}}))
+            return (self.inst_http, json.dumps({"status": self.inst_status}))
+        return (0, "[unrouted]")
+
+
+# ---------------------------------------------------------------------------
+# get_instance_status -- raw status probe
+# ---------------------------------------------------------------------------
+
+async def test_get_instance_status_running(monkeypatch):
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("RUNNING"))
+    st, code = await GCPComputeRest().get_instance_status("node", zone="us-central1-b")
+    assert st == "RUNNING"
+    assert code == 200
+
+
+async def test_get_instance_status_absent_404(monkeypatch):
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP(None, inst_http=404))
+    st, code = await GCPComputeRest().get_instance_status("node", zone="us-central1-b")
+    assert st is None
+    assert code == 404
+
+
+# ---------------------------------------------------------------------------
+# Intelligent state-inspection handoff: KEEP materializing, reap only dead
+# ---------------------------------------------------------------------------
+
+async def test_unknown_keeps_provisioning_node(monkeypatch):
+    # 'unknown' op BUT instances.get says STAGING -> slow-but-real -> KEEP it,
+    # do NOT reap, do NOT advance; hand to the L7 readiness gate (route AWAKENING).
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("STAGING"))
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"          # routes to AWAKENING -> L7 gate owns patience
+    assert "materializing" in detail
+    assert reaped == []                  # the materializing node is NOT reaped
+
+
+async def test_unknown_keeps_running_node(monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("RUNNING"))
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, _detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert reaped == []
+
+
+async def test_unknown_reaps_terminated_node(monkeypatch):
+    # 'unknown' AND instances.get says TERMINATED -> genuine failure -> reap + roll.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("TERMINATED"))
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, _detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "stockout"
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped
+
+
+async def test_unknown_reaps_absent_node(monkeypatch):
+    # 'unknown' AND instances.get 404 (nothing materialized) -> confirmed-reap
+    # (catch a late one) + roll. NEVER kept.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP(None, inst_http=404))
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, _detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "stockout"
+    assert reaped  # phantom-protection reap fired
+
+
 async def test_insert_unknown_uses_confirmed_reap(monkeypatch):
     # _insert_in_zone on 'unknown' must call the CONFIRMED reap (multiple deletes
     # until clean), not a single blind delete.
