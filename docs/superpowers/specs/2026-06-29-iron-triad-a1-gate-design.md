@@ -212,3 +212,18 @@ When the Docker pre-flight finds no local daemon, the op is flagged `REQUIRES_CL
 2. `python3 scripts/isomorphic_a1_local.py --mode container` with Docker Desktop up → drive to `A1_DISPATCH_PROVEN` locally.
 3. Capture failure telemetry on any non-proven (`failure_telemetry.capture_failure_telemetry`); fix; repeat at $0/minutes.
 4. One confirming cloud soak (`--max-wall-seconds 2400 --headless`) → `A1_DISPATCH_PROVEN` live → **first autonomous PR** → A1 gate passes → EXECUTION grade moves off C+.
+
+---
+
+## Addendum (2026-06-29) — FSM-routing correction: the PR-path unification
+
+The §2 "single mandatory path" assumed a linear op flow (generate → sandbox → apply → blast → lint → PR). The whole-branch review found the real Ouroboros FSM **branches by risk tier**: auto-apply ops (SAFE_AUTO/NOTIFY_APPLY) run Gate ①+② → auto-**commit** (no PR); Orange ops (APPROVAL_REQUIRED) hit `create_review_pr` (Gate ③ + enforcer) on a branch that runs *before* APPLY — so no single op assembled all three tokens, and an armed enforcer would refuse every autonomous PR.
+
+**Resolution (Tasks 12, 13a, 13b, 14):**
+- **Branch-bound tokens** (`dag_capability_token`): the HMAC binds a `branch_context`; `verify_chain` rejects a chain whose tokens were minted in different contexts (anti-injection from concurrent workspaces).
+- **`autonomous_pr_pipeline.run_pr_gate_pipeline`**: on the autonomous-PR path, materializes the candidate in an **isolated git worktree** (`ouroboros/a1-validate/<op_id>`), runs Gate ① (container exec) + Gate ② (blast radius) **there** (real tree untouched), mints sandbox+blast bound to the worktree branch, cleans up always. `create_review_pr` then mints lint, verifies the full chain, and asserts the tokens were minted in the expected worktree context.
+- **Hardening**: Docker pre-flight gated on `JARVIS_A1_TOKEN_ENFORCER_ENABLED` (true byte-identical OFF); Gate ② strict catch-all → tree-SHA rollback on any crash; tuning flags registered.
+
+**Net:** one autonomous op now survives the container, clears the blast radius, and passes the linter before its PR — the spec's single mandatory path, realized against the real FSM. All gates remain default-OFF.
+
+**Graduation blocker (tracked):** 4 non-autonomous `create_review_pr` callers (strategy_simulator, genesis_proposal, graduation_pr_proposer, bridge_adapters) don't pass tokens → refuse under enforcer-ON; reconcile (token-wire or CLI-approval exemption) before flipping `JARVIS_A1_TOKEN_ENFORCER_ENABLED` default-ON. Live container A1 soak is operator-run.
