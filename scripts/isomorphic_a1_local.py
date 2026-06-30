@@ -308,6 +308,72 @@ async def _open_failover_firewall(fw_name: str) -> Optional[str]:
         return None
 
 
+def _arm_synthetic_roadmap(env: Dict[str, str], run_dir: str) -> str:
+    """Deterministic Synthetic Roadmap Generator -- emit the A1 `emit source=roadmap`
+    provenance hop with a GENUINE signed payload (no hardcoded fake trace, no
+    REQUIRE_SIGNATURE bypass).
+
+    Builds a strategic GOAL and signs it with the PRODUCTION primitives
+    (``strategy_signer.sign_roadmap_doc`` -> ``roadmap_reader._build_signing_payload``
+    + ``compute_signature``: canonical compact sorted-key JSON, HMAC-SHA256) -- the
+    exact bytes the reader re-derives to verify. Writes it to an absolute path the
+    organism subprocess can read (same accessibility contract as JARVIS_TRINITY_ROOT)
+    and arms the reader env. compose_env already sets JARVIS_ROADMAP_ORCHESTRATOR_ENABLED
+    + JARVIS_A1_TRACE_ENABLED; the missing master gate was JARVIS_ROADMAP_READER_ENABLED.
+    The organism's _roadmap_ignition_daemon then ingests this goal -> the A1Trace emit
+    hop fires. Returns the roadmap file path.
+
+    The HMAC secret is a real per-run token (``generate_secret``, mirroring the
+    per-deployment GCE metadata secret) -- overridable via
+    JARVIS_A1_SYNTHETIC_ROADMAP_SECRET for byte-reproducible runs; never a committed
+    literal. The driver signs and injects the SAME secret into the child env so the
+    reader's verification (REQUIRE_SIGNATURE on) succeeds."""
+    import yaml as _yaml  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+    from backend.core.ouroboros.governance.strategy_signer import (  # noqa: PLC0415
+        generate_secret,
+        sign_roadmap_doc,
+    )
+
+    secret = (os.environ.get("JARVIS_A1_SYNTHETIC_ROADMAP_SECRET", "") or "").strip()
+    if not secret:
+        secret = generate_secret()
+
+    doc = {
+        "version": 1,
+        "operator_id": "a1-soak@jarvis.local",
+        "signed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "goals": [
+            {
+                "id": "GOAL-001",
+                "title": "A1 self-audit: confirm the autonomous dispatch chain is live",
+                "description": (
+                    "Synthetic strategic goal for the A1 soak -- exercises the full "
+                    "emit->ingest->dequeue->submit->accept provenance chain end to end."
+                ),
+                "priority": "high",
+                "target_files": ["backend/core/ouroboros/governance/a1_trace.py"],
+                "success_criteria": (
+                    "A complete 5-hop A1Trace chain is observed for this roadmap goal."
+                ),
+            }
+        ],
+    }
+    signed = sign_roadmap_doc(doc, secret)
+
+    rm_dir = os.path.join(run_dir, ".jarvis")
+    os.makedirs(rm_dir, exist_ok=True)
+    path = os.path.join(rm_dir, "roadmap.yaml")
+    with open(path, "w", encoding="utf-8") as fh:
+        _yaml.safe_dump(signed, fh, sort_keys=False)
+
+    env["JARVIS_ROADMAP_READER_ENABLED"] = "true"
+    env["JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE"] = "true"
+    env["JARVIS_ROADMAP_READER_HMAC_SECRET"] = secret
+    env["JARVIS_ROADMAP_READER_PATH"] = path
+    return path
+
+
 async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     """Arm the Hybrid Execution Mesh on the soak env, register the failover node
     for teardown UP FRONT, then open the driver-owned /32 firewall.
@@ -853,6 +919,21 @@ class IsomorphicA1Driver:
                 _trinity_root = os.path.join(run_dir, "trinity_root")
                 os.makedirs(_trinity_root, exist_ok=True)
                 env["JARVIS_TRINITY_ROOT"] = _trinity_root
+
+                # ---- Deterministic Synthetic Roadmap (A1 emit-hop provenance) ----
+                # compose_env arms the orchestrator + A1Trace flags but NOT the
+                # roadmap READER, and no signed roadmap exists -> the strategic-GOAL
+                # `emit source=roadmap` hop never fires and the A1 audit fails on a
+                # missing chain. Generate a GENUINE signed GOAL (production crypto)
+                # so _roadmap_ignition_daemon emits it. Skipped for stub wiring runs.
+                if not self.stub_soak:
+                    try:
+                        _rm_path = _arm_synthetic_roadmap(env, run_dir)
+                        _log("[A1] synthetic signed roadmap armed -> %s "
+                             "(reader ENABLED, REQUIRE_SIGNATURE on, real HMAC)" % _rm_path)
+                    except Exception as _exc:  # noqa: BLE001 -- never block the soak
+                        _log("[A1] WARN synthetic roadmap arming failed "
+                             "(emit hop will be absent): %r" % (_exc,))
 
                 _log("env composed: %d keys total, adversary overrides applied, "
                      "failover=%s" % (len(env), "enabled" if self.enable_failover
