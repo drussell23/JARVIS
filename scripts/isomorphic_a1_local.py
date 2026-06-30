@@ -186,6 +186,17 @@ _FAILOVER_FW_RULE_DEFAULT: str = "jarvis-ephemeral-failover-allow"
 _FAILOVER_NODE_DEFAULT: str = "jarvis-prime-failover"
 _FAILOVER_INFERENCE_PORT: int = 11434
 
+# Hybrid Execution Mesh (Task HM-B) -- L7 semantic-readiness poller defaults. The
+# audit must SUSPEND until the awakened 32B node returns HTTP 200 on /api/tags
+# (proving the ~20GB model is loaded into L4 VRAM) -- NO hardcoded sleeps:
+# exponential backoff (capped) bounded by a budget. All env-tunable so the soak
+# operator and the tests can shrink them.  Read at CALL time (not module-load) so
+# monkeypatch.setenv in tests takes effect.
+_READY_PROBE_BASE_S: float = 3.0          # env JARVIS_HYBRID_MESH_READY_BASE_S
+_READY_PROBE_CAP_S: float = 30.0          # env JARVIS_HYBRID_MESH_READY_CAP_S
+_READY_PROBE_TIMEOUT_S: float = 5.0       # env JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S
+_READY_BUDGET_DEFAULT_S: float = 900.0    # env JARVIS_HYBRID_MESH_READY_BUDGET_S
+
 
 def _reap_failover_resources() -> None:
     """Violently reap every awakened failover node + its ephemeral /32 firewall.
@@ -310,6 +321,123 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
         "JARVIS_FAILOVER_NODE_NAME", _FAILOVER_NODE_DEFAULT)
     _register_failover_resource(node=node_name, fw_rule=fw_name)
     await _open_failover_firewall(fw_name)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Execution Mesh (Task HM-B) -- L7 semantic-readiness poller. The A1
+# audit must SUSPEND until the awakened 32B node's inference server returns HTTP
+# 200 on /api/tags (the ~20GB model is loaded into L4 VRAM). Without this gate
+# the audit fires FAILED before the node can serve -- the exact failure of the
+# last live run.  No hardcoded sleeps: exponential backoff (capped) + a budget.
+# ---------------------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var with a fail-soft fallback (NEVER raises)."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _probe_api_tags(url: str) -> int:
+    """Blocking HTTP GET of the inference server's ``/api/tags`` -> status code.
+
+    Factored out as a TINY testable seam (tests monkeypatch THIS, not the real
+    network).  Mirrors the failover ``_default_node_ready_fn`` urllib style.
+    Returns the HTTP status (200 == 32B served; a real non-2xx like 503 while the
+    model still loads is returned verbatim so the poller treats it as 'not ready
+    yet').  Transport errors (connection refused, timeout, DNS) PROPAGATE -- the
+    caller catches them as 'not ready' and keeps backing off.
+    """
+    import urllib.error
+    import urllib.request
+
+    timeout = _env_float(
+        "JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S", _READY_PROBE_TIMEOUT_S)
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return int(getattr(resp, "status", None) or resp.getcode() or 0)
+    except urllib.error.HTTPError as he:
+        # A genuine HTTP status (e.g. 503 while VRAM still loading) -> not a
+        # transport error; return the code so the caller backs off, not aborts.
+        return int(getattr(he, "code", 0) or 0)
+
+
+async def _await_jprime_serving(
+    node_name: str, *, budget_s: float, port: int = 11434,
+) -> bool:
+    """Suspend until the awakened GCP node's inference server returns HTTP 200 on
+    ``/api/tags`` (the 32B is loaded into VRAM). Exponential backoff (cap'd),
+    bounded by ``budget_s``. Returns True on first 200, False if the budget
+    elapses. Fail-soft: transport errors are just 'not ready yet' -> keep backing
+    off.  NEVER raises -- worst case returns False and the audit proceeds (and the
+    ironclad teardown reaps the node).
+    """
+    base = _env_float("JARVIS_HYBRID_MESH_READY_BASE_S", _READY_PROBE_BASE_S)
+    cap = _env_float("JARVIS_HYBRID_MESH_READY_CAP_S", _READY_PROBE_CAP_S)
+    probe_to = _env_float(
+        "JARVIS_HYBRID_MESH_READY_PROBE_TIMEOUT_S", _READY_PROBE_TIMEOUT_S)
+
+    delay = base
+    start = time.monotonic()
+    deadline = start + budget_s
+    no_ip_logged = False
+
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            get_compute_rest,
+        )
+    except Exception as exc:  # noqa: BLE001 -- import must never crash the run
+        _log("[HybridMesh] WARN readiness poller cannot import gcp_compute_rest "
+             "(%r) -- skipping gate" % (exc,))
+        return False
+
+    while time.monotonic() < deadline:
+        external: Optional[str] = None
+        try:
+            _internal, external = await get_compute_rest().get_node_endpoints(
+                node_name)
+        except Exception as exc:  # noqa: BLE001 -- treat as 'not ready yet'
+            _log("[HybridMesh] endpoint resolve fail-soft (%r) -- backing off"
+                 % (exc,))
+            external = None
+
+        if not external:
+            if not no_ip_logged:
+                _log("[HybridMesh] node %s not RUNNING yet (no external IP) -- "
+                     "backing off" % node_name)
+                no_ip_logged = True
+        else:
+            url = "http://%s:%d/api/tags" % (external, port)
+            status = 0
+            try:
+                loop = asyncio.get_event_loop()
+                status = await asyncio.wait_for(
+                    loop.run_in_executor(None, _probe_api_tags, url),
+                    timeout=probe_to + 1.0,
+                )
+            except Exception:  # noqa: BLE001 -- timeout/transport -> not ready
+                status = 0
+            if status == 200:
+                elapsed = time.monotonic() - start
+                _log("[HybridMesh] J-Prime SERVING: 32B ready at %s after %.0fs"
+                     % (url, elapsed))
+                return True
+
+        # Not ready -> exponential backoff, clamped to the remaining budget.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.sleep(min(delay, remaining))
+        except asyncio.CancelledError:
+            return False
+        delay = min(delay * 2.0, cap)
+
+    _log("[HybridMesh] WARN J-Prime NOT ready after %.0fs -- proceeding to audit "
+         "(will likely FAIL; teardown will reap)" % budget_s)
+    return False
 
 
 def _install_revert_signal_handlers() -> None:
@@ -771,6 +899,25 @@ class IsomorphicA1Driver:
                                 scoped[0] if scoped else "<none found locally>"))
                     else:
                         _log("run-#12: no chaos files in manifest (stub mode?)")
+
+                    # ── d.5 L7 SEMANTIC READINESS GATE (Task HM-B) ───────────
+                    # When failover is armed the audit MUST suspend until the
+                    # awakened 32B node returns HTTP 200 on /api/tags (model loaded
+                    # into VRAM) -- otherwise the audit fires FAILED before the node
+                    # can serve (the exact failure of the last live run). Default
+                    # path (no --enable-failover): skipped entirely -> byte-identical.
+                    if self.enable_failover:
+                        _node = os.environ.get(
+                            "JARVIS_FAILOVER_NODE_NAME", _FAILOVER_NODE_DEFAULT)
+                        _budget = _env_float(
+                            "JARVIS_HYBRID_MESH_READY_BUDGET_S",
+                            _READY_BUDGET_DEFAULT_S)
+                        _log("[HybridMesh] L7 readiness gate: awaiting 32B SERVING "
+                             "(budget=%.0fs) before audit ..." % _budget)
+                        _served = await _await_jprime_serving(
+                            _node, budget_s=_budget)
+                        _log("[HybridMesh] L7 readiness gate -> %s"
+                             % ("SERVING" if _served else "TIMEOUT"))
 
                     # ── e. LAUNCH AUDITOR ────────────────────────────────────
                     _log("STEP audit: sse=%s log=%s" % (self.sse_base, debug_log))
