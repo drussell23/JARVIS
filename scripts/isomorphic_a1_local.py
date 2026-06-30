@@ -483,6 +483,20 @@ class IsomorphicA1Driver:
                 if not self.enable_failover:
                     env["JARVIS_FAILOVER_LIFECYCLE_ENABLED"] = "false"
 
+                # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
+                # (all default OFF in prod; this driver IS the A1 ignition harness).
+                env["JARVIS_RUNTIME_SANDBOX_ENABLED"] = "true"   # L4 container backend
+                env["JARVIS_A1_SANDBOX_LOCK_ENABLED"] = "true"   # Gate 1
+                env["JARVIS_A1_BLAST_RADIUS_ENABLED"] = "true"   # Gate 2
+                env["JARVIS_A1_PR_LINTER_ENABLED"] = "true"      # Gate 3
+                env["JARVIS_A1_TOKEN_ENFORCER_ENABLED"] = "true" # enforcer (PR needs token chain)
+                # File-isolation OFF -> autonomous writes land in repo_root ->
+                # durable commit (written=True) -> fixes the fsm_classify_to_applied
+                # blocker. Mirrors the failover_lifecycle pin (stale a1-disable-file-
+                # isolation branch folded here as 2 env vars).
+                env["JARVIS_FILE_ISOLATION_ENABLED"] = "false"
+                env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] = "false"
+
                 _log("env composed: %d keys total, adversary overrides applied, "
                      "failover=%s" % (len(env), "enabled" if self.enable_failover
                                       else "pinned-off"))
