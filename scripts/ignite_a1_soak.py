@@ -237,6 +237,72 @@ def _read_tail(log_path: Path, n: int = 40) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: live-failover
+# ---------------------------------------------------------------------------
+
+def _arm_failover_env(env: dict) -> dict:
+    """Stamp all JARVIS_FAILOVER_* keys into *env* for a live-failover run.
+
+    Returns the same dict (mutated in place).  GCP_PROJECT_ID / GCP_ZONE are
+    NOT set here -- they come from the operator's exported environment via the
+    caller's os.environ copy.
+    """
+    env.update({
+        # Failover mesh armed: DW primary -> J-Prime 32B golden-image fallback
+        "JARVIS_FAILOVER_LIFECYCLE_ENABLED": "true",
+        "JARVIS_FAILOVER_BUDGET_AWAKEN_ENABLED": "true",
+        "JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED": "true",
+        "JARVIS_FAILOVER_HEADER_AWARE_RECOVERY_ENABLED": "true",
+        # Force the 32B QUALITY GPU tier (g2-standard-4 + nvidia-l4 + jarvis-prime-coder-32b)
+        "JARVIS_FAILOVER_QUALITY_TIER_ENABLED": "true",
+        "JARVIS_FAILOVER_AWAKEN_URGENCY": "immediate",
+        "JARVIS_FAILOVER_QUALITY_MACHINE": "g2-standard-4",
+        "JARVIS_FAILOVER_QUALITY_ACCEL_TYPE": "nvidia-l4",
+        "JARVIS_FAILOVER_QUALITY_ACCEL_COUNT": "1",
+        "JARVIS_FAILOVER_QUALITY_IMAGE": "jarvis-prime-coder-32b",
+        "JARVIS_FAILOVER_INFERENCE_BIND_ENABLED": "true",
+    })
+    return env
+
+
+def _build_soak_argv(repo_root: Path, run_root: Path, *, live_failover: bool) -> list[str]:
+    """Build the soak driver argv.  Appends ``--enable-failover`` when *live_failover*."""
+    argv = [
+        sys.executable,
+        str(repo_root / "scripts" / "isomorphic_a1_local.py"),
+        "--mode", "container",
+        "--run-root", str(run_root),
+    ]
+    if live_failover:
+        argv.append("--enable-failover")
+    return argv
+
+
+def _load_preflight_fn(scripts_dir: Path):
+    """Return ``preflight_gcp_ready`` from the sibling a1_gcp_preflight module.
+
+    Tries a direct import first (works when scripts/ is on sys.path), then
+    falls back to importlib path-loading so this script works as __main__ too.
+    Never raises -- callers should catch ImportError.
+    """
+    try:
+        from a1_gcp_preflight import preflight_gcp_ready  # noqa: PLC0415
+        return preflight_gcp_ready
+    except Exception:
+        pass
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "a1_gcp_preflight",
+        scripts_dir / "a1_gcp_preflight.py",
+    )
+    if _spec is None or _spec.loader is None:
+        raise ImportError("Cannot load a1_gcp_preflight.py from " + str(scripts_dir))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    return _mod.preflight_gcp_ready
+
+
+# ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
 
@@ -269,6 +335,15 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
         action="store_true",
         help="Stub real subprocesses -- exercises wiring without Docker or soak.",
     )
+    parser.add_argument(
+        "--live-failover",
+        action="store_true",
+        help=(
+            "Awaken the GCP J-Prime 32B golden image as DW's fallback for a REAL "
+            "autonomous-PR run (real bounded GPU spend; runs the $0 credential "
+            "preflight first)."
+        ),
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -283,6 +358,7 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
     log_file = logs_dir / f"a1_ignition_{stamp}.log"
 
     # ------------------------------------------------------------------ dry-run stubs
+    _scripts_dir = Path(__file__).resolve().parent
     if args.dry_run:
         print("[DRY-RUN] Adaptive Ignition Harness (no real subprocesses)")
         print(f"[DRY-RUN] log_file   : {log_file}")
@@ -290,6 +366,28 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
         print(f"[DRY-RUN] max-wall-s : {args.max_wall_seconds}")
         print(f"[DRY-RUN] preflight  : {'SKIP' if args.skip_preflight else 'would run'}")
         print("[DRY-RUN] Docker check: STUBBED -> OK")
+        if args.live_failover:
+            print("[>] live-failover: running $0 GCP credential preflight ...")
+            try:
+                import asyncio as _aio
+                _preflight_fn = _load_preflight_fn(_scripts_dir)
+                _ok, _problems = _aio.run(_preflight_fn())
+            except Exception as _exc:
+                print(f"[!] live-failover preflight raised unexpectedly: {_exc}")
+                return 2
+            if not _ok:
+                print("\n[!] live-failover ABORTED at $0 -- GCP not ready (no node was created).")
+                print("    Run these in THIS terminal, then re-run with --live-failover:\n")
+                for _p in _problems:
+                    print("    " + _p.replace("\n", "\n    "))
+                return 2
+            print("[OK] GCP preflight green.")
+            _armed = _arm_failover_env({})
+            print("[DRY-RUN] live-failover env armed:")
+            for _k, _v in sorted(_armed.items()):
+                print(f"  {_k}={_v}")
+            _argv_preview = _build_soak_argv(repo_root, run_root, live_failover=True)
+            print(f"[DRY-RUN] soak argv: {' '.join(_argv_preview)}")
         print("[DRY-RUN] Soak       : STUBBED -> exit 0 (A1_DISPATCH_PROVEN)")
         print("")
         print("[OK] A1_DISPATCH_PROVEN (dry-run stub)")
@@ -305,6 +403,24 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
         return 2
 
     print(f"[OK] Docker daemon: {reason}")
+
+    # ------------------------------------------------------------------ GCP preflight (live-failover only)
+    if args.live_failover:
+        print("[>] live-failover: running $0 GCP credential preflight ...")
+        try:
+            import asyncio as _aio
+            _preflight_fn = _load_preflight_fn(_scripts_dir)
+            _ok, _problems = _aio.run(_preflight_fn())
+        except Exception as _exc:
+            print(f"[!] live-failover preflight raised unexpectedly: {_exc}")
+            return 2
+        if not _ok:
+            print("\n[!] live-failover ABORTED at $0 -- GCP not ready (no node was created).")
+            print("    Run these in THIS terminal, then re-run with --live-failover:\n")
+            for _p in _problems:
+                print("    " + _p.replace("\n", "\n    "))
+            return 2
+        print("[OK] GCP preflight green -- proceeding to awaken the 32B fallback.")
 
     # ------------------------------------------------------------------ open log
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -334,18 +450,15 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
 
         # ---------------------------------------------------------------- soak
         run_root.mkdir(parents=True, exist_ok=True)
-        soak_argv = [
-            sys.executable,
-            str(repo_root / "scripts" / "isomorphic_a1_local.py"),
-            "--mode", "container",
-            "--run-root", str(run_root),
-        ]
+        soak_argv = _build_soak_argv(repo_root, run_root, live_failover=args.live_failover)
         # The isomorphic driver does NOT take --max-wall-seconds; the wall cap is
         # read from the env by the battle-test harness the SoakRunner spawns
         # (OUROBOROS_BATTLE_MAX_WALL_SECONDS). Headless too, since this is non-TTY.
         _soak_env = dict(os.environ)
         _soak_env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] = str(args.max_wall_seconds)
         _soak_env.setdefault("OUROBOROS_BATTLE_HEADLESS", "1")
+        if args.live_failover:
+            _arm_failover_env(_soak_env)
         _write_log_header(log_fh, argv=soak_argv, cwd=repo_root)
         print(f"[>] Soak: {' '.join(soak_argv)}  (OUROBOROS_BATTLE_MAX_WALL_SECONDS={args.max_wall_seconds})")
         soak_rc = tee_run(soak_argv, log_fh, cwd=str(repo_root), env=_soak_env)

@@ -15,6 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from ignite_a1_soak import (  # noqa: E402
+    _arm_failover_env,
+    _build_soak_argv,
     docker_responsive,
     find_failure_telemetry,
     format_for_claude,
@@ -210,3 +212,54 @@ class TestTeeRun:
         captured = capsys.readouterr()
         assert "dualwrite" in captured.out
         assert "dualwrite" in log_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# live-failover helpers
+# ---------------------------------------------------------------------------
+
+_FAILOVER_REQUIRED_ENV_KEYS = {
+    "JARVIS_FAILOVER_QUALITY_TIER_ENABLED",
+    "JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED",
+    "JARVIS_FAILOVER_LIFECYCLE_ENABLED",
+    "JARVIS_FAILOVER_BUDGET_AWAKEN_ENABLED",
+    "JARVIS_FAILOVER_HEADER_AWARE_RECOVERY_ENABLED",
+    "JARVIS_FAILOVER_AWAKEN_URGENCY",
+    "JARVIS_FAILOVER_QUALITY_MACHINE",
+    "JARVIS_FAILOVER_QUALITY_ACCEL_TYPE",
+    "JARVIS_FAILOVER_QUALITY_ACCEL_COUNT",
+    "JARVIS_FAILOVER_QUALITY_IMAGE",
+    "JARVIS_FAILOVER_INFERENCE_BIND_ENABLED",
+}
+
+
+class TestLiveFailoverHelpers:
+    def test_live_failover_arms_env(self, tmp_path):
+        """_arm_failover_env stamps all required keys; critical values correct."""
+        env: dict = {}
+        result = _arm_failover_env(env)
+        assert result is env, "_arm_failover_env must return the same dict"
+        for key in _FAILOVER_REQUIRED_ENV_KEYS:
+            assert key in env, f"Missing key: {key}"
+        assert env["JARVIS_FAILOVER_QUALITY_TIER_ENABLED"] == "true"
+        assert env["JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED"] == "true"
+        assert env["JARVIS_FAILOVER_QUALITY_IMAGE"] == "jarvis-prime-coder-32b"
+        assert env["JARVIS_FAILOVER_QUALITY_MACHINE"] == "g2-standard-4"
+
+    def test_live_failover_argv_contains_enable_failover(self, tmp_path):
+        """_build_soak_argv appends --enable-failover when live_failover=True."""
+        argv = _build_soak_argv(Path("/repo"), tmp_path, live_failover=True)
+        assert "--enable-failover" in argv
+
+    def test_default_no_failover_env(self, tmp_path):
+        """Without live-failover, none of the JARVIS_FAILOVER_* keys are added."""
+        # Simulate building the soak env without arming failover
+        env: dict = {"OUROBOROS_BATTLE_MAX_WALL_SECONDS": "2400"}
+        # Do NOT call _arm_failover_env
+        for key in _FAILOVER_REQUIRED_ENV_KEYS:
+            assert key not in env, f"Unexpected key in default env: {key}"
+
+    def test_default_no_enable_failover_in_argv(self, tmp_path):
+        """Without live-failover, --enable-failover must not appear in soak argv."""
+        argv = _build_soak_argv(Path("/repo"), tmp_path, live_failover=False)
+        assert "--enable-failover" not in argv

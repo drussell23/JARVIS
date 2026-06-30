@@ -1182,6 +1182,84 @@ def _dw_heavy_fn_lane_enable_thinking() -> bool:
         return True
 
 
+def _parse_retry_after_headers(headers) -> Optional[float]:
+    """Return an absolute UNIX wake-up timestamp from Retry-After / x-ratelimit-reset,
+    or None. Retry-After may be delta-seconds or an HTTP-date; x-ratelimit-reset is a
+    UNIX ts (or delta). Never raises -> None on any parse failure.
+
+    Task CR5: lets the failover SERVING recovery probe suspend until the
+    provider's OWN stated reset deadline instead of a blind poll interval. Picks
+    the SOONEST sane FUTURE deadline across the recognised headers. Additive +
+    fail-soft -- a missing/garbage header simply yields None (legacy behaviour).
+    """
+    try:
+        if not headers:
+            return None
+        now = time.time()
+        # Case-insensitive lookup that tolerates dict / aiohttp CIMultiDict.
+        def _get(name: str):
+            try:
+                getter = getattr(headers, "get", None)
+                if getter is not None:
+                    val = getter(name)
+                    if val is None:
+                        val = getter(name.lower())
+                    if val is None:
+                        val = getter(name.upper())
+                    return val
+            except Exception:  # noqa: BLE001
+                return None
+            return None
+
+        candidates: List[float] = []
+
+        # --- Retry-After: delta-seconds OR an HTTP-date. ---
+        ra = _get("Retry-After")
+        if ra is not None:
+            ra_str = str(ra).strip()
+            if ra_str:
+                try:
+                    # Integer/float delta-seconds.
+                    candidates.append(now + float(ra_str))
+                except (ValueError, TypeError):
+                    # HTTP-date (RFC 7231) -> absolute ts.
+                    try:
+                        from email.utils import parsedate_to_datetime  # noqa: PLC0415
+                        dt = parsedate_to_datetime(ra_str)
+                        if dt is not None:
+                            candidates.append(dt.timestamp())
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # --- x-ratelimit-reset[-requests]: a UNIX ts (if large) else a delta. ---
+        for _name in ("x-ratelimit-reset", "x-ratelimit-reset-requests"):
+            rl = _get(_name)
+            if rl is None:
+                continue
+            rl_str = str(rl).strip()
+            if not rl_str:
+                continue
+            try:
+                rl_val = float(rl_str)
+            except (ValueError, TypeError):
+                continue
+            # Heuristic: a value already in absolute-UNIX-ts range is a deadline;
+            # a small value is a delta-seconds offset from now. 1e6 (~Jan 1970+12d)
+            # cleanly separates any realistic delta from any real epoch ts.
+            if rl_val >= 1_000_000.0:
+                candidates.append(rl_val)
+            else:
+                candidates.append(now + rl_val)
+
+        # Keep only sane FUTURE deadlines; return the soonest.
+        future = [c for c in candidates if c > now]
+        if not future:
+            return None
+        return min(future)
+    except Exception:  # noqa: BLE001 -- never raise from header parsing
+        return None
+
+
 class DoublewordInfraError(Exception):
     """Infrastructure failure from DoublewordProvider.
 
@@ -1214,11 +1292,17 @@ class DoublewordInfraError(Exception):
         *,
         response_body: str = "",
         model_id: str = "",
+        ratelimit_reset_ts: Optional[float] = None,
     ) -> None:
         super().__init__(reason)
         self.status_code = status_code
         self.response_body = (response_body or "")[:1024]  # bounded
         self.model_id = (model_id or "")[:128]
+        # Task CR5 (additive, default None): absolute UNIX wake-up deadline parsed
+        # from the 429's own Retry-After / x-ratelimit-reset header, so the
+        # failover SERVING recovery probe can suspend until the provider's stated
+        # reset instead of a blind interval. None -> legacy 429 behaviour.
+        self.ratelimit_reset_ts = ratelimit_reset_ts
 
     def is_modality_error(self) -> bool:
         """True iff the response indicates the model can't accept
@@ -1810,11 +1894,18 @@ class DoublewordProvider:
             self._daily_spend = 0.0
             self._budget_reset_date = today
 
-    def _check_budget(self) -> None:
+    def _check_budget(self, compute_context: Optional[str] = None) -> None:
         """Raise if daily budget is exhausted OR session-budget preflight
         refuses. Called before each generation (including from
         ``complete_sync``, which means the DW heavy non-streaming lane
-        inherits the gate transparently)."""
+        inherits the gate transparently).
+
+        ``compute_context`` (Task CR1 -- Financial Context Decoupling): threaded
+        from the callers that hold an OperationContext (``_generate_realtime``,
+        ``submit_batch``). When it equals ``"Local_Open_Source"`` the session
+        preflight ALLOWS the op (free local compute). Cognition-layer callers
+        without a context (``prompt_only``, ``complete_sync``) pass ``None`` --
+        byte-identical to the legacy gate."""
         self._maybe_reset_daily_budget()
         if self._daily_spend >= self._daily_budget:
             raise DoublewordInfraError(
@@ -1847,6 +1938,11 @@ class DoublewordProvider:
                 provider_name="doubleword",
                 estimated_cost_usd=float(self._max_cost_per_op or 0.0),
                 signal_source=None,
+                # Financial Context Decoupling (Task CR1) -- threaded from the
+                # caller's OperationContext (None for context-free cognition
+                # callers). "Local_Open_Source" bypasses the wallet gate;
+                # absent on billed cloud ops, so this is byte-identical.
+                compute_context=compute_context,
             )
         except ImportError:
             # Module absent on this build — graceful fall-through to
@@ -1883,7 +1979,9 @@ class DoublewordProvider:
         """
         if not self.is_available:
             return None
-        self._check_budget()
+        self._check_budget(
+            compute_context=getattr(ctx, "compute_context", None),
+        )
 
         from backend.core.ouroboros.governance.providers import (
             _build_codegen_prompt,
@@ -3124,7 +3222,9 @@ class DoublewordProvider:
         )
         from datetime import datetime, timezone
 
-        self._check_budget()
+        self._check_budget(
+            compute_context=getattr(context, "compute_context", None),
+        )
         t0 = time.monotonic()
         total_cost = 0.0
         self._last_chunk_at = 0.0  # reset — prevents stale timestamps from prior generation
@@ -3607,6 +3707,10 @@ class DoublewordProvider:
                                     status_code=resp.status,
                                     response_body=err_body,
                                     model_id=_effective_model,
+                                    # CR5: capture the provider's own reset deadline
+                                    # (Retry-After / x-ratelimit-reset) -> header-aware
+                                    # failover recovery sleep. None on non-429/no header.
+                                    ratelimit_reset_ts=_parse_retry_after_headers(resp.headers),
                                 )
 
                             # Two-Phase Stream Rupture Breaker.
@@ -4071,6 +4175,8 @@ class DoublewordProvider:
                                     status_code=resp.status,
                                     response_body=err_body,
                                     model_id=_effective_model,
+                                    # CR5: header-aware failover recovery deadline.
+                                    ratelimit_reset_ts=_parse_retry_after_headers(resp.headers),
                                 )
 
                             data = await resp.json()
@@ -5584,6 +5690,8 @@ class DoublewordProvider:
                     raise DoublewordInfraError(
                         f"complete_sync[{caller_id}] HTTP {resp.status}: {err_body[:200]}",
                         status_code=resp.status,
+                        # CR5: header-aware failover recovery deadline.
+                        ratelimit_reset_ts=_parse_retry_after_headers(resp.headers),
                     )
                 data = await resp.json()
                 choices = data.get("choices", [])

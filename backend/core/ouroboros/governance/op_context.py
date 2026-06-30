@@ -1012,6 +1012,7 @@ class OperationContext:
     # ---- Signal metadata (propagated from IntentEnvelope at intake) ----
     signal_urgency: str = ""   # "critical" | "high" | "normal" | "low"
     signal_source: str = ""    # "test_failure" | "voice_human" | "ai_miner" | etc.
+    compute_context: str = ""  # "" | "Local_Open_Source" (free local Ollama) -- bypasses the financial preflight
     # JSON-encoded snapshot of the originating envelope's
     # ``evidence`` dict. Frozen-friendly (string, no Mapping
     # ordering issues). Default empty string when no envelope (op
@@ -1394,6 +1395,18 @@ class OperationContext:
 
         # Final instance with correct hash
         return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_compute_context(self, compute_context: str) -> "OperationContext":
+        """Return a new context tagged with a compute_context.
+
+        ``"Local_Open_Source"`` marks an op as free local open-source compute
+        (e.g. local Ollama, $0.00), which bypasses the financial preflight in
+        :func:`session_budget_authority.check_preflight`. Mirrors the existing
+        ``with_*`` dataclasses.replace idiom (no hash-chain rewrite needed --
+        this is a pre-pipeline tag set alongside signal metadata).
+        """
+        import dataclasses as _dc
+        return _dc.replace(self, compute_context=compute_context)
 
     def with_pipeline_deadline(self, deadline: "datetime") -> "OperationContext":
         """Return a new context with pipeline_deadline set (no phase change).
