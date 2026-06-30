@@ -203,12 +203,11 @@ class Slice4bRunner(PhaseRunner):
                     _expected_branch = None
                     _sbx_tok = getattr(ctx, "sandbox_token", None)
                     _blast_tok = getattr(ctx, "blast_token", None)
-                    from backend.core.ouroboros.governance.autonomous_pr_pipeline import (
-                        pipeline_enabled,
-                        run_pr_gate_pipeline,
-                        PRGatePipelineError,
-                    )
-                    if pipeline_enabled():
+                    if os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in ("1", "true", "yes"):
+                        from backend.core.ouroboros.governance.autonomous_pr_pipeline import (
+                            run_pr_gate_pipeline,
+                            PRGatePipelineError,
+                        )
                         from backend.core.ouroboros.governance.dag_capability_token import (
                             DAGProofChain,
                         )

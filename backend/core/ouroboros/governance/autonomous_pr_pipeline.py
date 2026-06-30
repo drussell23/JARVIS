@@ -222,6 +222,12 @@ async def run_pr_gate_pipeline(
         except (SandboxLockFailed, RequiresCloudExecution) as exc:
             raise PRGatePipelineError(f"gate1: {exc}") from exc
 
+        # Capture pre-apply tree SHA BEFORE writing any candidate files so
+        # Gate 2's rollback assertion compares HEAD (pre-op) against HEAD (restored).
+        _tree_sha = tree_sha_fn or _default_tree_sha
+        _scope = [p for p, _ in candidate_files]
+        pre_sha = await _tree_sha(wt)
+
         # Apply the candidate into the worktree so Gate 2 tests see it.
         await (apply_candidate or _default_apply_candidate)(
             wt, list(candidate_files)
@@ -236,10 +242,7 @@ async def run_pr_gate_pipeline(
         from .reverse_dep_resolver import resolve_reverse_dependency_tests
 
         _resolver = graph_resolver or resolve_reverse_dependency_tests
-        _tree_sha = tree_sha_fn or _default_tree_sha
         _runner = test_run_fn or _default_test_run
-        _scope = [p for p, _ in candidate_files]
-        pre_sha = await _tree_sha(wt)
 
         async def _graph_fn(files):
             return await _resolver(files, repo_root=str(wt), oracle=None)
