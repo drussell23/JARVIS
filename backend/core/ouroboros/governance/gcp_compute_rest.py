@@ -974,6 +974,44 @@ class GCPComputeRest:
         )
         return (False, "DELETE_FAILED:{}".format(status))
 
+    async def get_serial_port_output(
+        self, name: Optional[str] = None, *, zone: Optional[str] = None, port: int = 1,
+    ) -> Tuple[Optional[str], str]:
+        """GET instances/<name>/serialPort?port=<port> via the SAME REST contract
+        as the dead-man delete -- reads the node's boot serial console for the
+        Autonomous Diagnostic Reaper (Task HW2). Returns (contents, detail):
+        (text, "ok:200") on success, (None, "<LOCUS>:..") on any failure.
+        Fail-CLOSED -- NEVER raises."""
+        token = await self.access_token()
+        if not token:
+            return (None, "AUTH_TOKEN_UNAVAILABLE:metadata_unreachable")
+        zone = zone or await self.zone()
+        project = await self.project()
+        if not zone or not project:
+            return (
+                None,
+                "IDENTITY_UNRESOLVED:zone={!r}:project={!r}".format(zone, project),
+            )
+        node = name or _node_name()
+        url = "{}/projects/{}/zones/{}/instances/{}/serialPort?port={}".format(
+            _COMPUTE_BASE, project, zone, node, int(port),
+        )
+        headers = {"Authorization": "Bearer {}".format(token)}
+        status, text = await _http_request(
+            url, method="GET", headers=headers, timeout_s=_rest_timeout(),
+        )
+        if 200 <= status < 300:
+            try:
+                contents = json.loads(text).get("contents", "") if text else ""
+            except Exception:  # noqa: BLE001 -- malformed body is still fail-soft
+                contents = text or ""
+            return (contents, "ok:{}".format(status))
+        logger.warning(
+            "[GCPComputeRest] serialPort read failed node=%s status=%s detail=%s",
+            node, status, (text or "")[-200:],
+        )
+        return (None, "SERIAL_READ_FAILED:{}".format(status))
+
     # -- ephemeral firewall micro-perimeter (IaC, same REST bridge) -------
 
     async def create_firewall_rule(
