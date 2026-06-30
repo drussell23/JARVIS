@@ -310,6 +310,12 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     """
     env["JARVIS_FAILOVER_HYBRID_MESH"] = "true"             # external-natIP route
     env["JARVIS_FAILOVER_INFERENCE_BIND_ENABLED"] = "true"  # node binds 0.0.0.0
+    # L4-capable zones ONLY (drop non-L4 zones like us-central1-f whose 400
+    # halts the multi-zonal chain). Quota is confirmed in us-central1.
+    env.setdefault("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b,us-central1-c")
+    # L4 Spot is scarce -> let a Spot stockout fall through to on-demand in
+    # the same quota'd zone (bounded $; the run is short + violently reaped).
+    env.setdefault("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "true")
     fw_name = os.environ.get(
         "JARVIS_FAILOVER_FW_RULE_NAME", _FAILOVER_FW_RULE_DEFAULT)
     node_name = os.environ.get(

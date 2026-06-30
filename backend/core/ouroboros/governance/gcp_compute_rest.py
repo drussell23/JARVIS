@@ -272,6 +272,14 @@ def _machine_type() -> str:
     return _env_str(_ENV_MACHINE_TYPE, _DEFAULT_MACHINE_TYPE)
 
 
+def _ondemand_on_stockout_enabled() -> bool:
+    """When true, a SPOT stockout in a zone falls through to an on-demand insert
+    in the SAME zone before giving up on it (L4 Spot is scarce; on-demand has
+    capacity in a quota'd region). Default OFF -> Spot-only across zones (prod
+    failover stays cheap)."""
+    return os.environ.get("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false").strip().lower() in ("1", "true", "yes")
+
+
 # ---------------------------------------------------------------------------
 # Low-level async HTTP (aiohttp if present, else stdlib urllib on the executor)
 # ---------------------------------------------------------------------------
@@ -724,6 +732,9 @@ class GCPComputeRest:
                 if op:
                     verdict = await self._await_insert_operation(project, zone, op, token)
                     if verdict == "stockout":
+                        if spot and _ondemand_on_stockout_enabled():
+                            logger.warning("[GCPComputeRest] SPOT stockout zone=%s -> trying ON-DEMAND same zone (quota'd region)", zone)
+                            continue
                         return ("stockout", "zone={}:op_stockout".format(zone))
                     if verdict == "error":
                         logger.warning("[GCPComputeRest] insert op error zone=%s mode=%s", zone, mode)
@@ -733,6 +744,9 @@ class GCPComputeRest:
                 return ("created", "zone={}:mode={}".format(zone, mode))
             # Synchronous rejection: a stockout here -> retry next zone.
             if is_stockout_error(text):
+                if spot and _ondemand_on_stockout_enabled():
+                    logger.warning("[GCPComputeRest] SPOT sync-stockout zone=%s -> trying ON-DEMAND same zone", zone)
+                    continue
                 return ("stockout", "zone={}:sync_stockout".format(zone))
             logger.warning("[GCPComputeRest] insert %s failed zone=%s status=%s detail=%s",
                            mode, zone, status, (text or "")[-200:])
