@@ -203,5 +203,45 @@ class WorkspaceCheckpointManager:
         )
         return False
 
+    async def tree_sha_for_ref(self, ref: str) -> str:
+        """Deterministic content TREE sha for a commit/ref. Empty/falsy ref -> HEAD.
+
+        ``git stash create`` returns a timestamped COMMIT sha; its ``^{tree}`` is
+        the content-addressed tree, identical for identical content.
+        """
+        target = (ref or "").strip() or "HEAD"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", f"{target}^{{tree}}",
+                cwd=str(self._project_root),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except (asyncio.TimeoutError, OSError) as exc:
+            logger.warning("[Checkpoint] tree_sha_for_ref(%s) failed: %s", target, exc)
+            return ""
+        if proc.returncode != 0:
+            return ""
+        return stdout.decode().strip()
+
+    async def working_tree_content_sha(self) -> str:
+        """Deterministic content TREE sha of the CURRENT working tree.
+
+        ``git stash create`` snapshots the WIP (empty output when clean -> HEAD),
+        then we resolve its ``^{tree}``.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "stash", "create",
+                cwd=str(self._project_root),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except (asyncio.TimeoutError, OSError) as exc:
+            logger.warning("[Checkpoint] working_tree_content_sha stash create failed: %s", exc)
+            return ""
+        ref = stdout.decode().strip()  # empty when the tree is clean
+        return await self.tree_sha_for_ref(ref)  # empty -> HEAD inside the helper
+
     def list_checkpoints(self) -> List[Checkpoint]:
         return list(self._checkpoints)

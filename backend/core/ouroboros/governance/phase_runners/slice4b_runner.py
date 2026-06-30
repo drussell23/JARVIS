@@ -1156,8 +1156,12 @@ class Slice4bRunner(PhaseRunner):
                 set(ctx.target_files)
                 | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
             )
-            # Reuse the APPLY-start checkpoint's tree SHA as the pre-op anchor.
-            _g2_pre_sha = getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
+            # Reuse the APPLY-start checkpoint's content TREE SHA as the pre-op anchor.
+            # stash_ref is a timestamped COMMIT sha; ^{tree} is content-addressed and
+            # deterministic — identical content produces identical tree SHA.
+            _g2_pre_sha = await _ckpt_mgr.tree_sha_for_ref(
+                getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
+            )
 
             async def _g2_graph_fn(files):
                 return await resolve_reverse_dependency_tests(
@@ -1180,8 +1184,7 @@ class Slice4bRunner(PhaseRunner):
             async def _g2_tree_sha():
                 if _ckpt_mgr is None:
                     return ""
-                _ck = await _ckpt_mgr.create_checkpoint(ctx.op_id, "blast-radius: current-tree")
-                return getattr(_ck, "stash_ref", "") if _ck is not None else ""
+                return await _ckpt_mgr.working_tree_content_sha()
 
             def _g2_dlq_fn(reason):
                 _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
