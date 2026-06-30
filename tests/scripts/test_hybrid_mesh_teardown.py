@@ -177,10 +177,29 @@ def test_firewall_opens_with_slash32_source(monkeypatch: Any) -> None:
 
     ok = asyncio.run(_driver._open_failover_firewall("fw-mesh"))
 
-    assert ok is True
+    # Fix 3: _open_failover_firewall returns the fw_name on success (not bool).
+    assert ok == "fw-mesh"
     assert rec.created_firewalls == [
         {"name": "fw-mesh", "source_ip": "203.0.113.7", "port": 11434},
     ]
+
+
+def test_fw_rule_none_when_not_opened(monkeypatch: Any) -> None:
+    """Fix 3: when resolve_local_public_ip returns None the firewall is NOT opened,
+    but the node is STILL registered for teardown (orphan safety)."""
+    rec = _Recorder()
+    _install_recorder(monkeypatch, rec, ip=None)  # cannot resolve public IP
+
+    env: Dict[str, str] = {}
+    asyncio.run(_driver._arm_failover_mesh(env))
+
+    # Node must be registered (orphan safety never weakened).
+    assert len(_driver._ACTIVE_FAILOVER_RESOURCES) == 1
+    assert _driver._ACTIVE_FAILOVER_RESOURCES[0]["node"]
+    # fw_rule must be None because the firewall was never actually opened.
+    assert _driver._ACTIVE_FAILOVER_RESOURCES[0]["fw_rule"] is None
+    # No firewall rule was created.
+    assert rec.created_firewalls == []
 
 
 def test_no_public_ip_skips_open_but_keeps_teardown(monkeypatch: Any) -> None:

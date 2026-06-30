@@ -235,20 +235,15 @@ def _reap_failover_resources() -> None:
 
     try:
         try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is not None:
-            # A live loop owns this thread -- asyncio.run() would raise. Reap on
-            # a side thread with its own loop so the node delete is still the
-            # last breath even when fired from a signal handler mid-soak.
+            loop = asyncio.get_running_loop()
+            # running-loop -> daemon-thread branch
             import threading
-
             t = threading.Thread(
                 target=_run_blocking, name="failover-reap", daemon=True)
             t.start()
-            t.join(timeout=30.0)
-        else:
+            t.join(timeout=float(os.environ.get("JARVIS_FAILOVER_REST_TIMEOUT_S", "30")) + 5.0)
+        except RuntimeError:
+            # no-loop -> asyncio.run branch
             _run_blocking()
         _log("[HybridMesh] reaped %d failover resource(s) -- "
              "node(s)+firewall(s) deleted" % len(resources))
@@ -272,12 +267,12 @@ def _register_failover_resource(
     })
 
 
-async def _open_failover_firewall(fw_name: str) -> bool:
+async def _open_failover_firewall(fw_name: str) -> Optional[str]:
     """Open the driver-owned ephemeral /32 INGRESS firewall for THIS host's
     public IP -> the failover node's inference port.  Reuses the existing GCP
     primitives (``resolve_local_public_ip`` + ``create_firewall_rule``) -- NO
-    ``0.0.0.0/0``, ever.  Fail-soft -> False; the teardown stays armed
-    regardless (the node was registered before this call)."""
+    ``0.0.0.0/0``, ever.  Returns ``fw_name`` on success, ``None`` on skip/fail;
+    the teardown stays armed regardless (the node was registered before this call)."""
     try:
         from backend.core.ouroboros.governance.gcp_compute_rest import (
             get_compute_rest,
@@ -288,17 +283,17 @@ async def _open_failover_firewall(fw_name: str) -> bool:
         if not ip:
             _log("[HybridMesh] WARN could not resolve local public IP -- "
                  "firewall NOT opened; node may be unreachable")
-            return False
+            return None
         ok, detail = await get_compute_rest().create_firewall_rule(
             name=fw_name, source_ip=ip, port=_FAILOVER_INFERENCE_PORT)
         _log("[HybridMesh] ephemeral /32 firewall %s for %s/32:%d -> %s (%s)" % (
             fw_name, ip, _FAILOVER_INFERENCE_PORT,
             "OPEN" if ok else "FAILED", detail))
-        return bool(ok)
+        return fw_name if ok else None
     except Exception as exc:  # noqa: BLE001
         _log("[HybridMesh] firewall open error "
              "(continuing -- teardown still armed): %r" % (exc,))
-        return False
+        return None
 
 
 async def _arm_failover_mesh(env: Dict[str, str]) -> None:
@@ -319,8 +314,13 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
         "JARVIS_FAILOVER_FW_RULE_NAME", _FAILOVER_FW_RULE_DEFAULT)
     node_name = os.environ.get(
         "JARVIS_FAILOVER_NODE_NAME", _FAILOVER_NODE_DEFAULT)
-    _register_failover_resource(node=node_name, fw_rule=fw_name)
-    await _open_failover_firewall(fw_name)
+    # Register the node for teardown UP FRONT (orphan safety) with fw_rule=None;
+    # fw_rule is updated to the opened name only if the firewall was actually
+    # created -- so a reap never deletes a rule that was never opened.
+    _register_failover_resource(node=node_name, fw_rule=None)
+    opened_fw = await _open_failover_firewall(fw_name)
+    if _ACTIVE_FAILOVER_RESOURCES:
+        _ACTIVE_FAILOVER_RESOURCES[-1]["fw_rule"] = opened_fw
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +337,25 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+# Soak-child wall budget: read at module load for logging; the helper re-reads
+# at call time so monkeypatch.setenv in tests takes effect.
+_ready_budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
+_failover_wall = _ready_budget + 600.0  # ~90s boot + audit + slack; READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
+
+
+def _failover_soak_wall(enable_failover: bool) -> int:
+    """Return the soak-child wall-clock budget in seconds.
+
+    enable_failover=False -> 300 (byte-identical default).
+    enable_failover=True  -> READY_BUDGET_S + 600 to accommodate 32B cold-start.
+    # READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
+    """
+    if not enable_failover:
+        return 300
+    budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
+    return int(budget + 600.0)
 
 
 def _probe_api_tags(url: str) -> int:
@@ -412,7 +431,7 @@ async def _await_jprime_serving(
             url = "http://%s:%d/api/tags" % (external, port)
             status = 0
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 status = await asyncio.wait_for(
                     loop.run_in_executor(None, _probe_api_tags, url),
                     timeout=probe_to + 1.0,
@@ -858,10 +877,16 @@ class IsomorphicA1Driver:
                     else:
                         _log("STEP soak: launching production O+V (pre-inject boot) "
                              "iso_cwd=%s" % iso_cwd)
+                        if self.enable_failover:
+                            _log("[HybridMesh] soak-child wall extended to %ds "
+                                 "(32B cold-start: readiness %ds + margin)" % (
+                                     _failover_soak_wall(True),
+                                     int(_env_float(
+                                         "JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0))))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
                             cost_cap=0.0,
-                            wall_seconds=300,
+                            wall_seconds=_failover_soak_wall(self.enable_failover),
                         )
                         # Thread IsomorphicEnv: launch child with disjoint cwd so
                         # os.getcwd()-as-repo-root bugs surface in the real chain.

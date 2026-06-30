@@ -173,3 +173,33 @@ def test_probe_failsoft(monkeypatch: Any) -> None:
         _driver._await_jprime_serving("node-d", budget_s=0.05))
 
     assert served is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: soak-child wall budget
+# ---------------------------------------------------------------------------
+
+def test_failover_wall_exceeds_readiness_budget(monkeypatch: Any) -> None:
+    """Fix 1: _failover_soak_wall accounts for 32B cold-start.
+
+    enable_failover=True  -> READY_BUDGET_S + 600 >= 1500 and > 300
+    enable_failover=False -> 300 (byte-identical default path)
+    """
+    # Default budget (900) -> wall must be 900 + 600 = 1500.
+    wall_on = _driver._failover_soak_wall(True)
+    assert wall_on >= 900 + 600, "failover wall must cover readiness budget + 600s margin"
+    assert wall_on > 300, "failover wall must exceed the non-failover default"
+
+    wall_off = _driver._failover_soak_wall(False)
+    assert wall_off == 300, "default (no failover) wall must be byte-identical 300"
+
+
+def test_failover_wall_respects_env_override(monkeypatch: Any) -> None:
+    """_failover_soak_wall re-reads env at call time so monkeypatch takes effect."""
+    monkeypatch.setenv("JARVIS_HYBRID_MESH_READY_BUDGET_S", "600")
+
+    wall_on = _driver._failover_soak_wall(True)
+    assert wall_on == 600 + 600  # 1200
+
+    wall_off = _driver._failover_soak_wall(False)
+    assert wall_off == 300  # unchanged
