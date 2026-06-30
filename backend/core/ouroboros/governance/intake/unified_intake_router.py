@@ -725,12 +725,26 @@ class IntakeRouterConfig:
     dispatch_timeout_s: float = 300.0
 
     @property
+    def _state_root(self) -> Path:
+        """Writable root for intake state (.jarvis WAL/lock/...).
+
+        Virtualizes the storage boundary so the code never depends on a
+        hardcoded, possibly-unprivileged absolute path. ``JARVIS_TRINITY_ROOT``
+        (when set) is the authoritative writable root -- the isomorphic local
+        soak injects a temp dir there so the literal ``/opt/trinity`` production
+        path is never required off the node. Unset => ``project_root`` (prod is
+        byte-identical: nothing reads the env var on the real node).
+        """
+        env_root = os.environ.get("JARVIS_TRINITY_ROOT", "").strip()
+        return Path(env_root) if env_root else self.project_root
+
+    @property
     def resolved_wal_path(self) -> Path:
-        return self.wal_path or (self.project_root / ".jarvis" / "intake_wal.jsonl")
+        return self.wal_path or (self._state_root / ".jarvis" / "intake_wal.jsonl")
 
     @property
     def resolved_lock_path(self) -> Path:
-        return self.lock_path or (self.project_root / ".jarvis" / "intake_router.lock")
+        return self.lock_path or (self._state_root / ".jarvis" / "intake_router.lock")
 
 
 class PendingAckStore:
