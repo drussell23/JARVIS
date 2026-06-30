@@ -7,7 +7,7 @@ Usage:
 
 Exit codes:
     0   A1_DISPATCH_PROVEN
-    1   soak non-zero (failure telemetry printed as [FOR CLAUDE] block)
+    non-zero (the driver's own exit code)   soak non-zero (failure telemetry printed as [FOR CLAUDE] block)
     2   docker daemon not responsive
     3   preflight (integration test) failed -- soak skipped
 """
@@ -71,6 +71,8 @@ def tee_run(argv: list[str], log_handle, *, env=None, cwd=None) -> int:
     Both streams are flushed after every line -- zero data loss guarantee.
     Returns the exit code of the subprocess.
     """
+    _env = dict(env if env is not None else os.environ)
+    _env.setdefault("PYTHONUNBUFFERED", "1")   # real-time tee: child flushes per line
     proc = subprocess.Popen(
         argv,
         stdout=PIPE,
@@ -78,9 +80,10 @@ def tee_run(argv: list[str], log_handle, *, env=None, cwd=None) -> int:
         text=True,
         bufsize=1,
         cwd=cwd,
-        env=env,
+        env=_env,
     )
-    assert proc.stdout is not None  # always present when stdout=PIPE
+    if proc.stdout is None:
+        raise RuntimeError("tee_run: subprocess stdout pipe was not created")
     for line in proc.stdout:
         sys.stdout.write(line)
         sys.stdout.flush()
