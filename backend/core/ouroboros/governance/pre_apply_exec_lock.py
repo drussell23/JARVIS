@@ -86,6 +86,25 @@ async def acquire_sandbox_execution_token(
     return token  # type: ignore[return-value]  # mint() returns the typed subclass
 
 
+async def docker_preflight(*, probe=None) -> bool:
+    """Async, non-blocking daemon ping run once at A1-loop start.
+
+    Surfaces Docker absence BEFORE an op reaches APPLY, so the orchestrator
+    can flag REQUIRES_CLOUD_EXECUTION early rather than failing mid-DAG.
+    Default-OFF safety: only warns when lock_enabled(); otherwise just returns
+    the bool with no side effects.
+    """
+    import asyncio
+    from . import container_sandbox
+    _probe = probe or container_sandbox.docker_available
+    available = await asyncio.get_running_loop().run_in_executor(None, _probe)
+    if not available and lock_enabled():
+        logger.warning(
+            "[Gate1] Docker daemon ABSENT at preflight -- ops will route REQUIRES_CLOUD_EXECUTION"
+        )
+    return available
+
+
 def _build_probe(candidate_files: Sequence[Tuple[str, str]]) -> str:
     """A deterministic compile-check payload over the candidate's .py files."""
     py = [p for p, _ in candidate_files if p.endswith(".py")]

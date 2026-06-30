@@ -1380,6 +1380,14 @@ class GovernedLoopService:
 
             await self._build_components()
 
+            # Task 9 -- async Docker pre-flight: surfaces daemon absence BEFORE
+            # any op reaches APPLY.  Fail-soft: boot continues regardless.
+            try:
+                from .pre_apply_exec_lock import docker_preflight
+                self._docker_ready = await docker_preflight()
+            except Exception:  # noqa: BLE001
+                self._docker_ready = None
+
             # Phase 4: initialize preemption FSM executor (ledger available after _build_components)
             self._fsm_engine = PreemptionFsmEngine()
             if self._ledger is not None:
