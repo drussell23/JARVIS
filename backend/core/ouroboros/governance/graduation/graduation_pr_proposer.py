@@ -290,25 +290,43 @@ async def propose_graduation_pr(
         except Exception as exc:  # noqa: BLE001
             return ProposalResult(False, flag, source_file, None, f"reviewer_unavailable:{exc}")
 
+    # Non-autonomous graduation path: mint a signed HumanOverrideToken to
+    # declare the exemption explicitly (no bypass flag, WAL-audited).
+    from backend.core.ouroboros.governance.dag_capability_token import (
+        DAGProofChain,
+        TokenKind,
+    )
+    _grad_op_id = f"sovereign-graduation-{flag.lower()}"
+    _override_chain = DAGProofChain()
+    _override_tok = _override_chain.mint(
+        kind=TokenKind.HUMAN_OVERRIDE,
+        op_id=_grad_op_id,
+        state_binding="non_autonomous",
+        payload={"caller": "graduation_pr_proposer", "reason": f"graduate:{flag}"},
+    )
     try:
         pr = await reviewer.create_review_pr(
-            op_id=f"sovereign-graduation-{flag.lower()}",
+            op_id=_grad_op_id,
             description=f"[SOVEREIGN GRADUATION] Activated {flag}",
             files=[(source_file, rw.new_text)],
             evidence={"flag": flag, "soaks": list(session_ids)},
             risk_tier_name="APPROVAL_REQUIRED",
             body_override=body,
             title_override=f"[SOVEREIGN GRADUATION] Activated {flag}",
+            chain=_override_chain,
+            override_token=_override_tok,
         )
     except TypeError:
         # OrangePRReviewer without body_override support — fall back to default
         # body (the manifest is still in the evidence + commit).
         pr = await reviewer.create_review_pr(
-            op_id=f"sovereign-graduation-{flag.lower()}",
+            op_id=_grad_op_id,
             description=f"[SOVEREIGN GRADUATION] Activated {flag}",
             files=[(source_file, rw.new_text)],
             evidence={"flag": flag, "manifest": body},
             risk_tier_name="APPROVAL_REQUIRED",
+            chain=_override_chain,
+            override_token=_override_tok,
         )
     except Exception as exc:  # noqa: BLE001
         return ProposalResult(False, flag, source_file, None, f"pr_create_failed:{exc}")

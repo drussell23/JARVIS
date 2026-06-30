@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 from backend.core.ouroboros.governance.dag_capability_token import (
     TokenKind, CapabilityToken, SandboxExecutionToken, BlastRadiusClearedToken,
-    LintClearedToken, DAGProofChain,
+    LintClearedToken, HumanOverrideToken, DAGProofChain,
 )
 
 OP = "op-123"
@@ -148,3 +148,47 @@ def test_empty_branch_context_backward_compatible():
     t1, t2, t3 = _full_chain(chain)
     assert all(t.branch_context == "" for t in (t1, t2, t3))
     assert chain.verify_chain([t1, t2, t3], op_id=OP) is True
+
+
+# ---------------------------------------------------------------------------
+# Task 16: HumanOverrideToken -- standalone second cryptographic path.
+# ---------------------------------------------------------------------------
+
+def _mint_override(chain: DAGProofChain, op_id: str = OP):
+    return chain.mint(
+        kind=TokenKind.HUMAN_OVERRIDE, op_id=op_id,
+        state_binding="non_autonomous",
+        payload={"caller": "test", "reason": "manual"},
+    )
+
+
+def test_human_override_mints_with_right_type():
+    # mint() resolves the concrete class via _KIND_CLS -> HumanOverrideToken.
+    chain = DAGProofChain()
+    tok = _mint_override(chain)
+    assert isinstance(tok, HumanOverrideToken)
+    assert tok.kind is TokenKind.HUMAN_OVERRIDE
+    assert tok.prev_hash == ""  # standalone -- not chain-linked.
+
+
+def test_human_override_verifies_genuine_rejects_forged():
+    chain = DAGProofChain()
+    tok = _mint_override(chain)
+    assert chain.verify(tok) is True
+    forged = dataclasses.replace(tok, sig="deadbeef" * 8)
+    assert chain.verify(forged) is False
+
+
+def test_human_override_cross_secret_rejected():
+    # An override minted by a foreign chain/secret never verifies here.
+    foreign = DAGProofChain()
+    tok = _mint_override(foreign)
+    local = DAGProofChain()
+    assert local.verify(tok) is False
+
+
+def test_human_override_excluded_from_autonomous_chain():
+    # The override is STANDALONE -- it can never substitute for a 3-token chain.
+    chain = DAGProofChain()
+    tok = _mint_override(chain)
+    assert chain.verify_chain([tok], op_id=OP) is False

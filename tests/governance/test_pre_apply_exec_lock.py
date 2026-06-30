@@ -9,16 +9,16 @@ from backend.core.ouroboros.governance.dag_capability_token import (
 CANDIDATE = [("backend/x.py", "def f():\n    return 1\n")]
 
 class _FakeResult:
-    def __init__(self, exit_code, breached=False):
-        self.exit_code = exit_code
-        self.breached = breached
-        self.diagnostic = "ok" if exit_code == 0 else "boom"
+    def __init__(self, returncode=0, ok=True, diagnostic="ok"):
+        self.returncode = returncode
+        self.ok = ok
+        self.diagnostic = diagnostic
 
 @pytest.mark.asyncio
 async def test_exit_zero_mints_token():
     chain = DAGProofChain()
     async def runner(**_):
-        return _FakeResult(0)
+        return _FakeResult(returncode=0, ok=True)
     tok = await lock.acquire_sandbox_execution_token(
         op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
         chain=chain, docker_available=lambda: True, runner=runner)
@@ -32,7 +32,7 @@ async def test_exit_zero_mints_token():
 async def test_nonzero_exit_raises_sandbox_lock_failed():
     chain = DAGProofChain()
     async def runner(**_):
-        return _FakeResult(1)
+        return _FakeResult(returncode=1, ok=True)
     with pytest.raises(lock.SandboxLockFailed):
         await lock.acquire_sandbox_execution_token(
             op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
@@ -52,7 +52,7 @@ async def test_no_docker_raises_requires_cloud_execution_no_process_fallback():
 async def test_containment_breach_raises_sandbox_lock_failed():
     chain = DAGProofChain()
     async def runner(**_):
-        return _FakeResult(0, breached=True)
+        return _FakeResult(returncode=0, ok=False)
     with pytest.raises(lock.SandboxLockFailed):
         await lock.acquire_sandbox_execution_token(
             op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
@@ -62,7 +62,7 @@ async def test_containment_breach_raises_sandbox_lock_failed():
 async def test_token_records_py_file_count():
     chain = DAGProofChain()
     async def runner(**_):
-        return _FakeResult(0)
+        return _FakeResult(returncode=0, ok=True)
     tok = await lock.acquire_sandbox_execution_token(
         op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
         chain=chain, docker_available=lambda: True, runner=runner)
@@ -72,9 +72,29 @@ async def test_token_records_py_file_count():
 async def test_branch_context_forwarded_to_token():
     chain = DAGProofChain()
     async def runner(**_):
-        return _FakeResult(0)
+        return _FakeResult(returncode=0, ok=True)
     tok = await lock.acquire_sandbox_execution_token(
         op_id="op-1", candidate_files=CANDIDATE, repo_root="/repo",
         chain=chain, docker_available=lambda: True, runner=runner,
         branch_context="wt-1")
     assert tok.branch_context == "wt-1"
+
+@pytest.mark.asyncio
+async def test_runner_called_with_real_run_in_container_signature():
+    """Pin the EXACT run_in_container signature -- no op_id, no **kwargs.
+
+    If the production call ever re-adds op_id (or any unknown kwarg) this
+    test TypeErrors, proving Gate 1 would crash on real Docker.
+    """
+    chain = DAGProofChain()
+    captured = {}
+    # Mirror container_sandbox.run_in_container's real signature exactly (no op_id).
+    async def runner(code, *, worktree, image=None, policy=None,
+                     seccomp_profile=None, docker_run=None, read_only=False):
+        captured["worktree"] = worktree
+        return _FakeResult(returncode=0, ok=True)
+    tok = await lock.acquire_sandbox_execution_token(
+        op_id="op-sig", candidate_files=CANDIDATE, repo_root="/repo",
+        chain=chain, docker_available=lambda: True, runner=runner)
+    assert isinstance(tok, SandboxExecutionToken)
+    assert captured["worktree"] == "/repo"  # call used real-signature kwargs only

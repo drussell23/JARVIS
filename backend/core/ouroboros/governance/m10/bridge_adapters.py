@@ -932,6 +932,19 @@ class OrangePRBridgeAdapter:
                         f"{type(err).__name__}: {err}"
                     ),
                 )
+        # Non-autonomous m10 proposer path: mint a signed HumanOverrideToken to
+        # declare the exemption explicitly (no bypass flag, WAL-audited).
+        from backend.core.ouroboros.governance.dag_capability_token import (
+            DAGProofChain,
+            TokenKind,
+        )
+        _override_chain = DAGProofChain()
+        _override_tok = _override_chain.mint(
+            kind=TokenKind.HUMAN_OVERRIDE,
+            op_id=proposal_id,
+            state_binding="non_autonomous",
+            payload={"caller": "m10_bridge_adapters", "reason": "m10_proposer_pr"},
+        )
         try:
             review_result = await reviewer.create_review_pr(
                 op_id=proposal_id,
@@ -939,6 +952,8 @@ class OrangePRBridgeAdapter:
                 files=[],
                 evidence={"source": "m10_proposer"},
                 risk_tier_name="APPROVAL_REQUIRED",
+                chain=_override_chain,
+                override_token=_override_tok,
             )
         except Exception as err:  # noqa: BLE001
             return PRQueueResult(

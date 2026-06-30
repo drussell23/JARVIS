@@ -63,13 +63,13 @@ async def acquire_sandbox_execution_token(
     _image = sandbox_image or container_sandbox.sandbox_image
     # Build a compile+import probe over the candidate's changed modules.
     probe = _build_probe(candidate_files)
-    result = await _run(code=probe, worktree=repo_root, op_id=op_id)
+    result = await _run(code=probe, worktree=repo_root)
 
-    exit_code = getattr(result, "exit_code", 1)
-    breached = bool(getattr(result, "breached", False))
-    if exit_code != 0 or breached:
+    _rc = result.returncode if getattr(result, "returncode", None) is not None else 1
+    _ok = bool(getattr(result, "ok", False))
+    if not _ok or _rc != 0:
         raise SandboxLockFailed(
-            f"op={op_id} exit={exit_code} breached={breached} "
+            f"op={op_id} returncode={_rc} ok={_ok} "
             f"diag={getattr(result, 'diagnostic', '')}")
 
     state_binding = _candidate_hash(candidate_files)
@@ -78,7 +78,7 @@ async def acquire_sandbox_execution_token(
         op_id=op_id,
         state_binding=state_binding,
         payload={
-            "exit_code": "0",
+            "exit_code": str(_rc),
             "image": _image(),
             "py_files": str(len([p for p, _ in candidate_files if p.endswith(".py")])),
         },

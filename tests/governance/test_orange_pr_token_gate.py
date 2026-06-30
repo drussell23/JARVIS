@@ -9,6 +9,14 @@ from backend.core.ouroboros.governance.dag_capability_token import (
 )
 
 
+def _mint_override(chain, op_id="op-1"):
+    return chain.mint(
+        kind=TokenKind.HUMAN_OVERRIDE, op_id=op_id,
+        state_binding="non_autonomous",
+        payload={"caller": "test", "reason": "manual"},
+    )
+
+
 def _chain_tokens(chain, op_id="op-1", branch_context=""):
     s = chain.mint(
         kind=TokenKind.SANDBOX_EXECUTION, op_id=op_id, state_binding="c",
@@ -116,3 +124,107 @@ async def test_matching_branch_context_passes_branch_check(monkeypatch, tmp_path
     # branch check was passed (not short-circuited by the mismatch guard).
     assert result is None
     assert any("rev-parse" in " ".join(c) for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Task 16: HumanOverrideToken -- the SECOND cryptographic path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_valid_override_token_authorizes(monkeypatch, tmp_path):
+    """Enforcer ON + a valid, signed HumanOverrideToken on the same chain with
+    a matching op_id passes the enforcer and REACHES git (proving the override
+    path authorized the PR without any autonomous chain)."""
+    monkeypatch.setenv("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_A1_PR_LINTER_ENABLED", "false")
+    chain = DAGProofChain()
+    override = _mint_override(chain, op_id="op-1")
+    rv = OrangePRReviewer(str(tmp_path))
+    calls: list = []
+
+    def fake_git(args):
+        calls.append(args)
+        return 1, "", "not a git repo"  # fail rev-parse -> hermetic, no real git.
+
+    rv._run_git_sync = fake_git
+    result = await rv.create_review_pr(
+        op_id="op-1",
+        description="d",
+        files=[("x.py", "y = 1\n")],
+        chain=chain,
+        override_token=override,
+    )
+    # None only because fake git fails — but git was ATTEMPTED, i.e. the
+    # enforcer authorized via the override and did NOT short-circuit.
+    assert result is None
+    assert any("rev-parse" in " ".join(c) for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_invalid_override_refused(monkeypatch, tmp_path):
+    """Forged override, wrong op_id, and wrong-type token are each refused at
+    the enforcer (None) WITHOUT touching git (polymorphism enforced)."""
+    import dataclasses
+
+    monkeypatch.setenv("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_A1_PR_LINTER_ENABLED", "false")
+    rv = OrangePRReviewer(str(tmp_path))
+    calls: list = []
+
+    def fake_git(args):
+        calls.append(args)
+        return 1, "", "not a git repo"
+
+    rv._run_git_sync = fake_git
+
+    chain = DAGProofChain()
+
+    # (a) Forged signature.
+    forged = dataclasses.replace(_mint_override(chain, op_id="op-1"), sig="dead" * 16)
+    assert await rv.create_review_pr(
+        op_id="op-1", description="d", files=[("x.py", "y = 1\n")],
+        chain=chain, override_token=forged,
+    ) is None
+
+    # (b) Genuine override but op_id mismatch.
+    wrong_op = _mint_override(chain, op_id="other-op")
+    assert await rv.create_review_pr(
+        op_id="op-1", description="d", files=[("x.py", "y = 1\n")],
+        chain=chain, override_token=wrong_op,
+    ) is None
+
+    # (c) Wrong-type token passed as override (a SandboxExecutionToken) ->
+    #     isinstance(HumanOverrideToken) is False -> refuse.
+    sandbox = chain.mint(
+        kind=TokenKind.SANDBOX_EXECUTION, op_id="op-1",
+        state_binding="c", payload={},
+    )
+    assert await rv.create_review_pr(
+        op_id="op-1", description="d", files=[("x.py", "y = 1\n")],
+        chain=chain, override_token=sandbox,
+    ) is None
+
+    # No git was ever attempted on a refusal -> enforcer refused cheaply.
+    assert not any("rev-parse" in " ".join(c) for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_path_still_required_without_override(monkeypatch, tmp_path):
+    """No override + an incomplete autonomous chain still refuses (the override
+    path did NOT weaken the autonomous lock)."""
+    monkeypatch.setenv("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_A1_PR_LINTER_ENABLED", "false")
+    rv = OrangePRReviewer(str(tmp_path))
+    chain = DAGProofChain()
+    s, b, l = _chain_tokens(chain)
+    # Omit the lint token entirely: no override, incomplete chain -> refuse.
+    result = await rv.create_review_pr(
+        op_id="op-1",
+        description="d",
+        files=[("x.py", "y = 1\n")],
+        chain=chain,
+        sandbox_token=s,
+        blast_token=b,
+        lint_token=None,
+    )
+    assert result is None
