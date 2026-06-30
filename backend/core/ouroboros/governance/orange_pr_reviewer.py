@@ -69,6 +69,20 @@ def is_orange_pr_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _token_enforcer_enabled() -> bool:
+    """True when the Iron Triad token enforcer gates ``create_review_pr``.
+
+    Default-OFF (``JARVIS_A1_TOKEN_ENFORCER_ENABLED`` unset/false) is
+    byte-identical legacy: the enforcer block is fully skipped and no
+    token-machinery imports are evaluated.
+    """
+    return os.environ.get("JARVIS_A1_TOKEN_ENFORCER_ENABLED", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def build_commit_message(
     op_id: str,
     description: str,
@@ -215,6 +229,10 @@ class OrangePRReviewer:
     async def _run_gh(self, *args: str) -> Tuple[int, str, str]:
         return await asyncio.to_thread(self._run_gh_sync, list(args))
 
+    def _enforcer_enabled(self) -> bool:
+        """Instance accessor for the Iron Triad token enforcer flag."""
+        return _token_enforcer_enabled()
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -228,6 +246,11 @@ class OrangePRReviewer:
         risk_tier_name: str = "APPROVAL_REQUIRED",
         body_override: Optional[str] = None,
         title_override: Optional[str] = None,
+        *,
+        chain: Any = None,
+        sandbox_token: Any = None,
+        blast_token: Any = None,
+        lint_token: Any = None,
     ) -> Optional[PRReviewResult]:
         """Open an async-review PR for the given candidate.
 
@@ -243,6 +266,59 @@ class OrangePRReviewer:
         if not files:
             logger.warning("[OrangePR] no files in candidate for op=%s", op_id)
             return None
+
+        # ---- Iron Triad enforcer: no verified token chain -> no PR ----
+        # Default-OFF (JARVIS_A1_TOKEN_ENFORCER_ENABLED unset/false): this whole
+        # block is skipped and the method behaves byte-identically to legacy.
+        # All token-machinery imports live INSIDE this block so the OFF path
+        # never evaluates them. Placed BEFORE any git op so an invalid/missing
+        # chain refuses cheaply, without touching the working tree.
+        if _token_enforcer_enabled():
+            from .dag_capability_token import (
+                SandboxExecutionToken,
+                BlastRadiusClearedToken,
+                LintClearedToken,
+            )
+            from .pr_self_linter import (
+                acquire_lint_cleared_token,
+                linter_enabled,
+                LintRejected,
+            )
+
+            # Gate 3: mint the lint token here if not already supplied.
+            if (
+                linter_enabled()
+                and lint_token is None
+                and blast_token is not None
+                and chain is not None
+            ):
+                _diff = "\n".join(f"--- {p}\n{c}" for p, c in files)
+                try:
+                    lint_token = await acquire_lint_cleared_token(
+                        op_id=op_id,
+                        diff=_diff,
+                        chain=chain,
+                        prev_token=blast_token,
+                    )
+                except LintRejected as _lr:
+                    logger.warning("[Gate3] op=%s LINT_REJECTED: %s", op_id, _lr)
+                    return None
+
+            # Mandatory typed token objects + verified hash chain, or refuse.
+            if not (
+                isinstance(sandbox_token, SandboxExecutionToken)
+                and isinstance(blast_token, BlastRadiusClearedToken)
+                and isinstance(lint_token, LintClearedToken)
+                and chain is not None
+                and chain.verify_chain(
+                    [sandbox_token, blast_token, lint_token], op_id=op_id
+                )
+            ):
+                logger.warning(
+                    "[Enforcer] op=%s missing/invalid token chain -> refuse PR",
+                    op_id,
+                )
+                return None
 
         rc, base_branch, err = await self._run_git("rev-parse", "--abbrev-ref", "HEAD")
         if rc != 0 or not base_branch:

@@ -204,6 +204,9 @@ class Slice4bRunner(PhaseRunner):
                             "file_count": len(_files_for_pr),
                         },
                         risk_tier_name=risk_tier.name,
+                        chain=getattr(ctx, "proof_chain", None),
+                        sandbox_token=getattr(ctx, "sandbox_token", None),
+                        blast_token=getattr(ctx, "blast_token", None),
                     )
                 except Exception:
                     logger.exception(
