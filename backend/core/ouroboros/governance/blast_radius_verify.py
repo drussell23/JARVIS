@@ -64,7 +64,10 @@ async def acquire_blast_radius_token(
             await rollback_fn(pre_op_tree_sha)
         restored = await current_tree_sha_fn()
         if dlq_fn is not None:
-            dlq_fn(reason)
+            try:
+                dlq_fn(reason)
+            except Exception as _dlq_exc:  # noqa: BLE001 — DLQ is best-effort; never mask the primary failure
+                logger.warning("[Gate2] op=%s dlq_fn failed (best-effort): %s", op_id, _dlq_exc)
         if restored != pre_op_tree_sha:
             raise BlastRadiusBreach(
                 f"op={op_id} ROLLBACK FAILED restored={restored!r} != pre={pre_op_tree_sha!r}"
@@ -76,6 +79,9 @@ async def acquire_blast_radius_token(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Gate2] op=%s graph FAILURE: %s", op_id, exc)
         await _rollback_and_assert("blast_radius_graph_failure")
+        # NOTE: if _rollback_and_assert raised BlastRadiusBreach (rollback left
+        # the tree at a different SHA), that propagates instead — a broken
+        # rollback is the more alarming signal and intentionally takes priority.
         raise BlastRadiusGraphFailure(f"op={op_id}: {exc}") from exc
 
     # Phase 2 -- run the closure; no retry

@@ -159,3 +159,39 @@ async def test_rollback_sha_mismatch_raises():
             rollback_fn=rollback_fn,
             dlq_fn=lambda r: None,
         )
+
+
+@pytest.mark.asyncio
+async def test_dlq_fn_exception_does_not_mask_primary_failure():
+    chain = DAGProofChain()
+    prev = _prev(chain)
+
+    async def graph_fn(files):
+        return {"tests/test_x.py"}
+
+    async def test_fn(tests):
+        return {"failed": ["tests/test_x.py::t"], "total": 1}
+
+    async def rollback_fn(sha):
+        pass
+
+    async def sha_pre():
+        return PRE
+
+    def boom_dlq(reason):
+        raise IOError("dlq disk full")
+
+    # The primary BlastRadiusBreach must still surface, NOT the IOError.
+    with pytest.raises(brv.BlastRadiusBreach):
+        await brv.acquire_blast_radius_token(
+            op_id="op-1",
+            scope_files=SCOPE,
+            pre_op_tree_sha=PRE,
+            chain=chain,
+            prev_token=prev,
+            graph_fn=graph_fn,
+            test_fn=test_fn,
+            current_tree_sha_fn=sha_pre,
+            rollback_fn=rollback_fn,
+            dlq_fn=boom_dlq,
+        )
