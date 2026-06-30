@@ -3904,6 +3904,19 @@ class CandidateGenerator:
             pass
         return None
 
+    def _resolve_dispatch_model_name(self) -> Optional[str]:
+        """The model the awakened J-Prime node actually serves -- the FSM's
+        awakened-tier truth (``active_jprime_model`` -> HW1 ``_active_model_label``,
+        e.g. ``qwen2.5-coder:32b``), so the OpenAI-compat request names a model the
+        node has loaded. None if undeterminable (caller keeps the env default).
+        Fail-soft -- NEVER raises."""
+        try:
+            from .failover_lifecycle import get_failover_controller
+            model = (get_failover_controller().active_jprime_model() or "").strip()
+            return model or None
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _failover_local_dispatch(
         self,
         context: OperationContext,
@@ -3935,11 +3948,19 @@ class CandidateGenerator:
             PrimeProvider as _F3cPrimeProvider,
         )
 
-        # Point a LocalConfig at the awakened endpoint (base_url override).
-        # All other knobs read from env via from_env() -> nothing hardcoded.
-        _cfg = _f3c_dc.replace(
-            _F3cLocalConfig.from_env(), base_url=endpoint,
-        )
+        # Point a LocalConfig at the awakened endpoint (base_url override) AND at
+        # the model the awakened node actually serves. LocalConfig.from_env()
+        # defaults model_name to a small survival model (qwen2.5-coder:3b); the
+        # QUALITY failover node serves qwen2.5-coder:32b, so without this override
+        # the OpenAI-compat request asks for a model the node does not have and
+        # ollama returns an error object with no "choices" -> KeyError('choices').
+        # The model label is the FSM's awakened-tier truth (HW1 _active_model_label),
+        # not a hardcoded string.
+        _overrides = {"base_url": endpoint}
+        _model = self._resolve_dispatch_model_name()
+        if _model:
+            _overrides["model_name"] = _model
+        _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
         _client = _F3cLocalPrimeClient(_cfg)
         try:
             _provider = _F3cPrimeProvider(
