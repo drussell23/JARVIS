@@ -935,6 +935,65 @@ class UnifiedIntakeRouter:
             self._dispatch_loop(), name="intake_dispatch"
         )
         await self._replay_wal()
+        await self._hydrate_fsm_checkpoints()
+
+    async def _hydrate_fsm_checkpoints(self) -> None:
+        """Autonomous startup resume: re-inject HMAC-VERIFIED suspended ops (from a
+        prior window's wall-clock cap / Spot preemption) with their preserved
+        exploration context, so the DAG fast-forwards instead of re-exploring.
+        Gated by ``JARVIS_FSM_RESUME_ENABLED`` (default on). Fully fail-soft --
+        NEVER blocks boot. Rejected (unverified) checkpoints fall back to clean boot."""
+        if os.environ.get("JARVIS_FSM_RESUME_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return
+        try:
+            from backend.core.ouroboros.governance import fsm_checkpoint as _ckpt  # noqa: PLC0415
+            from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: PLC0415
+                make_envelope as _make_env,
+            )
+
+            async def _reinject(env: "Dict[str, Any]") -> None:
+                _tf = tuple(env.get("target_files") or ())
+                _ev = {
+                    "resume": True,
+                    "resume_phase": env.get("resume_phase", ""),
+                    "resumed_op_id": env.get("op_id", ""),
+                    "tool_history": env.get("tool_history") or [],
+                    "exploration_records": env.get("exploration_records") or [],
+                    "intake_evidence_json": env.get("intake_evidence_json", ""),
+                    "signature": "fsm_resume:%s" % (env.get("op_id", "")),
+                }
+                envelope = _make_env(
+                    source="fsm_resume",
+                    description=env.get("description") or "resume suspended op",
+                    target_files=_tf,
+                    repo=os.environ.get("JARVIS_REPO_ROOT", "."),
+                    confidence=1.0,
+                    urgency="high",
+                    evidence=_ev,
+                    requires_human_ack=False,
+                    routing_override=(env.get("provider_route") or ""),
+                )
+                await self.ingest(envelope)
+
+            # hydrate_pending_checkpoints wants a sync ingest_fn; bridge to async by
+            # scheduling each re-inject and consuming the checkpoint on success.
+            _pending = _ckpt.list_pending()
+            for _cp in _pending:
+                try:
+                    await _reinject(_ckpt.build_resume_envelope(_cp))
+                    _ckpt.mark_resumed(_cp.op_id)
+                    logger.info(
+                        "Router: RESUMED suspended op=%s phase=%s (%d exploration "
+                        "records preserved -> Venom fast-forward)",
+                        _cp.op_id, _cp.phase, len(_cp.exploration_records),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Router: FSM resume re-inject failed op=%s -- left pending",
+                        getattr(_cp, "op_id", "?"),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.debug("Router: FSM checkpoint hydration skipped (fail-soft)", exc_info=True)
 
     async def stop(self) -> None:
         """Gracefully stop the dispatch loop and release the advisory lock."""

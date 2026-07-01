@@ -13,13 +13,67 @@ like the other observability ledgers).
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 _SCHEMA_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# Cryptographic State Verification (anti-corruption, fail-closed)
+# ---------------------------------------------------------------------------
+
+def _checkpoint_key(base_dir: "Optional[str]" = None) -> bytes:
+    """Locally-derived HMAC session key. ``JARVIS_CHECKPOINT_HMAC_SECRET`` if set
+    (driver-provisioned, like the signed roadmap), else a persisted local key
+    (generated ONCE via os.urandom at ``.ouroboros/checkpoint_key``, 0600). A resume
+    across ignitions on the SAME host verifies against the same persisted key.
+    NEVER raises (falls back to a process-stable default)."""
+    env = os.environ.get("JARVIS_CHECKPOINT_HMAC_SECRET", "").strip()
+    if env:
+        return env.encode("utf-8")
+    try:
+        d = checkpoint_dir(base_dir)
+        key_path = os.path.join(os.path.dirname(d), "checkpoint_key")
+        if os.path.isfile(key_path):
+            with open(key_path, "rb") as fh:
+                k = fh.read().strip()
+                if k:
+                    return k
+        k = hashlib.sha256(os.urandom(32)).hexdigest().encode("ascii")
+        tmp = key_path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(k)
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:  # noqa: BLE001
+            pass
+        os.replace(tmp, key_path)
+        return k
+    except Exception:  # noqa: BLE001
+        return b"jarvis-checkpoint-fallback-key"
+
+
+def _sign(payload_json: str, key: bytes) -> str:
+    return hmac.new(key, payload_json.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _verify(payload_json: str, signature: str, key: bytes) -> bool:
+    """Constant-time HMAC verify. Fail-closed on any defect. NEVER raises."""
+    try:
+        if not payload_json or not signature:
+            return False
+        return hmac.compare_digest(_sign(payload_json, key), str(signature))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def checkpoint_dir(base_dir: "Optional[str]" = None) -> str:
@@ -91,14 +145,19 @@ def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[Li
 
 
 def write_checkpoint(cp: FSMCheckpoint, *, base_dir: "Optional[str]" = None) -> "Optional[str]":
-    """Serialize a checkpoint to ``<dir>/<op_id>.json`` (atomic tmp+rename).
-    Returns the path, or None on failure. NEVER raises."""
+    """Serialize + HMAC-SIGN a checkpoint to ``<dir>/<op_id>.json`` (atomic
+    tmp+rename). The on-disk wrapper is ``{schema, payload, hmac}`` where ``hmac``
+    binds the exact payload bytes -- any tamper invalidates it. Returns the path, or
+    None on failure. NEVER raises."""
     try:
         d = checkpoint_dir(base_dir)
+        payload_json = cp.to_json()
+        sig = _sign(payload_json, _checkpoint_key(base_dir))
+        wrapper = json.dumps({"schema": _SCHEMA_VERSION, "payload": payload_json, "hmac": sig})
         path = os.path.join(d, "%s.json" % cp.op_id)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(cp.to_json())
+            fh.write(wrapper)
         os.replace(tmp, path)
         return path
     except Exception:  # noqa: BLE001
@@ -106,22 +165,112 @@ def write_checkpoint(cp: FSMCheckpoint, *, base_dir: "Optional[str]" = None) -> 
 
 
 def list_pending(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
-    """All un-resumed checkpoints (oldest first). Corrupt files are skipped.
-    NEVER raises."""
+    """All un-resumed checkpoints whose HMAC VERIFIES (oldest first). Corrupt,
+    tampered, empty, or unsigned files are REJECTED (fail-closed) + logged, never
+    returned -- zero corrupted executions. NEVER raises."""
     out: List[FSMCheckpoint] = []
     try:
         d = checkpoint_dir(base_dir)
+        key = _checkpoint_key(base_dir)
         names = [n for n in os.listdir(d) if n.endswith(".json") and not n.endswith(".tmp")]
         for n in sorted(names):
             try:
                 with open(os.path.join(d, n), "r", encoding="utf-8") as fh:
-                    out.append(FSMCheckpoint.from_json(fh.read()))
+                    wrapper = json.loads(fh.read())
+                payload_json = wrapper.get("payload") if isinstance(wrapper, dict) else None
+                sig = wrapper.get("hmac") if isinstance(wrapper, dict) else None
+                if not isinstance(payload_json, str) or not _verify(payload_json, sig or "", key):
+                    logger.warning(
+                        "[fsm_checkpoint] REJECT %s -- HMAC verify failed "
+                        "(corrupt/tampered/unsigned) -> clean boot for this op", n,
+                    )
+                    continue
+                out.append(FSMCheckpoint.from_json(payload_json))
             except Exception:  # noqa: BLE001
+                logger.warning("[fsm_checkpoint] REJECT %s -- unreadable -> clean boot", n)
                 continue
         out.sort(key=lambda c: c.created_at)
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_clock_cap") -> int:
+    """SUSPEND: on graceful shutdown (wall-clock cap / SIGTERM preemption), read the
+    in-flight registry and serialize a signed checkpoint for each active op (from its
+    ctx_ref + last_phase_name). Returns the count checkpointed. Fully fail-soft --
+    NEVER raises into the shutdown path (a checkpoint miss just means that op
+    restarts clean, never a crash)."""
+    n = 0
+    try:
+        from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: PLC0415
+            get_default_registry,
+        )
+        for rec in get_default_registry().snapshot():
+            try:
+                ctx = getattr(rec, "ctx_ref", None)
+                if ctx is None:
+                    continue
+                cp = capture_from_context(
+                    ctx, phase=getattr(rec, "last_phase_name", "") or "GENERATE",
+                    resume_reason=reason,
+                )
+                if cp is not None and write_checkpoint(cp, base_dir=base_dir):
+                    n += 1
+                    logger.info(
+                        "[fsm_checkpoint] SUSPENDED op=%s phase=%s reason=%s -> signed "
+                        "checkpoint (resumes next ignition)", cp.op_id, cp.phase, reason,
+                    )
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def build_resume_envelope(cp: FSMCheckpoint) -> Dict[str, Any]:
+    """Build a resume intake envelope from a verified checkpoint. Carries the
+    preserved tool/exploration context (Seamless Venom Hydration) so the model
+    FAST-FORWARDS -- it does not re-read files it already explored last window; the
+    Iron Gate credits the preserved exploration and generation picks up where it
+    left off."""
+    return {
+        "op_id": cp.op_id,
+        "description": cp.goal_description,
+        "target_files": list(cp.target_files),
+        "source": "fsm_resume",
+        "resume": True,
+        "resume_phase": cp.phase,
+        "tool_history": list(cp.tool_history),
+        "exploration_records": list(cp.exploration_records),
+        "intake_evidence_json": cp.intake_evidence_json,
+        "provider_route": cp.provider_route,
+    }
+
+
+def hydrate_pending_checkpoints(ingest_fn: Any, *, base_dir: "Optional[str]" = None) -> int:
+    """Autonomous-startup resume: read HMAC-VERIFIED pending checkpoints, re-inject
+    each via *ingest_fn* (with preserved exploration context), and consume it
+    (mark_resumed -> exactly once). Rejected (unverified) checkpoints are already
+    filtered by list_pending (fail-closed -> clean boot). Returns the count resumed.
+    NEVER raises -- a resume failure leaves that checkpoint pending for the next boot."""
+    n = 0
+    for cp in list_pending(base_dir=base_dir):
+        try:
+            ingest_fn(build_resume_envelope(cp))
+            mark_resumed(cp.op_id, base_dir=base_dir)
+            n += 1
+            logger.info(
+                "[fsm_checkpoint] RESUMED op=%s phase=%s (%d exploration records "
+                "preserved -> Venom fast-forward, no re-read)",
+                cp.op_id, cp.phase, len(cp.exploration_records),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[fsm_checkpoint] resume re-inject failed op=%s -- left pending "
+                "for next boot", cp.op_id,
+            )
+    return n
 
 
 def mark_resumed(op_id: str, *, base_dir: "Optional[str]" = None) -> bool:

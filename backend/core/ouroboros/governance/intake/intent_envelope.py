@@ -97,6 +97,13 @@ _VALID_SOURCES = frozenset({
     # Resurrected > Normal) and trigger preemption of a running resurrected op.
     "cli_emergency",
     "human_override",
+    # Added 2026-07-01 for the Autonomous FSM Checkpoint/Resume hydrator. A
+    # suspended op (checkpointed on the wall-clock cap / Spot preemption) is
+    # re-injected at the NEXT ignition's intake boot with its preserved
+    # exploration context (Venom fast-forward). Honest-source token: a resumed op
+    # MUST NOT masquerade as its original source -- observability + the resume
+    # ledger filter on it. Carries the HMAC-verified checkpoint context in evidence.
+    "fsm_resume",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
@@ -136,6 +143,9 @@ _VALID_ROUTING_OVERRIDES = frozenset({
 _EMPTY_TARGET_FILES_EXEMPT_SOURCES = frozenset({
     "vision_sensor",
     "swe_bench_pro",
+    # A resumed op may re-localize from its preserved exploration context rather
+    # than a pinned target list (the checkpoint carries tool/exploration history).
+    "fsm_resume",
 })
 
 
