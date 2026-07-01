@@ -140,6 +140,24 @@ def pytest_report_header(config):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_fsm_checkpoint_dir(tmp_path, monkeypatch):
+    """Point the FSM suspend/resume checkpoint ledger at a per-test tmp dir.
+
+    The REAL ``.ouroboros/checkpoints`` (the CWD-relative default) can hold
+    live PENDING checkpoints between soak windows; any test that starts an
+    intake router would otherwise hydrate + CONSUME them (``mark_resumed``
+    deletes the file) and re-inject heavy resume ops into the test's router --
+    the exact contamination that ate window-2's pending checkpoints and hung
+    the intake suite on 2026-07-01. Tests that need a specific dir still
+    override via their own ``monkeypatch.setenv`` (applied after this
+    autouse fixture).
+    """
+    monkeypatch.setenv(
+        "JARVIS_CHECKPOINT_DIR", str(tmp_path / "_fsm_checkpoints"),
+    )
+
+
+@pytest.fixture(autouse=True)
 async def _cancel_pending_async_tasks():
     """
     Cancel any tasks left pending after each async test completes.

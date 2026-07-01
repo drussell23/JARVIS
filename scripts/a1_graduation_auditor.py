@@ -1427,6 +1427,38 @@ async def log_tail_source(
 # ===========================================================================
 
 
+def _audit_defer_enabled() -> bool:
+    """Activity-Gated Audit Deferral master (default ON)."""
+    return (os.environ.get("JARVIS_A1_AUDIT_DEFER_ENABLED", "true") or "").strip().lower() \
+        not in {"0", "false", "no", "off"}
+
+
+def _audit_defer_slice_s() -> float:
+    return float(os.environ.get("JARVIS_A1_AUDIT_DEFER_SLICE_S", "30") or 30)
+
+
+def _audit_defer_absolute_s() -> float:
+    return float(os.environ.get("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", "900") or 900)
+
+
+def default_activity_probe() -> bool:
+    """Cross-process organism-activity probe: reads the stream_heartbeat FILE
+    mirror (env ``JARVIS_STREAM_HEARTBEAT_FILE``, wall-epoch text written by the
+    organism's ``_emit_stream_token`` on every streamed token). Fresh within
+    ``JARVIS_A1_AUDIT_ACTIVITY_WINDOW_S`` (default 90) => ACTIVE. Missing env /
+    file / parse error => inactive (fail-quiet: never blocks a verdict)."""
+    path = (os.environ.get("JARVIS_STREAM_HEARTBEAT_FILE", "") or "").strip()
+    if not path:
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            ts = float((fh.read() or "").strip() or 0.0)
+    except Exception:  # noqa: BLE001
+        return False
+    window = float(os.environ.get("JARVIS_A1_AUDIT_ACTIVITY_WINDOW_S", "90") or 90)
+    return (time.time() - ts) <= max(0.0, window)
+
+
 async def run_watch(
     auditor: A1GraduationAuditor,
     *,
@@ -1434,6 +1466,7 @@ async def run_watch(
     log_file: Optional[str],
     timeout_s: float,
     log: Callable[[str], None] = print,
+    activity_probe: Optional[Callable[[], bool]] = None,
 ) -> A1Verdict:
     """Run the live audit until A1_DISPATCH_PROVEN, an intervention trip, or a
     timeout. Returns the final verdict. Fail-CLOSED: a GraduationFailedException
@@ -1471,9 +1504,37 @@ async def run_watch(
     async def _deadline() -> None:
         try:
             await asyncio.wait_for(stop.wait(), timeout=timeout_s)
+            return
         except asyncio.TimeoutError:
-            log("[A1Auditor] timeout after %.0fs -- emitting partial verdict" % (timeout_s,))
-            stop.set()
+            pass
+        # Activity-Gated Audit Deferral: never render a blind verdict over a
+        # LIVE organism. On ceiling expiry, consult the activity probe (default:
+        # the stream_heartbeat cross-process file mirror); while the organism is
+        # actively streaming, defer assessment in bounded slices up to the
+        # absolute deferral ceiling. This gates ONLY the assessor's verdict
+        # timing -- the harness wall-clock hard cap stays completely blind
+        # (Slice-47 Watchdog Isolation Invariant) and still backstops the run.
+        if _audit_defer_enabled() and not stop.is_set():
+            _probe = activity_probe if activity_probe is not None else default_activity_probe
+            _absolute = _audit_defer_absolute_s()
+            _deferred = 0.0
+            while not stop.is_set() and _deferred < _absolute:
+                try:
+                    _active = bool(_probe())
+                except Exception:  # noqa: BLE001 -- a probe error never wedges the verdict
+                    _active = False
+                if not _active:
+                    break
+                _slice = min(_audit_defer_slice_s(), _absolute - _deferred)
+                log("[A1Auditor] ceiling reached but organism ACTIVE -- deferring "
+                    "verdict %.0fs (deferred %.0f/%.0fs)" % (_slice, _deferred, _absolute))
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=_slice)
+                    return  # proven / intervention landed during deferral
+                except asyncio.TimeoutError:
+                    _deferred += _slice
+        log("[A1Auditor] timeout after %.0fs -- emitting partial verdict" % (timeout_s,))
+        stop.set()
 
     deadline_task = asyncio.ensure_future(_deadline())
     tasks.append(deadline_task)

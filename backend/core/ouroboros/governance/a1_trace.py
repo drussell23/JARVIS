@@ -25,7 +25,7 @@ import collections
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,51 @@ def emit_probe(goal_id: Any, *, source: str = "?") -> None:
             "[A1Trace][emit-probe] EMIT goal=%s source=%s emit_ts=%.6f "
             "orchestrator_enabled=%s",
             gid, source, ts, orch,
+        )
+    except Exception:  # noqa: BLE001 — a probe must never break a hop
+        pass
+
+
+def get_emit_record(goal_id: Any) -> "Optional[tuple]":
+    """Read the ``(emit_ts_monotonic, source)`` record for *goal_id* from the
+    emit ledger -- ``None`` when absent. Read-only, NEVER raises. Consumed by
+    the FSM checkpoint layer to serialize Distributed Trace Lineage."""
+    try:
+        return _emit_ledger.get(str(goal_id))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def restore_emit_record(goal_id: Any, *, source: str,
+                        original_emit_wall: "Optional[float]" = None) -> None:
+    """Distributed Trace Lineage: re-establish the emit hop from HMAC-verified
+    checkpoint lineage after a cross-window suspend/resume.
+
+    The original emit fired in a PRIOR process whose monotonic clock is
+    meaningless here, so the ledger is re-seeded with a FRESH monotonic stamp
+    taken NOW -- hydration runs BEFORE ingest, so ``emit_ts <= ingest_ts``
+    genuinely holds in this process and the probe reports ``ordered=True``
+    honestly. The hop line carries ``lineage=resumed`` (+ the original
+    wall-clock ts when known) so the census entry is an ATTESTATION of
+    verified window-1 evidence, never a fabrication. Observe-only, fail-soft.
+    """
+    if not emit_probe_enabled():
+        return
+    try:
+        gid = str(goal_id)
+        ts = time.monotonic()
+        _emit_ledger[gid] = (ts, source)
+        _emit_ledger.move_to_end(gid)
+        while len(_emit_ledger) > _EMIT_LEDGER_MAX:
+            _emit_ledger.popitem(last=False)
+        # The hop-census line (auditor's _A1TRACE_RE) -- lineage-tagged.
+        a1trace("emit", gid, source=source, lineage="resumed",
+                original_emit_wall=original_emit_wall)
+        # The origin-witness probe line (auditor's _EMIT_PROBE_SOURCE_RE).
+        logger.warning(
+            "[A1Trace][emit-probe] EMIT goal=%s source=%s emit_ts=%.6f "
+            "orchestrator_enabled=%s lineage=resumed",
+            gid, source, ts, _roadmap_enabled_repr(),
         )
     except Exception:  # noqa: BLE001 — a probe must never break a hop
         pass
