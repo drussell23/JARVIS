@@ -733,7 +733,23 @@ class GCPComputeRest:
                 logger.warning("[GCPComputeRest] STOCKOUT zone=%s -> failover to next zone", z)
                 continue
             return (False, "INSERT_FAILED:{}".format(detail))  # non-stockout -> stop
-        return (False, "INSERT_FAILED:all_zones_stockout:{}".format(last))
+        # The ENTIRE cross-region matrix stocked out -> a genuine global L4 capacity
+        # wall. Emit a distinct, greppable marker so the ignition driver can
+        # fast-fail (short-circuit the L7 gate + audit) instead of waiting them out.
+        try:
+            from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+                regions_in_chain,
+            )
+            _regions = ",".join(regions_in_chain(zone))
+        except Exception:  # noqa: BLE001
+            _regions = "?"
+        logger.error(
+            "[GCPComputeRest] HARDWARE_CAPACITY_EXHAUSTED: L4 stockout across ALL "
+            "regions in the cross-region matrix (regions=%s zones=%d) -- global "
+            "capacity wall, no node materialized", _regions, len(chain),
+        )
+        return (False, "INSERT_FAILED:all_zones_stockout:regions={}:{}".format(
+            _regions, last))
 
     async def _insert_in_zone(
         self, *, zone, project, token, headers, node, machine, family,

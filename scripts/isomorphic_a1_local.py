@@ -409,9 +409,10 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     """
     env["JARVIS_FAILOVER_HYBRID_MESH"] = "true"             # external-natIP route
     env["JARVIS_FAILOVER_INFERENCE_BIND_ENABLED"] = "true"  # node binds 0.0.0.0
-    # L4-capable zones ONLY (drop non-L4 zones like us-central1-f whose 400
-    # halts the multi-zonal chain). Quota is confirmed in us-central1.
-    env.setdefault("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b,us-central1-c")
+    # Cross-Region Capacity Matrix: do NOT pin a single region -- a whole-region L4
+    # stockout must fall to a fallback region. Leave JARVIS_GCP_ZONE_FALLBACK unset
+    # so zone_fallback._DEFAULT_ZONES (the region-ordered L4 matrix) applies; an
+    # operator may still override with an explicit cross-region list.
     # L4 Spot is scarce -> let a Spot stockout fall through to on-demand in
     # the same quota'd zone (bounded $; the run is short + violently reaped).
     env.setdefault("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "true")
@@ -515,8 +516,27 @@ def _probe_api_tags(url: str) -> int:
         return int(getattr(he, "code", 0) or 0)
 
 
+_CAPACITY_EXHAUSTED_MARKER = "HARDWARE_CAPACITY_EXHAUSTED"
+
+
+def _hardware_capacity_exhausted(debug_log: Optional[str]) -> bool:
+    """True iff the organism logged a global L4 capacity wall (the cross-region
+    matrix stocked out with no node). Lets the L7 gate + audit fast-fail instead
+    of waiting out their full budgets. Fail-soft -> False when unreadable."""
+    if not debug_log:
+        return False
+    try:
+        if not os.path.isfile(debug_log):
+            return False
+        with open(debug_log, "r", encoding="utf-8", errors="ignore") as fh:
+            return _CAPACITY_EXHAUSTED_MARKER in fh.read()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _await_jprime_serving(
     node_name: str, *, budget_s: float, port: int = 11434,
+    debug_log: Optional[str] = None,
 ) -> bool:
     """Suspend until the awakened GCP node's inference server returns HTTP 200 on
     ``/api/tags`` (the 32B is loaded into VRAM). Exponential backoff (cap'd),
@@ -545,6 +565,12 @@ async def _await_jprime_serving(
         return False
 
     while time.monotonic() < deadline:
+        # Fast-Fail short-circuit: if the organism hit a global L4 capacity wall
+        # (cross-region matrix exhausted), stop waiting out the L7 budget NOW.
+        if _hardware_capacity_exhausted(debug_log):
+            _log("[HybridMesh] HardwareCapacityExhausted -> L7 gate fast-fail "
+                 "(cross-region L4 stockout; not waiting out %.0fs)" % budget_s)
+            return False
         external: Optional[str] = None
         try:
             _internal, external = await get_compute_rest().get_node_endpoints(
@@ -1096,28 +1122,46 @@ class IsomorphicA1Driver:
                         _log("[HybridMesh] L7 readiness gate: awaiting 32B SERVING "
                              "(budget=%.0fs) before audit ..." % _budget)
                         _served = await _await_jprime_serving(
-                            _node, budget_s=_budget)
+                            _node, budget_s=_budget, debug_log=debug_log)
                         _log("[HybridMesh] L7 readiness gate -> %s"
                              % ("SERVING" if _served else "TIMEOUT"))
 
-                    # ── e. LAUNCH AUDITOR ────────────────────────────────────
-                    _log("STEP audit: sse=%s log=%s" % (self.sse_base, debug_log))
-                    if self.stub_soak:
-                        aud_runner = harness_mod.StubAuditorRunner(
-                            strict=self.strict, goal_id="GOAL-ISO-A1")
-                    else:
-                        aud_runner = harness_mod.AuditorRunner(strict=self.strict)
-
-                    verdict = aud_runner.watch(
-                        base=self.sse_base,
-                        log_file=debug_log,
-                        timeout_s=_a1_audit_ceiling_s(),
-                        verdict_out=verdict_out,
+                    # ── Fast-Fail short-circuit: a global L4 capacity wall means the
+                    # cognitive loop can NEVER reach APPLIED this run. Skip the audit
+                    # ceiling entirely, emit a capacity verdict, and flow to teardown
+                    # -- zero wasted wall-clock (no 480s audit on a foregone result).
+                    _capacity_wall = (
+                        self.enable_failover and _hardware_capacity_exhausted(debug_log)
                     )
+                    if _capacity_wall:
+                        _log("[HybridMesh] HardwareCapacityExhausted -> short-circuit "
+                             "A1 audit (global L4 stockout; NOT a cognitive failure)")
+                        verdict = {
+                            "proven": False,
+                            "failure_locus": "hardware_capacity_exhausted:no_l4_global",
+                            "capacity_exhausted": True,
+                        }
+                        proven = False
+                        _log("STEP audit VERDICT: SKIPPED (hardware_capacity_exhausted)")
+                    else:
+                        # ── e. LAUNCH AUDITOR ────────────────────────────────
+                        _log("STEP audit: sse=%s log=%s" % (self.sse_base, debug_log))
+                        if self.stub_soak:
+                            aud_runner = harness_mod.StubAuditorRunner(
+                                strict=self.strict, goal_id="GOAL-ISO-A1")
+                        else:
+                            aud_runner = harness_mod.AuditorRunner(strict=self.strict)
 
-                    proven = bool(verdict.get("proven"))
-                    _log("STEP audit VERDICT: %s"
-                         % ("A1_DISPATCH_PROVEN" if proven else "FAILED"))
+                        verdict = aud_runner.watch(
+                            base=self.sse_base,
+                            log_file=debug_log,
+                            timeout_s=_a1_audit_ceiling_s(),
+                            verdict_out=verdict_out,
+                        )
+
+                        proven = bool(verdict.get("proven"))
+                        _log("STEP audit VERDICT: %s"
+                             % ("A1_DISPATCH_PROVEN" if proven else "FAILED"))
 
                     # ── f. FAILURE PATH: T5 telemetry + local autopsy ────────
                     if not proven:
