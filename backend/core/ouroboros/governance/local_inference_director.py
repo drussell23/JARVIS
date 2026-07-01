@@ -86,10 +86,19 @@ class LocalConfig:
 # derive the max SAFE num_ctx from the MEASURED VRAM buffer (no static cap), then
 # compress the payload to fit it (preserve the system rules + recent tool outputs).
 
-_KV_BYTES_PER_TOKEN_DEFAULT = 524288      # ~512KB/token: 2(K+V)*64L*8kv*128d*2B for a 32B GQA fp16 KV
+# Accurate KV cache per token for a 32B GQA fp16 model: 2(K+V) * 64 layers *
+# (8 kv_heads * 128 head_dim = 1024 kv_dim) * 2 bytes = 262144 = 256KB. (The prior
+# 512KB was 2x too conservative -- it double-counted the kv_dim -- which crushed
+# num_ctx and over-compressed the payload into empty responses.) Env-tunable.
+_KV_BYTES_PER_TOKEN_DEFAULT = 262144
 _CTX_OVERHEAD_BYTES_DEFAULT = 1_500_000_000  # CUDA/runtime/activation headroom
 _NUM_CTX_FLOOR_DEFAULT = 2048
 _NUM_CTX_CEILING_DEFAULT = 32768
+# Tokens reserved for the model's OUTPUT inside num_ctx. The generation cap
+# (max_tokens) is often 4096, but a patch is ~1-2K tokens; reserving the full cap
+# halved the INPUT budget and over-compressed. Reserve a bounded, env-tunable
+# output slice so the input window stays wide. Default 2048.
+_OUTPUT_RESERVE_TOKENS_DEFAULT = 2048
 
 
 def _int_env(name: str, default: int) -> int:
@@ -288,10 +297,16 @@ class LocalPrimeClient:
     TCPConnector + keep-alive eliminates per-call socket setup across L2 passes.
     """
 
-    def __init__(self, cfg: LocalConfig, session: Optional[Any] = None) -> None:
+    def __init__(self, cfg: LocalConfig, session: Optional[Any] = None,
+                 profiler: "Optional[LatencyProfiler]" = None) -> None:
         self._cfg = cfg
         self._session = session
-        self.profiler = LatencyProfiler(cfg)
+        # Stateful Latency Profiler: when injected (a session-scoped singleton kept
+        # per-endpoint by the dispatcher), the EWMA/sample window SURVIVES across
+        # ops + L7 retries -- so the client learns the 32B's real latency (incl. the
+        # one-time ~109s load) and adapts its timeout up instead of resetting to the
+        # cold seed on every fresh client (the "profiler amnesia").
+        self.profiler = profiler if profiler is not None else LatencyProfiler(cfg)
         self._governor: Any = None
 
     def attach_governor(self, governor: Any) -> None:
@@ -325,7 +340,13 @@ class LocalPrimeClient:
         # is preserved in full; older intermediate history is compressed. num_ctx is
         # also declared to the engine so it never pre-allocates a fatal KV cache.
         if self._cfg.num_ctx:
-            _reserve_out = max_tokens or 0
+            # Reserve only a BOUNDED output slice (not the full max_tokens cap) so
+            # the input window stays wide -> less compression -> fewer empty results.
+            _reserve_out = min(
+                max_tokens or 0,
+                _int_env("JARVIS_FAILOVER_OUTPUT_RESERVE_TOKENS", _OUTPUT_RESERVE_TOKENS_DEFAULT),
+            ) if max_tokens else _int_env(
+                "JARVIS_FAILOVER_OUTPUT_RESERVE_TOKENS", _OUTPUT_RESERVE_TOKENS_DEFAULT)
             _in_budget = max(256, int(self._cfg.num_ctx) - _reserve_out)
             system, user, _compressed = fit_prompt_to_window(
                 system, user, max_tokens=_in_budget,
@@ -462,6 +483,25 @@ class LocalPrimeClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+async def flush_vram(endpoint: str, model_name: str, *, timeout_s: float = 10.0) -> bool:
+    """Deterministic VRAM flush: POST ``keep_alive:0`` to the node so ollama
+    immediately unloads the model from VRAM. Fired synchronously by the FSM's
+    ``_reap_gpu_node`` BEFORE the GCP delete -- a violent, safe-termination flush so
+    the node never lingers holding VRAM. Best-effort -> bool; NEVER raises."""
+    if not endpoint or not model_name:
+        return False
+    try:
+        import aiohttp  # noqa: PLC0415
+        url = endpoint.rstrip("/") + "/api/generate"
+        timeout = aiohttp.ClientTimeout(total=max(1.0, timeout_s))
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, json={"model": model_name, "keep_alive": 0}) as resp:
+                await resp.read()
+        return True
+    except Exception:  # noqa: BLE001 -- flush is best-effort; teardown proceeds regardless
+        return False
 
 
 def build_local_prime_client() -> "Optional[LocalPrimeClient]":

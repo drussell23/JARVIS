@@ -1105,6 +1105,27 @@ class FailoverLifecycleController:
         """Reap the GPU node: delete the VM + its firewall rule (by reconstructed
         crypto-namespaced names) + unregister from the Fleet Registry. The CPU
         node is untouched. Idempotent + fail-soft. NEVER raises."""
+        # Deterministic VRAM flush (constraint 1): BEFORE the GCP delete, fire a
+        # synchronous keep_alive:0 to the node so ollama unloads the model from VRAM
+        # -- a violent, safe-termination flush bracketing the FSM-tied residency
+        # (dispatches keep the model resident with keep_alive=-1; the reap releases
+        # it here). Best-effort + short-bounded: a flush miss NEVER blocks the reap.
+        try:
+            _endpoint = self._endpoint or self._build_endpoint()
+            _model = getattr(self._awakened_tier, "model_label", "") or ""
+            if _endpoint and _model:
+                from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                    flush_vram as _flush_vram,
+                )
+                _flushed = await _flush_vram(_endpoint, _model, timeout_s=_env_float(
+                    "JARVIS_FAILOVER_VRAM_FLUSH_TIMEOUT_S", 10.0))
+                logger.info(
+                    "[FailoverLifecycle] VRAM flush (keep_alive:0) endpoint=%s model=%s ok=%s",
+                    _endpoint, _model, _flushed,
+                )
+        except Exception as _flush_exc:  # noqa: BLE001
+            logger.debug("[FailoverLifecycle] VRAM flush fail-soft err=%r", _flush_exc)
+
         try:
             from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
                 get_compute_rest,

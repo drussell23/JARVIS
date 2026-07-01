@@ -2686,6 +2686,18 @@ def _l7_rewarm_timeout_s() -> float:
         return 120.0
 
 
+def _failover_keep_alive_seconds() -> int:
+    """Deterministic VRAM residency: the keep_alive every failover dispatch passes
+    so ollama keeps the model RESIDENT while we're routing to the node (no ~109s
+    reload between ops). Default -1 (keep forever while SERVING); the FSM's
+    ``_reap_gpu_node`` fires the explicit ``keep_alive:0`` flush on teardown. Env
+    ``JARVIS_FAILOVER_KEEP_ALIVE_SECONDS``. NEVER raises."""
+    try:
+        return int(os.environ.get("JARVIS_FAILOVER_KEEP_ALIVE_SECONDS", "-1"))
+    except (TypeError, ValueError):
+        return -1
+
+
 _L7_RECOVERABLE_NAMES = frozenset({
     "ServerDisconnectedError", "ClientConnectionError", "ClientConnectionResetError",
     "ClientOSError", "ClientPayloadError", "ConnectionResetError",
@@ -4152,6 +4164,30 @@ class CandidateGenerator:
         default). Fail-soft -- NEVER raises."""
         return await _resolve_served_model(endpoint)
 
+    def _failover_profiler_for(self, endpoint: str, cfg: "Any") -> "Any":
+        """Session-scoped LatencyProfiler singleton, one per failover endpoint,
+        held on this generator so its EWMA/sample state persists across ops + L7
+        retries (cures profiler amnesia). A new endpoint (re-awaken) gets a fresh
+        profiler. Fail-soft -> a fresh profiler if the store is unavailable."""
+        try:
+            store = getattr(self, "_failover_profilers", None)
+            if store is None:
+                store = {}
+                self._failover_profilers = store  # type: ignore[attr-defined]
+            prof = store.get(endpoint)
+            if prof is None:
+                from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                    LatencyProfiler,
+                )
+                prof = LatencyProfiler(cfg)
+                store[endpoint] = prof
+            return prof
+        except Exception:  # noqa: BLE001
+            from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                LatencyProfiler,
+            )
+            return LatencyProfiler(cfg)
+
     async def _negotiate_num_ctx(self, endpoint: Optional[str]) -> Optional[int]:
         """Autonomous Context-Hardware Negotiator: derive the VRAM-safe context
         window for *endpoint* from the MEASURED buffer -- node VRAM (awakened GPU
@@ -4212,7 +4248,12 @@ class CandidateGenerator:
             PrimeProvider as _F3cPrimeProvider,
         )
 
-        _base_overrides: Dict[str, Any] = {"base_url": endpoint}
+        _base_overrides: Dict[str, Any] = {
+            "base_url": endpoint,
+            # Deterministic VRAM residency: keep the model resident while we route
+            # to this node (no ~109s reload between ops); the FSM reap flushes it.
+            "keep_alive_seconds": _failover_keep_alive_seconds(),
+        }
         _model = await self._resolve_dispatch_model_name(endpoint)
         if _model:
             _base_overrides["model_name"] = _model
@@ -4231,7 +4272,13 @@ class CandidateGenerator:
             if _num_ctx:
                 _overrides["num_ctx"] = int(_num_ctx)
             _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
-            _client = _F3cLocalPrimeClient(_cfg)
+            # Stateful, session-scoped Latency Profiler kept PER ENDPOINT on this
+            # generator: the EWMA/sample window survives across ops + L7 retries, so
+            # the client learns the 32B's real latency and scales its timeout up
+            # (cures the per-dispatch "profiler amnesia" that pinned it to the cold
+            # seed). A new endpoint (re-awaken) naturally gets a fresh profiler.
+            _prof = self._failover_profiler_for(endpoint, _cfg)
+            _client = _F3cLocalPrimeClient(_cfg, profiler=_prof)
             try:
                 _provider = _F3cPrimeProvider(
                     _client,
