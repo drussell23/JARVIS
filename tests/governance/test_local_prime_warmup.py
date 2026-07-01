@@ -175,3 +175,17 @@ async def test_warmup_timeout_is_respected():
     elapsed = asyncio.get_event_loop().time() - start
     # Should complete well within 1 second (not hang for 9999s).
     assert elapsed < 1.0, f"warmup took {elapsed:.2f}s, expected <1.0s"
+
+
+async def test_warmup_post_uses_dedicated_client_timeout():
+    """Dedicated Cold-Start HTTP Context: the warmup POST must carry its OWN
+    aiohttp ClientTimeout(total=timeout_s), overriding the session's 300s default
+    -- so a 19.9GB PCIe->VRAM transfer isn't dropped mid cold-load. Without this,
+    the effective warmup cap is min(720s wait_for, 300s aiohttp default) = 300s."""
+    import aiohttp
+    sess = _OkSession()
+    client = LocalPrimeClient(_cfg(), session=sess)
+    await client.warmup(timeout_s=600.0)
+    tmo = sess.posts[0].get("timeout")
+    assert isinstance(tmo, aiohttp.ClientTimeout), f"expected ClientTimeout, got {tmo!r}"
+    assert tmo.total == 600.0

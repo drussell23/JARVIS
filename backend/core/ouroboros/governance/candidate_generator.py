@@ -2528,6 +2528,30 @@ async def _fetch_served_model(endpoint: str, *, timeout_s: float = 8.0) -> Optio
         return None
 
 
+def _absolute_route_sealing(context: "Any") -> bool:
+    """Absolute Route Sealing predicate. When TRUE, a J-Prime dispatch that was
+    COMMITTED to (endpoint discovered) and then failed/empty must RAISE terminal --
+    NEVER cascade to the DW/adversary-stub lane (the hybrid-mesh cascade leak).
+
+    Two triggers:
+      * ``context.provider_override == "gcp-jprime"`` -- a Cryo-DLQ pin: the op was
+        SEALED for J-Prime, so a fall-through to dead DW would violate the seal
+        (ALWAYS absolute, independent of any flag);
+      * ``JARVIS_FAILOVER_ABSOLUTE_ROUTE_SEALING`` env flag -- arms sealing globally
+        for the hybrid-execution-mesh soak.
+
+    Default OFF -> byte-identical legacy fail-soft cascade. Fail-soft -> False."""
+    try:
+        override = (getattr(context, "provider_override", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        override = ""
+    if override == "gcp-jprime":
+        return True
+    return os.environ.get(
+        "JARVIS_FAILOVER_ABSOLUTE_ROUTE_SEALING", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 async def _resolve_served_model(
     endpoint: Optional[str],
     *,
@@ -4108,6 +4132,15 @@ class CandidateGenerator:
         # Fail-soft ABSOLUTE: if the local route errors (endpoint missing,
         # LocalPrimeClient raises, empty result), we log + fall through to the
         # normal DW path -- the op is NEVER lost.
+        # Absolute Route Sealing: when the router has committed to the sovereign
+        # J-Prime provider (Cryo-DLQ pin or the hybrid-mesh flag), a discovered-
+        # and-dispatched 32B FAILURE must be TERMINAL -- never cascade to the dead
+        # DW/adversary-stub lane. Only a COMMITTED dispatch (endpoint discovered)
+        # can seal; a pre-dispatch miss (no endpoint) is not "a 32B failure during
+        # generation" and falls through to the legacy path.
+        _sealing = _absolute_route_sealing(context)
+        _committed = False
+        _seal_reason: Optional[str] = None
         try:
             # DRY universal router: EVERY DW dispatch (primary, GENERATE_RETRY,
             # critique, immortal re-queue) funnels through this chokepoint, so one
@@ -4118,6 +4151,7 @@ class CandidateGenerator:
             # process's controller FSM isn't itself in SERVING state.
             _ep = await self._discover_jprime_endpoint()
             if _ep:
+                _committed = True
                 _local_result = await self._failover_local_dispatch(
                     context, deadline, _ep,
                 )
@@ -4131,15 +4165,33 @@ class CandidateGenerator:
                         _ep, getattr(context, "op_id", "?")[:16], provider_route,
                     )
                     return _local_result
+                _seal_reason = "empty_result"
                 logger.info(
                     "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime local "
-                    "route empty/failed -> falling through to DW (op=%s route=%s)",
+                    "route empty/failed (op=%s route=%s)",
                     getattr(context, "op_id", "?")[:16], provider_route,
                 )
         except Exception as _f3c_exc:  # noqa: BLE001 -- seam must never break the op
+            if _committed:
+                _seal_reason = type(_f3c_exc).__name__
             logger.warning(
-                "[CandidateGenerator] Phase 3c failover seam fail-soft err=%r "
-                "-> legacy DW path (op never lost)", _f3c_exc,
+                "[CandidateGenerator] Phase 3c failover seam err=%r%s", _f3c_exc,
+                "" if _committed else " (pre-dispatch, not committed)",
+            )
+
+        # SEAL: committed sovereign dispatch failed AND sealing is armed -> HALT the
+        # cognitive loop with a terminal reason (classified non-retryable by the
+        # orchestrator). The DW fall-through below is NEVER reached -- no cascade to
+        # the dead/adversary lane.
+        if _sealing and _committed and _seal_reason:
+            logger.warning(
+                "[CandidateGenerator] ABSOLUTE ROUTE SEAL op=%s reason=%s -- "
+                "HALTING cognitive loop (sovereign J-Prime committed + failed; DW "
+                "cascade FORBIDDEN)",
+                getattr(context, "op_id", "?")[:16], _seal_reason,
+            )
+            raise RuntimeError(
+                "sovereign_route_sealed:gcp-jprime:%s" % _seal_reason
             )
 
         from backend.core.ouroboros.governance.provider_topology import (
