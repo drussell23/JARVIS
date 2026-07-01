@@ -4270,60 +4270,69 @@ class CandidateGenerator:
                 "num_ctx=%d for the 32B at %s op=%s", _num_ctx, endpoint, _op,
             )
 
-        _attempts = _l7_recovery_attempts()
-        _last_exc: Optional[BaseException] = None
-        for _try in range(_attempts + 1):
-            _overrides = dict(_base_overrides)
-            if _num_ctx:
-                _overrides["num_ctx"] = int(_num_ctx)
-            _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
-            # Stateful, session-scoped Latency Profiler kept PER ENDPOINT on this
-            # generator: the EWMA/sample window survives across ops + L7 retries, so
-            # the client learns the 32B's real latency and scales its timeout up
-            # (cures the per-dispatch "profiler amnesia" that pinned it to the cold
-            # seed). A new endpoint (re-awaken) naturally gets a fresh profiler.
-            _prof = self._failover_profiler_for(endpoint, _cfg)
-            _client = _F3cLocalPrimeClient(_cfg, profiler=_prof)
-            try:
-                _provider = _F3cPrimeProvider(
-                    _client,
-                    repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
-                )
-                remaining = self._remaining_seconds(deadline)
-                if remaining <= 0.0:
-                    return None
-                return await asyncio.wait_for(
-                    _provider.generate(context, deadline),
-                    timeout=remaining,
-                )
-            except Exception as _exc:  # noqa: BLE001
-                _last_exc = _exc
-                # Non-recoverable OR out of retries -> propagate (sentinel seals).
-                if _try >= _attempts or not _is_l7_recoverable(_exc):
-                    raise
-                # AUTO-HEAL: tighten the window (more aggressive compression) +
-                # re-warm the worker, then retry. This is the sovereign path the
-                # sealer guards -- we exhaust recovery BEFORE halting.
+        # Stateful, session-scoped Latency Profiler kept PER ENDPOINT on this
+        # generator (EWMA survives across ops + L7 retries -- cures profiler
+        # amnesia). Built ONCE from the initial cfg; the L7 tighten rebuilds the
+        # client but reuses this profiler. A new endpoint (re-awaken) -> fresh one.
+        _init_overrides = dict(_base_overrides)
+        if _num_ctx:
+            _init_overrides["num_ctx"] = int(_num_ctx)
+        _init_cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_init_overrides)
+        _prof = self._failover_profiler_for(endpoint, _init_cfg)
+
+        async def _attempts() -> Optional[GenerationResult]:
+            nonlocal _num_ctx
+            _n = _l7_recovery_attempts()
+            _last_exc: Optional[BaseException] = None
+            for _try in range(_n + 1):
+                _overrides = dict(_base_overrides)
                 if _num_ctx:
-                    _num_ctx = max(512, int(_num_ctx * _l7_tighten_factor()))
-                logger.warning(
-                    "[CandidateGenerator] L7 AUTO-HEAL: %s on the 32B -> re-warm + "
-                    "tighten num_ctx=%s, retry %d/%d op=%s",
-                    type(_exc).__name__, _num_ctx, _try + 1, _attempts, _op,
-                )
+                    _overrides["num_ctx"] = int(_num_ctx)
+                _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
+                _client = _F3cLocalPrimeClient(_cfg, profiler=_prof)
                 try:
-                    await _client.warmup(timeout_s=_l7_rewarm_timeout_s())
-                except Exception:  # noqa: BLE001
-                    pass
-            finally:
-                try:
-                    await _client.aclose()
-                except Exception:  # noqa: BLE001
-                    pass
-        # Unreachable in practice (the loop returns or raises), but keep the net.
-        if _last_exc is not None:
-            raise _last_exc
-        return None
+                    _provider = _F3cPrimeProvider(
+                        _client,
+                        repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+                    )
+                    remaining = self._remaining_seconds(deadline)
+                    if remaining <= 0.0:
+                        return None
+                    return await asyncio.wait_for(
+                        _provider.generate(context, deadline),
+                        timeout=remaining,
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    _last_exc = _exc
+                    # Non-recoverable OR out of retries -> propagate (sentinel seals).
+                    if _try >= _n or not _is_l7_recoverable(_exc):
+                        raise
+                    # AUTO-HEAL: tighten the window + re-warm, then retry.
+                    if _num_ctx:
+                        _num_ctx = max(512, int(_num_ctx * _l7_tighten_factor()))
+                    logger.warning(
+                        "[CandidateGenerator] L7 AUTO-HEAL: %s on the 32B -> re-warm "
+                        "+ tighten num_ctx=%s, retry %d/%d op=%s",
+                        type(_exc).__name__, _num_ctx, _try + 1, _n, _op,
+                    )
+                    try:
+                        await _client.warmup(timeout_s=_l7_rewarm_timeout_s())
+                    except Exception:  # noqa: BLE001
+                        pass
+                finally:
+                    try:
+                        await _client.aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if _last_exc is not None:
+                raise _last_exc
+            return None
+
+        # Async Calibration Mutex (Scout Lock): on a COLD profiler the first
+        # concurrent op scouts (calibrates the EWMA) while the herd awaits the lock;
+        # once calibrated the herd runs CONCURRENTLY on the escalated seed -- the DAG
+        # is never serialized, only the one-shot cold calibration is gated.
+        return await _prof.run_calibrated(_attempts)
 
     async def _dispatch_via_sentinel(
         self,
