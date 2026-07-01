@@ -314,6 +314,132 @@ async def test_warmup_timeout_default():
 # (g) Existing AWAKENING-timeout still fires even when warmup is pending
 # ---------------------------------------------------------------------------
 
+## ---------------------------------------------------------------------------
+## (h) Semantic Pre-Flight FSM boundary: HEAVY tier is only legally SERVING
+##     after a confirmed warmup. Survival stays advisory (byte-identical legacy).
+## ---------------------------------------------------------------------------
+
+def _heavy_tier():
+    from types import SimpleNamespace
+    return SimpleNamespace(is_gpu=True, model_label="qwen2.5-coder:32b")
+
+
+async def test_heavy_tier_warmup_failure_stays_awakening(monkeypatch):
+    """HEAVY tier (32B/GPU) + strict gate: a failed warmup keeps the FSM in
+    AWAKENING (re-tick) -- it must NOT advertise a cold node whose first op times
+    out and cascades. The outer AWAKENING deadline still bounds a wedged node."""
+    monkeypatch.setenv("JARVIS_FAILOVER_WARMUP_STRICT", "true")
+    clock = FakeClock()
+
+    async def failing_warmup_fn():
+        return False
+
+    ctrl = _make_ctrl(clock, warmup_fn=failing_warmup_fn)
+    ctrl._get_forecast = lambda: _fake_forecast("HIGH", p50=300.0)
+    _fill_outage()
+    await ctrl.tick()  # DORMANT -> AWAKENING
+    ctrl._awakened_tier = _heavy_tier()  # force HEAVY
+    await ctrl.tick()  # warmup fails -> HEAVY strict gate -> STAY AWAKENING
+    assert ctrl.state == fl.FailoverState.AWAKENING
+    assert ctrl.is_jprime_serving() is False
+
+
+async def test_heavy_tier_warmup_success_reaches_serving(monkeypatch):
+    """HEAVY tier + strict gate: a CONFIRMED warmup transitions to SERVING."""
+    monkeypatch.setenv("JARVIS_FAILOVER_WARMUP_STRICT", "true")
+    clock = FakeClock()
+
+    async def ok_warmup_fn():
+        return True
+
+    ctrl = _make_ctrl(clock, warmup_fn=ok_warmup_fn)
+    ctrl._get_forecast = lambda: _fake_forecast("HIGH", p50=300.0)
+    _fill_outage()
+    await ctrl.tick()  # -> AWAKENING
+    ctrl._awakened_tier = _heavy_tier()
+    await ctrl.tick()  # warmup OK -> SERVING
+    assert ctrl.state == fl.FailoverState.SERVING
+    assert ctrl.is_jprime_serving() is True
+
+
+async def test_heavy_tier_strict_off_is_advisory(monkeypatch):
+    """Strict gate OFF -> even a HEAVY tier is advisory (legacy): a failed warmup
+    still proceeds to SERVING (escape hatch)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_WARMUP_STRICT", "false")
+    clock = FakeClock()
+
+    async def failing_warmup_fn():
+        return False
+
+    ctrl = _make_ctrl(clock, warmup_fn=failing_warmup_fn)
+    ctrl._get_forecast = lambda: _fake_forecast("HIGH", p50=300.0)
+    _fill_outage()
+    await ctrl.tick()  # -> AWAKENING
+    ctrl._awakened_tier = _heavy_tier()
+    await ctrl.tick()  # strict OFF -> advisory -> SERVING despite warmup fail
+    assert ctrl.state == fl.FailoverState.SERVING
+
+
+async def test_survival_tier_warmup_failure_still_serving(monkeypatch):
+    """Survival (7B/CPU, non-heavy) tier stays advisory even with strict ON --
+    the hard gate is HEAVY-only (byte-identical legacy for the survival tier)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_WARMUP_STRICT", "true")
+    clock = FakeClock()
+
+    async def failing_warmup_fn():
+        return False
+
+    ctrl = _make_ctrl(clock, warmup_fn=failing_warmup_fn)
+    ctrl._get_forecast = lambda: _fake_forecast("HIGH", p50=300.0)
+    _fill_outage()
+    await ctrl.tick()  # -> AWAKENING (default survival tier, non-heavy)
+    await ctrl.tick()  # warmup fails but survival -> advisory -> SERVING
+    assert ctrl.state == fl.FailoverState.SERVING
+
+
+## ---------------------------------------------------------------------------
+## (i) The default warmup_fn resolves the node's ACTUAL served model (/api/tags)
+##     so it loads the RIGHT weights -- not LocalConfig's default 3B.
+## ---------------------------------------------------------------------------
+
+async def test_default_warmup_fn_resolves_served_model(monkeypatch):
+    clock = FakeClock()
+    ctrl = _make_ctrl(clock)
+    ctrl._endpoint = "http://10.0.0.9:11434"
+
+    import backend.core.ouroboros.governance.local_inference_director as lid
+    import backend.core.ouroboros.governance.candidate_generator as cg
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+        async def warmup(self, *, timeout_s):
+            captured["timeout_s"] = timeout_s
+            return True
+
+        async def aclose(self):
+            captured["closed"] = True
+
+    async def _fake_resolve(endpoint, **_kw):
+        captured["resolve_ep"] = endpoint
+        return "qwen2.5-coder:32b"
+
+    monkeypatch.setattr(lid, "LocalPrimeClient", _FakeClient)
+    monkeypatch.setattr(cg, "_resolve_served_model", _fake_resolve)
+
+    warmup_fn = ctrl._build_default_warmup_fn()
+    ok = await warmup_fn()
+
+    assert ok is True
+    assert captured["resolve_ep"] == "http://10.0.0.9:11434"
+    assert captured["cfg"].model_name == "qwen2.5-coder:32b"  # NOT the 3B default
+    assert captured["cfg"].base_url == "http://10.0.0.9:11434"
+    assert captured.get("closed") is True
+
+
 async def test_awakening_timeout_fires_even_with_warmup_enabled(monkeypatch):
     """The outer AWAKENING deadline (JARVIS_FAILOVER_AWAKEN_TIMEOUT_S) still
     terminates a stuck node even when warmup is enabled. The warmup happens

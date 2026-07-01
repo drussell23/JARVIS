@@ -370,6 +370,16 @@ def _warmup_timeout_s() -> float:
     return max(1.0, _env_float("JARVIS_FAILOVER_WARMUP_TIMEOUT_S", 180.0))
 
 
+def _warmup_strict() -> bool:
+    """Semantic Pre-Flight FSM boundary. When TRUE (default), a HEAVY tier
+    (32B/GPU) is only legally SERVING after a CONFIRMED warmup -- a failed warmup
+    keeps the FSM in AWAKENING (re-tick, bounded by the outer AWAKENING deadline)
+    rather than advertising a cold node whose first op times out and cascades. The
+    survival (7B/CPU) tier stays advisory (byte-identical legacy) regardless. Set
+    ``JARVIS_FAILOVER_WARMUP_STRICT=false`` to make even a heavy tier advisory."""
+    return _enabled("JARVIS_FAILOVER_WARMUP_STRICT", "true")
+
+
 def _heavy_coldstart_mult() -> float:
     """Multiplier applied to cold-start timeouts when the awakened tier is HEAVY
     (a large model on a GPU -- e.g. qwen2.5-coder:32b on an L4, which needs minutes
@@ -1557,12 +1567,29 @@ class FailoverLifecycleController:
         timeout = self._adaptive_timeout(_warmup_timeout_s())
 
         import dataclasses  # noqa: PLC0415
-        # Build a config that targets the awakened node's base URL.
         base_cfg = LocalConfig.from_env()
-        node_cfg = dataclasses.replace(base_cfg, base_url=endpoint)
-        client = LocalPrimeClient(node_cfg)
 
         async def _warmup() -> bool:
+            # Resolve the model the node ACTUALLY serves from its own /api/tags
+            # (deterministic L7, memoized) so warmup loads the RIGHT weights into
+            # VRAM -- NOT LocalConfig's default 3B (which the 32B node doesn't have,
+            # so the warmup would fail and the first real op time out cold). This
+            # also POPULATES the shared per-endpoint cache, so the dispatch
+            # resolver gets a cache hit later -- zero extra /api/tags calls.
+            served: Optional[str] = None
+            try:
+                from backend.core.ouroboros.governance.candidate_generator import (  # noqa: PLC0415
+                    _resolve_served_model,
+                )
+                served = await _resolve_served_model(endpoint)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[FailoverLifecycle] warmup model resolve fail-soft err=%r", exc)
+            node_cfg = dataclasses.replace(
+                base_cfg,
+                base_url=endpoint,
+                **({"model_name": served} if served else {}),
+            )
+            client = LocalPrimeClient(node_cfg)
             try:
                 return await client.warmup(timeout_s=timeout)
             finally:
@@ -2177,6 +2204,22 @@ class FailoverLifecycleController:
                     "-- proceeding to SERVING (first op may be cold)", exc,
                 )
             if not warmup_ok:
+                # Semantic Pre-Flight FSM boundary: a HEAVY tier (32B/GPU) is only
+                # legally SERVING after a confirmed 1-token response. On a failed
+                # warmup, STAY in AWAKENING and re-tick (the outer adaptive AWAKENING
+                # deadline still reaps a genuinely wedged node) rather than
+                # advertising a cold node whose first real op times out at the
+                # inference budget and cascades to the dead DW/stub lane. The
+                # survival (7B/CPU) tier stays advisory (byte-identical legacy).
+                if _warmup_strict() and _tier_is_heavy(self._awakened_tier):
+                    logger.warning(
+                        "[FailoverLifecycle] warmup NOT confirmed for HEAVY tier "
+                        "(model=%s) -- STAYING AWAKENING (Semantic Pre-Flight gate); "
+                        "re-tick pending (outer deadline %.0fs bounds a wedged node)",
+                        getattr(self._awakened_tier, "model_label", "?"),
+                        self._adaptive_timeout(_awaken_timeout_s()),
+                    )
+                    return  # do NOT flip to SERVING; next tick re-warms
                 logger.warning(
                     "[FailoverLifecycle] warmup did not confirm within %.0fs "
                     "-- proceeding to SERVING (first op may be cold)",

@@ -491,6 +491,8 @@ _NONRETRYABLE_TERMINAL_REASONS: "frozenset[str]" = frozenset({
     "validation_budget_exhausted",   # VALIDATE budget gone
     "op_cost_cap_exceeded",          # per-op cost cap blown
     "user_cancelled",                # cooperative cancellation
+    "sovereign_route_sealed",        # Absolute Route Sealing: committed J-Prime
+                                     # dispatch failed; DW cascade forbidden -> halt
     _FAILFAST_CIRCUIT_OPEN_REASON,   # fail-fast exhaustion breaker open
 })
 
@@ -506,9 +508,15 @@ def _is_nonretryable_terminal(reason_code: str) -> bool:
 
     Pure, side-effect-free classifier over ``_NONRETRYABLE_TERMINAL_REASONS``.
     Always returns a ``bool`` and never raises (coerces non-str input to str).
+    Matches an exact code OR a ``prefix:detail`` shape by its colon-prefix head
+    (e.g. ``sovereign_route_sealed:gcp-jprime:LocalLatencyLockup`` -> matches
+    ``sovereign_route_sealed``). Existing colon-free codes are unaffected.
     """
     try:
-        return str(reason_code) in _NONRETRYABLE_TERMINAL_REASONS
+        code = str(reason_code)
+        if code in _NONRETRYABLE_TERMINAL_REASONS:
+            return True
+        return code.split(":", 1)[0] in _NONRETRYABLE_TERMINAL_REASONS
     except Exception:  # noqa: BLE001 — classifier must never raise
         return False
 

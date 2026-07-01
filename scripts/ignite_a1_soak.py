@@ -261,6 +261,17 @@ def _arm_failover_env(env: dict) -> dict:
         "JARVIS_FAILOVER_QUALITY_ACCEL_COUNT": "1",
         "JARVIS_FAILOVER_QUALITY_IMAGE": "jarvis-prime-coder-32b",
         "JARVIS_FAILOVER_INFERENCE_BIND_ENABLED": "true",
+        # Semantic Pre-Flight FSM boundary: a HEAVY (32B/GPU) tier is only legally
+        # SERVING after a CONFIRMED warmup (loads ~20GB into L4 VRAM with the RIGHT
+        # model, via /api/tags). A failed warmup keeps the FSM in AWAKENING (bounded
+        # by the outer deadline) instead of advertising a cold node whose first op
+        # times out and cascades. Default TRUE; set explicit for the soak record.
+        "JARVIS_FAILOVER_WARMUP_STRICT": "true",
+        # Absolute Route Sealing: once the router commits to the sovereign 32B, a
+        # failure/timeout HALTS the op (terminal) -- it must NEVER cascade to the
+        # dead DW / synthetic-adversary lane (the cascade leak that retry-stalled
+        # the last soak). The 32B is the designated provider here, not a bonus.
+        "JARVIS_FAILOVER_ABSOLUTE_ROUTE_SEALING": "true",
     })
     return env
 

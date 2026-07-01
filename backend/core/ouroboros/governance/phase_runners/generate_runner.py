@@ -1790,6 +1790,36 @@ class GENERATERunner(PhaseRunner):
 
                     )
 
+                # ── Absolute Route Sealing terminal ──
+                # The router committed to the sovereign J-Prime provider and it
+                # failed; the DW cascade is FORBIDDEN. This is a non-retryable
+                # terminal (re-driving through GENERATE_RETRY would just re-hit the
+                # same wedged/absent sovereign node) -- HALT the op cleanly rather
+                # than letting it cascade or retry-storm.
+                if "sovereign_route_sealed" in _err_msg:
+                    logger.warning(
+                        "[Orchestrator] ABSOLUTE ROUTE SEAL — op halted (sovereign "
+                        "J-Prime committed + failed, DW cascade forbidden) [%s] %s",
+                        ctx.op_id, _err_msg[:120],
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code=f"sovereign_route_sealed:{_err_msg[:80]}",
+                    )
+                    await orch._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {
+                            "reason": "sovereign_route_sealed",
+                            "error": _err_msg[:200],
+                            "route": _route or "unknown",
+                        },
+                    )
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason=ctx.terminal_reason_code or "generate_terminal",
+                        artifacts={"generation": generation, "episodic_memory": _episodic_memory},
+                    )
+
                 logger.warning(
                     "Generation attempt %d/%d failed for %s: %s",
                     attempt + 1,

@@ -297,7 +297,18 @@ class LocalPrimeClient:
                 "num_predict": 1,
                 "temperature": 0.0,
             }
-            async with sess.post(url, json=body) as resp:
+            # Dedicated Cold-Start HTTP Context: give the warmup POST its OWN total
+            # timeout == the (heavy-mult-scaled) warmup budget, overriding aiohttp's
+            # 300s session default. A 32B is ~20GB; the PCIe->VRAM cold-load can
+            # exceed 300s, and without this the socket would be dropped mid-transfer
+            # (min(720s wait_for, 300s default) = 300s). Fail-soft if aiohttp is
+            # unavailable -- fall back to the session default.
+            try:
+                import aiohttp  # noqa: PLC0415
+                _post_kw = {"timeout": aiohttp.ClientTimeout(total=max(1.0, timeout_s))}
+            except Exception:  # noqa: BLE001
+                _post_kw = {}
+            async with sess.post(url, json=body, **_post_kw) as resp:
                 await resp.json()
             return True
 
