@@ -1906,6 +1906,16 @@ class BattleTestHarness:
                 if os.environ.get(
                     "JARVIS_FSM_CHECKPOINT_ENABLED", "true",
                 ).strip().lower() not in ("0", "false", "no", "off"):
+                    # Fire cooperative shutdown FIRST so an in-flight STREAMING op
+                    # freezes at its next chunk boundary (raising
+                    # GracefulStreamInterruption -> its dispatch checkpoints the
+                    # partial deterministically) instead of holding the event loop
+                    # hostage until the blind SIGKILL. The subsequent GLS teardown
+                    # awaits the op, giving it the tick it needs to freeze.
+                    from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                        cooperative_shutdown as _coop_race,
+                    )
+                    _coop_race.request(self._stop_reason or "wall_clock_cap")
                     from backend.core.ouroboros.governance import (  # noqa: PLC0415
                         fsm_checkpoint as _fsm_ckpt,
                     )
