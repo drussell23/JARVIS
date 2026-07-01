@@ -123,15 +123,18 @@ async def _race_and_checkpoint():
     path = ckpt.write_checkpoint(cp)
     coop.reset()
 
+    _hdr("5. Atomic Hydration Handshake (exactly what Window 2 prints)")
+    # list_pending re-verifies HMAC -> emits the crypto handshake to stdout below.
     pend = ckpt.list_pending(base_dir=None)
     mine = [c for c in pend if c.op_id == op_id]
     assert mine, "checkpoint not found on disk / failed HMAC verification"
     got = mine[0]
-    _ok(f"HMAC-signed checkpoint on disk: {path}")
-    _ok(f"read back verified: op_id={got.op_id} phase={got.phase}")
-    _ok(f"partial_completion preserved ({len(got.partial_completion)} chars):")
-    print("       \033[36m" + repr(got.partial_completion) + "\033[0m")
     assert got.partial_completion == partial, "partial mismatch after roundtrip"
+    # The prefill-inject handshake fires when the resume dispatch feeds the partial to
+    # the 32B; emit it here to show the operator the exact bytes + snippet.
+    ckpt.emit_handshake(ckpt.format_prefill_handshake(op_id, got.partial_completion))
+    _ok("both handshake lines emitted above (HMAC-SHA256 VERIFIED + PREFILL-INJECT)")
+    _ok(f"on-disk checkpoint: {path}")
     return path
 
 

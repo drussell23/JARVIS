@@ -76,6 +76,64 @@ def _verify(payload_json: str, signature: str, key: bytes) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Atomic Hydration Handshake (strict cross-window observability)
+# ---------------------------------------------------------------------------
+# The window-1 (suspend) -> window-2 (resume) transition must be cryptographically
+# LEGIBLE, never silent. The handshake is forced to BOTH the module logger (debug.log,
+# greppable) AND stdout (the operator console) -- mirroring the streaming token
+# emitter's stdout discipline. Two facets: the crypto-verify handshake (proving the
+# checkpoint is authentic) and the prefill-inject handshake (proving the exact partial
+# thought that re-enters the LLM). Observability only -- authority-free, never raises.
+
+def emit_handshake(line: str) -> None:
+    """Emit one Atomic Hydration Handshake line to BOTH the logger and stdout.
+    Best-effort on every leg -- observability never breaks suspend/resume."""
+    try:
+        logger.info(line)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import sys  # noqa: PLC0415
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _handshake_snippet(text: str, *, head: int = 48, tail: int = 24) -> str:
+    """A bounded but EXACT (repr) snippet of the partial -- full repr when short, an
+    unambiguous head…tail elision when long (repr preserves newlines/escapes so the
+    operator sees the true bytes, not a lossy print)."""
+    text = text or ""
+    if len(text) <= head + tail + 1:
+        return repr(text)
+    return "%s … %s" % (repr(text[:head]), repr(text[-tail:]))
+
+
+def format_verified_handshake(op_id: str, phase: str, signature: str) -> str:
+    """Strict cryptographic handshake: the checkpoint's HMAC-SHA256 signature VERIFIED
+    (fail-closed gate passed). Carries a digest prefix so two windows can be correlated."""
+    return (
+        "[HYDRATION-HANDSHAKE] HMAC-SHA256 VERIFIED op=%s phase=%s digest=%s… "
+        "-> checkpoint AUTHENTIC (fail-closed crypto gate passed)"
+        % (op_id, phase, str(signature)[:16])
+    )
+
+
+def format_prefill_handshake(op_id: str, partial: str) -> str:
+    """Strict prefill-injection handshake: the EXACT byte-length + char-length + repr
+    snippet of the partial_completion being injected into the LLM as the assistant
+    prefill (the thought the 32B resumes typing from)."""
+    partial = partial or ""
+    n_bytes = len(partial.encode("utf-8"))
+    return (
+        "[HYDRATION-HANDSHAKE] PREFILL-INJECT op=%s partial_bytes=%d partial_chars=%d "
+        "snippet=%s -> injected as assistant prefill (32B continues the thought)"
+        % (op_id, n_bytes, len(partial), _handshake_snippet(partial))
+    )
+
+
 def checkpoint_dir(base_dir: "Optional[str]" = None) -> str:
     """Resolve the checkpoint ledger dir (env ``JARVIS_CHECKPOINT_DIR`` or
     ``<base>/.ouroboros/checkpoints``). Created on demand. NEVER raises."""
@@ -215,7 +273,11 @@ def list_pending(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
                         "(corrupt/tampered/unsigned) -> clean boot for this op", n,
                     )
                     continue
-                out.append(FSMCheckpoint.from_json(payload_json))
+                _cp = FSMCheckpoint.from_json(payload_json)
+                # Atomic Hydration Handshake (facet 1): positive proof the signature
+                # verified -- symmetric with the REJECT log above, forced to stdout.
+                emit_handshake(format_verified_handshake(_cp.op_id, _cp.phase, sig or ""))
+                out.append(_cp)
             except Exception:  # noqa: BLE001
                 logger.warning("[fsm_checkpoint] REJECT %s -- unreadable -> clean boot", n)
                 continue
