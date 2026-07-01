@@ -666,14 +666,33 @@ class LocalPrimeClient:
                 partial="".join(parts),
             )
 
-        async with sess.post(url, json=body) as resp:
-            reader = resp.content  # aiohttp StreamReader (line-iterable)
-            # Preemptive Asynchronous Race: one long-lived shutdown waiter raced
-            # against each readline. The instant the OS signal fires the event, the
-            # readline task is dropped and we yield the partial to THIS millisecond --
-            # zero-latency, not up to the inter-token window later.
-            _shutdown_task = asyncio.ensure_future(_coop.wait_async())
+        # Preemptive Asynchronous Race, phase 0 (response-begin): the server does
+        # not return response HEADERS until the model prefill completes (1-4 min on
+        # a heavy tier), so the ``post`` await is the LONGEST blocking window of a
+        # streaming call. A cooperative shutdown during prefill must freeze NOW with
+        # the prefill-seed partial -- not sit deaf until an outer cancel bypasses the
+        # checkpoint path (live gap bt-iso-1782942507: SIGTERM at 59s into prefill,
+        # tokens=0, no stall -> GSI never raised, 0 checkpoints).
+        _shutdown_task = asyncio.ensure_future(_coop.wait_async())
+        _req_cm = sess.post(url, json=body)
+        try:
+            _enter_task = asyncio.ensure_future(_req_cm.__aenter__())
+            _done_begin, _ = await asyncio.wait(
+                {_enter_task, _shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if _enter_task not in _done_begin:
+                # Shutdown fired while awaiting response headers (prefill) ->
+                # drop the in-flight request and freeze this millisecond.
+                _enter_task.cancel()
+                raise _freeze()
+            resp = _enter_task.result()  # re-raises genuine request errors faithfully
             try:
+                reader = resp.content  # aiohttp StreamReader (line-iterable)
+                # Phase 1 (chunk loop): the SAME long-lived waiter raced against
+                # each readline. The instant the OS signal fires the event, the
+                # readline task is dropped and we yield the partial to THIS
+                # millisecond -- zero-latency, not up to the inter-token window.
                 while True:
                     if _coop.is_requested():  # cheap fast-path (already requested)
                         raise _freeze()
@@ -713,8 +732,13 @@ class LocalPrimeClient:
                         parts.append(delta)
                         _emit_stream_token(delta)
             finally:
-                if not _shutdown_task.done():
-                    _shutdown_task.cancel()
+                try:
+                    await _req_cm.__aexit__(None, None, None)
+                except BaseException:  # noqa: BLE001 -- release never masks the freeze
+                    pass
+        finally:
+            if not _shutdown_task.done():
+                _shutdown_task.cancel()
         total_ms = (time.monotonic() - t0) * 1000.0
         text = "".join(parts)
         out_toks = max(1, len(text) // 4)
