@@ -104,6 +104,10 @@ class FSMCheckpoint:
     exploration_records: List[Dict[str, Any]] = field(default_factory=list)
     intake_evidence_json: str = ""
     provider_route: str = ""
+    # Partial-Thought Buffer: the exact raw string the LLM had emitted when the
+    # stream was cooperatively interrupted (may be half a tool call / code block).
+    # Window-2 resume prefills this so the model continues from the interrupted char.
+    partial_completion: str = ""
     created_at: float = 0.0
     resume_reason: str = ""
     schema_version: int = _SCHEMA_VERSION
@@ -116,6 +120,31 @@ class FSMCheckpoint:
         data = json.loads(blob)
         known = {k: data.get(k) for k in cls.__dataclass_fields__ if k in data}  # type: ignore[attr-defined]
         return cls(**known)
+
+
+# Partial-Thought side-channel: the streaming layer knows the partial string but not
+# the op_id; the dispatch layer knows the op_id but not the partial. The dispatch
+# stashes the interrupted partial keyed by op_id here; capture_from_context (invoked
+# by the harness suspend, which has the ctx/op_id) pops it into the checkpoint.
+_PARTIAL_STASH: Dict[str, str] = {}
+
+
+def stash_partial(op_id: str, partial: str) -> None:
+    """Record the partial thought of a cooperatively-interrupted op (by op_id) so the
+    suspend capture can fold it into the checkpoint. NEVER raises."""
+    try:
+        if op_id:
+            _PARTIAL_STASH[str(op_id)] = str(partial or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pop_partial(op_id: str) -> str:
+    """Consume a stashed partial (once). Returns "" if none. NEVER raises."""
+    try:
+        return _PARTIAL_STASH.pop(str(op_id), "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[List[Dict[str, Any]]]" = None,
@@ -137,6 +166,7 @@ def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[Li
             exploration_records=list(exploration_records or []),
             intake_evidence_json=str(getattr(context, "intake_evidence_json", "") or ""),
             provider_route=str(getattr(context, "provider_route", "") or ""),
+            partial_completion=pop_partial(op_id),
             created_at=time.time(),
             resume_reason=str(resume_reason),
         )
@@ -245,6 +275,7 @@ def build_resume_envelope(cp: FSMCheckpoint) -> Dict[str, Any]:
         "exploration_records": list(cp.exploration_records),
         "intake_evidence_json": cp.intake_evidence_json,
         "provider_route": cp.provider_route,
+        "partial_completion": cp.partial_completion,
     }
 
 
