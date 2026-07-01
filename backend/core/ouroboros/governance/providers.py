@@ -198,6 +198,34 @@ _CODEGEN_SYSTEM_PROMPT = (
     )
 )
 
+
+def _a1_exploration_addendum() -> str:
+    """A1 soak: teach the model the Iron Gate's exploration-first contract so it
+    does NOT emit zero-shot diffs (which the gate rejects -> GENERATE_RETRY). Text
+    names the exact _EXPLORATION_TOOLS + the >=2-before-patch floor the gate
+    enforces (orchestrator._min_explore). Read at CALL time (not frozen at import)
+    so it can be toggled per-run. Gated by JARVIS_A1_EXPLORATION_PROMPT_ENABLED
+    (default off -> byte-identical). NEVER raises."""
+    try:
+        val = (os.environ.get("JARVIS_A1_EXPLORATION_PROMPT_ENABLED", "") or "").strip().lower()
+        if val not in ("1", "true", "yes", "on"):
+            return ""
+        try:
+            floor = max(2, int(os.environ.get("JARVIS_MIN_EXPLORATION_CALLS", "2") or 2))
+        except (TypeError, ValueError):
+            floor = 2
+        return (
+            "\n\nEXPLORATION-FIRST MANDATE (hard-enforced by an Iron Gate): before "
+            "you emit ANY patch or full_content, you MUST first call the exploration "
+            "tools -- read_file and/or search_code (get_callers, list_symbols, "
+            "glob_files, list_dir also count) -- AT LEAST %d times. Read the target "
+            "file(s) and search for callers/usages FIRST, then propose your patch. A "
+            "patch proposed with fewer than %d exploration tool calls is AGGRESSIVELY "
+            "REJECTED and forces a retry. Explore, then patch." % (floor, floor)
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
 # ── Phase 2B: size/security constants ────────────────────────────────────
 # Prompt compression: aggressive defaults to reduce token cost.
 # With Venom tool loop active, the model can read_file to see specific
@@ -5452,7 +5480,7 @@ class PrimeProvider:
         async def _generate_raw(p: str) -> str:
             resp = await self._client.generate(
                 prompt=p,
-                system_prompt=_CODEGEN_SYSTEM_PROMPT,
+                system_prompt=_CODEGEN_SYSTEM_PROMPT + _a1_exploration_addendum(),
                 max_tokens=_retry_max_tokens,
                 temperature=_eff_temperature,
                 model_name=_brain_model,

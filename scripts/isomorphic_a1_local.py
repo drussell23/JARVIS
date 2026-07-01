@@ -409,6 +409,10 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     """
     env["JARVIS_FAILOVER_HYBRID_MESH"] = "true"             # external-natIP route
     env["JARVIS_FAILOVER_INFERENCE_BIND_ENABLED"] = "true"  # node binds 0.0.0.0
+    # Teach the 32B the Iron Gate's exploration-first contract (>=2 read_file/
+    # search_code before any patch) so it does not emit zero-shot diffs that the
+    # gate rejects -> GENERATE_RETRY. Injected into the Prime-path system prompt.
+    env.setdefault("JARVIS_A1_EXPLORATION_PROMPT_ENABLED", "true")
     # Cross-Region Capacity Matrix: do NOT pin a single region -- a whole-region L4
     # stockout must fall to a fallback region. Leave JARVIS_GCP_ZONE_FALLBACK unset
     # so zone_fallback._DEFAULT_ZONES (the region-ordered L4 matrix) applies; an
@@ -448,11 +452,12 @@ def _env_float(name: str, default: float) -> float:
 def _a1_audit_ceiling_s() -> float:
     """Tier-aware audit ceiling (no hardcoded window). The auditor early-exits the
     moment the verdict is proven; this is the SAFETY ceiling. It is derived from
-    the resolved failover tier: a heavy 32B/L4 op needs minutes to traverse
-    CLASSIFY->...->APPLY->terminal, so we scale the base by the SAME
-    JARVIS_JPRIME_HEAVY_COLDSTART_MULT used for the cold-start timeouts. Survival
-    (7B/CPU) -> base unchanged. Fail-soft -> base on any error."""
-    base = _env_float("JARVIS_A1_AUDIT_BASE_S", 120.0)
+    the resolved failover tier: a heavy 32B/L4 op runs a MULTI-TURN Venom tool loop
+    (explore -> read -> patch -> validate) that is I/O-heavy and slow, so we scale
+    the base by the SAME JARVIS_JPRIME_HEAVY_COLDSTART_MULT as the cold-start
+    timeouts. Base default 300s x4 = 1200s (~20 min) gives the agentic explore-then
+    -fix cycle real wall-clock. Survival (7B/CPU) -> base unchanged. Fail-soft."""
+    base = _env_float("JARVIS_A1_AUDIT_BASE_S", 300.0)
     try:
         from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
             resolve_tier,
