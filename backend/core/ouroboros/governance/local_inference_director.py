@@ -406,6 +406,69 @@ def _ewma_alpha() -> float:
         return 0.3
 
 
+class InterTokenStall(RuntimeError):
+    """Asynchronous Inter-Token Watchdog trip: the streamed generation went silent
+    (no token chunk within the inter-token timeout). A stalled stream = a wedged
+    worker; NON-recoverable (the L7 auto-heal seals/halts, never retries). A stream
+    that keeps emitting is allowed to run indefinitely -- total duration is NOT a
+    kill condition on the streaming (heavy) path."""
+    failure_class = "inter_token_stall"
+
+
+def _streaming_enabled() -> bool:
+    """Master switch for the streaming inter-token watchdog on the heavy (num_ctx)
+    generation path. Default TRUE. OFF -> legacy total-duration adaptive timeout."""
+    return _envb("JARVIS_LOCAL_STREAMING_ENABLED", True) if os.environ.get(
+        "JARVIS_LOCAL_STREAMING_ENABLED") is not None else True
+
+
+def _inter_token_timeout_s() -> float:
+    """Max wall-time between streamed token chunks before the Stream Breaker trips.
+    The model may run indefinitely as long as it emits within this gap. Default 30s."""
+    return max(1.0, _f_env("JARVIS_LOCAL_INTER_TOKEN_TIMEOUT_S", 30.0))
+
+
+_SSE_DONE = object()  # sentinel: the [DONE] terminator of an OpenAI-compat SSE stream
+
+
+def _parse_sse_delta(line: bytes) -> "Any":
+    """Parse ONE line of an ollama /v1/chat/completions SSE stream. Returns the
+    incremental content string, the ``_SSE_DONE`` sentinel on ``data: [DONE]``, or
+    None for keep-alives / non-data / parse errors. Pure + fail-soft."""
+    try:
+        s = line.decode("utf-8", "ignore").strip() if isinstance(line, (bytes, bytearray)) else str(line).strip()
+        if not s or not s.startswith("data:"):
+            return None
+        payload = s[len("data:"):].strip()
+        if payload == "[DONE]":
+            return _SSE_DONE
+        import json as _json  # noqa: PLC0415
+        obj = _json.loads(payload)
+        choices = obj.get("choices") or []
+        if not choices:
+            return None
+        delta = (choices[0] or {}).get("delta") or {}
+        return delta.get("content") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _emit_stream_token(text: str) -> None:
+    """Yield a streamed chunk to stdout for real-time observability (constraint 2).
+    Best-effort -- observability never breaks the generation. The 'wall yields to an
+    active stream' behavior (constraint 3) is achieved structurally at the dispatch
+    layer: the streaming path drops the outer op-deadline wait_for, so an
+    actively-emitting call is bounded ONLY by the per-chunk inter-token watchdog +
+    the STATIC hard wall-clock cap (kept blind per the Slice-47 Watchdog Isolation
+    Invariant -- never coupled to stream state)."""
+    try:
+        import sys  # noqa: PLC0415
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class LocalMemoryCritical(RuntimeError):
     """Raised when host memory is CRITICAL at local-generate admission time.
 
@@ -475,7 +538,8 @@ class LocalPrimeClient:
 
     async def complete(self, *, system: str, user: str, prompt_tokens: int,
                        temperature: float = 0.2,
-                       max_tokens: "Optional[int]" = None) -> LocalCompletion:
+                       max_tokens: "Optional[int]" = None,
+                       stream: "Optional[bool]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
@@ -517,6 +581,12 @@ class LocalPrimeClient:
             body["options"] = {"num_ctx": int(self._cfg.num_ctx)}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+
+        _use_stream = stream if stream is not None else (
+            bool(self._cfg.num_ctx) and _streaming_enabled())
+        if _use_stream:
+            return await self._complete_streaming(sess, url, body)
+
         t0 = time.monotonic()
         async with sess.post(url, json=body) as resp:
             data = await resp.json()
@@ -527,19 +597,70 @@ class LocalPrimeClient:
         self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
         return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
 
+    async def _complete_streaming(self, sess: Any, url: str, body: Dict[str, Any]) -> LocalCompletion:
+        """Streaming generation with the Asynchronous Inter-Token Watchdog. Reads the
+        SSE stream chunk-by-chunk; each ``readline`` is bounded by the inter-token
+        timeout (NOT the total duration), so a model that keeps emitting runs
+        indefinitely and only a genuine STALL (silence > timeout) trips the breaker.
+        Buffers the deltas (constraint 2) while yielding them to stdout, and records
+        the REAL end-to-end latency as a profiler sample on success."""
+        body = dict(body)
+        body["stream"] = True
+        inter_token_s = _inter_token_timeout_s()
+        parts: List[str] = []
+        ttft_ms = 0.0
+        t0 = time.monotonic()
+        first = True
+        async with sess.post(url, json=body) as resp:
+            reader = resp.content  # aiohttp StreamReader (line-iterable)
+            while True:
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=inter_token_s)
+                except asyncio.TimeoutError as e:
+                    raise InterTokenStall(
+                        "inter-token stall: no chunk within %.0fs (stream wedged)"
+                        % inter_token_s
+                    ) from e
+                if not line:
+                    break  # EOF -> stream complete
+                delta = _parse_sse_delta(line)
+                if delta is _SSE_DONE:
+                    break
+                if delta:
+                    if first:
+                        ttft_ms = (time.monotonic() - t0) * 1000.0
+                        first = False
+                    parts.append(delta)
+                    _emit_stream_token(delta)
+        total_ms = (time.monotonic() - t0) * 1000.0
+        text = "".join(parts)
+        out_toks = max(1, len(text) // 4)
+        # A completed stream is a REAL latency sample -> the EWMA learns + decays.
+        self.profiler.record(ttft_ms=ttft_ms or min(total_ms, 0.1 * total_ms),
+                             total_ms=total_ms, output_tokens=out_toks)
+        return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
+
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
                                max_tokens: "Optional[int]" = None) -> LocalCompletion:
-        # May raise UnrecoverableInferenceLatency (absolute breaker) -> propagates
-        # as terminal (non-recoverable; the L7 auto-heal seals/halts, no retry).
-        timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
-        if self._cfg.num_ctx:
-            # Emit the adaptive per-call budget so the Dynamic Global Audit Ceiling
-            # can derive itself (budget x max agentic rounds) from observed reality.
+        # HEAVY (num_ctx) STREAMING path: deprecate the total-duration timeout. The
+        # Inter-Token Watchdog inside _complete_streaming is the sole guard -- a
+        # model that keeps emitting tokens runs indefinitely; only a STALL trips it.
+        # This is the mathematically-robust replacement for guessing total latency.
+        if self._cfg.num_ctx and _streaming_enabled():
             logger.info(
-                "[LocalPrimeClient] adaptive inference budget=%.0fms warm=%s num_ctx=%d",
-                timeout_ms, self.profiler.is_warm(), int(self._cfg.num_ctx),
+                "[LocalPrimeClient] streaming generation (inter-token watchdog=%.0fs, "
+                "no total-duration cap) num_ctx=%d",
+                _inter_token_timeout_s(), int(self._cfg.num_ctx),
             )
+            return await self.complete(
+                system=system, user=user, prompt_tokens=prompt_tokens,
+                temperature=temperature, max_tokens=max_tokens, stream=True,
+            )
+
+        # SURVIVAL / non-streaming path: legacy total-duration adaptive timeout.
+        # May raise UnrecoverableInferenceLatency (absolute breaker) -> terminal.
+        timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
         try:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
@@ -547,8 +668,6 @@ class LocalPrimeClient:
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
-            # Asymmetric penalty injection: escalate the EWMA so the next dispatch
-            # gets a bigger budget (cures the cold-profiler starvation).
             self.profiler.record_timeout_penalty(timeout_ms)
             raise LocalLatencyLockup(
                 f"local_inference timeout: budget={timeout_ms:.0f}ms "

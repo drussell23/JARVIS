@@ -108,10 +108,12 @@ def test_unrecoverable_is_not_l7_recoverable():
 # --- integration: complete_guarded injects the penalty on timeout -----------
 
 def test_complete_guarded_injects_penalty_on_timeout():
+    # The total-duration timeout + penalty lives on the NON-streaming (survival)
+    # path now; the heavy num_ctx path streams (inter-token watchdog, no total cap).
     import asyncio
 
-    prof = lid.LatencyProfiler(_cfg(num_ctx=8192))
-    client = lid.LocalPrimeClient(_cfg(num_ctx=8192), session=object(), profiler=prof)
+    prof = lid.LatencyProfiler(_cfg(num_ctx=None))
+    client = lid.LocalPrimeClient(_cfg(num_ctx=None), session=object(), profiler=prof)
 
     async def _timeout_complete(**kw):
         raise asyncio.TimeoutError()
