@@ -317,6 +317,15 @@ def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_cl
                 continue
     except Exception:  # noqa: BLE001
         pass
+    if n == 0:
+        # A suspend that captures NOTHING must say so -- a silent 0 here cost a
+        # full cloud window to diagnose (bt-iso-1782942507: SIGTERM landed, the
+        # registry was empty because pool ops never registered, and this
+        # returned 0 without a trace).
+        logger.warning(
+            "[fsm_checkpoint] capture_inflight captured 0 op(s) (reason=%s) -- "
+            "in-flight registry empty or unavailable; nothing to suspend", reason,
+        )
     return n
 
 

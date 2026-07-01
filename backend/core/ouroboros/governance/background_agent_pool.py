@@ -1047,6 +1047,33 @@ class BackgroundAgentPool:
                             worker_id, _ctx_op_id, _exc,
                         )
 
+                # Suspend gap 6b -- mirror the op into the typed in-flight
+                # registry (master-gated, silent no-op when off) so a graceful
+                # shutdown's capture_inflight() can checkpoint POOL ops too.
+                # Registration previously existed only on the direct
+                # GovernedLoopService.submit() path; a SIGTERM mid-soak saw an
+                # EMPTY registry and wrote 0 checkpoints despite 3 in-flight
+                # pool ops (bt-iso-1782942507). Symmetric unregister in the
+                # finally below.
+                _inflight_registered = False
+                try:
+                    from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: PLC0415,E501
+                        register_op_safely as _reg_op_safely,
+                    )
+                    _inflight_registered = _reg_op_safely(
+                        _ctx_op_id or op.op_id,
+                        ctx_ref=op.context,
+                        last_phase_name=getattr(
+                            getattr(op.context, "phase", None), "name", "",
+                        ),
+                        metadata={
+                            "pool_worker": worker_id,
+                            "pool_op_id": str(op.op_id),
+                        },
+                    )
+                except Exception:  # noqa: BLE001 -- registry is observability, never blocks pickup
+                    _inflight_registered = False
+
                 try:
                     # Phase 1 Step 3C: § 4 bind contract dispatch. Read
                     # the live orchestrator from the process-wide bind
@@ -1385,6 +1412,18 @@ class BackgroundAgentPool:
                                 "failed for %s: %s",
                                 worker_id, _registered_ctx_op_id, _exc,
                             )
+                    # Suspend gap 6b cleanup -- symmetric with the in-flight
+                    # registry registration above. Unconditional on terminal
+                    # AND parked/preempted exits (a resumed dispatch
+                    # re-registers on its next worker pickup).
+                    if _inflight_registered:
+                        try:
+                            from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: PLC0415,E501
+                                unregister_op_safely as _unreg_op_safely,
+                            )
+                            _unreg_op_safely(_ctx_op_id or op.op_id)
+                        except Exception:  # noqa: BLE001 -- never leak the worker
+                            pass
 
         except asyncio.CancelledError:
             logger.debug("Worker %d shutting down (cancelled)", worker_id)
