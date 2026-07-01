@@ -5423,6 +5423,30 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001 — never let watchdog arm crash signal handler
             pass
 
+        # Autonomous FSM Suspend (signal/preemption path) — checkpoint in-flight ops
+        # BEFORE the async cleanup, so an external SIGTERM reap / GCP Spot preemption
+        # (not just the internal wall-event race) resumes on the next ignition.
+        # Sync, fast, fail-soft; no-op when nothing in-flight. Gated
+        # JARVIS_FSM_CHECKPOINT_ENABLED. Sits alongside the Preemption Shield.
+        try:
+            if os.environ.get(
+                "JARVIS_FSM_CHECKPOINT_ENABLED", "true",
+            ).strip().lower() not in ("0", "false", "no", "off"):
+                from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                    fsm_checkpoint as _fsm_ckpt_sig,
+                )
+                _sig_suspended = _fsm_ckpt_sig.capture_inflight(
+                    reason=(signal_name or self._stop_reason or "signal"),
+                )
+                if _sig_suspended:
+                    logger.warning(
+                        "[FSMCheckpoint] SUSPENDED %d in-flight op(s) on %s -> signed "
+                        "checkpoint; resumes next ignition",
+                        _sig_suspended, signal_name or "shutdown",
+                    )
+        except Exception:  # noqa: BLE001 — never let checkpoint crash the signal path
+            pass
+
         # Graceful Preemption Shield — SYNCHRONOUS, corruption-first. On a GCP
         # Spot SIGTERM we have ~30s before SIGKILL; the existing async cleanup
         # below can exceed that and says nothing about the working tree. Engage

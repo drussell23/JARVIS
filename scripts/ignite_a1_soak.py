@@ -473,6 +473,13 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
         _soak_env = dict(os.environ)
         _soak_env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] = str(args.max_wall_seconds)
         _soak_env.setdefault("OUROBOROS_BATTLE_HEADLESS", "1")
+        # Autonomous FSM Suspend/Resume: pin a STABLE, absolute checkpoint dir (+ its
+        # persisted HMAC key) so a suspended op checkpointed in window 1 is found +
+        # verified in window 2 -- the organism runs in an EPHEMERAL isomorphic cwd,
+        # so a CWD-relative default would land in a temp dir that never survives.
+        _soak_env.setdefault(
+            "JARVIS_CHECKPOINT_DIR", str(repo_root / ".ouroboros" / "checkpoints"),
+        )
         if args.live_failover:
             _arm_failover_env(_soak_env)
         _write_log_header(log_fh, argv=soak_argv, cwd=repo_root)
