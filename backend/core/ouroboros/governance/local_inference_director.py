@@ -210,6 +210,42 @@ class LatencyProfiler:
         # down toward the real latency. Acts as an escalating floor on the adaptive
         # timeout so a starved cold profiler still expands the window. 0 = no data.
         self._ewma_ms: float = 0.0
+        # Async Calibration Mutex (Scout Lock): the FIRST cold coroutine calibrates
+        # (Scout) while the concurrent herd waits on the lock; once calibrated, the
+        # gate is open and dispatches run fully concurrently on the escalated EWMA.
+        # Lazily bound to the running loop on first use.
+        self._calibrated: bool = False
+        self._scout_lock: "Optional[asyncio.Lock]" = None
+
+    def is_calibrated(self) -> bool:
+        return self._calibrated
+
+    def mark_calibrated(self) -> None:
+        self._calibrated = True
+
+    def _get_scout_lock(self) -> "asyncio.Lock":
+        if self._scout_lock is None:
+            self._scout_lock = asyncio.Lock()
+        return self._scout_lock
+
+    async def run_calibrated(self, coro_factory: "Any") -> Any:
+        """Async Calibration Mutex. If already calibrated -> run ``coro_factory()``
+        immediately (no lock, full concurrency). Otherwise the FIRST caller acquires
+        the scout lock and runs as the Scout; the concurrent herd awaits the lock.
+        The Scout marks the profiler calibrated when it finishes (success OR
+        timeout+escalate -- in ``finally``, so the herd is never stuck) and releases;
+        the herd then runs CONCURRENTLY, reading the newly escalated EWMA seed.
+        ``coro_factory`` is a zero-arg async callable (a fresh coroutine per call)."""
+        if self.is_calibrated():
+            return await coro_factory()
+        lock = self._get_scout_lock()
+        async with lock:
+            if not self.is_calibrated():
+                try:
+                    return await coro_factory()          # Scout
+                finally:
+                    self.mark_calibrated()
+        return await coro_factory()                       # herd (calibrated)
 
     def _cold_seed_ms(self) -> float:
         """Context-Aware Dynamic Seed. Survival/CPU (no num_ctx) -> plain base seed
@@ -497,6 +533,13 @@ class LocalPrimeClient:
         # May raise UnrecoverableInferenceLatency (absolute breaker) -> propagates
         # as terminal (non-recoverable; the L7 auto-heal seals/halts, no retry).
         timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
+        if self._cfg.num_ctx:
+            # Emit the adaptive per-call budget so the Dynamic Global Audit Ceiling
+            # can derive itself (budget x max agentic rounds) from observed reality.
+            logger.info(
+                "[LocalPrimeClient] adaptive inference budget=%.0fms warm=%s num_ctx=%d",
+                timeout_ms, self.profiler.is_warm(), int(self._cfg.num_ctx),
+            )
         try:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,

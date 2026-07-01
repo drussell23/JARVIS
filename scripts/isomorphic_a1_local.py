@@ -457,15 +457,35 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _a1_audit_ceiling_s() -> float:
-    """Tier-aware audit ceiling (no hardcoded window). The auditor early-exits the
-    moment the verdict is proven; this is the SAFETY ceiling. It is derived from
-    the resolved failover tier: a heavy 32B/L4 op runs a MULTI-TURN Venom tool loop
-    (explore -> read -> patch -> validate) that is I/O-heavy and slow, so we scale
-    the base by the SAME JARVIS_JPRIME_HEAVY_COLDSTART_MULT as the cold-start
-    timeouts. Base default 300s x4 = 1200s (~20 min) gives the agentic explore-then
-    -fix cycle real wall-clock. Survival (7B/CPU) -> base unchanged. Fail-soft."""
+def _a1_audit_ceiling_s(debug_log: "Optional[str]" = None) -> float:
+    """Dynamic Global Audit Ceiling (no hardcoded window). The auditor early-exits
+    the moment the verdict is proven; this is the SAFETY ceiling.
+
+    DYNAMIC path: derive it from OBSERVED reality -- the largest per-call inference
+    budget the profiler actually used (the escalated EWMA seed, logged as
+    ``budget=Xms``) multiplied by the expected max agentic rounds
+    (``JARVIS_A1_MAX_AGENTIC_ROUNDS``, default 5): a heavy op runs a multi-turn Venom
+    loop (explore -> read -> patch -> validate), so the run needs
+    ``per_call x rounds`` of wall-clock. This adapts to the 32B's real (escalating)
+    latency instead of a flat guess.
+
+    FALLBACK (no budget observed yet): the tier-aware base scaled by
+    ``JARVIS_JPRIME_HEAVY_COLDSTART_MULT``. Fail-soft -- NEVER raises."""
     base = _env_float("JARVIS_A1_AUDIT_BASE_S", 300.0)
+    max_rounds = max(1.0, _env_float("JARVIS_A1_MAX_AGENTIC_ROUNDS", 5.0))
+    # --- DYNAMIC: largest observed per-call budget x max agentic rounds ---
+    per_call_ms = 0.0
+    if debug_log:
+        try:
+            import re  # noqa: PLC0415
+            with open(debug_log, "r", encoding="utf-8", errors="ignore") as _fh:
+                for _m in re.finditer(r"budget=(\d+)ms", _fh.read()):
+                    per_call_ms = max(per_call_ms, float(_m.group(1)))
+        except Exception:  # noqa: BLE001
+            per_call_ms = 0.0
+    if per_call_ms > 0.0:
+        return max(base, (per_call_ms / 1000.0) * max_rounds)
+    # --- FALLBACK: tier-aware heavy-scaled base ---
     try:
         from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
             resolve_tier,
@@ -1168,7 +1188,7 @@ class IsomorphicA1Driver:
                         verdict = aud_runner.watch(
                             base=self.sse_base,
                             log_file=debug_log,
-                            timeout_s=_a1_audit_ceiling_s(),
+                            timeout_s=_a1_audit_ceiling_s(debug_log=debug_log),
                             verdict_out=verdict_out,
                         )
 

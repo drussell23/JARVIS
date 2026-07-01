@@ -226,7 +226,8 @@ def test_l7_autoheal_retries_then_succeeds(monkeypatch):
         async def _negotiate_num_ctx(self, ep):
             return 8192
         def _failover_profiler_for(self, ep, cfg):
-            return None
+            import backend.core.ouroboros.governance.local_inference_director as _lid
+            return _lid.LatencyProfiler(cfg)
 
     res = asyncio.run(
         cg.CandidateGenerator._failover_local_dispatch(_Stub(), object(), _deadline(), "http://n:11434")
@@ -271,7 +272,8 @@ def test_l7_autoheal_exhausts_then_raises(monkeypatch):
         async def _negotiate_num_ctx(self, ep):
             return 8192
         def _failover_profiler_for(self, ep, cfg):
-            return None
+            import backend.core.ouroboros.governance.local_inference_director as _lid
+            return _lid.LatencyProfiler(cfg)
 
     try:
         asyncio.run(
