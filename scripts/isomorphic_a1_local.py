@@ -1007,6 +1007,19 @@ class IsomorphicA1Driver:
                     # inside a live loop; only _reap_failover_resources uses run()).
                     await _arm_failover_mesh(env)
 
+                    # Autonomous FSM Suspend/Resume: pin a STABLE absolute checkpoint
+                    # dir into the ORGANISM env (compose_env starts from a manifest,
+                    # so JARVIS_CHECKPOINT_* is NOT inherited unless set here). The
+                    # organism runs in an ephemeral isomorphic cwd, so a CWD-relative
+                    # default would never survive to the next window. This shared dir
+                    # (+ its persisted HMAC key) lets window-1 suspend -> window-2
+                    # resume across ignitions.
+                    env["JARVIS_CHECKPOINT_DIR"] = str(
+                        Path(self.repo_root) / ".ouroboros" / "checkpoints"
+                    )
+                    env.setdefault("JARVIS_FSM_CHECKPOINT_ENABLED", "true")
+                    env.setdefault("JARVIS_FSM_RESUME_ENABLED", "true")
+
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).
                 env["JARVIS_RUNTIME_SANDBOX_ENABLED"] = "true"   # L4 container backend
