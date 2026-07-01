@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import math
 import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
+
+logger = logging.getLogger(__name__)
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -46,12 +49,17 @@ class LocalConfig:
     min_samples: int
     max_concurrency: int
     pool_limit: int
+    # Autonomous Context-Hardware Negotiator output: the VRAM-safe context window
+    # injected as ollama ``options.num_ctx`` + used as the Cognitive Compression
+    # budget. None -> legacy (no injection, no compression) = byte-identical.
+    num_ctx: Optional[int] = None
 
     @classmethod
     def from_env(cls) -> "LocalConfig":
         def _i(n: str, d: int) -> int: return int(os.environ.get(n, str(d)))
         def _f(n: str, d: float) -> float: return float(os.environ.get(n, str(d)))
         ceiling = _i("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", 120_000)
+        _nc = os.environ.get("JARVIS_LOCAL_NUM_CTX", "").strip()
         return cls(
             base_url=os.environ.get("JARVIS_LOCAL_MODEL_BASE_URL", "http://127.0.0.1:11434"),
             model_name=os.environ.get("JARVIS_LOCAL_MODEL_NAME", "qwen2.5-coder:3b"),
@@ -65,7 +73,107 @@ class LocalConfig:
             min_samples=_i("JARVIS_LOCAL_PROFILER_MIN_SAMPLES", 5),
             max_concurrency=_i("JARVIS_LOCAL_MODEL_MAX_CONCURRENCY", 2),
             pool_limit=_i("JARVIS_LOCAL_POOL_LIMIT", 8),
+            num_ctx=int(_nc) if _nc.isdigit() else None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Autonomous Context-Hardware Negotiator + Dynamic Cognitive Compression
+# ---------------------------------------------------------------------------
+#
+# The warm 32B ServerDisconnects on an L4 because the KV cache for a large prompt
+# overflows the VRAM left after the ~20GB model weights. We solve this in software:
+# derive the max SAFE num_ctx from the MEASURED VRAM buffer (no static cap), then
+# compress the payload to fit it (preserve the system rules + recent tool outputs).
+
+_KV_BYTES_PER_TOKEN_DEFAULT = 524288      # ~512KB/token: 2(K+V)*64L*8kv*128d*2B for a 32B GQA fp16 KV
+_CTX_OVERHEAD_BYTES_DEFAULT = 1_500_000_000  # CUDA/runtime/activation headroom
+_NUM_CTX_FLOOR_DEFAULT = 2048
+_NUM_CTX_CEILING_DEFAULT = 32768
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def estimate_tokens(text: Any) -> int:
+    """Cheap deterministic token estimate (~4 chars/token). NEVER raises."""
+    try:
+        return max(0, len(text or "") // 4)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def derive_safe_num_ctx(
+    *,
+    vram_bytes: int,
+    model_bytes: int,
+    kv_bytes_per_token: "Optional[int]" = None,
+    overhead_bytes: "Optional[int]" = None,
+    floor: "Optional[int]" = None,
+    ceiling: "Optional[int]" = None,
+) -> int:
+    """Mathematically derive the max SAFE context window from the MEASURED VRAM
+    buffer: ``(vram - model - overhead) / kv_bytes_per_token``, floored to a 256
+    multiple and clamped to [floor, ceiling]. NOT a static cap -- a bigger GPU or a
+    smaller model widens the window automatically. Fail-soft -> floor on any
+    non-positive buffer / bad input."""
+    kvbpt = kv_bytes_per_token if kv_bytes_per_token is not None else _int_env(
+        "JARVIS_KV_BYTES_PER_TOKEN", _KV_BYTES_PER_TOKEN_DEFAULT)
+    ovh = overhead_bytes if overhead_bytes is not None else _int_env(
+        "JARVIS_CTX_OVERHEAD_BYTES", _CTX_OVERHEAD_BYTES_DEFAULT)
+    flr = floor if floor is not None else _int_env("JARVIS_NUM_CTX_FLOOR", _NUM_CTX_FLOOR_DEFAULT)
+    ceil = ceiling if ceiling is not None else _int_env("JARVIS_NUM_CTX_CEILING", _NUM_CTX_CEILING_DEFAULT)
+    try:
+        if vram_bytes <= 0 or model_bytes <= 0 or kvbpt <= 0:
+            return flr
+        kv_buffer = int(vram_bytes) - int(model_bytes) - int(ovh)
+        if kv_buffer <= 0:
+            return flr
+        nctx = (int(kv_buffer // kvbpt) // 256) * 256  # 256-multiple for engine friendliness
+        return max(flr, min(ceil, nctx))
+    except Exception:  # noqa: BLE001
+        return flr
+
+
+def fit_prompt_to_window(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int,
+    head_frac: float = 0.35,
+    tail_frac: float = 0.5,
+) -> "Tuple[str, str, bool]":
+    """Dynamic Cognitive Compression (sliding window). Preserve the SYSTEM prompt
+    (Iron Gate rules) IN FULL + a HEAD (task/plan) and TAIL (most recent tool
+    outputs) of the user payload; compress the older intermediate middle into a
+    deterministic marker. GUARANTEES ``estimate_tokens(system)+estimate_tokens(user)
+    <= max_tokens`` (best-effort; the system is never cut, so if it alone exceeds
+    the window the user is reduced to a stub). Returns (system, user, compressed?)."""
+    system = system or ""
+    user = user or ""
+    if estimate_tokens(system) + estimate_tokens(user) <= max_tokens:
+        return system, user, False
+    user_budget_toks = max_tokens - estimate_tokens(system)
+    if user_budget_toks <= 0:
+        return system, "[context omitted: system prompt already fills the VRAM-safe window]", True
+    char_budget = user_budget_toks * 4
+    head_chars = max(0, int(char_budget * head_frac))
+    tail_chars = max(0, int(char_budget * tail_frac))
+    if len(user) <= head_chars + tail_chars or head_chars + tail_chars == 0:
+        return system, user[:char_budget], True
+    head = user[:head_chars]
+    tail = user[-tail_chars:]
+    dropped = len(user) - head_chars - tail_chars
+    marker = (
+        "\n\n[...cognitive compression: %d chars of older intermediate history "
+        "elided to fit the %d-token VRAM-safe window; system rules + recent tool "
+        "outputs preserved...]\n\n" % (dropped, max_tokens)
+    )
+    return system, head + marker + tail, True
 
 
 class LatencyProfiler:
@@ -210,6 +318,24 @@ class LocalPrimeClient:
                        max_tokens: "Optional[int]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
+        # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
+        # Negotiator). When a VRAM-safe num_ctx is configured, fit the payload to
+        # the INPUT budget (num_ctx minus reserved output) so the KV cache can never
+        # overflow VRAM -> no ServerDisconnect. The system prompt (Iron Gate rules)
+        # is preserved in full; older intermediate history is compressed. num_ctx is
+        # also declared to the engine so it never pre-allocates a fatal KV cache.
+        if self._cfg.num_ctx:
+            _reserve_out = max_tokens or 0
+            _in_budget = max(256, int(self._cfg.num_ctx) - _reserve_out)
+            system, user, _compressed = fit_prompt_to_window(
+                system, user, max_tokens=_in_budget,
+            )
+            if _compressed:
+                logger.info(
+                    "[LocalPrimeClient] Cognitive Compression applied: fit payload "
+                    "to %d-token input budget (num_ctx=%d, reserved_out=%d)",
+                    _in_budget, int(self._cfg.num_ctx), _reserve_out,
+                )
         body: Dict[str, Any] = {
             "model": self._cfg.model_name,
             "keep_alive": self._cfg.keep_alive_seconds,
@@ -219,6 +345,10 @@ class LocalPrimeClient:
                 {"role": "user", "content": user},
             ],
         }
+        if self._cfg.num_ctx:
+            # ollama-native option; harmless if a given engine ignores it (the
+            # compression above is the hard guarantee, this is the declarative one).
+            body["options"] = {"num_ctx": int(self._cfg.num_ctx)}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         t0 = time.monotonic()

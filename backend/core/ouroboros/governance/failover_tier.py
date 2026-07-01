@@ -23,6 +23,37 @@ from dataclasses import dataclass
 
 _PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
 
+# VRAM (GiB) per GCP accelerator type -- the physical ceiling the Context-Hardware
+# Negotiator derives the safe num_ctx from. Descriptive hardware facts, NOT a
+# tunable cap; an operator may override the resolved value with JARVIS_GPU_VRAM_GIB.
+_GPU_VRAM_GIB = {
+    "nvidia-l4": 24,
+    "nvidia-tesla-t4": 16,
+    "nvidia-t4": 16,
+    "nvidia-tesla-p100": 16,
+    "nvidia-tesla-v100": 16,
+    "nvidia-tesla-a100": 40,
+    "nvidia-a100": 40,
+    "nvidia-a100-80gb": 80,
+    "nvidia-h100": 80,
+    "nvidia-h100-80gb": 80,
+    "nvidia-h100-mega-80gb": 80,
+}
+
+
+def accelerator_vram_bytes(accel_type: str) -> int:
+    """Physical VRAM (bytes) for a GCP accelerator type. ``JARVIS_GPU_VRAM_GIB``
+    force-overrides the lookup (any node); an unknown type returns 0 so the caller
+    floors the context window rather than guessing. NEVER raises."""
+    try:
+        forced = (os.environ.get("JARVIS_GPU_VRAM_GIB", "") or "").strip()
+        if forced:
+            return int(float(forced) * (1024 ** 3))
+        gib = _GPU_VRAM_GIB.get((accel_type or "").strip().lower(), 0)
+        return int(gib * (1024 ** 3))
+    except Exception:  # noqa: BLE001 -- descriptive helper must never raise
+        return 0
+
 
 def _env(name: str, default: str) -> str:
     return (os.environ.get(name, default) or default).strip()
