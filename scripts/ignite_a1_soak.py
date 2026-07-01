@@ -253,10 +253,15 @@ def _arm_failover_env(env: dict) -> dict:
         "JARVIS_FAILOVER_BUDGET_AWAKEN_ENABLED": "true",
         "JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED": "true",
         "JARVIS_FAILOVER_HEADER_AWARE_RECOVERY_ENABLED": "true",
-        # Force the 32B QUALITY GPU tier (g2-standard-4 + nvidia-l4 + jarvis-prime-coder-32b)
+        # Force the 32B QUALITY GPU tier (g2-standard-8 + nvidia-l4 + jarvis-prime-coder-32b).
+        # Host bump 4->8: g2-standard-4 has only 16GB system RAM, but the 32B GGUF is
+        # ~19.85GB -> llama-server was kernel-OOM-killed loading weights into RAM
+        # (BEFORE the L4 VRAM was ever used). g2-standard-8 = 32GB RAM > 19.85GB +
+        # 4GB overhead; SAME nvidia-l4 GPU + SAME model (no GPU/quality change). The
+        # RAM Pre-Flight Gate now asserts this mathematically before instances.insert.
         "JARVIS_FAILOVER_QUALITY_TIER_ENABLED": "true",
         "JARVIS_FAILOVER_AWAKEN_URGENCY": "immediate",
-        "JARVIS_FAILOVER_QUALITY_MACHINE": "g2-standard-4",
+        "JARVIS_FAILOVER_QUALITY_MACHINE": "g2-standard-8",
         "JARVIS_FAILOVER_QUALITY_ACCEL_TYPE": "nvidia-l4",
         "JARVIS_FAILOVER_QUALITY_ACCEL_COUNT": "1",
         "JARVIS_FAILOVER_QUALITY_IMAGE": "jarvis-prime-coder-32b",

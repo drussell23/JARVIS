@@ -55,6 +55,100 @@ def accelerator_vram_bytes(accel_type: str) -> int:
         return 0
 
 
+class HardwareProvisioningMismatchError(RuntimeError):
+    """Raised by the RAM Pre-Flight Gate when a machine type's system RAM cannot
+    physically hold the model + OS overhead -- so the impossible ``instances.insert``
+    is NEVER attempted (the g2-standard-4/16GB vs 19.85GB-model kernel OOM class)."""
+
+
+# System RAM (MB) for machine types we provision. Descriptive hardware facts. The
+# g2-standard-N family derives N*4GiB by pattern; this map covers the survival
+# tier + pins the common g2 sizes. Override any type via
+# ``JARVIS_MACHINE_RAM_MB_<TYPE>`` (dashes -> underscores, upper-cased).
+_STATIC_MACHINE_RAM_MB = {
+    "e2-highmem-2": 16384,
+    "e2-highmem-4": 32768,
+    "e2-highmem-8": 65536,
+    "g2-standard-4": 16384,
+    "g2-standard-8": 32768,
+    "g2-standard-12": 49152,
+    "g2-standard-16": 65536,
+    "g2-standard-24": 98304,
+    "g2-standard-32": 131072,
+    "g2-standard-48": 196608,
+    "g2-standard-96": 393216,
+}
+
+_G2_STANDARD_RE = re.compile(r"^g2-standard-(\d+)$")
+
+
+def machine_type_ram_bytes(machine_type: str) -> int:
+    """System RAM (bytes) for a GCP machine type. Resolution order: env override
+    (``JARVIS_MACHINE_RAM_MB_<TYPE>``) -> static map -> g2-standard-N pattern
+    (N*4GiB). 0 when undeterminable (the gate then fails OPEN). NEVER raises."""
+    t = (machine_type or "").strip().lower()
+    if not t:
+        return 0
+    try:
+        env = os.environ.get("JARVIS_MACHINE_RAM_MB_" + t.upper().replace("-", "_"), "").strip()
+        if env:
+            return int(float(env) * 1024 * 1024)
+        mb = _STATIC_MACHINE_RAM_MB.get(t)
+        if mb:
+            return int(mb) * 1024 * 1024
+        m = _G2_STANDARD_RE.match(t)
+        if m:
+            return int(m.group(1)) * 4 * (1024 ** 3)
+        return 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def estimate_gguf_bytes(model_label: str) -> int:
+    """Estimate a model's on-disk GGUF size (bytes) from its parameter count:
+    ``params_B * 1e9 * JARVIS_GGUF_BYTES_PER_PARAM`` (default 0.62, ~q4_K_M -- this
+    yields ~19.8GB for a 32B, matching the observed 19.85GB /api/tags size).
+    ``JARVIS_FAILOVER_QUALITY_MODEL_BYTES`` force-overrides. 0 if the label has no
+    parseable param count. NEVER raises."""
+    try:
+        forced = (os.environ.get("JARVIS_FAILOVER_QUALITY_MODEL_BYTES", "") or "").strip()
+        if forced:
+            return int(forced)
+        billions = model_param_billions(model_label)
+        if billions <= 0:
+            return 0
+        bpp = float(os.environ.get("JARVIS_GGUF_BYTES_PER_PARAM", "0.62"))
+        return int(billions * 1e9 * bpp)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def assert_host_ram_fits_model(
+    machine_type: str,
+    model_label: str,
+    *,
+    overhead_bytes: "int | None" = None,
+) -> None:
+    """RAM Pre-Flight Gate: assert the machine's system RAM strictly exceeds the
+    model's GGUF size + OS overhead (``JARVIS_HOST_RAM_OVERHEAD_BYTES``, default
+    4GiB), BEFORE ``instances.insert``. Raises :class:`HardwareProvisioningMismatchError`
+    on a certain mismatch (the kernel-OOM-at-load class). Fails OPEN when RAM or
+    GGUF size is undeterminable -- block only when CERTAIN the load is impossible."""
+    ram = machine_type_ram_bytes(machine_type)
+    gguf = estimate_gguf_bytes(model_label)
+    if ram <= 0 or gguf <= 0:
+        return  # undeterminable -> do not block on ignorance
+    ovh = overhead_bytes if overhead_bytes is not None else _env_int(
+        "JARVIS_HOST_RAM_OVERHEAD_BYTES", 4 * (1024 ** 3))
+    required = gguf + max(0, ovh)
+    if ram <= required:
+        raise HardwareProvisioningMismatchError(
+            "host RAM %d bytes (%s) <= model GGUF %d + overhead %d = %d required -- "
+            "refusing to provision an impossible load (kernel OOM-at-load class)"
+            % (ram, machine_type, gguf, ovh, required)
+        )
+
+
 def _env(name: str, default: str) -> str:
     return (os.environ.get(name, default) or default).strip()
 

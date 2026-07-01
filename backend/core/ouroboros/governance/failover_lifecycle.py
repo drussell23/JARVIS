@@ -1996,6 +1996,42 @@ class FailoverLifecycleController:
 
         Fail-soft: on any failure, revert to DORMANT (retry next tick). The op
         is never lost -- the quarantine Cryo-DLQ remains the backstop."""
+        # RAM Pre-Flight Gate (before ANY instances.insert): assert the resolved
+        # tier's machine RAM can physically hold its model + OS overhead. A certain
+        # mismatch (e.g. g2-standard-4/16GB vs the 19.85GB 32B GGUF -> kernel OOM at
+        # load) HALTS the awaken here -- the impossible node is NEVER created. This
+        # is a distinct terminal from a transient awaken failure: revert DORMANT +
+        # arm the anti-thrash cooldown so we don't re-attempt the impossible config
+        # every tick, and flare it for observability.
+        try:
+            from backend.core.ouroboros.governance.failover_tier import (  # noqa: PLC0415
+                resolve_tier as _rt,
+                assert_host_ram_fits_model as _assert_ram,
+                HardwareProvisioningMismatchError as _HWMismatch,
+            )
+            _tier_preflight = _rt(
+                urgency=_env_str("JARVIS_FAILOVER_AWAKEN_URGENCY", ""),
+                complexity=_env_str("JARVIS_FAILOVER_AWAKEN_COMPLEXITY", ""),
+            )
+            _assert_ram(_tier_preflight.machine_type, _tier_preflight.model_label)
+        except _HWMismatch as _hw_exc:
+            logger.error(
+                "[FailoverLifecycle] RAM PRE-FLIGHT GATE FAILED -- %s. Refusing to "
+                "provision; reverting DORMANT + arming cooldown (no impossible "
+                "instances.insert).", _hw_exc,
+            )
+            try:
+                self._emit_flare(trigger="hw_provisioning_mismatch", route=self._route,
+                                 now=self._clock_fn())
+            except Exception:  # noqa: BLE001
+                pass
+            self._state = FailoverState.DORMANT
+            self._awakening_started_at = None
+            self._last_handback_at = self._clock_fn()  # anti-thrash: block re-awaken
+            return
+        except Exception as _pf_exc:  # noqa: BLE001 -- gate must be fail-OPEN on its own error
+            logger.debug("[FailoverLifecycle] RAM pre-flight gate fail-soft (proceeding) err=%r", _pf_exc)
+
         try:
             # The primary node's runtime GPU gate follows its resolved tier (the
             # survival 7B/CPU tier has no GPU -> no gate; a quality GPU tier does).
