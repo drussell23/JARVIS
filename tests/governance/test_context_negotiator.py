@@ -191,8 +191,9 @@ def test_l7_autoheal_retries_then_succeeds(monkeypatch):
     ctx_windows = []
 
     class _FakeClient:
-        def __init__(self, cfg):
+        def __init__(self, cfg, session=None, profiler=None):
             self.cfg = cfg
+            self.profiler = profiler
             ctx_windows.append(getattr(cfg, "num_ctx", None))
         async def warmup(self, *, timeout_s):
             warmups["n"] += 1
@@ -224,6 +225,8 @@ def test_l7_autoheal_retries_then_succeeds(monkeypatch):
             return "qwen2.5-coder:32b"
         async def _negotiate_num_ctx(self, ep):
             return 8192
+        def _failover_profiler_for(self, ep, cfg):
+            return None
 
     res = asyncio.run(
         cg.CandidateGenerator._failover_local_dispatch(_Stub(), object(), _deadline(), "http://n:11434")
@@ -243,7 +246,7 @@ def test_l7_autoheal_exhausts_then_raises(monkeypatch):
     import aiohttp
 
     class _FakeClient:
-        def __init__(self, cfg):
+        def __init__(self, cfg, session=None, profiler=None):
             pass
         async def warmup(self, *, timeout_s):
             return True
@@ -267,6 +270,8 @@ def test_l7_autoheal_exhausts_then_raises(monkeypatch):
             return "qwen2.5-coder:32b"
         async def _negotiate_num_ctx(self, ep):
             return 8192
+        def _failover_profiler_for(self, ep, cfg):
+            return None
 
     try:
         asyncio.run(
