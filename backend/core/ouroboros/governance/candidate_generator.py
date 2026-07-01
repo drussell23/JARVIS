@@ -4294,11 +4294,21 @@ class CandidateGenerator:
         except Exception:  # noqa: BLE001
             _resume_prefill = ""
         if _resume_prefill:
-            logger.info(
-                "[CandidateGenerator] RESUME prefill: continuing a %d-char partial "
-                "thought op=%s (32B resumes typing, no re-generation)",
-                len(_resume_prefill), _op,
-            )
+            # Atomic Hydration Handshake (facet 2): the EXACT bytes + snippet of the
+            # partial thought re-entering the LLM as the assistant prefill -> stdout.
+            try:
+                from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                    fsm_checkpoint as _hs_ckpt,
+                )
+                _hs_ckpt.emit_handshake(
+                    _hs_ckpt.format_prefill_handshake(_op, _resume_prefill)
+                )
+            except Exception:  # noqa: BLE001
+                logger.info(
+                    "[CandidateGenerator] RESUME prefill: continuing a %d-char partial "
+                    "thought op=%s (32B resumes typing, no re-generation)",
+                    len(_resume_prefill), _op,
+                )
 
         async def _attempts() -> Optional[GenerationResult]:
             nonlocal _num_ctx
