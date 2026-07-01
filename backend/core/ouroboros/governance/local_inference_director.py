@@ -406,13 +406,17 @@ def _ewma_alpha() -> float:
         return 0.3
 
 
-class GracefulStreamInterruption(RuntimeError):
-    """Raised by the streaming loop when a cooperative shutdown is requested mid-
-    generation (wall-clock cap / SIGTERM / Spot preemption). Distinct from a network
-    drop (ServerDisconnected) or a stall (InterTokenStall): this is a DELIBERATE,
-    orderly freeze-mid-sentence. Carries the exact buffered ``partial`` thought so
-    the FSM checkpointer can preserve it and window-2 resume can prefill it. NON-
-    recoverable (the op suspends -> checkpoint, never a retry)."""
+class GracefulStreamInterruption(BaseException):
+    """Cooperative freeze-mid-sentence (wall-clock cap / SIGTERM / Spot preemption).
+
+    Strict Exception Hierarchy Elevation: inherits from ``BaseException`` (like
+    ``asyncio.CancelledError`` / ``SystemExit``), NOT ``Exception`` -- so it PIERCES
+    the Venom tool loop's ``except Exception`` per-round guards (the Earmuff Bypass)
+    and propagates straight to the dispatch's explicit ``except GracefulStreamInterruption``
+    checkpoint boundary, instead of being swallowed as a round failure (whack-a-mole).
+    Distinct from a network drop / stall -- a DELIBERATE orderly suspend. Carries the
+    exact buffered ``partial`` thought so the checkpointer preserves it and window-2
+    resume prefills it. NON-recoverable (the op suspends -> checkpoint, never retry)."""
     failure_class = "graceful_stream_interruption"
 
     def __init__(self, message: str = "", *, partial: str = "") -> None:
@@ -655,35 +659,62 @@ class LocalPrimeClient:
         ttft_ms = 0.0
         t0 = time.monotonic()
         first = True
+
+        def _freeze() -> "GracefulStreamInterruption":
+            return GracefulStreamInterruption(
+                "cooperative shutdown (%s) mid-stream" % _coop.reason(),
+                partial="".join(parts),
+            )
+
         async with sess.post(url, json=body) as resp:
             reader = resp.content  # aiohttp StreamReader (line-iterable)
-            while True:
-                # Event-Driven Cooperative Yielding: at a SAFE chunk boundary, if a
-                # cooperative shutdown was requested, freeze mid-sentence and hand the
-                # buffered partial thought to the checkpointer -- do NOT hold the loop.
-                if _coop.is_requested():
-                    raise GracefulStreamInterruption(
-                        "cooperative shutdown (%s) mid-stream" % _coop.reason(),
-                        partial="".join(parts),
+            # Preemptive Asynchronous Race: one long-lived shutdown waiter raced
+            # against each readline. The instant the OS signal fires the event, the
+            # readline task is dropped and we yield the partial to THIS millisecond --
+            # zero-latency, not up to the inter-token window later.
+            _shutdown_task = asyncio.ensure_future(_coop.wait_async())
+            try:
+                while True:
+                    if _coop.is_requested():  # cheap fast-path (already requested)
+                        raise _freeze()
+                    _read_task = asyncio.ensure_future(reader.readline())
+                    done, _pending = await asyncio.wait(
+                        {_read_task, _shutdown_task},
+                        timeout=inter_token_s,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                try:
-                    line = await asyncio.wait_for(reader.readline(), timeout=inter_token_s)
-                except asyncio.TimeoutError as e:
-                    raise InterTokenStall(
-                        "inter-token stall: no chunk within %.0fs (stream wedged)"
-                        % inter_token_s
-                    ) from e
-                if not line:
-                    break  # EOF -> stream complete
-                delta = _parse_sse_delta(line)
-                if delta is _SSE_DONE:
-                    break
-                if delta:
-                    if first:
-                        ttft_ms = (time.monotonic() - t0) * 1000.0
-                        first = False
-                    parts.append(delta)
-                    _emit_stream_token(delta)
+                    if _read_task in done:
+                        # A chunk (or EOF) is already in hand -- NEVER drop it, even if
+                        # shutdown fired in the same tick. We buffer it here; the
+                        # cooperative check at the top of the NEXT iteration freezes
+                        # AFTER this chunk is appended, so the partial loses nothing.
+                        line = _read_task.result()
+                    elif _shutdown_task in done:
+                        # Read still blocked -> drop the in-flight I/O + yield NOW
+                        # (zero-latency: this millisecond, not after the read unblocks).
+                        _read_task.cancel()
+                        raise _freeze()
+                    else:
+                        # Neither fired within the window -> the stream is wedged.
+                        _read_task.cancel()
+                        raise InterTokenStall(
+                            "inter-token stall: no chunk within %.0fs (stream wedged)"
+                            % inter_token_s
+                        )
+                    if not line:
+                        break  # EOF -> stream complete
+                    delta = _parse_sse_delta(line)
+                    if delta is _SSE_DONE:
+                        break
+                    if delta:
+                        if first:
+                            ttft_ms = (time.monotonic() - t0) * 1000.0
+                            first = False
+                        parts.append(delta)
+                        _emit_stream_token(delta)
+            finally:
+                if not _shutdown_task.done():
+                    _shutdown_task.cancel()
         total_ms = (time.monotonic() - t0) * 1000.0
         text = "".join(parts)
         out_toks = max(1, len(text) // 4)

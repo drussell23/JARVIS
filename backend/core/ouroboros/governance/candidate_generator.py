@@ -4246,6 +4246,7 @@ class CandidateGenerator:
         import dataclasses as _f3c_dc
 
         from backend.core.ouroboros.governance.local_inference_director import (
+            GracefulStreamInterruption,
             LocalConfig as _F3cLocalConfig,
             LocalPrimeClient as _F3cLocalPrimeClient,
         )
@@ -4338,33 +4339,37 @@ class CandidateGenerator:
                         _provider.generate(context, deadline),
                         timeout=remaining,
                     )
+                except GracefulStreamInterruption as _gsi:
+                    # Cooperative freeze-mid-sentence. GSI is a BaseException by design
+                    # (the Earmuff Bypass) -- it pierced the Venom tool loop's
+                    # `except Exception` and lands HERE at the checkpoint boundary.
+                    # Capture the partial thought + write the checkpoint
+                    # DETERMINISTICALLY (we hold both the ctx and the partial), avoiding
+                    # the registry-unregister race, then re-raise so the op suspends
+                    # (never retried -- resumes next ignition via prefill).
+                    _last_exc = _gsi
+                    try:
+                        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                            fsm_checkpoint as _gsi_ckpt,
+                        )
+                        _partial = getattr(_gsi, "partial", "") or ""
+                        _gsi_ckpt.stash_partial(_op, _partial)
+                        _cp = _gsi_ckpt.capture_from_context(
+                            context, phase="GENERATE",
+                            resume_reason="graceful_stream_interruption",
+                        )
+                        if _cp is not None:
+                            _gsi_ckpt.write_checkpoint(_cp)
+                            logger.warning(
+                                "[CandidateGenerator] FROZE mid-stream op=%s -> "
+                                "checkpointed %d-char partial thought; resumes "
+                                "next ignition via prefill", _op, len(_partial),
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
                 except Exception as _exc:  # noqa: BLE001
                     _last_exc = _exc
-                    # Cooperative freeze-mid-sentence: capture the partial thought +
-                    # write the checkpoint DETERMINISTICALLY here (we hold both the
-                    # ctx and the partial), avoiding the registry-unregister race, then
-                    # re-raise so the op suspends (never retried).
-                    if type(_exc).__name__ == "GracefulStreamInterruption":
-                        try:
-                            from backend.core.ouroboros.governance import (  # noqa: PLC0415
-                                fsm_checkpoint as _gsi_ckpt,
-                            )
-                            _partial = getattr(_exc, "partial", "") or ""
-                            _gsi_ckpt.stash_partial(_op, _partial)
-                            _cp = _gsi_ckpt.capture_from_context(
-                                context, phase="GENERATE",
-                                resume_reason="graceful_stream_interruption",
-                            )
-                            if _cp is not None:
-                                _gsi_ckpt.write_checkpoint(_cp)
-                                logger.warning(
-                                    "[CandidateGenerator] FROZE mid-stream op=%s -> "
-                                    "checkpointed %d-char partial thought; resumes "
-                                    "next ignition via prefill", _op, len(_partial),
-                                )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise
                     # Non-recoverable OR out of retries -> propagate (sentinel seals).
                     if _try >= _n or not _is_l7_recoverable(_exc):
                         raise
