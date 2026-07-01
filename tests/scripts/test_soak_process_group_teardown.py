@@ -159,3 +159,24 @@ def test_reap_soak_runners_never_raises():
     _drv._reap_soak_runners()  # must not raise
 
     assert _drv._ACTIVE_SOAK_RUNNERS == []
+
+
+# ---------------------------------------------------------------------------
+# Fast-Fail: driver detects the global L4 capacity wall marker
+# ---------------------------------------------------------------------------
+
+def test_hardware_capacity_exhausted_detects_marker(tmp_path):
+    log = tmp_path / "debug.log"
+    log.write_text("...\n[GCPComputeRest] HARDWARE_CAPACITY_EXHAUSTED: L4 stockout ...\n...")
+    assert _drv._hardware_capacity_exhausted(str(log)) is True
+
+
+def test_hardware_capacity_exhausted_absent(tmp_path):
+    log = tmp_path / "debug.log"
+    log.write_text("[GCPComputeRest] instances.insert ok node=x zone=us-west1-a\n")
+    assert _drv._hardware_capacity_exhausted(str(log)) is False
+
+
+def test_hardware_capacity_exhausted_missing_file_is_false():
+    assert _drv._hardware_capacity_exhausted("/no/such/debug.log") is False
+    assert _drv._hardware_capacity_exhausted(None) is False
