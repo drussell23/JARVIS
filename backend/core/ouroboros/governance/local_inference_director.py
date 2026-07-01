@@ -467,6 +467,14 @@ def _emit_stream_token(text: str) -> None:
         sys.stdout.flush()
     except Exception:  # noqa: BLE001
         pass
+    # Feed the streaming liveness heartbeat -> the IDLE/staleness watchdog stays
+    # fresh while tokens flow (so a streaming op is never idle-killed). Does NOT
+    # touch the wall-clock cap (Slice-47: that stays blind). Best-effort.
+    try:
+        from backend.core.ouroboros.governance import stream_heartbeat as _hb  # noqa: PLC0415
+        _hb.pulse()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class LocalMemoryCritical(RuntimeError):
