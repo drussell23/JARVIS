@@ -480,6 +480,9 @@ def main() -> int:  # noqa: C901 -- intentionally linear top-level flow
         _soak_env.setdefault(
             "JARVIS_CHECKPOINT_DIR", str(repo_root / ".ouroboros" / "checkpoints"),
         )
+        # In-flight registry must be master-ON for capture_inflight() to see the
+        # ops it should checkpoint on suspend (register_op_safely no-ops when off).
+        _soak_env.setdefault("JARVIS_IN_FLIGHT_REGISTRY_ENABLED", "true")
         if args.live_failover:
             _arm_failover_env(_soak_env)
         _write_log_header(log_fh, argv=soak_argv, cwd=repo_root)

@@ -1019,6 +1019,11 @@ class IsomorphicA1Driver:
                     )
                     env.setdefault("JARVIS_FSM_CHECKPOINT_ENABLED", "true")
                     env.setdefault("JARVIS_FSM_RESUME_ENABLED", "true")
+                    # capture_inflight() reads the in-flight registry to know WHICH
+                    # ops to checkpoint -- but register_op_safely no-ops when the
+                    # registry master flag is off (default). Arm it so in-flight ops
+                    # are tracked and thus captured on suspend.
+                    env.setdefault("JARVIS_IN_FLIGHT_REGISTRY_ENABLED", "true")
 
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).
