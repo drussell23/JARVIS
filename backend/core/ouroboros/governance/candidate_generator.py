@@ -4028,30 +4028,33 @@ class CandidateGenerator:
         # LocalPrimeClient raises, empty result), we log + fall through to the
         # normal DW path -- the op is NEVER lost.
         try:
-            if lifecycle_enabled() and get_failover_controller().is_jprime_serving():
-                _ep = get_failover_controller().jprime_endpoint()
-                if _ep:
-                    _local_result = await self._failover_local_dispatch(
-                        context, deadline, _ep,
-                    )
-                    if _local_result is not None and len(
-                        getattr(_local_result, "candidates", ()) or ()
-                    ) > 0:
-                        logger.info(
-                            "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime "
-                            "SERVING -> routed generation to LocalPrimeClient "
-                            "endpoint=%s (DW bypassed) op=%s route=%s",
-                            _ep,
-                            getattr(context, "op_id", "?")[:16],
-                            provider_route,
-                        )
-                        return _local_result
+            # DRY universal router: EVERY DW dispatch (primary, GENERATE_RETRY,
+            # critique, immortal re-queue) funnels through this chokepoint, so one
+            # branch re-routes them all to the awakened 32B. Use the ROBUST
+            # discovery (_discover_jprime_endpoint: controller-published endpoint
+            # when SERVING, else a direct zone-aware GCP query) instead of only
+            # is_jprime_serving() -- so a RETRY routes to the 32B even when this
+            # process's controller FSM isn't itself in SERVING state.
+            _ep = await self._discover_jprime_endpoint()
+            if _ep:
+                _local_result = await self._failover_local_dispatch(
+                    context, deadline, _ep,
+                )
+                if _local_result is not None and len(
+                    getattr(_local_result, "candidates", ()) or ()
+                ) > 0:
                     logger.info(
-                        "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime "
-                        "local route empty/failed -> falling through to DW "
-                        "(op=%s route=%s)",
-                        getattr(context, "op_id", "?")[:16], provider_route,
+                        "[CandidateGenerator] Phase 3c DAG re-entry: routed "
+                        "generation to the awakened 32B endpoint=%s (DW bypassed) "
+                        "op=%s route=%s",
+                        _ep, getattr(context, "op_id", "?")[:16], provider_route,
                     )
+                    return _local_result
+                logger.info(
+                    "[CandidateGenerator] Phase 3c DAG re-entry: J-Prime local "
+                    "route empty/failed -> falling through to DW (op=%s route=%s)",
+                    getattr(context, "op_id", "?")[:16], provider_route,
+                )
         except Exception as _f3c_exc:  # noqa: BLE001 -- seam must never break the op
             logger.warning(
                 "[CandidateGenerator] Phase 3c failover seam fail-soft err=%r "
