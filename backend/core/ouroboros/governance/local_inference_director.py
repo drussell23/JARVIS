@@ -406,6 +406,20 @@ def _ewma_alpha() -> float:
         return 0.3
 
 
+class GracefulStreamInterruption(RuntimeError):
+    """Raised by the streaming loop when a cooperative shutdown is requested mid-
+    generation (wall-clock cap / SIGTERM / Spot preemption). Distinct from a network
+    drop (ServerDisconnected) or a stall (InterTokenStall): this is a DELIBERATE,
+    orderly freeze-mid-sentence. Carries the exact buffered ``partial`` thought so
+    the FSM checkpointer can preserve it and window-2 resume can prefill it. NON-
+    recoverable (the op suspends -> checkpoint, never a retry)."""
+    failure_class = "graceful_stream_interruption"
+
+    def __init__(self, message: str = "", *, partial: str = "") -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
 class InterTokenStall(RuntimeError):
     """Asynchronous Inter-Token Watchdog trip: the streamed generation went silent
     (no token chunk within the inter-token timeout). A stalled stream = a wedged
@@ -524,6 +538,10 @@ class LocalPrimeClient:
         # cold seed on every fresh client (the "profiler amnesia").
         self.profiler = profiler if profiler is not None else LatencyProfiler(cfg)
         self._governor: Any = None
+        # LLM Prefill Re-Ignition: when set (by the dispatch on a RESUMED op), the
+        # next generation continues from this saved partial thought instead of
+        # starting over. Consumed once per generate() call.
+        self._resume_prefill: str = ""
 
     def attach_governor(self, governor: Any) -> None:
         """Attach a LocalInferenceDirector so generate() consults memory_guard()
@@ -547,7 +565,8 @@ class LocalPrimeClient:
     async def complete(self, *, system: str, user: str, prompt_tokens: int,
                        temperature: float = 0.2,
                        max_tokens: "Optional[int]" = None,
-                       stream: "Optional[bool]" = None) -> LocalCompletion:
+                       stream: "Optional[bool]" = None,
+                       prefill: str = "") -> LocalCompletion:
         sess = await self._ensure_session()
         url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
@@ -574,14 +593,25 @@ class LocalPrimeClient:
                     "to %d-token input budget (num_ctx=%d, reserved_out=%d)",
                     _in_budget, int(self._cfg.num_ctx), _reserve_out,
                 )
+        # Explicit prefill arg wins; else the client-carried resume prefill (set by
+        # the dispatch on a RESUMED op), consumed once.
+        _eff_prefill = prefill or self._resume_prefill
+        self._resume_prefill = ""
+        _messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        # LLM Prefill Re-Ignition: on RESUME, inject the saved partial thought as a
+        # trailing assistant message so the model CONTINUES it (ollama/OpenAI treat a
+        # trailing assistant message as a prefill to keep typing) instead of starting
+        # the generation over. The returned text is prefill + continuation.
+        if _eff_prefill:
+            _messages.append({"role": "assistant", "content": _eff_prefill})
         body: Dict[str, Any] = {
             "model": self._cfg.model_name,
             "keep_alive": self._cfg.keep_alive_seconds,
             "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": _messages,
         }
         if self._cfg.num_ctx:
             # ollama-native option; harmless if a given engine ignores it (the
@@ -593,7 +623,7 @@ class LocalPrimeClient:
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
         if _use_stream:
-            return await self._complete_streaming(sess, url, body)
+            return await self._complete_streaming(sess, url, body, prefill=_eff_prefill)
 
         t0 = time.monotonic()
         async with sess.post(url, json=body) as resp:
@@ -605,23 +635,37 @@ class LocalPrimeClient:
         self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
         return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
 
-    async def _complete_streaming(self, sess: Any, url: str, body: Dict[str, Any]) -> LocalCompletion:
-        """Streaming generation with the Asynchronous Inter-Token Watchdog. Reads the
-        SSE stream chunk-by-chunk; each ``readline`` is bounded by the inter-token
-        timeout (NOT the total duration), so a model that keeps emitting runs
-        indefinitely and only a genuine STALL (silence > timeout) trips the breaker.
-        Buffers the deltas (constraint 2) while yielding them to stdout, and records
-        the REAL end-to-end latency as a profiler sample on success."""
+    async def _complete_streaming(self, sess: Any, url: str, body: Dict[str, Any],
+                                  *, prefill: str = "") -> LocalCompletion:
+        """Streaming generation with the Asynchronous Inter-Token Watchdog +
+        cooperative shutdown. Reads the SSE stream chunk-by-chunk; each ``readline``
+        is bounded by the inter-token timeout (NOT the total duration). Between
+        chunks it polls the cooperative-shutdown signal and, if set, raises
+        GracefulStreamInterruption carrying the exact buffered partial (freeze
+        mid-sentence -> the loop never holds the graceful shutdown hostage). On
+        RESUME the *prefill* seeds the buffer so the returned text is the prior
+        partial + the continuation (the model resumes from the interrupted char).
+        Records the REAL end-to-end latency on a clean finish."""
+        from backend.core.ouroboros.governance import cooperative_shutdown as _coop  # noqa: PLC0415
         body = dict(body)
         body["stream"] = True
         inter_token_s = _inter_token_timeout_s()
-        parts: List[str] = []
+        # Seed with the resume prefill so the assembled text continues the partial.
+        parts: List[str] = [prefill] if prefill else []
         ttft_ms = 0.0
         t0 = time.monotonic()
         first = True
         async with sess.post(url, json=body) as resp:
             reader = resp.content  # aiohttp StreamReader (line-iterable)
             while True:
+                # Event-Driven Cooperative Yielding: at a SAFE chunk boundary, if a
+                # cooperative shutdown was requested, freeze mid-sentence and hand the
+                # buffered partial thought to the checkpointer -- do NOT hold the loop.
+                if _coop.is_requested():
+                    raise GracefulStreamInterruption(
+                        "cooperative shutdown (%s) mid-stream" % _coop.reason(),
+                        partial="".join(parts),
+                    )
                 try:
                     line = await asyncio.wait_for(reader.readline(), timeout=inter_token_s)
                 except asyncio.TimeoutError as e:

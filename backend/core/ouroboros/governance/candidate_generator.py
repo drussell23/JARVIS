@@ -4280,6 +4280,25 @@ class CandidateGenerator:
         _init_cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_init_overrides)
         _prof = self._failover_profiler_for(endpoint, _init_cfg)
 
+        # LLM Prefill Re-Ignition: if this op is a RESUME, its checkpointed partial
+        # thought rides in the intake evidence -> feed it to the client as a prefill
+        # so the 32B continues from the interrupted character (no re-generation).
+        _resume_prefill = ""
+        try:
+            import json as _rj  # noqa: PLC0415
+            _ev_raw = getattr(context, "intake_evidence_json", "") or ""
+            if _ev_raw:
+                _ev = _rj.loads(_ev_raw)
+                _resume_prefill = str((_ev or {}).get("partial_completion", "") or "")
+        except Exception:  # noqa: BLE001
+            _resume_prefill = ""
+        if _resume_prefill:
+            logger.info(
+                "[CandidateGenerator] RESUME prefill: continuing a %d-char partial "
+                "thought op=%s (32B resumes typing, no re-generation)",
+                len(_resume_prefill), _op,
+            )
+
         async def _attempts() -> Optional[GenerationResult]:
             nonlocal _num_ctx
             _n = _l7_recovery_attempts()
@@ -4290,6 +4309,8 @@ class CandidateGenerator:
                     _overrides["num_ctx"] = int(_num_ctx)
                 _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
                 _client = _F3cLocalPrimeClient(_cfg, profiler=_prof)
+                if _resume_prefill:
+                    _client._resume_prefill = _resume_prefill  # continue the partial
                 try:
                     _provider = _F3cPrimeProvider(
                         _client,
@@ -4319,6 +4340,31 @@ class CandidateGenerator:
                     )
                 except Exception as _exc:  # noqa: BLE001
                     _last_exc = _exc
+                    # Cooperative freeze-mid-sentence: capture the partial thought +
+                    # write the checkpoint DETERMINISTICALLY here (we hold both the
+                    # ctx and the partial), avoiding the registry-unregister race, then
+                    # re-raise so the op suspends (never retried).
+                    if type(_exc).__name__ == "GracefulStreamInterruption":
+                        try:
+                            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                                fsm_checkpoint as _gsi_ckpt,
+                            )
+                            _partial = getattr(_exc, "partial", "") or ""
+                            _gsi_ckpt.stash_partial(_op, _partial)
+                            _cp = _gsi_ckpt.capture_from_context(
+                                context, phase="GENERATE",
+                                resume_reason="graceful_stream_interruption",
+                            )
+                            if _cp is not None:
+                                _gsi_ckpt.write_checkpoint(_cp)
+                                logger.warning(
+                                    "[CandidateGenerator] FROZE mid-stream op=%s -> "
+                                    "checkpointed %d-char partial thought; resumes "
+                                    "next ignition via prefill", _op, len(_partial),
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
                     # Non-recoverable OR out of retries -> propagate (sentinel seals).
                     if _try >= _n or not _is_l7_recoverable(_exc):
                         raise

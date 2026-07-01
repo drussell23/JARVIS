@@ -952,14 +952,25 @@ class UnifiedIntakeRouter:
             )
 
             async def _reinject(env: "Dict[str, Any]") -> None:
+                import json as _rj  # noqa: PLC0415
                 _tf = tuple(env.get("target_files") or ())
+                # Embed the partial thought + resume markers into intake_evidence_json
+                # (the string the GENERATE dispatch parses) so the prefill re-ignition
+                # reaches the LLM request -- the model continues from the exact char.
+                _ev_json = _rj.dumps({
+                    "resume": True,
+                    "resume_phase": env.get("resume_phase", ""),
+                    "partial_completion": env.get("partial_completion", ""),
+                    "resumed_op_id": env.get("op_id", ""),
+                })
                 _ev = {
                     "resume": True,
                     "resume_phase": env.get("resume_phase", ""),
+                    "partial_completion": env.get("partial_completion", ""),
                     "resumed_op_id": env.get("op_id", ""),
                     "tool_history": env.get("tool_history") or [],
                     "exploration_records": env.get("exploration_records") or [],
-                    "intake_evidence_json": env.get("intake_evidence_json", ""),
+                    "intake_evidence_json": _ev_json,
                     "signature": "fsm_resume:%s" % (env.get("op_id", "")),
                 }
                 envelope = _make_env(
