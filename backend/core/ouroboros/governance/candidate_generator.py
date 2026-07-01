@@ -4298,6 +4298,21 @@ class CandidateGenerator:
                     remaining = self._remaining_seconds(deadline)
                     if remaining <= 0.0:
                         return None
+                    # Master Wall Yielding (constraint 3, invariant-safe): on the
+                    # STREAMING path DROP the outer op-deadline wait_for -- an
+                    # actively-emitting stream must run indefinitely, bounded ONLY by
+                    # the per-chunk inter-token watchdog (inside the client) + the
+                    # STATIC hard wall-clock cap (kept blind per Slice-47). The
+                    # non-streaming survival path keeps the op-deadline cap.
+                    try:
+                        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                            _streaming_enabled as _f3c_stream_on,
+                        )
+                        _streaming = bool(_num_ctx) and _f3c_stream_on()
+                    except Exception:  # noqa: BLE001
+                        _streaming = False
+                    if _streaming:
+                        return await _provider.generate(context, deadline)
                     return await asyncio.wait_for(
                         _provider.generate(context, deadline),
                         timeout=remaining,
