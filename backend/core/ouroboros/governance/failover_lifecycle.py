@@ -1115,6 +1115,19 @@ class FailoverLifecycleController:
             logger.info("[FailoverLifecycle] GPU node REAPED (CPU survives)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FailoverLifecycle] GPU reap fail-soft err=%r", exc)
+        finally:
+            # FSM -> DORMANT: the awakened endpoint is dead. Drop the memoized
+            # per-endpoint served-model map so a fresh awaken re-queries the new
+            # node's /api/tags (deterministic L7). Lazy import breaks the cycle;
+            # fail-soft. Per-endpoint keying already self-invalidates a new IP --
+            # this also covers same-IP reuse.
+            try:
+                from backend.core.ouroboros.governance.candidate_generator import (  # noqa: PLC0415
+                    _invalidate_jprime_model_cache,
+                )
+                _invalidate_jprime_model_cache()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # Event hooks (gated, fail-soft)
