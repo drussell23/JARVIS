@@ -1895,6 +1895,34 @@ class BattleTestHarness:
                 except asyncio.CancelledError:
                     pass
 
+            # ── Autonomous FSM Suspend ──────────────────────────────────────
+            # Any op still in-flight when a graceful stop is decided (wall-clock
+            # cap, process-memory cap, idle, signal) is CHECKPOINTED here -- while
+            # the in-flight registry still holds its ctx -- so the NEXT ignition
+            # rehydrates and resumes it (invincible to the blind wall + Spot
+            # preemption; the wall stays blind per Slice-47). Fully fail-soft;
+            # no-op when nothing is in-flight. Gated JARVIS_FSM_CHECKPOINT_ENABLED.
+            try:
+                if os.environ.get(
+                    "JARVIS_FSM_CHECKPOINT_ENABLED", "true",
+                ).strip().lower() not in ("0", "false", "no", "off"):
+                    from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                        fsm_checkpoint as _fsm_ckpt,
+                    )
+                    _suspended = _fsm_ckpt.capture_inflight(
+                        reason=self._stop_reason or "graceful_shutdown",
+                    )
+                    if _suspended:
+                        logger.warning(
+                            "[FSMCheckpoint] SUSPENDED %d in-flight op(s) -> signed "
+                            "checkpoint; resumes on next ignition", _suspended,
+                        )
+            except Exception:  # noqa: BLE001 -- suspend never blocks shutdown
+                logger.debug(
+                    "[FSMCheckpoint] suspend capture skipped (fail-soft)",
+                    exc_info=True,
+                )
+
             # Determine stop reason — but preserve a restart_pending stamp
             # if the restart monitor already set it (otherwise it would be
             # overwritten with the generic "shutdown_signal").

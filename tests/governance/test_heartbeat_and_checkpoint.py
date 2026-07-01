@@ -98,3 +98,111 @@ def test_list_pending_skips_corrupt(tmp_path):
     ckpt.write_checkpoint(ckpt.FSMCheckpoint(op_id="ok", phase="GENERATE"), base_dir=base)
     got = ckpt.list_pending(base_dir=base)
     assert [c.op_id for c in got] == ["ok"]   # corrupt skipped, valid survives
+
+
+# --- Cryptographic State Verification (fail-closed) -------------------------
+
+def test_signed_checkpoint_verifies(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "test-secret-key")
+    base = str(tmp_path)
+    ckpt.write_checkpoint(ckpt.FSMCheckpoint(op_id="op-sig", phase="GENERATE"), base_dir=base)
+    got = ckpt.list_pending(base_dir=base)
+    assert [c.op_id for c in got] == ["op-sig"]   # valid HMAC -> accepted
+
+
+def test_tampered_payload_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "test-secret-key")
+    base = str(tmp_path)
+    import json as _json
+    import os
+    path = ckpt.write_checkpoint(ckpt.FSMCheckpoint(op_id="op-t", phase="GENERATE"), base_dir=base)
+    # Tamper the payload but keep the old signature.
+    with open(path) as fh:
+        w = _json.load(fh)
+    payload = _json.loads(w["payload"])
+    payload["goal_description"] = "MALICIOUS INJECTION"
+    w["payload"] = _json.dumps(payload)  # sig no longer matches
+    with open(path, "w") as fh:
+        _json.dump(w, fh)
+    assert ckpt.list_pending(base_dir=base) == []   # fail-closed -> clean boot
+
+
+def test_wrong_key_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "key-A")
+    base = str(tmp_path)
+    ckpt.write_checkpoint(ckpt.FSMCheckpoint(op_id="op-k", phase="GENERATE"), base_dir=base)
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "key-B")   # attacker/rotated key
+    assert ckpt.list_pending(base_dir=base) == []   # HMAC mismatch -> rejected
+
+
+def test_missing_hmac_rejected(tmp_path):
+    base = str(tmp_path)
+    d = ckpt.checkpoint_dir(base)
+    import os, json as _json
+    with open(os.path.join(d, "nosig.json"), "w") as fh:
+        _json.dump({"schema": 1, "payload": '{"op_id":"x","phase":"GENERATE"}'}, fh)  # no hmac
+    assert ckpt.list_pending(base_dir=base) == []
+
+
+# --- Resume hydration (Venom fast-forward) ----------------------------------
+
+def test_hydrate_reinjects_and_consumes(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "k")
+    base = str(tmp_path)
+    ckpt.write_checkpoint(ckpt.FSMCheckpoint(
+        op_id="op-r", phase="GENERATE", goal_description="finish the patch",
+        target_files=["m.py"], exploration_records=[{"tool": "read_file", "path": "m.py"}],
+    ), base_dir=base)
+
+    injected = []
+    ckpt.hydrate_pending_checkpoints(lambda env: injected.append(env), base_dir=base)
+
+    assert len(injected) == 1
+    env = injected[0]
+    assert env["op_id"] == "op-r" and env["resume"] is True and env["resume_phase"] == "GENERATE"
+    assert env["exploration_records"] == [{"tool": "read_file", "path": "m.py"}]  # preserved
+    # consumed exactly once -> a second boot re-injects nothing.
+    assert ckpt.list_pending(base_dir=base) == []
+    injected2 = []
+    ckpt.hydrate_pending_checkpoints(lambda env: injected2.append(env), base_dir=base)
+    assert injected2 == []
+
+
+def test_capture_inflight_from_registry(tmp_path, monkeypatch):
+    """SUSPEND: capture_inflight reads the in-flight registry and writes a signed
+    checkpoint per active op (from its ctx_ref)."""
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "k")
+    monkeypatch.setenv("JARVIS_CHECKPOINT_DIR", str(tmp_path / "cp"))
+    from backend.core.ouroboros.governance import in_flight_registry as ifr
+    ifr.reset_default_registry()
+    reg = ifr.get_default_registry()
+    ctx = SimpleNamespace(op_id="op-live", phase="GENERATE", description="fix it",
+                          target_files=("z.py",), intake_evidence_json="{}", provider_route="standard")
+    reg.register("op-live", ctx_ref=ctx, last_phase_name="GENERATE")
+
+    n = ckpt.capture_inflight(reason="wall_clock_cap")
+    assert n == 1
+    pending = ckpt.list_pending()
+    assert [c.op_id for c in pending] == ["op-live"]
+    assert pending[0].resume_reason == "wall_clock_cap"
+    ifr.reset_default_registry()
+
+
+def test_capture_inflight_empty_registry_is_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_DIR", str(tmp_path / "cp2"))
+    from backend.core.ouroboros.governance import in_flight_registry as ifr
+    ifr.reset_default_registry()
+    assert ckpt.capture_inflight(reason="x") == 0   # nothing in-flight -> no-op
+
+
+def test_hydrate_leaves_pending_on_ingest_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "k")
+    base = str(tmp_path)
+    ckpt.write_checkpoint(ckpt.FSMCheckpoint(op_id="op-f", phase="GENERATE"), base_dir=base)
+
+    def _boom(env):
+        raise RuntimeError("intake down")
+
+    ckpt.hydrate_pending_checkpoints(_boom, base_dir=base)
+    # ingest failed -> NOT consumed -> still pending for the next boot.
+    assert [c.op_id for c in ckpt.list_pending(base_dir=base)] == ["op-f"]
