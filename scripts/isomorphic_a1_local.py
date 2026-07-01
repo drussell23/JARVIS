@@ -413,13 +413,14 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     # search_code before any patch) so it does not emit zero-shot diffs that the
     # gate rejects -> GENERATE_RETRY. Injected into the Prime-path system prompt.
     env.setdefault("JARVIS_A1_EXPLORATION_PROMPT_ENABLED", "true")
-    # Heavy-tier local-inference timeouts: the LocalPrimeClient's adaptive timeout
-    # seeds at 30s (fine for a 7B), but a cold 32B's FIRST generation exceeds 30s ->
-    # LocalLatencyLockup -> no latency sample is ever recorded -> it never adapts up
-    # (stuck at the seed). Seed the cold-start budget + raise the ceiling to fit the
-    # slow 32B multi-turn tool loop so the first call actually completes.
-    env.setdefault("JARVIS_LOCAL_INFERENCE_TIMEOUT_SEED_MS", "150000")   # 150s cold seed
-    env.setdefault("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", "300000")        # 300s ceiling
+    # Heavy-tier local-inference timeouts are now DERIVED by the Adaptive EWMA
+    # Profiler, not a manual base timer: the Context-Aware Dynamic Seed scales the
+    # 30s base by JARVIS_JPRIME_HEAVY_COLDSTART_MULT x (num_ctx/baseline) (~244s for
+    # a 16k window on the 32B), asymmetric penalty injection escalates the EWMA on a
+    # timeout so the profiler is never starved, and the Absolute Global Circuit
+    # Breaker (default 20min) kills a genuinely wedged model. We therefore no longer
+    # hardcode SEED_MS/TIMEOUT_MS here -- only the absolute breaker safety ceiling.
+    env.setdefault("JARVIS_LOCAL_INFERENCE_ABSOLUTE_CEILING_MS", "1200000")  # 20min hard kill
     # Cross-Region Capacity Matrix: do NOT pin a single region -- a whole-region L4
     # stockout must fall to a fallback region. Leave JARVIS_GCP_ZONE_FALLBACK unset
     # so zone_fallback._DEFAULT_ZONES (the region-ordered L4 matrix) applies; an

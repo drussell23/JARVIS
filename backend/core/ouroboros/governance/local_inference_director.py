@@ -108,6 +108,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _f_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def estimate_tokens(text: Any) -> int:
     """Cheap deterministic token estimate (~4 chars/token). NEVER raises."""
     try:
@@ -199,6 +206,29 @@ class LatencyProfiler:
         self._ttft: Deque[float] = deque(maxlen=cfg.window_size)
         self._per_tok: Deque[float] = deque(maxlen=cfg.window_size)
         self._total: Deque[float] = deque(maxlen=cfg.window_size)
+        # Asymmetric EWMA (ms): timeouts jump it UP (penalty), successes blend it
+        # down toward the real latency. Acts as an escalating floor on the adaptive
+        # timeout so a starved cold profiler still expands the window. 0 = no data.
+        self._ewma_ms: float = 0.0
+
+    def _cold_seed_ms(self) -> float:
+        """Context-Aware Dynamic Seed. Survival/CPU (no num_ctx) -> plain base seed
+        (byte-identical legacy). Heavy/GPU (negotiated num_ctx) -> the base seed
+        scaled by JARVIS_JPRIME_HEAVY_COLDSTART_MULT AND the token payload
+        (num_ctx / baseline) -- a 16k window inherently needs a longer first budget
+        than 8k. Capped at half the absolute ceiling so escalation has room before
+        the breaker. NEVER raises."""
+        base = float(self._cfg.timeout_seed_ms)
+        if not self._cfg.num_ctx:
+            return base
+        try:
+            heavy_mult = max(1.0, _f_env("JARVIS_JPRIME_HEAVY_COLDSTART_MULT", 4.0))
+            baseline = max(1, _int_env("JARVIS_LOCAL_SEED_CTX_BASELINE", 8192))
+            ctx_factor = max(1.0, float(self._cfg.num_ctx) / baseline)
+            seed = base * heavy_mult * ctx_factor
+            return min(seed, _absolute_ceiling_ms() * 0.5)
+        except Exception:  # noqa: BLE001
+            return base
 
     def record(self, *, ttft_ms: float, total_ms: float, output_tokens: int) -> None:
         per_tok = (total_ms - ttft_ms) / max(1, output_tokens)
@@ -206,6 +236,23 @@ class LatencyProfiler:
             self._ttft.append(float(ttft_ms))
             self._per_tok.append(max(0.0, per_tok))
             self._total.append(float(total_ms))
+            # SUCCESS blends the EWMA DOWN toward the observed latency (asymmetric).
+            if self._ewma_ms <= 0.0:
+                self._ewma_ms = float(total_ms)
+            else:
+                a = _ewma_alpha()
+                self._ewma_ms = a * float(total_ms) + (1.0 - a) * self._ewma_ms
+
+    def record_timeout_penalty(self, timeout_ms: float) -> None:
+        """Asymmetric penalty injection: a TIMEOUT jumps the EWMA UP to
+        ``timeout_ms * escalation_factor`` so the very next dispatch expands the
+        window aggressively (breaks the cold-profiler starvation). NEVER raises."""
+        try:
+            penalty = float(timeout_ms) * _timeout_escalation_factor()
+            with self._lock:
+                self._ewma_ms = max(self._ewma_ms, penalty)
+        except Exception:  # noqa: BLE001
+            pass
 
     def is_warm(self) -> bool:
         with self._lock:
@@ -229,12 +276,40 @@ class LatencyProfiler:
             ttft_m = self._mean(self._ttft)
             tok_m = self._mean(self._per_tok)
             tot_sd = self._stddev(self._total)
-        if not warm:
-            return float(min(cfg.timeout_seed_ms, cfg.timeout_ceiling_ms))
-        est_out = max(1.0, prompt_tokens * cfg.output_ratio)
-        expected = ttft_m + tok_m * est_out
-        flexed = expected + cfg.margin_sigma * tot_sd
-        return float(max(cfg.timeout_floor_ms, min(flexed, cfg.timeout_ceiling_ms)))
+            ewma = self._ewma_ms
+
+        # SURVIVAL / CPU path (no negotiated num_ctx): BYTE-IDENTICAL legacy -- no
+        # EWMA escalation, no absolute breaker, soft ceiling is the cap.
+        if not cfg.num_ctx:
+            if not warm:
+                return float(min(cfg.timeout_seed_ms, cfg.timeout_ceiling_ms))
+            est_out = max(1.0, prompt_tokens * cfg.output_ratio)
+            flexed = ttft_m + tok_m * est_out + cfg.margin_sigma * tot_sd
+            return float(max(cfg.timeout_floor_ms, min(flexed, cfg.timeout_ceiling_ms)))
+
+        # HEAVY / GPU path: Context-Aware Dynamic Seed + asymmetric EWMA escalation
+        # + Absolute Global Circuit Breaker.
+        absolute = _absolute_ceiling_ms()
+        if warm:
+            est_out = max(1.0, prompt_tokens * cfg.output_ratio)
+            value = ttft_m + tok_m * est_out + cfg.margin_sigma * tot_sd
+        else:
+            value = self._cold_seed_ms()
+        # Never below the (timeout-escalated) EWMA -- a starved cold profiler still
+        # expands the window on the next dispatch.
+        if ewma > 0.0:
+            value = max(value, ewma)
+        # Runaway EWMA past the absolute ceiling kills the loop (no infinite
+        # inflation / endless billing on a genuinely wedged model).
+        if value >= absolute:
+            raise UnrecoverableInferenceLatency(
+                "adaptive inference timeout %.0fms >= absolute ceiling %.0fms "
+                "(EWMA=%.0fms) -- wedged model, halting to prevent endless billing"
+                % (value, absolute, ewma)
+            )
+        # The absolute ceiling is the cap so the dynamic seed / escalation is not
+        # crushed by the (survival-sized) soft ceiling.
+        return float(max(cfg.timeout_floor_ms, min(absolute, value)))
 
     def is_terminal_lag(self, *, elapsed_ms: float) -> bool:
         cfg = self._cfg
@@ -259,6 +334,40 @@ class LocalLatencyLockup(RuntimeError):
     J-Prime to PRIMARY_DEGRADED and cascade the op upstream.
     """
     failure_class = "terminal_lag_lockup"
+
+
+class UnrecoverableInferenceLatency(RuntimeError):
+    """Absolute Global Circuit Breaker: the adaptive/EWMA timeout inflated past the
+    absolute ceiling (default 20min). Raised to KILL the loop -- prevents infinite
+    EWMA inflation + endless billing on a genuinely wedged model. Non-recoverable:
+    the L7 auto-heal treats it as terminal (seal/halt), never retries."""
+    failure_class = "unrecoverable_inference_latency"
+
+
+def _absolute_ceiling_ms() -> float:
+    """Hard absolute inference-timeout ceiling (ms). The EWMA escalation can grow
+    the budget on timeouts; this is the un-inflatable kill line. Default 20min."""
+    return max(1000.0, _int_env("JARVIS_LOCAL_INFERENCE_ABSOLUTE_CEILING_MS", 1_200_000))
+
+
+def _timeout_escalation_factor() -> float:
+    """Asymmetric penalty multiplier: a timeout injects timeout*factor into the
+    EWMA so the next dispatch aggressively expands the window. Default 1.5."""
+    try:
+        f = float(os.environ.get("JARVIS_LOCAL_TIMEOUT_ESCALATION_FACTOR", "1.5"))
+        return f if f > 1.0 else 1.5
+    except (TypeError, ValueError):
+        return 1.5
+
+
+def _ewma_alpha() -> float:
+    """EWMA blend weight for SUCCESS samples (decays an escalated budget back
+    toward the real latency). Default 0.3. Timeouts jump UP (asymmetric max)."""
+    try:
+        a = float(os.environ.get("JARVIS_LOCAL_EWMA_ALPHA", "0.3"))
+        return a if 0.0 < a <= 1.0 else 0.3
+    except (TypeError, ValueError):
+        return 0.3
 
 
 class LocalMemoryCritical(RuntimeError):
@@ -385,6 +494,8 @@ class LocalPrimeClient:
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
                                max_tokens: "Optional[int]" = None) -> LocalCompletion:
+        # May raise UnrecoverableInferenceLatency (absolute breaker) -> propagates
+        # as terminal (non-recoverable; the L7 auto-heal seals/halts, no retry).
         timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
         try:
             return await asyncio.wait_for(
@@ -393,6 +504,9 @@ class LocalPrimeClient:
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
+            # Asymmetric penalty injection: escalate the EWMA so the next dispatch
+            # gets a bigger budget (cures the cold-profiler starvation).
+            self.profiler.record_timeout_penalty(timeout_ms)
             raise LocalLatencyLockup(
                 f"local_inference timeout: budget={timeout_ms:.0f}ms "
                 f"warm={self.profiler.is_warm()}"
