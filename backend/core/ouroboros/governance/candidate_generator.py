@@ -2474,6 +2474,82 @@ class FailbackStateMachine:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic L7 model resolution (awakened J-Prime failover node)
+# ---------------------------------------------------------------------------
+#
+# The Phase 3c dispatch must name the model the awakened node ACTUALLY serves
+# (loaded in VRAM). The old path read the FSM's ``_active_model_label``, which
+# lags -- empty when the endpoint is found by direct GCP query -- so it fell back
+# to the survival 7B and the node returned an error object with no "choices"
+# (KeyError('choices')). The race-free source of truth is the node's own ollama
+# ``/api/tags``. We query it ONCE per endpoint and memoize per-endpoint: a new
+# endpoint (node changed / re-awaken at a new IP) is a natural cache miss;
+# ``_invalidate_jprime_model_cache()`` clears it on FSM->DORMANT. No per-dispatch
+# network spam.
+
+_JPRIME_SERVED_MODEL_CACHE: Dict[str, str] = {}
+
+
+def _invalidate_jprime_model_cache() -> None:
+    """Clear the memoized per-endpoint served-model map. Called on FSM->DORMANT
+    (the node is gone); a fresh awaken re-queries /api/tags. Per-endpoint keying
+    already self-invalidates on a node/IP change -- this covers same-IP reuse."""
+    _JPRIME_SERVED_MODEL_CACHE.clear()
+
+
+def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:
+    """From an ollama ``/api/tags`` payload, pick the model loaded in VRAM -- the
+    largest by ``size`` (the 32B, not any small sidecar), preferring ``name`` then
+    ``model``. Pure + fail-soft -> None on empty/malformed input."""
+    try:
+        models = (tags or {}).get("models") or []
+        if not models:
+            return None
+        best = max(models, key=lambda m: (m or {}).get("size", 0) or 0)
+        return ((best.get("name") or best.get("model") or "").strip()) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _fetch_served_model(endpoint: str, *, timeout_s: float = 8.0) -> Optional[str]:
+    """GET ``<endpoint>/api/tags`` -> the model the node has loaded. Bounded by
+    *timeout_s*. Fail-soft -> None (node unreachable / non-200 / bad JSON)."""
+    try:
+        import aiohttp
+        url = endpoint.rstrip("/") + "/api/tags"
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+        return _parse_served_model(data)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _resolve_served_model(
+    endpoint: Optional[str],
+    *,
+    fetcher: "Optional[Any]" = None,
+) -> Optional[str]:
+    """Memoized per-endpoint served-model lookup. Fetches ONCE per endpoint via
+    *fetcher* (defaults to :func:`_fetch_served_model`) then serves from cache --
+    no per-dispatch spam. A ``None`` fetch result is NOT cached (transient node
+    unreachable -> retried next dispatch). *fetcher* is injectable for tests."""
+    if not endpoint:
+        return None
+    cached = _JPRIME_SERVED_MODEL_CACHE.get(endpoint)
+    if cached is not None:
+        return cached
+    fn = fetcher or _fetch_served_model
+    model = await fn(endpoint)
+    if model:
+        _JPRIME_SERVED_MODEL_CACHE[endpoint] = model
+    return model
+
+
+# ---------------------------------------------------------------------------
 # CandidateGenerator
 # ---------------------------------------------------------------------------
 
@@ -3904,18 +3980,23 @@ class CandidateGenerator:
             pass
         return None
 
-    def _resolve_dispatch_model_name(self) -> Optional[str]:
-        """The model the awakened J-Prime node actually serves -- the FSM's
-        awakened-tier truth (``active_jprime_model`` -> HW1 ``_active_model_label``,
-        e.g. ``qwen2.5-coder:32b``), so the OpenAI-compat request names a model the
-        node has loaded. None if undeterminable (caller keeps the env default).
-        Fail-soft -- NEVER raises."""
-        try:
-            from .failover_lifecycle import get_failover_controller
-            model = (get_failover_controller().active_jprime_model() or "").strip()
-            return model or None
-        except Exception:  # noqa: BLE001
-            return None
+    async def _resolve_dispatch_model_name(self, endpoint: Optional[str]) -> Optional[str]:
+        """The model the awakened J-Prime node ACTUALLY serves (loaded in VRAM) --
+        the deterministic L7 source of truth, queried from the node's own
+        ``/api/tags`` at *endpoint* and memoized per-endpoint.
+
+        Deliberately abandons the lagging FSM ``_active_model_label``: when the
+        endpoint is discovered by direct GCP query (controller not SERVING
+        in-process) that label is empty, so the old path fell back to the survival
+        7B and the node rejected the request with ``KeyError('choices')``. Asking
+        the node itself is race-free.
+
+        Memoized: fetched ONCE per endpoint, then served from cache -- no
+        per-dispatch/-retry network spam. A new endpoint (node changed / re-awaken
+        at a new IP) is a natural cache miss; ``_invalidate_jprime_model_cache()``
+        clears it on FSM->DORMANT. None if undeterminable (caller keeps the env
+        default). Fail-soft -- NEVER raises."""
+        return await _resolve_served_model(endpoint)
 
     async def _failover_local_dispatch(
         self,
@@ -3954,10 +4035,10 @@ class CandidateGenerator:
         # QUALITY failover node serves qwen2.5-coder:32b, so without this override
         # the OpenAI-compat request asks for a model the node does not have and
         # ollama returns an error object with no "choices" -> KeyError('choices').
-        # The model label is the FSM's awakened-tier truth (HW1 _active_model_label),
-        # not a hardcoded string.
+        # The model name is the node's OWN /api/tags truth (deterministic L7),
+        # memoized per-endpoint -- not the lagging FSM _active_model_label.
         _overrides = {"base_url": endpoint}
-        _model = self._resolve_dispatch_model_name()
+        _model = await self._resolve_dispatch_model_name(endpoint)
         if _model:
             _overrides["model_name"] = _model
         _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)

@@ -216,29 +216,30 @@ async def test_unrecognized_override_falls_through(monkeypatch):
     assert result is None
 
 
-async def test_dispatch_model_name_is_awakened_tier_model(monkeypatch):
+async def test_dispatch_model_name_is_node_served_model(monkeypatch):
     """The J-Prime dispatch must request the model the awakened node SERVES
-    (qwen2.5-coder:32b), not LocalConfig's small default -- else ollama returns an
-    error object with no 'choices' (the KeyError that severed the live GENERATE)."""
-    import backend.core.ouroboros.governance.failover_lifecycle as fl
+    (qwen2.5-coder:32b), read from the node's OWN /api/tags (deterministic L7) --
+    NOT the lagging FSM _active_model_label -- else ollama returns an error object
+    with no 'choices' (the KeyError that severed the live GENERATE)."""
+    import backend.core.ouroboros.governance.candidate_generator as cg
+    cg._invalidate_jprime_model_cache()
     gen = _make_generator(jprime=None)
 
-    monkeypatch.setattr(
-        fl, "get_failover_controller",
-        lambda: SimpleNamespace(active_jprime_model=lambda: "qwen2.5-coder:32b"),
-    )
-    assert gen._resolve_dispatch_model_name() == "qwen2.5-coder:32b"
+    async def _fetch(endpoint, **_kw):  # node's /api/tags truth
+        return "qwen2.5-coder:32b"
+
+    monkeypatch.setattr(cg, "_fetch_served_model", _fetch)
+    got = await gen._resolve_dispatch_model_name("http://10.0.0.5:11434")
+    assert got == "qwen2.5-coder:32b"
 
 
-async def test_dispatch_model_name_fail_soft(monkeypatch):
-    import backend.core.ouroboros.governance.failover_lifecycle as fl
+async def test_dispatch_model_name_fail_soft():
+    """Undeterminable endpoint -> None, never raises (caller keeps env default)."""
+    import backend.core.ouroboros.governance.candidate_generator as cg
+    cg._invalidate_jprime_model_cache()
     gen = _make_generator(jprime=None)
-
-    def _boom():
-        raise RuntimeError("no controller")
-
-    monkeypatch.setattr(fl, "get_failover_controller", _boom)
-    assert gen._resolve_dispatch_model_name() is None  # never raises
+    assert await gen._resolve_dispatch_model_name(None) is None
+    assert await gen._resolve_dispatch_model_name("") is None
 
 
 async def test_override_field_on_operation_context_roundtrips():
