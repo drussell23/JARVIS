@@ -2708,11 +2708,16 @@ _L7_RECOVERABLE_NAMES = frozenset({
 def _is_l7_recoverable(exc: BaseException) -> bool:
     """True iff *exc* is a transient connection-drop the auto-heal can retry (a
     warm worker that dropped mid-request -- e.g. a KV-cache OOM crash). A logic
-    error (ValueError, KeyError) is NOT recoverable. NEVER raises."""
+    error (ValueError, KeyError) is NOT recoverable. The Absolute Global Circuit
+    Breaker (``UnrecoverableInferenceLatency``) is explicitly NON-recoverable --
+    retrying a wedged model just re-inflates + bills; it must seal/halt. NEVER
+    raises."""
     try:
+        name = type(exc).__name__
+        if name == "UnrecoverableInferenceLatency":
+            return False
         if isinstance(exc, (ConnectionError, ConnectionResetError, ConnectionAbortedError)):
             return True
-        name = type(exc).__name__
         if name in _L7_RECOVERABLE_NAMES:
             return True
         return "disconnect" in str(exc).lower()
