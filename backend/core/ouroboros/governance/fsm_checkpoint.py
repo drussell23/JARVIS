@@ -166,6 +166,11 @@ class FSMCheckpoint:
     # stream was cooperatively interrupted (may be half a tool call / code block).
     # Window-2 resume prefills this so the model continues from the interrupted char.
     partial_completion: str = ""
+    # Distributed Trace Lineage -- the op's span identity across windows:
+    # origin_goal_id (the window-1 causal_id), origin_source (roadmap/sensor/...),
+    # emit_source + emit_wall_ts (the original emit hop evidence), resume_count.
+    # Rides INSIDE the HMAC-signed payload => tamper-evident nametag.
+    trace_lineage: Dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     resume_reason: str = ""
     schema_version: int = _SCHEMA_VERSION
@@ -205,6 +210,48 @@ def pop_partial(op_id: str) -> str:
         return ""
 
 
+def _build_trace_lineage(context: Any, op_id: str) -> Dict[str, Any]:
+    """Distributed Trace Lineage: mint (or carry forward) the op's span identity.
+
+    A RESUMED op's ORIGINAL lineage (window 1) rides in its intake evidence --
+    preserve it verbatim except the resume counter, so window N+2 still points
+    at window 1's identity. Otherwise mint fresh from this context + the live
+    a1_trace emit ledger (the original emit evidence, wall-clock-translated so
+    it stays meaningful across processes). NEVER raises."""
+    try:
+        prior: Dict[str, Any] = {}
+        try:
+            _ev = json.loads(getattr(context, "intake_evidence_json", "") or "{}")
+            _cand = _ev.get("trace_lineage") or {}
+            if isinstance(_cand, dict) and _cand.get("origin_goal_id"):
+                prior = dict(_cand)
+        except Exception:  # noqa: BLE001
+            prior = {}
+        if prior:
+            prior["resume_count"] = int(prior.get("resume_count", 0) or 0) + 1
+            return prior
+        lineage: Dict[str, Any] = {
+            "origin_goal_id": op_id,
+            "origin_source": str(getattr(context, "signal_source", "") or ""),
+            "resume_count": 1,
+        }
+        try:
+            from backend.core.ouroboros.governance import a1_trace as _a1t  # noqa: PLC0415
+            _rec = _a1t.get_emit_record(op_id)
+            if _rec is not None:
+                _emit_mono, _emit_src = _rec
+                lineage["emit_source"] = str(_emit_src)
+                # Translate the process-local monotonic stamp to wall-clock so
+                # the evidence survives the process boundary.
+                lineage["emit_wall_ts"] = time.time() - max(
+                    0.0, time.monotonic() - float(_emit_mono))
+        except Exception:  # noqa: BLE001
+            pass
+        return lineage
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[List[Dict[str, Any]]]" = None,
                          exploration_records: "Optional[List[Dict[str, Any]]]" = None,
                          resume_reason: str = "wall_clock_cap") -> "Optional[FSMCheckpoint]":
@@ -225,6 +272,7 @@ def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[Li
             intake_evidence_json=str(getattr(context, "intake_evidence_json", "") or ""),
             provider_route=str(getattr(context, "provider_route", "") or ""),
             partial_completion=pop_partial(op_id),
+            trace_lineage=_build_trace_lineage(context, op_id),
             created_at=time.time(),
             resume_reason=str(resume_reason),
         )
@@ -347,6 +395,7 @@ def build_resume_envelope(cp: FSMCheckpoint) -> Dict[str, Any]:
         "intake_evidence_json": cp.intake_evidence_json,
         "provider_route": cp.provider_route,
         "partial_completion": cp.partial_completion,
+        "trace_lineage": dict(cp.trace_lineage or {}),
     }
 
 

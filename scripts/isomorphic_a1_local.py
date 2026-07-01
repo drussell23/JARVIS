@@ -1024,6 +1024,17 @@ class IsomorphicA1Driver:
                     # registry master flag is off (default). Arm it so in-flight ops
                     # are tracked and thus captured on suspend.
                     env.setdefault("JARVIS_IN_FLIGHT_REGISTRY_ENABLED", "true")
+                    # Activity-Gated Audit Deferral: the organism mirrors its
+                    # stream heartbeat to this file on every streamed token; the
+                    # in-process auditor's default_activity_probe reads it
+                    # (cross-process, no new IPC) so the verdict defers while the
+                    # 32B is genuinely mid-thought. Armed in BOTH the organism
+                    # env (writer) and the driver process env (reader).
+                    _hb_file = str(
+                        Path(self.repo_root) / ".ouroboros" / "stream_heartbeat.epoch"
+                    )
+                    env["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
+                    os.environ["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
 
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).

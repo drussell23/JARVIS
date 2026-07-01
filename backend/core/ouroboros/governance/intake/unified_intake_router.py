@@ -952,38 +952,28 @@ class UnifiedIntakeRouter:
             )
 
             async def _reinject(env: "Dict[str, Any]") -> None:
-                import json as _rj  # noqa: PLC0415
-                _tf = tuple(env.get("target_files") or ())
-                # Embed the partial thought + resume markers into intake_evidence_json
-                # (the string the GENERATE dispatch parses) so the prefill re-ignition
-                # reaches the LLM request -- the model continues from the exact char.
-                _ev_json = _rj.dumps({
-                    "resume": True,
-                    "resume_phase": env.get("resume_phase", ""),
-                    "partial_completion": env.get("partial_completion", ""),
-                    "resumed_op_id": env.get("op_id", ""),
-                })
-                _ev = {
-                    "resume": True,
-                    "resume_phase": env.get("resume_phase", ""),
-                    "partial_completion": env.get("partial_completion", ""),
-                    "resumed_op_id": env.get("op_id", ""),
-                    "tool_history": env.get("tool_history") or [],
-                    "exploration_records": env.get("exploration_records") or [],
-                    "intake_evidence_json": _ev_json,
-                    "signature": "fsm_resume:%s" % (env.get("op_id", "")),
-                }
-                envelope = _make_env(
-                    source="fsm_resume",
-                    description=env.get("description") or "resume suspended op",
-                    target_files=_tf,
-                    repo=os.environ.get("JARVIS_REPO_ROOT", "."),
-                    confidence=1.0,
-                    urgency="high",
-                    evidence=_ev,
-                    requires_human_ack=False,
-                    routing_override=(env.get("provider_route") or ""),
-                )
+                # Distributed Trace Lineage: the kwargs reuse the ORIGINAL
+                # causal_id + carry the verified lineage; the partial thought
+                # + resume markers ride intake_evidence_json so the prefill
+                # re-ignition reaches the LLM (model continues the exact char).
+                _kw = _resume_envelope_kwargs(env)
+                _lin = _kw["evidence"].get("trace_lineage") or {}
+                if _lin.get("emit_source"):
+                    # Re-establish the window-1 emit hop from HMAC-verified
+                    # lineage BEFORE ingest, so the chain stays ordered in
+                    # THIS window's ledger + log (span continuation).
+                    try:
+                        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                            a1_trace as _a1t,
+                        )
+                        _a1t.restore_emit_record(
+                            _kw["causal_id"],
+                            source=str(_lin["emit_source"]),
+                            original_emit_wall=_lin.get("emit_wall_ts"),
+                        )
+                    except Exception:  # noqa: BLE001 -- lineage is observability
+                        pass
+                envelope = _make_env(**_kw)
                 await self.ingest(envelope)
 
             # hydrate_pending_checkpoints wants a sync ingest_fn; bridge to async by
@@ -1062,7 +1052,9 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.provenance_ledger import (  # noqa: PLC0415
                 stamp_provenance as _stamp_provenance,
             )
-            _stamp_provenance(envelope.causal_id, envelope.source)
+            # Trace Lineage: a resumed op stamps its ORIGINAL origin (from
+            # HMAC-verified checkpoint lineage), not the resume transport.
+            _stamp_provenance(envelope.causal_id, _provenance_origin_for(envelope))
         except Exception:  # noqa: BLE001
             pass
         # 1. Dedup check
@@ -2337,3 +2329,62 @@ def reset_default_intake_router_for_tests() -> None:
             _DEFAULT_INTAKE_ROUTER = None
     except Exception:  # noqa: BLE001 — defensive
         pass
+
+
+def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
+    """Build the ``make_envelope`` kwargs for an FSM-resume re-injection.
+
+    Distributed Trace Lineage: reuse the ORIGINAL causal_id (span continuation
+    -- the resumed op IS the same goal, so the A1Trace chain stays ONE span
+    across windows instead of minting an orphan id the auditor can never
+    verify) and carry the HMAC-verified lineage in the evidence so a further
+    suspension preserves window-1's identity."""
+    import json as _rj  # noqa: PLC0415
+
+    _lineage = dict(env.get("trace_lineage") or {})
+    _ev_json = _rj.dumps({
+        "resume": True,
+        "resume_phase": env.get("resume_phase", ""),
+        "partial_completion": env.get("partial_completion", ""),
+        "resumed_op_id": env.get("op_id", ""),
+        "trace_lineage": _lineage,
+    })
+    _ev = {
+        "resume": True,
+        "resume_phase": env.get("resume_phase", ""),
+        "partial_completion": env.get("partial_completion", ""),
+        "resumed_op_id": env.get("op_id", ""),
+        "tool_history": env.get("tool_history") or [],
+        "exploration_records": env.get("exploration_records") or [],
+        "trace_lineage": _lineage,
+        "intake_evidence_json": _ev_json,
+        "signature": "fsm_resume:%s" % (env.get("op_id", "")),
+    }
+    return {
+        "source": "fsm_resume",
+        "description": env.get("description") or "resume suspended op",
+        "target_files": tuple(env.get("target_files") or ()),
+        "repo": os.environ.get("JARVIS_REPO_ROOT", "."),
+        "confidence": 1.0,
+        "urgency": "high",
+        "evidence": _ev,
+        "requires_human_ack": False,
+        "causal_id": str(_lineage.get("origin_goal_id") or env.get("op_id") or ""),
+        "routing_override": (env.get("provider_route") or ""),
+    }
+
+
+def _provenance_origin_for(envelope: Any) -> str:
+    """Resolve the provenance-stamp origin for an envelope.
+
+    A resumed op's provenance class is a property of the SPAN, not of the
+    resume transport: when HMAC-verified checkpoint lineage carries the
+    original origin (e.g. ``roadmap``), stamp THAT -- so the auditor's
+    origin-driven ``required_hops`` sees the same pipeline it saw in window 1.
+    Falls back to the envelope source. NEVER raises."""
+    try:
+        _lin = (getattr(envelope, "evidence", None) or {}).get("trace_lineage") or {}
+        _orig = str(_lin.get("origin_source") or "").strip()
+        return _orig or str(getattr(envelope, "source", "") or "")
+    except Exception:  # noqa: BLE001
+        return str(getattr(envelope, "source", "") or "")

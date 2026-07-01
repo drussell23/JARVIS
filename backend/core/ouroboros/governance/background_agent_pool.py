@@ -1276,9 +1276,43 @@ class BackgroundAgentPool:
                             _target_file_count, _is_read_only,
                             _op_timeout_base_s,
                         )
-                    result = await asyncio.wait_for(
-                        _orch.run(op.context), timeout=_op_timeout_s,
-                    )
+                    # Dynamic FSM-Aware Timeboxing: the ceiling is enforced in
+                    # slices around a shielded task. At each expiry the LIVE
+                    # failover FSM is consulted (_fsm_timebox_extension_s) --
+                    # engaged lifecycle (zone hunt / heavy streaming) grants a
+                    # bounded extension; DORMANT kills exactly like the legacy
+                    # single wait_for (cancel + TimeoutError to the handler).
+                    _run_task = asyncio.ensure_future(_orch.run(op.context))
+                    _fsm_granted_s = 0.0
+                    _next_timeout_s = _op_timeout_s
+                    try:
+                        while True:
+                            try:
+                                result = await asyncio.wait_for(
+                                    asyncio.shield(_run_task),
+                                    timeout=_next_timeout_s,
+                                )
+                                break
+                            except asyncio.TimeoutError:
+                                _ext_s = _fsm_timebox_extension_s(_fsm_granted_s)
+                                if _ext_s <= 0.0:
+                                    _run_task.cancel()
+                                    try:
+                                        await _run_task
+                                    except BaseException:  # noqa: BLE001 -- drain the cancel
+                                        pass
+                                    raise
+                                _fsm_granted_s += _ext_s
+                                _next_timeout_s = _ext_s
+                                logger.info(
+                                    "Worker %d: %s bg_timebox reached but failover "
+                                    "FSM engaged (cold-start/heavy path) -- extending "
+                                    "%.0fs (granted %.0fs total)",
+                                    worker_id, op.op_id, _ext_s, _fsm_granted_s,
+                                )
+                    finally:
+                        if not _run_task.done():
+                            _run_task.cancel()
                     op.result = result
                     op.status = "completed"
                     self._completed_count += 1
@@ -1431,3 +1465,34 @@ class BackgroundAgentPool:
             logger.exception("Worker %d crashed unexpectedly", worker_id)
         finally:
             logger.debug("Worker %d exited", worker_id)
+
+
+def _fsm_timebox_extension_s(already_granted_s: float) -> float:
+    """Dynamic FSM-Aware Timeboxing: at bg_timebox expiry, consult the LIVE
+    failover FSM before killing the op.
+
+    When the lifecycle is engaged (AWAKENING zone-hunt / SERVING slow heavy
+    streaming), the elapsed wall is infrastructure cold-start or heavy-tier
+    inference -- not a wedged op -- so grant a bounded extension slice (env
+    ``JARVIS_BG_WORKER_FSM_EXTENSION_SLICE_S``, default 120) up to a total
+    budget (``JARVIS_BG_WORKER_FSM_EXTENSION_MAX_S``, default 900). DORMANT
+    (normal DW ops) returns 0.0 => byte-identical legacy anti-hang watchdog.
+    Live evidence: bt-iso-1782944904 killed a resumed op at its static 415s
+    ceiling while the FSM was 4 minutes into an AWAKENING zone hunt.
+    Master ``JARVIS_BG_FSM_TIMEBOX_ENABLED`` (default true). NEVER raises."""
+    try:
+        if (os.environ.get("JARVIS_BG_FSM_TIMEBOX_ENABLED", "true") or "").strip().lower() \
+                in ("0", "false", "no", "off"):
+            return 0.0
+        max_total = float(os.environ.get("JARVIS_BG_WORKER_FSM_EXTENSION_MAX_S", "900") or 900)
+        if already_granted_s >= max_total:
+            return 0.0
+        from backend.core.ouroboros.governance import failover_lifecycle as _fl  # noqa: PLC0415
+        if not _fl.lifecycle_enabled():
+            return 0.0
+        if _fl.get_failover_controller().state == _fl.FailoverState.DORMANT:
+            return 0.0
+        slice_s = float(os.environ.get("JARVIS_BG_WORKER_FSM_EXTENSION_SLICE_S", "120") or 120)
+        return max(0.0, min(slice_s, max_total - already_granted_s))
+    except Exception:  # noqa: BLE001 -- the watchdog must never break on a probe
+        return 0.0
