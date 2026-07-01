@@ -413,6 +413,13 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
     # search_code before any patch) so it does not emit zero-shot diffs that the
     # gate rejects -> GENERATE_RETRY. Injected into the Prime-path system prompt.
     env.setdefault("JARVIS_A1_EXPLORATION_PROMPT_ENABLED", "true")
+    # Heavy-tier local-inference timeouts: the LocalPrimeClient's adaptive timeout
+    # seeds at 30s (fine for a 7B), but a cold 32B's FIRST generation exceeds 30s ->
+    # LocalLatencyLockup -> no latency sample is ever recorded -> it never adapts up
+    # (stuck at the seed). Seed the cold-start budget + raise the ceiling to fit the
+    # slow 32B multi-turn tool loop so the first call actually completes.
+    env.setdefault("JARVIS_LOCAL_INFERENCE_TIMEOUT_SEED_MS", "150000")   # 150s cold seed
+    env.setdefault("JARVIS_LOCAL_INFERENCE_TIMEOUT_MS", "300000")        # 300s ceiling
     # Cross-Region Capacity Matrix: do NOT pin a single region -- a whole-region L4
     # stockout must fall to a fallback region. Leave JARVIS_GCP_ZONE_FALLBACK unset
     # so zone_fallback._DEFAULT_ZONES (the region-ordered L4 matrix) applies; an
