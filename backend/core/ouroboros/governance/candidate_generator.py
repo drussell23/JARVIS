@@ -2490,11 +2490,18 @@ class FailbackStateMachine:
 _JPRIME_SERVED_MODEL_CACHE: Dict[str, str] = {}
 
 
+# Sibling cache: the served model's on-disk BYTES (from the SAME /api/tags), used
+# by the Context-Hardware Negotiator to derive the VRAM-safe num_ctx.
+_JPRIME_SERVED_BYTES_CACHE: Dict[str, int] = {}
+
+
 def _invalidate_jprime_model_cache() -> None:
-    """Clear the memoized per-endpoint served-model map. Called on FSM->DORMANT
-    (the node is gone); a fresh awaken re-queries /api/tags. Per-endpoint keying
-    already self-invalidates on a node/IP change -- this covers same-IP reuse."""
+    """Clear the memoized per-endpoint served-model maps (name + bytes). Called on
+    FSM->DORMANT (the node is gone); a fresh awaken re-queries /api/tags.
+    Per-endpoint keying already self-invalidates on a node/IP change -- this covers
+    same-IP reuse."""
     _JPRIME_SERVED_MODEL_CACHE.clear()
+    _JPRIME_SERVED_BYTES_CACHE.clear()
 
 
 def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2576,6 +2583,129 @@ async def _resolve_served_model(
 # ---------------------------------------------------------------------------
 # CandidateGenerator
 # ---------------------------------------------------------------------------
+
+
+def _parse_served_model_bytes(tags: Optional[Dict[str, Any]]) -> int:
+    """On-disk BYTES of the largest model in an ollama /api/tags payload (the same
+    model _parse_served_model names). Pure, fail-soft -> 0."""
+    try:
+        models = (tags or {}).get("models") or []
+        if not models:
+            return 0
+        best = max(models, key=lambda m: (m or {}).get("size", 0) or 0)
+        return int(best.get("size", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def _fetch_served_model_bytes(endpoint: str, *, timeout_s: float = 8.0) -> int:
+    """GET <endpoint>/api/tags -> the served model's on-disk size in bytes.
+    Fail-soft -> 0."""
+    try:
+        import aiohttp
+        url = endpoint.rstrip("/") + "/api/tags"
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return 0
+                data = await resp.json(content_type=None)
+        return _parse_served_model_bytes(data)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def _resolve_served_model_bytes(
+    endpoint: Optional[str],
+    *,
+    fetcher: "Optional[Any]" = None,
+) -> int:
+    """Memoized per-endpoint served-model byte size (Context-Hardware Negotiator
+    input). Fetched once; a 0 result is not cached (retried). NEVER raises."""
+    if not endpoint:
+        return 0
+    cached = _JPRIME_SERVED_BYTES_CACHE.get(endpoint)
+    if cached:
+        return cached
+    fn = fetcher or _fetch_served_model_bytes
+    size = await fn(endpoint)
+    if size:
+        _JPRIME_SERVED_BYTES_CACHE[endpoint] = int(size)
+    return int(size or 0)
+
+
+def _awakened_vram_bytes() -> int:
+    """VRAM (bytes) of the awakened GPU tier -- the controller's live awakened tier
+    if available, else the QUALITY provisioning spec. 0 if not a GPU tier / unknown
+    (the negotiator then keeps the legacy path). NEVER raises."""
+    accel = ""
+    try:
+        from .failover_lifecycle import get_failover_controller  # noqa: PLC0415
+        _t = getattr(get_failover_controller(), "_awakened_tier", None)
+        accel = (getattr(_t, "accelerator_type", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        accel = ""
+    if not accel:
+        try:
+            from .failover_tier import _quality_tier  # noqa: PLC0415
+            accel = (getattr(_quality_tier(), "accelerator_type", "") or "").strip()
+        except Exception:  # noqa: BLE001
+            accel = ""
+    try:
+        from .failover_tier import accelerator_vram_bytes  # noqa: PLC0415
+        return accelerator_vram_bytes(accel)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# --- Resilient L7 Recovery (auto-heal on connection drop) -------------------
+
+def _l7_recovery_attempts() -> int:
+    """Extra retries after a recoverable L7 failure (ServerDisconnect) before the
+    dispatch raises (-> sentinel seam seals). Default 2. NEVER raises."""
+    try:
+        return max(0, int(os.environ.get("JARVIS_FAILOVER_L7_RECOVERY_ATTEMPTS", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _l7_tighten_factor() -> float:
+    """num_ctx shrink factor applied on each auto-heal retry (more aggressive
+    compression). Default 0.6. Clamped to (0,1). NEVER raises."""
+    try:
+        f = float(os.environ.get("JARVIS_FAILOVER_L7_TIGHTEN_FACTOR", "0.6"))
+        return f if 0.0 < f < 1.0 else 0.6
+    except (TypeError, ValueError):
+        return 0.6
+
+
+def _l7_rewarm_timeout_s() -> float:
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_FAILOVER_L7_REWARM_TIMEOUT_S", "120")))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+_L7_RECOVERABLE_NAMES = frozenset({
+    "ServerDisconnectedError", "ClientConnectionError", "ClientConnectionResetError",
+    "ClientOSError", "ClientPayloadError", "ConnectionResetError",
+    "ConnectionError", "ConnectionAbortedError", "ServerTimeoutError",
+})
+
+
+def _is_l7_recoverable(exc: BaseException) -> bool:
+    """True iff *exc* is a transient connection-drop the auto-heal can retry (a
+    warm worker that dropped mid-request -- e.g. a KV-cache OOM crash). A logic
+    error (ValueError, KeyError) is NOT recoverable. NEVER raises."""
+    try:
+        if isinstance(exc, (ConnectionError, ConnectionResetError, ConnectionAbortedError)):
+            return True
+        name = type(exc).__name__
+        if name in _L7_RECOVERABLE_NAMES:
+            return True
+        return "disconnect" in str(exc).lower()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class CandidateGenerator:
@@ -4022,6 +4152,25 @@ class CandidateGenerator:
         default). Fail-soft -- NEVER raises."""
         return await _resolve_served_model(endpoint)
 
+    async def _negotiate_num_ctx(self, endpoint: Optional[str]) -> Optional[int]:
+        """Autonomous Context-Hardware Negotiator: derive the VRAM-safe context
+        window for *endpoint* from the MEASURED buffer -- node VRAM (awakened GPU
+        tier) minus the served model's on-disk bytes (its own /api/tags) -- so the
+        KV cache can never overflow VRAM (the warm-32B ServerDisconnect root cause).
+        None when undeterminable (not a GPU tier / size unknown) -> caller keeps the
+        legacy path. Fail-soft -- NEVER raises."""
+        try:
+            model_bytes = await _resolve_served_model_bytes(endpoint)
+            vram_bytes = _awakened_vram_bytes()
+            if not model_bytes or not vram_bytes:
+                return None
+            from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                derive_safe_num_ctx,
+            )
+            return derive_safe_num_ctx(vram_bytes=vram_bytes, model_bytes=model_bytes)
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _failover_local_dispatch(
         self,
         context: OperationContext,
@@ -4032,16 +4181,26 @@ class CandidateGenerator:
 
         Builds a ``PrimeProvider`` wrapping a ``LocalPrimeClient`` pointed at the
         awakened J-Prime node's OpenAI-compatible endpoint and calls its
-        ``.generate(context, deadline)``. The PrimeProvider seat produces the
-        exact ``GenerationResult`` shape the dispatch returns, so APPLY/VERIFY
-        downstream is byte-identical.
+        ``.generate(context, deadline)``. The PrimeProvider seat produces the exact
+        ``GenerationResult`` shape the dispatch returns, so APPLY/VERIFY downstream
+        is byte-identical.
 
-        Reuses the existing PrimeProvider seat + LocalPrimeClient -- NO new
-        provider. The client is bound at the endpoint via ``LocalConfig`` (the
-        ``base_url`` override); nothing is hardcoded. Bounded by the op's own
-        remaining budget. Returns the ``GenerationResult`` on success or ``None``
-        to fall through to the DW path (the caller treats both empty + None as
-        fall-through). Fail-soft -- the caller's try/except is the final net.
+        Three intelligences layered here (all reuse existing seats -- no new
+        provider, nothing hardcoded):
+          * model name = the node's OWN /api/tags truth (deterministic L7), so the
+            request never asks for a model the node lacks (the KeyError('choices'));
+          * ``num_ctx`` = the Context-Hardware Negotiator's VRAM-safe window, which
+            drives Dynamic Cognitive Compression inside ``LocalPrimeClient`` so the
+            KV cache can never overflow VRAM;
+          * Resilient L7 Recovery: on a transient connection drop (a warm worker
+            that crashed mid-request -- e.g. a KV-cache OOM), AUTO-HEAL by
+            re-warming + tightening num_ctx and retrying, up to N times, before
+            raising (which lets the sentinel seam SEAL/halt -- never cascade).
+
+        Bounded by the op's own remaining budget. Returns the ``GenerationResult``
+        on success or ``None`` to fall through. Raises only when the auto-heal is
+        exhausted on a recoverable fault (so sealing halts) or on a non-recoverable
+        error (the caller's try/except is the final net).
         """
         import dataclasses as _f3c_dc
 
@@ -4053,38 +4212,66 @@ class CandidateGenerator:
             PrimeProvider as _F3cPrimeProvider,
         )
 
-        # Point a LocalConfig at the awakened endpoint (base_url override) AND at
-        # the model the awakened node actually serves. LocalConfig.from_env()
-        # defaults model_name to a small survival model (qwen2.5-coder:3b); the
-        # QUALITY failover node serves qwen2.5-coder:32b, so without this override
-        # the OpenAI-compat request asks for a model the node does not have and
-        # ollama returns an error object with no "choices" -> KeyError('choices').
-        # The model name is the node's OWN /api/tags truth (deterministic L7),
-        # memoized per-endpoint -- not the lagging FSM _active_model_label.
-        _overrides = {"base_url": endpoint}
+        _base_overrides: Dict[str, Any] = {"base_url": endpoint}
         _model = await self._resolve_dispatch_model_name(endpoint)
         if _model:
-            _overrides["model_name"] = _model
-        _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
-        _client = _F3cLocalPrimeClient(_cfg)
-        try:
-            _provider = _F3cPrimeProvider(
-                _client,
-                repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+            _base_overrides["model_name"] = _model
+        _num_ctx = await self._negotiate_num_ctx(endpoint)
+        _op = getattr(context, "op_id", "?")[:16]
+        if _num_ctx:
+            logger.info(
+                "[CandidateGenerator] Context-Hardware Negotiator: VRAM-safe "
+                "num_ctx=%d for the 32B at %s op=%s", _num_ctx, endpoint, _op,
             )
-            remaining = self._remaining_seconds(deadline)
-            if remaining <= 0.0:
-                return None
-            return await asyncio.wait_for(
-                _provider.generate(context, deadline),
-                timeout=remaining,
-            )
-        finally:
-            # Release the pooled aiohttp session (zero hanging FDs). Best-effort.
+
+        _attempts = _l7_recovery_attempts()
+        _last_exc: Optional[BaseException] = None
+        for _try in range(_attempts + 1):
+            _overrides = dict(_base_overrides)
+            if _num_ctx:
+                _overrides["num_ctx"] = int(_num_ctx)
+            _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
+            _client = _F3cLocalPrimeClient(_cfg)
             try:
-                await _client.aclose()
-            except Exception:  # noqa: BLE001
-                pass
+                _provider = _F3cPrimeProvider(
+                    _client,
+                    repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+                )
+                remaining = self._remaining_seconds(deadline)
+                if remaining <= 0.0:
+                    return None
+                return await asyncio.wait_for(
+                    _provider.generate(context, deadline),
+                    timeout=remaining,
+                )
+            except Exception as _exc:  # noqa: BLE001
+                _last_exc = _exc
+                # Non-recoverable OR out of retries -> propagate (sentinel seals).
+                if _try >= _attempts or not _is_l7_recoverable(_exc):
+                    raise
+                # AUTO-HEAL: tighten the window (more aggressive compression) +
+                # re-warm the worker, then retry. This is the sovereign path the
+                # sealer guards -- we exhaust recovery BEFORE halting.
+                if _num_ctx:
+                    _num_ctx = max(512, int(_num_ctx * _l7_tighten_factor()))
+                logger.warning(
+                    "[CandidateGenerator] L7 AUTO-HEAL: %s on the 32B -> re-warm + "
+                    "tighten num_ctx=%s, retry %d/%d op=%s",
+                    type(_exc).__name__, _num_ctx, _try + 1, _attempts, _op,
+                )
+                try:
+                    await _client.warmup(timeout_s=_l7_rewarm_timeout_s())
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                try:
+                    await _client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Unreachable in practice (the loop returns or raises), but keep the net.
+        if _last_exc is not None:
+            raise _last_exc
+        return None
 
     async def _dispatch_via_sentinel(
         self,
