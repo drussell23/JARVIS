@@ -366,6 +366,7 @@ async def test_unknown_keeps_provisioning_node(monkeypatch):
     # 'unknown' op BUT instances.get says STAGING -> slow-but-real -> KEEP it,
     # do NOT reap, do NOT advance; hand to the L7 readiness gate (route AWAKENING).
     monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "0")  # keep test instant
     _stub_identity(monkeypatch)
     monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("STAGING"))
     _patch_await(monkeypatch, ["unknown"])
@@ -380,6 +381,7 @@ async def test_unknown_keeps_provisioning_node(monkeypatch):
 
 async def test_unknown_keeps_running_node(monkeypatch):
     monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "0")  # keep test instant
     _stub_identity(monkeypatch)
     monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("RUNNING"))
     _patch_await(monkeypatch, ["unknown"])
@@ -434,3 +436,110 @@ async def test_insert_unknown_uses_confirmed_reap(monkeypatch):
 
     assert verdict == "stockout"
     assert calls["n"] >= 2  # confirmed reap, not a single delete
+
+
+# ---------------------------------------------------------------------------
+# Keep-Confirmation Window: a KEPT materializing node can still EVAPORATE
+# (GCE rolls back a post-STAGING capacity failure). Live: bt-iso-1782950534
+# kept a STAGING on-demand node that vanished -> AWAKENING wedged on a
+# phantom for the full 900s L7 budget with no re-hunt.
+# ---------------------------------------------------------------------------
+
+
+class _SequencedStatusHTTP:
+    """POST insert -> 200 op-insert; each GET instances/<node> consumes the
+    next scripted (status, http) pair (last repeats)."""
+
+    def __init__(self, seq):
+        self.seq = list(seq)
+        self.posts = 0
+        self.status_gets = 0
+
+    async def __call__(self, url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if method == "POST":
+            self.posts += 1
+            return (200, json.dumps({"name": "op-insert"}))
+        if method == "GET" and "/instances/" in url:
+            st, code = self.seq[min(self.status_gets, len(self.seq) - 1)]
+            self.status_gets += 1
+            if st is None:
+                return (code, json.dumps({"error": {"code": code}}))
+            return (code, json.dumps({"status": st}))
+        return (0, "[unrouted]")
+
+
+async def test_kept_node_that_evaporates_is_reaped_and_rolled(monkeypatch):
+    # Handoff sees STAGING (KEEP path) but the confirmation window then sees
+    # 404 (GCE rollback) -> confirmed-reap + roll, NEVER a phantom 'created'.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "5")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_INTERVAL_S", "0.01")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(
+        gr, "_http_request",
+        _SequencedStatusHTTP([("STAGING", 200), ("STAGING", 200), (None, 404)]),
+    )
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "stockout"
+    assert "evaporated" in detail
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped
+
+
+async def test_kept_node_that_reaches_running_is_confirmed_live(monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "5")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_INTERVAL_S", "0.01")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(
+        gr, "_http_request",
+        _SequencedStatusHTTP([("STAGING", 200), ("STAGING", 200), ("RUNNING", 200)]),
+    )
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "materializing" in detail
+    assert reaped == []
+
+
+async def test_kept_node_still_materializing_at_window_end_stays_kept(monkeypatch):
+    # Legacy pin: a node that EXISTS but is slow stays KEPT at window end --
+    # only proof-of-absence aborts the keep.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "0")
+    _stub_identity(monkeypatch)
+    monkeypatch.setattr(gr, "_http_request", _InsertAndStatusHTTP("STAGING"))
+    _patch_await(monkeypatch, ["unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "materializing" in detail
+    assert reaped == []
+
+
+async def test_evaporated_spot_keep_escalates_to_ondemand_same_zone(monkeypatch):
+    # Spot KEEP evaporates -> reap, then escalate to on-demand in the SAME
+    # zone first (mirrors the not-materializing branch's escalation).
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "true")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "5")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_INTERVAL_S", "0.01")
+    _stub_identity(monkeypatch)
+    http = _SequencedStatusHTTP([("STAGING", 200), (None, 404), ("RUNNING", 200)])
+    monkeypatch.setattr(gr, "_http_request", http)
+    _patch_await(monkeypatch, ["unknown", "unknown"])
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "mode=on-demand" in detail
+    assert http.posts == 2
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped
