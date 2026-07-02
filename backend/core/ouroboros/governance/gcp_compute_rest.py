@@ -52,6 +52,9 @@ Env knobs
   JARVIS_FAILOVER_REST_TIMEOUT_S      default 30.0
   JARVIS_FAILOVER_RUNNING_TIMEOUT_S   default 180.0  (await_running_ip budget)
   JARVIS_FAILOVER_RUNNING_POLL_S      default 5.0    (await_running_ip cadence)
+  JARVIS_FAILOVER_KEEP_VERIFY_BUDGET_S default 600.0 (KEEP-on-MATERIALIZING
+                                       insert-op re-verify budget -- a late
+                                       terminal stockout still rolls the zone)
   GCP_PROJECT_ID / GOOGLE_CLOUD_PROJECT  optional project override (else metadata)
   GCP_ZONE                            optional zone override (else metadata)
 """
@@ -286,6 +289,21 @@ def _reap_confirm_clean_streak() -> int:
     confirmed-clean. >1 so a node that materializes DURING the settle window
     resets the streak and is deleted before we trust the zone is empty."""
     return int(_env_float("JARVIS_REAP_CONFIRM_CLEAN_STREAK", 2, lo=1.0, hi=10.0))
+
+
+def _keep_verify_budget_s() -> float:
+    """Re-verification budget (seconds) for a KEEP-on-MATERIALIZING decision.
+
+    KEEP-on-MATERIALIZING is NOT a commit point: GCP can hold an insert op
+    PENDING well past the 90s ``_insert_op_poll_cap_s`` window while the
+    instance already shows STAGING, then terminally FAIL it (live:
+    bt-iso-1783021468 -- op held PENDING ~7min, instance STAGING throughout,
+    then DONE with ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS after our KEEP
+    branch had already stopped the zone-fallback roll). This is a MUCH more
+    generous budget than the initial verify window so a late-arriving
+    terminal failure is caught and the roll can still continue to the next
+    zone instead of wedging the L7 gate on a doomed node."""
+    return _env_float("JARVIS_FAILOVER_KEEP_VERIFY_BUDGET_S", 600.0, lo=0.0, hi=3600.0)
 
 
 def _running_timeout() -> float:
@@ -824,15 +842,58 @@ class GCPComputeRest:
                             if spot and _ondemand_on_stockout_enabled():
                                 continue  # escalate to on-demand same zone first
                             return ("stockout", "zone={}:kept_node_evaporated".format(zone))
-                        # 'live' or still-materializing at window end: KEEP, do NOT
-                        # reap, do NOT advance -> route to AWAKENING and hand patience
-                        # to the L7 readiness gate/racer (the right owner of "wait
-                        # for SERVING"). Resolves strict-reap-vs-slow-op tension.
+                        # 'live' or still-materializing at window end: candidate KEEP.
+                        # But KEEP-on-MATERIALIZING is NOT a commit point -- GCP can
+                        # (and did, bt-iso-1783021468: op held PENDING ~7min with the
+                        # instance STAGING throughout, then DONE with
+                        # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS) still terminally
+                        # FAIL the underlying insert op AFTER the node showed
+                        # materializing. Re-verify the SAME op (reusing the SAME poll
+                        # helper, a much more generous budget) BEFORE handing the node
+                        # to the L7 readiness gate -- catches a late stockout and lets
+                        # the zone roll continue instead of wedging on a doomed node.
+                        _keep_budget = _keep_verify_budget_s()
                         logger.info(
                             "[GCPComputeRest] insert op unverified BUT node MATERIALIZING "
-                            "(status=%s confirm=%s) zone=%s mode=%s -> KEEP + hand to "
-                            "L7 readiness gate", inst_status, _fate, zone, mode,
+                            "(status=%s confirm=%s) zone=%s mode=%s -> re-verifying insert "
+                            "op (budget=%.0fs) before KEEP", inst_status, _fate, zone, mode,
+                            _keep_budget,
                         )
+                        _keep_verdict = await self._await_insert_operation(
+                            project, zone, op, token, cap_s=_keep_budget,
+                        )
+                        if _keep_verdict in ("stockout", "error"):
+                            # The op RENEGED after materializing: the same failure
+                            # class as an immediate stockout -- reap the STAGING
+                            # remnant and CONTINUE the zone roll via the SAME
+                            # continue path (never a new/parallel loop).
+                            logger.warning(
+                                "[GCPComputeRest] KEEP-verify: insert op TERMINALLY "
+                                "FAILED after materializing (status=%s zone=%s mode=%s "
+                                "op_verdict=%s) -> confirmed-reap + roll next zone",
+                                inst_status, zone, mode, _keep_verdict,
+                            )
+                            await self._reap_zone_confirmed(node, zone)
+                            if spot and _ondemand_on_stockout_enabled():
+                                continue  # escalate to on-demand same zone first
+                            return ("stockout", "zone={}:kept_node_late_failed_{}".format(
+                                zone, _keep_verdict))
+                        if _keep_verdict == "unknown":
+                            # Budget expired with the op STILL pending -- fail-open to
+                            # the legacy KEEP semantics (the L7 gate has its own
+                            # budget), but make the extended uncertainty visible.
+                            logger.warning(
+                                "[GCPComputeRest] KEEP-verify budget (%.0fs) expired "
+                                "with insert op STILL PENDING zone=%s mode=%s -> "
+                                "fail-open KEEP (L7 gate owns further patience)",
+                                _keep_budget, zone, mode,
+                            )
+                        else:
+                            logger.info(
+                                "[GCPComputeRest] KEEP-verify: insert op confirmed DONE "
+                                "clean zone=%s mode=%s -> KEEP + hand to L7 readiness gate",
+                                zone, mode,
+                            )
                         return (
                             "created",
                             "zone={}:mode={}:materializing_{}".format(
@@ -868,7 +929,9 @@ class GCPComputeRest:
                            mode, zone, status, (text or "")[-200:])
         return ("failed", "zone={}:spot_and_on_demand_rejected".format(zone))
 
-    async def _await_insert_operation(self, project, zone, op_name, token) -> str:
+    async def _await_insert_operation(
+        self, project, zone, op_name, token, *, cap_s: Optional[float] = None,
+    ) -> str:
         """Poll a zonal insert operation to a TERMINAL state. FAIL-CLOSED.
 
         Returns:
@@ -882,12 +945,17 @@ class GCPComputeRest:
                         must assume a phantom node may exist (reap) and roll over.
                         NEVER an optimistic 'ok'.
 
+        ``cap_s`` overrides the default ``_insert_op_poll_cap_s()`` ceiling --
+        used by the KEEP-on-MATERIALIZING re-verify call (a MUCH more generous
+        budget, see ``_keep_verify_budget_s``) so the SAME poll helper is reused
+        rather than duplicated with a second bespoke loop.
+
         NEVER raises."""
         from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
             is_stockout_error,
         )
         url = "{}/projects/{}/zones/{}/operations/{}".format(_COMPUTE_BASE, project, zone, op_name)
-        cap = _insert_op_poll_cap_s()
+        cap = cap_s if cap_s is not None else _insert_op_poll_cap_s()
         interval = _insert_op_poll_interval_s()
         waited = 0.0
         while waited < cap:
