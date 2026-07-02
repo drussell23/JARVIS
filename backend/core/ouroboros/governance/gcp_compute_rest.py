@@ -762,7 +762,13 @@ class GCPComputeRest:
             is_stockout_error,
         )
         url = "{}/projects/{}/zones/{}/instances".format(_COMPUTE_BASE, project, zone)
-        for spot in (True, False):
+        # Spot opt-out (JARVIS_FAILOVER_SPOT_ENABLED, default true = legacy
+        # Spot-first): a Spot node was PREEMPTED mid-generation
+        # (iso-a1-20260701-173804) killing every candidate op -- verdict-
+        # critical runs arm =false for a preemption-free on-demand node.
+        _spot_enabled = (os.environ.get("JARVIS_FAILOVER_SPOT_ENABLED", "true")
+                         or "").strip().lower() not in ("0", "false", "no", "off")
+        for spot in ((True, False) if _spot_enabled else (False,)):
             payload = self._build_insert_payload(
                 name=node, zone=zone, project=project, machine_type=machine,
                 image_family=family, startup_script=startup_script, spot=spot,

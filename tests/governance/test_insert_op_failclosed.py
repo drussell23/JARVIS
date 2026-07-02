@@ -543,3 +543,39 @@ async def test_evaporated_spot_keep_escalates_to_ondemand_same_zone(monkeypatch)
     assert "mode=on-demand" in detail
     assert http.posts == 2
     assert ("jarvis-prime-failover", "us-central1-a") in reaped
+
+
+# ---------------------------------------------------------------------------
+# Spot opt-out: JARVIS_FAILOVER_SPOT_ENABLED=false -> on-demand ONLY.
+# A Spot node was PREEMPTED mid-generation (iso-a1-20260701-173804: STOPPING
+# at 17:49, mass ClientConnectorError, every candidate op sealed-dead) --
+# verdict-critical runs need a preemption-free node.
+# ---------------------------------------------------------------------------
+
+
+async def test_spot_disabled_goes_straight_to_ondemand(monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_SPOT_ENABLED", "false")
+    _stub_identity(monkeypatch)
+    http = _PostHTTP()
+    monkeypatch.setattr(gr, "_http_request", http)
+    _patch_await(monkeypatch, ["ok"])
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "mode=on-demand" in detail
+    assert http.posts == 1                    # never tried Spot
+
+
+async def test_spot_default_unchanged(monkeypatch):
+    monkeypatch.delenv("JARVIS_FAILOVER_SPOT_ENABLED", raising=False)
+    _stub_identity(monkeypatch)
+    http = _PostHTTP()
+    monkeypatch.setattr(gr, "_http_request", http)
+    _patch_await(monkeypatch, ["ok"])
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "mode=SPOT" in detail              # legacy Spot-first pinned
+    assert http.posts == 1
