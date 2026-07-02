@@ -674,13 +674,39 @@ class LocalPrimeClient:
         # checkpoint path (live gap bt-iso-1782942507: SIGTERM at 59s into prefill,
         # tokens=0, no stall -> GSI never raised, 0 checkpoints).
         _shutdown_task = asyncio.ensure_future(_coop.wait_async())
-        _req_cm = sess.post(url, json=body)
+        # Transport sovereignty: response-begin patience is owned by THIS
+        # machinery (cooperative race + heartbeat + the pool/audit ceilings
+        # above), NEVER by aiohttp's ambient 300s session default -- which
+        # killed L4-queued sealed ops at exactly 300s while they legitimately
+        # waited behind another op's generation (iso-a1-20260701-172436).
+        # Connection ESTABLISHMENT stays bounded (a dead host fails fast).
+        _req_kw: Dict[str, Any] = {"json": body}
+        try:
+            import aiohttp  # noqa: PLC0415 -- session is aiohttp when live
+            _req_kw["timeout"] = aiohttp.ClientTimeout(
+                total=None,
+                connect=float(os.environ.get(
+                    "JARVIS_STREAM_CONNECT_TIMEOUT_S", "30") or 30),
+            )
+        except Exception:  # noqa: BLE001 -- fakes/tests without aiohttp
+            pass
+        _req_cm = sess.post(url, **_req_kw)
         try:
             _enter_task = asyncio.ensure_future(_req_cm.__aenter__())
-            _done_begin, _ = await asyncio.wait(
-                {_enter_task, _shutdown_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Prefill-aware heartbeat: while headers are withheld (model
+            # prefill / L4 queue) the GPU is genuinely working -- pulse every
+            # JARVIS_STREAM_REQUEST_PULSE_S so the idle watchdog + the audit
+            # deferral probe see ACTIVE (tokens can't pulse yet by definition).
+            _pulse_s = float(os.environ.get("JARVIS_STREAM_REQUEST_PULSE_S", "15") or 15)
+            while True:
+                _done_begin, _ = await asyncio.wait(
+                    {_enter_task, _shutdown_task},
+                    timeout=max(0.01, _pulse_s),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if _done_begin:
+                    break
+                _emit_stream_token("")  # heartbeat-only pulse (empty delta)
             if _enter_task not in _done_begin:
                 # Shutdown fired while awaiting response headers (prefill) ->
                 # drop the in-flight request and freeze this millisecond.

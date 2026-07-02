@@ -105,3 +105,91 @@ def test_response_begin_error_still_propagates_faithfully():
                                   stream=True)
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Transport sovereignty + prefill-aware heartbeat (run iso-a1-20260701-172436,
+# 5/6): (a) aiohttp's AMBIENT 300s session timeout killed queued sealed ops
+# whose response-begin waited behind another op on the single L4 (TimeoutError
+# -> sovereign_route_sealed death, including the winning-chain op); (b) the
+# stream heartbeat only pulses on TOKENS, so a long prefill read as IDLE to
+# the audit-deferral probe and the verdict fired over a live op.
+# ---------------------------------------------------------------------------
+
+
+class _SseReader:
+    """Yields scripted SSE lines then EOF."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    async def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _OkResp:
+    def __init__(self, reader):
+        self.content = reader
+
+
+class _OkCM:
+    def __init__(self, reader):
+        self._r = reader
+
+    async def __aenter__(self):
+        return _OkResp(self._r)
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _sse(content):
+    import json as _j
+    return ("data: " + _j.dumps({"choices": [{"delta": {"content": content}}]}) + "\n").encode()
+
+
+def test_streaming_post_owns_transport_timeout():
+    """The streaming request must carry its OWN per-request ClientTimeout with
+    total=None -- response-begin patience is owned by the cooperative race /
+    watchdog stack, never by aiohttp's ambient session default (which killed
+    L4-queued sealed ops at exactly 300s)."""
+    import aiohttp
+    coop.reset()
+    sess = _Sess(_OkCM(_SseReader([_sse("hi"), b""])))
+    client = lid.LocalPrimeClient(_cfg(num_ctx=8192), session=sess)
+
+    async def _run():
+        out = await client.complete(system="s", user="u", prompt_tokens=10, stream=True)
+        assert "hi" in out.text
+
+    asyncio.run(_run())
+    assert sess.posted, "no request recorded"
+    kw = sess.posted[0]
+    assert "timeout" in kw, "streaming post must override the ambient session timeout"
+    assert isinstance(kw["timeout"], aiohttp.ClientTimeout)
+    assert kw["timeout"].total is None
+
+
+def test_response_begin_await_pulses_heartbeat(monkeypatch):
+    """While awaiting response headers (prefill / L4 queue) the client must
+    pulse the stream heartbeat periodically -- the GPU is genuinely working,
+    and the audit-deferral probe + idle watchdog must see ACTIVE."""
+    from backend.core.ouroboros.governance import stream_heartbeat as shb
+    monkeypatch.setenv("JARVIS_STREAM_REQUEST_PULSE_S", "0.05")
+    coop.reset()
+    shb.reset()
+    client = lid.LocalPrimeClient(_cfg(num_ctx=8192), session=_Sess(_StalledEnterCM()))
+
+    async def _run():
+        task = asyncio.ensure_future(
+            client.complete(system="s", user="u", prompt_tokens=10,
+                            stream=True, prefill="p"))
+        await asyncio.sleep(0.4)
+        pulses = shb.pulse_count()
+        coop.request("sigterm")            # release the stalled await
+        with pytest.raises(lid.GracefulStreamInterruption):
+            await task
+        return pulses
+
+    pulses = asyncio.run(_run())
+    assert pulses >= 3, "prefill window must pulse the heartbeat (got %d)" % pulses
