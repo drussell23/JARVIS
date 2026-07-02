@@ -942,6 +942,116 @@ class TestSubprocessIsomorphismPropagation:
         )
 
 
+    # ------------------------------------------------------------------
+    # 4f. --dw-session-budget default is 0.0 when env unset (legacy pin)
+    # ------------------------------------------------------------------
+
+    def test_dw_session_budget_default_zero_when_env_unset(
+        self, monkeypatch: Any,
+    ) -> None:
+        """With JARVIS_ISO_DW_SESSION_BUDGET_USD unset, --dw-session-budget
+        must default to 0.0 -- preserving the legacy $0 multi-vector-awaken
+        starve scenario byte-identical (root cause: run bt-iso-1783033231)."""
+        monkeypatch.delenv("JARVIS_ISO_DW_SESSION_BUDGET_USD", raising=False)
+        parser = _driver_mod.build_arg_parser()
+        args = parser.parse_args([])
+        assert args.dw_session_budget == 0.0, (
+            "Default --dw-session-budget must be 0.0 when "
+            "JARVIS_ISO_DW_SESSION_BUDGET_USD is unset; got %r"
+            % (args.dw_session_budget,)
+        )
+
+    # ------------------------------------------------------------------
+    # 4g. JARVIS_ISO_DW_SESSION_BUDGET_USD sets the --dw-session-budget default
+    # ------------------------------------------------------------------
+
+    def test_dw_session_budget_env_sets_default(self, monkeypatch: Any) -> None:
+        """JARVIS_ISO_DW_SESSION_BUDGET_USD=0.25 must become the
+        --dw-session-budget default when the flag is not passed on argv."""
+        monkeypatch.setenv("JARVIS_ISO_DW_SESSION_BUDGET_USD", "0.25")
+        parser = _driver_mod.build_arg_parser()
+        args = parser.parse_args([])
+        assert args.dw_session_budget == 0.25, (
+            "JARVIS_ISO_DW_SESSION_BUDGET_USD=0.25 must set the "
+            "--dw-session-budget default; got %r" % (args.dw_session_budget,)
+        )
+
+    # ------------------------------------------------------------------
+    # 4h. --dw-session-budget reaches the SoakRunner cost_cap launch seam
+    # ------------------------------------------------------------------
+
+    async def test_dw_session_budget_reaches_soak_runner_cost_cap(
+        self, tmp_path: Path,
+    ) -> None:
+        """--dw-session-budget 0.50 must flow all the way to
+        harness_mod.SoakRunner(cost_cap=0.50) -- the exact seam that fed the
+        hardcoded cost_cap=0.0 root cause (scripts/isomorphic_a1_local.py:1179,
+        pre-fix). Non-stub (stub_soak=False) is required to reach this seam."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        captured_kwargs: List[Dict[str, Any]] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _SpySoakRunner:
+            """Records the launch kwargs, then aborts before any real process
+            spawns -- the broad except at the orchestration try/except
+            (isomorphic_a1_local.py) swallows this and returns rc=1, so we
+            never need to mock the auditor or subprocess machinery."""
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.append(kwargs)
+                raise RuntimeError("capture-only — abort before real soak launch")
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            dw_session_budget=0.50,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "SoakRunner", _SpySoakRunner),
+        ):
+            rc = await driver.run()
+
+        assert rc == 1, "Spy-forced RuntimeError must surface as rc=1 (caught, not raised)"
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("cost_cap") == 0.50, (
+            "--dw-session-budget 0.50 must reach SoakRunner(cost_cap=0.50); "
+            "got kwargs=%r" % (captured_kwargs[0],)
+        )
+
+
 # ===========================================================================
 # Group 5 -- Script invocation (subprocess): catches unit-green/live-fails gap
 # ===========================================================================

@@ -61,6 +61,12 @@ Usage::
     python3 scripts/isomorphic_a1_local.py --stub-soak --mode container
     python3 scripts/isomorphic_a1_local.py                           # live soak
     python3 scripts/isomorphic_a1_local.py --enable-failover         # opt in to real GCE
+    python3 scripts/isomorphic_a1_local.py --dw-session-budget 0.50  # DW rehearsal mode:
+                                                                      # DW is a live generation
+                                                                      # lane for the APPLY tail
+                                                                      # instead of the default
+                                                                      # $0 multi-vector-awaken
+                                                                      # starve scenario.
 """
 from __future__ import annotations
 
@@ -916,6 +922,7 @@ class IsomorphicA1Driver:
         adversary_fault: Optional[str] = None,
         verbose: bool = False,
         enable_failover: bool = False,
+        dw_session_budget: float = 0.0,
         # Injection seam for tests: a zero-arg callable that returns an adversary
         # instance.  None -> use the real SyntheticAdversary from adversary_mod.
         _adversary_factory: Optional[Any] = None,
@@ -930,6 +937,16 @@ class IsomorphicA1Driver:
         self.adversary_fault: Optional[str] = adversary_fault
         self.verbose: bool = verbose
         self.enable_failover: bool = enable_failover
+        # DW rehearsal budget (root cause: scripts/isomorphic_a1_local.py hardcoded
+        # cost_cap=0.0 at the SoakRunner launch, which flows into the battle-test
+        # cost-cap env consumed by session_budget_authority.get_session_remaining_usd()
+        # (Tier 2), producing a $0 SessionBudgetPreflightRefused on every DW dispatch.
+        # That starve IS the intended multi-vector-awaken forcing function in failover
+        # runs -- but without --enable-failover it leaves the organism with ZERO live
+        # providers. Default 0.0 preserves that legacy starve scenario byte-identical;
+        # a nonzero value opts into DW as a live generation lane for the APPLY tail
+        # (the sanctioned DW-powered rehearsal mode).
+        self.dw_session_budget: float = dw_session_budget
         self._adversary_factory: Optional[Any] = _adversary_factory
 
     async def run(self) -> int:
@@ -1176,7 +1193,7 @@ class IsomorphicA1Driver:
                                          "JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0))))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
-                            cost_cap=0.0,
+                            cost_cap=self.dw_session_budget,
                             wall_seconds=_failover_soak_wall(self.enable_failover),
                         )
                         # Register for process-group teardown (finally+atexit+signal)
@@ -1402,6 +1419,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(default: JARVIS_FAILOVER_LIFECYCLE_ENABLED=false is pinned in "
              "child env to prevent accidental GCE spend).",
     )
+    p.add_argument(
+        "--dw-session-budget",
+        type=float,
+        default=float(os.environ.get("JARVIS_ISO_DW_SESSION_BUDGET_USD", "0.0")),
+        help="DW rehearsal mode: session budget in USD threaded into the soak "
+             "child's cost-cap (env: JARVIS_ISO_DW_SESSION_BUDGET_USD, default: "
+             "0.0). Default 0.0 preserves the legacy $0 multi-vector-awaken "
+             "starve scenario byte-identical; a nonzero value makes DW a live "
+             "generation lane for the APPLY tail (the sanctioned DW-powered "
+             "rehearsal mode) instead of a forced provider starve.",
+    )
     return p
 
 
@@ -1428,6 +1456,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
         verbose=args.verbose,
         enable_failover=args.enable_failover,
+        dw_session_budget=args.dw_session_budget,
     )
     return asyncio.run(driver.run())
 
