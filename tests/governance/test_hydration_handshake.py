@@ -89,6 +89,7 @@ def test_multibyte_partial_bytes_not_chars():
 # --- 4. end-to-end: resume dispatch emits the prefill handshake -------------
 
 def test_resume_dispatch_emits_prefill_handshake(tmp_path, monkeypatch, caplog, capsys):
+    monkeypatch.setenv("JARVIS_JPRIME_DISPATCH_READY_ENABLED", "false")  # gate predates this test
     monkeypatch.setenv("JARVIS_CHECKPOINT_DIR", str(tmp_path / "cp"))
     monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "hs")
     import json
@@ -109,7 +110,7 @@ def test_resume_dispatch_emits_prefill_handshake(tmp_path, monkeypatch, caplog, 
             pass
 
     class _FakeProvider:
-        def __init__(self, client, repo_root=None):
+        def __init__(self, client, repo_root=None, **_kw):  # venom/dilation kwargs
             self._client = client
         async def generate(self, context, deadline):
             # Prove the prefill actually reached the client.

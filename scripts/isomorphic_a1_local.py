@@ -511,17 +511,42 @@ _ready_budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
 _failover_wall = _ready_budget + 600.0  # ~90s boot + audit + slack; READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
 
 
+def _expected_agentic_cycle_s() -> float:
+    """Arm-time derivation of ONE full multi-round agentic cycle on the heavy
+    tier (Slice-47-safe: computed BEFORE launch, immutable once armed -- the
+    running wall stays blind to application state).
+
+    cycle = rounds x (cold-round seed x heavy-mult x ctx-factor) -- the SAME
+    physics the LatencyProfiler's ``_cold_seed_ms`` uses, so the wall and the
+    per-round budgets are derived from one model. ``JARVIS_HYBRID_MESH_
+    EXPECTED_NUM_CTX`` (default 16384) is the arm-time expectation of the
+    negotiated window (the runtime Negotiator measures the real one). Floored
+    at the legacy 600s margin; falls back to 600 on any error."""
+    try:
+        rounds = max(1, int(_env_float("JARVIS_A1_MAX_AGENTIC_ROUNDS", 5.0)))
+        seed_s = _env_float("JARVIS_LOCAL_INFERENCE_TIMEOUT_SEED_MS", 30_000.0) / 1000.0
+        mult = max(1.0, _env_float("JARVIS_JPRIME_HEAVY_COLDSTART_MULT", 4.0))
+        baseline = max(1.0, _env_float("JARVIS_LOCAL_SEED_CTX_BASELINE", 8192.0))
+        expected_ctx = max(1.0, _env_float("JARVIS_HYBRID_MESH_EXPECTED_NUM_CTX", 16384.0))
+        ctx_factor = max(1.0, expected_ctx / baseline)
+        return max(600.0, rounds * seed_s * mult * ctx_factor)
+    except Exception:  # noqa: BLE001 -- arm-time sizing must never block ignition
+        return 600.0
+
+
 def _failover_soak_wall(enable_failover: bool) -> int:
     """Return the soak-child wall-clock budget in seconds.
 
     enable_failover=False -> 300 (byte-identical default).
-    enable_failover=True  -> READY_BUDGET_S + 600 to accommodate 32B cold-start.
-    # READY_BUDGET_S + 600 < harness --max-wall-seconds (2400)
+    enable_failover=True  -> READY_BUDGET_S + _expected_agentic_cycle_s() --
+    the margin is DERIVED from round physics at arm time (was a static +600
+    that the 32B's multi-round loops outlived every run). Keep the result
+    below the harness --max-wall-seconds.
     """
     if not enable_failover:
         return 300
     budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
-    return int(budget + 600.0)
+    return int(budget + _expected_agentic_cycle_s())
 
 
 def _probe_api_tags(url: str) -> int:
@@ -1043,6 +1068,13 @@ class IsomorphicA1Driver:
                     # (bt-iso-1782957492). Driver teardown + Dead-Man's Switch
                     # remain the cost backstops.
                     env.setdefault("JARVIS_FAILOVER_HANDBACK_ENABLED", "false")
+                    # Arm-time adaptive audit patience: the deferral absolute
+                    # ceiling is DERIVED from the same round physics as the
+                    # soak wall (one model, no magic numbers) -- the verdict
+                    # can outwait one full multi-round agentic cycle.
+                    _cycle_s = str(int(_expected_agentic_cycle_s()))
+                    env.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)
+                    os.environ.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)
 
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).
