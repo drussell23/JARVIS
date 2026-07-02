@@ -1079,7 +1079,7 @@ class IsomorphicA1Driver:
                     # Scenario-premise config, like the handback pin: the
                     # physics formulas assume exclusive node access; give the
                     # soak exactly that.
-                    env.setdefault("JARVIS_BG_POOL_SIZE", "1")
+                    env["JARVIS_BG_POOL_SIZE"] = "1"  # HARD: compose_env manifest sets 6
                     _cycle_s = str(int(_expected_agentic_cycle_s()))
                     env.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)
                     os.environ.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)
