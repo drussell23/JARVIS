@@ -77,8 +77,12 @@ def test_capture_none_without_op_id():
 
 def test_write_list_and_mark_resumed(tmp_path):
     base = str(tmp_path)
-    c1 = ckpt.FSMCheckpoint(op_id="op-a", phase="GENERATE", created_at=1.0)
-    c2 = ckpt.FSMCheckpoint(op_id="op-b", phase="VALIDATE", created_at=2.0)
+    # Recent-but-ordered timestamps: this test proves oldest-first ORDERING,
+    # not TTL behavior -- absolute epoch-1970 stamps would now read as
+    # TTL-expired under the default JARVIS_CHECKPOINT_TTL_S (24h).
+    now = time.time()
+    c1 = ckpt.FSMCheckpoint(op_id="op-a", phase="GENERATE", created_at=now - 20.0)
+    c2 = ckpt.FSMCheckpoint(op_id="op-b", phase="VALIDATE", created_at=now - 10.0)
     assert ckpt.write_checkpoint(c1, base_dir=base)
     assert ckpt.write_checkpoint(c2, base_dir=base)
     pending = ckpt.list_pending(base_dir=base)
@@ -206,3 +210,42 @@ def test_hydrate_leaves_pending_on_ingest_failure(tmp_path, monkeypatch):
     ckpt.hydrate_pending_checkpoints(_boom, base_dir=base)
     # ingest failed -> NOT consumed -> still pending for the next boot.
     assert [c.op_id for c in ckpt.list_pending(base_dir=base)] == ["op-f"]
+
+
+# --- Checkpoint TTL expiry (stale-backlog boot inflation, bt-iso-1783035104) -
+
+def test_ttl_fresh_checkpoint_survives_list_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "ttl-secret")
+    base = str(tmp_path)
+    cp = ckpt.FSMCheckpoint(op_id="op-fresh", phase="GENERATE", created_at=time.time())
+    assert ckpt.write_checkpoint(cp, base_dir=base)
+    assert [c.op_id for c in ckpt.list_pending(base_dir=base)] == ["op-fresh"]
+
+
+def test_ttl_expired_checkpoint_excluded_and_moved_others_still_verify(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "ttl-secret")
+    monkeypatch.setenv("JARVIS_CHECKPOINT_TTL_S", "100")
+    base = str(tmp_path)
+    stale = ckpt.FSMCheckpoint(op_id="op-stale", phase="GENERATE", created_at=time.time() - 200.0)
+    fresh = ckpt.FSMCheckpoint(op_id="op-fresh2", phase="GENERATE", created_at=time.time())
+    assert ckpt.write_checkpoint(stale, base_dir=base)
+    assert ckpt.write_checkpoint(fresh, base_dir=base)
+
+    pending = ckpt.list_pending(base_dir=base)
+    assert [c.op_id for c in pending] == ["op-fresh2"]   # stale excluded, fresh still verifies
+
+    import os
+    expired_path = os.path.join(ckpt.checkpoint_dir(base), "expired", "op-stale.json")
+    assert os.path.isfile(expired_path)   # moved to expired/, never deleted (audit trail, §8)
+    stale_path = os.path.join(ckpt.checkpoint_dir(base), "op-stale.json")
+    assert not os.path.isfile(stale_path)
+
+
+def test_ttl_zero_disables_expiry_legacy_include_all(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "ttl-secret")
+    monkeypatch.setenv("JARVIS_CHECKPOINT_TTL_S", "0")
+    base = str(tmp_path)
+    ancient = ckpt.FSMCheckpoint(op_id="op-ancient", phase="GENERATE", created_at=1.0)
+    assert ckpt.write_checkpoint(ancient, base_dir=base)
+    # TTL=0 -> legacy include-all, even a 1970-epoch checkpoint survives.
+    assert [c.op_id for c in ckpt.list_pending(base_dir=base)] == ["op-ancient"]

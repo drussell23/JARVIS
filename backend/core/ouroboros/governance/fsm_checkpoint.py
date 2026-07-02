@@ -171,7 +171,12 @@ class FSMCheckpoint:
     # emit_source + emit_wall_ts (the original emit hop evidence), resume_count.
     # Rides INSIDE the HMAC-signed payload => tamper-evident nametag.
     trace_lineage: Dict[str, Any] = field(default_factory=dict)
-    created_at: float = 0.0
+    # Persisted creation timestamp (epoch seconds) -- the TTL expiry keys off
+    # THIS field. Real checkpoints always get an explicit time.time() from
+    # capture_from_context(); a default_factory (not a static 0.0) means a
+    # test/caller that omits it still gets a sane "now" rather than looking
+    # instantly TTL-expired (epoch 0).
+    created_at: float = field(default_factory=time.time)
     resume_reason: str = ""
     schema_version: int = _SCHEMA_VERSION
 
@@ -300,14 +305,50 @@ def write_checkpoint(cp: FSMCheckpoint, *, base_dir: "Optional[str]" = None) -> 
         return None
 
 
+def _checkpoint_ttl_s() -> float:
+    """TTL (seconds) for a pending checkpoint before it is excluded from resume
+    (env ``JARVIS_CHECKPOINT_TTL_S``, default 86400 = 24h). ``0`` disables expiry
+    (legacy include-all). NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_CHECKPOINT_TTL_S", "").strip()
+        return float(raw) if raw else 86400.0
+    except Exception:  # noqa: BLE001
+        return 86400.0
+
+
+def _expire_checkpoint(checkpoint_dir_path: str, name: str, op_id: str, age_s: float) -> None:
+    """Move a stale checkpoint file to the ``expired/`` subdir (audit trail --
+    §8, never deleted) + emit one WARNING naming op_id + age. NEVER raises."""
+    try:
+        expired_dir = os.path.join(checkpoint_dir_path, "expired")
+        os.makedirs(expired_dir, exist_ok=True)
+        os.replace(
+            os.path.join(checkpoint_dir_path, name),
+            os.path.join(expired_dir, name),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    logger.warning(
+        "[fsm_checkpoint] EXPIRED op=%s age=%.0fs (TTL exceeded) -> moved to "
+        "expired/ (stale campaign backlog, NOT resumed -- was inflating boot "
+        "latency and re-running every session, bt-iso-1783035104)",
+        op_id, age_s,
+    )
+
+
 def list_pending(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
     """All un-resumed checkpoints whose HMAC VERIFIES (oldest first). Corrupt,
     tampered, empty, or unsigned files are REJECTED (fail-closed) + logged, never
-    returned -- zero corrupted executions. NEVER raises."""
+    returned -- zero corrupted executions. Checkpoints older than
+    ``JARVIS_CHECKPOINT_TTL_S`` (default 24h) are EXCLUDED and moved to an
+    ``expired/`` subdir (audit trail, never deleted) -- stale campaigns must not
+    resurrect every session and inflate boot latency (bt-iso-1783035104).
+    NEVER raises."""
     out: List[FSMCheckpoint] = []
     try:
         d = checkpoint_dir(base_dir)
         key = _checkpoint_key(base_dir)
+        ttl_s = _checkpoint_ttl_s()
         names = [n for n in os.listdir(d) if n.endswith(".json") and not n.endswith(".tmp")]
         for n in sorted(names):
             try:
@@ -322,6 +363,11 @@ def list_pending(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
                     )
                     continue
                 _cp = FSMCheckpoint.from_json(payload_json)
+                if ttl_s > 0:
+                    age_s = time.time() - float(_cp.created_at or 0.0)
+                    if age_s > ttl_s:
+                        _expire_checkpoint(d, n, _cp.op_id, age_s)
+                        continue
                 # Atomic Hydration Handshake (facet 1): positive proof the signature
                 # verified -- symmetric with the REJECT log above, forced to stdout.
                 emit_handshake(format_verified_handshake(_cp.op_id, _cp.phase, sig or ""))

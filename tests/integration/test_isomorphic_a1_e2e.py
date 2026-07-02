@@ -71,6 +71,8 @@ OpLineageGraph = _auditor.OpLineageGraph
 _driver_mod = _load_script("isomorphic_a1_local")
 _touch_chaos_files = _driver_mod._touch_chaos_files
 _derive_scoped_test_targets = _driver_mod._derive_scoped_test_targets
+_derive_router_ready_timeout_s = _driver_mod._derive_router_ready_timeout_s
+_failover_soak_wall = _driver_mod._failover_soak_wall
 IsomorphicA1Driver = _driver_mod.IsomorphicA1Driver
 
 
@@ -941,6 +943,163 @@ class TestSubprocessIsomorphismPropagation:
             "JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT=1 is set; got %r" % zs_calls
         )
 
+    # ------------------------------------------------------------------
+    # 4e2. Wall-Scaled Router-Readiness Cap (bt-iso-1783035104)
+    # ------------------------------------------------------------------
+
+    def test_router_ready_timeout_composed_when_unset(self, tmp_path: Path) -> None:
+        """When JARVIS_A1_ROUTER_READY_TIMEOUT_S is NOT already set by the
+        operator, the driver composes it as max(60, wall/8) from the scenario's
+        wall (_failover_soak_wall) -- the driver owns the scenario's physics,
+        not a flat 60s constant."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _CapturingAuditor:
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                vpath = kwargs.get("verdict_out", "")
+                v: Dict[str, Any] = {"proven": False, "failure_locus": "test"}
+                if vpath:
+                    Path(vpath).parent.mkdir(parents=True, exist_ok=True)
+                    Path(vpath).write_text(json.dumps(v))
+                return v
+
+        original_compose = harness_mod.compose_env
+        env_ref: List[Dict[str, str]] = []
+
+        def _capturing_compose(**kwargs: Any) -> Dict[str, str]:
+            env = original_compose(**kwargs)
+            env.pop("JARVIS_A1_ROUTER_READY_TIMEOUT_S", None)  # ensure genuinely unset
+            env.pop("OUROBOROS_BATTLE_MAX_WALL_SECONDS", None)
+            env_ref.append(env)
+            return env
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=True,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,  # -> _failover_soak_wall(False) == 300
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "compose_env", _capturing_compose),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "StubAuditorRunner", lambda **kw: _CapturingAuditor()),
+        ):
+            import asyncio
+            asyncio.run(driver.run())
+
+        assert env_ref, "compose_env must have been called"
+        final_env = env_ref[0]
+        expected = _derive_router_ready_timeout_s(_failover_soak_wall(False))
+        assert float(final_env.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S", "-1")) == expected, (
+            "Driver must compose JARVIS_A1_ROUTER_READY_TIMEOUT_S=max(60, wall/8) "
+            "when unset; got %r (expected %r)"
+            % (final_env.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S"), expected)
+        )
+
+    def test_router_ready_timeout_respects_operator_override(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """An operator-set JARVIS_A1_ROUTER_READY_TIMEOUT_S must survive
+        composition untouched (setdefault semantics, never override)."""
+        monkeypatch.setenv("JARVIS_A1_ROUTER_READY_TIMEOUT_S", "12345")
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19996/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _CapturingAuditor:
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                vpath = kwargs.get("verdict_out", "")
+                v: Dict[str, Any] = {"proven": False, "failure_locus": "test"}
+                if vpath:
+                    Path(vpath).parent.mkdir(parents=True, exist_ok=True)
+                    Path(vpath).write_text(json.dumps(v))
+                return v
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=True,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "StubAuditorRunner", lambda **kw: _CapturingAuditor()),
+        ):
+            import asyncio
+            asyncio.run(driver.run())
+
+        # The operator's value must ride through os.environ -> compose_env's
+        # dict(os.environ) base -> untouched by the driver's setdefault.
+        assert os.environ.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S") == "12345"
+
+    def test_derive_router_ready_timeout_s_formula(self) -> None:
+        """Pure-function proof of the max(60, wall/8) formula."""
+        assert _derive_router_ready_timeout_s(300) == 60.0     # floored at legacy 60s
+        assert _derive_router_ready_timeout_s(480) == 60.0     # 480/8 == 60, boundary
+        assert _derive_router_ready_timeout_s(2400) == 300.0   # 2400/8 == 300
+        assert _derive_router_ready_timeout_s(4800) == 600.0
 
     # ------------------------------------------------------------------
     # 4f. --dw-session-budget default is 0.0 when env unset (legacy pin)

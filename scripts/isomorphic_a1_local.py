@@ -555,6 +555,20 @@ def _failover_soak_wall(enable_failover: bool) -> int:
     return int(budget + _expected_agentic_cycle_s())
 
 
+def _derive_router_ready_timeout_s(wall_seconds: float) -> float:
+    """Wall-Scaled Router-Readiness Cap (bt-iso-1783035104): the roadmap
+    daemon's intake-router readiness gate (``JARVIS_A1_ROUTER_READY_TIMEOUT_S``,
+    ``governed_loop_service.await_router_ready``) trips its circuit breaker when
+    intake-router boot exceeds the cap -- a flat 60s default is too tight for a
+    scenario whose composed wall legitimately needs a longer cold boot (e.g. a
+    large stale-checkpoint backlog before TTL expiry reaps it, or any other
+    boot-latency-inflating condition). The driver owns the scenario's physics,
+    so the cap SCALES with the scenario's wall (1/8th of it) rather than a
+    hardcoded constant -- floored at the legacy 60s default so short scenarios
+    are byte-identical."""
+    return max(60.0, float(wall_seconds) / 8.0)
+
+
 def _probe_api_tags(url: str) -> int:
     """Blocking HTTP GET of the inference server's ``/api/tags`` -> status code.
 
@@ -1012,6 +1026,23 @@ class IsomorphicA1Driver:
                 # CADENCE_POLICY) + adversary overrides.
                 env: Dict[str, str] = harness_mod.compose_env()
                 env.update(adversary.env_overrides())
+
+                # Wall-Scaled Router-Readiness Cap (bt-iso-1783035104): derive
+                # JARVIS_A1_ROUTER_READY_TIMEOUT_S from THIS scenario's composed
+                # wall rather than the flat 60s default -- the driver owns the
+                # scenario's physics. OUROBOROS_BATTLE_MAX_WALL_SECONDS may
+                # already be inherited from the operator's shell (compose_env()
+                # copies os.environ); otherwise fall back to the same wall this
+                # soak child is bound to (_failover_soak_wall). Operator env
+                # ALWAYS wins -- setdefault, never override.
+                _composed_wall_s = float(
+                    env.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "").strip()
+                    or _failover_soak_wall(self.enable_failover)
+                )
+                env.setdefault(
+                    "JARVIS_A1_ROUTER_READY_TIMEOUT_S",
+                    str(_derive_router_ready_timeout_s(_composed_wall_s)),
+                )
 
                 # Safety pin: prevent a local fidelity run from triggering a real
                 # GCE awaken attempt.  The any-route outage window has no time-decay,
