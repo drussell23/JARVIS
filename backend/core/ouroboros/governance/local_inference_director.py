@@ -123,6 +123,45 @@ def estimate_tokens(text: Any) -> int:
         return 0
 
 
+def expected_agentic_cycle_s(profiler: "Optional[LatencyProfiler]" = None,
+                             *, num_ctx: "Optional[int]" = None) -> float:
+    """THE shared time-physics formula: expected wall for ONE full multi-round
+    agentic cycle = rounds x expected-single-round wall.
+
+    EWMA-COUPLED when a calibrated ``LatencyProfiler`` is supplied
+    (``adaptive_timeout_ms`` -- the GPU speeding up shrinks the cycle
+    automatically); otherwise the cold-seed physics the profiler itself uses
+    (seed x heavy-mult x ctx-factor). ``num_ctx`` defaults to the configured
+    window, else the arm-time expectation ``JARVIS_HYBRID_MESH_EXPECTED_
+    NUM_CTX`` (16384). Consumed by the BudgetPlan hint, the Time-Dilated
+    Sovereign Deadline, the sovereign GENERATE physics floor, and the
+    driver's arm-time walls -- ONE model, no magic numbers. NEVER raises."""
+    rounds = 5
+    try:
+        rounds = max(1, int(float(os.environ.get(
+            "JARVIS_A1_MAX_AGENTIC_ROUNDS", "5") or 5)))
+        if profiler is not None:
+            try:
+                est_ms = float(profiler.adaptive_timeout_ms(
+                    prompt_tokens=max(1, int(num_ctx or 4096) // 4)))
+                return rounds * est_ms / 1000.0
+            except Exception:  # noqa: BLE001 -- fall back to cold physics
+                pass
+        cfg = LocalConfig.from_env()
+        seed_s = float(getattr(cfg, "timeout_seed_ms", 30_000) or 30_000) / 1000.0
+        mult = max(1.0, float(os.environ.get(
+            "JARVIS_JPRIME_HEAVY_COLDSTART_MULT", "4.0") or 4.0))
+        baseline = max(1.0, float(os.environ.get(
+            "JARVIS_LOCAL_SEED_CTX_BASELINE", "8192") or 8192))
+        ctx = float(num_ctx or getattr(cfg, "num_ctx", 0) or 0)
+        if ctx <= 0:
+            ctx = float(os.environ.get(
+                "JARVIS_HYBRID_MESH_EXPECTED_NUM_CTX", "16384") or 16384)
+        return rounds * seed_s * mult * max(1.0, ctx / baseline)
+    except Exception:  # noqa: BLE001 -- physics sizing must never break a caller
+        return rounds * 120.0
+
+
 def derive_safe_num_ctx(
     *,
     vram_bytes: int,
