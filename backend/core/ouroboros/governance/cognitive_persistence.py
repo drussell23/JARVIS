@@ -279,3 +279,72 @@ def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> O
 
 def inject_metrics(cache: PriorKnowledgeCache) -> "tuple[bool, int]":
     return (is_enabled() and len(cache) > 0, len(cache))
+
+
+# Task 4: distiller + terminal-time fire-and-forget recorder (write path)
+
+
+def distill_experiences(
+    records: List[Any],
+    *,
+    footprint: str,
+    terminal_reason: Optional[str],
+    phase: Optional[str],
+) -> List[CognitiveExperience]:
+    """Pure distillation of per-op tool records into cross-session experiences."""
+    out: List[CognitiveExperience] = []
+    for rec in records or []:
+        try:
+            status = getattr(getattr(rec, "status", None), "value", "") or ""
+            err = getattr(rec, "error_class", None)
+            if status == "ok" or not err:
+                continue
+            kind = (
+                ExperienceKind.HALLUCINATED_TOOL
+                if "unknown_tool" in str(err)
+                else ExperienceKind.FAILED_TOOL_PATTERN
+            )
+            out.append(CognitiveExperience(
+                kind=kind, footprint=footprint,
+                subject=sanitize_token(getattr(rec, "tool_name", "")),
+                error_class=sanitize_token(str(err), 96),
+            ))
+        except Exception:
+            continue
+    if terminal_reason:
+        out.append(CognitiveExperience(
+            kind=ExperienceKind.GENERATION_FAILURE, footprint=footprint,
+            subject=sanitize_token(phase or "UNKNOWN"),
+            error_class=sanitize_token(str(terminal_reason), 96),
+        ))
+    return out
+
+
+def record_terminal_experiences_fire_and_forget(
+    records: List[Any], *, footprint: str,
+    terminal_reason: Optional[str], phase: Optional[str], op_id: str,
+) -> None:
+    """Bounded background write. Never raises; no-op when disabled."""
+    if not is_enabled():
+        return
+    exps = distill_experiences(
+        records, footprint=footprint, terminal_reason=terminal_reason, phase=phase,
+    )
+    if not exps:
+        return
+
+    async def _write() -> None:
+        store = await get_default_store()
+        if store is None:
+            return
+        for exp in exps[:20]:  # per-op write cap
+            await store.record(exp, op_id=op_id)
+        logger.info(
+            "[CognitivePersistence] op=%s recorded=%d footprint=%s", op_id,
+            len(exps[:20]), footprint,
+        )
+
+    try:
+        asyncio.get_running_loop().create_task(_write())
+    except RuntimeError:
+        logger.debug("[CognitivePersistence] no running loop; write skipped")

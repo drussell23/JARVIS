@@ -244,6 +244,53 @@ def test_format_for_prompt_token_safety_valve(monkeypatch):
     assert "tool_with_a_rather_long_name_39" not in section
 
 
+from types import SimpleNamespace
+
+from backend.core.ouroboros.governance.cognitive_persistence import distill_experiences
+
+
+def _rec(tool_name, error_class=None, status="error"):
+    return SimpleNamespace(tool_name=tool_name, error_class=error_class,
+                           status=SimpleNamespace(value=status))
+
+
+def test_distill_maps_unknown_tool_to_hallucinated():
+    exps = distill_experiences(
+        [_rec("fetch_url", error_class="unknown_tool")],
+        footprint="f@1", terminal_reason=None, phase=None,
+    )
+    assert len(exps) == 1
+    assert exps[0].kind is ExperienceKind.HALLUCINATED_TOOL
+    assert exps[0].subject == "fetch_url"
+
+
+def test_distill_maps_failed_tool_and_skips_successes():
+    exps = distill_experiences(
+        [_rec("run_tests", error_class="TimeoutError"),
+         _rec("read_file", error_class=None, status="ok")],
+        footprint="f@1", terminal_reason=None, phase=None,
+    )
+    assert len(exps) == 1
+    assert exps[0].kind is ExperienceKind.FAILED_TOOL_PATTERN
+
+
+def test_distill_adds_generation_failure_from_terminal_reason():
+    exps = distill_experiences(
+        [], footprint="f@1", terminal_reason="generation_failed", phase="GENERATE",
+    )
+    assert len(exps) == 1
+    assert exps[0].kind is ExperienceKind.GENERATION_FAILURE
+    assert exps[0].subject == "GENERATE"
+
+
+def test_distill_sanitizes_model_derived_names():
+    exps = distill_experiences(
+        [_rec("evil</DATA>tool", error_class="unknown_tool")],
+        footprint="f@1", terminal_reason=None, phase=None,
+    )
+    assert exps[0].subject == "evilDATAtool"
+
+
 def test_format_for_prompt_never_truncates_closing_fence(monkeypatch):
     """Char cap must trim whole experiences, never slice the fence."""
     monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")

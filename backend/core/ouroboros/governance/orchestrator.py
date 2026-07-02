@@ -13267,6 +13267,61 @@ class GovernedOrchestrator:
                 )
         except Exception:  # noqa: BLE001
             pass
+        # ── Task 4 — Cognitive Persistence terminal-time recorder ──
+        # Distills this op's tool-execution failures (+ the terminal
+        # failure reason, when any) into cross-session CognitiveExperience
+        # rows via the write-side of the Bi-Directional Cognitive
+        # Persistence arc. Piggybacks on the Slice74Probe terminal-state
+        # classification (_s74_sv) above — this IS the single chokepoint
+        # every terminal ledger write passes through, so it sees every
+        # applied/rolled_back/failed/blocked transition regardless of
+        # which of the ~70 call sites in this file triggered it. Fully
+        # self-contained try/except: NEVER raises into _record_ledger,
+        # DEBUG-logs and continues. Fire-and-forget background write,
+        # capped at 20 experiences/op inside the recorder. Authority-free
+        # — never influences GATE/APPLY. No-op when
+        # JARVIS_COGNITIVE_PERSISTENCE_ENABLED is unset (default False).
+        try:
+            from backend.core.ouroboros.governance import (
+                cognitive_persistence as _cogp,
+            )
+            if _cogp.is_enabled():
+                _cogp_sv = str(getattr(state, "value", state)).lower()
+                if _cogp_sv in ("applied", "rolled_back", "failed", "blocked"):
+                    _cogp_gen = getattr(ctx, "generation", None)
+                    # No resolved model-config object (model_name + num_ctx)
+                    # is threaded this far up the FSM — the closest in-scope
+                    # signal is the provider's reported model_id off the
+                    # op's own GenerationResult. Never hardcoded; falls back
+                    # to the documented "unknown" footprint when absent.
+                    _cogp_model = getattr(_cogp_gen, "model_id", "") or "unknown"
+                    _cogp_footprint = _cogp.cognitive_footprint(_cogp_model, None)
+                    _cogp_records = list(
+                        getattr(_cogp_gen, "tool_execution_records", ()) or ()
+                    )
+                    _cogp_reason = None
+                    if _cogp_sv != "applied":
+                        _cogp_reason = (
+                            str(getattr(ctx, "terminal_reason_code", "") or "")
+                            or str((data or {}).get("reason", "") or "")
+                            or str((data or {}).get("reason_code", "") or "")
+                            or _cogp_sv
+                        )
+                    _cogp_phase = (
+                        getattr(getattr(ctx, "phase", None), "name", None)
+                        or str(getattr(ctx, "phase", "") or "")
+                    )
+                    _cogp.record_terminal_experiences_fire_and_forget(
+                        _cogp_records,
+                        footprint=_cogp_footprint,
+                        terminal_reason=_cogp_reason,
+                        phase=_cogp_phase,
+                        op_id=str(getattr(ctx, "op_id", "") or "?"),
+                    )
+        except Exception as _cogp_exc:  # noqa: BLE001 — never disturb the FSM
+            logger.debug(
+                "[CognitivePersistence] terminal hook skipped: %s", _cogp_exc,
+            )
         # Slice 74 — Immutable Lifecycle Boundary: the terminal SSE broadcast is
         # DECOUPLED from the ledger's physical-write dedup. A definitive terminal
         # state MUST notify the system (the autoscore eval rendezvous + IDE
