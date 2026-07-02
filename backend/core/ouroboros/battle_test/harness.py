@@ -827,7 +827,14 @@ class BattleTestHarness:
             if _silent_boot_handler is not None:
                 # Retain reference so the harness can close it
                 # explicitly on shutdown (Slice 7 follow-up #4 path).
-                self._log_file_path = _silent_boot_handler.baseFilename
+                # baseFilename is duck-typed (NonBlockingQueueHandler
+                # or legacy FileHandler both expose it per the
+                # configure_silent_boot contract) — getattr keeps
+                # this structurally honest under the widened
+                # Optional[logging.Handler] return type.
+                self._log_file_path = getattr(
+                    _silent_boot_handler, "baseFilename", None,
+                )
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[harness] silent_boot setup failed; falling back "
@@ -2207,7 +2214,7 @@ class BattleTestHarness:
                     )
                     _sb_installed = any(
                         getattr(_h, _SB_MARKER, False)
-                        and isinstance(_h, logging.FileHandler)
+                        and hasattr(_h, "baseFilename")
                         for _h in _root.handlers
                     )
                     if _sb_installed:

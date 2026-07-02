@@ -179,3 +179,79 @@ def test_register_flags_seeds_all_knobs():
     assert n == 7
     spec = registry.get_spec("JARVIS_HEADLESS_TELEMETRY_ENABLED")
     assert spec is not None and spec.default is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: silent_boot wires the non-blocking pipeline (Task L2)
+# ---------------------------------------------------------------------------
+
+import backend.core.ouroboros.governance.silent_boot as sb
+
+
+def _cleanup_root():
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if getattr(h, sb._HANDLER_MARKER, False):
+            root.removeHandler(h)
+            h.close()
+
+
+def test_silent_boot_installs_nonblocking_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_HEADLESS_TELEMETRY_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_SILENT_BOOT_ENABLED", "true")
+    try:
+        handler = sb.configure_silent_boot(tmp_path / "sess")
+        assert isinstance(handler, NonBlockingQueueHandler)
+        assert handler.baseFilename.endswith("debug.log")
+        # Idempotency: second call returns the SAME handler, no double-install
+        again = sb.configure_silent_boot(tmp_path / "sess")
+        assert again is handler
+        marked = [
+            h for h in logging.getLogger().handlers
+            if getattr(h, sb._HANDLER_MARKER, False)
+            and hasattr(h, "baseFilename")
+        ]
+        assert len(marked) == 1
+    finally:
+        _cleanup_root()
+
+
+def test_silent_boot_flag_off_uses_legacy_filehandler(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_HEADLESS_TELEMETRY_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_SILENT_BOOT_ENABLED", "true")
+    try:
+        handler = sb.configure_silent_boot(tmp_path / "sess")
+        assert type(handler) is logging.FileHandler  # byte-identical legacy
+    finally:
+        _cleanup_root()
+
+
+def test_silent_boot_falls_back_when_pipeline_build_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_HEADLESS_TELEMETRY_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_SILENT_BOOT_ENABLED", "true")
+    import backend.core.ouroboros.governance.headless_telemetry as ht
+
+    def _boom(*a, **k):
+        raise RuntimeError("pipeline exploded")
+
+    monkeypatch.setattr(ht, "build_nonblocking_handler", _boom)
+    try:
+        handler = sb.configure_silent_boot(tmp_path / "sess")
+        assert type(handler) is logging.FileHandler  # fail-soft fallback
+    finally:
+        _cleanup_root()
+
+
+def test_silent_boot_installs_heartbeat_on_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_HEADLESS_TELEMETRY_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_SILENT_BOOT_ENABLED", "true")
+    try:
+        sb.configure_silent_boot(tmp_path / "sess")
+        hbs = [
+            h for h in logging.getLogger().handlers
+            if isinstance(h, HeartbeatConsoleHandler)
+        ]
+        assert len(hbs) == 1
+        assert getattr(hbs[0], sb._HANDLER_MARKER, False)
+    finally:
+        _cleanup_root()
