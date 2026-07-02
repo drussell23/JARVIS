@@ -5875,6 +5875,27 @@ class GovernedLoopService:
                 on_op_active_unregister=_bg_unregister_active,
             )
             await self._bg_pool.start()
+            # Dynamic Fleet Registry Service Discovery: lanes TRACK the mesh.
+            # While sovereign endpoints serve, the worker count locks to the
+            # node count (one GPU = one lane; an N-node fleet = N lanes);
+            # when the fleet empties, the configured size restores. The
+            # Immutability Lock rejects env/manifest writers meanwhile.
+            try:
+                from backend.core.ouroboros.governance.fleet_registry import (  # noqa: PLC0415
+                    get_fleet_registry,
+                )
+                _pool_ref = self._bg_pool
+                _configured = int(self._bg_pool._pool_size)
+                get_fleet_registry().subscribe(
+                    lambda snap: _fleet_lane_sync(_pool_ref, _configured, snap)
+                )
+                # Reconcile against the CURRENT fleet too (a node may already
+                # be serving when the pool boots -- resume/rebind paths).
+                _fleet_lane_sync(
+                    _pool_ref, _configured, get_fleet_registry().snapshot()
+                )
+            except Exception:  # noqa: BLE001 -- discovery is enhancement, never blocks boot
+                logger.debug("[GLS] fleet lane sync wiring skipped", exc_info=True)
             logger.info(
                 "[GLS] BackgroundAgentPool started (pool_size=%d, queue_size=%d)",
                 self._bg_pool._pool_size, self._bg_pool._queue_size,
@@ -7318,3 +7339,24 @@ class GovernedLoopService:
             logger.warning("[GovernedLoop] L3 graph abort: graph_id=%s aborted=%s", graph_id, aborted)
         else:
             logger.debug("[GovernedLoop] Unhandled command: %s", ct)
+
+
+def _fleet_lane_sync(pool: Any, configured_size: int, snapshot: "Dict[str, str]") -> None:
+    """Topology observer -> pool lane target (Dynamic Fleet Service Discovery).
+
+    Non-empty fleet snapshot => lanes strictly equal the serving sovereign
+    node count, LOCKED (hardware-derived truth overrides env/manifest).
+    Empty fleet => the configured size restores, unlocked (DW-era regime).
+    The snapshot dict is structurally extensible -- future golden-image
+    topology payloads (VRAM, tiers) can weight lanes here without touching
+    the observer channel. NEVER raises."""
+    try:
+        _nodes = len(snapshot or {})
+        if _nodes > 0:
+            pool.set_target_pool_size(_nodes, source="fleet_topology", lock=True)
+        else:
+            pool.set_target_pool_size(
+                max(1, int(configured_size)), source="fleet_topology", lock=False,
+            )
+    except Exception:  # noqa: BLE001 -- lane sync must never break the fleet path
+        logger.debug("[GLS] fleet lane sync fail-soft", exc_info=True)

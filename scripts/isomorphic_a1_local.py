@@ -1072,14 +1072,11 @@ class IsomorphicA1Driver:
                     # ceiling is DERIVED from the same round physics as the
                     # soak wall (one model, no magic numbers) -- the verdict
                     # can outwait one full multi-round agentic cycle.
-                    # One L4 = ONE generation lane (bt-iso-1782980003: the
-                    # 32B ran a REAL 3-round tool chain but 5 concurrent pool
-                    # ops serialized on the single GPU inflated every op's
-                    # effective round time by queue depth -- nobody finished).
-                    # Scenario-premise config, like the handback pin: the
-                    # physics formulas assume exclusive node access; give the
-                    # soak exactly that.
-                    env["JARVIS_BG_POOL_SIZE"] = "1"  # HARD: compose_env manifest sets 6
+                    # Lane count: Dynamic Fleet Registry Service Discovery
+                    # (governed_loop_service._fleet_lane_sync) -- the pool
+                    # tracks serving sovereign endpoints live (one GPU = one
+                    # lane). The former hard-assign is deprecated; the
+                    # Immutability Lock also defeats the manifest's static 6.
                     _cycle_s = str(int(_expected_agentic_cycle_s()))
                     env.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)
                     os.environ.setdefault("JARVIS_A1_AUDIT_DEFER_ABSOLUTE_S", _cycle_s)

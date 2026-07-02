@@ -27,6 +27,34 @@ class FleetRegistry:
     def __init__(self) -> None:
         self._endpoints: Dict[str, str] = {}
         self._lock = threading.Lock()
+        # Topology observers (Dynamic Fleet Service Discovery): called with
+        # the post-change SNAPSHOT dict on every register/unregister. The
+        # dict payload is structurally extensible -- richer per-node metadata
+        # (VRAM, heterogeneous tiers from the J-Prime golden image, which is
+        # Immutable-Orange and ships via human-approved PR) rides the same
+        # channel without an API change. Observer errors NEVER break the
+        # registry (fail-soft).
+        self._observers: list = []
+
+    def subscribe(self, fn) -> None:
+        """Register a topology observer: ``fn(snapshot_dict)`` fires after
+        every register/unregister. NEVER raises."""
+        try:
+            if callable(fn):
+                self._observers.append(fn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _notify(self) -> None:
+        try:
+            snap = self.snapshot()
+            for fn in tuple(self._observers):
+                try:
+                    fn(snap)
+                except Exception:  # noqa: BLE001 -- an observer bug never breaks the fleet
+                    logger.debug("[FleetRegistry] observer fail-soft", exc_info=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     def register(self, node_class: str, endpoint: str) -> None:
         cls = str(node_class or "").strip()
@@ -36,6 +64,7 @@ class FleetRegistry:
         with self._lock:
             self._endpoints[cls] = ep
         logger.info("[FleetRegistry] register class=%s endpoint=%s", cls, ep)
+        self._notify()
 
     def unregister(self, node_class: str) -> None:
         cls = str(node_class or "").strip()
@@ -43,6 +72,7 @@ class FleetRegistry:
             existed = self._endpoints.pop(cls, None)
         if existed is not None:
             logger.info("[FleetRegistry] unregister class=%s (was %s)", cls, existed)
+            self._notify()
 
     def endpoint_for(self, node_class: str) -> Optional[str]:
         with self._lock:
