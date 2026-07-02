@@ -2562,7 +2562,12 @@ class FailoverLifecycleController:
                 "J-Prime op(s) to finish before teardown", n,
             )
             loop = asyncio.get_event_loop()
-            deadline = loop.time() + _handback_drain_budget_s()
+            # Heavy-tier drain patience: the base budget covers 'a slow CPU
+            # generation' (survival 7B), but a 32B multi-round op runs
+            # 200-400s PER CALL -- the FSM deleted its own node under 3
+            # committed ops (iso-a1-20260701-182533). Scale by the SAME
+            # heavy mult HW1 uses for awaken/warmup; survival byte-identical.
+            deadline = loop.time() + self._adaptive_timeout(_handback_drain_budget_s())
             poll = _handback_drain_poll_s()
             while self._inflight_count() > 0:
                 if loop.time() >= deadline:

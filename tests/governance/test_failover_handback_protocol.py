@@ -144,3 +144,47 @@ async def test_handback_drain_bounded_by_budget(monkeypatch):
 
 async def _noop(*a, **k):
     return None
+
+
+async def test_handback_drain_budget_scales_for_heavy_tier(monkeypatch):
+    """Heavy-tier drain patience (iso-a1-20260701-182533): the 120s drain budget
+    was sized for 'a slow CPU generation' -- a 32B multi-round op needs 200-400s
+    PER CALL, so the drain 'budget exhausted with 3 op(s) still in flight' and
+    the FSM deleted its own node under committed work. The drain budget must
+    scale by the SAME heavy mult HW1 uses for awaken/warmup deadlines (survival
+    tier byte-identical)."""
+    from backend.core.ouroboros.governance.failover_tier import FailoverTier
+    monkeypatch.setenv("JARVIS_HANDBACK_DRAIN_BUDGET_S", "0.2")
+    monkeypatch.setenv("JARVIS_HANDBACK_DRAIN_POLL_S", "0.05")
+    monkeypatch.setenv("JARVIS_JPRIME_HEAVY_COLDSTART_MULT", "4.0")
+    inflight = {"n": 2}
+    seen_at_teardown = {}
+
+    def vm_delete():
+        seen_at_teardown["n"] = inflight["n"]
+        return True
+
+    ctrl = FailoverLifecycleController(
+        vm_awaken_fn=lambda *, startup_script: True,
+        vm_delete_fn=vm_delete,
+        node_ready_fn=lambda e: True,
+        clock_fn=FakeClock(),
+        in_flight_fn=lambda: inflight["n"],
+    )
+    ctrl._awakened_tier = FailoverTier(
+        name="quality", machine_type="g2-standard-8", image_family="x",
+        model_label="qwen2.5-coder:32b", accelerator_type="nvidia-l4",
+        accelerator_count=1,
+    )
+    monkeypatch.setattr(ctrl, "_close_ephemeral_perimeter", _noop)
+
+    # Drain to 0 at 0.5s: PAST the 0.2s base budget, INSIDE the 0.8s heavy budget.
+    async def _drain():
+        await asyncio.sleep(0.5)
+        inflight["n"] = 0
+    drainer = asyncio.create_task(_drain())
+
+    await ctrl._tick_handback(now=1000.0)
+    await drainer
+    assert seen_at_teardown["n"] == 0     # zero-drop honored (waited past base budget)
+    assert ctrl.state.name == "DORMANT"
