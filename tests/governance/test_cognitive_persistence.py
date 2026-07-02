@@ -320,3 +320,33 @@ def test_format_for_prompt_never_truncates_closing_fence(monkeypatch):
     assert section is not None
     assert len(section) <= 2000
     assert section.rstrip().endswith("<<<END UNTRUSTED DATA>>>")
+
+
+# Task 5: boot hydration READ path
+import backend.core.ouroboros.governance.cognitive_persistence as cogp
+
+
+async def test_hydrate_populates_module_cache(monkeypatch, store):
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    await store.record(
+        CognitiveExperience(kind=ExperienceKind.HALLUCINATED_TOOL,
+                            footprint="f@1", subject="fetch_url",
+                            error_class="unknown_tool"),
+        op_id="op-1",
+    )
+
+    async def _fake_default_store():
+        return store
+    monkeypatch.setattr(cogp, "get_default_store", _fake_default_store)
+    monkeypatch.setattr(cogp, "_prior_knowledge_cache", cogp.PriorKnowledgeCache())
+
+    cache = await cogp.hydrate_prior_knowledge()
+    assert len(cache) == 1
+    assert cogp.get_prior_knowledge_cache() is cache
+
+
+async def test_hydrate_disabled_yields_empty_cache(monkeypatch):
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "false")
+    monkeypatch.setattr(cogp, "_prior_knowledge_cache", cogp.PriorKnowledgeCache())
+    cache = await cogp.hydrate_prior_knowledge()
+    assert len(cache) == 0

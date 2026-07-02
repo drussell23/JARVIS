@@ -348,3 +348,37 @@ def record_terminal_experiences_fire_and_forget(
         asyncio.get_running_loop().create_task(_write())
     except RuntimeError:
         logger.debug("[CognitivePersistence] no running loop; write skipped")
+
+
+# Task 5: boot hydration READ path -- module-level cache singleton
+
+_prior_knowledge_cache = PriorKnowledgeCache()
+
+
+def get_prior_knowledge_cache() -> PriorKnowledgeCache:
+    return _prior_knowledge_cache
+
+
+async def hydrate_prior_knowledge() -> PriorKnowledgeCache:
+    """Boot-time READ path. Fail-soft, bounded, empty cache when disabled."""
+    if not is_enabled():
+        return _prior_knowledge_cache
+    try:
+        timeout_s = float(os.getenv("JARVIS_COGNITIVE_HYDRATE_TIMEOUT_S", "10"))
+
+        async def _load() -> List[CognitiveExperience]:
+            store = await get_default_store()
+            if store is None:
+                return []
+            limit = int(os.getenv("JARVIS_COGNITIVE_HYDRATE_LIMIT", "200"))
+            return await store.load(limit=limit)
+
+        experiences = await asyncio.wait_for(_load(), timeout=timeout_s)
+        _prior_knowledge_cache.hydrate_from(experiences)
+        logger.info(
+            "[CognitivePersistence] hydrated %d prior experience(s) at boot",
+            len(experiences),
+        )
+    except Exception as e:  # noqa: BLE001 — boot must never block on memory
+        logger.debug("[CognitivePersistence] hydration skipped (fail-soft): %s", e)
+    return _prior_knowledge_cache

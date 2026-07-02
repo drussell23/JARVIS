@@ -993,6 +993,18 @@ class UnifiedIntakeRouter:
                         "Router: FSM resume re-inject failed op=%s -- left pending",
                         getattr(_cp, "op_id", "?"),
                     )
+
+            # Task 5 -- checkpoint-resume re-hydration seam: a resumed window
+            # re-loads prior cognitive experience alongside the FSM checkpoint
+            # it just replayed. Idempotent (module cache is just refreshed).
+            try:
+                from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+                if _cogp.is_enabled() and _cogp._env_bool(
+                    "JARVIS_COGNITIVE_HYDRATE_ON_CHECKPOINT_RESUME", True
+                ):
+                    await _cogp.hydrate_prior_knowledge()
+            except Exception as _e:  # noqa: BLE001
+                logger.debug("[IntakeRouter] cognitive re-hydration skipped (fail-soft): %s", _e)
         except Exception:  # noqa: BLE001
             logger.debug("Router: FSM checkpoint hydration skipped (fail-soft)", exc_info=True)
 
