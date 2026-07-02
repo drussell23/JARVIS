@@ -96,6 +96,14 @@ def http(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     # Tight poll so the never-RUNNING timeout test is fast.
     monkeypatch.setenv("JARVIS_FAILOVER_RUNNING_POLL_S", "0.1")
+    # This FakeHTTP scripts POST responses via a single SHARED, non-zone-aware
+    # index (see insert_responses above) -- it assumes the legacy strictly-
+    # linear one-zone-at-a-time chain. Pin the scatter-gather width to 1 (the
+    # explicit byte-equivalent rollback path, see gcp_compute_rest._scatter_width)
+    # so concurrent multi-zone racing never interleaves calls against this
+    # single script. Multi-zone racing itself is covered by
+    # test_gcp_compute_rest_scatter_gather.py's zone-aware fake.
+    monkeypatch.setenv("JARVIS_FAILOVER_SCATTER_WIDTH", "1")
     return fake
 
 

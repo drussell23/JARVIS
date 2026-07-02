@@ -334,6 +334,23 @@ def _ondemand_on_stockout_enabled() -> bool:
     return os.environ.get("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false").strip().lower() in ("1", "true", "yes")
 
 
+def _scatter_width() -> int:
+    """Concurrent-wave width for the scatter-gather multi-zone awaken
+    (``JARVIS_FAILOVER_SCATTER_WIDTH``, default 3). The zone chain is consumed W
+    zones at a time; every zone in a wave races concurrently (see
+    ``GCPComputeRest._race_wave``). ``W=1`` is the ROLLBACK path -- it collapses
+    the wave loop in ``create_instance`` to a sequence of single-element waves,
+    each fully awaited before the next is launched, which is byte-equivalent to
+    the legacy one-zone-at-a-time linear chain. Clamped to >=1 (a width of 0
+    would produce an empty wave and busy-loop)."""
+    raw = os.environ.get("JARVIS_FAILOVER_SCATTER_WIDTH", "3")
+    try:
+        width = int(str(raw).strip())
+    except (TypeError, ValueError):
+        width = 3
+    return max(1, width)
+
+
 # ---------------------------------------------------------------------------
 # Low-level async HTTP (aiohttp if present, else stdlib urllib on the executor)
 # ---------------------------------------------------------------------------
@@ -711,6 +728,24 @@ class GCPComputeRest:
         (ok, detail). Dynamic zone/project from metadata. Fail-CLOSED: a missing
         token / unresolved zone-or-project / HTTP error -> (False, "<LOCUS>:..").
         NEVER raises.
+
+        SCATTER-GATHER multi-zone awaken (Async Scatter-Gather Failover): the
+        zone_fallback_chain is consumed ``W`` zones at a time
+        (``JARVIS_FAILOVER_SCATTER_WIDTH``, default 3) -- see ``_scatter_width``.
+        Each wave races its zones CONCURRENTLY via ``_race_wave`` instead of the
+        old strictly-linear one-zone-at-a-time roll (which left most of a 9-zone
+        chain untried inside a single failover window). ``W=1`` is the rollback
+        path: it degenerates to a sequence of single-element waves, each fully
+        awaited before the next, reproducing the legacy linear sequence exactly.
+
+        Deliberate race-level scope (avoids tripling GPU cold-start spend): the
+        winner is the FIRST zone whose insert VERIFIES as created at the
+        create/RUNNING level -- ``_insert_in_zone`` returning 'created' (either a
+        clean DONE op or the KEEP-confirmed-materializing path), NOT the first
+        zone to clear the downstream L7 serving gate. That single serving gate
+        (unchanged, in ``await_running_ip`` / the readiness check upstream) takes
+        the winner from here; racing all the way to full serving would mean
+        paying for GPU boot on every zone in the wave simultaneously.
         """
         token = await self.access_token()
         if not token:
@@ -739,9 +774,12 @@ class GCPComputeRest:
         )
         chain = zone_fallback_chain(zone)
         last = ""
-        for z in chain:
-            verdict, detail = await self._insert_in_zone(
-                zone=z, project=project, token=token, headers=headers, node=node,
+        width = _scatter_width()
+        idx = 0
+        while idx < len(chain):
+            wave = chain[idx:idx + width]
+            verdict, detail = await self._race_wave(
+                wave, project=project, token=token, headers=headers, node=node,
                 machine=machine, family=family, startup_script=startup_script,
                 accelerator_type=accelerator_type, accelerator_count=accelerator_count,
             )
@@ -749,7 +787,11 @@ class GCPComputeRest:
             if verdict == "created":
                 return (True, "created:{}".format(detail))
             if verdict == "stockout":
-                logger.warning("[GCPComputeRest] STOCKOUT zone=%s -> failover to next zone", z)
+                logger.warning(
+                    "[GCPComputeRest] WAVE STOCKOUT zones=%s -> failover to next wave",
+                    wave,
+                )
+                idx += width
                 continue
             return (False, "INSERT_FAILED:{}".format(detail))  # non-stockout -> stop
         # The ENTIRE cross-region matrix stocked out -> a genuine global L4 capacity
@@ -928,6 +970,117 @@ class GCPComputeRest:
             logger.warning("[GCPComputeRest] insert %s failed zone=%s status=%s detail=%s",
                            mode, zone, status, (text or "")[-200:])
         return ("failed", "zone={}:spot_and_on_demand_rejected".format(zone))
+
+    async def _race_wave(
+        self, wave, *, project, token, headers, node, machine, family,
+        startup_script, accelerator_type, accelerator_count,
+    ) -> Tuple[str, str]:
+        """Scatter-gather ONE wave: launch ``_insert_in_zone`` (UNCHANGED --
+        Spot->on-demand escalation + KEEP-re-verify all reused as-is) CONCURRENTLY
+        for every zone in ``wave``, then gather via a ``asyncio.wait(...,
+        return_when=FIRST_COMPLETED)`` loop so the first VERIFIED create can
+        short-circuit the rest instead of waiting for the whole wave.
+
+        Returns a wave-level verdict in the SAME vocabulary ``_insert_in_zone``
+        uses, so ``create_instance``'s wave loop reads identically to the old
+        per-zone loop:
+          'created'  -- a zone won the race; detail identifies the winner.
+          'stockout' -- every zone in the wave stocked out; caller advances to
+                        the next W-zone wave.
+          'failed'   -- a non-stockout hard rejection surfaced (from a zone OR
+                        from an unexpected racer exception) and no zone won;
+                        mirrors the legacy per-zone contract by stopping the
+                        ENTIRE chain rather than rolling to the next wave.
+
+        Winner teardown (billing-critical): the moment a winner is decided,
+        every still-pending sibling racer is cancelled, and an async
+        best-effort delete is issued for EVERY OTHER zone in the wave --
+        UNCONDITIONALLY, regardless of that zone's own reported verdict --
+        because a cancelled racer may already have POSTed its own
+        instances.insert before cancellation landed. See ``_sweep_losers``.
+        NEVER raises."""
+        tasks = {
+            asyncio.ensure_future(self._insert_in_zone(
+                zone=z, project=project, token=token, headers=headers, node=node,
+                machine=machine, family=family, startup_script=startup_script,
+                accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+            )): z
+            for z in wave
+        }
+        pending = set(tasks.keys())
+        results: Dict[str, Tuple[str, str]] = {}
+        winner: Optional[Tuple[str, str]] = None
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done:
+                z = tasks[fut]
+                try:
+                    verdict, detail = fut.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:  # noqa: BLE001 -- a racer must NEVER blow up the wave
+                    verdict, detail = ("failed", "zone={}:racer_exception:{}".format(z, exc))
+                results[z] = (verdict, detail)
+                if verdict == "created" and winner is None:
+                    winner = (z, detail)
+            if winner is not None:
+                break
+
+        if winner is not None:
+            for fut in pending:
+                fut.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            losers = [z for z in wave if z != winner[0]]
+            await self._sweep_losers(node, losers)
+            logger.info(
+                "[GCPComputeRest] scatter-gather WINNER zone=%s wave=%s -> %d loser(s) reaped",
+                winner[0], wave, len(losers),
+            )
+            return ("created", winner[1])
+
+        # No winner: every zone in the wave terminated on its own (or never
+        # completed -- treated as a racer failure below). A hard (non-stockout)
+        # failure mirrors the legacy per-zone contract and stops the entire
+        # chain instead of rolling to the next wave.
+        for z in wave:
+            verdict, detail = results.get(z, ("failed", "zone={}:racer_no_result".format(z)))
+            if verdict == "failed":
+                return ("failed", detail)
+        last_zone = wave[-1] if wave else "?"
+        last_detail = results.get(
+            last_zone, ("stockout", "zone={}:wave_exhausted".format(last_zone))
+        )[1]
+        return ("stockout", last_detail)
+
+    async def _sweep_losers(self, node: str, loser_zones) -> None:
+        """Fire-and-forget, best-effort instance delete for every LOSING zone in
+        a decided scatter-gather wave. Billing-critical: a racer cancelled after
+        a winner was chosen may already have POSTed its own instances.insert, so
+        the sweep is UNCONDITIONAL across every wave member except the winner --
+        it does not consult that zone's own reported verdict.
+
+        Reuses ``delete_instance`` unchanged (already 404-tolerant/idempotent-OK
+        and internally bounded by ``_rest_timeout``); wrapped in an outer
+        ``asyncio.wait_for`` as a second bound + a broad except so a stuck or
+        raising delete can NEVER wedge or blow up the caller. Exactly one
+        WARNING is logged per loser zone. NEVER raises."""
+        if not loser_zones:
+            return
+
+        async def _reap_one(z: str) -> None:
+            try:
+                ok, detail = await asyncio.wait_for(
+                    self.delete_instance(node, zone=z), timeout=_rest_timeout() + 5.0,
+                )
+            except Exception as exc:  # noqa: BLE001 -- the sweep must NEVER raise
+                ok, detail = (False, "sweep_exc:{}".format(exc))
+            logger.warning(
+                "[GCPComputeRest] scatter-gather LOSER reap zone=%s node=%s ok=%s detail=%s",
+                z, node, ok, detail,
+            )
+
+        await asyncio.gather(*(_reap_one(z) for z in loser_zones), return_exceptions=True)
 
     async def _await_insert_operation(
         self, project, zone, op_name, token, *, cap_s: Optional[float] = None,
