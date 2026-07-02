@@ -260,12 +260,21 @@ def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> O
         return None
     max_tokens = int(os.getenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "600"))
     section = _render_section(picked)
-    while picked and _estimate_tokens(section) > max_tokens:
+    while picked and (
+        _estimate_tokens(section) > max_tokens
+        or len(section) > _SECTION_CAP_CHARS
+    ):
         picked = picked[:-1]  # select() is rank-ordered; drop the tail
         section = _render_section(picked)
     if not picked:
+        logger.debug(
+            "[CognitivePersistence] injection skipped: lone experience "
+            "exceeds the token/char ceiling",
+        )
         return None
-    return section[:_SECTION_CAP_CHARS]
+    # Both bounds are enforced by whole-experience trimming — NEVER a char
+    # slice, which could amputate the closing untrusted-data fence marker.
+    return section
 
 
 def inject_metrics(cache: PriorKnowledgeCache) -> "tuple[bool, int]":

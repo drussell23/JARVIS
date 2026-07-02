@@ -241,3 +241,19 @@ def test_format_for_prompt_token_safety_valve(monkeypatch):
     assert estimate_tokens(section) <= 120
     # Highest-count experience must survive the trim (lowest-rank dropped first)
     assert "tool_with_a_rather_long_name_00" in section
+    assert "tool_with_a_rather_long_name_39" not in section
+
+
+def test_format_for_prompt_never_truncates_closing_fence(monkeypatch):
+    """Char cap must trim whole experiences, never slice the fence."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_TOP_K", "12")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "600")
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from(
+        [_exp("x" * 60 + f"_{i:02d}", count=50 - i) for i in range(12)]
+    )
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section is not None
+    assert len(section) <= 2000
+    assert section.rstrip().endswith("<<<END UNTRUSTED DATA>>>")
