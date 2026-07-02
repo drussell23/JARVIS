@@ -4396,9 +4396,30 @@ class CandidateGenerator:
                 if _resume_prefill:
                     _client._resume_prefill = _resume_prefill  # continue the partial
                 try:
+                    # Venom on the sovereign path (the 6/6 last boss,
+                    # bt-iso-1782960801: 19 one-shot streams, 40 Iron Gate
+                    # rejections, ZERO tool executions). Hand the primary
+                    # provider's already-wired ToolLoopCoordinator (the SAME
+                    # loop the DW path runs; governed_loop_service wires it
+                    # into every provider seat) to the local PrimeProvider --
+                    # _generate_impl then takes the multi-turn tool branch:
+                    # tool advertisements, 2b.2-tool envelope parsing, REAL
+                    # read_file/search_code executions, with_tool_records()
+                    # crediting -> the exploration-first Iron Gate becomes
+                    # satisfiable on the 32B. Master JARVIS_JPRIME_VENOM_ENABLED
+                    # (default true); =false restores the one-shot legacy.
+                    _venom_on = (os.environ.get(
+                        "JARVIS_JPRIME_VENOM_ENABLED", "true") or "").strip().lower() \
+                        not in ("0", "false", "no", "off")
                     _provider = _F3cPrimeProvider(
                         _client,
                         repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+                        tool_loop=(getattr(getattr(self, "_primary", None),
+                                           "_tool_loop", None)
+                                   if _venom_on else None),
+                        mcp_client=(getattr(getattr(self, "_primary", None),
+                                            "_mcp_client", None)
+                                    if _venom_on else None),
                     )
                     remaining = self._remaining_seconds(deadline)
                     if remaining <= 0.0:

@@ -182,6 +182,7 @@ def _deadline(s=120.0):
 def test_l7_autoheal_retries_then_succeeds(monkeypatch):
     """A ServerDisconnected on the warm 32B triggers re-warm + tighten + retry --
     the second attempt (tighter window) succeeds, no permanent halt."""
+    monkeypatch.setenv("JARVIS_JPRIME_DISPATCH_READY_ENABLED", "false")  # gate predates this test
     monkeypatch.setenv("JARVIS_FAILOVER_L7_RECOVERY_ATTEMPTS", "2")
     import backend.core.ouroboros.governance.local_inference_director as lidmod
     import backend.core.ouroboros.governance.providers as provmod
@@ -206,7 +207,7 @@ def test_l7_autoheal_retries_then_succeeds(monkeypatch):
 
     class _FakeProvider:
         _calls = {"n": 0}
-        def __init__(self, client, repo_root=None):
+        def __init__(self, client, repo_root=None, **_kw):  # tool_loop/mcp_client (venom wiring)
             self.client = client
         async def generate(self, context, deadline):
             _FakeProvider._calls["n"] += 1
@@ -241,6 +242,7 @@ def test_l7_autoheal_retries_then_succeeds(monkeypatch):
 def test_l7_autoheal_exhausts_then_raises(monkeypatch):
     """If every attempt disconnects, the auto-heal exhausts and RAISES (so the
     sentinel seam seals/halts -- never cascades)."""
+    monkeypatch.setenv("JARVIS_JPRIME_DISPATCH_READY_ENABLED", "false")  # gate predates this test
     monkeypatch.setenv("JARVIS_FAILOVER_L7_RECOVERY_ATTEMPTS", "1")
     import backend.core.ouroboros.governance.local_inference_director as lidmod
     import backend.core.ouroboros.governance.providers as provmod
@@ -255,7 +257,7 @@ def test_l7_autoheal_exhausts_then_raises(monkeypatch):
             pass
 
     class _FakeProvider:
-        def __init__(self, client, repo_root=None):
+        def __init__(self, client, repo_root=None, **_kw):  # tool_loop/mcp_client (venom wiring)
             pass
         async def generate(self, context, deadline):
             raise aiohttp.ServerDisconnectedError("always down")

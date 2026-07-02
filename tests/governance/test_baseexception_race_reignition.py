@@ -128,6 +128,7 @@ def test_local_dispatch_checkpoints_on_interruption(tmp_path, monkeypatch):
     """The full local proof: a dispatch whose generation raises GSI THROUGH an
     intermediate `except Exception` (the tool-loop mimic) still writes a signed
     checkpoint (with the partial) to .ouroboros. No cloud, deterministic."""
+    monkeypatch.setenv("JARVIS_JPRIME_DISPATCH_READY_ENABLED", "false")  # gate predates this test
     monkeypatch.setenv("JARVIS_CHECKPOINT_DIR", str(tmp_path / "cp"))
     monkeypatch.setenv("JARVIS_CHECKPOINT_HMAC_SECRET", "local-secret")
     import backend.core.ouroboros.governance.candidate_generator as cg
@@ -145,7 +146,7 @@ def test_local_dispatch_checkpoints_on_interruption(tmp_path, monkeypatch):
             pass
 
     class _FakeProvider:
-        def __init__(self, client, repo_root=None):
+        def __init__(self, client, repo_root=None, **_kw):  # tool_loop/mcp_client (venom wiring)
             pass
         async def generate(self, context, deadline):
             # Mimic the Venom tool loop swallowing Exception -- GSI (BaseException)
