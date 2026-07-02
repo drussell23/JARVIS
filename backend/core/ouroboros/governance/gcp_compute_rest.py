@@ -62,6 +62,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -800,14 +801,31 @@ class GCPComputeRest:
                     # blindly trust (that leaves a phantom).
                     inst_status, http_code = await self.get_instance_status(node, zone=zone)
                     if (inst_status or "").upper() in _MATERIALIZING_STATES:
-                        # Slow-but-REAL: the node is materializing/up. KEEP it, do NOT
+                        # Slow-but-REAL: the node is materializing/up. But a kept
+                        # node can still EVAPORATE -- GCE rolls back a capacity
+                        # failure AFTER STAGING (live: bt-iso-1782950534 kept a
+                        # STAGING on-demand node that vanished, wedging AWAKENING
+                        # on a phantom for the full L7 budget with no re-hunt).
+                        # Confirm within a bounded window before committing.
+                        _fate = await self._confirm_kept_node(node, zone)
+                        if _fate == "phantom":
+                            logger.warning(
+                                "[GCPComputeRest] KEPT node EVAPORATED (GCE rollback "
+                                "after %s) zone=%s mode=%s -> confirmed-reap + roll "
+                                "next zone", inst_status, zone, mode,
+                            )
+                            await self._reap_zone_confirmed(node, zone)
+                            if spot and _ondemand_on_stockout_enabled():
+                                continue  # escalate to on-demand same zone first
+                            return ("stockout", "zone={}:kept_node_evaporated".format(zone))
+                        # 'live' or still-materializing at window end: KEEP, do NOT
                         # reap, do NOT advance -> route to AWAKENING and hand patience
-                        # to the L7 readiness gate/racer (the right owner of "wait for
-                        # SERVING"). This resolves the strict-reap-vs-slow-op tension.
+                        # to the L7 readiness gate/racer (the right owner of "wait
+                        # for SERVING"). Resolves strict-reap-vs-slow-op tension.
                         logger.info(
                             "[GCPComputeRest] insert op unverified BUT node MATERIALIZING "
-                            "(status=%s) zone=%s mode=%s -> KEEP + hand to L7 readiness gate",
-                            inst_status, zone, mode,
+                            "(status=%s confirm=%s) zone=%s mode=%s -> KEEP + hand to "
+                            "L7 readiness gate", inst_status, _fate, zone, mode,
                         )
                         return (
                             "created",
@@ -1101,6 +1119,34 @@ class GCPComputeRest:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[GCPComputeRest] get_instance_status fail-soft err=%r", exc)
             return (None, 0)
+
+    async def _confirm_kept_node(self, node: str, zone: str) -> str:
+        """Keep-Confirmation Window (phantom-keep guard).
+
+        A node KEPT on 'materializing' can still be ROLLED BACK by GCE moments
+        later (capacity failure after STAGING). Poll the instance until it
+        either proves LIVE (``'live'`` on RUNNING), proves PHANTOM
+        (``'phantom'`` on 404/TERMINATED -- evaporated), or is still
+        materializing when the window closes (``'materializing'`` -- keep,
+        legacy behavior: only proof-of-absence aborts a keep). Bounded by
+        ``JARVIS_KEEP_CONFIRM_WINDOW_S`` (120) x ``_INTERVAL_S`` (10).
+        NEVER raises."""
+        try:
+            window_s = float(os.environ.get("JARVIS_KEEP_CONFIRM_WINDOW_S", "120") or 120)
+            interval_s = float(os.environ.get("JARVIS_KEEP_CONFIRM_INTERVAL_S", "10") or 10)
+            deadline = time.monotonic() + max(0.0, window_s)
+            while True:
+                st, http_code = await self.get_instance_status(node, zone=zone)
+                stu = (st or "").upper()
+                if stu == "RUNNING":
+                    return "live"
+                if stu == "TERMINATED" or (st is None and http_code == 404):
+                    return "phantom"
+                if time.monotonic() >= deadline:
+                    return "materializing"
+                await asyncio.sleep(max(0.01, interval_s))
+        except Exception:  # noqa: BLE001 -- confirmation is a guard, never a blocker
+            return "materializing"
 
     async def _reap_zone_confirmed(self, node: str, zone: str) -> bool:
         """Strict pre-rollover reap: delete ``node`` in ``zone`` and CONFIRM the
