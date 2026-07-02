@@ -5751,6 +5751,20 @@ class BattleTestHarness:
                     # Decision: poke or starve the watchdog
                     if progressing_count > 0:
                         self._idle_watchdog.poke()
+                        # Cross-process activity truth: pulse the stream
+                        # heartbeat FILE mirror too, so the audit-deferral
+                        # probe (driver-side) sees ops progressing through
+                        # NON-streaming phases (VALIDATE / Iron Gate / APPLY)
+                        # as ACTIVE. Token pulses go blind there -- the
+                        # verdict fired over a mid-pipeline op in
+                        # iso-a1-20260701-180418. Best-effort, fail-soft.
+                        try:
+                            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                                stream_heartbeat as _act_hb,
+                            )
+                            _act_hb.pulse()
+                        except Exception:  # noqa: BLE001
+                            pass
                         if stale_count > 0:
                             logger.info(
                                 "[ActivityMonitor] %d progressing, %d stale — poked watchdog",

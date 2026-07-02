@@ -191,3 +191,23 @@ def test_authority_invariant_no_orchestrator_imports():
     for tok in forbidden:
         assert f"import {tok}" not in src, f"forbidden import: {tok}"
         assert f"from backend.core.ouroboros.governance.{tok}" not in src
+
+
+def test_activity_monitor_poke_also_pulses_heartbeat_mirror():
+    """Cross-process activity truth (run iso-a1-20260701-180418): the audit
+    deferral probe reads the stream_heartbeat FILE mirror, but pulses only
+    flowed during response-begin + token streaming -- VALIDATE/Iron-Gate/APPLY
+    were BLIND phases, so the verdict fired over an op that was mid-pipeline.
+    The ActivityMonitor's poke decision (progressing ops in ANY phase) must
+    also pulse the heartbeat mirror. Source-level pin (same pattern as the
+    authority invariant): the poke block wires stream_heartbeat."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "backend/core/ouroboros/battle_test/harness.py").read_text()
+    anchor = src.find("Decision: poke or starve the watchdog")
+    assert anchor != -1, "ActivityMonitor decision block moved -- update this pin"
+    window = src[anchor:anchor + 2000]
+    assert "stream_heartbeat" in window and "pulse" in window, (
+        "ActivityMonitor poke must pulse the stream_heartbeat mirror so the "
+        "audit-deferral probe sees non-streaming phases (VALIDATE/APPLY) as ACTIVE"
+    )
