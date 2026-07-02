@@ -242,6 +242,55 @@ def test_container_mode_root_is_live_path(tmp_path: Path) -> None:
         assert env.root.parts[-3:] == _PARITY_RELATIVE_SHAPE
 
 
+def test_run_container_argv_maps_host_uid_gid(tmp_path: Path, monkeypatch) -> None:
+    """``_run_container`` must include ``--user <host-uid>:<host-gid>`` —
+    dynamically resolved via ``os.getuid()``/``os.getgid()`` at call time,
+    never hardcoded, never root — so any write the containerized process
+    makes against a bind-mounted host path (e.g. the git worktree base)
+    lands with the SAME ownership as the host repo owner.
+
+    No live Docker daemon required: this asserts on the constructed argv,
+    not on actually running a container (mirrors the operator's ask for a
+    "compose/argv-level test").
+    """
+    repo = _make_repo(tmp_path)
+    captured: dict = {}
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        import subprocess as _sp
+        return _sp.CompletedProcess(argv, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(
+        "backend.core.ouroboros.battle_test.isomorphic_env.subprocess.run",
+        _fake_run,
+    )
+    env = IsomorphicEnv(repo, mode="container")
+    env._enter_container()
+    try:
+        env._run_container(["true"])
+    finally:
+        env._restore_node_env()
+        env._restore_sandbox_prefixes()
+        env._restore_cwd()
+        env._cleanup_tmpdir()
+
+    argv = captured["argv"]
+    assert "--user" in argv, f"--user flag missing from container argv: {argv!r}"
+    user_val = argv[argv.index("--user") + 1]
+    assert user_val == f"{os.getuid()}:{os.getgid()}", (
+        f"--user must map the HOST uid:gid; got {user_val!r}"
+    )
+    # Never root, never a hardcoded literal.
+    assert user_val != "0:0"
+
+
+def test_user_flag_helper_matches_host_identity() -> None:
+    """``IsomorphicEnv._user_flag()`` resolves the host identity dynamically."""
+    flag = IsomorphicEnv._user_flag()
+    assert flag == ["--user", f"{os.getuid()}:{os.getgid()}"]
+
+
 @pytest.mark.skipif(not _DOCKER_PRESENT, reason="Docker not available on this host")
 def test_container_mode_restores_state(tmp_path: Path) -> None:
     """Container mode must restore cwd/env/policy identically to process mode."""

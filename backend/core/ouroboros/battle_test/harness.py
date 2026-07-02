@@ -275,6 +275,23 @@ class HarnessConfig:
         explicit, already-plausible repo root (e.g. a worktree or a hermetic
         fixture) is honored verbatim. NEVER raises -- fail-soft to the value
         the caller passed.
+
+        Run bt-iso-1783024759 fix: the ``start=raw`` re-anchor attempt below
+        reuses the SAME possibly-nonexistent value as the ``.git``-walk-up
+        anchor. When ``raw`` is a stale isomorphic-container path (e.g.
+        ``/opt/trinity/jarvis``, which ``IsomorphicEnv._enter_container``
+        exports via ``JARVIS_REPO_PATH`` without ever materializing it on
+        the host filesystem) and the process cwd is also disjoint from the
+        real repo (the isomorphic driver forces this), that walk-up can
+        never find a ``.git`` anchor and the whole resolution raises --
+        silently leaving ``self.repo_path`` at the raw, nonexistent,
+        unwritable value. Downstream, ``WorktreeManager.create()``
+        (``ledger_sovereignty`` boot) then attempts ``mkdir(parents=True)``
+        under that path, hitting a root-owned system directory (``/opt``)
+        -> ``PermissionError(13, 'Permission denied')``. If the first
+        re-anchor attempt fails, retry with NO ``start`` override so the
+        resolver anchors on this module's own ``Path(__file__)`` location,
+        which is always real for the runtime executing it.
         """
         try:
             raw = Path(self.repo_path)
@@ -292,6 +309,11 @@ class HarnessConfig:
             return
         try:
             self.repo_path = _resolve_runtime_repo_root(start=raw)
+            return
+        except Exception:  # noqa: BLE001 -- try the code-location fallback next
+            pass
+        try:
+            self.repo_path = _resolve_runtime_repo_root()
         except Exception:  # noqa: BLE001 -- fail-soft: keep caller value
             pass
 

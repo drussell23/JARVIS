@@ -309,6 +309,31 @@ class IsomorphicEnv:
         kw.setdefault("env", os.environ.copy())
         return subprocess.run(cmd, **kw)  # type: ignore[return-value]
 
+    @staticmethod
+    def _user_flag() -> List[str]:
+        """Return ``["--user", "<uid>:<gid>"]`` mapping the HOST invoking
+        user's identity into the container, resolved dynamically via
+        ``os.getuid()``/``os.getgid()`` at call time -- never hardcoded.
+
+        Mandated hardening (no ``chmod -R 777``, no running the container as
+        root): any write the containerized process performs against a
+        bind-mounted host path lands with the SAME ownership as the host
+        repo owner, so a real (non-``:ro``) mount never produces a
+        ``PermissionError`` from a UID mismatch, and no artifact is ever
+        left root-owned on the host. Fails soft to ``[]`` (Docker's default
+        user) on platforms without ``os.getuid``/``os.getgid`` (e.g.
+        Windows) -- this repo's isomorphic container path targets
+        macOS/Linux hosts only.
+        """
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is None or getgid is None:
+            return []
+        try:
+            return ["--user", f"{getuid()}:{getgid()}"]
+        except OSError:
+            return []
+
     def _run_container(self, cmd: List[str], **kw: Any) -> "subprocess.CompletedProcess[bytes]":
         """Build a hardened ``docker run`` argv mounting the repo at the live path."""
         docker_bin = shutil.which("docker") or "docker"
@@ -330,6 +355,7 @@ class IsomorphicEnv:
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--pids-limit", "256",
+            *self._user_flag(),
             "--read-only",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
             # Mount the real repo_root at the live path (read-only — inspection only).
