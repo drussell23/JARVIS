@@ -128,6 +128,38 @@ logger = logging.getLogger("Ouroboros.Orchestrator")
 # Re-raises CancelledError so the asyncio cascade can drain WAL +
 # exit before the WallClockWatchdog Layer-3 hard-kill fires.
 
+def _sovereign_physics_floor_s(base_s: float) -> float:
+    """Sovereign-heavy physics floor for the route GENERATE budget.
+
+    The route table is DW-API-sized; when the failover lifecycle is ENGAGED
+    (AWAKENING/SERVING -- this op will route to the awakened heavy node whose
+    single streaming round costs 200-400s), the outer wait_for it feeds
+    severed EVERY multi-round attempt at ~375s (bt-iso-1782977669:
+    'Generation attempt failed' with asyncio.TimeoutError's empty str at
+    exactly the scaled budget). Floor the budget at
+    ``expected_agentic_cycle_s()`` -- the SAME rounds x round-wall physics the
+    BudgetPlan hint / Time-Dilated Deadline / arm-time walls share. DORMANT
+    (normal DW ops) / master-off / any error -> base unchanged. Only ever
+    RAISES (the route table stays the floor's floor). Master
+    ``JARVIS_SOVEREIGN_GEN_PHYSICS_FLOOR_ENABLED`` (default true).
+    NEVER raises."""
+    try:
+        if (os.environ.get("JARVIS_SOVEREIGN_GEN_PHYSICS_FLOOR_ENABLED", "true")
+                or "").strip().lower() in ("0", "false", "no", "off"):
+            return base_s
+        from backend.core.ouroboros.governance import failover_lifecycle as _fl  # noqa: PLC0415
+        if not _fl.lifecycle_enabled():
+            return base_s
+        if _fl.get_failover_controller().state == _fl.FailoverState.DORMANT:
+            return base_s
+        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+            expected_agentic_cycle_s,
+        )
+        return max(float(base_s), float(expected_agentic_cycle_s()))
+    except Exception:  # noqa: BLE001 -- a sizing floor must never break GENERATE
+        return base_s
+
+
 async def _slice12o_maybe_cooldown(
     *, orch: Any, ctx: Any, exc: BaseException, route: str,
 ) -> bool:
@@ -743,6 +775,19 @@ class GENERATERunner(PhaseRunner):
                         "[Orchestrator] adaptive gen budget skipped "
                         "(fail-open to route base)", exc_info=True,
                     )
+                # Sovereign-heavy physics floor — the LAST static clock:
+                # engaged lifecycle => budget floors at rounds x round-wall
+                # so one floored value propagates to deadline + outer
+                # wait_for + tool-loop budget.
+                _physics_gt = _sovereign_physics_floor_s(_gen_timeout)
+                if _physics_gt > _gen_timeout:
+                    logger.info(
+                        "[Orchestrator] sovereign physics floor: gen_timeout "
+                        "%.0fs → %.0fs route=%s op=%s",
+                        _gen_timeout, _physics_gt, _route,
+                        getattr(ctx, "op_id", "?"),
+                    )
+                    _gen_timeout = _physics_gt
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=_gen_timeout
                 )

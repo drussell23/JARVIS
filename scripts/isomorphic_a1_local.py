@@ -523,13 +523,13 @@ def _expected_agentic_cycle_s() -> float:
     negotiated window (the runtime Negotiator measures the real one). Floored
     at the legacy 600s margin; falls back to 600 on any error."""
     try:
-        rounds = max(1, int(_env_float("JARVIS_A1_MAX_AGENTIC_ROUNDS", 5.0)))
-        seed_s = _env_float("JARVIS_LOCAL_INFERENCE_TIMEOUT_SEED_MS", 30_000.0) / 1000.0
-        mult = max(1.0, _env_float("JARVIS_JPRIME_HEAVY_COLDSTART_MULT", 4.0))
-        baseline = max(1.0, _env_float("JARVIS_LOCAL_SEED_CTX_BASELINE", 8192.0))
-        expected_ctx = max(1.0, _env_float("JARVIS_HYBRID_MESH_EXPECTED_NUM_CTX", 16384.0))
-        ctx_factor = max(1.0, expected_ctx / baseline)
-        return max(600.0, rounds * seed_s * mult * ctx_factor)
+        # ONE physics model: delegate to the shared formula (the same one the
+        # BudgetPlan hint / Time-Dilated Deadline / sovereign GENERATE floor
+        # consume) -- floored at the legacy 600s margin.
+        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+            expected_agentic_cycle_s,
+        )
+        return max(600.0, float(expected_agentic_cycle_s()))
     except Exception:  # noqa: BLE001 -- arm-time sizing must never block ignition
         return 600.0
 
