@@ -5835,6 +5835,7 @@ class ToolLoopCoordinator:
 
     def _build_budget_plan(
         self, deadline: float, op_weight_lines: Optional[int] = None,
+        round_budget_hint_s: Optional[float] = None,
     ) -> BudgetPlan:
         """Construct a ``BudgetPlan`` for this ``run()`` invocation.
 
@@ -5858,10 +5859,24 @@ class ToolLoopCoordinator:
             total_budget_s=total_budget_s,
             target_line_count=op_weight_lines,
         )
+        # EWMA-Coupled Dynamic Round Budget: a profiler-derived hint (expected
+        # single-LLM-round wall on THIS node -- a heavy 32B/L4 runs 200-400s
+        # per streaming round) WIDENS the per-round ceiling so viability /
+        # fair-share / tool-deadline arithmetic reflects measured physics
+        # instead of the static DW-sized default (bt-iso-1782973775). A fast
+        # node's hint below the operator ceiling never lowers it; garbage /
+        # NaN fail-soft to legacy.
+        _max_per_round = self._tool_timeout_s
+        try:
+            if round_budget_hint_s is not None and \
+                    float(round_budget_hint_s) > _max_per_round:
+                _max_per_round = float(round_budget_hint_s)
+        except (TypeError, ValueError):
+            pass
         return BudgetPlan.build(
             total_budget_s=total_budget_s,
             hard_max_rounds=self._max_rounds,
-            max_per_round_s=self._tool_timeout_s,
+            max_per_round_s=_max_per_round,
             min_per_round_s=self._min_per_round_s,
             final_write_reserve_s=_reserve,
         )
@@ -5991,6 +6006,11 @@ class ToolLoopCoordinator:
         # static Slice-85 threshold). The caller computes it via the existing
         # ``providers._max_target_line_count``; no parallel weight calc here.
         prefetched_candidates: Optional[Sequence[Any]] = None,
+        # EWMA-Coupled Dynamic Round Budget: the caller's profiler-derived
+        # expected single-LLM-round wall (seconds) on the CURRENT node.
+        # Widens BudgetPlan.max_per_round_s for slow heavy hardware; ``None``
+        # (no profiler in the seat, e.g. DW) is byte-identical legacy.
+        round_budget_hint_s: Optional[float] = None,
         # Sovereign Epistemological Context Matrix (spec §5.1) — memory-supplied
         # PrefetchEntry sequence. When present, a bounded, clearly-labelled
         # "memory-supplied hints" block is PREPENDED to the opening prompt so
@@ -6041,7 +6061,10 @@ class ToolLoopCoordinator:
         # ── Structural budget plan ──
         # Built once per run() so all timing decisions are derived from
         # the same consistent snapshot of the deadline.
-        plan = self._build_budget_plan(deadline, op_weight_lines=op_weight_lines)
+        plan = self._build_budget_plan(
+            deadline, op_weight_lines=op_weight_lines,
+            round_budget_hint_s=round_budget_hint_s,
+        )
         self._last_budget_plan = plan
         effective_max_rounds = plan.effective_max_rounds
 

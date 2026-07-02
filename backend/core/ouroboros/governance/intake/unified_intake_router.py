@@ -1795,6 +1795,11 @@ class UnifiedIntakeRouter:
             provider_route=_pre_route,
             provider_route_reason=_pre_route_reason,
         )
+        # Time-Dilated Hydration: a resumed op is REBORN here -- stamp a
+        # fresh pipeline wall so no downstream reader (tool-loop envelope,
+        # L2 repair's direct pipeline_deadline read) inherits window-1's
+        # spent clock.
+        ctx = _stamp_resume_pipeline_deadline(ctx, envelope.source)
 
         # SWE-bench op-isolation + routing fix (#2): stamp the
         # complexity floor at the EARLIEST point — here, before the op
@@ -2329,6 +2334,25 @@ def reset_default_intake_router_for_tests() -> None:
             _DEFAULT_INTAKE_ROUTER = None
     except Exception:  # noqa: BLE001 — defensive
         pass
+
+
+def _stamp_resume_pipeline_deadline(ctx: Any, source: str) -> Any:
+    """Time-Dilated Hydration: a resumed op must NEVER inherit a spent
+    window-1 pipeline wall (the L2 repair path reads ``pipeline_deadline``
+    DIRECTLY, no phase-deadline floor -- a stale value collapses its budget
+    to seconds). Stamp a FRESH envelope at rebirth from the operator's
+    ``JARVIS_PIPELINE_TIMEOUT_S``. Non-resume sources pass through untouched.
+    NEVER raises."""
+    try:
+        if str(source or "") != "fsm_resume":
+            return ctx
+        from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+        _pt_s = max(1.0, float(os.environ.get(
+            "JARVIS_PIPELINE_TIMEOUT_S", "600") or 600))
+        return ctx.with_pipeline_deadline(
+            datetime.now(tz=timezone.utc) + timedelta(seconds=_pt_s))
+    except Exception:  # noqa: BLE001 -- hydration hygiene, never fatal
+        return ctx
 
 
 def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":

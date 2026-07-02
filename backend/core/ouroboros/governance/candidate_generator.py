@@ -2699,6 +2699,48 @@ async def _await_jprime_ready(
         await asyncio.sleep(max(0.01, poll_s))
 
 
+def _dilate_sovereign_deadline(deadline: "datetime", profiler: Any,
+                               num_ctx: int = 0) -> "datetime":
+    """Time-Dilated Sovereign Deadline (bt-iso-1782973775: resumed / late-
+    cascade dispatches reached the sealed 32B seam with 8-13s of a spent route
+    budget while a single streaming round costs 200-400s).
+
+    A COMMITTED sovereign dispatch derives its runway from the node's OWN
+    measured physics: ``now + expected_rounds x profiler.adaptive_timeout_ms``
+    (EWMA-floored; cold = the heavy-mult ctx-scaled seed -- the GPU speeding
+    up SHRINKS the dilation automatically), clamped by the operator's op
+    envelope ``JARVIS_PIPELINE_TIMEOUT_S``. Only ever EXTENDS (max) -- a
+    healthy deadline passes through untouched. Master
+    ``JARVIS_TIME_DILATION_ENABLED`` (default true). NEVER raises."""
+    try:
+        if (os.environ.get("JARVIS_TIME_DILATION_ENABLED", "true") or "").strip().lower() \
+                in ("0", "false", "no", "off"):
+            return deadline
+        if profiler is None:
+            return deadline
+        rounds = max(1, int(float(os.environ.get(
+            "JARVIS_A1_MAX_AGENTIC_ROUNDS", "5") or 5)))
+        est_ms = float(profiler.adaptive_timeout_ms(
+            prompt_tokens=max(1, int(num_ctx or 4096) // 4)))
+        runway_s = (est_ms / 1000.0) * rounds
+        envelope_s = max(1.0, float(os.environ.get(
+            "JARVIS_PIPELINE_TIMEOUT_S", "600") or 600))
+        runway_s = min(runway_s, envelope_s)
+        now = datetime.now(tz=timezone.utc)
+        dilated = now + timedelta(seconds=runway_s)
+        if dilated <= deadline:
+            return deadline
+        logger.info(
+            "[CandidateGenerator] Time-Dilated Sovereign Deadline: remaining "
+            "%.0fs -> %.0fs (rounds=%d x est=%.0fs, envelope<=%.0fs)",
+            max(0.0, (deadline - now).total_seconds()), runway_s, rounds,
+            est_ms / 1000.0, envelope_s,
+        )
+        return dilated
+    except Exception:  # noqa: BLE001 -- dilation is protective, never fatal
+        return deadline
+
+
 def _awakened_vram_bytes() -> int:
     """VRAM (bytes) of the awakened GPU tier -- the controller's live awakened tier
     if available, else the QUALITY provisioning spec. 0 if not a GPU tier / unknown
@@ -4353,6 +4395,10 @@ class CandidateGenerator:
             _init_overrides["num_ctx"] = int(_num_ctx)
         _init_cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_init_overrides)
         _prof = self._failover_profiler_for(endpoint, _init_cfg)
+        # Time-Dilated Sovereign Deadline: derive the committed dispatch's
+        # runway from THIS node's measured round physics (never from the
+        # scraps a spent route budget left behind).
+        deadline = _dilate_sovereign_deadline(deadline, _prof, int(_num_ctx or 0))
 
         # LLM Prefill Re-Ignition: if this op is a RESUME, its checkpointed partial
         # thought rides in the intake evidence -> feed it to the client as a prefill

@@ -2149,6 +2149,37 @@ def _should_compact_for_jprime() -> bool:
         return False
 
 
+def _round_budget_safety_factor() -> float:
+    """Safety multiplier over the profiler's expected round wall (>=1.0)."""
+    try:
+        return max(1.0, float(os.environ.get(
+            "JARVIS_TOOL_ROUND_BUDGET_SAFETY", "1.25") or 1.25))
+    except Exception:  # noqa: BLE001
+        return 1.25
+
+
+def _profiler_round_hint_s(client: Any, prompt: str) -> Optional[float]:
+    """EWMA-Coupled Dynamic Round Budget: derive the expected single-LLM-round
+    wall (seconds) for the CURRENT node from its calibrated LatencyProfiler --
+    ``adaptive_timeout_ms`` (mean TTFT + per-token x expected output +
+    margin-sigma, EWMA-floored; cold = the heavy-mult ctx-scaled seed) x a
+    safety factor. Unwraps the TieredPrimeClient composite (no ``.profiler``
+    attr -- the tiers own their profilers). ``None`` when no profiler is in
+    the seat (e.g. DW) or on any error -> the tool loop keeps its legacy
+    static ceiling. NEVER raises."""
+    try:
+        prof = getattr(client, "profiler", None)
+        if prof is None:
+            prof = getattr(getattr(client, "_light", None), "profiler", None)
+        if prof is None:
+            return None
+        est_ms = prof.adaptive_timeout_ms(
+            prompt_tokens=max(1, len(prompt or "") // 4))
+        return (float(est_ms) / 1000.0) * _round_budget_safety_factor()
+    except Exception:  # noqa: BLE001 -- a sizing hint must never break generation
+        return None
+
+
 def _build_tool_section(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -5634,6 +5665,9 @@ class PrimeProvider:
                     op_weight_lines=_op_weight_lines,
                     prefetched_candidates=getattr(context, "prefetch_manifest", None),
                     governor=_epi_governor,
+                    # EWMA-coupled: the plan's round arithmetic follows the
+                    # node's measured physics (None on profiler-less seats).
+                    round_budget_hint_s=_profiler_round_hint_s(self._client, prompt),
                 )
             finally:
                 # Idempotent close — no-op when master flag off.
