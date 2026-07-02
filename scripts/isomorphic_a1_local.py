@@ -1035,6 +1035,14 @@ class IsomorphicA1Driver:
                     )
                     env["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
                     os.environ["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
+                    # Scenario-premise pin: this soak's premise is a DEAD DW
+                    # (adversary chaos-kills generation) but the adversary's
+                    # PROBE path is healthy by design -- without this pin the
+                    # FSM hands the sovereign node back every ~6min of uptime
+                    # and deletes it under committed 32B ops
+                    # (bt-iso-1782957492). Driver teardown + Dead-Man's Switch
+                    # remain the cost backstops.
+                    env.setdefault("JARVIS_FAILOVER_HANDBACK_ENABLED", "false")
 
                 # ---- Iron Triad: arm the three gates + enforcer for the A1 soak ----
                 # (all default OFF in prod; this driver IS the A1 ignition harness).
