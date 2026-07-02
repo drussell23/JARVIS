@@ -2634,6 +2634,71 @@ async def _resolve_served_model_bytes(
     return int(size or 0)
 
 
+async def _await_jprime_ready(
+    endpoint: str,
+    *,
+    probe_fn: "Optional[Any]" = None,
+    op_id: str = "",
+) -> bool:
+    """Pre-SERVING dispatch readiness gate (bt-iso-1782959216): a COMMITTED
+    sovereign dispatch fired while the node was still BOOTING died on the 30s
+    survival probe and was SEALED TERMINAL (20 of 23 dispatches that run).
+    Wait for the node's own /api/tags to answer (the same L7 truth the driver
+    gate and the model resolver use) before dispatching:
+
+      * bounded by ``JARVIS_JPRIME_DISPATCH_READY_BUDGET_S`` (600s -- covers a
+        cold awaken) polling every ``_POLL_S`` (10s);
+      * each poll PULSES the stream heartbeat -- waiting for the sovereign
+        node IS activity (idle watchdog + audit-deferral probe stay fresh);
+      * cooperative shutdown FREEZES the wait (GracefulStreamInterruption ->
+        the dispatch's checkpoint boundary) so a suspend never burns budget;
+      * returns False on budget expiry -> caller proceeds with the legacy
+        attempt (no new failure mode, only added patience);
+      * master ``JARVIS_JPRIME_DISPATCH_READY_ENABLED`` (default true);
+        ``=false`` = legacy immediate dispatch, byte-identical.
+    """
+    if (os.environ.get("JARVIS_JPRIME_DISPATCH_READY_ENABLED", "true") or "").strip().lower() \
+            in ("0", "false", "no", "off"):
+        return True
+    from backend.core.ouroboros.governance import cooperative_shutdown as _coop  # noqa: PLC0415
+    from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+        GracefulStreamInterruption as _GSI,
+        _emit_stream_token as _hb_pulse,
+    )
+    _probe = probe_fn or _resolve_served_model_bytes
+    budget_s = float(os.environ.get("JARVIS_JPRIME_DISPATCH_READY_BUDGET_S", "600") or 600)
+    poll_s = float(os.environ.get("JARVIS_JPRIME_DISPATCH_READY_POLL_S", "10") or 10)
+    deadline = time.monotonic() + max(0.0, budget_s)
+    first = True
+    while True:
+        if _coop.is_requested():
+            raise _GSI(
+                "cooperative shutdown (%s) while awaiting sovereign node readiness"
+                % _coop.reason(), partial="",
+            )
+        try:
+            if await _probe(endpoint):
+                return True
+        except Exception:  # noqa: BLE001 -- a probe error is just "not ready yet"
+            pass
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[CandidateGenerator] sovereign node NOT ready after %.0fs "
+                "(endpoint=%s op=%s) -> proceeding with legacy attempt",
+                budget_s, endpoint, op_id,
+            )
+            return False
+        if first:
+            logger.info(
+                "[CandidateGenerator] sovereign node not ready yet (endpoint=%s "
+                "op=%s) -> waiting up to %.0fs (poll=%.0fs, heartbeat-pulsed)",
+                endpoint, op_id, budget_s, poll_s,
+            )
+            first = False
+        _hb_pulse("")  # waiting for the node IS activity
+        await asyncio.sleep(max(0.01, poll_s))
+
+
 def _awakened_vram_bytes() -> int:
     """VRAM (bytes) of the awakened GPU tier -- the controller's live awakened tier
     if available, else the QUALITY provisioning spec. 0 if not a GPU tier / unknown
@@ -4254,6 +4319,14 @@ class CandidateGenerator:
             PrimeProvider as _F3cPrimeProvider,
         )
 
+        # Pre-SERVING readiness gate: a committed dispatch against a node that
+        # is still booting dies on the 30s survival probe and gets SEALED
+        # (bt-iso-1782959216: 20/23 dispatches). Wait (bounded, heartbeat-
+        # pulsed, suspend-aware) for /api/tags before building the client --
+        # the model resolver + num_ctx negotiator then see the REAL node.
+        await _await_jprime_ready(
+            endpoint, op_id=getattr(context, "op_id", "?")[:16],
+        )
         _base_overrides: Dict[str, Any] = {
             "base_url": endpoint,
             # Deterministic VRAM residency: keep the model resident while we route
