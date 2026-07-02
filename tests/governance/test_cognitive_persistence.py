@@ -169,3 +169,75 @@ async def test_record_concurrent_same_pattern_never_loses_updates(store):
     assert all(results)
     loaded = await store.load(footprint="f@1")
     assert len(loaded) == 1 and loaded[0].count == 10
+
+
+# Task 3: PriorKnowledgeCache + format_for_prompt() tests
+from backend.core.ouroboros.governance.cognitive_persistence import (
+    PriorKnowledgeCache,
+    format_for_prompt,
+)
+
+
+def _exp(subject, count, footprint="qwen3:32b@16384",
+         kind=ExperienceKind.HALLUCINATED_TOOL, last_seen=100.0):
+    e = CognitiveExperience(kind=kind, footprint=footprint,
+                            subject=subject, error_class="unknown_tool")
+    e.count, e.last_seen = count, last_seen
+    return e
+
+
+def test_select_ranks_by_count_then_recency_and_prefers_footprint():
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from([
+        _exp("fetch_url", 5),
+        _exp("grep_files", 2, last_seen=200.0),
+        _exp("other_model_tool", 9, footprint="7b@cpu"),
+    ])
+    picked = cache.select(footprint="qwen3:32b@16384", top_k=2)
+    assert [e.subject for e in picked] == ["fetch_url", "grep_files"]
+    # cross-footprint fill when exact matches run out
+    picked3 = cache.select(footprint="qwen3:32b@16384", top_k=3)
+    assert picked3[2].subject == "other_model_tool"
+
+
+def test_format_for_prompt_fenced_bounded_and_none_when_empty(monkeypatch):
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    empty = PriorKnowledgeCache()
+    assert format_for_prompt(empty, footprint="f@1") is None
+
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from([_exp("fetch_url", 5)])
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section.startswith("## Prior Ephemeral Knowledge")
+    assert "BEGIN UNTRUSTED DATA" in section and "END UNTRUSTED DATA" in section
+    assert "fetch_url" in section and "5x" in section
+    assert len(section) <= 2000
+
+
+def test_format_for_prompt_respects_master_switch(monkeypatch):
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "false")
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from([_exp("fetch_url", 5)])
+    assert format_for_prompt(cache, footprint="qwen3:32b@16384") is None
+
+
+def test_format_for_prompt_token_safety_valve(monkeypatch):
+    """Section must shrink experience-by-experience to fit the token
+    ceiling — the L4 context-window overflow guard."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_TOP_K", "50")
+    cache = PriorKnowledgeCache()
+    # 40 experiences with long subjects — far beyond a tiny ceiling
+    cache.hydrate_from(
+        [_exp(f"tool_with_a_rather_long_name_{i:02d}", count=50 - i)
+         for i in range(40)]
+    )
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "120")
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section is not None
+    from backend.core.ouroboros.governance.local_inference_director import (
+        estimate_tokens,
+    )
+    assert estimate_tokens(section) <= 120
+    # Highest-count experience must survive the trim (lowest-rank dropped first)
+    assert "tool_with_a_rather_long_name_00" in section
