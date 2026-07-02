@@ -155,6 +155,11 @@ def _isolate_fsm_checkpoint_dir(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "JARVIS_CHECKPOINT_DIR", str(tmp_path / "_fsm_checkpoints"),
     )
+    # Same isolation for the cross-run latency-physics ledger (Amnesia Cure):
+    # tests must never read/poison the repo's real measured physics.
+    monkeypatch.setenv(
+        "JARVIS_LATENCY_LEDGER_PATH", str(tmp_path / "_latency_physics.json"),
+    )
 
 
 @pytest.fixture(autouse=True)

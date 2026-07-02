@@ -1060,6 +1060,11 @@ class IsomorphicA1Driver:
                     )
                     env["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
                     os.environ["JARVIS_STREAM_HEARTBEAT_FILE"] = _hb_file
+                    # The Amnesia Cure ledger must survive the EPHEMERAL
+                    # isomorphic cwd (same trap as JARVIS_CHECKPOINT_DIR):
+                    # pin the cross-run physics ledger to the REAL repo.
+                    env.setdefault("JARVIS_LATENCY_LEDGER_PATH", str(
+                        Path(self.repo_root) / ".jarvis" / "latency_physics.json"))
                     # Scenario-premise pin: this soak's premise is a DEAD DW
                     # (adversary chaos-kills generation) but the adversary's
                     # PROBE path is healthy by design -- without this pin the
