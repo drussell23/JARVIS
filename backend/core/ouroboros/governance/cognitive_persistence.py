@@ -7,6 +7,7 @@ injection as 'Prior Ephemeral Knowledge'. Authority-free; fail-soft.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -94,3 +95,87 @@ class CognitiveExperience:
             last_seen=float(payload.get("last_seen", 0.0)),
             op_ids=[str(o) for o in payload.get("op_ids", [])][-_OP_RING_CAP:],
         )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_enabled() -> bool:
+    return _env_bool("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", False)
+
+
+class CognitiveExperienceStore:
+    """Async fail-soft façade over PersistentIntelligenceManager for cogexp rows.
+
+    Never raises: record() returns False on failure, load() returns [].
+    """
+
+    def __init__(self, pim: Any) -> None:
+        self._pim = pim
+
+    async def record(self, exp: CognitiveExperience, op_id: str) -> bool:
+        try:
+            from backend.core.persistent_intelligence_manager import StateCategory
+            key = exp.key()
+            existing = await self._pim.get_entry(key)
+            if existing is not None and isinstance(existing.value, dict):
+                exp = CognitiveExperience.from_payload(existing.value)
+            exp.merge_occurrence(op_id, time.time())
+            await self._pim.set(
+                key, exp.to_payload(),
+                category=StateCategory.LEARNING,
+                metadata={"schema": SCHEMA_VERSION},
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 — fail-soft by contract
+            logger.debug("[CognitivePersistence] record skipped (fail-soft): %s", e)
+            return False
+
+    async def load(
+        self, footprint: Optional[str] = None, limit: int = 200
+    ) -> List[CognitiveExperience]:
+        try:
+            prefix = KEY_PREFIX + (f"{footprint}:" if footprint else "")
+            entries = await self._pim.get_by_prefix(prefix, limit=limit)
+            out: List[CognitiveExperience] = []
+            for entry in entries or []:
+                try:
+                    if isinstance(entry.value, dict):
+                        out.append(CognitiveExperience.from_payload(entry.value))
+                except Exception:
+                    continue  # one corrupt row never poisons the load
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[CognitivePersistence] load skipped (fail-soft): %s", e)
+            return []
+
+
+_default_store: Optional[CognitiveExperienceStore] = None
+_store_lock = asyncio.Lock()
+
+
+async def get_default_store() -> Optional[CognitiveExperienceStore]:
+    """Singleton bound to the real PIM. None when disabled or PIM init fails."""
+    global _default_store
+    if not is_enabled():
+        return None
+    if _default_store is not None:
+        return _default_store
+    async with _store_lock:
+        if _default_store is not None:
+            return _default_store
+        try:
+            from backend.core.persistent_intelligence_manager import (
+                get_persistent_intelligence,
+            )
+            timeout_s = float(os.getenv("JARVIS_COGNITIVE_HYDRATE_TIMEOUT_S", "10"))
+            pim = await asyncio.wait_for(get_persistent_intelligence(), timeout=timeout_s)
+            _default_store = CognitiveExperienceStore(pim=pim)
+            return _default_store
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[CognitivePersistence] PIM unavailable (fail-soft): %s", e)
+            return None
