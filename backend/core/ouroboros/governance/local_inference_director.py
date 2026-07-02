@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import logging
 import math
 import os
@@ -157,7 +158,22 @@ def expected_agentic_cycle_s(profiler: "Optional[LatencyProfiler]" = None,
         if ctx <= 0:
             ctx = float(os.environ.get(
                 "JARVIS_HYBRID_MESH_EXPECTED_NUM_CTX", "16384") or 16384)
-        return rounds * seed_s * mult * max(1.0, ctx / baseline)
+        per_round_s = seed_s * mult * max(1.0, ctx / baseline)
+        # The Amnesia Cure: fold the cross-run physics ledger into the cold
+        # path -- run N+1's very first floors/walls are sized from run N's
+        # MEASURED per-round truth (the max persisted EWMA), never below the
+        # seed formula. Fail-soft: empty/corrupt ledger -> formula only.
+        try:
+            if _physics_ledger_enabled():
+                _persisted = [
+                    float((v or {}).get("ewma_ms", 0.0) or 0.0) / 1000.0
+                    for v in _physics_ledger_load().values()
+                ]
+                if _persisted:
+                    per_round_s = max(per_round_s, max(_persisted))
+        except Exception:  # noqa: BLE001
+            pass
+        return rounds * per_round_s
     except Exception:  # noqa: BLE001 -- physics sizing must never break a caller
         return rounds * 120.0
 
@@ -231,6 +247,55 @@ def fit_prompt_to_window(
     return system, head + marker + tail, True
 
 
+def _physics_ledger_enabled() -> bool:
+    return (os.environ.get("JARVIS_LATENCY_LEDGER_ENABLED", "true") or "").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _physics_ledger_path() -> str:
+    return os.environ.get(
+        "JARVIS_LATENCY_LEDGER_PATH",
+        os.path.join(".jarvis", "latency_physics.json"),
+    )
+
+
+def _physics_ledger_load() -> dict:
+    """The Amnesia Cure ledger (bandit_router idiom): keyed physics dict at
+    .jarvis/latency_physics.json. Fail-soft: corrupt/missing -> {}."""
+    try:
+        with open(_physics_ledger_path(), encoding="utf-8") as fh:
+            data = json.loads(fh.read())
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _physics_ledger_save(key: str, payload: dict) -> None:
+    """Write-through one key (few hundred bytes). NEVER raises into dispatch."""
+    try:
+        path = _physics_ledger_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        data = _physics_ledger_load()
+        data[str(key)] = payload
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data))
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def physics_key(cfg: "LocalConfig") -> str:
+    """The DURABLE physics identity: (model, ctx-bucket) -- NOT the endpoint
+    (node IPs change every run; the physics belongs to the brain+window)."""
+    try:
+        model = str(getattr(cfg, "model_name", "") or "unknown")
+        ctx = int(getattr(cfg, "num_ctx", 0) or 0)
+        return "%s@%s" % (model, ctx if ctx > 0 else "cpu")
+    except Exception:  # noqa: BLE001
+        return "unknown@cpu"
+
+
 class LatencyProfiler:
     """Thread-safe sliding window of (ttft_ms, per_token_ms) -> bounded adaptive timeout.
 
@@ -239,16 +304,33 @@ class LatencyProfiler:
     wedged model still trips the breaker (watchdog-isolation invariant).
     """
 
-    def __init__(self, cfg: "LocalConfig") -> None:
+    def __init__(self, cfg: "LocalConfig", ledger_key: str = "") -> None:
         self._cfg = cfg
         self._lock = threading.Lock()
         self._ttft: Deque[float] = deque(maxlen=cfg.window_size)
         self._per_tok: Deque[float] = deque(maxlen=cfg.window_size)
         self._total: Deque[float] = deque(maxlen=cfg.window_size)
+        # The Amnesia Cure: warm-start from the cross-run physics ledger so a
+        # fresh process inherits the MEASURED truth instead of the blind seed.
+        self._ledger_key = str(ledger_key or "") if _physics_ledger_enabled() else ""
+        if self._ledger_key:
+            try:
+                _prior = _physics_ledger_load().get(self._ledger_key) or {}
+                for _v in (_prior.get("ttft") or [])[-cfg.window_size:]:
+                    self._ttft.append(float(_v))
+                for _v in (_prior.get("per_tok") or [])[-cfg.window_size:]:
+                    self._per_tok.append(float(_v))
+                for _v in (_prior.get("total") or [])[-cfg.window_size:]:
+                    self._total.append(float(_v))
+                self._ewma_prior = float(_prior.get("ewma_ms", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                self._ewma_prior = 0.0
+        else:
+            self._ewma_prior = 0.0
         # Asymmetric EWMA (ms): timeouts jump it UP (penalty), successes blend it
         # down toward the real latency. Acts as an escalating floor on the adaptive
         # timeout so a starved cold profiler still expands the window. 0 = no data.
-        self._ewma_ms: float = 0.0
+        self._ewma_ms: float = float(getattr(self, '_ewma_prior', 0.0) or 0.0)
         # Async Calibration Mutex (Scout Lock): the FIRST cold coroutine calibrates
         # (Scout) while the concurrent herd waits on the lock; once calibrated, the
         # gate is open and dispatches run fully concurrently on the escalated EWMA.
@@ -317,6 +399,7 @@ class LatencyProfiler:
             else:
                 a = _ewma_alpha()
                 self._ewma_ms = a * float(total_ms) + (1.0 - a) * self._ewma_ms
+        self._flush_physics()
 
     def record_timeout_penalty(self, timeout_ms: float) -> None:
         """Asymmetric penalty injection: a TIMEOUT jumps the EWMA UP to
@@ -326,6 +409,23 @@ class LatencyProfiler:
             penalty = float(timeout_ms) * _timeout_escalation_factor()
             with self._lock:
                 self._ewma_ms = max(self._ewma_ms, penalty)
+            self._flush_physics()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _flush_physics(self) -> None:
+        """Write-through the durable physics (Amnesia Cure). NEVER raises."""
+        if not self._ledger_key:
+            return
+        try:
+            with self._lock:
+                payload = {
+                    "ewma_ms": float(self._ewma_ms),
+                    "ttft": list(self._ttft),
+                    "per_tok": list(self._per_tok),
+                    "total": list(self._total),
+                }
+            _physics_ledger_save(self._ledger_key, payload)
         except Exception:  # noqa: BLE001
             pass
 

@@ -4290,8 +4290,12 @@ class CandidateGenerator:
             if prof is None:
                 from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
                     LatencyProfiler,
+                    physics_key,
                 )
-                prof = LatencyProfiler(cfg)
+                # The Amnesia Cure: key the profiler by its DURABLE physics
+                # identity (model@ctx -- endpoints/IPs change every run) so
+                # the EWMA warm-starts from the cross-run ledger.
+                prof = LatencyProfiler(cfg, ledger_key=physics_key(cfg))
                 store[endpoint] = prof
             return prof
         except Exception:  # noqa: BLE001
