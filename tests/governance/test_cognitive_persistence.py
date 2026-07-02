@@ -350,3 +350,22 @@ async def test_hydrate_disabled_yields_empty_cache(monkeypatch):
     monkeypatch.setattr(cogp, "_prior_knowledge_cache", cogp.PriorKnowledgeCache())
     cache = await cogp.hydrate_prior_knowledge()
     assert len(cache) == 0
+
+
+# Task 6: FlagRegistry seeds + orchestrator injector wiring
+def test_register_flags_seeds_all_knobs():
+    from backend.core.ouroboros.governance.flag_registry import FlagRegistry
+    registry = FlagRegistry()
+    n = cogp.register_flags(registry)
+    assert n == 7
+    spec = registry.get_spec("JARVIS_COGNITIVE_PERSISTENCE_ENABLED")
+    assert spec is not None and spec.default is False
+
+
+def test_orchestrator_exposes_injection_impl():
+    # Wired-but-inert guard: the helper must exist and be referenced in _run_pipeline.
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    assert hasattr(orch, "_inject_prior_knowledge_impl")
+    src = inspect.getsource(orch.Orchestrator._run_pipeline)
+    assert "_inject_prior_knowledge_impl" in src

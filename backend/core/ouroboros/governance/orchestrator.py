@@ -940,6 +940,64 @@ def _inject_last_session_summary_impl(
     return ctx
 
 
+def _inject_prior_knowledge_impl(ctx: OperationContext) -> OperationContext:
+    """Inject Prior Ephemeral Knowledge into ``ctx.strategic_memory_prompt``.
+
+    Extracted at module scope (mirrors ``_inject_last_session_summary_impl`` /
+    ``_inject_postmortem_recall_impl``). Reads the boot-hydrated
+    ``PriorKnowledgeCache`` singleton and renders up to
+    ``JARVIS_COGNITIVE_INJECT_TOP_K`` cross-session experiences into the
+    prompt via ``format_for_prompt``. Footprint resolution is best-effort:
+    ``OperationContext`` does not carry resolved model/context-window
+    attributes at CONTEXT_EXPANSION time (generation hasn't run yet), so
+    ``footprint`` stays ``None`` in the default path and ``select()``
+    degrades to the cross-footprint global top-K — this is the designed
+    degradation, not an error.
+
+    Authority invariant per PRD §12.2: read-only, best-effort, never blocks
+    the FSM. Fail-soft — any exception is swallowed with a DEBUG breadcrumb
+    and ``ctx`` is returned unchanged.
+    """
+    try:
+        from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+        cache = _cogp.get_prior_knowledge_cache()
+        footprint = None
+        try:
+            _model = getattr(ctx, "resolved_model_name", None)
+            _num_ctx = getattr(ctx, "resolved_num_ctx", None)
+            if _model:
+                footprint = _cogp.cognitive_footprint(_model, _num_ctx)
+        except Exception:
+            footprint = None
+        section = _cogp.format_for_prompt(cache, footprint)
+        if not section:
+            logger.debug(
+                "[CognitivePersistence] op=%s inject_site=context_expansion "
+                "section=empty",
+                ctx.op_id,
+            )
+            return ctx
+        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+        ctx = ctx.with_strategic_memory_context(
+            strategic_intent_id=ctx.strategic_intent_id or "prior-knowledge-v1",
+            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+            strategic_memory_prompt=(
+                _existing + "\n\n" + section if _existing else section
+            ),
+            strategic_memory_digest=ctx.strategic_memory_digest,
+        )
+        logger.info(
+            "[CognitivePersistence] op=%s injected prior knowledge: %d chars "
+            "footprint=%s inject_site=context_expansion",
+            ctx.op_id, len(section), footprint or "any",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "[CognitivePersistence] injection skipped (fail-soft): %s", e,
+        )
+    return ctx
+
+
 class _PreloadedExplorationRecord:
     """Synthetic exploration record for files the lean prompt builder inlined.
 
@@ -3496,6 +3554,13 @@ class GovernedOrchestrator:
             # module scope as `_inject_postmortem_recall_impl`. ConversationBridge
             # → PostmortemRecall → SemanticIndex ordering preserved.
             ctx = _inject_postmortem_recall_impl(ctx)
+
+            # ---- Task 6 Prior Ephemeral Knowledge: cross-session experiences ----
+            # Helper extraction mirrors LSS/PostmortemRecall pattern. Body lives
+            # at module scope as `_inject_prior_knowledge_impl`. Trust ordering:
+            # Strategic → ConversationBridge → PostmortemRecall → PriorKnowledge
+            # → SemanticIndex → Goals → UserPreferences.
+            ctx = _inject_prior_knowledge_impl(ctx)
 
             # ---- Phase 4 P3 Cognitive Metrics: Oracle pre-score ----
             # Best-effort observability — calls OraclePreScorer via the

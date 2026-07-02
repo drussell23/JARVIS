@@ -382,3 +382,53 @@ async def hydrate_prior_knowledge() -> PriorKnowledgeCache:
     except Exception as e:  # noqa: BLE001 — boot must never block on memory
         logger.debug("[CognitivePersistence] hydration skipped (fail-soft): %s", e)
     return _prior_knowledge_cache
+
+
+# Task 6: FlagRegistry seed hook
+
+
+def register_flags(registry: Any) -> int:
+    """FlagRegistry seed hook (auto-discovered convention)."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    src = "backend/core/ouroboros/governance/cognitive_persistence.py"
+    seeds = [
+        FlagSpec(name="JARVIS_COGNITIVE_PERSISTENCE_ENABLED", type=FlagType.BOOL,
+                 default=False, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Master switch: bi-directional cognitive persistence "
+                             "(cross-session experience ledger via PIM). §33.1 default-FALSE.",
+                 example="JARVIS_COGNITIVE_PERSISTENCE_ENABLED=true"),
+        FlagSpec(name="JARVIS_COGNITIVE_PROMPT_INJECTION_ENABLED", type=FlagType.BOOL,
+                 default=True, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Sub-switch: inject Prior Ephemeral Knowledge at CONTEXT_EXPANSION.",
+                 example="JARVIS_COGNITIVE_PROMPT_INJECTION_ENABLED=false"),
+        FlagSpec(name="JARVIS_COGNITIVE_INJECT_TOP_K", type=FlagType.INT,
+                 default=8, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Max prior experiences injected per op.",
+                 example="JARVIS_COGNITIVE_INJECT_TOP_K=4"),
+        FlagSpec(name="JARVIS_COGNITIVE_INJECT_MAX_TOKENS", type=FlagType.INT,
+                 default=600, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Token ceiling for the injected section "
+                             "(context-window overflow guard; estimator = "
+                             "local_inference_director.estimate_tokens).",
+                 example="JARVIS_COGNITIVE_INJECT_MAX_TOKENS=400"),
+        FlagSpec(name="JARVIS_COGNITIVE_HYDRATE_TIMEOUT_S", type=FlagType.FLOAT,
+                 default=10.0, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Boot hydration hard bound (asyncio.wait_for).",
+                 example="JARVIS_COGNITIVE_HYDRATE_TIMEOUT_S=5"),
+        FlagSpec(name="JARVIS_COGNITIVE_HYDRATE_LIMIT", type=FlagType.INT,
+                 default=200, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Max experience rows hydrated at boot.",
+                 example="JARVIS_COGNITIVE_HYDRATE_LIMIT=100"),
+        FlagSpec(name="JARVIS_COGNITIVE_HYDRATE_ON_CHECKPOINT_RESUME", type=FlagType.BOOL,
+                 default=True, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Also re-hydrate when FSM checkpoint hydration fires "
+                             "(unified_intake_router seam).",
+                 example="JARVIS_COGNITIVE_HYDRATE_ON_CHECKPOINT_RESUME=false"),
+    ]
+    registry.bulk_register(seeds)
+    return len(seeds)
