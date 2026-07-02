@@ -188,3 +188,31 @@ async def test_handback_drain_budget_scales_for_heavy_tier(monkeypatch):
     await drainer
     assert seen_at_teardown["n"] == 0     # zero-drop honored (waited past base budget)
     assert ctrl.state.name == "DORMANT"
+
+
+async def test_handback_master_disable_pins_serving(monkeypatch):
+    """Scenario-premise pin (A1 soak): the sandbox adversary's PROBE path is
+    healthy BY DESIGN while generation is chaos-killed, so deep_probe_recovered
+    kept triggering handback every ~6min and the FSM deleted the node the
+    scenario depends on (bt-iso-1782957492: even the 480s heavy drain expired
+    with 5 ops in flight). JARVIS_FAILOVER_HANDBACK_ENABLED=false pins SERVING
+    (default true = legacy handback, byte-identical)."""
+    monkeypatch.setenv("JARVIS_FAILOVER_HANDBACK_ENABLED", "false")
+    torn = {"n": 0}
+    ctrl = FailoverLifecycleController(
+        vm_awaken_fn=lambda *, startup_script: True,
+        vm_delete_fn=lambda: torn.__setitem__("n", 1) or True,
+        node_ready_fn=lambda e: True,
+        clock_fn=FakeClock(),
+        in_flight_fn=lambda: 0,
+        dw_probe_fn=lambda: True,          # DW looks healthy on every probe
+    )
+    monkeypatch.setattr(ctrl, "_close_ephemeral_perimeter", _noop)
+    ctrl._state = fl.FailoverState.SERVING
+    ctrl._serving_started_at = 0.0
+    monkeypatch.setattr(ctrl, "_deep_probe_recovered", lambda: True)
+
+    await ctrl._tick_serving(now=100000.0)   # uptime huge, deep probe recovered
+
+    assert ctrl.state.name == "SERVING"      # pinned -- no handback fired
+    assert torn["n"] == 0                    # node NEVER deleted

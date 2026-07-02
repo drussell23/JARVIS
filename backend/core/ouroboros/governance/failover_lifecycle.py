@@ -309,6 +309,19 @@ def _ready_backoff_cap_s() -> float:
     return max(0.01, _env_float("JARVIS_FAILOVER_READY_BACKOFF_CAP_S", 15.0))
 
 
+def _handback_enabled() -> bool:
+    """Master handback gate (default ON = legacy). ``=false`` pins SERVING --
+    the operator/scenario owns the sovereign node's lifetime. Built for the A1
+    soak, whose PREMISE is a dead DW: the sandbox adversary's probe path is
+    healthy by design (independent probe/gen paths), so deep_probe_recovered
+    kept handing the node back mid-scenario and deleting it under committed
+    32B ops (bt-iso-1782957492: even the 480s heavy drain expired with 5 ops
+    in flight). The Dead-Man's Switch + driver teardown remain the cost
+    backstops when handback is pinned off."""
+    return (os.environ.get("JARVIS_FAILOVER_HANDBACK_ENABLED", "true") or "").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 def _handback_drain_budget_s() -> float:
     """Max seconds HANDBACK waits for in-flight J-Prime ops to drain to 0 before
     tearing down anyway (bounded -- never deadlock the FSM; the Dead-Man's Switch
@@ -2387,6 +2400,17 @@ class FailoverLifecycleController:
         deep_ok = self._deep_probe_recovered()
 
         if (hyst_ok or deep_ok) and uptime_ok:
+            if not _handback_enabled():
+                # Scenario/operator pin: recovery observed but handback is
+                # master-off -- the sovereign node stays SERVING (A1 soak:
+                # the premise is a dead DW; a healthy PROBE must not delete
+                # the node mid-scenario). Cost backstops: Dead-Man's Switch
+                # + driver teardown.
+                logger.debug(
+                    "[FailoverLifecycle] handback gate met but "
+                    "JARVIS_FAILOVER_HANDBACK_ENABLED=false -- staying SERVING",
+                )
+                return
             logger.info(
                 "[FailoverLifecycle] HANDBACK gate passed: gradient_streak=%d (>=%d) "
                 "deep_probe_recovered=%s uptime=%.1fs (>=%.1fs)",
