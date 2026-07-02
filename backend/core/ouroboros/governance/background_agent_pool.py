@@ -347,6 +347,15 @@ class BackgroundAgentPool:
             queue_size if queue_size is not None
             else _read_env_int("JARVIS_BG_QUEUE_SIZE", 16)
         )
+        # Dynamic Fleet Topology (lanes track the mesh): the live worker
+        # TARGET. Boot = configured size (governs the mesh-dormant DW-era
+        # regime); while sovereign endpoints serve, the FleetRegistry
+        # observer locks the target to the node count (one GPU = one lane).
+        self._target_pool_size: int = self._pool_size
+        # Immutability Lock: while True, hardware-derived topology is the
+        # mathematical authority -- lower-ranked writers (env/config/
+        # manifest) are silently rejected.
+        self._topology_locked: bool = False
         # PriorityQueue: items are (priority, submission_order, op).
         # Lower priority number = runs first.  Ensures IMMEDIATE ops
         # don't starve BACKGROUND ops when workers free up.
@@ -398,6 +407,57 @@ class BackgroundAgentPool:
 
     # -- Lifecycle -----------------------------------------------------------
 
+    def set_target_pool_size(self, n: int, *, source: str = "config",
+                             lock: bool = False) -> bool:
+        """Dynamic Fleet Topology resize + the Immutability Lock.
+
+        ``source="fleet_topology"`` is the hardware-derived authority: it
+        always applies and sets/releases the lock. Any other source
+        (env/config/manifest) is silently REJECTED while the lock is held --
+        the mesh's physical lane count is a mathematical truth, not a
+        preference. Shrink is cooperative (workers retire between dequeues);
+        grow respawns retired worker ids. Returns True when applied."""
+        try:
+            _n = max(1, int(n))
+        except (TypeError, ValueError):
+            return False
+        if self._topology_locked and source != "fleet_topology":
+            logger.info(
+                "Immutability Lock: rejected pool resize to %d from source=%s "
+                "(topology-derived target=%d is authoritative)",
+                _n, source, self._target_pool_size,
+            )
+            return False
+        self._target_pool_size = _n
+        if source == "fleet_topology":
+            self._topology_locked = bool(lock)
+            logger.info(
+                "Fleet topology: lane target=%d (locked=%s) -- lanes track "
+                "the serving mesh", _n, self._topology_locked,
+            )
+        if self._running:
+            self._reconcile_workers()
+        return True
+
+    def _reconcile_workers(self) -> None:
+        """Spawn workers for ids below the target whose task is missing or
+        done (grow); shrink is cooperative via the worker-loop retire check.
+        NEVER raises."""
+        try:
+            for i in range(self._target_pool_size):
+                if i >= len(self._workers):
+                    self._workers.append(asyncio.create_task(
+                        self._worker_loop(worker_id=i),
+                        name=f"bg-agent-worker-{i}",
+                    ))
+                elif self._workers[i].done():
+                    self._workers[i] = asyncio.create_task(
+                        self._worker_loop(worker_id=i),
+                        name=f"bg-agent-worker-{i}",
+                    )
+        except Exception:  # noqa: BLE001 -- reconcile must never break the pool
+            logger.debug("worker reconcile fail-soft", exc_info=True)
+
     async def start(self) -> None:
         """Create the worker coroutines and begin processing the queue.
 
@@ -414,7 +474,7 @@ class BackgroundAgentPool:
                 self._worker_loop(worker_id=i),
                 name=f"bg-agent-worker-{i}",
             )
-            for i in range(self._pool_size)
+            for i in range(self._target_pool_size)
         ]
         # Stage 1.6 — register self in the process-wide bind so the
         # GENERATE-park wrapper can re-submit resumed dispatches
@@ -975,6 +1035,16 @@ class BackgroundAgentPool:
         logger.debug("Worker %d started", worker_id)
         try:
             while self._running:
+                # Dynamic Fleet Topology: cooperative retire when the live
+                # target shrank below this worker's id (mesh topology says
+                # fewer lanes than workers). Never mid-op -- only between
+                # dequeues, so in-flight work always completes.
+                if worker_id >= self._target_pool_size:
+                    logger.info(
+                        "Worker %d retiring (topology target=%d)",
+                        worker_id, self._target_pool_size,
+                    )
+                    break
                 # HIBERNATION_MODE: block here while paused. Bounded wait so
                 # stop() still reacts within ~2s even if resume() never fires.
                 if not self._unpaused_event.is_set():
