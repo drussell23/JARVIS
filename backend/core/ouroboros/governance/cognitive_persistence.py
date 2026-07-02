@@ -116,20 +116,22 @@ class CognitiveExperienceStore:
 
     def __init__(self, pim: Any) -> None:
         self._pim = pim
+        self._record_lock = asyncio.Lock()
 
     async def record(self, exp: CognitiveExperience, op_id: str) -> bool:
         try:
             from backend.core.persistent_intelligence_manager import StateCategory
             key = exp.key()
-            existing = await self._pim.get_entry(key)
-            if existing is not None and isinstance(existing.value, dict):
-                exp = CognitiveExperience.from_payload(existing.value)
-            exp.merge_occurrence(op_id, time.time())
-            await self._pim.set(
-                key, exp.to_payload(),
-                category=StateCategory.LEARNING,
-                metadata={"schema": SCHEMA_VERSION},
-            )
+            async with self._record_lock:
+                existing = await self._pim.get_entry(key)
+                if existing is not None and isinstance(existing.value, dict):
+                    exp = CognitiveExperience.from_payload(existing.value)
+                exp.merge_occurrence(op_id, time.time())
+                await self._pim.set(
+                    key, exp.to_payload(),
+                    category=StateCategory.LEARNING,
+                    metadata={"schema": SCHEMA_VERSION},
+                )
             return True
         except Exception as e:  # noqa: BLE001 — fail-soft by contract
             logger.debug("[CognitivePersistence] record skipped (fail-soft): %s", e)

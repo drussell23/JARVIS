@@ -136,3 +136,36 @@ async def test_store_never_raises_on_broken_pim(store):
                               footprint="f@1", subject="s", error_class="e")
     assert await broken.record(exp, op_id="op-1") is False
     assert await broken.load() == []
+
+
+async def test_record_concurrent_same_pattern_never_loses_updates(store):
+    """Read-modify-write must be serialized: N concurrent records of the
+    same pattern yield count == N (no lost updates)."""
+    import asyncio
+
+    # Force interleaving: make the fake PIM yield control inside its
+    # async methods so an unserialized read-modify-write WOULD lose updates.
+    orig_get, orig_set = store._pim.get_entry, store._pim.set
+
+    async def yielding_get(key):
+        await asyncio.sleep(0)
+        return await orig_get(key)
+
+    async def yielding_set(key, value, **kw):
+        await asyncio.sleep(0)
+        return await orig_set(key, value, **kw)
+
+    store._pim.get_entry, store._pim.set = yielding_get, yielding_set
+
+    def _exp():
+        return CognitiveExperience(
+            kind=ExperienceKind.FAILED_TOOL_PATTERN,
+            footprint="f@1", subject="run_tests", error_class="TimeoutError",
+        )
+
+    results = await asyncio.gather(
+        *(store.record(_exp(), op_id=f"op-{i}") for i in range(10))
+    )
+    assert all(results)
+    loaded = await store.load(footprint="f@1")
+    assert len(loaded) == 1 and loaded[0].count == 10
