@@ -157,20 +157,29 @@ class CognitiveExperienceStore:
 
 
 _default_store: Optional[CognitiveExperienceStore] = None
-_store_lock = asyncio.Lock()
+_store_lock: Optional[asyncio.Lock] = None
+
+
+def _get_store_lock() -> asyncio.Lock:
+    """Lazily constructed under a running loop — py3.9 binds the loop at
+    Lock construction, so a module-level instance could bind the wrong loop."""
+    global _store_lock
+    if _store_lock is None:
+        _store_lock = asyncio.Lock()
+    return _store_lock
 
 
 async def get_default_store() -> Optional[CognitiveExperienceStore]:
     """Singleton bound to the real PIM. None when disabled or PIM init fails."""
     global _default_store
-    if not is_enabled():
-        return None
-    if _default_store is not None:
-        return _default_store
-    async with _store_lock:
+    try:
+        if not is_enabled():
+            return None
         if _default_store is not None:
             return _default_store
-        try:
+        async with _get_store_lock():
+            if _default_store is not None:
+                return _default_store
             from backend.core.persistent_intelligence_manager import (
                 get_persistent_intelligence,
             )
@@ -178,9 +187,9 @@ async def get_default_store() -> Optional[CognitiveExperienceStore]:
             pim = await asyncio.wait_for(get_persistent_intelligence(), timeout=timeout_s)
             _default_store = CognitiveExperienceStore(pim=pim)
             return _default_store
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[CognitivePersistence] PIM unavailable (fail-soft): %s", e)
-            return None
+    except Exception as e:  # noqa: BLE001 — never raise; caller treats None as "unavailable"
+        logger.debug("[CognitivePersistence] PIM unavailable (fail-soft): %s", e)
+        return None
 
 
 # Task 3: PriorKnowledgeCache + format_for_prompt() (prompt injection surface)
@@ -278,6 +287,13 @@ def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> O
 
 
 def inject_metrics(cache: PriorKnowledgeCache) -> "tuple[bool, int]":
+    """Master-enabled + non-empty-cache signal for observability surfaces.
+
+    Caveat: this does NOT reflect JARVIS_COGNITIVE_PROMPT_INJECTION_ENABLED
+    (the sub-switch checked inside format_for_prompt) — the returned bool
+    means "persistence is on and there is something to inject", not
+    "format_for_prompt would actually inject on the next call".
+    """
     return (is_enabled() and len(cache) > 0, len(cache))
 
 
@@ -320,6 +336,13 @@ def distill_experiences(
     return out
 
 
+# A bare create_task() Task is only weak-referenced by the event loop —
+# nothing else holds it, so it can be garbage-collected mid-flight, silently
+# dropping the exact write this feature exists to make durable. Keep a
+# strong ref here until the task finishes (the standard asyncio idiom).
+_pending_writes: "set" = set()
+
+
 def record_terminal_experiences_fire_and_forget(
     records: List[Any], *, footprint: str,
     terminal_reason: Optional[str], phase: Optional[str], op_id: str,
@@ -337,15 +360,17 @@ def record_terminal_experiences_fire_and_forget(
         store = await get_default_store()
         if store is None:
             return
-        for exp in exps[:20]:  # per-op write cap
-            await store.record(exp, op_id=op_id)
+        bounded = exps[:20]  # per-op write cap
+        recorded = sum([await store.record(exp, op_id=op_id) for exp in bounded])
         logger.info(
-            "[CognitivePersistence] op=%s recorded=%d footprint=%s", op_id,
-            len(exps[:20]), footprint,
+            "[CognitivePersistence] op=%s attempted=%d recorded=%d footprint=%s",
+            op_id, len(bounded), recorded, footprint,
         )
 
     try:
-        asyncio.get_running_loop().create_task(_write())
+        _task = asyncio.get_running_loop().create_task(_write())
+        _pending_writes.add(_task)
+        _task.add_done_callback(_pending_writes.discard)
     except RuntimeError:
         logger.debug("[CognitivePersistence] no running loop; write skipped")
 

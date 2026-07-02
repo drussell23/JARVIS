@@ -110,3 +110,9 @@ async def test_session_a_writes_session_b_reads_and_injects(isolated_pim_env):
     assert section is not None
     assert "fetch_url" in section and "hallucinated_tool" in section
     assert "BEGIN UNTRUSTED DATA" in section
+
+    # Live injection always calls format_for_prompt with footprint=None
+    # (ctx lacks resolved model attrs) -- the global top-K path must also
+    # serve the persisted experience, not just the exact-footprint path.
+    live_section = cogp.format_for_prompt(cache, footprint=None)
+    assert live_section is not None and "fetch_url" in live_section

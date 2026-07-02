@@ -200,6 +200,19 @@ def test_select_ranks_by_count_then_recency_and_prefers_footprint():
     assert picked3[2].subject == "other_model_tool"
 
 
+def test_select_none_footprint_serves_global_top_k():
+    """The live injection path always passes footprint=None — the global
+    rank-ordered top-K must be served (no exact-match bucket exists)."""
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from([
+        _exp("a_tool", 3, footprint="m1@8k"),
+        _exp("b_tool", 9, footprint="m2@cpu"),
+        _exp("c_tool", 5, footprint="m3@16k"),
+    ])
+    picked = cache.select(footprint=None, top_k=2)
+    assert [e.subject for e in picked] == ["b_tool", "c_tool"]
+
+
 def test_format_for_prompt_fenced_bounded_and_none_when_empty(monkeypatch):
     monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
     empty = PriorKnowledgeCache()

@@ -155,6 +155,27 @@ def test_heartbeat_noop_without_tty(monkeypatch):
     assert pipe.chunks == []
 
 
+def test_heartbeat_respects_runtime_env_flip(monkeypatch):
+    """HeartbeatConsoleHandler reads JARVIS_CONSOLE_HEARTBEAT_ENABLED per-emit —
+    a runtime flip (e.g. harness suppression for an interactive SerpentFlow
+    session) must take effect on the very next emit, without reconstructing
+    the handler."""
+    monkeypatch.setenv("JARVIS_CONSOLE_HEARTBEAT_INTERVAL_S", "10")
+    monkeypatch.setenv("JARVIS_CONSOLE_HEARTBEAT_ENABLED", "true")
+    fake = _FakeTTY()
+    hb = HeartbeatConsoleHandler(stream=fake)
+    now = [1000.0]
+    monkeypatch.setattr(hb, "_now", lambda: now[0])
+
+    hb.emit(_record("first"))
+    assert len(fake.chunks) == 1
+
+    monkeypatch.setenv("JARVIS_CONSOLE_HEARTBEAT_ENABLED", "false")
+    now[0] += 11.0  # advance past the rate-limit interval
+    hb.emit(_record("second"))
+    assert len(fake.chunks) == 1, "no new chunk once suppressed at runtime"
+
+
 def test_heartbeat_never_raises_on_broken_stream():
     class _Broken:
         def write(self, s):

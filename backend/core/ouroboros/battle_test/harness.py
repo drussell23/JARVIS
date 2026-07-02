@@ -2153,6 +2153,14 @@ class BattleTestHarness:
                 )
                 self._serpent_flow.set_plan_review_mode(self._plan_before_execute)
 
+                # SerpentFlow owns the terminal (prompt_toolkit patch_stdout +
+                # bottom_toolbar). The telemetry heartbeat writes raw \r-lines
+                # to sys.__stdout__, bypassing that protection — suppress it
+                # for interactive sessions unless the operator explicitly
+                # opted in. Read per-emit, so this takes effect immediately.
+                if "JARVIS_CONSOLE_HEARTBEAT_ENABLED" not in os.environ:
+                    os.environ["JARVIS_CONSOLE_HEARTBEAT_ENABLED"] = "false"
+
                 # CC1 — operator-selectable per-op rendering. Default
                 # CLAUDE: terse one-line-per-op idiom matching Claude
                 # Code's tool-call visual model. Hot-revert via
