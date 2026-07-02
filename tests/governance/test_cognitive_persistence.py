@@ -274,6 +274,22 @@ def test_distill_maps_failed_tool_and_skips_successes():
     assert exps[0].kind is ExperienceKind.FAILED_TOOL_PATTERN
 
 
+def test_distill_skips_real_success_status():
+    # status="success" is the REAL ToolExecStatus.SUCCESS value (not "ok") —
+    # skipped both with no error_class and with a stale error_class set,
+    # since a success record should never distill into an experience.
+    exps = distill_experiences(
+        [_rec("read_file", error_class=None, status="success")],
+        footprint="f@1", terminal_reason=None, phase=None,
+    )
+    assert exps == []
+    exps = distill_experiences(
+        [_rec("read_file", error_class="SomeStaleError", status="success")],
+        footprint="f@1", terminal_reason=None, phase=None,
+    )
+    assert exps == []
+
+
 def test_distill_adds_generation_failure_from_terminal_reason():
     exps = distill_experiences(
         [], footprint="f@1", terminal_reason="generation_failed", phase="GENERATE",

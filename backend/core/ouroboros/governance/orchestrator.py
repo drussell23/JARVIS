@@ -13273,19 +13273,25 @@ class GovernedOrchestrator:
         # rows via the write-side of the Bi-Directional Cognitive
         # Persistence arc. Piggybacks on the Slice74Probe terminal-state
         # classification (_s74_sv) above — this IS the single chokepoint
-        # every terminal ledger write passes through, so it sees every
-        # applied/rolled_back/failed/blocked transition regardless of
-        # which of the ~70 call sites in this file triggered it. Fully
-        # self-contained try/except: NEVER raises into _record_ledger,
-        # DEBUG-logs and continues. Fire-and-forget background write,
-        # capped at 20 experiences/op inside the recorder. Authority-free
-        # — never influences GATE/APPLY. No-op when
-        # JARVIS_COGNITIVE_PERSISTENCE_ENABLED is unset (default False).
+        # every terminal ledger write passes through. In practice this
+        # fires on applied/failed/blocked: OperationState.ROLLED_BACK
+        # never reaches _record_ledger (rollback rows are appended
+        # directly in change_engine.py's own ledger.append call) — the
+        # "rolled_back" branch below stays in the state guard purely as
+        # a future-proofing no-op. Gated on `written` (computed above)
+        # to match the SessionRecorder dedup semantics a few lines up —
+        # a replayed/deduped ledger write must never double-count
+        # experience occurrences. Fully self-contained try/except: NEVER
+        # raises into _record_ledger, DEBUG-logs and continues.
+        # Fire-and-forget background write, capped at 20 experiences/op
+        # inside the recorder. Authority-free — never influences
+        # GATE/APPLY. No-op when JARVIS_COGNITIVE_PERSISTENCE_ENABLED is
+        # unset (default False).
         try:
             from backend.core.ouroboros.governance import (
                 cognitive_persistence as _cogp,
             )
-            if _cogp.is_enabled():
+            if _cogp.is_enabled() and written:
                 _cogp_sv = str(getattr(state, "value", state)).lower()
                 if _cogp_sv in ("applied", "rolled_back", "failed", "blocked"):
                     _cogp_gen = getattr(ctx, "generation", None)
@@ -13307,10 +13313,25 @@ class GovernedOrchestrator:
                             or str((data or {}).get("reason_code", "") or "")
                             or _cogp_sv
                         )
-                    _cogp_phase = (
-                        getattr(getattr(ctx, "phase", None), "name", None)
-                        or str(getattr(ctx, "phase", "") or "")
-                    )
+                    # Most terminal paths have already advanced ctx.phase to
+                    # POSTMORTEM/CANCELLED by the time _record_ledger runs —
+                    # ctx.phase.name mislabels the originating phase. The
+                    # codebase-wide convention (10+ call sites) for the true
+                    # originating phase is data["entry_phase"]; prefer it and
+                    # only fall back to ctx.phase.name when it's absent.
+                    _cogp_phase = ""
+                    try:
+                        _cogp_phase = (
+                            str((data or {}).get("entry_phase") or "")
+                            if isinstance(data, dict) else ""
+                        )
+                    except Exception:
+                        _cogp_phase = ""
+                    if not _cogp_phase:
+                        _cogp_phase = (
+                            getattr(getattr(ctx, "phase", None), "name", None)
+                            or str(getattr(ctx, "phase", "") or "")
+                        )
                     _cogp.record_terminal_experiences_fire_and_forget(
                         _cogp_records,
                         footprint=_cogp_footprint,

@@ -297,7 +297,7 @@ def distill_experiences(
         try:
             status = getattr(getattr(rec, "status", None), "value", "") or ""
             err = getattr(rec, "error_class", None)
-            if status == "ok" or not err:
+            if status in ("ok", "success") or not err:
                 continue
             kind = (
                 ExperienceKind.HALLUCINATED_TOOL
