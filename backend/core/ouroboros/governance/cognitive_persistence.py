@@ -253,11 +253,50 @@ def _render_section(picked: List[CognitiveExperience]) -> str:
     return "\n".join(lines)
 
 
+def _effective_max_tokens() -> "tuple[int, str]":
+    """The injection ceiling: static valve clamped by a fraction of the
+    ACTIVE context window, whichever is stricter.
+
+    Window resolution order (no new plumbing — the resolved model config
+    is not threaded to the injection seam):
+      1. JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS — explicit operator override
+      2. JARVIS_LOCAL_NUM_CTX — the canonical local-inference window env
+      3. unset/invalid -> static valve only
+    Fraction: JARVIS_COGNITIVE_INJECT_CTX_FRACTION (default 0.10 — prior
+    knowledge may never claim more than 10% of the model's window).
+    Returns (ceiling_tokens, source_tag) for pre-flight telemetry.
+    """
+    static = int(os.getenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "600"))
+    ctx = 0
+    for _var in ("JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS", "JARVIS_LOCAL_NUM_CTX"):
+        raw = (os.getenv(_var) or "").strip()
+        if raw:
+            try:
+                ctx = int(raw)
+            except ValueError:
+                ctx = 0
+            if ctx > 0:
+                break
+    if ctx <= 0:
+        return static, "static"
+    try:
+        fraction = float(os.getenv("JARVIS_COGNITIVE_INJECT_CTX_FRACTION", "0.10"))
+    except ValueError:
+        fraction = 0.10
+    dynamic = max(1, int(ctx * fraction))
+    if dynamic < static:
+        return dynamic, "ctx_fraction"
+    return static, "static"
+
+
 def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> Optional[str]:
     """Render the 'Prior Ephemeral Knowledge' section, or None when off/empty.
 
-    Context-window safety valve: drop lowest-rank experiences until the
-    rendered section fits JARVIS_COGNITIVE_INJECT_MAX_TOKENS.
+    Context-window safety valve: drop lowest-rank experiences (least
+    reinforced, then oldest) until the rendered section fits the effective
+    ceiling — min(static valve, fraction-of-active-window). Emits one
+    pre-flight telemetry INFO line with the exact byte/token footprint
+    BEFORE the section can reach any prompt.
     """
     if not is_enabled():
         return None
@@ -267,13 +306,15 @@ def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> O
     picked = cache.select(footprint, top_k)
     if not picked:
         return None
-    max_tokens = int(os.getenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "600"))
+    max_tokens, ceiling_source = _effective_max_tokens()
+    dropped = 0
     section = _render_section(picked)
     while picked and (
         _estimate_tokens(section) > max_tokens
         or len(section) > _SECTION_CAP_CHARS
     ):
         picked = picked[:-1]  # select() is rank-ordered; drop the tail
+        dropped += 1
         section = _render_section(picked)
     if not picked:
         logger.debug(
@@ -283,6 +324,13 @@ def format_for_prompt(cache: PriorKnowledgeCache, footprint: Optional[str]) -> O
         return None
     # Both bounds are enforced by whole-experience trimming — NEVER a char
     # slice, which could amputate the closing untrusted-data fence marker.
+    logger.info(
+        "[CognitivePersistence] preflight: kept=%d dropped=%d tokens~%d "
+        "bytes=%d ceiling=%d source=%s footprint=%s",
+        len(picked), dropped, _estimate_tokens(section),
+        len(section.encode("utf-8")), max_tokens, ceiling_source,
+        footprint or "any",
+    )
     return section
 
 
@@ -441,6 +489,18 @@ def register_flags(registry: Any) -> int:
                              "(context-window overflow guard; estimator = "
                              "local_inference_director.estimate_tokens).",
                  example="JARVIS_COGNITIVE_INJECT_MAX_TOKENS=400"),
+        FlagSpec(name="JARVIS_COGNITIVE_INJECT_CTX_FRACTION", type=FlagType.FLOAT,
+                 default=0.10, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Max fraction of the active context window the "
+                             "injected section may claim (dynamic ceiling; "
+                             "strictest of this and INJECT_MAX_TOKENS wins).",
+                 example="JARVIS_COGNITIVE_INJECT_CTX_FRACTION=0.05"),
+        FlagSpec(name="JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS", type=FlagType.INT,
+                 default=0, category=Category.EXPERIMENTAL, source_file=src,
+                 description="Explicit active-context-window override for the "
+                             "dynamic ceiling (0 = derive from "
+                             "JARVIS_LOCAL_NUM_CTX, else static valve only).",
+                 example="JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS=16384"),
         FlagSpec(name="JARVIS_COGNITIVE_HYDRATE_TIMEOUT_S", type=FlagType.FLOAT,
                  default=10.0, category=Category.EXPERIMENTAL, source_file=src,
                  description="Boot hydration hard bound (asyncio.wait_for).",

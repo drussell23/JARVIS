@@ -370,7 +370,7 @@ def test_register_flags_seeds_all_knobs():
     from backend.core.ouroboros.governance.flag_registry import FlagRegistry
     registry = FlagRegistry()
     n = cogp.register_flags(registry)
-    assert n == 7
+    assert n == 9
     spec = registry.get_spec("JARVIS_COGNITIVE_PERSISTENCE_ENABLED")
     assert spec is not None and spec.default is False
 
@@ -382,3 +382,79 @@ def test_orchestrator_exposes_injection_impl():
     assert hasattr(orch, "_inject_prior_knowledge_impl")
     src = inspect.getsource(orch.Orchestrator._run_pipeline)
     assert "_inject_prior_knowledge_impl" in src
+
+
+# ── Pre-flight injection telemetry + dynamic context-window ceiling ──
+
+
+def test_ceiling_clamps_to_fraction_of_active_ctx_window(monkeypatch):
+    """10% of a 2000-token window (200) must beat the 600 static valve."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_TOP_K", "50")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_MAX_TOKENS", "600")
+    monkeypatch.setenv("JARVIS_LOCAL_NUM_CTX", "2000")
+    monkeypatch.delenv("JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS", raising=False)
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from(
+        [_exp(f"tool_with_a_rather_long_name_{i:02d}", count=50 - i)
+         for i in range(40)]
+    )
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section is not None
+    from backend.core.ouroboros.governance.local_inference_director import (
+        estimate_tokens,
+    )
+    assert estimate_tokens(section) <= 200
+    assert "tool_with_a_rather_long_name_00" in section
+
+
+def test_ceiling_override_env_beats_local_num_ctx(monkeypatch):
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_TOP_K", "50")
+    monkeypatch.setenv("JARVIS_LOCAL_NUM_CTX", "999999")
+    monkeypatch.setenv("JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS", "1000")
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from(
+        [_exp(f"tool_with_a_rather_long_name_{i:02d}", count=50 - i)
+         for i in range(40)]
+    )
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    from backend.core.ouroboros.governance.local_inference_director import (
+        estimate_tokens,
+    )
+    assert section is not None and estimate_tokens(section) <= 100
+
+
+def test_ceiling_static_when_no_ctx_signal(monkeypatch):
+    """No window signal anywhere -> static valve only, small cache unaffected."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_LOCAL_NUM_CTX", raising=False)
+    monkeypatch.delenv("JARVIS_COGNITIVE_ACTIVE_CTX_TOKENS", raising=False)
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from([_exp("fetch_url", 5)])
+    section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section is not None and "fetch_url" in section
+
+
+def test_preflight_telemetry_line_logged(monkeypatch, caplog):
+    """The exact injection footprint (kept/dropped/tokens/bytes/ceiling)
+    must be logged BEFORE the prompt ships to the model."""
+    import logging as _logging
+
+    monkeypatch.setenv("JARVIS_COGNITIVE_PERSISTENCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_COGNITIVE_INJECT_TOP_K", "50")
+    monkeypatch.setenv("JARVIS_LOCAL_NUM_CTX", "2000")
+    cache = PriorKnowledgeCache()
+    cache.hydrate_from(
+        [_exp(f"tool_with_a_rather_long_name_{i:02d}", count=50 - i)
+         for i in range(40)]
+    )
+    with caplog.at_level(_logging.INFO,
+                         logger="backend.core.ouroboros.governance.cognitive_persistence"):
+        section = format_for_prompt(cache, footprint="qwen3:32b@16384")
+    assert section is not None
+    pre = [r for r in caplog.records if "preflight" in r.getMessage()]
+    assert len(pre) == 1
+    msg = pre[0].getMessage()
+    for token in ("kept=", "dropped=", "tokens~", "bytes=", "ceiling=", "source="):
+        assert token in msg, f"missing {token} in: {msg}"
