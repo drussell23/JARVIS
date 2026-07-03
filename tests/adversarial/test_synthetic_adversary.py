@@ -48,6 +48,7 @@ import socket
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -2284,6 +2285,181 @@ class TestV1BatchServerRoundTrip:
                     "Stage 4 output must carry repair candidate with original_source"
                 )
         finally:
+            await adv.stop()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# NEW -- Batch-Passthrough Contract Parity (bt-iso-1783036735)
+#
+# Evidence: "[DoublewordProvider] File upload exception: TimeoutError" +
+# "submit_batch: file upload failed" on 4-17KB payloads. Root cause traced to
+# build_batch_output_line()'s generic (no chaos-manifest-match) fallback
+# returning the bare non-JSON string "adversary batch stub" for EVERY batch
+# op that isn't the specific scripted chaos-repair target -- even though
+# every real submit_batch() call tags its prompt with the 2b.1 schema
+# instruction. doubleword_provider._parse_generation_response then raises
+# doubleword_schema_invalid:json_parse_error on that bare string, which
+# (via the LLM-heal retry / hedge-race machinery) manifests upstream as the
+# reported failure. This is the "fake mirrors only part of the real
+# collaborator's contract" failure class -- cover the whole batch lifecycle
+# for GENERIC ops, not just the one scripted chaos scenario.
+# ════════════════════════════════════════════════════════════════════════════════
+
+_GENERIC_2B1_INPUT_LINE: str = json.dumps({
+    "custom_id": "op-generic-2b1-001",
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "body": {
+        "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a code generation assistant. "
+                    "Use schema_version '2b.1' with full_content containing "
+                    "the COMPLETE file."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "## File: scripts/chaos_injector.py [SHA-256: deadbeefcafe]\n"
+                    "Improve this file."
+                ),
+            },
+        ],
+        "max_tokens": 8192,
+        "temperature": 0.2,
+    },
+})
+
+
+class TestBuildBatchOutputLineGenericTwoB1Passthrough:
+    """(2a-pure) build_batch_output_line must return a schema-valid 2b.1
+    response for a 2b.1-instructed batch input even when NO chaos manifest
+    is active -- pure-function, no bind required."""
+
+    def test_generic_2b1_input_no_manifest_produces_valid_2b1_json(self) -> None:
+        raw = build_batch_output_line(
+            "op-generic-2b1-001", _GENERIC_2B1_INPUT_LINE, None,
+        )
+        entry = json.loads(raw)
+        content = entry["response"]["body"]["choices"][0]["message"]["content"]
+        candidates_obj = json.loads(content)  # must not raise (was a bare string)
+        assert candidates_obj.get("schema_version") == _DW_CANDIDATES_SCHEMA_VERSION, (
+            f"generic 2b.1 batch response must carry schema_version="
+            f"{_DW_CANDIDATES_SCHEMA_VERSION!r}, got {candidates_obj.get('schema_version')!r}"
+        )
+        cands = candidates_obj.get("candidates", [])
+        assert cands, "generic 2b.1 batch response must carry at least one candidate"
+        assert cands[0].get("file_path") == "scripts/chaos_injector.py", (
+            f"file_path must be recovered from the '## File:' prompt marker, "
+            f"got {cands[0].get('file_path')!r}"
+        )
+        assert cands[0].get("full_content"), "full_content must be non-empty"
+        assert cands[0].get("rationale"), "rationale must be non-empty (schema-mandatory)"
+
+    def test_non_2b1_generic_input_still_produces_bare_stub(self) -> None:
+        """Regression guard: a truly generic (non-2b.1) batch input keeps the
+        legacy bare-string stub -- this fix is scoped to 2b.1-tagged inputs,
+        preserving test_generic_input_no_manifest_produces_stub's contract."""
+        raw = build_batch_output_line(
+            "op-generic-001", _BATCH_INPUT_GENERIC_LINE, None,
+        )
+        entry = json.loads(raw)
+        content = entry["response"]["body"]["choices"][0]["message"]["content"]
+        assert content == "adversary batch stub"
+
+
+@_needs_bind
+class TestDoublewordProviderRealBatchRoundTrip:
+    """(2a) Drive the REAL DoublewordProvider against the adversary as a
+    scripted fake upstream -- proves the full upload -> create -> poll ->
+    retrieve -> parse contract for a GENERIC (non-chaos) op, not just the one
+    scripted chaos-repair scenario. This is the test class the pure-function
+    tests above cannot substitute for: it exercises doubleword_provider's
+    ACTUAL parser, not a hand-shaped assertion of the adversary's own output.
+    """
+
+    async def test_generic_batch_round_trip_parses_cleanly(self) -> None:
+        from backend.core.ouroboros.governance.doubleword_provider import DoublewordProvider
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        adv, _clock = _make_adversary()
+        await adv.start()
+        provider = None
+        try:
+            os.environ.update(adv.env_overrides())
+            provider = DoublewordProvider(repo_root=Path(_REPO_ROOT), api_key="test-fake-key")
+            assert provider.is_available
+
+            ctx = OperationContext.create(
+                target_files=("scripts/chaos_injector.py",),
+                description="generic batch passthrough round trip",
+            )
+            pending = await provider.submit_batch(ctx)
+            assert pending is not None, (
+                "submit_batch must succeed against a healthy adversary"
+            )
+
+            result = await provider.poll_and_retrieve(pending, ctx)
+            assert result is not None, (
+                "poll_and_retrieve must parse the adversary's generic 2b.1 "
+                "response cleanly -- a bare non-JSON stub breaks the real "
+                "doubleword_provider parser (doubleword_schema_invalid:"
+                "json_parse_error), which was the actual bt-iso-1783036735 "
+                "failure mode"
+            )
+            assert len(result.candidates) > 0, (
+                "parsed GenerationResult must carry at least one candidate"
+            )
+        finally:
+            if provider is not None:
+                await provider.close()
+            await adv.stop()
+
+    async def test_batch_route_outage_fails_fast_not_hung(self) -> None:
+        """(2b) When the batch lane is unavailable (adversary OUTAGE state),
+        submit_batch must fail FAST with the protocol-correct unavailable
+        response (503 + JSON error body from _handle_v1_files) -- not hang
+        until a client-side timeout. doubleword_provider.submit_batch's
+        ``if not file_id: ... return None`` (doubleword_provider.py, guarded
+        by _upload_file's ``resp.status >= 300 -> return None``) is the exact
+        seam that lets the caller cleanly cascade to the RT (Tier 0) lane
+        instead of waiting out DOUBLEWORD_REQUEST_TIMEOUT_S (120s default) --
+        the reported TimeoutError failure mode is what happens when this
+        fast-fail contract is NOT honored."""
+        from backend.core.ouroboros.governance.doubleword_provider import DoublewordProvider
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        adv, _clock = _make_adversary()
+        await adv.start()
+        provider = None
+        try:
+            os.environ.update(adv.env_overrides())
+            adv.set_state(AdversaryState.OUTAGE)
+            provider = DoublewordProvider(repo_root=Path(_REPO_ROOT), api_key="test-fake-key")
+
+            ctx = OperationContext.create(
+                target_files=("scripts/chaos_injector.py",),
+                description="batch outage fast-fail",
+            )
+            t0 = time.monotonic()
+            pending = await provider.submit_batch(ctx)
+            elapsed = time.monotonic() - t0
+
+            assert pending is None, (
+                "submit_batch must return None (not raise, not hang) on an "
+                "outage upload -- the caller's documented fallback contract"
+            )
+            assert elapsed < 5.0, (
+                f"submit_batch must fail FAST on outage (got {elapsed:.2f}s) "
+                "-- a multi-second hang here reproduces the reported "
+                "TimeoutError failure mode instead of a clean RT fallback"
+            )
+        finally:
+            if provider is not None:
+                await provider.close()
             await adv.stop()
 
 

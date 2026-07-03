@@ -1210,6 +1210,169 @@ class TestSubprocessIsomorphismPropagation:
             "got kwargs=%r" % (captured_kwargs[0],)
         )
 
+    # ------------------------------------------------------------------
+    # 4i. Composed OUROBOROS_BATTLE_MAX_WALL_SECONDS reaches SoakRunner
+    #     (bt-iso-1783036735: soak child SIGTERMed ~6min despite
+    #     --max-wall-seconds 5000 -- the wall was computed TWICE
+    #     independently and the SoakRunner seam ignored the composed one)
+    # ------------------------------------------------------------------
+
+    def _run_soak_wall_scenario(
+        self,
+        tmp_path: Path,
+        harness_mod: Any,
+        wall_env_value: "Optional[str]",
+    ) -> Any:
+        """Shared driver-run scaffold for the composed-wall tests below.
+
+        Patches ``compose_env`` to inject ``wall_env_value`` for
+        ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` directly into the RETURNED
+        composed-env dict (bypassing the unrelated linux_prod overlay's own
+        static 3600s default, which env.update()-clobbers whatever the
+        process env carries -- a separate, pre-existing, intentional
+        precedence rule documented in compose_env()'s own docstring, not
+        part of this seam). ``None`` leaves the key genuinely absent.
+        Returns the list of kwargs SoakRunner was constructed with.
+        """
+        captured_kwargs: List[Dict[str, Any]] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _SpySoakRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.append(kwargs)
+                raise RuntimeError("capture-only — abort before real soak launch")
+
+        original_compose = harness_mod.compose_env
+
+        def _compose_with_wall(**kwargs: Any) -> Dict[str, str]:
+            env = original_compose(**kwargs)
+            if wall_env_value is None:
+                env.pop("OUROBOROS_BATTLE_MAX_WALL_SECONDS", None)
+            else:
+                env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] = wall_env_value
+            return env
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        async def _drive() -> int:
+            with (
+                patch(
+                    "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                    return_value=_NoopEnv(),
+                ),
+                patch.object(harness_mod, "compose_env", _compose_with_wall),
+                patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+                patch.object(harness_mod, "SoakRunner", _SpySoakRunner),
+            ):
+                return await driver.run()
+
+        return _drive, captured_kwargs
+
+    async def test_composed_wall_reaches_soak_runner_non_failover(
+        self, tmp_path: Path,
+    ) -> None:
+        """An explicit OUROBOROS_BATTLE_MAX_WALL_SECONDS=5000 in the composed
+        env dict (the ONE compose_env() returns to the driver -- the single
+        source of truth the mandate names) MUST reach
+        harness_mod.SoakRunner(wall_seconds=5000) even in non-failover mode --
+        NOT silently collapse to the 300s legacy default."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "5000"
+        )
+        rc = await _drive()
+
+        assert rc == 1, "Spy-forced RuntimeError must surface as rc=1 (caught, not raised)"
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 5000, (
+            "OUROBOROS_BATTLE_MAX_WALL_SECONDS=5000 must reach "
+            "SoakRunner(wall_seconds=5000) in non-failover mode, not silently "
+            "collapse to the 300s legacy default; got kwargs=%r"
+            % (captured_kwargs[0],)
+        )
+
+    async def test_composed_wall_malformed_falls_back_loudly(
+        self, tmp_path: Path, capsys: Any,
+    ) -> None:
+        """A malformed OUROBOROS_BATTLE_MAX_WALL_SECONDS (non-numeric) must
+        NOT crash the driver and must NOT silently propagate -- it falls back
+        to the documented legacy default (300s, non-failover) with a loud
+        WARN log line."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "not-a-number"
+        )
+        rc = await _drive()
+
+        assert rc == 1
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 300, (
+            "Malformed OUROBOROS_BATTLE_MAX_WALL_SECONDS must fall back to "
+            "the 300s legacy default (non-failover); got kwargs=%r"
+            % (captured_kwargs[0],)
+        )
+        out = capsys.readouterr().out
+        assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS" in out and "not-a-number" in out, (
+            "Malformed value must be logged LOUDLY (never silent); captured "
+            "stdout=%r" % (out,)
+        )
+
+    async def test_composed_wall_zero_falls_back_loudly(
+        self, tmp_path: Path, capsys: Any,
+    ) -> None:
+        """OUROBOROS_BATTLE_MAX_WALL_SECONDS=0 must NOT silently produce a
+        zero-second (instant-kill) soak wall -- it falls back to the
+        documented legacy default with a loud WARN log line."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "0"
+        )
+        rc = await _drive()
+
+        assert rc == 1
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 300, (
+            "OUROBOROS_BATTLE_MAX_WALL_SECONDS=0 must fall back to the 300s "
+            "legacy default (non-failover), never a 0s instant-kill wall; "
+            "got kwargs=%r" % (captured_kwargs[0],)
+        )
+        out = capsys.readouterr().out
+        assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS" in out and "0" in out, (
+            "Zero value must be logged LOUDLY (never silent); captured "
+            "stdout=%r" % (out,)
+        )
+
 
 # ===========================================================================
 # Group 5 -- Script invocation (subprocess): catches unit-green/live-fails gap

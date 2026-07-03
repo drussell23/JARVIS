@@ -541,7 +541,10 @@ def _expected_agentic_cycle_s() -> float:
 
 
 def _failover_soak_wall(enable_failover: bool) -> int:
-    """Return the soak-child wall-clock budget in seconds.
+    """Return the DOCUMENTED LEGACY soak-child wall-clock budget in seconds --
+    the fallback used ONLY when the composed env carries no explicit
+    ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` (see ``_composed_soak_wall_s``,
+    the single source of truth for the actual wall handed to SoakRunner).
 
     enable_failover=False -> 300 (byte-identical default).
     enable_failover=True  -> READY_BUDGET_S + _expected_agentic_cycle_s() --
@@ -553,6 +556,49 @@ def _failover_soak_wall(enable_failover: bool) -> int:
         return 300
     budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
     return int(budget + _expected_agentic_cycle_s())
+
+
+def _composed_soak_wall_s(env: Dict[str, str], enable_failover: bool) -> float:
+    """Single source of truth for the soak child's wall-clock budget
+    (bt-iso-1783036735): reads ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` back from
+    the ALREADY-COMPOSED ``env`` dict -- never re-parses ``os.environ``
+    directly, since ``compose_env()`` is the one place operator/ignition
+    inheritance happens (dict(os.environ) at its base). Every consumer that
+    needs this scenario's wall (``SoakRunner.wall_seconds``,
+    ``JARVIS_A1_ROUTER_READY_TIMEOUT_S`` derivation, operator-visible
+    logging) MUST call this one helper so they can never disagree.
+
+    Root cause this closes: the soak-child wall was previously computed
+    TWICE independently -- once here (correct, composed-env-aware) for the
+    router-readiness derivation, and once again at the SoakRunner
+    construction seam via a bare ``_failover_soak_wall(self.enable_failover)``
+    call that ignored the composed env entirely and silently collapsed
+    non-failover runs to the 300s legacy default regardless of an operator's
+    explicit ``--max-wall-seconds 5000`` (bt-iso-1783036735: soak child
+    SIGTERMed ~6min after boot despite a 5000s budget).
+
+    Malformed / zero / missing -> fail LOUD (never silent) + fall back to
+    the documented legacy default (``_failover_soak_wall``).
+    """
+    legacy_default = float(_failover_soak_wall(enable_failover))
+    raw = env.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "").strip()
+    if not raw:
+        return legacy_default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        _log(
+            "WARN OUROBOROS_BATTLE_MAX_WALL_SECONDS=%r is not numeric -- "
+            "falling back to legacy default %ds" % (raw, int(legacy_default))
+        )
+        return legacy_default
+    if parsed <= 0:
+        _log(
+            "WARN OUROBOROS_BATTLE_MAX_WALL_SECONDS=%r must be > 0 -- "
+            "falling back to legacy default %ds" % (raw, int(legacy_default))
+        )
+        return legacy_default
+    return parsed
 
 
 def _derive_router_ready_timeout_s(wall_seconds: float) -> float:
@@ -1034,11 +1080,11 @@ class IsomorphicA1Driver:
                 # already be inherited from the operator's shell (compose_env()
                 # copies os.environ); otherwise fall back to the same wall this
                 # soak child is bound to (_failover_soak_wall). Operator env
-                # ALWAYS wins -- setdefault, never override.
-                _composed_wall_s = float(
-                    env.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "").strip()
-                    or _failover_soak_wall(self.enable_failover)
-                )
+                # ALWAYS wins -- setdefault, never override. _composed_soak_wall_s
+                # is the SINGLE reader of this value (bt-iso-1783036735) -- the
+                # SoakRunner launch seam below reuses the SAME number, never a
+                # second independent computation.
+                _composed_wall_s = _composed_soak_wall_s(env, self.enable_failover)
                 env.setdefault(
                     "JARVIS_A1_ROUTER_READY_TIMEOUT_S",
                     str(_derive_router_ready_timeout_s(_composed_wall_s)),
@@ -1216,16 +1262,28 @@ class IsomorphicA1Driver:
                     else:
                         _log("STEP soak: launching production O+V (pre-inject boot) "
                              "iso_cwd=%s" % iso_cwd)
+                        # bt-iso-1783036735: reuse the SAME _composed_wall_s computed
+                        # above for JARVIS_A1_ROUTER_READY_TIMEOUT_S -- do NOT call
+                        # _failover_soak_wall() again here. That second, independent
+                        # call ignored the composed OUROBOROS_BATTLE_MAX_WALL_SECONDS
+                        # entirely and silently collapsed every non-failover run to
+                        # the 300s legacy default regardless of an operator's
+                        # explicit --max-wall-seconds (the ~6min SIGTERM root cause).
+                        _soak_wall_s = int(_composed_wall_s)
                         if self.enable_failover:
                             _log("[HybridMesh] soak-child wall extended to %ds "
                                  "(32B cold-start: readiness %ds + margin)" % (
-                                     _failover_soak_wall(True),
+                                     _soak_wall_s,
                                      int(_env_float(
                                          "JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0))))
+                        else:
+                            _log("[Wall] soak-child wall = %ds (composed from "
+                                 "OUROBOROS_BATTLE_MAX_WALL_SECONDS, legacy "
+                                 "default 300s)" % (_soak_wall_s,))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
                             cost_cap=self.dw_session_budget,
-                            wall_seconds=_failover_soak_wall(self.enable_failover),
+                            wall_seconds=_soak_wall_s,
                         )
                         # Register for process-group teardown (finally+atexit+signal)
                         # BEFORE launch so a crash mid-launch still reaps the group.

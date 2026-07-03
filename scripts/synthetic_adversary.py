@@ -275,6 +275,13 @@ _2B1_SCHEMA_RE: re.Pattern = re.compile(
     re.IGNORECASE,
 )
 
+# Marker ``_build_codegen_prompt`` (providers.py) always emits ahead of the
+# source snapshot for every real generation request (RT or batch, chaos or
+# generic) -- e.g. ``"## File: backend/foo.py [SHA-256: abc123]"``. Used to
+# recover the target file path for the batch-passthrough generic-2b.1
+# fallback below (bt-iso-1783036735).
+_FILE_MARKER_RE: re.Pattern = re.compile(r"## File:\s+(\S+)")
+
 # Mapping: FailureSource value → nearest FaultType for FaultInjector registration.
 # Used only for the FaultInjector boundary-dispatch record; HTTP behaviour is
 # driven by the original FailureSource string.
@@ -494,6 +501,39 @@ def _prompt_is_2b1(prompt: str) -> bool:
     quotes/colons/whitespace separators).  Thread-safe (no mutable state).
     """
     return bool(_2B1_SCHEMA_RE.search(prompt))
+
+
+def _extract_target_file_from_prompt(prompt: str) -> str:
+    """Best-effort extraction of the target file path from a codegen prompt.
+
+    ``_build_codegen_prompt`` (providers.py) emits a ``## File: <path>
+    [...]`` marker ahead of the source snapshot for every real generation
+    request -- RT and batch alike. Pure function; returns "" when no marker
+    is found (e.g. a synthetic non-codegen probe payload).
+    """
+    m = _FILE_MARKER_RE.search(prompt)
+    return m.group(1) if m else ""
+
+
+def _read_repo_file_safe(rel_path: str) -> str:
+    """Best-effort read of ``rel_path`` under the repo root. Never raises.
+
+    Returns "" when ``rel_path`` is empty, escapes the repo root, or cannot
+    be read (new file / bad path) -- callers must supply their own fallback.
+    """
+    if not rel_path:
+        return ""
+    try:
+        abs_path = os.path.realpath(os.path.join(_REPO_ROOT, rel_path))
+        _repo_root_real = os.path.realpath(_REPO_ROOT)
+        if os.path.commonpath([abs_path, _repo_root_real]) != _repo_root_real:
+            return ""  # path escapes the repo root -- never read outside it
+        if not os.path.isfile(abs_path):
+            return ""
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:  # noqa: BLE001 -- generic fallback must never raise
+        return ""
 
 
 def _count_prior_tool_results(messages: List[Dict[str, Any]]) -> int:
@@ -817,6 +857,36 @@ def build_batch_output_line(
             has_tools=False,
             simulate_zero_shot=simulate_zero_shot,
         )
+    elif _prompt_is_2b1(input_line_json):
+        # Batch-Passthrough contract parity (bt-iso-1783036735). A real DW
+        # batch worker ALWAYS returns a schema-valid 2b.1 response for a
+        # 2b.1-instructed request -- regardless of whether this particular
+        # op happens to target the active chaos-manifest file (or whether a
+        # chaos manifest is even loaded). The bare "adversary batch stub"
+        # string below is not valid JSON at all: it broke
+        # doubleword_provider._parse_generation_response
+        # (doubleword_schema_invalid:json_parse_error) for every GENERIC
+        # (non-chaos) batch op -- exactly the "fake mirrors only part of the
+        # real collaborator's contract" failure class. Echo the target
+        # file's own on-disk content back as a syntactically-valid, schema-
+        # conformant no-op candidate; when the file can't be resolved, fall
+        # back to a minimal-but-valid stub payload.
+        _generic_target = _extract_target_file_from_prompt(input_line_json)
+        _generic_content = _read_repo_file_safe(_generic_target)
+        content = json.dumps({
+            "schema_version": _DW_CANDIDATES_SCHEMA_VERSION,
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "file_path": _generic_target or "adversary_generic_stub.py",
+                    "full_content": _generic_content or "# adversary generic stub\n",
+                    "rationale": (
+                        "Synthetic generic batch response (no chaos-manifest "
+                        "match) -- infrastructure fidelity, not model correctness."
+                    ),
+                }
+            ],
+        })
     else:
         content = "adversary batch stub"
 
