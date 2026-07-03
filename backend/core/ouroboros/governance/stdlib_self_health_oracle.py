@@ -426,14 +426,35 @@ class StdlibSelfHealthOracle:
             # as a plain synchronous callback on the loop thread
             # (Loop Deadman capture bt-iso-1783056401 -- an "async
             # def" whose body never awaits is still a blocking
-            # callback). Same idiom as http_healthcheck_oracle.py's
-            # query_signals: loop.run_in_executor with a pure sync
-            # fn taking/returning plain data only.
-            loop = asyncio.get_event_loop()
-            summaries = await loop.run_in_executor(
-                None, _load_recent_summaries,
+            # callback).
+            #
+            # fs-hot-tier Phase 2 convergence (2026-07-02): this used
+            # to be its own ad-hoc ``loop.run_in_executor(None, ...)``
+            # dispatch — the DEFAULT asyncio executor, contested by
+            # every other ``asyncio.to_thread`` caller (16 sensors +
+            # DreamEngine). Rerouted onto the shared
+            # ``cooperative_fs_io.offload`` substrate (the same
+            # dedicated ``advisor-blast`` thread pool every other
+            # fs-hot-tier fix now uses) so the fleet converges on ONE
+            # off-loop mechanism instead of three divergent ones (the
+            # audit's finding — this + posture_observer's own
+            # dedicated executor). ``_load_recent_summaries`` itself
+            # is untouched. ``OffloadError`` degrades to an empty
+            # summaries tuple — the same "no sessions" shape this
+            # oracle already tolerates.
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _summaries_result = await offload(
+                _load_recent_summaries,
                 self._project_root, lookback_sessions(),
                 max_scan_sessions(),
+                cpu_bound=False,
+            )
+            summaries = (
+                () if is_offload_error(_summaries_result)
+                else _summaries_result
             )
             now = time.time()
             return (

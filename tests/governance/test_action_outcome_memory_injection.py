@@ -208,17 +208,17 @@ def _make_loaded_service(tmp_path):
 
 
 class TestStrategicDirectionIntegration:
-    def test_no_ctx_no_action_outcomes_section(
+    async def test_no_ctx_no_action_outcomes_section(
         self, monkeypatch, tmp_path,
     ):
         """Backward compat: no kwargs -> no section."""
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt()
+        body = await svc.format_for_prompt()
         assert body
         assert "Recent Region Outcomes" not in body
 
-    def test_disabled_master_no_section(
+    async def test_disabled_master_no_section(
         self, monkeypatch, tmp_path,
     ):
         """Master-flag-off → no section even when ctx provided."""
@@ -230,25 +230,25 @@ class TestStrategicDirectionIntegration:
             "JARVIS_ACTION_OUTCOME_HISTORY_DIR", str(tmp_path),
         )
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
         assert "Recent Region Outcomes" not in body
 
-    def test_no_matches_no_section(
+    async def test_no_matches_no_section(
         self, monkeypatch, tmp_path,
     ):
         """Master-on but empty history → no section emitted."""
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
         assert "Recent Region Outcomes" not in body
 
-    def test_matches_inject_section(
+    async def test_matches_inject_section(
         self, monkeypatch, tmp_path,
     ):
         """End-to-end: plant outcomes, verify section appears."""
@@ -275,7 +275,7 @@ class TestStrategicDirectionIntegration:
             weight=3,
         ))
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
@@ -283,7 +283,7 @@ class TestStrategicDirectionIntegration:
         assert "applied_verified" in body
         assert "Imported from canonical module" in body
 
-    def test_section_appended_LAST(
+    async def test_section_appended_LAST(
         self, monkeypatch, tmp_path,
     ):
         """**Load-bearing ordering**: action-outcomes appears
@@ -341,7 +341,7 @@ class TestStrategicDirectionIntegration:
             weight=3,
         ))
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
@@ -355,7 +355,7 @@ class TestStrategicDirectionIntegration:
         # Action outcomes MUST come AFTER failure modes
         assert ao_idx > fm_idx
 
-    def test_only_target_files_required(
+    async def test_only_target_files_required(
         self, monkeypatch, tmp_path,
     ):
         """Unlike Upgrade 3 Slice 4 which required BOTH
@@ -364,13 +364,13 @@ class TestStrategicDirectionIntegration:
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
         # target_files=None → no section
-        body_none = svc.format_for_prompt(
+        body_none = await svc.format_for_prompt(
             target_files=None,
             plan={"approach": "refactor"},
         )
         assert "Recent Region Outcomes" not in body_none
 
-    def test_plan_not_required_for_action_outcomes(
+    async def test_plan_not_required_for_action_outcomes(
         self, monkeypatch, tmp_path,
     ):
         """target_files alone (no plan) is sufficient for the
@@ -401,7 +401,7 @@ class TestStrategicDirectionIntegration:
         svc = _make_loaded_service(tmp_path)
         # Pass target_files but plan=None → M11 fires;
         # Upgrade 3 won't (it needs both).
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan=None,
         )
@@ -419,18 +419,18 @@ class TestStrategicDirectionIntegration:
 
 
 class TestRenderActionOutcomesSection:
-    def test_none_target_files_returns_empty(self):
+    async def test_none_target_files_returns_empty(self):
         from backend.core.ouroboros.governance.strategic_direction import (  # noqa: E501
             StrategicDirectionService,
         )
         result = (
-            StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
+            await StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
                 target_files=None,
             )
         )
         assert result == ""
 
-    def test_empty_target_files_with_no_history(
+    async def test_empty_target_files_with_no_history(
         self, monkeypatch, tmp_path,
     ):
         """target_files=() (empty but provided) is valid input;
@@ -440,13 +440,13 @@ class TestRenderActionOutcomesSection:
             StrategicDirectionService,
         )
         result = (
-            StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
+            await StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
                 target_files=(),
             )
         )
         assert result == ""
 
-    def test_master_off_returns_empty(
+    async def test_master_off_returns_empty(
         self, monkeypatch, tmp_path,
     ):
         monkeypatch.delenv(
@@ -460,7 +460,105 @@ class TestRenderActionOutcomesSection:
             StrategicDirectionService,
         )
         result = (
-            StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
+            await StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
+                target_files=("a.py", "b.py"),
+            )
+        )
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 (audit row 3, 2026-07-02) — recall_for_region
+# (and the read_all_action_outcomes iterdir it falls back to) routes
+# through cooperative_fs_io.offload(cpu_bound=False) -- syscall-bound
+# flat-dir scan, thread pool sufficient.
+# ---------------------------------------------------------------------------
+
+
+class TestSubstrateRouting:
+    async def test_routes_recall_through_offload_substrate(
+        self, monkeypatch, tmp_path,
+    ):
+        _enable(monkeypatch, tmp_path)
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
+            ActionOutcomeRecord,
+            OutcomeKind,
+            record_action_outcome,
+        )
+        from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
+            SituationKind,
+        )
+        from backend.core.ouroboros.governance.strategic_direction import (  # noqa: E501
+            StrategicDirectionService,
+        )
+
+        record_action_outcome(ActionOutcomeRecord(
+            signature_hash="a" * 64,
+            situation_kind=SituationKind.MULTI_FILE_REFACTOR,
+            attempted_action_kind="add_dataclass",
+            outcome_kind=OutcomeKind.APPLIED_VERIFIED,
+            target_files=("a.py", "b.py"),
+            commit_hash="abc1234",
+            summary="substrate routing probe",
+            observed_at_unix=time.time(),
+            op_id="op-1",
+            cluster_id="42",
+            weight=3,
+        ))
+
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
+                recall_for_region,
+            )
+            if fn is recall_for_region:
+                calls["n"] += 1
+                calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        result = (
+            await StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
+                target_files=("a.py", "b.py"),
+            )
+        )
+
+        assert calls["n"] == 1, (
+            "recall_for_region must route through "
+            "cooperative_fs_io.offload"
+        )
+        assert calls["cpu_bound"] is False, (
+            "recall_for_region is a syscall-bound flat-dir scan -- "
+            "thread pool is sufficient, no process pool needed"
+        )
+        assert "Recent Region Outcomes" in result
+
+    async def test_offload_error_degrades_to_empty_no_raise(
+        self, monkeypatch, tmp_path,
+    ):
+        _enable(monkeypatch, tmp_path)
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        from backend.core.ouroboros.governance.strategic_direction import (  # noqa: E501
+            StrategicDirectionService,
+        )
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="recall_for_region",
+                exc_type="PermissionError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        result = (
+            await StrategicDirectionService._render_action_outcomes_section(  # noqa: E501, SLF001
                 target_files=("a.py", "b.py"),
             )
         )

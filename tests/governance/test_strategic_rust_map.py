@@ -21,7 +21,9 @@ Pins:
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -68,6 +70,19 @@ def _svc(root: Path) -> StrategicDirectionService:
     s = StrategicDirectionService(root)
     s._digest = "PRINCIPLES"
     return s
+
+
+def _slow_crawl_rust_subsystems(repo_root: Path):
+    """Module-level (picklable-by-reference) slow crawl stand-in for
+    the loop-responsiveness test below. MUST be module-level, not a
+    test-local closure -- cpu_bound=True dispatches through a
+    'spawn'-based ProcessPoolExecutor, which requires the target
+    callable to be picklable by reference; a local closure would trip
+    OffloadPicklingError before ever reaching the pool, which would
+    make the responsiveness assertion vacuously true instead of
+    actually proving the fix."""
+    time.sleep(0.3)  # runs in a SEPARATE OS process -- never the loop thread
+    return crawl_rust_subsystems(repo_root)
 
 
 # ---------------------------------------------------------------------------
@@ -136,20 +151,20 @@ def test_crawler_search_root_env(monkeypatch, tmp_path):
 # Strategic-direction section
 # ---------------------------------------------------------------------------
 
-def test_graduated_default_true_injects_without_flag(tmp_path):
+async def test_graduated_default_true_injects_without_flag(tmp_path):
     # P4 GRADUATED (soak bt-2026-05-18-194040 PASS): with NO env set
     # the section now renders by default (was empty pre-graduation).
     _crate(tmp_path, "backend/a", "crate_a")
     assert "## Rust Subsystems" in (
-        _svc(tmp_path)._render_rust_subsystems_section()
+        await _svc(tmp_path)._render_rust_subsystems_section()
     )
 
 
-def test_explicit_disable_hot_reverts_to_empty(monkeypatch, tmp_path):
+async def test_explicit_disable_hot_reverts_to_empty(monkeypatch, tmp_path):
     # Hot-revert is env=false ONLY (no code path deleted).
     monkeypatch.setenv(_FLAG, "false")
     _crate(tmp_path, "backend/a", "crate_a")
-    assert _svc(tmp_path)._render_rust_subsystems_section() == ""
+    assert await _svc(tmp_path)._render_rust_subsystems_section() == ""
 
 
 def test_ast_pin_graduated_default_true_persists():
@@ -158,7 +173,7 @@ def test_ast_pin_graduated_default_true_persists():
     tree = ast.parse(_SRC.read_text())
     fn = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         and n.name == "_render_rust_subsystems_section"
     )
     for call in ast.walk(fn):
@@ -179,10 +194,10 @@ def test_ast_pin_graduated_default_true_persists():
     pytest.fail("env-default read for the rust-map flag not found")
 
 
-def test_section_enabled_lists_crates_with_disclaimers(monkeypatch, tmp_path):
+async def test_section_enabled_lists_crates_with_disclaimers(monkeypatch, tmp_path):
     monkeypatch.setenv(_FLAG, "true")
     _crate(tmp_path, "backend/core", "jarvis_core", desc="perf core")
-    block = _svc(tmp_path)._render_rust_subsystems_section()
+    block = await _svc(tmp_path)._render_rust_subsystems_section()
     assert "## Rust Subsystems" in block
     assert "jarvis_core" in block
     low = block.lower()
@@ -192,29 +207,29 @@ def test_section_enabled_lists_crates_with_disclaimers(monkeypatch, tmp_path):
     assert "venom" in low and ".rs" in block
 
 
-def test_section_char_budget_cap(monkeypatch, tmp_path):
+async def test_section_char_budget_cap(monkeypatch, tmp_path):
     monkeypatch.setenv(_FLAG, "true")
     monkeypatch.setenv("JARVIS_STRATEGIC_RUST_MAX_CHARS", "30")
     _crate(tmp_path, "backend/a", "aaaaa", desc="x" * 200)
     _crate(tmp_path, "backend/b", "bbbbb", desc="y" * 200)
-    block = _svc(tmp_path)._render_rust_subsystems_section()
+    block = await _svc(tmp_path)._render_rust_subsystems_section()
     assert block.count("\n- **") <= 1
 
 
-def test_section_fail_silent_on_crawler_error(monkeypatch, tmp_path):
+async def test_section_fail_silent_on_crawler_error(monkeypatch, tmp_path):
     monkeypatch.setenv(_FLAG, "true")
     import backend.core.ouroboros.roadmap.source_crawlers as sc
     monkeypatch.setattr(
         sc, "crawl_rust_subsystems",
         lambda _r: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert _svc(tmp_path)._render_rust_subsystems_section() == ""
+    assert await _svc(tmp_path)._render_rust_subsystems_section() == ""
 
 
-def test_wired_into_format_for_prompt(monkeypatch, tmp_path):
+async def test_wired_into_format_for_prompt(monkeypatch, tmp_path):
     monkeypatch.setenv(_FLAG, "true")
     _crate(tmp_path, "backend/w", "wired_crate", desc="d")
-    out = _svc(tmp_path).format_for_prompt()
+    out = await _svc(tmp_path).format_for_prompt()
     assert "## Rust Subsystems" in out
     assert "wired_crate" in out
 
@@ -228,7 +243,7 @@ def test_ast_pin_composes_crawler_no_glob_in_strategic_direction():
     tree = ast.parse(src)
     node = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         and n.name == "_render_rust_subsystems_section"
     )
     body = ast.unparse(node)
@@ -248,7 +263,7 @@ def test_ast_pin_composes_crawler_no_glob_in_strategic_direction():
 
     fmt = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "format_for_prompt"
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "format_for_prompt"
     )
     fmt_src = ast.unparse(fmt)
     assert "_render_rust_subsystems_section" in fmt_src
@@ -267,12 +282,12 @@ def test_ast_pin_composes_crawler_no_glob_in_strategic_direction():
 _STRAT_LOGGER = "backend.core.ouroboros.governance.strategic_direction"
 
 
-def test_telemetry_info_fires_when_injected(monkeypatch, tmp_path, caplog):
+async def test_telemetry_info_fires_when_injected(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv(_FLAG, "true")
     _crate(tmp_path, "backend/c", "secret_crate_name",
            desc="SECRET_RUST_TOKEN")
     with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
-        _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R1")
+        await _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R1")
     line = next(
         (r.getMessage() for r in caplog.records
          if "rust-map injected" in r.getMessage()), None,
@@ -282,42 +297,160 @@ def test_telemetry_info_fires_when_injected(monkeypatch, tmp_path, caplog):
     assert "crates=1" in line and "chars=" in line
 
 
-def test_telemetry_counts_only_no_body_text(monkeypatch, tmp_path, caplog):
+async def test_telemetry_counts_only_no_body_text(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv(_FLAG, "true")
     _crate(tmp_path, "backend/c", "secret_crate_name",
            desc="SECRET_RUST_TOKEN")
     with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
-        _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R2")
+        await _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R2")
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert "SECRET_RUST_TOKEN" not in blob, "must not log crate summary"
     assert "secret_crate_name" not in blob, "must not log crate name"
     assert "backend/c" not in blob, "must not log crate path"
 
 
-def test_telemetry_silent_when_flag_off(monkeypatch, tmp_path, caplog):
+async def test_telemetry_silent_when_flag_off(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv(_FLAG, "false")  # graduated default-true now
     _crate(tmp_path, "backend/c", "crate_a")
     with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
-        _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R3")
+        await _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R3")
     assert not any(
         "rust-map injected" in r.getMessage() for r in caplog.records
     )
 
 
-def test_telemetry_silent_when_no_crates(monkeypatch, tmp_path, caplog):
+async def test_telemetry_silent_when_no_crates(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv(_FLAG, "true")
     with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
-        _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R4")
+        await _svc(tmp_path)._render_rust_subsystems_section(op_id="op-R4")
     assert not any(
         "rust-map injected" in r.getMessage() for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 (2026-07-02) — THE #1 FIX. crawl_rust_subsystems
+# routes through cooperative_fs_io.offload(cpu_bound=True) instead of
+# running synchronously on the loop thread (the CONFIRMED 41s
+# blocker). Substrate routing, correctness parity, fail-soft, and an
+# end-to-end loop-responsiveness proof on this — the HOTTEST — path.
+# ---------------------------------------------------------------------------
+
+
+async def test_rust_section_routes_crawl_through_offload_substrate(
+    monkeypatch, tmp_path,
+):
+    """Spy on cooperative_fs_io.offload — the crawl must be dispatched
+    through the substrate with cpu_bound=True (process pool, since the
+    walk is followed by tomllib/regex parsing — CPU work a thread
+    wouldn't free the GIL for)."""
+    monkeypatch.setenv(_FLAG, "true")
+    _crate(tmp_path, "backend/a", "crate_a", desc="d")
+    from backend.core.ouroboros.governance import cooperative_fs_io
+
+    calls = {"n": 0, "cpu_bound": None}
+    real_offload = cooperative_fs_io.offload
+
+    async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+        if fn is crawl_rust_subsystems:
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+        return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+    monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+    block = await _svc(tmp_path)._render_rust_subsystems_section()
+
+    assert calls["n"] == 1, (
+        "crawl_rust_subsystems must route through "
+        "cooperative_fs_io.offload"
+    )
+    assert calls["cpu_bound"] is True, (
+        "crawl_rust_subsystems does CPU work (tomllib/regex parse) "
+        "after the walk -- must use the process pool, not a thread"
+    )
+    assert "crate_a" in block
+
+
+async def test_rust_section_offload_error_degrades_to_empty_no_raise(
+    monkeypatch, tmp_path,
+):
+    """Fail-soft: an OffloadError from the substrate must degrade to
+    the same empty-section result as 'no crates found' -- never
+    raise into prompt composition."""
+    monkeypatch.setenv(_FLAG, "true")
+    _crate(tmp_path, "backend/a", "crate_a")
+    from backend.core.ouroboros.governance import cooperative_fs_io
+    from backend.core.ouroboros.governance.cooperative_fs_io import (
+        OffloadError,
+    )
+
+    async def _boom_offload(fn, *args, **kwargs):
+        return OffloadError(
+            fn_name="crawl_rust_subsystems",
+            exc_type="PermissionError",
+            message="synthetic offload-layer fault",
+            cpu_bound=True,
+        )
+
+    monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+    block = await _svc(tmp_path)._render_rust_subsystems_section()
+    assert block == ""
+
+
+async def test_rust_section_loop_stays_responsive_during_offloaded_crawl(
+    monkeypatch, tmp_path,
+):
+    """End-to-end loop-responsiveness proof on the HOTTEST path: a
+    concurrent 50ms-cadence heartbeat must keep ticking while the
+    offloaded rust crawl runs, even when the crawl is artificially
+    slow. This is the direct regression pin for the CONFIRMED 41s
+    event-loop stall (crawl_rust_subsystems on the loop thread)."""
+    monkeypatch.setenv(_FLAG, "true")
+    _crate(tmp_path, "backend/a", "crate_a")
+
+    import backend.core.ouroboros.roadmap.source_crawlers as sc
+
+    monkeypatch.setattr(
+        sc, "crawl_rust_subsystems", _slow_crawl_rust_subsystems,
+    )
+
+    ticks = 0
+    running = True
+
+    async def heartbeat():
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.05)
+
+    hb_task = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0.01)
+    before = ticks
+
+    block = await _svc(tmp_path)._render_rust_subsystems_section()
+
+    running = False
+    await asyncio.sleep(0.01)
+    hb_task.cancel()
+    try:
+        await hb_task
+    except asyncio.CancelledError:
+        pass
+
+    during = ticks - before
+    assert during >= 2, (
+        f"Heartbeat starved during the rust-subsystems crawl: "
+        f"ticks={during} over a 0.3s slow crawl -- the offload fix "
+        "failed and the crawl is still blocking the event loop"
+    )
+    assert "crate_a" in block
 
 
 def test_ast_pin_telemetry_is_counts_only():
     tree = ast.parse(_SRC.read_text())
     fn = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         and n.name == "_render_rust_subsystems_section"
     )
     info_calls = [

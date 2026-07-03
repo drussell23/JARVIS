@@ -637,7 +637,7 @@ class TestStrategicDirectionIntegration:
         svc = StrategicDirectionService(tmp_path)
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]
-        out = svc.format_for_prompt()
+        out = await svc.format_for_prompt()
         assert "Current Strategic Posture" not in out
 
     @pytest.mark.asyncio
@@ -659,7 +659,7 @@ class TestStrategicDirectionIntegration:
         svc = StrategicDirectionService(tmp_path)
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]
-        out = svc.format_for_prompt()
+        out = await svc.format_for_prompt()
         assert "Current Strategic Posture" in out
         assert "HARDEN" in out
 
@@ -682,7 +682,7 @@ class TestStrategicDirectionIntegration:
         svc = StrategicDirectionService(tmp_path)
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]
-        out = svc.format_for_prompt()
+        out = await svc.format_for_prompt()
         assert "Current Strategic Posture" not in out
 
     @pytest.mark.asyncio
@@ -708,7 +708,7 @@ class TestStrategicDirectionIntegration:
         svc = StrategicDirectionService(tmp_path)
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]
-        out = svc.format_for_prompt()
+        out = await svc.format_for_prompt()
         # Section omitted (no reading) but doesn't crash
         assert "Current Strategic Posture" not in out
         assert "test digest" in out

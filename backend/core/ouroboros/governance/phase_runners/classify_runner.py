@@ -393,14 +393,53 @@ class CLASSIFYRunner(PhaseRunner):
                             ctx.op_id[:16] if ctx.op_id else "-",
                             _cap,
                         )
-                        return _advisor.advise(
+                        # fs-hot-tier Phase 2 (audit row 5, 2026-07-02):
+                        # precomputing blast radius skips the HEAVY
+                        # scan, but ``advise()`` still runs
+                        # ``operation_advisor._compute_test_coverage``
+                        # -> ``target_stratification.file_has_test_
+                        # coverage``'s uncached Strategy-1
+                        # ``top.rglob("test_*.py")`` synchronously —
+                        # this fast path called ``advise()`` directly
+                        # on the loop (bypassing ``advise_async``'s
+                        # dedicated executor). Route the SAME sync
+                        # call (identical args — behavior-preserving)
+                        # through the shared substrate instead of
+                        # switching to ``advise_async`` (which lacks
+                        # the ``_precomputed_blast_radius`` seam and
+                        # would silently reintroduce the heavy scan
+                        # this fast path exists to skip).
+                        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                            is_offload_error,
+                            offload,
+                        )
+                        _adv_result = await offload(
+                            _advisor.advise,
                             ctx.target_files,
                             ctx.description,
                             ctx.op_id,
                             is_read_only=ctx.is_read_only,
                             repo_root=_adv_repo_root,
                             _precomputed_blast_radius=_cap,
+                            cpu_bound=False,
                         )
+                        if is_offload_error(_adv_result):
+                            logger.debug(
+                                "[Advisor] background_tier_skip advise "
+                                "offload degraded (%s: %s) — retrying "
+                                "inline synchronously",
+                                _adv_result.exc_type,
+                                _adv_result.message,
+                            )
+                            return _advisor.advise(
+                                ctx.target_files,
+                                ctx.description,
+                                ctx.op_id,
+                                is_read_only=ctx.is_read_only,
+                                repo_root=_adv_repo_root,
+                                _precomputed_blast_radius=_cap,
+                            )
+                        return _adv_result
 
                     # Dispatch through the dedicated ``advisor-blast``
                     # ThreadPoolExecutor (PR-B 2026-05-13), NOT the
@@ -469,15 +508,38 @@ class CLASSIFYRunner(PhaseRunner):
                     from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
                         blast_radius_conservative_cap,
                     )
+                    from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                        is_offload_error,
+                        offload,
+                    )
                     _cap = blast_radius_conservative_cap()
-                    _advisory = _advisor.advise(
+                    _adv_result = await offload(
+                        _advisor.advise,
                         ctx.target_files,
                         ctx.description,
                         ctx.op_id,
                         is_read_only=ctx.is_read_only,
                         repo_root=_adv_repo_root,
                         _precomputed_blast_radius=_cap,
+                        cpu_bound=False,
                     )
+                    if is_offload_error(_adv_result):
+                        logger.debug(
+                            "[Advisor] background_tier_skip fallback "
+                            "advise offload degraded (%s: %s) — "
+                            "retrying inline synchronously",
+                            _adv_result.exc_type, _adv_result.message,
+                        )
+                        _advisory = _advisor.advise(
+                            ctx.target_files,
+                            ctx.description,
+                            ctx.op_id,
+                            is_read_only=ctx.is_read_only,
+                            repo_root=_adv_repo_root,
+                            _precomputed_blast_radius=_cap,
+                        )
+                    else:
+                        _advisory = _adv_result
                 else:
                     _advisory = await _advisor.advise_async(
                         ctx.target_files,
@@ -696,7 +758,7 @@ class CLASSIFYRunner(PhaseRunner):
                 # is the CLASSIFY-phase injection site the battle-test
                 # ops actually traverse (soak bt-2026-05-18-181131
                 # fired here, not the orchestrator inline path).
-                _strat_prompt = _strategic_svc.format_for_prompt(
+                _strat_prompt = await _strategic_svc.format_for_prompt(
                     op_id=getattr(ctx, "op_id", None),
                 )
                 if _strat_prompt:

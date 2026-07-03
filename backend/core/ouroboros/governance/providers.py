@@ -5483,8 +5483,32 @@ class PrimeProvider:
                 len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
-            prompt = _build_codegen_prompt(
-                context,
+            # fs-hot-tier Phase 2 (audit row 4, 2026-07-02):
+            # ``_build_codegen_prompt`` reaches
+            # ``_find_context_files``'s uncached
+            # ``tests_dir.rglob("test_*.py")`` on EVERY GENERATE for
+            # this provider — the confirmed "every-GENERATE" HOT
+            # caller chain. ``_build_codegen_prompt`` itself is used
+            # synchronously by 100+ existing tests and 5 other
+            # provider call sites (doubleword_provider.py), so its
+            # public sync contract is untouched (AST-identical body);
+            # only THIS call site is routed through the substrate —
+            # the whole sync call runs off the loop thread via the
+            # shared ``advisor-blast`` thread pool (syscall-bound:
+            # file reads + rglob, no need for a process pool). A
+            # genuine business exception raised inside
+            # ``_build_codegen_prompt`` (e.g. the deliberate
+            # ``prompt_too_large`` RuntimeError) is NOT a "crawl
+            # failure" the substrate should swallow — on
+            # ``OffloadError`` we retry the identical call inline
+            # synchronously so that exception propagates exactly as
+            # it did pre-Phase-2 (rare path; only fires on genuine
+            # failure, never on the common success path).
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
@@ -5493,6 +5517,23 @@ class PrimeProvider:
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",
             )
+            _prompt_result = await offload(
+                _build_codegen_prompt,
+                context,
+                cpu_bound=False,
+                **_prompt_kwargs,
+            )
+            if is_offload_error(_prompt_result):
+                logger.debug(
+                    "[ClaudeProvider] _build_codegen_prompt offload "
+                    "degraded (%s: %s) — retrying inline "
+                    "synchronously so genuine business exceptions "
+                    "(e.g. prompt_too_large) still propagate",
+                    _prompt_result.exc_type, _prompt_result.message,
+                )
+                prompt = _build_codegen_prompt(context, **_prompt_kwargs)
+            else:
+                prompt = _prompt_result
         accumulated_chars = len(prompt)
         tool_rounds = 0
         start = time.monotonic()
@@ -9892,8 +9933,23 @@ class ClaudeProvider:
                 len(_preloaded_files),
             )
         else:
-            prompt_text = _build_codegen_prompt(
-                context,
+            # fs-hot-tier Phase 2 (audit row 4, 2026-07-02): THE
+            # confirmed "every GENERATE" caller chain
+            # (ClaudeProvider.generate -> _assemble_codegen_prompt ->
+            # _build_codegen_prompt -> _find_context_files's uncached
+            # tests_dir.rglob("test_*.py")). This method is already
+            # async (extracted for the S1 cache-key seam), so the
+            # substrate offload slots in directly — no signature
+            # changes needed here. ``_build_codegen_prompt`` itself
+            # stays untouched (100+ existing sync callers). A genuine
+            # business exception (e.g. prompt_too_large) must still
+            # propagate, so an OffloadError retries the identical
+            # call inline synchronously rather than being swallowed.
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
@@ -9904,6 +9960,25 @@ class ClaudeProvider:
                     context, "provider_route", "",
                 ) or "",
             )
+            _prompt_result = await offload(
+                _build_codegen_prompt,
+                context,
+                cpu_bound=False,
+                **_prompt_kwargs,
+            )
+            if is_offload_error(_prompt_result):
+                logger.debug(
+                    "[ClaudeAPI] _build_codegen_prompt offload "
+                    "degraded (%s: %s) — retrying inline "
+                    "synchronously so genuine business exceptions "
+                    "(e.g. prompt_too_large) still propagate",
+                    _prompt_result.exc_type, _prompt_result.message,
+                )
+                prompt_text = _build_codegen_prompt(
+                    context, **_prompt_kwargs,
+                )
+            else:
+                prompt_text = _prompt_result
         return prompt_text, _mcp_tools, _preloaded_files
 
     def _finalize_codegen_result(

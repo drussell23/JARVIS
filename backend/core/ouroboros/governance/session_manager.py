@@ -23,6 +23,7 @@ Environment variables
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import logging
@@ -36,6 +37,53 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.SessionManager")
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 (audit row 6, 2026-07-02) — ``list_active`` cache
+# ---------------------------------------------------------------------------
+#
+# ``ConversationLedgerObserver.__call__`` (a SYNC bridge turn observer,
+# fired inline on EVERY conversation turn from many sync call sites
+# across the codebase) called ``list_active()`` directly — a
+# ``glob("*.json")`` + per-file JSON parse of the session dir, on the
+# asyncio loop thread, unconditionally per-op.
+#
+# Unlike the other fs-hot-tier fixes, there is no single async seam to
+# insert an ``await offload(...)`` at: the observer's calling contract
+# is explicitly synchronous (``record_turn`` promises "never stalls",
+# fires observers outside its lock, and is itself called from a mix of
+# sync AND async call sites). Converting that whole chain to ``async``
+# would ripple across every ``bridge.record_turn(...)`` call site in
+# the codebase — far outside this fix's blast radius.
+#
+# Root-cause fix: a short TTL cache (``JARVIS_SESSION_ACTIVE_CACHE_TTL_S``)
+# that is refreshed OFF the loop thread via the
+# ``cooperative_fs_io.offload`` substrate whenever an event loop is
+# running in the calling thread (the common case — this whole app is
+# async-first), served fire-and-forget via ``loop.create_task``. The
+# stale/cached value (or an empty list on a cold cache) is returned
+# immediately — the loop is NEVER blocked waiting for the scan. Only
+# when NO event loop is running at all (rare — CLI / non-async test
+# contexts) does this fall back to a direct synchronous scan, which is
+# safe precisely because there is no loop to stall.
+
+_SESSION_ACTIVE_CACHE_TTL_ENV = "JARVIS_SESSION_ACTIVE_CACHE_TTL_S"
+_DEFAULT_SESSION_ACTIVE_CACHE_TTL_S = 5.0
+
+
+def _session_active_cache_ttl_s() -> float:
+    """``JARVIS_SESSION_ACTIVE_CACHE_TTL_S`` — seconds a cached
+    :meth:`SessionManager.list_active` snapshot stays fresh before a
+    background refresh is scheduled. Default 5s (well under typical
+    inter-turn spacing); floored at 0.5s. NEVER raises."""
+    raw = os.environ.get(
+        _SESSION_ACTIVE_CACHE_TTL_ENV,
+        str(_DEFAULT_SESSION_ACTIVE_CACHE_TTL_S),
+    )
+    try:
+        return max(0.5, float(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_SESSION_ACTIVE_CACHE_TTL_S
 
 # ---------------------------------------------------------------------------
 # Environment defaults
@@ -150,6 +198,11 @@ class SessionManager:
         self._dir = storage_dir
         self._lock = threading.RLock()
         self._dir.mkdir(parents=True, exist_ok=True)
+        # fs-hot-tier Phase 2 — list_active() TTL cache (see module
+        # header for the full rationale).
+        self._active_cache: Optional[List[Session]] = None
+        self._active_cache_ts: float = 0.0
+        self._active_cache_refresh_inflight: bool = False
         logger.info("SessionManager initialised (dir=%s)", self._dir)
 
     # -- private helpers ----------------------------------------------------
@@ -310,6 +363,103 @@ class SessionManager:
                     results.append(session)
             results.sort(key=lambda s: s.updated_at, reverse=True)
             return results
+
+    def list_active_cached(self) -> List[Session]:
+        """Loop-safe variant of :meth:`list_active` (fs-hot-tier
+        Phase 2, audit row 6).
+
+        Serves a TTL-cached snapshot (:func:`_session_active_cache_ttl_s`)
+        and schedules a fire-and-forget background refresh — routed
+        through ``cooperative_fs_io.offload`` — whenever an event loop
+        is running in this thread, so :meth:`list_active`'s
+        synchronous ``glob`` + per-file JSON parse NEVER runs directly
+        on the asyncio loop thread. When no loop is running (rare —
+        CLI / non-async contexts), falls back to a direct synchronous
+        scan (safe: no loop to stall). NEVER raises.
+        """
+        now = time.time()
+        ttl = _session_active_cache_ttl_s()
+        with self._lock:
+            cached = self._active_cache
+            cache_ts = self._active_cache_ts
+            fresh = cached is not None and (now - cache_ts) < ttl
+
+        if fresh:
+            return list(cached)  # type: ignore[arg-type]
+
+        scheduled = self._maybe_schedule_active_cache_refresh()
+        if scheduled:
+            # Serve whatever we have (stale cache, or an empty list
+            # on a genuinely cold cache) rather than block the loop.
+            return list(cached) if cached is not None else []
+
+        # No running loop in this thread — safe to compute inline.
+        result = self.list_active()
+        with self._lock:
+            self._active_cache = list(result)
+            self._active_cache_ts = time.time()
+        return result
+
+    def _maybe_schedule_active_cache_refresh(self) -> bool:
+        """Fire-and-forget off-loop cache refresh via
+        :func:`cooperative_fs_io.offload`. Returns True iff a refresh
+        is scheduled or already in flight (i.e. the caller should NOT
+        compute synchronously). NEVER raises."""
+        with self._lock:
+            if self._active_cache_refresh_inflight:
+                return True
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            self._active_cache_refresh_inflight = True
+        try:
+            task = loop.create_task(self._refresh_active_cache_async())
+        except Exception:  # noqa: BLE001 — defensive
+            with self._lock:
+                self._active_cache_refresh_inflight = False
+            return False
+
+        def _log_refresh_failure(t: "asyncio.Task[None]") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.debug(
+                    "[SessionManager] active-cache background "
+                    "refresh task raised", exc_info=exc,
+                )
+
+        task.add_done_callback(_log_refresh_failure)
+        return True
+
+    async def _refresh_active_cache_async(self) -> None:
+        """Off-loop refresh of the ``list_active`` cache via the
+        shared ``cooperative_fs_io`` substrate. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            result = await offload(self.list_active, cpu_bound=False)
+            if not is_offload_error(result):
+                with self._lock:
+                    self._active_cache = list(result)
+                    self._active_cache_ts = time.time()
+            else:
+                logger.debug(
+                    "[SessionManager] active-cache refresh offload "
+                    "degraded (%s: %s) — cache left stale",
+                    result.exc_type, result.message,
+                )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[SessionManager] active-cache background refresh "
+                "failed", exc_info=True,
+            )
+        finally:
+            with self._lock:
+                self._active_cache_refresh_inflight = False
 
     def list_recent(self, limit: int = 10) -> List[Session]:
         """Return the most recent sessions regardless of state."""

@@ -3456,7 +3456,7 @@ class GovernedOrchestrator:
                 and not _should_insulate_prompt(getattr(ctx, "signal_source", ""))
             ):
                 try:
-                    _strat_prompt = _strategic_svc.format_for_prompt(
+                    _strat_prompt = await _strategic_svc.format_for_prompt(
                         op_id=getattr(ctx, "op_id", None),
                     )
                     if _strat_prompt:

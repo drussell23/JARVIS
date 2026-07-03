@@ -253,6 +253,84 @@ class TestOffLoopExecution:
 
 
 # ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 (2026-07-02) — convergence onto the shared
+# cooperative_fs_io.offload substrate. Replaces the ad-hoc
+# ``loop.run_in_executor(None, ...)`` (the DEFAULT/contested pool)
+# with ``offload(..., cpu_bound=False)`` (the dedicated advisor-blast
+# pool every other fs-hot-tier fix now routes through) — closing one
+# of the three divergent off-loop mechanisms the audit found.
+# ---------------------------------------------------------------------------
+
+
+class TestSubstrateConvergence:
+    @pytest.mark.asyncio
+    async def test_query_signals_routes_through_offload_substrate(
+        self, tmp_path, monkeypatch,
+    ):
+        """query_signals() must dispatch the scan via
+        cooperative_fs_io.offload (spied), not a bespoke executor
+        call — proves the convergence, not just the outcome."""
+        from backend.core.ouroboros.governance import cooperative_fs_io
+
+        sessions_dir = tmp_path / ".ouroboros" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        _make_session(sessions_dir, "sess-000", mtime_offset_s=0)
+
+        oracle = StdlibSelfHealthOracle(project_root=tmp_path)
+
+        calls = {"count": 0}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, **kwargs):
+            if fn is mod._load_recent_summaries:
+                calls["count"] += 1
+            return await real_offload(fn, *args, **kwargs)
+
+        # ``query_signals`` does a function-local
+        # ``from cooperative_fs_io import offload`` on every call, so
+        # the spy must patch the SOURCE module attribute — patching
+        # ``mod.offload`` would not be observed (the local import
+        # always re-resolves against ``cooperative_fs_io`` directly).
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+
+        signals = await oracle.query_signals()
+        assert calls["count"] == 1, (
+            "query_signals must dispatch _load_recent_summaries via "
+            "cooperative_fs_io.offload"
+        )
+        assert isinstance(signals, tuple) and len(signals) == 3
+
+    @pytest.mark.asyncio
+    async def test_offload_error_degrades_to_empty_summaries_no_raise(
+        self, tmp_path, monkeypatch,
+    ):
+        """A pickling/offload-layer fault (OffloadError, not a raw
+        exception from the scan fn) must ALSO degrade gracefully --
+        never propagate into query_signals()'s caller."""
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+
+        oracle = StdlibSelfHealthOracle(project_root=tmp_path)
+
+        async def _fake_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_load_recent_summaries",
+                exc_type="RuntimeError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _fake_offload)
+
+        signals = await oracle.query_signals()
+        assert isinstance(signals, tuple)
+        assert len(signals) == 3
+        assert signals[0].verdict.value == "insufficient_data"
+
+
+# ---------------------------------------------------------------------------
 # (c) RED-first: fail-soft. A raising scan must never propagate an
 #     exception -- neither at the pure sync-fn layer nor through the
 #     async query_signals() boundary.
@@ -292,7 +370,24 @@ class TestFailSoft:
     ):
         """End-to-end: even if the executor-dispatched function
         raises, query_signals() must return a signal tuple, never
-        propagate the exception to the caller (adapter contract)."""
+        propagate the exception to the caller (adapter contract).
+
+        fs-hot-tier Phase 2 convergence (2026-07-02): the dispatch
+        now routes through ``cooperative_fs_io.offload`` instead of
+        an ad-hoc ``loop.run_in_executor(None, ...)``. The substrate
+        catches the scan's exception INSIDE the executor and returns
+        an ``OffloadError`` (never re-raised) — ``query_signals``
+        degrades this to an empty ``summaries`` tuple BEFORE it ever
+        reaches the outer ``except Exception`` handler. Empty
+        summaries is the SAME "no data" shape
+        ``_load_recent_summaries`` already produces on its own
+        internal failures (see ``TestFailSoft`` above) and correctly
+        renders as ``INSUFFICIENT_DATA`` (the documented empty-input
+        verdict in ``_completion_signal``/``_cost_signal``/
+        ``_stop_reason_signal``) rather than a coarse blanket
+        DISABLED — strictly more informative, still fail-soft, still
+        never raises.
+        """
         oracle = StdlibSelfHealthOracle(project_root=tmp_path)
 
         def _boom(project_root, lookback, max_scan):
@@ -303,9 +398,9 @@ class TestFailSoft:
         signals = await oracle.query_signals()
         assert isinstance(signals, tuple)
         assert len(signals) >= 1
-        # Adapter contract: on internal failure it reports DISABLED,
-        # never raises.
-        assert signals[0].verdict.value == "disabled"
+        # Adapter contract: on internal scan failure it degrades to
+        # the "no data" verdict, never raises.
+        assert signals[0].verdict.value == "insufficient_data"
 
     def test_unparseable_summary_json_skipped_not_raised(
         self, tmp_path,

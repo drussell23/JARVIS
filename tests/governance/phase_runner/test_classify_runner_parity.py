@@ -683,4 +683,135 @@ async def test_classify_runner_no_downgrade_preserves_higher_prestamp(
     )
 
 
+# ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 (audit row 5, 2026-07-02) — background-tier-skip
+# ``_advisor.advise(...)`` routes through the shared
+# ``cooperative_fs_io.offload`` substrate.
+#
+# The Slice 12T ``_bg_tier_skip`` fast path injects a precomputed
+# ``blast_radius`` to skip the HEAVY blast scan, but ``advise()``
+# still runs ``operation_advisor._compute_test_coverage`` ->
+# ``target_stratification.file_has_test_coverage``'s uncached
+# Strategy-1 ``top.rglob("test_*.py")`` synchronously — and this
+# fast path called ``advise()`` directly on the loop, bypassing
+# ``advise_async``'s dedicated executor entirely. Phase 2 wraps the
+# SAME sync call (identical args) in ``offload(..., cpu_bound=False)``
+# instead of switching to ``advise_async`` (which lacks the
+# ``_precomputed_blast_radius`` seam and would silently reintroduce
+# the heavy scan this fast path exists to skip).
+# ---------------------------------------------------------------------------
+
+
+def _bg_tier_ctx(tmp_path: Path) -> OperationContext:
+    (tmp_path / "a.py").write_text("x = 1\n")
+    return OperationContext.create(
+        target_files=(str(tmp_path / "a.py"),),
+        description="background sensor op",
+        signal_source="todo_scanner",  # a _BACKGROUND_SOURCES member
+    )
+
+
+@pytest.mark.asyncio
+async def test_bg_tier_skip_routes_advise_through_offload_substrate(
+    tmp_path, monkeypatch,
+):
+    """The primary (capture_phase_decision-wrapped) bg-tier-skip path
+    must dispatch ``_advisor.advise(...)`` via
+    ``cooperative_fs_io.offload`` — not directly on the loop."""
+    from backend.core.ouroboros.governance import cooperative_fs_io
+    from backend.core.ouroboros.governance.operation_advisor import (
+        OperationAdvisor,
+    )
+
+    ctx = _bg_tier_ctx(tmp_path)
+    orch = _orch(tmp_path)
+
+    calls = {"n": 0}
+    real_offload = cooperative_fs_io.offload
+
+    async def _spy_offload(fn, *args, **kwargs):
+        is_advise = (
+            getattr(fn, "__func__", None) is OperationAdvisor.advise
+        )
+        if is_advise:
+            calls["n"] += 1
+        return await real_offload(fn, *args, **kwargs)
+
+    monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+
+    assert calls["n"] == 1, (
+        "background-tier-skip advise() call must route through "
+        "cooperative_fs_io.offload"
+    )
+    assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_bg_tier_skip_offloaded_result_matches_sync_call(
+    tmp_path,
+):
+    """Correctness: the offloaded advise() call must produce the
+    SAME Advisory (risk tier, blast radius) as a direct synchronous
+    call with identical args would — the substrate must not change
+    behavior, only where it runs."""
+    from backend.core.ouroboros.governance.operation_advisor import (
+        OperationAdvisor,
+    )
+    from backend.core.ouroboros.governance.bounded_walker import (
+        blast_radius_conservative_cap,
+    )
+
+    ctx = _bg_tier_ctx(tmp_path)
+    orch = _orch(tmp_path)
+
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+    advisory = result.artifacts.get("advisory")
+    assert advisory is not None
+
+    direct = OperationAdvisor(orch._config.project_root).advise(
+        ctx.target_files,
+        ctx.description,
+        ctx.op_id,
+        is_read_only=ctx.is_read_only,
+        repo_root=None,
+        _precomputed_blast_radius=blast_radius_conservative_cap(),
+    )
+    assert advisory.decision == direct.decision
+    assert advisory.blast_radius == direct.blast_radius
+    assert advisory.blast_radius == blast_radius_conservative_cap()
+
+
+@pytest.mark.asyncio
+async def test_bg_tier_skip_offload_error_falls_back_no_crash(
+    tmp_path, monkeypatch,
+):
+    """Fail-soft: when the substrate degrades to an OffloadError, the
+    fast path must retry inline synchronously and still produce a
+    valid classification — never crash the op, never propagate the
+    OffloadError."""
+    from backend.core.ouroboros.governance import cooperative_fs_io
+    from backend.core.ouroboros.governance.cooperative_fs_io import (
+        OffloadError,
+    )
+
+    ctx = _bg_tier_ctx(tmp_path)
+    orch = _orch(tmp_path)
+
+    async def _boom_offload(fn, *args, **kwargs):
+        return OffloadError(
+            fn_name="advise",
+            exc_type="RuntimeError",
+            message="synthetic offload-layer fault",
+            cpu_bound=False,
+        )
+
+    monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+    assert result.status == "ok"
+    assert result.artifacts.get("advisory") is not None
+
+
 __all__ = []

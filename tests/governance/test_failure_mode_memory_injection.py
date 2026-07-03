@@ -291,20 +291,20 @@ def _make_loaded_service(tmp_path):
 
 
 class TestStrategicDirectionIntegration:
-    def test_no_ctx_no_failure_section(
+    async def test_no_ctx_no_failure_section(
         self, monkeypatch, tmp_path,
     ):
         """Backward compat: existing call sites that pass no
         kwargs are byte-identical to pre-Slice-4."""
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt()
+        body = await svc.format_for_prompt()
         assert body
         assert (
             "Prior Failure Modes for This Situation" not in body
         )
 
-    def test_disabled_master_no_section(
+    async def test_disabled_master_no_section(
         self, monkeypatch, tmp_path,
     ):
         """Master-flag-off → no section even when ctx provided."""
@@ -316,7 +316,7 @@ class TestStrategicDirectionIntegration:
             "JARVIS_FAILURE_MODE_HISTORY_DIR", str(tmp_path),
         )
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
@@ -324,14 +324,14 @@ class TestStrategicDirectionIntegration:
             "Prior Failure Modes for This Situation" not in body
         )
 
-    def test_no_matches_no_section(
+    async def test_no_matches_no_section(
         self, monkeypatch, tmp_path,
     ):
         """Master-on but empty history → retriever returns empty,
         so section is omitted (PRD: no empty headers)."""
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
@@ -339,7 +339,7 @@ class TestStrategicDirectionIntegration:
             "Prior Failure Modes for This Situation" not in body
         )
 
-    def test_matches_inject_section(
+    async def test_matches_inject_section(
         self, monkeypatch, tmp_path,
     ):
         """End-to-end: plant two recurring failures, verify the
@@ -364,7 +364,7 @@ class TestStrategicDirectionIntegration:
                 weight=3,
             ))
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor across two files"},
         )
@@ -372,7 +372,7 @@ class TestStrategicDirectionIntegration:
         assert "missing_import" in body
         assert "Verify imports first" in body
 
-    def test_section_appended_after_existing_blocks(
+    async def test_section_appended_after_existing_blocks(
         self, monkeypatch, tmp_path,
     ):
         """Section ordering: failure-modes always last so the
@@ -396,7 +396,7 @@ class TestStrategicDirectionIntegration:
             weight=3,
         ))
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py", "b.py"),
             plan={"approach": "refactor"},
         )
@@ -408,26 +408,26 @@ class TestStrategicDirectionIntegration:
         assert sd_idx >= 0
         assert fm_idx > sd_idx
 
-    def test_only_target_files_no_section(
+    async def test_only_target_files_no_section(
         self, monkeypatch, tmp_path,
     ):
         """Both kwargs required — partial ctx (target_files only)
         does NOT trigger the section."""
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=("a.py",), plan=None,
         )
         assert (
             "Prior Failure Modes for This Situation" not in body
         )
 
-    def test_only_plan_no_section(
+    async def test_only_plan_no_section(
         self, monkeypatch, tmp_path,
     ):
         _enable(monkeypatch, tmp_path)
         svc = _make_loaded_service(tmp_path)
-        body = svc.format_for_prompt(
+        body = await svc.format_for_prompt(
             target_files=None, plan={"approach": "refactor"},
         )
         assert (

@@ -131,7 +131,7 @@ def test_ast_pin_attach_and_detach_assign_governed_loop_service():
 # End-to-end: the production resolution snippet now reaches injection
 # ---------------------------------------------------------------------------
 
-def test_wired_stack_resolves_strategic_and_fires_dev_memory(
+async def test_wired_stack_resolves_strategic_and_fires_dev_memory(
     monkeypatch, tmp_path, caplog,
 ):
     # Curated repo memory/ + enabled flag (the P3 conditions).
@@ -159,7 +159,7 @@ def test_wired_stack_resolves_strategic_and_fires_dev_memory(
         "production read path must resolve the loaded service"
     )
     with caplog.at_level(logging.INFO, logger=_STRAT_LOGGER):
-        out = _strategic_svc.format_for_prompt(op_id="op-int")
+        out = await _strategic_svc.format_for_prompt(op_id="op-int")
 
     assert "## Recent Developer Memory" in out
     line = next(
