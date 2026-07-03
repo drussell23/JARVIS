@@ -9,6 +9,29 @@ Boundary Principle:
   Agentic: The routing decision to USE Doubleword (complexity > 0.85, ULTRA_TASKS)
            is made by the governance pipeline's routing layer, not this provider.
 
+Prompt caching (cache_control on the stable prefix):
+  DoubleWord supports Anthropic-style ``cache_control`` markers on content
+  blocks (5-min / 1-hour TTL, ~90% off cached input tokens). We mark ONLY the
+  stable prefix — the system prompt + the Slice-131 stable tool catalog +
+  output schema — leaving the volatile per-op content (goal, target_files,
+  exploration results, and the StrategicDirection "Recent Development Momentum"
+  git-log digest) OUTSIDE the cached block so the cache key never busts.
+  Gated by ``JARVIS_DW_PROMPT_CACHE_ENABLED`` (default false); TTL via
+  ``JARVIS_DW_PROMPT_CACHE_TTL`` (``5m`` | ``1h``, default ``1h``). Reuses the
+  Slice-131 ``stable_prefix_out`` split (RT/lean path) and Claude's
+  ``prompt_cache_min_chars`` floor logic — no duplicated prompt assembly. The
+  Async/batch path uses the full prompt builder (no stable/volatile split), so
+  its cacheable prefix is system-only and normally below the token floor —
+  caching is therefore RT-effective in practice (the marker is wired on both
+  paths and is a no-op below the floor).
+
+Zero Data Retention (ZDR):
+  ZDR is opt-in per-org (contract-side with DoubleWord — email DoubleWord to
+  enable it on the org). The env flag ``JARVIS_DW_ZDR_ENABLED`` (default false)
+  only ASSERTS ZDR per-request via the header ``_DW_ZDR_HEADER`` on the
+  Realtime + Async request egress. The exact header name is a single documented
+  constant awaiting confirmation from DoubleWord (Meryem) — see ``_DW_ZDR_HEADER``.
+
 Doubleword API docs: https://docs.doubleword.ai
 """
 from __future__ import annotations
@@ -116,6 +139,114 @@ _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
 _DW_REASONING_EFFORT = os.environ.get("JARVIS_DW_REASONING_EFFORT", "none")
+
+# ---------------------------------------------------------------------------
+# Prompt caching (cache_control on the stable prefix) + Zero Data Retention
+# All env-driven, no hardcoding. See the module docstring for the full contract.
+# ---------------------------------------------------------------------------
+# ~1024-token Anthropic cache floor expressed in chars. DW's own char/token
+# estimate (_DW_CHARS_PER_TOKEN=3.5) → ~3584; we use 4096 (≈1024 tokens at the
+# conservative 4 chars/token) so we never mark a prefix below the real floor.
+_DW_PROMPT_CACHE_MIN_CHARS_DEFAULT = 4096
+_DW_PROMPT_CACHE_VALID_TTLS = ("5m", "1h")
+
+# TODO(dw-zdr): confirm the EXACT per-request ZDR header name + value with
+# DoubleWord (Meryem). This is a single, clearly-named constant that is trivial
+# to correct — we deliberately do NOT guess-ship a wrong header silently. ZDR
+# also requires org-level enablement (contract-side); this flag only asserts it
+# per-request.
+_DW_ZDR_HEADER = "X-Doubleword-Zero-Data-Retention"
+_DW_ZDR_HEADER_VALUE = "true"
+
+
+def _dw_prompt_cache_enabled() -> bool:
+    """Master switch for DW prompt caching. Default FALSE (safe opt-in). When
+    off, the request is byte-identical legacy (no cache_control markers)."""
+    return os.environ.get(
+        "JARVIS_DW_PROMPT_CACHE_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dw_prompt_cache_ttl() -> str:
+    """Cache TTL from ``JARVIS_DW_PROMPT_CACHE_TTL`` — ``5m`` or ``1h`` (default
+    ``1h`` so a single cache write amortizes across a 40-80min soak). Any
+    invalid value fails soft to ``1h``. NEVER raises."""
+    raw = os.environ.get("JARVIS_DW_PROMPT_CACHE_TTL", "1h").strip().lower()
+    return raw if raw in _DW_PROMPT_CACHE_VALID_TTLS else "1h"
+
+
+def _dw_prompt_cache_min_chars() -> int:
+    """DRY: reuse Claude's floor-parse logic (providers.prompt_cache_min_chars)
+    keyed to DW's own env var + a real ~1024-token default. Lazy import avoids
+    the providers.py <-> doubleword_provider.py cycle. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.providers import (
+            prompt_cache_min_chars as _pcmc,
+        )
+        return _pcmc(
+            "JARVIS_DW_PROMPT_CACHE_MIN_CHARS",
+            _DW_PROMPT_CACHE_MIN_CHARS_DEFAULT,
+        )
+    except Exception:  # noqa: BLE001 — cache plumbing never breaks generation
+        return _DW_PROMPT_CACHE_MIN_CHARS_DEFAULT
+
+
+def _dw_shape_cached_system(
+    system_text: Any, *, enabled: bool, min_chars: int, ttl: str
+) -> Any:
+    """Return the DW ``system`` message content, folding a cache_control marker
+    onto the stable prefix when enabled AND the prefix meets the floor.
+
+    Mirror of :meth:`ClaudeProvider._build_cached_system_blocks`, but emits the
+    OpenAI-compatible content-block shape DW's chat/completions API accepts
+    (``content`` may be a list of ``{"type":"text", ...}`` blocks — the same
+    shape already used for multi-modal image_url blocks). The marker adds ONLY
+    ``cache_control`` metadata; the text is byte-identical. Fail-soft: any error
+    or a gated/short prefix returns the plain string (un-cached request)."""
+    try:
+        if not enabled:
+            return system_text
+        if not isinstance(system_text, str) or not system_text:
+            return system_text
+        if len(system_text) < max(0, int(min_chars)):
+            return system_text
+        return [
+            {
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral", "ttl": ttl},
+            }
+        ]
+    except Exception:  # noqa: BLE001 — caching plumbing NEVER breaks generation
+        return system_text
+
+
+def dw_zdr_enabled() -> bool:
+    """Master switch for per-request ZDR assertion. Default FALSE."""
+    return os.environ.get(
+        "JARVIS_DW_ZDR_ENABLED", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def dw_zdr_request_headers() -> Dict[str, str]:
+    """Per-request ZDR header dict — ``{_DW_ZDR_HEADER: "true"}`` when enabled,
+    else empty. Merge into the egress headers at each POST site. NEVER raises."""
+    try:
+        return {_DW_ZDR_HEADER: _DW_ZDR_HEADER_VALUE} if dw_zdr_enabled() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _dw_apply_zdr(headers: Dict[str, str]) -> Dict[str, str]:
+    """Fold the ZDR header into an already-composed egress header dict.
+    Fail-soft: returns ``headers`` unchanged on any error."""
+    try:
+        _zdr = dw_zdr_request_headers()
+        if _zdr:
+            return {**(headers or {}), **_zdr}
+        return headers
+    except Exception:  # noqa: BLE001
+        return headers
 
 
 # Slice 55 — complexity → reasoning_effort map. Leaf/utility work goes fast &
@@ -1564,6 +1695,34 @@ class DoublewordProvider:
         # codegen payload site. ``None`` → module-level ``_DW_TEMPERATURE`` (byte-identical).
         self._epistemic_temp_override: Optional[float] = None
 
+    def _dw_build_system_content(
+        self, base_system_prompt: str, stable_prefix: List[str]
+    ) -> Any:
+        """Compose the DW ``system`` message ``content``.
+
+        Folds the Slice-131 stable prefix (tool catalog + output schema — only
+        populated on the RT/lean path when DW prompt caching requested the
+        split) into ``base_system_prompt`` and marks the result with
+        ``cache_control`` when :func:`_dw_prompt_cache_enabled`. When the split
+        didn't fire (``stable_prefix`` empty — e.g. the full/batch builder) the
+        base system prompt is typically below the token floor, so the marker is
+        a no-op and the content is the plain legacy string (byte-identical).
+        Fail-soft throughout."""
+        try:
+            _base = (
+                base_system_prompt
+                if not stable_prefix
+                else base_system_prompt + "\n\n" + "\n\n".join(stable_prefix)
+            )
+            return _dw_shape_cached_system(
+                _base,
+                enabled=_dw_prompt_cache_enabled(),
+                min_chars=_dw_prompt_cache_min_chars(),
+                ttl=_dw_prompt_cache_ttl(),
+            )
+        except Exception:  # noqa: BLE001 — caching plumbing never breaks generation
+            return base_system_prompt
+
     def _eff_dw_temperature(self) -> float:
         """Effective sampling temperature for the DW codegen payload (T2).
 
@@ -2053,21 +2212,30 @@ class DoublewordProvider:
         # variable so the egress interceptor can sanitize + weight-check it
         # BEFORE it is serialized into JSONL. I2 asymmetry: only CONFIRMED
         # overweight blocks; sanitize/estimate errors pass through unchanged.
+        _batch_system_prompt = (
+            "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
+            "RULES: "
+            "1. Start your response with { and end with }. "
+            "2. No text before or after the JSON. No markdown fences. No explanations. "
+            "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
+            "4. No trailing commas before } or ]. "
+            "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
+            "6. NEVER return unified diffs, patches, or partial file content. "
+            "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
+            "(1 sentence, max 200 chars). Missing rationale will be rejected."
+        )
+        # DW prompt caching — the Async/batch path uses the full prompt builder
+        # (no stable/volatile split), so the stable prefix is system-only and
+        # normally below the token floor → the marker is a no-op here (RT is
+        # where caching is effective). Wired for consistency + fail-soft; empty
+        # sink keeps it byte-identical when off.
+        _batch_system_content = self._dw_build_system_content(
+            _batch_system_prompt, []
+        )
         _batch_body: dict = {
             "model": _effective_model,
             "messages": [
-                {"role": "system", "content": (
-                    "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
-                    "RULES: "
-                    "1. Start your response with { and end with }. "
-                    "2. No text before or after the JSON. No markdown fences. No explanations. "
-                    "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
-                    "4. No trailing commas before } or ]. "
-                    "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
-                    "6. NEVER return unified diffs, patches, or partial file content. "
-                    "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
-                    "(1 sentence, max 200 chars). Missing rationale will be rejected."
-                )},
+                {"role": "system", "content": _batch_system_content},
                 {"role": "user", "content": prompt},
             ],
             "max_tokens": _retry_max_tokens,
@@ -3374,6 +3542,13 @@ class DoublewordProvider:
             _will_skip_tools = True
         _tools_available = self._tool_loop is not None and not _will_skip_tools
         _preloaded_files: List[str] = []
+        # DW prompt caching (Slice-131 split): when the master flag is on, divert
+        # the STABLE tool catalog + output schema into this sink so ONLY they are
+        # folded into the cache_control-marked system prefix — the volatile
+        # per-op user prompt (goal, target_files, exploration, git-momentum
+        # digest) stays outside the cached block. Empty unless the split fires.
+        _dw_cache_on = _dw_prompt_cache_enabled()
+        _dw_stable_prefix: List[str] = []
         if prompt_override:
             prompt = prompt_override
         elif _should_use_lean_prompt(context, tools_enabled=_tools_available):
@@ -3384,6 +3559,8 @@ class DoublewordProvider:
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
                 preloaded_out=_preloaded_files,
+                stable_prefix_out=_dw_stable_prefix if _dw_cache_on else None,
+                force_prefix_split=_dw_cache_on,
             )
             logger.info(
                 "[DoublewordProvider] RT: using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
@@ -3426,6 +3603,14 @@ class DoublewordProvider:
             "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
             "(1 sentence, max 200 chars) explaining WHY the change is being made. "
             "Missing or empty rationale will cause the response to be rejected."
+        )
+
+        # DW prompt caching — compose the system message content once (folds the
+        # stable tool-catalog/schema prefix into the cached block when enabled).
+        # Plain string (byte-identical legacy) when caching off / split empty /
+        # below the token floor. Fail-soft.
+        _dw_system_content = self._dw_build_system_content(
+            _SYSTEM_PROMPT, _dw_stable_prefix
         )
 
         # Mutable container to capture token usage from _generate_raw
@@ -3505,7 +3690,7 @@ class DoublewordProvider:
             body = {
                 "model": _effective_model,
                 "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": _dw_system_content},
                     {"role": "user", "content": _user_content},
                 ],
                 "max_tokens": _eff_max_tokens,
@@ -3698,9 +3883,9 @@ class DoublewordProvider:
                         async with session.post(
                             f"{self._base_url}/chat/completions",
                             json=body,
-                            headers=_aegis_merge_lease_headers(
+                            headers=_dw_apply_zdr(_aegis_merge_lease_headers(
                                 _call_auth, _aegis_lease,
-                            ),
+                            )),
                             timeout=self._request_timeout(),
                         ) as resp:
                             if resp.status >= 300:
@@ -4181,9 +4366,9 @@ class DoublewordProvider:
                         async with session.post(
                             f"{self._base_url}/chat/completions",
                             json=body,
-                            headers=_aegis_merge_lease_headers(
+                            headers=_dw_apply_zdr(_aegis_merge_lease_headers(
                                 _call_auth, _aegis_lease,
-                            ),
+                            )),
                             timeout=self._request_timeout(),
                         ) as resp:
                             if resp.status >= 300:
@@ -4808,7 +4993,7 @@ class DoublewordProvider:
             async with session.post(
                 f"{self._base_url}/files",
                 data=data,
-                headers=_call_headers,
+                headers=_dw_apply_zdr(_call_headers),
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
@@ -4896,9 +5081,9 @@ class DoublewordProvider:
                     "endpoint": "/v1/chat/completions",
                     "completion_window": _DW_COMPLETION_WINDOW,
                 },
-                headers=_aegis_merge_lease_headers(
+                headers=_dw_apply_zdr(_aegis_merge_lease_headers(
                     _call_auth, _aegis_lease,
-                ),
+                )),
                 timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
