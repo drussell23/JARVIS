@@ -189,6 +189,15 @@ class BusBridgeClient:
         event_id = ev_dict.get("event_id", "")
         qid = bf.qualified_id(frame.source_id, event_id)
         if qid in self._seen:
+            # Already republished locally, but the contiguous high-water
+            # mark tracks what has been RECEIVED on the wire (for
+            # Last-Event-ID replay resumption), independent of local
+            # republish dedup. A replay that re-delivers already-seen
+            # events MUST still advance the mark across them -- otherwise
+            # the mark stalls, every reconnect replays the same prefix
+            # from high_water+1, and a drop_after fault starves the still
+            # -missing tail forever (zero-drop guarantee broken).
+            self._advance_contiguous(event_id)
             return
         self._seen.add(qid)
         try:
