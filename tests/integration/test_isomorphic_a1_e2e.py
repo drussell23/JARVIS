@@ -1753,3 +1753,160 @@ class TestBootWaitEventLoopYield:
             "All waits in the adversary-serving window must use "
             "'await asyncio.sleep()' so the SyntheticAdversary keeps serving."
         )
+
+
+# ===========================================================================
+# Group 8 -- Audit-at-teardown sequencing (STEP audit bound to soak-child exit)
+# ===========================================================================
+
+
+class TestAuditAtTeardownSequencing:
+    """The driver used to invoke STEP audit on a fixed ~5min post-boot
+    ceiling (_a1_audit_ceiling_s) while the soak child was STILL RUNNING --
+    stale FAILED verdicts, because the chain hadn't finished yet.
+
+    The fix: bind the audit invocation to the soak child's ACTUAL exit,
+    reusing the existing process-wait primitive (Popen.wait -- the SAME one
+    SoakRunner.stop()/_reap_soak_runners() already use in teardown), offloaded
+    via run_in_executor so it does not starve the co-located SyntheticAdversary
+    event loop. These tests prove: (1) the wait happens BEFORE the audit is
+    invoked, and (2) the completed-session audit runs in --replay mode.
+    """
+
+    def _scaffold(self, tmp_path: Path, harness_mod: Any):
+        """Build a full non-stub driver run that reaches the real STEP audit
+        invocation (unlike the existing SpySoakRunner tests, which abort
+        before the soak ever launches)."""
+        call_order: List[str] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _FakeProc:
+            """Fake Popen handle. .wait() records call order + a fake pid."""
+            def __init__(self) -> None:
+                self.pid = 4242
+                self.returncode: "Optional[int]" = None
+
+            def poll(self) -> "Optional[int]":
+                return self.returncode
+
+            def wait(self, timeout: "Optional[float]" = None) -> int:
+                call_order.append("proc.wait")
+                self.returncode = 0
+                return 0
+
+        debug_log = tmp_path / "session" / "debug.log"
+        debug_log.parent.mkdir(parents=True, exist_ok=True)
+        debug_log.write_text("boot complete\n", encoding="utf-8")
+        fake_proc = _FakeProc()
+
+        class _FakeSoakHandle:
+            def __init__(self) -> None:
+                self.debug_log = str(debug_log)
+                self.session_dir = str(debug_log.parent)
+                self.proc = fake_proc
+
+        class _FakeSoakRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+            def launch(self, env: Dict[str, str], run_dir: str) -> Any:
+                return _FakeSoakHandle()
+            def stop(self) -> None:
+                pass
+
+        class _SpyAuditorRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                self.kwargs = kwargs
+                _captured_auditor_kwargs.append(kwargs)
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                call_order.append("auditor.watch")
+                return {"proven": True, "criteria": {}}
+
+        _captured_auditor_kwargs: List[Dict[str, Any]] = []
+
+        async def _fake_await_soak_boot(proc: Any, log: str, timeout_s: float = 90.0) -> bool:
+            return True
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            dw_session_budget=0.0,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        patches = [
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "SoakRunner", _FakeSoakRunner),
+            patch.object(harness_mod, "AuditorRunner", _SpyAuditorRunner),
+            patch.object(_driver_mod, "_await_soak_boot", _fake_await_soak_boot),
+        ]
+        return driver, patches, call_order, _captured_auditor_kwargs, fake_proc
+
+    async def test_soak_proc_wait_happens_before_audit_invocation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Popen.wait() must be called BEFORE AuditorRunner.watch() -- the
+        audit must never fire while the soak child could still be running."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, call_order, _auditor_kwargs, _proc = self._scaffold(
+            tmp_path, harness_mod,
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            rc = await driver.run()
+
+        assert "proc.wait" in call_order, "soak-child wait must have been invoked"
+        assert "auditor.watch" in call_order, "the auditor must still run"
+        assert call_order.index("proc.wait") < call_order.index("auditor.watch"), (
+            "audit must be invoked AFTER the soak child exits, not on a fixed "
+            "post-boot ceiling; got order=%r" % (call_order,)
+        )
+        assert rc == 0
+
+    async def test_audit_invoked_in_replay_mode_after_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once the driver waits for the ACTUAL soak-child completion, the
+        audit is a static replay of a finished session -- AuditorRunner must
+        be constructed with replay=True."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, _call_order, auditor_kwargs, _proc = self._scaffold(
+            tmp_path, harness_mod,
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            await driver.run()
+
+        assert auditor_kwargs, "AuditorRunner must have been constructed"
+        assert auditor_kwargs[0].get("replay") is True, (
+            "post-completion audit must run in --replay mode; got kwargs=%r"
+            % (auditor_kwargs[0],)
+        )

@@ -1344,6 +1344,47 @@ class IsomorphicA1Driver:
                         _log("[HybridMesh] L7 readiness gate -> %s"
                              % ("SERVING" if _served else "TIMEOUT"))
 
+                    # ── Bind the audit invocation to ACTUAL soak-child completion ──
+                    #
+                    # THE BUG: the audit used to fire on a fixed ~5min post-boot
+                    # ceiling (_a1_audit_ceiling_s) while the soak child was STILL
+                    # RUNNING (chains not yet complete) -- stale FAILED verdicts.
+                    # THE FIX: the driver already has the process handle it will
+                    # eventually SIGTERM-wait in teardown (SoakRunner.stop() /
+                    # _reap_soak_runners()) -- reuse that SAME existing primitive
+                    # (Popen.wait, a single bounded call, no sleep loop) HERE, so
+                    # the audit only ever sees a COMPLETE debug.log. Bounded by the
+                    # child's own wall-clock cap (+ grace) -- the harness's
+                    # watchdog thread (Watchdog Isolation Invariant, Slice 47)
+                    # guarantees the child exits by then, so this never hangs.
+                    # Offloaded to a thread (run_in_executor) so the blocking
+                    # Popen.wait() does NOT starve this driver's OWN event loop --
+                    # the co-located SyntheticAdversary aiohttp server runs on
+                    # that SAME loop and must keep serving the child's requests
+                    # throughout the wait.
+                    if soak_proc is not None:
+                        import subprocess as _subprocess_mod  # noqa: PLC0415
+                        _wait_budget_s = float(_soak_wall_s) + 30.0
+                        _log("STEP await soak-child exit (bind audit to ACTUAL "
+                             "completion, budget=%.0fs) -- no more stale FAILED "
+                             "verdicts from a fixed post-boot audit window"
+                             % _wait_budget_s)
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: soak_proc.wait(timeout=_wait_budget_s),
+                            )
+                            _log("STEP soak-child exited (rc=%s)"
+                                 % (soak_proc.returncode,))
+                        except _subprocess_mod.TimeoutExpired:
+                            _log("WARN soak-child did not exit within "
+                                 "wall(%.0fs)+30s grace -- auditing whatever the "
+                                 "log currently holds (should not happen; the "
+                                 "child's own wall-clock watchdog guarantees "
+                                 "exit)" % (_soak_wall_s,))
+                        except Exception as exc:  # noqa: BLE001
+                            _log("soak-child wait warning: %r" % (exc,))
+
                     # ── Fast-Fail short-circuit: a global L4 capacity wall means the
                     # cognitive loop can NEVER reach APPLIED this run. Skip the audit
                     # ceiling entirely, emit a capacity verdict, and flow to teardown
@@ -1368,7 +1409,13 @@ class IsomorphicA1Driver:
                             aud_runner = harness_mod.StubAuditorRunner(
                                 strict=self.strict, goal_id="GOAL-ISO-A1")
                         else:
-                            aud_runner = harness_mod.AuditorRunner(strict=self.strict)
+                            # replay=True: we just waited for the soak-child to
+                            # ACTUALLY exit (above) -- this is now a static
+                            # replay of a COMPLETE, finished session log, not a
+                            # live concurrent audit.
+                            aud_runner = harness_mod.AuditorRunner(
+                                strict=self.strict, replay=True,
+                            )
 
                         verdict = aud_runner.watch(
                             base=self.sse_base,

@@ -554,8 +554,14 @@ class AuditorRunner:
     debug.log, writing the verdict JSON. Subprocesses the real script so the
     auditor's reconnect/backoff/intervention-lock run unmodified."""
 
-    def __init__(self, *, strict: bool = True) -> None:
+    def __init__(self, *, strict: bool = True, replay: bool = False) -> None:
         self.strict = strict
+        # Audit-at-teardown sequencing fix: the driver now waits for the soak
+        # child to ACTUALLY exit before invoking this runner, so by the time
+        # `watch()` is called the SSE stream is dead (server process gone)
+        # and the log file is a COMPLETE, finished session -- exactly the
+        # `--replay` static-replay scenario the auditor was extended for.
+        self.replay = replay
 
     def watch(self, *, base: str, log_file: str, timeout_s: float,
               verdict_out: str) -> Dict[str, Any]:
@@ -565,6 +571,8 @@ class AuditorRunner:
             "--timeout", str(timeout_s), "--verdict-out", verdict_out,
             "--strict" if self.strict else "--lenient",
         ]
+        if self.replay:
+            argv.append("--replay")
         # The auditor's load_audit_flags() lacks the harness's AST-source fallback,
         # so on a node where the heavy CADENCE_POLICY import fails it dies at
         # flag_set_load (runs #7/#8). subprocess.run() inherits os.environ, which does
