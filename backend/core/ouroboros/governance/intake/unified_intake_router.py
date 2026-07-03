@@ -518,6 +518,7 @@ def _compute_priority(
     repo_root: "Optional[Path]" = None,
     resurrected: bool = False,
     semantic_boost_override: "Optional[int]" = None,
+    stratification_penalty_override: "Optional[int]" = None,
 ) -> Tuple[int, Optional[Any]]:
     """Compute cost-aware priority score + rich goal alignment for an envelope.
 
@@ -699,7 +700,15 @@ def _compute_priority(
     # Authority invariant: priority ordering ONLY — never fed to UrgencyRouter,
     # Iron Gate, risk tier, policy engine, FORBIDDEN_PATH, or approval gating.
     stratification_penalty = 0
-    if repo_root is not None and _ingest_stratification_enabled():
+    if stratification_penalty_override is not None:
+        # Tier-4 — the caller (``_ingest_impl``) already computed (or
+        # deliberately degraded) the stratification penalty OFF the asyncio
+        # loop. The inline path below runs file_has_test_coverage's
+        # tests-tree rglob + cold AST-map build synchronously — the traced
+        # 41.7 s on-loop block (bt-iso-1783102490) — so the hot intake path
+        # must NEVER reach it. Evidence stash is done by the caller.
+        stratification_penalty = max(0, int(stratification_penalty_override))
+    elif repo_root is not None and _ingest_stratification_enabled():
         try:
             from backend.core.ouroboros.governance.target_stratification import (
                 ingest_priority_penalty,
@@ -1245,10 +1254,68 @@ class UnifiedIntakeRouter:
                 "[Router] offloaded semantic scorer skipped: %s", _sem_exc,
             )
             _semantic_override = None
+        # Tier-4 — stratification coverage penalty OFF the asyncio loop.
+        # The inline path (``_compute_priority`` → ``ingest_priority_penalty``
+        # → ``file_has_test_coverage``) rglob-walks the ENTIRE tests/ tree
+        # (~2,839 files) per signal and cold-builds the AST import map
+        # (read + ast.parse of ~963K test lines) on first miss — the traced
+        # 41,713 ms single on-loop block of bt-iso-1783102490 (plus the
+        # 1–16 s recurring blocks). Here we branch on index warmth:
+        #   * warm  → penalty via cheap in-memory lookups, dispatched
+        #     through ``cooperative_fs_io.offload`` (thread hop covers the
+        #     residual ``_count_lines`` file read);
+        #   * cold  → PROCEED DEGRADED (override 0 — no penalty, no
+        #     evidence) and fire the single-flight off-loop index build.
+        #     The prior is advisory priority-ordering only, so ops flowing
+        #     unbiased while the index warms mirrors the SemanticIndex
+        #     Tier-2b fail-soft convention; intake never waits ~40 s.
+        # Fail-soft: ANY fault degrades to 0 — never None, because None
+        # would route ``_compute_priority`` back onto the inline on-loop
+        # scan (the bug this block eradicates).
+        _strat_override: Optional[int] = None
+        if envelope.target_files and _ingest_stratification_enabled():
+            _strat_override = 0  # degraded-proceed default
+            try:
+                from backend.core.ouroboros.governance.target_stratification import (  # noqa: E501
+                    coverage_index_ready,
+                    ingest_priority_penalty,
+                    trigger_coverage_index_build,
+                )
+                _idx_ready = coverage_index_ready(self._config.project_root)
+                # Always fire the trigger — it self-gates (single-flight
+                # "building" set, TTL freshness, failure cooldown) and
+                # returns immediately; also covers TTL refresh when warm.
+                trigger_coverage_index_build(self._config.project_root)
+                if _idx_ready:
+                    from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                        is_offload_error,
+                        offload,
+                    )
+                    _pen = await offload(
+                        ingest_priority_penalty,
+                        envelope.target_files,
+                        self._config.project_root,
+                        suppress=_is_test_generation_intent(envelope),
+                        cpu_bound=False,
+                    )
+                    if not is_offload_error(_pen):
+                        _strat_override = max(0, int(_pen))
+                        if _strat_override > 0 and isinstance(
+                            envelope.evidence, dict,
+                        ):
+                            envelope.evidence["stratification_penalty"] = (
+                                _strat_override
+                            )
+            except Exception as _strat_exc:  # noqa: BLE001 — never break intake
+                logger.debug(
+                    "[Router] offloaded stratification skipped (degraded): %s",
+                    _strat_exc,
+                )
         priority, alignment = _compute_priority(
             envelope, dependency_credit=_dep_credit,
             repo_root=self._config.project_root,
             semantic_boost_override=_semantic_override,
+            stratification_penalty_override=_strat_override,
         )
         # Stash goal-alignment diagnostics on the envelope so downstream
         # phases (orchestrator, SerpentFlow postmortems, dead-letter audit)

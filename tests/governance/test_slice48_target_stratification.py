@@ -261,3 +261,111 @@ def test_analyze_file_stamps_coverage(tmp_path: Path) -> None:
     assert covered.has_test_coverage is True
     assert uncovered.has_test_coverage is False
     assert none_root.has_test_coverage is True  # unknown → no penalty
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tier-4 — off-loop coverage index (warm fast path parity + lifecycle).
+# The index answers Strategy 1 via set/bisect lookups and Strategy 2 via
+# the prebuilt AST map — it must be semantically identical to the legacy
+# filesystem scan for every case above.
+# ═══════════════════════════════════════════════════════════════════════
+import time as _time
+
+import backend.core.ouroboros.governance.target_stratification as _ts
+
+
+@pytest.fixture(autouse=True)
+def _tier4_reset_index_state():
+    _ts.reset_coverage_index()
+    _strat_ast_cache.clear()
+    yield
+    _ts.reset_coverage_index()
+    _strat_ast_cache.clear()
+
+
+def _install_index(root: Path) -> None:
+    """Build + install the coverage index synchronously (test-only shortcut)."""
+    idx = _ts._build_coverage_index_sync(
+        _ts._resolve_scan_root(root), _ts._strat_test_dir_names(),
+    )
+    with _ts._COVERAGE_IDX_LOCK:
+        _ts._coverage_index[_ts._resolve_scan_root(root)] = idx
+
+
+@pytest.mark.parametrize("covered_case", ["exact", "suffix", "ast", "none"])
+def test_warm_index_parity_with_legacy_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, covered_case: str,
+) -> None:
+    monkeypatch.setenv("JARVIS_STRATIFICATION_AST_IMPORT_ENABLED", "true")
+    src = tmp_path / "backend" / "core" / "widget.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def some_func():\n    return 1\n")
+    (tmp_path / "tests").mkdir()
+    if covered_case == "exact":
+        (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
+    elif covered_case == "suffix":
+        (tmp_path / "tests" / "test_widget_slice4.py").write_text(
+            "def test_x(): pass\n"
+        )
+    elif covered_case == "ast":
+        (tmp_path / "tests" / "test_other.py").write_text(
+            "from backend.core.widget import some_func\n"
+            "def test_it(): assert some_func() is not None\n"
+        )
+
+    legacy = file_has_test_coverage("backend/core/widget.py", tmp_path)
+    _strat_ast_cache.clear()  # legacy run may have warmed it — isolate
+
+    _install_index(tmp_path)
+    warm = file_has_test_coverage("backend/core/widget.py", tmp_path)
+
+    assert warm == legacy == (covered_case != "none")
+
+
+def test_warm_index_answers_without_filesystem_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
+    _install_index(tmp_path)
+
+    # Sever the traversal paths entirely — a warm index must not walk.
+    def _boom(*a, **k):
+        raise AssertionError("filesystem traversal ran despite warm index")
+
+    monkeypatch.setattr(_ts, "_iter_test_files", _boom)
+    monkeypatch.setattr(_ts, "_strat_build_ast_map", _boom)
+    monkeypatch.setattr(Path, "rglob", _boom)
+
+    assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
+    assert file_has_test_coverage("backend/core/nope.py", tmp_path) is False
+
+
+def test_index_master_switch_off_restores_legacy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
+    _install_index(tmp_path)
+    monkeypatch.setenv("JARVIS_STRATIFICATION_INDEX_ENABLED", "false")
+    # Index ignored (lookup returns None) → legacy scan still answers.
+    assert _ts.coverage_index_ready(tmp_path) is False
+    assert _ts.trigger_coverage_index_build(tmp_path) == "skipped_disabled"
+    assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
+
+
+def test_trigger_sentinels_lifecycle(tmp_path: Path) -> None:
+    # No running loop → sync callers can't schedule a task.
+    assert _ts.trigger_coverage_index_build(tmp_path) == "skipped_no_loop"
+    # Fresh index within TTL → skipped.
+    _install_index(tmp_path)
+    assert _ts.trigger_coverage_index_build(tmp_path) == "skipped_fresh"
+    # Failure cooldown → skipped.
+    _ts.reset_coverage_index()
+    with _ts._COVERAGE_IDX_LOCK:
+        _ts._coverage_index_failed_at[_ts._resolve_scan_root(tmp_path)] = (
+            _time.time()
+        )
+    assert _ts.trigger_coverage_index_build(tmp_path) == (
+        "skipped_failed_cooldown"
+    )
