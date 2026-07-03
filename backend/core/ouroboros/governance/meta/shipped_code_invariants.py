@@ -52,6 +52,7 @@ import ast
 import asyncio as _asyncio
 import logging
 import os
+import re
 import threading
 import time as _time
 from dataclasses import dataclass, field
@@ -3474,6 +3475,70 @@ def _validate_replay_lazy_imports_sse_publisher(
 
 
 # ---------------------------------------------------------------------------
+# Stage 0 -- distributed event-bus transport substrate: structural
+# isolation pins (Task 8)
+# ---------------------------------------------------------------------------
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_WSURL_RE = re.compile(r"wss?://")
+
+
+def _validate_realtime_actuation_no_remote_transport(
+    tree: ast.Module, source: str,  # noqa: ARG001 -- interface
+) -> Tuple[str, ...]:
+    """Real-time actuation layers (Ghost Hands) MUST NOT import the
+    network transport subpackage. A remote dependency on a
+    hard-real-time cursor/keyboard path would couple actuation
+    latency to network RTT. Structural block. NEVER raises."""
+    out: List[str] = []
+    try:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if "governance.transport" in mod:
+                    out.append(
+                        f"real-time actuation imports remote "
+                        f"transport: from {mod} "
+                        f"(line {node.lineno})"
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if "governance.transport" in (alias.name or ""):
+                        out.append(
+                            f"real-time actuation imports remote "
+                            f"transport: import {alias.name} "
+                            f"(line {node.lineno})"
+                        )
+    except Exception:  # noqa: BLE001 -- validators never raise
+        return ()
+    return tuple(out)
+
+
+def _validate_transport_no_hardcoded_endpoints(
+    tree: ast.Module, source: str,  # noqa: ARG001 -- interface
+) -> Tuple[str, ...]:
+    """The transport config module must resolve every endpoint from
+    env -- no baked IPv4 literals, no baked ws:// / wss:// URLs.
+    NEVER raises."""
+    out: List[str] = []
+    try:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(
+                node.value, str,
+            ):
+                val = node.value
+                if _IPV4_RE.search(val) or _WSURL_RE.search(val):
+                    out.append(
+                        f"hardcoded endpoint literal {val!r} "
+                        f"(line {getattr(node, 'lineno', -1)}) "
+                        f"-- resolve from env"
+                    )
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
 # Seed registration
 # ---------------------------------------------------------------------------
 
@@ -4972,6 +5037,54 @@ def _register_seed_invariants() -> None:
                 "registration."
             ),
             validate=_validate_confidence_threshold_tightener,
+        ),
+    )
+
+    # -- Stage 0 transport substrate (Task 8) -----------------------
+    # Real-time actuation isolation: registered ONCE PER real-time
+    # Ghost Hands module -- a network transport dependency on any of
+    # these hard-real-time paths would couple actuation latency to
+    # network RTT.
+    for _module_stem in (
+        "cgevent_worker",
+        "silent_actuator",
+        "background_actuator",
+        "yabai_aware_actuator",
+        "orchestrator",
+    ):
+        register_shipped_code_invariant(
+            ShippedCodeInvariant(
+                invariant_name=(
+                    "realtime_actuation_no_remote_transport__"
+                    f"{_module_stem}"
+                ),
+                target_file=f"backend/ghost_hands/{_module_stem}.py",
+                description=(
+                    "Real-time actuation (Ghost Hands) MUST NOT "
+                    "import backend.core.ouroboros.governance."
+                    "transport -- a hard-real-time path cannot "
+                    "take a network dependency (Stage 0 "
+                    "latency-scope invariant)."
+                ),
+                validate=(
+                    _validate_realtime_actuation_no_remote_transport
+                ),
+            ),
+        )
+
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="transport_config_no_hardcoded_endpoints",
+            target_file=(
+                "backend/core/ouroboros/governance/transport/"
+                "transport_config.py"
+            ),
+            description=(
+                "TransportConfig must resolve every endpoint from "
+                "env -- no baked IPv4 or ws:// / wss:// literals "
+                "(Stage 0 no-hardcoding invariant)."
+            ),
+            validate=_validate_transport_no_hardcoded_endpoints,
         ),
     )
 
