@@ -60,6 +60,7 @@ import asyncio
 import inspect
 import os
 import threading
+import time
 from pathlib import Path
 from typing import List
 
@@ -70,10 +71,70 @@ from backend.core.ouroboros.governance import operation_advisor
 from backend.core.ouroboros.governance import predictive_engine
 from backend.core.ouroboros.governance.cooperative_fs_io import (
     COOPERATIVE_FS_IO_ENABLED_ENV_VAR,
+    OffloadError,
+    OffloadPicklingError,
     cooperative_fs_io_enabled,
+    is_offload_error,
     iter_files_cooperative,
+    offload,
     read_text_offloaded,
+    walk_for_filename_offloaded,
 )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Module-level offload targets (picklable-by-reference — REQUIRED for
+# the cpu_bound=True / ProcessPoolExecutor path; closures cannot be
+# pickled under macOS's 'spawn' start method).
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _worker_get_pid() -> int:
+    return os.getpid()
+
+
+def _worker_add(a: int, b: int) -> int:
+    return a + b
+
+
+def _worker_raise_permission_error() -> None:
+    raise PermissionError("synthetic permission denial")
+
+
+def _worker_raise_file_not_found() -> None:
+    raise FileNotFoundError("synthetic missing file")
+
+
+def _worker_cpu_busy_loop(duration_s: float) -> int:
+    """Pure-Python CPU-bound busy loop — holds the GIL for the whole
+    duration if run in a thread; a separate OS process is required to
+    keep a concurrent loop responsive while this runs."""
+    deadline = time.monotonic() + duration_s
+    counter = 0
+    while time.monotonic() < deadline:
+        counter += 1
+    return counter
+
+
+def _worker_thread_sleep(duration_s: float) -> str:
+    time.sleep(duration_s)
+    return "slept"
+
+
+class _Unpicklable:
+    """An object that cannot be pickled (holds a lock)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+
+def _worker_takes_unpicklable(obj: "_Unpicklable") -> str:
+    return "ok"
+
+
+def _local_closure_target() -> int:  # pragma: no cover — used via a
+    # closure-wrapping helper below, not called directly.
+    return 1
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -578,3 +639,429 @@ class TestPublicSurface:
         # AsyncGenerator functions return AsyncGenerator objects
         # — inspect.isasyncgenfunction is the right check.
         assert inspect.isasyncgenfunction(iter_files_cooperative)
+
+    def test_offload_substrate_exports(self):
+        for name in (
+            "offload",
+            "walk_for_filename_offloaded",
+            "OffloadError",
+            "OffloadPicklingError",
+            "is_offload_error",
+            "fs_process_pool_workers",
+            "shutdown_fs_process_pool",
+        ):
+            assert hasattr(cooperative_fs_io, name), (
+                f"cooperative_fs_io.{name} missing — unified offload "
+                "substrate public surface regressed"
+            )
+
+    def test_offload_is_a_coroutine_function(self):
+        assert asyncio.iscoroutinefunction(offload)
+
+    def test_walk_for_filename_offloaded_is_a_coroutine_function(self):
+        assert asyncio.iscoroutinefunction(walk_for_filename_offloaded)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Unified offload substrate — offload()
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestOffloadThreadPath:
+    @pytest.mark.asyncio
+    async def test_returns_fn_result(self):
+        result = await offload(_worker_add, 2, 3)
+        assert result == 5
+
+    @pytest.mark.asyncio
+    async def test_supports_kwargs(self):
+        result = await offload(_worker_add, a=2, b=4)
+        assert result == 6
+
+    @pytest.mark.asyncio
+    async def test_runs_on_advisor_blast_thread(self):
+        """Thread path MUST reuse the EXISTING advisor-blast pool —
+        no second thread pool."""
+        captured = {}
+        original = cooperative_fs_io._offload_worker
+
+        def _spy(fn, args, kwargs, cpu_bound):
+            captured["thread_name"] = (
+                threading.current_thread().name
+            )
+            return original(fn, args, kwargs, cpu_bound)
+
+        cooperative_fs_io._offload_worker = _spy  # type: ignore[assignment]
+        try:
+            await offload(_worker_add, 1, 1)
+        finally:
+            cooperative_fs_io._offload_worker = original  # type: ignore[assignment]
+
+        assert "thread_name" in captured
+        assert captured["thread_name"].startswith("advisor-blast"), (
+            f"offload(cpu_bound=False) ran on "
+            f"{captured['thread_name']!r}; expected 'advisor-blast' "
+            "prefix — must reuse the existing dedicated thread pool"
+        )
+
+
+class TestOffloadProcessPath:
+    @pytest.mark.asyncio
+    async def test_runs_in_a_separate_process(self):
+        main_pid = os.getpid()
+        worker_pid = await offload(_worker_get_pid, cpu_bound=True)
+        assert worker_pid != main_pid, (
+            "offload(cpu_bound=True) did not run in a separate "
+            "process — the bounded ProcessPoolExecutor is not being "
+            "used"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_fn_result(self):
+        result = await offload(_worker_add, 10, 5, cpu_bound=True)
+        assert result == 15
+
+    def test_default_worker_count_bounded(self, monkeypatch):
+        monkeypatch.delenv(
+            "JARVIS_FS_PROCESS_POOL_WORKERS", raising=False,
+        )
+        n = cooperative_fs_io.fs_process_pool_workers()
+        assert n >= 1
+        cpu = os.cpu_count() or 1
+        assert n <= max(1, min(2, cpu // 2 or 1))
+
+    def test_worker_count_env_override(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FS_PROCESS_POOL_WORKERS", "3")
+        assert cooperative_fs_io.fs_process_pool_workers() == 3
+
+    def test_invalid_worker_count_falls_back_to_default(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "JARVIS_FS_PROCESS_POOL_WORKERS", "not-a-number",
+        )
+        # Never raises — falls back to the computed default.
+        assert cooperative_fs_io.fs_process_pool_workers() >= 1
+
+
+class TestOffloadFailSoft:
+    @pytest.mark.asyncio
+    async def test_thread_path_permission_error_is_fail_soft(self):
+        result = await offload(_worker_raise_permission_error)
+        assert is_offload_error(result)
+        assert isinstance(result, OffloadError)
+        assert result.exc_type == "PermissionError"
+        assert result.cpu_bound is False
+
+    @pytest.mark.asyncio
+    async def test_thread_path_file_not_found_is_fail_soft(self):
+        result = await offload(_worker_raise_file_not_found)
+        assert is_offload_error(result)
+        assert result.exc_type == "FileNotFoundError"
+
+    @pytest.mark.asyncio
+    async def test_process_path_permission_error_is_fail_soft(self):
+        result = await offload(
+            _worker_raise_permission_error, cpu_bound=True,
+        )
+        assert is_offload_error(result)
+        assert result.exc_type == "PermissionError"
+        assert result.cpu_bound is True
+
+    @pytest.mark.asyncio
+    async def test_fail_soft_does_not_raise_into_caller(self):
+        """The load-bearing never-raise claim: awaiting a failing
+        offload MUST NOT raise — it returns a structured result."""
+        try:
+            result = await offload(_worker_raise_permission_error)
+        except PermissionError:
+            pytest.fail(
+                "offload() let PermissionError propagate into the "
+                "caller's coroutine — never-raise contract broken"
+            )
+        assert is_offload_error(result)
+
+    @pytest.mark.asyncio
+    async def test_loop_stays_responsive_after_fail_soft_error(self):
+        """Prove the loop itself is undamaged after a fail-soft
+        error — a subsequent trivial coroutine still resolves
+        promptly."""
+        await offload(_worker_raise_permission_error)
+        # If the loop or the shared executor were wedged, this would
+        # hang / timeout.
+        result = await asyncio.wait_for(
+            offload(_worker_add, 1, 1), timeout=5.0,
+        )
+        assert result == 2
+
+
+class TestOffloadPicklingValidation:
+    @pytest.mark.asyncio
+    async def test_non_picklable_arg_raises_loud_typed_error(self):
+        with pytest.raises(OffloadPicklingError) as exc_info:
+            await offload(
+                _worker_takes_unpicklable,
+                _Unpicklable(),
+                cpu_bound=True,
+            )
+        # Message names the offending call site, not a raw pickle
+        # traceback.
+        assert "offload(cpu_bound=True)" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_closure_target_raises_loud_typed_error(self):
+        """A closure cannot be pickled by reference — cpu_bound=True
+        must reject it loudly rather than letting a cryptic
+        PicklingError surface from inside the process pool."""
+        captured_value = 42
+
+        def _closure() -> int:
+            return captured_value
+
+        with pytest.raises(OffloadPicklingError):
+            await offload(_closure, cpu_bound=True)
+
+    @pytest.mark.asyncio
+    async def test_lambda_target_raises_loud_typed_error(self):
+        with pytest.raises(OffloadPicklingError):
+            await offload(lambda: 1, cpu_bound=True)
+
+    @pytest.mark.asyncio
+    async def test_picklable_target_does_not_raise(self):
+        # Sanity: a normal module-level fn + picklable args must NOT
+        # trip the pickling gate.
+        result = await offload(_worker_add, 1, 2, cpu_bound=True)
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_pickling_validation_happens_before_pool_submission(
+        self,
+    ):
+        """The validation must fire synchronously, before any
+        executor/process-pool involvement — assert no process-pool
+        singleton is lazily created by a rejected call."""
+        cooperative_fs_io.shutdown_fs_process_pool()
+        assert cooperative_fs_io._FS_PROCESS_POOL is None
+        with pytest.raises(OffloadPicklingError):
+            await offload(lambda: 1, cpu_bound=True)
+        assert cooperative_fs_io._FS_PROCESS_POOL is None, (
+            "OffloadPicklingError should reject BEFORE the process "
+            "pool is lazily created — pickling validation is not "
+            "happening eagerly enough"
+        )
+
+
+class TestOffloadMasterOff:
+    @pytest.mark.asyncio
+    async def test_master_off_thread_path_runs_synchronously(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            COOPERATIVE_FS_IO_ENABLED_ENV_VAR, "false",
+        )
+        result = await offload(_worker_add, 3, 4)
+        assert result == 7
+
+    @pytest.mark.asyncio
+    async def test_master_off_fail_soft_still_holds(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            COOPERATIVE_FS_IO_ENABLED_ENV_VAR, "false",
+        )
+        result = await offload(_worker_raise_permission_error)
+        assert is_offload_error(result)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Loop-responsiveness — the load-bearing claim for BOTH pools
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestOffloadLoopResponsiveness:
+    @pytest.mark.asyncio
+    async def test_thread_path_does_not_block_loop(self):
+        """A ~1s blocking sleep dispatched via cpu_bound=False must
+        not starve a concurrently-running 20ms-cadence heartbeat."""
+        ticks = 0
+        running = True
+
+        async def heartbeat():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.02)
+
+        hb_task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)  # let the heartbeat warm up
+        before = ticks
+
+        await offload(_worker_thread_sleep, 1.0)
+
+        running = False
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+        during = ticks - before
+        assert during >= 20, (
+            f"Heartbeat only ticked {during} times during a 1s "
+            "thread-pool offload (expected >=20 at 20ms cadence) — "
+            "the loop was starved; offload(cpu_bound=False) is not "
+            "actually off-loop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_path_does_not_block_loop(self):
+        """A ~1s pure-Python CPU busy-loop dispatched via
+        cpu_bound=True must not starve a concurrently-running 20ms-
+        cadence heartbeat. A ThreadPoolExecutor would fail this test
+        (GIL contention) — only a separate process passes."""
+        ticks = 0
+        running = True
+
+        async def heartbeat():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.02)
+
+        hb_task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)  # let the heartbeat warm up
+        before = ticks
+
+        await offload(_worker_cpu_busy_loop, 1.0, cpu_bound=True)
+
+        running = False
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+        during = ticks - before
+        assert during >= 20, (
+            f"Heartbeat only ticked {during} times during a 1s "
+            "process-pool CPU-bound offload (expected >=20 at 20ms "
+            "cadence) — the loop was starved; offload(cpu_bound=True) "
+            "is not actually running in a separate process"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# walk_for_filename_offloaded
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def planted_tree(tmp_path: Path) -> Path:
+    """A tree with a planted target file at the top level, one nested
+    two levels deep, and one nested inside a skip-dir."""
+    (tmp_path / "found_top" / "MARKER.txt").parent.mkdir(
+        parents=True,
+    )
+    (tmp_path / "found_top" / "MARKER.txt").write_text("top\n")
+
+    (tmp_path / "nested" / "deeper" / "MARKER.txt").parent.mkdir(
+        parents=True,
+    )
+    (tmp_path / "nested" / "deeper" / "MARKER.txt").write_text(
+        "deep\n",
+    )
+
+    (tmp_path / "node_modules" / "pkg" / "MARKER.txt").parent.mkdir(
+        parents=True,
+    )
+    (tmp_path / "node_modules" / "pkg" / "MARKER.txt").write_text(
+        "should not be found\n",
+    )
+    return tmp_path
+
+
+class TestWalkForFilenameOffloaded:
+    @pytest.mark.asyncio
+    async def test_finds_planted_file(self, planted_tree):
+        results = await walk_for_filename_offloaded(
+            planted_tree, "MARKER.txt",
+        )
+        names = {str(p) for p in results}
+        assert any("found_top" in n for n in names)
+        assert any("nested" in n and "deeper" in n for n in names)
+
+    @pytest.mark.asyncio
+    async def test_honors_skip_dirnames_prune(self, planted_tree):
+        """A planted file inside a skipped dir MUST NOT be found —
+        the in-place dirnames[:] prune must structurally prevent
+        descent, not just filter results post-hoc."""
+        results = await walk_for_filename_offloaded(
+            planted_tree,
+            "MARKER.txt",
+            skip_dirnames=frozenset({"node_modules"}),
+        )
+        names = {str(p) for p in results}
+        assert not any("node_modules" in n for n in names), (
+            "walk_for_filename_offloaded descended into a "
+            "skip_dirnames-listed directory — prune semantics "
+            "regressed"
+        )
+        # The non-skipped matches are still found.
+        assert any("found_top" in n for n in names)
+
+    @pytest.mark.asyncio
+    async def test_default_skip_dirnames_prunes_node_modules(
+        self, planted_tree,
+    ):
+        """Default skip set (bounded_walker.default_skip_dirs())
+        already includes node_modules — no explicit override
+        needed."""
+        results = await walk_for_filename_offloaded(
+            planted_tree, "MARKER.txt",
+        )
+        names = {str(p) for p in results}
+        assert not any("node_modules" in n for n in names)
+
+    @pytest.mark.asyncio
+    async def test_honors_max_results(self, planted_tree):
+        results = await walk_for_filename_offloaded(
+            planted_tree,
+            "MARKER.txt",
+            skip_dirnames=frozenset(),  # allow node_modules too
+            max_results=1,
+        )
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_matches_returns_empty_list(self, tmp_path):
+        results = await walk_for_filename_offloaded(
+            tmp_path, "does_not_exist.txt",
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_missing_root_never_raises(self, tmp_path):
+        missing = tmp_path / "does_not_exist_dir"
+        results = await walk_for_filename_offloaded(
+            missing, "MARKER.txt",
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_master_off_still_finds_files(
+        self, planted_tree, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            COOPERATIVE_FS_IO_ENABLED_ENV_VAR, "false",
+        )
+        results = await walk_for_filename_offloaded(
+            planted_tree, "MARKER.txt",
+        )
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_returns_path_objects(self, planted_tree):
+        results = await walk_for_filename_offloaded(
+            planted_tree, "MARKER.txt",
+        )
+        assert all(isinstance(p, Path) for p in results)
