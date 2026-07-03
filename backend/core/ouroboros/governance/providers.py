@@ -2040,6 +2040,23 @@ def _build_communication_mode_block(ctx: "OperationContext") -> Optional[str]:
     )
 
 
+def prompt_cache_min_chars(
+    env_var: str = "JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS",
+    default: int = 0,
+) -> int:
+    """Shared cache-floor parse — clamp ``>= 0``, fail-soft to ``default``.
+
+    Single source of truth for the "don't mark a prefix below the cache floor"
+    logic (Phase 3a). Consumed by both :class:`ClaudeProvider` (its ``__init__``)
+    and :class:`DoublewordProvider` (DW prompt caching) so the two providers can
+    never drift on how the minimum-character threshold is read. NEVER raises.
+    """
+    try:
+        return max(0, int(os.environ.get(env_var, str(default))))
+    except (ValueError, TypeError):
+        return default
+
+
 def _prompt_prefix_cache_enabled() -> bool:
     """Slice 131 P2a — gate the tool-catalog prefix-cache inversion. Default-FALSE
     → OFF byte-identical (the stable tool catalog + output schema stay in the
@@ -2665,14 +2682,22 @@ def _build_lean_codegen_prompt(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     preloaded_out: Optional[List[str]] = None,
     stable_prefix_out: Optional[List[str]] = None,
+    force_prefix_split: bool = False,
 ) -> str:
     """Build a lean, tool-first generation prompt (~3-6K tokens).
 
     Slice 131 P2a: when ``stable_prefix_out`` is provided AND
-    ``JARVIS_PROMPT_PREFIX_CACHE_ENABLED`` is on, the STABLE tool catalog +
-    output schema are diverted into ``stable_prefix_out`` (for the caller to fold
-    into the cached system prefix) instead of the volatile user prompt. Default
-    (no sink / flag off) is byte-identical legacy behavior.
+    (``JARVIS_PROMPT_PREFIX_CACHE_ENABLED`` is on OR ``force_prefix_split`` is
+    True), the STABLE tool catalog + output schema are diverted into
+    ``stable_prefix_out`` (for the caller to fold into the cached system prefix)
+    instead of the volatile user prompt. Default (no sink / flag off) is
+    byte-identical legacy behavior.
+
+    ``force_prefix_split`` lets a provider that owns its OWN prompt-cache master
+    flag (DoubleWord: ``JARVIS_DW_PROMPT_CACHE_ENABLED``) request the split
+    without the operator also having to flip the global
+    ``JARVIS_PROMPT_PREFIX_CACHE_ENABLED``. Claude never passes it, so the
+    Claude path stays gated exactly as before.
 
     Unlike ``_build_codegen_prompt`` which front-loads full file contents,
     import context, test context, and expanded context into a single
@@ -2877,7 +2902,7 @@ Rules:
     # (byte-identical legacy: tool section then schema).
     _route_stable_tail(
         parts, stable_prefix_out, _tool_section, schema_instruction,
-        enabled=_prompt_prefix_cache_enabled(),
+        enabled=_prompt_prefix_cache_enabled() or bool(force_prefix_split),
     )
 
     # ── 8a. Slice 20 Phase 3 — DW zero-candidate prohibition ────────────
@@ -6710,13 +6735,10 @@ class ClaudeProvider:
             os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_ENABLED", "true").lower()
             not in ("false", "0", "no", "off")
         )
-        try:
-            self._prompt_cache_min_chars = max(
-                0,
-                int(os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", "0")),
-            )
-        except ValueError:
-            self._prompt_cache_min_chars = 0
+        # DRY: shared floor-parse helper (also consumed by DoublewordProvider).
+        self._prompt_cache_min_chars = prompt_cache_min_chars(
+            "JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", 0
+        )
 
         # Cumulative cache telemetry — surfaced via get_cache_stats() and
         # logged periodically so operators can verify the savings path is
