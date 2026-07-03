@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import ssl
 
-import pytest
-
 from backend.core.ouroboros.governance.transport.transport_config import TransportConfig
 from backend.core.ouroboros.governance.transport import transport_security as ts
 

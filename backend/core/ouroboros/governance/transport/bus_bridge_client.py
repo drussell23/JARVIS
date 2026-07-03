@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Callable, Optional, Set
+from collections import OrderedDict
+from typing import Callable, Optional
 
 import aiohttp
 
@@ -21,6 +22,8 @@ from backend.core.ouroboros.governance.transport.transport_security import (
 from backend.core.ouroboros.governance.transport import bus_frame as bf
 
 logger = logging.getLogger(__name__)
+
+_DEDUP_MAX = 8192  # bounded seen-id memory (mirrors bus_bridge_server.py)
 
 # Broker-internal bookkeeping event types. Same rationale as
 # bus_bridge_server.py: these are produced by
@@ -54,7 +57,7 @@ class BusBridgeClient:
         self._high_water: int = 0
         self._degraded = False
         self._missed_hb = 0
-        self._seen: Set[str] = set()
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
 
     @property
     def last_event_id(self) -> Optional[str]:
@@ -84,6 +87,17 @@ class BusBridgeClient:
         if seq == self._high_water + 1:
             self._high_water = seq
             self._last_event_id = event_id
+
+    def _mark_seen(self, qid: str) -> bool:
+        """Return True if NEW (not seen before). Bounded FIFO eviction --
+        mirrors BusBridgeServer._mark_seen so the client's dedup memory
+        cannot grow unbounded across a long-lived session."""
+        if qid in self._seen:
+            return False
+        self._seen[qid] = None
+        if len(self._seen) > _DEDUP_MAX:
+            self._seen.popitem(last=False)
+        return True
 
     def _resolve_url(self) -> str:
         if self._url:
@@ -188,7 +202,7 @@ class BusBridgeClient:
         ev_dict = frame.event or {}
         event_id = ev_dict.get("event_id", "")
         qid = bf.qualified_id(frame.source_id, event_id)
-        if qid in self._seen:
+        if not self._mark_seen(qid):
             # Already republished locally, but the contiguous high-water
             # mark tracks what has been RECEIVED on the wire (for
             # Last-Event-ID replay resumption), independent of local
@@ -199,7 +213,6 @@ class BusBridgeClient:
             # -missing tail forever (zero-drop guarantee broken).
             self._advance_contiguous(event_id)
             return
-        self._seen.add(qid)
         try:
             self._broker.publish(
                 ev_dict.get("event_type", ""),

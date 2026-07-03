@@ -10,7 +10,7 @@ import time
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestServer
 
 from backend.core.ouroboros.governance.ide_observability_stream import StreamEventBroker
 from backend.core.ouroboros.governance.transport.transport_config import TransportConfig

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from backend.core.ouroboros.governance.ide_observability_stream import StreamEventBroker
 from backend.core.ouroboros.governance.transport.transport_config import TransportConfig
 from backend.core.ouroboros.governance.transport.bus_bridge_client import BusBridgeClient
