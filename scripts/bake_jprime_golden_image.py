@@ -63,6 +63,15 @@ _DEFAULT_MACHINE = os.environ.get("JPRIME_BAKE_MACHINE", "e2-highmem-2")
 _DEFAULT_MODEL = os.environ.get("JPRIME_BAKE_MODEL", "qwen2.5-coder:7b")
 _DEFAULT_IMAGE_FAMILY = os.environ.get("JPRIME_IMAGE_FAMILY", "jarvis-prime-coder")
 _DEFAULT_BOOT_DISK = os.environ.get("JPRIME_BAKE_BOOT_DISK_SIZE", "30GB")
+# Cold-start remediation: read the model bytes off a FASTER boot disk than the
+# legacy pd-balanced. pd-ssd delivers far higher sequential throughput (the
+# model-bytes -> RAM/VRAM load is the 108-710s tail), the model is baked ONTO
+# this disk so the image captures it, and the bake node is ephemeral so the
+# per-GB/mo premium is moot. Arg/env-overridable -- never hardcoded.
+_DEFAULT_BOOT_DISK_TYPE = os.environ.get("JPRIME_BAKE_BOOT_DISK_TYPE", "pd-ssd")
+# OLLAMA_KEEP_ALIVE=-1 keeps the model resident once loaded (never evicted). Baked
+# into the ollama systemd unit so an AWAKENED node inherits it. Arg/env-overridable.
+_DEFAULT_KEEP_ALIVE = os.environ.get("JPRIME_OLLAMA_KEEP_ALIVE", "-1")
 _DEFAULT_BAKE_TIMEOUT_S = int(os.environ.get("JPRIME_BAKE_TIMEOUT_S", "1800"))
 _DEFAULT_DEBIAN_IMAGE_FAMILY = os.environ.get(
     "JPRIME_BAKE_SOURCE_IMAGE_FAMILY", "debian-12"
@@ -123,19 +132,50 @@ def _run(cmd: List[str], *, timeout_s: float = 120.0) -> Tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # Startup-script generator (installs Ollama, serves, pulls model, sentinels).
 # --------------------------------------------------------------------------- #
-def build_startup_script(model: str, *, sentinel_path: str = _SENTINEL_PATH) -> str:
+def build_startup_script(
+    model: str,
+    *,
+    sentinel_path: str = _SENTINEL_PATH,
+    keep_alive: str = _DEFAULT_KEEP_ALIVE,
+) -> str:
     """Return the metadata startup-script that bakes the node.
 
     Installs Ollama, runs `ollama serve` (systemd if available, nohup fallback),
-    `ollama pull <model>`, and writes the readiness sentinel ONLY after the pull
-    completes. Pure string assembly -- no I/O, no subprocess. ASCII only.
+    `ollama pull <model>`, HYDRATES the model into RAM/VRAM with a real 1-token
+    generate, and writes the readiness sentinel ONLY after that hydration returns
+    200. Pure string assembly -- no I/O, no subprocess. ASCII only.
+
+    Cold-start remediation wired here (108-710s pull -> disk-load):
+      * OLLAMA_KEEP_ALIVE (default -1) baked into the ollama systemd unit as a
+        drop-in so an AWAKENED node from this image keeps weights resident.
+      * VRAM/RAM hydration BEFORE the sentinel: the sentinel (which the poll loop
+        and downstream L7 gate key on) is written only after a real generate
+        succeeds -- never a fixed sleep, never an un-hydrated "serving" lie. A
+        model that pulled but cannot load fails HERE (no sentinel -> reaper rolls).
+      * Per-phase ISO timestamp echoes (serve-up / pull-start / pull-done /
+        hydration-start / hydration-done / sentinel-written) so a real bake emits
+        measurable per-phase durations.
     """
     model_q = shlex.quote(model)
     sentinel_q = shlex.quote(sentinel_path)
+    keep_alive_q = shlex.quote(keep_alive)
+    # Real 1-token generate to force weights resident. num_predict=1 keeps it cheap;
+    # the awaited 200 IS the readiness proof (no arbitrary sleep). model substituted.
+    hydrate_q = shlex.quote(
+        json.dumps(
+            {
+                "model": model,
+                "prompt": "ok",
+                "stream": False,
+                "options": {"num_predict": 1},
+            }
+        )
+    )
     return f"""#!/usr/bin/env bash
 # JARVIS J-Prime golden-image bake startup-script (auto-generated).
-# Installs the Ollama serving runtime, pulls the code model into RAM-backed
-# serving, and writes the readiness sentinel ONLY after the pull completes.
+# Installs the Ollama serving runtime, pulls the code model, HYDRATES it into
+# RAM/VRAM with a real generate, and writes the readiness sentinel ONLY after
+# hydration succeeds (never after a bare pull).
 set -uo pipefail
 
 # ROOT-CAUSE FIX (v1 bake abort): Ollama (Go) calls envconfig.Models() at CLI
@@ -144,10 +184,15 @@ set -uo pipefail
 # and the `ollama pull` CLI died instantly. Export HOME before ANY ollama call.
 export HOME=/root
 export OLLAMA_HOST=127.0.0.1:{_OLLAMA_PORT}
+# Keep the model resident once loaded (never evict). Exported for the nohup path;
+# also baked into the systemd unit below so the IMAGE carries it to awakened nodes.
+export OLLAMA_KEEP_ALIVE={keep_alive_q}
 
 LOG=/var/log/jprime_bake.log
 exec > >(tee -a "$LOG") 2>&1
-echo "[jprime-bake] startup-script begin $(date -u +%FT%TZ) (HOME=$HOME)"
+# ISO-8601 millisecond timestamp helper for per-phase cold-start instrumentation.
+_ts() {{ date -u +%FT%T.%3NZ; }}
+echo "[jprime-bake] startup-script begin $(_ts) (HOME=$HOME)"
 
 # Never leave a stale sentinel from a re-run.
 rm -f {sentinel_q} || true
@@ -155,6 +200,14 @@ rm -f {sentinel_q} || true
 # 1. Install the Ollama serving runtime.
 echo "[jprime-bake] installing Ollama serving runtime"
 curl -fsSL https://ollama.com/install.sh | sh
+
+# 1b. Persist OLLAMA_KEEP_ALIVE into the ollama systemd unit so the BAKED IMAGE
+#     carries it -- an awakened node keeps weights resident with no re-config.
+mkdir -p /etc/systemd/system/ollama.service.d || true
+cat > /etc/systemd/system/ollama.service.d/10-jarvis-keepalive.conf <<'JKA'
+[Service]
+Environment="OLLAMA_KEEP_ALIVE={keep_alive}"
+JKA
 
 # 2. Serve. Prefer the systemd unit the installer ships (it runs ollama with a
 #    correct per-service HOME); fall back to nohup (HOME exported above) only if
@@ -173,21 +226,37 @@ fi
 echo "[jprime-bake] waiting for ollama endpoint on :{_OLLAMA_PORT}"
 for i in $(seq 1 60); do
     if curl -fsS "http://localhost:{_OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
-        echo "[jprime-bake] ollama endpoint is up"
+        echo "[jprime-bake] phase=ollama-serve-up ts=$(_ts)"
         break
     fi
     sleep 5
 done
 
-# 4. Pull the code model (loaded in RAM + generating on CPU -- no GPU here).
-echo "[jprime-bake] pulling model {model_q}"
+# 4. Pull the code model onto the boot disk (the image captures it -> no re-pull
+#    on awaken).
+echo "[jprime-bake] phase=pull-start model={model_q} ts=$(_ts)"
 if ollama pull {model_q}; then
-    echo "[jprime-bake] model pull complete -- writing readiness sentinel"
-    # Sentinel written ONLY after a successful pull.
-    echo "ready model={model} ts=$(date -u +%FT%TZ)" > {sentinel_q}
-    echo "[jprime-bake] startup-script done $(date -u +%FT%TZ)"
+    echo "[jprime-bake] phase=pull-done ts=$(_ts)"
 else
     echo "[jprime-bake] ERROR: ollama pull failed -- NOT writing sentinel"
+    exit 1
+fi
+
+# 5. HYDRATION: force the weights resident with a real 1-token generate. The
+#    readiness sentinel is written ONLY after this 200 (not after the bare pull,
+#    not a fixed sleep) so is_serving / the L7 gate never sees an un-hydrated
+#    model. A model that pulled but cannot load fails HERE -> no sentinel -> the
+#    reaper/roll handles it, never a half-hydrated "serving" lie.
+echo "[jprime-bake] phase=hydration-start ts=$(_ts)"
+if curl -fsS --max-time 600 "http://localhost:{_OLLAMA_PORT}/api/generate" \\
+        -H 'Content-Type: application/json' -d {hydrate_q} >/dev/null; then
+    echo "[jprime-bake] phase=hydration-done ts=$(_ts)"
+    # Sentinel written ONLY after a successful hydration.
+    echo "ready model={model} keep_alive={keep_alive} ts=$(_ts)" > {sentinel_q}
+    echo "[jprime-bake] phase=sentinel-written ts=$(_ts)"
+    echo "[jprime-bake] startup-script done $(_ts)"
+else
+    echo "[jprime-bake] ERROR: hydration generate failed -- NOT writing sentinel"
     exit 1
 fi
 """
@@ -294,7 +363,7 @@ def _create_node_cmd(
         f"--image-family={args.source_image_family}",
         f"--image-project={args.source_image_project}",
         f"--boot-disk-size={args.boot_disk_size}",
-        "--boot-disk-type=pd-balanced",
+        f"--boot-disk-type={args.boot_disk_type}",
         f"--metadata-from-file=startup-script={startup_script_path}",
     ]
 
@@ -531,7 +600,8 @@ def _print_plan(args: argparse.Namespace, node: str, startup_script: str) -> Non
     print(f"  model          : {args.model}")
     print(f"  bake node      : {node}  (ON-DEMAND for bake reliability)")
     print(f"  source image   : {args.source_image_family}/{args.source_image_project}")
-    print(f"  boot disk      : {args.boot_disk_size}")
+    print(f"  boot disk      : {args.boot_disk_size} ({args.boot_disk_type})")
+    print(f"  keep-alive     : {args.ollama_keep_alive} (baked into image)")
     print(f"  bake timeout   : {args.bake_timeout_s}s")
     print(f"  -> image name  : {args.image_name}")
     print(f"  -> image family: {args.image_family}")
@@ -715,6 +785,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="golden image family (env JPRIME_IMAGE_FAMILY)")
     p.add_argument("--boot-disk-size", default=_DEFAULT_BOOT_DISK,
                    help="bake node boot disk size")
+    p.add_argument("--boot-disk-type", default=_DEFAULT_BOOT_DISK_TYPE,
+                   help="bake node boot disk type -- faster read for the model "
+                        "load (env JPRIME_BAKE_BOOT_DISK_TYPE, default pd-ssd)")
+    p.add_argument("--ollama-keep-alive", default=_DEFAULT_KEEP_ALIVE,
+                   help="OLLAMA_KEEP_ALIVE baked into the image so awakened nodes "
+                        "keep weights resident (env JPRIME_OLLAMA_KEEP_ALIVE, "
+                        "default -1 = never evict)")
     p.add_argument("--bake-timeout-s", type=int, default=_DEFAULT_BAKE_TIMEOUT_S,
                    help="readiness poll timeout (seconds)")
     p.add_argument("--source-image-family", default=_DEFAULT_DEBIAN_IMAGE_FAMILY,
@@ -737,7 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     node = args.node_name or f"jarvis-prime-bake-{_now_stamp()}-{int(time.time()) % 100000}"
-    startup_script = build_startup_script(args.model)
+    startup_script = build_startup_script(args.model, keep_alive=args.ollama_keep_alive)
 
     if args.dry_run:
         _print_plan(args, node, startup_script)

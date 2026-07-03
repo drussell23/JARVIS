@@ -201,6 +201,44 @@ async def test_create_instance_builds_correct_payload_and_url(http, monkeypatch)
     assert any(it["key"] == "startup-script" and "echo hi" in it["value"] for it in items)
 
 
+async def test_create_instance_boot_disk_type_defaults_to_faster_pd_ssd(http, monkeypatch):
+    # Cold-start remediation: the awakened node reads baked-in weights off its
+    # boot disk -- default it to pd-ssd (faster than GCE-default pd-standard).
+    monkeypatch.delenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", raising=False)
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    # dynamic zonal diskType URL (zone from metadata = us-west2-b), never hardcoded.
+    assert payload["disks"][0]["initializeParams"]["diskType"] == (
+        "zones/us-west2-b/diskTypes/pd-ssd"
+    )
+
+
+async def test_create_instance_boot_disk_type_is_env_overridable(http, monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", "hyperdisk-balanced")
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    assert payload["disks"][0]["initializeParams"]["diskType"] == (
+        "zones/us-west2-b/diskTypes/hyperdisk-balanced"
+    )
+
+
+async def test_create_instance_boot_disk_type_empty_omits_field(http, monkeypatch):
+    # Empty -> omit diskType so GCE applies its default (legacy pd-standard).
+    monkeypatch.setenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", "")
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    assert "diskType" not in payload["disks"][0]["initializeParams"]
+
+
 async def test_create_instance_spot_fails_falls_back_to_on_demand(http):
     # Spot POST 409 -> on-demand POST 200.
     http.insert_responses = [

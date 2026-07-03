@@ -219,10 +219,19 @@ _ENV_META_TIMEOUT = "JARVIS_FAILOVER_METADATA_TIMEOUT_S"
 _ENV_REST_TIMEOUT = "JARVIS_FAILOVER_REST_TIMEOUT_S"
 _ENV_RUNNING_TIMEOUT = "JARVIS_FAILOVER_RUNNING_TIMEOUT_S"
 _ENV_RUNNING_POLL = "JARVIS_FAILOVER_RUNNING_POLL_S"
+_ENV_BOOT_DISK_TYPE = "JARVIS_FAILOVER_BOOT_DISK_TYPE"
 
 _DEFAULT_IMAGE_FAMILY = "jarvis-prime-coder"
 _DEFAULT_NODE_NAME = "jarvis-prime-failover"
 _DEFAULT_MACHINE_TYPE = "e2-highmem-2"
+# Cold-start remediation: the awakened node reads the (baked-in, never re-pulled)
+# model bytes off its boot disk into RAM/VRAM -- that disk-load is the 108-710s
+# tail. Default the awaken boot disk to pd-ssd (far higher sequential throughput
+# than the GCE-default pd-standard). Env-overridable; empty string -> omit the
+# field (legacy GCE default). The node is ephemeral so the per-GB/mo premium is
+# moot. Local SSD is deliberately NOT used here: it is ephemeral and cannot carry
+# a baked image, so a boot-disk upgrade is the simpler high-ROI lever.
+_DEFAULT_BOOT_DISK_TYPE = "pd-ssd"
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +249,18 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 86400.0) 
     except (TypeError, ValueError):
         v = default
     return max(lo, min(v, hi))
+
+
+def _boot_disk_type() -> str:
+    """Boot-disk type for the awakened node (faster read = faster model load).
+
+    Env-overridable via JARVIS_FAILOVER_BOOT_DISK_TYPE; unset -> pd-ssd default;
+    explicitly empty ("") -> omit the field (legacy GCE-default pd-standard).
+    Read raw (NOT _env_str, which collapses "" back to the default). Never raises."""
+    raw = os.environ.get(_ENV_BOOT_DISK_TYPE)
+    if raw is None:
+        return _DEFAULT_BOOT_DISK_TYPE
+    return raw.strip()
 
 
 def _meta_timeout() -> float:
@@ -651,6 +672,18 @@ class GCPComputeRest:
         project from metadata; sourceImage = the golden-image family; Spot
         scheduling (provisioningModel=SPOT + instanceTerminationAction=DELETE)
         when spot=True, on-demand otherwise; the project default network."""
+        # Faster boot disk = faster model-bytes -> RAM/VRAM load (the cold-start
+        # tail). Dynamic zonal diskType URL (never hardcoded); empty -> omit so
+        # GCE applies its default (pd-standard), the legacy behaviour.
+        init_params: Dict[str, Any] = {
+            # Golden image by family -- never a hardcoded image name.
+            "sourceImage": "projects/{}/global/images/family/{}".format(
+                project, image_family
+            ),
+        }
+        disk_type = _boot_disk_type()
+        if disk_type:
+            init_params["diskType"] = "zones/{}/diskTypes/{}".format(zone, disk_type)
         payload: Dict[str, Any] = {
             "name": name,
             "machineType": "zones/{}/machineTypes/{}".format(zone, machine_type),
@@ -658,12 +691,7 @@ class GCPComputeRest:
                 {
                     "boot": True,
                     "autoDelete": True,
-                    "initializeParams": {
-                        # Golden image by family -- never a hardcoded image name.
-                        "sourceImage": "projects/{}/global/images/family/{}".format(
-                            project, image_family
-                        ),
-                    },
+                    "initializeParams": init_params,
                 }
             ],
             "networkInterfaces": [
