@@ -273,9 +273,22 @@ async def _coverage_index_build_task(scan_root: Path) -> None:
             except Exception:  # noqa: BLE001
                 idx = None
         else:
+            # cpu_bound=True → ProcessPoolExecutor (not the thread pool):
+            # _build_coverage_index_sync runs ast.parse over the whole test
+            # tree (~963K lines) = pure-Python, GIL-holding CPU. A thread
+            # offload would hold the GIL for the entire parse and still leave
+            # a ~592ms on-loop residual (grazing the 500ms starvation floor);
+            # only a separate process frees the loop. Safe because the target
+            # is a module-level function with picklable args (Path + frozenset)
+            # and a picklable return (the _CoverageIndex NamedTuple of str/Path
+            # containers — round-trip pinned by test_coverage_index_pickle_
+            # roundtrip). Fail-soft is preserved: offload catches worker faults
+            # (OffloadError) and pool-creation faults (spawn blocked) alike, and
+            # the outer except is belt-and-suspenders — a failed build leaves
+            # callers degraded, never raises into intake.
             result = await offload(
                 _build_coverage_index_sync, scan_root, dir_names,
-                cpu_bound=False,
+                cpu_bound=True,
             )
             idx = None if is_offload_error(result) else result
     except Exception:  # noqa: BLE001 — belt-and-suspenders
@@ -343,7 +356,21 @@ def trigger_coverage_index_build(repo_root: Union[str, Path]) -> str:
         with _COVERAGE_IDX_LOCK:
             _coverage_index_building.discard(scan_root)
         return "skipped_no_loop"
-    task = loop.create_task(_coverage_index_build_task(scan_root))
+    try:
+        task = loop.create_task(_coverage_index_build_task(scan_root))
+    except Exception:  # noqa: BLE001 — scheduling fault must not wedge the flag
+        # If create_task raised (loop closing, etc.) the "building" flag would
+        # otherwise leak and every future trigger returns "skipped_running"
+        # forever — the repo wedged out of ever rebuilding the index. Discard
+        # it under the lock so the next trigger can retry.
+        with _COVERAGE_IDX_LOCK:
+            _coverage_index_building.discard(scan_root)
+        logger.debug(
+            "[Stratification] coverage index build task scheduling failed "
+            "root=%s (flag released, will retry on next trigger)",
+            scan_root, exc_info=True,
+        )
+        return "skipped_no_loop"
     _coverage_index_tasks.add(task)
     task.add_done_callback(_coverage_index_tasks.discard)
     return "started"

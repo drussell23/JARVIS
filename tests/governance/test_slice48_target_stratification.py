@@ -369,3 +369,78 @@ def test_trigger_sentinels_lifecycle(tmp_path: Path) -> None:
     assert _ts.trigger_coverage_index_build(tmp_path) == (
         "skipped_failed_cooldown"
     )
+
+
+# ── Fix 1: _CoverageIndex survives the ProcessPoolExecutor boundary ──────
+def test_coverage_index_pickle_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build now dispatches with ``cpu_bound=True`` (process pool) so the
+    ``_CoverageIndex`` return crosses a pickle boundary. Prove a representative
+    index round-trips byte-faithfully — including the ``ast_map``'s
+    ``List[Path]`` values (Path is picklable) — so the process-pool path is
+    structurally sound without needing to actually spawn a worker.
+    """
+    import pickle
+
+    monkeypatch.setenv("JARVIS_STRATIFICATION_AST_IMPORT_ENABLED", "true")
+    src = tmp_path / "backend" / "core" / "widget.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def some_func():\n    return 1\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
+    (tmp_path / "tests" / "test_other.py").write_text(
+        "from backend.core.widget import some_func\ndef t(): pass\n"
+    )
+
+    idx = _ts._build_coverage_index_sync(
+        _ts._resolve_scan_root(tmp_path), _ts._strat_test_dir_names(),
+    )
+    restored = pickle.loads(pickle.dumps(idx))
+
+    assert isinstance(restored, _ts._CoverageIndex)
+    assert restored.names_set == idx.names_set
+    assert restored.names_sorted == idx.names_sorted
+    assert restored.ast_map == idx.ast_map
+    assert restored.built_at == idx.built_at
+    # ast_map values are List[Path] — confirm Path objects survived the trip.
+    assert restored.ast_map  # non-empty (test_other imports the module)
+    for paths in restored.ast_map.values():
+        for p in paths:
+            assert isinstance(p, Path)
+
+
+# ── Fix 3: create_task scheduling failure must release the building flag ──
+@pytest.mark.asyncio
+async def test_trigger_create_task_failure_releases_building_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``loop.create_task`` raises, the ``scan_root`` flag (added under the
+    lock before scheduling) must be discarded — otherwise every future trigger
+    returns ``skipped_running`` forever and the repo is wedged out of ever
+    rebuilding its coverage index.
+    """
+    import asyncio
+
+    _ts.reset_coverage_index()
+    loop = asyncio.get_running_loop()
+
+    def _boom(*a, **k):
+        raise RuntimeError("synthetic create_task scheduling failure")
+
+    monkeypatch.setattr(loop, "create_task", _boom)
+    result = _ts.trigger_coverage_index_build(tmp_path)
+    assert result == "skipped_no_loop"  # scheduling fault → non-started sentinel
+
+    scan_root = _ts._resolve_scan_root(tmp_path)
+    with _ts._COVERAGE_IDX_LOCK:
+        assert scan_root not in _ts._coverage_index_building, (
+            "building flag leaked after create_task failure — repo wedged in "
+            "perpetual skipped_running"
+        )
+
+    # Not wedged: with create_task restored a fresh trigger can proceed again
+    # (i.e. NOT skipped_running).
+    monkeypatch.undo()
+    assert _ts.trigger_coverage_index_build(tmp_path) != "skipped_running"
+    _ts.reset_coverage_index()
