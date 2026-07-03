@@ -160,63 +160,43 @@ _CONV_COMMIT_RE = re.compile(
 # Bounded (operators with more cores can raise via env). Lazy
 # singleton (no startup cost when posture observer isn't active).
 
-import threading as _threading_fs  # noqa: E402
-from concurrent.futures import (  # noqa: E402
-    ThreadPoolExecutor as _ThreadPoolExecutor_fs,
-)
+# Tier-2b (bt-iso-1783093701 LoopSink, 2nd starvation tier) — the bespoke
+# 2-worker ``fs_signal_executor`` ThreadPoolExecutor that Slice 33 Arc 2
+# Phase 2 / Slice 257 introduced was a THIRD divergent offload mechanism
+# (alongside cooperative_fs_io's advisor-blast pool and the process pool).
+# It is now KILLED and CONVERGED onto the single unified
+# ``cooperative_fs_io.offload`` gateway: every fs-signal + git-subprocess
+# collector routes through ``offload(cpu_bound=False)`` (thread path —
+# ``subprocess.run(git log)`` releases the GIL while the child runs, and
+# session-dir summary scans are IO-bound). One pool, one contract, no
+# bespoke lifecycle to shut down. See ``build_bundle_async`` /
+# ``commit_ratios_async``.
+async def _offload_signal(fn: "Callable[..., Any]", *args: Any) -> Any:
+    """Route a filesystem / git-subprocess signal collector through the
+    unified ``cooperative_fs_io.offload`` substrate (thread pool).
 
-_FS_SIGNAL_EXECUTOR_MAX_WORKERS_ENV: str = (
-    "JARVIS_POSTURE_FS_SIGNAL_EXECUTOR_MAX_WORKERS"
-)
-_DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS: int = 2
-_fs_signal_executor: Optional[_ThreadPoolExecutor_fs] = None
-_fs_signal_executor_lock = _threading_fs.Lock()
-
-
-def _fs_signal_executor_max_workers() -> int:
+    Fail-soft: on any substrate fault OR an ``OffloadError`` (the collector
+    raised inside the worker), returns ``None`` so the caller can fall back
+    to its own neutral default — the collector fault NEVER propagates into
+    the posture cycle. If the substrate import itself fails, degrades to a
+    bare ``asyncio.to_thread`` (still off-loop)."""
     try:
-        raw = os.environ.get(_FS_SIGNAL_EXECUTOR_MAX_WORKERS_ENV, "").strip()
-        if not raw:
-            return _DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return _DEFAULT_FS_SIGNAL_EXECUTOR_MAX_WORKERS
-
-
-def _get_fs_signal_executor() -> _ThreadPoolExecutor_fs:
-    """Slice 33 Arc 2 Phase 2 — lazy singleton dedicated to filesystem
-    signal collection (recent_summaries-backed signals). Separate from
-    asyncio's default ThreadPoolExecutor so heavy session-dir scans
-    don't contend with oracle file reads / parse dispatches."""
-    global _fs_signal_executor
-    if _fs_signal_executor is not None:
-        return _fs_signal_executor
-    with _fs_signal_executor_lock:
-        if _fs_signal_executor is None:
-            _fs_signal_executor = _ThreadPoolExecutor_fs(
-                max_workers=_fs_signal_executor_max_workers(),
-                thread_name_prefix="posture-fs-signal",
-            )
-            logger.info(
-                "[PostureObserver] fs_signal_executor initialised "
-                "max_workers=%d",
-                _fs_signal_executor_max_workers(),
-            )
-    return _fs_signal_executor
-
-
-def shutdown_fs_signal_executor() -> None:
-    """Slice 33 Arc 2 Phase 2 — clean shutdown. NEVER raises."""
-    global _fs_signal_executor
-    with _fs_signal_executor_lock:
-        if _fs_signal_executor is None:
-            return
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+    except Exception:  # noqa: BLE001 — substrate import fault
         try:
-            _fs_signal_executor.shutdown(wait=False, cancel_futures=True)
+            return await asyncio.to_thread(fn, *args)
         except Exception:  # noqa: BLE001
-            pass
-        finally:
-            _fs_signal_executor = None
+            return None
+    result = await offload(fn, *args, cpu_bound=False)
+    if is_offload_error(result):
+        logger.debug(
+            "[PostureObserver] signal collector OffloadError: %r", result,
+        )
+        return None
+    return result
 
 
 # Callable the wiring layer can inject to surface in-flight op count.
@@ -407,20 +387,30 @@ class SignalCollector:
         cancel it and ``ControlPlaneStarvation`` stayed silent — the heartbeat
         froze and the 120s external watchdog SIGKILLed the session.
 
-        The fix runs the git calls in the dedicated ``fs_signal_executor``
-        (the pool the other fs-backed signals already use). A slow fork now
-        blocks a worker thread, never the loop, so the heartbeat keeps
-        beating. ``subprocess.run`` timeouts (2s HEAD / 5s log) still bound
-        the work; the Slice 52 HEAD-cache short-circuit is preserved.
+        Tier-2b converges this onto the single unified
+        ``cooperative_fs_io.offload`` substrate (``_offload_signal``, thread
+        path — ``subprocess.run(git ...)`` releases the GIL while the child
+        runs, so the fork blocks a worker thread, never the loop; the
+        Slice 257 off-loop invariant holds via the shared advisor-blast pool
+        instead of the killed bespoke pool). ``subprocess.run`` timeouts
+        (2s HEAD / 5s log) still bound the work; the Slice 52 HEAD-cache
+        short-circuit is preserved.
         """
-        loop = asyncio.get_running_loop()
-        executor = _get_fs_signal_executor()
+        # Tier-2b — converge onto the unified offload substrate (thread path:
+        # ``subprocess.run(git ...)`` releases the GIL while the child runs,
+        # so the fork/exec blocks a worker thread, never the loop — the
+        # Slice 257 off-loop invariant is preserved via the shared
+        # advisor-blast pool instead of the killed bespoke pool).
         window = commit_window()
-        head = await loop.run_in_executor(executor, self._git_head)
+        head = await _offload_signal(self._git_head)
+        if head is None:
+            head = ""
         cache = self._commit_ratios_cache
         if head and cache is not None and cache[0] == head and cache[1] == window:
             return dict(cache[2])
-        subjects = await loop.run_in_executor(executor, self._git_subjects, window)
+        subjects = await _offload_signal(self._git_subjects, window)
+        if subjects is None:
+            subjects = []
         ratios = self._compute_commit_ratios(subjects)
         if head:
             self._commit_ratios_cache = (head, window, dict(ratios))
@@ -648,21 +638,22 @@ class SignalCollector:
         )
 
     async def build_bundle_async(self) -> SignalBundle:
-        """Slice 33 Arc 1 — chunked async signal collection.
+        """Chunked async signal collection — every collector off-loop.
 
         Closes v27 (bt-2026-05-27-232749) sink: ``build_bundle`` ran 12
-        synchronous signal collectors sequentially in ONE
-        ``asyncio.to_thread`` call, holding the GIL for 22.56 s on a
-        cold session (LoopSink event_1). The fix: each collector runs
-        in its own ``asyncio.to_thread`` with explicit ``sleep(0)``
-        cooperative yields between them. Per-signal LoopSink wires
-        attribute heavy individual collectors so v28 surfaces them.
+        synchronous signal collectors sequentially in ONE blocking call,
+        holding the GIL for 22.56 s on a cold session. Each collector now
+        runs off-loop with explicit ``sleep(0)`` cooperative yields between
+        them, so the 22.56 s monolithic block becomes short hops that each
+        yield the loop a scheduling slot.
 
-        Each individual signal returns to the event loop in milliseconds
-        even under GIL contention — the 22.56 s monolithic block becomes
-        12 short hops, each yielding the loop a scheduling slot.
-        Operator binding: "true non-blocking asyncio primitives or
-        explicit chunked yielding". This is the explicit-chunked path.
+        Tier-2b (bt-iso-1783093701, 2nd starvation tier): every collector
+        — the git-subprocess commit ratios AND the filesystem summary scans
+        — is CONVERGED onto the single unified ``cooperative_fs_io.offload``
+        gateway (via ``_offload_signal``). The prior code scattered dispatch
+        across a bespoke ``fs_signal_executor`` pool and ad-hoc executor /
+        thread calls; that third divergent offload mechanism is killed. One
+        pool, one contract, one fail-soft path.
         """
         import asyncio as _asyncio_ls  # noqa: WPS433 — local alias
         from backend.core.ouroboros.telemetry.loop_sink import (
@@ -679,54 +670,61 @@ class SignalCollector:
             ratios = await self.commit_ratios_async()
         await _asyncio_ls.sleep(0)
 
-        # Slice 33 Arc 2 Phase 2 — 4 filesystem-bound signals
-        # (postmortem/iron_gate/l2_repair/session_lessons all call
-        # recent_summaries which iterates .ouroboros/sessions/*/
-        # summary.json) route through a DEDICATED 2-worker
-        # ThreadPoolExecutor so heavy session-dir scans don't contend
-        # with the default executor's other consumers (oracle file
-        # reads / parse dispatches / etc.).
-        _loop_fs = _asyncio_ls.get_running_loop()
-        _fs_exec = _get_fs_signal_executor()
-
+        # Tier-2b — the 4 filesystem-bound signals
+        # (postmortem/iron_gate/l2_repair/session_lessons all iterate
+        # .ouroboros/sessions/*/summary.json) plus the remaining CPU/git
+        # collectors now ALL route through the single unified
+        # ``cooperative_fs_io.offload`` gateway (``_offload_signal`` →
+        # advisor-blast thread pool). The bespoke ``fs_signal_executor`` and
+        # scattered ``to_thread`` calls are gone — one pool, one contract.
+        # Fail-soft: ``_offload_signal`` returns ``None`` on collector fault;
+        # each signal falls back to its neutral 0.0 default below.
         async with _ls_sink_async("posture.signal.postmortem_failure_rate"):
-            pm = await _loop_fs.run_in_executor(
-                _fs_exec, self.postmortem_failure_rate,
-            )
+            pm = await _offload_signal(self.postmortem_failure_rate)
+            if pm is None:
+                pm = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.iron_gate_reject_rate"):
-            ig = await _loop_fs.run_in_executor(
-                _fs_exec, self.iron_gate_reject_rate,
-            )
+            ig = await _offload_signal(self.iron_gate_reject_rate)
+            if ig is None:
+                ig = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.l2_repair_rate"):
-            l2 = await _loop_fs.run_in_executor(
-                _fs_exec, self.l2_repair_rate,
-            )
+            l2 = await _offload_signal(self.l2_repair_rate)
+            if l2 is None:
+                l2 = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.open_ops_normalized"):
-            oo = await _asyncio_ls.to_thread(self.open_ops_normalized)
+            oo = await _offload_signal(self.open_ops_normalized)
+            if oo is None:
+                oo = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.session_lessons_infra_ratio"):
-            sl = await _loop_fs.run_in_executor(
-                _fs_exec, self.session_lessons_infra_ratio,
-            )
+            sl = await _offload_signal(self.session_lessons_infra_ratio)
+            if sl is None:
+                sl = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.time_since_last_graduation_inv"):
-            ts = await _asyncio_ls.to_thread(self.time_since_last_graduation_inv)
+            ts = await _offload_signal(self.time_since_last_graduation_inv)
+            if ts is None:
+                ts = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.cost_burn_normalized"):
-            cb = await _asyncio_ls.to_thread(self.cost_burn_normalized)
+            cb = await _offload_signal(self.cost_burn_normalized)
+            if cb is None:
+                cb = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.worktree_orphan_count"):
-            wo = await _asyncio_ls.to_thread(self.worktree_orphan_count)
+            wo = await _offload_signal(self.worktree_orphan_count)
+            if wo is None:
+                wo = 0
         base = baseline_bundle()
         return SignalBundle(
             feat_ratio=ratios["feat"],

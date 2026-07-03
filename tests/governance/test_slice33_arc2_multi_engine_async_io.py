@@ -105,9 +105,17 @@ def test_ast_pin_phase1_git_subjects_async_present() -> None:
                 git_subjects_async_found = True
             if node.name == "commit_ratios_async":
                 body = ast.unparse(node)
-                assert "_git_subjects_async" in body, (
-                    "commit_ratios_async must call _git_subjects_async"
+                # Tier-2b (post Slice 257) — commit_ratios_async no longer
+                # forks on the loop via _git_subjects_async; it converges the
+                # git work onto the unified cooperative_fs_io.offload
+                # substrate (via _offload_signal, thread path — the fork
+                # blocks a worker thread, never the loop). Off-loop invariant
+                # proven by test_slice257's thread-identity test.
+                assert "_offload_signal(" in body, (
+                    "commit_ratios_async must route git work through "
+                    "the unified offload substrate (_offload_signal)"
                 )
+                assert "create_subprocess_exec(" not in body
                 commit_ratios_async_found = True
     assert git_subjects_async_found, "_git_subjects_async missing"
     assert commit_ratios_async_found, "commit_ratios_async missing"
@@ -134,14 +142,20 @@ def test_ast_pin_phase1_git_momentum_async_present() -> None:
     assert "_parse_git_log_output" in src
 
 
-def test_ast_pin_phase2_fs_signal_executor_substrate() -> None:
-    """Phase 2 dedicated filesystem executor MUST be present with
-    lazy singleton + shutdown helpers, AND build_bundle_async MUST
-    route the 4 filesystem-bound signals through it."""
+def test_ast_pin_phase2_fs_signal_offload_substrate() -> None:
+    """Tier-2b — the bespoke ``fs_signal_executor`` pool is KILLED and the
+    filesystem/git signals CONVERGED onto the single unified
+    ``cooperative_fs_io.offload`` substrate (via the ``_offload_signal``
+    helper). build_bundle_async MUST route every signal through it and MUST
+    NOT reference the old bespoke pool or scattered run_in_executor/
+    to_thread calls."""
     src = POSTURE_FILE.read_text()
-    assert "_get_fs_signal_executor" in src
-    assert "shutdown_fs_signal_executor" in src
-    assert "JARVIS_POSTURE_FS_SIGNAL_EXECUTOR_MAX_WORKERS" in src
+    # The bespoke pool + its lifecycle helpers are gone.
+    assert "_get_fs_signal_executor" not in src
+    assert "shutdown_fs_signal_executor" not in src
+    # The convergence helper is present and delegates to the substrate.
+    assert "_offload_signal" in src
+    assert "cooperative_fs_io" in src
     tree = ast.parse(src, filename=str(POSTURE_FILE))
     for node in ast.walk(tree):
         if (
@@ -149,16 +163,17 @@ def test_ast_pin_phase2_fs_signal_executor_substrate() -> None:
             and node.name == "build_bundle_async"
         ):
             body = ast.unparse(node)
-            assert "_get_fs_signal_executor" in body, (
-                "build_bundle_async must call _get_fs_signal_executor"
-            )
-            # The 4 named filesystem signals must use run_in_executor
-            # (not to_thread). Count the run_in_executor calls — should
-            # be 4 (postmortem, iron_gate, l2_repair, session_lessons).
-            n_exec = body.count("run_in_executor")
-            assert n_exec >= 4, (
-                f"build_bundle_async expected ≥4 run_in_executor calls "
-                f"(one per filesystem signal), found {n_exec}"
+            # No bespoke pool, no scattered executor/to_thread dispatch.
+            assert "_get_fs_signal_executor" not in body
+            assert "run_in_executor" not in body
+            assert "to_thread" not in body
+            # Every collector routes through the unified offload helper —
+            # the 4 fs signals + commit ratios are done here or in
+            # commit_ratios_async; at least the 8 in-body collectors use it.
+            n_off = body.count("_offload_signal(")
+            assert n_off >= 8, (
+                f"build_bundle_async expected ≥8 _offload_signal dispatches, "
+                f"found {n_off}"
             )
             return
     pytest.fail("build_bundle_async not located")
@@ -289,81 +304,63 @@ def test_spine_phase1_git_momentum_async_parity() -> None:
     )
 
 
-def test_spine_phase2_fs_executor_lazy_singleton() -> None:
-    """``_get_fs_signal_executor`` returns the same instance across
-    calls, with the configured max_workers."""
-    from backend.core.ouroboros.governance.posture_observer import (
-        _get_fs_signal_executor, shutdown_fs_signal_executor,
-    )
-    try:
-        e1 = _get_fs_signal_executor()
-        e2 = _get_fs_signal_executor()
-        assert e1 is e2, "fs_executor must be a singleton"
-        assert e1._max_workers == 2, (
-            f"default max_workers should be 2, got {e1._max_workers}"
-        )
-    finally:
-        shutdown_fs_signal_executor()
-
-
-def test_spine_phase2_fs_executor_max_workers_env_override() -> None:
-    """``JARVIS_POSTURE_FS_SIGNAL_EXECUTOR_MAX_WORKERS`` env knob
-    overrides the default."""
-    from backend.core.ouroboros.governance.posture_observer import (
-        _get_fs_signal_executor, shutdown_fs_signal_executor,
-    )
-    shutdown_fs_signal_executor()  # reset for env override
-    with mock.patch.dict(
-        os.environ,
-        {"JARVIS_POSTURE_FS_SIGNAL_EXECUTOR_MAX_WORKERS": "4"},
-    ):
-        try:
-            e = _get_fs_signal_executor()
-            assert e._max_workers == 4
-        finally:
-            shutdown_fs_signal_executor()
-
-
-def test_spine_phase2_build_bundle_async_uses_fs_executor() -> None:
-    """``build_bundle_async`` MUST submit the 4 named filesystem
-    signals to the dedicated executor — verified by patching
-    ``_get_fs_signal_executor`` to return a mock and checking
-    submit count."""
+def test_spine_phase2_fs_signal_offload_helper_delegates_to_substrate() -> None:
+    """``_offload_signal`` routes its callable through
+    ``cooperative_fs_io.offload`` (thread path) and returns the result."""
     from backend.core.ouroboros.governance import posture_observer
-    fake_exec = mock.MagicMock()
-    fake_exec._max_workers = 2
+    from backend.core.ouroboros.governance import cooperative_fs_io
 
-    # Make run_in_executor return Futures that resolve to whatever
-    # the wrapped fn returns
+    seen = {"cpu_bound": None, "fn": None}
+    real_offload = cooperative_fs_io.offload
+
+    async def spy_offload(fn, *args, cpu_bound=False, **kwargs):
+        seen["cpu_bound"] = cpu_bound
+        seen["fn"] = getattr(fn, "__name__", repr(fn))
+        return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
     async def run() -> int:
-        with mock.patch.object(
-            posture_observer, "_get_fs_signal_executor",
-            return_value=fake_exec,
-        ):
+        with mock.patch.object(cooperative_fs_io, "offload", spy_offload):
+            return await posture_observer._offload_signal(lambda: 7)
+
+    result = asyncio.run(run())
+    assert result == 7
+    # Filesystem/git signals are IO/GIL-releasing → THREAD (cpu_bound False).
+    assert seen["cpu_bound"] is False
+
+
+def test_spine_phase2_build_bundle_async_routes_through_offload() -> None:
+    """``build_bundle_async`` MUST dispatch every signal collector through
+    ``cooperative_fs_io.offload`` (thread path) — no bespoke pool, no
+    run_in_executor, no scattered to_thread."""
+    from backend.core.ouroboros.governance import posture_observer
+    from backend.core.ouroboros.governance import cooperative_fs_io
+
+    dispatched: list = []
+    real_offload = cooperative_fs_io.offload
+
+    async def spy_offload(fn, *args, cpu_bound=False, **kwargs):
+        dispatched.append((getattr(fn, "__name__", repr(fn)), cpu_bound))
+        return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+    async def run() -> None:
+        with mock.patch.object(cooperative_fs_io, "offload", spy_offload):
             c = posture_observer.SignalCollector(Path.cwd())
-            # Patch loop.run_in_executor to call the fn directly
-            # (avoid actually using fake_exec for execution)
-            real_loop = asyncio.get_running_loop()
-            orig_rie = real_loop.run_in_executor
+            await c.build_bundle_async()
 
-            calls = []
-
-            def patched_rie(executor, fn, *args):
-                if executor is fake_exec:
-                    calls.append(fn.__name__)
-                return orig_rie(executor if executor is not fake_exec else None, fn, *args)
-
-            real_loop.run_in_executor = patched_rie  # type: ignore[method-assign]
-            try:
-                await c.build_bundle_async()
-            finally:
-                real_loop.run_in_executor = orig_rie  # type: ignore[method-assign]
-            return len(calls)
-
-    n_calls = asyncio.run(run())
-    assert n_calls == 4, (
-        f"expected 4 fs_executor dispatches "
-        f"(postmortem/iron_gate/l2_repair/session_lessons), got {n_calls}"
+    asyncio.run(run())
+    names = [n for n, _ in dispatched]
+    # The 4 named filesystem signals must all be dispatched off-loop via
+    # the unified substrate.
+    for expected in (
+        "postmortem_failure_rate",
+        "iron_gate_reject_rate",
+        "l2_repair_rate",
+        "session_lessons_infra_ratio",
+    ):
+        assert expected in names, f"{expected} not routed through offload"
+    # Everything is thread-pool (fastembed/git/IO release the GIL).
+    assert all(cpu is False for _, cpu in dispatched), (
+        "posture signals must use the THREAD path (cpu_bound=False)"
     )
 
 
