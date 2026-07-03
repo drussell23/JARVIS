@@ -34,6 +34,8 @@ mutates Iron Gate / risk tier / route / approval directly.
 """
 from __future__ import annotations
 
+import asyncio
+import heapq
 import json
 import logging
 import os
@@ -52,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_LOOKBACK = 10
+_DEFAULT_MAX_SCAN_SESSIONS = 25
 _DEFAULT_BASELINE_COST = 0.50
 _DEFAULT_HEALTHY_COMPLETION = 0.80
 _DEFAULT_DEGRADED_COMPLETION = 0.50
@@ -103,6 +106,19 @@ def lookback_sessions() -> int:
     )
 
 
+def max_scan_sessions() -> int:
+    """Upper bound on how many session directories the scan phase
+    will even consider, selected newest-first by directory mtime,
+    BEFORE any ``summary.json`` is opened/parsed. Decoupled from
+    ``lookback_sessions`` (which further trims to the N actually
+    scored) so the two knobs can't silently regress into an
+    unbounded scan of a monotonically-growing sessions dir."""
+    return _env_int(
+        "JARVIS_SELF_HEALTH_ORACLE_MAX_SESSIONS",
+        _DEFAULT_MAX_SCAN_SESSIONS, minimum=1,
+    )
+
+
 def baseline_cost_usd() -> float:
     return _env_float(
         "JARVIS_STDLIB_SELF_HEALTH_BASELINE_COST_USD",
@@ -129,18 +145,75 @@ def _resolve_sessions_dir(project_root: Optional[Path]) -> Path:
     return Path(base) / _SESSIONS_DIRNAME
 
 
+def _scan_recent_session_names(
+    sessions_dir: Path, max_scan: int,
+) -> Tuple[str, ...]:
+    """Bounded newest-N directory-name scan.
+
+    Load-bearing perf fix (Loop Deadman capture bt-iso-1783056401):
+    the previous implementation did
+    ``sorted(p.name for p in sessions_dir.iterdir() if p.is_dir())``
+    -- a *full* ``pathlib.Path.is_dir()`` (separate ``stat(2)``
+    syscall per entry) across every session directory ever written,
+    growing monotonically (751+ dirs observed, 1.5s -> 17.6s block).
+
+    This version bounds the WORK, not just the result:
+      * ``os.scandir`` -- ``DirEntry`` is typically satisfied from
+        the cached ``readdir(2)`` result on POSIX, so
+        ``entry.is_dir()`` avoids the extra ``stat(2)`` syscall
+        ``Path.is_dir()`` issues per entry.
+      * ``heapq.nlargest`` -- bounded newest-N selection by mtime,
+        not a full sort of every entry.
+      * ``max_scan`` (env ``JARVIS_SELF_HEALTH_ORACLE_MAX_SESSIONS``)
+        caps how many directories are even eligible, independent of
+        how many the sessions dir actually contains.
+
+    Fail-soft: any ``OSError`` during the scan yields ``()``, never
+    raises. Pure/synchronous -- designed to run entirely off the
+    event loop thread via ``loop.run_in_executor``.
+    """
+    candidates: list = []
+    try:
+        with os.scandir(sessions_dir) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+                candidates.append((mtime, entry.name))
+    except OSError:
+        return ()
+    newest = heapq.nlargest(
+        max(1, max_scan), candidates, key=lambda pair: pair[0],
+    )
+    return tuple(name for _, name in newest)
+
+
 def _load_recent_summaries(
     project_root: Optional[Path], lookback: int,
+    max_scan: int = _DEFAULT_MAX_SCAN_SESSIONS,
 ) -> Tuple[dict, ...]:
-    sessions_dir = _resolve_sessions_dir(project_root)
-    if not sessions_dir.is_dir():
-        return ()
+    """Pure, synchronous: bounded scan + bounded parse.
+
+    Receives/returns only plain, immutable-shaped data (a
+    ``Path``/``Optional[Path]`` + two ``int``s in; a tuple of plain
+    ``dict``s out) so nothing mutable crosses the executor-thread
+    boundary. Fail-soft throughout -- a scan or parse failure never
+    raises into the caller (contract required because this now runs
+    via ``loop.run_in_executor``, off the event loop).
+    """
     try:
-        names = sorted(
-            (p.name for p in sessions_dir.iterdir() if p.is_dir()),
-            reverse=True,
+        sessions_dir = _resolve_sessions_dir(project_root)
+        if not sessions_dir.is_dir():
+            return ()
+        names = _scan_recent_session_names(sessions_dir, max_scan)
+    except Exception:  # noqa: BLE001 -- defensive, off-loop fail-soft
+        logger.debug(
+            "[StdlibSelfHealthOracle] session scan failed",
+            exc_info=True,
         )
-    except OSError:
         return ()
     summaries: list = []
     for name in names[:max(1, lookback)]:
@@ -349,8 +422,18 @@ class StdlibSelfHealthOracle:
                     summary="stdlib_self_health_oracle disabled",
                     payload={}, severity=0.0,
                 ),)
-            summaries = _load_recent_summaries(
+            # Off-loop: filesystem scan + JSON parse must never run
+            # as a plain synchronous callback on the loop thread
+            # (Loop Deadman capture bt-iso-1783056401 -- an "async
+            # def" whose body never awaits is still a blocking
+            # callback). Same idiom as http_healthcheck_oracle.py's
+            # query_signals: loop.run_in_executor with a pure sync
+            # fn taking/returning plain data only.
+            loop = asyncio.get_event_loop()
+            summaries = await loop.run_in_executor(
+                None, _load_recent_summaries,
                 self._project_root, lookback_sessions(),
+                max_scan_sessions(),
             )
             now = time.time()
             return (
@@ -387,7 +470,9 @@ def register_shipped_invariants() -> list:
     REQUIRED_FUNCS = (
         "stdlib_self_health_enabled",
         "lookback_sessions",
+        "max_scan_sessions",
         "baseline_cost_usd",
+        "_scan_recent_session_names",
         "_completion_signal",
         "_cost_signal",
         "_stop_reason_signal",
@@ -396,6 +481,7 @@ def register_shipped_invariants() -> list:
     REQUIRED_CLASSES = ("StdlibSelfHealthOracle",)
     REQUIRED_CONSTANTS = (
         "_DEFAULT_LOOKBACK",
+        "_DEFAULT_MAX_SCAN_SESSIONS",
         "_DEFAULT_BASELINE_COST",
         "_DEFAULT_HEALTHY_COMPLETION",
         "_DEFAULT_DEGRADED_COMPLETION",
@@ -461,6 +547,7 @@ __all__ = [
     "StdlibSelfHealthOracle",
     "stdlib_self_health_enabled",
     "lookback_sessions",
+    "max_scan_sessions",
     "baseline_cost_usd",
     "register_shipped_invariants",
 ]
